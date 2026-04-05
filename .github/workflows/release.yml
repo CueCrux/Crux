@@ -30,7 +30,7 @@ jobs:
             os: macos-13
             suffix: darwin-amd64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
