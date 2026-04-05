@@ -20,7 +20,7 @@ zip = "0.6.6"
 corecrux-types = { path = "../corecrux-types" }
 
 [dev-dependencies]
-rand = "0.8.5"
+rand = "0.10.0"
 tempfile = "3.16.0"
 
 [lints]
