@@ -1,0 +1,24 @@
+{
+  "kind": "replay",
+  "runId": "candidate-b-pass",
+  "results": {
+    "completed": 10000,
+    "errors": 0,
+    "timeouts": 0,
+    "eventsRead": 500000,
+    "bytesRead": 64000000,
+    "grpcMessagesSent": 15000,
+    "latencyMs": {
+      "p50": 3.0,
+      "p95": 8.0,
+      "max": 20.0
+    },
+    "throughputReadsPerSec": 3500.0,
+    "throughputEventsPerSec": 175000.0,
+    "throughputBytesPerSec": 22400000.0,
+    "grpcMessagesPerSec": 5250.0,
+    "avgEventsPerMessage": 33.33,
+    "avgBytesPerMessage": 4266.67
+  },
+  "metrics": "corecrux_store_lock_wait_seconds_bucket{op=\"read_stream_batched\",le=\"0.0005\"} 250\ncorecrux_store_lock_wait_seconds_bucket{op=\"read_stream_batched\",le=\"0.001\"} 600\ncorecrux_store_lock_wait_seconds_bucket{op=\"read_stream_batched\",le=\"0.002\"} 900\ncorecrux_store_lock_wait_seconds_bucket{op=\"read_stream_batched\",le=\"0.004\"} 980\ncorecrux_store_lock_wait_seconds_bucket{op=\"read_stream_batched\",le=\"0.008\"} 995\ncorecrux_store_lock_wait_seconds_bucket{op=\"read_stream_batched\",le=\"+Inf\"} 1000\n"
+}

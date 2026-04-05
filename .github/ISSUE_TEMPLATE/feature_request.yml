@@ -1,0 +1,31 @@
+name: Feature Request
+description: Suggest a new feature or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: "Thanks for the suggestion! Please describe the feature you'd like."
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      placeholder: A clear description of the feature
+    validations:
+      required: true
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      placeholder: Why do you need this? What problem does it solve?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      placeholder: What workarounds or alternatives have you considered?
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      placeholder: Any other context, mockups, or references

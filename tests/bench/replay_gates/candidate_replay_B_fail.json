@@ -1,0 +1,24 @@
+{
+  "kind": "replay",
+  "runId": "candidate-b-fail",
+  "results": {
+    "completed": 10000,
+    "errors": 0,
+    "timeouts": 0,
+    "eventsRead": 500000,
+    "bytesRead": 64000000,
+    "grpcMessagesSent": 45000,
+    "latencyMs": {
+      "p50": 10.0,
+      "p95": 20.0,
+      "max": 90.0
+    },
+    "throughputReadsPerSec": 2500.0,
+    "throughputEventsPerSec": 125000.0,
+    "throughputBytesPerSec": 16000000.0,
+    "grpcMessagesPerSec": 11250.0,
+    "avgEventsPerMessage": 11.11,
+    "avgBytesPerMessage": 1422.22
+  },
+  "metrics": "corecrux_store_lock_wait_seconds_bucket{op=\"read_stream_batched\",le=\"0.0005\"} 50\ncorecrux_store_lock_wait_seconds_bucket{op=\"read_stream_batched\",le=\"0.001\"} 150\ncorecrux_store_lock_wait_seconds_bucket{op=\"read_stream_batched\",le=\"0.002\"} 300\ncorecrux_store_lock_wait_seconds_bucket{op=\"read_stream_batched\",le=\"0.004\"} 450\ncorecrux_store_lock_wait_seconds_bucket{op=\"read_stream_batched\",le=\"0.008\"} 650\ncorecrux_store_lock_wait_seconds_bucket{op=\"read_stream_batched\",le=\"0.016\"} 850\ncorecrux_store_lock_wait_seconds_bucket{op=\"read_stream_batched\",le=\"0.032\"} 980\ncorecrux_store_lock_wait_seconds_bucket{op=\"read_stream_batched\",le=\"+Inf\"} 1000\n"
+}

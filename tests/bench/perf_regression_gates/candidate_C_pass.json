@@ -1,0 +1,13 @@
+{
+  "schema": "corecrux.v3.replay.v3",
+  "results": {
+    "throughputReadsPerSec": 17500.0,
+    "latencyMsPerRead": {
+      "p95": 0.67
+    },
+    "errors": 0,
+    "timeouts": 0,
+    "eventsReadRatio": 0.99,
+    "avgReadsPerRpc": 18.0
+  }
+}

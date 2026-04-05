@@ -1,0 +1,24 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+
+name: Semver Check
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  semver:
+    name: Semver Compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks
+      - name: Check semver
+        run: cargo semver-checks check-release --workspace

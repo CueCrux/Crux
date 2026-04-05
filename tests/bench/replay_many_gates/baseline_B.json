@@ -1,0 +1,12 @@
+{
+  "kind": "replay",
+  "runId": "baseline-many-b",
+  "results": {
+    "throughputReadsPerSec": 850.0,
+    "latencyMs": { "p95": 12.0 },
+    "avgReadsPerRpc": 8.0,
+    "eventsReadRatio": 1.0,
+    "errors": 0,
+    "timeouts": 0
+  }
+}

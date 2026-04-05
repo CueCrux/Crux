@@ -1,0 +1,17 @@
+# Default owner for everything
+* @myles
+
+# Core storage engine
+crates/corecrux-storage/ @myles
+crates/corecrux-segment/ @myles
+crates/corecrux-frame/ @myles
+
+# Retrieval
+crates/corecrux-retrieval/ @myles
+crates/corecrux-index/ @myles
+
+# MCP server
+crates/crux-mcp/ @myles
+
+# CI/CD
+.github/ @myles

@@ -1,0 +1,108 @@
+[workspace]
+members = [
+  "crates/corecrux-types",
+  "crates/corecrux-frame",
+  "crates/corecrux-proto",
+  "crates/corecrux-receipts",
+  "crates/corecrux-segment",
+  "crates/corecrux-storage",
+  "crates/corecrux-projections",
+  "crates/corecrux-index",
+  "crates/corecrux-retrieval",
+  "crates/corecrux-memory",
+  "crates/crux-sync",
+  "crates/crux-contrib",
+  "crates/crux-observe",
+  "crates/crux-mcp",
+  "crates/corecruxd",
+  "crates/corecruxctl",
+  "crates/crux-integration-tests",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "LicenseRef-CCL-1.0"
+rust-version = "1.88.0"
+
+# ── Strictest lint configuration ────────────────────────────────────
+# All clippy lint groups denied. Pedantic enabled. Specific overrides below.
+# `unwrap_used` and `expect_used` are warn (not deny) because extracted
+# monorepo code contains hundreds of legitimate uses; new crates override to deny.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_imports = "deny"
+unused_variables = "deny"
+unused_mut = "deny"
+unreachable_code = "deny"
+unreachable_patterns = "deny"
+
+[workspace.lints.clippy]
+# ── Group-level enforcement ──
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# ── Deny: zero-tolerance lints ──
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+wildcard_imports = "deny"
+enum_glob_use = "deny"
+
+# ── Warn: target for future cleanup (extracted code) ──
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+missing_docs_in_private_items = "warn"
+
+# ── Allow: pedantic lints too noisy for extracted code ──
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+return_self_not_must_use = "allow"
+struct_excessive_bools = "allow"
+too_many_lines = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+similar_names = "allow"
+items_after_statements = "allow"
+single_match_else = "allow"
+match_same_arms = "allow"
+redundant_closure_for_method_calls = "allow"
+unnested_or_patterns = "allow"
+if_not_else = "allow"
+manual_let_else = "allow"
+needless_pass_by_value = "allow"
+trivially_copy_pass_by_ref = "allow"
+implicit_hasher = "allow"
+doc_markdown = "allow"
+used_underscore_binding = "allow"
+unreadable_literal = "allow"
+default_trait_access = "allow"
+uninlined_format_args = "allow"
+match_wildcard_for_single_variants = "allow"
+option_if_let_else = "allow"
+manual_string_new = "allow"
+no_effect_underscore_binding = "allow"
+ignored_unit_patterns = "allow"
+
+# ── Build profiles ──────────────────────────────────────────────────
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,21 @@
+{
+  "schema": "corecrux.v3.append.v1",
+  "results": {
+    "appendStageDeltas": {
+      "stagesAvgMs": {
+        "fenceWait": 1.95
+      },
+      "laneAvgMs": {
+        "wait": 6.2
+      },
+      "storeAvgMs": {
+        "lockWait": 4.8
+      }
+    },
+    "throughputEventsPerSec": 24000.0,
+    "latencyMs": {
+      "p95": 10.9
+    },
+    "errors": 0
+  }
+}

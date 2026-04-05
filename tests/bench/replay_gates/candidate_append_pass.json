@@ -1,0 +1,14 @@
+{
+  "kind": "append",
+  "runId": "candidate-append-pass",
+  "results": {
+    "totalEvents": 590000,
+    "batches": 10000,
+    "errors": 0,
+    "latencyMs": {
+      "p50": 3.6,
+      "p95": 9.8
+    },
+    "throughputEventsPerSec": 9500.0
+  }
+}

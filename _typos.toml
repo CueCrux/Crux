@@ -1,0 +1,9 @@
+[default.extend-words]
+# Domain-specific terms that aren't typos
+ccxi = "ccxi"
+ccxseg = "ccxseg"
+ccxs = "ccxs"
+corecrux = "corecrux"
+corecruxd = "corecruxd"
+corecruxctl = "corecruxctl"
+pfordelta = "pfordelta"

@@ -1,0 +1,230 @@
+// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+// Licensed under the CueCrux Community Licence (CCL v1.0).
+// See LICENCE.md in the repository root.
+
+syntax = "proto3";
+
+package corecrux.dataplane.v1;
+
+service CoreCruxDataPlaneV1 {
+  rpc AppendBatch(AppendBatchRequest) returns (AppendBatchResponse);
+  rpc ReadStream(ReadStreamRequest) returns (stream ReadStreamResponse);
+  rpc ReadStreamBatched(ReadStreamBatchedRequest) returns (stream ReadStreamBatchResponse);
+  rpc ReadStreamBatchedUnary(ReadStreamBatchedRequest) returns (ReadStreamBatchResponse);
+  rpc ReadManyBatchedUnary(ReadManyBatchedRequest) returns (ReadManyBatchedResponse);
+  rpc ReadManyFramesBatchedUnary(ReadManyFramesBatchedRequest) returns (ReadManyFramesBatchedResponse);
+  rpc ReadFramesBatchedUnary(ReadStreamBatchedRequest) returns (ReadFramesBatchRawResponse);
+  rpc ReplaySession(stream ReplaySessionRequest) returns (stream ReplaySessionResponse);
+  // Determinism hook: return raw stored frame bytes for a list of locations.
+  rpc ReadFrames(ReadFramesRequest) returns (stream ReadFramesResponse);
+}
+
+// Phase 8 (optional): large replay export bundles over gRPC streaming.
+service CoreCruxExportV1 {
+  rpc ExportReceiptBundle(ExportReceiptBundleRequest) returns (stream ExportChunk);
+}
+
+message AppendBatchRequest {
+  string tenant_id = 1;
+  string stream_type = 2;
+  string stream_id = 3;
+  repeated AppendEvent events = 4;
+  uint64 expected_next_seq = 5;
+  optional uint64 client_shard_map_version = 6;
+}
+
+message AppendEvent {
+  string event_id = 1;
+  string occurred_at = 2; // RFC3339
+  string event_type = 3;
+  string content_type = 4;
+  bytes payload = 5; // opaque bytes
+}
+
+message AppendBatchResponse {
+  repeated AppendResult results = 1;
+  WriteConfirmation write_confirmation = 2;
+}
+
+message WriteConfirmation {
+  uint64 commit_seq = 1;
+  uint64 segment_id = 2;
+  bytes receipt_hash = 3;
+  bytes vault_signature = 4;
+  string key_id = 5;
+  bool unsigned = 6;
+}
+
+message AppendResult {
+  enum Status {
+    APPENDED = 0;
+    DUPLICATE_COMMITTED = 1;
+    REJECTED = 2;
+    DUPLICATE_IN_BATCH = 3;
+  }
+  Status status = 1;
+  uint64 seq = 2;
+  FrameLocation location = 3;
+  bytes payload_hash = 4; // 32 bytes (BLAKE3)
+  bytes header_hash = 5;  // 32 bytes (BLAKE3)
+  uint64 shard_map_version = 6;
+  string error_code = 7;
+  string error_message = 8;
+}
+
+message FrameLocation {
+  uint64 shard_id = 1;
+  uint64 segment_id = 2;
+  uint64 offset = 3;
+  uint64 epoch = 4;
+}
+
+message ReadStreamRequest {
+  string tenant_id = 1;
+  string stream_type = 2;
+  string stream_id = 3;
+  uint64 from_seq_inclusive = 4;
+  uint32 max_events = 5;
+
+  enum ReadMode {
+    DECODED = 0;
+    RAW_FRAMES = 1;
+  }
+  ReadMode mode = 6;
+
+  // If set > 0, returns the last N events for the stream (ascending seq order).
+  // Takes precedence over from_seq_inclusive/max_events.
+  uint32 tail_events = 7;
+}
+
+message ReadStreamResponse {
+  uint64 seq = 1;
+  string event_id = 2;
+  string occurred_at = 3;
+  string ingested_at = 4;
+  string event_type = 5;
+  string content_type = 6;
+  bytes payload = 7;
+  FrameLocation location = 8;
+}
+
+message ReadStreamBatchedRequest {
+  ReadStreamRequest base = 1;
+  uint32 max_events_per_message = 2;
+  uint32 max_bytes_per_message = 3;
+}
+
+message ReadStreamBatchResponse {
+  repeated ReadStreamResponse events = 1;
+  uint32 event_count = 2;
+  uint64 payload_bytes = 3;
+  bool eof = 4;
+}
+
+message ReadFramesRequest {
+  repeated FrameLocation locations = 1;
+}
+
+message ReadFramesResponse {
+  FrameLocation location = 1;
+  bytes frame_bytes = 2; // exact stored bytes
+}
+
+message ReadFramesBatchRawResponse {
+  repeated FrameLocation locations = 1;
+  bytes frames_blob = 2;
+  repeated uint32 frame_offsets = 3;
+  repeated uint32 frame_lens = 4;
+  uint32 frame_count = 5;
+  uint64 frame_bytes = 6;
+  bool eof = 7;
+}
+
+message ReadManyBatchedRequest {
+  repeated ReadStreamBatchedRequest reads = 1;
+}
+
+message ReadManyBatchedResult {
+  uint32 request_index = 1;
+  string stream_id = 2;
+  ReadStreamBatchResponse batch = 3;
+}
+
+message ReadManyBatchedResponse {
+  repeated ReadManyBatchedResult results = 1;
+  uint32 result_count = 2;
+  uint64 payload_bytes = 3;
+}
+
+message ReadManyFramesBatchedRequest {
+  repeated ReadStreamBatchedRequest reads = 1;
+}
+
+message ReadManyFramesBatchedResult {
+  uint32 request_index = 1;
+  string stream_id = 2;
+  ReadFramesBatchRawResponse batch = 3;
+}
+
+message ReadManyFramesBatchedResponse {
+  repeated ReadManyFramesBatchedResult results = 1;
+  uint32 result_count = 2;
+  uint64 frame_bytes = 3;
+  uint64 frame_count = 4;
+}
+
+message ReplaySessionRequest {
+  uint32 request_id = 1;
+  oneof request {
+    ReadManyBatchedRequest decoded_reads = 2;
+    ReadManyFramesBatchedRequest frame_reads = 3;
+  }
+}
+
+message ReplaySessionResponse {
+  uint32 request_id = 1;
+  oneof response {
+    ReadManyBatchedResponse decoded = 2;
+    ReadManyFramesBatchedResponse frames = 3;
+  }
+  bool eof = 4;
+  string error_code = 5;
+  string error_message = 6;
+}
+
+enum ExportFormat {
+  EXPORT_FORMAT_ZIP = 0;
+  EXPORT_FORMAT_TAR_ZST = 1;
+}
+
+enum ExportRedaction {
+  EXPORT_REDACTION_TENANT_SAFE = 0;
+  EXPORT_REDACTION_NONE = 1;
+  EXPORT_REDACTION_METADATA_ONLY = 2;
+}
+
+enum ReceiptExportInclude {
+  RECEIPT_EXPORT_INCLUDE_BODY = 0;
+  RECEIPT_EXPORT_INCLUDE_SIG = 1;
+  RECEIPT_EXPORT_INCLUDE_VERIFICATION = 2;
+  RECEIPT_EXPORT_INCLUDE_TRACE_SUMMARY = 3;
+  RECEIPT_EXPORT_INCLUDE_SUBJECT_LINKS = 4;
+  RECEIPT_EXPORT_INCLUDE_LINKED_RECEIPTS = 5;
+}
+
+message ExportReceiptBundleRequest {
+  string tenant_id = 1;
+  string receipt_id = 2;
+  ExportFormat format = 3;
+  ExportRedaction redaction = 4;
+  repeated ReceiptExportInclude include = 5;
+}
+
+message ExportChunk {
+  uint32 ordinal = 1;
+  bytes data = 2;
+  bool eof = 3;
+  // Only populated on the first chunk.
+  string content_type = 4;
+  string filename = 5;
+}

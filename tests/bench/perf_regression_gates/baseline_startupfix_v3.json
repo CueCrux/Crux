@@ -1,0 +1,64 @@
+{
+  "schema": "corecrux.perf.regression.baseline.v1",
+  "runFamily": "fixture-startupfix",
+  "metrics": {
+    "append": {
+      "throughputEventsPerSec": 25421.74,
+      "p95Ms": 9.98,
+      "stagesAvgMs": {
+        "fenceWait": 1.7
+      },
+      "laneAvgMs": {
+        "wait": 5.0
+      },
+      "storeAvgMs": {
+        "lockWait": 3.9
+      }
+    },
+    "replay": {
+      "A": {
+        "throughputReadsPerSec": 21327.81,
+        "p95MsPerRead": 0.52
+      },
+      "B": {
+        "throughputReadsPerSec": 15376.19,
+        "p95MsPerRead": 0.74
+      },
+      "C": {
+        "throughputReadsPerSec": 19750.01,
+        "p95MsPerRead": 0.57
+      }
+    }
+  },
+  "thresholds": {
+    "append": {
+      "minThroughputRatio": 0.85,
+      "maxP95Ratio": 1.25,
+      "maxFenceWaitRatio": 1.35,
+      "maxLaneWaitRatio": 1.35,
+      "maxStoreLockWaitRatio": 1.35,
+      "maxStoreLockWaitMsAbs": 0.5
+    },
+    "replay": {
+      "common": {
+        "minEventsReadRatio": 0.98,
+        "requireSessionUseFramesFalse": true
+      },
+      "A": {
+        "minThroughputRatio": 0.85,
+        "maxP95Ratio": 1.25,
+        "minAvgReadsPerRpc": 16
+      },
+      "B": {
+        "minThroughputRatio": 0.8,
+        "maxP95Ratio": 1.35,
+        "minAvgReadsPerRpc": 8
+      },
+      "C": {
+        "minThroughputRatio": 0.85,
+        "maxP95Ratio": 1.25,
+        "minAvgReadsPerRpc": 16
+      }
+    }
+  }
+}

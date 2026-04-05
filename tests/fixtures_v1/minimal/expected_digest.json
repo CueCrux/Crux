@@ -1,0 +1,8 @@
+{
+  "total_events": 3,
+  "per_stream_last_seq": {
+    "tenant-a\u0000answers\u0000stream-1": 2,
+    "tenant-b\u0000receipts\u0000stream-2": 1
+  },
+  "digest_blake3": "9e5d9211b04e1a9de89c97e81f11e4718d38878b6a95efdffbe641136867208f"
+}

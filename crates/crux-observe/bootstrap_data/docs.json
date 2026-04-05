@@ -1,0 +1,9 @@
+[
+  {"slug": "quickstart", "title": "Five-Minute Quickstart", "content": "1. docker compose up -d\n2. curl http://localhost:14800/healthz\n3. POST /v1/query/text-search with query and tenant_id\n4. PUT /v1/facts to store a fact\n5. corecruxctl verify-store --data-dir ./data"},
+  {"slug": "api-append", "title": "Appending Events", "content": "POST /v1/append with tenant_id, stream_type, stream_id, and events array. Each event needs event_id, occurred_at (RFC3339), event_type, and payload (JSON string)."},
+  {"slug": "api-text-search", "title": "Text Search", "content": "POST /v1/query/text-search with tenant_id and query. Optional: token_budget (fill until budget), min_score (relevance floor), mode=scan (metadata only)."},
+  {"slug": "api-facts", "title": "Fact Store", "content": "PUT /v1/facts to store. GET /v1/facts?query=... to search. GET /v1/facts/entity/{name} by entity. DELETE /v1/facts/{id} to soft-delete."},
+  {"slug": "api-sessions", "title": "Session Store", "content": "PUT /v1/sessions/{id}/state with JSON body. GET /v1/sessions/{id}/state to retrieve. State persists across requests within the session."},
+  {"slug": "architecture", "title": "Architecture", "content": "14 Rust crates. corecruxd is the HTTP+gRPC daemon on port 14800. Append-only event store with sealed segments. .ccxi companion indexes for BM25. CROWN receipts on every operation."},
+  {"slug": "config", "title": "Configuration", "content": "All config via environment variables. CORECRUXD_DATA_DIR (data), CORECRUXD_HTTP_PORT (default 14800), CORECRUXD_BUILD_CCXI (index building), CORECRUXD_QUERY_TEXT_SEARCH (enable search)."}
+]

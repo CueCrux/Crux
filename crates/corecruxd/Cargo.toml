@@ -1,0 +1,68 @@
+[package]
+name = "corecruxd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[features]
+default = []
+otel = [
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:opentelemetry-otlp",
+  "dep:tracing-opentelemetry",
+]
+
+[dependencies]
+axum = "0.8.1"
+base64 = "0.22.1"
+blake3 = "1.5.1"
+chrono = { version = "0.4.40", default-features = false, features = ["clock"] }
+crc32fast = "1.4.2"
+ed25519-dalek = { version = "2.2.0", features = ["std"] }
+fs2 = "0.4.3"
+jsonwebtoken = "9.3.0"
+prometheus = "0.13.4"
+prost = "0.13.5"
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.139"
+xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
+tar = "0.4.44"
+tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-stream = "0.1.15"
+tonic = "0.12.3"
+tower-http = { version = "0.6.2", features = ["catch-panic", "timeout", "trace"] }
+thiserror = "2.0.12"
+tracing = "0.1.41"
+tracing-opentelemetry = { version = "0.28", optional = true }
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
+ureq = { version = "2.12.1", features = ["json"] }
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", features = ["tonic"], optional = true }
+uuid = { version = "1.16.0", features = ["v4"] }
+zstd = "0.11.2"
+zip = "0.6.6"
+
+corecrux-frame = { path = "../corecrux-frame" }
+corecrux-memory = { path = "../corecrux-memory" }
+corecrux-projections = { path = "../corecrux-projections" }
+corecrux-proto = { path = "../corecrux-proto" }
+corecrux-retrieval = { path = "../corecrux-retrieval" }
+corecrux-receipts = { path = "../corecrux-receipts" }
+corecrux-segment = { path = "../corecrux-segment" }
+corecrux-storage = { path = "../corecrux-storage" }
+corecrux-types = { path = "../corecrux-types" }
+crux-observe = { path = "../crux-observe" }
+
+[dev-dependencies]
+corecrux-index = { path = "../corecrux-index" }
+serial_test = "3"
+tempfile = "3"
+
+[build-dependencies]
+anyhow = "1.0.97"
+
+[lints]
+workspace = true

@@ -1,0 +1,212 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-lint-
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Check for typos
+        uses: crate-ci/typos@v1
+
+      - name: Clippy (workspace lint config)
+        run: cargo clippy --workspace
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Smoke test
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          CORECRUXD_DATA_DIR=/tmp/crux-smoke ./target/release/corecruxd &
+          sleep 3
+          curl -sf http://localhost:14800/healthz | jq .
+          curl -sf http://localhost:14800/readyz
+          curl -sf http://localhost:14800/metrics | head -5
+          kill %1
+
+  msrv:
+    name: MSRV (1.88.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-msrv-
+
+      - name: Build with MSRV
+        run: cargo build --workspace
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-cov-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-cov-
+
+      - name: Generate coverage report
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+      - name: Coverage summary
+        run: cargo llvm-cov --workspace --summary-only
+
+      - name: Enforce coverage thresholds
+        run: |
+          SUMMARY=$(cargo llvm-cov --workspace --summary-only 2>&1)
+          TOTAL=$(echo "$SUMMARY" | grep "^TOTAL" | awk '{print $4}' | tr -d '%')
+          echo "::notice::Total workspace coverage: ${TOTAL}%"
+
+          FAILED=0
+
+          # Workspace floor: 81% (ratchets up as tests are added)
+          if (( $(echo "$TOTAL < 81" | bc -l) )); then
+            echo "::error::Workspace coverage ${TOTAL}% is below 81% floor"
+            FAILED=1
+          fi
+
+          # New crate floor: 95%
+          for crate in corecrux-memory crux-sync crux-contrib; do
+            COV=$(echo "$SUMMARY" | grep "^${crate}/" | awk '{sum+=$1; missed+=$2} END {if(sum>0) printf "%.1f", (1-missed/sum)*100; else print "100.0"}')
+            echo "${crate}: ${COV}%"
+            if (( $(echo "$COV < 95" | bc -l) )); then
+              echo "::error::${crate} coverage ${COV}% is below 95% floor"
+              FAILED=1
+            fi
+          done
+
+          # Phase 1 code floor: 90%
+          for file in corecruxd/src/config.rs corecruxd/src/control.rs corecruxd/src/structured_log.rs corecruxd/src/problem.rs; do
+            COV=$(echo "$SUMMARY" | grep "^${file}" | awk '{print $4}' | tr -d '%')
+            echo "${file}: ${COV}%"
+            if [ -n "$COV" ] && (( $(echo "$COV < 90" | bc -l) )); then
+              echo "::error::${file} coverage ${COV}% is below 90% floor"
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -eq 1 ]; then
+            exit 1
+          fi
+          echo "All coverage thresholds met."
+
+      - name: Upload coverage to GitHub
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: lcov.info

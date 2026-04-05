@@ -1,0 +1,12 @@
+{
+  "kind": "replay",
+  "runId": "candidate-many-pass-c",
+  "results": {
+    "throughputReadsPerSec": 3900.0,
+    "latencyMs": { "p95": 3.0 },
+    "avgReadsPerRpc": 12.0,
+    "eventsReadRatio": 1.0,
+    "errors": 0,
+    "timeouts": 0
+  }
+}

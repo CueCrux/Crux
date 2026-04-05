@@ -1,0 +1,14 @@
+{
+  "kind": "append",
+  "runId": "candidate-append-fail",
+  "results": {
+    "totalEvents": 500000,
+    "batches": 10000,
+    "errors": 0,
+    "latencyMs": {
+      "p50": 4.4,
+      "p95": 12.9
+    },
+    "throughputEventsPerSec": 8000.0
+  }
+}

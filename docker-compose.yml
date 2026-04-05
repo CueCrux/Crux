@@ -1,0 +1,32 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+
+version: "3.8"
+
+services:
+  corecrux:
+    image: cuecrux/corecrux-community:latest
+    build: .
+    ports:
+      - "14800:14800"
+    volumes:
+      - corecrux-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:14800/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    environment:
+      - CORECRUXD_DATA_DIR=/data
+      - CORECRUXD_BUILD_CCXI=1
+      - CORECRUX_LOG_FORMAT=json
+      # Optional: enable commons sync
+      # - CORECRUX_SYNC_TOKEN=vcx_...
+      # - CORECRUX_SYNC_ENDPOINT=https://vaultcrux.com/api/v1/community/sync
+
+volumes:
+  corecrux-data:

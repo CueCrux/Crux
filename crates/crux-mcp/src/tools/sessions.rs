@@ -1,0 +1,277 @@
+// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+// Licensed under the CueCrux Community Licence (CCL v1.0).
+// See LICENCE.md in the repository root.
+
+//! Session state tool handlers: `get_session`, `save_session`, `list_sessions`,
+//! `delete_session`.
+
+use serde_json::{json, Value};
+
+use crate::dispatch::McpContext;
+use crate::protocol::{JsonRpcError, INVALID_PARAMS};
+
+/// `get_session` — retrieve session state by ID.
+pub async fn handle_get_session(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let session_id = require_str(args, "session_id")?;
+
+    let store = ctx.session_store.read().await;
+    match store.get(session_id) {
+        Some(session) => Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string_pretty(&session.state).unwrap_or_default()
+            }]
+        })),
+        None => Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": format!("no session found: {session_id}")
+            }],
+            "isError": false
+        })),
+    }
+}
+
+/// `save_session` — create or update session state.
+pub async fn handle_save_session(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let session_id = require_str(args, "session_id")?;
+    let state = args
+        .get("state")
+        .cloned()
+        .ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "missing required param: state".to_string(),
+            data: Some(json!({"param": "state", "required": true})),
+        })?;
+
+    let mut store = ctx.session_store.write().await;
+    let session = store.put(session_id, state);
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": format!("saved session {} ({} tokens)", session.session_id, session.total_tokens)
+        }]
+    }))
+}
+
+/// `list_sessions` — list all session IDs.
+pub async fn handle_list_sessions(_args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let store = ctx.session_store.read().await;
+    let mut ids = store.list().iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    ids.sort();
+
+    if ids.is_empty() {
+        return Ok(json!({
+            "content": [{ "type": "text", "text": "no sessions" }]
+        }));
+    }
+
+    let text = ids.join("\n");
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }]
+    }))
+}
+
+/// `delete_session` — delete a session by ID.
+pub async fn handle_delete_session(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let session_id = require_str(args, "session_id")?;
+
+    let mut store = ctx.session_store.write().await;
+    let deleted = store.delete(session_id);
+
+    if deleted {
+        Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": format!("deleted session {session_id}")
+            }]
+        }))
+    } else {
+        Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": format!("session not found: {session_id}")
+            }],
+            "isError": false
+        }))
+    }
+}
+
+/// Extract a required string parameter or return an INVALID_PARAMS error.
+fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, JsonRpcError> {
+    args.get(field)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("missing required param: {field}"),
+            data: Some(json!({"param": field, "required": true})),
+        })
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::McpContext;
+
+    fn test_ctx() -> McpContext {
+        McpContext::new_default("test-node")
+    }
+
+    #[tokio::test]
+    async fn get_session_not_found() {
+        let ctx = test_ctx();
+        let result = handle_get_session(
+            &json!({"session_id": "nonexistent"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no session found"));
+    }
+
+    #[tokio::test]
+    async fn get_session_missing_id() {
+        let ctx = test_ctx();
+        let err = handle_get_session(&json!({}), &ctx).await.unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn save_and_get_roundtrip() {
+        let ctx = test_ctx();
+
+        // Save
+        let result = handle_save_session(
+            &json!({"session_id": "s1", "state": {"step": 1, "done": false}}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("saved session s1"));
+
+        // Get
+        let result = handle_get_session(
+            &json!({"session_id": "s1"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"step\": 1"));
+    }
+
+    #[tokio::test]
+    async fn save_session_missing_state() {
+        let ctx = test_ctx();
+        let err = handle_save_session(
+            &json!({"session_id": "s1"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn save_session_overwrites() {
+        let ctx = test_ctx();
+
+        handle_save_session(
+            &json!({"session_id": "s1", "state": {"v": 1}}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        handle_save_session(
+            &json!({"session_id": "s1", "state": {"v": 2, "extra": true}}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_get_session(
+            &json!({"session_id": "s1"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"v\": 2"));
+        assert!(text.contains("\"extra\": true"));
+    }
+
+    // ── list_sessions tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_sessions_empty() {
+        let ctx = test_ctx();
+        let result = handle_list_sessions(&json!({}), &ctx).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "no sessions");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_returns_sorted() {
+        let ctx = test_ctx();
+        handle_save_session(&json!({"session_id": "z_sess", "state": {}}), &ctx).await.unwrap();
+        handle_save_session(&json!({"session_id": "a_sess", "state": {}}), &ctx).await.unwrap();
+
+        let result = handle_list_sessions(&json!({}), &ctx).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines, vec!["a_sess", "z_sess"]);
+    }
+
+    // ── delete_session tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_session_existing() {
+        let ctx = test_ctx();
+        handle_save_session(&json!({"session_id": "s1", "state": {"x": 1}}), &ctx).await.unwrap();
+
+        let result = handle_delete_session(&json!({"session_id": "s1"}), &ctx).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("deleted session s1"));
+
+        // Verify it's gone.
+        let result = handle_get_session(&json!({"session_id": "s1"}), &ctx).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no session found"));
+    }
+
+    #[tokio::test]
+    async fn delete_session_nonexistent() {
+        let ctx = test_ctx();
+        let result = handle_delete_session(&json!({"session_id": "nope"}), &ctx).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("session not found"));
+    }
+
+    #[tokio::test]
+    async fn delete_session_missing_param() {
+        let ctx = test_ctx();
+        let err = handle_delete_session(&json!({}), &ctx).await.unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.data.is_some());
+        assert_eq!(err.data.unwrap()["param"], "session_id");
+    }
+
+    // ── structured error data ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn save_session_missing_state_has_structured_data() {
+        let ctx = test_ctx();
+        let err = handle_save_session(&json!({"session_id": "s1"}), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.data.is_some());
+        assert_eq!(err.data.unwrap()["param"], "state");
+    }
+}

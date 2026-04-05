@@ -1,0 +1,30 @@
+[package]
+name = "corecrux-retrieval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3 = "1.5.1"
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.139"
+thiserror = "2.0.11"
+tracing = "0.1.41"
+xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
+
+corecrux-index = { path = "../corecrux-index" }
+corecrux-projections = { path = "../corecrux-projections" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.139"
+tempfile = "3.16.0"
+xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
+
+[[bench]]
+name = "bm25_bench"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "crux": {
+      "url": "http://localhost:14801/mcp"
+    }
+  }
+}

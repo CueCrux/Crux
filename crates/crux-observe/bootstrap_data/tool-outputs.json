@@ -1,0 +1,18 @@
+[
+  {"tool": "query", "output": "{ results: [{doc_id, score, segment_index, token_count}], coverage: {score, gaps, below_floor}, meta: {backend, took_ms, segments_searched} }"},
+  {"tool": "query_scan", "output": "{ results: [{doc_id, score, token_count}], meta: {took_ms, segments_searched} }"},
+  {"tool": "query_expand", "output": "{ results: [{doc_id, content, token_count}] }"},
+  {"tool": "store_fact", "output": "{ fact_id, entity, key, value, stored_at, tokens, confidence }"},
+  {"tool": "query_facts", "output": "{ facts: [{fact_id, entity, key, value, confidence, stored_at}], total_tokens }"},
+  {"tool": "delete_fact", "output": "{ deleted: bool, fact_id }"},
+  {"tool": "list_entities", "output": "{ entities: [string] }"},
+  {"tool": "get_bootstrap", "output": "{ facts: [{entity, key, value}], total_tokens }"},
+  {"tool": "get_session", "output": "{ session_id, state, updated_at, total_tokens }"},
+  {"tool": "save_session", "output": "{ session_id, updated_at }"},
+  {"tool": "list_sessions", "output": "{ sessions: [string] }"},
+  {"tool": "delete_session", "output": "{ deleted: bool, session_id }"},
+  {"tool": "get_gaps", "output": "{ gaps: [{entity, key, value, stored_at}], total_tokens }"},
+  {"tool": "get_agent_identity", "output": "{ agent_name: string }"},
+  {"tool": "create_handoff", "output": "{ handoff_id, content_hash, signature, facts_count, total_tokens }"},
+  {"tool": "accept_handoff", "output": "{ session_id, facts_imported, verified: bool }"}
+]

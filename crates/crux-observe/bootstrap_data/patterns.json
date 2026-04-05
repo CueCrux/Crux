@@ -1,0 +1,10 @@
+[
+  {"slug": "token-reduction", "title": "Token Reduction Pattern", "content": "Use token_budget instead of top_k. POST /v1/query/text-search with token_budget=4000 returns the best results that fit in 4000 tokens. Reduces prompt cost by 60-80%."},
+  {"slug": "scan-expand", "title": "Progressive Retrieval", "content": "Two-pass pattern: first POST with mode=scan to get metadata (titles, scores, token counts). Then POST /v1/query/text-search/expand with selected result_ids to fetch full content."},
+  {"slug": "fact-memory", "title": "Agent Fact Memory", "content": "Store extracted facts via PUT /v1/facts. 12 tokens per fact vs 3000 tokens replaying conversation. Query with GET /v1/facts?query=keyword&token_budget=500."},
+  {"slug": "session-state", "title": "Session Persistence", "content": "PUT /v1/sessions/{id}/state with decisions, open questions, constraints. Resume later with GET. 87 tokens vs 15K conversation replay."},
+  {"slug": "coverage-check", "title": "Coverage Awareness", "content": "Every text-search response includes coverage.score (0-1) and coverage.gaps[]. If score < 0.5, the corpus doesn't cover the query well — inform the user."},
+  {"slug": "mcp-init", "title": "MCP Initialisation", "content": "1. Connect via MCP. 2. Call tools/list. 3. Use query for search, store_fact for memory."},
+  {"slug": "private-facts", "title": "Private Facts", "content": "Set private=true to scope facts to your agent only. Other agents cannot see private facts."},
+  {"slug": "handoff-workflow", "title": "Handoff Workflow", "content": "Agent A: create_handoff(session_id, include_facts=true). Pass package to Agent B. Agent B: accept_handoff(package)."}
+]

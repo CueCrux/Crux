@@ -1,0 +1,14 @@
+[
+  {"code": "IoReadFailed", "title": "IO Read Failed", "content": "Segment file read failed. Check: disk health (smartctl), filesystem permissions, NFS mount stability. If persistent, run corecruxctl verify-store."},
+  {"code": "IoWriteFailed", "title": "IO Write Failed", "content": "Segment file write failed. Check: disk space (df -h), write permissions, filesystem read-only state."},
+  {"code": "SegmentCorrupt", "title": "Segment Corrupt", "content": "BLAKE3 hash mismatch on segment data. Run corecruxctl verify-store --mode full. If confirmed, the segment needs replay from a replica."},
+  {"code": "InvalidFrame", "title": "Invalid Frame", "content": "Frame header hash mismatch. Likely a truncated write during crash. corecruxd handles this automatically via commit marker truncation on restart."},
+  {"code": "Backpressure", "title": "Backpressure Active", "content": "Append rejected due to backpressure. The system is under load. Wait and retry with exponential backoff. Check /metrics for corecrux_backpressure_active gauge."},
+  {"code": "ShardNotOwner", "title": "Shard Not Owner", "content": "Request routed to wrong node. This happens during shard rebalancing. Retry — the client should re-fetch the shard map and route correctly."},
+  {"code": "EpochMismatch", "title": "Epoch Mismatch", "content": "Shard epoch changed (rebalance in progress). Retry with updated shard map version."},
+  {"code": "Timeout", "title": "Operation Timeout", "content": "Operation exceeded deadline. Check: disk latency (iostat), network latency, lock contention (/metrics corecrux_store_lock_wait_seconds)."},
+  {"code": "Internal", "title": "Internal Error", "content": "Unexpected internal error. Check daemon logs for stack traces. Report at github.com/CueCrux/Crux/issues if reproducible."},
+  {"code": "LowCoverage", "title": "Low Coverage", "content": "Query returned coverage.score < 0.5. Try broader terms, check get_gaps(), or inform user the corpus doesn't cover this topic."},
+  {"code": "SessionNotFound", "title": "Session Not Found", "content": "Session ID not found. Create a new session with save_session."},
+  {"code": "InvalidParams", "title": "Invalid Parameters", "content": "MCP tool received missing or invalid parameters. Check the tool's inputSchema."}
+]

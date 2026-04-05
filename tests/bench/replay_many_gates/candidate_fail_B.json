@@ -1,0 +1,12 @@
+{
+  "kind": "replay",
+  "runId": "candidate-many-fail-b",
+  "results": {
+    "throughputReadsPerSec": 700.0,
+    "latencyMs": { "p95": 14.0 },
+    "avgReadsPerRpc": 1.0,
+    "eventsReadRatio": 0.87,
+    "errors": 0,
+    "timeouts": 2
+  }
+}

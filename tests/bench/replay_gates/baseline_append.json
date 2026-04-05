@@ -1,0 +1,14 @@
+{
+  "kind": "append",
+  "runId": "baseline-append",
+  "results": {
+    "totalEvents": 600000,
+    "batches": 10000,
+    "errors": 0,
+    "latencyMs": {
+      "p50": 3.4,
+      "p95": 9.1
+    },
+    "throughputEventsPerSec": 10000.0
+  }
+}
