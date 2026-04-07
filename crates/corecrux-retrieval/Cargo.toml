@@ -16,7 +16,7 @@ corecrux-index = { path = "../corecrux-index" }
 corecrux-projections = { path = "../corecrux-projections" }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 serde = { version = "1.0.218", features = ["derive"] }
 serde_json = "1.0.139"
 tempfile = "3.16.0"
