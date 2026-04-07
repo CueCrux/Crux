@@ -211,6 +211,7 @@ fn require_str<'a>(params: &'a Value, field: &str) -> Result<&'a str, JsonRpcErr
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::dispatch::McpContext;

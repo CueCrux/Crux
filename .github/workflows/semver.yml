@@ -10,10 +10,13 @@ jobs:
   semver:
     name: Semver Compatibility
     runs-on: [self-hosted, ci]
+    env:
+      CARGO_HOME: /home/gha-runner/.cargo
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - name: Check semver
         run: cargo semver-checks check-release --workspace || echo "::warning::Semver check failed (expected for first release or missing baseline)"
         continue-on-error: true

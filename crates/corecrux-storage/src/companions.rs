@@ -16,6 +16,8 @@ use std::path::Path;
 /// `.ccxi` file is written atomically alongside the `.ccxseg` file.
 ///
 /// Non-fatal: returns `Err` on failure but the sealed segment remains valid.
+// SAFETY: try_into().unwrap() on fixed-size byte slices with matching array length.
+#[allow(clippy::unwrap_used)]
 pub(crate) fn build_ccxi_companion(
     shard_dir: &Path,
     shard_id: u32,

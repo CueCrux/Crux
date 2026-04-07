@@ -57,6 +57,7 @@ pub async fn handle_get_gaps(args: &Value, ctx: &McpContext) -> Result<Value, Js
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::dispatch::McpContext;

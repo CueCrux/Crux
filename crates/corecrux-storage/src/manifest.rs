@@ -106,6 +106,8 @@ pub fn load_manifest_segment_catalog(shard_dir: &Path) -> Result<ManifestSegment
     })
 }
 
+// SAFETY: try_into().unwrap() on fixed-size byte slices with matching array length.
+#[allow(clippy::unwrap_used)]
 pub(crate) fn load_manifest_records(manifest: &mut File) -> Result<(ManifestState, u64)> {
     manifest.seek(SeekFrom::Start(0)).map_err(io_err)?;
     let mut hdr = [0u8; MANIFEST_HEADER_LEN];
@@ -163,6 +165,8 @@ pub(crate) fn load_manifest_records(manifest: &mut File) -> Result<(ManifestStat
     Ok((state, offset))
 }
 
+// SAFETY: try_into().unwrap() on fixed-size byte slices with matching array length.
+#[allow(clippy::unwrap_used)]
 pub(crate) fn validate_manifest_header(bytes: &[u8]) -> Result<()> {
     if bytes.len() < MANIFEST_HEADER_LEN {
         return Err(StorageError::ManifestHeaderInvalid {

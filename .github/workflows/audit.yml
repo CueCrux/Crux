@@ -15,8 +15,11 @@ jobs:
   advisories:
     name: Advisory audit
     runs-on: [self-hosted, ci]
+    env:
+      CARGO_HOME: /home/gha-runner/.cargo
     steps:
       - uses: actions/checkout@v6
+      - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Check advisories
         run: cargo deny check advisories
@@ -24,8 +27,11 @@ jobs:
   licenses:
     name: Licence check
     runs-on: [self-hosted, ci]
+    env:
+      CARGO_HOME: /home/gha-runner/.cargo
     steps:
       - uses: actions/checkout@v6
+      - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Check licenses
         run: cargo deny check licenses

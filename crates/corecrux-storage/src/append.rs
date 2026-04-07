@@ -33,6 +33,8 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 impl ShardStorage {
+    // SAFETY: try_into().unwrap() on fixed-size byte slices with matching array length.
+    #[allow(clippy::unwrap_used)]
     pub(crate) fn load_head_segment_from_disk(&mut self) -> Result<()> {
         let mut candidates: Vec<(u64, PathBuf, String)> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&self.paths.segments_dir) {

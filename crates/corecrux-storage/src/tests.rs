@@ -7,8 +7,10 @@ use super::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::companions::build_ccxi_companion;
     use crate::manifest::{load_manifest_records, validate_manifest_header};
     use corecrux_frame::{canonical_header_bytes_v1, compute_header_hash, compute_payload_hash, CanonicalHeaderV1};
+    use corecrux_segment::FrameMetaV1;
 
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -460,6 +462,69 @@ mod tests {
         (dir, storage)
     }
 
+    fn build_ccxi_test_frame(
+        tenant_id: &str,
+        stream_type: &str,
+        stream_id: &str,
+        seq: u64,
+        event_id: &str,
+        payload: &[u8],
+        record_off: u32,
+    ) -> (Vec<u8>, FrameMetaV1, u64) {
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).expect("stream hash");
+        let payload_hash = compute_payload_hash(payload);
+        let canonical = CanonicalHeaderV1 {
+            tenant_id: tenant_id.to_string(),
+            stream_id: stream_id.to_string(),
+            stream_type: stream_type.to_string(),
+            seq,
+            event_id: event_id.to_string(),
+            occurred_at: "2026-04-07T00:00:00Z".to_string(),
+            ingested_at: "2026-04-07T00:00:01Z".to_string(),
+            event_type: "evt.created".to_string(),
+            content_type: "application/json".to_string(),
+            payload_len: payload.len() as u32,
+            payload_hash,
+        };
+        let canonical_bytes = canonical_header_bytes_v1(&canonical);
+        let header_hash = compute_header_hash(&canonical_bytes);
+        let mut header_bytes = canonical_bytes;
+        header_bytes.extend_from_slice(&header_hash);
+        let frame_bytes = corecrux_segment::encode_frame_v1(&header_bytes, payload).expect("encode frame");
+        let meta = FrameMetaV1 {
+            stream_hash,
+            seq,
+            record_off,
+            frame_len: frame_bytes.len() as u32,
+            payload_len: payload.len() as u32,
+            event_id_hash16: [0; 16],
+            header_digest8: [0; 8],
+            payload_digest8: [0; 8],
+        };
+        (frame_bytes, meta, stream_hash)
+    }
+
+    fn build_ccxi_raw_frame(
+        header_bytes: &[u8],
+        payload: &[u8],
+        stream_hash: u64,
+        seq: u64,
+        record_off: u32,
+    ) -> (Vec<u8>, FrameMetaV1) {
+        let frame_bytes = corecrux_segment::encode_frame_v1(header_bytes, payload).expect("encode frame");
+        let meta = FrameMetaV1 {
+            stream_hash,
+            seq,
+            record_off,
+            frame_len: frame_bytes.len() as u32,
+            payload_len: payload.len() as u32,
+            event_id_hash16: [0; 16],
+            header_digest8: [0; 8],
+            payload_digest8: [0; 8],
+        };
+        (frame_bytes, meta)
+    }
+
     #[test]
     fn startup_dirrun_bootstrap_skip_gate_is_stable() {
         let _g = TEST_LOCK.lock().unwrap();
@@ -595,6 +660,90 @@ mod tests {
         match err {
             StorageError::FailedPrecondition { code, .. } => {
                 assert_eq!(code, "REPLICATION_SEGMENT_CONFLICT");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn apply_replicated_segment_rejects_shard_mismatch() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+
+        let seg = build_test_replicated_segment(2, 1, 89, "tenant-a", "artifact", "1", 1, "evt-1", b"payload");
+        let err = storage
+            .apply_replicated_segment_v1(&seg.bytes)
+            .expect_err("expected shard mismatch");
+        match err {
+            StorageError::FailedPrecondition { code, .. } => {
+                assert_eq!(code, "REPLICATION_SHARD_MISMATCH");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn apply_replicated_segment_rejects_epoch_mismatch() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+
+        let seg = build_test_replicated_segment(1, 2, 90, "tenant-a", "artifact", "1", 1, "evt-1", b"payload");
+        let err = storage
+            .apply_replicated_segment_v1(&seg.bytes)
+            .expect_err("expected epoch mismatch");
+        match err {
+            StorageError::FailedPrecondition { code, .. } => {
+                assert_eq!(code, "REPLICATION_EPOCH_MISMATCH");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn read_segment_bytes_for_replication_roundtrip_and_missing_segment() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+
+        let seg = build_test_replicated_segment(1, 1, 91, "tenant-a", "artifact", "1", 1, "evt-1", b"payload");
+        storage
+            .apply_replicated_segment_v1(&seg.bytes)
+            .expect("apply replicated segment");
+
+        let (bytes, hash) = storage
+            .read_segment_bytes_for_replication(91)
+            .expect("read replicated bytes");
+        assert_eq!(bytes, seg.bytes);
+        assert_eq!(hash, seg.footer.segment_hash);
+
+        let err = storage
+            .read_segment_bytes_for_replication(999)
+            .expect_err("missing segment should fail");
+        match err {
+            StorageError::ManifestRecordInvalid { msg } => {
+                assert!(msg.contains("segment_seq 999 not found"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn read_segment_bytes_for_replication_detects_manifest_hash_mismatch() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+
+        let seg = build_test_replicated_segment(1, 1, 92, "tenant-a", "artifact", "1", 1, "evt-1", b"payload");
+        storage
+            .apply_replicated_segment_v1(&seg.bytes)
+            .expect("apply replicated segment");
+
+        storage.segments_by_seq.get_mut(&92).expect("segment meta").segment_hash = [0u8; 32];
+
+        let err = storage
+            .read_segment_bytes_for_replication(92)
+            .expect_err("hash mismatch should fail");
+        match err {
+            StorageError::ManifestRecordInvalid { msg } => {
+                assert!(msg.contains("segment hash mismatch for segment_seq 92"));
             }
             other => panic!("unexpected error: {other}"),
         }
@@ -3859,5 +4008,154 @@ mod tests {
         let (_dir, storage) = open_test_storage(ShardStorageOptions::default());
         let stats = storage.directory_lsm_stats_v1();
         assert!(stats.levels.is_empty());
+    }
+
+    #[test]
+    fn build_ccxi_companion_writes_index_and_uses_stream_hash_fallback_for_bad_headers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shard_dir = dir.path();
+        std::fs::create_dir_all(shard_dir.join("tmp")).expect("tmp dir");
+        std::fs::create_dir_all(shard_dir.join("segments")).expect("segments dir");
+
+        let (frame_a, mut meta_a, _) = build_ccxi_test_frame(
+            "tenant-a",
+            "artifact",
+            "stream-a",
+            1,
+            "evt-a",
+            br#"alpha alpha beta"#,
+            0,
+        );
+
+        let fallback_stream_hash = 0xABCD_EF01_2345_6789;
+        let (frame_b, mut meta_b) =
+            build_ccxi_raw_frame(b"not-a-canonical-header", b"gamma", fallback_stream_hash, 2, 0);
+
+        meta_b.record_off = frame_a.len() as u32;
+        let mut record_area = frame_a;
+        record_area.extend_from_slice(&frame_b);
+        meta_a.record_off = 0;
+
+        let segment_id = SegmentId([0x11; 16]);
+        build_ccxi_companion(shard_dir, 7, 3, 42, &segment_id, &record_area, &[meta_a, meta_b])
+            .expect("build companion");
+
+        let final_path = shard_dir.join(format!("segments/seg-{:020}-{}.ccxi", 42, hex16(&segment_id.0)));
+        let ccxi = std::fs::read(&final_path).expect("read ccxi");
+        let reader = corecrux_index::CcxiReader::from_bytes(&ccxi).expect("parse ccxi");
+
+        assert_eq!(reader.header.shard_id, 7);
+        assert_eq!(reader.header.segment_seq, 42);
+        assert_eq!(reader.header.epoch, 3);
+        assert_eq!(reader.header.total_frames, 2);
+        assert_eq!(reader.docs.len(), 2);
+
+        let tenant_hash = xxhash_rust::xxh64::xxh64(b"tenant-a", 0);
+        assert_eq!(reader.docs[0].tenant_hash_full, tenant_hash);
+        assert_eq!(reader.docs[1].tenant_hash_full, fallback_stream_hash);
+
+        let alpha_hash = corecrux_index::tokenize("alpha").first().expect("alpha token").hash;
+        let alpha_entry = reader.find_token(alpha_hash).expect("alpha postings");
+        let (alpha_docs, alpha_tfs) = reader.decode_postings(alpha_entry);
+        assert_eq!(alpha_docs, vec![0]);
+        assert_eq!(alpha_tfs, vec![2]);
+
+        let gamma_hash = corecrux_index::tokenize("gamma").first().expect("gamma token").hash;
+        let gamma_entry = reader.find_token(gamma_hash).expect("gamma postings");
+        let (gamma_docs, gamma_tfs) = reader.decode_postings(gamma_entry);
+        assert_eq!(gamma_docs, vec![1]);
+        assert_eq!(gamma_tfs, vec![1]);
+    }
+
+    #[test]
+    fn build_ccxi_companion_skips_malformed_and_non_indexable_frames_without_writing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shard_dir = dir.path();
+        std::fs::create_dir_all(shard_dir.join("tmp")).expect("tmp dir");
+        std::fs::create_dir_all(shard_dir.join("segments")).expect("segments dir");
+
+        let short_frame = b"tiny".to_vec();
+        let truncated_frame = {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&corecrux_segment::FRAME_MAGIC_CRX1.to_le_bytes());
+            bytes.extend_from_slice(&corecrux_segment::FRAME_VERSION_V1.to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&32u32.to_le_bytes());
+            bytes
+        };
+        let (empty_frame, _) = build_ccxi_raw_frame(b"bad-header", b"", 1, 1, 0);
+        let (binary_frame, _) = build_ccxi_raw_frame(b"bad-header", &[0xff, 0xfe, 0xfd], 2, 2, 0);
+
+        let mut record_area = Vec::new();
+        let short_off = record_area.len() as u32;
+        record_area.extend_from_slice(&short_frame);
+        let truncated_off = record_area.len() as u32;
+        record_area.extend_from_slice(&truncated_frame);
+        let empty_off = record_area.len() as u32;
+        record_area.extend_from_slice(&empty_frame);
+        let binary_off = record_area.len() as u32;
+        record_area.extend_from_slice(&binary_frame);
+
+        let metas = vec![
+            FrameMetaV1 {
+                stream_hash: 1,
+                seq: 1,
+                record_off: short_off,
+                frame_len: short_frame.len() as u32,
+                payload_len: 0,
+                event_id_hash16: [0; 16],
+                header_digest8: [0; 8],
+                payload_digest8: [0; 8],
+            },
+            FrameMetaV1 {
+                stream_hash: 2,
+                seq: 2,
+                record_off: truncated_off,
+                frame_len: truncated_frame.len() as u32,
+                payload_len: 32,
+                event_id_hash16: [0; 16],
+                header_digest8: [0; 8],
+                payload_digest8: [0; 8],
+            },
+            FrameMetaV1 {
+                stream_hash: 3,
+                seq: 3,
+                record_off: empty_off,
+                frame_len: empty_frame.len() as u32,
+                payload_len: 0,
+                event_id_hash16: [0; 16],
+                header_digest8: [0; 8],
+                payload_digest8: [0; 8],
+            },
+            FrameMetaV1 {
+                stream_hash: 4,
+                seq: 4,
+                record_off: binary_off,
+                frame_len: binary_frame.len() as u32,
+                payload_len: 3,
+                event_id_hash16: [0; 16],
+                header_digest8: [0; 8],
+                payload_digest8: [0; 8],
+            },
+            FrameMetaV1 {
+                stream_hash: 5,
+                seq: 5,
+                record_off: record_area.len() as u32 + 10,
+                frame_len: 16,
+                payload_len: 0,
+                event_id_hash16: [0; 16],
+                header_digest8: [0; 8],
+                payload_digest8: [0; 8],
+            },
+        ];
+
+        let segment_id = SegmentId([0x22; 16]);
+        build_ccxi_companion(shard_dir, 9, 4, 77, &segment_id, &record_area, &metas).expect("skip malformed frames");
+
+        let final_path = shard_dir.join(format!("segments/seg-{:020}-{}.ccxi", 77, hex16(&segment_id.0)));
+        assert!(
+            !final_path.exists(),
+            "non-indexable frames should not produce a ccxi file"
+        );
     }
 }
