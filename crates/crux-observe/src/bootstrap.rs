@@ -109,11 +109,16 @@ impl BootstrapSeeder {
             };
         }
 
+        // SAFETY: Bootstrap JSON files are compile-time constants — deserialization cannot fail.
+        #[allow(clippy::expect_used)]
         let docs: Vec<DocEntry> = serde_json::from_str(BOOTSTRAP_DOCS).expect("bootstrap docs.json is invalid");
+        #[allow(clippy::expect_used)]
         let patterns: Vec<PatternEntry> =
             serde_json::from_str(BOOTSTRAP_PATTERNS).expect("bootstrap patterns.json is invalid");
+        #[allow(clippy::expect_used)]
         let resolutions: Vec<ResolutionEntry> =
             serde_json::from_str(BOOTSTRAP_RESOLUTIONS).expect("bootstrap resolutions.json is invalid");
+        #[allow(clippy::expect_used)]
         let tool_outputs: Vec<ToolOutputEntry> =
             serde_json::from_str(BOOTSTRAP_TOOL_OUTPUTS).expect("bootstrap tool-outputs.json is invalid");
 

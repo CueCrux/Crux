@@ -693,10 +693,10 @@ impl ProjectionStoreV1 {
         self.meta.pressure_events.schema_version = 1;
         self.meta.artifact_dependents.schema_version = 3;
 
-        self.meta.artifact_living_state.cursor = cursor_after.clone();
-        self.meta.artifact_relations.cursor = cursor_after.clone();
-        self.meta.pressure_events.cursor = cursor_after.clone();
-        self.meta.artifact_dependents.cursor = cursor_after.clone();
+        self.meta.artifact_living_state.cursor.clone_from(&cursor_after);
+        self.meta.artifact_relations.cursor.clone_from(&cursor_after);
+        self.meta.pressure_events.cursor.clone_from(&cursor_after);
+        self.meta.artifact_dependents.cursor.clone_from(&cursor_after);
 
         self.meta.artifact_living_state.snapshot_blake3 = Some(living_hash);
         self.meta.artifact_relations.snapshot_blake3 = Some(relations_hash);
@@ -1399,6 +1399,7 @@ fn gc_cold_segments_dir_v1(
     ))
 }
 
+#[allow(clippy::unnecessary_wraps)] // Result return kept for caller ergonomics with `?` chains
 fn collect_files_recursive_v1(root: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -1422,6 +1423,7 @@ fn collect_files_recursive_v1(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+#[allow(clippy::unnecessary_wraps)] // Result return kept for caller ergonomics
 fn remove_parent_dirs_if_empty_v1(root: &Path, path: &Path) -> std::io::Result<()> {
     let mut cur = path.parent();
     while let Some(dir) = cur {

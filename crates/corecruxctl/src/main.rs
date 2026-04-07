@@ -2,6 +2,9 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+// CLI binary — printing to stdout/stderr is correct behaviour.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -21,6 +24,7 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)] // CLI subcommands — allocation cost is negligible at startup
 enum Command {
     /// Deterministic replay checks from a replay pack (preferred) or legacy JSONL input.
     Replay {

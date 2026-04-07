@@ -132,8 +132,7 @@ pub(super) async fn export_facts(
     let limit = params
         .get("limit")
         .and_then(|v| v.parse::<u32>().ok())
-        .map(|v| v.min(10000) as usize)
-        .unwrap_or(1000);
+        .map_or(1000, |v| v.min(10000) as usize);
 
     let store = state.fact_store.read().await;
     let result = store.export(since, cursor, limit);

@@ -4,6 +4,9 @@
 
 //! Integration test harness for CoreCrux Community Edition.
 
+// Test harness: panics, unwraps, expects, and large error types are acceptable.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::result_large_err)]
+
 use std::io::Read as _;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

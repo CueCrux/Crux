@@ -167,6 +167,8 @@ where
             });
 
             // Ring buffer eviction.
+            // SAFETY: Mutex poisoning indicates a prior panic — propagating is correct here.
+            #[allow(clippy::unwrap_used)]
             let mut ids = fact_ids.lock().unwrap();
             ids.push_back(fact.fact_id.clone());
             while ids.len() > max_facts {

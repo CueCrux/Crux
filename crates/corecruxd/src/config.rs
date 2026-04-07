@@ -489,8 +489,7 @@ pub fn load_config() -> Config {
 
         fact_persistence_enabled: std::env::var("CORECRUXD_FACT_PERSISTENCE")
             .ok()
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(true),
+            .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
 
         sync_enabled: std::env::var("CORECRUXD_SYNC_ENABLED")
             .ok()

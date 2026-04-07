@@ -62,6 +62,8 @@ impl ShardStorage {
 
         // Keep the newest head by segment_seq; quarantine the rest.
         candidates.sort_by_key(|(seq, _, _)| *seq);
+        // SAFETY: candidates is guaranteed non-empty — we returned early above if empty.
+        #[allow(clippy::expect_used)]
         let (keep_seq, keep_path, keep_name) = candidates.pop().expect("candidates non-empty after is_empty check");
         for (_seq, path, name) in candidates {
             let dst = self
@@ -97,9 +99,8 @@ impl ShardStorage {
             self.next_head_commit_id = self.next_head_commit_id.max(cf.commit_id.saturating_add(1));
         }
 
-        let committed_end = recovered_commit
-            .map(|cf| cf.commit_offset as usize)
-            .unwrap_or(corecrux_segment::SEGMENT_HEADER_LEN);
+        let committed_end =
+            recovered_commit.map_or(corecrux_segment::SEGMENT_HEADER_LEN, |cf| cf.commit_offset as usize);
         let mut truncate_to = committed_end;
 
         let mut cur = corecrux_segment::SEGMENT_HEADER_LEN;
@@ -732,6 +733,8 @@ impl ShardStorage {
                 if cold_lookup_cache.is_none() {
                     cold_lookup_cache = Some(self.lookup_duplicate_cold_batch(stream_hash, &cold_batch_prefixes)?);
                 }
+                // SAFETY: cold_lookup_cache is set to Some on the line above this block.
+                #[allow(clippy::expect_used)]
                 let cold = cold_lookup_cache.as_ref().expect("cold lookup cache initialized");
                 if let Some(found) = cold.find(key.event_id_hash16, event_id) {
                     // Warm the hot cache on cold hit.
@@ -887,6 +890,8 @@ impl ShardStorage {
             self.ensure_head_open()?;
 
             let (head_segment_seq, base_record_len, base_region_crc32c, commit_id) = {
+                // SAFETY: ensure_head_open() is called above — head is guaranteed Some.
+                #[allow(clippy::expect_used)]
                 let head = self.head.as_ref().expect("head open");
                 (
                     head.segment_seq,
@@ -897,10 +902,7 @@ impl ShardStorage {
             };
             self.next_head_commit_id = self.next_head_commit_id.saturating_add(1);
 
-            let commit_seq = encoded
-                .last()
-                .map(|e| e.seq)
-                .unwrap_or_else(|| seq_cursor.saturating_sub(1));
+            let commit_seq = encoded.last().map_or_else(|| seq_cursor.saturating_sub(1), |e| e.seq);
             let mut pre_commit_crc32c = base_region_crc32c;
             for e in &encoded {
                 pre_commit_crc32c = crc32c::crc32c_append(pre_commit_crc32c, &e.frame_bytes);
@@ -922,6 +924,8 @@ impl ShardStorage {
             // Durably append event frames + commit frame, then fence before publishing outcomes.
             let io_write_start = std::time::Instant::now();
             {
+                // SAFETY: ensure_head_open() called above — head is guaranteed Some.
+                #[allow(clippy::expect_used)]
                 let head_file = &self.head.as_ref().expect("head open").file;
                 write_at_file(head_file, write_offset, &append_bytes)?;
                 head_file.sync_all().map_err(io_err)?;
@@ -945,6 +949,8 @@ impl ShardStorage {
             let mut record_cursor = base_record_len;
             let mut new_head_entries_asc: Vec<TocByOffsetEntryV1> = Vec::with_capacity(encoded.len());
             {
+                // SAFETY: ensure_head_open() called above — head is guaranteed Some.
+                #[allow(clippy::expect_used)]
                 let head = self.head.as_mut().expect("head open");
 
                 for e in &encoded {
@@ -1037,7 +1043,7 @@ impl ShardStorage {
             stats.add_index_elapsed(index_update_start.elapsed());
 
             // Seal the head once it reaches the configured threshold.
-            let should_seal = self.head.as_ref().map(|h| h.record_len >= max_head).unwrap_or(false);
+            let should_seal = self.head.as_ref().is_some_and(|h| h.record_len >= max_head);
             if should_seal {
                 let _ = self.seal_head_segment()?;
             }
@@ -1804,10 +1810,7 @@ impl ShardStorage {
                 .map(|s| (s.segment_seq, s.sealed_at_unix_ns))
                 .collect();
             for (segment_seq, sealed_at_unix_ns) in segs {
-                let extents = extents_by_segment
-                    .get(&segment_seq)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
+                let extents = extents_by_segment.get(&segment_seq).map_or(&[][..], |v| v.as_slice());
                 let live = self.filter_extents_live(extents);
                 let key = DirRunKey {
                     level: 0,
@@ -1828,10 +1831,7 @@ impl ShardStorage {
             if present.contains(&segment_seq) {
                 continue;
             }
-            let extents = extents_by_segment
-                .get(&segment_seq)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
+            let extents = extents_by_segment.get(&segment_seq).map_or(&[][..], |v| v.as_slice());
             let live = self.filter_extents_live(extents);
             if live.is_empty() {
                 continue;

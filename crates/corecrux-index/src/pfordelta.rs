@@ -49,6 +49,8 @@ pub fn pfordelta_decode(data: &[u8]) -> Vec<u32> {
         return Vec::new();
     }
 
+    // SAFETY: data[0..4] is a 4-byte slice — try_into to [u8; 4] is infallible.
+    #[allow(clippy::unwrap_used)]
     let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
     let mut deltas = Vec::with_capacity(count);
     let mut cursor = 4usize;
@@ -188,6 +190,8 @@ fn decode_block(data: &[u8], mut cursor: usize, expected: usize, deltas: &mut Ve
             break;
         }
         let idx = data[cursor] as usize;
+        // SAFETY: data[cursor+1..cursor+5] is a 4-byte slice — try_into to [u8; 4] is infallible.
+        #[allow(clippy::unwrap_used)]
         let val = u32::from_le_bytes(data[cursor + 1..cursor + 5].try_into().unwrap());
         cursor += 5;
         if idx < values.len() {

@@ -23,7 +23,7 @@ struct Document {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Fields deserialized from benchmark JSON but only `query` and `expected_doc_ids` are read.
+#[allow(dead_code, clippy::struct_field_names)] // Fields deserialized from benchmark JSON; names match the schema.
 struct Query {
     query_id: String,
     query: String,

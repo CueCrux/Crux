@@ -1570,6 +1570,8 @@ fn stream_header_source_refs(opts: &AuditPackOptionsV1, headers: &[StreamHeaderL
             tenant_id,
             stream_type,
             stream_id,
+            // SAFETY: headers.len() > 1 is checked on the line above.
+            #[allow(clippy::expect_used)]
             headers.last().expect("last header"),
         ));
     }

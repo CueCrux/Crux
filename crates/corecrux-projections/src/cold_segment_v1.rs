@@ -2,6 +2,11 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+// SAFETY: All .try_into().unwrap() in decode/parse functions below operate on fixed-size
+// sub-slices from validated header/index regions. The slice lengths match the target
+// array size, so the conversion is infallible.
+#![allow(clippy::unwrap_used)]
+
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -157,6 +162,7 @@ pub fn read_and_verify_cold_segment_index_v1(
     // Verify hash by streaming the file.
     let mut f = std::fs::File::open(path)?;
     let mut hasher = blake3::Hasher::new();
+    #[allow(clippy::large_stack_arrays)] // 256 KiB read buffer; acceptable for I/O-bound hashing
     let mut buf = [0u8; 256 * 1024];
     loop {
         let n = f.read(&mut buf)?;

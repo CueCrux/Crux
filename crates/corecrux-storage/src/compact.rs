@@ -28,6 +28,7 @@ impl ShardStorage {
         DirectoryLsmStatsV1 { levels }
     }
 
+    #[allow(clippy::unused_self)] // Method on ShardStorage for API consistency; will use self in future compaction state
     pub(crate) fn derive_compacted_run_id_v1(&self, level_out: u32, a: DirRunKey, b: DirRunKey) -> u64 {
         let (k1, k2) = if (a.level, a.run_id) <= (b.level, b.run_id) {
             (a, b)

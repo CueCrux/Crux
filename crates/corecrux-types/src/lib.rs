@@ -637,6 +637,8 @@ pub fn validate_shard_map_v1(map: &ShardMapV1) -> ShardMapResult<()> {
             });
         }
     }
+    // SAFETY: intervals is non-empty — validated by the overlap check loop above.
+    #[allow(clippy::unwrap_used)]
     if intervals[0].start != 0 || intervals.last().unwrap().end != RING_END {
         return Err(ShardMapError::Invalid {
             msg: "active ranges do not cover full ring (missing start/end)".to_string(),

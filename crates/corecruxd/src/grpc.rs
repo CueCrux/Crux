@@ -281,6 +281,7 @@ impl DataPlaneService {
         }
     }
 
+    #[allow(clippy::unused_self)] // Method for API consistency; may use self for shard-local state
     fn append_lane_bucket(&self, lane_key: &str) -> u8 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         lane_key.hash(&mut h);

@@ -1131,6 +1131,7 @@ fn measure_data_dir_space(path: &Path) -> Result<(u64, u64), String> {
     Ok((total, free))
 }
 
+#[allow(clippy::too_many_arguments)] // Background guard requires shared state handles
 fn spawn_capacity_guard(
     config: crate::config::Config,
     metrics: Metrics,

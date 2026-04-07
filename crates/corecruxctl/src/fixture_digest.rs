@@ -38,7 +38,7 @@ pub fn fixture_segment_path(fixture: &str) -> Result<PathBuf, Box<dyn std::error
         .join(format!("{fixture}.ccxseg")))
 }
 
-#[allow(clippy::unwrap_used)] // Diagnostic function: panics on corrupt sealed-segment frames (by design)
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Diagnostic function: panics on corrupt sealed-segment frames (by design)
 fn replay_digest(frames: &[(corecrux_storage::FrameLocation, Vec<u8>)]) -> (u64, String) {
     let mut hasher = blake3::Hasher::new();
     for (loc, frame) in frames {

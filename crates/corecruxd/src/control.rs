@@ -260,8 +260,8 @@ fn valve_state_mut<'a>(state: &'a mut ControlV1, valve: &str) -> Result<&'a mut 
 
 fn apply_valve_state_v1(target: &mut ValveV1, value: &ControlValveStateV1) {
     target.enabled = value.enabled;
-    target.actor = value.actor.clone();
-    target.reason = value.reason.clone();
+    target.actor.clone_from(&value.actor);
+    target.reason.clone_from(&value.reason);
     target.updated_at_unix_ns = value.updated_at_unix_ns;
     target.retry_after_ms = value.retry_after_ms;
     target.events_per_sec = value.events_per_sec;

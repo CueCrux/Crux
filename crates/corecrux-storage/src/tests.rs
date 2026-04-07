@@ -595,6 +595,26 @@ mod tests {
         .expect("build segment")
     }
 
+    fn toc_entry(
+        stream_hash: u64,
+        seq: u64,
+        block_id: u32,
+        in_block_offset: u32,
+        frame_len: u32,
+    ) -> TocByOffsetEntryV1 {
+        TocByOffsetEntryV1 {
+            stream_hash,
+            seq,
+            block_id,
+            in_block_offset,
+            frame_len,
+            flags: 0,
+            event_id_hash16: [0; 16],
+            header_digest8: [0; 8],
+            payload_digest8: [0; 8],
+        }
+    }
+
     #[test]
     fn apply_replicated_segment_roundtrip_and_idempotent() {
         let _g = TEST_LOCK.lock().unwrap();
@@ -2122,6 +2142,73 @@ mod tests {
     }
 
     #[test]
+    fn tail_locator_helpers_truncate_group_and_fallback() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+
+        let stream_hash = 0x42;
+        let first: Vec<_> = (1..=40)
+            .map(|seq| toc_entry(stream_hash, seq, 0, seq as u32, 16))
+            .collect();
+        let second: Vec<_> = (41..=66)
+            .map(|seq| toc_entry(stream_hash, seq, 1, seq as u32, 16))
+            .collect();
+
+        storage.update_tail_locator_for_stream_entries(stream_hash, 10, &first);
+        storage.update_tail_locator_for_stream_entries(stream_hash, 11, &second);
+
+        let locator = storage.tail_locator_by_stream.get(&stream_hash).expect("tail locator");
+        assert_eq!(locator.entries_asc.len(), STREAM_TAIL_LOCATOR_MAX_EVENTS);
+        assert_eq!(locator.entries_asc.first().expect("oldest locator entry").entry.seq, 3);
+
+        let pointer = storage.tail_pointer_by_stream.get(&stream_hash).expect("tail pointer");
+        assert_eq!(pointer.latest_segment_seq, 11);
+        assert_eq!(pointer.latest_seq, 66);
+        assert_eq!(pointer.grouped_desc.len(), 2);
+        assert_eq!(pointer.grouped_desc[0].segment_seq, 11);
+        assert_eq!(pointer.grouped_desc[0].entries_desc[0].seq, 66);
+
+        let fast_entries = storage.locator_tail_entries_desc(stream_hash, 60, 4);
+        assert_eq!(
+            fast_entries.iter().map(|entry| entry.entry.seq).collect::<Vec<_>>(),
+            vec![66, 65, 64, 63]
+        );
+
+        let (fast_groups, fast_full) = storage.locator_tail_segments_desc(stream_hash, 60, 4);
+        assert!(fast_full);
+        assert_eq!(fast_groups.len(), 1);
+        assert_eq!(fast_groups[0].0, 11);
+        assert_eq!(
+            fast_groups[0].1.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            vec![66, 65, 64, 63]
+        );
+
+        storage.tail_pointer_by_stream.clear();
+        let fallback_entries = storage.locator_tail_entries_desc(stream_hash, 65, 3);
+        assert_eq!(
+            fallback_entries
+                .iter()
+                .map(|entry| (entry.segment_seq, entry.entry.seq))
+                .collect::<Vec<_>>(),
+            vec![(11, 66), (11, 65)]
+        );
+
+        let (fallback_groups, fallback_full) = storage.locator_tail_segments_desc(stream_hash, 65, 3);
+        assert!(!fallback_full);
+        assert_eq!(fallback_groups.len(), 1);
+        assert_eq!(fallback_groups[0].0, 11);
+        assert_eq!(
+            fallback_groups[0].1.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            vec![66, 65]
+        );
+
+        assert!(storage.locator_tail_entries_desc(stream_hash, 0, 0).is_empty());
+        let (no_groups, no_full) = storage.locator_tail_segments_desc(stream_hash, 0, 0);
+        assert!(no_groups.is_empty());
+        assert!(!no_full);
+    }
+
+    #[test]
     fn replay_from_cursor_continues_deterministically() {
         let _g = TEST_LOCK.lock().unwrap();
 
@@ -2247,6 +2334,111 @@ mod tests {
         // read_frame_bytes must work against head locations.
         let frame = storage.read_frame_bytes(locs[0].segment_seq, locs[0].offset).unwrap();
         let _ = decode_frame_v1(&frame).unwrap();
+    }
+
+    #[test]
+    fn read_frame_bytes_batch_supports_mixed_sealed_and_head_locations() {
+        let _g = TEST_LOCK.lock().unwrap();
+
+        let opts = ShardStorageOptions {
+            head_max_record_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        let (_dir, mut storage) = open_test_storage(opts);
+
+        let tenant_id = "t1";
+        let stream_type = "s";
+        let stream_id = "a";
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+
+        for i in 1..=2 {
+            let event_id = format!("sealed-{i}");
+            storage
+                .append_batch(
+                    stream_hash,
+                    0,
+                    tenant_id,
+                    stream_type,
+                    stream_id,
+                    "2026-02-06T00:00:01Z",
+                    std::slice::from_ref(&AppendEventInput {
+                        event_id: &event_id,
+                        occurred_at: "2026-02-06T00:00:00Z",
+                        event_type: "t",
+                        content_type: "application/octet-stream",
+                        payload_bytes: b"sealed",
+                    }),
+                )
+                .unwrap();
+        }
+        storage.force_seal_head().unwrap();
+        let sealed_locations: Vec<_> = storage
+            .read_stream(tenant_id, stream_type, stream_id, stream_hash, 1, 2)
+            .expect("sealed stream read")
+            .into_iter()
+            .map(|event| event.location)
+            .collect();
+        assert_eq!(sealed_locations.len(), 2);
+
+        let mut head_locations = Vec::new();
+        for i in 1..=2 {
+            let event_id = format!("head-{i}");
+            let out = storage
+                .append_batch(
+                    stream_hash,
+                    0,
+                    tenant_id,
+                    stream_type,
+                    stream_id,
+                    "2026-02-06T00:00:02Z",
+                    std::slice::from_ref(&AppendEventInput {
+                        event_id: &event_id,
+                        occurred_at: "2026-02-06T00:00:00Z",
+                        event_type: "t",
+                        content_type: "application/octet-stream",
+                        payload_bytes: b"head",
+                    }),
+                )
+                .unwrap();
+            head_locations.push(out[0].location.expect("head location"));
+        }
+
+        let mut locations = Vec::new();
+        locations.extend_from_slice(&sealed_locations);
+        locations.extend_from_slice(&head_locations);
+
+        let packed = storage.read_frame_bytes_batch_packed(&locations).expect("packed batch");
+        assert_eq!(packed.frame_offsets.len(), 4);
+        assert_eq!(packed.frame_lens.len(), 4);
+        assert_eq!(
+            packed.frame_bytes,
+            packed.frame_lens.iter().map(|len| *len as u64).sum::<u64>()
+        );
+        assert!(!packed.frames_blob.is_empty());
+
+        let frames = storage.read_frame_bytes_batch(&locations).expect("batch frames");
+        assert_eq!(frames.len(), 4);
+        for (location, frame) in locations.iter().zip(frames.iter()) {
+            assert_eq!(
+                frame,
+                &storage
+                    .read_frame_bytes(location.segment_seq, location.offset)
+                    .expect("single frame")
+            );
+            let _ = decode_frame_v1(frame).expect("decode frame");
+        }
+    }
+
+    #[test]
+    fn read_frame_bytes_batch_packed_empty_returns_empty_payload() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, storage) = open_test_storage(ShardStorageOptions::default());
+
+        let packed = storage.read_frame_bytes_batch_packed(&[]).expect("empty packed batch");
+        assert!(packed.frames_blob.is_empty());
+        assert!(packed.frame_offsets.is_empty());
+        assert!(packed.frame_lens.is_empty());
+        assert_eq!(packed.frame_bytes, 0);
     }
 
     #[test]
@@ -2593,6 +2785,229 @@ mod tests {
         let expected: ExpectedReplayDigest = serde_json::from_str(&expected_str).expect("parse expected digest");
 
         assert_eq!(stats.total_frames, expected.total_frames);
+    }
+
+    #[test]
+    fn replay_and_integrity_scan_reject_zero_budget() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, storage) = open_test_storage(ShardStorageOptions::default());
+
+        let replay_err = storage
+            .replay_scan_stats_all(0)
+            .expect_err("zero replay budget should fail");
+        match replay_err {
+            StorageError::InvalidArgument { code, .. } => assert_eq!(code, "BUDGET_BYTES_ZERO"),
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let integrity_err = storage
+            .integrity_scan_stats_all(0)
+            .expect_err("zero integrity budget should fail");
+        match integrity_err {
+            StorageError::InvalidArgument { code, .. } => assert_eq!(code, "BUDGET_BYTES_ZERO"),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn replay_scan_stats_counts_sealed_and_head_segments() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let opts = ShardStorageOptions {
+            head_max_record_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        let (_dir, mut storage) = open_test_storage(opts);
+
+        let tenant_id = "t1";
+        let stream_type = "s";
+        let stream_id = "scan";
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+
+        for i in 1..=2 {
+            let event_id = format!("sealed-{i}");
+            storage
+                .append_batch(
+                    stream_hash,
+                    0,
+                    tenant_id,
+                    stream_type,
+                    stream_id,
+                    "2026-02-06T00:00:01Z",
+                    std::slice::from_ref(&AppendEventInput {
+                        event_id: &event_id,
+                        occurred_at: "2026-02-06T00:00:00Z",
+                        event_type: "t",
+                        content_type: "application/octet-stream",
+                        payload_bytes: b"x",
+                    }),
+                )
+                .unwrap();
+        }
+        storage.force_seal_head().unwrap();
+
+        for i in 1..=2 {
+            let event_id = format!("head-{i}");
+            storage
+                .append_batch(
+                    stream_hash,
+                    0,
+                    tenant_id,
+                    stream_type,
+                    stream_id,
+                    "2026-02-06T00:00:02Z",
+                    std::slice::from_ref(&AppendEventInput {
+                        event_id: &event_id,
+                        occurred_at: "2026-02-06T00:00:00Z",
+                        event_type: "t",
+                        content_type: "application/octet-stream",
+                        payload_bytes: b"x",
+                    }),
+                )
+                .unwrap();
+        }
+
+        let stats = storage.replay_scan_stats_all(1).expect("replay scan");
+        assert_eq!(stats.total_segments, 2);
+        assert_eq!(stats.total_frames, 4);
+        assert!(stats.total_compressed_bytes > 0);
+        assert!(stats.total_uncompressed_bytes > 0);
+    }
+
+    #[test]
+    fn replay_and_integrity_scan_reject_missing_trailer_index() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+
+        let tenant_id = "t1";
+        let stream_type = "s";
+        let stream_id = "missing-trailer";
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+
+        storage
+            .append_batch(
+                stream_hash,
+                0,
+                tenant_id,
+                stream_type,
+                stream_id,
+                "2026-02-06T00:00:01Z",
+                &[AppendEventInput {
+                    event_id: "e1",
+                    occurred_at: "2026-02-06T00:00:00Z",
+                    event_type: "t",
+                    content_type: "application/octet-stream",
+                    payload_bytes: b"x",
+                }],
+            )
+            .unwrap();
+
+        storage.segment_trailers_by_seq.clear();
+
+        let replay_err = storage
+            .replay_scan_stats_all(1024)
+            .expect_err("missing trailer should fail replay scan");
+        match replay_err {
+            StorageError::ManifestRecordInvalid { msg } => {
+                assert!(msg.contains("missing trailer index for sealed segment"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let integrity_err = storage
+            .integrity_scan_stats_all(1024)
+            .expect_err("missing trailer should fail integrity scan");
+        match integrity_err {
+            StorageError::ManifestRecordInvalid { msg } => {
+                assert!(msg.contains("missing trailer index for sealed segment"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn integrity_scan_detects_sealed_and_head_frame_count_mismatches() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut sealed_storage) = open_test_storage(ShardStorageOptions::default());
+
+        let tenant_id = "t1";
+        let stream_type = "s";
+        let sealed_stream_id = "sealed-mismatch";
+        let sealed_stream_hash =
+            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, sealed_stream_id).unwrap();
+
+        sealed_storage
+            .append_batch(
+                sealed_stream_hash,
+                0,
+                tenant_id,
+                stream_type,
+                sealed_stream_id,
+                "2026-02-06T00:00:01Z",
+                &[AppendEventInput {
+                    event_id: "e1",
+                    occurred_at: "2026-02-06T00:00:00Z",
+                    event_type: "t",
+                    content_type: "application/octet-stream",
+                    payload_bytes: b"x",
+                }],
+            )
+            .unwrap();
+        sealed_storage.segments_in_order[0].toc_entry_count += 1;
+
+        let sealed_err = sealed_storage
+            .integrity_scan_stats_all(1)
+            .expect_err("sealed mismatch should fail");
+        match sealed_err {
+            StorageError::ManifestRecordInvalid { msg } => {
+                assert!(msg.contains("integrity scan frame count mismatch for segment_seq"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        let opts = ShardStorageOptions {
+            head_max_record_bytes: 1024 * 1024,
+            ..Default::default()
+        };
+        let (_dir2, mut head_storage) = open_test_storage(opts);
+        let head_stream_id = "head-mismatch";
+        let head_stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, head_stream_id).unwrap();
+        for i in 1..=2 {
+            let event_id = format!("e{i}");
+            head_storage
+                .append_batch(
+                    head_stream_hash,
+                    0,
+                    tenant_id,
+                    stream_type,
+                    head_stream_id,
+                    "2026-02-06T00:00:01Z",
+                    std::slice::from_ref(&AppendEventInput {
+                        event_id: &event_id,
+                        occurred_at: "2026-02-06T00:00:00Z",
+                        event_type: "t",
+                        content_type: "application/octet-stream",
+                        payload_bytes: b"x",
+                    }),
+                )
+                .unwrap();
+        }
+        head_storage
+            .head
+            .as_mut()
+            .expect("head segment")
+            .frames
+            .pop()
+            .expect("remove one head frame");
+
+        let head_err = head_storage
+            .integrity_scan_stats_all(1)
+            .expect_err("head mismatch should fail");
+        match head_err {
+            StorageError::ManifestRecordInvalid { msg } => {
+                assert!(msg.contains("integrity scan frame count mismatch for head segment_seq"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

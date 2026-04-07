@@ -493,7 +493,7 @@ fn decode_dir_run_v1(bytes: &[u8]) -> Result<DirRunDecodedV1> {
     let mut total: u64 = 0;
 
     let mut pt_cur = DIRRUN_PARTITION_TABLE_OFFSET_V1;
-    for part in parts.iter_mut() {
+    for part in &mut parts {
         let end = pt_cur
             .checked_add(DIRRUN_PARTITION_ENTRY_LEN_V1)
             .ok_or(StorageError::ManifestRecordInvalid {
@@ -563,6 +563,7 @@ fn dir_run_relative_path_v1(level: u32, run_id: u64) -> String {
     format!("directory/dirrun-l{level}-r{run_id:020}.ccxdir")
 }
 
+#[allow(clippy::many_single_char_names)] // Merge loop: a/b inputs, i/j cursors, e entry — standard naming
 fn merge_dir_extents_partition_sorted_unique_cpu(a: &[DirExtentV1], b: &[DirExtentV1]) -> Vec<DirExtentV1> {
     let mut out: Vec<DirExtentV1> = Vec::with_capacity(a.len().saturating_add(b.len()));
     let mut i = 0usize;
@@ -1215,7 +1216,7 @@ fn append_head_record_to_blocks(
         });
     }
 
-    let cur_block_len = blocks.last().map(|b| b.uncompressed_len as usize).unwrap_or(0);
+    let cur_block_len = blocks.last().map_or(0, |b| b.uncompressed_len as usize);
     if cur_block_len > 0 && cur_block_len.saturating_add(record_bytes.len()) > max_len {
         let next_id = blocks.len() as u32;
         blocks.push(BlockMetaV1 {
@@ -1234,6 +1235,8 @@ fn append_head_record_to_blocks(
         msg: "record length exceeds u32".to_string(),
     })?;
 
+    // SAFETY: blocks is guaranteed non-empty — we push at least one entry above.
+    #[allow(clippy::expect_used)]
     let block = blocks.last_mut().expect("blocks non-empty");
     let in_block_offset = block.uncompressed_len;
     if let Some(stream_hash) = stream_hash_for_bloom {
@@ -1874,8 +1877,7 @@ fn parse_segment_seq_from_filename(name: &str) -> Option<u64> {
 fn failpoint_active(name: &str) -> bool {
     std::env::var("CORECRUX_STORAGE_FAILPOINT")
         .ok()
-        .map(|v| v == name)
-        .unwrap_or(false)
+        .is_some_and(|v| v == name)
 }
 
 fn decode_stored_event_from_frame_bytes(
@@ -2386,7 +2388,7 @@ fn toc_lower_bound(entries: &[corecrux_segment::TocEntryV1], stream_hash: u64, s
     let mut lo = 0usize;
     let mut hi = entries.len();
     while lo < hi {
-        let mid = (lo + hi) / 2;
+        let mid = lo.midpoint(hi);
         let e = entries[mid];
         let less = e.stream_hash < stream_hash || (e.stream_hash == stream_hash && e.seq < seq);
         if less {
@@ -2404,7 +2406,7 @@ fn toc_stream_range(entries: &[corecrux_segment::TocEntryV1], stream_hash: u64) 
         let mut lo = 0usize;
         let mut hi = entries.len();
         while lo < hi {
-            let mid = (lo + hi) / 2;
+            let mid = lo.midpoint(hi);
             if entries[mid].stream_hash < stream_hash {
                 lo = mid + 1;
             } else {
@@ -2419,7 +2421,7 @@ fn toc_stream_range(entries: &[corecrux_segment::TocEntryV1], stream_hash: u64) 
         let mut lo = start;
         let mut hi = entries.len();
         while lo < hi {
-            let mid = (lo + hi) / 2;
+            let mid = lo.midpoint(hi);
             if entries[mid].stream_hash <= stream_hash {
                 lo = mid + 1;
             } else {

@@ -64,18 +64,7 @@ pub fn append_ops_event<T: Serialize>(
         for result in &response.results {
             let status = append_result::Status::try_from(result.status).unwrap_or(append_result::Status::Rejected);
             if status == append_result::Status::Rejected {
-                let code = result.error_code.trim();
-                let message = result.error_message.trim();
-                let detail = if code.is_empty() && message.is_empty() {
-                    "append rejected".to_string()
-                } else if code.is_empty() {
-                    message.to_string()
-                } else if message.is_empty() {
-                    code.to_string()
-                } else {
-                    format!("{code}: {message}")
-                };
-                return Err(detail.into());
+                return Err(append_rejection_detail(&result.error_code, &result.error_message).into());
             }
         }
 
@@ -83,14 +72,9 @@ pub fn append_ops_event<T: Serialize>(
             commit_seq: response.write_confirmation.as_ref().map(|value| value.commit_seq),
             segment_id: response.write_confirmation.as_ref().map(|value| value.segment_id),
             unsigned: response.write_confirmation.as_ref().map(|value| value.unsigned),
-            key_id: response.write_confirmation.and_then(|value| {
-                let trimmed = value.key_id.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            }),
+            key_id: response
+                .write_confirmation
+                .and_then(|value| normalize_optional_string(value.key_id)),
         })
     })
 }
@@ -101,6 +85,29 @@ fn maybe_set_scopes<T>(request: &mut tonic::Request<T>, scopes: Option<&str>) ->
         request.metadata_mut().insert("x-corecrux-scopes", value);
     }
     Ok(())
+}
+
+fn append_rejection_detail(code: &str, message: &str) -> String {
+    let code = code.trim();
+    let message = message.trim();
+    if code.is_empty() && message.is_empty() {
+        "append rejected".to_string()
+    } else if code.is_empty() {
+        message.to_string()
+    } else if message.is_empty() {
+        code.to_string()
+    } else {
+        format!("{code}: {message}")
+    }
+}
+
+fn normalize_optional_string(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +246,13 @@ mod tests {
         assert_eq!(val.to_str().unwrap(), "  read  ");
     }
 
+    #[test]
+    fn maybe_set_scopes_invalid_value_is_rejected() {
+        let mut req = tonic::Request::new(());
+        let err = maybe_set_scopes(&mut req, Some("read\nwrite")).unwrap_err();
+        assert!(err.to_string().contains("invalid scopes metadata value"));
+    }
+
     // ── OpsAppendOptions: scopes None ───────────────────────────────
 
     #[test]
@@ -251,6 +265,27 @@ mod tests {
         let dbg = format!("{:?}", opts);
         assert!(dbg.contains("None"));
         assert!(dbg.contains("node-x"));
+    }
+
+    #[test]
+    fn append_rejection_detail_formats_all_variants() {
+        assert_eq!(append_rejection_detail("", ""), "append rejected");
+        assert_eq!(append_rejection_detail("CODE", ""), "CODE");
+        assert_eq!(append_rejection_detail("", "bad request"), "bad request");
+        assert_eq!(append_rejection_detail(" CODE ", " bad request "), "CODE: bad request");
+    }
+
+    #[test]
+    fn normalize_optional_string_trims_and_drops_empty_values() {
+        assert_eq!(
+            normalize_optional_string("key-1".to_string()),
+            Some("key-1".to_string())
+        );
+        assert_eq!(
+            normalize_optional_string("  key-2  ".to_string()),
+            Some("key-2".to_string())
+        );
+        assert_eq!(normalize_optional_string("   ".to_string()), None);
     }
 
     // ── OpsAppendReceipt: selective fields ──────────────────────────

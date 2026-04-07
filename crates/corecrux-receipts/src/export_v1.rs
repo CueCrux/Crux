@@ -398,6 +398,8 @@ fn build_zip_deterministic(entries: &[ArchiveEntry<'_>]) -> Result<Vec<u8>, Expo
     {
         let mut zw = zip::ZipWriter::new(&mut cursor);
 
+        // SAFETY: 1980-01-01 00:00:00 is a valid zip timestamp — static constant.
+        #[allow(clippy::expect_used)]
         let ts = zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).expect("static zip timestamp");
         let opts = FileOptions::default()
             .compression_method(zip::CompressionMethod::Stored)

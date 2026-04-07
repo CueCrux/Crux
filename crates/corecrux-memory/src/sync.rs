@@ -164,10 +164,12 @@ impl SyncClient {
         loop {
             let mut url = format!("{}/v1/facts/export?limit=1000", self.remote_url);
             if let Some(ref s) = since {
-                url.push_str(&format!("&since={}", s));
+                use std::fmt::Write;
+                let _ = write!(url, "&since={s}");
             }
             if let Some(ref c) = current_cursor {
-                url.push_str(&format!("&cursor={}", c));
+                use std::fmt::Write;
+                let _ = write!(url, "&cursor={c}");
             }
 
             let resp = ureq::get(&url)
@@ -198,7 +200,7 @@ impl SyncClient {
         // Update cursor
         let mut cursor = self.load_cursor();
         cursor.last_pull_at = Some(Utc::now().to_rfc3339());
-        cursor.last_pull_cursor = current_cursor.clone();
+        cursor.last_pull_cursor.clone_from(&current_cursor);
         cursor.pull_count += total_pulled as u64;
         self.save_cursor(&cursor);
 
@@ -271,8 +273,8 @@ impl SyncClient {
             .all_facts()
             .filter(|f| !f.deleted)
             .filter(|f| !self.is_private(f))
-            .filter(|f| f.source_receipt.as_deref().map_or(true, |r| !r.starts_with("sync:")))
-            .filter(|f| since.map_or(true, |s| f.stored_at > s))
+            .filter(|f| f.source_receipt.as_deref().is_none_or(|r| !r.starts_with("sync:")))
+            .filter(|f| since.is_none_or(|s| f.stored_at > s))
             .collect();
 
         if local_facts.is_empty() {
@@ -479,7 +481,7 @@ mod tests {
         let local_only: Vec<_> = store
             .all_facts()
             .filter(|f| !f.deleted)
-            .filter(|f| f.source_receipt.as_deref().map_or(true, |r| !r.starts_with("sync:")))
+            .filter(|f| f.source_receipt.as_deref().is_none_or(|r| !r.starts_with("sync:")))
             .collect();
         assert_eq!(local_only.len(), 1);
         assert_eq!(local_only[0].entity, "local");

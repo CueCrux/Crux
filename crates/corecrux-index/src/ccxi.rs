@@ -366,6 +366,8 @@ impl CcxiReader {
         let mut cursor = tf_start + 4;
         for _ in 0..tf_count {
             if cursor + 2 <= data.len() {
+                // SAFETY: data[cursor..cursor+2] is a 2-byte slice — try_into to [u8; 2] is infallible.
+                #[allow(clippy::unwrap_used)]
                 tfs.push(u16::from_le_bytes(data[cursor..cursor + 2].try_into().unwrap()));
                 cursor += 2;
             }

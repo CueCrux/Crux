@@ -267,6 +267,7 @@ pub(super) async fn append_control_evidence_event<T: serde::Serialize>(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)] // Evidence event builder — fields map 1:1 to the event schema
 pub(super) fn build_admin_action_submitted_event(
     state: &AppState,
     action_id: &str,
@@ -292,6 +293,7 @@ pub(super) fn build_admin_action_submitted_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Evidence event builder — fields map 1:1 to the event schema
 pub(super) fn build_control_mutation_event(
     state: &AppState,
     action_id: &str,
@@ -322,6 +324,7 @@ pub(super) fn build_control_mutation_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Evidence event builder — fields map 1:1 to the event schema
 pub(super) fn build_admin_action_finished_event(
     state: &AppState,
     action_id: &str,
@@ -796,8 +799,8 @@ pub(super) async fn execute_admin_action(
             }
 
             if knowledge_authority_changed {
-                control_state.knowledge_authority.actor = actor.clone();
-                control_state.knowledge_authority.reason = reason.clone();
+                control_state.knowledge_authority.actor.clone_from(&actor);
+                control_state.knowledge_authority.reason.clone_from(&reason);
                 control_state.knowledge_authority.updated_at_unix_ns = now;
                 changed = true;
             }

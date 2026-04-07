@@ -2,6 +2,10 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+// SAFETY: All .try_into().unwrap() in decode functions below operate on fixed-size
+// sub-slices carved from chunks_exact(STRIDE). The slice lengths are compile-time
+// constants that match the target array size, so the conversion is infallible.
+#![allow(clippy::unwrap_used)]
 use std::collections::BTreeMap;
 
 use crate::state::{DependentEdgeV1, LivingStateRowV1, PressureEventRowV1, RelationEdgeV1};
