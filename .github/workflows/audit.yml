@@ -16,7 +16,7 @@ jobs:
     name: Advisory audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@cargo-deny
@@ -34,7 +34,7 @@ jobs:
     name: Licence check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@cargo-deny
