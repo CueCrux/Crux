@@ -433,6 +433,7 @@ pub fn compare(file1: &str, file2: &str) -> Result<(), Box<dyn std::error::Error
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

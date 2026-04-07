@@ -19,6 +19,7 @@ pub fn run(_device_index: i32) -> Result<SmokeReport, Box<dyn std::error::Error 
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -462,6 +462,7 @@ fn now_unix_ns() -> u64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::{has_partial_scope, reconcile_maps, ReconcilePostgresOptions, ReconcileRecord};
     use std::collections::HashMap;

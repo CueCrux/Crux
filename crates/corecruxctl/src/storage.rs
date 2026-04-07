@@ -261,7 +261,9 @@ pub fn offload_segments(opts: &StorageOffloadOptions) -> Result<StorageOffloadRe
         if let std::collections::btree_map::Entry::Vacant(e) = indexes.entry(shard_id) {
             e.insert(load_offload_index(&opts.data_dir, opts.tier, shard_id)?);
         }
-        let index = indexes.get_mut(&shard_id).expect("index loaded");
+        let index = indexes
+            .get_mut(&shard_id)
+            .ok_or_else(|| -> DynError { format!("offload index missing for shard {shard_id}").into() })?;
 
         for segment in catalog.segments {
             let source_path = shard_dir.join(&segment.relative_path);
@@ -715,6 +717,7 @@ fn hex_bytes(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
         build_segment_offloaded_event_id, build_target_path, offload_index_path, offload_segments, parse_target,

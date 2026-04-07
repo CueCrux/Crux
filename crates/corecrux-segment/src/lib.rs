@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+#![deny(clippy::unwrap_used)]
+
 //! `corecrux-segment` — Sealed segment format for CoreCrux.
 //!
 //! Spec source: PlanCrux `CoreCrux-V3-Phase-2.md`.
@@ -1370,6 +1372,7 @@ pub fn seal_segment_v1_from_record_area_with_block_codec(
     })
 }
 
+#[allow(clippy::unwrap_used)] // SAFETY: all try_into().unwrap() are on fixed-size slices after bounds checks
 pub fn decode_trailer_index_v1(toc_area: &[u8], toc_header: &TocHeaderV1) -> Result<Option<TrailerIndexV1>> {
     let payload_len = toc_header.toc_payload_len as usize;
     let crc_tables_len = toc_header.crc_tables_len as usize;
@@ -1830,6 +1833,7 @@ fn encode_blk1_payload(blocks: &[BlockMetaV1]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[allow(clippy::unwrap_used)] // SAFETY: all try_into().unwrap() are on fixed-size slices after bounds checks
 fn decode_blk1_payload(payload: &[u8]) -> Result<(u32, u32, u32, Vec<BlockMetaV1>)> {
     if payload.len() < 16 {
         return Err(SegmentError::TrailerSectionInvalid {
@@ -1882,6 +1886,7 @@ fn encode_tbo1_payload(entries: &[TocByOffsetEntryV1]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[allow(clippy::unwrap_used)] // SAFETY: all try_into().unwrap() are on fixed-size slices after bounds checks
 fn decode_tbo1_payload(payload: &[u8]) -> Result<Vec<TocByOffsetEntryV1>> {
     if payload.len() < 8 {
         return Err(SegmentError::TrailerSectionInvalid {
@@ -1923,6 +1928,7 @@ fn encode_tsi1_payload(sorted_idx: &[u32]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[allow(clippy::unwrap_used)] // SAFETY: all try_into().unwrap() are on fixed-size slices after bounds checks
 fn decode_tsi1_payload(payload: &[u8]) -> Result<Vec<u32>> {
     if payload.len() < 8 {
         return Err(SegmentError::TrailerSectionInvalid {
@@ -1961,6 +1967,7 @@ pub fn encode_block_meta_v1(b: &BlockMetaV1) -> [u8; BLOCK_META_V1_LEN] {
     out
 }
 
+#[allow(clippy::unwrap_used)] // SAFETY: all try_into().unwrap() are on fixed-size slices after exact-length check
 fn decode_block_meta_v1(bytes: &[u8]) -> Result<BlockMetaV1> {
     if bytes.len() != BLOCK_META_V1_LEN {
         return Err(SegmentError::TrailerSectionInvalid {
@@ -2007,6 +2014,7 @@ pub fn encode_toc_by_offset_entry_v1(e: &TocByOffsetEntryV1) -> [u8; TOC_BY_OFFS
     out
 }
 
+#[allow(clippy::unwrap_used)] // SAFETY: all try_into().unwrap() are on fixed-size slices after exact-length check
 fn decode_toc_by_offset_entry_v1(bytes: &[u8]) -> Result<TocByOffsetEntryV1> {
     if bytes.len() != TOC_BY_OFFSET_ENTRY_V1_LEN {
         return Err(SegmentError::TrailerSectionInvalid {
@@ -2592,6 +2600,7 @@ fn read_u64(bytes: &[u8], off: usize) -> Result<u64> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use corecrux_frame::{canonical_header_bytes_v1, compute_header_hash, compute_payload_hash};
@@ -3337,6 +3346,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod proptest_tests {
     use super::*;
     use proptest::prelude::*;

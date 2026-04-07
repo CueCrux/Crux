@@ -104,6 +104,7 @@ fn maybe_set_scopes<T>(request: &mut tonic::Request<T>, scopes: Option<&str>) ->
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

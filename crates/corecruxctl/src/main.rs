@@ -2144,6 +2144,7 @@ fn rebuild_ccxi_from_segment(
 // ── tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use clap::Parser;

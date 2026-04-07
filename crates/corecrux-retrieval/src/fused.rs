@@ -15,12 +15,7 @@
 //!
 //! CoreCrux v5 launches with BM25 + graph fusion only. The `dense` weight exists in
 //! `FusionWeights` but `dense_score` is hardcoded to 0.0. Dense vector retrieval
-//! (Qdrant) remains in the Engine retrieval path as a parallel lane. Fusion of
-//! CoreCrux BM25+graph results with Qdrant dense results happens at the Engine level,
-//! not inside CoreCrux.
-//!
-//! Rationale: Qdrant integration already works in Engine. Building a CoreCrux-native
-//! dense index would delay launch with no quality gain on a clean-slate deployment.
+//! uses pgvector in the Engine retrieval path as a parallel lane.
 //! If conceptual/paraphrased queries prove to need in-CoreCrux dense support, that's
 //! a future milestone — the FusionWeights plumbing is ready for it.
 

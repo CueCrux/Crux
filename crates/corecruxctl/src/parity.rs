@@ -1012,6 +1012,7 @@ fn get_corecrux_json<T: for<'de> Deserialize<'de>>(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
         build_parity_pack_report, deterministic_artifact_score, hash_hex_bytes, hash_hex_json, hash_prefix, hash_u64,

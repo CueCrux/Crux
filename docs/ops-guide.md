@@ -113,3 +113,45 @@ Without rate limiting, a burst of append requests can:
 - Increase response latency for all endpoints
 
 The daemon will not crash but will degrade gracefully.
+
+## Segment Corruption Recovery
+
+CoreCrux uses append-only sealed segments with BLAKE3 integrity hashes.
+
+### Detection
+
+```bash
+corecruxctl verify-store --data-dir ./data --scope full
+```
+
+Reports any segment with mismatched BLAKE3 hashes, truncated frames, or missing trailer indexes.
+
+### Recovery
+
+1. **Quarantine the corrupted segment**: Move it to a backup directory
+   ```bash
+   mv data/shards/0/segments/seg_corrupted.ccxseg data/quarantine/
+   ```
+
+2. **Restart the daemon**: It will replay from the last good commit marker
+   ```bash
+   CORECRUXD_DATA_DIR=./data ./corecruxd
+   ```
+
+3. **Verify integrity after restart**:
+   ```bash
+   corecruxctl verify-store --data-dir ./data --scope recent
+   ```
+
+### Prevention
+
+- Use filesystem-level snapshots (ZFS, LVM) for point-in-time recovery
+- Run `verify-store --scope recent` as a cron job (daily)
+- Monitor the `corecrux_segment_corrupt_total` Prometheus metric
+- Enable capacity guards (`CORECRUXD_CAPACITY_GUARD_ENABLED=1`) to prevent writes when disk is low
+
+### What data is lost
+
+Sealed segments are immutable — corruption in a sealed segment means those events are unrecoverable from this node. Use receipt export (`/v1/replay/exports/receipts/{id}`) to verify which events had receipts issued before the corruption window.
+
+Facts stored via the fact store (`/v1/facts`) are journaled separately in `facts.jsonl` and are unaffected by segment corruption.

@@ -129,6 +129,7 @@ pub fn run(http_base: &str, non_interactive: bool) -> Result<(), Box<dyn std::er
 }
 
 /// Build the contents of a `config.env` file from wizard answers.
+#[allow(clippy::unwrap_used)] // SAFETY: writeln! to a String is infallible
 fn build_config_env(data_dir: &str, auth_mode: &str, build_ccxi: &str) -> String {
     let mut buf = String::new();
     writeln!(buf, "# CoreCrux quickstart configuration").unwrap();

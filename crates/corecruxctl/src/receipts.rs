@@ -395,6 +395,7 @@ fn list_shards(shard_root: &Path) -> Result<Vec<u32>, Box<dyn std::error::Error 
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
