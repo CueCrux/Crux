@@ -22,6 +22,7 @@
 
 pub mod fact_store;
 pub mod session_store;
+pub mod sync;
 
 pub use fact_store::{Fact, FactStore};
 pub use session_store::{SessionState, SessionStore};

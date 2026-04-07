@@ -111,6 +111,45 @@ pub(super) async fn query_facts(
         .into_response()
 }
 
+pub(super) async fn export_facts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
+        if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+            return problem.into_response();
+        }
+    }
+
+    let since = params
+        .get("since")
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+
+    let cursor = params.get("cursor").map(|s| s.as_str());
+
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v.min(10000) as usize)
+        .unwrap_or(1000);
+
+    let store = state.fact_store.read().await;
+    let result = store.export(since, cursor, limit);
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "facts": result.facts,
+            "next_cursor": result.next_cursor,
+            "has_more": result.has_more,
+            "exported_at": chrono::Utc::now().to_rfc3339(),
+        })),
+    )
+        .into_response()
+}
+
 // ── Session Store API (Phase 1.5) ──────────────────────────────────
 
 pub(super) async fn put_session_state(
