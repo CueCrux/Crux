@@ -6,7 +6,7 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
-prost = "0.13.5"
+prost = "0.14.3"
 tonic = "0.12.3"
 
 [build-dependencies]
