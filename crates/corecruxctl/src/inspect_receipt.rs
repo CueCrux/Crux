@@ -35,7 +35,7 @@ pub fn run(data_dir: &str, receipt_id: &str) -> Result<(), Box<dyn std::error::E
         for seg_entry in std::fs::read_dir(&path)? {
             let seg_entry = seg_entry?;
             let seg_path = seg_entry.path();
-            if seg_path.extension().map(|e| e == "ccxseg").unwrap_or(false) {
+            if seg_path.extension().is_some_and(|e| e == "ccxseg") {
                 // Try to find receipts in this segment
                 if let Ok(bytes) = std::fs::read(&seg_path) {
                     // Simple scan for receipt ID in raw bytes

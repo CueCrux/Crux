@@ -146,7 +146,7 @@ pub fn bm25_score_multi(
 
             // Global DF: sum across all readers
             let mut global_df = 0usize;
-            for r in readers.iter() {
+            for r in readers {
                 if let Some(e) = r.find_token(qt.hash) {
                     let (ids, _) = r.decode_postings(e);
                     global_df += ids.len();
@@ -279,7 +279,7 @@ pub fn bm25_search(
 
             // Global DF
             let mut global_df = 0usize;
-            for r in readers.iter() {
+            for r in readers {
                 if let Some(e) = r.find_token(qt.hash) {
                     let (ids, _) = r.decode_postings(e);
                     global_df += ids.len();
@@ -353,7 +353,7 @@ pub fn bm25_search(
         .iter()
         .enumerate()
         .filter(|(_, &matched)| !matched)
-        .filter_map(|(i, _)| original_words.get(i).map(|s| s.to_string()))
+        .filter_map(|(i, _)| original_words.get(i).map(|s| (*s).to_string()))
         .collect();
 
     Bm25SearchResult {

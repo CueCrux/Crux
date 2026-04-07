@@ -128,10 +128,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .copied()
             .or_else(|| panic_info.payload().downcast_ref::<String>().map(|s| s.as_str()))
             .unwrap_or("unknown");
-        let location = panic_info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "unknown".to_string());
+        let location = panic_info.location().map_or_else(
+            || "unknown".to_string(),
+            |l| format!("{}:{}:{}", l.file(), l.line(), l.column()),
+        );
         tracing::error!(
             panic.payload = payload,
             panic.location = %location,
@@ -608,10 +608,7 @@ async fn reconcile_control_checkpoint_with_evidence(
         }
 
         let batch_len = batch.len();
-        from_seq = batch
-            .last()
-            .map(|event| event.seq.saturating_add(1))
-            .unwrap_or(from_seq);
+        from_seq = batch.last().map_or(from_seq, |event| event.seq.saturating_add(1));
 
         for event in batch {
             match event.event_type.as_str() {
@@ -735,15 +732,13 @@ async fn reconcile_control_checkpoint_with_evidence(
 fn insecure_dev_auth_bind_allowed() -> bool {
     std::env::var("CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn replication_auth_bearer_configured() -> bool {
     std::env::var("CORECRUXD_REPLICATION_AUTH_BEARER")
         .ok()
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false)
+        .is_some_and(|v| !v.trim().is_empty())
 }
 
 fn shard_map_advertise_addr(listen_addr: SocketAddr) -> String {
@@ -892,8 +887,7 @@ fn observe_shard_map_metrics(metrics: &Metrics, table: &RoutingTable, node_id: &
         let follower_count = shard
             .followers
             .as_ref()
-            .map(|followers| followers.iter().filter(|f| f.node_id != node_id).count())
-            .unwrap_or(0);
+            .map_or(0, |followers| followers.iter().filter(|f| f.node_id != node_id).count());
         metrics.set_replication_follower_targets(&shard.shard_id, follower_count);
         metrics.set_replication_lag_segments(&shard.shard_id, 0, 0);
     }
@@ -944,9 +938,7 @@ fn load_or_init_node_meta(
         return Ok(meta);
     }
 
-    let node_id = node_id_override
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("node-{}", uuid::Uuid::new_v4()));
+    let node_id = node_id_override.map_or_else(|| format!("node-{}", uuid::Uuid::new_v4()), |s| s.to_string());
 
     let meta = NodeMetaV1 {
         v: 1,
@@ -2062,7 +2054,7 @@ mod tests {
         let debug_str = format!("{:?}", plan);
         assert!(debug_str.contains("checkpoint"));
         assert!(debug_str.contains("10"));
-        assert!(debug_str.contains("3"));
+        assert!(debug_str.contains('3'));
     }
 
     // ── reconcile_control_from_evidence: checkpoint-only (no mutations) ─

@@ -2110,7 +2110,7 @@ mod tests {
 
     #[test]
     fn canonical_relation_key_v1_sort_order() {
-        let mut keys = vec![
+        let mut keys = [
             CanonicalRelationKeyV1 {
                 src_artifact_id: 2,
                 dst_artifact_id: 3,
@@ -2139,7 +2139,7 @@ mod tests {
 
     #[test]
     fn canonical_dependent_key_v1_sort_order() {
-        let mut keys = vec![
+        let mut keys = [
             CanonicalDependentKeyV1 {
                 dependent_type: "query".to_string(),
                 dependent_id: "q2".to_string(),

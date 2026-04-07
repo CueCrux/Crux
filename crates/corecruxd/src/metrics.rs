@@ -2057,9 +2057,7 @@ impl Metrics {
     }
 
     pub fn set_knowledge_parity_outcome(&self, outcome: Option<&KnowledgeParityOutcomeV1>) {
-        let status = outcome
-            .map(|entry| entry.status)
-            .unwrap_or(KnowledgeParityStatusV1::Unknown);
+        let status = outcome.map_or(KnowledgeParityStatusV1::Unknown, |entry| entry.status);
         for candidate in [
             KnowledgeParityStatusV1::Unknown,
             KnowledgeParityStatusV1::Pass,
@@ -2071,13 +2069,13 @@ impl Metrics {
                 .set(if candidate == status { 1.0 } else { 0.0 });
         }
         self.knowledge_parity_mismatch_count
-            .set(outcome.map(|entry| entry.mismatch_count).unwrap_or(0) as f64);
+            .set(outcome.map_or(0, |entry| entry.mismatch_count) as f64);
         self.knowledge_parity_cursor_missing_count
-            .set(outcome.map(|entry| entry.cursor_missing_count).unwrap_or(0) as f64);
+            .set(outcome.map_or(0, |entry| entry.cursor_missing_count) as f64);
         self.knowledge_parity_pass_ratio_bps
-            .set(outcome.map(|entry| entry.pass_ratio_bps).unwrap_or(0) as f64);
+            .set(outcome.map_or(0, |entry| entry.pass_ratio_bps) as f64);
         self.knowledge_parity_projection_lag_ms
-            .set(outcome.map(|entry| entry.projection_lag_ms).unwrap_or(0) as f64);
+            .set(outcome.map_or(0, |entry| entry.projection_lag_ms) as f64);
     }
 
     pub fn inc_receipt_verify_total(&self, result: &str) {

@@ -223,9 +223,10 @@ fn graceful_shutdown_on_sigterm() {
                 return;
             }
             Ok(None) => {
-                if std::time::Instant::now() > deadline {
-                    panic!("corecruxd did not exit within 5 seconds after SIGTERM");
-                }
+                assert!(
+                    !(std::time::Instant::now() > deadline),
+                    "corecruxd did not exit within 5 seconds after SIGTERM"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(e) => panic!("error waiting for corecruxd: {e}"),

@@ -57,7 +57,7 @@ pub async fn handle_save_session(args: &Value, ctx: &McpContext) -> Result<Value
 /// `list_sessions` — list all session IDs.
 pub async fn handle_list_sessions(_args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let store = ctx.session_store.read().await;
-    let mut ids = store.list().iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let mut ids = store.list().iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
     ids.sort();
 
     if ids.is_empty() {

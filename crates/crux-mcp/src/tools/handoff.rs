@@ -17,7 +17,7 @@ pub async fn handle_create_handoff(args: &Value, ctx: &McpContext) -> Result<Val
     let include_facts = args.get("include_facts").and_then(|v| v.as_bool()).unwrap_or(false);
     let message = args.get("message").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    let agent_name = ctx.agent.as_ref().map(|a| a.name.as_str()).unwrap_or("anonymous");
+    let agent_name = ctx.agent.as_ref().map_or("anonymous", |a| a.name.as_str());
 
     let session_store = ctx.session_store.read().await;
     let fact_store = ctx.fact_store.read().await;
@@ -61,7 +61,7 @@ pub async fn handle_accept_handoff(args: &Value, ctx: &McpContext) -> Result<Val
         data: None,
     })?;
 
-    let agent_name = ctx.agent.as_ref().map(|a| a.name.as_str()).unwrap_or("anonymous");
+    let agent_name = ctx.agent.as_ref().map_or("anonymous", |a| a.name.as_str());
 
     let mut session_store = ctx.session_store.write().await;
     let mut fact_store = ctx.fact_store.write().await;

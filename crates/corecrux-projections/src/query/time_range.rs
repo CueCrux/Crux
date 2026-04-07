@@ -80,7 +80,7 @@ pub struct TimeRangeResponse {
 pub fn time_range_scan(state: &ProjectionState, req: &TimeRangeRequest) -> TimeRangeResponse {
     let limit = req.limit.clamp(1, 500);
 
-    let scoped_ids: BTreeSet<u32> = req.artifact_ids.iter().cloned().collect();
+    let scoped_ids: BTreeSet<u32> = req.artifact_ids.iter().copied().collect();
     let scope_all = scoped_ids.is_empty();
 
     let mut stats = TimeRangeStats::default();

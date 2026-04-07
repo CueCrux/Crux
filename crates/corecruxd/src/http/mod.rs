@@ -445,8 +445,7 @@ struct ProjMetaQuery {
 fn is_query_feature_enabled(env_var: &str) -> bool {
     std::env::var(env_var)
         .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 fn hex16(bytes: &[u8; 16]) -> String {

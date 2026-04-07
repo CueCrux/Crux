@@ -103,7 +103,7 @@ pub fn graph_expand(state: &ProjectionState, req: &GraphExpandRequest) -> GraphE
 
     // Activation map: artifact_id -> NodeActivation
     let mut activations: BTreeMap<u32, NodeActivation> = BTreeMap::new();
-    let seed_set: BTreeSet<u32> = req.seed_artifact_ids.iter().cloned().collect();
+    let seed_set: BTreeSet<u32> = req.seed_artifact_ids.iter().copied().collect();
 
     // Initialize seeds with score 1.0
     for &seed_id in &req.seed_artifact_ids {
@@ -131,7 +131,7 @@ pub fn graph_expand(state: &ProjectionState, req: &GraphExpandRequest) -> GraphE
         let mut next_frontier: BTreeSet<u32> = BTreeSet::new();
 
         for &src_id in &frontier {
-            let parent_score = activations.get(&src_id).map(|a| a.score).unwrap_or(0.0);
+            let parent_score = activations.get(&src_id).map_or(0.0, |a| a.score);
             if parent_score < 0.01 {
                 continue;
             }
@@ -254,7 +254,7 @@ pub fn graph_expand(state: &ProjectionState, req: &GraphExpandRequest) -> GraphE
                 artifact_id,
                 score: activation.score,
                 hop_distance: activation.hop_distance,
-                edge_types_used: activation.edge_types.iter().cloned().collect(),
+                edge_types_used: activation.edge_types.iter().copied().collect(),
                 state: artifact_state,
             }
         })

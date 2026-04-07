@@ -395,8 +395,7 @@ fn verify_receipt_artifacts(
         keyring: Some(&keyring),
         verified_at: bundled_report
             .as_ref()
-            .map(|r| r.verified_at.as_str())
-            .unwrap_or("1970-01-01T00:00:00Z"),
+            .map_or("1970-01-01T00:00:00Z", |r| r.verified_at.as_str()),
         verifier_build: &build_info(),
         recompute_candidate_digest: true,
     })?;
@@ -1482,7 +1481,7 @@ mod tests {
     fn parse_manifest_epoch_too_short() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("MANIFEST");
-        std::fs::write(&path, &[0u8; 10]).expect("write");
+        std::fs::write(&path, [0u8; 10]).expect("write");
         assert!(parse_manifest_epoch(&path).is_err());
     }
 
@@ -2248,7 +2247,7 @@ mod tests {
         }
         let after_digest = control_state_digest_v1(&after);
 
-        let valve_names = vec![
+        let valve_names = [
             "pause_ingest",
             "pause_compaction",
             "throttle",
@@ -2258,7 +2257,7 @@ mod tests {
         let valve_changes: Vec<corecrux_types::ValveChangeV1> = valve_names
             .iter()
             .map(|name| corecrux_types::ValveChangeV1 {
-                valve: name.to_string(),
+                valve: (*name).to_string(),
                 before: corecrux_types::ControlValveStateV1::default(),
                 after: corecrux_types::ControlValveStateV1 {
                     enabled: true,

@@ -471,12 +471,8 @@ pub(super) async fn execute_admin_action(
         }
         "scrub-now" => {
             let started = std::time::Instant::now();
-            let scope = read_param_str(params, "scope")
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| state.scrub_scope.clone());
-            let mode = read_param_str(params, "mode")
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| state.scrub_mode.clone());
+            let scope = read_param_str(params, "scope").map_or_else(|| state.scrub_scope.clone(), ToOwned::to_owned);
+            let mode = read_param_str(params, "mode").map_or_else(|| state.scrub_mode.clone(), ToOwned::to_owned);
             let full = read_param_bool(params, "full")
                 .unwrap_or_else(|| mode.eq_ignore_ascii_case("full") || scope.eq_ignore_ascii_case("all"));
             let sample_rate = read_param_f64(params, "sampleRate")
@@ -580,11 +576,9 @@ pub(super) async fn execute_admin_action(
         }
         "runtime-knob-update" => {
             let actor = read_param_str(params, "actor")
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| "admin-action-runtime-knob-update".to_string());
+                .map_or_else(|| "admin-action-runtime-knob-update".to_string(), ToOwned::to_owned);
             let reason = read_param_str(params, "reason")
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| "runtime knob update action".to_string());
+                .map_or_else(|| "runtime knob update action".to_string(), ToOwned::to_owned);
             let now = control::now_unix_ns();
 
             let mut control_state = state.control.write().await;
@@ -1182,8 +1176,7 @@ pub(super) async fn post_admin_action(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("act_{}", uuid::Uuid::new_v4()));
+        .map_or_else(|| format!("act_{}", uuid::Uuid::new_v4()), ToOwned::to_owned);
     if action_id.len() > 128 {
         return problem_response(StatusCode::BAD_REQUEST, "actionId must be <= 128 characters");
     }
@@ -2013,11 +2006,9 @@ pub(super) async fn get_replication_status(State(state): State<AppState>, header
             "unassigned"
         };
 
-        let follower_targets = shard
-            .followers
-            .as_ref()
-            .map(|followers| followers.iter().filter(|f| f.node_id != state.node_id).count())
-            .unwrap_or(0);
+        let follower_targets = shard.followers.as_ref().map_or(0, |followers| {
+            followers.iter().filter(|f| f.node_id != state.node_id).count()
+        });
         let topology_ok = follower_targets > 0;
         if is_leader && !matches!(shard.state, corecrux_types::ShardState::Retired) {
             local_leader_shards = local_leader_shards.saturating_add(1);

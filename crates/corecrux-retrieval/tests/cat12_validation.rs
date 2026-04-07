@@ -228,7 +228,7 @@ fn cat12_fused_retrieve() {
     let mut total_recall = 0.0f64;
     let mut query_count = 0;
 
-    for (_qi, q) in corpus.queries.iter().enumerate() {
+    for q in corpus.queries.iter() {
         let req = FusedRetrieveRequest {
             tenant_id: tenant_id.to_string(),
             query: q.query.clone(),

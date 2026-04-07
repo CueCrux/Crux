@@ -18,13 +18,9 @@ concurrency:
 jobs:
   build:
     name: Build rustdoc
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci]
     steps:
       - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
 
       - name: Build documentation
         env:
@@ -58,7 +54,7 @@ jobs:
     name: Deploy to GitHub Pages
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci]
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

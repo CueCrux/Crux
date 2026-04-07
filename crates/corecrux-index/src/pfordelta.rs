@@ -97,7 +97,7 @@ fn encode_block(deltas: &[u32], out: &mut Vec<u8>) {
     out.push(block_len as u8); // actual count in this block
 
     // Bit-pack the values (exceptions stored as 0 in the packed array)
-    let packed_bytes = ((block_len as u32) * (bit_width as u32) + 7) / 8;
+    let packed_bytes = ((block_len as u32) * (bit_width as u32)).div_ceil(8);
     let pack_start = out.len();
     out.resize(pack_start + packed_bytes as usize, 0);
 
@@ -105,7 +105,7 @@ fn encode_block(deltas: &[u32], out: &mut Vec<u8>) {
         let val = if d > max_val { 0 } else { d };
         let bit_offset = i as u32 * bit_width as u32;
         let byte_offset = (bit_offset / 8) as usize;
-        let bit_shift = (bit_offset % 8) as u32;
+        let bit_shift = bit_offset % 8;
 
         // Write value across potentially multiple bytes
         let mut remaining_bits = bit_width as u32;
@@ -142,7 +142,7 @@ fn decode_block(data: &[u8], mut cursor: usize, expected: usize, deltas: &mut Ve
     cursor += 3;
 
     let block_len = block_len.min(expected);
-    let packed_bytes = ((block_len as u32) * bit_width + 7) / 8;
+    let packed_bytes = ((block_len as u32) * bit_width).div_ceil(8);
 
     if cursor + packed_bytes as usize > data.len() {
         return data.len();
@@ -155,7 +155,7 @@ fn decode_block(data: &[u8], mut cursor: usize, expected: usize, deltas: &mut Ve
     for i in 0..block_len {
         let bit_offset = i as u32 * bit_width;
         let byte_offset = (bit_offset / 8) as usize;
-        let bit_shift = (bit_offset % 8) as u32;
+        let bit_shift = bit_offset % 8;
 
         let mut val = 0u32;
         let mut remaining_bits = bit_width;

@@ -680,7 +680,7 @@ fn default_node_id() -> String {
 
 fn build_node_context(ops: Option<&OpsAppendOptions>) -> EvidenceNodeContextV1 {
     EvidenceNodeContextV1 {
-        node_id: ops.map(|value| value.node_id.clone()).unwrap_or_else(default_node_id),
+        node_id: ops.map_or_else(default_node_id, |value| value.node_id.clone()),
         build: build_info(),
         http_listen_addr: None,
         grpc_listen_addr: ops.map(|value| value.grpc.clone()),
