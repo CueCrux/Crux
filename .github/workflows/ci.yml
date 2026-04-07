@@ -66,11 +66,13 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install Rust
+        if: matrix.name != 'hetzner-linux'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - name: Install protoc
+        if: matrix.name != 'hetzner-linux'
         uses: arduino/setup-protoc@v3
         with:
           version: "25.x"
