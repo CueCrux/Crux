@@ -13,9 +13,8 @@ use std::sync::OnceLock;
 use corecrux_proto::dataplane_v1::core_crux_data_plane_v1_client::CoreCruxDataPlaneV1Client;
 use corecrux_proto::dataplane_v1::core_crux_export_v1_client::CoreCruxExportV1Client;
 use corecrux_proto::dataplane_v1::{
-    AppendBatchRequest, AppendEvent, ExportReceiptBundleRequest, ReadFramesRequest,
-    ReadManyBatchedRequest, ReadManyFramesBatchedRequest, ReadStreamBatchedRequest,
-    ReadStreamRequest, ReplaySessionRequest,
+    AppendBatchRequest, AppendEvent, ExportReceiptBundleRequest, ReadFramesRequest, ReadManyBatchedRequest,
+    ReadManyFramesBatchedRequest, ReadStreamBatchedRequest, ReadStreamRequest, ReplaySessionRequest,
 };
 use crux_integration_tests::TestDaemon;
 
@@ -164,9 +163,7 @@ async fn read_many_frames_batched_unary_returns_unimplemented() {
         .expect("connect");
 
     let status = client
-        .read_many_frames_batched_unary(tonic::Request::new(ReadManyFramesBatchedRequest {
-            reads: vec![],
-        }))
+        .read_many_frames_batched_unary(tonic::Request::new(ReadManyFramesBatchedRequest { reads: vec![] }))
         .await
         .expect_err("should be unimplemented");
 
@@ -228,9 +225,7 @@ async fn read_frames_returns_unimplemented() {
 
 #[tokio::test]
 async fn export_receipt_bundle_returns_unimplemented() {
-    let mut client = CoreCruxExportV1Client::connect(grpc_endpoint())
-        .await
-        .expect("connect");
+    let mut client = CoreCruxExportV1Client::connect(grpc_endpoint()).await.expect("connect");
 
     let status = client
         .export_receipt_bundle(tonic::Request::new(ExportReceiptBundleRequest {
@@ -252,43 +247,37 @@ async fn unimplemented_messages_mention_proprietary_edition() {
         .expect("connect");
 
     // Sample several RPCs and verify consistent messaging.
-    let rpcs: Vec<(&str, tonic::Code, String)> = vec![
-        (
-            "AppendBatch",
-            client
-                .append_batch(tonic::Request::new(AppendBatchRequest {
-                    tenant_id: "t".into(),
-                    stream_type: "t".into(),
-                    stream_id: "s".into(),
-                    events: vec![],
-                    expected_next_seq: 0,
-                    client_shard_map_version: None,
-                }))
-                .await
-                .unwrap_err()
-                .code(),
-            client
-                .append_batch(tonic::Request::new(AppendBatchRequest {
-                    tenant_id: "t".into(),
-                    stream_type: "t".into(),
-                    stream_id: "s".into(),
-                    events: vec![],
-                    expected_next_seq: 0,
-                    client_shard_map_version: None,
-                }))
-                .await
-                .unwrap_err()
-                .message()
-                .to_string(),
-        ),
-    ];
+    let rpcs: Vec<(&str, tonic::Code, String)> = vec![(
+        "AppendBatch",
+        client
+            .append_batch(tonic::Request::new(AppendBatchRequest {
+                tenant_id: "t".into(),
+                stream_type: "t".into(),
+                stream_id: "s".into(),
+                events: vec![],
+                expected_next_seq: 0,
+                client_shard_map_version: None,
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        client
+            .append_batch(tonic::Request::new(AppendBatchRequest {
+                tenant_id: "t".into(),
+                stream_type: "t".into(),
+                stream_id: "s".into(),
+                events: vec![],
+                expected_next_seq: 0,
+                client_shard_map_version: None,
+            }))
+            .await
+            .unwrap_err()
+            .message()
+            .to_string(),
+    )];
 
     for (name, code, msg) in &rpcs {
-        assert_eq!(
-            *code,
-            tonic::Code::Unimplemented,
-            "{name} should return Unimplemented"
-        );
+        assert_eq!(*code, tonic::Code::Unimplemented, "{name} should return Unimplemented");
         assert!(
             msg.contains("proprietary"),
             "{name} error should mention 'proprietary': {msg}"

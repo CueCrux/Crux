@@ -37,7 +37,7 @@ impl SessionStore {
     /// Create or update session state.
     ///
     /// If `ttl_seconds` is `Some`, the session will expire after the given
-    /// duration and be reaped by [`reap_expired`].
+    /// duration and be reaped on the next cleanup pass.
     pub fn put(&mut self, session_id: &str, state: serde_json::Value, ttl_seconds: Option<u64>) -> SessionState {
         let tokens = estimate_tokens(&state);
         let expires_at = ttl_seconds.map(|secs| Utc::now() + chrono::Duration::seconds(secs as i64));
