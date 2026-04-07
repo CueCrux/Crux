@@ -19,16 +19,23 @@ pub struct TestDaemon {
 
 impl TestDaemon {
     /// Start a corecruxd instance on random ports.
+    ///
+    /// Set `CORECRUXD_BINARY` to override the daemon binary path (useful when
+    /// `cargo llvm-cov` or other tools use a non-standard target directory).
     pub fn start() -> Self {
         let data_dir = tempfile::tempdir().expect("create tempdir");
         let http_port = portpicker::pick_unused_port().expect("pick HTTP port");
         let grpc_port = portpicker::pick_unused_port().expect("pick gRPC port");
 
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let binary = std::path::Path::new(manifest_dir)
-            .parent().unwrap()  // crates/
-            .parent().unwrap()  // Crux/
-            .join("target/debug/corecruxd");
+        let binary = if let Ok(path) = std::env::var("CORECRUXD_BINARY") {
+            std::path::PathBuf::from(path)
+        } else {
+            let manifest_dir = env!("CARGO_MANIFEST_DIR");
+            std::path::Path::new(manifest_dir)
+                .parent().unwrap()  // crates/
+                .parent().unwrap()  // Crux/
+                .join("target/debug/corecruxd")
+        };
 
         let process = Command::new(&binary)
             .env("CORECRUXD_DATA_DIR", data_dir.path())
