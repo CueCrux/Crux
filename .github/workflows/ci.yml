@@ -28,6 +28,7 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -51,11 +52,16 @@ jobs:
         run: cargo clippy --workspace
 
   test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - name: ubuntu-latest
+            runner: ubuntu-latest
+          - name: hetzner-linux
+            runner: [self-hosted, ci]
     steps:
       - uses: actions/checkout@v6
 
@@ -68,6 +74,7 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -78,8 +85,8 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-
+          key: ${{ matrix.name }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.name }}-cargo-test-
 
       - name: Build (includes daemon for integration tests)
         run: cargo build --workspace
@@ -91,7 +98,7 @@ jobs:
         run: cargo build --release
 
       - name: Smoke test
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.name == 'ubuntu-latest' || matrix.name == 'hetzner-linux'
         run: |
           CORECRUXD_DATA_DIR=/tmp/crux-smoke ./target/release/corecruxd &
           sleep 3
@@ -115,6 +122,7 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -146,6 +154,7 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
