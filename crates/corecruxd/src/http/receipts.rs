@@ -1063,7 +1063,7 @@ pub(super) fn build_zip_deterministic_bytes(files: &[(String, Vec<u8>)]) -> Resu
     {
         let mut zw = zip::ZipWriter::new(&mut cursor);
         let ts = zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).expect("static zip timestamp");
-        let opts = zip::write::FileOptions::default()
+        let opts = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored)
             .last_modified_time(ts)
             .unix_permissions(0o644);

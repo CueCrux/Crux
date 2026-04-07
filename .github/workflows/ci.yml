@@ -15,37 +15,39 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # NOTE: All jobs run on self-hosted Hetzner runners (git-runner-ci-v8/v9).
-  # When GitHub Actions credits are available, add ubuntu-latest as a matrix
-  # entry for the lint job as a fallback if self-hosted runners are down.
-  # Example:
-  #   lint:
-  #     runs-on: ${{ matrix.runner }}
-  #     strategy:
-  #       fail-fast: false
-  #       matrix:
-  #         runner:
-  #           - [self-hosted, ci]
-  #           - ubuntu-latest
-  #     steps:
-  #       - name: Install Rust  # only on GitHub-hosted
-  #         if: matrix.runner == 'ubuntu-latest'
-  #         uses: dtolnay/rust-toolchain@stable
-  #         with:
-  #           components: rustfmt, clippy
-  #       - name: Install protoc  # only on GitHub-hosted
-  #         if: matrix.runner == 'ubuntu-latest'
-  #         uses: arduino/setup-protoc@v3
-  #         with:
-  #           version: "25.x"
-  #           repo-token: ${{ secrets.GITHUB_TOKEN }}
-
   lint:
-    name: Lint
-    runs-on: [self-hosted, ci]
+    name: Lint (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: self-hosted
+            runner: [self-hosted, ci]
+            needs_setup: false
+          - name: github
+            runner: ubuntu-latest
+            needs_setup: true
     steps:
       - uses: actions/checkout@v6
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust
+        if: matrix.needs_setup
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install protoc
+        if: matrix.needs_setup
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install typos
+        if: matrix.needs_setup
+        run: cargo install typos-cli
 
       - name: Check formatting
         run: cargo fmt --check

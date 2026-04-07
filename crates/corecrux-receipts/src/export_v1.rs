@@ -5,7 +5,7 @@
 use std::io::Write as _;
 
 use thiserror::Error;
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 
 use crate::verify_v1::VerificationReportV1;
 
@@ -401,7 +401,7 @@ fn build_zip_deterministic(entries: &[ArchiveEntry<'_>]) -> Result<Vec<u8>, Expo
         // SAFETY: 1980-01-01 00:00:00 is a valid zip timestamp — static constant.
         #[allow(clippy::expect_used)]
         let ts = zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).expect("static zip timestamp");
-        let opts = FileOptions::default()
+        let opts = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored)
             .last_modified_time(ts)
             .unix_permissions(0o644);
