@@ -7,3 +7,23 @@ corecrux = "corecrux"
 corecruxd = "corecruxd"
 corecruxctl = "corecruxctl"
 pfordelta = "pfordelta"
+# NLP tokenizer: stemming test data (intentional substrings)
+ment = "ment"
+ful = "ful"
+runn = "runn"
+numer = "numer"
+RTO = "RTO"
+ba = "ba"
+Nd = "Nd"
+als = "als"
+mch = "mch"
+
+[default.extend-identifiers]
+# Acceptable variant spelling (used in struct fields and function names)
+unparseable = "unparseable"
+unparseable_segment_files = "unparseable_segment_files"
+verify_with_unparseable_sig_cbor = "verify_with_unparseable_sig_cbor"
+compare_dependent_keys_unparseable_engine_timestamp_no_drift_warn = "compare_dependent_keys_unparseable_engine_timestamp_no_drift_warn"
+build_trace_summary_unparseable_body = "build_trace_summary_unparseable_body"
+build_subject_links_unparseable_body = "build_subject_links_unparseable_body"
+build_lineage_unparseable_body = "build_lineage_unparseable_body"
