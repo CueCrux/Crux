@@ -132,6 +132,7 @@ pub fn decode_living_rows_v1(input: &[u8]) -> Result<BTreeMap<(u64, u32), Living
     Ok(out)
 }
 
+#[allow(dead_code)] // Full-collection variant kept for wire-compat; filtered variant used in production.
 pub fn encode_relations_edges_v1(edges: &BTreeMap<(u64, u32, u32, u8), RelationEdgeV1>) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(edges.len() * RELATION_EDGE_STRIDE_V1);
     for ((tenant_hash, src, dst, relation_type), edge) in edges {
@@ -174,9 +175,7 @@ pub fn encode_relations_edges_for_src_v1(
     out
 }
 
-pub fn decode_relations_edges_v1(
-    input: &[u8],
-) -> Result<BTreeMap<(u64, u32, u32, u8), RelationEdgeV1>> {
+pub fn decode_relations_edges_v1(input: &[u8]) -> Result<BTreeMap<(u64, u32, u32, u8), RelationEdgeV1>> {
     if !input.len().is_multiple_of(RELATION_EDGE_STRIDE_V1) {
         return Err(ProjectionError::InvalidEvent {
             msg: "relations snapshot block length is not a multiple of edge stride".to_string(),
@@ -206,9 +205,8 @@ pub fn decode_relations_edges_v1(
     Ok(out)
 }
 
-pub fn encode_dependents_edges_v1(
-    edges: &BTreeMap<(u64, u32, u8, uuid::Uuid), DependentEdgeV1>,
-) -> Vec<u8> {
+#[allow(dead_code)] // Full-collection variant kept for wire-compat; filtered variant used in production.
+pub fn encode_dependents_edges_v1(edges: &BTreeMap<(u64, u32, u8, uuid::Uuid), DependentEdgeV1>) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(edges.len() * DEPENDENT_EDGE_STRIDE_V1);
     for ((tenant_hash, artifact_id, dependent_type, dependent_id), edge) in edges {
         let mut rec = [0u8; DEPENDENT_EDGE_STRIDE_V1];
@@ -234,8 +232,7 @@ pub fn encode_dependents_edges_for_artifact_v1(
     let end = (tenant_hash, artifact_id, u8::MAX, uuid_max);
 
     let mut out: Vec<u8> = Vec::new();
-    for ((tenant_hash, artifact_id, dependent_type, dependent_id), edge) in edges.range(start..=end)
-    {
+    for ((tenant_hash, artifact_id, dependent_type, dependent_id), edge) in edges.range(start..=end) {
         let mut rec = [0u8; DEPENDENT_EDGE_STRIDE_V1];
         rec[0..8].copy_from_slice(&tenant_hash.to_le_bytes());
         rec[8..12].copy_from_slice(&artifact_id.to_le_bytes());
@@ -248,9 +245,7 @@ pub fn encode_dependents_edges_for_artifact_v1(
     out
 }
 
-pub fn decode_dependents_edges_v1(
-    input: &[u8],
-) -> Result<BTreeMap<(u64, u32, u8, uuid::Uuid), DependentEdgeV1>> {
+pub fn decode_dependents_edges_v1(input: &[u8]) -> Result<BTreeMap<(u64, u32, u8, uuid::Uuid), DependentEdgeV1>> {
     if !input.len().is_multiple_of(DEPENDENT_EDGE_STRIDE_V1) {
         return Err(ProjectionError::InvalidEvent {
             msg: "dependents snapshot block length is not a multiple of edge stride".to_string(),
@@ -277,9 +272,7 @@ pub fn decode_dependents_edges_v1(
     Ok(out)
 }
 
-pub fn encode_pressure_rows_v1(
-    rows: &BTreeMap<(u64, u32, uuid::Uuid), PressureEventRowV1>,
-) -> Vec<u8> {
+pub fn encode_pressure_rows_v1(rows: &BTreeMap<(u64, u32, uuid::Uuid), PressureEventRowV1>) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(rows.len() * PRESSURE_ROW_STRIDE_V1);
     for ((tenant_hash, artifact_id, pressure_event_id), row) in rows {
         let mut rec = [0u8; PRESSURE_ROW_STRIDE_V1];
@@ -299,9 +292,7 @@ pub fn encode_pressure_rows_v1(
     out
 }
 
-pub fn decode_pressure_rows_v1(
-    input: &[u8],
-) -> Result<BTreeMap<(u64, u32, uuid::Uuid), PressureEventRowV1>> {
+pub fn decode_pressure_rows_v1(input: &[u8]) -> Result<BTreeMap<(u64, u32, uuid::Uuid), PressureEventRowV1>> {
     if !input.len().is_multiple_of(PRESSURE_ROW_STRIDE_V1) {
         return Err(ProjectionError::InvalidEvent {
             msg: "pressure snapshot block length is not a multiple of row stride".to_string(),
@@ -346,7 +337,7 @@ pub fn decode_pressure_rows_v1(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{LivingStatusV1, LivingStateRowV1, RelationEdgeV1, DependentEdgeV1, PressureEventRowV1};
+    use crate::state::{DependentEdgeV1, LivingStateRowV1, LivingStatusV1, PressureEventRowV1, RelationEdgeV1};
     use uuid::Uuid;
 
     // ---- Hot Pointers ----

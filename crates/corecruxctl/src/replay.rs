@@ -8,9 +8,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use corecrux_frame::{
-    canonical_header_bytes_v1, compute_header_hash, compute_payload_hash, CanonicalHeaderV1,
-};
+use corecrux_frame::{canonical_header_bytes_v1, compute_header_hash, compute_payload_hash, CanonicalHeaderV1};
 use corecrux_types::{DriftClass, DRIFT_SOURCE_CHANGE};
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -78,9 +76,7 @@ pub struct ReplayPackReport {
     pub input: String,
 }
 
-fn resolve_pack_input_jsonl(
-    pack: &Path,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+fn resolve_pack_input_jsonl(pack: &Path) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let candidates = [
         pack.join("input.jsonl"),
         pack.join("events.jsonl"),
@@ -118,9 +114,7 @@ fn extract_digest_field(v: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn load_expected_digest_from_pack(
-    pack: &Path,
-) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+fn load_expected_digest_from_pack(pack: &Path) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     let candidates = [
         pack.join("expected/digest.json"),
         pack.join("expected/replay.digest.json"),
@@ -177,16 +171,12 @@ pub fn replay_digest_from_pack(
         input: input.display().to_string(),
     };
     if strict && !report.ok {
-        return Err(
-            format!("strict replay pack mismatch (drift_class={DRIFT_SOURCE_CHANGE})").into(),
-        );
+        return Err(format!("strict replay pack mismatch (drift_class={DRIFT_SOURCE_CHANGE})").into());
     }
     Ok(report)
 }
 
-pub fn replay_digest_from_jsonl(
-    path: &Path,
-) -> Result<ReplayDigest, Box<dyn std::error::Error + Send + Sync>> {
+pub fn replay_digest_from_jsonl(path: &Path) -> Result<ReplayDigest, Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
@@ -200,8 +190,7 @@ pub fn replay_digest_from_jsonl(
             continue;
         }
         let rec: V3JsonlRecord = serde_json::from_str(&line)?;
-        let payload =
-            base64::engine::general_purpose::STANDARD.decode(rec.payload_b64.as_bytes())?;
+        let payload = base64::engine::general_purpose::STANDARD.decode(rec.payload_b64.as_bytes())?;
         let payload_hash = compute_payload_hash(&payload);
 
         let canonical = CanonicalHeaderV1 {
@@ -228,10 +217,7 @@ pub fn replay_digest_from_jsonl(
         hasher.update(&rec.location.offset.to_le_bytes());
 
         total_events += 1;
-        let stream_key = format!(
-            "{}\u{0}{}\u{0}{}",
-            rec.tenant_id, rec.stream_type, rec.stream_id
-        );
+        let stream_key = format!("{}\u{0}{}\u{0}{}", rec.tenant_id, rec.stream_type, rec.stream_id);
         per_stream_last_seq.insert(stream_key, rec.seq);
     }
 
@@ -245,9 +231,7 @@ pub fn replay_digest_from_jsonl(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        load_expected_digest_from_pack, replay_digest_from_pack, resolve_pack_input_jsonl,
-    };
+    use super::{load_expected_digest_from_pack, replay_digest_from_pack, resolve_pack_input_jsonl};
 
     fn temp_pack_dir(name: &str) -> std::path::PathBuf {
         let ts = std::time::SystemTime::now()
@@ -279,14 +263,8 @@ mod tests {
     #[test]
     fn loads_expected_digest_from_expected_digest_file() {
         let dir = temp_pack_dir("expected-digest");
-        write_file(
-            &dir.join("expected/digest.json"),
-            r#"{"digest_blake3":"abc123"}"#,
-        );
-        write_file(
-            &dir.join("manifest.json"),
-            r#"{"digest_blake3":"should_not_win"}"#,
-        );
+        write_file(&dir.join("expected/digest.json"), r#"{"digest_blake3":"abc123"}"#);
+        write_file(&dir.join("manifest.json"), r#"{"digest_blake3":"should_not_win"}"#);
         let got = load_expected_digest_from_pack(&dir)
             .expect("load expected digest")
             .expect("digest present");
@@ -301,17 +279,11 @@ mod tests {
             &dir.join("input.jsonl"),
             r#"{"tenantId":"t","streamType":"s","streamId":"id","seq":1,"eventId":"e1","occurredAt":"2026-01-01T00:00:00Z","ingestedAt":"2026-01-01T00:00:00Z","eventType":"evt","contentType":"application/json","payloadB64":"e30=","location":{"shardId":1,"segmentId":1,"offset":0}}"#,
         );
-        write_file(
-            &dir.join("expected/digest.json"),
-            r#"{"digest_blake3":"deadbeef"}"#,
-        );
+        write_file(&dir.join("expected/digest.json"), r#"{"digest_blake3":"deadbeef"}"#);
 
         let non_strict = replay_digest_from_pack(&dir, false).expect("non-strict replay");
         assert!(!non_strict.ok);
-        assert_eq!(
-            non_strict.drift_class.as_deref(),
-            Some("DRIFT_SOURCE_CHANGE")
-        );
+        assert_eq!(non_strict.drift_class.as_deref(), Some("DRIFT_SOURCE_CHANGE"));
 
         let strict = replay_digest_from_pack(&dir, true);
         assert!(strict.is_err());

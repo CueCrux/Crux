@@ -382,9 +382,7 @@ pub struct ShardMapV1 {
 pub fn build_info() -> BuildInfo {
     BuildInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        commit: option_env!("CORECRUX_GIT_SHA")
-            .unwrap_or("unknown")
-            .to_string(),
+        commit: option_env!("CORECRUX_GIT_SHA").unwrap_or("unknown").to_string(),
     }
 }
 
@@ -416,11 +414,9 @@ pub fn parse_u64_hex(input: &str) -> ShardMapResult<u64> {
 pub fn parse_shard_id_u32(shard_id: &str) -> ShardMapResult<u32> {
     // Phase 3 convention: shardId is a string, typically "shard-0001".
     // For Phase 2 storage/manifest fields we still carry a numeric shard_id.
-    let (_, suffix) = shard_id
-        .rsplit_once('-')
-        .ok_or_else(|| ShardMapError::Invalid {
-            msg: format!("invalid shardId '{shard_id}' (expected 'shard-<digits>')"),
-        })?;
+    let (_, suffix) = shard_id.rsplit_once('-').ok_or_else(|| ShardMapError::Invalid {
+        msg: format!("invalid shardId '{shard_id}' (expected 'shard-<digits>')"),
+    })?;
     if suffix.is_empty() || !suffix.as_bytes().iter().all(|b| b.is_ascii_digit()) {
         return Err(ShardMapError::Invalid {
             msg: format!("invalid shardId '{shard_id}' (expected digits suffix)"),
@@ -521,10 +517,7 @@ pub fn compute_shard_map_v1_blake3_hex(map: &ShardMapV1) -> ShardMapResult<Strin
 pub fn validate_shard_map_v1(map: &ShardMapV1) -> ShardMapResult<()> {
     if map.v != SHARDMAP_V1 {
         return Err(ShardMapError::Invalid {
-            msg: format!(
-                "unsupported shard map version v={} (expected {SHARDMAP_V1})",
-                map.v
-            ),
+            msg: format!("unsupported shard map version v={} (expected {SHARDMAP_V1})", map.v),
         });
     }
     if map.cluster_id.trim().is_empty() {
@@ -620,10 +613,7 @@ pub fn validate_shard_map_v1(map: &ShardMapV1) -> ShardMapResult<()> {
                 intervals.push(Interval { start, end });
             } else {
                 // Wrap-around: split into [start, 2^64) and [0, end)
-                intervals.push(Interval {
-                    start,
-                    end: RING_END,
-                });
+                intervals.push(Interval { start, end: RING_END });
                 if end != 0 {
                     intervals.push(Interval { start: 0, end });
                 }
@@ -721,21 +711,11 @@ impl ProblemDetails {
     // -- Factory methods for common HTTP errors --
 
     pub fn bad_request(detail: impl Into<String>) -> Self {
-        Self::new(
-            400,
-            format!("{CORE_ERROR_BASE_URI}/bad-request"),
-            "Bad Request",
-        )
-        .with_detail(detail)
+        Self::new(400, format!("{CORE_ERROR_BASE_URI}/bad-request"), "Bad Request").with_detail(detail)
     }
 
     pub fn unauthorized(detail: impl Into<String>) -> Self {
-        Self::new(
-            401,
-            format!("{CORE_ERROR_BASE_URI}/unauthorized"),
-            "Unauthorized",
-        )
-        .with_detail(detail)
+        Self::new(401, format!("{CORE_ERROR_BASE_URI}/unauthorized"), "Unauthorized").with_detail(detail)
     }
 
     pub fn forbidden(detail: impl Into<String>) -> Self {
@@ -756,30 +736,15 @@ impl ProblemDetails {
     }
 
     pub fn rate_limited(detail: impl Into<String>) -> Self {
-        Self::new(
-            429,
-            format!("{CORE_ERROR_BASE_URI}/rate-limited"),
-            "Too Many Requests",
-        )
-        .with_detail(detail)
+        Self::new(429, format!("{CORE_ERROR_BASE_URI}/rate-limited"), "Too Many Requests").with_detail(detail)
     }
 
     pub fn internal(detail: impl Into<String>) -> Self {
-        Self::new(
-            500,
-            format!("{CORE_ERROR_BASE_URI}/internal"),
-            "Internal Server Error",
-        )
-        .with_detail(detail)
+        Self::new(500, format!("{CORE_ERROR_BASE_URI}/internal"), "Internal Server Error").with_detail(detail)
     }
 
     pub fn not_implemented(detail: impl Into<String>) -> Self {
-        Self::new(
-            501,
-            format!("{CORE_ERROR_BASE_URI}/not-implemented"),
-            "Not Implemented",
-        )
-        .with_detail(detail)
+        Self::new(501, format!("{CORE_ERROR_BASE_URI}/not-implemented"), "Not Implemented").with_detail(detail)
     }
 
     pub fn service_unavailable(detail: impl Into<String>) -> Self {
@@ -861,10 +826,7 @@ mod tests {
     fn shard_helpers_parse_and_normalize() {
         assert_eq!(parse_shard_id_u32("shard-0042").expect("shard id"), 42);
         assert!(parse_shard_id_u32("bad-shard").is_err());
-        assert_eq!(
-            parse_u64_hex("0x000000000000000f").expect("hex parse"),
-            15_u64
-        );
+        assert_eq!(parse_u64_hex("0x000000000000000f").expect("hex parse"), 15_u64);
         assert_eq!(format_u64_hex(15), "0x000000000000000f");
     }
 
@@ -877,10 +839,7 @@ mod tests {
             canon.shards[1].followers.as_ref().expect("followers")[0].node_id,
             "node-a"
         );
-        assert_eq!(
-            canon.shards[1].ranges[0].end_exclusive,
-            "0x0000000000000000"
-        );
+        assert_eq!(canon.shards[1].ranges[0].end_exclusive, "0x0000000000000000");
 
         map.blake3 = compute_shard_map_v1_blake3_hex(&map).expect("hash");
         validate_shard_map_v1(&map).expect("valid shard map");
@@ -896,10 +855,7 @@ mod tests {
             .with_extensions(json!({ "request_id": "req-123" }));
 
         let encoded = serde_json::to_value(problem).expect("serialize");
-        assert_eq!(
-            encoded["type"],
-            format!("{CORE_ERROR_BASE_URI}/rate-limited")
-        );
+        assert_eq!(encoded["type"], format!("{CORE_ERROR_BASE_URI}/rate-limited"));
         assert_eq!(encoded["title"], "Too Many Requests");
         assert_eq!(encoded["status"], 429);
         assert_eq!(encoded["detail"], "slow down");
@@ -962,10 +918,7 @@ mod tests {
     fn problem_details_unauthorized() {
         let pd = ProblemDetails::unauthorized("invalid token");
         assert_eq!(pd.status, 401);
-        assert_eq!(
-            pd.problem_type,
-            format!("{CORE_ERROR_BASE_URI}/unauthorized")
-        );
+        assert_eq!(pd.problem_type, format!("{CORE_ERROR_BASE_URI}/unauthorized"));
         assert_eq!(pd.title, "Unauthorized");
         assert_eq!(pd.detail.as_deref(), Some("invalid token"));
     }
@@ -990,10 +943,7 @@ mod tests {
     fn problem_details_precondition_failed() {
         let pd = ProblemDetails::precondition_failed("wrong epoch");
         assert_eq!(pd.status, 412);
-        assert_eq!(
-            pd.problem_type,
-            format!("{CORE_ERROR_BASE_URI}/precondition-failed")
-        );
+        assert_eq!(pd.problem_type, format!("{CORE_ERROR_BASE_URI}/precondition-failed"));
         assert_eq!(pd.title, "Precondition Failed");
     }
 
@@ -1009,10 +959,7 @@ mod tests {
     fn problem_details_not_implemented() {
         let pd = ProblemDetails::not_implemented("feature disabled");
         assert_eq!(pd.status, 501);
-        assert_eq!(
-            pd.problem_type,
-            format!("{CORE_ERROR_BASE_URI}/not-implemented")
-        );
+        assert_eq!(pd.problem_type, format!("{CORE_ERROR_BASE_URI}/not-implemented"));
         assert_eq!(pd.title, "Not Implemented");
     }
 
@@ -1020,10 +967,7 @@ mod tests {
     fn problem_details_service_unavailable() {
         let pd = ProblemDetails::service_unavailable("shard down");
         assert_eq!(pd.status, 503);
-        assert_eq!(
-            pd.problem_type,
-            format!("{CORE_ERROR_BASE_URI}/service-unavailable")
-        );
+        assert_eq!(pd.problem_type, format!("{CORE_ERROR_BASE_URI}/service-unavailable"));
         assert_eq!(pd.title, "Service Unavailable");
     }
 

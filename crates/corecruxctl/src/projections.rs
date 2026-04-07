@@ -110,15 +110,9 @@ pub fn rebuild_projections_v1(
     for (shard_id, shard_dir) in shard_dirs {
         let epoch = read_epoch_from_manifest(&shard_dir.join("MANIFEST"))?;
 
-        let storage = ShardStorage::open(
-            &shard_root,
-            shard_id,
-            epoch,
-            ShardStorageOptions::default(),
-        )?;
+        let storage = ShardStorage::open(&shard_root, shard_id, epoch, ShardStorageOptions::default())?;
 
-        let mut proj =
-            corecrux_projections::ProjectionStoreV1::load_or_init(&shard_dir, shard_id, epoch)?;
+        let mut proj = corecrux_projections::ProjectionStoreV1::load_or_init(&shard_dir, shard_id, epoch)?;
         let r = proj.rebuild_from_genesis(&storage, batch_frames)?;
         reports.push(ShardRebuildReportV1 {
             shard_id,
@@ -155,18 +149,12 @@ pub fn seed_minimal_projection_events_v1(
     std::fs::create_dir_all(&shard_root)?;
 
     let epoch = 1u64;
-    let mut storage = ShardStorage::open(
-        &shard_root,
-        shard_id,
-        epoch,
-        ShardStorageOptions::default(),
-    )?;
+    let mut storage = ShardStorage::open(&shard_root, shard_id, epoch, ShardStorageOptions::default())?;
 
     let stream_type = "artifact";
     let stream_id = artifact_id.to_string();
     let stream_hash =
-        corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, &stream_id)
-            .map_err(|e| e.to_string())?;
+        corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, &stream_id).map_err(|e| e.to_string())?;
 
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
@@ -213,24 +201,12 @@ pub fn seed_minimal_projection_events_v1(
 
     for (batch_index, events) in [
         vec![
-            (
-                corecrux_projections::EVT_LIVING_STATE_UPDATE_V1,
-                living.encode_bin(),
-            ),
-            (
-                corecrux_projections::EVT_RELATION_UPSERT_V1,
-                rel_up_1.encode_bin(),
-            ),
+            (corecrux_projections::EVT_LIVING_STATE_UPDATE_V1, living.encode_bin()),
+            (corecrux_projections::EVT_RELATION_UPSERT_V1, rel_up_1.encode_bin()),
         ],
         vec![
-            (
-                corecrux_projections::EVT_RELATION_DELETE_V1,
-                rel_del_1.encode_bin(),
-            ),
-            (
-                corecrux_projections::EVT_RELATION_UPSERT_V1,
-                rel_up_2.encode_bin(),
-            ),
+            (corecrux_projections::EVT_RELATION_DELETE_V1, rel_del_1.encode_bin()),
+            (corecrux_projections::EVT_RELATION_UPSERT_V1, rel_up_2.encode_bin()),
         ],
     ]
     .into_iter()
@@ -259,15 +235,7 @@ pub fn seed_minimal_projection_events_v1(
             });
         }
 
-        let outcomes = storage.append_batch(
-            stream_hash,
-            0,
-            tenant_id,
-            stream_type,
-            &stream_id,
-            &now,
-            &inputs,
-        )?;
+        let outcomes = storage.append_batch(stream_hash, 0, tenant_id, stream_type, &stream_id, &now, &inputs)?;
 
         segments_written = segments_written.saturating_add(1);
         frames_written = frames_written.saturating_add(outcomes.len() as u64);
@@ -355,8 +323,7 @@ pub fn gc_orphan_cold_segments_v1(
     for (shard_id, shard_dir) in shard_dirs {
         let epoch = read_epoch_from_manifest(&shard_dir.join("MANIFEST"))?;
 
-        let mut proj =
-            corecrux_projections::ProjectionStoreV1::load_or_init(&shard_dir, shard_id, epoch)?;
+        let mut proj = corecrux_projections::ProjectionStoreV1::load_or_init(&shard_dir, shard_id, epoch)?;
         let r = proj.gc_orphan_cold_segments_v1(corecrux_projections::ColdSegmentGcOptionsV1 {
             dry_run,
             min_age_seconds,
@@ -591,7 +558,7 @@ mod tests {
         fs::create_dir(&shards_dir).unwrap();
         fs::create_dir(shards_dir.join("not-a-shard")).unwrap();
         fs::create_dir(shards_dir.join("shard-")).unwrap(); // no digits
-        // Create a file, not a directory
+                                                            // Create a file, not a directory
         fs::write(shards_dir.join("shard-0001"), "file not dir").unwrap();
         let report = rebuild_projections_v1(tmp.path(), None, 0, 100).unwrap();
         assert!(report.shards.is_empty());

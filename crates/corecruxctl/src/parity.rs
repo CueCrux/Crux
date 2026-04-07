@@ -303,9 +303,7 @@ pub fn parity_living_v1(
                 );
             }
 
-            if eng_state.pressure_level.map(|v| v as i64)
-                != ccx_state.pressure_level.map(|v| v as i64)
-            {
+            if eng_state.pressure_level.map(|v| v as i64) != ccx_state.pressure_level.map(|v| v as i64) {
                 push_mismatch(
                     &mut mismatches,
                     &mut summary,
@@ -394,7 +392,9 @@ pub fn parity_living_v1(
         )?;
         let ccx_deps: CoreCruxDependentsResp = get_corecrux_json(
             corecrux_base,
-            &format!("/v1/admin/projections/artifacts/{artifact_id}/dependents?tenant_id={tenant_id}&limit=200&offset=0"),
+            &format!(
+                "/v1/admin/projections/artifacts/{artifact_id}/dependents?tenant_id={tenant_id}&limit=200&offset=0"
+            ),
         )?;
         compare_dependent_keys(
             &mut mismatches,
@@ -408,7 +408,9 @@ pub fn parity_living_v1(
         let eng_pressure: EnginePressureResp = get_engine_json(
             engine_base,
             engine_api_key,
-            &format!("/internal/living/artifacts/{artifact_id}/pressure-events?tenant_id={tenant_id}&limit=200&offset=0"),
+            &format!(
+                "/internal/living/artifacts/{artifact_id}/pressure-events?tenant_id={tenant_id}&limit=200&offset=0"
+            ),
         )?;
         let ccx_pressure: CoreCruxPressureResp = get_corecrux_json(
             corecrux_base,
@@ -493,9 +495,7 @@ fn hash_hex_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
-fn hash_hex_json<T: Serialize>(
-    value: &T,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+fn hash_hex_json<T: Serialize>(value: &T) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let bytes = serde_json::to_vec(value)?;
     Ok(hash_hex_bytes(&bytes))
 }
@@ -512,10 +512,7 @@ fn hash_u64(value: &str) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-fn write_json_file<T: Serialize>(
-    path: &Path,
-    value: &T,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -538,12 +535,16 @@ fn fetch_engine_canonical_artifact(
     let rel_out: EngineRelationsResp = get_engine_json(
         engine_base,
         api_key,
-        &format!("/internal/living/artifacts/{artifact_id}/relations?tenant_id={tenant_id}&direction=out&limit=200&offset=0"),
+        &format!(
+            "/internal/living/artifacts/{artifact_id}/relations?tenant_id={tenant_id}&direction=out&limit=200&offset=0"
+        ),
     )?;
     let rel_in: EngineRelationsResp = get_engine_json(
         engine_base,
         api_key,
-        &format!("/internal/living/artifacts/{artifact_id}/relations?tenant_id={tenant_id}&direction=in&limit=200&offset=0"),
+        &format!(
+            "/internal/living/artifacts/{artifact_id}/relations?tenant_id={tenant_id}&direction=in&limit=200&offset=0"
+        ),
     )?;
     let deps: EngineDependentsResp = get_engine_json(
         engine_base,
@@ -636,7 +637,9 @@ fn fetch_corecrux_canonical_artifact(
     )?;
     let pressure: CoreCruxPressureResp = get_corecrux_json(
         corecrux_base,
-        &format!("/v1/admin/projections/artifacts/{artifact_id}/pressure-events?tenant_id={tenant_id}&limit=200&offset=0"),
+        &format!(
+            "/v1/admin/projections/artifacts/{artifact_id}/pressure-events?tenant_id={tenant_id}&limit=200&offset=0"
+        ),
     )?;
 
     let mut relations_out: Vec<CanonicalRelationKeyV1> = rel_out
@@ -696,10 +699,7 @@ fn fetch_corecrux_canonical_artifact(
     })
 }
 
-fn build_parity_pack_report(
-    checked: u32,
-    mut mismatches: Vec<ParityPackMismatchExampleV1>,
-) -> ParityPackReportV1 {
+fn build_parity_pack_report(checked: u32, mut mismatches: Vec<ParityPackMismatchExampleV1>) -> ParityPackReportV1 {
     let mismatch_total = mismatches.len() as u32;
     if mismatches.len() > 50 {
         mismatches.truncate(50);
@@ -723,11 +723,7 @@ pub fn generate_parity_pack(
     std::fs::create_dir_all(opts.out_dir.join("expected"))?;
     std::fs::create_dir_all(opts.out_dir.join("actual"))?;
 
-    let candidate_n = opts
-        .sample_size
-        .saturating_mul(4)
-        .max(opts.sample_size)
-        .max(1);
+    let candidate_n = opts.sample_size.saturating_mul(4).max(opts.sample_size).max(1);
     let candidates = fetch_engine_sample(
         &opts.engine_base,
         &opts.engine_api_key,
@@ -742,10 +738,7 @@ pub fn generate_parity_pack(
 
     let generated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let mut projection_versions = BTreeMap::new();
-    projection_versions.insert(
-        "artifact_living_state".to_string(),
-        opts.projections.clone(),
-    );
+    projection_versions.insert("artifact_living_state".to_string(), opts.projections.clone());
     let mut kernel_versions = BTreeMap::new();
     kernel_versions.insert("projection".to_string(), "unknown".to_string());
 
@@ -772,26 +765,15 @@ pub fn generate_parity_pack(
     for (idx, artifact_id) in sampled_artifacts.iter().copied().enumerate() {
         let sample_id = format!("s{:06}", idx + 1);
         let object_key = format!("artifact:{artifact_id}");
-        let expected = fetch_engine_canonical_artifact(
-            &opts.engine_base,
-            &opts.engine_api_key,
-            &opts.tenant_id,
-            artifact_id,
-        )?;
-        let actual =
-            fetch_corecrux_canonical_artifact(&opts.corecrux_base, &opts.tenant_id, artifact_id)?;
+        let expected =
+            fetch_engine_canonical_artifact(&opts.engine_base, &opts.engine_api_key, &opts.tenant_id, artifact_id)?;
+        let actual = fetch_corecrux_canonical_artifact(&opts.corecrux_base, &opts.tenant_id, artifact_id)?;
 
         let expected_hash = hash_hex_json(&expected)?;
         let actual_hash = hash_hex_json(&actual)?;
 
-        let expected_path = opts
-            .out_dir
-            .join("expected")
-            .join(format!("{sample_id}.json"));
-        let actual_path = opts
-            .out_dir
-            .join("actual")
-            .join(format!("{sample_id}.json"));
+        let expected_path = opts.out_dir.join("expected").join(format!("{sample_id}.json"));
+        let actual_path = opts.out_dir.join("actual").join(format!("{sample_id}.json"));
         write_json_file(&expected_path, &expected)?;
         write_json_file(&actual_path, &actual)?;
 
@@ -857,24 +839,12 @@ fn compare_relation_keys(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut e_keys: Vec<(u32, u32, String)> = engine
         .iter()
-        .map(|r| {
-            (
-                r.src_artifact_id,
-                r.dst_artifact_id,
-                r.relation_type.clone(),
-            )
-        })
+        .map(|r| (r.src_artifact_id, r.dst_artifact_id, r.relation_type.clone()))
         .collect();
     e_keys.sort();
     let mut c_keys: Vec<(u32, u32, String)> = corecrux
         .iter()
-        .map(|r| {
-            (
-                r.src_artifact_id,
-                r.dst_artifact_id,
-                r.relation_type.clone(),
-            )
-        })
+        .map(|r| (r.src_artifact_id, r.dst_artifact_id, r.relation_type.clone()))
         .collect();
     c_keys.sort();
     if e_keys != c_keys {
@@ -968,10 +938,7 @@ fn compare_pressure_counts(
     corecrux: &[CoreCruxPressureRow],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let e_open = engine.iter().filter(|r| r.resolved_at.is_none()).count();
-    let c_open = corecrux
-        .iter()
-        .filter(|r| r.resolved_at_micros == 0)
-        .count();
+    let c_open = corecrux.iter().filter(|r| r.resolved_at_micros == 0).count();
     if e_open != c_open {
         push_mismatch(
             mismatches,
@@ -1047,9 +1014,9 @@ fn get_corecrux_json<T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_parity_pack_report, deterministic_artifact_score, hash_hex_bytes, hash_hex_json,
-        hash_prefix, hash_u64, parse_rfc3339_to_micros, push_mismatch, select_artifact_sample,
-        ParityPackMismatchExampleV1, ParitySeverityV1, ParitySummaryV1, DRIFT_SOURCE_CHANGE,
+        build_parity_pack_report, deterministic_artifact_score, hash_hex_bytes, hash_hex_json, hash_prefix, hash_u64,
+        parse_rfc3339_to_micros, push_mismatch, select_artifact_sample, ParityPackMismatchExampleV1, ParitySeverityV1,
+        ParitySummaryV1, DRIFT_SOURCE_CHANGE,
     };
 
     #[test]
@@ -1242,11 +1209,10 @@ mod tests {
 
     use super::{
         compare_dependent_keys, compare_pressure_counts, compare_relation_keys, write_json_file,
-        CanonicalArtifactProjectionStateV1, CanonicalCountsV1, CanonicalDependentKeyV1,
-        CanonicalRelationKeyV1, CoreCruxDependentRow, CoreCruxPressureRow, CoreCruxRelationRow,
-        EngineDependentRow, EnginePressureRow, EngineRelationRow, ParityLivingReportV1,
-        ParityMismatchV1, ParityPackManifestV1, ParityPackReportV1, ParityPackResultV1,
-        ParityPackSampleRecordV1,
+        CanonicalArtifactProjectionStateV1, CanonicalCountsV1, CanonicalDependentKeyV1, CanonicalRelationKeyV1,
+        CoreCruxDependentRow, CoreCruxPressureRow, CoreCruxRelationRow, EngineDependentRow, EnginePressureRow,
+        EngineRelationRow, ParityLivingReportV1, ParityMismatchV1, ParityPackManifestV1, ParityPackReportV1,
+        ParityPackResultV1, ParityPackSampleRecordV1,
     };
 
     #[test]
@@ -1263,15 +1229,7 @@ mod tests {
             dst_artifact_id: 2,
             relation_type: "cites".to_string(),
         }];
-        compare_relation_keys(
-            &mut mismatches,
-            &mut summary,
-            100,
-            "relations_out",
-            &engine,
-            &corecrux,
-        )
-        .unwrap();
+        compare_relation_keys(&mut mismatches, &mut summary, 100, "relations_out", &engine, &corecrux).unwrap();
         assert!(mismatches.is_empty());
         assert_eq!(summary.fail, 0);
     }
@@ -1290,15 +1248,7 @@ mod tests {
             dst_artifact_id: 3,
             relation_type: "cites".to_string(),
         }];
-        compare_relation_keys(
-            &mut mismatches,
-            &mut summary,
-            100,
-            "relations_out",
-            &engine,
-            &corecrux,
-        )
-        .unwrap();
+        compare_relation_keys(&mut mismatches, &mut summary, 100, "relations_out", &engine, &corecrux).unwrap();
         assert_eq!(mismatches.len(), 1);
         assert_eq!(summary.fail, 1);
         assert_eq!(mismatches[0].kind, "relations_out");
@@ -1433,8 +1383,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("a").join("b").join("c.json");
         write_json_file(&nested, &serde_json::json!({"ok": true})).unwrap();
-        let read: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&nested).unwrap()).unwrap();
+        let read: serde_json::Value = serde_json::from_slice(&std::fs::read(&nested).unwrap()).unwrap();
         assert_eq!(read["ok"], true);
     }
 
@@ -1703,15 +1652,7 @@ mod tests {
                 relation_type: "cites".to_string(),
             },
         ];
-        compare_relation_keys(
-            &mut mismatches,
-            &mut summary,
-            100,
-            "relations_out",
-            &engine,
-            &corecrux,
-        )
-        .unwrap();
+        compare_relation_keys(&mut mismatches, &mut summary, 100, "relations_out", &engine, &corecrux).unwrap();
         // Same set, different order → should be no mismatch
         assert!(mismatches.is_empty());
         assert_eq!(summary.fail, 0);
@@ -1842,8 +1783,7 @@ mod tests {
         let path = tmp.path().join("data.json");
         write_json_file(&path, &serde_json::json!({"v": 1})).unwrap();
         write_json_file(&path, &serde_json::json!({"v": 2})).unwrap();
-        let read: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let read: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(read["v"], 2);
     }
 
@@ -2054,15 +1994,7 @@ mod tests {
                 relation_type: "references".to_string(),
             },
         ];
-        compare_relation_keys(
-            &mut mismatches,
-            &mut summary,
-            1,
-            "relations_out",
-            &engine,
-            &corecrux,
-        )
-        .unwrap();
+        compare_relation_keys(&mut mismatches, &mut summary, 1, "relations_out", &engine, &corecrux).unwrap();
         assert!(mismatches.is_empty());
     }
 
@@ -2089,15 +2021,7 @@ mod tests {
             dst_artifact_id: 2,
             relation_type: "cites".to_string(),
         }];
-        compare_relation_keys(
-            &mut mismatches,
-            &mut summary,
-            1,
-            "relations_in",
-            &engine,
-            &corecrux,
-        )
-        .unwrap();
+        compare_relation_keys(&mut mismatches, &mut summary, 1, "relations_in", &engine, &corecrux).unwrap();
         assert_eq!(summary.fail, 1);
         assert_eq!(mismatches[0].kind, "relations_in");
     }
@@ -2114,8 +2038,7 @@ mod tests {
             "e": true
         });
         write_json_file(&path, &value).unwrap();
-        let read: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let read: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(read["a"]["b"]["c"][1], 2);
         assert_eq!(read["d"], serde_json::Value::Null);
         assert_eq!(read["e"], true);
@@ -2283,10 +2206,22 @@ mod tests {
 
     #[test]
     fn engine_counts_equality() {
-        let a = super::EngineCounts { relations_out: 1, relations_in: 2, dependents: 3 };
-        let b = super::EngineCounts { relations_out: 1, relations_in: 2, dependents: 3 };
+        let a = super::EngineCounts {
+            relations_out: 1,
+            relations_in: 2,
+            dependents: 3,
+        };
+        let b = super::EngineCounts {
+            relations_out: 1,
+            relations_in: 2,
+            dependents: 3,
+        };
         assert_eq!(a, b);
-        let c = super::EngineCounts { relations_out: 0, relations_in: 0, dependents: 0 };
+        let c = super::EngineCounts {
+            relations_out: 0,
+            relations_in: 0,
+            dependents: 0,
+        };
         assert_ne!(a, c);
     }
 
@@ -2294,7 +2229,11 @@ mod tests {
 
     #[test]
     fn engine_counts_serde_round_trip() {
-        let counts = super::EngineCounts { relations_out: 5, relations_in: 3, dependents: 2 };
+        let counts = super::EngineCounts {
+            relations_out: 5,
+            relations_in: 3,
+            dependents: 2,
+        };
         let json = serde_json::to_string(&counts).unwrap();
         let deser: super::EngineCounts = serde_json::from_str(&json).unwrap();
         assert_eq!(counts, deser);

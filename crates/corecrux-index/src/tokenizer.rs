@@ -155,7 +155,7 @@ mod tests {
     fn basic_tokenization() {
         let tokens = tokenize("Hello, World! This is a test.");
         assert!(tokens.len() >= 4); // hello, world, this, test (skips "is", "a")
-        // Verify determinism
+                                    // Verify determinism
         let tokens2 = tokenize("Hello, World! This is a test.");
         assert_eq!(tokens, tokens2);
     }

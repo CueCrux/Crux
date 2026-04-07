@@ -291,9 +291,7 @@ pub fn decode_frame_v1(frame_bytes: &[u8]) -> Result<FrameV1Decoded> {
     let payload_len = read_u32(frame_bytes, 8)? as usize;
 
     let header_off = 12usize;
-    let payload_off = header_off
-        .checked_add(header_len)
-        .ok_or(SegmentError::BufferTooSmall)?;
+    let payload_off = header_off.checked_add(header_len).ok_or(SegmentError::BufferTooSmall)?;
     let crc_off = payload_off
         .checked_add(payload_len)
         .ok_or(SegmentError::BufferTooSmall)?;
@@ -307,10 +305,7 @@ pub fn decode_frame_v1(frame_bytes: &[u8]) -> Result<FrameV1Decoded> {
     let crc = read_u32(frame_bytes, crc_off)?;
     let expected = crc32fast::hash(&payload_bytes);
     if crc != expected {
-        return Err(SegmentError::CrcMismatch {
-            expected,
-            actual: crc,
-        });
+        return Err(SegmentError::CrcMismatch { expected, actual: crc });
     }
 
     Ok(FrameV1Decoded {
@@ -431,8 +426,7 @@ pub fn build_segment_v1(
 
     let toc_crc32c_table = block_crc32c(&toc_payload, DEFAULT_TOC_BLOCK_SIZE as usize);
 
-    let crc_tables_len =
-        (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
+    let crc_tables_len = (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
 
     // Re-encode toc header now that we have the full crc_tables_len.
     let toc_payload = encode_toc_payload_v1(
@@ -457,8 +451,7 @@ pub fn build_segment_v1(
     )?;
 
     let toc_crc32c_table = block_crc32c(&toc_payload, DEFAULT_TOC_BLOCK_SIZE as usize);
-    let crc_tables_len =
-        (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
+    let crc_tables_len = (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
 
     let toc_header = TocHeaderV1 {
         entry_count: toc_entries.len() as u64,
@@ -515,8 +508,7 @@ pub fn build_segment_v1(
         *h.finalize().as_bytes()
     };
 
-    let file_len =
-        (SEGMENT_HEADER_LEN as u64) + record_area_len + toc_len + (SEGMENT_FOOTER_LEN as u64);
+    let file_len = (SEGMENT_HEADER_LEN as u64) + record_area_len + toc_len + (SEGMENT_FOOTER_LEN as u64);
     if file_len > u32::MAX as u64 {
         return Err(SegmentError::LengthOutOfRange {
             msg: "segment file exceeds 4GiB; not supported in v1 footer encoding".to_string(),
@@ -708,8 +700,7 @@ pub fn build_segment_v1_with_block_codec(
 
     let toc_crc32c_table = block_crc32c(&toc_payload, DEFAULT_TOC_BLOCK_SIZE as usize);
 
-    let crc_tables_len =
-        (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
+    let crc_tables_len = (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
 
     // Re-encode toc header now that we have the full crc_tables_len.
     let toc_payload = encode_toc_payload_v1(
@@ -734,8 +725,7 @@ pub fn build_segment_v1_with_block_codec(
     )?;
 
     let toc_crc32c_table = block_crc32c(&toc_payload, DEFAULT_TOC_BLOCK_SIZE as usize);
-    let crc_tables_len =
-        (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
+    let crc_tables_len = (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
 
     let toc_header = TocHeaderV1 {
         entry_count: toc_entries.len() as u64,
@@ -798,8 +788,7 @@ pub fn build_segment_v1_with_block_codec(
         *h.finalize().as_bytes()
     };
 
-    let file_len =
-        (SEGMENT_HEADER_LEN as u64) + record_area_len + toc_len + (SEGMENT_FOOTER_LEN as u64);
+    let file_len = (SEGMENT_HEADER_LEN as u64) + record_area_len + toc_len + (SEGMENT_FOOTER_LEN as u64);
     if file_len > u32::MAX as u64 {
         return Err(SegmentError::LengthOutOfRange {
             msg: "segment file exceeds 4GiB; not supported in v1 footer encoding".to_string(),
@@ -970,8 +959,7 @@ pub fn seal_segment_v1_from_record_area(
 
     let toc_crc32c_table = block_crc32c(&toc_payload, DEFAULT_TOC_BLOCK_SIZE as usize);
 
-    let crc_tables_len =
-        (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
+    let crc_tables_len = (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
 
     // Re-encode toc header now that we have the full crc_tables_len.
     let toc_payload = encode_toc_payload_v1(
@@ -996,8 +984,7 @@ pub fn seal_segment_v1_from_record_area(
     )?;
 
     let toc_crc32c_table = block_crc32c(&toc_payload, DEFAULT_TOC_BLOCK_SIZE as usize);
-    let crc_tables_len =
-        (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
+    let crc_tables_len = (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
 
     let toc_header = TocHeaderV1 {
         entry_count: toc_entries.len() as u64,
@@ -1054,8 +1041,7 @@ pub fn seal_segment_v1_from_record_area(
         *h.finalize().as_bytes()
     };
 
-    let file_len =
-        (SEGMENT_HEADER_LEN as u64) + record_area_len + toc_len + (SEGMENT_FOOTER_LEN as u64);
+    let file_len = (SEGMENT_HEADER_LEN as u64) + record_area_len + toc_len + (SEGMENT_FOOTER_LEN as u64);
     if file_len > u32::MAX as u64 {
         return Err(SegmentError::LengthOutOfRange {
             msg: "segment file exceeds 4GiB; not supported in v1 footer encoding".to_string(),
@@ -1249,8 +1235,7 @@ pub fn seal_segment_v1_from_record_area_with_block_codec(
 
     let toc_crc32c_table = block_crc32c(&toc_payload, DEFAULT_TOC_BLOCK_SIZE as usize);
 
-    let crc_tables_len =
-        (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
+    let crc_tables_len = (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
 
     let toc_payload = encode_toc_payload_v1(
         toc_entries.len() as u64,
@@ -1274,8 +1259,7 @@ pub fn seal_segment_v1_from_record_area_with_block_codec(
     )?;
 
     let toc_crc32c_table = block_crc32c(&toc_payload, DEFAULT_TOC_BLOCK_SIZE as usize);
-    let crc_tables_len =
-        (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
+    let crc_tables_len = (record_crc32c_table.len() as u64 * 4) + (toc_crc32c_table.len() as u64 * 4);
 
     let toc_header = TocHeaderV1 {
         entry_count: toc_entries.len() as u64,
@@ -1337,8 +1321,7 @@ pub fn seal_segment_v1_from_record_area_with_block_codec(
         *h.finalize().as_bytes()
     };
 
-    let file_len =
-        (SEGMENT_HEADER_LEN as u64) + record_area_len + toc_len + (SEGMENT_FOOTER_LEN as u64);
+    let file_len = (SEGMENT_HEADER_LEN as u64) + record_area_len + toc_len + (SEGMENT_FOOTER_LEN as u64);
     if file_len > u32::MAX as u64 {
         return Err(SegmentError::LengthOutOfRange {
             msg: "segment file exceeds 4GiB; not supported in v1 footer encoding".to_string(),
@@ -1387,10 +1370,7 @@ pub fn seal_segment_v1_from_record_area_with_block_codec(
     })
 }
 
-pub fn decode_trailer_index_v1(
-    toc_area: &[u8],
-    toc_header: &TocHeaderV1,
-) -> Result<Option<TrailerIndexV1>> {
+pub fn decode_trailer_index_v1(toc_area: &[u8], toc_header: &TocHeaderV1) -> Result<Option<TrailerIndexV1>> {
     let payload_len = toc_header.toc_payload_len as usize;
     let crc_tables_len = toc_header.crc_tables_len as usize;
     let ext_off = payload_len
@@ -1436,9 +1416,7 @@ pub fn decode_trailer_index_v1(
         let payload_len = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
         let expected_crc = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
         cursor += header_len;
-        let end = cursor
-            .checked_add(payload_len)
-            .ok_or(SegmentError::BufferTooSmall)?;
+        let end = cursor.checked_add(payload_len).ok_or(SegmentError::BufferTooSmall)?;
         if end > ext.len() {
             return Err(SegmentError::TrailerSectionInvalid {
                 msg: "trailer section payload out of bounds".to_string(),
@@ -1469,9 +1447,7 @@ pub fn decode_trailer_index_v1(
         }
     }
 
-    let Some((record_block_uncompressed_max_len, bloom_bytes_per_block, bloom_hash_k, blocks)) =
-        blk_section
-    else {
+    let Some((record_block_uncompressed_max_len, bloom_bytes_per_block, bloom_hash_k, blocks)) = blk_section else {
         return Err(SegmentError::TrailerSectionInvalid {
             msg: "missing BLK1 section".to_string(),
         });
@@ -1632,9 +1608,7 @@ fn build_record_blocks_and_trailer_index_parts_v1(
     frames: &[FrameMetaTmp],
     record_block_codec: u32,
 ) -> Result<RecordBlocksAndTrailerIndexPartsV1> {
-    if record_block_codec != RECORD_BLOCK_CODEC_NONE_V1
-        && record_block_codec != RECORD_BLOCK_CODEC_LZ4_V1
-    {
+    if record_block_codec != RECORD_BLOCK_CODEC_NONE_V1 && record_block_codec != RECORD_BLOCK_CODEC_LZ4_V1 {
         return Err(SegmentError::LengthOutOfRange {
             msg: format!("unsupported record_block_codec {record_block_codec}"),
         });
@@ -1691,10 +1665,7 @@ fn build_record_blocks_and_trailer_index_parts_v1(
 
         let (codec, compressed_bytes) = match record_block_codec {
             RECORD_BLOCK_CODEC_NONE_V1 => (RECORD_BLOCK_CODEC_NONE_V1, uncompressed.to_vec()),
-            RECORD_BLOCK_CODEC_LZ4_V1 => (
-                RECORD_BLOCK_CODEC_LZ4_V1,
-                lz4_flex::block::compress(uncompressed),
-            ),
+            RECORD_BLOCK_CODEC_LZ4_V1 => (RECORD_BLOCK_CODEC_LZ4_V1, lz4_flex::block::compress(uncompressed)),
             _ => unreachable!("validated above"),
         };
 
@@ -1726,10 +1697,7 @@ fn build_record_blocks_and_trailer_index_parts_v1(
             });
         }
         if physical_len != compressed_bytes.len() {
-            record_area.resize(
-                record_area.len() + (physical_len - compressed_bytes.len()),
-                0u8,
-            );
+            record_area.resize(record_area.len() + (physical_len - compressed_bytes.len()), 0u8);
         }
 
         blocks.push(BlockMetaV1 {
@@ -1819,11 +1787,7 @@ fn encode_trailer_section_v1(magic: u32, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn bloom_insert_stream_hash_v1(
-    bits: &mut [u8; BLOOM_BYTES_PER_BLOCK_V1],
-    bloom_hash_k: u32,
-    stream_hash: u64,
-) {
+pub fn bloom_insert_stream_hash_v1(bits: &mut [u8; BLOOM_BYTES_PER_BLOCK_V1], bloom_hash_k: u32, stream_hash: u64) {
     let key = stream_hash.to_le_bytes();
     let m = (BLOOM_BYTES_PER_BLOCK_V1 as u64) * 8;
     for seed in 0..bloom_hash_k {
@@ -1909,12 +1873,7 @@ fn decode_blk1_payload(payload: &[u8]) -> Result<(u32, u32, u32, Vec<BlockMetaV1
 }
 
 fn encode_tbo1_payload(entries: &[TocByOffsetEntryV1]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(
-        8 + entries
-            .len()
-            .checked_mul(TOC_BY_OFFSET_ENTRY_V1_LEN)
-            .unwrap_or(0),
-    );
+    let mut out = Vec::with_capacity(8 + entries.len().checked_mul(TOC_BY_OFFSET_ENTRY_V1_LEN).unwrap_or(0));
     out.extend_from_slice(&(TOC_BY_OFFSET_ENTRY_V1_LEN as u32).to_le_bytes());
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for e in entries {
@@ -1937,11 +1896,7 @@ fn decode_tbo1_payload(payload: &[u8]) -> Result<Vec<TocByOffsetEntryV1>> {
     }
     let count = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
     let expected = 8usize
-        .checked_add(
-            count
-                .checked_mul(entry_len)
-                .ok_or(SegmentError::BufferTooSmall)?,
-        )
+        .checked_add(count.checked_mul(entry_len).ok_or(SegmentError::BufferTooSmall)?)
         .ok_or(SegmentError::BufferTooSmall)?;
     if payload.len() != expected {
         return Err(SegmentError::TrailerSectionInvalid {
@@ -1986,9 +1941,7 @@ fn decode_tsi1_payload(payload: &[u8]) -> Result<Vec<u32>> {
     let mut out = Vec::with_capacity(count);
     let mut off = 8usize;
     for _ in 0..count {
-        out.push(u32::from_le_bytes(
-            payload[off..off + 4].try_into().unwrap(),
-        ));
+        out.push(u32::from_le_bytes(payload[off..off + 4].try_into().unwrap()));
         off += 4;
     }
     Ok(out)
@@ -2085,14 +2038,7 @@ fn decode_toc_by_offset_entry_v1(bytes: &[u8]) -> Result<TocByOffsetEntryV1> {
     })
 }
 
-pub fn decode_segment_v1(
-    bytes: &[u8],
-) -> Result<(
-    SegmentHeaderV1,
-    TocHeaderV1,
-    Vec<TocEntryV1>,
-    SegmentFooterV1,
-)> {
+pub fn decode_segment_v1(bytes: &[u8]) -> Result<(SegmentHeaderV1, TocHeaderV1, Vec<TocEntryV1>, SegmentFooterV1)> {
     if bytes.len() < SEGMENT_HEADER_LEN + SEGMENT_FOOTER_LEN {
         return Err(SegmentError::BufferTooSmall);
     }
@@ -2661,29 +2607,28 @@ mod tests {
         let created_at = 1_700_000_000_000_000_000;
         let sealed_at = created_at + 1;
 
-        let make_frame =
-            |seq: u64, event_id: &str, payload: &[u8]| -> (Vec<u8>, [u8; 32], [u8; 32]) {
-                let payload_hash = compute_payload_hash(payload);
-                let canonical = corecrux_frame::CanonicalHeaderV1 {
-                    tenant_id: "tenant-a".to_string(),
-                    stream_id: "stream-1".to_string(),
-                    stream_type: "answers".to_string(),
-                    seq,
-                    event_id: event_id.to_string(),
-                    occurred_at: "2026-02-07T00:00:00Z".to_string(),
-                    ingested_at: "2026-02-07T00:00:00Z".to_string(),
-                    event_type: "test.event".to_string(),
-                    content_type: "application/octet-stream".to_string(),
-                    payload_len: payload.len() as u32,
-                    payload_hash,
-                };
-                let canonical_bytes = canonical_header_bytes_v1(&canonical);
-                let header_hash = compute_header_hash(&canonical_bytes);
-                let mut header_bytes = Vec::with_capacity(canonical_bytes.len() + 32);
-                header_bytes.extend_from_slice(&canonical_bytes);
-                header_bytes.extend_from_slice(&header_hash);
-                (header_bytes, payload_hash, header_hash)
+        let make_frame = |seq: u64, event_id: &str, payload: &[u8]| -> (Vec<u8>, [u8; 32], [u8; 32]) {
+            let payload_hash = compute_payload_hash(payload);
+            let canonical = corecrux_frame::CanonicalHeaderV1 {
+                tenant_id: "tenant-a".to_string(),
+                stream_id: "stream-1".to_string(),
+                stream_type: "answers".to_string(),
+                seq,
+                event_id: event_id.to_string(),
+                occurred_at: "2026-02-07T00:00:00Z".to_string(),
+                ingested_at: "2026-02-07T00:00:00Z".to_string(),
+                event_type: "test.event".to_string(),
+                content_type: "application/octet-stream".to_string(),
+                payload_len: payload.len() as u32,
+                payload_hash,
             };
+            let canonical_bytes = canonical_header_bytes_v1(&canonical);
+            let header_hash = compute_header_hash(&canonical_bytes);
+            let mut header_bytes = Vec::with_capacity(canonical_bytes.len() + 32);
+            header_bytes.extend_from_slice(&canonical_bytes);
+            header_bytes.extend_from_slice(&header_hash);
+            (header_bytes, payload_hash, header_hash)
+        };
 
         let stream_hash = 0x0102_0304_0506_0708u64;
 
@@ -2797,10 +2742,7 @@ mod tests {
             trailer.record_block_uncompressed_max_len,
             RECORD_BLOCK_UNCOMPRESSED_MAX_LEN_V1
         );
-        assert_eq!(
-            trailer.bloom_bytes_per_block as usize,
-            BLOOM_BYTES_PER_BLOCK_V1
-        );
+        assert_eq!(trailer.bloom_bytes_per_block as usize, BLOOM_BYTES_PER_BLOCK_V1);
 
         use std::collections::HashMap;
         let mut by_key: HashMap<(u64, u64), u32> = HashMap::new();
@@ -2866,9 +2808,7 @@ mod tests {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join(MIN_FIXTURE_REL)
             .canonicalize()
-            .unwrap_or_else(|_| {
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(MIN_FIXTURE_REL)
-            });
+            .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(MIN_FIXTURE_REL));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -3153,16 +3093,8 @@ mod tests {
         bloom_insert_stream_hash_v1(&mut bloom, BLOOM_HASH_K_V1, 0x12345);
         bloom_insert_stream_hash_v1(&mut bloom, BLOOM_HASH_K_V1, 0xABCDE);
 
-        assert!(bloom_maybe_contains_stream_hash_v1(
-            &bloom,
-            BLOOM_HASH_K_V1,
-            0x12345
-        ));
-        assert!(bloom_maybe_contains_stream_hash_v1(
-            &bloom,
-            BLOOM_HASH_K_V1,
-            0xABCDE
-        ));
+        assert!(bloom_maybe_contains_stream_hash_v1(&bloom, BLOOM_HASH_K_V1, 0x12345));
+        assert!(bloom_maybe_contains_stream_hash_v1(&bloom, BLOOM_HASH_K_V1, 0xABCDE));
         // Empty bloom should not match a random hash (with high probability)
         let empty_bloom = [0u8; BLOOM_BYTES_PER_BLOCK_V1];
         assert!(!bloom_maybe_contains_stream_hash_v1(
@@ -3292,9 +3224,7 @@ mod tests {
         let err = decode_segment_v1(&bytes).unwrap_err();
         // Could be NotSealed or CrcMismatch/HashMismatch due to footer change
         match err {
-            SegmentError::NotSealed
-            | SegmentError::CrcMismatch { .. }
-            | SegmentError::HashMismatch { .. } => {}
+            SegmentError::NotSealed | SegmentError::CrcMismatch { .. } | SegmentError::HashMismatch { .. } => {}
             other => panic!("unexpected error: {other:?}"),
         }
     }
@@ -3338,9 +3268,7 @@ mod tests {
         let toc_off = footer.toc_offset as usize;
         let toc_len = footer.toc_len as usize;
         let toc_area = &out.bytes[toc_off..toc_off + toc_len];
-        let toc_payload_len_raw = u64::from_le_bytes(
-            toc_area[40..48].try_into().unwrap(),
-        ) as usize;
+        let toc_payload_len_raw = u64::from_le_bytes(toc_area[40..48].try_into().unwrap()) as usize;
         let toc_payload = &toc_area[..toc_payload_len_raw];
         let toc_header = decode_toc_header_v1(&toc_payload[..TOC_HEADER_LEN]).unwrap();
         let trailer = decode_trailer_index_v1(toc_area, &toc_header)
@@ -3354,16 +3282,7 @@ mod tests {
 
     #[test]
     fn build_segment_empty_frames() {
-        let out = build_segment_v1(
-            0,
-            1,
-            1,
-            SegmentId([0u8; 16]),
-            1,
-            2,
-            &[],
-        )
-        .unwrap();
+        let out = build_segment_v1(0, 1, 1, SegmentId([0u8; 16]), 1, 2, &[]).unwrap();
 
         let (hdr, toc_h, entries, footer) = decode_segment_v1(&out.bytes).unwrap();
         assert_eq!(hdr.segment_seq, 1);

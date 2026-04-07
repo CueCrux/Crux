@@ -8,8 +8,8 @@ use ed25519_dalek::SigningKey;
 use rand::{RngCore, SeedableRng};
 
 use crate::export_v1::{
-    build_receipt_export_v1, BuildReceiptExportInput, ExportFormatV1, ExportRedactionV1,
-    ReceiptEventHeaderRefV1, ReceiptExportIncludeV1, ReceiptExportOptionsV1,
+    build_receipt_export_v1, BuildReceiptExportInput, ExportFormatV1, ExportRedactionV1, ReceiptEventHeaderRefV1,
+    ReceiptExportIncludeV1, ReceiptExportOptionsV1,
 };
 use crate::keyring_v1::{Ed25519KeyEntryV1, Ed25519KeyRingV1};
 use crate::verify_v1::{verify_receipt_v1, ReceiptSigV1, VerifyReceiptInput};
@@ -53,10 +53,7 @@ fn encode_body_cbor_with_retrieval_trace(candidate_digest: &str) -> Vec<u8> {
 
     let candidates = Value::Array(vec![
         Value::Map(vec![
-            (
-                Value::Text("chunk_id".to_string()),
-                Value::Text("CHUNK1".to_string()),
-            ),
+            (Value::Text("chunk_id".to_string()), Value::Text("CHUNK1".to_string())),
             (Value::Text("sparse_score".to_string()), Value::Float(0.1)),
             (
                 Value::Text("lane_scores".to_string()),
@@ -68,16 +65,10 @@ fn encode_body_cbor_with_retrieval_trace(candidate_digest: &str) -> Vec<u8> {
             (Value::Text("fusion_score".to_string()), Value::Float(0.3)),
             (Value::Text("priors_score".to_string()), Value::Null),
             (Value::Text("anchor_score".to_string()), Value::Float(0.0)),
-            (
-                Value::Text("rerank_score".to_string()),
-                Value::Float(1.234567),
-            ),
+            (Value::Text("rerank_score".to_string()), Value::Float(1.234567)),
         ]),
         Value::Map(vec![
-            (
-                Value::Text("chunk_id".to_string()),
-                Value::Text("chunk2".to_string()),
-            ),
+            (Value::Text("chunk_id".to_string()), Value::Text("chunk2".to_string())),
             (Value::Text("sparse_score".to_string()), Value::Null),
             (
                 Value::Text("lane_scores".to_string()),
@@ -181,10 +172,7 @@ fn verify_tier2_candidate_digest_recompute_sets_match_flag() {
     assert!(report.trace_checks.lanes_used_present);
     assert!(report.trace_checks.candidates_present);
     assert!(report.trace_checks.candidate_digest_present);
-    assert_eq!(
-        report.trace_checks.candidate_digest_matches_recompute,
-        Some(true)
-    );
+    assert_eq!(report.trace_checks.candidate_digest_matches_recompute, Some(true));
     assert_eq!(
         report
             .trace_summary
@@ -226,10 +214,7 @@ fn verify_tier2_candidate_digest_recompute_reports_mismatch() {
     assert!(report.trace_checks.lanes_used_present);
     assert!(report.trace_checks.candidates_present);
     assert!(report.trace_checks.candidate_digest_present);
-    assert_eq!(
-        report.trace_checks.candidate_digest_matches_recompute,
-        Some(false)
-    );
+    assert_eq!(report.trace_checks.candidate_digest_matches_recompute, Some(false));
     assert_eq!(
         report
             .trace_summary
@@ -431,8 +416,7 @@ fn export_includes_lineage_when_requested() {
     })
     .expect("verify");
 
-    let lineage =
-        br#"{"schema":"cuecrux.receipt.lineage.v1","parse_ok":true,"linked_receipts":[]}"#;
+    let lineage = br#"{"schema":"cuecrux.receipt.lineage.v1","parse_ok":true,"linked_receipts":[]}"#;
     let bundle = build_receipt_export_v1(
         BuildReceiptExportInput {
             generated_at: "2026-02-09T00:00:01Z",
@@ -709,8 +693,7 @@ fn verification_report_path_deterministic_and_hashes_tenant() {
 fn store_and_load_verification_report_roundtrip() {
     use crate::store_v1::{load_verification_report_v1, store_verification_report_v1};
     use crate::verify_v1::{
-        VerificationIntegrityV1, VerificationReportV1, VerificationSigInfoV1,
-        VerificationTraceChecksV1,
+        VerificationIntegrityV1, VerificationReportV1, VerificationSigInfoV1, VerificationTraceChecksV1,
     };
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -756,19 +739,15 @@ fn load_nonexistent_returns_none() {
     use crate::store_v1::load_verification_report_v1;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let result = load_verification_report_v1(tmp.path(), "t-missing", "r-missing")
-        .expect("load should not fail");
+    let result = load_verification_report_v1(tmp.path(), "t-missing", "r-missing").expect("load should not fail");
     assert!(result.is_none());
 }
 
 #[test]
 fn load_report_with_mismatched_tenant_returns_error() {
-    use crate::store_v1::{
-        load_verification_report_v1, store_verification_report_v1, verification_report_path_v1,
-    };
+    use crate::store_v1::{load_verification_report_v1, store_verification_report_v1, verification_report_path_v1};
     use crate::verify_v1::{
-        VerificationIntegrityV1, VerificationReportV1, VerificationSigInfoV1,
-        VerificationTraceChecksV1,
+        VerificationIntegrityV1, VerificationReportV1, VerificationSigInfoV1, VerificationTraceChecksV1,
     };
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -833,10 +812,7 @@ fn subject_resolve_mode_parse() {
         SubjectResolveModeV1::parse("verified"),
         Some(SubjectResolveModeV1::Verified)
     );
-    assert_eq!(
-        SubjectResolveModeV1::parse("audit"),
-        Some(SubjectResolveModeV1::Audit)
-    );
+    assert_eq!(SubjectResolveModeV1::parse("audit"), Some(SubjectResolveModeV1::Audit));
     assert_eq!(SubjectResolveModeV1::parse("unknown"), None);
     assert_eq!(SubjectResolveModeV1::parse(""), None);
 }
@@ -864,16 +840,13 @@ fn subject_index_path_deterministic_and_hashes_ids() {
 
 #[test]
 fn update_and_resolve_subject_index_roundtrip() {
-    use crate::subject_index_v1::{
-        resolve_subject_receipt_id_v1, update_subject_index_v1, SubjectResolveModeV1,
-    };
+    use crate::subject_index_v1::{resolve_subject_receipt_id_v1, update_subject_index_v1, SubjectResolveModeV1};
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
 
     // Create initial entry (light mode).
-    update_subject_index_v1(root, "t1", "answer", "s1", "r-100", "light", "2026-01-01T00:00:00Z")
-        .expect("create");
+    update_subject_index_v1(root, "t1", "answer", "s1", "r-100", "light", "2026-01-01T00:00:00Z").expect("create");
 
     let latest = resolve_subject_receipt_id_v1(root, "t1", "answer", "s1", SubjectResolveModeV1::Latest)
         .expect("resolve")
@@ -881,13 +854,12 @@ fn update_and_resolve_subject_index_roundtrip() {
     assert_eq!(latest, "r-100");
 
     // Verified mode should be None.
-    let verified = resolve_subject_receipt_id_v1(root, "t1", "answer", "s1", SubjectResolveModeV1::Verified)
-        .expect("resolve");
+    let verified =
+        resolve_subject_receipt_id_v1(root, "t1", "answer", "s1", SubjectResolveModeV1::Verified).expect("resolve");
     assert!(verified.is_none());
 
     // Add a verified entry with a later timestamp.
-    update_subject_index_v1(root, "t1", "answer", "s1", "r-200", "verified", "2026-01-02T00:00:00Z")
-        .expect("update");
+    update_subject_index_v1(root, "t1", "answer", "s1", "r-200", "verified", "2026-01-02T00:00:00Z").expect("update");
 
     let latest2 = resolve_subject_receipt_id_v1(root, "t1", "answer", "s1", SubjectResolveModeV1::Latest)
         .expect("resolve")
@@ -900,25 +872,21 @@ fn update_and_resolve_subject_index_roundtrip() {
     assert_eq!(verified2, "r-200");
 
     // Audit mode should still be None.
-    let audit = resolve_subject_receipt_id_v1(root, "t1", "answer", "s1", SubjectResolveModeV1::Audit)
-        .expect("resolve");
+    let audit =
+        resolve_subject_receipt_id_v1(root, "t1", "answer", "s1", SubjectResolveModeV1::Audit).expect("resolve");
     assert!(audit.is_none());
 }
 
 #[test]
 fn subject_index_latest_not_overwritten_by_older_timestamp() {
-    use crate::subject_index_v1::{
-        resolve_subject_receipt_id_v1, update_subject_index_v1, SubjectResolveModeV1,
-    };
+    use crate::subject_index_v1::{resolve_subject_receipt_id_v1, update_subject_index_v1, SubjectResolveModeV1};
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
 
-    update_subject_index_v1(root, "t1", "answer", "s1", "r-new", "light", "2026-06-01T00:00:00Z")
-        .expect("create");
+    update_subject_index_v1(root, "t1", "answer", "s1", "r-new", "light", "2026-06-01T00:00:00Z").expect("create");
     // Insert an older entry — should NOT overwrite latest.
-    update_subject_index_v1(root, "t1", "answer", "s1", "r-old", "light", "2026-01-01T00:00:00Z")
-        .expect("update");
+    update_subject_index_v1(root, "t1", "answer", "s1", "r-old", "light", "2026-01-01T00:00:00Z").expect("update");
 
     let latest = resolve_subject_receipt_id_v1(root, "t1", "answer", "s1", SubjectResolveModeV1::Latest)
         .expect("resolve")
@@ -928,15 +896,12 @@ fn subject_index_latest_not_overwritten_by_older_timestamp() {
 
 #[test]
 fn subject_index_audit_slot_works() {
-    use crate::subject_index_v1::{
-        resolve_subject_receipt_id_v1, update_subject_index_v1, SubjectResolveModeV1,
-    };
+    use crate::subject_index_v1::{resolve_subject_receipt_id_v1, update_subject_index_v1, SubjectResolveModeV1};
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
 
-    update_subject_index_v1(root, "t1", "action", "a1", "r-10", "audit", "2026-03-01T00:00:00Z")
-        .expect("create");
+    update_subject_index_v1(root, "t1", "action", "a1", "r-10", "audit", "2026-03-01T00:00:00Z").expect("create");
 
     let audit = resolve_subject_receipt_id_v1(root, "t1", "action", "a1", SubjectResolveModeV1::Audit)
         .expect("resolve")
@@ -944,8 +909,8 @@ fn subject_index_audit_slot_works() {
     assert_eq!(audit, "r-10");
 
     // Verified should be None since we only wrote audit.
-    let verified = resolve_subject_receipt_id_v1(root, "t1", "action", "a1", SubjectResolveModeV1::Verified)
-        .expect("resolve");
+    let verified =
+        resolve_subject_receipt_id_v1(root, "t1", "action", "a1", SubjectResolveModeV1::Verified).expect("resolve");
     assert!(verified.is_none());
 }
 
@@ -1207,8 +1172,14 @@ fn export_redaction_parse_roundtrip() {
     use crate::export_v1::ExportRedactionV1;
 
     assert_eq!(ExportRedactionV1::parse("none"), Some(ExportRedactionV1::None));
-    assert_eq!(ExportRedactionV1::parse("metadata_only"), Some(ExportRedactionV1::MetadataOnly));
-    assert_eq!(ExportRedactionV1::parse("tenant_safe"), Some(ExportRedactionV1::TenantSafe));
+    assert_eq!(
+        ExportRedactionV1::parse("metadata_only"),
+        Some(ExportRedactionV1::MetadataOnly)
+    );
+    assert_eq!(
+        ExportRedactionV1::parse("tenant_safe"),
+        Some(ExportRedactionV1::TenantSafe)
+    );
     assert_eq!(ExportRedactionV1::parse("full"), None);
 
     assert_eq!(ExportRedactionV1::None.as_str(), "none");
@@ -1324,8 +1295,7 @@ fn export_tar_zst_format_works() {
     assert!(!bundle.archive_bytes.is_empty());
 
     // Decompress and verify tar contents.
-    let decompressed = zstd::decode_all(std::io::Cursor::new(&bundle.archive_bytes))
-        .expect("zstd decode");
+    let decompressed = zstd::decode_all(std::io::Cursor::new(&bundle.archive_bytes)).expect("zstd decode");
     let mut archive = tar::Archive::new(std::io::Cursor::new(&decompressed));
     let file_names: Vec<String> = archive
         .entries()

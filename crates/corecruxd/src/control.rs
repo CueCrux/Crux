@@ -108,11 +108,7 @@ pub struct ControlV1 {
     #[serde(rename = "updatedAtUnixNs")]
     pub updated_at_unix_ns: u64,
     pub valves: ValvesV1,
-    #[serde(
-        rename = "tenantThrottles",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "tenantThrottles", default, skip_serializing_if = "Vec::is_empty")]
     pub tenant_throttles: Vec<TenantThrottleV1>,
     #[serde(rename = "knowledgeAuthority")]
     pub knowledge_authority: KnowledgeAuthorityV1,
@@ -183,9 +179,7 @@ pub fn canonical_control_bytes_v1(state: &ControlV1) -> Vec<u8> {
 }
 
 pub fn control_hash_blake3_hex(state: &ControlV1) -> String {
-    blake3::hash(&canonical_control_bytes_v1(state))
-        .to_hex()
-        .to_string()
+    blake3::hash(&canonical_control_bytes_v1(state)).to_hex().to_string()
 }
 
 pub fn control_state_digest_v1(state: &ControlV1) -> ControlStateDigestV1 {
@@ -211,22 +205,14 @@ pub fn valve_state_v1(valve: &ValveV1) -> ControlValveStateV1 {
 
 pub fn valve_changes_v1(before: &ControlV1, after: &ControlV1) -> Vec<ValveChangeV1> {
     let candidates = [
-        (
-            "pause_ingest",
-            &before.valves.pause_ingest,
-            &after.valves.pause_ingest,
-        ),
+        ("pause_ingest", &before.valves.pause_ingest, &after.valves.pause_ingest),
         (
             "pause_compaction",
             &before.valves.pause_compaction,
             &after.valves.pause_compaction,
         ),
         ("throttle", &before.valves.throttle, &after.valves.throttle),
-        (
-            "read_only",
-            &before.valves.read_only,
-            &after.valves.read_only,
-        ),
+        ("read_only", &before.valves.read_only, &after.valves.read_only),
         (
             "emergency_brake",
             &before.valves.emergency_brake,
@@ -250,10 +236,7 @@ pub fn valve_changes_v1(before: &ControlV1, after: &ControlV1) -> Vec<ValveChang
         .collect()
 }
 
-pub fn knowledge_authority_change_v1(
-    before: &ControlV1,
-    after: &ControlV1,
-) -> Option<KnowledgeAuthorityChangeV1> {
+pub fn knowledge_authority_change_v1(before: &ControlV1, after: &ControlV1) -> Option<KnowledgeAuthorityChangeV1> {
     if before.knowledge_authority == after.knowledge_authority {
         None
     } else {
@@ -290,10 +273,7 @@ fn apply_knowledge_authority_change_v1(state: &mut ControlV1, change: &Knowledge
     state.knowledge_authority = change.after.clone();
 }
 
-pub fn apply_control_state_mutation_v1(
-    state: &mut ControlV1,
-    mutation: &ControlStateMutationV1,
-) -> Result<(), String> {
+pub fn apply_control_state_mutation_v1(state: &mut ControlV1, mutation: &ControlStateMutationV1) -> Result<(), String> {
     let before = control_state_digest_v1(state);
     if before != mutation.control_before {
         return Err(format!(
@@ -324,6 +304,7 @@ pub fn apply_control_state_mutation_v1(
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Fields read by proprietary edition gRPC handlers.
 pub struct ValveDecision {
     pub allow_ingest: bool,
     pub ingest_error: Option<(String, u32)>, // (code, retry_after_ms)
@@ -370,8 +351,7 @@ impl ValveDecision {
 #[cfg(test)]
 mod tests {
     use corecrux_types::{
-        BuildInfo, ControlStateMutationV1, EvidenceAuthContextV1, EvidenceNodeContextV1,
-        EvidenceRequestContextV1,
+        BuildInfo, ControlStateMutationV1, EvidenceAuthContextV1, EvidenceNodeContextV1, EvidenceRequestContextV1,
     };
 
     use super::*;
@@ -381,10 +361,7 @@ mod tests {
         let before = ControlV1::default();
         let mut after = before.clone();
         after.updated_at_unix_ns = 42;
-        after
-            .valves
-            .throttle
-            .set(true, "operator", "maintenance", 42);
+        after.valves.throttle.set(true, "operator", "maintenance", 42);
         after.valves.throttle.set_retry_after_ms(Some(250));
         after
             .valves
@@ -407,18 +384,9 @@ mod tests {
         let before = ControlV1::default();
         let mut after = before.clone();
         after.updated_at_unix_ns = 44;
-        after
-            .valves
-            .read_only
-            .set(true, "operator", "maintenance", 44);
-        after
-            .valves
-            .throttle
-            .set(true, "operator", "maintenance", 44);
-        after
-            .valves
-            .throttle
-            .set_throttle_params(Some(12), Some(2048), Some(4));
+        after.valves.read_only.set(true, "operator", "maintenance", 44);
+        after.valves.throttle.set(true, "operator", "maintenance", 44);
+        after.valves.throttle.set_throttle_params(Some(12), Some(2048), Some(4));
 
         let mutation = ControlStateMutationV1 {
             schema: "corecrux.control.state_mutation.v1".to_string(),
@@ -490,8 +458,8 @@ mod tests {
             result: None,
         };
 
-        let err = apply_control_state_mutation_v1(&mut state, &mutation)
-            .expect_err("mismatched before digest must fail");
+        let err =
+            apply_control_state_mutation_v1(&mut state, &mutation).expect_err("mismatched before digest must fail");
         assert!(err.contains("before digest mismatch"));
     }
 
@@ -522,10 +490,7 @@ mod tests {
 
         let mut state = ControlV1::default();
         state.updated_at_unix_ns = 999;
-        state
-            .valves
-            .pause_ingest
-            .set(true, "test", "testing", 999);
+        state.valves.pause_ingest.set(true, "test", "testing", 999);
         let bytes = serde_json::to_vec_pretty(&state).unwrap();
         std::fs::write(&path, bytes).unwrap();
 
@@ -539,8 +504,7 @@ mod tests {
 
     #[test]
     fn write_control_atomic_creates_file_and_removes_tmp() {
-        let dir =
-            std::env::temp_dir().join(format!("corecrux_test_atomic_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("corecrux_test_atomic_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("control_atomic.json");
         let tmp_path = path.with_extension("json.tmp");
@@ -551,8 +515,7 @@ mod tests {
         assert!(path.exists());
         assert!(!tmp_path.exists(), "tmp file should be renamed away");
 
-        let loaded: ControlV1 =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).expect("parse");
+        let loaded: ControlV1 = serde_json::from_slice(&std::fs::read(&path).unwrap()).expect("parse");
         assert_eq!(loaded, state);
 
         let _ = std::fs::remove_file(&path);
@@ -618,20 +581,11 @@ mod tests {
     fn valve_changes_v1_detects_all_five_valves() {
         let before = ControlV1::default();
         let mut after = before.clone();
-        after
-            .valves
-            .pause_ingest
-            .set(true, "a", "r", 1);
-        after
-            .valves
-            .pause_compaction
-            .set(true, "a", "r", 2);
+        after.valves.pause_ingest.set(true, "a", "r", 1);
+        after.valves.pause_compaction.set(true, "a", "r", 2);
         after.valves.throttle.set(true, "a", "r", 3);
         after.valves.read_only.set(true, "a", "r", 4);
-        after
-            .valves
-            .emergency_brake
-            .set(true, "a", "r", 5);
+        after.valves.emergency_brake.set(true, "a", "r", 5);
 
         let changes = valve_changes_v1(&before, &after);
         assert_eq!(changes.len(), 5);
@@ -653,9 +607,7 @@ mod tests {
     #[test]
     fn valve_decision_emergency_brake_blocks_everything() {
         let mut c = ControlV1::default();
-        c.valves
-            .emergency_brake
-            .set(true, "admin", "fire", 1);
+        c.valves.emergency_brake.set(true, "admin", "fire", 1);
         let d = ValveDecision::from_control(&c);
         assert!(!d.allow_ingest);
         assert!(!d.allow_compaction);
@@ -683,9 +635,7 @@ mod tests {
     #[test]
     fn valve_decision_pause_ingest_allows_compaction() {
         let mut c = ControlV1::default();
-        c.valves
-            .pause_ingest
-            .set(true, "admin", "pause", 1);
+        c.valves.pause_ingest.set(true, "admin", "pause", 1);
         let d = ValveDecision::from_control(&c);
         assert!(!d.allow_ingest);
         assert!(d.allow_compaction);
@@ -699,12 +649,8 @@ mod tests {
     #[test]
     fn valve_decision_pause_ingest_plus_compaction() {
         let mut c = ControlV1::default();
-        c.valves
-            .pause_ingest
-            .set(true, "admin", "pause", 1);
-        c.valves
-            .pause_compaction
-            .set(true, "admin", "pause", 1);
+        c.valves.pause_ingest.set(true, "admin", "pause", 1);
+        c.valves.pause_compaction.set(true, "admin", "pause", 1);
         let d = ValveDecision::from_control(&c);
         assert!(!d.allow_ingest);
         assert!(!d.allow_compaction);
@@ -724,9 +670,7 @@ mod tests {
     #[test]
     fn valve_decision_only_compaction_paused() {
         let mut c = ControlV1::default();
-        c.valves
-            .pause_compaction
-            .set(true, "admin", "pause", 1);
+        c.valves.pause_compaction.set(true, "admin", "pause", 1);
         let d = ValveDecision::from_control(&c);
         assert!(d.allow_ingest);
         assert!(!d.allow_compaction);
@@ -806,18 +750,12 @@ mod tests {
         let before = ControlV1::default();
         let mut after = before.clone();
         after.updated_at_unix_ns = 50;
-        after
-            .valves
-            .pause_ingest
-            .set(true, "op", "test", 50);
+        after.valves.pause_ingest.set(true, "op", "test", 50);
 
         // Build a mutation that applies the correct valve changes but claims a
         // different after-digest (from a state with read_only enabled too).
         let mut wrong_after = after.clone();
-        wrong_after
-            .valves
-            .read_only
-            .set(true, "op", "extra", 50);
+        wrong_after.valves.read_only.set(true, "op", "extra", 50);
 
         let mutation = ControlStateMutationV1 {
             schema: "corecrux.control.state_mutation.v1".to_string(),
@@ -852,8 +790,8 @@ mod tests {
         };
 
         let mut rebuilt = before;
-        let err = apply_control_state_mutation_v1(&mut rebuilt, &mutation)
-            .expect_err("after digest mismatch must fail");
+        let err =
+            apply_control_state_mutation_v1(&mut rebuilt, &mutation).expect_err("after digest mismatch must fail");
         assert!(err.contains("after digest mismatch"));
     }
 
@@ -896,8 +834,7 @@ mod tests {
         };
 
         let mut rebuilt = before;
-        let err = apply_control_state_mutation_v1(&mut rebuilt, &mutation)
-            .expect_err("unknown valve must fail");
+        let err = apply_control_state_mutation_v1(&mut rebuilt, &mutation).expect_err("unknown valve must fail");
         assert!(err.contains("unknown control valve"));
     }
 

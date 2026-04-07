@@ -1,0 +1,13 @@
+[package]
+name = "crux-examples"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[example]]
+name = "append_and_query"
+path = "append_and_query.rs"
+
+[dependencies]
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"

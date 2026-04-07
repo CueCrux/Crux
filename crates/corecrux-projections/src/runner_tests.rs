@@ -10,13 +10,12 @@ mod tests {
     use std::path::Path;
 
     use corecrux_frame::{
-        canonical_header_bytes_v1, compute_header_hash, compute_payload_hash, stream_hash_xxhash64,
-        CanonicalHeaderV1,
+        canonical_header_bytes_v1, compute_header_hash, compute_payload_hash, stream_hash_xxhash64, CanonicalHeaderV1,
     };
     use corecrux_segment::{build_segment_v1, SegmentId};
     use corecrux_storage::{
-        encode_manifest_add_segment_v1, encode_manifest_header_v1, frame_manifest_record,
-        SegmentMeta, ShardPaths, ShardStorage, ShardStorageOptions,
+        encode_manifest_add_segment_v1, encode_manifest_header_v1, frame_manifest_record, SegmentMeta, ShardPaths,
+        ShardStorage, ShardStorageOptions,
     };
     use uuid::Uuid;
 
@@ -30,8 +29,8 @@ mod tests {
     };
     use crate::events::{
         DependentEvidenceUpsertV1, LivingStateUpdateV1, PressureEventUpsertV1, RelationUpsertV1,
-        CONTENT_TYPE_PROJ_BIN_V1, EVT_DEPENDENT_EVIDENCE_UPSERT_V1, EVT_LIVING_STATE_UPDATE_V1,
-        EVT_PRESSURE_UPSERT_V1, EVT_RELATION_UPSERT_V1,
+        CONTENT_TYPE_PROJ_BIN_V1, EVT_DEPENDENT_EVIDENCE_UPSERT_V1, EVT_LIVING_STATE_UPDATE_V1, EVT_PRESSURE_UPSERT_V1,
+        EVT_RELATION_UPSERT_V1,
     };
 
     fn make_frame(
@@ -105,8 +104,8 @@ mod tests {
         for frames in segments {
             let seg_id = SegmentId(*Uuid::new_v4().as_bytes());
             let built = build_segment_v1(
-                shard_id, epoch, seg_seq, seg_id, /*created_at_unix_ns=*/ 123,
-                /*sealed_at_unix_ns=*/ 124, &frames,
+                shard_id, epoch, seg_seq, seg_id, /*created_at_unix_ns=*/ 123, /*sealed_at_unix_ns=*/ 124,
+                &frames,
             )
             .unwrap();
             let name = format!("seg-{seg_seq:08}.ccxseg");
@@ -139,13 +138,7 @@ mod tests {
         }
         mf.sync_all().unwrap();
 
-        let storage = ShardStorage::open(
-            root,
-            shard_id,
-            epoch,
-            ShardStorageOptions::default(),
-        )
-        .unwrap();
+        let storage = ShardStorage::open(root, shard_id, epoch, ShardStorageOptions::default()).unwrap();
 
         (dir, storage)
     }
@@ -239,9 +232,7 @@ mod tests {
         let (dir_a, storage_a) = build_storage_with_segments(vec![frames.clone()]);
         let shard_dir_a = dir_a.path().join("shard-0001");
         let mut proj_a = crate::ProjectionStoreV1::load_or_init(&shard_dir_a, 1, 1).unwrap();
-        let _ = proj_a
-            .rebuild_from_genesis(&storage_a, /*batch_frames=*/ 1)
-            .unwrap();
+        let _ = proj_a.rebuild_from_genesis(&storage_a, /*batch_frames=*/ 1).unwrap();
         let living_a = std::fs::read(&proj_a.files.living_snapshot_path).unwrap();
         let living_hash_a = CcxsSnapshot::snapshot_blake3_hex(&living_a);
         let relations_a = std::fs::read(&proj_a.files.relations_snapshot_path).unwrap();
@@ -255,9 +246,7 @@ mod tests {
         let (dir_b, storage_b) = build_storage_with_segments(vec![frames]);
         let shard_dir_b = dir_b.path().join("shard-0001");
         let mut proj_b = crate::ProjectionStoreV1::load_or_init(&shard_dir_b, 1, 1).unwrap();
-        let _ = proj_b
-            .rebuild_from_genesis(&storage_b, /*batch_frames=*/ 1024)
-            .unwrap();
+        let _ = proj_b.rebuild_from_genesis(&storage_b, /*batch_frames=*/ 1024).unwrap();
         let living_b = std::fs::read(&proj_b.files.living_snapshot_path).unwrap();
         let living_hash_b = CcxsSnapshot::snapshot_blake3_hex(&living_b);
         let relations_b = std::fs::read(&proj_b.files.relations_snapshot_path).unwrap();
@@ -332,9 +321,7 @@ mod tests {
         let (dir_a, storage_a) = build_storage_with_segments(vec![frames.clone()]);
         let shard_dir_a = dir_a.path().join("shard-0001");
         let mut proj_a = crate::ProjectionStoreV1::load_or_init(&shard_dir_a, 1, 1).unwrap();
-        let _ = proj_a
-            .rebuild_from_genesis(&storage_a, /*batch_frames=*/ 1024)
-            .unwrap();
+        let _ = proj_a.rebuild_from_genesis(&storage_a, /*batch_frames=*/ 1024).unwrap();
 
         // Run B: two segments split.
         let seg1 = vec![frames[0].clone()];
@@ -342,9 +329,7 @@ mod tests {
         let (dir_b, storage_b) = build_storage_with_segments(vec![seg1, seg2]);
         let shard_dir_b = dir_b.path().join("shard-0001");
         let mut proj_b = crate::ProjectionStoreV1::load_or_init(&shard_dir_b, 1, 1).unwrap();
-        let _ = proj_b
-            .rebuild_from_genesis(&storage_b, /*batch_frames=*/ 1024)
-            .unwrap();
+        let _ = proj_b.rebuild_from_genesis(&storage_b, /*batch_frames=*/ 1024).unwrap();
 
         // Compare decoded state (not snapshot bytes), since cursor differs by segment layout.
         assert_eq!(proj_a.state.living, proj_b.state.living);
@@ -473,10 +458,42 @@ mod tests {
         };
 
         let frames = vec![
-            make_frame(tenant_id, 1, 1, "evt-a1", EVT_LIVING_STATE_UPDATE_V1, CONTENT_TYPE_PROJ_BIN_V1, &living.encode_bin()),
-            make_frame(tenant_id, 1, 2, "evt-a2", EVT_RELATION_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &rel.encode_bin()),
-            make_frame(tenant_id, 1, 3, "evt-a3", EVT_DEPENDENT_EVIDENCE_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &dep.encode_bin()),
-            make_frame(tenant_id, 1, 4, "evt-a4", EVT_PRESSURE_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &pressure.encode_bin()),
+            make_frame(
+                tenant_id,
+                1,
+                1,
+                "evt-a1",
+                EVT_LIVING_STATE_UPDATE_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &living.encode_bin(),
+            ),
+            make_frame(
+                tenant_id,
+                1,
+                2,
+                "evt-a2",
+                EVT_RELATION_UPSERT_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &rel.encode_bin(),
+            ),
+            make_frame(
+                tenant_id,
+                1,
+                3,
+                "evt-a3",
+                EVT_DEPENDENT_EVIDENCE_UPSERT_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &dep.encode_bin(),
+            ),
+            make_frame(
+                tenant_id,
+                1,
+                4,
+                "evt-a4",
+                EVT_PRESSURE_UPSERT_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &pressure.encode_bin(),
+            ),
         ];
 
         let (dir_a, storage) = build_storage_with_segments(vec![frames]);
@@ -505,7 +522,10 @@ mod tests {
             updated_at_micros: 0,
         };
         let frames = vec![make_frame(
-            tenant_id, 1, 1, "evt-c1",
+            tenant_id,
+            1,
+            1,
+            "evt-c1",
             EVT_LIVING_STATE_UPDATE_V1,
             CONTENT_TYPE_PROJ_BIN_V1,
             &living.encode_bin(),
@@ -527,8 +547,7 @@ mod tests {
     fn tick_updates_cursor() {
         let tenant_id = "tenant-cursor";
         let living = LivingStateUpdateV1 {
-            fields_mask: LivingStateUpdateV1::MASK_LIVING_STATUS
-                | LivingStateUpdateV1::MASK_UPDATED_AT,
+            fields_mask: LivingStateUpdateV1::MASK_LIVING_STATUS | LivingStateUpdateV1::MASK_UPDATED_AT,
             artifact_id: 5,
             living_status: 2,
             confidence_q16: 0,
@@ -538,7 +557,10 @@ mod tests {
             updated_at_micros: 100,
         };
         let frames = vec![make_frame(
-            tenant_id, 5, 1, "evt-cur1",
+            tenant_id,
+            5,
+            1,
+            "evt-cur1",
             EVT_LIVING_STATE_UPDATE_V1,
             CONTENT_TYPE_PROJ_BIN_V1,
             &living.encode_bin(),
@@ -566,7 +588,7 @@ mod tests {
         let ev = crate::events::ProjectionEventV1::LivingStateUpdate(LivingStateUpdateV1 {
             fields_mask: LivingStateUpdateV1::MASK_LIVING_STATUS,
             artifact_id: 1,
-            living_status: 1, // active
+            living_status: 1,      // active
             confidence_q16: 65535, // should be ignored (not in mask)
             last_validated_at_micros: 0,
             next_review_at_micros: 0,
@@ -605,13 +627,11 @@ mod tests {
         // Delete it.
         state.apply(
             tenant_hash,
-            crate::events::ProjectionEventV1::RelationDelete(
-                crate::events::RelationDeleteV1 {
-                    src_artifact_id: 1,
-                    dst_artifact_id: 2,
-                    relation_type: 0,
-                },
-            ),
+            crate::events::ProjectionEventV1::RelationDelete(crate::events::RelationDeleteV1 {
+                src_artifact_id: 1,
+                dst_artifact_id: 2,
+                relation_type: 0,
+            }),
         );
         assert!(state.relations.is_empty());
     }
@@ -646,10 +666,7 @@ mod tests {
             }),
         );
 
-        let edge = state
-            .dependents
-            .get(&(tenant_hash, 1, 0, dep_id))
-            .unwrap();
+        let edge = state.dependents.get(&(tenant_hash, 1, 0, dep_id)).unwrap();
         assert_eq!(edge.last_seen_at_micros, 100); // max(100, 50)
         assert_eq!(edge.usage_weight_q16, 50); // max(50, 30)
     }
@@ -915,8 +932,16 @@ mod tests {
     #[test]
     fn relation_type_engine_str_roundtrip() {
         use crate::state::RelationTypeV1;
-        let strs = ["supports", "contradicts", "supersedes", "duplicates",
-                     "elaborates", "derived_from", "cites", "about_same_entity"];
+        let strs = [
+            "supports",
+            "contradicts",
+            "supersedes",
+            "duplicates",
+            "elaborates",
+            "derived_from",
+            "cites",
+            "about_same_entity",
+        ];
         for s in &strs {
             let rt = RelationTypeV1::from_engine_str(s).unwrap();
             assert_eq!(rt.as_engine_str(), *s);
@@ -989,10 +1014,42 @@ mod tests {
         };
 
         let frames = vec![
-            make_frame(tenant_id, 1, 1, "evt-rb1", EVT_LIVING_STATE_UPDATE_V1, CONTENT_TYPE_PROJ_BIN_V1, &living.encode_bin()),
-            make_frame(tenant_id, 1, 2, "evt-rb2", EVT_RELATION_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &rel.encode_bin()),
-            make_frame(tenant_id, 1, 3, "evt-rb3", EVT_DEPENDENT_EVIDENCE_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &dep.encode_bin()),
-            make_frame(tenant_id, 1, 4, "evt-rb4", EVT_PRESSURE_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &pressure.encode_bin()),
+            make_frame(
+                tenant_id,
+                1,
+                1,
+                "evt-rb1",
+                EVT_LIVING_STATE_UPDATE_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &living.encode_bin(),
+            ),
+            make_frame(
+                tenant_id,
+                1,
+                2,
+                "evt-rb2",
+                EVT_RELATION_UPSERT_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &rel.encode_bin(),
+            ),
+            make_frame(
+                tenant_id,
+                1,
+                3,
+                "evt-rb3",
+                EVT_DEPENDENT_EVIDENCE_UPSERT_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &dep.encode_bin(),
+            ),
+            make_frame(
+                tenant_id,
+                1,
+                4,
+                "evt-rb4",
+                EVT_PRESSURE_UPSERT_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &pressure.encode_bin(),
+            ),
         ];
 
         let (dir, storage) = build_storage_with_segments(vec![frames]);
@@ -1032,8 +1089,7 @@ mod tests {
     fn rebuild_from_genesis_batch_size_1_matches_large_batch() {
         let tenant_id = "tenant-batch-cmp";
         let living = LivingStateUpdateV1 {
-            fields_mask: LivingStateUpdateV1::MASK_LIVING_STATUS
-                | LivingStateUpdateV1::MASK_UPDATED_AT,
+            fields_mask: LivingStateUpdateV1::MASK_LIVING_STATUS | LivingStateUpdateV1::MASK_UPDATED_AT,
             artifact_id: 5,
             living_status: 2,
             confidence_q16: 0,
@@ -1052,8 +1108,24 @@ mod tests {
             updated_at_micros: 201,
         };
         let frames = vec![
-            make_frame(tenant_id, 5, 1, "evt-bc1", EVT_LIVING_STATE_UPDATE_V1, CONTENT_TYPE_PROJ_BIN_V1, &living.encode_bin()),
-            make_frame(tenant_id, 5, 2, "evt-bc2", EVT_RELATION_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &rel.encode_bin()),
+            make_frame(
+                tenant_id,
+                5,
+                1,
+                "evt-bc1",
+                EVT_LIVING_STATE_UPDATE_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &living.encode_bin(),
+            ),
+            make_frame(
+                tenant_id,
+                5,
+                2,
+                "evt-bc2",
+                EVT_RELATION_UPSERT_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &rel.encode_bin(),
+            ),
         ];
 
         // Batch size 1 (microbatching)
@@ -1112,9 +1184,33 @@ mod tests {
         };
 
         let frames = vec![
-            make_frame(tenant_id, 1, 1, "evt-tr1", EVT_LIVING_STATE_UPDATE_V1, CONTENT_TYPE_PROJ_BIN_V1, &living.encode_bin()),
-            make_frame(tenant_id, 1, 2, "evt-tr2", EVT_RELATION_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &rel.encode_bin()),
-            make_frame(tenant_id, 1, 3, "evt-tr3", EVT_DEPENDENT_EVIDENCE_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &dep.encode_bin()),
+            make_frame(
+                tenant_id,
+                1,
+                1,
+                "evt-tr1",
+                EVT_LIVING_STATE_UPDATE_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &living.encode_bin(),
+            ),
+            make_frame(
+                tenant_id,
+                1,
+                2,
+                "evt-tr2",
+                EVT_RELATION_UPSERT_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &rel.encode_bin(),
+            ),
+            make_frame(
+                tenant_id,
+                1,
+                3,
+                "evt-tr3",
+                EVT_DEPENDENT_EVIDENCE_UPSERT_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &dep.encode_bin(),
+            ),
         ];
 
         // Via tick
@@ -1162,8 +1258,24 @@ mod tests {
             updated_at_micros: 21,
         };
         let frames = vec![
-            make_frame(tenant_id, 10, 1, "evt-cs1", EVT_RELATION_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &rel1.encode_bin()),
-            make_frame(tenant_id, 10, 2, "evt-cs2", EVT_RELATION_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &rel2.encode_bin()),
+            make_frame(
+                tenant_id,
+                10,
+                1,
+                "evt-cs1",
+                EVT_RELATION_UPSERT_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &rel1.encode_bin(),
+            ),
+            make_frame(
+                tenant_id,
+                10,
+                2,
+                "evt-cs2",
+                EVT_RELATION_UPSERT_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &rel2.encode_bin(),
+            ),
         ];
 
         let (dir, storage) = build_storage_with_segments(vec![frames]);
@@ -1175,7 +1287,10 @@ mod tests {
         let cold_files = collect_cold_files(&proj.files.cold_relations_segments_dir);
         assert!(!cold_files.is_empty(), "should have cold segment files");
         for file_rel in &cold_files {
-            assert!(file_rel.ends_with(".ccxcseg"), "cold segments should have .ccxcseg extension");
+            assert!(
+                file_rel.ends_with(".ccxcseg"),
+                "cold segments should have .ccxcseg extension"
+            );
         }
 
         // Verify snapshot has valid hot ptrs that resolve to cold segments.
@@ -1190,14 +1305,27 @@ mod tests {
         let dir = std::path::PathBuf::from("/tmp/test-shard");
         let files = crate::ProjectionFilesV1::for_shard_dir(&dir);
         assert_eq!(files.projections_dir, dir.join("projections"));
-        assert_eq!(
-            files.meta_path,
-            dir.join("projections/projections.meta.json")
-        );
-        assert!(files.living_snapshot_path.to_str().unwrap().contains("artifact_living_state"));
-        assert!(files.relations_snapshot_path.to_str().unwrap().contains("artifact_relations"));
-        assert!(files.pressure_snapshot_path.to_str().unwrap().contains("pressure_events"));
-        assert!(files.dependents_snapshot_path.to_str().unwrap().contains("artifact_dependents"));
+        assert_eq!(files.meta_path, dir.join("projections/projections.meta.json"));
+        assert!(files
+            .living_snapshot_path
+            .to_str()
+            .unwrap()
+            .contains("artifact_living_state"));
+        assert!(files
+            .relations_snapshot_path
+            .to_str()
+            .unwrap()
+            .contains("artifact_relations"));
+        assert!(files
+            .pressure_snapshot_path
+            .to_str()
+            .unwrap()
+            .contains("pressure_events"));
+        assert!(files
+            .dependents_snapshot_path
+            .to_str()
+            .unwrap()
+            .contains("artifact_dependents"));
         assert_eq!(
             files.cold_relations_segments_dir,
             dir.join("projections/cold/relations/segments")
@@ -1225,7 +1353,10 @@ mod tests {
             updated_at_micros: 0,
         };
         let frames = vec![make_frame(
-            tenant_id, 1, 1, "evt-serde1",
+            tenant_id,
+            1,
+            1,
+            "evt-serde1",
             EVT_LIVING_STATE_UPDATE_V1,
             CONTENT_TYPE_PROJ_BIN_V1,
             &living.encode_bin(),
@@ -1261,8 +1392,7 @@ mod tests {
     fn gc_orphan_cold_segments_on_fresh_store() {
         let tenant_id = "tenant-gc";
         let living = LivingStateUpdateV1 {
-            fields_mask: LivingStateUpdateV1::MASK_LIVING_STATUS
-                | LivingStateUpdateV1::MASK_UPDATED_AT,
+            fields_mask: LivingStateUpdateV1::MASK_LIVING_STATUS | LivingStateUpdateV1::MASK_UPDATED_AT,
             artifact_id: 1,
             living_status: 1,
             confidence_q16: 0,
@@ -1282,8 +1412,24 @@ mod tests {
         };
 
         let frames = vec![
-            make_frame(tenant_id, 1, 1, "evt-gc1", EVT_LIVING_STATE_UPDATE_V1, CONTENT_TYPE_PROJ_BIN_V1, &living.encode_bin()),
-            make_frame(tenant_id, 1, 2, "evt-gc2", EVT_RELATION_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &rel.encode_bin()),
+            make_frame(
+                tenant_id,
+                1,
+                1,
+                "evt-gc1",
+                EVT_LIVING_STATE_UPDATE_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &living.encode_bin(),
+            ),
+            make_frame(
+                tenant_id,
+                1,
+                2,
+                "evt-gc2",
+                EVT_RELATION_UPSERT_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &rel.encode_bin(),
+            ),
         ];
 
         let (dir, storage) = build_storage_with_segments(vec![frames]);
@@ -1321,9 +1467,15 @@ mod tests {
             created_at_micros: 10,
             updated_at_micros: 11,
         };
-        let frames = vec![
-            make_frame(tenant_id, 1, 1, "evt-gcd1", EVT_RELATION_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &rel.encode_bin()),
-        ];
+        let frames = vec![make_frame(
+            tenant_id,
+            1,
+            1,
+            "evt-gcd1",
+            EVT_RELATION_UPSERT_V1,
+            CONTENT_TYPE_PROJ_BIN_V1,
+            &rel.encode_bin(),
+        )];
 
         let (dir, storage) = build_storage_with_segments(vec![frames]);
         let shard_dir = dir.path().join("shard-0001");
@@ -1372,8 +1524,24 @@ mod tests {
         };
 
         let frames = vec![
-            make_frame(tenant_id, 1, 1, "evt-rl1", EVT_LIVING_STATE_UPDATE_V1, CONTENT_TYPE_PROJ_BIN_V1, &living.encode_bin()),
-            make_frame(tenant_id, 1, 2, "evt-rl2", EVT_RELATION_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &rel.encode_bin()),
+            make_frame(
+                tenant_id,
+                1,
+                1,
+                "evt-rl1",
+                EVT_LIVING_STATE_UPDATE_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &living.encode_bin(),
+            ),
+            make_frame(
+                tenant_id,
+                1,
+                2,
+                "evt-rl2",
+                EVT_RELATION_UPSERT_V1,
+                CONTENT_TYPE_PROJ_BIN_V1,
+                &rel.encode_bin(),
+            ),
         ];
 
         let (dir, storage) = build_storage_with_segments(vec![frames]);
@@ -1421,13 +1589,19 @@ mod tests {
 
         // Two segments, one frame each.
         let seg1 = vec![make_frame(
-            tenant_id, 1, 1, "evt-mt1",
+            tenant_id,
+            1,
+            1,
+            "evt-mt1",
             EVT_LIVING_STATE_UPDATE_V1,
             CONTENT_TYPE_PROJ_BIN_V1,
             &living1.encode_bin(),
         )];
         let seg2 = vec![make_frame(
-            tenant_id, 2, 1, "evt-mt2",
+            tenant_id,
+            2,
+            1,
+            "evt-mt2",
             EVT_LIVING_STATE_UPDATE_V1,
             CONTENT_TYPE_PROJ_BIN_V1,
             &living2.encode_bin(),
@@ -1449,8 +1623,7 @@ mod tests {
         assert_eq!(r2.commit_id, 2);
         let cursor2 = r2.cursor_after.clone().unwrap();
         assert!(
-            cursor2.segment_seq > cursor1.segment_seq
-                || cursor2.offset > cursor1.offset,
+            cursor2.segment_seq > cursor1.segment_seq || cursor2.offset > cursor1.offset,
             "cursor should advance"
         );
 
@@ -1509,18 +1682,10 @@ mod tests {
 
     fn assert_hot_ptrs_resolve(cold_segments_dir: &Path, snapshot_bytes: &[u8]) {
         let snap = CcxsSnapshot::decode(snapshot_bytes).unwrap();
-        let Some((_, block)) = snap
-            .blocks
-            .iter()
-            .find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1)
-        else {
+        let Some((_, block)) = snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1) else {
             panic!("snapshot missing hot ptr block");
         };
-        let Some((_, dir_block)) = snap
-            .blocks
-            .iter()
-            .find(|(t, _)| *t == CCXS_BLOCK_COLD_SEGMENT_DIR_V1)
-        else {
+        let Some((_, dir_block)) = snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_COLD_SEGMENT_DIR_V1) else {
             panic!("snapshot missing cold segment dir block");
         };
         let ptrs = decode_hot_ptrs_v1(block).unwrap();
@@ -1532,14 +1697,8 @@ mod tests {
             std::collections::BTreeMap::new();
         for s in dir {
             let seg_path = cold_segment_path_v1(cold_segments_dir, &s.segment_blake3);
-            assert!(
-                seg_path.exists(),
-                "missing cold segment {}",
-                seg_path.display()
-            );
-            let (_hdr, idx) =
-                read_and_verify_cold_segment_index_v1(&seg_path, &s.segment_blake3, s.file_len)
-                    .unwrap();
+            assert!(seg_path.exists(), "missing cold segment {}", seg_path.display());
+            let (_hdr, idx) = read_and_verify_cold_segment_index_v1(&seg_path, &s.segment_blake3, s.file_len).unwrap();
             for it in idx {
                 locs.insert(it.block_blake3, (seg_path.clone(), it.offset, it.len));
             }
@@ -1548,12 +1707,7 @@ mod tests {
         for (_key, p) in ptrs {
             let (seg_path, offset, len) = locs
                 .get(&p.blake3)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing cold block blake3 {}",
-                        blake3::Hash::from(p.blake3).to_hex()
-                    )
-                })
+                .unwrap_or_else(|| panic!("missing cold block blake3 {}", blake3::Hash::from(p.blake3).to_hex()))
                 .clone();
             assert_eq!(len as usize, p.block_len as usize);
             let bytes = read_cold_segment_block_v1(&seg_path, offset, len).unwrap();
@@ -1576,7 +1730,9 @@ mod tests {
         assert!(files.cold_relations_dir.starts_with(&files.projections_dir));
         assert!(files.cold_dependents_dir.starts_with(&files.projections_dir));
         assert!(files.cold_relations_segments_dir.starts_with(&files.cold_relations_dir));
-        assert!(files.cold_dependents_segments_dir.starts_with(&files.cold_dependents_dir));
+        assert!(files
+            .cold_dependents_segments_dir
+            .starts_with(&files.cold_dependents_dir));
     }
 
     // ── ColdSegmentGcOptionsV1 fields ───────────────────────────────
@@ -1598,7 +1754,7 @@ mod tests {
 
     #[test]
     fn cold_segment_gc_report_serde() {
-        use crate::{ColdSegmentGcReportV1, ColdSegmentGcProjectionReportV1};
+        use crate::{ColdSegmentGcProjectionReportV1, ColdSegmentGcReportV1};
         let report = ColdSegmentGcReportV1 {
             shard_id: 1,
             epoch: 2,
@@ -1694,12 +1850,8 @@ mod tests {
         let segments: Vec<Vec<corecrux_segment::FrameInput<'static>>> = vec![];
         let (dir, storage) = build_storage_with_segments(segments);
 
-        let mut proj = crate::ProjectionStoreV1::load_or_init(
-            &ShardPaths::for_root(dir.path(), 1).shard_dir,
-            1,
-            1,
-        )
-        .unwrap();
+        let mut proj =
+            crate::ProjectionStoreV1::load_or_init(&ShardPaths::for_root(dir.path(), 1).shard_dir, 1, 1).unwrap();
         let r = proj.rebuild_from_genesis(&storage, 100).unwrap();
         assert_eq!(r.frames_processed, 0);
         assert_eq!(r.state_counts.living_rows, 0);
@@ -1715,12 +1867,8 @@ mod tests {
         let segments: Vec<Vec<corecrux_segment::FrameInput<'static>>> = vec![];
         let (dir, storage) = build_storage_with_segments(segments);
 
-        let mut proj = crate::ProjectionStoreV1::load_or_init(
-            &ShardPaths::for_root(dir.path(), 1).shard_dir,
-            1,
-            1,
-        )
-        .unwrap();
+        let mut proj =
+            crate::ProjectionStoreV1::load_or_init(&ShardPaths::for_root(dir.path(), 1).shard_dir, 1, 1).unwrap();
         let result = proj.tick(&storage, 100).unwrap();
         assert!(result.is_none());
     }
@@ -1732,12 +1880,8 @@ mod tests {
         let segments: Vec<Vec<corecrux_segment::FrameInput<'static>>> = vec![];
         let (dir, _storage) = build_storage_with_segments(segments);
 
-        let mut proj = crate::ProjectionStoreV1::load_or_init(
-            &ShardPaths::for_root(dir.path(), 1).shard_dir,
-            1,
-            1,
-        )
-        .unwrap();
+        let mut proj =
+            crate::ProjectionStoreV1::load_or_init(&ShardPaths::for_root(dir.path(), 1).shard_dir, 1, 1).unwrap();
         let report = proj
             .gc_orphan_cold_segments_v1(crate::ColdSegmentGcOptionsV1 {
                 dry_run: true,

@@ -39,8 +39,7 @@ impl ToolingEnvironment {
         }
 
         match std::env::var("CORECRUXCTL_ENV") {
-            Ok(raw) => Self::parse(&raw)
-                .ok_or_else(|| format!("invalid CORECRUXCTL_ENV value '{raw}'").into()),
+            Ok(raw) => Self::parse(&raw).ok_or_else(|| format!("invalid CORECRUXCTL_ENV value '{raw}'").into()),
             Err(std::env::VarError::NotPresent) => Ok(Self::Local),
             Err(err) => Err(format!("failed to read CORECRUXCTL_ENV: {err}").into()),
         }
@@ -70,14 +69,8 @@ mod tests {
 
     #[test]
     fn parse_case_insensitive() {
-        assert_eq!(
-            ToolingEnvironment::parse("LOCAL"),
-            Some(ToolingEnvironment::Local)
-        );
-        assert_eq!(
-            ToolingEnvironment::parse("Staging"),
-            Some(ToolingEnvironment::Staging)
-        );
+        assert_eq!(ToolingEnvironment::parse("LOCAL"), Some(ToolingEnvironment::Local));
+        assert_eq!(ToolingEnvironment::parse("Staging"), Some(ToolingEnvironment::Staging));
         assert_eq!(
             ToolingEnvironment::parse("  PRODUCTION  "),
             Some(ToolingEnvironment::Production)
@@ -94,8 +87,7 @@ mod tests {
     #[test]
     fn resolve_uses_explicit_over_env() {
         // Explicit value should always win regardless of env var
-        let result =
-            ToolingEnvironment::resolve(Some(ToolingEnvironment::Production)).unwrap();
+        let result = ToolingEnvironment::resolve(Some(ToolingEnvironment::Production)).unwrap();
         assert_eq!(result, ToolingEnvironment::Production);
     }
 

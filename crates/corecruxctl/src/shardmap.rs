@@ -9,9 +9,8 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt as _;
 
 use corecrux_types::{
-    compute_shard_map_v1_blake3_hex, format_u64_hex, parse_shard_id_u32, parse_u64_hex,
-    validate_shard_map_v1, HashRange, NodeAddr, ShardDescriptor, ShardMapV1, ShardState,
-    SHARDMAP_HASH_FN_V1, SHARDMAP_KEY_ENCODING_V1,
+    compute_shard_map_v1_blake3_hex, format_u64_hex, parse_shard_id_u32, parse_u64_hex, validate_shard_map_v1,
+    HashRange, NodeAddr, ShardDescriptor, ShardMapV1, ShardState, SHARDMAP_HASH_FN_V1, SHARDMAP_KEY_ENCODING_V1,
 };
 
 pub fn init_dev_shard_map_v1(
@@ -40,8 +39,7 @@ pub fn init_dev_shard_map_v1(
             (step * ((i + 1) as u128)) as u64
         };
 
-        let data_dir =
-            data_dir.map(|root| root.join("shards").join(&shard_id).display().to_string());
+        let data_dir = data_dir.map(|root| root.join("shards").join(&shard_id).display().to_string());
 
         shards.push(ShardDescriptor {
             shard_id,
@@ -88,13 +86,11 @@ pub fn split_shard_map_v1(
 
     let at = parse_u64_hex(at_hex)?;
 
-    let target_idx = out
-        .shards
-        .iter()
-        .position(|s| s.shard_id == shard_id)
-        .ok_or_else(|| corecrux_types::ShardMapError::Invalid {
+    let target_idx = out.shards.iter().position(|s| s.shard_id == shard_id).ok_or_else(|| {
+        corecrux_types::ShardMapError::Invalid {
             msg: format!("unknown shardId '{shard_id}'"),
-        })?;
+        }
+    })?;
 
     // Allocate new shardId if not provided.
     let mut max_id: u32 = 0;
@@ -103,8 +99,7 @@ pub fn split_shard_map_v1(
             max_id = max_id.max(n);
         }
     }
-    let new_shard_id =
-        new_shard_id.unwrap_or_else(|| format!("shard-{max_id_plus:04}", max_id_plus = max_id + 1));
+    let new_shard_id = new_shard_id.unwrap_or_else(|| format!("shard-{max_id_plus:04}", max_id_plus = max_id + 1));
 
     // Determine split range and snapshot target metadata before taking a mutable borrow.
     let (split_range_idx, old_end) = {
@@ -125,9 +120,7 @@ pub fn split_shard_map_v1(
         }
         let Some(i) = split_idx else {
             return Err(corecrux_types::ShardMapError::Invalid {
-                msg: format!(
-                    "no splittable non-wrap range found in shard '{shard_id}' for at={at_hex}"
-                ),
+                msg: format!("no splittable non-wrap range found in shard '{shard_id}' for at={at_hex}"),
             });
         };
         (i, old_end)
@@ -209,8 +202,7 @@ pub fn set_shard_gpu_id_v1(
 
 pub fn read_shard_map_v1(path: &Path) -> std::io::Result<ShardMapV1> {
     let bytes = std::fs::read(path)?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    serde_json::from_slice(&bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
 pub fn write_shard_map_v1(path: &Path, map: &ShardMapV1) -> std::io::Result<()> {
@@ -224,8 +216,7 @@ pub fn write_shard_map_v1(path: &Path, map: &ShardMapV1) -> std::io::Result<()> 
 }
 
 pub fn publish_shard_map_v1(data_dir: &Path, map: &ShardMapV1) -> std::io::Result<()> {
-    validate_shard_map_v1(map)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
+    validate_shard_map_v1(map).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
 
     let routing_dir = data_dir.join("meta").join("routing");
     let tmp_dir = routing_dir.join("tmp");
@@ -297,11 +288,7 @@ fn write_new_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
     }
-    let mut f = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)?;
+    let mut f = OpenOptions::new().create(true).truncate(true).write(true).open(path)?;
     f.write_all(bytes)?;
     f.flush()?;
     f.sync_all()?;
@@ -337,15 +324,7 @@ mod tests {
 
     #[test]
     fn init_dev_shard_map_single_shard_covers_full_ring() {
-        let map = init_dev_shard_map_v1(
-            1,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map = init_dev_shard_map_v1(1, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         assert_eq!(map.v, 1);
         assert_eq!(map.version, 1);
         assert_eq!(map.cluster_id, "dev");
@@ -365,15 +344,7 @@ mod tests {
 
     #[test]
     fn init_dev_shard_map_multiple_shards_partition_ring() {
-        let map = init_dev_shard_map_v1(
-            4,
-            "test-cluster",
-            "node-1",
-            "10.0.0.1:4006",
-            "10.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map = init_dev_shard_map_v1(4, "test-cluster", "node-1", "10.0.0.1:4006", "10.0.0.1:4007", None).unwrap();
         assert_eq!(map.shards.len(), 4);
         for (i, s) in map.shards.iter().enumerate() {
             assert_eq!(s.shard_id, format!("shard-{:04}", i + 1));
@@ -383,10 +354,7 @@ mod tests {
         // First shard starts at 0.
         assert_eq!(map.shards[0].ranges[0].start_inclusive, "0x0000000000000000");
         // Last shard wraps to 0.
-        assert_eq!(
-            map.shards[3].ranges[0].end_exclusive,
-            "0x0000000000000000"
-        );
+        assert_eq!(map.shards[3].ranges[0].end_exclusive, "0x0000000000000000");
         // Validation passes.
         validate_shard_map_v1(&map).unwrap();
     }
@@ -414,15 +382,7 @@ mod tests {
 
     #[test]
     fn init_dev_shard_map_zero_count_becomes_one() {
-        let map = init_dev_shard_map_v1(
-            0,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map = init_dev_shard_map_v1(0, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         assert_eq!(map.shards.len(), 1);
     }
 
@@ -449,14 +409,8 @@ mod tests {
             .iter()
             .find(|s| s.shard_id == "shard-0003")
             .expect("new shard exists");
-        assert_eq!(
-            new_shard.ranges[0].start_inclusive,
-            "0x4000000000000000"
-        );
-        assert_eq!(
-            new_shard.ranges[0].end_exclusive,
-            "0x8000000000000000"
-        );
+        assert_eq!(new_shard.ranges[0].start_inclusive, "0x4000000000000000");
+        assert_eq!(new_shard.ranges[0].end_exclusive, "0x8000000000000000");
         // New shard inherits data_dir in correct location.
         assert!(new_shard.data_dir.as_ref().unwrap().contains("shard-0003"));
         validate_shard_map_v1(&split).unwrap();
@@ -464,15 +418,7 @@ mod tests {
 
     #[test]
     fn split_shard_map_custom_new_shard_id() {
-        let two = init_dev_shard_map_v1(
-            2,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let two = init_dev_shard_map_v1(2, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         let split = split_shard_map_v1(
             &two,
             "shard-0001",
@@ -480,23 +426,12 @@ mod tests {
             Some("custom-shard".to_string()),
         )
         .unwrap();
-        assert!(split
-            .shards
-            .iter()
-            .any(|s| s.shard_id == "custom-shard"));
+        assert!(split.shards.iter().any(|s| s.shard_id == "custom-shard"));
     }
 
     #[test]
     fn split_shard_map_unknown_shard_returns_error() {
-        let map = init_dev_shard_map_v1(
-            2,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map = init_dev_shard_map_v1(2, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         let result = split_shard_map_v1(&map, "nonexistent", "0x4000000000000000", None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -505,32 +440,15 @@ mod tests {
 
     #[test]
     fn split_shard_map_out_of_range_returns_error() {
-        let two = init_dev_shard_map_v1(
-            2,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let two = init_dev_shard_map_v1(2, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         // shard-0001 range is [0, 0x8000000000000000). 0xF... is out of this range.
-        let result =
-            split_shard_map_v1(&two, "shard-0001", "0xF000000000000000", None);
+        let result = split_shard_map_v1(&two, "shard-0001", "0xF000000000000000", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn set_gpu_unknown_shard_returns_error() {
-        let map = init_dev_shard_map_v1(
-            1,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map = init_dev_shard_map_v1(1, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         let result = set_shard_gpu_id_v1(&map, "nonexistent", 0);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("nonexistent"));
@@ -538,15 +456,7 @@ mod tests {
 
     #[test]
     fn set_gpu_negative_returns_error() {
-        let map = init_dev_shard_map_v1(
-            1,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map = init_dev_shard_map_v1(1, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         let result = set_shard_gpu_id_v1(&map, "shard-0001", -1);
         assert!(result.is_err());
     }
@@ -555,15 +465,7 @@ mod tests {
     fn write_and_read_shard_map_round_trip() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("shard-map.json");
-        let map = init_dev_shard_map_v1(
-            2,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map = init_dev_shard_map_v1(2, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         write_shard_map_v1(&path, &map).unwrap();
         let loaded = read_shard_map_v1(&path).unwrap();
         assert_eq!(loaded.blake3, map.blake3);
@@ -575,15 +477,7 @@ mod tests {
     fn publish_shard_map_writes_versioned_file_and_current() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path();
-        let map = init_dev_shard_map_v1(
-            2,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map = init_dev_shard_map_v1(2, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         publish_shard_map_v1(data_dir, &map).unwrap();
         let routing_dir = data_dir.join("meta").join("routing");
         let versioned = routing_dir.join("shardmap.v00000001.json");
@@ -598,15 +492,7 @@ mod tests {
     fn publish_shard_map_rejects_wrong_version() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path();
-        let mut map = init_dev_shard_map_v1(
-            2,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let mut map = init_dev_shard_map_v1(2, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         // Version 1 should succeed, version 3 (skipping 2) should fail.
         publish_shard_map_v1(data_dir, &map).unwrap();
         map.version = 3;
@@ -619,15 +505,7 @@ mod tests {
 
     #[test]
     fn set_gpu_bumps_version_and_sets_prev_hash() {
-        let map = init_dev_shard_map_v1(
-            2,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map = init_dev_shard_map_v1(2, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         assert_eq!(map.version, 1);
         assert!(map.prev_blake3.is_none());
         assert!(map.blake3.len() >= 16);
@@ -636,11 +514,7 @@ mod tests {
         assert_eq!(out.version, 2);
         assert_eq!(out.prev_blake3.as_deref(), Some(map.blake3.as_str()));
 
-        let shard = out
-            .shards
-            .iter()
-            .find(|s| s.shard_id == "shard-0001")
-            .unwrap();
+        let shard = out.shards.iter().find(|s| s.shard_id == "shard-0001").unwrap();
         assert_eq!(shard.gpu_id, Some(1));
 
         validate_shard_map_v1(&out).unwrap();

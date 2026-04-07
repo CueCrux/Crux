@@ -12,20 +12,19 @@ use corecrux_segment::decode_frame_v1;
 use corecrux_storage::{ReplayCursor, ReplayFrames, ShardStorage};
 
 use crate::ccxs::{
-    CcxsProjectionId, CcxsSnapshot, CcxsSnapshotHeaderV1, CCXS_BLOCK_COLD_SEGMENT_DIR_V1,
-    CCXS_BLOCK_EDGES_V1, CCXS_BLOCK_EVENTS_V1, CCXS_BLOCK_HOT_PTRS_V1, CCXS_BLOCK_ROWS_V1,
-    CCXS_CODEC_NONE,
+    CcxsProjectionId, CcxsSnapshot, CcxsSnapshotHeaderV1, CCXS_BLOCK_COLD_SEGMENT_DIR_V1, CCXS_BLOCK_EDGES_V1,
+    CCXS_BLOCK_EVENTS_V1, CCXS_BLOCK_HOT_PTRS_V1, CCXS_BLOCK_ROWS_V1, CCXS_CODEC_NONE,
 };
 use crate::codec_v1::{
     decode_dependents_edges_v1, decode_hot_ptrs_v1, decode_living_rows_v1, decode_pressure_rows_v1,
-    decode_relations_edges_v1, encode_dependents_edges_for_artifact_v1, encode_hot_ptrs_v1,
-    encode_living_rows_v1, encode_pressure_rows_v1, encode_relations_edges_for_src_v1,
-    HotPtrEntryV1, DEPENDENT_EDGE_STRIDE_V1, RELATION_EDGE_STRIDE_V1,
+    decode_relations_edges_v1, encode_dependents_edges_for_artifact_v1, encode_hot_ptrs_v1, encode_living_rows_v1,
+    encode_pressure_rows_v1, encode_relations_edges_for_src_v1, HotPtrEntryV1, DEPENDENT_EDGE_STRIDE_V1,
+    RELATION_EDGE_STRIDE_V1,
 };
 use crate::cold_segment_v1::{
-    build_cold_segment_v1, cold_segment_path_v1, decode_cold_segment_dir_v1,
-    encode_cold_segment_dir_v1, read_and_verify_cold_segment_index_v1, read_cold_segment_block_v1,
-    ColdBlockLocV1, ColdSegmentDirEntryV1, ColdSegmentIndexEntryV1,
+    build_cold_segment_v1, cold_segment_path_v1, decode_cold_segment_dir_v1, encode_cold_segment_dir_v1,
+    read_and_verify_cold_segment_index_v1, read_cold_segment_block_v1, ColdBlockLocV1, ColdSegmentDirEntryV1,
+    ColdSegmentIndexEntryV1,
 };
 use crate::events::{parse_projection_event, ProjectionEventV1};
 use crate::meta::{load_projections_meta_v1, store_projections_meta_v1, ProjectionCursorV1};
@@ -173,9 +172,7 @@ impl ProjectionStoreV1 {
                     if CcxsSnapshot::snapshot_blake3_hex(&bytes) == h {
                         match CcxsSnapshot::decode(&bytes) {
                             Ok(snap) => {
-                                if let Some((_, block)) =
-                                    snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_ROWS_V1)
-                                {
+                                if let Some((_, block)) = snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_ROWS_V1) {
                                     if let Ok(rows) = decode_living_rows_v1(block) {
                                         state.living = rows;
                                     } else {
@@ -219,18 +216,13 @@ impl ProjectionStoreV1 {
                                     }
                                 }
                                 2 => {
-                                    if let Some((_, block)) = snap
-                                        .blocks
-                                        .iter()
-                                        .find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1)
+                                    if let Some((_, block)) =
+                                        snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1)
                                     {
                                         match decode_hot_ptrs_v1(block) {
                                             Ok(ptrs) => {
                                                 relations_hot_ptrs = ptrs;
-                                                match load_relations_from_cold_blocks(
-                                                    &files,
-                                                    &relations_hot_ptrs,
-                                                ) {
+                                                match load_relations_from_cold_blocks(&files, &relations_hot_ptrs) {
                                                     Ok(edges) => state.relations = edges,
                                                     Err(_) => ok = false,
                                                 }
@@ -243,17 +235,10 @@ impl ProjectionStoreV1 {
                                 }
                                 3 => {
                                     if let (Some((_, hot_block)), Some((_, dir_block))) = (
-                                        snap.blocks
-                                            .iter()
-                                            .find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1),
-                                        snap.blocks
-                                            .iter()
-                                            .find(|(t, _)| *t == CCXS_BLOCK_COLD_SEGMENT_DIR_V1),
+                                        snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1),
+                                        snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_COLD_SEGMENT_DIR_V1),
                                     ) {
-                                        match (
-                                            decode_hot_ptrs_v1(hot_block),
-                                            decode_cold_segment_dir_v1(dir_block),
-                                        ) {
+                                        match (decode_hot_ptrs_v1(hot_block), decode_cold_segment_dir_v1(dir_block)) {
                                             (Ok(ptrs), Ok(dir)) => {
                                                 relations_hot_ptrs = ptrs;
                                                 match load_cold_segment_indexes(
@@ -283,10 +268,7 @@ impl ProjectionStoreV1 {
                                 }
                                 other => {
                                     return Err(ProjectionError::InvalidEvent {
-                                        msg: format!(
-                                            "unsupported relations schema_version {}",
-                                            other
-                                        ),
+                                        msg: format!("unsupported relations schema_version {}", other),
                                     });
                                 }
                             },
@@ -324,18 +306,13 @@ impl ProjectionStoreV1 {
                                     }
                                 }
                                 2 => {
-                                    if let Some((_, block)) = snap
-                                        .blocks
-                                        .iter()
-                                        .find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1)
+                                    if let Some((_, block)) =
+                                        snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1)
                                     {
                                         match decode_hot_ptrs_v1(block) {
                                             Ok(ptrs) => {
                                                 dependents_hot_ptrs = ptrs;
-                                                match load_dependents_from_cold_blocks(
-                                                    &files,
-                                                    &dependents_hot_ptrs,
-                                                ) {
+                                                match load_dependents_from_cold_blocks(&files, &dependents_hot_ptrs) {
                                                     Ok(edges) => state.dependents = edges,
                                                     Err(_) => ok = false,
                                                 }
@@ -348,17 +325,10 @@ impl ProjectionStoreV1 {
                                 }
                                 3 => {
                                     if let (Some((_, hot_block)), Some((_, dir_block))) = (
-                                        snap.blocks
-                                            .iter()
-                                            .find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1),
-                                        snap.blocks
-                                            .iter()
-                                            .find(|(t, _)| *t == CCXS_BLOCK_COLD_SEGMENT_DIR_V1),
+                                        snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_HOT_PTRS_V1),
+                                        snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_COLD_SEGMENT_DIR_V1),
                                     ) {
-                                        match (
-                                            decode_hot_ptrs_v1(hot_block),
-                                            decode_cold_segment_dir_v1(dir_block),
-                                        ) {
+                                        match (decode_hot_ptrs_v1(hot_block), decode_cold_segment_dir_v1(dir_block)) {
                                             (Ok(ptrs), Ok(dir)) => {
                                                 dependents_hot_ptrs = ptrs;
                                                 match load_cold_segment_indexes(
@@ -388,10 +358,7 @@ impl ProjectionStoreV1 {
                                 }
                                 other => {
                                     return Err(ProjectionError::InvalidEvent {
-                                        msg: format!(
-                                            "unsupported dependents schema_version {}",
-                                            other
-                                        ),
+                                        msg: format!("unsupported dependents schema_version {}", other),
                                     });
                                 }
                             },
@@ -415,9 +382,7 @@ impl ProjectionStoreV1 {
                     if CcxsSnapshot::snapshot_blake3_hex(&bytes) == h {
                         match CcxsSnapshot::decode(&bytes) {
                             Ok(snap) => {
-                                if let Some((_, block)) =
-                                    snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_EVENTS_V1)
-                                {
+                                if let Some((_, block)) = snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_EVENTS_V1) {
                                     if let Ok(rows) = decode_pressure_rows_v1(block) {
                                         state.pressure = rows;
                                     } else {
@@ -466,14 +431,10 @@ impl ProjectionStoreV1 {
     }
 
     fn cursor_from_meta(&self) -> Option<ReplayCursor> {
-        self.meta
-            .artifact_living_state
-            .cursor
-            .as_ref()
-            .map(|c| ReplayCursor {
-                segment_seq: c.segment_seq,
-                offset: c.offset,
-            })
+        self.meta.artifact_living_state.cursor.as_ref().map(|c| ReplayCursor {
+            segment_seq: c.segment_seq,
+            offset: c.offset,
+        })
     }
 
     fn cursor_v1_from_replay(&self, c: ReplayCursor) -> ProjectionCursorV1 {
@@ -485,14 +446,9 @@ impl ProjectionStoreV1 {
         }
     }
 
-    pub fn tick(
-        &mut self,
-        storage: &ShardStorage,
-        max_frames: u32,
-    ) -> Result<Option<ProjectionsTickResultV1>> {
+    pub fn tick(&mut self, storage: &ShardStorage, max_frames: u32) -> Result<Option<ProjectionsTickResultV1>> {
         let cursor_before = self.meta.artifact_living_state.cursor.clone();
-        let (frames, end_cursor) =
-            storage.replay_from_sealed(self.cursor_from_meta(), max_frames)?;
+        let (frames, end_cursor) = storage.replay_from_sealed(self.cursor_from_meta(), max_frames)?;
         if frames.is_empty() {
             return Ok(None);
         }
@@ -505,9 +461,7 @@ impl ProjectionStoreV1 {
             if let Some((tenant_hash, event_type, content_type, payload_bytes)) =
                 decode_frame_projection_inputs(frame_bytes)?
             {
-                if let Some(ev) =
-                    parse_projection_event(&event_type, &content_type, &payload_bytes)?
-                {
+                if let Some(ev) = parse_projection_event(&event_type, &content_type, &payload_bytes)? {
                     match &ev {
                         ProjectionEventV1::RelationUpsert(p) => {
                             touched_relations.insert((tenant_hash, p.src_artifact_id));
@@ -583,9 +537,7 @@ impl ProjectionStoreV1 {
                 if let Some((tenant_hash, event_type, content_type, payload_bytes)) =
                     decode_frame_projection_inputs(frame_bytes)?
                 {
-                    if let Some(ev) =
-                        parse_projection_event(&event_type, &content_type, &payload_bytes)?
-                    {
+                    if let Some(ev) = parse_projection_event(&event_type, &content_type, &payload_bytes)? {
                         let _ = self.state.apply(tenant_hash, ev);
                     }
                 }
@@ -737,8 +689,7 @@ impl ProjectionStoreV1 {
 
         // Finally: projections.meta.json (source of truth).
         self.meta.commit_id = self.meta.commit_id.saturating_add(1);
-        self.meta.created_at =
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.meta.created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         self.meta.artifact_living_state.schema_version = 1;
         self.meta.artifact_relations.schema_version = 3;
@@ -794,8 +745,7 @@ impl ProjectionStoreV1 {
         }
 
         for (tenant_hash, src) in keys {
-            let bytes =
-                encode_relations_edges_for_src_v1(&self.state.relations, tenant_hash, src);
+            let bytes = encode_relations_edges_for_src_v1(&self.state.relations, tenant_hash, src);
             if bytes.is_empty() {
                 self.relations_hot_ptrs.remove(&(tenant_hash, src));
                 continue;
@@ -848,11 +798,7 @@ impl ProjectionStoreV1 {
         }
 
         for (tenant_hash, artifact_id) in keys {
-            let bytes = encode_dependents_edges_for_artifact_v1(
-                &self.state.dependents,
-                tenant_hash,
-                artifact_id,
-            );
+            let bytes = encode_dependents_edges_for_artifact_v1(&self.state.dependents, tenant_hash, artifact_id);
             if bytes.is_empty() {
                 self.dependents_hot_ptrs.remove(&(tenant_hash, artifact_id));
                 continue;
@@ -869,8 +815,7 @@ impl ProjectionStoreV1 {
             if !self.dependents_block_locs.contains_key(&entry.blake3) {
                 blocks_to_write.insert(entry.blake3, bytes);
             }
-            self.dependents_hot_ptrs
-                .insert((tenant_hash, artifact_id), entry);
+            self.dependents_hot_ptrs.insert((tenant_hash, artifact_id), entry);
         }
 
         write_cold_segments_for_blocks(
@@ -882,10 +827,7 @@ impl ProjectionStoreV1 {
         Ok(())
     }
 
-    pub fn gc_orphan_cold_segments_v1(
-        &mut self,
-        opts: ColdSegmentGcOptionsV1,
-    ) -> Result<ColdSegmentGcReportV1> {
+    pub fn gc_orphan_cold_segments_v1(&mut self, opts: ColdSegmentGcOptionsV1) -> Result<ColdSegmentGcReportV1> {
         let rel_reachable = reachable_cold_segments_from_snapshot_v1(
             &self.files.relations_snapshot_path,
             self.meta.artifact_relations.schema_version,
@@ -913,8 +855,7 @@ impl ProjectionStoreV1 {
         )?;
 
         if !rel_deleted.is_empty() {
-            self.relations_cold_segments
-                .retain(|seg, _| !rel_deleted.contains(seg));
+            self.relations_cold_segments.retain(|seg, _| !rel_deleted.contains(seg));
             self.relations_block_locs
                 .retain(|_block, loc| !rel_deleted.contains(&loc.segment_blake3));
         }
@@ -927,21 +868,17 @@ impl ProjectionStoreV1 {
 
         // Safety: ensure current hot pointers still resolve to block locations after GC.
         for p in self.relations_hot_ptrs.values() {
-            if self.meta.artifact_relations.schema_version >= 3
-                && !self.relations_block_locs.contains_key(&p.blake3)
-            {
+            if self.meta.artifact_relations.schema_version >= 3 && !self.relations_block_locs.contains_key(&p.blake3) {
                 return Err(ProjectionError::InvalidEvent {
                     msg: "relations hot ptr references missing cold block loc after GC".to_string(),
                 });
             }
         }
         for p in self.dependents_hot_ptrs.values() {
-            if self.meta.artifact_dependents.schema_version >= 3
-                && !self.dependents_block_locs.contains_key(&p.blake3)
+            if self.meta.artifact_dependents.schema_version >= 3 && !self.dependents_block_locs.contains_key(&p.blake3)
             {
                 return Err(ProjectionError::InvalidEvent {
-                    msg: "dependents hot ptr references missing cold block loc after GC"
-                        .to_string(),
+                    msg: "dependents hot ptr references missing cold block loc after GC".to_string(),
                 });
             }
         }
@@ -975,20 +912,14 @@ fn fsync_dir(path: &Path) -> std::io::Result<()> {
 
 const COLD_SEGMENT_MAX_BYTES_V1: usize = 64 * 1024 * 1024;
 
-fn ensure_cold_segment_written(
-    segments_dir: &Path,
-    segment_blake3: &[u8; 32],
-    bytes: &[u8],
-) -> Result<PathBuf> {
+fn ensure_cold_segment_written(segments_dir: &Path, segment_blake3: &[u8; 32], bytes: &[u8]) -> Result<PathBuf> {
     let final_path = cold_segment_path_v1(segments_dir, segment_blake3);
     if final_path.exists() {
         return Ok(final_path);
     }
-    let parent = final_path
-        .parent()
-        .ok_or_else(|| ProjectionError::InvalidEvent {
-            msg: "cold segment path missing parent".to_string(),
-        })?;
+    let parent = final_path.parent().ok_or_else(|| ProjectionError::InvalidEvent {
+        msg: "cold segment path missing parent".to_string(),
+    })?;
     std::fs::create_dir_all(parent)?;
 
     // Write to a temp path in the same directory, then rename into place. This avoids producing
@@ -1035,11 +966,7 @@ fn write_cold_segments_for_blocks(
             return Ok(());
         }
         let (seg_bytes, seg_blake3, index_entries) = build_cold_segment_v1(cur);
-        let _path = ensure_cold_segment_written(
-            segments_dir,
-            &seg_blake3,
-            &seg_bytes,
-        )?;
+        let _path = ensure_cold_segment_written(segments_dir, &seg_blake3, &seg_bytes)?;
 
         segs_out.insert(seg_blake3, seg_bytes.len() as u64);
         for ColdSegmentIndexEntryV1 {
@@ -1082,10 +1009,7 @@ fn write_cold_segments_for_blocks(
     Ok(())
 }
 
-fn load_cold_segment_indexes(
-    segments_dir: &Path,
-    dir: &[ColdSegmentDirEntryV1],
-) -> Result<ColdSegmentMapsV1> {
+fn load_cold_segment_indexes(segments_dir: &Path, dir: &[ColdSegmentDirEntryV1]) -> Result<ColdSegmentMapsV1> {
     let mut segs: BTreeMap<[u8; 32], u64> = BTreeMap::new();
     let mut locs: BTreeMap<[u8; 32], ColdBlockLocV1> = BTreeMap::new();
 
@@ -1096,8 +1020,7 @@ fn load_cold_segment_indexes(
             });
         }
         let path = cold_segment_path_v1(segments_dir, &e.segment_blake3);
-        let (_hdr, idx) =
-            read_and_verify_cold_segment_index_v1(&path, &e.segment_blake3, e.file_len)?;
+        let (_hdr, idx) = read_and_verify_cold_segment_index_v1(&path, &e.segment_blake3, e.file_len)?;
         for it in idx {
             if it.codec != 0 {
                 return Err(ProjectionError::InvalidEvent {
@@ -1131,17 +1054,16 @@ fn build_reachable_segment_dir(
 ) -> Result<BTreeMap<[u8; 32], u64>> {
     let mut out: BTreeMap<[u8; 32], u64> = BTreeMap::new();
     for p in hot_ptrs.values() {
-        let loc = block_locs
-            .get(&p.blake3)
-            .ok_or_else(|| ProjectionError::InvalidEvent {
-                msg: "hot ptr references missing cold block location".to_string(),
-            })?;
-        let file_len = cold_segments
-            .get(&loc.segment_blake3)
-            .copied()
-            .ok_or_else(|| ProjectionError::InvalidEvent {
-                msg: "cold block location references missing cold segment".to_string(),
-            })?;
+        let loc = block_locs.get(&p.blake3).ok_or_else(|| ProjectionError::InvalidEvent {
+            msg: "hot ptr references missing cold block location".to_string(),
+        })?;
+        let file_len =
+            cold_segments
+                .get(&loc.segment_blake3)
+                .copied()
+                .ok_or_else(|| ProjectionError::InvalidEvent {
+                    msg: "cold block location references missing cold segment".to_string(),
+                })?;
         out.insert(loc.segment_blake3, file_len);
     }
     Ok(out)
@@ -1220,8 +1142,7 @@ fn load_dependents_from_cold_blocks(
         for (k, v) in decoded {
             if k.0 != *tenant_hash || k.1 != *artifact_id {
                 return Err(ProjectionError::InvalidEvent {
-                    msg: "cold dependents block contains wrong tenant_hash/artifact_id keys"
-                        .to_string(),
+                    msg: "cold dependents block contains wrong tenant_hash/artifact_id keys".to_string(),
                 });
             }
             out.insert(k, v);
@@ -1237,18 +1158,15 @@ fn load_relations_from_cold_segments(
 ) -> Result<BTreeMap<(u64, u32, u32, u8), crate::RelationEdgeV1>> {
     let mut out: BTreeMap<(u64, u32, u32, u8), crate::RelationEdgeV1> = BTreeMap::new();
     for ((tenant_hash, src), p) in ptrs {
-        let loc = locs
-            .get(&p.blake3)
-            .ok_or_else(|| ProjectionError::InvalidEvent {
-                msg: "hot ptr references missing cold block loc".to_string(),
-            })?;
+        let loc = locs.get(&p.blake3).ok_or_else(|| ProjectionError::InvalidEvent {
+            msg: "hot ptr references missing cold block loc".to_string(),
+        })?;
         if loc.len != p.block_len {
             return Err(ProjectionError::InvalidEvent {
                 msg: "hot ptr block_len != cold block loc len".to_string(),
             });
         }
-        let seg_path =
-            cold_segment_path_v1(&files.cold_relations_segments_dir, &loc.segment_blake3);
+        let seg_path = cold_segment_path_v1(&files.cold_relations_segments_dir, &loc.segment_blake3);
         let bytes = read_cold_segment_block_v1(&seg_path, loc.offset, loc.len)?;
         let actual = blake3::hash(&bytes);
         if actual.as_bytes() != &p.blake3 {
@@ -1281,18 +1199,15 @@ fn load_dependents_from_cold_segments(
 ) -> Result<BTreeMap<(u64, u32, u8, uuid::Uuid), crate::DependentEdgeV1>> {
     let mut out: BTreeMap<(u64, u32, u8, uuid::Uuid), crate::DependentEdgeV1> = BTreeMap::new();
     for ((tenant_hash, artifact_id), p) in ptrs {
-        let loc = locs
-            .get(&p.blake3)
-            .ok_or_else(|| ProjectionError::InvalidEvent {
-                msg: "hot ptr references missing cold block loc".to_string(),
-            })?;
+        let loc = locs.get(&p.blake3).ok_or_else(|| ProjectionError::InvalidEvent {
+            msg: "hot ptr references missing cold block loc".to_string(),
+        })?;
         if loc.len != p.block_len {
             return Err(ProjectionError::InvalidEvent {
                 msg: "hot ptr block_len != cold block loc len".to_string(),
             });
         }
-        let seg_path =
-            cold_segment_path_v1(&files.cold_dependents_segments_dir, &loc.segment_blake3);
+        let seg_path = cold_segment_path_v1(&files.cold_dependents_segments_dir, &loc.segment_blake3);
         let bytes = read_cold_segment_block_v1(&seg_path, loc.offset, loc.len)?;
         let actual = blake3::hash(&bytes);
         if actual.as_bytes() != &p.blake3 {
@@ -1309,8 +1224,7 @@ fn load_dependents_from_cold_segments(
         for (k, v) in decoded {
             if k.0 != *tenant_hash || k.1 != *artifact_id {
                 return Err(ProjectionError::InvalidEvent {
-                    msg: "cold dependents block contains wrong tenant_hash/artifact_id keys"
-                        .to_string(),
+                    msg: "cold dependents block contains wrong tenant_hash/artifact_id keys".to_string(),
                 });
             }
             out.insert(k, v);
@@ -1353,16 +1267,9 @@ fn reachable_cold_segments_from_snapshot_v1(
     }
 
     let snap = CcxsSnapshot::decode(&bytes)?;
-    let Some((_, dir_block)) = snap
-        .blocks
-        .iter()
-        .find(|(t, _)| *t == CCXS_BLOCK_COLD_SEGMENT_DIR_V1)
-    else {
+    let Some((_, dir_block)) = snap.blocks.iter().find(|(t, _)| *t == CCXS_BLOCK_COLD_SEGMENT_DIR_V1) else {
         return Err(ProjectionError::InvalidEvent {
-            msg: format!(
-                "snapshot missing cold segment dir block at {}",
-                snapshot_path.display()
-            ),
+            msg: format!("snapshot missing cold segment dir block at {}", snapshot_path.display()),
         });
     };
     let dir = decode_cold_segment_dir_v1(dir_block)?;
@@ -1423,11 +1330,7 @@ fn gc_cold_segments_dir_v1(
     let cutoff = if opts.min_age_seconds == 0 {
         None
     } else {
-        Some(
-            std::time::SystemTime::now()
-                .checked_sub(std::time::Duration::from_secs(opts.min_age_seconds)),
-        )
-        .flatten()
+        Some(std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(opts.min_age_seconds))).flatten()
     };
 
     let files = collect_files_recursive_v1(segments_dir)?;
@@ -1548,11 +1451,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
-    let mut f = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp)?;
+    let mut f = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp)?;
     f.write_all(bytes)?;
     f.flush()?;
     f.sync_all()?;
@@ -1579,10 +1478,8 @@ fn decode_frame_projection_inputs(frame_bytes: &[u8]) -> Result<Option<Projectio
     }
     let canonical_len = decoded.header_bytes.len() - 32;
     let canonical = &decoded.header_bytes[..canonical_len];
-    let hdr = decode_canonical_header_bytes_v1(canonical).map_err(|e| {
-        ProjectionError::InvalidFrameHeader {
-            msg: format!("canonical header decode failed: {e}"),
-        }
+    let hdr = decode_canonical_header_bytes_v1(canonical).map_err(|e| ProjectionError::InvalidFrameHeader {
+        msg: format!("canonical header decode failed: {e}"),
     })?;
     let tenant_hash = crate::state::tenant_hash_xxhash64(&hdr.tenant_id);
     Ok(Some((

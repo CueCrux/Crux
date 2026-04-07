@@ -60,7 +60,7 @@ expect_used = "warn"
 panic = "warn"
 print_stdout = "warn"
 print_stderr = "warn"
-missing_docs_in_private_items = "warn"
+missing_docs_in_private_items = "allow"
 
 # ── Allow: pedantic lints too noisy for extracted code ──
 module_name_repetitions = "allow"

@@ -19,9 +19,7 @@ pub fn pressure_code_id_xxhash16(code: &str) -> u16 {
     (h & 0xFFFF) as u16
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LivingStatusV1 {
     Dormant,
@@ -79,9 +77,7 @@ impl LivingStatusV1 {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationTypeV1 {
     Supports,
@@ -150,9 +146,7 @@ impl RelationTypeV1 {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependentTypeV1 {
     Answer,
@@ -271,7 +265,7 @@ pub struct ProjectionApplyStats {
 /// Phase 6: Entity count — tracks unique entity names per (tenant, type, predicate)
 #[derive(Debug, Clone, Default)]
 pub struct EntityCountRowV1 {
-    pub items: BTreeSet<String>,  // deduplicated entity names
+    pub items: BTreeSet<String>, // deduplicated entity names
     pub last_updated_micros: i64,
 }
 
@@ -368,13 +362,19 @@ impl ProjectionState {
             Some(row) => p.occurred_at_micros >= row.occurred_at_micros,
         };
         if should_update {
-            let prev = self.entity_current_state.get(&state_key).map(|r| (r.current_value.clone(), r.occurred_at_micros));
-            self.entity_current_state.insert(state_key, EntityCurrentStateRowV1 {
-                current_value: p.object_value.clone(),
-                occurred_at_micros: p.occurred_at_micros,
-                previous_value: prev.as_ref().map(|(v, _)| v.clone()),
-                previous_occurred_at_micros: prev.map(|(_, t)| t).unwrap_or(0),
-            });
+            let prev = self
+                .entity_current_state
+                .get(&state_key)
+                .map(|r| (r.current_value.clone(), r.occurred_at_micros));
+            self.entity_current_state.insert(
+                state_key,
+                EntityCurrentStateRowV1 {
+                    current_value: p.object_value.clone(),
+                    occurred_at_micros: p.occurred_at_micros,
+                    previous_value: prev.as_ref().map(|(v, _)| v.clone()),
+                    previous_occurred_at_micros: prev.map(|(_, t)| t).unwrap_or(0),
+                },
+            );
         }
     }
 
@@ -406,12 +406,7 @@ impl ProjectionState {
     }
 
     fn apply_relation_upsert(&mut self, tenant_hash: u64, p: &RelationUpsertV1) {
-        let key = (
-            tenant_hash,
-            p.src_artifact_id,
-            p.dst_artifact_id,
-            p.relation_type,
-        );
+        let key = (tenant_hash, p.src_artifact_id, p.dst_artifact_id, p.relation_type);
         let _ = self.ensure_living_row(tenant_hash, p.src_artifact_id);
         let _ = self.ensure_living_row(tenant_hash, p.dst_artifact_id);
         self.relations.insert(
@@ -426,12 +421,7 @@ impl ProjectionState {
     }
 
     fn apply_relation_delete(&mut self, tenant_hash: u64, p: &RelationDeleteV1) {
-        let key = (
-            tenant_hash,
-            p.src_artifact_id,
-            p.dst_artifact_id,
-            p.relation_type,
-        );
+        let key = (tenant_hash, p.src_artifact_id, p.dst_artifact_id, p.relation_type);
         self.relations.remove(&key);
     }
 

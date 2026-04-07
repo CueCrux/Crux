@@ -255,8 +255,7 @@ pub fn read_and_verify_cold_segment_index_v1(
         if let Some(prev) = last_hash {
             if h <= prev {
                 return Err(ProjectionError::InvalidEvent {
-                    msg: "cold segment index entries are not strictly increasing by blake3"
-                        .to_string(),
+                    msg: "cold segment index entries are not strictly increasing by blake3".to_string(),
                 });
             }
         }

@@ -80,8 +80,7 @@ pub fn bm25_score(
             let dl = reader.docs[did].doc_length_tokens as f32;
 
             // BM25 term score
-            let tf_norm = (tf * (params.k1 + 1.0))
-                / (tf + params.k1 * (1.0 - params.b + params.b * dl / avg_dl));
+            let tf_norm = (tf * (params.k1 + 1.0)) / (tf + params.k1 * (1.0 - params.b + params.b * dl / avg_dl));
 
             scores[did] += idf * tf_norm;
         }
@@ -169,8 +168,7 @@ pub fn bm25_score_multi(
 
                 let tf = tfs.get(i).copied().unwrap_or(1) as f32;
                 let dl = reader.docs[did].doc_length_tokens as f32;
-                let tf_norm = (tf * (params.k1 + 1.0))
-                    / (tf + params.k1 * (1.0 - params.b + params.b * dl / avg_dl));
+                let tf_norm = (tf * (params.k1 + 1.0)) / (tf + params.k1 * (1.0 - params.b + params.b * dl / avg_dl));
                 scores[did] += idf * tf_norm;
             }
         }
@@ -303,8 +301,7 @@ pub fn bm25_search(
 
                 let tf = tfs.get(i).copied().unwrap_or(1) as f32;
                 let dl = reader.docs[did].doc_length_tokens as f32;
-                let tf_norm = (tf * (params.k1 + 1.0))
-                    / (tf + params.k1 * (1.0 - params.b + params.b * dl / avg_dl));
+                let tf_norm = (tf * (params.k1 + 1.0)) / (tf + params.k1 * (1.0 - params.b + params.b * dl / avg_dl));
                 scores[did] += idf * tf_norm;
             }
         }
@@ -405,13 +402,7 @@ mod tests {
         let bytes = builder.build();
         let reader = CcxiReader::from_bytes(&bytes).unwrap();
 
-        let hits = bm25_score(
-            &reader,
-            "terraform",
-            5,
-            Some(0xAAAA),
-            &Bm25Params::default(),
-        );
+        let hits = bm25_score(&reader, "terraform", 5, Some(0xAAAA), &Bm25Params::default());
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, 0);
@@ -422,13 +413,7 @@ mod tests {
         let bytes = build_test_index();
         let reader = CcxiReader::from_bytes(&bytes).unwrap();
 
-        let hits = bm25_score(
-            &reader,
-            "quantum entanglement photon",
-            5,
-            None,
-            &Bm25Params::default(),
-        );
+        let hits = bm25_score(&reader, "quantum entanglement photon", 5, None, &Bm25Params::default());
         assert!(hits.is_empty());
     }
 }

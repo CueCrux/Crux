@@ -43,10 +43,7 @@ impl Outbox {
         };
 
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
         let line = serde_json::to_string(&entry)?;
         writeln!(file, "{}", line)?;
 

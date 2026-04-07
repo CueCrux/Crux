@@ -26,13 +26,7 @@ pub fn payload_hash_prefix(payload: &[u8]) -> String {
     digest.chars().take(12).collect()
 }
 
-pub fn emit_command_log(
-    op: &str,
-    outcome: &str,
-    took_ms: u64,
-    error_code: Option<&str>,
-    error_detail: Option<&str>,
-) {
+pub fn emit_command_log(op: &str, outcome: &str, took_ms: u64, error_code: Option<&str>, error_detail: Option<&str>) {
     let event = CommandLogEvent {
         ts: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         level: if outcome == "ok" {

@@ -106,11 +106,7 @@ pub fn store_projections_meta_v1(path: &Path, meta: &ProjectionsMetaV1) -> Resul
 
     let tmp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(meta)?;
-    let mut f = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp)?;
+    let mut f = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp)?;
     f.write_all(&bytes)?;
     f.flush()?;
     f.sync_all()?;

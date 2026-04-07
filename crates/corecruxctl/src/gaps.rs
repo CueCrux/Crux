@@ -52,9 +52,7 @@ pub fn run(data_dir: &str, since: Option<&str>) -> Result<(), Box<dyn std::error
                 if let Ok(bytes) = std::fs::read(&seg_path) {
                     if bytes.len() >= 256 {
                         // total_frames at offset 30 (u32 LE) in header
-                        let total_frames = u32::from_le_bytes([
-                            bytes[30], bytes[31], bytes[32], bytes[33],
-                        ]);
+                        let total_frames = u32::from_le_bytes([bytes[30], bytes[31], bytes[32], bytes[33]]);
                         total_docs += total_frames as usize;
                     }
                 }
@@ -80,12 +78,17 @@ pub fn run(data_dir: &str, since: Option<&str>) -> Result<(), Box<dyn std::error
         0.0
     };
 
-    println!("Index Coverage: {:.1}% ({}/{} segments indexed)",
-        coverage_pct, indexed_segments, total_segments);
+    println!(
+        "Index Coverage: {:.1}% ({}/{} segments indexed)",
+        coverage_pct, indexed_segments, total_segments
+    );
     println!();
 
     if indexed_segments < total_segments {
-        println!("Gap: {} segments lack .ccxi companion indexes.", total_segments - indexed_segments);
+        println!(
+            "Gap: {} segments lack .ccxi companion indexes.",
+            total_segments - indexed_segments
+        );
         println!("     Documents in these segments are not searchable via BM25.");
         println!("     Re-seal with CORECRUXD_BUILD_CCXI=1 to build missing indexes.");
     } else {

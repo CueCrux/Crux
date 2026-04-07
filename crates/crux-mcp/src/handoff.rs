@@ -173,16 +173,16 @@ pub fn accept_handoff(
 
     // 3. Verify Ed25519 signature.
     let pubkey_bytes = B64.decode(&signed.public_key_b64)?;
-    let pubkey_array: [u8; 32] = pubkey_bytes.try_into().map_err(|_| {
-        HandoffError::InvalidPublicKey("public key must be 32 bytes".to_string())
-    })?;
-    let verifying_key = VerifyingKey::from_bytes(&pubkey_array)
-        .map_err(|e| HandoffError::InvalidPublicKey(e.to_string()))?;
+    let pubkey_array: [u8; 32] = pubkey_bytes
+        .try_into()
+        .map_err(|_| HandoffError::InvalidPublicKey("public key must be 32 bytes".to_string()))?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&pubkey_array).map_err(|e| HandoffError::InvalidPublicKey(e.to_string()))?;
 
     let sig_bytes = B64.decode(&signed.signature_b64)?;
-    let sig_array: [u8; 64] = sig_bytes.try_into().map_err(|_| {
-        HandoffError::SignatureInvalid("signature must be 64 bytes".to_string())
-    })?;
+    let sig_array: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| HandoffError::SignatureInvalid("signature must be 64 bytes".to_string()))?;
     let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
 
     verifying_key
@@ -194,7 +194,7 @@ pub fn accept_handoff(
 
     // 5. Load session state.
     let session_loaded = if let Some(state) = package.session_state {
-        session_store.put(&package.session_id, state);
+        session_store.put(&package.session_id, state, None);
         true
     } else {
         false
@@ -234,7 +234,7 @@ mod tests {
 
     fn seed_stores() -> (SessionStore, FactStore) {
         let mut sessions = SessionStore::new();
-        sessions.put("sess_handoff", json!({"step": 3, "notes": "in progress"}));
+        sessions.put("sess_handoff", json!({"step": 3, "notes": "in progress"}), None);
 
         let mut facts = FactStore::new();
         facts.store(StoreFact {
@@ -278,22 +278,15 @@ mod tests {
         let mut recv_sessions = SessionStore::new();
         let mut recv_facts = FactStore::new();
 
-        let result = accept_handoff(
-            &mut recv_sessions,
-            &mut recv_facts,
-            &signed,
-            "agent-beta",
-        )
-        .expect("accept_handoff should succeed");
+        let result = accept_handoff(&mut recv_sessions, &mut recv_facts, &signed, "agent-beta")
+            .expect("accept_handoff should succeed");
 
         assert!(result.session_loaded);
         assert_eq!(result.facts_loaded, 2);
         assert!(result.verified);
 
         // Verify session was loaded.
-        let loaded = recv_sessions
-            .get("sess_handoff")
-            .expect("session should exist");
+        let loaded = recv_sessions.get("sess_handoff").expect("session should exist");
         assert_eq!(loaded.state["step"], 3);
 
         // Verify facts were loaded.
@@ -304,15 +297,8 @@ mod tests {
     fn tampered_payload_rejected() {
         let (sessions, facts) = seed_stores();
 
-        let mut signed = create_handoff(
-            &sessions,
-            &facts,
-            "sess_handoff",
-            true,
-            "agent-alpha",
-            None,
-        )
-        .expect("create_handoff should succeed");
+        let mut signed = create_handoff(&sessions, &facts, "sess_handoff", true, "agent-alpha", None)
+            .expect("create_handoff should succeed");
 
         // Tamper with the payload.
         signed.payload_b64 = B64.encode(b"tampered payload data");
@@ -320,13 +306,8 @@ mod tests {
         let mut recv_sessions = SessionStore::new();
         let mut recv_facts = FactStore::new();
 
-        let err = accept_handoff(
-            &mut recv_sessions,
-            &mut recv_facts,
-            &signed,
-            "agent-beta",
-        )
-        .expect_err("should reject tampered payload");
+        let err = accept_handoff(&mut recv_sessions, &mut recv_facts, &signed, "agent-beta")
+            .expect_err("should reject tampered payload");
 
         assert!(
             matches!(err, HandoffError::HashMismatch { .. }),
@@ -338,15 +319,8 @@ mod tests {
     fn wrong_signature_rejected() {
         let (sessions, facts) = seed_stores();
 
-        let signed = create_handoff(
-            &sessions,
-            &facts,
-            "sess_handoff",
-            true,
-            "agent-alpha",
-            None,
-        )
-        .expect("create_handoff should succeed");
+        let signed = create_handoff(&sessions, &facts, "sess_handoff", true, "agent-alpha", None)
+            .expect("create_handoff should succeed");
 
         // Create a different keypair and re-sign the same hash.
         let other_key = SigningKey::generate(&mut OsRng);
@@ -362,13 +336,8 @@ mod tests {
         let mut recv_sessions = SessionStore::new();
         let mut recv_facts = FactStore::new();
 
-        let err = accept_handoff(
-            &mut recv_sessions,
-            &mut recv_facts,
-            &bad_signed,
-            "agent-beta",
-        )
-        .expect_err("should reject bad signature");
+        let err = accept_handoff(&mut recv_sessions, &mut recv_facts, &bad_signed, "agent-beta")
+            .expect_err("should reject bad signature");
 
         assert!(
             matches!(err, HandoffError::SignatureInvalid(_)),
@@ -393,13 +362,8 @@ mod tests {
         let mut recv_sessions = SessionStore::new();
         let mut recv_facts = FactStore::new();
 
-        let result = accept_handoff(
-            &mut recv_sessions,
-            &mut recv_facts,
-            &signed,
-            "agent-beta",
-        )
-        .expect("accept_handoff should succeed");
+        let result = accept_handoff(&mut recv_sessions, &mut recv_facts, &signed, "agent-beta")
+            .expect("accept_handoff should succeed");
 
         assert!(result.session_loaded);
         assert_eq!(result.facts_loaded, 0);
@@ -411,26 +375,14 @@ mod tests {
         let sessions = SessionStore::new(); // empty
         let facts = FactStore::new();
 
-        let signed = create_handoff(
-            &sessions,
-            &facts,
-            "no_such_session",
-            false,
-            "agent-alpha",
-            None,
-        )
-        .expect("create_handoff should succeed even without session");
+        let signed = create_handoff(&sessions, &facts, "no_such_session", false, "agent-alpha", None)
+            .expect("create_handoff should succeed even without session");
 
         let mut recv_sessions = SessionStore::new();
         let mut recv_facts = FactStore::new();
 
-        let result = accept_handoff(
-            &mut recv_sessions,
-            &mut recv_facts,
-            &signed,
-            "agent-beta",
-        )
-        .expect("accept_handoff should succeed");
+        let result = accept_handoff(&mut recv_sessions, &mut recv_facts, &signed, "agent-beta")
+            .expect("accept_handoff should succeed");
 
         assert!(!result.session_loaded);
         assert_eq!(result.facts_loaded, 0);

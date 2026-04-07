@@ -1,6 +1,23 @@
 # Using Crux as Your Memory & Retrieval Backend
 
-CoreCrux provides agents with append-only event storage, BM25 full-text retrieval, a receipted fact store, session persistence, and multi-agent handoff — all from a single binary on port 14800.
+CoreCrux provides agents with append-only event storage, BM25 full-text retrieval, a receipted fact store, session persistence, and multi-agent handoff — all from a single binary on port 14800 (HTTP) and port 14801 (MCP).
+
+## Your First 3 Calls
+
+New to CoreCrux? Start here:
+
+```
+1. get_bootstrap("patterns")
+   → Learn token reduction, scan-expand, fact memory, and session patterns.
+
+2. store_fact(entity="test", key="hello", value="world")
+   → Store your first fact. Confirm you get a fact_id back.
+
+3. query_facts(query="hello")
+   → Retrieve it. You should see your fact with confidence=1.0.
+```
+
+That's it — you're connected and working. Read on for authentication, tool selection, and advanced patterns.
 
 ## Authentication
 

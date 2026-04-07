@@ -188,11 +188,7 @@ pub struct EvidenceManifestV1 {
     pub artifacts: BTreeMap<String, EvidenceArtifactDescriptorV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relationships: Vec<EvidenceRelationshipV1>,
-    #[serde(
-        rename = "missingCapabilities",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "missingCapabilities", default, skip_serializing_if = "Vec::is_empty")]
     pub missing_capabilities: Vec<String>,
 }
 

@@ -9,9 +9,8 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt as _;
 
 use corecrux_types::{
-    compute_shard_map_v1_blake3_hex, format_u64_hex, parse_u64_hex, validate_shard_map_v1,
-    HashRange, NodeAddr, ShardDescriptor, ShardMapV1, ShardState, SHARDMAP_HASH_FN_V1,
-    SHARDMAP_KEY_ENCODING_V1,
+    compute_shard_map_v1_blake3_hex, format_u64_hex, parse_u64_hex, validate_shard_map_v1, HashRange, NodeAddr,
+    ShardDescriptor, ShardMapV1, ShardState, SHARDMAP_HASH_FN_V1, SHARDMAP_KEY_ENCODING_V1,
 };
 
 #[derive(Debug, Clone)]
@@ -139,9 +138,7 @@ impl ShardMapStore {
 
     pub fn load_current(&self) -> std::io::Result<LoadedShardMap> {
         let current_version = read_current_version(&self.current_path)?;
-        let path = self
-            .routing_dir
-            .join(format!("shardmap.v{current_version:08}.json"));
+        let path = self.routing_dir.join(format!("shardmap.v{current_version:08}.json"));
         let map = read_shard_map_file(&path)?;
         if map.version != current_version {
             return Err(std::io::Error::new(
@@ -161,8 +158,7 @@ impl ShardMapStore {
     }
 
     pub fn publish(&self, map: &ShardMapV1) -> std::io::Result<()> {
-        validate_shard_map_v1(map)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
+        validate_shard_map_v1(map).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
 
         // Serialize map before locking to keep lock hold time small.
         let bytes = serde_json::to_vec_pretty(map)
@@ -180,12 +176,8 @@ impl ShardMapStore {
         lock_file.lock_exclusive()?;
 
         let version = map.version;
-        let tmp_path = self
-            .tmp_dir
-            .join(format!("shardmap.v{version:08}.json.tmp"));
-        let final_path = self
-            .routing_dir
-            .join(format!("shardmap.v{version:08}.json"));
+        let tmp_path = self.tmp_dir.join(format!("shardmap.v{version:08}.json.tmp"));
+        let final_path = self.routing_dir.join(format!("shardmap.v{version:08}.json"));
 
         write_new_file_atomic(&tmp_path, &bytes)?;
         std::fs::rename(&tmp_path, &final_path)?;
@@ -266,11 +258,7 @@ fn write_new_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
     }
-    let mut f = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)?;
+    let mut f = OpenOptions::new().create(true).truncate(true).write(true).open(path)?;
     f.write_all(bytes)?;
     f.flush()?;
     f.sync_all()?;
@@ -291,8 +279,7 @@ fn read_current_version(path: &Path) -> std::io::Result<u64> {
 
 fn read_shard_map_file(path: &Path) -> std::io::Result<ShardMapV1> {
     let bytes = std::fs::read(path)?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    serde_json::from_slice(&bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
 fn default_dev_shard_map_v1(
@@ -362,8 +349,11 @@ fn default_dev_shard_map_v1(
         blake3: String::new(),
         prev_blake3: None,
     };
-    map.blake3 = compute_shard_map_v1_blake3_hex(&map)
-        .expect("compute shard map v1 blake3 for default dev map");
+    // SAFETY: BLAKE3 hash of a well-formed ShardMapV1 with valid UTF-8 — cannot fail.
+    #[allow(clippy::expect_used)]
+    {
+        map.blake3 = compute_shard_map_v1_blake3_hex(&map).expect("compute shard map v1 blake3 for default dev map");
+    }
     map
 }
 
@@ -484,53 +474,37 @@ mod tests {
 
         // startInclusive routes to that shard.
         assert_eq!(
-            rt.route_stream_hash(0x0000_0000_0000_0000)
-                .unwrap()
-                .shard_id,
+            rt.route_stream_hash(0x0000_0000_0000_0000).unwrap().shard_id,
             "shard-0001"
         );
         assert_eq!(
-            rt.route_stream_hash(0x4000_0000_0000_0000)
-                .unwrap()
-                .shard_id,
+            rt.route_stream_hash(0x4000_0000_0000_0000).unwrap().shard_id,
             "shard-0002"
         );
         assert_eq!(
-            rt.route_stream_hash(0x8000_0000_0000_0000)
-                .unwrap()
-                .shard_id,
+            rt.route_stream_hash(0x8000_0000_0000_0000).unwrap().shard_id,
             "shard-0003"
         );
         assert_eq!(
-            rt.route_stream_hash(0xC000_0000_0000_0000)
-                .unwrap()
-                .shard_id,
+            rt.route_stream_hash(0xC000_0000_0000_0000).unwrap().shard_id,
             "shard-0004"
         );
 
         // endExclusive routes to the next shard.
         assert_eq!(
-            rt.route_stream_hash(0x3FFF_FFFF_FFFF_FFFF)
-                .unwrap()
-                .shard_id,
+            rt.route_stream_hash(0x3FFF_FFFF_FFFF_FFFF).unwrap().shard_id,
             "shard-0001"
         );
         assert_eq!(
-            rt.route_stream_hash(0x7FFF_FFFF_FFFF_FFFF)
-                .unwrap()
-                .shard_id,
+            rt.route_stream_hash(0x7FFF_FFFF_FFFF_FFFF).unwrap().shard_id,
             "shard-0002"
         );
         assert_eq!(
-            rt.route_stream_hash(0xBFFF_FFFF_FFFF_FFFF)
-                .unwrap()
-                .shard_id,
+            rt.route_stream_hash(0xBFFF_FFFF_FFFF_FFFF).unwrap().shard_id,
             "shard-0003"
         );
         assert_eq!(
-            rt.route_stream_hash(0xFFFF_FFFF_FFFF_FFFF)
-                .unwrap()
-                .shard_id,
+            rt.route_stream_hash(0xFFFF_FFFF_FFFF_FFFF).unwrap().shard_id,
             "shard-0004"
         );
     }
@@ -556,8 +530,7 @@ mod tests {
         };
         let rt = RoutingTable::new(loaded).unwrap();
         // Should parse as a valid RFC3339 timestamp
-        chrono::DateTime::parse_from_rfc3339(&rt.loaded_at)
-            .expect("loaded_at should be valid RFC3339");
+        chrono::DateTime::parse_from_rfc3339(&rt.loaded_at).expect("loaded_at should be valid RFC3339");
     }
 
     #[test]
@@ -715,15 +688,7 @@ mod tests {
     fn default_dev_shard_map_single_shard_full_ring() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let routing_dir = tmp.path().join("meta").join("routing");
-        let map = default_dev_shard_map_v1(
-            &routing_dir,
-            "dev",
-            "n1",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            1,
-            None,
-        );
+        let map = default_dev_shard_map_v1(&routing_dir, "dev", "n1", "127.0.0.1:4006", "127.0.0.1:4007", 1, None);
         assert_eq!(map.shards.len(), 1);
         // Single shard should cover [0, 0) = full ring
         assert_eq!(map.shards[0].ranges[0].start_inclusive, format_u64_hex(0));
@@ -736,29 +701,15 @@ mod tests {
             shard_map: map,
         };
         let rt = RoutingTable::new(loaded).unwrap();
-        assert_eq!(
-            rt.route_stream_hash(0).unwrap().shard_id,
-            "shard-0001"
-        );
-        assert_eq!(
-            rt.route_stream_hash(u64::MAX).unwrap().shard_id,
-            "shard-0001"
-        );
+        assert_eq!(rt.route_stream_hash(0).unwrap().shard_id, "shard-0001");
+        assert_eq!(rt.route_stream_hash(u64::MAX).unwrap().shard_id, "shard-0001");
     }
 
     #[test]
     fn default_dev_shard_map_zero_shards_clamped_to_one() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let routing_dir = tmp.path().join("meta").join("routing");
-        let map = default_dev_shard_map_v1(
-            &routing_dir,
-            "dev",
-            "n1",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            0,
-            None,
-        );
+        let map = default_dev_shard_map_v1(&routing_dir, "dev", "n1", "127.0.0.1:4006", "127.0.0.1:4007", 0, None);
         // shard_count.max(1) clamps 0 to 1
         assert_eq!(map.shards.len(), 1);
     }
@@ -797,21 +748,9 @@ mod tests {
         };
         let rt = RoutingTable::new(loaded).unwrap();
 
-        assert_eq!(
-            rt.route_stream_hash(0x0000_0000_0000_0000).unwrap().gpu_id,
-            Some(0)
-        );
-        assert_eq!(
-            rt.route_stream_hash(0x4000_0000_0000_0000).unwrap().gpu_id,
-            Some(1)
-        );
-        assert_eq!(
-            rt.route_stream_hash(0x8000_0000_0000_0000).unwrap().gpu_id,
-            None
-        );
-        assert_eq!(
-            rt.route_stream_hash(0xC000_0000_0000_0000).unwrap().gpu_id,
-            Some(2)
-        );
+        assert_eq!(rt.route_stream_hash(0x0000_0000_0000_0000).unwrap().gpu_id, Some(0));
+        assert_eq!(rt.route_stream_hash(0x4000_0000_0000_0000).unwrap().gpu_id, Some(1));
+        assert_eq!(rt.route_stream_hash(0x8000_0000_0000_0000).unwrap().gpu_id, None);
+        assert_eq!(rt.route_stream_hash(0xC000_0000_0000_0000).unwrap().gpu_id, Some(2));
     }
 }

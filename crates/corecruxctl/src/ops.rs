@@ -5,8 +5,7 @@
 use std::str::FromStr;
 
 use corecrux_proto::dataplane_v1::{
-    append_result, core_crux_data_plane_v1_client::CoreCruxDataPlaneV1Client, AppendBatchRequest,
-    AppendEvent,
+    append_result, core_crux_data_plane_v1_client::CoreCruxDataPlaneV1Client, AppendBatchRequest, AppendEvent,
 };
 use corecrux_types::OPS_EVIDENCE_CONTENT_TYPE_V1;
 use serde::Serialize;
@@ -39,9 +38,7 @@ pub fn append_ops_event<T: Serialize>(
     event_id: &str,
     payload: &T,
 ) -> Result<OpsAppendReceipt, DynError> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
 
     rt.block_on(async {
         let payload_bytes = serde_json::to_vec(payload)?;
@@ -65,8 +62,7 @@ pub fn append_ops_event<T: Serialize>(
 
         let response = client.append_batch(request).await?.into_inner();
         for result in &response.results {
-            let status = append_result::Status::try_from(result.status)
-                .unwrap_or(append_result::Status::Rejected);
+            let status = append_result::Status::try_from(result.status).unwrap_or(append_result::Status::Rejected);
             if status == append_result::Status::Rejected {
                 let code = result.error_code.trim();
                 let message = result.error_message.trim();
@@ -84,18 +80,9 @@ pub fn append_ops_event<T: Serialize>(
         }
 
         Ok(OpsAppendReceipt {
-            commit_seq: response
-                .write_confirmation
-                .as_ref()
-                .map(|value| value.commit_seq),
-            segment_id: response
-                .write_confirmation
-                .as_ref()
-                .map(|value| value.segment_id),
-            unsigned: response
-                .write_confirmation
-                .as_ref()
-                .map(|value| value.unsigned),
+            commit_seq: response.write_confirmation.as_ref().map(|value| value.commit_seq),
+            segment_id: response.write_confirmation.as_ref().map(|value| value.segment_id),
+            unsigned: response.write_confirmation.as_ref().map(|value| value.unsigned),
             key_id: response.write_confirmation.and_then(|value| {
                 let trimmed = value.key_id.trim();
                 if trimmed.is_empty() {
@@ -108,13 +95,9 @@ pub fn append_ops_event<T: Serialize>(
     })
 }
 
-fn maybe_set_scopes<T>(
-    request: &mut tonic::Request<T>,
-    scopes: Option<&str>,
-) -> Result<(), DynError> {
+fn maybe_set_scopes<T>(request: &mut tonic::Request<T>, scopes: Option<&str>) -> Result<(), DynError> {
     if let Some(scopes) = scopes {
-        let value = MetadataValue::from_str(scopes)
-            .map_err(|err| format!("invalid scopes metadata value: {err}"))?;
+        let value = MetadataValue::from_str(scopes).map_err(|err| format!("invalid scopes metadata value: {err}"))?;
         request.metadata_mut().insert("x-corecrux-scopes", value);
     }
     Ok(())

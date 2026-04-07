@@ -21,10 +21,7 @@ impl CoordinatorClient {
         format!("{}/{}", self.base, p)
     }
 
-    fn get_json<T: DeserializeOwned>(
-        &self,
-        path: &str,
-    ) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+    fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
         let url = self.url(path);
         let resp = ureq::get(&url).call()?;
         let text = resp.into_string()?;
@@ -56,21 +53,15 @@ impl CoordinatorClient {
         self.post_json("/v1/splits", req)
     }
 
-    pub fn list_moves(
-        &self,
-    ) -> Result<Vec<OrchestrationRecord>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn list_moves(&self) -> Result<Vec<OrchestrationRecord>, Box<dyn std::error::Error + Send + Sync>> {
         self.get_json("/v1/moves")
     }
 
-    pub fn list_splits(
-        &self,
-    ) -> Result<Vec<OrchestrationRecord>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn list_splits(&self) -> Result<Vec<OrchestrationRecord>, Box<dyn std::error::Error + Send + Sync>> {
         self.get_json("/v1/splits")
     }
 
-    pub fn list_leases(
-        &self,
-    ) -> Result<Vec<LeaseRecord>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn list_leases(&self) -> Result<Vec<LeaseRecord>, Box<dyn std::error::Error + Send + Sync>> {
         self.get_json("/v1/leases")
     }
 }
@@ -92,9 +83,7 @@ impl CoreCruxClient {
         format!("{}/{}", self.base, p)
     }
 
-    pub fn get_shard_map(
-        &self,
-    ) -> Result<corecrux_types::ShardMapV1, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn get_shard_map(&self) -> Result<corecrux_types::ShardMapV1, Box<dyn std::error::Error + Send + Sync>> {
         let url = self.url("/v1/shard-map");
         let resp = ureq::get(&url).call()?;
         let text = resp.into_string()?;
@@ -301,13 +290,7 @@ pub fn verify_move(
         .map(ToString::to_string)
         .or_else(|| selected.as_ref().and_then(|r| r.target_node_id.clone()));
 
-    let checks = build_move_checks(
-        &map,
-        &leases,
-        shard_id,
-        target.as_deref(),
-        require_lease_match,
-    );
+    let checks = build_move_checks(&map, &leases, shard_id, target.as_deref(), require_lease_match);
     let ok = checks.iter().all(|c| c.ok);
 
     Ok(VerifyReport {
@@ -348,12 +331,7 @@ pub fn verify_split(
         new_shard_id.to_string()
     };
 
-    let checks = build_split_checks(
-        &map,
-        parent_shard_id,
-        &expected_new_shard,
-        expected_split.as_deref(),
-    );
+    let checks = build_split_checks(&map, parent_shard_id, &expected_new_shard, expected_split.as_deref());
     let ok = checks.iter().all(|c| c.ok);
 
     Ok(VerifyReport {
@@ -367,11 +345,7 @@ pub fn verify_split(
     })
 }
 
-fn select_record(
-    records: &[OrchestrationRecord],
-    shard_id: &str,
-    job_id: Option<&str>,
-) -> Option<OrchestrationRecord> {
+fn select_record(records: &[OrchestrationRecord], shard_id: &str, job_id: Option<&str>) -> Option<OrchestrationRecord> {
     if let Some(j) = job_id {
         return records.iter().find(|r| r.job_id == j).cloned();
     }
@@ -433,8 +407,7 @@ fn build_move_checks(
             },
         });
         if require_lease_match {
-            let ok =
-                lease.is_some_and(|l| l.leader_node_id == s.leader.node_id && l.epoch == s.epoch);
+            let ok = lease.is_some_and(|l| l.leader_node_id == s.leader.node_id && l.epoch == s.epoch);
             checks.push(VerifyCheck {
                 name: "lease_matches_shard_map".to_string(),
                 ok,
@@ -507,16 +480,10 @@ fn build_split_checks(
             }
         };
 
-        let parent_boundary = parent.is_some_and(|s| {
-            s.ranges
-                .iter()
-                .any(|r| canonical_hex(&r.end_exclusive) == split_norm)
-        });
-        let child_boundary = child.is_some_and(|s| {
-            s.ranges
-                .iter()
-                .any(|r| canonical_hex(&r.start_inclusive) == split_norm)
-        });
+        let parent_boundary =
+            parent.is_some_and(|s| s.ranges.iter().any(|r| canonical_hex(&r.end_exclusive) == split_norm));
+        let child_boundary =
+            child.is_some_and(|s| s.ranges.iter().any(|r| canonical_hex(&r.start_inclusive) == split_norm));
         checks.push(VerifyCheck {
             name: "split_point_boundary_present".to_string(),
             ok: parent_boundary && child_boundary,
@@ -549,8 +516,8 @@ fn canonical_hex(input: &str) -> String {
 mod tests {
     use super::*;
     use corecrux_types::{
-        compute_shard_map_v1_blake3_hex, HashRange, NodeAddr, ShardDescriptor, ShardMapV1,
-        ShardState, SHARDMAP_HASH_FN_V1, SHARDMAP_KEY_ENCODING_V1, SHARDMAP_V1,
+        compute_shard_map_v1_blake3_hex, HashRange, NodeAddr, ShardDescriptor, ShardMapV1, ShardState,
+        SHARDMAP_HASH_FN_V1, SHARDMAP_KEY_ENCODING_V1, SHARDMAP_V1,
     };
 
     fn node(id: &str) -> NodeAddr {
@@ -614,14 +581,8 @@ mod tests {
     #[test]
     fn corecrux_client_url_normalizes_trailing_slashes() {
         let client = CoreCruxClient::new("http://example.com/");
-        assert_eq!(
-            client.url("/v1/shard-map"),
-            "http://example.com/v1/shard-map"
-        );
-        assert_eq!(
-            client.url("v1/shard-map"),
-            "http://example.com/v1/shard-map"
-        );
+        assert_eq!(client.url("/v1/shard-map"), "http://example.com/v1/shard-map");
+        assert_eq!(client.url("v1/shard-map"), "http://example.com/v1/shard-map");
     }
 
     #[test]
@@ -749,14 +710,8 @@ mod tests {
 
     #[test]
     fn canonical_hex_normalizes_input() {
-        assert_eq!(
-            canonical_hex("0x0000000000000000"),
-            "0x0000000000000000"
-        );
-        assert_eq!(
-            canonical_hex("0x4000000000000000"),
-            "0x4000000000000000"
-        );
+        assert_eq!(canonical_hex("0x0000000000000000"), "0x0000000000000000");
+        assert_eq!(canonical_hex("0x4000000000000000"), "0x4000000000000000");
     }
 
     #[test]
@@ -779,10 +734,7 @@ mod tests {
             updated_unix_ms: 0,
         }];
         let checks = build_move_checks(&map, &leases, "shard-0001", Some("node-b"), true);
-        let lease_match = checks
-            .iter()
-            .find(|c| c.name == "lease_matches_shard_map")
-            .unwrap();
+        let lease_match = checks.iter().find(|c| c.name == "lease_matches_shard_map").unwrap();
         assert!(!lease_match.ok);
     }
 
@@ -790,10 +742,7 @@ mod tests {
     fn build_split_checks_missing_child_shard() {
         let map = sample_map();
         let checks = build_split_checks(&map, "shard-0001", "shard-9999", None);
-        let child_check = checks
-            .iter()
-            .find(|c| c.name == "new_shard_exists")
-            .unwrap();
+        let child_check = checks.iter().find(|c| c.name == "new_shard_exists").unwrap();
         assert!(!child_check.ok);
     }
 
@@ -890,8 +839,7 @@ mod tests {
         });
         map.blake3 = compute_shard_map_v1_blake3_hex(&map).expect("hash");
 
-        let checks =
-            build_split_checks(&map, "shard-0001", "shard-0003", Some("0x4000000000000000"));
+        let checks = build_split_checks(&map, "shard-0001", "shard-0003", Some("0x4000000000000000"));
         assert!(checks.iter().all(|c| c.ok), "checks={checks:?}");
     }
 
@@ -1199,7 +1147,10 @@ mod tests {
         let map = sample_map();
         // Use a split point that doesn't match any boundary
         let checks = build_split_checks(&map, "shard-0001", "shard-0002", Some("0x1234567890ABCDEF"));
-        let boundary_check = checks.iter().find(|c| c.name == "split_point_boundary_present").unwrap();
+        let boundary_check = checks
+            .iter()
+            .find(|c| c.name == "split_point_boundary_present")
+            .unwrap();
         assert!(!boundary_check.ok);
     }
 

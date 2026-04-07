@@ -63,13 +63,14 @@ CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 1. **Start the server:**
    ```bash
    docker compose up -d
-   # or: CORECRUXD_DATA_DIR=./data ./corecruxd
+   # or: source config.example.env && ./corecruxd
    ```
 
-2. **Check health:**
+2. **Verify it's ready:**
    ```bash
-   curl http://localhost:14800/healthz
+   curl -sf http://localhost:14800/readyz && echo "ready"
    ```
+   Wait for `{"ok": true}` before sending requests. `/healthz` checks if the process is alive; `/readyz` checks if it can serve traffic.
 
 3. **Append events:**
    ```bash
@@ -208,7 +209,7 @@ CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 
 ```mermaid
 graph TD
-    cruxmcp[crux-mcp<br/>MCP Server<br/>16 tools]
+    cruxmcp[crux-mcp<br/>MCP Server<br/>18 tools]
     observe[crux-observe<br/>Self-Observation]
     sync[crux-sync<br/>Outbox Sync]
     contrib[crux-contrib<br/>Contributions]
@@ -262,6 +263,38 @@ CoreCrux is configured via environment variables:
 | `CORECRUXD_HTTP_PORT` | `14800` | HTTP API port |
 | `CORECRUXD_BUILD_CCXI` | `0` | Build `.ccxi` indexes at seal time |
 | `CORECRUX_LOG_FORMAT` | `text` | Log format (`text` or `json`) |
+
+See `config.example.env` for the full list with descriptions.
+
+## MCP Server (for AI Agents)
+
+CoreCrux includes a built-in MCP server on port **14801** with 18 tools for retrieval, fact storage, sessions, decisions, and multi-agent handoff.
+
+### Connect an agent
+
+**Claude Desktop / Claude Code:** Copy `examples/mcp-configs/claude-desktop.json` into your Claude config. See `examples/mcp-configs/README.md` for paths.
+
+**Cursor:** Copy `examples/mcp-configs/cursor.json` to `.cursor/mcp.json`.
+
+**Verify the connection:**
+```bash
+curl -s -X POST http://localhost:14801/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | jq '.result.tools | length'
+# Expected: 18
+```
+
+### Agent quickstart (first 3 calls)
+
+1. `get_bootstrap("patterns")` — learn usage patterns
+2. `store_fact(entity="test", key="hello", value="world")` — store your first fact
+3. `query_facts(query="hello")` — retrieve it
+
+See `docs/agent-guide.md` for the full agent integration guide.
+
+## Troubleshooting
+
+See `docs/troubleshooting.md` for common issues and fixes.
 
 ## Licence
 

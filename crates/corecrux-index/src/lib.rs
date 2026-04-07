@@ -11,16 +11,13 @@
 //!
 //! The index is built on CPU at seal time and loaded (decompressed) to GPU device memory at query time.
 
-mod tokenizer;
-mod pfordelta;
 mod ccxi;
+mod pfordelta;
+mod tokenizer;
 
+pub use ccxi::{CcxiBuilder, CcxiHeader, CcxiReader, DocEntry, VocabEntry, CCXI_MAGIC, CCXI_VERSION};
+pub use pfordelta::{pfordelta_decode, pfordelta_encode};
 pub use tokenizer::{tokenize, Token};
-pub use pfordelta::{pfordelta_encode, pfordelta_decode};
-pub use ccxi::{
-    CcxiBuilder, CcxiReader, CcxiHeader, DocEntry, VocabEntry,
-    CCXI_MAGIC, CCXI_VERSION,
-};
 
 use thiserror::Error;
 

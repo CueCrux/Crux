@@ -9,9 +9,8 @@ use ed25519_dalek::{Signer as _, SigningKey};
 
 use corecrux_frame::{decode_canonical_header_bytes_v1, stream_hash_xxhash64};
 use corecrux_receipts::{
-    update_subject_index_v1, Ed25519KeyEntryV1, Ed25519KeyRingV1, ReceiptSigV1,
-    CONTENT_TYPE_RECEIPT_BODY_V1, CONTENT_TYPE_RECEIPT_SIG_V1, EVT_RECEIPT_BODY_V1,
-    EVT_RECEIPT_SIG_V1, STREAM_TYPE_RECEIPT,
+    update_subject_index_v1, Ed25519KeyEntryV1, Ed25519KeyRingV1, ReceiptSigV1, CONTENT_TYPE_RECEIPT_BODY_V1,
+    CONTENT_TYPE_RECEIPT_SIG_V1, EVT_RECEIPT_BODY_V1, EVT_RECEIPT_SIG_V1, STREAM_TYPE_RECEIPT,
 };
 use corecrux_segment::decode_frame_v1;
 use corecrux_storage::{AppendEventInput, ShardStorage, ShardStorageOptions};
@@ -89,10 +88,7 @@ pub fn seed_minimal_receipt_v1(
     std::fs::create_dir_all(&shard_root)?;
 
     // Default Phase 8 keyring location.
-    let keyring_path = data_dir
-        .join("meta")
-        .join("keys")
-        .join("ed25519-keyring.json");
+    let keyring_path = data_dir.join("meta").join("keys").join("ed25519-keyring.json");
     if let Some(parent) = keyring_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -161,12 +157,7 @@ pub fn seed_minimal_receipt_v1(
     ciborium::ser::into_writer(&sig, &mut sig_bytes)?;
 
     let epoch = 1u64;
-    let mut storage = ShardStorage::open(
-        &shard_root,
-        shard_id,
-        epoch,
-        ShardStorageOptions::default(),
-    )?;
+    let mut storage = ShardStorage::open(&shard_root, shard_id, epoch, ShardStorageOptions::default())?;
 
     let stream_hash = stream_hash_xxhash64(tenant_id, STREAM_TYPE_RECEIPT, receipt_id)?;
 
@@ -206,12 +197,8 @@ pub fn seed_minimal_receipt_v1(
         .map(|o| SeedOutcomeV1 {
             status: match o.status {
                 corecrux_storage::AppendStatus::Appended => "APPENDED".to_string(),
-                corecrux_storage::AppendStatus::DuplicateCommitted => {
-                    "DUPLICATE_COMMITTED".to_string()
-                }
-                corecrux_storage::AppendStatus::DuplicateInBatch => {
-                    "DUPLICATE_IN_BATCH".to_string()
-                }
+                corecrux_storage::AppendStatus::DuplicateCommitted => "DUPLICATE_COMMITTED".to_string(),
+                corecrux_storage::AppendStatus::DuplicateInBatch => "DUPLICATE_IN_BATCH".to_string(),
                 corecrux_storage::AppendStatus::Rejected => "REJECTED".to_string(),
             },
             seq: o.seq,
@@ -267,12 +254,7 @@ pub fn backfill_subject_index_v1(
     let mut totals = BackfillTotalsV1::default();
 
     for shard_id in shards {
-        let storage = ShardStorage::open(
-            &shard_root,
-            shard_id,
-            /*epoch=*/ 1,
-            ShardStorageOptions::default(),
-        )?;
+        let storage = ShardStorage::open(&shard_root, shard_id, /*epoch=*/ 1, ShardStorageOptions::default())?;
 
         let mut rep = BackfillShardReportV1 {
             shard_id,
@@ -337,12 +319,8 @@ pub fn backfill_subject_index_v1(
 
                 let mode = idx.mode.as_deref().unwrap_or("unknown");
                 if dry_run {
-                    let _ = corecrux_receipts::subject_index_path_v1(
-                        &subject_index_root,
-                        &hdr.tenant_id,
-                        kind,
-                        subject_id,
-                    );
+                    let _ =
+                        corecrux_receipts::subject_index_path_v1(&subject_index_root, &hdr.tenant_id, kind, subject_id);
                 } else {
                     update_subject_index_v1(
                         &subject_index_root,
@@ -535,14 +513,7 @@ mod tests {
     #[test]
     fn seed_minimal_receipt_v1_creates_keyring_and_appends() {
         let tmp = tempfile::tempdir().unwrap();
-        let report = seed_minimal_receipt_v1(
-            tmp.path(),
-            1,
-            "test-tenant",
-            "receipt-001",
-            0,
-        )
-        .expect("seed receipt");
+        let report = seed_minimal_receipt_v1(tmp.path(), 1, "test-tenant", "receipt-001", 0).expect("seed receipt");
 
         assert_eq!(report.shard_id, 1);
         assert_eq!(report.tenant_id, "test-tenant");

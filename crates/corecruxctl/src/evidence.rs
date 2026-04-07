@@ -2,23 +2,22 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-use std::collections::BTreeSet;
-use std::io::{Cursor, Read};
-use std::path::{Path, PathBuf};
 use corecrux_frame::{compute_header_hash, decode_canonical_header_bytes_v1};
 use corecrux_projections::{load_projections_meta_v1, CcxsSnapshot};
 use corecrux_receipts::{
-    verify_receipt_v1, Ed25519KeyRingV1, ReplayExportManifestV1, VerificationReportV1,
-    VerifyReceiptInput,
+    verify_receipt_v1, Ed25519KeyRingV1, ReplayExportManifestV1, VerificationReportV1, VerifyReceiptInput,
 };
 use corecrux_segment::decode_frame_v1;
 use corecrux_storage::{ShardStorage, ShardStorageOptions};
 use corecrux_types::{
-    build_info, AuditPackIndexV2, ControlCheckpointMaterializedV1, ControlStateDigestV1,
-    ControlStateMutationV1, EvidenceManifestV1, EvidenceSourceRefV1, EvidenceStatusV1,
-    EVT_CONTROL_CHECKPOINT_MATERIALIZED_V1, EVT_CONTROL_STATE_MUTATION_V1,
+    build_info, AuditPackIndexV2, ControlCheckpointMaterializedV1, ControlStateDigestV1, ControlStateMutationV1,
+    EvidenceManifestV1, EvidenceSourceRefV1, EvidenceStatusV1, EVT_CONTROL_CHECKPOINT_MATERIALIZED_V1,
+    EVT_CONTROL_STATE_MUTATION_V1,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::io::{Cursor, Read};
+use std::path::{Path, PathBuf};
 
 use crate::fixture_digest;
 
@@ -171,8 +170,7 @@ struct ControlEvidenceReplayPlan {
     applied_mutations: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 struct LocalValveV1 {
     pub enabled: bool,
     pub actor: String,
@@ -189,8 +187,7 @@ struct LocalValveV1 {
     pub max_in_flight: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 struct LocalValvesV1 {
     #[serde(rename = "pauseIngest")]
     pub pause_ingest: LocalValveV1,
@@ -211,8 +208,6 @@ struct LocalControlV1 {
     pub valves: LocalValvesV1,
 }
 
-
-
 impl Default for LocalControlV1 {
     fn default() -> Self {
         Self {
@@ -227,23 +222,11 @@ pub fn control_verify(opts: &ControlVerifyOptions) -> Result<ControlVerifyReport
     Ok(collect_control_evidence_bundle_v1(opts)?.report)
 }
 
-pub fn collect_control_evidence_bundle_v1(
-    opts: &ControlVerifyOptions,
-) -> Result<ControlEvidenceBundleV1, DynError> {
+pub fn collect_control_evidence_bundle_v1(opts: &ControlVerifyOptions) -> Result<ControlEvidenceBundleV1, DynError> {
     let control_path = opts.data_dir.join("CONTROL.json");
     let (checkpoint_bytes, _) = load_control_checkpoint(&control_path)?;
-    let lines = collect_control_evidence_lines_v1(
-        &opts.data_dir,
-        opts.device_index,
-        opts.batch_frames.max(1),
-    )?;
-    verify_control_inputs_v1(
-        &opts.data_dir,
-        &control_path,
-        checkpoint_bytes,
-        lines,
-        opts.hosted_only,
-    )
+    let lines = collect_control_evidence_lines_v1(&opts.data_dir, opts.device_index, opts.batch_frames.max(1))?;
+    verify_control_inputs_v1(&opts.data_dir, &control_path, checkpoint_bytes, lines, opts.hosted_only)
 }
 
 pub fn verify_evidence_pack(opts: &PackVerifyOptions) -> Result<EvidenceVerifyReportV1, DynError> {
@@ -260,8 +243,7 @@ pub fn verify_evidence_pack(opts: &PackVerifyOptions) -> Result<EvidenceVerifyRe
         let index: AuditPackIndexV2 = serde_json::from_slice(&std::fs::read(&index_path)?)?;
         let manifest_hash = blake3::hash(&manifest_bytes).to_hex().to_string();
         let manifest_size = manifest_bytes.len() as u64;
-        let ok =
-            index.manifest_blake3 == manifest_hash && index.manifest_size_bytes == manifest_size;
+        let ok = index.manifest_blake3 == manifest_hash && index.manifest_size_bytes == manifest_size;
         checks.push(EvidenceVerifyCheckV1 {
             name: "audit_pack_index_v2".to_string(),
             ok,
@@ -306,17 +288,9 @@ pub fn verify_evidence_pack(opts: &PackVerifyOptions) -> Result<EvidenceVerifyRe
         artifact_checks.push(result);
     }
 
-    checks.extend(verify_control_artifacts(
-        &opts.pack_dir,
-        &manifest,
-        opts.strict,
-    )?);
+    checks.extend(verify_control_artifacts(&opts.pack_dir, &manifest, opts.strict)?);
     checks.extend(verify_receipt_artifacts(&opts.pack_dir, &manifest)?);
-    checks.extend(verify_replay_artifacts(
-        &opts.pack_dir,
-        &manifest,
-        opts.device_index,
-    )?);
+    checks.extend(verify_replay_artifacts(&opts.pack_dir, &manifest, opts.device_index)?);
     checks.extend(verify_projection_artifacts(&opts.pack_dir, &manifest)?);
 
     let ok = failed_artifacts == 0 && checks.iter().all(|check| check.ok);
@@ -343,16 +317,13 @@ fn verify_control_artifacts(
     let report_path = artifact_path_by_kind(manifest, "control_verify_report");
 
     let mut checks = Vec::new();
-    let (Some(checkpoint_path), Some(evidence_path), Some(report_path)) =
-        (checkpoint, evidence, report_path)
-    else {
+    let (Some(checkpoint_path), Some(evidence_path), Some(report_path)) = (checkpoint, evidence, report_path) else {
         return Ok(checks);
     };
 
     let checkpoint_bytes = std::fs::read(pack_dir.join(checkpoint_path))?;
     let evidence_bytes = std::fs::read(pack_dir.join(evidence_path))?;
-    let bundled_report: ControlVerifyReportV1 =
-        serde_json::from_slice(&std::fs::read(pack_dir.join(report_path))?)?;
+    let bundled_report: ControlVerifyReportV1 = serde_json::from_slice(&std::fs::read(pack_dir.join(report_path))?)?;
     let lines = parse_control_evidence_jsonl(&evidence_bytes)?;
     let rebuilt = verify_control_inputs_v1(
         Path::new(&bundled_report.data_dir),
@@ -419,9 +390,7 @@ fn verify_receipt_artifacts(
         tenant_id: &export_manifest.tenant_id,
         receipt_id: &export_manifest.receipt_id,
         body_bytes: &body,
-        stored_body_payload_hash: parse_hex32(
-            &export_manifest.receipt_refs.receipt_body_payload_hash,
-        )?,
+        stored_body_payload_hash: parse_hex32(&export_manifest.receipt_refs.receipt_body_payload_hash)?,
         sig_bytes: Some(&sig),
         keyring: Some(&keyring),
         verified_at: bundled_report
@@ -459,8 +428,7 @@ fn verify_replay_artifacts(
         return Ok(checks);
     };
 
-    let report: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(pack_dir.join(report_path))?)?;
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(pack_dir.join(report_path))?)?;
     let run_a_digest = report
         .get("run_a")
         .and_then(|v| v.get("digest_blake3"))
@@ -471,10 +439,7 @@ fn verify_replay_artifacts(
         .and_then(|v| v.get("digest_blake3"))
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let replay = fixture_digest::segment_replay_digest_from_segment_path(
-        &pack_dir.join(input_path),
-        device_index,
-    )?;
+    let replay = fixture_digest::segment_replay_digest_from_segment_path(&pack_dir.join(input_path), device_index)?;
     let ok = replay.digest_blake3 == run_a_digest && replay.digest_blake3 == run_b_digest;
     checks.push(EvidenceVerifyCheckV1 {
         name: "replay_determinism".to_string(),
@@ -502,17 +467,11 @@ fn verify_projection_artifacts(
             .parent()
             .ok_or_else(|| format!("projection meta has no parent: {}", meta_path.display()))?;
         for snapshot_artifact in manifest.artifacts.values().filter(|candidate| {
-            candidate.kind == "projection_snapshot_ccxs"
-                && pack_dir.join(&candidate.path).parent() == Some(meta_dir)
+            candidate.kind == "projection_snapshot_ccxs" && pack_dir.join(&candidate.path).parent() == Some(meta_dir)
         }) {
             let snapshot_path = pack_dir.join(&snapshot_artifact.path);
-            let projection =
-                projection_name_from_snapshot_artifact(snapshot_artifact).ok_or_else(|| {
-                    format!(
-                        "projection snapshot missing source ref: {}",
-                        snapshot_artifact.path
-                    )
-                })?;
+            let projection = projection_name_from_snapshot_artifact(snapshot_artifact)
+                .ok_or_else(|| format!("projection snapshot missing source ref: {}", snapshot_artifact.path))?;
             let expected = expected_projection_hash(&meta, &projection);
             let actual = CcxsSnapshot::snapshot_blake3_hex(&std::fs::read(&snapshot_path)?);
             checks.push(EvidenceVerifyCheckV1 {
@@ -529,19 +488,14 @@ fn verify_projection_artifacts(
     Ok(checks)
 }
 
-fn projection_name_from_snapshot_artifact(
-    artifact: &corecrux_types::EvidenceArtifactDescriptorV1,
-) -> Option<String> {
+fn projection_name_from_snapshot_artifact(artifact: &corecrux_types::EvidenceArtifactDescriptorV1) -> Option<String> {
     artifact.source_refs.iter().find_map(|source| match source {
         EvidenceSourceRefV1::ProjectionSnapshot { projection, .. } => Some(projection.clone()),
         _ => None,
     })
 }
 
-fn expected_projection_hash(
-    meta: &corecrux_projections::ProjectionsMetaV1,
-    projection: &str,
-) -> Option<String> {
+fn expected_projection_hash(meta: &corecrux_projections::ProjectionsMetaV1, projection: &str) -> Option<String> {
     match projection {
         "artifact_living_state" => meta.artifact_living_state.snapshot_blake3.clone(),
         "artifact_relations" => meta.artifact_relations.snapshot_blake3.clone(),
@@ -559,19 +513,14 @@ fn artifact_path_by_kind<'a>(manifest: &'a EvidenceManifestV1, kind: &str) -> Op
         .map(|artifact| artifact.path.as_str())
 }
 
-fn read_zip_entry<R: Read + std::io::Seek>(
-    zip: &mut zip::ZipArchive<R>,
-    path: &str,
-) -> Result<Vec<u8>, DynError> {
+fn read_zip_entry<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, path: &str) -> Result<Vec<u8>, DynError> {
     let mut file = zip.by_name(path)?;
     let mut out = Vec::new();
     file.read_to_end(&mut out)?;
     Ok(out)
 }
 
-pub fn parse_control_evidence_jsonl(
-    bytes: &[u8],
-) -> Result<Vec<ControlEvidenceJsonLineV1>, DynError> {
+pub fn parse_control_evidence_jsonl(bytes: &[u8]) -> Result<Vec<ControlEvidenceJsonLineV1>, DynError> {
     let mut out = Vec::new();
     for line in bytes.split(|b| *b == b'\n') {
         if line.is_empty() {
@@ -609,17 +558,8 @@ fn collect_control_evidence_lines_v1(
 
     let mut lines = Vec::new();
     for shard_id in shard_ids {
-        let epoch = parse_manifest_epoch(
-            &shard_root
-                .join(format!("shard-{shard_id:04}"))
-                .join("MANIFEST"),
-        )?;
-        let storage = ShardStorage::open(
-            &shard_root,
-            shard_id,
-            epoch,
-            ShardStorageOptions::default(),
-        )?;
+        let epoch = parse_manifest_epoch(&shard_root.join(format!("shard-{shard_id:04}")).join("MANIFEST"))?;
+        let storage = ShardStorage::open(&shard_root, shard_id, epoch, ShardStorageOptions::default())?;
 
         let mut cursor = None;
         loop {
@@ -761,10 +701,7 @@ fn verify_control_inputs_v1(
                 state_matches_evidence: false,
                 checkpoint_bytes_match_expected: false,
                 error_code: Some("MULTIPLE_HOSTED_SHARDS".to_string()),
-                error_message: Some(
-                    "control evidence stream should not appear on multiple local shards"
-                        .to_string(),
-                ),
+                error_message: Some("control evidence stream should not appear on multiple local shards".to_string()),
             },
             checkpoint_bytes,
             evidence_lines: lines,
@@ -792,12 +729,7 @@ fn verify_control_inputs_v1(
     }
 
     let (ok, anchor, anchor_seq, applied_mutations, expected_state, error_code, error_message) =
-        match reconcile_control_from_evidence(
-            &current_state,
-            &checkpoint_bytes,
-            &checkpoints,
-            &mutations,
-        ) {
+        match reconcile_control_from_evidence(&current_state, &checkpoint_bytes, &checkpoints, &mutations) {
             Ok(Some(plan)) => (
                 true,
                 Some(plan.anchor.to_string()),
@@ -820,9 +752,7 @@ fn verify_control_inputs_v1(
         };
 
     let expected_checkpoint_bytes = checkpoint_control_bytes_v1(&expected_state);
-    let expected_checkpoint_blake3 = blake3::hash(&expected_checkpoint_bytes)
-        .to_hex()
-        .to_string();
+    let expected_checkpoint_blake3 = blake3::hash(&expected_checkpoint_bytes).to_hex().to_string();
     let expected_checkpoint_size_bytes = expected_checkpoint_bytes.len() as u64;
     let expected_control_hash = control_state_digest_v1(&expected_state).control_hash_blake3;
     let state_matches_evidence = current_state == expected_state;
@@ -839,10 +769,7 @@ fn verify_control_inputs_v1(
     } else if !checkpoint_bytes_match_expected {
         (
             Some("CONTROL_CHECKPOINT_BYTES_DRIFT".to_string()),
-            Some(
-                "CONTROL.json bytes are not the canonical checkpoint bytes for the replayed state"
-                    .to_string(),
-            ),
+            Some("CONTROL.json bytes are not the canonical checkpoint bytes for the replayed state".to_string()),
         )
     } else {
         (None, None)
@@ -918,9 +845,7 @@ fn reconcile_control_from_evidence(
         (Some(found), None) | (None, Some(found)) => (current.clone(), found.1, found.0),
         (None, None) => {
             let Some(first_mutation) = mutations.first() else {
-                return Err(
-                    "control evidence contains no state mutation anchor for CONTROL.json".into(),
-                );
+                return Err("control evidence contains no state mutation anchor for CONTROL.json".into());
             };
             let default_state = LocalControlV1::default();
             if first_mutation.payload.control_before != control_state_digest_v1(&default_state) {
@@ -1085,11 +1010,7 @@ mod tests {
         checkpoint_control_bytes_v1(&LocalControlV1::default())
     }
 
-    fn line_for_mutation(
-        seq: u64,
-        before: &LocalControlV1,
-        after: &LocalControlV1,
-    ) -> ControlEvidenceJsonLineV1 {
+    fn line_for_mutation(seq: u64, before: &LocalControlV1, after: &LocalControlV1) -> ControlEvidenceJsonLineV1 {
         let mutation = ControlStateMutationV1 {
             schema: EVT_CONTROL_STATE_MUTATION_V1.to_string(),
             action_id: format!("act-{seq}"),
@@ -1220,10 +1141,10 @@ mod tests {
 
     #[test]
     fn hex32_produces_lowercase_64_chars() {
-        let bytes = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33,
-                     0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
-                     0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02, 0x03, 0x04,
-                     0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c];
+        let bytes = [
+            0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+        ];
         let hex = hex32(&bytes);
         assert_eq!(hex.len(), 64);
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
@@ -1270,10 +1191,7 @@ mod tests {
             artifact_path_by_kind(&manifest, "control_checkpoint_json"),
             Some("checkpoint.json")
         );
-        assert_eq!(
-            artifact_path_by_kind(&manifest, "nonexistent_kind"),
-            None
-        );
+        assert_eq!(artifact_path_by_kind(&manifest, "nonexistent_kind"), None);
     }
 
     #[test]
@@ -1412,14 +1330,7 @@ mod tests {
         let bytes = default_checkpoint_bytes();
         std::fs::write(&control_path, &bytes).expect("write");
 
-        let bundle = verify_control_inputs_v1(
-            dir.path(),
-            &control_path,
-            bytes,
-            Vec::new(),
-            false,
-        )
-        .expect("verify");
+        let bundle = verify_control_inputs_v1(dir.path(), &control_path, bytes, Vec::new(), false).expect("verify");
         assert!(bundle.report.ok);
         assert!(!bundle.report.hosted);
         assert!(bundle.report.error_code.is_none());
@@ -1432,14 +1343,7 @@ mod tests {
         let bytes = default_checkpoint_bytes();
         std::fs::write(&control_path, &bytes).expect("write");
 
-        let bundle = verify_control_inputs_v1(
-            dir.path(),
-            &control_path,
-            bytes,
-            Vec::new(),
-            true,
-        )
-        .expect("verify");
+        let bundle = verify_control_inputs_v1(dir.path(), &control_path, bytes, Vec::new(), true).expect("verify");
         assert!(!bundle.report.ok);
         assert_eq!(bundle.report.error_code.as_deref(), Some("NOT_HOSTED"));
     }
@@ -1524,10 +1428,7 @@ mod tests {
         .expect("verify control inputs");
 
         assert!(!bundle.report.ok);
-        assert_eq!(
-            bundle.report.error_code.as_deref(),
-            Some("CONTROL_STATE_DRIFT")
-        );
+        assert_eq!(bundle.report.error_code.as_deref(), Some("CONTROL_STATE_DRIFT"));
         assert!(!bundle.report.state_matches_evidence);
     }
 
@@ -1550,10 +1451,10 @@ mod tests {
 
     #[test]
     fn parse_hex32_round_trips() {
-        let original = [0xdeu8, 0xad, 0xbe, 0xef, 0x01, 0x23, 0x45, 0x67,
-                         0x89, 0xab, 0xcd, 0xef, 0x00, 0x11, 0x22, 0x33,
-                         0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
-                         0xcc, 0xdd, 0xee, 0xff, 0x10, 0x20, 0x30, 0x40];
+        let original = [
+            0xdeu8, 0xad, 0xbe, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x00, 0x11, 0x22, 0x33, 0x44,
+            0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x20, 0x30, 0x40,
+        ];
         let hex = hex32(&original);
         let parsed = parse_hex32(&hex).unwrap();
         assert_eq!(parsed, original);
@@ -1654,19 +1555,10 @@ mod tests {
         let mut line2 = line1.clone();
         line2.shard_id = 2; // different shard
 
-        let bundle = verify_control_inputs_v1(
-            dir.path(),
-            &control_path,
-            bytes,
-            vec![line1, line2],
-            false,
-        )
-        .expect("verify");
+        let bundle =
+            verify_control_inputs_v1(dir.path(), &control_path, bytes, vec![line1, line2], false).expect("verify");
         assert!(!bundle.report.ok);
-        assert_eq!(
-            bundle.report.error_code.as_deref(),
-            Some("MULTIPLE_HOSTED_SHARDS")
-        );
+        assert_eq!(bundle.report.error_code.as_deref(), Some("MULTIPLE_HOSTED_SHARDS"));
     }
 
     #[test]
@@ -1983,10 +1875,9 @@ mod tests {
             },
         }];
 
-        let plan =
-            reconcile_control_from_evidence(&state, &checkpoint_bytes, &checkpoints, &mutations)
-                .unwrap()
-                .expect("should have plan");
+        let plan = reconcile_control_from_evidence(&state, &checkpoint_bytes, &checkpoints, &mutations)
+            .unwrap()
+            .expect("should have plan");
         // Checkpoint at seq 5 > mutation at seq 3, so checkpoint anchor wins
         assert_eq!(plan.anchor, "checkpoint");
         assert_eq!(plan.anchor_seq, 5);
@@ -2042,12 +1933,9 @@ mod tests {
             },
         }];
 
-        let result =
-            reconcile_control_from_evidence(&state, &checkpoint_bytes, &[], &mutations);
+        let result = reconcile_control_from_evidence(&state, &checkpoint_bytes, &[], &mutations);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("does not match any checkpoint"));
+        assert!(result.unwrap_err().contains("does not match any checkpoint"));
     }
 
     // ── verify_control_inputs checkpoint bytes drift ──────────────
@@ -2162,7 +2050,7 @@ mod tests {
     fn list_shards_ignores_non_shard_names() {
         let dir = tempdir().expect("tempdir");
         std::fs::create_dir(dir.path().join("shard-0001")).unwrap();
-        std::fs::create_dir(dir.path().join("shard-abc")).unwrap();  // non-numeric
+        std::fs::create_dir(dir.path().join("shard-abc")).unwrap(); // non-numeric
         std::fs::create_dir(dir.path().join("notshard-0002")).unwrap(); // wrong prefix
         std::fs::write(dir.path().join("shard-0003"), "file").unwrap(); // file, not dir
         let shards = list_shards(dir.path()).unwrap();
@@ -2324,10 +2212,9 @@ mod tests {
         ];
 
         let checkpoint = checkpoint_control_bytes_v1(&state0);
-        let plan =
-            reconcile_control_from_evidence(&state0, &checkpoint, &[], &mutations)
-                .unwrap()
-                .expect("should have plan");
+        let plan = reconcile_control_from_evidence(&state0, &checkpoint, &[], &mutations)
+            .unwrap()
+            .expect("should have plan");
 
         assert_eq!(plan.anchor, "default");
         assert_eq!(plan.applied_mutations, 2);
@@ -2676,10 +2563,9 @@ mod tests {
             },
         }];
 
-        let plan =
-            reconcile_control_from_evidence(&state, &checkpoint_bytes, &[], &mutations)
-                .unwrap()
-                .expect("should have plan");
+        let plan = reconcile_control_from_evidence(&state, &checkpoint_bytes, &[], &mutations)
+            .unwrap()
+            .expect("should have plan");
         assert_eq!(plan.anchor, "mutation");
         assert_eq!(plan.anchor_seq, 7);
     }

@@ -116,10 +116,7 @@ mod tests {
 
     #[test]
     fn bootstrap_entity_formatting() {
-        assert_eq!(
-            bootstrap_entity("doc", "readme"),
-            "__bootstrap__::doc:readme"
-        );
+        assert_eq!(bootstrap_entity("doc", "readme"), "__bootstrap__::doc:readme");
     }
 
     #[test]

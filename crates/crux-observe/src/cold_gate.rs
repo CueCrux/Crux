@@ -32,12 +32,7 @@ impl ColdGate {
 
     /// Pull bootstrap facts matching the given query. Only returns facts under
     /// the `__bootstrap__::` entity prefix.
-    pub async fn pull(
-        &self,
-        query: &str,
-        top_k: usize,
-        token_budget: Option<usize>,
-    ) -> ColdPullResult {
+    pub async fn pull(&self, query: &str, top_k: usize, token_budget: Option<usize>) -> ColdPullResult {
         let store = self.fact_store.read().await;
         let result = store.query(&FactQuery {
             query: Some(query.to_string()),

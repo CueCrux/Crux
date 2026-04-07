@@ -20,9 +20,7 @@ impl AdminClient {
         format!("{}/{}", self.base, path)
     }
 
-    pub fn get_control(
-        &self,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn get_control(&self) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let url = self.url("/v1/admin/control");
         let resp = ureq::get(&url).call()?;
         let text = resp.into_string()?;
@@ -72,10 +70,7 @@ impl AdminClient {
         Ok(serde_json::from_str(&text)?)
     }
 
-    pub fn ops_log(
-        &self,
-        query: OpsLogReq<'_>,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn ops_log(&self, query: OpsLogReq<'_>) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let mut req = ureq::get(&self.url("/v1/admin/ops-log"));
         if let Some(node_id) = query.node_id {
             req = req.query("nodeId", node_id);
@@ -173,13 +168,19 @@ mod tests {
     #[test]
     fn admin_client_url_strips_trailing_slash() {
         let client = AdminClient::new("http://localhost:14800/");
-        assert_eq!(client.url("/v1/admin/control"), "http://localhost:14800/v1/admin/control");
+        assert_eq!(
+            client.url("/v1/admin/control"),
+            "http://localhost:14800/v1/admin/control"
+        );
     }
 
     #[test]
     fn admin_client_url_no_trailing_slash() {
         let client = AdminClient::new("http://localhost:14800");
-        assert_eq!(client.url("/v1/admin/control"), "http://localhost:14800/v1/admin/control");
+        assert_eq!(
+            client.url("/v1/admin/control"),
+            "http://localhost:14800/v1/admin/control"
+        );
     }
 
     #[test]
@@ -408,10 +409,7 @@ mod tests {
     #[test]
     fn admin_client_deep_base_path() {
         let client = AdminClient::new("http://host:1234/api/v2/");
-        assert_eq!(
-            client.url("/test"),
-            "http://host:1234/api/v2/test"
-        );
+        assert_eq!(client.url("/test"), "http://host:1234/api/v2/test");
     }
 
     // ── SetValvesReq: minimal (all None) ────────────────────────────

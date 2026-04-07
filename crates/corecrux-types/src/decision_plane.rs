@@ -4,16 +4,14 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const DECISION_EVENT_CONTENT_TYPE_V1: &str =
-    "application/json; profile=corecrux-decision-plane-v1";
+pub const DECISION_EVENT_CONTENT_TYPE_V1: &str = "application/json; profile=corecrux-decision-plane-v1";
 pub const EVT_AGENT_DECISION_RECORDED_V1: &str = "agent.decision.recorded.v1";
 pub const EVT_AGENT_ACTION_EXECUTED_V1: &str = "agent.action.executed.v1";
 pub const EVT_AGENT_ACTION_SUPERSEDED_V1: &str = "agent.action.superseded.v1";
 pub const EVT_KNOWLEDGE_STATE_RECONSTRUCTED_V1: &str = "knowledge.state.reconstructed.v1";
 
 // Enrichment receipt events (Agent Enrichment & Orchestration v1.0)
-pub const ENRICHMENT_CONTENT_TYPE_V1: &str =
-    "application/json; profile=corecrux-enrichment-v1";
+pub const ENRICHMENT_CONTENT_TYPE_V1: &str = "application/json; profile=corecrux-enrichment-v1";
 pub const EVT_ENRICHMENT_GAP_EMITTED_V1: &str = "enrichment.gap.emitted.v1";
 pub const EVT_ENRICHMENT_VALIDATION_EMITTED_V1: &str = "enrichment.validation.emitted.v1";
 pub const EVT_ENRICHMENT_CORRECTION_SUBMITTED_V1: &str = "enrichment.correction.submitted.v1";
@@ -89,11 +87,7 @@ pub struct AgentDecisionRecordedV1 {
     pub tenant_id: String,
     #[serde(rename = "sessionId")]
     pub session_id: String,
-    #[serde(
-        rename = "contextReceiptIds",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "contextReceiptIds", default, skip_serializing_if = "Vec::is_empty")]
     pub context_receipt_ids: Vec<String>,
     #[serde(rename = "knowledgeStateCursor")]
     pub knowledge_state_cursor: DecisionSegmentCursorV1,
@@ -103,22 +97,13 @@ pub struct AgentDecisionRecordedV1 {
     pub tool_parameters_hash: String,
     #[serde(rename = "toolParametersMode")]
     pub tool_parameters_mode: ToolParametersModeV1,
-    #[serde(
-        rename = "toolParametersInline",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "toolParametersInline", skip_serializing_if = "Option::is_none")]
     pub tool_parameters_inline: Option<String>,
-    #[serde(
-        rename = "toolParametersRef",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "toolParametersRef", skip_serializing_if = "Option::is_none")]
     pub tool_parameters_ref: Option<String>,
     #[serde(rename = "toolParametersSchemaVersion")]
     pub tool_parameters_schema_version: String,
-    #[serde(
-        rename = "toolParametersPreview",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "toolParametersPreview", skip_serializing_if = "Option::is_none")]
     pub tool_parameters_preview: Option<String>,
     #[serde(rename = "sufficiencySignal")]
     pub sufficiency_signal: DecisionSufficiencySignalV1,
@@ -144,17 +129,9 @@ pub struct AgentActionExecutedV1 {
     #[serde(rename = "sessionId")]
     pub session_id: String,
     pub outcome: DecisionOutcomeV1,
-    #[serde(
-        rename = "artefactsProduced",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "artefactsProduced", default, skip_serializing_if = "Vec::is_empty")]
     pub artefacts_produced: Vec<String>,
-    #[serde(
-        rename = "receiptsProduced",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "receiptsProduced", default, skip_serializing_if = "Vec::is_empty")]
     pub receipts_produced: Vec<String>,
     #[serde(rename = "errorCode", skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
@@ -228,35 +205,17 @@ pub struct KnowledgeStateSnapshotV1 {
     pub at_cursor: DecisionSegmentCursorV1,
     #[serde(rename = "snapshotHash")]
     pub snapshot_hash: String,
-    #[serde(
-        rename = "currentArtefacts",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "currentArtefacts", default, skip_serializing_if = "Vec::is_empty")]
     pub current_artefacts: Vec<String>,
-    #[serde(
-        rename = "supersededArtefacts",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "supersededArtefacts", default, skip_serializing_if = "Vec::is_empty")]
     pub superseded_artefacts: Vec<String>,
-    #[serde(
-        rename = "pendingPressureEvents",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "pendingPressureEvents", default, skip_serializing_if = "Vec::is_empty")]
     pub pending_pressure_events: Vec<String>,
-    #[serde(
-        rename = "confidenceLandscape",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "confidenceLandscape", skip_serializing_if = "Option::is_none")]
     pub confidence_landscape: Option<Vec<KnowledgeConfidencePointV1>>,
     #[serde(rename = "generatedAt")]
     pub generated_at: String,
-    #[serde(
-        rename = "reconstructionReceiptId",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "reconstructionReceiptId", skip_serializing_if = "Option::is_none")]
     pub reconstruction_receipt_id: Option<String>,
 }
 
@@ -281,28 +240,13 @@ pub struct KnowledgeStateReconstructedV1 {
     pub include_confidence_landscape: bool,
     #[serde(rename = "snapshotHash")]
     pub snapshot_hash: String,
-    #[serde(
-        rename = "currentArtefacts",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "currentArtefacts", default, skip_serializing_if = "Vec::is_empty")]
     pub current_artefacts: Vec<String>,
-    #[serde(
-        rename = "supersededArtefacts",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "supersededArtefacts", default, skip_serializing_if = "Vec::is_empty")]
     pub superseded_artefacts: Vec<String>,
-    #[serde(
-        rename = "pendingPressureEvents",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "pendingPressureEvents", default, skip_serializing_if = "Vec::is_empty")]
     pub pending_pressure_events: Vec<String>,
-    #[serde(
-        rename = "confidenceLandscape",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "confidenceLandscape", skip_serializing_if = "Option::is_none")]
     pub confidence_landscape: Option<Vec<KnowledgeConfidencePointV1>>,
     #[serde(rename = "generatedAt")]
     pub generated_at: String,
@@ -328,17 +272,9 @@ pub struct AuditDecisionReportV1 {
     pub action_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<DecisionOutcomeV1>,
-    #[serde(
-        rename = "relatedReceiptIds",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "relatedReceiptIds", default, skip_serializing_if = "Vec::is_empty")]
     pub related_receipt_ids: Vec<String>,
-    #[serde(
-        rename = "missingCapabilities",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "missingCapabilities", default, skip_serializing_if = "Vec::is_empty")]
     pub missing_capabilities: Vec<String>,
 }
 
@@ -374,11 +310,7 @@ pub struct EnrichmentGapEmittedV1 {
     pub result_count: u32,
     #[serde(rename = "maxConfidence")]
     pub max_confidence: f32,
-    #[serde(
-        rename = "missingDimensions",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "missingDimensions", default, skip_serializing_if = "Vec::is_empty")]
     pub missing_dimensions: Vec<String>,
     #[serde(rename = "receiptHash")]
     pub receipt_hash: String,
@@ -498,10 +430,7 @@ mod tests {
         assert_eq!(encoded["toolParametersMode"], "hash_only");
         assert!(encoded.get("toolParametersInline").is_none());
         assert!(encoded.get("toolParametersRef").is_none());
-        assert_eq!(
-            encoded["toolParametersPreview"],
-            "query: 'architecture overview'"
-        );
+        assert_eq!(encoded["toolParametersPreview"], "query: 'architecture overview'");
         assert_eq!(encoded["toolParametersSchemaVersion"], "1.0");
     }
 
@@ -524,9 +453,7 @@ mod tests {
             tool_parameters_hash: "cd".repeat(32),
             tool_parameters_mode: ToolParametersModeV1::EncryptedRef,
             tool_parameters_inline: None,
-            tool_parameters_ref: Some(
-                "vault://tenant-1/params/dec-3/blake3:cdcdcdcd".to_string(),
-            ),
+            tool_parameters_ref: Some("vault://tenant-1/params/dec-3/blake3:cdcdcdcd".to_string()),
             tool_parameters_schema_version: "1.0".to_string(),
             tool_parameters_preview: Some("recipient_count: 1".to_string()),
             sufficiency_signal: DecisionSufficiencySignalV1::Unknown,
@@ -537,10 +464,7 @@ mod tests {
         let encoded = serde_json::to_value(&decision).expect("encode decision");
         assert_eq!(encoded["toolParametersMode"], "encrypted_ref");
         assert!(encoded.get("toolParametersInline").is_none());
-        assert!(encoded["toolParametersRef"]
-            .as_str()
-            .unwrap()
-            .starts_with("vault://"));
+        assert!(encoded["toolParametersRef"].as_str().unwrap().starts_with("vault://"));
     }
 
     #[test]

@@ -43,7 +43,10 @@ pub fn run(data_dir: &str, receipt_id: &str) -> Result<(), Box<dyn std::error::E
                     if bytes.windows(receipt_bytes.len()).any(|w| w == receipt_bytes) {
                         println!("Found in: {}", seg_path.display());
                         println!("  Shard:   {}", dir_name);
-                        println!("  Segment: {}", seg_path.file_name().unwrap_or_default().to_string_lossy());
+                        println!(
+                            "  Segment: {}",
+                            seg_path.file_name().unwrap_or_default().to_string_lossy()
+                        );
                         found = true;
                     }
                 }

@@ -15,10 +15,7 @@ use corecrux_retrieval::bm25::{self, Bm25Params};
 pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let _tenant_id = require_str(params, "tenant_id")?;
     let query = require_str(params, "query")?;
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(10) as usize;
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let min_score = params.get("min_score").and_then(|v| v.as_f64()).map(|f| f as f32);
     let token_budget = params.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize);
 
@@ -90,10 +87,7 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
 pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let _tenant_id = require_str(params, "tenant_id")?;
     let query = require_str(params, "query")?;
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(20) as usize;
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
     let index = ctx.retrieval_index.read().await;
     if index.total_docs() == 0 {
@@ -103,14 +97,7 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
     }
 
     let readers = index.readers();
-    let result = bm25::bm25_search(
-        &readers,
-        query,
-        limit,
-        None,
-        &Bm25Params::default(),
-        None,
-    );
+    let result = bm25::bm25_search(&readers, query, limit, None, &Bm25Params::default(), None);
 
     let scan: Vec<Value> = result
         .hits
@@ -214,14 +201,11 @@ pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Val
 
 /// Extract a required string parameter or return an `INVALID_PARAMS` error.
 fn require_str<'a>(params: &'a Value, field: &str) -> Result<&'a str, JsonRpcError> {
-    params
-        .get(field)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| JsonRpcError {
-            code: INVALID_PARAMS,
-            message: format!("missing required param: {field}"),
-            data: Some(json!({"param": field, "required": true})),
-        })
+    params.get(field).and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
+        code: INVALID_PARAMS,
+        message: format!("missing required param: {field}"),
+        data: Some(json!({"param": field, "required": true})),
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -238,12 +222,9 @@ mod tests {
     #[tokio::test]
     async fn query_empty_index() {
         let ctx = test_ctx();
-        let result = handle_query(
-            &json!({"tenant_id": "t1", "query": "hello"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let result = handle_query(&json!({"tenant_id": "t1", "query": "hello"}), &ctx)
+            .await
+            .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("empty"));
     }
@@ -251,30 +232,23 @@ mod tests {
     #[tokio::test]
     async fn query_missing_tenant() {
         let ctx = test_ctx();
-        let err = handle_query(&json!({"query": "hello"}), &ctx)
-            .await
-            .unwrap_err();
+        let err = handle_query(&json!({"query": "hello"}), &ctx).await.unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
     #[tokio::test]
     async fn query_missing_query() {
         let ctx = test_ctx();
-        let err = handle_query(&json!({"tenant_id": "t1"}), &ctx)
-            .await
-            .unwrap_err();
+        let err = handle_query(&json!({"tenant_id": "t1"}), &ctx).await.unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
     #[tokio::test]
     async fn query_scan_empty_index() {
         let ctx = test_ctx();
-        let result = handle_query_scan(
-            &json!({"tenant_id": "t1", "query": "hello"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let result = handle_query_scan(&json!({"tenant_id": "t1", "query": "hello"}), &ctx)
+            .await
+            .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("empty"));
     }
@@ -282,24 +256,18 @@ mod tests {
     #[tokio::test]
     async fn query_expand_missing_result_ids() {
         let ctx = test_ctx();
-        let err = handle_query_expand(
-            &json!({"tenant_id": "t1"}),
-            &ctx,
-        )
-        .await
-        .unwrap_err();
+        let err = handle_query_expand(&json!({"tenant_id": "t1"}), &ctx)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
     #[tokio::test]
     async fn query_expand_invalid_id_format() {
         let ctx = test_ctx();
-        let result = handle_query_expand(
-            &json!({"tenant_id": "t1", "result_ids": ["bad_format"]}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let result = handle_query_expand(&json!({"tenant_id": "t1", "result_ids": ["bad_format"]}), &ctx)
+            .await
+            .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("invalid result_id"));
         // Verify the new response shape: chunks + tokens_loaded + errors
@@ -313,12 +281,9 @@ mod tests {
     async fn query_expand_response_matches_http_shape() {
         let ctx = test_ctx();
         // With an empty index, valid IDs will produce segment-not-found errors.
-        let result = handle_query_expand(
-            &json!({"tenant_id": "t1", "result_ids": ["0:0", "1:5"]}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let result = handle_query_expand(&json!({"tenant_id": "t1", "result_ids": ["0:0", "1:5"]}), &ctx)
+            .await
+            .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert!(parsed.get("chunks").is_some());
@@ -328,9 +293,7 @@ mod tests {
     #[tokio::test]
     async fn query_missing_tenant_has_structured_data() {
         let ctx = test_ctx();
-        let err = handle_query(&json!({"query": "hello"}), &ctx)
-            .await
-            .unwrap_err();
+        let err = handle_query(&json!({"query": "hello"}), &ctx).await.unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
         let data = err.data.unwrap();
         assert_eq!(data["param"], "tenant_id");

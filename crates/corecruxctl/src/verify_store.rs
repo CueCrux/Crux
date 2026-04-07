@@ -199,9 +199,7 @@ fn open_storage_for_shard(
     )?)
 }
 
-pub fn verify_store(
-    opts: &VerifyStoreOptions,
-) -> Result<VerifyStoreReport, Box<dyn std::error::Error + Send + Sync>> {
+pub fn verify_store(opts: &VerifyStoreOptions) -> Result<VerifyStoreReport, Box<dyn std::error::Error + Send + Sync>> {
     let shard_root = opts.data_dir.join("shards");
     let mut shard_ids = if let Some(sid) = opts.shard {
         vec![sid]
@@ -218,9 +216,7 @@ pub fn verify_store(
 
     for shard_id in shard_ids {
         let include = sampled_in(opts.mode, opts.sample_rate, shard_id);
-        let manifest = shard_root
-            .join(format!("shard-{shard_id:04}"))
-            .join("MANIFEST");
+        let manifest = shard_root.join(format!("shard-{shard_id:04}")).join("MANIFEST");
         let epoch = match parse_manifest_epoch(&manifest) {
             Ok(v) => v,
             Err(err) => {
@@ -419,10 +415,7 @@ mod tests {
             classify_corruption_reason("TOC checksum failed"),
             "TOC_CHECKSUM_MISMATCH"
         );
-        assert_eq!(
-            classify_corruption_reason("toc crc mismatch"),
-            "TOC_CHECKSUM_MISMATCH"
-        );
+        assert_eq!(classify_corruption_reason("toc crc mismatch"), "TOC_CHECKSUM_MISMATCH");
     }
 
     #[test]
@@ -447,38 +440,23 @@ mod tests {
 
     #[test]
     fn classify_invalid_toc() {
-        assert_eq!(
-            classify_corruption_reason("invalid toc entry"),
-            "INVALID_TOC"
-        );
+        assert_eq!(classify_corruption_reason("invalid toc entry"), "INVALID_TOC");
     }
 
     #[test]
     fn classify_invalid_frame() {
-        assert_eq!(
-            classify_corruption_reason("invalid frame at offset 0"),
-            "INVALID_FRAME"
-        );
-        assert_eq!(
-            classify_corruption_reason("frame count mismatch"),
-            "INVALID_FRAME"
-        );
+        assert_eq!(classify_corruption_reason("invalid frame at offset 0"), "INVALID_FRAME");
+        assert_eq!(classify_corruption_reason("frame count mismatch"), "INVALID_FRAME");
     }
 
     #[test]
     fn classify_io_error() {
-        assert_eq!(
-            classify_corruption_reason("IO error: broken pipe"),
-            "IO_READ_FAILED"
-        );
+        assert_eq!(classify_corruption_reason("IO error: broken pipe"), "IO_READ_FAILED");
         assert_eq!(
             classify_corruption_reason("no such file or directory"),
             "IO_READ_FAILED"
         );
-        assert_eq!(
-            classify_corruption_reason("permission denied"),
-            "IO_READ_FAILED"
-        );
+        assert_eq!(classify_corruption_reason("permission denied"), "IO_READ_FAILED");
     }
 
     #[test]
@@ -668,10 +646,7 @@ mod tests {
         assert_eq!(report.shards.len(), 1);
         assert_eq!(report.shards[0].shard_id, 0);
         assert!(!report.shards[0].ok);
-        assert_eq!(
-            report.shards[0].reason.as_deref(),
-            Some("MANIFEST_READ_FAILED")
-        );
+        assert_eq!(report.shards[0].reason.as_deref(), Some("MANIFEST_READ_FAILED"));
     }
 
     #[test]

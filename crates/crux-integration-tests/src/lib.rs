@@ -48,7 +48,13 @@ impl TestDaemon {
             .unwrap_or_else(|e| panic!("start corecruxd at {}: {}", binary.display(), e));
 
         let base_url = format!("http://127.0.0.1:{http_port}");
-        let mut daemon = Self { process, http_port, grpc_port, data_dir, base_url };
+        let mut daemon = Self {
+            process,
+            http_port,
+            grpc_port,
+            data_dir,
+            base_url,
+        };
         daemon.wait_healthy(Duration::from_secs(10));
         daemon
     }

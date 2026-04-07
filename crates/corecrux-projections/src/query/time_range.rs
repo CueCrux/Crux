@@ -102,9 +102,7 @@ pub fn time_range_scan(state: &ProjectionState, req: &TimeRangeRequest) -> TimeR
         for &aid in &scoped_ids {
             stats.artifacts_scanned += 1;
             if let Some(row) = state.living.get(&(req.tenant_hash, aid)) {
-                if row.updated_at_micros >= req.start_micros
-                    && row.updated_at_micros < req.end_micros
-                {
+                if row.updated_at_micros >= req.start_micros && row.updated_at_micros < req.end_micros {
                     changed_artifacts.insert(aid, row.clone());
                 }
             }
@@ -124,10 +122,8 @@ pub fn time_range_scan(state: &ProjectionState, req: &TimeRangeRequest) -> TimeR
             stats.relations_scanned += 1;
 
             // Check if this relation was created or updated in the window
-            let in_window = (edge.updated_at_micros >= req.start_micros
-                && edge.updated_at_micros < req.end_micros)
-                || (edge.created_at_micros >= req.start_micros
-                    && edge.created_at_micros < req.end_micros);
+            let in_window = (edge.updated_at_micros >= req.start_micros && edge.updated_at_micros < req.end_micros)
+                || (edge.created_at_micros >= req.start_micros && edge.created_at_micros < req.end_micros);
 
             if !in_window {
                 continue;

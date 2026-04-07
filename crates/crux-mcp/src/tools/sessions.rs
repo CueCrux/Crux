@@ -35,17 +35,16 @@ pub async fn handle_get_session(args: &Value, ctx: &McpContext) -> Result<Value,
 /// `save_session` — create or update session state.
 pub async fn handle_save_session(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let session_id = require_str(args, "session_id")?;
-    let state = args
-        .get("state")
-        .cloned()
-        .ok_or_else(|| JsonRpcError {
-            code: INVALID_PARAMS,
-            message: "missing required param: state".to_string(),
-            data: Some(json!({"param": "state", "required": true})),
-        })?;
+    let state = args.get("state").cloned().ok_or_else(|| JsonRpcError {
+        code: INVALID_PARAMS,
+        message: "missing required param: state".to_string(),
+        data: Some(json!({"param": "state", "required": true})),
+    })?;
+
+    let ttl_seconds = args.get("ttl_seconds").and_then(|v| v.as_u64());
 
     let mut store = ctx.session_store.write().await;
-    let session = store.put(session_id, state);
+    let session = store.put(session_id, state, ttl_seconds);
 
     Ok(json!({
         "content": [{
@@ -100,13 +99,11 @@ pub async fn handle_delete_session(args: &Value, ctx: &McpContext) -> Result<Val
 
 /// Extract a required string parameter or return an INVALID_PARAMS error.
 fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, JsonRpcError> {
-    args.get(field)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| JsonRpcError {
-            code: INVALID_PARAMS,
-            message: format!("missing required param: {field}"),
-            data: Some(json!({"param": field, "required": true})),
-        })
+    args.get(field).and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
+        code: INVALID_PARAMS,
+        message: format!("missing required param: {field}"),
+        data: Some(json!({"param": field, "required": true})),
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -123,12 +120,9 @@ mod tests {
     #[tokio::test]
     async fn get_session_not_found() {
         let ctx = test_ctx();
-        let result = handle_get_session(
-            &json!({"session_id": "nonexistent"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let result = handle_get_session(&json!({"session_id": "nonexistent"}), &ctx)
+            .await
+            .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("no session found"));
     }
@@ -145,22 +139,14 @@ mod tests {
         let ctx = test_ctx();
 
         // Save
-        let result = handle_save_session(
-            &json!({"session_id": "s1", "state": {"step": 1, "done": false}}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let result = handle_save_session(&json!({"session_id": "s1", "state": {"step": 1, "done": false}}), &ctx)
+            .await
+            .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("saved session s1"));
 
         // Get
-        let result = handle_get_session(
-            &json!({"session_id": "s1"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let result = handle_get_session(&json!({"session_id": "s1"}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"step\": 1"));
     }
@@ -168,12 +154,9 @@ mod tests {
     #[tokio::test]
     async fn save_session_missing_state() {
         let ctx = test_ctx();
-        let err = handle_save_session(
-            &json!({"session_id": "s1"}),
-            &ctx,
-        )
-        .await
-        .unwrap_err();
+        let err = handle_save_session(&json!({"session_id": "s1"}), &ctx)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
@@ -181,26 +164,15 @@ mod tests {
     async fn save_session_overwrites() {
         let ctx = test_ctx();
 
-        handle_save_session(
-            &json!({"session_id": "s1", "state": {"v": 1}}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        handle_save_session(&json!({"session_id": "s1", "state": {"v": 1}}), &ctx)
+            .await
+            .unwrap();
 
-        handle_save_session(
-            &json!({"session_id": "s1", "state": {"v": 2, "extra": true}}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        handle_save_session(&json!({"session_id": "s1", "state": {"v": 2, "extra": true}}), &ctx)
+            .await
+            .unwrap();
 
-        let result = handle_get_session(
-            &json!({"session_id": "s1"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let result = handle_get_session(&json!({"session_id": "s1"}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"v\": 2"));
         assert!(text.contains("\"extra\": true"));
@@ -219,8 +191,12 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_returns_sorted() {
         let ctx = test_ctx();
-        handle_save_session(&json!({"session_id": "z_sess", "state": {}}), &ctx).await.unwrap();
-        handle_save_session(&json!({"session_id": "a_sess", "state": {}}), &ctx).await.unwrap();
+        handle_save_session(&json!({"session_id": "z_sess", "state": {}}), &ctx)
+            .await
+            .unwrap();
+        handle_save_session(&json!({"session_id": "a_sess", "state": {}}), &ctx)
+            .await
+            .unwrap();
 
         let result = handle_list_sessions(&json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -233,7 +209,9 @@ mod tests {
     #[tokio::test]
     async fn delete_session_existing() {
         let ctx = test_ctx();
-        handle_save_session(&json!({"session_id": "s1", "state": {"x": 1}}), &ctx).await.unwrap();
+        handle_save_session(&json!({"session_id": "s1", "state": {"x": 1}}), &ctx)
+            .await
+            .unwrap();
 
         let result = handle_delete_session(&json!({"session_id": "s1"}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -248,7 +226,9 @@ mod tests {
     #[tokio::test]
     async fn delete_session_nonexistent() {
         let ctx = test_ctx();
-        let result = handle_delete_session(&json!({"session_id": "nope"}), &ctx).await.unwrap();
+        let result = handle_delete_session(&json!({"session_id": "nope"}), &ctx)
+            .await
+            .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("session not found"));
     }

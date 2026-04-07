@@ -90,9 +90,9 @@ pub fn import_stage1_events_log(
         let actual_crc = crc32c::crc32c(&payload);
         if expected_crc != actual_crc {
             return Err(format!(
-        "crc32c mismatch at record start offset {}: expected {expected_crc}, actual {actual_crc}",
-        offset - (len as u64) - 8
-      )
+                "crc32c mismatch at record start offset {}: expected {expected_crc}, actual {actual_crc}",
+                offset - (len as u64) - 8
+            )
             .into());
         }
 

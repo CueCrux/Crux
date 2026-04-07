@@ -14,9 +14,7 @@ use corecrux_memory::{FactStore, SessionStore};
 use corecrux_retrieval::IndexManager;
 
 use crate::agent::{AgentIdentity, AgentRegistry};
-use crate::protocol::{
-    JsonRpcRequest, JsonRpcResponse, INVALID_PARAMS, METHOD_NOT_FOUND,
-};
+use crate::protocol::{JsonRpcRequest, JsonRpcResponse, INVALID_PARAMS, METHOD_NOT_FOUND};
 use crate::tools;
 
 /// Shared state passed to every MCP handler.
@@ -79,11 +77,7 @@ pub const SERVER_NAME: &str = "crux";
 pub const SERVER_VERSION: &str = "0.1.0";
 
 /// Route a JSON-RPC request to the appropriate handler.
-pub async fn dispatch(
-    req: JsonRpcRequest,
-    ctx: &McpContext,
-    _agent: Option<&AgentIdentity>,
-) -> JsonRpcResponse {
+pub async fn dispatch(req: JsonRpcRequest, ctx: &McpContext, _agent: Option<&AgentIdentity>) -> JsonRpcResponse {
     match req.method.as_str() {
         // ── MCP lifecycle ──────────────────────────────────────────────
         "initialize" => JsonRpcResponse::success(
@@ -96,6 +90,15 @@ pub async fn dispatch(
                 "serverInfo": {
                     "name": SERVER_NAME,
                     "version": SERVER_VERSION
+                },
+                "_welcome": {
+                    "hint": "Call get_bootstrap(\"patterns\") to learn optimal usage patterns.",
+                    "quickstart": [
+                        "get_bootstrap(\"patterns\") — learn usage patterns",
+                        "store_fact(entity, key, value) — store a fact",
+                        "query_facts(query) — search facts"
+                    ],
+                    "docs": "https://github.com/CueCrux/Crux/blob/main/docs/agent-guide.md"
                 }
             }),
         ),
@@ -112,11 +115,7 @@ pub async fn dispatch(
         // ── Fallback ───────────────────────────────────────────────────
         other => {
             warn!(method = other, "unknown MCP method");
-            JsonRpcResponse::error(
-                req.id,
-                METHOD_NOT_FOUND,
-                format!("method not found: {other}"),
-            )
+            JsonRpcResponse::error(req.id, METHOD_NOT_FOUND, format!("method not found: {other}"))
         }
     }
 }
@@ -130,18 +129,11 @@ async fn dispatch_tool_call(
     let name = match params.get("name").and_then(|v| v.as_str()) {
         Some(n) => n,
         None => {
-            return JsonRpcResponse::error(
-                id,
-                INVALID_PARAMS,
-                "tools/call requires a \"name\" parameter",
-            );
+            return JsonRpcResponse::error(id, INVALID_PARAMS, "tools/call requires a \"name\" parameter");
         }
     };
 
-    let args = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
 
     match tools::call_tool(name, &args, ctx).await {
         Ok(result) => JsonRpcResponse::success(id, result),
@@ -215,12 +207,7 @@ mod tests {
     #[tokio::test]
     async fn tools_call_get_gaps() {
         let ctx = test_ctx();
-        let resp = dispatch(
-            rpc("tools/call", json!({"name": "get_gaps"})),
-            &ctx,
-            None,
-        )
-        .await;
+        let resp = dispatch(rpc("tools/call", json!({"name": "get_gaps"})), &ctx, None).await;
         // get_gaps on empty store returns no-gaps message.
         assert!(resp.error.is_none());
     }
@@ -236,12 +223,7 @@ mod tests {
     #[tokio::test]
     async fn tools_call_unknown_tool() {
         let ctx = test_ctx();
-        let resp = dispatch(
-            rpc("tools/call", json!({"name": "nonexistent"})),
-            &ctx,
-            None,
-        )
-        .await;
+        let resp = dispatch(rpc("tools/call", json!({"name": "nonexistent"})), &ctx, None).await;
         let err = resp.error.unwrap();
         assert_eq!(err.code, METHOD_NOT_FOUND);
         assert!(err.message.contains("unknown tool"));
@@ -269,10 +251,7 @@ mod tests {
         )
         .await;
         assert!(resp.error.is_none());
-        let text = resp.result.unwrap()["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let text = resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
         assert!(text.starts_with("stored fact f_"));
 
         // Query it
@@ -292,10 +271,7 @@ mod tests {
         )
         .await;
         assert!(resp.error.is_none());
-        let text = resp.result.unwrap()["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let text = resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
         assert!(text.contains("CueCrux"));
     }
 }

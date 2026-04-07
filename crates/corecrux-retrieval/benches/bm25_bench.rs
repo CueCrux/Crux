@@ -65,9 +65,7 @@ fn bench_bm25_score_multi(c: &mut Criterion) {
 
     // Build multiple segments to simulate multi-segment scoring
     for num_segments in [2, 4, 8] {
-        let segment_bytes: Vec<Vec<u8>> = (0..num_segments)
-            .map(|_| build_index(1_000))
-            .collect();
+        let segment_bytes: Vec<Vec<u8>> = (0..num_segments).map(|_| build_index(1_000)).collect();
         let readers: Vec<CcxiReader> = segment_bytes
             .iter()
             .map(|b| CcxiReader::from_bytes(b).unwrap())
@@ -75,21 +73,17 @@ fn bench_bm25_score_multi(c: &mut Criterion) {
         let reader_refs: Vec<&CcxiReader> = readers.iter().collect();
         let params = Bm25Params::default();
 
-        group.bench_with_input(
-            BenchmarkId::new("segments", num_segments),
-            &num_segments,
-            |b, _| {
-                b.iter(|| {
-                    bm25_score_multi(
-                        black_box(&reader_refs),
-                        black_box("kubernetes deployment scaling"),
-                        black_box(10),
-                        None,
-                        &params,
-                    )
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("segments", num_segments), &num_segments, |b, _| {
+            b.iter(|| {
+                bm25_score_multi(
+                    black_box(&reader_refs),
+                    black_box("kubernetes deployment scaling"),
+                    black_box(10),
+                    None,
+                    &params,
+                )
+            });
+        });
     }
 
     group.finish();

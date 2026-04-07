@@ -1,0 +1,484 @@
+// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+// Licensed under the CueCrux Community Licence (CCL v1.0).
+// See LICENCE.md in the repository root.
+
+//! CruxScore Lite benchmark harness.
+//!
+//! Ingests a labelled corpus, runs queries, measures 7 metrics, and optionally
+//! uploads results to scorecrux.com.
+
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+
+// ── Corpus types ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct Document {
+    doc_id: String,
+    #[allow(dead_code)]
+    domain: String,
+    title: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Fields deserialized from benchmark JSON but only `query` and `expected_doc_ids` are read.
+struct Query {
+    query_id: String,
+    query: String,
+    expected_doc_ids: Vec<String>,
+    domain: String,
+    difficulty: String,
+}
+
+// ── Score types ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CruxScoreLite {
+    pub version: String,
+    pub coverage_score: f32,
+    pub recall_at_5: f32,
+    pub mrr: f32,
+    pub fact_recall: f32,
+    pub version_chain_depth: f32,
+    pub query_latency_p50_ms: f64,
+    pub query_latency_p95_ms: f64,
+    pub corpus_size: usize,
+    pub query_count: usize,
+    pub config_hash: String,
+    pub crux_version: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BenchmarkReport {
+    suite: String,
+    scores: CruxScoreLite,
+    config: BenchmarkConfig,
+    system: SystemInfo,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BenchmarkConfig {
+    bm25_k1: f32,
+    bm25_b: f32,
+    graph_weight: f32,
+    build_ccxi: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SystemInfo {
+    crux_version: String,
+    os: String,
+    arch: String,
+}
+
+// ── Entry point ──────────────────────────────────────────────────
+
+pub fn run(
+    http_base: &str,
+    suite: &str,
+    upload: bool,
+    output: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match suite {
+        "quick" => run_quick(http_base, upload, output),
+        "standard" => {
+            eprintln!("Standard benchmark suite: download from scorecrux.com on first run.");
+            eprintln!("Not yet available — use --suite quick for now.");
+            Ok(())
+        }
+        other => {
+            eprintln!("Unknown suite: {other}. Available: quick, standard");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_quick(
+    http_base: &str,
+    upload: bool,
+    output: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Check daemon is reachable
+    eprintln!("\n  CruxScore Lite Benchmark (quick suite)\n");
+    eprint!("  Connecting to {http_base}... ");
+    match ureq::get(&format!("{http_base}/readyz")).call() {
+        Ok(_) => eprintln!("connected"),
+        Err(e) => {
+            eprintln!("failed: {e}");
+            eprintln!("  Is corecruxd running? Start it with: source config.example.env && corecruxd");
+            return Err("daemon not reachable".into());
+        }
+    }
+
+    // Load embedded corpus
+    let docs: Vec<Document> = serde_json::from_str(include_str!("../benchmark/corpus/quick/documents.json"))?;
+    let queries: Vec<Query> = serde_json::from_str(include_str!("../benchmark/corpus/quick/queries.json"))?;
+
+    eprintln!("  Corpus: {} documents, {} queries\n", docs.len(), queries.len());
+
+    // Step 1: Ingest documents as facts
+    eprint!("  Ingesting documents... ");
+    let ingest_start = Instant::now();
+    for doc in &docs {
+        let body = serde_json::json!({
+            "entity": format!("__benchmark__::{}", doc.doc_id),
+            "key": "content",
+            "value": format!("{}\n\n{}", doc.title, doc.content),
+            "confidence": 1.0
+        });
+        ureq::put(&format!("{http_base}/v1/facts"))
+            .set("Content-Type", "application/json")
+            .send_json(body)?;
+    }
+    let ingest_ms = ingest_start.elapsed().as_millis();
+    eprintln!("{} docs in {}ms", docs.len(), ingest_ms);
+
+    // Step 2: Run queries and measure
+    eprint!("  Running queries... ");
+    let mut latencies: Vec<f64> = Vec::new();
+    let mut recall_hits = 0usize;
+    let mut recall_total = 0usize;
+    let mut mrr_sum = 0.0f64;
+    let mut coverage_sum = 0.0f32;
+
+    for q in &queries {
+        let start = Instant::now();
+        let resp = ureq::get(&format!(
+            "{http_base}/v1/facts?query={}&top_k=5",
+            urlencoding::encode(&q.query)
+        ))
+        .call()?;
+        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        latencies.push(latency_ms);
+
+        let body: serde_json::Value = resp.into_json()?;
+        let facts = body["facts"].as_array().map(|a| a.to_vec()).unwrap_or_default();
+
+        // Extract doc_ids from returned facts (entity = __benchmark__::{doc_id})
+        let returned_ids: Vec<String> = facts
+            .iter()
+            .filter_map(|f| {
+                f["entity"]
+                    .as_str()
+                    .and_then(|e| e.strip_prefix("__benchmark__::"))
+                    .map(String::from)
+            })
+            .collect();
+
+        // Recall@5: fraction of expected docs found in top-5
+        let hits: usize = q.expected_doc_ids.iter().filter(|id| returned_ids.contains(id)).count();
+        recall_hits += hits;
+        recall_total += q.expected_doc_ids.len();
+
+        // MRR: reciprocal rank of first expected doc
+        let first_rank = returned_ids
+            .iter()
+            .position(|id| q.expected_doc_ids.contains(id))
+            .map(|pos| 1.0 / (pos as f64 + 1.0))
+            .unwrap_or(0.0);
+        mrr_sum += first_rank;
+
+        // Coverage: simple term coverage
+        let query_terms: Vec<&str> = q.query.split_whitespace().collect();
+        let matched = query_terms
+            .iter()
+            .filter(|t| {
+                facts.iter().any(|f| {
+                    f["value"]
+                        .as_str()
+                        .map(|v| v.to_lowercase().contains(&t.to_lowercase()))
+                        .unwrap_or(false)
+                })
+            })
+            .count();
+        coverage_sum += matched as f32 / query_terms.len().max(1) as f32;
+    }
+
+    eprintln!("{} queries completed", queries.len());
+
+    // Step 3: Fact store benchmark (store + version + recall)
+    eprint!("  Fact store benchmark... ");
+    let fact_test_count = 10;
+    let mut fact_ids = Vec::new();
+    for i in 0..fact_test_count {
+        let body = serde_json::json!({
+            "entity": "__benchmark__::fact_test",
+            "key": format!("key_{i}"),
+            "value": format!("test value {i}"),
+            "confidence": 0.9
+        });
+        let resp: serde_json::Value = ureq::put(&format!("{http_base}/v1/facts"))
+            .set("Content-Type", "application/json")
+            .send_json(body)?
+            .into_json()?;
+        if let Some(id) = resp["fact_id"].as_str() {
+            fact_ids.push(id.to_string());
+        }
+    }
+    // Update one fact to test versioning
+    let body = serde_json::json!({
+        "entity": "__benchmark__::fact_test",
+        "key": "key_0",
+        "value": "updated value 0",
+        "confidence": 0.95
+    });
+    ureq::put(&format!("{http_base}/v1/facts"))
+        .set("Content-Type", "application/json")
+        .send_json(body)?;
+
+    // Query back
+    let resp: serde_json::Value = ureq::get(&format!(
+        "{http_base}/v1/facts?query=test+value&entity=__benchmark__::fact_test&top_k=20"
+    ))
+    .call()?
+    .into_json()?;
+    let found = resp["facts"].as_array().map(|a| a.len()).unwrap_or(0);
+    let fact_recall = found as f32 / (fact_test_count + 1) as f32; // +1 for the update
+
+    // Check version chain
+    let history_resp: serde_json::Value = ureq::get(&format!(
+        "{http_base}/v1/facts/entity/__benchmark__::fact_test/key/key_0/history"
+    ))
+    .call()?
+    .into_json()?;
+    let chain_depth = history_resp["versions"].as_array().map(|a| a.len()).unwrap_or(1);
+
+    eprintln!("{} facts, chain depth {}", fact_test_count, chain_depth);
+
+    // Step 4: Compute scores
+    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p50 = percentile(&latencies, 0.50);
+    let p95 = percentile(&latencies, 0.95);
+
+    let scores = CruxScoreLite {
+        version: "lite-1.0".to_string(),
+        coverage_score: coverage_sum / queries.len().max(1) as f32,
+        recall_at_5: recall_hits as f32 / recall_total.max(1) as f32,
+        mrr: mrr_sum as f32 / queries.len().max(1) as f32,
+        fact_recall: fact_recall.min(1.0),
+        version_chain_depth: chain_depth as f32,
+        query_latency_p50_ms: p50,
+        query_latency_p95_ms: p95,
+        corpus_size: docs.len(),
+        query_count: queries.len(),
+        config_hash: "default".to_string(),
+        crux_version: env!("CARGO_PKG_VERSION").to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+
+    // Step 5: Display results
+    eprintln!("\n  CruxScore Lite Results:");
+    eprintln!("  ────────────────────────────────");
+    eprintln!("    coverage_score:     {:.3}", scores.coverage_score);
+    eprintln!("    recall@5:           {:.3}", scores.recall_at_5);
+    eprintln!("    mrr:                {:.3}", scores.mrr);
+    eprintln!("    fact_recall:        {:.3}", scores.fact_recall);
+    eprintln!("    version_chain:      {:.1}", scores.version_chain_depth);
+    eprintln!("    query_latency_p50:  {:.1}ms", scores.query_latency_p50_ms);
+    eprintln!("    query_latency_p95:  {:.1}ms", scores.query_latency_p95_ms);
+
+    // Step 6: Build report
+    let report = BenchmarkReport {
+        suite: "quick".to_string(),
+        scores: scores.clone(),
+        config: BenchmarkConfig {
+            bm25_k1: 1.2,
+            bm25_b: 0.75,
+            graph_weight: 0.3,
+            build_ccxi: true,
+        },
+        system: SystemInfo {
+            crux_version: env!("CARGO_PKG_VERSION").to_string(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+        },
+    };
+
+    let json = serde_json::to_string_pretty(&report)?;
+
+    // Save to file
+    let out_path = output.unwrap_or("cruxscore-report.json");
+    std::fs::write(out_path, &json)?;
+    eprintln!("\n  Report saved to: {out_path}");
+
+    // Step 7: Cleanup benchmark data
+    eprint!("  Cleaning up benchmark data... ");
+    let cleanup_resp: serde_json::Value = ureq::get(&format!(
+        "{http_base}/v1/facts?entity=__benchmark__::fact_test&top_k=100"
+    ))
+    .call()?
+    .into_json()?;
+    if let Some(facts) = cleanup_resp["facts"].as_array() {
+        for f in facts {
+            if let Some(id) = f["fact_id"].as_str() {
+                let _ = ureq::delete(&format!("{http_base}/v1/facts/{id}")).call();
+            }
+        }
+    }
+    // Also clean up benchmark docs
+    for doc in &docs {
+        let entity = format!("__benchmark__::{}", doc.doc_id);
+        let resp: serde_json::Value = ureq::get(&format!(
+            "{http_base}/v1/facts?entity={}&top_k=10",
+            urlencoding::encode(&entity)
+        ))
+        .call()?
+        .into_json()?;
+        if let Some(facts) = resp["facts"].as_array() {
+            for f in facts {
+                if let Some(id) = f["fact_id"].as_str() {
+                    let _ = ureq::delete(&format!("{http_base}/v1/facts/{id}")).call();
+                }
+            }
+        }
+    }
+    eprintln!("done");
+
+    // Step 8: Upload (optional)
+    if upload {
+        eprint!("\n  Uploading to scorecrux.com... ");
+        match ureq::post("https://scorecrux.com/api/v1/submit")
+            .set("Content-Type", "application/json")
+            .send_json(serde_json::json!(report))
+        {
+            Ok(resp) => {
+                let body: serde_json::Value = resp.into_json().unwrap_or_default();
+                if let Some(url) = body["url"].as_str() {
+                    eprintln!("uploaded!");
+                    eprintln!("  View at: {url}");
+                } else {
+                    eprintln!("uploaded (no URL in response)");
+                }
+            }
+            Err(e) => {
+                eprintln!("failed: {e}");
+                eprintln!("  Report saved locally — upload manually later.");
+            }
+        }
+    }
+
+    eprintln!();
+    Ok(())
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = (p * (sorted.len() - 1) as f64).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+pub fn compare(file1: &str, file2: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let r1: BenchmarkReport = serde_json::from_str(&std::fs::read_to_string(file1)?)?;
+    let r2: BenchmarkReport = serde_json::from_str(&std::fs::read_to_string(file2)?)?;
+
+    eprintln!("\n  CruxScore Lite Comparison");
+    eprintln!("  ──────────────────────────────────────────────");
+    eprintln!("  {:25} {:>10} {:>10} {:>10}", "Metric", "Run 1", "Run 2", "Delta");
+    eprintln!("  {:25} {:>10} {:>10} {:>10}", "─────", "─────", "─────", "─────");
+
+    let metrics = [
+        ("coverage_score", r1.scores.coverage_score, r2.scores.coverage_score),
+        ("recall@5", r1.scores.recall_at_5, r2.scores.recall_at_5),
+        ("mrr", r1.scores.mrr, r2.scores.mrr),
+        ("fact_recall", r1.scores.fact_recall, r2.scores.fact_recall),
+        (
+            "version_chain",
+            r1.scores.version_chain_depth,
+            r2.scores.version_chain_depth,
+        ),
+    ];
+
+    for (name, v1, v2) in &metrics {
+        let delta = v2 - v1;
+        let arrow = if delta > 0.001 {
+            "+"
+        } else if delta < -0.001 {
+            ""
+        } else {
+            " "
+        };
+        eprintln!("  {:25} {:>10.3} {:>10.3} {:>9}{:.3}", name, v1, v2, arrow, delta);
+    }
+
+    let lat_metrics = [
+        (
+            "query_latency_p50_ms",
+            r1.scores.query_latency_p50_ms,
+            r2.scores.query_latency_p50_ms,
+        ),
+        (
+            "query_latency_p95_ms",
+            r1.scores.query_latency_p95_ms,
+            r2.scores.query_latency_p95_ms,
+        ),
+    ];
+
+    for (name, v1, v2) in &lat_metrics {
+        let delta = v2 - v1;
+        let arrow = if delta > 0.1 {
+            "+"
+        } else if delta < -0.1 {
+            ""
+        } else {
+            " "
+        };
+        eprintln!("  {:25} {:>9.1}ms {:>9.1}ms {:>8}{:.1}ms", name, v1, v2, arrow, delta);
+    }
+
+    eprintln!();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentile_basic() {
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        assert!((percentile(&data, 0.5) - 3.0).abs() < 0.01);
+        assert!((percentile(&data, 0.0) - 1.0).abs() < 0.01);
+        assert!((percentile(&data, 1.0) - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn percentile_empty() {
+        assert!((percentile(&[], 0.5) - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn corpus_deserializes() {
+        let docs: Vec<Document> = serde_json::from_str(include_str!("../benchmark/corpus/quick/documents.json"))
+            .expect("documents.json must parse");
+        assert_eq!(docs.len(), 50);
+
+        let queries: Vec<Query> = serde_json::from_str(include_str!("../benchmark/corpus/quick/queries.json"))
+            .expect("queries.json must parse");
+        assert_eq!(queries.len(), 20);
+    }
+
+    #[test]
+    fn all_query_doc_ids_exist_in_corpus() {
+        let docs: Vec<Document> =
+            serde_json::from_str(include_str!("../benchmark/corpus/quick/documents.json")).unwrap();
+        let queries: Vec<Query> = serde_json::from_str(include_str!("../benchmark/corpus/quick/queries.json")).unwrap();
+
+        let doc_ids: std::collections::HashSet<&str> = docs.iter().map(|d| d.doc_id.as_str()).collect();
+
+        for q in &queries {
+            for id in &q.expected_doc_ids {
+                assert!(
+                    doc_ids.contains(id.as_str()),
+                    "query {} references doc_id {} which doesn't exist",
+                    q.query_id,
+                    id
+                );
+            }
+        }
+    }
+}

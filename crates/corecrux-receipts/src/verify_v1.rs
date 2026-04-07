@@ -5,9 +5,7 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use thiserror::Error;
 
-use crate::candidate_digest_v1::{
-    parse_stored_candidate_digest_bytes_v1, recompute_candidate_digest_bytes_v1,
-};
+use crate::candidate_digest_v1::{parse_stored_candidate_digest_bytes_v1, recompute_candidate_digest_bytes_v1};
 use crate::keyring_v1::Ed25519KeyRingV1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,11 +87,7 @@ pub struct VerificationReportV1 {
     /// Best-effort extracted trace values from the receipt body (for drift tools).
     ///
     /// This is additive metadata; the canonical truth is always the stored receipt body bytes.
-    #[serde(
-        rename = "trace_summary",
-        skip_serializing_if = "Option::is_none",
-        default
-    )]
+    #[serde(rename = "trace_summary", skip_serializing_if = "Option::is_none", default)]
     pub trace_summary: Option<VerificationTraceSummaryV1>,
 
     #[serde(rename = "signature_valid")]
@@ -168,11 +162,7 @@ pub struct VerificationTraceSummaryV1 {
     /// Stored candidate_digest value as extracted from the receipt body bytes.
     ///
     /// We never reserialize receipt bytes; this is a convenience field for drift tools.
-    #[serde(
-        rename = "candidate_digest",
-        skip_serializing_if = "Option::is_none",
-        default
-    )]
+    #[serde(rename = "candidate_digest", skip_serializing_if = "Option::is_none", default)]
     pub candidate_digest: Option<String>,
 }
 
@@ -191,34 +181,27 @@ pub struct VerifyReceiptInput<'a> {
     pub recompute_candidate_digest: bool,
 }
 
-pub fn verify_receipt_v1(
-    input: VerifyReceiptInput<'_>,
-) -> Result<VerificationReportV1, VerifyError> {
+pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationReportV1, VerifyError> {
     let computed = blake3::hash(input.body_bytes);
     let payload_hash_matches = computed.as_bytes() == &input.stored_body_payload_hash;
 
     // Optional parseability check: we only care that it's valid CBOR; canonical-form checks are
     // explicitly producer-side in Phase 8.
     let mut parsed_body: Option<ciborium::value::Value> = None;
-    let canonical_bytes_parse_ok = match ciborium::de::from_reader::<ciborium::value::Value, _>(
-        std::io::Cursor::new(input.body_bytes),
-    ) {
-        Ok(v) => {
-            parsed_body = Some(v);
-            true
-        }
-        Err(_) => false,
-    };
+    let canonical_bytes_parse_ok =
+        match ciborium::de::from_reader::<ciborium::value::Value, _>(std::io::Cursor::new(input.body_bytes)) {
+            Ok(v) => {
+                parsed_body = Some(v);
+                true
+            }
+            Err(_) => false,
+        };
 
-    let (trace_checks, trace_summary) =
-        compute_trace_checks(parsed_body.as_ref(), input.recompute_candidate_digest);
+    let (trace_checks, trace_summary) = compute_trace_checks(parsed_body.as_ref(), input.recompute_candidate_digest);
 
     // Report the stored header payloadHash; this is the anchor value exported and indexed by CoreCrux.
     let payload_hash_hex = hex32(&input.stored_body_payload_hash);
-    let verifier_build = format!(
-        "{}@{}",
-        input.verifier_build.version, input.verifier_build.commit
-    );
+    let verifier_build = format!("{}@{}", input.verifier_build.version, input.verifier_build.commit);
 
     // If body hash doesn't match, we still attempt to verify the signature over the stored bytes
     // so operators can distinguish "corrupt storage" from "bad signature".
@@ -360,9 +343,7 @@ pub fn verify_receipt_v1(
         });
     }
 
-    if sig.signed_payload_hash.len() != 32
-        || sig.signed_payload_hash.as_slice() != input.stored_body_payload_hash
-    {
+    if sig.signed_payload_hash.len() != 32 || sig.signed_payload_hash.as_slice() != input.stored_body_payload_hash {
         err = if !payload_hash_matches {
             VerifyErrorCodeV1::BodyHashMismatch
         } else {
@@ -618,20 +599,13 @@ fn hex32(bytes: &[u8; 32]) -> String {
 fn compute_trace_checks(
     parsed_body: Option<&ciborium::value::Value>,
     recompute_candidate_digest: bool,
-) -> (
-    VerificationTraceChecksV1,
-    Option<VerificationTraceSummaryV1>,
-) {
+) -> (VerificationTraceChecksV1, Option<VerificationTraceSummaryV1>) {
     use ciborium::value::Value;
 
     let Some(parsed_body) = parsed_body else {
         return (
             VerificationTraceChecksV1 {
-                candidate_digest_matches_recompute: if recompute_candidate_digest {
-                    Some(false)
-                } else {
-                    None
-                },
+                candidate_digest_matches_recompute: if recompute_candidate_digest { Some(false) } else { None },
                 ..Default::default()
             },
             None,
@@ -641,11 +615,7 @@ fn compute_trace_checks(
     let Value::Map(map) = parsed_body else {
         return (
             VerificationTraceChecksV1 {
-                candidate_digest_matches_recompute: if recompute_candidate_digest {
-                    Some(false)
-                } else {
-                    None
-                },
+                candidate_digest_matches_recompute: if recompute_candidate_digest { Some(false) } else { None },
                 ..Default::default()
             },
             None,
@@ -657,11 +627,7 @@ fn compute_trace_checks(
     let Some(Value::Map(rt)) = retrieval else {
         return (
             VerificationTraceChecksV1 {
-                candidate_digest_matches_recompute: if recompute_candidate_digest {
-                    Some(false)
-                } else {
-                    None
-                },
+                candidate_digest_matches_recompute: if recompute_candidate_digest { Some(false) } else { None },
                 ..Default::default()
             },
             None,
@@ -690,9 +656,7 @@ fn compute_trace_checks(
     let priors_applied_present = get_val(rt, "priors_applied")
         .or_else(|| get_val(rt, "priorsApplied"))
         .is_some();
-    let rerank_present = get_val(rt, "rerank")
-        .or_else(|| get_val(rt, "reranker"))
-        .is_some();
+    let rerank_present = get_val(rt, "rerank").or_else(|| get_val(rt, "reranker")).is_some();
     let candidates_present = matches!(get_val(rt, "candidates"), Some(Value::Array(_)));
 
     let anchors = get_val(rt, "anchors").or_else(|| get_val(rt, "anchoring"));
@@ -734,11 +698,9 @@ fn compute_trace_checks(
                 candidate_digest_present,
                 candidate_digest_matches_recompute: None,
             },
-            candidate_digest
-                .clone()
-                .map(|v| VerificationTraceSummaryV1 {
-                    candidate_digest: Some(v),
-                }),
+            candidate_digest.clone().map(|v| VerificationTraceSummaryV1 {
+                candidate_digest: Some(v),
+            }),
         );
     }
 
@@ -765,11 +727,9 @@ fn compute_trace_checks(
             candidate_digest_present,
             candidate_digest_matches_recompute: Some(matches),
         },
-        candidate_digest
-            .clone()
-            .map(|v| VerificationTraceSummaryV1 {
-                candidate_digest: Some(v),
-            }),
+        candidate_digest.clone().map(|v| VerificationTraceSummaryV1 {
+            candidate_digest: Some(v),
+        }),
     )
 }
 
@@ -856,8 +816,14 @@ mod tests {
         assert_eq!(VerifyErrorCodeV1::SigMissing.as_str(), "SIG_MISSING");
         assert_eq!(VerifyErrorCodeV1::SigParseError.as_str(), "SIG_PARSE_ERROR");
         assert_eq!(VerifyErrorCodeV1::SigAlgUnsupported.as_str(), "SIG_ALG_UNSUPPORTED");
-        assert_eq!(VerifyErrorCodeV1::SigReceiptIdMismatch.as_str(), "SIG_RECEIPT_ID_MISMATCH");
-        assert_eq!(VerifyErrorCodeV1::SigPayloadHashMismatch.as_str(), "SIG_PAYLOAD_HASH_MISMATCH");
+        assert_eq!(
+            VerifyErrorCodeV1::SigReceiptIdMismatch.as_str(),
+            "SIG_RECEIPT_ID_MISMATCH"
+        );
+        assert_eq!(
+            VerifyErrorCodeV1::SigPayloadHashMismatch.as_str(),
+            "SIG_PAYLOAD_HASH_MISMATCH"
+        );
         assert_eq!(VerifyErrorCodeV1::KeyRingMissing.as_str(), "KEYRING_MISSING");
         assert_eq!(VerifyErrorCodeV1::KeyNotFound.as_str(), "KEY_NOT_FOUND");
         assert_eq!(VerifyErrorCodeV1::PubKeyInvalid.as_str(), "PUBKEY_INVALID");
@@ -957,8 +923,7 @@ mod tests {
             v: 1,
             keys: vec![Ed25519KeyEntryV1 {
                 key_id: "k1".to_string(),
-                pub_key_base64: base64::engine::general_purpose::STANDARD
-                    .encode(vk.as_bytes()),
+                pub_key_base64: base64::engine::general_purpose::STANDARD.encode(vk.as_bytes()),
             }],
         };
 
@@ -1106,8 +1071,7 @@ mod tests {
             v: 1,
             keys: vec![Ed25519KeyEntryV1 {
                 key_id: "different-key".to_string(),
-                pub_key_base64: base64::engine::general_purpose::STANDARD
-                    .encode(vk.as_bytes()),
+                pub_key_base64: base64::engine::general_purpose::STANDARD.encode(vk.as_bytes()),
             }],
         };
 
@@ -1218,8 +1182,7 @@ mod tests {
         };
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&sig, &mut bytes).unwrap();
-        let parsed: ReceiptSigV1 =
-            ciborium::de::from_reader(std::io::Cursor::new(&bytes)).unwrap();
+        let parsed: ReceiptSigV1 = ciborium::de::from_reader(std::io::Cursor::new(&bytes)).unwrap();
         assert_eq!(parsed.receipt_id, "r-test");
         assert_eq!(parsed.alg, "ed25519");
         assert_eq!(parsed.signature, vec![1, 2, 3, 4]);
@@ -1230,10 +1193,7 @@ mod tests {
     #[test]
     fn val_to_digest_text() {
         let v = ciborium::value::Value::Text("digest_value".to_string());
-        assert_eq!(
-            val_to_candidate_digest_string(&v),
-            Some("digest_value".to_string())
-        );
+        assert_eq!(val_to_candidate_digest_string(&v), Some("digest_value".to_string()));
     }
 
     #[test]

@@ -16,10 +16,11 @@ pub enum CommitLevel {
 impl CommitLevel {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim() {
-            "local" | "LOCAL" | "local_commit" | "LOCAL_COMMIT" | "local-commit"
-            | "LOCAL-COMMIT" => Some(Self::LocalCommit),
-            "replicated" | "REPLICATED" | "replicated_commit" | "REPLICATED_COMMIT"
-            | "replicated-commit" | "REPLICATED-COMMIT" => Some(Self::ReplicatedCommit),
+            "local" | "LOCAL" | "local_commit" | "LOCAL_COMMIT" | "local-commit" | "LOCAL-COMMIT" => {
+                Some(Self::LocalCommit)
+            }
+            "replicated" | "REPLICATED" | "replicated_commit" | "REPLICATED_COMMIT" | "replicated-commit"
+            | "REPLICATED-COMMIT" => Some(Self::ReplicatedCommit),
             _ => None,
         }
     }
@@ -43,9 +44,7 @@ impl StoreLockStrategy {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim() {
             "mutex" | "MUTEX" => Some(Self::Mutex),
-            "rwlock" | "RWLOCK" | "rw_lock" | "RW_LOCK" | "rw-lock" | "RW-LOCK" => {
-                Some(Self::RwLock)
-            }
+            "rwlock" | "RWLOCK" | "rw_lock" | "RW_LOCK" | "rw-lock" | "RW-LOCK" => Some(Self::RwLock),
             "sharded" | "SHARDED" => Some(Self::Sharded),
             _ => None,
         }
@@ -62,14 +61,14 @@ impl StoreLockStrategy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendLaneScope {
-    Gpu,
+    Global,
     Shard,
 }
 
 impl AppendLaneScope {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim() {
-            "gpu" | "GPU" => Some(Self::Gpu),
+            "global" | "GLOBAL" => Some(Self::Global),
             "shard" | "SHARD" => Some(Self::Shard),
             _ => None,
         }
@@ -77,7 +76,7 @@ impl AppendLaneScope {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Gpu => "gpu",
+            Self::Global => "global",
             Self::Shard => "shard",
         }
     }
@@ -101,14 +100,8 @@ pub struct Config {
     pub replicated_commit_require_all_followers: bool,
     pub auth_mode: AuthMode,
 
-    // Phase 9: IO backend selection (gpu-dev vs gpu-gds).
+    // IO backend selection.
     pub io_backend: String,
-    pub gds_require_no_compat_mode: bool,
-    pub gds_preflight_io: bool,
-    pub gds_library_path: Option<String>,
-
-    // Phase 9: Optional hardware-profile pinning (fail /readyz on mismatch).
-    pub hardware_profile_path: Option<PathBuf>,
 
     // Phase 7 projections (Living Objects).
     pub projections_enabled: bool,
@@ -135,7 +128,6 @@ pub struct Config {
     pub store_lock_strategy: StoreLockStrategy,
     pub append_lane_enabled: bool,
     pub append_lane_scope: AppendLaneScope,
-    pub append_gpu_lane_fanout: usize,
     pub tail_cache_enabled: bool,
     pub read_retry_failed_readyz_threshold: u64,
     pub backpressure_high_watermark_ratio: f64,
@@ -177,7 +169,7 @@ pub fn load_config() -> Config {
     let http_host: IpAddr = std::env::var("CORECRUXD_HTTP_HOST")
         .unwrap_or_else(|_| "127.0.0.1".to_string())
         .parse()
-        .unwrap_or_else(|_| "127.0.0.1".parse().expect("default http host parses"));
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let http_port: u16 = std::env::var("CORECRUXD_HTTP_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -186,17 +178,15 @@ pub fn load_config() -> Config {
     let grpc_host: IpAddr = std::env::var("CORECRUXD_GRPC_HOST")
         .unwrap_or_else(|_| "127.0.0.1".to_string())
         .parse()
-        .unwrap_or_else(|_| "127.0.0.1".parse().expect("default grpc host parses"));
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let grpc_port: u16 = std::env::var("CORECRUXD_GRPC_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4007);
 
-    let data_dir =
-        std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+    let data_dir = std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
     let log_level = std::env::var("CORECRUXD_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
-    let service_name =
-        std::env::var("CORECRUXD_SERVICE").unwrap_or_else(|_| "corecruxd".to_string());
+    let service_name = std::env::var("CORECRUXD_SERVICE").unwrap_or_else(|_| "corecruxd".to_string());
     let cluster_id = std::env::var("CORECRUXD_CLUSTER_ID").unwrap_or_else(|_| "dev".to_string());
     let node_id_override = std::env::var("CORECRUXD_NODE_ID").ok();
     let routing_reload_interval_ms = std::env::var("CORECRUXD_ROUTING_RELOAD_INTERVAL_MS")
@@ -225,32 +215,17 @@ pub fn load_config() -> Config {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5_000)
         .clamp(100, 120_000);
-    let replicated_commit_require_all_followers =
-        std::env::var("CORECRUXD_REPLICATED_COMMIT_REQUIRE_ALL_FOLLOWERS")
-            .ok()
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(true);
+    let replicated_commit_require_all_followers = std::env::var("CORECRUXD_REPLICATED_COMMIT_REQUIRE_ALL_FOLLOWERS")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(true);
 
     let auth_mode = std::env::var("CORECRUXD_AUTH_MODE")
         .ok()
         .and_then(|s| AuthMode::parse(&s))
         .unwrap_or(AuthMode::DevScopes);
 
-    let io_backend =
-        std::env::var("CORECRUXD_IO_BACKEND").unwrap_or_else(|_| "gpu-dev".to_string());
-    let gds_require_no_compat_mode = std::env::var("CORECRUXD_GDS_REQUIRE_NO_COMPAT_MODE")
-        .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(true);
-    let gds_preflight_io = std::env::var("CORECRUXD_GDS_PREFLIGHT_IO")
-        .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(true);
-    let gds_library_path = std::env::var("CORECRUXD_GDS_LIBRARY_PATH").ok();
-
-    let hardware_profile_path = std::env::var("CORECRUXD_HARDWARE_PROFILE_PATH")
-        .ok()
-        .map(PathBuf::from);
+    let io_backend = std::env::var("CORECRUXD_IO_BACKEND").unwrap_or_else(|_| "cpu".to_string());
 
     let build_ccxi = std::env::var("CORECRUXD_BUILD_CCXI")
         .ok()
@@ -279,14 +254,11 @@ pub fn load_config() -> Config {
         .ok()
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(true);
-    let receipts_recompute_candidate_digest =
-        std::env::var("CORECRUXD_RECEIPTS_RECOMPUTE_CANDIDATE_DIGEST")
-            .ok()
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false);
-    let receipts_keyring_path = std::env::var("CORECRUXD_RECEIPTS_KEYRING_PATH")
+    let receipts_recompute_candidate_digest = std::env::var("CORECRUXD_RECEIPTS_RECOMPUTE_CANDIDATE_DIGEST")
         .ok()
-        .map(PathBuf::from);
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    let receipts_keyring_path = std::env::var("CORECRUXD_RECEIPTS_KEYRING_PATH").ok().map(PathBuf::from);
     let receipts_keyring_json = std::env::var("CORECRUXD_RECEIPTS_KEYRING_JSON").ok();
     let replay_batch_max_events = std::env::var("CORECRUXD_REPLAY_BATCH_MAX_EVENTS")
         .ok()
@@ -320,39 +292,27 @@ pub fn load_config() -> Config {
         .ok()
         .as_deref()
         .and_then(AppendLaneScope::parse)
-        // Keep default lane scope aligned with current store write-lock domain (per-GPU store).
-        // Per-shard lane scope is available via env for experiments, but shifts queueing into
-        // store.lockWait until store-level shard lock domains are implemented.
-        .unwrap_or(AppendLaneScope::Gpu);
-    let append_gpu_lane_fanout = std::env::var("CORECRUXD_APPEND_GPU_LANE_FANOUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
-        .clamp(1, 64);
+        .unwrap_or(AppendLaneScope::Global);
     let tail_cache_enabled = std::env::var("CORECRUXD_TAIL_CACHE_ENABLED")
         .ok()
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(true);
-    let read_retry_failed_readyz_threshold =
-        std::env::var("CORECRUXD_READ_RETRY_FAILED_READYZ_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3);
-    let mut backpressure_high_watermark_ratio: f64 =
-        std::env::var("CORECRUXD_BACKPRESSURE_HIGH_WATERMARK_RATIO")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.90);
-    let mut backpressure_low_watermark_ratio: f64 =
-        std::env::var("CORECRUXD_BACKPRESSURE_LOW_WATERMARK_RATIO")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.80);
+    let read_retry_failed_readyz_threshold = std::env::var("CORECRUXD_READ_RETRY_FAILED_READYZ_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let mut backpressure_high_watermark_ratio: f64 = std::env::var("CORECRUXD_BACKPRESSURE_HIGH_WATERMARK_RATIO")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.90);
+    let mut backpressure_low_watermark_ratio: f64 = std::env::var("CORECRUXD_BACKPRESSURE_LOW_WATERMARK_RATIO")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.80);
     backpressure_high_watermark_ratio = backpressure_high_watermark_ratio.clamp(0.01, 0.99);
     backpressure_low_watermark_ratio = backpressure_low_watermark_ratio.clamp(0.0, 0.98);
     if backpressure_low_watermark_ratio >= backpressure_high_watermark_ratio {
-        backpressure_low_watermark_ratio =
-            (backpressure_high_watermark_ratio - 0.05).clamp(0.0, 0.95);
+        backpressure_low_watermark_ratio = (backpressure_high_watermark_ratio - 0.05).clamp(0.0, 0.95);
     }
     let backpressure_retry_after_ms = std::env::var("CORECRUXD_BACKPRESSURE_RETRY_AFTER_MS")
         .ok()
@@ -380,10 +340,8 @@ pub fn load_config() -> Config {
         .and_then(|s| s.parse().ok())
         .unwrap_or(300)
         .clamp(10, 86_400);
-    let scrub_scope =
-        std::env::var("CORECRUXD_SCRUB_SCOPE").unwrap_or_else(|_| "recent".to_string());
-    let scrub_mode =
-        std::env::var("CORECRUXD_SCRUB_MODE").unwrap_or_else(|_| "sampled".to_string());
+    let scrub_scope = std::env::var("CORECRUXD_SCRUB_SCOPE").unwrap_or_else(|_| "recent".to_string());
+    let scrub_mode = std::env::var("CORECRUXD_SCRUB_MODE").unwrap_or_else(|_| "sampled".to_string());
     let scrub_sample_rate: f64 = std::env::var("CORECRUXD_SCRUB_SAMPLE_RATE")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
@@ -408,12 +366,11 @@ pub fn load_config() -> Config {
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.10)
         .clamp(0.01, 0.90);
-    let capacity_emergency_free_ratio: f64 =
-        std::env::var("CORECRUXD_CAPACITY_EMERGENCY_FREE_RATIO")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.10)
-            .clamp(0.01, 0.90);
+    let capacity_emergency_free_ratio: f64 = std::env::var("CORECRUXD_CAPACITY_EMERGENCY_FREE_RATIO")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.10)
+        .clamp(0.01, 0.90);
     let mut capacity_resume_free_ratio: f64 = std::env::var("CORECRUXD_CAPACITY_RESUME_FREE_RATIO")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
@@ -425,11 +382,9 @@ pub fn load_config() -> Config {
     let capacity_critical_free_ratio = capacity_critical_free_ratio
         .max(capacity_emergency_free_ratio)
         .min(capacity_warning_free_ratio);
-    let capacity_emergency_free_ratio =
-        capacity_emergency_free_ratio.min(capacity_critical_free_ratio);
+    let capacity_emergency_free_ratio = capacity_emergency_free_ratio.min(capacity_critical_free_ratio);
     if capacity_resume_free_ratio <= capacity_emergency_free_ratio {
-        capacity_resume_free_ratio =
-            (capacity_emergency_free_ratio + 0.05).min(capacity_warning_free_ratio);
+        capacity_resume_free_ratio = (capacity_emergency_free_ratio + 0.05).min(capacity_warning_free_ratio);
     }
 
     Config {
@@ -450,10 +405,6 @@ pub fn load_config() -> Config {
         auth_mode,
 
         io_backend,
-        gds_require_no_compat_mode,
-        gds_preflight_io,
-        gds_library_path,
-        hardware_profile_path,
 
         build_ccxi,
 
@@ -474,7 +425,6 @@ pub fn load_config() -> Config {
         store_lock_strategy,
         append_lane_enabled,
         append_lane_scope,
-        append_gpu_lane_fanout,
         tail_cache_enabled,
         read_retry_failed_readyz_threshold,
         backpressure_high_watermark_ratio,
@@ -550,14 +500,8 @@ mod tests {
     #[test]
     fn commit_level_parse_accepts_aliases() {
         assert_eq!(CommitLevel::parse("local"), Some(CommitLevel::LocalCommit));
-        assert_eq!(
-            CommitLevel::parse("LOCAL_COMMIT"),
-            Some(CommitLevel::LocalCommit)
-        );
-        assert_eq!(
-            CommitLevel::parse("replicated"),
-            Some(CommitLevel::ReplicatedCommit)
-        );
+        assert_eq!(CommitLevel::parse("LOCAL_COMMIT"), Some(CommitLevel::LocalCommit));
+        assert_eq!(CommitLevel::parse("replicated"), Some(CommitLevel::ReplicatedCommit));
         assert_eq!(
             CommitLevel::parse("REPLICATED-COMMIT"),
             Some(CommitLevel::ReplicatedCommit)
@@ -579,18 +523,9 @@ mod tests {
 
     #[test]
     fn store_lock_strategy_parse_accepts_aliases() {
-        assert_eq!(
-            StoreLockStrategy::parse("mutex"),
-            Some(StoreLockStrategy::Mutex)
-        );
-        assert_eq!(
-            StoreLockStrategy::parse("RW_LOCK"),
-            Some(StoreLockStrategy::RwLock)
-        );
-        assert_eq!(
-            StoreLockStrategy::parse("sharded"),
-            Some(StoreLockStrategy::Sharded)
-        );
+        assert_eq!(StoreLockStrategy::parse("mutex"), Some(StoreLockStrategy::Mutex));
+        assert_eq!(StoreLockStrategy::parse("RW_LOCK"), Some(StoreLockStrategy::RwLock));
+        assert_eq!(StoreLockStrategy::parse("sharded"), Some(StoreLockStrategy::Sharded));
     }
 
     #[test]
@@ -601,22 +536,20 @@ mod tests {
 
     #[test]
     fn append_lane_scope_parse_accepts_aliases() {
-        assert_eq!(AppendLaneScope::parse("gpu"), Some(AppendLaneScope::Gpu));
-        assert_eq!(
-            AppendLaneScope::parse("SHARD"),
-            Some(AppendLaneScope::Shard)
-        );
+        assert_eq!(AppendLaneScope::parse("global"), Some(AppendLaneScope::Global));
+        assert_eq!(AppendLaneScope::parse("SHARD"), Some(AppendLaneScope::Shard));
     }
 
     #[test]
     fn append_lane_scope_parse_rejects_invalid_values() {
         assert_eq!(AppendLaneScope::parse(""), None);
         assert_eq!(AppendLaneScope::parse("store"), None);
+        assert_eq!(AppendLaneScope::parse("gpu"), None);
     }
 
     #[test]
     fn append_lane_scope_as_str_is_stable() {
-        assert_eq!(AppendLaneScope::Gpu.as_str(), "gpu");
+        assert_eq!(AppendLaneScope::Global.as_str(), "global");
         assert_eq!(AppendLaneScope::Shard.as_str(), "shard");
     }
 
@@ -629,10 +562,7 @@ mod tests {
 
     #[test]
     fn commit_level_parse_trims_whitespace() {
-        assert_eq!(
-            CommitLevel::parse("  local  "),
-            Some(CommitLevel::LocalCommit)
-        );
+        assert_eq!(CommitLevel::parse("  local  "), Some(CommitLevel::LocalCommit));
         assert_eq!(
             CommitLevel::parse("\treplicated\n"),
             Some(CommitLevel::ReplicatedCommit)
@@ -641,22 +571,13 @@ mod tests {
 
     #[test]
     fn store_lock_strategy_parse_trims_whitespace() {
-        assert_eq!(
-            StoreLockStrategy::parse("  mutex  "),
-            Some(StoreLockStrategy::Mutex)
-        );
-        assert_eq!(
-            StoreLockStrategy::parse("\trwlock\n"),
-            Some(StoreLockStrategy::RwLock)
-        );
+        assert_eq!(StoreLockStrategy::parse("  mutex  "), Some(StoreLockStrategy::Mutex));
+        assert_eq!(StoreLockStrategy::parse("\trwlock\n"), Some(StoreLockStrategy::RwLock));
     }
 
     #[test]
     fn append_lane_scope_parse_trims_whitespace() {
-        assert_eq!(
-            AppendLaneScope::parse("  gpu  "),
-            Some(AppendLaneScope::Gpu)
-        );
+        assert_eq!(AppendLaneScope::parse("  global  "), Some(AppendLaneScope::Global));
     }
 
     #[test]
@@ -720,11 +641,11 @@ mod tests {
 
     #[test]
     fn append_lane_scope_all_parse_aliases() {
-        for alias in &["gpu", "GPU"] {
+        for alias in &["global", "GLOBAL"] {
             assert_eq!(
                 AppendLaneScope::parse(alias),
-                Some(AppendLaneScope::Gpu),
-                "expected Gpu for alias '{alias}'"
+                Some(AppendLaneScope::Global),
+                "expected Global for alias '{alias}'"
             );
         }
         for alias in &["shard", "SHARD"] {
@@ -779,11 +700,7 @@ mod tests {
         assert_eq!(cfg.replicated_commit_timeout_ms, 5000);
         assert!(cfg.replicated_commit_require_all_followers);
         assert_eq!(cfg.auth_mode, crate::auth::AuthMode::DevScopes);
-        assert_eq!(cfg.io_backend, "gpu-dev");
-        assert!(cfg.gds_require_no_compat_mode);
-        assert!(cfg.gds_preflight_io);
-        assert_eq!(cfg.gds_library_path, None);
-        assert_eq!(cfg.hardware_profile_path, None);
+        assert_eq!(cfg.io_backend, "cpu");
         assert!(!cfg.build_ccxi);
         assert!(!cfg.projections_enabled);
         assert_eq!(cfg.projections_batch_frames, 1024);
@@ -799,8 +716,7 @@ mod tests {
         assert!(cfg.replay_use_batched_rpc_default);
         assert_eq!(cfg.store_lock_strategy, StoreLockStrategy::Sharded);
         assert!(cfg.append_lane_enabled);
-        assert_eq!(cfg.append_lane_scope, AppendLaneScope::Gpu);
-        assert_eq!(cfg.append_gpu_lane_fanout, 1);
+        assert_eq!(cfg.append_lane_scope, AppendLaneScope::Global);
         assert!(cfg.tail_cache_enabled);
         assert_eq!(cfg.read_retry_failed_readyz_threshold, 3);
         // backpressure defaults
@@ -857,8 +773,6 @@ mod tests {
         std::env::set_var("CORECRUXD_REPLICATED_COMMIT_REQUIRE_ALL_FOLLOWERS", "false");
         std::env::set_var("CORECRUXD_AUTH_MODE", "off");
         std::env::set_var("CORECRUXD_IO_BACKEND", "gpu-gds");
-        std::env::set_var("CORECRUXD_GDS_REQUIRE_NO_COMPAT_MODE", "false");
-        std::env::set_var("CORECRUXD_GDS_PREFLIGHT_IO", "false");
         std::env::set_var("CORECRUXD_BUILD_CCXI", "true");
         std::env::set_var("CORECRUXD_PROJECTIONS_ENABLED", "1");
         std::env::set_var("CORECRUXD_PROJECTIONS_BATCH_FRAMES", "2048");
@@ -869,7 +783,6 @@ mod tests {
         std::env::set_var("CORECRUXD_STORE_LOCK_STRATEGY", "rwlock");
         std::env::set_var("CORECRUXD_APPEND_LANE_ENABLED", "false");
         std::env::set_var("CORECRUXD_APPEND_LANE_SCOPE", "shard");
-        std::env::set_var("CORECRUXD_APPEND_GPU_LANE_FANOUT", "4");
         std::env::set_var("CORECRUXD_TAIL_CACHE_ENABLED", "false");
         std::env::set_var("CORECRUXD_REPLAY_USE_BATCHED_RPC_DEFAULT", "false");
         std::env::set_var("CORECRUXD_SCRUB_SCHEDULER_ENABLED", "true");
@@ -899,9 +812,8 @@ mod tests {
         assert_eq!(cfg.replicated_commit_timeout_ms, 10000);
         assert!(!cfg.replicated_commit_require_all_followers);
         assert_eq!(cfg.auth_mode, crate::auth::AuthMode::Off);
+        // io_backend from CORECRUXD_IO_BACKEND env (test sets "gpu-gds", kept for compatibility)
         assert_eq!(cfg.io_backend, "gpu-gds");
-        assert!(!cfg.gds_require_no_compat_mode);
-        assert!(!cfg.gds_preflight_io);
         assert!(cfg.build_ccxi);
         assert!(cfg.projections_enabled);
         assert_eq!(cfg.projections_batch_frames, 2048);
@@ -912,7 +824,6 @@ mod tests {
         assert_eq!(cfg.store_lock_strategy, StoreLockStrategy::RwLock);
         assert!(!cfg.append_lane_enabled);
         assert_eq!(cfg.append_lane_scope, AppendLaneScope::Shard);
-        assert_eq!(cfg.append_gpu_lane_fanout, 4);
         assert!(!cfg.tail_cache_enabled);
         assert!(!cfg.replay_use_batched_rpc_default);
         assert!(cfg.scrub_scheduler_enabled);
@@ -943,24 +854,6 @@ mod tests {
         std::env::set_var("CORECRUXD_REPLICATED_COMMIT_TIMEOUT_MS", "999999");
         let cfg = super::load_config();
         assert_eq!(cfg.replicated_commit_timeout_ms, 120_000);
-
-        clear_corecruxd_env();
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn load_config_clamping_append_gpu_lane_fanout() {
-        let lock = env_lock();
-        let _g = lock.lock().unwrap();
-        clear_corecruxd_env();
-
-        std::env::set_var("CORECRUXD_APPEND_GPU_LANE_FANOUT", "0");
-        let cfg = super::load_config();
-        assert_eq!(cfg.append_gpu_lane_fanout, 1);
-
-        std::env::set_var("CORECRUXD_APPEND_GPU_LANE_FANOUT", "999");
-        let cfg = super::load_config();
-        assert_eq!(cfg.append_gpu_lane_fanout, 64);
 
         clear_corecruxd_env();
     }

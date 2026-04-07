@@ -95,6 +95,7 @@ impl CorrelationIds {
         }
     }
 
+    #[allow(dead_code)] // Used by proprietary edition gRPC handlers.
     pub fn from_metadata(meta: &MetadataMap) -> Self {
         let request_id = meta
             .get("x-request-id")
@@ -236,10 +237,7 @@ mod tests {
         let value = log.to_json_value();
         assert!(value.get("ts").is_some());
         assert_eq!(value.get("level").and_then(|v| v.as_str()), Some("info"));
-        assert_eq!(
-            value.get("op").and_then(|v| v.as_str()),
-            Some("verify_store")
-        );
+        assert_eq!(value.get("op").and_then(|v| v.as_str()), Some("verify_store"));
         assert_eq!(value.get("outcome").and_then(|v| v.as_str()), Some("ok"));
         assert_eq!(value.get("took_ms").and_then(|v| v.as_u64()), Some(12));
         assert!(value.get("payload").is_none());

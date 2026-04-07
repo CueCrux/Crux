@@ -2,14 +2,30 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+// The daemon must never panic on untrusted input. Escalate workspace-level
+// warn lints to deny for the corecruxd binary. Individual call sites may
+// #[allow] with a // SAFETY: justification if the unwrap is provably safe.
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::panic)]
+
 mod auth;
 mod config;
 mod control;
+// Dataplane store stubs: proprietary edition provides the real implementation.
+#[allow(dead_code)]
 mod dataplane_store;
+// gRPC service stubs: proprietary edition implements full RPCs; community
+// edition keeps the server skeleton. Suppress dead_code for stub internals.
+#[allow(dead_code)]
 mod grpc;
 mod http;
+// metrics: Prometheus register!() macros use expect() at init — safe, panics
+// only on duplicate registration (programmer error caught in tests).
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod metrics;
 mod ops_events;
+mod playground;
 mod pool;
 mod problem;
 mod shard_map;
@@ -29,10 +45,9 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
 use corecrux_types::{
-    BuildInfo, CapacityThresholdBreachedV1, CompatContract, ControlCheckpointMaterializedV1,
-    ControlStateMutationV1, ShardRebalanceRecordedV1, DEFAULT_COMPAT_REQUIRES, DEFAULT_SDK_VERSION,
-    EVT_CAPACITY_THRESHOLD_BREACHED_V1, EVT_CONTROL_CHECKPOINT_MATERIALIZED_V1,
-    EVT_CONTROL_STATE_MUTATION_V1, EVT_SHARD_REBALANCE_RECORDED_V1,
+    BuildInfo, CapacityThresholdBreachedV1, CompatContract, ControlCheckpointMaterializedV1, ControlStateMutationV1,
+    DEFAULT_COMPAT_REQUIRES, DEFAULT_SDK_VERSION, EVT_CAPACITY_THRESHOLD_BREACHED_V1,
+    EVT_CONTROL_CHECKPOINT_MATERIALIZED_V1, EVT_CONTROL_STATE_MUTATION_V1,
 };
 
 use crate::auth::AuthMode;
@@ -42,7 +57,6 @@ use crate::http::{AppState, CapacityState, Readiness};
 use crate::metrics::Metrics;
 use crate::ops_events::{append_ops_event, build_node_context, now_unix_ms};
 use crate::shard_map::{RoutingTable, ShardMapStore};
-use crate::structured_log::{ErrorCode, StructuredOpLog};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -58,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         replication_auth_bearer_configured(),
     )
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    // Used only in CUDA builds today; keep the config fields live on CPU-only builds too.
+    // Keep config fields live on CPU-only builds for future use.
     let _ = (
         config.routing_strict_client_version,
         config.commit_level,
@@ -101,10 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.capacity_critical_free_ratio,
         config.capacity_emergency_free_ratio,
         config.capacity_resume_free_ratio,
-        config.gds_require_no_compat_mode,
-        config.gds_preflight_io,
-        &config.gds_library_path,
-        &config.hardware_profile_path,
+        config.projections_enabled,
+        config.projections_batch_frames,
+        config.projections_tick_interval_ms,
     );
     init_tracing(&config.log_level);
 
@@ -113,12 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .payload()
             .downcast_ref::<&str>()
             .copied()
-            .or_else(|| {
-                panic_info
-                    .payload()
-                    .downcast_ref::<String>()
-                    .map(|s| s.as_str())
-            })
+            .or_else(|| panic_info.payload().downcast_ref::<String>().map(|s| s.as_str()))
             .unwrap_or("unknown");
         let location = panic_info
             .location()
@@ -136,31 +144,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let control_path = config.data_dir.join("CONTROL.json");
     let control_handle = crate::control::ControlHandle::load_or_init(control_path.clone())?;
-    let control: Arc<RwLock<crate::control::ControlV1>> =
-        Arc::new(RwLock::new(control_handle.state));
+    let control: Arc<RwLock<crate::control::ControlV1>> = Arc::new(RwLock::new(control_handle.state));
 
     let build = BuildInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        commit: option_env!("CORECRUX_GIT_SHA")
-            .unwrap_or("unknown")
-            .to_string(),
+        commit: option_env!("CORECRUX_GIT_SHA").unwrap_or("unknown").to_string(),
     };
 
     let metrics = Metrics::new(&build, &config.service_name);
-    metrics.set_gpu_up(false);
     metrics.set_peer_cache_bytes(0);
     {
         let c = control.read().await.clone();
         update_control_metrics(&metrics, &c);
     }
-    // CPU-only: keep a stable metrics surface.
     metrics.set_io_backend(&config.io_backend);
-    metrics.set_gds_active(false);
-    metrics.set_gds_degraded(false);
-    metrics.set_hardware_profile_match(true);
-    metrics.set_gpu_worker_up(0, false);
     metrics.touch_peer_cache_metrics();
-    metrics.inc_kernel_launch("smoke", "skipped");
 
     let gpu_id_for_meta: Option<i32> = None;
 
@@ -188,58 +186,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )?;
     let routing_table = RoutingTable::new(loaded)?;
     metrics.set_shardmap_version(routing_table.current_version());
-    let default_gpu_id_for_metrics: i32 = 0;
-    observe_shard_map_metrics(
-        &metrics,
-        &routing_table,
-        default_gpu_id_for_metrics,
-        &node_id,
-    );
+    observe_shard_map_metrics(&metrics, &routing_table, &node_id);
     let routing: Arc<RwLock<RoutingTable>> = Arc::new(RwLock::new(routing_table));
     let routing_errors: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
 
-    // CPU-only: GPU readiness is "skipped" and therefore ready=true.
-    let readiness = Arc::new(RwLock::new(Readiness {
-        gpu_context: true,
-        gpu_context_error: None,
-        kernel_module_loaded: true,
-        kernel_module_error: None,
-        smoke_kernel_ok: true,
-        smoke_kernel_error: None,
-        io_backend_ok: true,
-        io_backend_error: None,
-        gds_active: true,
-        gds_degraded: false,
-        gds_error: None,
-        hardware_profile_ok: true,
-        hardware_profile_error: None,
-        control_evidence_hosted: false,
-        control_evidence_ok: true,
-        control_evidence_error: None,
-    }));
+    let readiness = Arc::new(RwLock::new(Readiness::default()));
 
-    // GPU initialization removed (CPU-only community edition).
-    // The CUDA pool_res block and all its contents have been stripped.
+    // Community edition: no dataplane pool (requires proprietary edition).
     let dataplane_pool: Option<crate::pool::DataPlanePool> = None;
 
-
-    let control_evidence_status = reconcile_control_checkpoint_with_evidence(
-        &control_path,
-        control.clone(),
-        dataplane_pool.as_ref(),
-        &metrics,
-    )
-    .await;
+    let control_evidence_status =
+        reconcile_control_checkpoint_with_evidence(&control_path, control.clone(), dataplane_pool.as_ref(), &metrics)
+            .await;
     {
         let mut guard = readiness.write().await;
         guard.control_evidence_hosted = control_evidence_status.hosted_locally;
         guard.control_evidence_ok = control_evidence_status.ok;
-        guard.control_evidence_error =
-            if control_evidence_status.hosted_locally && !control_evidence_status.ok {
-                control_evidence_status.detail.clone()
-            } else {
-                None
-            };
+        guard.control_evidence_error = if control_evidence_status.hosted_locally && !control_evidence_status.ok {
+            control_evidence_status.detail.clone()
+        } else {
+            None
+        };
     }
 
     spawn_routing_reloader(
@@ -248,34 +215,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         routing.clone(),
         routing_errors.clone(),
         metrics.clone(),
-        dataplane_pool.clone(),
-        build.clone(),
         node_id.clone(),
     );
 
-    if config.projections_enabled {
-        if let Some(pool) = dataplane_pool.clone() {
-            spawn_projection_runner(config.clone(), pool, control.clone(), metrics.clone());
-        } else {
-            tracing::warn!(
-                "CORECRUXD_PROJECTIONS_ENABLED=1 but dataplane_pool is unavailable (CUDA init failed?)"
-            );
-        }
-    }
-
     let corruption_detected = Arc::new(RwLock::new(false));
-    if config.scrub_scheduler_enabled {
-        if let Some(pool) = dataplane_pool.clone() {
-            spawn_scrub_scheduler(
-                config.clone(),
-                pool,
-                control.clone(),
-                corruption_detected.clone(),
-            );
-        } else {
-            tracing::warn!("CORECRUXD_SCRUB_SCHEDULER_ENABLED=1 but dataplane_pool is unavailable");
-        }
-    }
 
     let (initial_total_bytes, initial_free_bytes, initial_capacity_error) =
         match measure_data_dir_space(&config.data_dir) {
@@ -319,7 +262,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         sdk_version: DEFAULT_SDK_VERSION.to_string(),
         auth: auth.clone(),
         data_dir: config.data_dir.clone(),
-        io_backend: config.io_backend.clone(),
         read_retry_failed_readyz_threshold: config.read_retry_failed_readyz_threshold,
         commit_level: config.commit_level,
         metrics: metrics.clone(),
@@ -362,8 +304,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         session_store: Arc::new(RwLock::new(corecrux_memory::SessionStore::new())),
     };
 
-    // crux-observe: auto-seed bootstrap data on startup
-    if crux_observe::config::self_observe_enabled() {
+    // Bootstrap: always seed agent-facing documentation on startup (idempotent).
+    // Self-observation (ops error/warning capture) still requires CRUX_SELF_OBSERVE=true.
+    {
         let seeder = crux_observe::bootstrap::BootstrapSeeder::new(state.fact_store.clone());
         let result = seeder.seed().await;
         if result.already_seeded {
@@ -373,10 +316,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    // Clone session_store handle before state is moved into the router.
+    let session_store_handle = state.session_store.clone();
+
     let app: Router = http::router(state).layer(TraceLayer::new_for_http());
 
     let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
     spawn_shutdown_signal(shutdown_tx.clone());
+
+    // Session TTL reaper — runs every 60s, removes expired sessions.
+    {
+        let session_store = session_store_handle;
+        let mut rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let reaped = session_store.write().await.reap_expired();
+                        if reaped > 0 {
+                            tracing::info!(reaped, "session-ttl-reaper");
+                        }
+                    }
+                    _ = rx.recv() => break,
+                }
+            }
+        });
+    }
 
     let http_addr = config.http_addr;
     let grpc_addr = config.grpc_addr;
@@ -388,7 +354,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         commit_level = config.commit_level.as_str(),
         append_lane_enabled = config.append_lane_enabled,
         append_lane_scope = config.append_lane_scope.as_str(),
-        append_gpu_lane_fanout = config.append_gpu_lane_fanout,
         follower_reads_enabled = config.follower_reads_enabled,
         "corecruxd starting"
     );
@@ -418,17 +383,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             store_lock_strategy: config.store_lock_strategy,
             append_lane_enabled: config.append_lane_enabled,
             append_lane_scope: config.append_lane_scope,
-            append_gpu_lane_fanout: config.append_gpu_lane_fanout,
         };
-        let svc = grpc::DataPlaneService::new(
-            dataplane_pool,
-            control.clone(),
-            metrics.clone(),
-            auth.clone(),
-            svc_cfg,
-        );
-        let export_svc =
-            grpc::ExportService::new(export_pool, metrics.clone(), build.clone(), auth.clone());
+        let svc = grpc::DataPlaneService::new(dataplane_pool, control.clone(), metrics.clone(), auth.clone(), svc_cfg);
+        let export_svc = grpc::ExportService::new(export_pool, metrics.clone(), build.clone(), auth.clone());
         tokio::spawn(async move {
             grpc::serve(grpc_addr, svc, export_svc, async move {
                 let _ = rx.recv().await;
@@ -562,14 +519,10 @@ fn reconcile_control_from_evidence(
         (Some(found), None) | (None, Some(found)) => (current.clone(), found.1, found.0),
         (None, None) => {
             let Some(first_mutation) = mutations.first() else {
-                return Err(
-                    "control evidence contains no state mutation anchor for CONTROL.json".into(),
-                );
+                return Err("control evidence contains no state mutation anchor for CONTROL.json".into());
             };
             let default_state = crate::control::ControlV1::default();
-            if first_mutation.payload.control_before
-                != crate::control::control_state_digest_v1(&default_state)
-            {
+            if first_mutation.payload.control_before != crate::control::control_state_digest_v1(&default_state) {
                 return Err(
                     "CONTROL.json does not match any checkpoint or mutation anchor, and evidence does not start from the default control state".into(),
                 );
@@ -613,18 +566,12 @@ async fn reconcile_control_checkpoint_with_evidence(
     {
         Ok((_decision, store)) => store,
         Err(AppendError::WrongShard { .. }) => {
-            tracing::info!(
-                "control evidence replay skipped because system/corecrux/control is not hosted locally"
-            );
-            return ControlEvidenceRuntimeStatus::non_hosted(
-                "system/corecrux/control is not hosted locally",
-            );
+            tracing::info!("control evidence replay skipped because system/corecrux/control is not hosted locally");
+            return ControlEvidenceRuntimeStatus::non_hosted("system/corecrux/control is not hosted locally");
         }
         Err(err) => {
             tracing::warn!(err = %err, "failed to route control evidence replay; using CONTROL.json checkpoint");
-            return ControlEvidenceRuntimeStatus::hosted_err(format!(
-                "failed to route control evidence replay: {err}"
-            ));
+            return ControlEvidenceRuntimeStatus::hosted_err(format!("failed to route control evidence replay: {err}"));
         }
     };
 
@@ -669,8 +616,7 @@ async fn reconcile_control_checkpoint_with_evidence(
         for event in batch {
             match event.event_type.as_str() {
                 EVT_CONTROL_CHECKPOINT_MATERIALIZED_V1 => {
-                    match serde_json::from_slice::<ControlCheckpointMaterializedV1>(&event.payload)
-                    {
+                    match serde_json::from_slice::<ControlCheckpointMaterializedV1>(&event.payload) {
                         Ok(payload) => checkpoints.push(ControlCheckpointRecord {
                             seq: event.seq,
                             payload,
@@ -724,18 +670,11 @@ async fn reconcile_control_checkpoint_with_evidence(
                 err = %err,
                 "failed to read CONTROL.json for evidence reconciliation"
             );
-            return ControlEvidenceRuntimeStatus::hosted_err(format!(
-                "failed to read CONTROL.json: {err}"
-            ));
+            return ControlEvidenceRuntimeStatus::hosted_err(format!("failed to read CONTROL.json: {err}"));
         }
     };
 
-    let plan = match reconcile_control_from_evidence(
-        &current,
-        &current_checkpoint_bytes,
-        &checkpoints,
-        &mutations,
-    ) {
+    let plan = match reconcile_control_from_evidence(&current, &current_checkpoint_bytes, &checkpoints, &mutations) {
         Ok(Some(plan)) => plan,
         Ok(None) => {
             tracing::info!("control evidence stream has no replayable control records yet");
@@ -837,10 +776,7 @@ fn validate_network_auth_posture(
     }
 
     let jwt_auth_mode = matches!(auth_mode, AuthMode::JwtHs256 | AuthMode::JwtJwks);
-    if jwt_auth_mode
-        && matches!(commit_level, CommitLevel::ReplicatedCommit)
-        && !replication_auth_bearer_present
-    {
+    if jwt_auth_mode && matches!(commit_level, CommitLevel::ReplicatedCommit) && !replication_auth_bearer_present {
         return Err(
             "ReplicatedCommit with JWT auth requires CORECRUXD_REPLICATION_AUTH_BEARER for follower replication"
                 .to_string(),
@@ -849,7 +785,6 @@ fn validate_network_auth_posture(
 
     Ok(())
 }
-
 
 fn init_tracing(level: &str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -874,17 +809,17 @@ fn init_tracing(level: &str) {
 
             let provider = opentelemetry_sdk::trace::TracerProvider::builder()
                 .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-                .with_resource(opentelemetry_sdk::Resource::new(vec![
-                    opentelemetry::KeyValue::new("service.name", "corecruxd"),
-                ]))
+                .with_resource(opentelemetry_sdk::Resource::new(vec![opentelemetry::KeyValue::new(
+                    "service.name",
+                    "corecruxd",
+                )]))
                 .build();
 
             opentelemetry::global::set_tracer_provider(provider.clone());
             opentelemetry::global::set_text_map_propagator(
                 opentelemetry_sdk::propagation::TraceContextPropagator::new(),
             );
-            let otel_layer =
-                tracing_opentelemetry::OpenTelemetryLayer::new(provider.tracer("corecruxd"));
+            let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(provider.tracer("corecruxd"));
 
             let fmt_layer = if log_format.eq_ignore_ascii_case("json") {
                 tracing_subscriber::fmt::layer().json().boxed()
@@ -902,18 +837,13 @@ fn init_tracing(level: &str) {
     }
 
     if log_format.eq_ignore_ascii_case("json") {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .init();
+        tracing_subscriber::fmt().json().with_env_filter(filter).init();
     } else {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 }
 
-fn acquire_lock(
-    data_dir: &std::path::Path,
-) -> Result<std::fs::File, Box<dyn std::error::Error + Send + Sync>> {
+fn acquire_lock(data_dir: &std::path::Path) -> Result<std::fs::File, Box<dyn std::error::Error + Send + Sync>> {
     let lock_path = data_dir.join("LOCK");
     let file = OpenOptions::new()
         .create(true)
@@ -929,6 +859,8 @@ fn spawn_shutdown_signal(tx: broadcast::Sender<()>) {
     tokio::spawn(async move {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
+        // SAFETY: SIGTERM registration failure is fatal — daemon cannot shut down gracefully.
+        #[allow(clippy::expect_used)]
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to register SIGTERM handler");
         #[cfg(unix)]
@@ -948,15 +880,8 @@ fn spawn_shutdown_signal(tx: broadcast::Sender<()>) {
     });
 }
 
-fn observe_shard_map_metrics(
-    metrics: &Metrics,
-    table: &RoutingTable,
-    default_gpu_id: i32,
-    node_id: &str,
-) {
+fn observe_shard_map_metrics(metrics: &Metrics, table: &RoutingTable, node_id: &str) {
     for shard in &table.shard_map.shards {
-        let owner_gpu_id = shard.gpu_id.unwrap_or(default_gpu_id);
-        metrics.set_shard_owner_gpu_id(&shard.shard_id, owner_gpu_id);
         let state = match shard.state {
             corecrux_types::ShardState::Active => "active",
             corecrux_types::ShardState::Draining => "draining",
@@ -980,9 +905,7 @@ async fn serve_http(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), std::io::Error> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(listener, app).with_graceful_shutdown(shutdown).await?;
     Ok(())
 }
 
@@ -1039,11 +962,7 @@ fn load_or_init_node_meta(
     let bytes = serde_json::to_vec_pretty(&meta)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
-    let mut f = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp)?;
+    let mut f = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp)?;
     f.write_all(&bytes)?;
     f.flush()?;
     f.sync_all()?;
@@ -1058,14 +977,10 @@ fn spawn_routing_reloader(
     routing: Arc<RwLock<RoutingTable>>,
     routing_errors: Arc<RwLock<Vec<String>>>,
     metrics: Metrics,
-    dataplane_pool: Option<crate::pool::DataPlanePool>,
-    build: BuildInfo,
     node_id: String,
 ) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
-            config.routing_reload_interval_ms,
-        ));
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(config.routing_reload_interval_ms));
         loop {
             interval.tick().await;
 
@@ -1101,11 +1016,7 @@ fn spawn_routing_reloader(
             };
 
             metrics.set_shardmap_version(new_table.current_version());
-            let default_gpu_id_for_metrics: i32 = dataplane_pool
-                .as_ref()
-                .map(|p| p.default_gpu_id())
-                .unwrap_or(0);
-            observe_shard_map_metrics(&metrics, &new_table, default_gpu_id_for_metrics, &node_id);
+            observe_shard_map_metrics(&metrics, &new_table, &node_id);
 
             tracing::info!(
                 old_version = current_version,
@@ -1120,124 +1031,6 @@ fn spawn_routing_reloader(
             }
 
             routing_errors.write().await.clear();
-
-            if let Some(pool) = dataplane_pool.as_ref() {
-                for gpu_id in pool.gpu_ids() {
-                    let Some(store) = pool.store_for_gpu_id(gpu_id) else {
-                        continue;
-                    };
-                    let store = store.read().await;
-                    if let Err(err) = store.sync_shards().await {
-                        routing_errors.write().await.push(format!(
-                            "failed to sync shards after routing reload (gpu_id={gpu_id}): {err:?}"
-                        ));
-                    }
-                }
-
-                let _ = emit_shardmap_updated_event(
-                    pool,
-                    &build,
-                    &node_id,
-                    config.http_addr,
-                    config.grpc_addr,
-                    &new_table.shard_map,
-                )
-                .await;
-            }
-        }
-    });
-}
-
-fn spawn_projection_runner(
-    config: crate::config::Config,
-    dataplane_pool: crate::pool::DataPlanePool,
-    control: Arc<RwLock<crate::control::ControlV1>>,
-    _metrics: Metrics,
-) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
-            config.projections_tick_interval_ms.max(10),
-        ));
-        loop {
-            interval.tick().await;
-
-            // Respect pause_compaction/emergency_brake for background maintenance work.
-            let c = control.read().await.clone();
-            if c.valves.pause_compaction.enabled || c.valves.emergency_brake.enabled {
-                continue;
-            }
-
-            dataplane_pool
-                .tick_projections_all(config.projections_batch_frames)
-                .await;
-
-        }
-    });
-}
-
-fn spawn_scrub_scheduler(
-    config: crate::config::Config,
-    dataplane_pool: crate::pool::DataPlanePool,
-    control: Arc<RwLock<crate::control::ControlV1>>,
-    corruption_detected: Arc<RwLock<bool>>,
-) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-            config.scrub_interval_secs.max(10),
-        ));
-        loop {
-            interval.tick().await;
-            let started = std::time::Instant::now();
-
-            let c = control.read().await.clone();
-            if c.valves.pause_compaction.enabled || c.valves.emergency_brake.enabled {
-                continue;
-            }
-
-            let mode_full = config.scrub_mode.eq_ignore_ascii_case("full")
-                || config.scrub_scope.eq_ignore_ascii_case("all");
-            let sample_rate = if mode_full {
-                1.0
-            } else {
-                config.scrub_sample_rate.clamp(0.0, 1.0)
-            };
-            let summary = dataplane_pool
-                .verify_store_integrity_all(mode_full, sample_rate, 8 * 1024 * 1024, true)
-                .await;
-            let mut op_log = StructuredOpLog::new(
-                if summary.ok { "info" } else { "error" },
-                "scrub",
-                if summary.ok { "ok" } else { "fail" },
-                started.elapsed().as_millis() as u64,
-            );
-            if !summary.ok {
-                op_log.error_code = Some(ErrorCode::SegmentCorrupt.as_str().to_string());
-            }
-            if !summary.ok {
-                *corruption_detected.write().await = true;
-                tracing::error!(
-                    ts = %op_log.ts,
-                    level = %op_log.level,
-                    op = %op_log.op,
-                    outcome = %op_log.outcome,
-                    took_ms = op_log.took_ms,
-                    error_code = %op_log.error_code.clone().unwrap_or_default(),
-                    scanned_shards = summary.scanned_shards,
-                    failed_shards = summary.failed_shards,
-                    "scrub scheduler detected corruption"
-                );
-            } else {
-                tracing::info!(
-                    ts = %op_log.ts,
-                    level = %op_log.level,
-                    op = %op_log.op,
-                    outcome = %op_log.outcome,
-                    took_ms = op_log.took_ms,
-                    scanned_shards = summary.scanned_shards,
-                    failed_shards = summary.failed_shards,
-                    "scrub scheduler run complete"
-                );
-            }
         }
     });
 }
@@ -1348,16 +1141,12 @@ fn spawn_capacity_guard(
                             free_ratio, config.capacity_emergency_free_ratio
                         );
                         let now_ns = crate::control::now_unix_ns();
-                        control_state.valves.pause_ingest.set(
-                            true,
-                            "capacity_guard",
-                            &reason,
-                            now_ns,
-                        );
+                        control_state
+                            .valves
+                            .pause_ingest
+                            .set(true, "capacity_guard", &reason, now_ns);
                         control_state.updated_at_unix_ns = now_ns;
-                        if let Err(err) =
-                            crate::control::write_control_atomic(&control_path, &control_state)
-                        {
+                        if let Err(err) = crate::control::write_control_atomic(&control_path, &control_state) {
                             tracing::warn!(err = %err, "capacity guard failed to persist CONTROL.json");
                         } else {
                             metrics.set_valve_pause_ingest(true);
@@ -1380,9 +1169,7 @@ fn spawn_capacity_guard(
                         .pause_ingest
                         .set(false, "capacity_guard", &reason, now_ns);
                     control_state.updated_at_unix_ns = now_ns;
-                    if let Err(err) =
-                        crate::control::write_control_atomic(&control_path, &control_state)
-                    {
+                    if let Err(err) = crate::control::write_control_atomic(&control_path, &control_state) {
                         tracing::warn!(err = %err, "capacity guard failed to persist CONTROL.json");
                     } else {
                         metrics.set_valve_pause_ingest(false);
@@ -1393,8 +1180,7 @@ fn spawn_capacity_guard(
                 }
 
                 let pause_ingest_active = control_state.valves.pause_ingest.enabled;
-                let auto_paused = pause_ingest_active
-                    && control_state.valves.pause_ingest.actor == "capacity_guard";
+                let auto_paused = pause_ingest_active && control_state.valves.pause_ingest.actor == "capacity_guard";
                 (pause_ingest_active, auto_paused)
             };
 
@@ -1440,14 +1226,8 @@ fn spawn_capacity_guard(
                         payload.observed_at_unix_ms,
                         level.as_str()
                     );
-                    if let Err(err) = append_ops_event(
-                        pool,
-                        &node_id,
-                        EVT_CAPACITY_THRESHOLD_BREACHED_V1,
-                        event_id,
-                        &payload,
-                    )
-                    .await
+                    if let Err(err) =
+                        append_ops_event(pool, &node_id, EVT_CAPACITY_THRESHOLD_BREACHED_V1, event_id, &payload).await
                     {
                         tracing::warn!(err = ?err, "failed to append capacity ops event");
                     }
@@ -1458,89 +1238,6 @@ fn spawn_capacity_guard(
             last_auto_paused = auto_paused;
         }
     });
-}
-
-async fn emit_shardmap_updated_event(
-    pool: &crate::pool::DataPlanePool,
-    build: &BuildInfo,
-    node_id: &str,
-    http_addr: SocketAddr,
-    grpc_addr: SocketAddr,
-    shard_map: &corecrux_types::ShardMapV1,
-) -> Result<(), crate::dataplane_store::AppendError> {
-    #[derive(serde::Serialize)]
-    struct Payload<'a> {
-        version: u64,
-        blake3: &'a str,
-        #[serde(rename = "createdAt")]
-        created_at: &'a str,
-        #[serde(rename = "operatorId")]
-        operator_id: &'a str,
-        reason: &'a str,
-    }
-
-    let payload = Payload {
-        version: shard_map.version,
-        blake3: &shard_map.blake3,
-        created_at: &shard_map.created_at,
-        operator_id: node_id,
-        reason: "routing_reload",
-    };
-    let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
-
-    let blake3_prefix = shard_map.blake3.get(0..16).unwrap_or("unknown");
-    let event_id = format!(
-        "corecrux.routing.shardmap_updated.v1:{}:{blake3_prefix}",
-        shard_map.version
-    );
-
-    let occurred_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-    let event = corecrux_proto::dataplane_v1::AppendEvent {
-        event_id,
-        occurred_at,
-        event_type: "corecrux.routing.shardmap_updated.v1".to_string(),
-        content_type: "application/json".to_string(),
-        payload: payload_bytes,
-    };
-
-    let (_decision, store) = pool
-        .store_for_stream("system", "corecrux", "routing", None)
-        .await?;
-    let store = store.read().await;
-    let _ = store
-        .append_batch("system", "corecrux", "routing", 0, None, &[event])
-        .await?;
-
-    let ops_payload = ShardRebalanceRecordedV1 {
-        schema: EVT_SHARD_REBALANCE_RECORDED_V1.to_string(),
-        recorded_at_unix_ms: now_unix_ms(),
-        shard_map_version: shard_map.version,
-        shard_map_blake3: shard_map.blake3.clone(),
-        created_at: shard_map.created_at.clone(),
-        actor: node_id.to_string(),
-        reason: "routing_reload".to_string(),
-        node: build_node_context(
-            build,
-            node_id,
-            Some(http_addr.to_string()),
-            Some(grpc_addr.to_string()),
-        ),
-    };
-    let ops_event_id = format!(
-        "{EVT_SHARD_REBALANCE_RECORDED_V1}:{}:{}",
-        shard_map.version,
-        shard_map.blake3.get(0..16).unwrap_or("unknown")
-    );
-    append_ops_event(
-        pool,
-        node_id,
-        EVT_SHARD_REBALANCE_RECORDED_V1,
-        ops_event_id,
-        &ops_payload,
-    )
-    .await?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1580,11 +1277,7 @@ mod tests {
         }
     }
 
-    fn mutation_record(
-        seq: u64,
-        before: &control::ControlV1,
-        after: &control::ControlV1,
-    ) -> ControlMutationRecord {
+    fn mutation_record(seq: u64, before: &control::ControlV1, after: &control::ControlV1) -> ControlMutationRecord {
         ControlMutationRecord {
             seq,
             payload: ControlStateMutationV1 {
@@ -1680,10 +1373,7 @@ mod tests {
     #[test]
     fn shard_map_advertise_addr_preserves_explicit_host() {
         assert_eq!(
-            shard_map_advertise_addr(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
-                4006
-            )),
+            shard_map_advertise_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 4006)),
             "10.1.2.3:4006"
         );
     }
@@ -1712,10 +1402,7 @@ mod tests {
 
         let mut final_state = checkpoint_state.clone();
         final_state.updated_at_unix_ns = 20;
-        final_state
-            .valves
-            .throttle
-            .set(true, "operator", "maintenance", 20);
+        final_state.valves.throttle.set(true, "operator", "maintenance", 20);
         final_state
             .valves
             .throttle
@@ -1745,14 +1432,8 @@ mod tests {
             .valves
             .emergency_brake
             .set(true, "operator", "maintenance", 30);
-        final_state
-            .valves
-            .read_only
-            .set(true, "operator", "maintenance", 30);
-        final_state
-            .valves
-            .pause_ingest
-            .set(true, "operator", "maintenance", 30);
+        final_state.valves.read_only.set(true, "operator", "maintenance", 30);
+        final_state.valves.pause_ingest.set(true, "operator", "maintenance", 30);
         final_state
             .valves
             .pause_compaction
@@ -1846,10 +1527,7 @@ mod tests {
 
     #[test]
     fn shard_map_advertise_addr_preserves_v6_explicit_host() {
-        let addr = SocketAddr::new(
-            IpAddr::V6("fe80::1".parse().unwrap()),
-            4006,
-        );
+        let addr = SocketAddr::new(IpAddr::V6("fe80::1".parse().unwrap()), 4006);
         assert_eq!(shard_map_advertise_addr(addr), "[fe80::1]:4006");
     }
 
@@ -1864,13 +1542,8 @@ mod tests {
     #[test]
     fn reconcile_empty_evidence_returns_none() {
         let state = control::ControlV1::default();
-        let result = reconcile_control_from_evidence(
-            &state,
-            &control::checkpoint_control_bytes_v1(&state),
-            &[],
-            &[],
-        )
-        .expect("reconcile succeeds");
+        let result = reconcile_control_from_evidence(&state, &control::checkpoint_control_bytes_v1(&state), &[], &[])
+            .expect("reconcile succeeds");
         assert!(result.is_none());
     }
 
@@ -1879,17 +1552,11 @@ mod tests {
         let default_state = control::ControlV1::default();
         let mut mid_state = default_state.clone();
         mid_state.updated_at_unix_ns = 10;
-        mid_state
-            .valves
-            .read_only
-            .set(true, "operator", "test", 10);
+        mid_state.valves.read_only.set(true, "operator", "test", 10);
 
         let mut final_state = mid_state.clone();
         final_state.updated_at_unix_ns = 20;
-        final_state
-            .valves
-            .throttle
-            .set(true, "operator", "test", 20);
+        final_state.valves.throttle.set(true, "operator", "test", 20);
         final_state
             .valves
             .throttle
@@ -1920,17 +1587,11 @@ mod tests {
         let default_state = control::ControlV1::default();
         let mut mid_state = default_state.clone();
         mid_state.updated_at_unix_ns = 10;
-        mid_state
-            .valves
-            .read_only
-            .set(true, "operator", "test", 10);
+        mid_state.valves.read_only.set(true, "operator", "test", 10);
 
         let mut final_state = mid_state.clone();
         final_state.updated_at_unix_ns = 20;
-        final_state
-            .valves
-            .throttle
-            .set(true, "operator", "test", 20);
+        final_state.valves.throttle.set(true, "operator", "test", 20);
         final_state
             .valves
             .throttle
@@ -1968,17 +1629,11 @@ mod tests {
         // Create mutations that start from a non-default state
         let mut state_a = control::ControlV1::default();
         state_a.updated_at_unix_ns = 100;
-        state_a
-            .valves
-            .read_only
-            .set(true, "operator", "test", 100);
+        state_a.valves.read_only.set(true, "operator", "test", 100);
 
         let mut state_b = state_a.clone();
         state_b.updated_at_unix_ns = 200;
-        state_b
-            .valves
-            .pause_ingest
-            .set(true, "operator", "test", 200);
+        state_b.valves.pause_ingest.set(true, "operator", "test", 200);
 
         // Current state matches nothing; first mutation's control_before != default
         let err = reconcile_control_from_evidence(
@@ -1997,24 +1652,15 @@ mod tests {
 
         let mut state1 = default_state.clone();
         state1.updated_at_unix_ns = 10;
-        state1
-            .valves
-            .read_only
-            .set(true, "operator", "step1", 10);
+        state1.valves.read_only.set(true, "operator", "step1", 10);
 
         let mut state2 = state1.clone();
         state2.updated_at_unix_ns = 20;
-        state2
-            .valves
-            .pause_ingest
-            .set(true, "operator", "step2", 20);
+        state2.valves.pause_ingest.set(true, "operator", "step2", 20);
 
         let mut state3 = state2.clone();
         state3.updated_at_unix_ns = 30;
-        state3
-            .valves
-            .emergency_brake
-            .set(true, "operator", "step3", 30);
+        state3.valves.emergency_brake.set(true, "operator", "step3", 30);
 
         let plan = reconcile_control_from_evidence(
             &default_state,
@@ -2233,7 +1879,11 @@ mod tests {
             &build,
         )
         .unwrap();
-        assert!(meta.node_id.starts_with("node-"), "expected 'node-' prefix, got: {}", meta.node_id);
+        assert!(
+            meta.node_id.starts_with("node-"),
+            "expected 'node-' prefix, got: {}",
+            meta.node_id
+        );
         assert!(meta.node_id.len() > 10, "expected UUID suffix");
     }
 
@@ -2381,10 +2031,7 @@ mod tests {
         let parsed: ControlCheckpointMaterializedV1 = serde_json::from_slice(&json).unwrap();
         assert_eq!(parsed.checkpoint_id, "checkpoint-42");
         assert_eq!(parsed.materialized_at_unix_ms, 42);
-        assert_eq!(
-            parsed.control_state,
-            control::control_state_digest_v1(&state)
-        );
+        assert_eq!(parsed.control_state, control::control_state_digest_v1(&state));
     }
 
     #[test]
@@ -2392,23 +2039,14 @@ mod tests {
         let before = control::ControlV1::default();
         let mut after = before.clone();
         after.updated_at_unix_ns = 99;
-        after
-            .valves
-            .pause_ingest
-            .set(true, "test", "test-reason", 99);
+        after.valves.pause_ingest.set(true, "test", "test-reason", 99);
         let rec = mutation_record(7, &before, &after);
         let json = serde_json::to_vec(&rec.payload).unwrap();
         let parsed: ControlStateMutationV1 = serde_json::from_slice(&json).unwrap();
         assert_eq!(parsed.action_id, "act-7");
         assert_eq!(parsed.mutation_type, "set_valves");
-        assert_eq!(
-            parsed.control_before,
-            control::control_state_digest_v1(&before)
-        );
-        assert_eq!(
-            parsed.control_after,
-            control::control_state_digest_v1(&after)
-        );
+        assert_eq!(parsed.control_before, control::control_state_digest_v1(&before));
+        assert_eq!(parsed.control_after, control::control_state_digest_v1(&after));
     }
 
     // ── ControlEvidenceReplayPlan Debug ─────────────────────────────────
@@ -2453,10 +2091,7 @@ mod tests {
         let default_state = control::ControlV1::default();
         let mut final_state = default_state.clone();
         final_state.updated_at_unix_ns = 50;
-        final_state
-            .valves
-            .throttle
-            .set(true, "operator", "test", 50);
+        final_state.valves.throttle.set(true, "operator", "test", 50);
         final_state
             .valves
             .throttle
@@ -2569,10 +2204,7 @@ mod tests {
     fn insecure_dev_auth_bind_allowed_true_variants() {
         for val in &["true", "TRUE", "yes", "YES"] {
             std::env::set_var("CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND", val);
-            assert!(
-                super::insecure_dev_auth_bind_allowed(),
-                "expected true for {val}"
-            );
+            assert!(super::insecure_dev_auth_bind_allowed(), "expected true for {val}");
         }
         std::env::remove_var("CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND");
     }
@@ -2652,10 +2284,7 @@ mod tests {
     #[serial_test::serial]
     fn classify_capacity_level_full_is_healthy() {
         let cfg = crate::config::load_config();
-        assert_eq!(
-            super::classify_capacity_level(1.0, &cfg),
-            super::CapacityLevel::Healthy
-        );
+        assert_eq!(super::classify_capacity_level(1.0, &cfg), super::CapacityLevel::Healthy);
     }
 
     #[test]
@@ -2686,10 +2315,7 @@ mod tests {
         let default_state = control::ControlV1::default();
         let mut checkpoint_state = default_state.clone();
         checkpoint_state.updated_at_unix_ns = 10;
-        checkpoint_state
-            .valves
-            .read_only
-            .set(true, "op", "test", 10);
+        checkpoint_state.valves.read_only.set(true, "op", "test", 10);
 
         // Current state is default, but checkpoint is for a different state.
         // Checkpoint won't anchor because current != checkpoint state.
@@ -2870,7 +2496,14 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = crate::shard_map::ShardMapStore::new(tmp.path());
         let loaded = store
-            .load_or_init("test-cluster", "node-a", "127.0.0.1:4006", "127.0.0.1:4007", num_shards, gpu_id)
+            .load_or_init(
+                "test-cluster",
+                "node-a",
+                "127.0.0.1:4006",
+                "127.0.0.1:4007",
+                num_shards,
+                gpu_id,
+            )
             .expect("load_or_init");
         crate::shard_map::RoutingTable::new(loaded).unwrap()
     }
@@ -2888,7 +2521,7 @@ mod tests {
         let metrics = crate::metrics::Metrics::new(&build, "test-observe");
         let table = make_routing_table_via_store(2, None);
         // Should not panic; exercises the shard metrics path for active/no-followers.
-        super::observe_shard_map_metrics(&metrics, &table, 0, "node-a");
+        super::observe_shard_map_metrics(&metrics, &table, "node-a");
     }
 
     #[test]
@@ -2897,7 +2530,7 @@ mod tests {
         let metrics = crate::metrics::Metrics::new(&build, "test-observe-gpu");
         let table = make_routing_table_via_store(2, Some(1));
         // Exercises the gpu_id branch (non-default gpu id).
-        super::observe_shard_map_metrics(&metrics, &table, 0, "node-a");
+        super::observe_shard_map_metrics(&metrics, &table, "node-a");
     }
 
     #[test]
@@ -2905,7 +2538,7 @@ mod tests {
         let build = test_build();
         let metrics = crate::metrics::Metrics::new(&build, "test-observe-single");
         let table = make_routing_table_via_store(1, None);
-        super::observe_shard_map_metrics(&metrics, &table, 0, "node-a");
+        super::observe_shard_map_metrics(&metrics, &table, "node-a");
     }
 
     #[test]
@@ -2913,7 +2546,7 @@ mod tests {
         let build = test_build();
         let metrics = crate::metrics::Metrics::new(&build, "test-observe-four");
         let table = make_routing_table_via_store(4, Some(0));
-        super::observe_shard_map_metrics(&metrics, &table, 0, "node-a");
+        super::observe_shard_map_metrics(&metrics, &table, "node-a");
     }
 
     // ── init_tracing (idempotent, safe to call in test) ───────────────
@@ -2957,10 +2590,22 @@ mod tests {
         std::env::set_var("CORECRUXD_CAPACITY_EMERGENCY_FREE_RATIO", "0.05");
         let cfg = crate::config::load_config();
 
-        assert_eq!(super::classify_capacity_level(0.35, &cfg), super::CapacityLevel::Healthy);
-        assert_eq!(super::classify_capacity_level(0.25, &cfg), super::CapacityLevel::Warning);
-        assert_eq!(super::classify_capacity_level(0.10, &cfg), super::CapacityLevel::Critical);
-        assert_eq!(super::classify_capacity_level(0.03, &cfg), super::CapacityLevel::Emergency);
+        assert_eq!(
+            super::classify_capacity_level(0.35, &cfg),
+            super::CapacityLevel::Healthy
+        );
+        assert_eq!(
+            super::classify_capacity_level(0.25, &cfg),
+            super::CapacityLevel::Warning
+        );
+        assert_eq!(
+            super::classify_capacity_level(0.10, &cfg),
+            super::CapacityLevel::Critical
+        );
+        assert_eq!(
+            super::classify_capacity_level(0.03, &cfg),
+            super::CapacityLevel::Emergency
+        );
 
         std::env::remove_var("CORECRUXD_CAPACITY_WARNING_FREE_RATIO");
         std::env::remove_var("CORECRUXD_CAPACITY_CRITICAL_FREE_RATIO");
@@ -3127,8 +2772,7 @@ mod tests {
     ) -> (super::CapacityLevel, bool, bool) {
         let level = super::classify_capacity_level(free_ratio, config);
         let guard_owned = current_pause_ingest_actor == "capacity_guard";
-        let should_pause = level == super::CapacityLevel::Emergency
-            && (!current_pause_ingest_enabled || guard_owned);
+        let should_pause = level == super::CapacityLevel::Emergency && (!current_pause_ingest_enabled || guard_owned);
         let should_resume = guard_owned
             && current_pause_ingest_enabled
             && level != super::CapacityLevel::Emergency
@@ -3140,8 +2784,7 @@ mod tests {
     #[serial_test::serial]
     fn capacity_guard_healthy_no_action() {
         let cfg = crate::config::load_config();
-        let (level, should_pause, should_resume) =
-            capacity_guard_decide(0.50, &cfg, false, "");
+        let (level, should_pause, should_resume) = capacity_guard_decide(0.50, &cfg, false, "");
         assert_eq!(level, super::CapacityLevel::Healthy);
         assert!(!should_pause);
         assert!(!should_resume);
@@ -3151,8 +2794,7 @@ mod tests {
     #[serial_test::serial]
     fn capacity_guard_emergency_pauses_ingest() {
         let cfg = crate::config::load_config();
-        let (level, should_pause, should_resume) =
-            capacity_guard_decide(0.01, &cfg, false, "");
+        let (level, should_pause, should_resume) = capacity_guard_decide(0.01, &cfg, false, "");
         assert_eq!(level, super::CapacityLevel::Emergency);
         assert!(should_pause);
         assert!(!should_resume);
@@ -3162,8 +2804,7 @@ mod tests {
     #[serial_test::serial]
     fn capacity_guard_emergency_when_already_paused_by_guard() {
         let cfg = crate::config::load_config();
-        let (level, should_pause, _) =
-            capacity_guard_decide(0.01, &cfg, true, "capacity_guard");
+        let (level, should_pause, _) = capacity_guard_decide(0.01, &cfg, true, "capacity_guard");
         assert_eq!(level, super::CapacityLevel::Emergency);
         assert!(should_pause);
     }
@@ -3172,8 +2813,7 @@ mod tests {
     #[serial_test::serial]
     fn capacity_guard_emergency_does_not_override_operator_pause() {
         let cfg = crate::config::load_config();
-        let (level, should_pause, _) =
-            capacity_guard_decide(0.01, &cfg, true, "operator");
+        let (level, should_pause, _) = capacity_guard_decide(0.01, &cfg, true, "operator");
         assert_eq!(level, super::CapacityLevel::Emergency);
         assert!(!should_pause);
     }
@@ -3183,8 +2823,7 @@ mod tests {
     fn capacity_guard_resume_when_recovered() {
         std::env::set_var("CORECRUXD_CAPACITY_RESUME_FREE_RATIO", "0.25");
         let cfg = crate::config::load_config();
-        let (level, should_pause, should_resume) =
-            capacity_guard_decide(0.30, &cfg, true, "capacity_guard");
+        let (level, should_pause, should_resume) = capacity_guard_decide(0.30, &cfg, true, "capacity_guard");
         assert_eq!(level, super::CapacityLevel::Healthy);
         assert!(!should_pause);
         assert!(should_resume);
@@ -3196,8 +2835,7 @@ mod tests {
     fn capacity_guard_no_resume_if_not_guard_owned() {
         std::env::set_var("CORECRUXD_CAPACITY_RESUME_FREE_RATIO", "0.25");
         let cfg = crate::config::load_config();
-        let (_, _, should_resume) =
-            capacity_guard_decide(0.30, &cfg, true, "operator");
+        let (_, _, should_resume) = capacity_guard_decide(0.30, &cfg, true, "operator");
         assert!(!should_resume);
         std::env::remove_var("CORECRUXD_CAPACITY_RESUME_FREE_RATIO");
     }
@@ -3207,8 +2845,7 @@ mod tests {
     fn capacity_guard_no_resume_below_resume_threshold() {
         std::env::set_var("CORECRUXD_CAPACITY_RESUME_FREE_RATIO", "0.25");
         let cfg = crate::config::load_config();
-        let (_, _, should_resume) =
-            capacity_guard_decide(0.22, &cfg, true, "capacity_guard");
+        let (_, _, should_resume) = capacity_guard_decide(0.22, &cfg, true, "capacity_guard");
         assert!(!should_resume);
         std::env::remove_var("CORECRUXD_CAPACITY_RESUME_FREE_RATIO");
     }
@@ -3261,7 +2898,6 @@ mod tests {
             sdk_version: corecrux_types::DEFAULT_SDK_VERSION.to_string(),
             auth,
             data_dir: tmp.path().to_path_buf(),
-            io_backend: "cpu".to_string(),
             read_retry_failed_readyz_threshold: 0,
             commit_level: crate::config::CommitLevel::LocalCommit,
             metrics: metrics.clone(),
@@ -3269,35 +2905,21 @@ mod tests {
             routing: std::sync::Arc::new(tokio::sync::RwLock::new(routing_table)),
             routing_errors: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
             dataplane_pool: None,
-            readiness: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::http::Readiness::default(),
-            )),
-            control: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::control::ControlV1::default(),
-            )),
+            readiness: std::sync::Arc::new(tokio::sync::RwLock::new(crate::http::Readiness::default())),
+            control: std::sync::Arc::new(tokio::sync::RwLock::new(crate::control::ControlV1::default())),
             control_path: tmp.path().join("CONTROL.json"),
             action_max_pending: 10,
             action_timeout_secs: 60,
             scrub_scope: "recent".to_string(),
             scrub_mode: "sampled".to_string(),
             scrub_sample_rate: 0.25,
-            admin_actions: std::sync::Arc::new(tokio::sync::RwLock::new(
-                std::collections::BTreeMap::new(),
-            )),
+            admin_actions: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
             corruption_detected: std::sync::Arc::new(tokio::sync::RwLock::new(false)),
-            capacity: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::http::CapacityState::default(),
-            )),
+            capacity: std::sync::Arc::new(tokio::sync::RwLock::new(crate::http::CapacityState::default())),
             admin_force_seal_enabled: false,
-            retrieval_index: std::sync::Arc::new(tokio::sync::RwLock::new(
-                corecrux_retrieval::IndexManager::new(),
-            )),
-            fact_store: std::sync::Arc::new(tokio::sync::RwLock::new(
-                corecrux_memory::FactStore::new(),
-            )),
-            session_store: std::sync::Arc::new(tokio::sync::RwLock::new(
-                corecrux_memory::SessionStore::new(),
-            )),
+            retrieval_index: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_retrieval::IndexManager::new())),
+            fact_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::FactStore::new())),
+            session_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::SessionStore::new())),
         };
 
         let router: axum::Router = crate::http::router(state);
@@ -3335,7 +2957,11 @@ mod tests {
     // ── capacity free_ratio calculation ───────────────────────────────
 
     fn capacity_free_ratio(total_bytes: u64, free_bytes: u64) -> f64 {
-        if total_bytes == 0 { 0.0 } else { free_bytes as f64 / total_bytes as f64 }
+        if total_bytes == 0 {
+            0.0
+        } else {
+            free_bytes as f64 / total_bytes as f64
+        }
     }
 
     #[test]
@@ -3453,7 +3079,10 @@ mod tests {
             http_listen_addr: "127.0.0.1:14800".to_string(),
             grpc_listen_addr: "127.0.0.1:14801".to_string(),
             gpu_id: Some(5),
-            build: BuildInfo { version: "v".to_string(), commit: "c".to_string() },
+            build: BuildInfo {
+                version: "v".to_string(),
+                commit: "c".to_string(),
+            },
         };
         let cloned = meta.clone();
         assert_eq!(cloned.v, 1);

@@ -19,6 +19,8 @@ pub struct SessionState {
     pub state: serde_json::Value,
     pub updated_at: DateTime<Utc>,
     pub total_tokens: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// In-memory session store.
@@ -33,14 +35,19 @@ impl SessionStore {
     }
 
     /// Create or update session state.
-    pub fn put(&mut self, session_id: &str, state: serde_json::Value) -> SessionState {
+    ///
+    /// If `ttl_seconds` is `Some`, the session will expire after the given
+    /// duration and be reaped by [`reap_expired`].
+    pub fn put(&mut self, session_id: &str, state: serde_json::Value, ttl_seconds: Option<u64>) -> SessionState {
         let tokens = estimate_tokens(&state);
+        let expires_at = ttl_seconds.map(|secs| Utc::now() + chrono::Duration::seconds(secs as i64));
 
         let session = SessionState {
             session_id: session_id.to_string(),
             state,
             updated_at: Utc::now(),
             total_tokens: tokens,
+            expires_at,
         };
 
         self.sessions.insert(session_id.to_string(), session.clone());
@@ -66,6 +73,31 @@ impl SessionStore {
     pub fn count(&self) -> usize {
         self.sessions.len()
     }
+
+    /// Remove all sessions whose `expires_at` has passed. Returns the number
+    /// of sessions reaped.
+    pub fn reap_expired(&mut self) -> usize {
+        let now = Utc::now();
+        let expired: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.expires_at.map_or(false, |exp| now >= exp))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let count = expired.len();
+        for id in expired {
+            self.sessions.remove(&id);
+        }
+        count
+    }
+
+    /// Test helper: override `expires_at` for a session.
+    #[cfg(test)]
+    pub fn set_expires_at_for_test(&mut self, id: &str, at: DateTime<Utc>) {
+        if let Some(session) = self.sessions.get_mut(id) {
+            session.expires_at = Some(at);
+        }
+    }
 }
 
 /// Estimate tokens from a JSON value (serialized bytes / 4).
@@ -89,9 +121,10 @@ mod tests {
             "context_summary": "Building community edition."
         });
 
-        let session = store.put("sess_001", state.clone());
+        let session = store.put("sess_001", state.clone(), None);
         assert_eq!(session.session_id, "sess_001");
         assert!(session.total_tokens > 0);
+        assert!(session.expires_at.is_none());
 
         let retrieved = store.get("sess_001").unwrap();
         assert_eq!(retrieved.state, state);
@@ -101,8 +134,8 @@ mod tests {
     fn update_session_overwrites() {
         let mut store = SessionStore::new();
 
-        store.put("sess_001", json!({"step": 1}));
-        store.put("sess_001", json!({"step": 2, "done": true}));
+        store.put("sess_001", json!({"step": 1}), None);
+        store.put("sess_001", json!({"step": 2, "done": true}), None);
 
         let session = store.get("sess_001").unwrap();
         assert_eq!(session.state["step"], 2);
@@ -112,7 +145,7 @@ mod tests {
     #[test]
     fn delete_session() {
         let mut store = SessionStore::new();
-        store.put("sess_001", json!({}));
+        store.put("sess_001", json!({}), None);
         assert_eq!(store.count(), 1);
         store.delete("sess_001");
         assert_eq!(store.count(), 0);
@@ -123,8 +156,8 @@ mod tests {
         let mut store = SessionStore::new();
         assert!(store.list().is_empty());
 
-        store.put("sess_a", json!({"a": 1}));
-        store.put("sess_b", json!({"b": 2}));
+        store.put("sess_a", json!({"a": 1}), None);
+        store.put("sess_b", json!({"b": 2}), None);
 
         let mut ids = store.list();
         ids.sort();
@@ -153,7 +186,7 @@ mod tests {
     fn session_state_serde_roundtrip() {
         let mut store = SessionStore::new();
         let state = json!({"decisions": ["a", "b"], "count": 42});
-        let session = store.put("sess_rt", state.clone());
+        let session = store.put("sess_rt", state.clone(), None);
 
         let json_str = serde_json::to_string(&session).unwrap();
         let deserialized: SessionState = serde_json::from_str(&json_str).unwrap();
@@ -166,10 +199,14 @@ mod tests {
     fn put_updates_token_count() {
         let mut store = SessionStore::new();
 
-        store.put("sess_t", json!("short"));
+        store.put("sess_t", json!("short"), None);
         let t1 = store.get("sess_t").unwrap().total_tokens;
 
-        store.put("sess_t", json!({"a_much_longer_value": "with more content to increase token count significantly"}));
+        store.put(
+            "sess_t",
+            json!({"a_much_longer_value": "with more content to increase token count significantly"}),
+            None,
+        );
         let t2 = store.get("sess_t").unwrap().total_tokens;
 
         assert!(t2 > t1);
@@ -178,12 +215,65 @@ mod tests {
     #[test]
     fn list_after_delete() {
         let mut store = SessionStore::new();
-        store.put("s1", json!({}));
-        store.put("s2", json!({}));
+        store.put("s1", json!({}), None);
+        store.put("s2", json!({}), None);
         store.delete("s1");
 
         let ids = store.list();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], "s2");
+    }
+
+    // ── Session TTL tests ──────────────────────────────────────────
+
+    #[test]
+    fn put_with_ttl_sets_expires_at() {
+        let mut store = SessionStore::new();
+        let before = Utc::now();
+        let session = store.put("ttl_test", json!({"x": 1}), Some(3600));
+        let after = Utc::now();
+
+        let exp = session.expires_at.expect("expires_at should be set");
+        // Should be roughly 1 hour from now.
+        assert!(exp >= before + chrono::Duration::seconds(3600));
+        assert!(exp <= after + chrono::Duration::seconds(3600));
+    }
+
+    #[test]
+    fn put_without_ttl_has_no_expiry() {
+        let mut store = SessionStore::new();
+        let session = store.put("no_ttl", json!({"y": 2}), None);
+        assert!(session.expires_at.is_none());
+    }
+
+    #[test]
+    fn reap_expired_removes_old() {
+        let mut store = SessionStore::new();
+        store.put("expired", json!({}), Some(3600));
+        store.set_expires_at_for_test("expired", Utc::now() - chrono::Duration::seconds(10));
+
+        let reaped = store.reap_expired();
+        assert_eq!(reaped, 1);
+        assert!(store.get("expired").is_none());
+    }
+
+    #[test]
+    fn reap_expired_keeps_valid() {
+        let mut store = SessionStore::new();
+        store.put("still_valid", json!({}), Some(3600));
+
+        let reaped = store.reap_expired();
+        assert_eq!(reaped, 0);
+        assert!(store.get("still_valid").is_some());
+    }
+
+    #[test]
+    fn reap_expired_ignores_no_ttl() {
+        let mut store = SessionStore::new();
+        store.put("no_ttl", json!({}), None);
+
+        let reaped = store.reap_expired();
+        assert_eq!(reaped, 0);
+        assert!(store.get("no_ttl").is_some());
     }
 }

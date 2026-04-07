@@ -8,6 +8,7 @@
 //! specification. [`list_tools`] returns the full catalogue advertised to
 //! MCP clients via the `tools/list` response.
 
+pub mod decision;
 pub mod facts;
 pub mod handoff;
 pub mod observe;
@@ -27,7 +28,7 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
-/// Return the full tool catalogue (16 tools) advertised to MCP clients.
+/// Return the full tool catalogue (17 tools) advertised to MCP clients.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         // ── Retrieval ──────────────────────────────────────────────
@@ -138,8 +139,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "delete_fact".to_string(),
-            description: "Soft-delete a fact by its ID. The fact's receipt is preserved."
-                .to_string(),
+            description: "Soft-delete a fact by its ID. The fact's receipt is preserved.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -182,11 +182,27 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 ]
             }),
         },
+        ToolDefinition {
+            name: "fact_history".to_string(),
+            description: "Return the full version chain for a given (entity, key) pair. \
+                          Shows how a fact evolved over time, including superseded versions."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity": { "type": "string", "description": "Entity name" },
+                    "key":    { "type": "string", "description": "Fact key" }
+                },
+                "required": ["entity", "key"],
+                "examples": [
+                    { "entity": "project-alpha", "key": "status" }
+                ]
+            }),
+        },
         // ── Sessions ───────────────────────────────────────────────
         ToolDefinition {
             name: "get_session".to_string(),
-            description: "Retrieve session state by ID. Returns the full JSON state object."
-                .to_string(),
+            description: "Retrieve session state by ID. Returns the full JSON state object.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -200,24 +216,24 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "save_session".to_string(),
-            description: "Create or update session state. Overwrites the previous state."
-                .to_string(),
+            description: "Create or update session state. Overwrites the previous state.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string", "description": "Session identifier" },
-                    "state":      { "type": "object", "description": "Arbitrary JSON state to persist" }
+                    "session_id":   { "type": "string",  "description": "Session identifier" },
+                    "state":        { "type": "object",  "description": "Arbitrary JSON state to persist" },
+                    "ttl_seconds":  { "type": "integer", "description": "Optional time-to-live in seconds. Session expires after this duration." }
                 },
                 "required": ["session_id", "state"],
                 "examples": [
-                    { "session_id": "session-42", "state": { "decisions": ["Use PostgreSQL"], "open_questions": ["Which cache?"] } }
+                    { "session_id": "session-42", "state": { "decisions": ["Use PostgreSQL"], "open_questions": ["Which cache?"] } },
+                    { "session_id": "session-42", "state": { "step": 1 }, "ttl_seconds": 3600 }
                 ]
             }),
         },
         ToolDefinition {
             name: "list_sessions".to_string(),
-            description: "List all active session IDs. Returns a sorted list."
-                .to_string(),
+            description: "List all active session IDs. Returns a sorted list.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -226,8 +242,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "delete_session".to_string(),
-            description: "Delete a session by ID. Returns confirmation or not-found."
-                .to_string(),
+            description: "Delete a session by ID. Returns confirmation or not-found.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -304,6 +319,34 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 ]
             }),
         },
+        // ── Decisions ─────────────────────────────────────────────
+        ToolDefinition {
+            name: "record_decision".to_string(),
+            description: "Record why a decision was made. Stores an append-only, \
+                          BLAKE3-hashed decision record as a fact. Queryable via \
+                          query_facts with entity prefix __decisions__::."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action":       { "type": "string",  "description": "What was decided / what action was taken" },
+                    "rationale":    { "type": "string",  "description": "Why this decision was made" },
+                    "alternatives": { "type": "array",   "items": { "type": "string" }, "description": "Other options that were considered" },
+                    "confidence":   { "type": "number",  "description": "Confidence in this decision (0..1)", "default": 1.0 },
+                    "session_id":   { "type": "string",  "description": "Session to associate this decision with", "default": "_default" },
+                    "context_refs": { "type": "array",   "items": { "type": "string" }, "description": "References to facts or receipts that informed this decision" }
+                },
+                "required": ["action", "rationale"],
+                "examples": [
+                    {
+                        "action": "Chose PostgreSQL over MongoDB for the metadata store",
+                        "rationale": "Need ACID transactions for receipt chains; document flexibility not required",
+                        "alternatives": ["MongoDB", "SQLite"],
+                        "confidence": 0.9
+                    }
+                ]
+            }),
+        },
     ]
 }
 
@@ -337,6 +380,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "delete_fact",        "output": "{ deleted: bool, fact_id }" },
         { "tool": "list_entities",      "output": "{ entities: [string] }" },
         { "tool": "get_bootstrap",      "output": "{ facts: [{entity, key, value}], total_tokens }" },
+        { "tool": "fact_history",       "output": "{ versions: [{fact_id, value, version, supersedes, confidence, stored_at, deleted}] }" },
         { "tool": "get_session",        "output": "{ session_id, state, updated_at, total_tokens }" },
         { "tool": "save_session",       "output": "{ session_id, updated_at }" },
         { "tool": "list_sessions",      "output": "{ sessions: [string] }" },
@@ -344,15 +388,13 @@ pub fn tool_output_docs() -> Value {
         { "tool": "get_gaps",           "output": "{ gaps: [{entity, key, value, stored_at}], total_tokens }" },
         { "tool": "get_agent_identity", "output": "{ agent_name: string }" },
         { "tool": "create_handoff",     "output": "{ handoff_id, content_hash, signature, facts_count, total_tokens }" },
-        { "tool": "accept_handoff",     "output": "{ session_id, facts_imported, verified: bool }" }
+        { "tool": "accept_handoff",     "output": "{ session_id, facts_imported, verified: bool }" },
+        { "tool": "record_decision",    "output": "{ decision_id, decision_hash, entity, action }" }
     ])
 }
 
 /// `get_agent_identity` — return the calling agent's name.
-pub async fn handle_get_agent_identity(
-    _args: &Value,
-    ctx: &McpContext,
-) -> Result<Value, JsonRpcError> {
+pub async fn handle_get_agent_identity(_args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let name = ctx
         .agent
         .as_ref()
@@ -368,11 +410,7 @@ pub async fn handle_get_agent_identity(
 }
 
 /// Dispatch a tool call by name. Returns the MCP `content` array.
-pub async fn call_tool(
-    name: &str,
-    args: &Value,
-    ctx: &McpContext,
-) -> Result<Value, JsonRpcError> {
+pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     match name {
         "query" => query::handle_query(args, ctx).await,
         "query_scan" => query::handle_query_scan(args, ctx).await,
@@ -382,6 +420,7 @@ pub async fn call_tool(
         "delete_fact" => facts::handle_delete_fact(args, ctx).await,
         "list_entities" => facts::handle_list_entities(args, ctx).await,
         "get_bootstrap" => facts::handle_get_bootstrap(args, ctx).await,
+        "fact_history" => facts::handle_fact_history(args, ctx).await,
         "get_session" => sessions::handle_get_session(args, ctx).await,
         "save_session" => sessions::handle_save_session(args, ctx).await,
         "list_sessions" => sessions::handle_list_sessions(args, ctx).await,
@@ -390,6 +429,7 @@ pub async fn call_tool(
         "get_agent_identity" => handle_get_agent_identity(args, ctx).await,
         "create_handoff" => handoff::handle_create_handoff(args, ctx).await,
         "accept_handoff" => handoff::handle_accept_handoff(args, ctx).await,
+        "record_decision" => decision::handle_record_decision(args, ctx).await,
         _ => Err(JsonRpcError {
             code: crate::protocol::METHOD_NOT_FOUND,
             message: format!("unknown tool: {name}"),
@@ -404,7 +444,7 @@ mod tests {
     use crate::agent::AgentIdentity;
     use crate::dispatch::McpContext;
 
-    const TOOL_COUNT: usize = 16;
+    const TOOL_COUNT: usize = 18;
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
@@ -513,10 +553,7 @@ mod tests {
         let docs = tool_output_docs();
         let arr = docs.as_array().unwrap();
         let tool_names: Vec<String> = list_tools().into_iter().map(|t| t.name).collect();
-        let doc_names: Vec<String> = arr
-            .iter()
-            .map(|d| d["tool"].as_str().unwrap().to_string())
-            .collect();
+        let doc_names: Vec<String> = arr.iter().map(|d| d["tool"].as_str().unwrap().to_string()).collect();
         for name in &tool_names {
             assert!(
                 doc_names.contains(name),
@@ -542,9 +579,7 @@ mod tests {
     #[tokio::test]
     async fn get_agent_identity_anonymous() {
         let ctx = test_ctx();
-        let result = handle_get_agent_identity(&json!({}), &ctx)
-            .await
-            .unwrap();
+        let result = handle_get_agent_identity(&json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, "anonymous");
     }
@@ -556,9 +591,7 @@ mod tests {
             name: "alice".to_string(),
             token_hash: [0u8; 32],
         });
-        let result = handle_get_agent_identity(&json!({}), &agent_ctx)
-            .await
-            .unwrap();
+        let result = handle_get_agent_identity(&json!({}), &agent_ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, "alice");
     }
@@ -578,9 +611,7 @@ mod tests {
     #[tokio::test]
     async fn call_tool_list_entities() {
         let ctx = test_ctx();
-        let result = call_tool("list_entities", &json!({}), &ctx)
-            .await
-            .unwrap();
+        let result = call_tool("list_entities", &json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, "no entities found");
     }
@@ -588,9 +619,7 @@ mod tests {
     #[tokio::test]
     async fn call_tool_get_bootstrap() {
         let ctx = test_ctx();
-        let result = call_tool("get_bootstrap", &json!({}), &ctx)
-            .await
-            .unwrap();
+        let result = call_tool("get_bootstrap", &json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("no bootstrap"));
     }
@@ -598,9 +627,7 @@ mod tests {
     #[tokio::test]
     async fn call_tool_list_sessions() {
         let ctx = test_ctx();
-        let result = call_tool("list_sessions", &json!({}), &ctx)
-            .await
-            .unwrap();
+        let result = call_tool("list_sessions", &json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, "no sessions");
     }
@@ -618,9 +645,7 @@ mod tests {
     #[tokio::test]
     async fn call_tool_get_agent_identity() {
         let ctx = test_ctx();
-        let result = call_tool("get_agent_identity", &json!({}), &ctx)
-            .await
-            .unwrap();
+        let result = call_tool("get_agent_identity", &json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, "anonymous");
     }

@@ -14,10 +14,9 @@ use crate::{evidence, fixture_digest, parity, snapshot};
 use corecrux_projections::load_projections_meta_v1;
 use corecrux_receipts::ReplayExportManifestV1;
 use corecrux_types::{
-    AuditArtifactSummaryV2, AuditPackIndexV2, BuildInfo, CompatContract,
-    EvidenceArtifactDescriptorV1, EvidenceManifestV1, EvidenceProducerV1,
-    EvidenceProjectionCursorV1, EvidenceRelationshipV1, EvidenceSourceRefV1, EvidenceStatusV1,
-    EvidenceSubjectScopeV1, HealthzResponse, AUDIT_PACK_INDEX_SCHEMA_V2, DEFAULT_COMPAT_REQUIRES,
+    AuditArtifactSummaryV2, AuditPackIndexV2, BuildInfo, CompatContract, EvidenceArtifactDescriptorV1,
+    EvidenceManifestV1, EvidenceProducerV1, EvidenceProjectionCursorV1, EvidenceRelationshipV1, EvidenceSourceRefV1,
+    EvidenceStatusV1, EvidenceSubjectScopeV1, HealthzResponse, AUDIT_PACK_INDEX_SCHEMA_V2, DEFAULT_COMPAT_REQUIRES,
     EVIDENCE_MANIFEST_SCHEMA_V1,
 };
 
@@ -319,10 +318,7 @@ pub fn generate_audit_pack_v1(opts: &AuditPackOptionsV1) -> Result<AuditPackInde
                 compat_requires: Some(compat.requires.clone()),
             }],
         },
-        format!(
-            "corecrux_version={} compat={}",
-            corecrux_build.version, compat.requires
-        ),
+        format!("corecrux_version={} compat={}", corecrux_build.version, compat.requires),
     );
 
     let local_binding_mode = LocalEvidenceStatusReportV1 {
@@ -366,16 +362,14 @@ pub fn generate_audit_pack_v1(opts: &AuditPackOptionsV1) -> Result<AuditPackInde
 
     match opts.data_dir.as_ref() {
         Some(data_dir) => {
-            let control_bundle =
-                evidence::collect_control_evidence_bundle_v1(&evidence::ControlVerifyOptions {
-                    data_dir: data_dir.clone(),
-                    hosted_only: false,
-                    device_index: opts.device_index,
-                    batch_frames: 8192,
-                })?;
+            let control_bundle = evidence::collect_control_evidence_bundle_v1(&evidence::ControlVerifyOptions {
+                data_dir: data_dir.clone(),
+                hosted_only: false,
+                device_index: opts.device_index,
+                batch_frames: 8192,
+            })?;
             let control_report_path = out_dir.join("control_verify.json");
-            let control_report_meta =
-                write_pretty_json(&control_report_path, &control_bundle.report)?;
+            let control_report_meta = write_pretty_json(&control_report_path, &control_bundle.report)?;
             let control_status = control_verify_status(&control_bundle.report);
             register_manifest_artifact(
                 &mut manifest_artifacts,
@@ -395,15 +389,12 @@ pub fn generate_audit_pack_v1(opts: &AuditPackOptionsV1) -> Result<AuditPackInde
                 },
                 format!(
                     "hosted={} ok={} evidence_events={}",
-                    control_bundle.report.hosted,
-                    control_bundle.report.ok,
-                    control_bundle.report.evidence_events
+                    control_bundle.report.hosted, control_bundle.report.ok, control_bundle.report.evidence_events
                 ),
             );
             if control_bundle.report.hosted {
                 let control_checkpoint_path = out_dir.join("control_checkpoint.json");
-                let control_checkpoint_meta =
-                    write_bytes(&control_checkpoint_path, &control_bundle.checkpoint_bytes)?;
+                let control_checkpoint_meta = write_bytes(&control_checkpoint_path, &control_bundle.checkpoint_bytes)?;
                 register_manifest_artifact(
                     &mut manifest_artifacts,
                     &mut artifact_summaries,
@@ -426,8 +417,7 @@ pub fn generate_audit_pack_v1(opts: &AuditPackOptionsV1) -> Result<AuditPackInde
                         control_bundle.report.expected_checkpoint_size_bytes
                     ),
                 );
-                let evidence_jsonl =
-                    evidence::control_evidence_jsonl(&control_bundle.evidence_lines)?;
+                let evidence_jsonl = evidence::control_evidence_jsonl(&control_bundle.evidence_lines)?;
                 let control_evidence_path = out_dir.join("control_evidence.jsonl");
                 let control_evidence_meta = write_bytes(&control_evidence_path, &evidence_jsonl)?;
                 register_manifest_artifact(
@@ -618,9 +608,7 @@ pub fn generate_audit_pack_v1(opts: &AuditPackOptionsV1) -> Result<AuditPackInde
             file: idempotency_meta.relative_path.clone(),
             summary: format!(
                 "comparison={} total_events={} duplicates={}",
-                idempotency_report.comparison,
-                idempotency_report.total_events,
-                idempotency_report.duplicate_count
+                idempotency_report.comparison, idempotency_report.total_events, idempotency_report.duplicate_count
             ),
         },
     );
@@ -646,9 +634,7 @@ pub fn generate_audit_pack_v1(opts: &AuditPackOptionsV1) -> Result<AuditPackInde
         },
         format!(
             "comparison={} total_events={} duplicates={}",
-            idempotency_report.comparison,
-            idempotency_report.total_events,
-            idempotency_report.duplicate_count
+            idempotency_report.comparison, idempotency_report.total_events, idempotency_report.duplicate_count
         ),
     );
 
@@ -780,9 +766,7 @@ pub fn generate_audit_pack_v1(opts: &AuditPackOptionsV1) -> Result<AuditPackInde
             file: integrity_meta.relative_path.clone(),
             summary: format!(
                 "health_ok={} ready_ok={} build_info={}",
-                integrity_report.health_ok,
-                integrity_report.ready_ok,
-                integrity_report.metrics_build_info_present
+                integrity_report.health_ok, integrity_report.ready_ok, integrity_report.metrics_build_info_present
             ),
         },
     );
@@ -804,9 +788,7 @@ pub fn generate_audit_pack_v1(opts: &AuditPackOptionsV1) -> Result<AuditPackInde
         },
         format!(
             "health_ok={} ready_ok={} build_info={}",
-            integrity_report.health_ok,
-            integrity_report.ready_ok,
-            integrity_report.metrics_build_info_present
+            integrity_report.health_ok, integrity_report.ready_ok, integrity_report.metrics_build_info_present
         ),
     );
 
@@ -974,10 +956,7 @@ fn build_stream_reports(opts: &AuditPackOptionsV1) -> Result<StreamAuditOutputsV
                     digest_blake3: None,
                     cross_system: None,
                     issues: Vec::new(),
-                    note: Some(
-                        "stream audit skipped (provide --tenant-id --stream-type --stream-id)"
-                            .to_string(),
-                    ),
+                    note: Some("stream audit skipped (provide --tenant-id --stream-type --stream-id)".to_string()),
                 },
                 idempotency: IdempotencyParityReportV1 {
                     schema: "corecrux.audit.idempotency_parity.v1".to_string(),
@@ -988,10 +967,7 @@ fn build_stream_reports(opts: &AuditPackOptionsV1) -> Result<StreamAuditOutputsV
                     duplicate_count: 0,
                     cross_system: None,
                     issues: Vec::new(),
-                    note: Some(
-                        "stream audit skipped (provide --tenant-id --stream-type --stream-id)"
-                            .to_string(),
-                    ),
+                    note: Some("stream audit skipped (provide --tenant-id --stream-type --stream-id)".to_string()),
                 },
                 headers: Vec::new(),
             });
@@ -1030,18 +1006,14 @@ fn pack_producer() -> EvidenceProducerV1 {
     EvidenceProducerV1 {
         name: "corecruxctl".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        commit: option_env!("CORECRUX_GIT_SHA")
-            .unwrap_or("unknown")
-            .to_string(),
+        commit: option_env!("CORECRUX_GIT_SHA").unwrap_or("unknown").to_string(),
     }
 }
 
 fn observe_corecrux_identity(opts: &AuditPackOptionsV1) -> (BuildInfo, CompatContract) {
     let fallback_build = BuildInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        commit: option_env!("CORECRUX_GIT_SHA")
-            .unwrap_or("unknown")
-            .to_string(),
+        commit: option_env!("CORECRUX_GIT_SHA").unwrap_or("unknown").to_string(),
     };
     let fallback_compat = CompatContract {
         requires: DEFAULT_COMPAT_REQUIRES.to_string(),
@@ -1063,10 +1035,7 @@ fn observe_corecrux_identity(opts: &AuditPackOptionsV1) -> (BuildInfo, CompatCon
 
 fn build_subject_scope(opts: &AuditPackOptionsV1) -> EvidenceSubjectScopeV1 {
     EvidenceSubjectScopeV1 {
-        tenant_id: opts
-            .tenant_id
-            .clone()
-            .or_else(|| opts.parity_tenant_id.clone()),
+        tenant_id: opts.tenant_id.clone().or_else(|| opts.parity_tenant_id.clone()),
         stream_type: opts.stream_type.clone(),
         stream_id: opts.stream_id.clone(),
         receipt_id: opts.receipt_id.clone(),
@@ -1126,9 +1095,7 @@ fn control_verify_status(report: &evidence::ControlVerifyReportV1) -> AuditStatu
     }
 }
 
-fn control_evidence_source_refs(
-    lines: &[evidence::ControlEvidenceJsonLineV1],
-) -> Vec<EvidenceSourceRefV1> {
+fn control_evidence_source_refs(lines: &[evidence::ControlEvidenceJsonLineV1]) -> Vec<EvidenceSourceRefV1> {
     let Some(first) = lines.first() else {
         return Vec::new();
     };
@@ -1311,10 +1278,7 @@ fn add_snapshot_evidence_artifacts(
                     .unwrap_or_else(|| projection.projection.clone())
             ));
             let dst_meta = write_bytes(&dst, &bytes)?;
-            let projection_key = format!(
-                "projection_snapshot_{}_{}",
-                shard.shard_id, projection.projection
-            );
+            let projection_key = format!("projection_snapshot_{}_{}", shard.shard_id, projection.projection);
             register_manifest_artifact(
                 artifacts,
                 summaries,
@@ -1352,10 +1316,7 @@ fn add_snapshot_evidence_artifacts(
             });
             relationships.push(EvidenceRelationshipV1 {
                 from: meta_key.clone(),
-                to: format!(
-                    "projection_snapshot_{}_{}",
-                    shard.shard_id, projection.projection
-                ),
+                to: format!("projection_snapshot_{}_{}", shard.shard_id, projection.projection),
                 relation: "describes".to_string(),
             });
         }
@@ -1388,10 +1349,7 @@ fn add_receipt_evidence_artifacts(
     let receipt_source_ref = EvidenceSourceRefV1::Receipt {
         tenant_id: export_manifest.tenant_id.clone(),
         receipt_id: export_manifest.receipt_id.clone(),
-        body_payload_hash: export_manifest
-            .receipt_refs
-            .receipt_body_payload_hash
-            .clone(),
+        body_payload_hash: export_manifest.receipt_refs.receipt_body_payload_hash.clone(),
         sig_event_ref: Some(export_manifest.receipt_refs.receipt_sig_event_ref.clone()),
     };
 
@@ -1413,11 +1371,7 @@ fn add_receipt_evidence_artifacts(
             produced_by: producer.clone(),
             source_refs: vec![receipt_source_ref.clone()],
         },
-        format!(
-            "selector={} receipt_id={}",
-            selector.kind(),
-            export_manifest.receipt_id
-        ),
+        format!("selector={} receipt_id={}", selector.kind(), export_manifest.receipt_id),
     );
 
     let export_manifest_path = out_dir.join("receipt_export_manifest.json");
@@ -1447,10 +1401,7 @@ fn add_receipt_evidence_artifacts(
     });
 
     let verification_json = read_zip_entry(&mut zip, "verification/report.json")?;
-    let verification_meta = write_bytes(
-        &out_dir.join("receipt_verification_report.json"),
-        &verification_json,
-    )?;
+    let verification_meta = write_bytes(&out_dir.join("receipt_verification_report.json"), &verification_json)?;
     register_manifest_artifact(
         artifacts,
         summaries,
@@ -1562,9 +1513,7 @@ fn receipt_selector(opts: &AuditPackOptionsV1) -> Result<Option<ReceiptSelector>
         selectors.push(ReceiptSelector::Action(id.clone()));
     }
     if selectors.len() > 1 {
-        return Err(
-            "use only one of --receipt-id, --answer-id, or --action-id for audit-pack".into(),
-        );
+        return Err("use only one of --receipt-id, --answer-id, or --action-id for audit-pack".into());
     }
     Ok(selectors.into_iter().next())
 }
@@ -1585,10 +1534,7 @@ fn fetch_receipt_export_bundle(
     Ok(bytes)
 }
 
-fn read_zip_entry<R: Read + std::io::Seek>(
-    zip: &mut zip::ZipArchive<R>,
-    path: &str,
-) -> Result<Vec<u8>, DynError> {
+fn read_zip_entry<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, path: &str) -> Result<Vec<u8>, DynError> {
     let mut file = zip.by_name(path)?;
     let mut out = Vec::new();
     file.read_to_end(&mut out)?;
@@ -1605,10 +1551,7 @@ fn stream_headers_jsonl(headers: &[StreamHeaderLineV1]) -> Result<Vec<u8>, DynEr
     Ok(out)
 }
 
-fn stream_header_source_refs(
-    opts: &AuditPackOptionsV1,
-    headers: &[StreamHeaderLineV1],
-) -> Vec<EvidenceSourceRefV1> {
+fn stream_header_source_refs(opts: &AuditPackOptionsV1, headers: &[StreamHeaderLineV1]) -> Vec<EvidenceSourceRefV1> {
     let Some(tenant_id) = opts.tenant_id.as_ref() else {
         return Vec::new();
     };
@@ -1622,12 +1565,7 @@ fn stream_header_source_refs(
         return Vec::new();
     }
     let mut refs = Vec::new();
-    refs.push(frame_source_ref(
-        tenant_id,
-        stream_type,
-        stream_id,
-        &headers[0],
-    ));
+    refs.push(frame_source_ref(tenant_id, stream_type, stream_id, &headers[0]));
     if headers.len() > 1 {
         refs.push(frame_source_ref(
             tenant_id,
@@ -1708,9 +1646,7 @@ fn load_v1_comparator_source(
     stream_id: &str,
 ) -> Result<Option<ComparatorSourceV1>, DynError> {
     match (v1_events_log, v1_stream_jsonl) {
-        (Some(_), Some(_)) => {
-            Err("provide only one comparator source (--v1-events-log OR --v1-stream-jsonl)".into())
-        }
+        (Some(_), Some(_)) => Err("provide only one comparator source (--v1-events-log OR --v1-stream-jsonl)".into()),
         (Some(path), None) => Ok(Some((
             format!("v1_events_log:{}", path.display()),
             load_v1_events_log_comparator(path, tenant_id, stream_type, stream_id)?,
@@ -1753,17 +1689,11 @@ fn load_v1_events_log_comparator(
         let expected_crc = u32::from_be_bytes(crc_buf);
         let actual_crc = crc32c::crc32c(&payload);
         if expected_crc != actual_crc {
-            return Err(format!(
-                "crc32c mismatch in v1 events.log: expected {expected_crc}, got {actual_crc}"
-            )
-            .into());
+            return Err(format!("crc32c mismatch in v1 events.log: expected {expected_crc}, got {actual_crc}").into());
         }
 
         let env: Stage1EventEnvelopeV1 = serde_json::from_slice(&payload)?;
-        if env.tenant_id != tenant_id
-            || env.stream_type != stream_type
-            || env.stream_id != stream_id
-        {
+        if env.tenant_id != tenant_id || env.stream_type != stream_type || env.stream_id != stream_id {
             continue;
         }
 
@@ -1865,9 +1795,7 @@ fn fetch_stream_headers_v1(
     Ok(out)
 }
 
-fn analyze_stream_headers_local(
-    headers: &[StreamHeaderLineV1],
-) -> (OrderingParityReportV1, IdempotencyParityReportV1) {
+fn analyze_stream_headers_local(headers: &[StreamHeaderLineV1]) -> (OrderingParityReportV1, IdempotencyParityReportV1) {
     let mut ordering_issues: Vec<AuditIssueV1> = Vec::new();
     let mut idempotency_issues: Vec<AuditIssueV1> = Vec::new();
     let mut seen_event_id: HashMap<&str, u64> = HashMap::new();
@@ -1969,11 +1897,7 @@ fn build_cross_system_reports(
     if v3_headers.len() != v1_rows.len() {
         ordering_issues.push(AuditIssueV1 {
             kind: "ORDER_COUNT_MISMATCH".to_string(),
-            message: format!(
-                "event count mismatch: v1={} v3={}",
-                v1_rows.len(),
-                v3_headers.len()
-            ),
+            message: format!("event count mismatch: v1={} v3={}", v1_rows.len(), v3_headers.len()),
             seq: None,
             event_id: None,
         });
@@ -2056,9 +1980,7 @@ fn build_cross_system_reports(
     }
     let mut v1_counts: HashMap<String, (u64, u64)> = HashMap::new();
     for row in v1_rows {
-        let entry = v1_counts
-            .entry(row.event_id.clone())
-            .or_insert((0, row.seq));
+        let entry = v1_counts.entry(row.event_id.clone()).or_insert((0, row.seq));
         entry.0 = entry.0.saturating_add(1);
         if row.seq < entry.1 {
             entry.1 = row.seq;
@@ -2094,10 +2016,7 @@ fn build_cross_system_reports(
             None => {
                 idempotency_issues.push(AuditIssueV1 {
                     kind: "IDEMPOTENCY_EVENT_ID_MISSING_V3".to_string(),
-                    message: format!(
-                        "eventId {} present in v1 comparator but missing in v3",
-                        event_id
-                    ),
+                    message: format!("eventId {} present in v1 comparator but missing in v3", event_id),
                     seq: Some(*v1_first_seq),
                     event_id: Some(event_id.clone()),
                 });
@@ -2108,20 +2027,14 @@ fn build_cross_system_reports(
         if !v1_counts.contains_key(event_id) {
             idempotency_issues.push(AuditIssueV1 {
                 kind: "IDEMPOTENCY_EVENT_ID_EXTRA_V3".to_string(),
-                message: format!(
-                    "eventId {} present in v3 but missing in v1 comparator",
-                    event_id
-                ),
+                message: format!("eventId {} present in v3 but missing in v1 comparator", event_id),
                 seq: Some(*v3_first_seq),
                 event_id: Some(event_id.clone()),
             });
         }
     }
 
-    let v3_dup_count = v3_counts
-        .values()
-        .map(|(count, _)| count.saturating_sub(1))
-        .sum();
+    let v3_dup_count = v3_counts.values().map(|(count, _)| count.saturating_sub(1)).sum();
     let ordering_status = if ordering_issues.is_empty() {
         AuditStatusV1::Pass
     } else {
@@ -2204,11 +2117,7 @@ fn build_projection_parity_report(opts: &AuditPackOptionsV1) -> ProjectionParity
         };
     }
 
-    let tenant_id = match opts
-        .parity_tenant_id
-        .as_deref()
-        .or(opts.tenant_id.as_deref())
-    {
+    let tenant_id = match opts.parity_tenant_id.as_deref().or(opts.tenant_id.as_deref()) {
         Some(v) => v,
         None => {
             return ProjectionParityReportV1 {
@@ -2284,10 +2193,7 @@ fn build_projection_parity_report(opts: &AuditPackOptionsV1) -> ProjectionParity
     }
 }
 
-fn build_replay_determinism_report(
-    fixture: &str,
-    device_index: i32,
-) -> Result<ReplayDeterminismReportV1, DynError> {
+fn build_replay_determinism_report(fixture: &str, device_index: i32) -> Result<ReplayDeterminismReportV1, DynError> {
     let run_a = fixture_digest::segment_fixture_replay_digest(fixture, device_index)?;
     let run_b = fixture_digest::segment_fixture_replay_digest(fixture, device_index)?;
     let digest_match = run_a.digest_blake3 == run_b.digest_blake3;
@@ -2606,10 +2512,7 @@ mod tests {
 
     #[test]
     fn file_name_string_extracts_final_component() {
-        assert_eq!(
-            file_name_string(std::path::Path::new("/a/b/c.json")),
-            "c.json"
-        );
+        assert_eq!(file_name_string(std::path::Path::new("/a/b/c.json")), "c.json");
     }
 
     #[test]
@@ -2921,8 +2824,7 @@ mod tests {
         assert!(legacy_index_path.exists());
 
         let manifest: EvidenceManifestV1 =
-            serde_json::from_slice(&std::fs::read(&manifest_path).expect("read manifest"))
-                .expect("parse manifest");
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("read manifest")).expect("parse manifest");
         assert_eq!(manifest.schema, EVIDENCE_MANIFEST_SCHEMA_V1);
         assert!(manifest.artifacts.contains_key("build_info"));
         assert!(manifest.artifacts.contains_key("local_binding_mode"));
@@ -2938,16 +2840,11 @@ mod tests {
             .contains(&"decision_plane_events".to_string()));
 
         let persisted_index: AuditPackIndexV2 =
-            serde_json::from_slice(&std::fs::read(&index_v2_path).expect("read index"))
-                .expect("parse index");
+            serde_json::from_slice(&std::fs::read(&index_v2_path).expect("read index")).expect("parse index");
         assert_eq!(persisted_index.schema, AUDIT_PACK_INDEX_SCHEMA_V2);
         assert!(persisted_index.artifact_summary.contains_key("build_info"));
-        assert!(persisted_index
-            .artifact_summary
-            .contains_key("local_binding_mode"));
-        assert!(persisted_index
-            .artifact_summary
-            .contains_key("legacy_audit_pack_index"));
+        assert!(persisted_index.artifact_summary.contains_key("local_binding_mode"));
+        assert!(persisted_index.artifact_summary.contains_key("legacy_audit_pack_index"));
     }
 
     // ── AuditStatusV1::worst edge cases ────────────────────────────
@@ -3059,9 +2956,7 @@ mod tests {
         // data_dir is Some → no control_checkpoint_binding skip
         assert!(!caps.contains(&"current_surface_skipped:control_checkpoint_binding".to_string()));
         // keyring is Some → no receipt_signature skip
-        assert!(!caps.contains(
-            &"current_surface_skipped:receipt_signature_reverify_keyring_missing".to_string()
-        ));
+        assert!(!caps.contains(&"current_surface_skipped:receipt_signature_reverify_keyring_missing".to_string()));
         // Always includes default capabilities
         assert!(caps.contains(&"decision_plane_events".to_string()));
     }
@@ -3094,9 +2989,7 @@ mod tests {
         };
         let caps = manifest_missing_capabilities(&opts);
         // receipt without keyring → adds keyring missing capability
-        assert!(caps.contains(
-            &"current_surface_skipped:receipt_signature_reverify_keyring_missing".to_string()
-        ));
+        assert!(caps.contains(&"current_surface_skipped:receipt_signature_reverify_keyring_missing".to_string()));
     }
 
     // ── default_missing_capabilities ───────────────────────────────
@@ -3154,8 +3047,7 @@ mod tests {
         let meta = write_pretty_json(&path, &data).expect("write");
         assert_eq!(meta.relative_path, "test.json");
         assert!(meta.size_bytes > 0);
-        let read_back: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let read_back: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(read_back["hello"], "world");
         assert_eq!(read_back["num"], 42);
     }
@@ -3514,10 +3406,7 @@ mod tests {
         ];
         let (ordering, _idempotency) = build_cross_system_reports(&v3, &v1, "test");
         assert_eq!(ordering.status, AuditStatusV1::Fail);
-        assert!(ordering
-            .issues
-            .iter()
-            .any(|i| i.kind == "ORDER_COUNT_MISMATCH"));
+        assert!(ordering.issues.iter().any(|i| i.kind == "ORDER_COUNT_MISMATCH"));
     }
 
     // ── receipt_selector: single selectors ────────────────────────
@@ -3673,10 +3562,7 @@ mod tests {
         let rows = vec![h(5, "e1"), h(5, "e2")];
         let (ordering, _idempotency) = analyze_stream_headers_local(&rows);
         assert_eq!(ordering.status, AuditStatusV1::Fail);
-        assert!(ordering
-            .issues
-            .iter()
-            .any(|i| i.kind == "ORDER_SEQ_NON_MONOTONIC"));
+        assert!(ordering.issues.iter().any(|i| i.kind == "ORDER_SEQ_NON_MONOTONIC"));
     }
 
     // ── analyze_stream_headers_local: duplicate event ids ────────
@@ -3729,10 +3615,7 @@ mod tests {
         ];
         let (ordering, _) = build_cross_system_reports(&v3, &v1, "test");
         assert_eq!(ordering.status, AuditStatusV1::Fail);
-        assert!(ordering
-            .issues
-            .iter()
-            .any(|i| i.kind == "ORDER_SEQ_NON_MONOTONIC_V1"));
+        assert!(ordering.issues.iter().any(|i| i.kind == "ORDER_SEQ_NON_MONOTONIC_V1"));
     }
 
     // ── cross_system: v3 non-monotonic seq ───────────────────────
@@ -3760,10 +3643,7 @@ mod tests {
         ];
         let (ordering, _) = build_cross_system_reports(&v3, &v1, "test");
         assert_eq!(ordering.status, AuditStatusV1::Fail);
-        assert!(ordering
-            .issues
-            .iter()
-            .any(|i| i.kind == "ORDER_SEQ_NON_MONOTONIC_V3"));
+        assert!(ordering.issues.iter().any(|i| i.kind == "ORDER_SEQ_NON_MONOTONIC_V3"));
     }
 
     // ── cross_system: empty inputs ──────────────────────────────
@@ -4156,7 +4036,12 @@ mod tests {
 
     #[test]
     fn audit_status_worst_is_symmetric() {
-        let variants = [AuditStatusV1::Pass, AuditStatusV1::Warn, AuditStatusV1::Fail, AuditStatusV1::Skipped];
+        let variants = [
+            AuditStatusV1::Pass,
+            AuditStatusV1::Warn,
+            AuditStatusV1::Fail,
+            AuditStatusV1::Skipped,
+        ];
         for a in &variants {
             for b in &variants {
                 assert_eq!(AuditStatusV1::worst(*a, *b), AuditStatusV1::worst(*b, *a));
@@ -4261,8 +4146,13 @@ mod tests {
     fn pack_build_info_v1_serializes() {
         let info = PackBuildInfoV1 {
             schema: "corecrux.audit_pack.build.v1".to_string(),
-            corecrux_build: BuildInfo { version: "0.1.0".to_string(), commit: "abc".to_string() },
-            compat: CompatContract { requires: DEFAULT_COMPAT_REQUIRES.to_string() },
+            corecrux_build: BuildInfo {
+                version: "0.1.0".to_string(),
+                commit: "abc".to_string(),
+            },
+            compat: CompatContract {
+                requires: DEFAULT_COMPAT_REQUIRES.to_string(),
+            },
             producer: pack_producer(),
             corecrux_base: "http://localhost".to_string(),
             offline: true,
@@ -4327,16 +4217,14 @@ mod tests {
 
     #[test]
     fn stream_digest_v1_deterministic() {
-        let rows = vec![
-            ComparatorEventRowV1 {
-                seq: 1,
-                event_id: "e1".to_string(),
-                event_type: "t".to_string(),
-                occurred_at: "2026-01-01T00:00:00Z".to_string(),
-                header_hash: "aa".to_string(),
-                payload_hash: "bb".to_string(),
-            },
-        ];
+        let rows = vec![ComparatorEventRowV1 {
+            seq: 1,
+            event_id: "e1".to_string(),
+            event_type: "t".to_string(),
+            occurred_at: "2026-01-01T00:00:00Z".to_string(),
+            header_hash: "aa".to_string(),
+            payload_hash: "bb".to_string(),
+        }];
         let d1 = stream_digest_v1(&rows);
         let d2 = stream_digest_v1(&rows);
         assert_eq!(d1, d2);

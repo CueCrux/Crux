@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CoreCrux Playground</title>
+<style>
+:root {
+  --bg: #1a1a2e;
+  --bg-card: #16213e;
+  --bg-input: #0f3460;
+  --text: #e0e0e0;
+  --text-dim: #8888aa;
+  --accent: #4cc9f0;
+  --accent-hover: #3aa8d8;
+  --error: #f44336;
+  --success: #4caf50;
+  --border: #2a2a4e;
+  --font: 'Menlo', 'Consolas', 'Monaco', monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: var(--font); background: var(--bg); color: var(--text); font-size: 13px; line-height: 1.5; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; border-bottom: 1px solid var(--border); }
+header h1 { font-size: 16px; font-weight: 600; color: var(--accent); }
+header .ver { font-size: 11px; color: var(--text-dim); }
+nav { display: flex; gap: 0; border-bottom: 1px solid var(--border); background: var(--bg-card); overflow-x: auto; }
+nav button { background: none; border: none; color: var(--text-dim); padding: 10px 18px; cursor: pointer; font-family: var(--font); font-size: 12px; border-bottom: 2px solid transparent; white-space: nowrap; }
+nav button:hover { color: var(--text); }
+nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab { display: none; padding: 16px 20px; max-width: 1000px; }
+.tab.active { display: block; }
+h2 { font-size: 14px; margin-bottom: 12px; color: var(--accent); }
+h3 { font-size: 12px; margin: 16px 0 8px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; }
+.form-row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; align-items: flex-end; }
+label { display: block; font-size: 11px; color: var(--text-dim); margin-bottom: 2px; }
+input, select, textarea { background: var(--bg-input); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; font-family: var(--font); font-size: 12px; width: 100%; }
+input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+.field { flex: 1; min-width: 120px; }
+button.btn { background: var(--accent); color: var(--bg); border: none; padding: 6px 16px; border-radius: 4px; cursor: pointer; font-family: var(--font); font-size: 12px; font-weight: 600; white-space: nowrap; }
+button.btn:hover { background: var(--accent-hover); }
+button.btn.sm { padding: 4px 10px; font-size: 11px; }
+.result { background: var(--bg-card); border: 1px solid var(--border); border-radius: 4px; padding: 12px; margin-top: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; max-height: 500px; overflow-y: auto; font-size: 12px; }
+.result.error { border-color: var(--error); color: var(--error); }
+.status-badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+.status-badge.ok { background: var(--success); color: #000; }
+.status-badge.fail { background: var(--error); color: #fff; }
+table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }
+th { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); color: var(--accent); font-weight: 600; }
+td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+tr:hover td { background: rgba(76,201,240,0.05); }
+.health-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+.health-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 4px; padding: 12px; }
+.health-card .label { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }
+.mono { font-family: var(--font); }
+.mt { margin-top: 12px; }
+.mb { margin-bottom: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>CoreCrux Playground</h1>
+  <span class="ver" id="version-display">loading...</span>
+</header>
+
+<nav id="tabs">
+  <button data-tab="health" class="active">Health</button>
+  <button data-tab="facts">Facts</button>
+  <button data-tab="history">History</button>
+  <button data-tab="search">Search</button>
+  <button data-tab="sessions">Sessions</button>
+  <button data-tab="decisions">Decisions</button>
+</nav>
+
+<!-- Health Tab -->
+<div id="tab-health" class="tab active">
+  <h2>System Health</h2>
+  <div class="health-grid">
+    <div class="health-card">
+      <div class="label">/healthz</div>
+      <div id="healthz-status">--</div>
+    </div>
+    <div class="health-card">
+      <div class="label">/readyz</div>
+      <div id="readyz-status">--</div>
+    </div>
+  </div>
+  <h3>Version Info</h3>
+  <div class="result" id="health-version">loading...</div>
+  <p class="mt" style="font-size:11px;color:var(--text-dim)">Auto-refreshes every 5 seconds</p>
+</div>
+
+<!-- Facts Tab -->
+<div id="tab-facts" class="tab">
+  <h2>Fact Store</h2>
+
+  <h3>Store a Fact</h3>
+  <div class="form-row">
+    <div class="field"><label>Entity</label><input id="fact-entity" placeholder="e.g. user:alice"></div>
+    <div class="field"><label>Key</label><input id="fact-key" placeholder="e.g. email"></div>
+    <div class="field"><label>Value</label><input id="fact-value" placeholder="e.g. alice@example.com"></div>
+    <div class="field" style="max-width:100px"><label>Confidence</label><input id="fact-confidence" type="number" min="0" max="1" step="0.1" value="1.0"></div>
+    <div><button class="btn" onclick="storeFact()">Store</button></div>
+  </div>
+  <div class="result" id="store-fact-result" style="display:none"></div>
+
+  <h3>Query Facts</h3>
+  <div class="form-row">
+    <div class="field"><label>Query (text)</label><input id="query-text" placeholder="free-text query"></div>
+    <div class="field"><label>Entity</label><input id="query-entity" placeholder="exact entity"></div>
+    <div class="field"><label>Entity Prefix</label><input id="query-prefix" placeholder="entity_prefix"></div>
+    <div class="field" style="max-width:80px"><label>Top K</label><input id="query-topk" type="number" value="10"></div>
+    <div><button class="btn" onclick="queryFacts()">Query</button></div>
+  </div>
+  <div class="result" id="query-facts-result" style="display:none"></div>
+
+  <h3>Get Fact by ID</h3>
+  <div class="form-row">
+    <div class="field"><label>Fact ID</label><input id="get-fact-id" placeholder="fact ID"></div>
+    <div><button class="btn" onclick="getFact()">Get</button></div>
+    <div><button class="btn" style="background:var(--error)" onclick="deleteFact()">Delete</button></div>
+  </div>
+  <div class="result" id="get-fact-result" style="display:none"></div>
+
+  <h3>Get Facts by Entity</h3>
+  <div class="form-row">
+    <div class="field"><label>Entity</label><input id="entity-lookup" placeholder="entity name"></div>
+    <div><button class="btn" onclick="getFactsByEntity()">Lookup</button></div>
+  </div>
+  <div class="result" id="entity-facts-result" style="display:none"></div>
+</div>
+
+<!-- History Tab -->
+<div id="tab-history" class="tab">
+  <h2>Fact History</h2>
+  <p class="mb" style="color:var(--text-dim);font-size:12px">View version timeline for an entity+key pair. Queries facts by entity and filters by key.</p>
+  <div class="form-row">
+    <div class="field"><label>Entity</label><input id="hist-entity" placeholder="entity"></div>
+    <div class="field"><label>Key</label><input id="hist-key" placeholder="key"></div>
+    <div><button class="btn" onclick="getHistory()">Load History</button></div>
+  </div>
+  <div class="result" id="history-result" style="display:none"></div>
+</div>
+
+<!-- Search Tab -->
+<div id="tab-search" class="tab">
+  <h2>Text Search</h2>
+  <div class="form-row">
+    <div class="field" style="flex:3"><label>Query</label><input id="search-query" placeholder="search text..."></div>
+    <div class="field" style="max-width:80px"><label>Top K</label><input id="search-topk" type="number" value="10"></div>
+    <div><button class="btn" onclick="textSearch()">Search</button></div>
+  </div>
+  <div class="result" id="search-result" style="display:none"></div>
+</div>
+
+<!-- Sessions Tab -->
+<div id="tab-sessions" class="tab">
+  <h2>Session State</h2>
+
+  <h3>Save Session State</h3>
+  <div class="form-row">
+    <div class="field"><label>Session ID</label><input id="session-save-id" placeholder="my-session"></div>
+    <div><button class="btn" onclick="saveSession()">Save</button></div>
+  </div>
+  <div class="field mt"><label>State (JSON)</label>
+    <textarea id="session-save-body" rows="4" placeholder='{"notes": "hello"}'></textarea>
+  </div>
+  <div class="result" id="session-save-result" style="display:none"></div>
+
+  <h3>Load Session State</h3>
+  <div class="form-row">
+    <div class="field"><label>Session ID</label><input id="session-load-id" placeholder="my-session"></div>
+    <div><button class="btn" onclick="loadSession()">Load</button></div>
+  </div>
+  <div class="result" id="session-load-result" style="display:none"></div>
+</div>
+
+<!-- Decisions Tab -->
+<div id="tab-decisions" class="tab">
+  <h2>Decisions</h2>
+  <p class="mb" style="color:var(--text-dim);font-size:12px">Decisions are stored as facts with entity prefix <code>__decisions__</code>.</p>
+
+  <h3>Record a Decision</h3>
+  <div class="form-row">
+    <div class="field"><label>Action</label><input id="dec-action" placeholder="e.g. deploy-v2"></div>
+    <div class="field"><label>Rationale</label><input id="dec-rationale" placeholder="why this action"></div>
+  </div>
+  <div class="form-row">
+    <div class="field"><label>Alternatives (comma-separated)</label><input id="dec-alternatives" placeholder="alt-a, alt-b"></div>
+    <div><button class="btn" onclick="recordDecision()">Record</button></div>
+  </div>
+  <div class="result" id="dec-store-result" style="display:none"></div>
+
+  <h3>Query Decisions</h3>
+  <div class="form-row">
+    <div class="field" style="max-width:80px"><label>Top K</label><input id="dec-topk" type="number" value="20"></div>
+    <div><button class="btn" onclick="queryDecisions()">Query</button></div>
+  </div>
+  <div class="result" id="dec-query-result" style="display:none"></div>
+</div>
+
+<script>
+/* ── Tab switching ─────────────────────────────────────────────────── */
+document.querySelectorAll('#tabs button').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    document.querySelectorAll('#tabs button').forEach(function(b) { b.classList.remove('active'); });
+    document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+  });
+});
+
+/* ── Helpers ───────────────────────────────────────────────────────── */
+function show(id, data, isError) {
+  var el = document.getElementById(id);
+  el.style.display = 'block';
+  el.className = 'result' + (isError ? ' error' : '');
+  if (typeof data === 'string') { el.textContent = data; }
+  else { el.textContent = JSON.stringify(data, null, 2); }
+}
+
+function badge(ok) {
+  return '<span class="status-badge ' + (ok ? 'ok' : 'fail') + '">' + (ok ? 'OK' : 'FAIL') + '</span>';
+}
+
+async function api(method, path, body) {
+  var opts = { method: method, headers: {} };
+  if (body !== undefined) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  var resp = await fetch(path, opts);
+  var text = await resp.text();
+  var data;
+  try { data = JSON.parse(text); } catch(e) { data = text; }
+  if (!resp.ok) { throw { status: resp.status, body: data }; }
+  return data;
+}
+
+/* ── Health Tab ────────────────────────────────────────────────────── */
+async function refreshHealth() {
+  try {
+    var hz = await fetch('/healthz');
+    document.getElementById('healthz-status').innerHTML = badge(hz.ok) + ' <span style="color:var(--text-dim)">' + hz.status + '</span>';
+  } catch(e) {
+    document.getElementById('healthz-status').innerHTML = badge(false) + ' <span style="color:var(--error)">unreachable</span>';
+  }
+  try {
+    var rz = await fetch('/readyz');
+    document.getElementById('readyz-status').innerHTML = badge(rz.ok) + ' <span style="color:var(--text-dim)">' + rz.status + '</span>';
+  } catch(e) {
+    document.getElementById('readyz-status').innerHTML = badge(false) + ' <span style="color:var(--error)">unreachable</span>';
+  }
+  try {
+    var ver = await api('GET', '/v1/version');
+    document.getElementById('health-version').textContent = JSON.stringify(ver, null, 2);
+    document.getElementById('version-display').textContent = 'v' + (ver.version || '?') + ' (' + (ver.commit || '?').slice(0, 8) + ')';
+  } catch(e) {
+    document.getElementById('health-version').textContent = 'Failed to load version info';
+    document.getElementById('version-display').textContent = 'offline';
+  }
+}
+refreshHealth();
+setInterval(refreshHealth, 5000);
+
+/* ── Facts Tab ─────────────────────────────────────────────────────── */
+async function storeFact() {
+  try {
+    var body = {
+      entity: document.getElementById('fact-entity').value,
+      key: document.getElementById('fact-key').value,
+      value: document.getElementById('fact-value').value,
+      confidence: parseFloat(document.getElementById('fact-confidence').value) || 1.0
+    };
+    var res = await api('PUT', '/v1/facts', body);
+    show('store-fact-result', res, false);
+  } catch(e) { show('store-fact-result', e.body || e.message || 'Error', true); }
+}
+
+async function queryFacts() {
+  try {
+    var params = new URLSearchParams();
+    var q = document.getElementById('query-text').value;
+    var ent = document.getElementById('query-entity').value;
+    var pfx = document.getElementById('query-prefix').value;
+    var tk = document.getElementById('query-topk').value;
+    if (q) params.set('query', q);
+    if (ent) params.set('entity', ent);
+    if (pfx) params.set('entity_prefix', pfx);
+    if (tk) params.set('top_k', tk);
+    var res = await api('GET', '/v1/facts?' + params.toString());
+    show('query-facts-result', res, false);
+  } catch(e) { show('query-facts-result', e.body || e.message || 'Error', true); }
+}
+
+async function getFact() {
+  try {
+    var id = document.getElementById('get-fact-id').value;
+    if (!id) { show('get-fact-result', 'Please enter a fact ID', true); return; }
+    var res = await api('GET', '/v1/facts/' + encodeURIComponent(id));
+    show('get-fact-result', res, false);
+  } catch(e) { show('get-fact-result', e.body || e.message || 'Error', true); }
+}
+
+async function deleteFact() {
+  try {
+    var id = document.getElementById('get-fact-id').value;
+    if (!id) { show('get-fact-result', 'Please enter a fact ID', true); return; }
+    var res = await api('DELETE', '/v1/facts/' + encodeURIComponent(id));
+    show('get-fact-result', res, false);
+  } catch(e) { show('get-fact-result', e.body || e.message || 'Error', true); }
+}
+
+async function getFactsByEntity() {
+  try {
+    var ent = document.getElementById('entity-lookup').value;
+    if (!ent) { show('entity-facts-result', 'Please enter an entity', true); return; }
+    var res = await api('GET', '/v1/facts/entity/' + encodeURIComponent(ent));
+    show('entity-facts-result', res, false);
+  } catch(e) { show('entity-facts-result', e.body || e.message || 'Error', true); }
+}
+
+/* ── History Tab ───────────────────────────────────────────────────── */
+async function getHistory() {
+  try {
+    var ent = document.getElementById('hist-entity').value;
+    var key = document.getElementById('hist-key').value;
+    if (!ent) { show('history-result', 'Please enter an entity', true); return; }
+    var res = await api('GET', '/v1/facts/entity/' + encodeURIComponent(ent));
+    var facts = (res.facts || []);
+    if (key) { facts = facts.filter(function(f) { return f.key === key; }); }
+    facts.sort(function(a, b) { return (a.version || 0) - (b.version || 0); });
+    show('history-result', { entity: ent, key: key || '(all)', versions: facts.length, timeline: facts }, false);
+  } catch(e) { show('history-result', e.body || e.message || 'Error', true); }
+}
+
+/* ── Search Tab ────────────────────────────────────────────────────── */
+async function textSearch() {
+  try {
+    var q = document.getElementById('search-query').value;
+    if (!q) { show('search-result', 'Please enter a query', true); return; }
+    var body = { query: q, top_k: parseInt(document.getElementById('search-topk').value) || 10 };
+    var res = await api('POST', '/v1/query/text-search', body);
+    show('search-result', res, false);
+  } catch(e) { show('search-result', e.body || e.message || 'Error', true); }
+}
+
+/* ── Sessions Tab ──────────────────────────────────────────────────── */
+async function saveSession() {
+  try {
+    var id = document.getElementById('session-save-id').value;
+    if (!id) { show('session-save-result', 'Please enter a session ID', true); return; }
+    var raw = document.getElementById('session-save-body').value;
+    var body;
+    try { body = JSON.parse(raw); } catch(e) { show('session-save-result', 'Invalid JSON: ' + e.message, true); return; }
+    var res = await api('PUT', '/v1/sessions/' + encodeURIComponent(id) + '/state', body);
+    show('session-save-result', res, false);
+  } catch(e) { show('session-save-result', e.body || e.message || 'Error', true); }
+}
+
+async function loadSession() {
+  try {
+    var id = document.getElementById('session-load-id').value;
+    if (!id) { show('session-load-result', 'Please enter a session ID', true); return; }
+    var res = await api('GET', '/v1/sessions/' + encodeURIComponent(id) + '/state');
+    show('session-load-result', res, false);
+  } catch(e) { show('session-load-result', e.body || e.message || 'Error', true); }
+}
+
+/* ── Decisions Tab ─────────────────────────────────────────────────── */
+async function recordDecision() {
+  try {
+    var action = document.getElementById('dec-action').value;
+    if (!action) { show('dec-store-result', 'Please enter an action', true); return; }
+    var alts = document.getElementById('dec-alternatives').value;
+    var body = {
+      entity: '__decisions__:' + action,
+      key: 'decision',
+      value: JSON.stringify({
+        action: action,
+        rationale: document.getElementById('dec-rationale').value,
+        alternatives: alts ? alts.split(',').map(function(s) { return s.trim(); }) : [],
+        recorded_at: new Date().toISOString()
+      }),
+      confidence: 1.0
+    };
+    var res = await api('PUT', '/v1/facts', body);
+    show('dec-store-result', res, false);
+  } catch(e) { show('dec-store-result', e.body || e.message || 'Error', true); }
+}
+
+async function queryDecisions() {
+  try {
+    var params = new URLSearchParams();
+    params.set('entity_prefix', '__decisions__');
+    params.set('top_k', document.getElementById('dec-topk').value || '20');
+    var res = await api('GET', '/v1/facts?' + params.toString());
+    show('dec-query-result', res, false);
+  } catch(e) { show('dec-query-result', e.body || e.message || 'Error', true); }
+}
+</script>
+</body>
+</html>

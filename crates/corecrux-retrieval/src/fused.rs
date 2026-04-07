@@ -78,11 +78,19 @@ pub struct FusedRetrieveRequest {
     pub graph_cold_start_threshold: usize,
 }
 
-fn default_graph_cold_start_threshold() -> usize { 100 }
+fn default_graph_cold_start_threshold() -> usize {
+    100
+}
 
-fn default_top_k() -> usize { 20 }
-fn default_graph_hops() -> u32 { 1 }
-fn default_min_confidence() -> f32 { 0.3 }
+fn default_top_k() -> usize {
+    20
+}
+fn default_graph_hops() -> u32 {
+    1
+}
+fn default_min_confidence() -> f32 {
+    0.3
+}
 
 /// A single result from fused retrieval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,10 +195,7 @@ pub fn fused_retrieve(
     }
 
     // Normalize BM25 scores to [0, 1]
-    let max_bm25 = bm25_hits
-        .iter()
-        .map(|h| h.score)
-        .fold(0.0f32, f32::max);
+    let max_bm25 = bm25_hits.iter().map(|h| h.score).fold(0.0f32, f32::max);
     let bm25_norm = if max_bm25 > 0.0 { max_bm25 } else { 1.0 };
 
     // Phase 2: Graph signal boost
@@ -262,11 +267,36 @@ mod tests {
         let tenant_id = "test-tenant";
         let tenant_hash = xxhash_rust::xxh64::xxh64(tenant_id.as_bytes(), 0);
         let mut builder = CcxiBuilder::new(0, 1, 100);
-        builder.add_document(0, "terraform module drift detection infrastructure as code", 0, tenant_hash);
-        builder.add_document(1, "terraform workspace management cloud infrastructure", 100, tenant_hash);
-        builder.add_document(2, "kubernetes deployment strategy container orchestration", 200, tenant_hash);
-        builder.add_document(3, "developer experience SDK testing framework tooling", 300, tenant_hash);
-        builder.add_document(4, "CI CD pipeline automation deployment continuous integration", 400, tenant_hash);
+        builder.add_document(
+            0,
+            "terraform module drift detection infrastructure as code",
+            0,
+            tenant_hash,
+        );
+        builder.add_document(
+            1,
+            "terraform workspace management cloud infrastructure",
+            100,
+            tenant_hash,
+        );
+        builder.add_document(
+            2,
+            "kubernetes deployment strategy container orchestration",
+            200,
+            tenant_hash,
+        );
+        builder.add_document(
+            3,
+            "developer experience SDK testing framework tooling",
+            300,
+            tenant_hash,
+        );
+        builder.add_document(
+            4,
+            "CI CD pipeline automation deployment continuous integration",
+            400,
+            tenant_hash,
+        );
 
         let bytes = builder.build();
         let mut mgr = IndexManager::new();
@@ -300,7 +330,12 @@ mod tests {
         // Build index with docs from both tenants
         let mut builder = CcxiBuilder::new(0, 1, 100);
         builder.add_document(0, "terraform drift detection infrastructure monitoring", 0, target_hash);
-        builder.add_document(1, "terraform drift detection infrastructure monitoring", 100, collider_hash);
+        builder.add_document(
+            1,
+            "terraform drift detection infrastructure monitoring",
+            100,
+            collider_hash,
+        );
         let bytes = builder.build();
 
         let mut mgr = IndexManager::new();
@@ -312,7 +347,12 @@ mod tests {
             query: "terraform drift detection".to_string(),
             query_embedding: None,
             top_k: 10,
-            weights: FusionWeights { bm25: 1.0, graph: 0.0, dense: 0.0, sparse: 0.0 },
+            weights: FusionWeights {
+                bm25: 1.0,
+                graph: 0.0,
+                dense: 0.0,
+                sparse: 0.0,
+            },
             graph_hops: 0,
             min_confidence: 0.0,
             include_state: false,
@@ -321,7 +361,10 @@ mod tests {
         };
         let resp = fused_retrieve(&mgr, &req, None).unwrap();
         assert_eq!(resp.results.len(), 1, "should return exactly 1 hit for target tenant");
-        assert_eq!(resp.results[0].doc_id, 0, "should return doc from target tenant, not collider");
+        assert_eq!(
+            resp.results[0].doc_id, 0,
+            "should return doc from target tenant, not collider"
+        );
 
         // Query as collider tenant — should see only doc 1
         let req2 = FusedRetrieveRequest {
@@ -329,7 +372,12 @@ mod tests {
             query: "terraform drift detection".to_string(),
             query_embedding: None,
             top_k: 10,
-            weights: FusionWeights { bm25: 1.0, graph: 0.0, dense: 0.0, sparse: 0.0 },
+            weights: FusionWeights {
+                bm25: 1.0,
+                graph: 0.0,
+                dense: 0.0,
+                sparse: 0.0,
+            },
             graph_hops: 0,
             min_confidence: 0.0,
             include_state: false,
@@ -338,7 +386,10 @@ mod tests {
         };
         let resp2 = fused_retrieve(&mgr, &req2, None).unwrap();
         assert_eq!(resp2.results.len(), 1, "collider tenant should see exactly 1 hit");
-        assert_eq!(resp2.results[0].doc_id, 1, "collider tenant should see only its own doc");
+        assert_eq!(
+            resp2.results[0].doc_id, 1,
+            "collider tenant should see only its own doc"
+        );
     }
 
     #[test]

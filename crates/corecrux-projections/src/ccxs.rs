@@ -14,9 +14,7 @@ pub enum CcxsError {
     UnsupportedVersion { v: u32 },
     #[error("unsupported projection id {id}")]
     UnsupportedProjectionId { id: u32 },
-    #[error(
-        "block hash mismatch for block_type={block_type}: expected={expected} actual={actual}"
-    )]
+    #[error("block hash mismatch for block_type={block_type}: expected={expected} actual={actual}")]
     BlockHashMismatch {
         block_type: u32,
         expected: String,
@@ -302,9 +300,7 @@ impl<'a> Cursor<'a> {
 
     fn read_u64(&mut self) -> Result<u64> {
         let b = self.read_exact(8)?;
-        Ok(u64::from_le_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
+        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
     }
 
     fn read_32(&mut self) -> Result<[u8; 32]> {
@@ -323,13 +319,34 @@ mod tests {
 
     #[test]
     fn projection_id_from_u32_valid_values() {
-        assert!(matches!(CcxsProjectionId::from_u32(1), Ok(CcxsProjectionId::ArtifactLivingState)));
-        assert!(matches!(CcxsProjectionId::from_u32(2), Ok(CcxsProjectionId::ArtifactRelations)));
-        assert!(matches!(CcxsProjectionId::from_u32(3), Ok(CcxsProjectionId::PressureEvents)));
-        assert!(matches!(CcxsProjectionId::from_u32(4), Ok(CcxsProjectionId::ArtifactDependents)));
-        assert!(matches!(CcxsProjectionId::from_u32(10), Ok(CcxsProjectionId::EntityCount)));
-        assert!(matches!(CcxsProjectionId::from_u32(11), Ok(CcxsProjectionId::EntityTimeline)));
-        assert!(matches!(CcxsProjectionId::from_u32(12), Ok(CcxsProjectionId::EntityCurrentState)));
+        assert!(matches!(
+            CcxsProjectionId::from_u32(1),
+            Ok(CcxsProjectionId::ArtifactLivingState)
+        ));
+        assert!(matches!(
+            CcxsProjectionId::from_u32(2),
+            Ok(CcxsProjectionId::ArtifactRelations)
+        ));
+        assert!(matches!(
+            CcxsProjectionId::from_u32(3),
+            Ok(CcxsProjectionId::PressureEvents)
+        ));
+        assert!(matches!(
+            CcxsProjectionId::from_u32(4),
+            Ok(CcxsProjectionId::ArtifactDependents)
+        ));
+        assert!(matches!(
+            CcxsProjectionId::from_u32(10),
+            Ok(CcxsProjectionId::EntityCount)
+        ));
+        assert!(matches!(
+            CcxsProjectionId::from_u32(11),
+            Ok(CcxsProjectionId::EntityTimeline)
+        ));
+        assert!(matches!(
+            CcxsProjectionId::from_u32(12),
+            Ok(CcxsProjectionId::EntityCurrentState)
+        ));
     }
 
     #[test]
@@ -569,7 +586,9 @@ mod tests {
         };
         assert!(e.to_string().contains("block hash mismatch"));
 
-        let e = CcxsError::Invalid { msg: "test error".to_string() };
+        let e = CcxsError::Invalid {
+            msg: "test error".to_string(),
+        };
         assert!(e.to_string().contains("test error"));
     }
 
@@ -813,7 +832,10 @@ mod tests {
         let truncated = &bytes[..bytes.len() - 1];
         let err = CcxsSnapshot::decode(truncated).unwrap_err();
         // Should be either BufferTooSmall or BlockHashMismatch
-        assert!(matches!(err, CcxsError::BufferTooSmall | CcxsError::BlockHashMismatch { .. }));
+        assert!(matches!(
+            err,
+            CcxsError::BufferTooSmall | CcxsError::BlockHashMismatch { .. }
+        ));
     }
 
     // ── decode rejects unsupported projection ID ────────────────────

@@ -19,22 +19,19 @@ mod verify_v1;
 
 pub use body_v1::{extract_body_index_v1, extract_linked_receipts_v1, ReceiptBodyIndexV1};
 pub use export_v1::{
-    build_receipt_export_v1, BuildReceiptExportInput, ExportError, ExportFileV1, ExportFormatV1,
-    ExportRedactionV1, ReceiptEventHeaderRefV1, ReceiptExportBundleV1, ReceiptExportIncludeV1,
-    ReceiptExportOptionsV1, ReplayExportManifestV1,
+    build_receipt_export_v1, BuildReceiptExportInput, ExportError, ExportFileV1, ExportFormatV1, ExportRedactionV1,
+    ReceiptEventHeaderRefV1, ReceiptExportBundleV1, ReceiptExportIncludeV1, ReceiptExportOptionsV1,
+    ReplayExportManifestV1,
 };
 pub use keyring_v1::{Ed25519KeyEntryV1, Ed25519KeyRingV1, KeyRingError};
 pub use store_v1::{
-    load_verification_report_v1, store_verification_report_v1, verification_report_path_v1,
-    ReceiptStoreError,
+    load_verification_report_v1, store_verification_report_v1, verification_report_path_v1, ReceiptStoreError,
 };
 pub use subject_index_v1::{
-    resolve_subject_receipt_id_v1, subject_index_path_v1, update_subject_index_v1,
-    ReceiptSubjectIndexV1, ReceiptSubjectLatestV1, SubjectResolveModeV1,
+    resolve_subject_receipt_id_v1, subject_index_path_v1, update_subject_index_v1, ReceiptSubjectIndexV1,
+    ReceiptSubjectLatestV1, SubjectResolveModeV1,
 };
-pub use verify_v1::{
-    verify_receipt_v1, ReceiptSigV1, VerificationReportV1, VerifyErrorCodeV1, VerifyReceiptInput,
-};
+pub use verify_v1::{verify_receipt_v1, ReceiptSigV1, VerificationReportV1, VerifyErrorCodeV1, VerifyReceiptInput};
 
 pub const STREAM_TYPE_RECEIPT: &str = "receipt";
 pub const EVT_RECEIPT_BODY_V1: &str = "receipt.body.v1";

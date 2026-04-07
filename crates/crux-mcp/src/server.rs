@@ -27,11 +27,7 @@ pub fn router(ctx: McpContext) -> axum::Router {
 }
 
 /// `POST /mcp` — JSON-RPC 2.0 endpoint (MCP Streamable HTTP).
-async fn handle_mcp_post(
-    State(ctx): State<Arc<McpContext>>,
-    headers: HeaderMap,
-    body: String,
-) -> impl IntoResponse {
+async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap, body: String) -> impl IntoResponse {
     // Extract optional bearer token for agent lookup.
     let agent = headers
         .get("authorization")
@@ -119,10 +115,7 @@ mod tests {
         let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body_bytes).unwrap();
         assert!(rpc_resp.error.is_none());
-        assert_eq!(
-            rpc_resp.result.as_ref().unwrap()["protocolVersion"],
-            PROTOCOL_VERSION
-        );
+        assert_eq!(rpc_resp.result.as_ref().unwrap()["protocolVersion"], PROTOCOL_VERSION);
     }
 
     #[tokio::test]

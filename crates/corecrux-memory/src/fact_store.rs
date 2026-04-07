@@ -25,6 +25,16 @@ pub struct Fact {
     pub stored_at: DateTime<Utc>,
     pub tokens: usize,
     pub deleted: bool,
+    /// Monotonic version number for this (entity, key) pair. Starts at 1.
+    #[serde(default = "default_version")]
+    pub version: u32,
+    /// The fact_id this fact supersedes (previous version of the same entity+key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+}
+
+fn default_version() -> u32 {
+    1
 }
 
 /// Request to store a new fact.
@@ -64,6 +74,8 @@ fn default_top_k() -> usize {
 pub struct FactStore {
     facts: HashMap<String, Fact>,
     entity_index: HashMap<String, Vec<String>>,
+    /// Index of (entity, key) → ordered list of fact_ids (version chain).
+    key_index: HashMap<(String, String), Vec<String>>,
 }
 
 impl FactStore {
@@ -71,27 +83,44 @@ impl FactStore {
         Self::default()
     }
 
-    /// Store a fact and return its ID.
+    /// Store a fact and return it. If a fact with the same (entity, key) already
+    /// exists, the new fact is assigned the next version number and links to the
+    /// previous version via `supersedes`.
     pub fn store(&mut self, req: StoreFact) -> Fact {
         let fact_id = format!("f_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let tokens = estimate_tokens(&req.value);
 
+        let key_pair = (req.entity.clone(), req.key.clone());
+        let (version, supersedes) = match self.key_index.get(&key_pair) {
+            Some(chain) => {
+                let prev = chain
+                    .iter()
+                    .rev()
+                    .find_map(|id| self.facts.get(id).filter(|f| !f.deleted));
+                match prev {
+                    Some(prev_fact) => (prev_fact.version + 1, Some(prev_fact.fact_id.clone())),
+                    None => (1, None),
+                }
+            }
+            None => (1, None),
+        };
+
         let fact = Fact {
             fact_id: fact_id.clone(),
             entity: req.entity.clone(),
-            key: req.key,
+            key: req.key.clone(),
             value: req.value,
             source_receipt: req.source_receipt,
             confidence: req.confidence,
             stored_at: Utc::now(),
             tokens,
             deleted: false,
+            version,
+            supersedes,
         };
 
-        self.entity_index
-            .entry(req.entity)
-            .or_default()
-            .push(fact_id.clone());
+        self.entity_index.entry(req.entity).or_default().push(fact_id.clone());
+        self.key_index.entry(key_pair).or_default().push(fact_id.clone());
         self.facts.insert(fact_id, fact.clone());
 
         fact
@@ -157,9 +186,9 @@ impl FactStore {
                     let value_lower = f.value.to_lowercase();
                     let key_lower = f.key.to_lowercase();
                     let entity_lower = f.entity.to_lowercase();
-                    terms.iter().any(|t| {
-                        value_lower.contains(t) || key_lower.contains(t) || entity_lower.contains(t)
-                    })
+                    terms
+                        .iter()
+                        .any(|t| value_lower.contains(t) || key_lower.contains(t) || entity_lower.contains(t))
                 } else {
                     true
                 }
@@ -222,6 +251,20 @@ impl FactStore {
     /// Total number of active (non-deleted) facts.
     pub fn count(&self) -> usize {
         self.facts.values().filter(|f| !f.deleted).count()
+    }
+
+    /// Return all versions of a fact for a given (entity, key) pair, ordered by
+    /// version ascending. Includes deleted (superseded) versions for audit trail.
+    pub fn fact_history(&self, entity: &str, key: &str) -> Vec<&Fact> {
+        let key_pair = (entity.to_string(), key.to_string());
+        match self.key_index.get(&key_pair) {
+            Some(chain) => {
+                let mut facts: Vec<&Fact> = chain.iter().filter_map(|id| self.facts.get(id)).collect();
+                facts.sort_by_key(|f| f.version);
+                facts
+            }
+            None => Vec::new(),
+        }
     }
 }
 

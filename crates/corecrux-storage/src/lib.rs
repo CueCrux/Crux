@@ -32,13 +32,12 @@ use fs2::FileExt as _;
 use thiserror::Error;
 
 use corecrux_frame::{
-    canonical_header_bytes_v1, compute_header_hash, compute_payload_hash,
-    decode_canonical_header_bytes_v1, CanonicalHeaderV1,
+    canonical_header_bytes_v1, compute_header_hash, compute_payload_hash, decode_canonical_header_bytes_v1,
+    CanonicalHeaderV1,
 };
 use corecrux_segment::{
-    bloom_maybe_contains_stream_hash_v1, decode_frame_v1, decode_segment_v1,
-    decode_trailer_index_v1, encode_frame_v1, BlockMetaV1, FrameInput, SegmentId,
-    TocByOffsetEntryV1, TrailerIndexV1,
+    bloom_maybe_contains_stream_hash_v1, decode_frame_v1, decode_segment_v1, decode_trailer_index_v1, encode_frame_v1,
+    BlockMetaV1, FrameInput, SegmentId, TocByOffsetEntryV1, TrailerIndexV1,
 };
 
 pub const MANIFEST_MAGIC_CCMF: u32 = 0x464D_4343; // "CCMF"
@@ -404,11 +403,11 @@ fn encode_dir_run_v1(created_at_unix_ns: u64, extents: &[DirExtentV1]) -> Result
 
     let mut pt_cur = DIRRUN_PARTITION_TABLE_OFFSET_V1;
     for (off, cnt) in offsets {
-        let end = pt_cur.checked_add(DIRRUN_PARTITION_ENTRY_LEN_V1).ok_or(
-            StorageError::ManifestRecordInvalid {
+        let end = pt_cur
+            .checked_add(DIRRUN_PARTITION_ENTRY_LEN_V1)
+            .ok_or(StorageError::ManifestRecordInvalid {
                 msg: "dirrun partition table cursor overflow".to_string(),
-            },
-        )?;
+            })?;
         if end > DIRRUN_HEADER_LEN {
             return Err(StorageError::ManifestRecordInvalid {
                 msg: "dirrun partition table exceeds header".to_string(),
@@ -476,17 +475,11 @@ fn decode_dir_run_v1(bytes: &[u8]) -> Result<DirRunDecodedV1> {
         });
     }
 
-    let expected_crc = u32::from_le_bytes(
-        bytes[DIRRUN_HEADER_LEN - 4..DIRRUN_HEADER_LEN]
-            .try_into()
-            .unwrap(),
-    );
+    let expected_crc = u32::from_le_bytes(bytes[DIRRUN_HEADER_LEN - 4..DIRRUN_HEADER_LEN].try_into().unwrap());
     let actual_crc = crc32c::crc32c(&bytes[..DIRRUN_HEADER_LEN - 4]);
     if expected_crc != actual_crc {
         return Err(StorageError::ManifestRecordInvalid {
-            msg: format!(
-                "dirrun header crc mismatch: expected={expected_crc:#x} actual={actual_crc:#x}"
-            ),
+            msg: format!("dirrun header crc mismatch: expected={expected_crc:#x} actual={actual_crc:#x}"),
         });
     }
 
@@ -498,11 +491,11 @@ fn decode_dir_run_v1(bytes: &[u8]) -> Result<DirRunDecodedV1> {
 
     let mut pt_cur = DIRRUN_PARTITION_TABLE_OFFSET_V1;
     for part in parts.iter_mut() {
-        let end = pt_cur.checked_add(DIRRUN_PARTITION_ENTRY_LEN_V1).ok_or(
-            StorageError::ManifestRecordInvalid {
+        let end = pt_cur
+            .checked_add(DIRRUN_PARTITION_ENTRY_LEN_V1)
+            .ok_or(StorageError::ManifestRecordInvalid {
                 msg: "dirrun partition table cursor overflow".to_string(),
-            },
-        )?;
+            })?;
         if end > DIRRUN_HEADER_LEN {
             return Err(StorageError::ManifestRecordInvalid {
                 msg: "dirrun partition table exceeds header".to_string(),
@@ -528,11 +521,9 @@ fn decode_dir_run_v1(bytes: &[u8]) -> Result<DirRunDecodedV1> {
             .ok_or(StorageError::ManifestRecordInvalid {
                 msg: "dirrun partition length overflow".to_string(),
             })?;
-        let end = start
-            .checked_add(len)
-            .ok_or(StorageError::ManifestRecordInvalid {
-                msg: "dirrun partition end overflow".to_string(),
-            })?;
+        let end = start.checked_add(len).ok_or(StorageError::ManifestRecordInvalid {
+            msg: "dirrun partition end overflow".to_string(),
+        })?;
         if end > bytes.len() {
             return Err(StorageError::ManifestRecordInvalid {
                 msg: "dirrun partition out of bounds".to_string(),
@@ -569,10 +560,7 @@ fn dir_run_relative_path_v1(level: u32, run_id: u64) -> String {
     format!("directory/dirrun-l{level}-r{run_id:020}.ccxdir")
 }
 
-fn merge_dir_extents_partition_sorted_unique_cpu(
-    a: &[DirExtentV1],
-    b: &[DirExtentV1],
-) -> Vec<DirExtentV1> {
+fn merge_dir_extents_partition_sorted_unique_cpu(a: &[DirExtentV1], b: &[DirExtentV1]) -> Vec<DirExtentV1> {
     let mut out: Vec<DirExtentV1> = Vec::with_capacity(a.len().saturating_add(b.len()));
     let mut i = 0usize;
     let mut j = 0usize;
@@ -667,7 +655,6 @@ pub struct ReadFrameBatchPackedV1 {
     pub frame_lens: Vec<u32>,
     pub frame_bytes: u64,
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplayScanStats {
@@ -804,12 +791,11 @@ fn add_selected_entries_stats(
 
     let mut disk_bytes = 0u64;
     for block_id in block_ids {
-        let block =
-            blocks
-                .get(block_id as usize)
-                .ok_or_else(|| StorageError::ManifestRecordInvalid {
-                    msg: format!("toc block_id {} out of range", block_id),
-                })?;
+        let block = blocks
+            .get(block_id as usize)
+            .ok_or_else(|| StorageError::ManifestRecordInvalid {
+                msg: format!("toc block_id {} out of range", block_id),
+            })?;
         let physical_len = if block.physical_len == 0 {
             block.compressed_len
         } else {
@@ -930,10 +916,7 @@ impl IdemHotCache {
         }
 
         self.by_key.entry(key).or_default().push(entry);
-        self.order.push_back(IdemOrderEntry {
-            key,
-            seq: entry.seq,
-        });
+        self.order.push_back(IdemOrderEntry { key, seq: entry.seq });
         self.total_entries += 1;
 
         while self.total_entries > self.cap {
@@ -1032,7 +1015,6 @@ struct HeadTailFrameRef {
     seq: u64,
 }
 
-
 fn build_head_stream_tail_index(frames: &[HeadFrameMeta]) -> HashMap<u64, Vec<HeadTailFrameRef>> {
     let mut by_stream: HashMap<u64, Vec<HeadTailFrameRef>> = HashMap::new();
     for (idx, frame) in frames.iter().enumerate() {
@@ -1042,9 +1024,7 @@ fn build_head_stream_tail_index(frames: &[HeadFrameMeta]) -> HashMap<u64, Vec<He
             seq: frame.seq,
         });
         if bucket.len() > HEAD_STREAM_TAIL_INDEX_MAX_EVENTS {
-            let drop_n = bucket
-                .len()
-                .saturating_sub(HEAD_STREAM_TAIL_INDEX_MAX_EVENTS);
+            let drop_n = bucket.len().saturating_sub(HEAD_STREAM_TAIL_INDEX_MAX_EVENTS);
             bucket.drain(0..drop_n);
         }
     }
@@ -1060,9 +1040,7 @@ fn push_head_stream_tail_index(
     let bucket = by_stream.entry(stream_hash).or_default();
     bucket.push(HeadTailFrameRef { frame_idx, seq });
     if bucket.len() > HEAD_STREAM_TAIL_INDEX_MAX_EVENTS {
-        let drop_n = bucket
-            .len()
-            .saturating_sub(HEAD_STREAM_TAIL_INDEX_MAX_EVENTS);
+        let drop_n = bucket.len().saturating_sub(HEAD_STREAM_TAIL_INDEX_MAX_EVENTS);
         bucket.drain(0..drop_n);
     }
 }
@@ -1113,17 +1091,11 @@ fn decode_commit_frame_v1(bytes: &[u8]) -> Result<CommitFrameV1> {
             msg: format!("invalid commit frame header_len: {header_len}"),
         });
     }
-    let expected = u32::from_le_bytes(
-        bytes[COMMIT_FRAME_LEN_V1 - 4..COMMIT_FRAME_LEN_V1]
-            .try_into()
-            .unwrap(),
-    );
+    let expected = u32::from_le_bytes(bytes[COMMIT_FRAME_LEN_V1 - 4..COMMIT_FRAME_LEN_V1].try_into().unwrap());
     let actual = crc32c::crc32c(&bytes[..COMMIT_FRAME_LEN_V1 - 4]);
     if expected != actual {
         return Err(StorageError::ManifestRecordInvalid {
-            msg: format!(
-                "commit frame header crc mismatch: expected={expected:#x} actual={actual:#x}"
-            ),
+            msg: format!("commit frame header crc mismatch: expected={expected:#x} actual={actual:#x}"),
         });
     }
 
@@ -1238,10 +1210,7 @@ fn append_head_record_to_blocks(
         });
     }
 
-    let cur_block_len = blocks
-        .last()
-        .map(|b| b.uncompressed_len as usize)
-        .unwrap_or(0);
+    let cur_block_len = blocks.last().map(|b| b.uncompressed_len as usize).unwrap_or(0);
     if cur_block_len > 0 && cur_block_len.saturating_add(record_bytes.len()) > max_len {
         let next_id = blocks.len() as u32;
         blocks.push(BlockMetaV1 {
@@ -1256,19 +1225,14 @@ fn append_head_record_to_blocks(
         });
     }
 
-    let rec_len_u32 =
-        u32::try_from(record_bytes.len()).map_err(|_| StorageError::ManifestRecordInvalid {
-            msg: "record length exceeds u32".to_string(),
-        })?;
+    let rec_len_u32 = u32::try_from(record_bytes.len()).map_err(|_| StorageError::ManifestRecordInvalid {
+        msg: "record length exceeds u32".to_string(),
+    })?;
 
     let block = blocks.last_mut().expect("blocks non-empty");
     let in_block_offset = block.uncompressed_len;
     if let Some(stream_hash) = stream_hash_for_bloom {
-        corecrux_segment::bloom_insert_stream_hash_v1(
-            &mut block.bloom,
-            corecrux_segment::BLOOM_HASH_K_V1,
-            stream_hash,
-        );
+        corecrux_segment::bloom_insert_stream_hash_v1(&mut block.bloom, corecrux_segment::BLOOM_HASH_K_V1, stream_hash);
     }
     block.crc32c = crc32c::crc32c_append(block.crc32c, record_bytes);
     block.uncompressed_len = block.uncompressed_len.saturating_add(rec_len_u32);
@@ -1276,8 +1240,6 @@ fn append_head_record_to_blocks(
     block.physical_len = block.compressed_len;
     Ok((block.block_id, in_block_offset))
 }
-
-
 
 pub struct ShardStorage {
     options: ShardStorageOptions,
@@ -1312,12 +1274,7 @@ pub struct ShardStorage {
 }
 
 impl ShardStorage {
-    pub fn open(
-        root: &Path,
-        shard_id: u32,
-        epoch: u64,
-        options: ShardStorageOptions,
-    ) -> Result<Self> {
+    pub fn open(root: &Path, shard_id: u32, epoch: u64, options: ShardStorageOptions) -> Result<Self> {
         if options.event_id_hash_prefix_len == 0 || options.event_id_hash_prefix_len > 16 {
             return Err(StorageError::InvalidArgument {
                 code: "CONFIG_INVALID".to_string(),
@@ -1384,9 +1341,7 @@ impl ShardStorage {
                 if let Some(seq) = parse_segment_seq_from_filename(name) {
                     max_seg_seq_on_disk = max_seg_seq_on_disk.max(seq);
                 }
-                let dst = paths
-                    .quarantine_dir
-                    .join(format!("tmp-{}-{name}", now_unix_ns()));
+                let dst = paths.quarantine_dir.join(format!("tmp-{}-{name}", now_unix_ns()));
                 std::fs::rename(&p, &dst).map_err(io_err)?;
             }
         }
@@ -1412,9 +1367,7 @@ impl ShardStorage {
                 if referenced.contains(&rel) {
                     continue;
                 }
-                let dst = paths
-                    .quarantine_dir
-                    .join(format!("orphan-{}-{name}", now_unix_ns()));
+                let dst = paths.quarantine_dir.join(format!("orphan-{}-{name}", now_unix_ns()));
                 std::fs::rename(&p, &dst).map_err(io_err)?;
             }
         }
@@ -1449,8 +1402,7 @@ impl ShardStorage {
         let mut segments_in_order = Vec::new();
         let mut directory_by_stream: HashMap<u64, Vec<StreamSegmentRef>> = HashMap::new();
         let mut segment_trailers_by_seq: HashMap<u64, TrailerIndexV1> = HashMap::new();
-        let mut segment_stream_ranges_by_seq: HashMap<u64, HashMap<u64, (u32, u32)>> =
-            HashMap::new();
+        let mut segment_stream_ranges_by_seq: HashMap<u64, HashMap<u64, (u32, u32)>> = HashMap::new();
         let mut extents_by_segment: HashMap<u64, Vec<DirExtentV1>> = HashMap::new();
 
         let mut next_seq_by_stream: HashMap<u64, u64> = HashMap::new();
@@ -1507,14 +1459,11 @@ impl ShardStorage {
                     max_seq = entries[i].seq;
                     i += 1;
                 }
-                directory_by_stream
-                    .entry(sh)
-                    .or_default()
-                    .push(StreamSegmentRef {
-                        segment_seq: seg.segment_seq,
-                        min_seq,
-                        max_seq,
-                    });
+                directory_by_stream.entry(sh).or_default().push(StreamSegmentRef {
+                    segment_seq: seg.segment_seq,
+                    min_seq,
+                    max_seq,
+                });
                 next_seq_by_stream
                     .entry(sh)
                     .and_modify(|v| *v = (*v).max(max_seq + 1))
@@ -1546,10 +1495,7 @@ impl ShardStorage {
                     };
                     let key = IdemKey {
                         stream_hash,
-                        event_id_hash16: normalize_hash16_prefix(
-                            h16,
-                            options.event_id_hash_prefix_len,
-                        ),
+                        event_id_hash16: normalize_hash16_prefix(h16, options.event_id_hash_prefix_len),
                     };
                     idem_prefix_seen.insert(key);
                     idem_hot.insert(key, IdemEntry { seq, loc });
@@ -1603,10 +1549,8 @@ impl ShardStorage {
         // Guard startup time on large legacy data dirs: if no dir-runs exist and segment count is
         // very large, skip immediate run publishing and continue with the in-memory directory that
         // was already rebuilt from TOCs above.
-        let skip_bootstrap_dirruns = should_skip_startup_dirrun_bootstrap(
-            out.dir_runs.is_empty(),
-            out.segments_in_order.len(),
-        );
+        let skip_bootstrap_dirruns =
+            should_skip_startup_dirrun_bootstrap(out.dir_runs.is_empty(), out.segments_in_order.len());
         if !skip_bootstrap_dirruns {
             out.bootstrap_directory_runs_on_open(&extents_by_segment)?;
         }
@@ -1642,9 +1586,7 @@ impl ShardStorage {
 
         // Keep the newest head by segment_seq; quarantine the rest.
         candidates.sort_by_key(|(seq, _, _)| *seq);
-        let (keep_seq, keep_path, keep_name) = candidates
-            .pop()
-            .expect("candidates non-empty after is_empty check");
+        let (keep_seq, keep_path, keep_name) = candidates.pop().expect("candidates non-empty after is_empty check");
         for (_seq, path, name) in candidates {
             let dst = self
                 .paths
@@ -1661,9 +1603,7 @@ impl ShardStorage {
                 msg: "head segment file too small".to_string(),
             });
         }
-        let seg_header = corecrux_segment::decode_segment_header_v1(
-            &bytes[..corecrux_segment::SEGMENT_HEADER_LEN],
-        )?;
+        let seg_header = corecrux_segment::decode_segment_header_v1(&bytes[..corecrux_segment::SEGMENT_HEADER_LEN])?;
         if seg_header.shard_id != self.shard_id || seg_header.epoch != self.epoch {
             return Err(StorageError::ManifestRecordInvalid {
                 msg: "head segment header shard_id/epoch mismatch".to_string(),
@@ -1745,26 +1685,17 @@ impl ShardStorage {
                     break;
                 }
             };
-            let stream_hash = corecrux_frame::stream_hash_xxhash64(
-                &hdr.tenant_id,
-                &hdr.stream_type,
-                &hdr.stream_id,
-            )
-            .map_err(|e| StorageError::ManifestRecordInvalid {
-                msg: format!("invalid stream key in head segment: {e}"),
-            })?;
+            let stream_hash = corecrux_frame::stream_hash_xxhash64(&hdr.tenant_id, &hdr.stream_type, &hdr.stream_id)
+                .map_err(|e| StorageError::ManifestRecordInvalid {
+                    msg: format!("invalid stream key in head segment: {e}"),
+                })?;
 
             let record_off_u64 = record_len;
-            let record_off_u32 =
-                u32::try_from(record_off_u64).map_err(|_| StorageError::ManifestRecordInvalid {
-                    msg: "head segment record_off exceeds u32".to_string(),
-                })?;
-            let (block_id, in_block_offset) = append_head_record_to_blocks(
-                &mut blocks,
-                record_len,
-                frame_bytes,
-                Some(stream_hash),
-            )?;
+            let record_off_u32 = u32::try_from(record_off_u64).map_err(|_| StorageError::ManifestRecordInvalid {
+                msg: "head segment record_off exceeds u32".to_string(),
+            })?;
+            let (block_id, in_block_offset) =
+                append_head_record_to_blocks(&mut blocks, record_len, frame_bytes, Some(stream_hash))?;
 
             let event_id_hash = blake3_hash16(hdr.event_id.as_bytes());
             let mut header_digest8 = [0u8; 8];
@@ -1801,17 +1732,13 @@ impl ShardStorage {
 
             let key = IdemKey {
                 stream_hash,
-                event_id_hash16: normalize_hash16_prefix(
-                    event_id_hash,
-                    self.options.event_id_hash_prefix_len,
-                ),
+                event_id_hash16: normalize_hash16_prefix(event_id_hash, self.options.event_id_hash_prefix_len),
             };
             let loc = FrameLocation {
                 shard_id: self.shard_id as u64,
                 epoch: self.epoch,
                 segment_seq: seg_header.segment_seq,
-                offset: (corecrux_segment::SEGMENT_HEADER_LEN as u64)
-                    .saturating_add(record_off_u64),
+                offset: (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(record_off_u64),
             };
             self.idem_prefix_seen.insert(key);
             self.idem_hot.insert(key, IdemEntry { seq: hdr.seq, loc });
@@ -1821,9 +1748,7 @@ impl ShardStorage {
         }
 
         if last_commit_id > 0 {
-            self.next_head_commit_id = self
-                .next_head_commit_id
-                .max(last_commit_id.saturating_add(1));
+            self.next_head_commit_id = self.next_head_commit_id.max(last_commit_id.saturating_add(1));
         }
 
         let expected_end = (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(record_len);
@@ -1906,18 +1831,15 @@ impl ShardStorage {
         let mut record_area: Vec<u8> = Vec::with_capacity(head.record_len as usize);
         let mut metas: Vec<corecrux_segment::FrameMetaV1> = Vec::with_capacity(head.frames.len());
         for f in &head.frames {
-            let src_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64)
-                .saturating_add(f.record_off as u64) as usize;
+            let src_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(f.record_off as u64) as usize;
             let src_end = src_off.saturating_add(f.frame_len as usize);
             if src_end > bytes.len() {
                 return Err(StorageError::ManifestRecordInvalid {
                     msg: "head frame points outside segment bytes during seal".to_string(),
                 });
             }
-            let dst_off_u32 = u32::try_from(record_area.len()).map_err(|_| {
-                StorageError::ManifestRecordInvalid {
-                    msg: "sealed record_off exceeds u32".to_string(),
-                }
+            let dst_off_u32 = u32::try_from(record_area.len()).map_err(|_| StorageError::ManifestRecordInvalid {
+                msg: "sealed record_off exceeds u32".to_string(),
             })?;
             record_area.extend_from_slice(&bytes[src_off..src_end]);
 
@@ -1949,10 +1871,7 @@ impl ShardStorage {
         let segment_id = head.segment_id;
 
         let tmp_rel = format!("tmp/seg-{segment_seq:020}-{}.partial", hex16(&segment_id.0));
-        let final_rel = format!(
-            "segments/seg-{segment_seq:020}-{}.ccxseg",
-            hex16(&segment_id.0)
-        );
+        let final_rel = format!("segments/seg-{segment_seq:020}-{}.ccxseg", hex16(&segment_id.0));
         let tmp_path = self.paths.shard_dir.join(&tmp_rel);
         let final_path = self.paths.shard_dir.join(&final_rel);
 
@@ -2029,8 +1948,7 @@ impl ShardStorage {
         if let Some(ti) = decode_trailer_index_v1(toc_area, &seg.toc_header)? {
             let ranges = build_trailer_stream_ranges(&ti);
             self.segment_trailers_by_seq.insert(segment_seq, ti);
-            self.segment_stream_ranges_by_seq
-                .insert(segment_seq, ranges);
+            self.segment_stream_ranges_by_seq.insert(segment_seq, ranges);
         }
         let seg_file = File::open(&final_path).map_err(io_err)?;
         self.segment_files_by_seq.insert(segment_seq, seg_file);
@@ -2047,14 +1965,11 @@ impl ShardStorage {
                 max_seq = entries[i].seq;
                 i += 1;
             }
-            self.directory_by_stream
-                .entry(sh)
-                .or_default()
-                .push(StreamSegmentRef {
-                    segment_seq,
-                    min_seq,
-                    max_seq,
-                });
+            self.directory_by_stream.entry(sh).or_default().push(StreamSegmentRef {
+                segment_seq,
+                min_seq,
+                max_seq,
+            });
             dir_extents.push(DirExtentV1 {
                 stream_hash: sh,
                 min_seq,
@@ -2117,10 +2032,7 @@ impl ShardStorage {
         let segment_id = deterministic_segment_id(self.epoch, segment_seq);
         let created_at = now_unix_ns();
 
-        let rel = format!(
-            "segments/seg-{segment_seq:020}-{}.ccxhead",
-            hex16(&segment_id.0)
-        );
+        let rel = format!("segments/seg-{segment_seq:020}-{}.ccxhead", hex16(&segment_id.0));
         let path = self.paths.shard_dir.join(&rel);
 
         let mut file = OpenOptions::new()
@@ -2148,11 +2060,7 @@ impl ShardStorage {
 
         // Re-open the file handle without O_TRUNC semantics (paranoia).
         drop(file);
-        file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(io_err)?;
+        file = OpenOptions::new().read(true).write(true).open(&path).map_err(io_err)?;
 
         self.head = Some(HeadSegment {
             segment_seq,
@@ -2239,8 +2147,7 @@ impl ShardStorage {
             batch_bytes = batch_bytes.saturating_add(ev.payload_bytes.len());
             // event_id bytes are bounded independently; don't let a single oversize id turn into a
             // request-level backpressure when we can reject it per-event.
-            batch_bytes =
-                batch_bytes.saturating_add(ev.event_id.len().min(self.options.max_event_id_bytes));
+            batch_bytes = batch_bytes.saturating_add(ev.event_id.len().min(self.options.max_event_id_bytes));
         }
         if batch_bytes > self.options.max_batch_bytes {
             return Err(StorageError::ResourceExhausted {
@@ -2256,9 +2163,7 @@ impl ShardStorage {
         let current_next = *self.next_seq_by_stream.get(&stream_hash).unwrap_or(&1);
         if expected_next_seq != 0 && expected_next_seq != current_next {
             return Err(StorageError::ManifestRecordInvalid {
-                msg: format!(
-                    "expected_next_seq={expected_next_seq} does not match current_next_seq={current_next}"
-                ),
+                msg: format!("expected_next_seq={expected_next_seq} does not match current_next_seq={current_next}"),
             });
         }
 
@@ -2281,8 +2186,7 @@ impl ShardStorage {
             events
                 .iter()
                 .filter_map(|ev| {
-                    if ev.event_id.is_empty() || ev.event_id.len() > self.options.max_event_id_bytes
-                    {
+                    if ev.event_id.is_empty() || ev.event_id.len() > self.options.max_event_id_bytes {
                         return None;
                     }
                     Some(normalize_hash16_prefix(
@@ -2299,10 +2203,7 @@ impl ShardStorage {
         for ev in events {
             let event_id = ev.event_id; // bytes-first: do not trim or normalize
             if event_id.is_empty() {
-                outcomes.push(rejected_outcome(
-                    "EVENT_ID_EMPTY",
-                    "event_id is empty".to_string(),
-                ));
+                outcomes.push(rejected_outcome("EVENT_ID_EMPTY", "event_id is empty".to_string()));
                 continue;
             }
             if event_id.len() > self.options.max_event_id_bytes {
@@ -2318,13 +2219,9 @@ impl ShardStorage {
             }
 
             if let Some(&first_idx) = seen_in_batch.get(event_id) {
-                let first =
-                    outcomes
-                        .get(first_idx)
-                        .cloned()
-                        .ok_or_else(|| StorageError::Internal {
-                            msg: "intra-batch alias index out of bounds".to_string(),
-                        })?;
+                let first = outcomes.get(first_idx).cloned().ok_or_else(|| StorageError::Internal {
+                    msg: "intra-batch alias index out of bounds".to_string(),
+                })?;
                 if first.status == AppendStatus::Rejected {
                     outcomes.push(first);
                 } else {
@@ -2343,10 +2240,7 @@ impl ShardStorage {
             let full_h16 = blake3_hash16(event_id.as_bytes());
             let key = IdemKey {
                 stream_hash,
-                event_id_hash16: normalize_hash16_prefix(
-                    full_h16,
-                    self.options.event_id_hash_prefix_len,
-                ),
+                event_id_hash16: normalize_hash16_prefix(full_h16, self.options.event_id_hash_prefix_len),
             };
 
             // Hot lookup (bounded) + verify-on-hit (bytes-first).
@@ -2360,12 +2254,9 @@ impl ShardStorage {
             // only when this (stream_hash, event_id_hash_prefix) has been seen before.
             if self.idem_hot.is_incomplete() && self.idem_prefix_seen.contains(&key) {
                 if cold_lookup_cache.is_none() {
-                    cold_lookup_cache =
-                        Some(self.lookup_duplicate_cold_batch(stream_hash, &cold_batch_prefixes)?);
+                    cold_lookup_cache = Some(self.lookup_duplicate_cold_batch(stream_hash, &cold_batch_prefixes)?);
                 }
-                let cold = cold_lookup_cache
-                    .as_ref()
-                    .expect("cold lookup cache initialized");
+                let cold = cold_lookup_cache.as_ref().expect("cold lookup cache initialized");
                 if let Some(found) = cold.find(key.event_id_hash16, event_id) {
                     // Warm the hot cache on cold hit.
                     self.idem_prefix_seen.insert(key);
@@ -2511,9 +2402,7 @@ impl ShardStorage {
             let batch_record_len = total_bytes.saturating_add(COMMIT_FRAME_LEN_V1);
             let max_head = self.options.head_max_record_bytes as u64;
             if let Some(h) = self.head.as_ref() {
-                if h.record_len > 0
-                    && h.record_len.saturating_add(batch_record_len as u64) > max_head
-                {
+                if h.record_len > 0 && h.record_len.saturating_add(batch_record_len as u64) > max_head {
                     // Keep head sizes bounded by sealing before a large append.
                     let _ = self.seal_head_segment()?;
                 }
@@ -2544,12 +2433,10 @@ impl ShardStorage {
                 .saturating_add(base_record_len)
                 .saturating_add(total_bytes as u64)
                 .saturating_add(COMMIT_FRAME_LEN_V1 as u64);
-            let commit_frame =
-                encode_commit_frame_v1(commit_id, commit_seq, commit_offset, pre_commit_crc32c);
+            let commit_frame = encode_commit_frame_v1(commit_id, commit_seq, commit_offset, pre_commit_crc32c);
             let committed_region_crc32c = crc32c::crc32c_append(pre_commit_crc32c, &commit_frame);
 
-            let write_offset =
-                (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(base_record_len);
+            let write_offset = (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(base_record_len);
             let mut append_bytes: Vec<u8> = Vec::with_capacity(batch_record_len);
             for e in &encoded {
                 append_bytes.extend_from_slice(&e.frame_bytes);
@@ -2580,22 +2467,19 @@ impl ShardStorage {
             // Publish locations + update derived head indexes + idempotency state.
             let index_update_start = std::time::Instant::now();
             let mut record_cursor = base_record_len;
-            let mut new_head_entries_asc: Vec<TocByOffsetEntryV1> =
-                Vec::with_capacity(encoded.len());
+            let mut new_head_entries_asc: Vec<TocByOffsetEntryV1> = Vec::with_capacity(encoded.len());
             {
                 let head = self.head.as_mut().expect("head open");
 
                 for e in &encoded {
-                    let frame_len_u32 = u32::try_from(e.frame_bytes.len()).map_err(|_| {
-                        StorageError::ManifestRecordInvalid {
+                    let frame_len_u32 =
+                        u32::try_from(e.frame_bytes.len()).map_err(|_| StorageError::ManifestRecordInvalid {
                             msg: "frame too large".to_string(),
-                        }
-                    })?;
-                    let record_off_u32 = u32::try_from(record_cursor).map_err(|_| {
-                        StorageError::ManifestRecordInvalid {
+                        })?;
+                    let record_off_u32 =
+                        u32::try_from(record_cursor).map_err(|_| StorageError::ManifestRecordInvalid {
                             msg: "head record_off exceeds u32".to_string(),
-                        }
-                    })?;
+                        })?;
                     let (block_id, in_block_offset) = append_head_record_to_blocks(
                         &mut head.blocks,
                         record_cursor,
@@ -2616,12 +2500,7 @@ impl ShardStorage {
                         in_block_offset,
                     });
                     let frame_idx = head.frames.len().saturating_sub(1);
-                    push_head_stream_tail_index(
-                        &mut head.stream_tail_idx_by_stream,
-                        stream_hash,
-                        frame_idx,
-                        e.seq,
-                    );
+                    push_head_stream_tail_index(&mut head.stream_tail_idx_by_stream, stream_hash, frame_idx, e.seq);
                     new_head_entries_asc.push(TocByOffsetEntryV1 {
                         stream_hash,
                         seq: e.seq,
@@ -2660,24 +2539,17 @@ impl ShardStorage {
                     shard_id: self.shard_id as u64,
                     epoch: self.epoch,
                     segment_seq: head_segment_seq,
-                    offset: (corecrux_segment::SEGMENT_HEADER_LEN as u64)
-                        .saturating_add(record_cursor),
+                    offset: (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(record_cursor),
                 };
 
                 let key = IdemKey {
                     stream_hash,
-                    event_id_hash16: normalize_hash16_prefix(
-                        e.event_id_hash16,
-                        self.options.event_id_hash_prefix_len,
-                    ),
+                    event_id_hash16: normalize_hash16_prefix(e.event_id_hash16, self.options.event_id_hash_prefix_len),
                 };
                 self.idem_prefix_seen.insert(key);
                 self.idem_hot.insert(key, IdemEntry { seq: e.seq, loc });
 
-                for o in outcomes
-                    .iter_mut()
-                    .filter(|o| o.seq == e.seq && o.location.is_none())
-                {
+                for o in outcomes.iter_mut().filter(|o| o.seq == e.seq && o.location.is_none()) {
                     o.location = Some(loc);
                 }
 
@@ -2685,19 +2557,11 @@ impl ShardStorage {
             }
 
             self.next_seq_by_stream.insert(stream_hash, seq_cursor);
-            self.update_tail_locator_for_stream_entries(
-                stream_hash,
-                head_segment_seq,
-                &new_head_entries_asc,
-            );
+            self.update_tail_locator_for_stream_entries(stream_hash, head_segment_seq, &new_head_entries_asc);
             stats.add_index_elapsed(index_update_start.elapsed());
 
             // Seal the head once it reaches the configured threshold.
-            let should_seal = self
-                .head
-                .as_ref()
-                .map(|h| h.record_len >= max_head)
-                .unwrap_or(false);
+            let should_seal = self.head.as_ref().map(|h| h.record_len >= max_head).unwrap_or(false);
             if should_seal {
                 let _ = self.seal_head_segment()?;
             }
@@ -2739,10 +2603,7 @@ impl ShardStorage {
 
         // Write to tmp file and fsync.
         let tmp_rel = format!("tmp/seg-{segment_seq:020}-{}.partial", hex16(&segment_id.0));
-        let final_rel = format!(
-            "segments/seg-{segment_seq:020}-{}.ccxseg",
-            hex16(&segment_id.0)
-        );
+        let final_rel = format!("segments/seg-{segment_seq:020}-{}.ccxseg", hex16(&segment_id.0));
         let tmp_path = self.paths.shard_dir.join(&tmp_rel);
         let final_path = self.paths.shard_dir.join(&final_rel);
 
@@ -2850,17 +2711,12 @@ impl ShardStorage {
         let toc_area = &seg.bytes[toc_off..toc_off + toc_len];
         let mut stream_tail_entries_asc: Vec<TocByOffsetEntryV1> = Vec::new();
         if let Some(ti) = decode_trailer_index_v1(toc_area, &toc_h)? {
-            let mut tail = select_stream_tail_from_trailer_sorted(
-                &ti,
-                stream_hash,
-                STREAM_TAIL_LOCATOR_MAX_EVENTS,
-            );
+            let mut tail = select_stream_tail_from_trailer_sorted(&ti, stream_hash, STREAM_TAIL_LOCATOR_MAX_EVENTS);
             tail.reverse();
             stream_tail_entries_asc = tail;
             let ranges = build_trailer_stream_ranges(&ti);
             self.segment_trailers_by_seq.insert(segment_seq, ti);
-            self.segment_stream_ranges_by_seq
-                .insert(segment_seq, ranges);
+            self.segment_stream_ranges_by_seq.insert(segment_seq, ranges);
         }
         // Update shard directory for range/tail reads (derived index).
         let mut dir_extents: Vec<DirExtentV1> = Vec::new();
@@ -2874,14 +2730,11 @@ impl ShardStorage {
                 max_seq = entries[i].seq;
                 i += 1;
             }
-            self.directory_by_stream
-                .entry(sh)
-                .or_default()
-                .push(StreamSegmentRef {
-                    segment_seq,
-                    min_seq,
-                    max_seq,
-                });
+            self.directory_by_stream.entry(sh).or_default().push(StreamSegmentRef {
+                segment_seq,
+                min_seq,
+                max_seq,
+            });
             dir_extents.push(DirExtentV1 {
                 stream_hash: sh,
                 min_seq,
@@ -2924,28 +2777,18 @@ impl ShardStorage {
             let full_h16 = blake3_hash16(nf.event_id.as_bytes());
             let key = IdemKey {
                 stream_hash,
-                event_id_hash16: normalize_hash16_prefix(
-                    full_h16,
-                    self.options.event_id_hash_prefix_len,
-                ),
+                event_id_hash16: normalize_hash16_prefix(full_h16, self.options.event_id_hash_prefix_len),
             };
             self.idem_prefix_seen.insert(key);
             self.idem_hot.insert(key, IdemEntry { seq: nf.seq, loc });
 
             // Patch the corresponding outcomes (Appended + any intra-batch aliases) by seq.
-            for o in outcomes
-                .iter_mut()
-                .filter(|o| o.seq == nf.seq && o.location.is_none())
-            {
+            for o in outcomes.iter_mut().filter(|o| o.seq == nf.seq && o.location.is_none()) {
                 o.location = Some(loc);
             }
         }
         self.next_seq_by_stream.insert(stream_hash, seq_cursor);
-        self.update_tail_locator_for_stream_entries(
-            stream_hash,
-            segment_seq,
-            &stream_tail_entries_asc,
-        );
+        self.update_tail_locator_for_stream_entries(stream_hash, segment_seq, &stream_tail_entries_asc);
 
         self.segments_by_seq.insert(segment_seq, seg_meta.clone());
         let seg_file = File::open(&final_path).map_err(io_err)?;
@@ -2967,10 +2810,7 @@ impl ShardStorage {
     ///
     /// This preserves the same durability boundary as local append:
     /// write segment bytes -> rename into `segments/` -> append MANIFEST AddSegment record.
-    pub fn apply_replicated_segment_v1(
-        &mut self,
-        segment_bytes: &[u8],
-    ) -> Result<ReplicatedSegmentApplyResultV1> {
+    pub fn apply_replicated_segment_v1(&mut self, segment_bytes: &[u8]) -> Result<ReplicatedSegmentApplyResultV1> {
         // Followers should not have local head writes, but sealing here keeps state transitions
         // deterministic if a host is repurposed.
         self.seal_head_segment_if_any()?;
@@ -3024,10 +2864,7 @@ impl ShardStorage {
         }
 
         let tmp_rel = format!("tmp/seg-{segment_seq:020}-{}.partial", hex16(&segment_id.0));
-        let final_rel = format!(
-            "segments/seg-{segment_seq:020}-{}.ccxseg",
-            hex16(&segment_id.0)
-        );
+        let final_rel = format!("segments/seg-{segment_seq:020}-{}.ccxseg", hex16(&segment_id.0));
         let tmp_path = self.paths.shard_dir.join(&tmp_rel);
         let final_path = self.paths.shard_dir.join(&final_rel);
 
@@ -3084,8 +2921,7 @@ impl ShardStorage {
         if let Some(ti) = decode_trailer_index_v1(toc_area, &toc_hdr)? {
             let ranges = build_trailer_stream_ranges(&ti);
             self.segment_trailers_by_seq.insert(segment_seq, ti);
-            self.segment_stream_ranges_by_seq
-                .insert(segment_seq, ranges);
+            self.segment_stream_ranges_by_seq.insert(segment_seq, ranges);
         }
         let seg_file = File::open(&final_path).map_err(io_err)?;
         self.segment_files_by_seq.insert(segment_seq, seg_file);
@@ -3101,14 +2937,11 @@ impl ShardStorage {
                 max_seq = entries[i].seq;
                 i += 1;
             }
-            self.directory_by_stream
-                .entry(sh)
-                .or_default()
-                .push(StreamSegmentRef {
-                    segment_seq,
-                    min_seq,
-                    max_seq,
-                });
+            self.directory_by_stream.entry(sh).or_default().push(StreamSegmentRef {
+                segment_seq,
+                min_seq,
+                max_seq,
+            });
             dir_extents.push(DirExtentV1 {
                 stream_hash: sh,
                 min_seq,
@@ -3133,10 +2966,7 @@ impl ShardStorage {
             h16.copy_from_slice(&e.event_id_hash16);
             let key = IdemKey {
                 stream_hash,
-                event_id_hash16: normalize_hash16_prefix(
-                    h16,
-                    self.options.event_id_hash_prefix_len,
-                ),
+                event_id_hash16: normalize_hash16_prefix(h16, self.options.event_id_hash_prefix_len),
             };
             let loc = FrameLocation {
                 shard_id: self.shard_id as u64,
@@ -3178,8 +3008,7 @@ impl ShardStorage {
         };
 
         for e in candidates {
-            let (hdr, payload_hash, header_hash) =
-                self.read_canonical_and_hashes_for_location(e.loc)?;
+            let (hdr, payload_hash, header_hash) = self.read_canonical_and_hashes_for_location(e.loc)?;
             if hdr.event_id == event_id {
                 return Ok(Some(AppendOutcome {
                     status: AppendStatus::DuplicateCommitted,
@@ -3217,10 +3046,7 @@ impl ShardStorage {
                     if f.stream_hash != stream_hash {
                         continue;
                     }
-                    let norm = normalize_hash16_prefix(
-                        f.event_id_hash16,
-                        self.options.event_id_hash_prefix_len,
-                    );
+                    let norm = normalize_hash16_prefix(f.event_id_hash16, self.options.event_id_hash_prefix_len);
                     if !needed_prefixes.contains(&norm) {
                         continue;
                     }
@@ -3228,11 +3054,9 @@ impl ShardStorage {
                         shard_id: self.shard_id as u64,
                         epoch: self.epoch,
                         segment_seq: head.segment_seq,
-                        offset: (corecrux_segment::SEGMENT_HEADER_LEN as u64)
-                            .saturating_add(f.record_off as u64),
+                        offset: (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(f.record_off as u64),
                     };
-                    let (hdr, payload_hash, header_hash) =
-                        self.read_canonical_and_hashes_for_location(loc)?;
+                    let (hdr, payload_hash, header_hash) = self.read_canonical_and_hashes_for_location(loc)?;
                     out.by_prefix.entry(norm).or_default().push(ColdBatchMatch {
                         event_id: hdr.event_id.clone(),
                         outcome: AppendOutcome {
@@ -3334,11 +3158,7 @@ impl ShardStorage {
     }
 
     #[allow(dead_code)]
-    fn lookup_duplicate_cold(
-        &self,
-        key: &IdemKey,
-        event_id: &str,
-    ) -> Result<Option<AppendOutcome>> {
+    fn lookup_duplicate_cold(&self, key: &IdemKey, event_id: &str) -> Result<Option<AppendOutcome>> {
         // Head segments are not tracked by MANIFEST. If our hot cache is incomplete, we must
         // include head bytes in the cold path to preserve idempotency correctness.
         if let Some(head) = self.head.as_ref() {
@@ -3347,10 +3167,7 @@ impl ShardStorage {
                     if f.stream_hash != key.stream_hash {
                         continue;
                     }
-                    let norm = normalize_hash16_prefix(
-                        f.event_id_hash16,
-                        self.options.event_id_hash_prefix_len,
-                    );
+                    let norm = normalize_hash16_prefix(f.event_id_hash16, self.options.event_id_hash_prefix_len);
                     if norm != key.event_id_hash16 {
                         continue;
                     }
@@ -3358,11 +3175,9 @@ impl ShardStorage {
                         shard_id: self.shard_id as u64,
                         epoch: self.epoch,
                         segment_seq: head.segment_seq,
-                        offset: (corecrux_segment::SEGMENT_HEADER_LEN as u64)
-                            .saturating_add(f.record_off as u64),
+                        offset: (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(f.record_off as u64),
                     };
-                    let (hdr, payload_hash, header_hash) =
-                        self.read_canonical_and_hashes_for_location(loc)?;
+                    let (hdr, payload_hash, header_hash) = self.read_canonical_and_hashes_for_location(loc)?;
                     if hdr.event_id != event_id {
                         continue;
                     }
@@ -3458,9 +3273,7 @@ impl ShardStorage {
         } else {
             Err(StorageError::ResourceExhausted {
                 code: "BACKPRESSURE_COLD_IDEMPOTENCY".to_string(),
-                msg: format!(
-                    "cold idempotency scan exceeded limit (scanned {limit} of {total} segments)"
-                ),
+                msg: format!("cold idempotency scan exceeded limit (scanned {limit} of {total} segments)"),
                 retry_after_ms: Some(100),
             })
         }
@@ -3484,11 +3297,10 @@ impl ShardStorage {
         let payload_hash = compute_payload_hash(&decoded.payload_bytes);
 
         // Sanity: verify canonical parses (helps detect format drift).
-        let header = decode_canonical_header_bytes_v1(canonical_bytes).map_err(|e| {
-            StorageError::ManifestRecordInvalid {
+        let header =
+            decode_canonical_header_bytes_v1(canonical_bytes).map_err(|e| StorageError::ManifestRecordInvalid {
                 msg: format!("failed to parse stored canonical header bytes: {e}"),
-            }
-        })?;
+            })?;
 
         Ok((header, payload_hash, header_hash))
     }
@@ -3512,17 +3324,11 @@ impl ShardStorage {
         self.append_manifest_framed_with_stats(framed, None)
     }
 
-    fn append_manifest_framed_with_stats(
-        &mut self,
-        framed: &[u8],
-        stats: Option<&mut AppendStatsV1>,
-    ) -> Result<()> {
+    fn append_manifest_framed_with_stats(&mut self, framed: &[u8], stats: Option<&mut AppendStatsV1>) -> Result<()> {
         // Manifest is control-plane state (small, append-only). Keep it on a plain fsync() path
         // so gpu-gds can remain strict about 4KiB alignment for segment IO without forcing a
         // manifest format/version bump.
-        self.manifest
-            .seek(SeekFrom::Start(self.manifest_end))
-            .map_err(io_err)?;
+        self.manifest.seek(SeekFrom::Start(self.manifest_end)).map_err(io_err)?;
         self.manifest.write_all(framed).map_err(io_err)?;
         let fence_fsync_start = std::time::Instant::now();
         self.manifest.sync_all().map_err(io_err)?;
@@ -3553,11 +3359,7 @@ impl ShardStorage {
     }
 
     fn stream_cut_seq(&self, stream_hash: u64) -> u64 {
-        let m = self
-            .stream_meta
-            .get(&stream_hash)
-            .copied()
-            .unwrap_or_default();
+        let m = self.stream_meta.get(&stream_hash).copied().unwrap_or_default();
         m.min_live_seq.max(m.tombstone_seq)
     }
 
@@ -3688,13 +3490,11 @@ impl ShardStorage {
                         continue;
                     }
 
-                    out.entry(e.stream_hash)
-                        .or_default()
-                        .push(StreamSegmentRef {
-                            segment_seq: e.segment_seq,
-                            min_seq: e.min_seq,
-                            max_seq: e.max_seq,
-                        });
+                    out.entry(e.stream_hash).or_default().push(StreamSegmentRef {
+                        segment_seq: e.segment_seq,
+                        min_seq: e.min_seq,
+                        max_seq: e.max_seq,
+                    });
                     present_segments.insert(e.segment_seq);
                 }
             }
@@ -3707,10 +3507,7 @@ impl ShardStorage {
         Ok(present_segments)
     }
 
-    fn bootstrap_directory_runs_on_open(
-        &mut self,
-        extents_by_segment: &HashMap<u64, Vec<DirExtentV1>>,
-    ) -> Result<()> {
+    fn bootstrap_directory_runs_on_open(&mut self, extents_by_segment: &HashMap<u64, Vec<DirExtentV1>>) -> Result<()> {
         // Ensure we have at least L0 runs for any sealed segments that are missing from directory
         // state (e.g. crash between AddSegment and AddDirRun records, or older data dirs).
         if self.dir_runs.is_empty() && !self.segments_in_order.is_empty() {
@@ -3772,11 +3569,7 @@ impl ShardStorage {
         min_live_seq: u64,
         tombstone_seq: u64,
     ) -> Result<(u64, u64)> {
-        let cur = self
-            .stream_meta
-            .get(&stream_hash)
-            .copied()
-            .unwrap_or_default();
+        let cur = self.stream_meta.get(&stream_hash).copied().unwrap_or_default();
         if min_live_seq != 0 && min_live_seq < cur.min_live_seq {
             return Err(StorageError::InvalidArgument {
                 code: "CHECKPOINT_NON_MONOTONIC".to_string(),
@@ -3823,20 +3616,12 @@ impl ShardStorage {
             refs.retain(|r| r.max_seq >= cut);
         }
 
-        let e = self
-            .stream_meta
-            .get(&stream_hash)
-            .copied()
-            .unwrap_or_default();
+        let e = self.stream_meta.get(&stream_hash).copied().unwrap_or_default();
         Ok((e.min_live_seq, e.tombstone_seq))
     }
 
     pub fn stream_meta_v1(&self, stream_hash: u64) -> (u64, u64) {
-        let m = self
-            .stream_meta
-            .get(&stream_hash)
-            .copied()
-            .unwrap_or_default();
+        let m = self.stream_meta.get(&stream_hash).copied().unwrap_or_default();
         (m.min_live_seq, m.tombstone_seq)
     }
 
@@ -3921,11 +3706,7 @@ impl ShardStorage {
         Ok(events)
     }
 
-    fn compact_dir_run_pair_v1(
-        &mut self,
-        a: &DirRunMeta,
-        b: &DirRunMeta,
-    ) -> Result<DirCompactionEventV1> {
+    fn compact_dir_run_pair_v1(&mut self, a: &DirRunMeta, b: &DirRunMeta) -> Result<DirCompactionEventV1> {
         let start = std::time::Instant::now();
         if a.key.level != b.key.level {
             return Err(StorageError::ManifestRecordInvalid {
@@ -3947,9 +3728,7 @@ impl ShardStorage {
         for pid in 0..DIRRUN_PARTITIONS_V1 {
             let pa = &a_dec.partitions[pid];
             let pb = &b_dec.partitions[pid];
-            let mut merged =
-                merge_dir_extents_partition_sorted_unique_cpu(pa, pb)
-            ;
+            let mut merged = merge_dir_extents_partition_sorted_unique_cpu(pa, pb);
             let before = merged.len() as u64;
             merged.retain(|e| e.max_seq >= self.stream_cut_seq(e.stream_hash));
             let after = merged.len() as u64;
@@ -4025,13 +3804,8 @@ impl ShardStorage {
                     .and_then(|m| m.get(&stream_hash))
                     .copied()
                     .map(|(a, b)| (a as usize, b as usize));
-                let mut selected = select_stream_tail_from_trailer_sorted_from_seq_with_range(
-                    ti,
-                    range_hint,
-                    stream_hash,
-                    cut,
-                    need,
-                );
+                let mut selected =
+                    select_stream_tail_from_trailer_sorted_from_seq_with_range(ti, range_hint, stream_hash, cut, need);
                 selected.retain(|e| e.seq >= cut);
                 for e in selected {
                     if desc.len() >= STREAM_TAIL_LOCATOR_MAX_EVENTS {
@@ -4138,10 +3912,7 @@ impl ShardStorage {
             if e.entry.seq < cut {
                 continue;
             }
-            if let Some(group) = groups
-                .iter_mut()
-                .find(|(segment_seq, _)| *segment_seq == e.segment_seq)
-            {
+            if let Some(group) = groups.iter_mut().find(|(segment_seq, _)| *segment_seq == e.segment_seq) {
                 group.1.push(e.entry);
             } else {
                 groups.push((e.segment_seq, vec![e.entry]));
@@ -4173,21 +3944,13 @@ impl ShardStorage {
                 .map(|entry| StreamTailLocatorEntry { segment_seq, entry }),
         );
         if locator.entries_asc.len() > STREAM_TAIL_LOCATOR_MAX_EVENTS {
-            let drop_n = locator
-                .entries_asc
-                .len()
-                .saturating_sub(STREAM_TAIL_LOCATOR_MAX_EVENTS);
+            let drop_n = locator.entries_asc.len().saturating_sub(STREAM_TAIL_LOCATOR_MAX_EVENTS);
             locator.entries_asc.drain(0..drop_n);
         }
         self.rebuild_tail_pointer_for_stream(stream_hash);
     }
 
-    fn locator_tail_entries_desc(
-        &self,
-        stream_hash: u64,
-        cut: u64,
-        limit: usize,
-    ) -> Vec<StreamTailLocatorEntry> {
+    fn locator_tail_entries_desc(&self, stream_hash: u64, cut: u64, limit: usize) -> Vec<StreamTailLocatorEntry> {
         if limit == 0 {
             return Vec::new();
         }
@@ -4195,8 +3958,7 @@ impl ShardStorage {
         if let Some(ptr) = self.tail_pointer_by_stream.get(&stream_hash) {
             if cut <= ptr.latest_seq {
                 let _latest_segment_seq = ptr.latest_segment_seq;
-                let mut out: Vec<StreamTailLocatorEntry> =
-                    Vec::with_capacity(limit.min(ptr.entries_desc.len()));
+                let mut out: Vec<StreamTailLocatorEntry> = Vec::with_capacity(limit.min(ptr.entries_desc.len()));
                 for e in &ptr.entries_desc {
                     if e.entry.seq < cut {
                         continue;
@@ -4213,8 +3975,7 @@ impl ShardStorage {
         let Some(locator) = self.tail_locator_by_stream.get(&stream_hash) else {
             return Vec::new();
         };
-        let mut out: Vec<StreamTailLocatorEntry> =
-            Vec::with_capacity(limit.min(locator.entries_asc.len()));
+        let mut out: Vec<StreamTailLocatorEntry> = Vec::with_capacity(limit.min(locator.entries_asc.len()));
         for e in locator.entries_asc.iter().rev() {
             if e.entry.seq < cut {
                 continue;
@@ -4242,8 +4003,7 @@ impl ShardStorage {
 
         let seg_path = self.paths.shard_dir.join(&seg.relative_path);
         let file_fallback: File;
-        let file_ref: &File = if let Some(cached) = self.segment_files_by_seq.get(&seg.segment_seq)
-        {
+        let file_ref: &File = if let Some(cached) = self.segment_files_by_seq.get(&seg.segment_seq) {
             cached
         } else {
             file_fallback = File::open(&seg_path).map_err(io_err)?;
@@ -4256,16 +4016,12 @@ impl ShardStorage {
             let Some(meta) = ti.blocks.get(e.block_id as usize) else {
                 return false;
             };
-            meta.codec == corecrux_segment::RECORD_BLOCK_CODEC_NONE_V1
-                && meta.compressed_len == meta.uncompressed_len
+            meta.codec == corecrux_segment::RECORD_BLOCK_CODEC_NONE_V1 && meta.compressed_len == meta.uncompressed_len
         });
 
         if can_frame_window_read {
             let io_start = std::time::Instant::now();
-            let read = read_selected_frames_codec_none_from_entries(file_ref,
-                &ti.blocks,
-                selected,
-            )?;
+            let read = read_selected_frames_codec_none_from_entries(file_ref, &ti.blocks, selected)?;
             stats.add_io_elapsed(io_start.elapsed());
             stats.disk_bytes_estimate = stats
                 .disk_bytes_estimate
@@ -4275,13 +4031,12 @@ impl ShardStorage {
             let decode_start = std::time::Instant::now();
             for (e, frame) in selected.iter().zip(read.frames.iter()) {
                 let bid = e.block_id as usize;
-                let block_start =
-                    block_starts
-                        .get(bid)
-                        .copied()
-                        .ok_or(StorageError::ManifestRecordInvalid {
-                            msg: "block start missing".to_string(),
-                        })?;
+                let block_start = block_starts
+                    .get(bid)
+                    .copied()
+                    .ok_or(StorageError::ManifestRecordInvalid {
+                        msg: "block start missing".to_string(),
+                    })?;
                 let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64)
                     .checked_add(block_start)
                     .and_then(|v| v.checked_add(e.in_block_offset as u64))
@@ -4308,10 +4063,7 @@ impl ShardStorage {
             block_ids.dedup();
 
             let io_start = std::time::Instant::now();
-            let blocks = read_blocks_cpu(file_ref,
-                &ti.blocks,
-                &block_ids,
-            )?;
+            let blocks = read_blocks_cpu(file_ref, &ti.blocks, &block_ids)?;
             stats.add_io_elapsed(io_start.elapsed());
 
             let decode_start = std::time::Instant::now();
@@ -4324,23 +4076,20 @@ impl ShardStorage {
                 };
                 let start = e.in_block_offset as usize;
                 let len = e.frame_len as usize;
-                let end = start
-                    .checked_add(len)
-                    .ok_or(StorageError::ManifestRecordInvalid {
-                        msg: "frame slice overflow".to_string(),
-                    })?;
+                let end = start.checked_add(len).ok_or(StorageError::ManifestRecordInvalid {
+                    msg: "frame slice overflow".to_string(),
+                })?;
                 if end > buf.len() {
                     return Err(StorageError::ManifestRecordInvalid {
                         msg: "frame points outside uncompressed block".to_string(),
                     });
                 }
-                let block_start =
-                    block_starts
-                        .get(bid)
-                        .copied()
-                        .ok_or(StorageError::ManifestRecordInvalid {
-                            msg: "block start missing".to_string(),
-                        })?;
+                let block_start = block_starts
+                    .get(bid)
+                    .copied()
+                    .ok_or(StorageError::ManifestRecordInvalid {
+                        msg: "block start missing".to_string(),
+                    })?;
                 let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64)
                     .checked_add(block_start)
                     .and_then(|v| v.checked_add(e.in_block_offset as u64))
@@ -4411,84 +4160,75 @@ impl ShardStorage {
                 if r.max_seq < from_seq_inclusive {
                     continue;
                 }
-                let seg = self.segments_by_seq.get(&r.segment_seq).ok_or_else(|| {
-                    StorageError::ManifestRecordInvalid {
-                        msg: "segment referenced by directory missing from segments_by_seq"
-                            .to_string(),
-                    }
-                })?;
+                let seg =
+                    self.segments_by_seq
+                        .get(&r.segment_seq)
+                        .ok_or_else(|| StorageError::ManifestRecordInvalid {
+                            msg: "segment referenced by directory missing from segments_by_seq".to_string(),
+                        })?;
 
                 let seg_path = self.paths.shard_dir.join(&seg.relative_path);
                 if let Some(ti) = self.segment_trailers_by_seq.get(&r.segment_seq) {
                     let file = File::open(&seg_path).map_err(io_err)?;
                     let remaining = limit.saturating_sub(out.len());
                     let selected =
-                        select_stream_range_from_trailer_sorted(
-                            ti,
-                            stream_hash,
-                            from_seq_inclusive,
-                            remaining,
-                        )
-                    ;
+                        select_stream_range_from_trailer_sorted(ti, stream_hash, from_seq_inclusive, remaining);
                     if selected.is_empty() {
                         continue;
                     }
                     stats.segments_touched = stats.segments_touched.saturating_add(1);
 
                     let block_starts = block_logical_starts(&ti.blocks)?;
-                        let mut block_ids: Vec<u32> = selected.iter().map(|e| e.block_id).collect();
-                        block_ids.sort_unstable();
-                        block_ids.dedup();
+                    let mut block_ids: Vec<u32> = selected.iter().map(|e| e.block_id).collect();
+                    block_ids.sort_unstable();
+                    block_ids.dedup();
 
-                        let blocks = read_blocks_cpu(&file,
-                            &ti.blocks,
-                            &block_ids,
-                        )?;
+                    let blocks = read_blocks_cpu(&file, &ti.blocks, &block_ids)?;
 
-                        for e in selected {
-                            let bid = e.block_id as usize;
-                            let Some(buf) = blocks.get(bid).and_then(|v| v.as_ref()) else {
-                                return Err(StorageError::ManifestRecordInvalid {
-                                    msg: "block buffer missing".to_string(),
-                                });
-                            };
-                            let start = e.in_block_offset as usize;
-                            let len = e.frame_len as usize;
-                            let end = start.checked_add(len).ok_or(
-                                StorageError::ManifestRecordInvalid {
-                                    msg: "frame slice overflow".to_string(),
-                                },
-                            )?;
-                            if end > buf.len() {
-                                return Err(StorageError::ManifestRecordInvalid {
-                                    msg: "frame points outside uncompressed block".to_string(),
-                                });
-                            }
-                            let block_start = block_starts.get(bid).copied().ok_or(
-                                StorageError::ManifestRecordInvalid {
-                                    msg: "block start missing".to_string(),
-                                },
-                            )?;
-                            let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64)
-                                .checked_add(block_start)
-                                .and_then(|v| v.checked_add(e.in_block_offset as u64))
-                                .ok_or(StorageError::ManifestRecordInvalid {
-                                    msg: "frame offset overflow".to_string(),
-                                })?;
-
-                            let ev = decode_stored_event_from_frame_bytes(
-                                self.shard_id as u64,
-                                seg.epoch,
-                                seg.segment_seq,
-                                frame_off,
-                                &buf[start..end],
-                            )?;
-                            out.push(ev);
-                            if out.len() >= limit {
-                                return Ok((out, stats));
-                            }
+                    for e in selected {
+                        let bid = e.block_id as usize;
+                        let Some(buf) = blocks.get(bid).and_then(|v| v.as_ref()) else {
+                            return Err(StorageError::ManifestRecordInvalid {
+                                msg: "block buffer missing".to_string(),
+                            });
+                        };
+                        let start = e.in_block_offset as usize;
+                        let len = e.frame_len as usize;
+                        let end = start.checked_add(len).ok_or(StorageError::ManifestRecordInvalid {
+                            msg: "frame slice overflow".to_string(),
+                        })?;
+                        if end > buf.len() {
+                            return Err(StorageError::ManifestRecordInvalid {
+                                msg: "frame points outside uncompressed block".to_string(),
+                            });
                         }
-                    
+                        let block_start =
+                            block_starts
+                                .get(bid)
+                                .copied()
+                                .ok_or(StorageError::ManifestRecordInvalid {
+                                    msg: "block start missing".to_string(),
+                                })?;
+                        let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64)
+                            .checked_add(block_start)
+                            .and_then(|v| v.checked_add(e.in_block_offset as u64))
+                            .ok_or(StorageError::ManifestRecordInvalid {
+                                msg: "frame offset overflow".to_string(),
+                            })?;
+
+                        let ev = decode_stored_event_from_frame_bytes(
+                            self.shard_id as u64,
+                            seg.epoch,
+                            seg.segment_seq,
+                            frame_off,
+                            &buf[start..end],
+                        )?;
+                        out.push(ev);
+                        if out.len() >= limit {
+                            return Ok((out, stats));
+                        }
+                    }
+
                     continue;
                 }
 
@@ -4546,52 +4286,44 @@ impl ShardStorage {
                         .collect();
                     if !selected.is_empty() {
                         stats.segments_touched = stats.segments_touched.saturating_add(1);
-                            let mut block_ids: Vec<u32> =
-                                selected.iter().map(|f| f.block_id).collect();
-                            block_ids.sort_unstable();
-                            block_ids.dedup();
+                        let mut block_ids: Vec<u32> = selected.iter().map(|f| f.block_id).collect();
+                        block_ids.sort_unstable();
+                        block_ids.dedup();
 
-                            let blocks = read_blocks_cpu(&head.file,
-                                &head.blocks,
-                                &block_ids,
-                            )?;
+                        let blocks = read_blocks_cpu(&head.file, &head.blocks, &block_ids)?;
 
-                            for f in selected {
-                                let bid = f.block_id as usize;
-                                let Some(buf) = blocks.get(bid).and_then(|v| v.as_ref()) else {
-                                    return Err(StorageError::ManifestRecordInvalid {
-                                        msg: "head block buffer missing".to_string(),
-                                    });
-                                };
-                                let start = f.in_block_offset as usize;
-                                let len = f.frame_len as usize;
-                                let end = start.checked_add(len).ok_or(
-                                    StorageError::ManifestRecordInvalid {
-                                        msg: "head frame slice overflow".to_string(),
-                                    },
-                                )?;
-                                if end > buf.len() {
-                                    return Err(StorageError::ManifestRecordInvalid {
-                                        msg: "head frame points outside uncompressed block"
-                                            .to_string(),
-                                    });
-                                }
-
-                                let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64)
-                                    .saturating_add(f.record_off as u64);
-                                let ev = decode_stored_event_from_frame_bytes(
-                                    self.shard_id as u64,
-                                    self.epoch,
-                                    head.segment_seq,
-                                    frame_off,
-                                    &buf[start..end],
-                                )?;
-                                out.push(ev);
-                                if out.len() >= limit {
-                                    break;
-                                }
+                        for f in selected {
+                            let bid = f.block_id as usize;
+                            let Some(buf) = blocks.get(bid).and_then(|v| v.as_ref()) else {
+                                return Err(StorageError::ManifestRecordInvalid {
+                                    msg: "head block buffer missing".to_string(),
+                                });
+                            };
+                            let start = f.in_block_offset as usize;
+                            let len = f.frame_len as usize;
+                            let end = start.checked_add(len).ok_or(StorageError::ManifestRecordInvalid {
+                                msg: "head frame slice overflow".to_string(),
+                            })?;
+                            if end > buf.len() {
+                                return Err(StorageError::ManifestRecordInvalid {
+                                    msg: "head frame points outside uncompressed block".to_string(),
+                                });
                             }
-                        
+
+                            let frame_off =
+                                (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(f.record_off as u64);
+                            let ev = decode_stored_event_from_frame_bytes(
+                                self.shard_id as u64,
+                                self.epoch,
+                                head.segment_seq,
+                                frame_off,
+                                &buf[start..end],
+                            )?;
+                            out.push(ev);
+                            if out.len() >= limit {
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -4658,8 +4390,7 @@ impl ShardStorage {
                 if used_fastpath {
                     stats.head_tail_fastpath_hits = stats.head_tail_fastpath_hits.saturating_add(1);
                 } else {
-                    stats.head_tail_fastpath_misses =
-                        stats.head_tail_fastpath_misses.saturating_add(1);
+                    stats.head_tail_fastpath_misses = stats.head_tail_fastpath_misses.saturating_add(1);
                 }
 
                 if selected_idx_desc.len() < remaining {
@@ -4701,8 +4432,7 @@ impl ShardStorage {
                             payload_digest8: f.payload_digest8,
                         });
                     }
-                    let estimated_disk_bytes =
-                        add_selected_entries_stats(&mut stats, &head.blocks, &entries)?;
+                    let estimated_disk_bytes = add_selected_entries_stats(&mut stats, &head.blocks, &entries)?;
                     let can_frame_window_read = selected.iter().all(|f| {
                         let Some(meta) = head.blocks.get(f.block_id as usize) else {
                             return false;
@@ -4712,10 +4442,7 @@ impl ShardStorage {
                     });
                     if can_frame_window_read {
                         let io_start = std::time::Instant::now();
-                        let read = read_selected_frames_codec_none_from_entries(&head.file,
-                            &head.blocks,
-                            &entries,
-                        )?;
+                        let read = read_selected_frames_codec_none_from_entries(&head.file, &head.blocks, &entries)?;
                         stats.add_io_elapsed(io_start.elapsed());
                         stats.disk_bytes_estimate = stats
                             .disk_bytes_estimate
@@ -4724,8 +4451,8 @@ impl ShardStorage {
 
                         let decode_start = std::time::Instant::now();
                         for (f, frame) in selected.iter().zip(read.frames.iter()) {
-                            let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64)
-                                .saturating_add(f.record_off as u64);
+                            let frame_off =
+                                (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(f.record_off as u64);
                             let ev = decode_stored_event_from_frame_bytes(
                                 self.shard_id as u64,
                                 self.epoch,
@@ -4745,10 +4472,7 @@ impl ShardStorage {
                         block_ids.dedup();
 
                         let io_start = std::time::Instant::now();
-                        let blocks = read_blocks_cpu(&head.file,
-                            &head.blocks,
-                            &block_ids,
-                        )?;
+                        let blocks = read_blocks_cpu(&head.file, &head.blocks, &block_ids)?;
                         stats.add_io_elapsed(io_start.elapsed());
 
                         let decode_start = std::time::Instant::now();
@@ -4761,18 +4485,16 @@ impl ShardStorage {
                             };
                             let start = f.in_block_offset as usize;
                             let len = f.frame_len as usize;
-                            let end = start.checked_add(len).ok_or(
-                                StorageError::ManifestRecordInvalid {
-                                    msg: "head frame slice overflow".to_string(),
-                                },
-                            )?;
+                            let end = start.checked_add(len).ok_or(StorageError::ManifestRecordInvalid {
+                                msg: "head frame slice overflow".to_string(),
+                            })?;
                             if end > buf.len() {
                                 return Err(StorageError::ManifestRecordInvalid {
                                     msg: "head frame points outside uncompressed block".to_string(),
                                 });
                             }
-                            let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64)
-                                .saturating_add(f.record_off as u64);
+                            let frame_off =
+                                (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(f.record_off as u64);
                             let ev = decode_stored_event_from_frame_bytes(
                                 self.shard_id as u64,
                                 self.epoch,
@@ -4801,11 +4523,9 @@ impl ShardStorage {
             self.locator_tail_segments_desc(stream_hash, cut, limit);
         stats.add_index_elapsed(index_start.elapsed());
         if locator_can_fully_satisfy {
-            stats.locator_fully_satisfied_hits =
-                stats.locator_fully_satisfied_hits.saturating_add(1);
+            stats.locator_fully_satisfied_hits = stats.locator_fully_satisfied_hits.saturating_add(1);
         } else {
-            stats.locator_fully_satisfied_misses =
-                stats.locator_fully_satisfied_misses.saturating_add(1);
+            stats.locator_fully_satisfied_misses = stats.locator_fully_satisfied_misses.saturating_add(1);
         }
 
         // Fast path for cache-neutral tails: when the locator already has enough entries,
@@ -4817,8 +4537,7 @@ impl ShardStorage {
                 }
                 let Some(seg) = self.segments_by_seq.get(&seg_seq) else {
                     return Err(StorageError::ManifestRecordInvalid {
-                        msg: "segment referenced by locator missing from segments_by_seq"
-                            .to_string(),
+                        msg: "segment referenced by locator missing from segments_by_seq".to_string(),
                     });
                 };
                 let Some(ti) = self.segment_trailers_by_seq.get(&seg_seq) else {
@@ -4836,9 +4555,7 @@ impl ShardStorage {
                 if selected.is_empty() {
                     continue;
                 }
-                self.read_selected_tail_entries_from_trailer(
-                    seg, ti, &selected, &mut stats, &mut out, limit,
-                )?;
+                self.read_selected_tail_entries_from_trailer(seg, ti, &selected, &mut stats, &mut out, limit)?;
             }
             out.reverse(); // ascending seq
             stats.total_nanos = total_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
@@ -4852,19 +4569,18 @@ impl ShardStorage {
             if r.max_seq < cut {
                 continue;
             }
-            let seg = self.segments_by_seq.get(&r.segment_seq).ok_or_else(|| {
-                StorageError::ManifestRecordInvalid {
+            let seg = self
+                .segments_by_seq
+                .get(&r.segment_seq)
+                .ok_or_else(|| StorageError::ManifestRecordInvalid {
                     msg: "segment referenced by directory missing from segments_by_seq".to_string(),
-                }
-            })?;
+                })?;
 
             let seg_path = self.paths.shard_dir.join(&seg.relative_path);
             if let Some(ti) = self.segment_trailers_by_seq.get(&r.segment_seq) {
                 let remaining = limit.saturating_sub(out.len());
                 let index_start = std::time::Instant::now();
-                let mut selected = locator_desc_by_segment
-                    .remove(&r.segment_seq)
-                    .unwrap_or_default();
+                let mut selected = locator_desc_by_segment.remove(&r.segment_seq).unwrap_or_default();
                 if selected.len() > remaining {
                     selected.truncate(remaining);
                 }
@@ -4908,9 +4624,7 @@ impl ShardStorage {
                 if selected.is_empty() {
                     continue;
                 }
-                self.read_selected_tail_entries_from_trailer(
-                    seg, ti, &selected, &mut stats, &mut out, limit,
-                )?;
+                self.read_selected_tail_entries_from_trailer(seg, ti, &selected, &mut stats, &mut out, limit)?;
 
                 if out.len() >= limit {
                     break;
@@ -4922,8 +4636,7 @@ impl ShardStorage {
             let io_start = std::time::Instant::now();
             let bytes = std::fs::read(&seg_path).map_err(io_err)?;
             stats.add_io_elapsed(io_start.elapsed());
-            stats.disk_bytes_estimate =
-                stats.disk_bytes_estimate.saturating_add(bytes.len() as u64);
+            stats.disk_bytes_estimate = stats.disk_bytes_estimate.saturating_add(bytes.len() as u64);
             let index_start = std::time::Instant::now();
             let (_h, _toc_h, entries, _f) = decode_segment_v1(&bytes)?;
             let (start, end) = toc_stream_range(&entries, stream_hash);
@@ -5051,62 +4764,56 @@ impl ShardStorage {
                 let remaining = limit.saturating_sub(out.len());
                 let take = remaining.min(ti.toc_by_offset.len() - start_pos);
                 let slice = &ti.toc_by_offset[start_pos..start_pos + take];
-                    let mut block_ids: Vec<u32> = slice.iter().map(|e| e.block_id).collect();
-                    block_ids.sort_unstable();
-                    block_ids.dedup();
-                    let blocks = read_blocks_cpu(&file,
-                        &ti.blocks,
-                        &block_ids,
-                    )?;
+                let mut block_ids: Vec<u32> = slice.iter().map(|e| e.block_id).collect();
+                block_ids.sort_unstable();
+                block_ids.dedup();
+                let blocks = read_blocks_cpu(&file, &ti.blocks, &block_ids)?;
 
-                    for e in slice {
-                        if out.len() >= limit {
-                            break;
-                        }
-                        let bid = e.block_id as usize;
-                        let Some(buf) = blocks.get(bid).and_then(|v| v.as_ref()) else {
-                            return Err(StorageError::ManifestRecordInvalid {
-                                msg: "block buffer missing".to_string(),
-                            });
-                        };
-                        let start = e.in_block_offset as usize;
-                        let len = e.frame_len as usize;
-                        let end =
-                            start
-                                .checked_add(len)
-                                .ok_or(StorageError::ManifestRecordInvalid {
-                                    msg: "frame slice overflow".to_string(),
-                                })?;
-                        if end > buf.len() {
-                            return Err(StorageError::ManifestRecordInvalid {
-                                msg: "replay frame points outside uncompressed block".to_string(),
-                            });
-                        }
-
-                        let block_start = block_starts.get(bid).copied().ok_or(
-                            StorageError::ManifestRecordInvalid {
-                                msg: "block start missing".to_string(),
-                            },
-                        )?;
-                        let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64)
-                            .checked_add(block_start)
-                            .and_then(|v| v.checked_add(e.in_block_offset as u64))
-                            .ok_or(StorageError::ManifestRecordInvalid {
-                                msg: "frame offset overflow".to_string(),
-                            })?;
-
-                        let frame = buf[start..end].to_vec();
-                        let _ = decode_frame_v1(&frame)?;
-                        let loc = FrameLocation {
-                            shard_id: self.shard_id as u64,
-                            epoch: seg.epoch,
-                            segment_seq: seg.segment_seq,
-                            offset: frame_off,
-                        };
-                        out.push((loc, frame));
-                        offset = frame_off.saturating_add(e.frame_len as u64);
+                for e in slice {
+                    if out.len() >= limit {
+                        break;
                     }
-                
+                    let bid = e.block_id as usize;
+                    let Some(buf) = blocks.get(bid).and_then(|v| v.as_ref()) else {
+                        return Err(StorageError::ManifestRecordInvalid {
+                            msg: "block buffer missing".to_string(),
+                        });
+                    };
+                    let start = e.in_block_offset as usize;
+                    let len = e.frame_len as usize;
+                    let end = start.checked_add(len).ok_or(StorageError::ManifestRecordInvalid {
+                        msg: "frame slice overflow".to_string(),
+                    })?;
+                    if end > buf.len() {
+                        return Err(StorageError::ManifestRecordInvalid {
+                            msg: "replay frame points outside uncompressed block".to_string(),
+                        });
+                    }
+
+                    let block_start = block_starts
+                        .get(bid)
+                        .copied()
+                        .ok_or(StorageError::ManifestRecordInvalid {
+                            msg: "block start missing".to_string(),
+                        })?;
+                    let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64)
+                        .checked_add(block_start)
+                        .and_then(|v| v.checked_add(e.in_block_offset as u64))
+                        .ok_or(StorageError::ManifestRecordInvalid {
+                            msg: "frame offset overflow".to_string(),
+                        })?;
+
+                    let frame = buf[start..end].to_vec();
+                    let _ = decode_frame_v1(&frame)?;
+                    let loc = FrameLocation {
+                        shard_id: self.shard_id as u64,
+                        epoch: seg.epoch,
+                        segment_seq: seg.segment_seq,
+                        offset: frame_off,
+                    };
+                    out.push((loc, frame));
+                    offset = frame_off.saturating_add(e.frame_len as u64);
+                }
             } else {
                 // Fallback: Phase 2 scan.
                 let bytes = std::fs::read(&seg_path).map_err(io_err)?;
@@ -5119,11 +4826,10 @@ impl ShardStorage {
                 }
 
                 while offset < record_end && out.len() < limit {
-                    let frame_len = frame_len_at(&bytes, offset).ok_or_else(|| {
-                        StorageError::ManifestRecordInvalid {
+                    let frame_len =
+                        frame_len_at(&bytes, offset).ok_or_else(|| StorageError::ManifestRecordInvalid {
                             msg: "failed to compute frame length at replay cursor".to_string(),
-                        }
-                    })?;
+                        })?;
                     let end = offset.saturating_add(frame_len as u64);
                     if end > record_end || end as usize > bytes.len() {
                         return Err(StorageError::ManifestRecordInvalid {
@@ -5174,7 +4880,6 @@ impl ShardStorage {
 
         Ok((out, None))
     }
-
 
     #[tracing::instrument(
         level = "info",
@@ -5233,12 +4938,8 @@ impl ShardStorage {
         while seg_idx < total_segments && out.len() < limit {
             // Special final "segment": the currently-appending head segment (if enabled).
             if seg_idx == sealed_len {
-                let head = self
-                    .head
-                    .as_ref()
-                    .expect("head exists when seg_idx==sealed_len");
-                let record_end =
-                    (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(head.record_len);
+                let head = self.head.as_ref().expect("head exists when seg_idx==sealed_len");
+                let record_end = (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(head.record_len);
 
                 if offset < corecrux_segment::SEGMENT_HEADER_LEN as u64 {
                     offset = corecrux_segment::SEGMENT_HEADER_LEN as u64;
@@ -5250,8 +4951,7 @@ impl ShardStorage {
                 }
 
                 let start_pos = head.frames.partition_point(|f| {
-                    let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64)
-                        .saturating_add(f.record_off as u64);
+                    let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(f.record_off as u64);
                     frame_off < offset
                 });
                 if start_pos >= head.frames.len() {
@@ -5263,53 +4963,44 @@ impl ShardStorage {
                 let remaining = limit.saturating_sub(out.len());
                 let take = remaining.min(head.frames.len() - start_pos);
                 let slice = &head.frames[start_pos..start_pos + take];
-                    let mut block_ids: Vec<u32> = slice.iter().map(|f| f.block_id).collect();
-                    block_ids.sort_unstable();
-                    block_ids.dedup();
-                    let blocks = read_blocks_cpu(&head.file,
-                        &head.blocks,
-                        &block_ids,
-                    )?;
+                let mut block_ids: Vec<u32> = slice.iter().map(|f| f.block_id).collect();
+                block_ids.sort_unstable();
+                block_ids.dedup();
+                let blocks = read_blocks_cpu(&head.file, &head.blocks, &block_ids)?;
 
-                    for f in slice {
-                        if out.len() >= limit {
-                            break;
-                        }
-                        let bid = f.block_id as usize;
-                        let Some(buf) = blocks.get(bid).and_then(|v| v.as_ref()) else {
-                            return Err(StorageError::ManifestRecordInvalid {
-                                msg: "head block buffer missing".to_string(),
-                            });
-                        };
-                        let start = f.in_block_offset as usize;
-                        let len = f.frame_len as usize;
-                        let end =
-                            start
-                                .checked_add(len)
-                                .ok_or(StorageError::ManifestRecordInvalid {
-                                    msg: "head replay frame slice overflow".to_string(),
-                                })?;
-                        if end > buf.len() {
-                            return Err(StorageError::ManifestRecordInvalid {
-                                msg: "head replay frame points outside uncompressed block"
-                                    .to_string(),
-                            });
-                        }
-
-                        let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64)
-                            .saturating_add(f.record_off as u64);
-                        let frame = buf[start..end].to_vec();
-                        let _ = decode_frame_v1(&frame)?;
-                        let loc = FrameLocation {
-                            shard_id: self.shard_id as u64,
-                            epoch: self.epoch,
-                            segment_seq: head.segment_seq,
-                            offset: frame_off,
-                        };
-                        out.push((loc, frame));
-                        offset = frame_off.saturating_add(f.frame_len as u64);
+                for f in slice {
+                    if out.len() >= limit {
+                        break;
                     }
-                
+                    let bid = f.block_id as usize;
+                    let Some(buf) = blocks.get(bid).and_then(|v| v.as_ref()) else {
+                        return Err(StorageError::ManifestRecordInvalid {
+                            msg: "head block buffer missing".to_string(),
+                        });
+                    };
+                    let start = f.in_block_offset as usize;
+                    let len = f.frame_len as usize;
+                    let end = start.checked_add(len).ok_or(StorageError::ManifestRecordInvalid {
+                        msg: "head replay frame slice overflow".to_string(),
+                    })?;
+                    if end > buf.len() {
+                        return Err(StorageError::ManifestRecordInvalid {
+                            msg: "head replay frame points outside uncompressed block".to_string(),
+                        });
+                    }
+
+                    let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(f.record_off as u64);
+                    let frame = buf[start..end].to_vec();
+                    let _ = decode_frame_v1(&frame)?;
+                    let loc = FrameLocation {
+                        shard_id: self.shard_id as u64,
+                        epoch: self.epoch,
+                        segment_seq: head.segment_seq,
+                        offset: frame_off,
+                    };
+                    out.push((loc, frame));
+                    offset = frame_off.saturating_add(f.frame_len as u64);
+                }
 
                 if out.len() >= limit {
                     if offset >= record_end {
@@ -5365,62 +5056,56 @@ impl ShardStorage {
                 let remaining = limit.saturating_sub(out.len());
                 let take = remaining.min(ti.toc_by_offset.len() - start_pos);
                 let slice = &ti.toc_by_offset[start_pos..start_pos + take];
-                    let mut block_ids: Vec<u32> = slice.iter().map(|e| e.block_id).collect();
-                    block_ids.sort_unstable();
-                    block_ids.dedup();
-                    let blocks = read_blocks_cpu(&file,
-                        &ti.blocks,
-                        &block_ids,
-                    )?;
+                let mut block_ids: Vec<u32> = slice.iter().map(|e| e.block_id).collect();
+                block_ids.sort_unstable();
+                block_ids.dedup();
+                let blocks = read_blocks_cpu(&file, &ti.blocks, &block_ids)?;
 
-                    for e in slice {
-                        if out.len() >= limit {
-                            break;
-                        }
-                        let bid = e.block_id as usize;
-                        let Some(buf) = blocks.get(bid).and_then(|v| v.as_ref()) else {
-                            return Err(StorageError::ManifestRecordInvalid {
-                                msg: "block buffer missing".to_string(),
-                            });
-                        };
-                        let start = e.in_block_offset as usize;
-                        let len = e.frame_len as usize;
-                        let end =
-                            start
-                                .checked_add(len)
-                                .ok_or(StorageError::ManifestRecordInvalid {
-                                    msg: "frame slice overflow".to_string(),
-                                })?;
-                        if end > buf.len() {
-                            return Err(StorageError::ManifestRecordInvalid {
-                                msg: "replay frame points outside uncompressed block".to_string(),
-                            });
-                        }
-
-                        let block_start = block_starts.get(bid).copied().ok_or(
-                            StorageError::ManifestRecordInvalid {
-                                msg: "block start missing".to_string(),
-                            },
-                        )?;
-                        let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64)
-                            .checked_add(block_start)
-                            .and_then(|v| v.checked_add(e.in_block_offset as u64))
-                            .ok_or(StorageError::ManifestRecordInvalid {
-                                msg: "frame offset overflow".to_string(),
-                            })?;
-
-                        let frame = buf[start..end].to_vec();
-                        let _ = decode_frame_v1(&frame)?;
-                        let loc = FrameLocation {
-                            shard_id: self.shard_id as u64,
-                            epoch: seg.epoch,
-                            segment_seq: seg.segment_seq,
-                            offset: frame_off,
-                        };
-                        out.push((loc, frame));
-                        offset = frame_off.saturating_add(e.frame_len as u64);
+                for e in slice {
+                    if out.len() >= limit {
+                        break;
                     }
-                
+                    let bid = e.block_id as usize;
+                    let Some(buf) = blocks.get(bid).and_then(|v| v.as_ref()) else {
+                        return Err(StorageError::ManifestRecordInvalid {
+                            msg: "block buffer missing".to_string(),
+                        });
+                    };
+                    let start = e.in_block_offset as usize;
+                    let len = e.frame_len as usize;
+                    let end = start.checked_add(len).ok_or(StorageError::ManifestRecordInvalid {
+                        msg: "frame slice overflow".to_string(),
+                    })?;
+                    if end > buf.len() {
+                        return Err(StorageError::ManifestRecordInvalid {
+                            msg: "replay frame points outside uncompressed block".to_string(),
+                        });
+                    }
+
+                    let block_start = block_starts
+                        .get(bid)
+                        .copied()
+                        .ok_or(StorageError::ManifestRecordInvalid {
+                            msg: "block start missing".to_string(),
+                        })?;
+                    let frame_off = (corecrux_segment::SEGMENT_HEADER_LEN as u64)
+                        .checked_add(block_start)
+                        .and_then(|v| v.checked_add(e.in_block_offset as u64))
+                        .ok_or(StorageError::ManifestRecordInvalid {
+                            msg: "frame offset overflow".to_string(),
+                        })?;
+
+                    let frame = buf[start..end].to_vec();
+                    let _ = decode_frame_v1(&frame)?;
+                    let loc = FrameLocation {
+                        shard_id: self.shard_id as u64,
+                        epoch: seg.epoch,
+                        segment_seq: seg.segment_seq,
+                        offset: frame_off,
+                    };
+                    out.push((loc, frame));
+                    offset = frame_off.saturating_add(e.frame_len as u64);
+                }
             } else {
                 // Fallback: Phase 2 scan.
                 let bytes = std::fs::read(&seg_path).map_err(io_err)?;
@@ -5433,11 +5118,10 @@ impl ShardStorage {
                 }
 
                 while offset < record_end && out.len() < limit {
-                    let frame_len = frame_len_at(&bytes, offset).ok_or_else(|| {
-                        StorageError::ManifestRecordInvalid {
+                    let frame_len =
+                        frame_len_at(&bytes, offset).ok_or_else(|| StorageError::ManifestRecordInvalid {
                             msg: "failed to compute frame length at replay cursor".to_string(),
-                        }
-                    })?;
+                        })?;
                     let end = offset.saturating_add(frame_len as u64);
                     if end > record_end || end as usize > bytes.len() {
                         return Err(StorageError::ManifestRecordInvalid {
@@ -5535,16 +5219,8 @@ impl ShardStorage {
 
             stats.total_segments += 1;
 
-            stats.total_compressed_bytes += ti
-                .blocks
-                .iter()
-                .map(|b| b.compressed_len as u64)
-                .sum::<u64>();
-            stats.total_uncompressed_bytes += ti
-                .blocks
-                .iter()
-                .map(|b| b.uncompressed_len as u64)
-                .sum::<u64>();
+            stats.total_compressed_bytes += ti.blocks.iter().map(|b| b.compressed_len as u64).sum::<u64>();
+            stats.total_uncompressed_bytes += ti.blocks.iter().map(|b| b.uncompressed_len as u64).sum::<u64>();
 
             let mut i = 0usize;
             while i < ti.blocks.len() {
@@ -5573,21 +5249,17 @@ impl ShardStorage {
                     batch_ids.push(ti.blocks[i].block_id);
                     i += 1;
                 }
-                    let blocks = read_blocks_cpu(&file,
-                        &ti.blocks,
-                        &batch_ids,
-                    )?;
-                    for bid in &batch_ids {
-                        let idx = *bid as usize;
-                        let Some(buf) = blocks.get(idx).and_then(|v| v.as_ref()) else {
-                            return Err(StorageError::ManifestRecordInvalid {
-                                msg: "block buffer missing during replay scan".to_string(),
-                            });
-                        };
-                        let frames = scan_frames_v1_block_bytes(buf)?;
-                        stats.total_frames = stats.total_frames.saturating_add(frames as u64);
-                    }
-                
+                let blocks = read_blocks_cpu(&file, &ti.blocks, &batch_ids)?;
+                for bid in &batch_ids {
+                    let idx = *bid as usize;
+                    let Some(buf) = blocks.get(idx).and_then(|v| v.as_ref()) else {
+                        return Err(StorageError::ManifestRecordInvalid {
+                            msg: "block buffer missing during replay scan".to_string(),
+                        });
+                    };
+                    let frames = scan_frames_v1_block_bytes(buf)?;
+                    stats.total_frames = stats.total_frames.saturating_add(frames as u64);
+                }
             }
         }
 
@@ -5595,16 +5267,8 @@ impl ShardStorage {
         if let Some(head) = self.head.as_ref() {
             stats.total_segments += 1;
 
-            stats.total_compressed_bytes += head
-                .blocks
-                .iter()
-                .map(|b| b.compressed_len as u64)
-                .sum::<u64>();
-            stats.total_uncompressed_bytes += head
-                .blocks
-                .iter()
-                .map(|b| b.uncompressed_len as u64)
-                .sum::<u64>();
+            stats.total_compressed_bytes += head.blocks.iter().map(|b| b.compressed_len as u64).sum::<u64>();
+            stats.total_uncompressed_bytes += head.blocks.iter().map(|b| b.uncompressed_len as u64).sum::<u64>();
 
             let mut i = 0usize;
             while i < head.blocks.len() {
@@ -5631,21 +5295,17 @@ impl ShardStorage {
                     batch_ids.push(head.blocks[i].block_id);
                     i += 1;
                 }
-                    let blocks = read_blocks_cpu(&head.file,
-                        &head.blocks,
-                        &batch_ids,
-                    )?;
-                    for bid in &batch_ids {
-                        let idx = *bid as usize;
-                        let Some(buf) = blocks.get(idx).and_then(|v| v.as_ref()) else {
-                            return Err(StorageError::ManifestRecordInvalid {
-                                msg: "head block buffer missing during replay scan".to_string(),
-                            });
-                        };
-                        let frames = scan_frames_v1_block_bytes(buf)?;
-                        stats.total_frames = stats.total_frames.saturating_add(frames as u64);
-                    }
-                
+                let blocks = read_blocks_cpu(&head.file, &head.blocks, &batch_ids)?;
+                for bid in &batch_ids {
+                    let idx = *bid as usize;
+                    let Some(buf) = blocks.get(idx).and_then(|v| v.as_ref()) else {
+                        return Err(StorageError::ManifestRecordInvalid {
+                            msg: "head block buffer missing during replay scan".to_string(),
+                        });
+                    };
+                    let frames = scan_frames_v1_block_bytes(buf)?;
+                    stats.total_frames = stats.total_frames.saturating_add(frames as u64);
+                }
             }
         }
 
@@ -5685,16 +5345,8 @@ impl ShardStorage {
 
             stats.total_segments += 1;
             stats.total_blocks += ti.blocks.len() as u64;
-            stats.total_compressed_bytes += ti
-                .blocks
-                .iter()
-                .map(|b| b.compressed_len as u64)
-                .sum::<u64>();
-            stats.total_uncompressed_bytes += ti
-                .blocks
-                .iter()
-                .map(|b| b.uncompressed_len as u64)
-                .sum::<u64>();
+            stats.total_compressed_bytes += ti.blocks.iter().map(|b| b.compressed_len as u64).sum::<u64>();
+            stats.total_uncompressed_bytes += ti.blocks.iter().map(|b| b.uncompressed_len as u64).sum::<u64>();
 
             let mut seg_frames: u64 = 0;
             let mut i = 0usize;
@@ -5724,21 +5376,17 @@ impl ShardStorage {
                     batch_ids.push(ti.blocks[i].block_id);
                     i += 1;
                 }
-                    let blocks = read_blocks_cpu(&file,
-                        &ti.blocks,
-                        &batch_ids,
-                    )?;
-                    for bid in &batch_ids {
-                        let idx = *bid as usize;
-                        let Some(buf) = blocks.get(idx).and_then(|v| v.as_ref()) else {
-                            return Err(StorageError::ManifestRecordInvalid {
-                                msg: "block buffer missing during integrity scan".to_string(),
-                            });
-                        };
-                        let frames = scan_frames_v1_block_bytes(buf)?;
-                        seg_frames = seg_frames.saturating_add(frames as u64);
-                    }
-                
+                let blocks = read_blocks_cpu(&file, &ti.blocks, &batch_ids)?;
+                for bid in &batch_ids {
+                    let idx = *bid as usize;
+                    let Some(buf) = blocks.get(idx).and_then(|v| v.as_ref()) else {
+                        return Err(StorageError::ManifestRecordInvalid {
+                            msg: "block buffer missing during integrity scan".to_string(),
+                        });
+                    };
+                    let frames = scan_frames_v1_block_bytes(buf)?;
+                    seg_frames = seg_frames.saturating_add(frames as u64);
+                }
             }
 
             if seg_frames != seg.toc_entry_count {
@@ -5756,16 +5404,8 @@ impl ShardStorage {
         if let Some(head) = self.head.as_ref() {
             stats.total_segments += 1;
             stats.total_blocks += head.blocks.len() as u64;
-            stats.total_compressed_bytes += head
-                .blocks
-                .iter()
-                .map(|b| b.compressed_len as u64)
-                .sum::<u64>();
-            stats.total_uncompressed_bytes += head
-                .blocks
-                .iter()
-                .map(|b| b.uncompressed_len as u64)
-                .sum::<u64>();
+            stats.total_compressed_bytes += head.blocks.iter().map(|b| b.compressed_len as u64).sum::<u64>();
+            stats.total_uncompressed_bytes += head.blocks.iter().map(|b| b.uncompressed_len as u64).sum::<u64>();
 
             let expected = head.frames.len() as u64;
             let mut scanned: u64 = 0;
@@ -5795,21 +5435,17 @@ impl ShardStorage {
                     batch_ids.push(head.blocks[i].block_id);
                     i += 1;
                 }
-                    let blocks = read_blocks_cpu(&head.file,
-                        &head.blocks,
-                        &batch_ids,
-                    )?;
-                    for bid in &batch_ids {
-                        let idx = *bid as usize;
-                        let Some(buf) = blocks.get(idx).and_then(|v| v.as_ref()) else {
-                            return Err(StorageError::ManifestRecordInvalid {
-                                msg: "head block buffer missing during integrity scan".to_string(),
-                            });
-                        };
-                        let frames = scan_frames_v1_block_bytes(buf)?;
-                        scanned = scanned.saturating_add(frames as u64);
-                    }
-                
+                let blocks = read_blocks_cpu(&head.file, &head.blocks, &batch_ids)?;
+                for bid in &batch_ids {
+                    let idx = *bid as usize;
+                    let Some(buf) = blocks.get(idx).and_then(|v| v.as_ref()) else {
+                        return Err(StorageError::ManifestRecordInvalid {
+                            msg: "head block buffer missing during integrity scan".to_string(),
+                        });
+                    };
+                    let frames = scan_frames_v1_block_bytes(buf)?;
+                    scanned = scanned.saturating_add(frames as u64);
+                }
             }
 
             if scanned != expected {
@@ -5830,19 +5466,15 @@ impl ShardStorage {
         if let Some(head) = self.head.as_ref() {
             if head.segment_seq == segment_seq {
                 let (block_idx, in_block_offset) = logical_offset_to_block(&head.blocks, offset)?;
-                let blocks = read_blocks_cpu(&head.file,
-                    &head.blocks,
-                    &[block_idx as u32],
-                )?;
+                let blocks = read_blocks_cpu(&head.file, &head.blocks, &[block_idx as u32])?;
                 let Some(buf) = blocks.get(block_idx).and_then(|v| v.as_ref()) else {
                     return Err(StorageError::ManifestRecordInvalid {
                         msg: "head block buffer missing".to_string(),
                     });
                 };
-                let frame_len =
-                    frame_len_at(buf, in_block_offset as u64).ok_or(StorageError::Io {
-                        msg: "failed to compute head frame length for logical offset".to_string(),
-                    })?;
+                let frame_len = frame_len_at(buf, in_block_offset as u64).ok_or(StorageError::Io {
+                    msg: "failed to compute head frame length for logical offset".to_string(),
+                })?;
                 let start = in_block_offset as usize;
                 let end = start.saturating_add(frame_len);
                 if end > buf.len() {
@@ -5854,19 +5486,17 @@ impl ShardStorage {
             }
         }
 
-        let seg = self.segments_by_seq.get(&segment_seq).ok_or_else(|| {
-            StorageError::ManifestRecordInvalid {
+        let seg = self
+            .segments_by_seq
+            .get(&segment_seq)
+            .ok_or_else(|| StorageError::ManifestRecordInvalid {
                 msg: format!("segment_seq {segment_seq} not found"),
-            }
-        })?;
+            })?;
         let seg_path = self.paths.shard_dir.join(&seg.relative_path);
         if let Some(ti) = self.segment_trailers_by_seq.get(&segment_seq) {
             let file = File::open(&seg_path).map_err(io_err)?;
             let (block_idx, in_block_offset) = logical_offset_to_block(&ti.blocks, offset)?;
-            let blocks = read_blocks_cpu(&file,
-                &ti.blocks,
-                &[block_idx as u32],
-            )?;
+            let blocks = read_blocks_cpu(&file, &ti.blocks, &[block_idx as u32])?;
             let Some(buf) = blocks.get(block_idx).and_then(|v| v.as_ref()) else {
                 return Err(StorageError::ManifestRecordInvalid {
                     msg: "block buffer missing".to_string(),
@@ -5909,10 +5539,7 @@ impl ShardStorage {
         Ok(out)
     }
 
-    pub fn read_frame_bytes_batch_packed(
-        &self,
-        locations: &[FrameLocation],
-    ) -> Result<ReadFrameBatchPackedV1> {
+    pub fn read_frame_bytes_batch_packed(&self, locations: &[FrameLocation]) -> Result<ReadFrameBatchPackedV1> {
         fn extract_frame(buf: &[u8], in_block_offset: usize, context: &str) -> Result<Vec<u8>> {
             let frame_len = frame_len_at(buf, in_block_offset as u64).ok_or(StorageError::Io {
                 msg: format!("failed to compute {context} frame length for logical offset"),
@@ -5966,17 +5593,13 @@ impl ShardStorage {
 
             if let Some(head) = self.head.as_ref() {
                 if head.segment_seq == loc.segment_seq {
-                    let (block_idx, in_block_offset) =
-                        logical_offset_to_block(&head.blocks, loc.offset)?;
+                    let (block_idx, in_block_offset) = logical_offset_to_block(&head.blocks, loc.offset)?;
                     let needs_reload = cached_head_block
                         .as_ref()
                         .map(|(cached_idx, _)| *cached_idx != block_idx as u32)
                         .unwrap_or(true);
                     if needs_reload {
-                        let blocks = read_blocks_cpu(&head.file,
-                            &head.blocks,
-                            &[block_idx as u32],
-                        )?;
+                        let blocks = read_blocks_cpu(&head.file, &head.blocks, &[block_idx as u32])?;
                         let Some(buf) = blocks.get(block_idx).and_then(|v| v.as_ref()) else {
                             return Err(StorageError::ManifestRecordInvalid {
                                 msg: "head block buffer missing".to_string(),
@@ -5985,10 +5608,7 @@ impl ShardStorage {
                         cached_head_block = Some((block_idx as u32, buf.clone()));
                     }
                     let frame = extract_frame(
-                        &cached_head_block
-                            .as_ref()
-                            .expect("cached head block just loaded")
-                            .1,
+                        &cached_head_block.as_ref().expect("cached head block just loaded").1,
                         in_block_offset as usize,
                         "head",
                     )?;
@@ -6003,11 +5623,12 @@ impl ShardStorage {
                 }
             }
 
-            let seg = self.segments_by_seq.get(&loc.segment_seq).ok_or_else(|| {
-                StorageError::ManifestRecordInvalid {
-                    msg: format!("segment_seq {} not found", loc.segment_seq),
-                }
-            })?;
+            let seg =
+                self.segments_by_seq
+                    .get(&loc.segment_seq)
+                    .ok_or_else(|| StorageError::ManifestRecordInvalid {
+                        msg: format!("segment_seq {} not found", loc.segment_seq),
+                    })?;
             let seg_path = self.paths.shard_dir.join(&seg.relative_path);
             if let Some(ti) = self.segment_trailers_by_seq.get(&loc.segment_seq) {
                 let (block_idx, in_block_offset) = logical_offset_to_block(&ti.blocks, loc.offset)?;
@@ -6024,14 +5645,8 @@ impl ShardStorage {
                         let file = File::open(&seg_path).map_err(io_err)?;
                         cached_sealed_file = Some((loc.segment_seq, file));
                     }
-                    let file_ref = &cached_sealed_file
-                        .as_ref()
-                        .expect("cached sealed file just loaded")
-                        .1;
-                    let blocks = read_blocks_cpu(file_ref,
-                        &ti.blocks,
-                        &[block_idx_u32],
-                    )?;
+                    let file_ref = &cached_sealed_file.as_ref().expect("cached sealed file just loaded").1;
+                    let blocks = read_blocks_cpu(file_ref, &ti.blocks, &[block_idx_u32])?;
                     let Some(buf) = blocks.get(block_idx).and_then(|v| v.as_ref()) else {
                         return Err(StorageError::ManifestRecordInvalid {
                             msg: "block buffer missing".to_string(),
@@ -6040,10 +5655,7 @@ impl ShardStorage {
                     cached_sealed_block = Some((loc.segment_seq, block_idx_u32, buf.clone()));
                 }
                 let frame = extract_frame(
-                    &cached_sealed_block
-                        .as_ref()
-                        .expect("cached sealed block just loaded")
-                        .2,
+                    &cached_sealed_block.as_ref().expect("cached sealed block just loaded").2,
                     in_block_offset as usize,
                     "sealed",
                 )?;
@@ -6077,15 +5689,13 @@ impl ShardStorage {
     /// Read a committed sealed segment payload for replication shipping.
     ///
     /// Returns the exact on-disk bytes and the canonical segment hash recorded in MANIFEST.
-    pub fn read_segment_bytes_for_replication(
-        &self,
-        segment_seq: u64,
-    ) -> Result<(Vec<u8>, [u8; 32])> {
-        let seg = self.segments_by_seq.get(&segment_seq).ok_or_else(|| {
-            StorageError::ManifestRecordInvalid {
+    pub fn read_segment_bytes_for_replication(&self, segment_seq: u64) -> Result<(Vec<u8>, [u8; 32])> {
+        let seg = self
+            .segments_by_seq
+            .get(&segment_seq)
+            .ok_or_else(|| StorageError::ManifestRecordInvalid {
                 msg: format!("segment_seq {segment_seq} not found"),
-            }
-        })?;
+            })?;
         let seg_path = self.paths.shard_dir.join(&seg.relative_path);
         let bytes = std::fs::read(&seg_path).map_err(io_err)?;
         let (_hdr, _toc, _entries, footer) = decode_segment_v1(&bytes)?;
@@ -6093,8 +5703,7 @@ impl ShardStorage {
             return Err(StorageError::ManifestRecordInvalid {
                 msg: format!(
                     "segment hash mismatch for segment_seq {segment_seq}: manifest={:?} footer={:?}",
-                    seg.segment_hash,
-                    footer.segment_hash
+                    seg.segment_hash, footer.segment_hash
                 ),
             });
         }
@@ -6325,15 +5934,11 @@ fn parse_manifest_record(bytes: &[u8]) -> Result<Option<ManifestRecord>> {
         return Ok(None);
     }
     match record_type {
-        MANIFEST_RECORD_TYPE_ADD_SEGMENT_V1 => Ok(Some(ManifestRecord::AddSegment(
-            parse_add_segment_v1(bytes)?,
-        ))),
-        MANIFEST_RECORD_TYPE_ADD_DIR_RUN_V1 => Ok(Some(ManifestRecord::AddDirRun(
-            parse_add_dir_run_v1(bytes)?,
-        ))),
-        MANIFEST_RECORD_TYPE_REMOVE_DIR_RUN_V1 => Ok(Some(ManifestRecord::RemoveDirRun(
-            parse_remove_dir_run_v1(bytes)?,
-        ))),
+        MANIFEST_RECORD_TYPE_ADD_SEGMENT_V1 => Ok(Some(ManifestRecord::AddSegment(parse_add_segment_v1(bytes)?))),
+        MANIFEST_RECORD_TYPE_ADD_DIR_RUN_V1 => Ok(Some(ManifestRecord::AddDirRun(parse_add_dir_run_v1(bytes)?))),
+        MANIFEST_RECORD_TYPE_REMOVE_DIR_RUN_V1 => {
+            Ok(Some(ManifestRecord::RemoveDirRun(parse_remove_dir_run_v1(bytes)?)))
+        }
         MANIFEST_RECORD_TYPE_STREAM_META_UPDATE_V1 => Ok(Some(ManifestRecord::StreamMetaUpdate(
             parse_stream_meta_update_v1(bytes)?,
         ))),
@@ -6515,8 +6120,7 @@ fn write_at_file(file: &File, offset: u64, data: &[u8]) -> Result<()> {
         let n = {
             #[cfg(unix)]
             {
-                std::os::unix::fs::FileExt::write_at(file, &data[written..], offset + written as u64)
-                    .map_err(io_err)?
+                std::os::unix::fs::FileExt::write_at(file, &data[written..], offset + written as u64).map_err(io_err)?
             }
             #[cfg(windows)]
             {
@@ -6551,11 +6155,7 @@ fn write_new_file_host(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// CPU-only block reader: reads, decompresses and validates blocks from a segment file.
-fn read_blocks_cpu(
-    file: &File,
-    blocks: &[BlockMetaV1],
-    block_ids: &[u32],
-) -> Result<Vec<Option<Vec<u8>>>> {
+fn read_blocks_cpu(file: &File, blocks: &[BlockMetaV1], block_ids: &[u32]) -> Result<Vec<Option<Vec<u8>>>> {
     if blocks.is_empty() {
         return Ok(Vec::new());
     }
@@ -6567,11 +6167,9 @@ fn read_blocks_cpu(
     let mut reqs: Vec<&BlockMetaV1> = Vec::with_capacity(block_ids.len());
     for &id in block_ids {
         let idx = id as usize;
-        let b = blocks
-            .get(idx)
-            .ok_or_else(|| StorageError::ManifestRecordInvalid {
-                msg: format!("block_id {id} out of bounds"),
-            })?;
+        let b = blocks.get(idx).ok_or_else(|| StorageError::ManifestRecordInvalid {
+            msg: format!("block_id {id} out of bounds"),
+        })?;
         reqs.push(b);
     }
     reqs.sort_by_key(|b| b.file_offset);
@@ -6599,8 +6197,7 @@ fn read_blocks_cpu(
             let expected_next = cur.start.saturating_add(cur.len as u64);
             if b.file_offset == expected_next {
                 let rel_off = b.file_offset.checked_sub(cur.start).unwrap_or_default() as usize;
-                cur.parts
-                    .push((b.block_id, rel_off, disk_len, compressed_len));
+                cur.parts.push((b.block_id, rel_off, disk_len, compressed_len));
                 cur.len = cur.len.saturating_add(disk_len);
                 continue;
             }
@@ -6631,12 +6228,11 @@ fn read_selected_frames_codec_none_from_entries(
 
     let mut reqs: Vec<(usize, u64, usize)> = Vec::with_capacity(entries.len());
     for (entry_index, e) in entries.iter().enumerate() {
-        let block =
-            blocks
-                .get(e.block_id as usize)
-                .ok_or_else(|| StorageError::ManifestRecordInvalid {
-                    msg: format!("block_id {} out of bounds", e.block_id),
-                })?;
+        let block = blocks
+            .get(e.block_id as usize)
+            .ok_or_else(|| StorageError::ManifestRecordInvalid {
+                msg: format!("block_id {} out of bounds", e.block_id),
+            })?;
         if block.codec != corecrux_segment::RECORD_BLOCK_CODEC_NONE_V1 {
             return Err(StorageError::ManifestRecordInvalid {
                 msg: format!("codec {} requires block decode path", block.codec),
@@ -6649,22 +6245,23 @@ fn read_selected_frames_codec_none_from_entries(
         }
         let start_in_block = e.in_block_offset as usize;
         let frame_len = e.frame_len as usize;
-        let end_in_block =
-            start_in_block
-                .checked_add(frame_len)
-                .ok_or(StorageError::ManifestRecordInvalid {
-                    msg: "frame slice overflow".to_string(),
-                })?;
+        let end_in_block = start_in_block
+            .checked_add(frame_len)
+            .ok_or(StorageError::ManifestRecordInvalid {
+                msg: "frame slice overflow".to_string(),
+            })?;
         if end_in_block > block.uncompressed_len as usize {
             return Err(StorageError::ManifestRecordInvalid {
                 msg: "frame points outside codec=none block".to_string(),
             });
         }
-        let file_off = block.file_offset.checked_add(start_in_block as u64).ok_or(
-            StorageError::ManifestRecordInvalid {
-                msg: "frame file offset overflow".to_string(),
-            },
-        )?;
+        let file_off =
+            block
+                .file_offset
+                .checked_add(start_in_block as u64)
+                .ok_or(StorageError::ManifestRecordInvalid {
+                    msg: "frame file offset overflow".to_string(),
+                })?;
         reqs.push((entry_index, file_off, frame_len));
     }
 
@@ -6807,11 +6404,10 @@ fn decode_stored_event_from_frame_bytes(
 
     let canonical_len = decoded.header_bytes.len() - 32;
     let canonical_bytes = &decoded.header_bytes[..canonical_len];
-    let header = decode_canonical_header_bytes_v1(canonical_bytes).map_err(|e| {
-        StorageError::ManifestRecordInvalid {
+    let header =
+        decode_canonical_header_bytes_v1(canonical_bytes).map_err(|e| StorageError::ManifestRecordInvalid {
             msg: format!("failed to parse stored canonical header bytes: {e}"),
-        }
-    })?;
+        })?;
 
     Ok(StoredEvent {
         seq: header.seq,
@@ -6843,8 +6439,8 @@ fn select_stream_range_from_trailer_sorted(
     if start == end {
         return Vec::new();
     }
-    let rel = ti.toc_sorted_idx[start..end]
-        .partition_point(|&idx| ti.toc_by_offset[idx as usize].seq < from_seq_inclusive);
+    let rel =
+        ti.toc_sorted_idx[start..end].partition_point(|&idx| ti.toc_by_offset[idx as usize].seq < from_seq_inclusive);
     let mut pos = start + rel;
     let mut out = Vec::new();
     while pos < end && out.len() < limit {
@@ -6877,8 +6473,8 @@ fn select_stream_tail_from_trailer_sorted_from_seq_with_range(
     if start == end {
         return Vec::new();
     }
-    let rel = ti.toc_sorted_idx[start..end]
-        .partition_point(|&idx| ti.toc_by_offset[idx as usize].seq < min_seq_inclusive);
+    let rel =
+        ti.toc_sorted_idx[start..end].partition_point(|&idx| ti.toc_by_offset[idx as usize].seq < min_seq_inclusive);
     let start = start.saturating_add(rel);
     if start == end {
         return Vec::new();
@@ -7017,11 +6613,11 @@ fn block_logical_starts(blocks: &[BlockMetaV1]) -> Result<Vec<u64>> {
             });
         }
         out.push(cur);
-        cur = cur.checked_add(b.uncompressed_len as u64).ok_or(
-            StorageError::ManifestRecordInvalid {
+        cur = cur
+            .checked_add(b.uncompressed_len as u64)
+            .ok_or(StorageError::ManifestRecordInvalid {
                 msg: "block logical offset overflow".to_string(),
-            },
-        )?;
+            })?;
     }
     Ok(out)
 }
@@ -7053,7 +6649,6 @@ struct CoalescedReadPlan {
     parts: Vec<(u32, usize, usize, usize)>,
 }
 
-
 fn scan_frames_v1_block_bytes(block: &[u8]) -> Result<u32> {
     let mut pos: usize = 0;
     let mut frames: u32 = 0;
@@ -7065,11 +6660,11 @@ fn scan_frames_v1_block_bytes(block: &[u8]) -> Result<u32> {
         }
         let magic = u32::from_le_bytes(block[pos..pos + 4].try_into().unwrap());
         if magic == COMMIT_FRAME_MAGIC_CCMT {
-            let end = pos.checked_add(COMMIT_FRAME_LEN_V1).ok_or(
-                StorageError::ManifestRecordInvalid {
+            let end = pos
+                .checked_add(COMMIT_FRAME_LEN_V1)
+                .ok_or(StorageError::ManifestRecordInvalid {
                     msg: "commit frame length overflow in block".to_string(),
-                },
-            )?;
+                })?;
             if end > block.len() {
                 return Err(StorageError::ManifestRecordInvalid {
                     msg: "commit frame extends beyond end of block".to_string(),
@@ -7107,11 +6702,9 @@ fn scan_frames_v1_block_bytes(block: &[u8]) -> Result<u32> {
                 msg: "frame length overflow in block".to_string(),
             })?;
 
-        let end = pos
-            .checked_add(frame_len)
-            .ok_or(StorageError::ManifestRecordInvalid {
-                msg: "frame slice overflow in block".to_string(),
-            })?;
+        let end = pos.checked_add(frame_len).ok_or(StorageError::ManifestRecordInvalid {
+            msg: "frame slice overflow in block".to_string(),
+        })?;
         if end > block.len() {
             return Err(StorageError::ManifestRecordInvalid {
                 msg: "frame extends beyond end of block".to_string(),
@@ -7136,29 +6729,25 @@ fn decode_blocks_from_plan_parts(
 ) -> Result<()> {
     for (block_id, rel_off, disk_len, compressed_len) in parts {
         let idx = *block_id as usize;
-        let meta = blocks
-            .get(idx)
-            .ok_or_else(|| StorageError::ManifestRecordInvalid {
-                msg: "block meta missing".to_string(),
+        let meta = blocks.get(idx).ok_or_else(|| StorageError::ManifestRecordInvalid {
+            msg: "block meta missing".to_string(),
+        })?;
+        let disk_end = rel_off
+            .checked_add(*disk_len)
+            .ok_or(StorageError::ManifestRecordInvalid {
+                msg: "block slice overflow".to_string(),
             })?;
-        let disk_end =
-            rel_off
-                .checked_add(*disk_len)
-                .ok_or(StorageError::ManifestRecordInvalid {
-                    msg: "block slice overflow".to_string(),
-                })?;
         if disk_end > buf.len() {
             return Err(StorageError::ManifestRecordInvalid {
                 msg: "block slice out of bounds".to_string(),
             });
         }
 
-        let comp_end =
-            rel_off
-                .checked_add(*compressed_len)
-                .ok_or(StorageError::ManifestRecordInvalid {
-                    msg: "block compressed slice overflow".to_string(),
-                })?;
+        let comp_end = rel_off
+            .checked_add(*compressed_len)
+            .ok_or(StorageError::ManifestRecordInvalid {
+                msg: "block compressed slice overflow".to_string(),
+            })?;
         if comp_end > buf.len() {
             return Err(StorageError::ManifestRecordInvalid {
                 msg: "block compressed slice out of bounds".to_string(),
@@ -7177,11 +6766,10 @@ fn decode_blocks_from_plan_parts(
             }
             1 => {
                 let want = meta.uncompressed_len as usize;
-                let out = lz4_flex::block::decompress(compressed, want).map_err(|e| {
-                    StorageError::ManifestRecordInvalid {
+                let out =
+                    lz4_flex::block::decompress(compressed, want).map_err(|e| StorageError::ManifestRecordInvalid {
                         msg: format!("block lz4 decompress error: {e}"),
-                    }
-                })?;
+                    })?;
                 if out.len() != want {
                     return Err(StorageError::ManifestRecordInvalid {
                         msg: "block lz4 decompressed_len mismatch".to_string(),
@@ -7258,11 +6846,12 @@ fn read_selected_frames_codec_none_host(
         read_exact_file_at(file, plan.start, &mut buf)?;
         disk_bytes_read = disk_bytes_read.saturating_add(plan.len as u64);
         for part in &plan.parts {
-            let end = part.rel_off.checked_add(part.frame_len).ok_or(
-                StorageError::ManifestRecordInvalid {
+            let end = part
+                .rel_off
+                .checked_add(part.frame_len)
+                .ok_or(StorageError::ManifestRecordInvalid {
                     msg: "frame window slice overflow".to_string(),
-                },
-            )?;
+                })?;
             if end > buf.len() {
                 return Err(StorageError::ManifestRecordInvalid {
                     msg: "frame window slice out of bounds".to_string(),
@@ -7375,11 +6964,9 @@ fn hex16(bytes: &[u8; 16]) -> String {
 }
 
 fn read_u16(bytes: &[u8], cur: &mut usize) -> Result<u16> {
-    let end = cur
-        .checked_add(2)
-        .ok_or_else(|| StorageError::ManifestRecordInvalid {
-            msg: "cursor overflow".to_string(),
-        })?;
+    let end = cur.checked_add(2).ok_or_else(|| StorageError::ManifestRecordInvalid {
+        msg: "cursor overflow".to_string(),
+    })?;
     if end > bytes.len() {
         return Err(StorageError::ManifestRecordInvalid {
             msg: "buffer too small".to_string(),
@@ -7392,11 +6979,9 @@ fn read_u16(bytes: &[u8], cur: &mut usize) -> Result<u16> {
 }
 
 fn read_u32(bytes: &[u8], cur: &mut usize) -> Result<u32> {
-    let end = cur
-        .checked_add(4)
-        .ok_or_else(|| StorageError::ManifestRecordInvalid {
-            msg: "cursor overflow".to_string(),
-        })?;
+    let end = cur.checked_add(4).ok_or_else(|| StorageError::ManifestRecordInvalid {
+        msg: "cursor overflow".to_string(),
+    })?;
     if end > bytes.len() {
         return Err(StorageError::ManifestRecordInvalid {
             msg: "buffer too small".to_string(),
@@ -7409,11 +6994,9 @@ fn read_u32(bytes: &[u8], cur: &mut usize) -> Result<u32> {
 }
 
 fn read_u64(bytes: &[u8], cur: &mut usize) -> Result<u64> {
-    let end = cur
-        .checked_add(8)
-        .ok_or_else(|| StorageError::ManifestRecordInvalid {
-            msg: "cursor overflow".to_string(),
-        })?;
+    let end = cur.checked_add(8).ok_or_else(|| StorageError::ManifestRecordInvalid {
+        msg: "cursor overflow".to_string(),
+    })?;
     if end > bytes.len() {
         return Err(StorageError::ManifestRecordInvalid {
             msg: "buffer too small".to_string(),
@@ -7484,9 +7067,8 @@ fn build_ccxi_companion(
             continue;
         }
         let header_len = u16::from_le_bytes([frame_bytes[6], frame_bytes[7]]) as usize;
-        let payload_len = u32::from_le_bytes([
-            frame_bytes[8], frame_bytes[9], frame_bytes[10], frame_bytes[11],
-        ]) as usize;
+        let payload_len =
+            u32::from_le_bytes([frame_bytes[8], frame_bytes[9], frame_bytes[10], frame_bytes[11]]) as usize;
         let payload_start = 12 + header_len;
         let payload_end = payload_start + payload_len;
         if payload_end > frame_bytes.len() {
@@ -7645,9 +7227,24 @@ mod tests {
     #[test]
     fn encode_decode_dir_run_with_extents_roundtrip() {
         let extents = vec![
-            DirExtentV1 { stream_hash: 0x00, min_seq: 1, max_seq: 5, segment_seq: 1 },
-            DirExtentV1 { stream_hash: 0x01, min_seq: 1, max_seq: 3, segment_seq: 2 },
-            DirExtentV1 { stream_hash: 0xFF, min_seq: 10, max_seq: 20, segment_seq: 3 },
+            DirExtentV1 {
+                stream_hash: 0x00,
+                min_seq: 1,
+                max_seq: 5,
+                segment_seq: 1,
+            },
+            DirExtentV1 {
+                stream_hash: 0x01,
+                min_seq: 1,
+                max_seq: 3,
+                segment_seq: 2,
+            },
+            DirExtentV1 {
+                stream_hash: 0xFF,
+                min_seq: 10,
+                max_seq: 20,
+                segment_seq: 3,
+            },
         ];
         let bytes = encode_dir_run_v1(99999, &extents).unwrap();
         let decoded = decode_dir_run_v1(&bytes).unwrap();
@@ -7658,8 +7255,18 @@ mod tests {
     #[test]
     fn encode_dir_run_deduplicates_same_key_extents() {
         let extents = vec![
-            DirExtentV1 { stream_hash: 0x42, min_seq: 10, max_seq: 20, segment_seq: 1 },
-            DirExtentV1 { stream_hash: 0x42, min_seq: 5, max_seq: 25, segment_seq: 1 },
+            DirExtentV1 {
+                stream_hash: 0x42,
+                min_seq: 10,
+                max_seq: 20,
+                segment_seq: 1,
+            },
+            DirExtentV1 {
+                stream_hash: 0x42,
+                min_seq: 5,
+                max_seq: 25,
+                segment_seq: 1,
+            },
         ];
         let bytes = encode_dir_run_v1(0, &extents).unwrap();
         let decoded = decode_dir_run_v1(&bytes).unwrap();
@@ -7690,15 +7297,35 @@ mod tests {
 
     #[test]
     fn dir_extent_key_cmp_equal_elements() {
-        let a = DirExtentV1 { stream_hash: 1, min_seq: 0, max_seq: 0, segment_seq: 5 };
-        let b = DirExtentV1 { stream_hash: 1, min_seq: 99, max_seq: 99, segment_seq: 5 };
+        let a = DirExtentV1 {
+            stream_hash: 1,
+            min_seq: 0,
+            max_seq: 0,
+            segment_seq: 5,
+        };
+        let b = DirExtentV1 {
+            stream_hash: 1,
+            min_seq: 99,
+            max_seq: 99,
+            segment_seq: 5,
+        };
         assert_eq!(dir_extent_key_cmp(&a, &b), std::cmp::Ordering::Equal);
     }
 
     #[test]
     fn dir_extent_key_cmp_different_stream_hash() {
-        let a = DirExtentV1 { stream_hash: 1, min_seq: 0, max_seq: 0, segment_seq: 1 };
-        let b = DirExtentV1 { stream_hash: 2, min_seq: 0, max_seq: 0, segment_seq: 1 };
+        let a = DirExtentV1 {
+            stream_hash: 1,
+            min_seq: 0,
+            max_seq: 0,
+            segment_seq: 1,
+        };
+        let b = DirExtentV1 {
+            stream_hash: 2,
+            min_seq: 0,
+            max_seq: 0,
+            segment_seq: 1,
+        };
         assert_eq!(dir_extent_key_cmp(&a, &b), std::cmp::Ordering::Less);
         assert_eq!(dir_extent_key_cmp(&b, &a), std::cmp::Ordering::Greater);
     }
@@ -7710,8 +7337,14 @@ mod tests {
         assert!(!should_skip_startup_dirrun_bootstrap(false, 0));
         assert!(!should_skip_startup_dirrun_bootstrap(false, 999_999));
         assert!(!should_skip_startup_dirrun_bootstrap(true, 0));
-        assert!(!should_skip_startup_dirrun_bootstrap(true, STARTUP_DIRRUN_BOOTSTRAP_SEGMENT_LIMIT_V1));
-        assert!(should_skip_startup_dirrun_bootstrap(true, STARTUP_DIRRUN_BOOTSTRAP_SEGMENT_LIMIT_V1 + 1));
+        assert!(!should_skip_startup_dirrun_bootstrap(
+            true,
+            STARTUP_DIRRUN_BOOTSTRAP_SEGMENT_LIMIT_V1
+        ));
+        assert!(should_skip_startup_dirrun_bootstrap(
+            true,
+            STARTUP_DIRRUN_BOOTSTRAP_SEGMENT_LIMIT_V1 + 1
+        ));
     }
 
     // ── StorageError display strings ────────────────────────────────
@@ -7738,22 +7371,36 @@ mod tests {
         };
         assert!(err.to_string().contains("resource exhausted"));
 
-        let err = StorageError::Internal { msg: "oops".to_string() };
+        let err = StorageError::Internal {
+            msg: "oops".to_string(),
+        };
         assert!(err.to_string().contains("internal error"));
 
-        let err = StorageError::Io { msg: "disk fail".to_string() };
+        let err = StorageError::Io {
+            msg: "disk fail".to_string(),
+        };
         assert!(err.to_string().contains("io error"));
 
-        let err = StorageError::ManifestHeaderInvalid { msg: "corrupt".to_string() };
+        let err = StorageError::ManifestHeaderInvalid {
+            msg: "corrupt".to_string(),
+        };
         assert!(err.to_string().contains("manifest header invalid"));
 
-        let err = StorageError::ManifestCrcMismatch { expected: 0xAA, actual: 0xBB };
+        let err = StorageError::ManifestCrcMismatch {
+            expected: 0xAA,
+            actual: 0xBB,
+        };
         assert!(err.to_string().contains("manifest crc mismatch"));
 
-        let err = StorageError::ManifestRecordCrcMismatch { expected: 0xCC, actual: 0xDD };
+        let err = StorageError::ManifestRecordCrcMismatch {
+            expected: 0xCC,
+            actual: 0xDD,
+        };
         assert!(err.to_string().contains("manifest record crc mismatch"));
 
-        let err = StorageError::ManifestRecordInvalid { msg: "bad record".to_string() };
+        let err = StorageError::ManifestRecordInvalid {
+            msg: "bad record".to_string(),
+        };
         assert!(err.to_string().contains("manifest record invalid"));
     }
 
@@ -7792,9 +7439,18 @@ mod tests {
     #[test]
     fn parse_segment_seq_from_filename_various_valid() {
         // Format: seg-<20-digit-padded-seq>-<hash>.ccxseg
-        assert_eq!(parse_segment_seq_from_filename("seg-00000000000000000042-abcd.ccxseg"), Some(42));
-        assert_eq!(parse_segment_seq_from_filename("seg-00000000000000000001-efgh.ccxseg"), Some(1));
-        assert_eq!(parse_segment_seq_from_filename("seg-00000000000000999999-ijkl.ccxseg"), Some(999999));
+        assert_eq!(
+            parse_segment_seq_from_filename("seg-00000000000000000042-abcd.ccxseg"),
+            Some(42)
+        );
+        assert_eq!(
+            parse_segment_seq_from_filename("seg-00000000000000000001-efgh.ccxseg"),
+            Some(1)
+        );
+        assert_eq!(
+            parse_segment_seq_from_filename("seg-00000000000000999999-ijkl.ccxseg"),
+            Some(999999)
+        );
     }
 
     #[test]
@@ -7917,8 +7573,7 @@ mod tests {
     fn open_test_storage(options: ShardStorageOptions) -> (tempfile::TempDir, ShardStorage) {
         let dir = tempfile::tempdir().unwrap();
 
-        let storage =
-            ShardStorage::open(dir.path(), 1, 1, options).unwrap();
+        let storage = ShardStorage::open(dir.path(), 1, 1, options).unwrap();
 
         (dir, storage)
     }
@@ -7968,8 +7623,7 @@ mod tests {
         let header_hash = compute_header_hash(&canonical_bytes);
         let mut header_bytes = canonical_bytes.clone();
         header_bytes.extend_from_slice(&header_hash);
-        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id)
-            .expect("stream hash");
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).expect("stream hash");
 
         let frame = corecrux_segment::FrameInput {
             stream_hash,
@@ -7994,7 +7648,6 @@ mod tests {
         .expect("build segment")
     }
 
-
     #[test]
     fn apply_replicated_segment_roundtrip_and_idempotent() {
         let _g = TEST_LOCK.lock().unwrap();
@@ -8004,17 +7657,7 @@ mod tests {
         let stream_type = "artifact";
         let stream_id = "1";
         let payload = b"replicated-payload".to_vec();
-        let seg = build_test_replicated_segment(
-            1,
-            1,
-            77,
-            tenant_id,
-            stream_type,
-            stream_id,
-            1,
-            "evt-1",
-            &payload,
-        );
+        let seg = build_test_replicated_segment(1, 1, 77, tenant_id, stream_type, stream_id, 1, "evt-1", &payload);
 
         let applied = storage
             .apply_replicated_segment_v1(&seg.bytes)
@@ -8022,8 +7665,7 @@ mod tests {
         assert!(applied.applied);
         assert_eq!(applied.segment_seq, 77);
 
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
         let got = storage
             .read_stream(tenant_id, stream_type, stream_id, stream_hash, 0, 32)
             .expect("read stream");
@@ -8048,17 +7690,8 @@ mod tests {
         let stream_type = "artifact";
         let stream_id = "1";
 
-        let seg_ok = build_test_replicated_segment(
-            1,
-            1,
-            88,
-            tenant_id,
-            stream_type,
-            stream_id,
-            1,
-            "evt-1",
-            b"payload-a",
-        );
+        let seg_ok =
+            build_test_replicated_segment(1, 1, 88, tenant_id, stream_type, stream_id, 1, "evt-1", b"payload-a");
         storage
             .apply_replicated_segment_v1(&seg_ok.bytes)
             .expect("initial apply");
@@ -8109,9 +7742,7 @@ mod tests {
             epoch: 1,
             segment_seq: 1,
             segment_id: SegmentId([1u8; 16]),
-            relative_path:
-                "segments/seg-00000000000000000001-00000000000000000000000000000000.ccxseg"
-                    .to_string(),
+            relative_path: "segments/seg-00000000000000000001-00000000000000000000000000000000.ccxseg".to_string(),
             file_len: 999,
             created_at_unix_ns: 1,
             sealed_at_unix_ns: 2,
@@ -8189,8 +7820,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         for i in 0..10u32 {
             let eid = format!("e{i}");
@@ -8217,11 +7847,7 @@ mod tests {
             storage.compact_directory_until_within_limits().unwrap();
         }
 
-        let l0 = storage
-            .dir_runs
-            .values()
-            .filter(|r| r.key.level == 0)
-            .count();
+        let l0 = storage.dir_runs.values().filter(|r| r.key.level == 0).count();
         assert!(l0 <= 2, "expected l0<=2, got {l0}");
 
         let got = storage
@@ -8293,8 +7919,7 @@ mod tests {
         };
         while start.elapsed() < std::time::Duration::from_secs(secs) && i < max_events {
             let stream_id = format!("stream-{}", i % streams);
-            let stream_hash =
-                corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, &stream_id).unwrap();
+            let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, &stream_id).unwrap();
 
             let eid = format!("e{i}");
             let mut payload = vec![0u8; 32];
@@ -8344,17 +7969,12 @@ mod tests {
             }
         }
 
-        let l0 = storage
-            .dir_runs
-            .values()
-            .filter(|r| r.key.level == 0)
-            .count();
+        let l0 = storage.dir_runs.values().filter(|r| r.key.level == 0).count();
         assert!(l0 <= l0_max, "expected l0<={l0_max}, got {l0}");
 
         // Quick correctness smoke: at least one stream has readable tail bytes.
         let stream_id = "stream-0";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
         let got = storage
             .read_tail(tenant_id, stream_type, stream_id, stream_hash, 16)
             .unwrap();
@@ -8415,8 +8035,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         // 6 segments, 1 event each (seq 1..=6).
         for i in 0..6u32 {
@@ -8463,8 +8082,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         storage.update_stream_meta(stream_hash, 0, 5).unwrap();
 
@@ -8504,8 +8122,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         storage.update_stream_meta(stream_hash, 10, 20).unwrap();
 
@@ -8531,8 +8148,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         let payload = b"hello";
         let events = [
@@ -8587,8 +8203,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         let events = [AppendEventInput {
             event_id: "e1",
@@ -8619,12 +8234,7 @@ mod tests {
         assert!(stats.total_nanos >= stats.fence_wait_nanos);
         assert!(stats.total_nanos >= stats.fence_fsync_nanos);
         assert!(stats.total_nanos >= stats.fence_nanos);
-        assert!(
-            stats.fence_nanos
-                >= stats
-                    .fence_wait_nanos
-                    .saturating_add(stats.fence_fsync_nanos)
-        );
+        assert!(stats.fence_nanos >= stats.fence_wait_nanos.saturating_add(stats.fence_fsync_nanos));
         assert!(stats.io_write_nanos.saturating_add(stats.fence_nanos) > 0);
     }
 
@@ -8637,8 +8247,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         let events = [
             AppendEventInput {
@@ -8679,10 +8288,7 @@ mod tests {
             hasher.update(blake3::hash(&frame).as_bytes());
         }
 
-        assert_eq!(
-            confirmation.commit_seq,
-            outcomes.last().expect("outcome").seq
-        );
+        assert_eq!(confirmation.commit_seq, outcomes.last().expect("outcome").seq);
         assert_eq!(
             confirmation.segment_id,
             outcomes
@@ -8701,8 +8307,7 @@ mod tests {
         let tenant_id = "tenant-a";
         let stream_type = "answers";
         let stream_id = "stream-a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
         let occurred_at = "2026-03-07T00:00:00Z";
         let events = [
             AppendEventInput {
@@ -8721,19 +8326,10 @@ mod tests {
             },
         ];
         storage
-            .append_batch(
-                stream_hash,
-                0,
-                tenant_id,
-                stream_type,
-                stream_id,
-                occurred_at,
-                &events,
-            )
+            .append_batch(stream_hash, 0, tenant_id, stream_type, stream_id, occurred_at, &events)
             .expect("append batch");
 
-        let catalog =
-            load_manifest_segment_catalog(&storage.paths.shard_dir).expect("manifest catalog");
+        let catalog = load_manifest_segment_catalog(&storage.paths.shard_dir).expect("manifest catalog");
         assert_eq!(catalog.shard_id, 1);
         assert_eq!(catalog.epoch, 1);
         assert!(!catalog.segments.is_empty());
@@ -8753,8 +8349,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         let ev = AppendEventInput {
             event_id: "e1",
@@ -8811,8 +8406,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         // Find two different eventIds that collide on the first hash byte.
         let (a, b) = {
@@ -8902,8 +8496,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         let ev_a = AppendEventInput {
             event_id: "a",
@@ -8977,8 +8570,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         let oversize = AppendEventInput {
             event_id: "abcd",
@@ -9038,8 +8630,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         let events = [
             AppendEventInput {
@@ -9090,8 +8681,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         std::env::set_var("CORECRUX_STORAGE_FAILPOINT", "after_manifest_commit");
         let err = storage
@@ -9115,8 +8705,7 @@ mod tests {
         std::env::remove_var("CORECRUX_STORAGE_FAILPOINT");
         drop(storage);
 
-        let mut reopened =
-            ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
+        let mut reopened = ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
 
         let retry = reopened
             .append_batch(
@@ -9154,8 +8743,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         std::env::set_var("CORECRUX_STORAGE_FAILPOINT", "after_manifest_commit");
         let err = storage
@@ -9179,8 +8767,7 @@ mod tests {
         std::env::remove_var("CORECRUX_STORAGE_FAILPOINT");
         drop(storage);
 
-        let mut reopened =
-            ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
+        let mut reopened = ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
 
         let (before_frames, before_end) = reopened.replay_from(None, 0).unwrap();
         assert_eq!(before_end, None);
@@ -9224,8 +8811,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         std::env::set_var("CORECRUX_STORAGE_FAILPOINT", "after_rename_before_manifest");
         let err = storage
@@ -9249,8 +8835,7 @@ mod tests {
         std::env::remove_var("CORECRUX_STORAGE_FAILPOINT");
         drop(storage);
 
-        let mut reopened =
-            ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
+        let mut reopened = ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
 
         assert_eq!(reopened.segments_in_order.len(), 0);
         let out = reopened
@@ -9309,8 +8894,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         let out = storage
             .append_batch(
@@ -9332,12 +8916,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].status, AppendStatus::Appended);
 
-        let rel = storage
-            .head
-            .as_ref()
-            .expect("head exists")
-            .relative_path
-            .clone();
+        let rel = storage.head.as_ref().expect("head exists").relative_path.clone();
         let head_path = storage.paths.shard_dir.join(rel);
         let committed_len = std::fs::metadata(&head_path).unwrap().len();
         {
@@ -9349,8 +8928,7 @@ mod tests {
         assert!(len_with_garbage > committed_len);
         drop(storage);
 
-        let reopened =
-            ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
+        let reopened = ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
 
         let len_recovered = std::fs::metadata(&head_path).unwrap().len();
         assert_eq!(len_recovered, committed_len);
@@ -9375,13 +8953,9 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
-        std::env::set_var(
-            "CORECRUX_STORAGE_FAILPOINT",
-            "after_head_commit_fence_before_ack",
-        );
+        std::env::set_var("CORECRUX_STORAGE_FAILPOINT", "after_head_commit_fence_before_ack");
         let err = storage
             .append_batch(
                 stream_hash,
@@ -9403,8 +8977,7 @@ mod tests {
         std::env::remove_var("CORECRUX_STORAGE_FAILPOINT");
         drop(storage);
 
-        let mut reopened =
-            ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
+        let mut reopened = ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
 
         let retry = reopened
             .append_batch(
@@ -9438,8 +9011,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         for i in 1..=5 {
             let event_id = format!("e{i}");
@@ -9485,8 +9057,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         for i in 1..=5 {
             let event_id = format!("e{i}");
@@ -9528,8 +9099,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         for i in 1..=3 {
             let event_id = format!("e{i}");
@@ -9586,8 +9156,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         let mut locs: Vec<FrameLocation> = Vec::new();
         for i in 1..=5 {
@@ -9645,9 +9214,7 @@ mod tests {
         assert_eq!(frames.len(), 5);
 
         // read_frame_bytes must work against head locations.
-        let frame = storage
-            .read_frame_bytes(locs[0].segment_seq, locs[0].offset)
-            .unwrap();
+        let frame = storage.read_frame_bytes(locs[0].segment_seq, locs[0].offset).unwrap();
         let _ = decode_frame_v1(&frame).unwrap();
     }
 
@@ -9664,8 +9231,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         let _ = storage
             .append_batch(
@@ -9688,13 +9254,7 @@ mod tests {
 
         // Reopen with head disabled; startup should seal any head file.
 
-        let reopened = ShardStorage::open(
-            dir.path(),
-            1,
-            1,
-            ShardStorageOptions::default(),
-        )
-        .unwrap();
+        let reopened = ShardStorage::open(dir.path(), 1, 1, ShardStorageOptions::default()).unwrap();
 
         assert_eq!(reopened.segments_in_order.len(), 1);
         assert!(reopened.head.is_none());
@@ -9738,13 +9298,7 @@ mod tests {
             bloom: [0u8; corecrux_segment::BLOOM_BYTES_PER_BLOCK_V1],
         };
 
-
-        let blocks = read_blocks_cpu(
-            &f,
-            std::slice::from_ref(&meta),
-            &[0],
-        )
-        .unwrap();
+        let blocks = read_blocks_cpu(&f, std::slice::from_ref(&meta), &[0]).unwrap();
         let got = blocks[0].as_ref().unwrap();
         assert_eq!(got, uncompressed);
     }
@@ -9762,8 +9316,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         for i in 1..=5 {
             let event_id = format!("e{i}");
@@ -9862,8 +9415,7 @@ mod tests {
         let expected_path = fixture_dir.join("expected_replay_digest.json");
 
         let seg_bytes = std::fs::read(&fixture_seg).expect("read fixture segment");
-        let (_h, _toc_h, _entries, footer) =
-            corecrux_segment::decode_segment_v1(&seg_bytes).expect("decode segment");
+        let (_h, _toc_h, _entries, footer) = corecrux_segment::decode_segment_v1(&seg_bytes).expect("decode segment");
 
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
@@ -9914,13 +9466,7 @@ mod tests {
 
         // Now open storage and replay on the same path (GPU-first in CUDA builds).
 
-        let storage = ShardStorage::open(
-            root,
-            shard_id,
-            epoch,
-            ShardStorageOptions::default(),
-        )
-        .expect("open storage");
+        let storage = ShardStorage::open(root, shard_id, epoch, ShardStorageOptions::default()).expect("open storage");
 
         let (frames, end) = storage.replay_from(None, 0).expect("replay fixture");
         assert_eq!(end, None);
@@ -9942,8 +9488,7 @@ mod tests {
             }
             Err(e) => panic!("read expected digest: {e}"),
         };
-        let expected: ExpectedReplayDigest =
-            serde_json::from_str(&expected_str).expect("parse expected digest");
+        let expected: ExpectedReplayDigest = serde_json::from_str(&expected_str).expect("parse expected digest");
 
         assert_eq!(total_frames, expected.total_frames);
         assert_eq!(digest_blake3, expected.digest_blake3);
@@ -9958,8 +9503,7 @@ mod tests {
         let expected_path = fixture_dir.join("expected_replay_digest.json");
 
         let seg_bytes = std::fs::read(&fixture_seg).expect("read fixture segment");
-        let (_h, _toc_h, _entries, footer) =
-            corecrux_segment::decode_segment_v1(&seg_bytes).expect("decode segment");
+        let (_h, _toc_h, _entries, footer) = corecrux_segment::decode_segment_v1(&seg_bytes).expect("decode segment");
 
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
@@ -10008,21 +9552,14 @@ mod tests {
         mf.write_all(&framed).expect("write manifest record");
         mf.sync_all().expect("sync manifest");
 
-        let storage = ShardStorage::open(
-            root,
-            shard_id,
-            epoch,
-            ShardStorageOptions::default(),
-        )
-        .expect("open storage");
+        let storage = ShardStorage::open(root, shard_id, epoch, ShardStorageOptions::default()).expect("open storage");
 
         let stats = storage
             .integrity_scan_stats_all(8 * 1024 * 1024)
             .expect("integrity scan");
 
         let expected_str = std::fs::read_to_string(&expected_path).expect("read expected digest");
-        let expected: ExpectedReplayDigest =
-            serde_json::from_str(&expected_str).expect("parse expected digest");
+        let expected: ExpectedReplayDigest = serde_json::from_str(&expected_str).expect("parse expected digest");
 
         assert_eq!(stats.total_frames, expected.total_frames);
     }
@@ -10046,8 +9583,7 @@ mod tests {
         let content_type = "application/octet-stream";
 
         let streams = ["a", "b", "c"];
-        let mut stream_hashes: std::collections::HashMap<&str, u64> =
-            std::collections::HashMap::new();
+        let mut stream_hashes: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
         for s in &streams {
             let h = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, s).unwrap();
             stream_hashes.insert(s, h);
@@ -10068,8 +9604,7 @@ mod tests {
             events: &[(&str, u64, &str, &'static [u8])], // (stream_id, seq, event_id, payload)
         ) -> corecrux_segment::SegmentBuildOutput {
             use corecrux_frame::{
-                canonical_header_bytes_v1, compute_header_hash, compute_payload_hash,
-                CanonicalHeaderV1,
+                canonical_header_bytes_v1, compute_header_hash, compute_payload_hash, CanonicalHeaderV1,
             };
 
             let segment_id = deterministic_segment_id(epoch, segment_seq);
@@ -10086,9 +9621,7 @@ mod tests {
             let mut header_bufs: Vec<Vec<u8>> = Vec::with_capacity(n);
 
             for (stream_id, seq, event_id, payload) in events {
-                let stream_hash =
-                    corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id)
-                        .unwrap();
+                let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
                 stream_hashes.push(stream_hash);
                 seqs.push(*seq);
                 event_ids.push((*event_id).to_string());
@@ -10187,10 +9720,7 @@ mod tests {
             ],
         );
 
-        let seg_metas = [
-            (1u64, seg1.footer, seg1.bytes),
-            (2u64, seg2.footer, seg2.bytes),
-        ];
+        let seg_metas = [(1u64, seg1.footer, seg1.bytes), (2u64, seg2.footer, seg2.bytes)];
 
         let mut manifest = OpenOptions::new()
             .create(true)
@@ -10205,10 +9735,7 @@ mod tests {
         let mut metas: Vec<SegmentMeta> = Vec::new();
         for (segment_seq, footer, bytes) in seg_metas {
             let segment_id = footer.segment_id;
-            let rel = format!(
-                "segments/seg-{segment_seq:020}-{}.ccxseg",
-                hex16(&segment_id.0)
-            );
+            let rel = format!("segments/seg-{segment_seq:020}-{}.ccxseg", hex16(&segment_id.0));
             let path = paths.shard_dir.join(&rel);
             std::fs::write(&path, &bytes).unwrap();
 
@@ -10239,21 +9766,14 @@ mod tests {
         manifest.sync_all().unwrap();
 
         // Open storage (GPU-first in CUDA builds).
-        let storage = ShardStorage::open(
-            root,
-            shard_id,
-            epoch,
-            ShardStorageOptions::default(),
-        )
-        .unwrap();
+        let storage = ShardStorage::open(root, shard_id, epoch, ShardStorageOptions::default()).unwrap();
 
         // CPU reference scan of the on-disk bytes (ignores directory + TOC sorted index).
         let mut scanned: Vec<(u64, StoredEvent)> = Vec::new();
         for seg in &metas {
             let seg_path = paths.shard_dir.join(&seg.relative_path);
             let bytes = std::fs::read(&seg_path).unwrap();
-            let (_h, toc_h, _entries, footer) =
-                corecrux_segment::decode_segment_v1(&bytes).unwrap();
+            let (_h, toc_h, _entries, footer) = corecrux_segment::decode_segment_v1(&bytes).unwrap();
             let toc_off = footer.toc_offset as usize;
             let toc_len = footer.toc_len as usize;
             let toc_area = &bytes[toc_off..toc_off + toc_len];
@@ -10336,15 +9856,8 @@ mod tests {
                 assert_eq!(a.payload, b.payload);
             }
 
-            let got = storage
-                .read_stream(tenant_id, stream_type, s, sh, 2, 10)
-                .unwrap();
-            let want_range: Vec<StoredEvent> = truth
-                .iter()
-                .filter(|e| e.seq >= 2)
-                .take(10)
-                .cloned()
-                .collect();
+            let got = storage.read_stream(tenant_id, stream_type, s, sh, 2, 10).unwrap();
+            let want_range: Vec<StoredEvent> = truth.iter().filter(|e| e.seq >= 2).take(10).cloned().collect();
             assert_eq!(got.len(), want_range.len());
             for (a, b) in got.iter().zip(want_range.iter()) {
                 assert_eq!(a.seq, b.seq);
@@ -10446,8 +9959,7 @@ mod tests {
                 };
 
                 let frames_in_seg = 20 + rng.gen_range_u32(180); // 20..=199
-                let mut events: Vec<(u64, u64, String, Vec<u8>)> =
-                    Vec::with_capacity(frames_in_seg as usize);
+                let mut events: Vec<(u64, u64, String, Vec<u8>)> = Vec::with_capacity(frames_in_seg as usize);
                 for _ in 0..frames_in_seg {
                     let sidx = rng.gen_range_u32(num_streams) as usize;
                     let seq = next_seq[sidx];
@@ -10474,8 +9986,7 @@ mod tests {
                     seqs.push(seq);
                     event_ids.push(event_id);
                     payload_bufs.push(payload);
-                    let payload_hash =
-                        compute_payload_hash(payload_bufs.last().unwrap().as_slice());
+                    let payload_hash = compute_payload_hash(payload_bufs.last().unwrap().as_slice());
 
                     // stream_id is not used for hashing at this point; it is payload for header.
                     // Use a deterministic placeholder derived from stream_hash.
@@ -10530,10 +10041,7 @@ mod tests {
                 )
                 .unwrap();
 
-                let rel = format!(
-                    "segments/seg-{segment_seq:020}-{}.ccxseg",
-                    hex16(&segment_id.0)
-                );
+                let rel = format!("segments/seg-{segment_seq:020}-{}.ccxseg", hex16(&segment_id.0));
                 let path = paths.shard_dir.join(&rel);
                 std::fs::write(&path, &seg.bytes).unwrap();
 
@@ -10564,13 +10072,7 @@ mod tests {
             manifest.sync_all().unwrap();
 
             // Open storage (GPU-first in CUDA builds).
-            let storage = ShardStorage::open(
-                root,
-                shard_id,
-                epoch,
-                ShardStorageOptions::default(),
-            )
-            .unwrap();
+            let storage = ShardStorage::open(root, shard_id, epoch, ShardStorageOptions::default()).unwrap();
 
             // CPU truth scan.
             let mut truth_by_stream: std::collections::HashMap<u64, Vec<StoredEvent>> =
@@ -10578,8 +10080,7 @@ mod tests {
             for seg in &metas {
                 let seg_path = paths.shard_dir.join(&seg.relative_path);
                 let bytes = std::fs::read(&seg_path).unwrap();
-                let (_h, toc_h, _entries, footer) =
-                    corecrux_segment::decode_segment_v1(&bytes).unwrap();
+                let (_h, toc_h, _entries, footer) = corecrux_segment::decode_segment_v1(&bytes).unwrap();
                 let toc_off = footer.toc_offset as usize;
                 let toc_len = footer.toc_len as usize;
                 let toc_area = &bytes[toc_off..toc_off + toc_len];
@@ -10643,9 +10144,7 @@ mod tests {
 
                 // Tail.
                 let tail_limit = rng.gen_range_u32(25);
-                let got_tail = storage
-                    .read_tail(tenant_id, stream_type, sid, sh, tail_limit)
-                    .unwrap();
+                let got_tail = storage.read_tail(tenant_id, stream_type, sid, sh, tail_limit).unwrap();
                 let want_tail: Vec<StoredEvent> = truth
                     .iter()
                     .rev()
@@ -10669,17 +10168,8 @@ mod tests {
                 let got = storage
                     .read_stream(tenant_id, stream_type, sid, sh, from_seq, limit)
                     .unwrap();
-                let take = if limit == 0 {
-                    usize::MAX
-                } else {
-                    limit as usize
-                };
-                let want: Vec<StoredEvent> = truth
-                    .iter()
-                    .filter(|e| e.seq >= from_seq)
-                    .take(take)
-                    .cloned()
-                    .collect();
+                let take = if limit == 0 { usize::MAX } else { limit as usize };
+                let want: Vec<StoredEvent> = truth.iter().filter(|e| e.seq >= from_seq).take(take).cloned().collect();
                 assert_eq!(got.len(), want.len());
                 for (a, b) in got.iter().zip(want.iter()) {
                     assert_eq!(a.seq, b.seq);
@@ -10701,12 +10191,7 @@ mod tests {
 
         // Attempt to open the same shard while the first handle is live.
 
-        let result = ShardStorage::open(
-            dir.path(),
-            1,
-            1,
-            ShardStorageOptions::default(),
-        );
+        let result = ShardStorage::open(dir.path(), 1, 1, ShardStorageOptions::default());
 
         let err = match result {
             Ok(_) => panic!("second open should fail while first holds flock"),
@@ -10755,11 +10240,26 @@ mod tests {
 
     #[test]
     fn dir_extent_key_cmp_orders_by_stream_hash_then_segment_seq() {
-        let a = DirExtentV1 { stream_hash: 1, min_seq: 0, max_seq: 0, segment_seq: 10 };
-        let b = DirExtentV1 { stream_hash: 2, min_seq: 0, max_seq: 0, segment_seq: 5 };
+        let a = DirExtentV1 {
+            stream_hash: 1,
+            min_seq: 0,
+            max_seq: 0,
+            segment_seq: 10,
+        };
+        let b = DirExtentV1 {
+            stream_hash: 2,
+            min_seq: 0,
+            max_seq: 0,
+            segment_seq: 5,
+        };
         assert!(dir_extent_key_cmp(&a, &b).is_lt());
 
-        let c = DirExtentV1 { stream_hash: 1, min_seq: 0, max_seq: 0, segment_seq: 20 };
+        let c = DirExtentV1 {
+            stream_hash: 1,
+            min_seq: 0,
+            max_seq: 0,
+            segment_seq: 20,
+        };
         assert!(dir_extent_key_cmp(&a, &c).is_lt());
 
         assert!(dir_extent_key_cmp(&a, &a).is_eq());
@@ -10785,7 +10285,12 @@ mod tests {
 
     #[test]
     fn merge_dir_extents_one_empty() {
-        let a = vec![DirExtentV1 { stream_hash: 1, min_seq: 5, max_seq: 10, segment_seq: 1 }];
+        let a = vec![DirExtentV1 {
+            stream_hash: 1,
+            min_seq: 5,
+            max_seq: 10,
+            segment_seq: 1,
+        }];
         let result = merge_dir_extents_partition_sorted_unique_cpu(&a, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].stream_hash, 1);
@@ -10797,8 +10302,18 @@ mod tests {
 
     #[test]
     fn merge_dir_extents_deduplicates_same_key() {
-        let a = vec![DirExtentV1 { stream_hash: 1, min_seq: 5, max_seq: 10, segment_seq: 1 }];
-        let b = vec![DirExtentV1 { stream_hash: 1, min_seq: 3, max_seq: 12, segment_seq: 1 }];
+        let a = vec![DirExtentV1 {
+            stream_hash: 1,
+            min_seq: 5,
+            max_seq: 10,
+            segment_seq: 1,
+        }];
+        let b = vec![DirExtentV1 {
+            stream_hash: 1,
+            min_seq: 3,
+            max_seq: 12,
+            segment_seq: 1,
+        }];
         let result = merge_dir_extents_partition_sorted_unique_cpu(&a, &b);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].min_seq, 3);
@@ -10808,12 +10323,32 @@ mod tests {
     #[test]
     fn merge_dir_extents_interleaved() {
         let a = vec![
-            DirExtentV1 { stream_hash: 1, min_seq: 1, max_seq: 5, segment_seq: 1 },
-            DirExtentV1 { stream_hash: 3, min_seq: 1, max_seq: 3, segment_seq: 1 },
+            DirExtentV1 {
+                stream_hash: 1,
+                min_seq: 1,
+                max_seq: 5,
+                segment_seq: 1,
+            },
+            DirExtentV1 {
+                stream_hash: 3,
+                min_seq: 1,
+                max_seq: 3,
+                segment_seq: 1,
+            },
         ];
         let b = vec![
-            DirExtentV1 { stream_hash: 2, min_seq: 1, max_seq: 2, segment_seq: 1 },
-            DirExtentV1 { stream_hash: 4, min_seq: 1, max_seq: 4, segment_seq: 1 },
+            DirExtentV1 {
+                stream_hash: 2,
+                min_seq: 1,
+                max_seq: 2,
+                segment_seq: 1,
+            },
+            DirExtentV1 {
+                stream_hash: 4,
+                min_seq: 1,
+                max_seq: 4,
+                segment_seq: 1,
+            },
         ];
         let result = merge_dir_extents_partition_sorted_unique_cpu(&a, &b);
         assert_eq!(result.len(), 4);
@@ -10843,7 +10378,7 @@ mod tests {
     fn decode_commit_frame_v1_bad_version() {
         let mut frame = encode_commit_frame_v1(1, 2, 3, 4);
         frame[4] = 99; // corrupt version
-        // Recalculate CRC so it passes the CRC check
+                       // Recalculate CRC so it passes the CRC check
         let crc = crc32c::crc32c(&frame[..COMMIT_FRAME_LEN_V1 - 4]);
         frame[COMMIT_FRAME_LEN_V1 - 4..].copy_from_slice(&crc.to_le_bytes());
         let err = decode_commit_frame_v1(&frame).unwrap_err();
@@ -10902,7 +10437,7 @@ mod tests {
         hdr[MANIFEST_HEADER_LEN - 4..].copy_from_slice(&0xDEADu32.to_le_bytes());
         let err = validate_manifest_header(&hdr).unwrap_err();
         match err {
-            StorageError::ManifestCrcMismatch { .. } => {},
+            StorageError::ManifestCrcMismatch { .. } => {}
             other => panic!("expected ManifestCrcMismatch, got {other:?}"),
         }
     }
@@ -11052,7 +10587,12 @@ mod tests {
         };
         let entry = IdemEntry {
             seq: 1,
-            loc: FrameLocation { shard_id: 0, epoch: 0, segment_seq: 0, offset: 0 },
+            loc: FrameLocation {
+                shard_id: 0,
+                epoch: 0,
+                segment_seq: 0,
+                offset: 0,
+            },
         };
         cache.insert(key, entry);
         assert!(cache.is_incomplete());
@@ -11062,10 +10602,24 @@ mod tests {
     #[test]
     fn idem_hot_cache_eviction() {
         let mut cache = IdemHotCache::new(2);
-        let key1 = IdemKey { stream_hash: 1, event_id_hash16: [1u8; 16] };
-        let key2 = IdemKey { stream_hash: 2, event_id_hash16: [2u8; 16] };
-        let key3 = IdemKey { stream_hash: 3, event_id_hash16: [3u8; 16] };
-        let loc = FrameLocation { shard_id: 0, epoch: 0, segment_seq: 0, offset: 0 };
+        let key1 = IdemKey {
+            stream_hash: 1,
+            event_id_hash16: [1u8; 16],
+        };
+        let key2 = IdemKey {
+            stream_hash: 2,
+            event_id_hash16: [2u8; 16],
+        };
+        let key3 = IdemKey {
+            stream_hash: 3,
+            event_id_hash16: [3u8; 16],
+        };
+        let loc = FrameLocation {
+            shard_id: 0,
+            epoch: 0,
+            segment_seq: 0,
+            offset: 0,
+        };
 
         cache.insert(key1, IdemEntry { seq: 1, loc });
         cache.insert(key2, IdemEntry { seq: 2, loc });
@@ -11215,16 +10769,24 @@ mod tests {
 
     #[test]
     fn storage_error_display_includes_codes() {
-        let e = StorageError::InvalidArgument { code: "X".into(), msg: "Y".into() };
+        let e = StorageError::InvalidArgument {
+            code: "X".into(),
+            msg: "Y".into(),
+        };
         assert!(e.to_string().contains("X"));
         assert!(e.to_string().contains("Y"));
 
         let e2 = StorageError::ResourceExhausted {
-            code: "BP".into(), msg: "full".into(), retry_after_ms: Some(500),
+            code: "BP".into(),
+            msg: "full".into(),
+            retry_after_ms: Some(500),
         };
         assert!(e2.to_string().contains("BP"));
 
-        let e3 = StorageError::ManifestCrcMismatch { expected: 0xAA, actual: 0xBB };
+        let e3 = StorageError::ManifestCrcMismatch {
+            expected: 0xAA,
+            actual: 0xBB,
+        };
         assert!(e3.to_string().contains("0xaa"));
         assert!(e3.to_string().contains("0xbb"));
     }
@@ -11235,19 +10797,40 @@ mod tests {
     fn build_head_stream_tail_index_groups_by_stream() {
         let frames = vec![
             HeadFrameMeta {
-                stream_hash: 1, seq: 1, record_off: 0, frame_len: 10,
-                payload_len: 5, event_id_hash16: [0u8; 16], header_digest8: [0u8; 8],
-                payload_digest8: [0u8; 8], block_id: 0, in_block_offset: 0,
+                stream_hash: 1,
+                seq: 1,
+                record_off: 0,
+                frame_len: 10,
+                payload_len: 5,
+                event_id_hash16: [0u8; 16],
+                header_digest8: [0u8; 8],
+                payload_digest8: [0u8; 8],
+                block_id: 0,
+                in_block_offset: 0,
             },
             HeadFrameMeta {
-                stream_hash: 2, seq: 1, record_off: 10, frame_len: 10,
-                payload_len: 5, event_id_hash16: [0u8; 16], header_digest8: [0u8; 8],
-                payload_digest8: [0u8; 8], block_id: 0, in_block_offset: 10,
+                stream_hash: 2,
+                seq: 1,
+                record_off: 10,
+                frame_len: 10,
+                payload_len: 5,
+                event_id_hash16: [0u8; 16],
+                header_digest8: [0u8; 8],
+                payload_digest8: [0u8; 8],
+                block_id: 0,
+                in_block_offset: 10,
             },
             HeadFrameMeta {
-                stream_hash: 1, seq: 2, record_off: 20, frame_len: 10,
-                payload_len: 5, event_id_hash16: [0u8; 16], header_digest8: [0u8; 8],
-                payload_digest8: [0u8; 8], block_id: 0, in_block_offset: 20,
+                stream_hash: 1,
+                seq: 2,
+                record_off: 20,
+                frame_len: 10,
+                payload_len: 5,
+                event_id_hash16: [0u8; 16],
+                header_digest8: [0u8; 8],
+                payload_digest8: [0u8; 8],
+                block_id: 0,
+                in_block_offset: 20,
             },
         ];
         let idx = build_head_stream_tail_index(&frames);
@@ -11274,9 +10857,15 @@ mod tests {
         assert!(!should_skip_startup_dirrun_bootstrap(false, usize::MAX));
 
         // At the limit: not skipped
-        assert!(!should_skip_startup_dirrun_bootstrap(true, STARTUP_DIRRUN_BOOTSTRAP_SEGMENT_LIMIT_V1));
+        assert!(!should_skip_startup_dirrun_bootstrap(
+            true,
+            STARTUP_DIRRUN_BOOTSTRAP_SEGMENT_LIMIT_V1
+        ));
         // One over: skipped
-        assert!(should_skip_startup_dirrun_bootstrap(true, STARTUP_DIRRUN_BOOTSTRAP_SEGMENT_LIMIT_V1 + 1));
+        assert!(should_skip_startup_dirrun_bootstrap(
+            true,
+            STARTUP_DIRRUN_BOOTSTRAP_SEGMENT_LIMIT_V1 + 1
+        ));
     }
 
     // ── Manifest with CRC mismatch ───────────────────────────────────
@@ -11328,8 +10917,7 @@ mod tests {
         let tenant_id = "t1";
         let stream_type = "s";
         let stream_id = "a";
-        let stream_hash =
-            corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
         let events = [AppendEventInput {
             event_id: "e1",

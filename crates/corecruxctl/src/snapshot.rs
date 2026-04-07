@@ -115,10 +115,7 @@ const PROJECTIONS: [ProjectionDef; 4] = [
     },
 ];
 
-fn expected_hash_for_projection(
-    meta: &corecrux_projections::ProjectionsMetaV1,
-    key: &str,
-) -> Option<String> {
+fn expected_hash_for_projection(meta: &corecrux_projections::ProjectionsMetaV1, key: &str) -> Option<String> {
     match key {
         "artifact_living_state" => meta.artifact_living_state.snapshot_blake3.clone(),
         "artifact_relations" => meta.artifact_relations.snapshot_blake3.clone(),
@@ -138,15 +135,10 @@ fn shard_ids(opts: &SnapshotOptions) -> Result<Vec<u32>, Box<dyn std::error::Err
     Ok(ids)
 }
 
-pub fn list_snapshots(
-    opts: &SnapshotOptions,
-) -> Result<SnapshotListReport, Box<dyn std::error::Error + Send + Sync>> {
+pub fn list_snapshots(opts: &SnapshotOptions) -> Result<SnapshotListReport, Box<dyn std::error::Error + Send + Sync>> {
     let mut shards: Vec<SnapshotShardListItem> = Vec::new();
     for shard_id in shard_ids(opts)? {
-        let shard_dir = opts
-            .data_dir
-            .join("shards")
-            .join(format!("shard-{shard_id:04}"));
+        let shard_dir = opts.data_dir.join("shards").join(format!("shard-{shard_id:04}"));
         let projections_dir = shard_dir.join("projections");
         let meta_path = projections_dir.join("projections.meta.json");
         let meta = load_projections_meta_v1(&meta_path)?;
@@ -169,10 +161,7 @@ pub fn list_snapshots(
             });
         }
 
-        shards.push(SnapshotShardListItem {
-            shard_id,
-            projections,
-        });
+        shards.push(SnapshotShardListItem { shard_id, projections });
     }
 
     Ok(SnapshotListReport {
@@ -188,10 +177,7 @@ pub fn verify_snapshots(
     let mut out_shards = Vec::new();
 
     for shard_id in shard_ids(opts)? {
-        let shard_dir = opts
-            .data_dir
-            .join("shards")
-            .join(format!("shard-{shard_id:04}"));
+        let shard_dir = opts.data_dir.join("shards").join(format!("shard-{shard_id:04}"));
         let projections_dir = shard_dir.join("projections");
         let meta_path = projections_dir.join("projections.meta.json");
         let meta = load_projections_meta_v1(&meta_path)?;
@@ -363,8 +349,7 @@ mod tests {
                 shard_id: 0,
                 projections: vec![SnapshotProjectionListItem {
                     projection: "artifact_living_state".to_string(),
-                    path: "/data/shards/shard-0000/projections/artifact_living_state.snapshot.ccxs"
-                        .to_string(),
+                    path: "/data/shards/shard-0000/projections/artifact_living_state.snapshot.ccxs".to_string(),
                     exists: true,
                     bytes: 1024,
                     expected_blake3: Some("abc".to_string()),

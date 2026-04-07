@@ -65,19 +65,12 @@ pub fn apply_graph_boost(
     }
 
     // Build frame_offset → entity overlap map
-    let max_overlap = entity_matches
-        .iter()
-        .map(|m| m.overlap_count)
-        .max()
-        .unwrap_or(1)
-        .max(1) as f32;
+    let max_overlap = entity_matches.iter().map(|m| m.overlap_count).max().unwrap_or(1).max(1) as f32;
 
     let entity_boost_by_offset: std::collections::HashMap<u32, f32> = entity_matches
         .iter()
         .map(|m| {
-            let boost = params.entity_weight
-                * (m.overlap_count as f32 / max_overlap)
-                * m.confidence;
+            let boost = params.entity_weight * (m.overlap_count as f32 / max_overlap) * m.confidence;
             (m.frame_offset, boost)
         })
         .collect();
@@ -90,37 +83,24 @@ pub fn apply_graph_boost(
         .map(|h| h.frame_offset)
         .collect();
 
-    let mut relation_boost_by_offset: std::collections::HashMap<u32, f32> =
-        std::collections::HashMap::new();
+    let mut relation_boost_by_offset: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
     for edge in relation_edges {
         if seed_offsets.contains(&edge.src_frame_offset) {
             let boost = params.relation_weight * edge.confidence;
-            let entry = relation_boost_by_offset
-                .entry(edge.dst_frame_offset)
-                .or_insert(0.0);
+            let entry = relation_boost_by_offset.entry(edge.dst_frame_offset).or_insert(0.0);
             *entry = entry.max(boost); // take max boost from any relation
         }
     }
 
     // Apply boosts to hits
     for hit in hits.iter_mut() {
-        let entity_boost = entity_boost_by_offset
-            .get(&hit.frame_offset)
-            .copied()
-            .unwrap_or(0.0);
-        let relation_boost = relation_boost_by_offset
-            .get(&hit.frame_offset)
-            .copied()
-            .unwrap_or(0.0);
+        let entity_boost = entity_boost_by_offset.get(&hit.frame_offset).copied().unwrap_or(0.0);
+        let relation_boost = relation_boost_by_offset.get(&hit.frame_offset).copied().unwrap_or(0.0);
         hit.score += entity_boost + relation_boost;
     }
 
     // Re-sort by boosted score
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 }
 
 #[cfg(test)]
@@ -130,14 +110,40 @@ mod tests {
     #[test]
     fn entity_boost_raises_matched_docs() {
         let mut hits = vec![
-            MergedBm25Hit { segment_index: 0, doc_id: 0, score: 1.0, tenant_hash_lo16: 0, tenant_hash_full: 0, frame_offset: 0, doc_length_tokens: 100 },
-            MergedBm25Hit { segment_index: 0, doc_id: 1, score: 0.8, tenant_hash_lo16: 0, tenant_hash_full: 0, frame_offset: 100, doc_length_tokens: 100 },
-            MergedBm25Hit { segment_index: 0, doc_id: 2, score: 0.6, tenant_hash_lo16: 0, tenant_hash_full: 0, frame_offset: 200, doc_length_tokens: 100 },
+            MergedBm25Hit {
+                segment_index: 0,
+                doc_id: 0,
+                score: 1.0,
+                tenant_hash_lo16: 0,
+                tenant_hash_full: 0,
+                frame_offset: 0,
+                doc_length_tokens: 100,
+            },
+            MergedBm25Hit {
+                segment_index: 0,
+                doc_id: 1,
+                score: 0.8,
+                tenant_hash_lo16: 0,
+                tenant_hash_full: 0,
+                frame_offset: 100,
+                doc_length_tokens: 100,
+            },
+            MergedBm25Hit {
+                segment_index: 0,
+                doc_id: 2,
+                score: 0.6,
+                tenant_hash_lo16: 0,
+                tenant_hash_full: 0,
+                frame_offset: 200,
+                doc_length_tokens: 100,
+            },
         ];
 
-        let entity_matches = vec![
-            EntityMatch { frame_offset: 200, overlap_count: 3, confidence: 0.9 },
-        ];
+        let entity_matches = vec![EntityMatch {
+            frame_offset: 200,
+            overlap_count: 3,
+            confidence: 0.9,
+        }];
 
         apply_graph_boost(&mut hits, &entity_matches, &[], &GraphParams::default());
 
@@ -149,13 +155,31 @@ mod tests {
     #[test]
     fn relation_boost_promotes_linked_doc() {
         let mut hits = vec![
-            MergedBm25Hit { segment_index: 0, doc_id: 0, score: 1.0, tenant_hash_lo16: 0, tenant_hash_full: 0, frame_offset: 0, doc_length_tokens: 100 },
-            MergedBm25Hit { segment_index: 0, doc_id: 1, score: 0.3, tenant_hash_lo16: 0, tenant_hash_full: 0, frame_offset: 100, doc_length_tokens: 100 },
+            MergedBm25Hit {
+                segment_index: 0,
+                doc_id: 0,
+                score: 1.0,
+                tenant_hash_lo16: 0,
+                tenant_hash_full: 0,
+                frame_offset: 0,
+                doc_length_tokens: 100,
+            },
+            MergedBm25Hit {
+                segment_index: 0,
+                doc_id: 1,
+                score: 0.3,
+                tenant_hash_lo16: 0,
+                tenant_hash_full: 0,
+                frame_offset: 100,
+                doc_length_tokens: 100,
+            },
         ];
 
-        let relations = vec![
-            RelationEdge { src_frame_offset: 0, dst_frame_offset: 100, confidence: 0.95 },
-        ];
+        let relations = vec![RelationEdge {
+            src_frame_offset: 0,
+            dst_frame_offset: 100,
+            confidence: 0.95,
+        }];
 
         apply_graph_boost(&mut hits, &[], &relations, &GraphParams::default());
 
@@ -165,9 +189,15 @@ mod tests {
 
     #[test]
     fn no_boost_when_empty() {
-        let mut hits = vec![
-            MergedBm25Hit { segment_index: 0, doc_id: 0, score: 1.0, tenant_hash_lo16: 0, tenant_hash_full: 0, frame_offset: 0, doc_length_tokens: 100 },
-        ];
+        let mut hits = vec![MergedBm25Hit {
+            segment_index: 0,
+            doc_id: 0,
+            score: 1.0,
+            tenant_hash_lo16: 0,
+            tenant_hash_full: 0,
+            frame_offset: 0,
+            doc_length_tokens: 100,
+        }];
 
         apply_graph_boost(&mut hits, &[], &[], &GraphParams::default());
 

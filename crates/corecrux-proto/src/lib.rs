@@ -49,8 +49,7 @@ mod tests {
 
         let mut buf = Vec::new();
         req.encode(&mut buf).expect("encode append batch");
-        let decoded =
-            dataplane_v1::AppendBatchRequest::decode(buf.as_slice()).expect("decode append batch");
+        let decoded = dataplane_v1::AppendBatchRequest::decode(buf.as_slice()).expect("decode append batch");
 
         assert_eq!(decoded.stream_id, "stream-42");
         assert_eq!(decoded.expected_next_seq, 7);
@@ -77,8 +76,7 @@ mod tests {
             error_code: String::new(),
             error_message: String::new(),
         };
-        let status_back = dataplane_v1::append_result::Status::try_from(result.status)
-            .expect("status enum conversion");
+        let status_back = dataplane_v1::append_result::Status::try_from(result.status).expect("status enum conversion");
         assert_eq!(status_back, dataplane_v1::append_result::Status::Appended);
 
         let replay_req = dataplane_v1::ReplaySessionRequest {
@@ -89,14 +87,11 @@ mod tests {
         };
         let mut buf = Vec::new();
         replay_req.encode(&mut buf).expect("encode replay request");
-        let decoded = dataplane_v1::ReplaySessionRequest::decode(buf.as_slice())
-            .expect("decode replay request");
+        let decoded = dataplane_v1::ReplaySessionRequest::decode(buf.as_slice()).expect("decode replay request");
 
         assert!(matches!(
             decoded.request,
-            Some(dataplane_v1::replay_session_request::Request::DecodedReads(
-                _
-            ))
+            Some(dataplane_v1::replay_session_request::Request::DecodedReads(_))
         ));
     }
 }

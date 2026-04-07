@@ -100,7 +100,7 @@ pub fn build_manifest(
             canon: Canon::default(),
         },
         envelope_signature: String::new(), // Set after signing
-        envelope_hash: String::new(),       // Set after hashing
+        envelope_hash: String::new(),      // Set after hashing
     };
 
     // Compute envelope hash

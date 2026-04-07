@@ -20,7 +20,13 @@ The binaries are at `target/release/corecruxd` and `target/release/corecruxctl`.
 ## Running Tests
 
 ```bash
-cargo test --workspace
+cargo test --workspace                    # All unit tests
+cargo test -p crux-integration-tests      # HTTP + gRPC integration tests
+```
+
+Integration tests spawn a `corecruxd` process, so build the debug binary first:
+```bash
+cargo build --bin corecruxd
 ```
 
 ## Code Style

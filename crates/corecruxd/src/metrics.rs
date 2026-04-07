@@ -4,24 +4,20 @@
 
 use std::sync::Arc;
 
-use prometheus::{
-    Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramVec, Registry, TextEncoder,
-};
+use prometheus::{Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramVec, Registry, TextEncoder};
 
 use corecrux_types::{
-    BuildInfo, KnowledgeAuthorityModeV1, KnowledgeAuthorityV1, KnowledgeParityOutcomeV1,
-    KnowledgeParityStatusV1, KnowledgeRolloutStageV1,
+    BuildInfo, KnowledgeAuthorityModeV1, KnowledgeAuthorityV1, KnowledgeParityOutcomeV1, KnowledgeParityStatusV1,
+    KnowledgeRolloutStageV1,
 };
 
+// Some metric fields are registered at init but only exercised in the
+// proprietary edition. Suppress dead-code warnings for the struct+impl.
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct Metrics {
     registry: Arc<Registry>,
-    gpu_up: Gauge,
-    gpu_worker_up: GaugeVec,
     io_backend: GaugeVec,
-    gds_active: Gauge,
-    gds_degraded: Gauge,
-    hardware_profile_match: Gauge,
     valve_pause_ingest: Gauge,
     valve_pause_compaction: Gauge,
     valve_throttle: Gauge,
@@ -86,7 +82,6 @@ pub struct Metrics {
     storage_tail_path_total: CounterVec,
     storage_head_frames_scanned_total: Counter,
 
-    gpu_mem_bytes: GaugeVec,
     read_amplification_p50: GaugeVec,
     read_amplification_p95: GaugeVec,
 
@@ -108,7 +103,6 @@ pub struct Metrics {
     replication_min_follower_acked_segment_seq: GaugeVec,
     replication_lag_segments: GaugeVec,
 
-    shard_owner_gpu_id: GaugeVec,
     shard_state: GaugeVec,
 
     peer_cache_hits_total: Counter,
@@ -151,9 +145,9 @@ pub struct Metrics {
     seal_duration_seconds: HistogramVec,
     seal_backlog_frames: Gauge,
     ccxi_missing_total: Gauge,
-    vram_evictions_total: Counter,
 }
 
+#[allow(dead_code)] // See struct-level comment above.
 impl Metrics {
     pub fn new(build: &BuildInfo, service: &str) -> Self {
         let registry = Arc::new(Registry::new());
@@ -192,56 +186,14 @@ impl Metrics {
             .register(Box::new(corecrux_build_info.clone()))
             .expect("register corecrux_build_info");
 
-        let gpu_up = Gauge::new(
-            "corecrux_gpu_up",
-            "Whether the CUDA runtime is initialized (0/1)",
-        )
-        .expect("corecrux_gpu_up gauge");
-        registry
-            .register(Box::new(gpu_up.clone()))
-            .expect("register corecrux_gpu_up");
-
-        let gpu_worker_up = GaugeVec::new(
-            prometheus::Opts::new(
-                "corecrux_gpu_worker_up",
-                "Per-GPU worker liveness (label gpu_id=...) (0/1)",
-            ),
-            &["gpu_id"],
-        )
-        .expect("corecrux_gpu_worker_up gauge");
-        registry
-            .register(Box::new(gpu_worker_up.clone()))
-            .expect("register corecrux_gpu_worker_up");
-
         let io_backend = GaugeVec::new(
-            prometheus::Opts::new(
-                "corecrux_io_backend",
-                "Selected IO backend (label backend=...)",
-            ),
+            prometheus::Opts::new("corecrux_io_backend", "Selected IO backend (label backend=...)"),
             &["backend"],
         )
         .expect("corecrux_io_backend gauge");
         registry
             .register(Box::new(io_backend.clone()))
             .expect("register corecrux_io_backend");
-
-        let gds_active = Gauge::new(
-            "corecrux_gds_active",
-            "Whether GPUDirect Storage (cuFile) is engaged for gpu-gds backend (0/1)",
-        )
-        .expect("corecrux_gds_active gauge");
-        registry
-            .register(Box::new(gds_active.clone()))
-            .expect("register corecrux_gds_active");
-
-        let gds_degraded = Gauge::new(
-            "corecrux_gds_degraded",
-            "Whether gpu-gds is running in a degraded mode (compat/bounce/staging) (0/1)",
-        )
-        .expect("corecrux_gds_degraded gauge");
-        registry
-            .register(Box::new(gds_degraded.clone()))
-            .expect("register corecrux_gds_degraded");
 
         let peer_cache_hits_total = Counter::new(
             "corecrux_peer_cache_hits_total",
@@ -280,10 +232,7 @@ impl Metrics {
             .expect("register corecrux_tail_cache_hits_total");
 
         let tail_cache_misses_total = CounterVec::new(
-            prometheus::Opts::new(
-                "corecrux_tail_cache_misses_total",
-                "Tail cache misses by shard",
-            ),
+            prometheus::Opts::new("corecrux_tail_cache_misses_total", "Tail cache misses by shard"),
             &["shard"],
         )
         .expect("corecrux_tail_cache_misses_total counter");
@@ -292,10 +241,7 @@ impl Metrics {
             .expect("register corecrux_tail_cache_misses_total");
 
         let tail_cache_bytes = GaugeVec::new(
-            prometheus::Opts::new(
-                "corecrux_tail_cache_bytes",
-                "Tail cache resident bytes by shard",
-            ),
+            prometheus::Opts::new("corecrux_tail_cache_bytes", "Tail cache resident bytes by shard"),
             &["shard"],
         )
         .expect("corecrux_tail_cache_bytes gauge");
@@ -303,20 +249,8 @@ impl Metrics {
             .register(Box::new(tail_cache_bytes.clone()))
             .expect("register corecrux_tail_cache_bytes");
 
-        let hardware_profile_match = Gauge::new(
-            "corecrux_hardware_profile_match",
-            "Whether the pinned hardware profile matches detected hardware (0/1)",
-        )
-        .expect("corecrux_hardware_profile_match gauge");
-        registry
-            .register(Box::new(hardware_profile_match.clone()))
-            .expect("register corecrux_hardware_profile_match");
-
-        let valve_pause_ingest = Gauge::new(
-            "corecrux_valve_pause_ingest",
-            "Operator valve: pause_ingest (0/1)",
-        )
-        .expect("corecrux_valve_pause_ingest gauge");
+        let valve_pause_ingest = Gauge::new("corecrux_valve_pause_ingest", "Operator valve: pause_ingest (0/1)")
+            .expect("corecrux_valve_pause_ingest gauge");
         registry
             .register(Box::new(valve_pause_ingest.clone()))
             .expect("register corecrux_valve_pause_ingest");
@@ -330,18 +264,14 @@ impl Metrics {
             .register(Box::new(valve_pause_compaction.clone()))
             .expect("register corecrux_valve_pause_compaction");
 
-        let valve_throttle =
-            Gauge::new("corecrux_valve_throttle", "Operator valve: throttle (0/1)")
-                .expect("corecrux_valve_throttle gauge");
+        let valve_throttle = Gauge::new("corecrux_valve_throttle", "Operator valve: throttle (0/1)")
+            .expect("corecrux_valve_throttle gauge");
         registry
             .register(Box::new(valve_throttle.clone()))
             .expect("register corecrux_valve_throttle");
 
-        let valve_read_only = Gauge::new(
-            "corecrux_valve_read_only",
-            "Operator valve: read_only (0/1)",
-        )
-        .expect("corecrux_valve_read_only gauge");
+        let valve_read_only = Gauge::new("corecrux_valve_read_only", "Operator valve: read_only (0/1)")
+            .expect("corecrux_valve_read_only gauge");
         registry
             .register(Box::new(valve_read_only.clone()))
             .expect("register corecrux_valve_read_only");
@@ -373,29 +303,20 @@ impl Metrics {
             .register(Box::new(throttle_ratio.clone()))
             .expect("register corecrux_throttle_ratio");
 
-        let data_dir_bytes_total = Gauge::new(
-            "corecrux_data_dir_bytes_total",
-            "Configured data directory total bytes",
-        )
-        .expect("corecrux_data_dir_bytes_total gauge");
+        let data_dir_bytes_total = Gauge::new("corecrux_data_dir_bytes_total", "Configured data directory total bytes")
+            .expect("corecrux_data_dir_bytes_total gauge");
         registry
             .register(Box::new(data_dir_bytes_total.clone()))
             .expect("register corecrux_data_dir_bytes_total");
 
-        let data_dir_bytes_free = Gauge::new(
-            "corecrux_data_dir_bytes_free",
-            "Configured data directory free bytes",
-        )
-        .expect("corecrux_data_dir_bytes_free gauge");
+        let data_dir_bytes_free = Gauge::new("corecrux_data_dir_bytes_free", "Configured data directory free bytes")
+            .expect("corecrux_data_dir_bytes_free gauge");
         registry
             .register(Box::new(data_dir_bytes_free.clone()))
             .expect("register corecrux_data_dir_bytes_free");
 
-        let data_dir_free_ratio = Gauge::new(
-            "corecrux_data_dir_free_ratio",
-            "Configured data directory free ratio",
-        )
-        .expect("corecrux_data_dir_free_ratio gauge");
+        let data_dir_free_ratio = Gauge::new("corecrux_data_dir_free_ratio", "Configured data directory free ratio")
+            .expect("corecrux_data_dir_free_ratio gauge");
         registry
             .register(Box::new(data_dir_free_ratio.clone()))
             .expect("register corecrux_data_dir_free_ratio");
@@ -412,12 +333,11 @@ impl Metrics {
             .register(Box::new(write_confirmations_total.clone()))
             .expect("register corecrux_write_confirmations_total");
 
-        let write_confirmation_sign_duration_ms =
-            Histogram::with_opts(prometheus::HistogramOpts::new(
-                "corecrux_write_confirmation_sign_duration_ms",
-                "Write confirmation signing latency in milliseconds",
-            ))
-            .expect("corecrux_write_confirmation_sign_duration_ms histogram");
+        let write_confirmation_sign_duration_ms = Histogram::with_opts(prometheus::HistogramOpts::new(
+            "corecrux_write_confirmation_sign_duration_ms",
+            "Write confirmation signing latency in milliseconds",
+        ))
+        .expect("corecrux_write_confirmation_sign_duration_ms histogram");
         registry
             .register(Box::new(write_confirmation_sign_duration_ms.clone()))
             .expect("register corecrux_write_confirmation_sign_duration_ms");
@@ -467,20 +387,15 @@ impl Metrics {
             .register(Box::new(write_rejects_total.clone()))
             .expect("register corecrux_write_rejects_total");
 
-        let backpressure_active_gauge = Gauge::new(
-            "corecrux_backpressure_active_gauge",
-            "Backpressure active state (0/1)",
-        )
-        .expect("corecrux_backpressure_active_gauge gauge");
+        let backpressure_active_gauge =
+            Gauge::new("corecrux_backpressure_active_gauge", "Backpressure active state (0/1)")
+                .expect("corecrux_backpressure_active_gauge gauge");
         registry
             .register(Box::new(backpressure_active_gauge.clone()))
             .expect("register corecrux_backpressure_active_gauge");
 
         let replay_total = CounterVec::new(
-            prometheus::Opts::new(
-                "corecrux_replay_total",
-                "Replay attempts by result (ok|fail)",
-            ),
+            prometheus::Opts::new("corecrux_replay_total", "Replay attempts by result (ok|fail)"),
             &["result"],
         )
         .expect("corecrux_replay_total counter");
@@ -489,10 +404,7 @@ impl Metrics {
             .expect("register corecrux_replay_total");
 
         let replay_mismatch_total = CounterVec::new(
-            prometheus::Opts::new(
-                "corecrux_replay_mismatch_total",
-                "Replay mismatches by drift class",
-            ),
+            prometheus::Opts::new("corecrux_replay_mismatch_total", "Replay mismatches by drift class"),
             &["drift_class"],
         )
         .expect("corecrux_replay_mismatch_total counter");
@@ -531,10 +443,7 @@ impl Metrics {
             .expect("register corecrux_segment_scrub_seconds");
 
         let dir_l0_runs = GaugeVec::new(
-            prometheus::Opts::new(
-                "corecrux_dir_l0_runs",
-                "Directory L0 run count (LSM) per shard",
-            ),
+            prometheus::Opts::new("corecrux_dir_l0_runs", "Directory L0 run count (LSM) per shard"),
             &["shard"],
         )
         .expect("corecrux_dir_l0_runs gauge");
@@ -687,10 +596,7 @@ impl Metrics {
             .expect("register corecrux_stream_read_latency_seconds");
 
         let read_retry_total = CounterVec::new(
-            prometheus::Opts::new(
-                "corecrux_read_retry_total",
-                "Read retries by operation/reason/outcome",
-            ),
+            prometheus::Opts::new("corecrux_read_retry_total", "Read retries by operation/reason/outcome"),
             &["op", "reason", "outcome"],
         )
         .expect("corecrux_read_retry_total counter");
@@ -798,10 +704,7 @@ impl Metrics {
             .expect("register corecrux_grpc_messages_sent_total");
 
         let grpc_send_seconds = HistogramVec::new(
-            prometheus::HistogramOpts::new(
-                "corecrux_grpc_send_seconds",
-                "gRPC send+encode duration by rpc",
-            ),
+            prometheus::HistogramOpts::new("corecrux_grpc_send_seconds", "gRPC send+encode duration by rpc"),
             &["rpc"],
         )
         .expect("corecrux_grpc_send_seconds histogram");
@@ -822,10 +725,7 @@ impl Metrics {
             .expect("register corecrux_grpc_send_blocked_seconds");
 
         let replay_events_total = CounterVec::new(
-            prometheus::Opts::new(
-                "corecrux_replay_events_total",
-                "Replay events returned by rpc",
-            ),
+            prometheus::Opts::new("corecrux_replay_events_total", "Replay events returned by rpc"),
             &["rpc"],
         )
         .expect("corecrux_replay_events_total counter");
@@ -834,10 +734,7 @@ impl Metrics {
             .expect("register corecrux_replay_events_total");
 
         let replay_bytes_total = CounterVec::new(
-            prometheus::Opts::new(
-                "corecrux_replay_bytes_total",
-                "Replay bytes returned by rpc",
-            ),
+            prometheus::Opts::new("corecrux_replay_bytes_total", "Replay bytes returned by rpc"),
             &["rpc"],
         )
         .expect("corecrux_replay_bytes_total counter");
@@ -974,18 +871,6 @@ impl Metrics {
             .register(Box::new(storage_head_frames_scanned_total.clone()))
             .expect("register corecrux_storage_head_frames_scanned_total");
 
-        let gpu_mem_bytes = GaugeVec::new(
-            prometheus::Opts::new(
-                "corecrux_gpu_mem_bytes",
-                "GPU-visible memory pool accounting (bytes)",
-            ),
-            &["pool", "type"],
-        )
-        .expect("corecrux_gpu_mem_bytes gauge");
-        registry
-            .register(Box::new(gpu_mem_bytes.clone()))
-            .expect("register corecrux_gpu_mem_bytes");
-
         let read_amplification_p50 = GaugeVec::new(
             prometheus::Opts::new(
                 "corecrux_read_amplification_p50",
@@ -1011,10 +896,7 @@ impl Metrics {
             .expect("register corecrux_read_amplification_p95");
 
         let kernel_launch_total = CounterVec::new(
-            prometheus::Opts::new(
-                "corecrux_kernel_launch_total",
-                "Kernel launches and outcomes",
-            ),
+            prometheus::Opts::new("corecrux_kernel_launch_total", "Kernel launches and outcomes"),
             &["kernel", "result"],
         )
         .expect("corecrux_kernel_launch_total counter");
@@ -1032,10 +914,7 @@ impl Metrics {
             .expect("register corecrux_shardmap_version");
 
         let routing_lookup_total = CounterVec::new(
-            prometheus::Opts::new(
-                "corecrux_routing_lookup_total",
-                "Routing lookups and outcomes",
-            ),
+            prometheus::Opts::new("corecrux_routing_lookup_total", "Routing lookups and outcomes"),
             &["op", "outcome"],
         )
         .expect("corecrux_routing_lookup_total counter");
@@ -1044,10 +923,7 @@ impl Metrics {
             .expect("register corecrux_routing_lookup_total");
 
         let routing_lookup_seconds = HistogramVec::new(
-            prometheus::HistogramOpts::new(
-                "corecrux_routing_lookup_seconds",
-                "Routing lookup duration in seconds",
-            ),
+            prometheus::HistogramOpts::new("corecrux_routing_lookup_seconds", "Routing lookup duration in seconds"),
             &["op"],
         )
         .expect("corecrux_routing_lookup_seconds histogram");
@@ -1092,10 +968,7 @@ impl Metrics {
             .expect("register corecrux_replication_follower_watermark_segment_seq");
 
         let replicated_commit_total = CounterVec::new(
-            prometheus::Opts::new(
-                "corecrux_replicated_commit_total",
-                "ReplicatedCommit outcomes",
-            ),
+            prometheus::Opts::new("corecrux_replicated_commit_total", "ReplicatedCommit outcomes"),
             &["result"],
         )
         .expect("corecrux_replicated_commit_total counter");
@@ -1210,18 +1083,6 @@ impl Metrics {
         registry
             .register(Box::new(replication_lag_segments.clone()))
             .expect("register corecrux_replication_lag_segments");
-
-        let shard_owner_gpu_id = GaugeVec::new(
-            prometheus::Opts::new(
-                "corecrux_shard_owner_gpu_id",
-                "Configured owner GPU id for a shard (value is gpu_id)",
-            ),
-            &["shardId"],
-        )
-        .expect("corecrux_shard_owner_gpu_id gauge");
-        registry
-            .register(Box::new(shard_owner_gpu_id.clone()))
-            .expect("register corecrux_shard_owner_gpu_id");
 
         let shard_state = GaugeVec::new(
             prometheus::Opts::new(
@@ -1553,23 +1414,9 @@ impl Metrics {
             .register(Box::new(ccxi_missing_total.clone()))
             .expect("register corecrux_ccxi_missing_total");
 
-        let vram_evictions_total = Counter::new(
-            "corecrux_vram_evictions_total",
-            "Total number of hot-tier segment evictions from VRAM",
-        )
-        .expect("corecrux_vram_evictions_total counter");
-        registry
-            .register(Box::new(vram_evictions_total.clone()))
-            .expect("register corecrux_vram_evictions_total");
-
         Self {
             registry,
-            gpu_up,
-            gpu_worker_up,
             io_backend,
-            gds_active,
-            gds_degraded,
-            hardware_profile_match,
             valve_pause_ingest,
             valve_pause_compaction,
             valve_throttle,
@@ -1634,7 +1481,6 @@ impl Metrics {
             storage_tail_path_total,
             storage_head_frames_scanned_total,
 
-            gpu_mem_bytes,
             read_amplification_p50,
             read_amplification_p95,
 
@@ -1655,7 +1501,6 @@ impl Metrics {
             replication_leader_segment_seq,
             replication_min_follower_acked_segment_seq,
             replication_lag_segments,
-            shard_owner_gpu_id,
             shard_state,
             peer_cache_hits_total,
             peer_cache_misses_total,
@@ -1695,36 +1540,11 @@ impl Metrics {
             seal_duration_seconds,
             seal_backlog_frames,
             ccxi_missing_total,
-            vram_evictions_total,
         }
-    }
-
-    pub fn set_gpu_up(&self, up: bool) {
-        self.gpu_up.set(if up { 1.0 } else { 0.0 });
-    }
-
-    pub fn set_gpu_worker_up(&self, gpu_id: i32, up: bool) {
-        self.gpu_worker_up
-            .with_label_values(&[&gpu_id.to_string()])
-            .set(if up { 1.0 } else { 0.0 });
     }
 
     pub fn set_io_backend(&self, backend: &str) {
         self.io_backend.with_label_values(&[backend]).set(1.0);
-    }
-
-    pub fn set_gds_active(&self, active: bool) {
-        self.gds_active.set(if active { 1.0 } else { 0.0 });
-    }
-
-    pub fn set_gds_degraded(&self, degraded: bool) {
-        self.gds_degraded.set(if degraded { 1.0 } else { 0.0 });
-    }
-
-    pub fn set_shard_owner_gpu_id(&self, shard_id: &str, gpu_id: i32) {
-        self.shard_owner_gpu_id
-            .with_label_values(&[shard_id])
-            .set(gpu_id as f64);
     }
 
     pub fn set_shard_state(&self, shard_id: &str, state: &str) {
@@ -1736,21 +1556,15 @@ impl Metrics {
     }
 
     pub fn inc_tail_cache_hit(&self, shard_id: &str) {
-        self.tail_cache_hits_total
-            .with_label_values(&[shard_id])
-            .inc();
+        self.tail_cache_hits_total.with_label_values(&[shard_id]).inc();
     }
 
     pub fn inc_tail_cache_miss(&self, shard_id: &str) {
-        self.tail_cache_misses_total
-            .with_label_values(&[shard_id])
-            .inc();
+        self.tail_cache_misses_total.with_label_values(&[shard_id]).inc();
     }
 
     pub fn set_tail_cache_bytes(&self, shard_id: &str, bytes: u64) {
-        self.tail_cache_bytes
-            .with_label_values(&[shard_id])
-            .set(bytes as f64);
+        self.tail_cache_bytes.with_label_values(&[shard_id]).set(bytes as f64);
     }
 
     pub fn touch_peer_cache_metrics(&self) {
@@ -1774,17 +1588,12 @@ impl Metrics {
         self.peer_cache_bytes.set(bytes as f64);
     }
 
-    pub fn set_hardware_profile_match(&self, ok: bool) {
-        self.hardware_profile_match.set(if ok { 1.0 } else { 0.0 });
-    }
-
     pub fn set_valve_pause_ingest(&self, enabled: bool) {
         self.valve_pause_ingest.set(if enabled { 1.0 } else { 0.0 });
     }
 
     pub fn set_valve_pause_compaction(&self, enabled: bool) {
-        self.valve_pause_compaction
-            .set(if enabled { 1.0 } else { 0.0 });
+        self.valve_pause_compaction.set(if enabled { 1.0 } else { 0.0 });
     }
 
     pub fn set_valve_throttle(&self, enabled: bool) {
@@ -1796,8 +1605,7 @@ impl Metrics {
     }
 
     pub fn set_valve_emergency_brake(&self, enabled: bool) {
-        self.valve_emergency_brake
-            .set(if enabled { 1.0 } else { 0.0 });
+        self.valve_emergency_brake.set(if enabled { 1.0 } else { 0.0 });
     }
 
     pub fn set_valve_state(&self, valve: &str, enabled: bool) {
@@ -1830,14 +1638,12 @@ impl Metrics {
 
     pub fn observe_write_confirmation_sign_duration_ms(&self, duration_ms: f64) {
         if duration_ms.is_finite() && duration_ms >= 0.0 {
-            self.write_confirmation_sign_duration_ms
-                .observe(duration_ms);
+            self.write_confirmation_sign_duration_ms.observe(duration_ms);
         }
     }
 
     pub fn set_write_confirmation_unsigned_queue_depth(&self, depth: u64) {
-        self.write_confirmation_unsigned_queue_depth
-            .set(depth as f64);
+        self.write_confirmation_unsigned_queue_depth.set(depth as f64);
     }
 
     pub fn inc_tenant_throttle_reject(&self, tenant_id_hash: &str) {
@@ -1847,9 +1653,7 @@ impl Metrics {
     }
 
     pub fn inc_emergency_brake(&self, source: &str) {
-        self.emergency_brake_total
-            .with_label_values(&[source])
-            .inc();
+        self.emergency_brake_total.with_label_values(&[source]).inc();
     }
 
     pub fn inc_write_reject(&self, reason: &str) {
@@ -1857,8 +1661,7 @@ impl Metrics {
     }
 
     pub fn set_backpressure_active(&self, active: bool) {
-        self.backpressure_active_gauge
-            .set(if active { 1.0 } else { 0.0 });
+        self.backpressure_active_gauge.set(if active { 1.0 } else { 0.0 });
     }
 
     pub fn inc_replay_total(&self, result: &str) {
@@ -1866,15 +1669,11 @@ impl Metrics {
     }
 
     pub fn inc_replay_mismatch(&self, drift_class: &str) {
-        self.replay_mismatch_total
-            .with_label_values(&[drift_class])
-            .inc();
+        self.replay_mismatch_total.with_label_values(&[drift_class]).inc();
     }
 
     pub fn inc_segment_corrupt(&self, reason: &str) {
-        self.segment_corrupt_total
-            .with_label_values(&[reason])
-            .inc();
+        self.segment_corrupt_total.with_label_values(&[reason]).inc();
     }
 
     pub fn observe_verify_store_seconds(&self, secs: f64) {
@@ -1886,9 +1685,7 @@ impl Metrics {
     }
 
     pub fn set_dir_l0_runs(&self, shard: &str, runs: u32) {
-        self.dir_l0_runs
-            .with_label_values(&[shard])
-            .set(runs as f64);
+        self.dir_l0_runs.with_label_values(&[shard]).set(runs as f64);
     }
 
     pub fn set_dir_level_bytes(&self, shard: &str, level: u32, bytes: u64) {
@@ -1899,22 +1696,11 @@ impl Metrics {
 
     pub fn inc_dir_compaction(&self, shard: &str, level_from: u32, level_to: u32, status: &str) {
         self.dir_compactions_total
-            .with_label_values(&[
-                shard,
-                &level_from.to_string(),
-                &level_to.to_string(),
-                status,
-            ])
+            .with_label_values(&[shard, &level_from.to_string(), &level_to.to_string(), status])
             .inc();
     }
 
-    pub fn observe_dir_compaction_seconds(
-        &self,
-        shard: &str,
-        level_from: u32,
-        level_to: u32,
-        secs: f64,
-    ) {
+    pub fn observe_dir_compaction_seconds(&self, shard: &str, level_from: u32, level_to: u32, secs: f64) {
         self.dir_compaction_seconds
             .with_label_values(&[shard, &level_from.to_string(), &level_to.to_string()])
             .observe(secs);
@@ -1934,9 +1720,7 @@ impl Metrics {
 
     pub fn set_dir_dead_extent_ratio(&self, shard: &str, ratio_0_to_1: f64) {
         let r = ratio_0_to_1.clamp(0.0, 1.0);
-        self.dir_dead_extent_ratio
-            .with_label_values(&[shard])
-            .set(r);
+        self.dir_dead_extent_ratio.with_label_values(&[shard]).set(r);
     }
 
     pub fn inc_checkpoints_installed(&self, shard: &str, stream_type: &str) {
@@ -1952,21 +1736,15 @@ impl Metrics {
     }
 
     pub fn inc_stream_tombstones(&self, shard: &str) {
-        self.stream_tombstones_total
-            .with_label_values(&[shard])
-            .inc();
+        self.stream_tombstones_total.with_label_values(&[shard]).inc();
     }
 
     pub fn inc_stream_tombstone_rejects(&self, shard: &str) {
-        self.stream_tombstone_rejects_total
-            .with_label_values(&[shard])
-            .inc();
+        self.stream_tombstone_rejects_total.with_label_values(&[shard]).inc();
     }
 
     pub fn observe_append_latency_seconds(&self, shard: &str, secs: f64) {
-        self.append_latency_seconds
-            .with_label_values(&[shard])
-            .observe(secs);
+        self.append_latency_seconds.with_label_values(&[shard]).observe(secs);
     }
 
     pub fn observe_stream_read_latency_seconds(&self, shard: &str, op: &str, secs: f64) {
@@ -1976,38 +1754,27 @@ impl Metrics {
     }
 
     pub fn inc_read_retry(&self, op: &str, reason: &str, outcome: &str) {
-        self.read_retry_total
-            .with_label_values(&[op, reason, outcome])
-            .inc();
+        self.read_retry_total.with_label_values(&[op, reason, outcome]).inc();
     }
 
     pub fn read_retry_failed_total(&self, reason: &str) -> u64 {
         let mut total = 0.0f64;
         for op in ["tail", "range"] {
-            total += self
-                .read_retry_total
-                .with_label_values(&[op, reason, "failed"])
-                .get();
+            total += self.read_retry_total.with_label_values(&[op, reason, "failed"]).get();
         }
         total.max(0.0).round() as u64
     }
 
     pub fn observe_store_lock_wait_seconds(&self, op: &str, secs: f64) {
-        self.store_lock_wait_seconds
-            .with_label_values(&[op])
-            .observe(secs);
+        self.store_lock_wait_seconds.with_label_values(&[op]).observe(secs);
     }
 
     pub fn observe_store_lock_hold_seconds(&self, op: &str, secs: f64) {
-        self.store_lock_hold_seconds
-            .with_label_values(&[op])
-            .observe(secs);
+        self.store_lock_hold_seconds.with_label_values(&[op]).observe(secs);
     }
 
     pub fn observe_store_service_seconds(&self, op: &str, secs: f64) {
-        self.store_service_seconds
-            .with_label_values(&[op])
-            .observe(secs);
+        self.store_service_seconds.with_label_values(&[op]).observe(secs);
     }
 
     pub fn set_append_lane_waiters(&self, waiters: u64) {
@@ -2043,27 +1810,19 @@ impl Metrics {
     }
 
     pub fn observe_grpc_send_seconds(&self, rpc: &str, secs: f64) {
-        self.grpc_send_seconds
-            .with_label_values(&[rpc])
-            .observe(secs);
+        self.grpc_send_seconds.with_label_values(&[rpc]).observe(secs);
     }
 
     pub fn observe_grpc_send_blocked_seconds(&self, rpc: &str, secs: f64) {
-        self.grpc_send_blocked_seconds
-            .with_label_values(&[rpc])
-            .observe(secs);
+        self.grpc_send_blocked_seconds.with_label_values(&[rpc]).observe(secs);
     }
 
     pub fn add_replay_events(&self, rpc: &str, count: u64) {
-        self.replay_events_total
-            .with_label_values(&[rpc])
-            .inc_by(count as f64);
+        self.replay_events_total.with_label_values(&[rpc]).inc_by(count as f64);
     }
 
     pub fn add_replay_bytes(&self, rpc: &str, bytes: u64) {
-        self.replay_bytes_total
-            .with_label_values(&[rpc])
-            .inc_by(bytes as f64);
+        self.replay_bytes_total.with_label_values(&[rpc]).inc_by(bytes as f64);
     }
 
     pub fn observe_replay_build_response_seconds(&self, rpc: &str, secs: f64) {
@@ -2073,15 +1832,11 @@ impl Metrics {
     }
 
     pub fn observe_replay_encode_seconds(&self, rpc: &str, secs: f64) {
-        self.replay_encode_seconds
-            .with_label_values(&[rpc])
-            .observe(secs);
+        self.replay_encode_seconds.with_label_values(&[rpc]).observe(secs);
     }
 
     pub fn observe_rpc_total_seconds(&self, rpc: &str, secs: f64) {
-        self.rpc_total_seconds
-            .with_label_values(&[rpc])
-            .observe(secs);
+        self.rpc_total_seconds.with_label_values(&[rpc]).observe(secs);
     }
 
     pub fn observe_storage_tail_stage_seconds(&self, stage: &str, secs: f64) {
@@ -2097,9 +1852,7 @@ impl Metrics {
     }
 
     pub fn observe_append_fence_wait_seconds(&self, shard: &str, secs: f64) {
-        self.append_fence_wait_seconds
-            .with_label_values(&[shard])
-            .observe(secs);
+        self.append_fence_wait_seconds.with_label_values(&[shard]).observe(secs);
     }
 
     pub fn observe_append_fence_fsync_seconds(&self, shard: &str, secs: f64) {
@@ -2121,37 +1874,23 @@ impl Metrics {
     }
 
     pub fn inc_storage_tail_path(&self, path: &str, outcome: &str) {
-        self.storage_tail_path_total
-            .with_label_values(&[path, outcome])
-            .inc();
+        self.storage_tail_path_total.with_label_values(&[path, outcome]).inc();
     }
 
     pub fn add_storage_head_frames_scanned(&self, count: u64) {
         self.storage_head_frames_scanned_total.inc_by(count as f64);
     }
 
-    pub fn set_gpu_mem_bytes(&self, pool: &str, ty: &str, bytes: u64) {
-        self.gpu_mem_bytes
-            .with_label_values(&[pool, ty])
-            .set(bytes as f64);
-    }
-
     pub fn set_read_amplification_p50(&self, shard: &str, segs: f64) {
-        self.read_amplification_p50
-            .with_label_values(&[shard])
-            .set(segs);
+        self.read_amplification_p50.with_label_values(&[shard]).set(segs);
     }
 
     pub fn set_read_amplification_p95(&self, shard: &str, segs: f64) {
-        self.read_amplification_p95
-            .with_label_values(&[shard])
-            .set(segs);
+        self.read_amplification_p95.with_label_values(&[shard]).set(segs);
     }
 
     pub fn inc_kernel_launch(&self, kernel: &str, result: &str) {
-        self.kernel_launch_total
-            .with_label_values(&[kernel, result])
-            .inc();
+        self.kernel_launch_total.with_label_values(&[kernel, result]).inc();
     }
 
     pub fn set_shardmap_version(&self, version: u64) {
@@ -2159,27 +1898,19 @@ impl Metrics {
     }
 
     pub fn inc_routing_lookup(&self, op: &str, outcome: &str) {
-        self.routing_lookup_total
-            .with_label_values(&[op, outcome])
-            .inc();
+        self.routing_lookup_total.with_label_values(&[op, outcome]).inc();
     }
 
     pub fn observe_routing_lookup_seconds(&self, op: &str, secs: f64) {
-        self.routing_lookup_seconds
-            .with_label_values(&[op])
-            .observe(secs);
+        self.routing_lookup_seconds.with_label_values(&[op]).observe(secs);
     }
 
     pub fn inc_shard_request(&self, shard_id: &str, op: &str) {
-        self.shard_requests_total
-            .with_label_values(&[shard_id, op])
-            .inc();
+        self.shard_requests_total.with_label_values(&[shard_id, op]).inc();
     }
 
     pub fn inc_replication_receive_total(&self, result: &str) {
-        self.replication_receive_total
-            .with_label_values(&[result])
-            .inc();
+        self.replication_receive_total.with_label_values(&[result]).inc();
     }
 
     pub fn set_replication_follower_watermark(&self, shard_id: &str, segment_seq: u64) {
@@ -2189,9 +1920,7 @@ impl Metrics {
     }
 
     pub fn inc_replicated_commit_total(&self, result: &str) {
-        self.replicated_commit_total
-            .with_label_values(&[result])
-            .inc();
+        self.replicated_commit_total.with_label_values(&[result]).inc();
     }
 
     pub fn set_replicated_commit_acks(&self, shard_id: &str, required: usize, actual: usize) {
@@ -2283,21 +2012,15 @@ impl Metrics {
     }
 
     pub fn inc_projection_tick_fail(&self, shard: &str) {
-        self.projections_tick_fail_total
-            .with_label_values(&[shard])
-            .inc();
+        self.projections_tick_fail_total.with_label_values(&[shard]).inc();
     }
 
     pub fn inc_shard_open_attempts(&self, caller: &str) {
-        self.shard_open_attempts_total
-            .with_label_values(&[caller])
-            .inc();
+        self.shard_open_attempts_total.with_label_values(&[caller]).inc();
     }
 
     pub fn inc_lock_contention(&self, caller: &str) {
-        self.lock_contention_total
-            .with_label_values(&[caller])
-            .inc();
+        self.lock_contention_total.with_label_values(&[caller]).inc();
     }
 
     pub fn set_projection_snapshot_valid(&self, projection: &str, ok: bool) {
@@ -2326,11 +2049,7 @@ impl Metrics {
         ] {
             self.knowledge_rollout_stage
                 .with_label_values(&[stage.as_str()])
-                .set(if state.rollout_stage == stage {
-                    1.0
-                } else {
-                    0.0
-                });
+                .set(if state.rollout_stage == stage { 1.0 } else { 0.0 });
         }
         self.knowledge_rollback_triggered
             .set(if state.rollback_triggered { 1.0 } else { 0.0 });
@@ -2366,9 +2085,7 @@ impl Metrics {
     }
 
     pub fn inc_receipt_verify_fail(&self, reason: &str) {
-        self.receipt_verify_fail_total
-            .with_label_values(&[reason])
-            .inc();
+        self.receipt_verify_fail_total.with_label_values(&[reason]).inc();
     }
 
     pub fn inc_receipt_export_total(&self, status: &str) {
@@ -2378,15 +2095,12 @@ impl Metrics {
     // ── v4.2 query metrics ─────────────────────────────────────────
 
     pub fn observe_graph_expand(&self, duration_secs: f64, nodes_visited: u32) {
-        self.query_graph_expand_duration_seconds
-            .observe(duration_secs.max(0.0));
-        self.query_graph_expand_nodes_visited
-            .observe(nodes_visited as f64);
+        self.query_graph_expand_duration_seconds.observe(duration_secs.max(0.0));
+        self.query_graph_expand_nodes_visited.observe(nodes_visited as f64);
     }
 
     pub fn observe_time_range(&self, duration_secs: f64, artifacts_scanned: u32) {
-        self.query_time_range_duration_seconds
-            .observe(duration_secs.max(0.0));
+        self.query_time_range_duration_seconds.observe(duration_secs.max(0.0));
         self.query_time_range_artifacts_scanned
             .observe(artifacts_scanned as f64);
     }
@@ -2405,10 +2119,6 @@ impl Metrics {
 
     pub fn set_ccxi_missing_total(&self, count: u64) {
         self.ccxi_missing_total.set(count as f64);
-    }
-
-    pub fn inc_vram_evictions(&self) {
-        self.vram_evictions_total.inc();
     }
 
     pub fn render(&self) -> Result<String, prometheus::Error> {
@@ -2448,22 +2158,6 @@ mod tests {
         assert!(rendered.contains("0.0.1-test"));
         assert!(rendered.contains("abc123"));
         assert!(rendered.contains("test-service"));
-    }
-
-    #[test]
-    fn set_gpu_up_updates_metric() {
-        let m = test_metrics();
-        m.set_gpu_up(true);
-        let rendered = m.render().unwrap();
-        assert!(rendered.contains("corecrux_gpu_up 1"));
-    }
-
-    #[test]
-    fn set_gpu_up_false() {
-        let m = test_metrics();
-        m.set_gpu_up(false);
-        let rendered = m.render().unwrap();
-        assert!(rendered.contains("corecrux_gpu_up 0"));
     }
 
     #[test]
@@ -2550,24 +2244,6 @@ mod tests {
     }
 
     #[test]
-    fn set_gds_active_and_degraded() {
-        let m = test_metrics();
-        m.set_gds_active(true);
-        m.set_gds_degraded(false);
-        let rendered = m.render().unwrap();
-        assert!(rendered.contains("corecrux_gds_active 1"));
-        assert!(rendered.contains("corecrux_gds_degraded 0"));
-    }
-
-    #[test]
-    fn set_hardware_profile_match() {
-        let m = test_metrics();
-        m.set_hardware_profile_match(true);
-        let rendered = m.render().unwrap();
-        assert!(rendered.contains("corecrux_hardware_profile_match 1"));
-    }
-
-    #[test]
     fn set_throttle_ratio() {
         let m = test_metrics();
         m.set_throttle_ratio(0.75);
@@ -2598,25 +2274,6 @@ mod tests {
         assert!(rendered.contains("corecrux_tail_cache_hits_total"));
         assert!(rendered.contains("corecrux_tail_cache_misses_total"));
         assert!(rendered.contains("corecrux_tail_cache_bytes"));
-    }
-
-    #[test]
-    fn shard_owner_and_state_metrics() {
-        let m = test_metrics();
-        m.set_shard_owner_gpu_id("shard-0001", 0);
-        m.set_shard_state("shard-0001", "active");
-        let rendered = m.render().unwrap();
-        assert!(rendered.contains("corecrux_shard_owner_gpu_id"));
-        assert!(rendered.contains("corecrux_shard_state"));
-    }
-
-    #[test]
-    fn gpu_worker_up_per_gpu() {
-        let m = test_metrics();
-        m.set_gpu_worker_up(0, true);
-        m.set_gpu_worker_up(1, false);
-        let rendered = m.render().unwrap();
-        assert!(rendered.contains("corecrux_gpu_worker_up"));
     }
 
     #[test]
@@ -2652,12 +2309,10 @@ mod tests {
         m.observe_seal_duration("seal", 0.02);
         m.set_seal_backlog_frames(100);
         m.set_ccxi_missing_total(5);
-        m.inc_vram_evictions();
         let rendered = m.render().unwrap();
         assert!(rendered.contains("corecrux_seal_duration_seconds"));
         assert!(rendered.contains("corecrux_seal_backlog_frames 100"));
         assert!(rendered.contains("corecrux_ccxi_missing_total 5"));
-        assert!(rendered.contains("corecrux_vram_evictions_total 1"));
     }
 
     #[test]

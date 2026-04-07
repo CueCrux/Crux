@@ -109,14 +109,13 @@ impl BootstrapSeeder {
             };
         }
 
-        let docs: Vec<DocEntry> =
-            serde_json::from_str(BOOTSTRAP_DOCS).expect("bootstrap docs.json is invalid");
+        let docs: Vec<DocEntry> = serde_json::from_str(BOOTSTRAP_DOCS).expect("bootstrap docs.json is invalid");
         let patterns: Vec<PatternEntry> =
             serde_json::from_str(BOOTSTRAP_PATTERNS).expect("bootstrap patterns.json is invalid");
-        let resolutions: Vec<ResolutionEntry> = serde_json::from_str(BOOTSTRAP_RESOLUTIONS)
-            .expect("bootstrap resolutions.json is invalid");
-        let tool_outputs: Vec<ToolOutputEntry> = serde_json::from_str(BOOTSTRAP_TOOL_OUTPUTS)
-            .expect("bootstrap tool-outputs.json is invalid");
+        let resolutions: Vec<ResolutionEntry> =
+            serde_json::from_str(BOOTSTRAP_RESOLUTIONS).expect("bootstrap resolutions.json is invalid");
+        let tool_outputs: Vec<ToolOutputEntry> =
+            serde_json::from_str(BOOTSTRAP_TOOL_OUTPUTS).expect("bootstrap tool-outputs.json is invalid");
 
         let mut reqs: Vec<StoreFact> = Vec::new();
 
@@ -264,8 +263,7 @@ mod tests {
 
     #[test]
     fn bootstrap_tool_outputs_deserialises() {
-        let entries: Vec<ToolOutputEntry> =
-            serde_json::from_str(BOOTSTRAP_TOOL_OUTPUTS).unwrap();
+        let entries: Vec<ToolOutputEntry> = serde_json::from_str(BOOTSTRAP_TOOL_OUTPUTS).unwrap();
         assert_eq!(entries.len(), 16);
         for e in &entries {
             assert!(!e.tool.is_empty());
@@ -275,8 +273,7 @@ mod tests {
 
     #[test]
     fn bootstrap_resolutions_deserialises() {
-        let resolutions: Vec<ResolutionEntry> =
-            serde_json::from_str(BOOTSTRAP_RESOLUTIONS).unwrap();
+        let resolutions: Vec<ResolutionEntry> = serde_json::from_str(BOOTSTRAP_RESOLUTIONS).unwrap();
         assert!(!resolutions.is_empty());
         for r in &resolutions {
             assert!(!r.code.is_empty());

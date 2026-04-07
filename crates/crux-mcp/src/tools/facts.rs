@@ -29,14 +29,8 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         .get("source_receipt")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let confidence = args
-        .get("confidence")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1.0) as f32;
-    let private = args
-        .get("private")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let confidence = args.get("confidence").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+    let private = args.get("private").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Apply agent-scoped entity prefix for private facts.
     let entity = if private {
@@ -60,11 +54,48 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     let mut store = ctx.fact_store.write().await;
     let fact = store.store(req);
 
+    let supersedes_msg = match &fact.supersedes {
+        Some(prev) => format!(", supersedes={prev}, version={}", fact.version),
+        None => format!(", version={}", fact.version),
+    };
+
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": format!("stored fact {} (entity={}, key={})", fact.fact_id, fact.entity, fact.key)
+            "text": format!("stored fact {} (entity={}, key={}{})", fact.fact_id, fact.entity, fact.key, supersedes_msg)
         }]
+    }))
+}
+
+/// `fact_history` — return the full version chain for a given (entity, key) pair.
+pub async fn handle_fact_history(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let entity = require_str(args, "entity")?;
+    let key = require_str(args, "key")?;
+
+    let store = ctx.fact_store.read().await;
+    let history = store.fact_history(entity, key);
+
+    if history.is_empty() {
+        return Ok(json!({
+            "content": [{ "type": "text", "text": format!("no history for entity={entity}, key={key}") }]
+        }));
+    }
+
+    let text = history
+        .iter()
+        .map(|f| {
+            let status = if f.deleted { " [deleted]" } else { "" };
+            let sup = f.supersedes.as_deref().unwrap_or("-");
+            format!(
+                "v{}: {} = {} (confidence={:.2}, stored_at={}, supersedes={}){}",
+                f.version, f.fact_id, f.value, f.confidence, f.stored_at, sup, status
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }]
     }))
 }
 
@@ -72,22 +103,10 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
 ///
 /// Results are filtered to exclude private facts owned by other agents.
 pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let query = args
-        .get("query")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let entity = args
-        .get("entity")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let top_k = args
-        .get("top_k")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(10) as usize;
-    let token_budget = args
-        .get("token_budget")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
+    let query = args.get("query").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let entity = args.get("entity").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize);
 
     let q = FactQuery {
         query,
@@ -194,10 +213,7 @@ const BOOTSTRAP_PREFIX: &str = "__bootstrap__::";
 /// Accepts an optional `topic` parameter ("patterns", "docs", "errors") to
 /// filter bootstrap facts by sub-entity.
 pub async fn handle_get_bootstrap(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let topic = args
-        .get("topic")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let topic = args.get("topic").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let prefix = match &topic {
         Some(t) => format!("{BOOTSTRAP_PREFIX}{t}"),
@@ -239,13 +255,11 @@ pub async fn handle_get_bootstrap(args: &Value, ctx: &McpContext) -> Result<Valu
 
 /// Extract a required string parameter or return an INVALID_PARAMS error.
 fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, JsonRpcError> {
-    args.get(field)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| JsonRpcError {
-            code: INVALID_PARAMS,
-            message: format!("missing required param: {field}"),
-            data: Some(json!({"param": field, "required": true})),
-        })
+    args.get(field).and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
+        code: INVALID_PARAMS,
+        message: format!("missing required param: {field}"),
+        data: Some(json!({"param": field, "required": true})),
+    })
 }
 
 // ── Tests ────────────────────────────────────────────���────────────────────
@@ -263,12 +277,9 @@ mod tests {
     #[tokio::test]
     async fn store_fact_basic() {
         let ctx = test_ctx();
-        let result = handle_store_fact(
-            &json!({"entity": "proj", "key": "name", "value": "CueCrux"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let result = handle_store_fact(&json!({"entity": "proj", "key": "name", "value": "CueCrux"}), &ctx)
+            .await
+            .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("stored fact f_"));
         assert!(text.contains("entity=proj"));
@@ -277,31 +288,22 @@ mod tests {
     #[tokio::test]
     async fn store_fact_missing_entity() {
         let ctx = test_ctx();
-        let err = handle_store_fact(
-            &json!({"key": "k", "value": "v"}),
-            &ctx,
-        )
-        .await
-        .unwrap_err();
+        let err = handle_store_fact(&json!({"key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
     #[tokio::test]
     async fn store_and_query_roundtrip() {
         let ctx = test_ctx();
-        handle_store_fact(
-            &json!({"entity": "alpha", "key": "status", "value": "active"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        handle_store_fact(&json!({"entity": "alpha", "key": "status", "value": "active"}), &ctx)
+            .await
+            .unwrap();
 
-        let result = handle_query_facts(
-            &json!({"query": "active", "entity": "alpha"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let result = handle_query_facts(&json!({"query": "active", "entity": "alpha"}), &ctx)
+            .await
+            .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("active"));
     }
@@ -342,9 +344,7 @@ mod tests {
             name: "bob".to_string(),
             token_hash: [1u8; 32],
         });
-        let result = handle_query_facts(&json!({"query": "hidden"}), &bob_ctx)
-            .await
-            .unwrap();
+        let result = handle_query_facts(&json!({"query": "hidden"}), &bob_ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, "no facts found");
     }
@@ -360,12 +360,7 @@ mod tests {
         .unwrap();
 
         // Should be stored with un-prefixed entity.
-        let result = handle_query_facts(
-            &json!({"entity": "notes"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let result = handle_query_facts(&json!({"entity": "notes"}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("notes"));
     }
@@ -375,19 +370,14 @@ mod tests {
     #[tokio::test]
     async fn delete_fact_existing() {
         let ctx = test_ctx();
-        let result = handle_store_fact(
-            &json!({"entity": "e", "key": "k", "value": "v"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let result = handle_store_fact(&json!({"entity": "e", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         // Extract fact_id from "stored fact f_..."
         let fact_id = text.split_whitespace().nth(2).unwrap();
 
-        let result = handle_delete_fact(&json!({"fact_id": fact_id}), &ctx)
-            .await
-            .unwrap();
+        let result = handle_delete_fact(&json!({"fact_id": fact_id}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("deleted fact"));
     }
@@ -395,9 +385,7 @@ mod tests {
     #[tokio::test]
     async fn delete_fact_nonexistent() {
         let ctx = test_ctx();
-        let result = handle_delete_fact(&json!({"fact_id": "f_nope"}), &ctx)
-            .await
-            .unwrap();
+        let result = handle_delete_fact(&json!({"fact_id": "f_nope"}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("fact not found"));
     }
@@ -424,9 +412,15 @@ mod tests {
     #[tokio::test]
     async fn list_entities_returns_sorted_unique() {
         let ctx = test_ctx();
-        handle_store_fact(&json!({"entity": "beta", "key": "k", "value": "v"}), &ctx).await.unwrap();
-        handle_store_fact(&json!({"entity": "alpha", "key": "k", "value": "v"}), &ctx).await.unwrap();
-        handle_store_fact(&json!({"entity": "alpha", "key": "k2", "value": "v2"}), &ctx).await.unwrap();
+        handle_store_fact(&json!({"entity": "beta", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        handle_store_fact(&json!({"entity": "alpha", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        handle_store_fact(&json!({"entity": "alpha", "key": "k2", "value": "v2"}), &ctx)
+            .await
+            .unwrap();
 
         let result = handle_list_entities(&json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -447,9 +441,7 @@ mod tests {
     #[tokio::test]
     async fn get_bootstrap_with_topic_empty() {
         let ctx = test_ctx();
-        let result = handle_get_bootstrap(&json!({"topic": "patterns"}), &ctx)
-            .await
-            .unwrap();
+        let result = handle_get_bootstrap(&json!({"topic": "patterns"}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("no bootstrap knowledge for topic 'patterns'"));
     }
@@ -471,12 +463,9 @@ mod tests {
         .await
         .unwrap();
         // Non-bootstrap fact should not appear.
-        handle_store_fact(
-            &json!({"entity": "project", "key": "name", "value": "CueCrux"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        handle_store_fact(&json!({"entity": "project", "key": "name", "value": "CueCrux"}), &ctx)
+            .await
+            .unwrap();
 
         // Query all bootstrap.
         let result = handle_get_bootstrap(&json!({}), &ctx).await.unwrap();
@@ -486,9 +475,7 @@ mod tests {
         assert!(!text.contains("CueCrux"));
 
         // Query filtered by topic.
-        let result = handle_get_bootstrap(&json!({"topic": "patterns"}), &ctx)
-            .await
-            .unwrap();
+        let result = handle_get_bootstrap(&json!({"topic": "patterns"}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("exponential backoff"));
         assert!(!text.contains("increase memory"));
@@ -499,12 +486,9 @@ mod tests {
     #[tokio::test]
     async fn store_fact_missing_entity_has_structured_data() {
         let ctx = test_ctx();
-        let err = handle_store_fact(
-            &json!({"key": "k", "value": "v"}),
-            &ctx,
-        )
-        .await
-        .unwrap_err();
+        let err = handle_store_fact(&json!({"key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
         let data = err.data.unwrap();
         assert_eq!(data["param"], "entity");

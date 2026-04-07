@@ -59,7 +59,10 @@ pub fn run(data_dir: &str, receipt_id: &str) -> Result<(), Box<dyn std::error::E
     }
 
     println!("To explain a retrieval decision, the receipt must contain the query");
-    println!("parameters and result set. Use `inspect-receipt {}` first to view", receipt_id);
+    println!(
+        "parameters and result set. Use `inspect-receipt {}` first to view",
+        receipt_id
+    );
     println!("the receipt payload, then re-run the query against the indexed segments.");
     println!();
     println!("Retrieval path:");

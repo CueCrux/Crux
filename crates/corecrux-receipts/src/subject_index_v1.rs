@@ -48,18 +48,10 @@ impl SubjectResolveModeV1 {
     }
 }
 
-pub fn subject_index_path_v1(
-    root: &Path,
-    tenant_id: &str,
-    kind: &str,
-    subject_id: &str,
-) -> PathBuf {
+pub fn subject_index_path_v1(root: &Path, tenant_id: &str, kind: &str, subject_id: &str) -> PathBuf {
     let tenant_dir = tenant_dir_name_v1(tenant_id);
     let key = subject_key_hex16(subject_id);
-    root.join("v1")
-        .join(kind)
-        .join(tenant_dir)
-        .join(format!("{key}.json"))
+    root.join("v1").join(kind).join(tenant_dir).join(format!("{key}.json"))
 }
 
 pub fn update_subject_index_v1(

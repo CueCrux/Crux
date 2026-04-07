@@ -12,9 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::ValueEnum;
 use corecrux_segment::decode_segment_v1;
 use corecrux_storage::load_manifest_segment_catalog;
-use corecrux_types::{
-    build_info, EvidenceNodeContextV1, SegmentOffloadedV1, EVT_SEGMENT_OFFLOADED_V1,
-};
+use corecrux_types::{build_info, EvidenceNodeContextV1, SegmentOffloadedV1, EVT_SEGMENT_OFFLOADED_V1};
 use serde::{Deserialize, Serialize};
 
 use crate::ops::{append_ops_event, OpsAppendOptions, OpsAppendReceipt};
@@ -258,10 +256,7 @@ pub fn offload_segments(opts: &StorageOffloadOptions) -> Result<StorageOffloadRe
     let mut dirty_indexes = BTreeSet::new();
 
     for shard_id in list_shards(&opts.data_dir.join("shards"))? {
-        let shard_dir = opts
-            .data_dir
-            .join("shards")
-            .join(format!("shard-{shard_id:04}"));
+        let shard_dir = opts.data_dir.join("shards").join(format!("shard-{shard_id:04}"));
         let catalog = load_manifest_segment_catalog(&shard_dir)?;
         if let std::collections::btree_map::Entry::Vacant(e) = indexes.entry(shard_id) {
             e.insert(load_offload_index(&opts.data_dir, opts.tier, shard_id)?);
@@ -302,11 +297,7 @@ pub fn offload_segments(opts: &StorageOffloadOptions) -> Result<StorageOffloadRe
             }
 
             let inspection = inspect_source_segment(&source_path, &segment.segment_hash)?;
-            let index_key = build_index_key(
-                segment.segment_seq,
-                &inspection.source_hash_blake3,
-                &target_digest,
-            );
+            let index_key = build_index_key(segment.segment_seq, &inspection.source_hash_blake3, &target_digest);
             item.bytes_copied = inspection.file_len;
             item.transfer_hash_blake3 = Some(inspection.source_hash_blake3.clone());
 
@@ -393,18 +384,13 @@ pub fn offload_segments(opts: &StorageOffloadOptions) -> Result<StorageOffloadRe
                 index.entries.insert(
                     index_key,
                     OffloadIndexEntry {
-                        key: build_index_key(
-                            segment.segment_seq,
-                            &inspection.source_hash_blake3,
-                            &target_digest,
-                        ),
+                        key: build_index_key(segment.segment_seq, &inspection.source_hash_blake3, &target_digest),
                         segment_seq: segment.segment_seq,
                         source_hash_blake3: inspection.source_hash_blake3.clone(),
                         target_digest: target_digest.clone(),
                         target_kind: target.kind().as_str().to_string(),
                         target_path: target_path.clone(),
-                        indexed_at: chrono::Utc::now()
-                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        indexed_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                     },
                 );
                 dirty_indexes.insert(shard_id);
@@ -507,9 +493,7 @@ fn parse_target(
         }
         OffloadTargetKind::Rsync => {
             if !trimmed.contains(':') {
-                return Err(
-                    "--target-kind rsync requires a remote rsync target like host:/path".into(),
-                );
+                return Err("--target-kind rsync requires a remote rsync target like host:/path".into());
             }
             Ok(OffloadTarget::Rsync {
                 prefix: trimmed.to_string(),
@@ -524,18 +508,13 @@ fn build_target_path(target: &OffloadTarget, shard_id: u32, relative_path: &str)
     match target {
         OffloadTarget::Local { root } => root.join(&shard_relative).display().to_string(),
         OffloadTarget::S3 { prefix } | OffloadTarget::Rsync { prefix, .. } => {
-            let suffix = shard_relative
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
+            let suffix = shard_relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
             format!("{}/{}", prefix.trim_end_matches('/'), suffix)
         }
     }
 }
 
-fn inspect_source_segment(
-    path: &Path,
-    manifest_segment_hash: &[u8; 32],
-) -> Result<SourceInspection, DynError> {
+fn inspect_source_segment(path: &Path, manifest_segment_hash: &[u8; 32]) -> Result<SourceInspection, DynError> {
     let bytes = std::fs::read(path)?;
     let (_header, _toc, _entries, footer) = decode_segment_v1(&bytes)?;
     if &footer.segment_hash != manifest_segment_hash {
@@ -547,11 +526,7 @@ fn inspect_source_segment(
     })
 }
 
-fn copy_to_target(
-    target: &OffloadTarget,
-    source_path: &Path,
-    target_path: &str,
-) -> Result<(), DynError> {
+fn copy_to_target(target: &OffloadTarget, source_path: &Path, target_path: &str) -> Result<(), DynError> {
     match target {
         OffloadTarget::Local { .. } => {
             let target_path = PathBuf::from(target_path);
@@ -598,9 +573,7 @@ fn verify_target_copy(target: &OffloadTarget, target_path: &str) -> Result<Strin
                 .arg(&temp_path)
                 .status()?;
             if !status.success() {
-                return Err(
-                    format!("aws s3 cp verification download failed for {target_path}").into(),
-                );
+                return Err(format!("aws s3 cp verification download failed for {target_path}").into());
             }
             blake3_file_hex(&temp_path)
         }
@@ -642,11 +615,7 @@ fn offload_index_path(data_dir: &Path, tier: StorageTier, shard_id: u32) -> Path
         .join(format!("shard-{shard_id:04}.json"))
 }
 
-fn load_offload_index(
-    data_dir: &Path,
-    tier: StorageTier,
-    shard_id: u32,
-) -> Result<OffloadIndexState, DynError> {
+fn load_offload_index(data_dir: &Path, tier: StorageTier, shard_id: u32) -> Result<OffloadIndexState, DynError> {
     let path = offload_index_path(data_dir, tier, shard_id);
     if !path.exists() {
         return Ok(OffloadIndexState {
@@ -705,19 +674,13 @@ fn default_node_id() -> String {
     std::env::var("CORECRUX_NODE_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("HOSTNAME")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|value| !value.trim().is_empty()))
         .unwrap_or_else(|| "unknown-node".to_string())
 }
 
 fn build_node_context(ops: Option<&OpsAppendOptions>) -> EvidenceNodeContextV1 {
     EvidenceNodeContextV1 {
-        node_id: ops
-            .map(|value| value.node_id.clone())
-            .unwrap_or_else(default_node_id),
+        node_id: ops.map(|value| value.node_id.clone()).unwrap_or_else(default_node_id),
         build: build_info(),
         http_listen_addr: None,
         grpc_listen_addr: ops.map(|value| value.grpc.clone()),
@@ -754,15 +717,13 @@ fn hex_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_segment_offloaded_event_id, build_target_path, offload_index_path, offload_segments,
-        parse_target, OffloadTarget, OffloadTargetKind, StorageOffloadItem, StorageOffloadOptions,
-        StorageOffloadReport, StorageTier,
+        build_segment_offloaded_event_id, build_target_path, offload_index_path, offload_segments, parse_target,
+        OffloadTarget, OffloadTargetKind, StorageOffloadItem, StorageOffloadOptions, StorageOffloadReport, StorageTier,
     };
     use crate::tooling_env::ToolingEnvironment;
     use corecrux_segment::decode_segment_v1;
     use corecrux_storage::{
-        encode_manifest_add_segment_v1, encode_manifest_header_v1, frame_manifest_record,
-        SegmentMeta,
+        encode_manifest_add_segment_v1, encode_manifest_header_v1, frame_manifest_record, SegmentMeta,
     };
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -838,8 +799,7 @@ mod tests {
 
     #[test]
     fn parse_target_rsync_uses_default_rsh() {
-        let target =
-            parse_target("host:/path", Some(OffloadTargetKind::Rsync), None).expect("parse");
+        let target = parse_target("host:/path", Some(OffloadTargetKind::Rsync), None).expect("parse");
         match target {
             OffloadTarget::Rsync { rsync_rsh, .. } => assert_eq!(rsync_rsh, "ssh"),
             _ => panic!("expected rsync target"),
@@ -848,12 +808,7 @@ mod tests {
 
     #[test]
     fn parse_target_rsync_custom_rsh() {
-        let target = parse_target(
-            "host:/path",
-            Some(OffloadTargetKind::Rsync),
-            Some("ssh -p 2222"),
-        )
-        .expect("parse");
+        let target = parse_target("host:/path", Some(OffloadTargetKind::Rsync), Some("ssh -p 2222")).expect("parse");
         match target {
             OffloadTarget::Rsync { rsync_rsh, .. } => assert_eq!(rsync_rsh, "ssh -p 2222"),
             _ => panic!("expected rsync target"),
@@ -869,15 +824,9 @@ mod tests {
     #[test]
     fn offload_index_path_structure() {
         let path = offload_index_path(Path::new("/data"), StorageTier::Warm, 7);
-        assert_eq!(
-            path,
-            PathBuf::from("/data/meta/offload/warm/shard-0007.json")
-        );
+        assert_eq!(path, PathBuf::from("/data/meta/offload/warm/shard-0007.json"));
         let path_cold = offload_index_path(Path::new("/data"), StorageTier::Cold, 1);
-        assert_eq!(
-            path_cold,
-            PathBuf::from("/data/meta/offload/cold/shard-0001.json")
-        );
+        assert_eq!(path_cold, PathBuf::from("/data/meta/offload/cold/shard-0001.json"));
     }
 
     #[test]
@@ -971,9 +920,7 @@ mod tests {
             node_id: None,
         })
         .expect_err("should fail");
-        assert!(err
-            .to_string()
-            .contains("--allow-missing-ops-evidence"));
+        assert!(err.to_string().contains("--allow-missing-ops-evidence"));
     }
 
     #[test]
@@ -1006,12 +953,8 @@ mod tests {
 
     #[test]
     fn parse_target_supports_explicit_rsync_kind() {
-        let target = parse_target(
-            "archive-host:/srv/corecrux",
-            Some(OffloadTargetKind::Rsync),
-            None,
-        )
-        .expect("parse rsync target");
+        let target = parse_target("archive-host:/srv/corecrux", Some(OffloadTargetKind::Rsync), None)
+            .expect("parse rsync target");
         assert!(matches!(target, OffloadTarget::Rsync { .. }));
     }
 
@@ -1226,15 +1169,12 @@ mod tests {
     }
 
     fn seed_manifest_backed_fixture(root: &Path) {
-        let fixture_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures_segments/minimal");
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures_segments/minimal");
         let fixture_seg = fixture_dir.join("minimal.ccxseg");
         let seg_bytes = std::fs::read(&fixture_seg).expect("read fixture segment");
         let (_h, _toc_h, _entries, footer) = decode_segment_v1(&seg_bytes).expect("decode segment");
 
-        let shard_dir = root
-            .join("shards")
-            .join(format!("shard-{:04}", footer.shard_id));
+        let shard_dir = root.join("shards").join(format!("shard-{:04}", footer.shard_id));
         std::fs::create_dir_all(shard_dir.join("segments")).expect("create shard segments dir");
 
         let rel = "segments/minimal.ccxseg";
@@ -1249,8 +1189,7 @@ mod tests {
             .write(true)
             .open(&manifest_path)
             .expect("create MANIFEST");
-        let header =
-            encode_manifest_header_v1(footer.shard_id, footer.epoch, 123).expect("manifest header");
+        let header = encode_manifest_header_v1(footer.shard_id, footer.epoch, 123).expect("manifest header");
         manifest.write_all(&header).expect("write manifest header");
 
         let segment = SegmentMeta {

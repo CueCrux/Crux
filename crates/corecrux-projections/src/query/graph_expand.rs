@@ -11,9 +11,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::state::{
-    dequantize_confidence_f32, LivingStateRowV1, ProjectionState, RelationTypeV1,
-};
+use crate::state::{dequantize_confidence_f32, LivingStateRowV1, ProjectionState, RelationTypeV1};
 
 /// Request for graph expansion.
 #[derive(Debug, Clone)]
@@ -184,8 +182,7 @@ pub fn graph_expand(state: &ProjectionState, req: &GraphExpandRequest) -> GraphE
             // We limit this to a bounded scan for performance
             let tenant_start = (req.tenant_hash, 0u32, src_id, 0u8);
             let tenant_end = (req.tenant_hash, u32::MAX, src_id, u8::MAX);
-            for ((_t, other_src, dst, rt), edge) in state.relations.range(tenant_start..=tenant_end)
-            {
+            for ((_t, other_src, dst, rt), edge) in state.relations.range(tenant_start..=tenant_end) {
                 if *dst != src_id {
                     continue;
                 }
@@ -207,13 +204,11 @@ pub fn graph_expand(state: &ProjectionState, req: &GraphExpandRequest) -> GraphE
                 // Incoming edges get slightly less boost (0.9x) to prefer forward traversal
                 let propagated = parent_score * conf * edge_boost(rt_enum) * HOP_DECAY * 0.9;
 
-                let activation = activations
-                    .entry(*other_src)
-                    .or_insert_with(|| NodeActivation {
-                        score: 0.0,
-                        hop_distance: hop + 1,
-                        edge_types: BTreeSet::new(),
-                    });
+                let activation = activations.entry(*other_src).or_insert_with(|| NodeActivation {
+                    score: 0.0,
+                    hop_distance: hop + 1,
+                    edge_types: BTreeSet::new(),
+                });
 
                 if propagated > activation.score {
                     activation.score = propagated;
@@ -242,8 +237,7 @@ pub fn graph_expand(state: &ProjectionState, req: &GraphExpandRequest) -> GraphE
     }
 
     // Select top-K by score using a min-heap (collect all into sorted vec is simpler for <200 items)
-    let mut scored: Vec<(u32, &NodeActivation)> =
-        activations.iter().map(|(&k, v)| (k, v)).collect();
+    let mut scored: Vec<(u32, &NodeActivation)> = activations.iter().map(|(&k, v)| (k, v)).collect();
     scored.sort_by(|a, b| b.1.score.partial_cmp(&a.1.score).unwrap_or(Ordering::Equal));
     scored.truncate(budget);
 

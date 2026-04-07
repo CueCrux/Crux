@@ -63,8 +63,7 @@ fn import_v1_produces_deterministic_digest() {
     let jsonl_path = PathBuf::from(result.output_jsonl);
 
     let expected: ReplayDigest =
-        serde_json::from_str(&fs::read_to_string(digest_path).expect("read digest"))
-            .expect("parse digest");
+        serde_json::from_str(&fs::read_to_string(digest_path).expect("read digest")).expect("parse digest");
     let actual = replay_digest_from_jsonl(&jsonl_path).expect("compute digest");
 
     assert_eq!(actual.digest_blake3, expected.digest_blake3);

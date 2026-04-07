@@ -11,13 +11,7 @@ fn main() -> anyhow::Result<()> {
         .current_dir(repo_root())
         .output()
         .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(o.stdout)
-            } else {
-                None
-            }
-        })
+        .and_then(|o| if o.status.success() { Some(o.stdout) } else { None })
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())

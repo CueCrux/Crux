@@ -77,7 +77,11 @@ fn encode_block(deltas: &[u32], out: &mut Vec<u8>) {
     let p90_val = sorted.get(p90_idx).copied().unwrap_or(0);
     let bit_width = if p90_val == 0 { 1 } else { 32 - p90_val.leading_zeros() } as u8;
 
-    let max_val = if bit_width >= 32 { u32::MAX } else { (1u32 << bit_width) - 1 };
+    let max_val = if bit_width >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << bit_width) - 1
+    };
 
     // Identify exceptions
     let mut exceptions: Vec<(u8, u32)> = Vec::new();

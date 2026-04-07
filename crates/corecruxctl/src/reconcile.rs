@@ -49,23 +49,11 @@ pub struct ReconcileHashMismatchSample {
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct ReconcileSamples {
-    #[serde(
-        rename = "missingInPostgres",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "missingInPostgres", default, skip_serializing_if = "Vec::is_empty")]
     pub missing_in_postgres: Vec<String>,
-    #[serde(
-        rename = "missingInCoreCrux",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "missingInCoreCrux", default, skip_serializing_if = "Vec::is_empty")]
     pub missing_in_corecrux: Vec<String>,
-    #[serde(
-        rename = "hashMismatch",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "hashMismatch", default, skip_serializing_if = "Vec::is_empty")]
     pub hash_mismatch: Vec<ReconcileHashMismatchSample>,
 }
 
@@ -138,9 +126,7 @@ struct PostgresCollectResult {
     rows: u64,
 }
 
-pub fn reconcile_postgres(
-    opts: &ReconcilePostgresOptions,
-) -> Result<ReconcilePostgresReport, DynError> {
+pub fn reconcile_postgres(opts: &ReconcilePostgresOptions) -> Result<ReconcilePostgresReport, DynError> {
     let started = Instant::now();
     let corecrux = collect_corecrux_records(opts)?;
     let postgres = collect_postgres_records(opts)?;
@@ -202,9 +188,7 @@ fn list_shards(shards_root: &Path) -> Result<Vec<u32>, DynError> {
     Ok(shard_ids)
 }
 
-fn collect_corecrux_records(
-    opts: &ReconcilePostgresOptions,
-) -> Result<CoreCruxCollectResult, DynError> {
+fn collect_corecrux_records(opts: &ReconcilePostgresOptions) -> Result<CoreCruxCollectResult, DynError> {
     let shards_root = opts.data_dir.join("shards");
     let cutoff_unix_ns = opts
         .window_days
@@ -253,31 +237,20 @@ fn collect_corecrux_records(
             let start = entry.file_offset as usize;
             let end = start.saturating_add(entry.frame_len as usize);
             if end > bytes.len() {
-                return Err(format!(
-                    "frame range out of bounds for {}:{}",
-                    segment_path.display(),
-                    entry.seq
-                )
-                .into());
+                return Err(format!("frame range out of bounds for {}:{}", segment_path.display(), entry.seq).into());
             }
             let frame = decode_frame_v1(&bytes[start..end])?;
             if frame.header_bytes.len() < 32 {
-                return Err(format!(
-                    "stored header too short for {}:{}",
+                return Err(format!("stored header too short for {}:{}", segment_path.display(), entry.seq).into());
+            }
+            let canonical_len = frame.header_bytes.len() - 32;
+            let header = decode_canonical_header_bytes_v1(&frame.header_bytes[..canonical_len]).map_err(|err| {
+                format!(
+                    "failed to decode canonical header for {}:{}: {err}",
                     segment_path.display(),
                     entry.seq
                 )
-                .into());
-            }
-            let canonical_len = frame.header_bytes.len() - 32;
-            let header = decode_canonical_header_bytes_v1(&frame.header_bytes[..canonical_len])
-                .map_err(|err| {
-                    format!(
-                        "failed to decode canonical header for {}:{}: {err}",
-                        segment_path.display(),
-                        entry.seq
-                    )
-                })?;
+            })?;
 
             if header.tenant_id != opts.tenant_id {
                 continue;
@@ -289,11 +262,7 @@ fn collect_corecrux_records(
             {
                 continue;
             }
-            if opts
-                .stream_id
-                .as_deref()
-                .is_some_and(|value| value != header.stream_id)
-            {
+            if opts.stream_id.as_deref().is_some_and(|value| value != header.stream_id) {
                 continue;
             }
 
@@ -325,9 +294,7 @@ fn collect_corecrux_records(
     })
 }
 
-fn collect_postgres_records(
-    opts: &ReconcilePostgresOptions,
-) -> Result<PostgresCollectResult, DynError> {
+fn collect_postgres_records(opts: &ReconcilePostgresOptions) -> Result<PostgresCollectResult, DynError> {
     let mut client = Client::connect(&opts.connection_string, NoTls)?;
     let mut records = HashMap::new();
     let mut rows_seen = 0u64;
@@ -603,8 +570,7 @@ mod tests {
             },
         );
         let postgres = corecrux.clone();
-        let (matched, missing_pg, missing_cc, hash_mm, samples) =
-            reconcile_maps(&corecrux, &postgres, 10);
+        let (matched, missing_pg, missing_cc, hash_mm, samples) = reconcile_maps(&corecrux, &postgres, 10);
         assert_eq!(matched, 2);
         assert_eq!(missing_pg, 0);
         assert_eq!(missing_cc, 0);
@@ -618,8 +584,7 @@ mod tests {
     fn reconcile_maps_both_empty() {
         let corecrux = HashMap::new();
         let postgres = HashMap::new();
-        let (matched, missing_pg, missing_cc, hash_mm, _samples) =
-            reconcile_maps(&corecrux, &postgres, 10);
+        let (matched, missing_pg, missing_cc, hash_mm, _samples) = reconcile_maps(&corecrux, &postgres, 10);
         assert_eq!(matched, 0);
         assert_eq!(missing_pg, 0);
         assert_eq!(missing_cc, 0);
@@ -641,8 +606,7 @@ mod tests {
         }
         // postgres is empty, so all 20 are missing_in_postgres.
         let postgres = HashMap::new();
-        let (_matched, missing_pg, _missing_cc, _hash_mm, samples) =
-            reconcile_maps(&corecrux, &postgres, 5);
+        let (_matched, missing_pg, _missing_cc, _hash_mm, samples) = reconcile_maps(&corecrux, &postgres, 5);
         assert_eq!(missing_pg, 20);
         assert_eq!(samples.missing_in_postgres.len(), 5);
     }
@@ -654,9 +618,7 @@ mod tests {
             "postgres://***@example.com/db"
         );
         assert_eq!(
-            super::redact_connection_string(
-                "postgres://user:secret@example.com/db?sslmode=require"
-            ),
+            super::redact_connection_string("postgres://user:secret@example.com/db?sslmode=require"),
             "postgres://***@example.com/db"
         );
         assert_eq!(super::redact_connection_string(""), "empty");
@@ -775,8 +737,7 @@ mod tests {
                 },
             );
         }
-        let (_matched, _missing_pg, _missing_cc, hash_mm, samples) =
-            reconcile_maps(&corecrux, &postgres, 3);
+        let (_matched, _missing_pg, _missing_cc, hash_mm, samples) = reconcile_maps(&corecrux, &postgres, 3);
         assert_eq!(hash_mm, 20);
         assert_eq!(samples.hash_mismatch.len(), 3);
     }
@@ -797,8 +758,7 @@ mod tests {
                 },
             );
         }
-        let (_matched, _missing_pg, missing_cc, _hash_mm, samples) =
-            reconcile_maps(&corecrux, &postgres, 4);
+        let (_matched, _missing_pg, missing_cc, _hash_mm, samples) = reconcile_maps(&corecrux, &postgres, 4);
         assert_eq!(missing_cc, 15);
         assert_eq!(samples.missing_in_corecrux.len(), 4);
     }
@@ -1018,8 +978,7 @@ mod tests {
             },
         );
         let postgres = HashMap::new();
-        let (_matched, missing_pg, _missing_cc, _hash_mm, samples) =
-            reconcile_maps(&corecrux, &postgres, 0);
+        let (_matched, missing_pg, _missing_cc, _hash_mm, samples) = reconcile_maps(&corecrux, &postgres, 0);
         assert_eq!(missing_pg, 1);
         // sample_limit=0 means no samples collected
         assert!(samples.missing_in_postgres.is_empty());
@@ -1047,8 +1006,7 @@ mod tests {
                 stream_id: "s".to_string(),
             },
         );
-        let (matched, missing_pg, missing_cc, hash_mm, samples) =
-            reconcile_maps(&corecrux, &postgres, 10);
+        let (matched, missing_pg, missing_cc, hash_mm, samples) = reconcile_maps(&corecrux, &postgres, 10);
         assert_eq!(matched, 0);
         assert_eq!(missing_pg, 0);
         assert_eq!(missing_cc, 2);
@@ -1087,8 +1045,7 @@ mod tests {
                 },
             );
         }
-        let (matched, missing_pg, missing_cc, hash_mm, _samples) =
-            reconcile_maps(&corecrux, &postgres, 5);
+        let (matched, missing_pg, missing_cc, hash_mm, _samples) = reconcile_maps(&corecrux, &postgres, 5);
         assert_eq!(matched + hash_mm, 100);
         assert_eq!(missing_pg, 0);
         assert_eq!(missing_cc, 0);
@@ -1099,10 +1056,7 @@ mod tests {
 
     #[test]
     fn redact_connection_string_scheme_no_at() {
-        assert_eq!(
-            super::redact_connection_string("postgres://localhost/db"),
-            "redacted"
-        );
+        assert_eq!(super::redact_connection_string("postgres://localhost/db"), "redacted");
     }
 
     // ── redact_connection_string: with port ──────────────────────
@@ -1263,10 +1217,7 @@ mod tests {
 
     #[test]
     fn reconcile_schema_v2_value() {
-        assert_eq!(
-            super::RECONCILE_SCHEMA_V2,
-            "corecruxctl.reconcile.postgres.v2"
-        );
+        assert_eq!(super::RECONCILE_SCHEMA_V2, "corecruxctl.reconcile.postgres.v2");
     }
 
     // ── ReconcilePostgresOptions: clone + debug ──────────────────────
@@ -1300,7 +1251,10 @@ mod tests {
         };
         assert_eq!(opts.stream_type.as_deref(), Some("knowledge"));
         assert_eq!(opts.shard, Some(2));
-        assert_eq!(opts.evidence_out.as_ref().unwrap().display().to_string(), "/out/report.json");
+        assert_eq!(
+            opts.evidence_out.as_ref().unwrap().display().to_string(),
+            "/out/report.json"
+        );
     }
 
     // ── ReconcileHashMismatchSample: debug + clone ───────────────────
@@ -1373,8 +1327,7 @@ mod tests {
                 stream_id: "s".to_string(),
             },
         );
-        let (matched, missing_pg, missing_cc, hash_mm, samples) =
-            reconcile_maps(&corecrux, &postgres, 10);
+        let (matched, missing_pg, missing_cc, hash_mm, samples) = reconcile_maps(&corecrux, &postgres, 10);
         assert_eq!(matched, 0);
         assert_eq!(missing_pg, 0);
         assert_eq!(missing_cc, 0);

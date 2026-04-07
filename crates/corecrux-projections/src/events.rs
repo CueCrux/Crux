@@ -39,13 +39,13 @@ pub enum ProjectionEventV1 {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EntityFactV1 {
     pub tenant_id: String,
-    pub entity_type: String,      // Person, Place, Item, Activity, Event, Organization, Creative_Work
-    pub entity_name: String,      // "Science Museum", "Dr. Jones", "Guitar"
-    pub predicate: String,        // visited, owns, sees, bought, changed, NOT_owns, stopped
-    pub object_value: String,     // value/target of the predicate
-    pub occurred_at_micros: i64,  // 0 if unknown
-    pub session_id: String,       // source session/document
-    pub confidence_q16: u16,      // 0..65535 mapped to 0.0..1.0
+    pub entity_type: String,  // Person, Place, Item, Activity, Event, Organization, Creative_Work
+    pub entity_name: String,  // "Science Museum", "Dr. Jones", "Guitar"
+    pub predicate: String,    // visited, owns, sees, bought, changed, NOT_owns, stopped
+    pub object_value: String, // value/target of the predicate
+    pub occurred_at_micros: i64, // 0 if unknown
+    pub session_id: String,   // source session/document
+    pub confidence_q16: u16,  // 0..65535 mapped to 0.0..1.0
 }
 
 impl EntityFactV1 {
@@ -122,8 +122,7 @@ impl EntityFactV1 {
         }
         let secs = self.occurred_at_micros / 1_000_000;
         let nanos = ((self.occurred_at_micros % 1_000_000) * 1000) as u32;
-        chrono::DateTime::from_timestamp(secs, nanos)
-            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        chrono::DateTime::from_timestamp(secs, nanos).map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
     }
 }
 
@@ -402,11 +401,11 @@ pub fn parse_projection_event(
     let ev = match event_type {
         EVT_LIVING_STATE_UPDATE_V1 => {
             if is_json {
-                ProjectionEventV1::LivingStateUpdate(serde_json::from_slice(payload).map_err(
-                    |e| ProjectionError::InvalidEvent {
+                ProjectionEventV1::LivingStateUpdate(serde_json::from_slice(payload).map_err(|e| {
+                    ProjectionError::InvalidEvent {
                         msg: format!("LivingStateUpdateV1 json decode failed: {e}"),
-                    },
-                )?)
+                    }
+                })?)
             } else {
                 ProjectionEventV1::LivingStateUpdate(LivingStateUpdateV1::decode_bin(payload)?)
             }
@@ -446,15 +445,13 @@ pub fn parse_projection_event(
         }
         EVT_DEPENDENT_EVIDENCE_UPSERT_V1 => {
             if is_json {
-                ProjectionEventV1::DependentEvidenceUpsert(
-                    serde_json::from_slice(payload).map_err(|e| ProjectionError::InvalidEvent {
+                ProjectionEventV1::DependentEvidenceUpsert(serde_json::from_slice(payload).map_err(|e| {
+                    ProjectionError::InvalidEvent {
                         msg: format!("DependentEvidenceUpsertV1 json decode failed: {e}"),
-                    })?,
-                )
+                    }
+                })?)
             } else {
-                ProjectionEventV1::DependentEvidenceUpsert(DependentEvidenceUpsertV1::decode_bin(
-                    payload,
-                )?)
+                ProjectionEventV1::DependentEvidenceUpsert(DependentEvidenceUpsertV1::decode_bin(payload)?)
             }
         }
         EVT_ENTITY_FACT_V1 => {
@@ -481,12 +478,9 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_exact(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or_else(|| ProjectionError::InvalidEvent {
-                msg: "cursor overflow".to_string(),
-            })?;
+        let end = self.pos.checked_add(n).ok_or_else(|| ProjectionError::InvalidEvent {
+            msg: "cursor overflow".to_string(),
+        })?;
         if end > self.input.len() {
             return Err(ProjectionError::InvalidEvent {
                 msg: "payload too small".to_string(),
@@ -513,9 +507,7 @@ impl<'a> Cursor<'a> {
 
     fn read_i64(&mut self) -> Result<i64> {
         let b = self.read_exact(8)?;
-        Ok(i64::from_le_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
+        Ok(i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
     }
 
     fn read_uuid(&mut self) -> Result<Uuid> {
@@ -890,17 +882,9 @@ mod tests {
             updated_at_micros: 0,
         };
         let payload = living.encode_bin();
-        let result = parse_projection_event(
-            EVT_LIVING_STATE_UPDATE_V1,
-            CONTENT_TYPE_PROJ_BIN_V1,
-            &payload,
-        )
-        .unwrap();
+        let result = parse_projection_event(EVT_LIVING_STATE_UPDATE_V1, CONTENT_TYPE_PROJ_BIN_V1, &payload).unwrap();
         assert!(result.is_some());
-        assert!(matches!(
-            result.unwrap(),
-            ProjectionEventV1::LivingStateUpdate(_)
-        ));
+        assert!(matches!(result.unwrap(), ProjectionEventV1::LivingStateUpdate(_)));
     }
 
     #[test]
@@ -916,14 +900,9 @@ mod tests {
             updated_at_micros: 0,
         };
         let payload = serde_json::to_vec(&living).unwrap();
-        let result =
-            parse_projection_event(EVT_LIVING_STATE_UPDATE_V1, "application/json", &payload)
-                .unwrap();
+        let result = parse_projection_event(EVT_LIVING_STATE_UPDATE_V1, "application/json", &payload).unwrap();
         assert!(result.is_some());
-        assert!(matches!(
-            result.unwrap(),
-            ProjectionEventV1::LivingStateUpdate(_)
-        ));
+        assert!(matches!(result.unwrap(), ProjectionEventV1::LivingStateUpdate(_)));
     }
 
     #[test]
@@ -938,16 +917,8 @@ mod tests {
             updated_at_micros: 0,
         };
         let payload = rel.encode_bin();
-        let result = parse_projection_event(
-            EVT_RELATION_UPSERT_V1,
-            CONTENT_TYPE_PROJ_BIN_V1,
-            &payload,
-        )
-        .unwrap();
-        assert!(matches!(
-            result.unwrap(),
-            ProjectionEventV1::RelationUpsert(_)
-        ));
+        let result = parse_projection_event(EVT_RELATION_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &payload).unwrap();
+        assert!(matches!(result.unwrap(), ProjectionEventV1::RelationUpsert(_)));
     }
 
     #[test]
@@ -958,12 +929,8 @@ mod tests {
             relation_type: 1,
         };
         let payload = serde_json::to_vec(&del).unwrap();
-        let result =
-            parse_projection_event(EVT_RELATION_DELETE_V1, "application/json", &payload).unwrap();
-        assert!(matches!(
-            result.unwrap(),
-            ProjectionEventV1::RelationDelete(_)
-        ));
+        let result = parse_projection_event(EVT_RELATION_DELETE_V1, "application/json", &payload).unwrap();
+        assert!(matches!(result.unwrap(), ProjectionEventV1::RelationDelete(_)));
     }
 
     #[test]
@@ -979,16 +946,8 @@ mod tests {
             receipt_id: None,
         };
         let payload = pres.encode_bin();
-        let result = parse_projection_event(
-            EVT_PRESSURE_UPSERT_V1,
-            CONTENT_TYPE_PROJ_BIN_V1,
-            &payload,
-        )
-        .unwrap();
-        assert!(matches!(
-            result.unwrap(),
-            ProjectionEventV1::PressureUpsert(_)
-        ));
+        let result = parse_projection_event(EVT_PRESSURE_UPSERT_V1, CONTENT_TYPE_PROJ_BIN_V1, &payload).unwrap();
+        assert!(matches!(result.unwrap(), ProjectionEventV1::PressureUpsert(_)));
     }
 
     #[test]
@@ -1001,16 +960,8 @@ mod tests {
             usage_weight_q16: 100,
         };
         let payload = serde_json::to_vec(&dep).unwrap();
-        let result = parse_projection_event(
-            EVT_DEPENDENT_EVIDENCE_UPSERT_V1,
-            "application/json",
-            &payload,
-        )
-        .unwrap();
-        assert!(matches!(
-            result.unwrap(),
-            ProjectionEventV1::DependentEvidenceUpsert(_)
-        ));
+        let result = parse_projection_event(EVT_DEPENDENT_EVIDENCE_UPSERT_V1, "application/json", &payload).unwrap();
+        assert!(matches!(result.unwrap(), ProjectionEventV1::DependentEvidenceUpsert(_)));
     }
 
     #[test]
@@ -1026,9 +977,7 @@ mod tests {
             confidence_q16: 50000,
         };
         let payload = fact.encode_json();
-        let result =
-            parse_projection_event(EVT_ENTITY_FACT_V1, CONTENT_TYPE_ENTITY_JSON_V1, &payload)
-                .unwrap();
+        let result = parse_projection_event(EVT_ENTITY_FACT_V1, CONTENT_TYPE_ENTITY_JSON_V1, &payload).unwrap();
         assert!(matches!(result.unwrap(), ProjectionEventV1::EntityFact(_)));
     }
 
@@ -1045,12 +994,7 @@ mod tests {
             confidence_q16: 0,
         };
         let payload = fact.encode_bin();
-        let result = parse_projection_event(
-            EVT_ENTITY_FACT_V1,
-            CONTENT_TYPE_PROJ_BIN_V1,
-            &payload,
-        )
-        .unwrap();
+        let result = parse_projection_event(EVT_ENTITY_FACT_V1, CONTENT_TYPE_PROJ_BIN_V1, &payload).unwrap();
         assert!(matches!(result.unwrap(), ProjectionEventV1::EntityFact(_)));
     }
 
@@ -1062,11 +1006,7 @@ mod tests {
 
     #[test]
     fn parse_projection_event_bad_json_returns_err() {
-        let result = parse_projection_event(
-            EVT_LIVING_STATE_UPDATE_V1,
-            "application/json",
-            b"not json",
-        );
+        let result = parse_projection_event(EVT_LIVING_STATE_UPDATE_V1, "application/json", b"not json");
         assert!(result.is_err());
     }
 

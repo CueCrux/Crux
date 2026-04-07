@@ -8,12 +8,12 @@
 //! and scores queries using BM25 + graph signals from ProjectionState.
 
 pub mod bm25;
+pub mod fused;
 pub mod graph;
 pub mod index_manager;
-pub mod fused;
 
+pub use graph::{apply_graph_boost, EntityMatch, GraphParams, RelationEdge};
 pub use index_manager::{IndexManager, IndexTier, TierStats};
-pub use graph::{apply_graph_boost, EntityMatch, RelationEdge, GraphParams};
 
 use thiserror::Error;
 

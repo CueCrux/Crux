@@ -86,9 +86,7 @@ impl AgentRegistry {
 
     /// Create an empty registry (single-user / no-auth mode).
     pub fn empty() -> Self {
-        Self {
-            agents: Vec::new(),
-        }
+        Self { agents: Vec::new() }
     }
 
     /// Look up an agent by raw bearer token.
@@ -138,8 +136,7 @@ mod tests {
 
     #[test]
     fn pairs_str_skips_malformed() {
-        let reg =
-            AgentRegistry::from_pairs_str("good:crux_at_x,,badnodelim,:empty_name,empty_tok:");
+        let reg = AgentRegistry::from_pairs_str("good:crux_at_x,,badnodelim,:empty_name,empty_tok:");
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.agents[0].name, "good");
     }

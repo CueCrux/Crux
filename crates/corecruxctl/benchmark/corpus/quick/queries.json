@@ -1,0 +1,22 @@
+[
+  {"query_id": "q01", "query": "API rate limiting policy", "expected_doc_ids": ["eng-03", "eng-07"], "domain": "engineering", "difficulty": "easy"},
+  {"query_id": "q02", "query": "deployment rollback procedure", "expected_doc_ids": ["eng-02", "ops-04"], "domain": "engineering", "difficulty": "easy"},
+  {"query_id": "q03", "query": "authentication token expiration", "expected_doc_ids": ["eng-05", "eng-08"], "domain": "engineering", "difficulty": "medium"},
+  {"query_id": "q04", "query": "data retention compliance requirements", "expected_doc_ids": ["legal-02", "legal-06"], "domain": "legal", "difficulty": "easy"},
+  {"query_id": "q05", "query": "GDPR data subject access request process", "expected_doc_ids": ["legal-04", "legal-08"], "domain": "legal", "difficulty": "medium"},
+  {"query_id": "q06", "query": "intellectual property assignment clause", "expected_doc_ids": ["legal-03", "legal-09"], "domain": "legal", "difficulty": "hard"},
+  {"query_id": "q07", "query": "quarterly revenue forecast methodology", "expected_doc_ids": ["fin-02", "fin-07"], "domain": "finance", "difficulty": "easy"},
+  {"query_id": "q08", "query": "travel expense approval thresholds", "expected_doc_ids": ["fin-05", "fin-09"], "domain": "finance", "difficulty": "easy"},
+  {"query_id": "q09", "query": "budget variance analysis process", "expected_doc_ids": ["fin-03", "fin-08"], "domain": "finance", "difficulty": "medium"},
+  {"query_id": "q10", "query": "machine learning model evaluation metrics", "expected_doc_ids": ["sci-01", "sci-06"], "domain": "science", "difficulty": "easy"},
+  {"query_id": "q11", "query": "peer review double blind protocol", "expected_doc_ids": ["sci-04", "sci-09"], "domain": "science", "difficulty": "medium"},
+  {"query_id": "q12", "query": "statistical significance p-value threshold", "expected_doc_ids": ["sci-03", "sci-07"], "domain": "science", "difficulty": "medium"},
+  {"query_id": "q13", "query": "incident severity classification levels", "expected_doc_ids": ["ops-01", "ops-06"], "domain": "operations", "difficulty": "easy"},
+  {"query_id": "q14", "query": "capacity planning memory threshold alerts", "expected_doc_ids": ["ops-05", "ops-08"], "domain": "operations", "difficulty": "medium"},
+  {"query_id": "q15", "query": "change management approval workflow", "expected_doc_ids": ["ops-03", "ops-10"], "domain": "operations", "difficulty": "easy"},
+  {"query_id": "q16", "query": "API versioning backward compatibility strategy", "expected_doc_ids": ["eng-01", "eng-06"], "domain": "engineering", "difficulty": "hard"},
+  {"query_id": "q17", "query": "contract termination notice period", "expected_doc_ids": ["legal-01", "legal-07"], "domain": "legal", "difficulty": "easy"},
+  {"query_id": "q18", "query": "research reproducibility data sharing requirements", "expected_doc_ids": ["sci-05", "sci-10"], "domain": "science", "difficulty": "hard"},
+  {"query_id": "q19", "query": "SLA uptime percentage calculation method", "expected_doc_ids": ["ops-02", "ops-07"], "domain": "operations", "difficulty": "medium"},
+  {"query_id": "q20", "query": "cost centre allocation for cloud infrastructure", "expected_doc_ids": ["fin-01", "fin-06"], "domain": "finance", "difficulty": "hard"}
+]

@@ -2,13 +2,32 @@
 
 Example configuration files for connecting MCP clients to a running CoreCrux instance.
 
+## How it works
+
+CoreCrux runs two servers:
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| **14800** | HTTP/REST | Human-facing API (`/healthz`, `/v1/facts`, `/v1/query/*`) |
+| **14801** | MCP (JSON-RPC) | Agent-facing API (18 tools for retrieval, facts, sessions, decisions) |
+
+Your MCP client connects to `http://localhost:14801/mcp`.
+
 ## Prerequisites
 
-CoreCrux must be running with the MCP server enabled (default port 14801).
+1. CoreCrux must be running:
+   ```bash
+   docker compose up -d
+   # or: source config.example.env && ./corecruxd
+   ```
 
-```bash
-cargo run --release -p corecruxd
-```
+2. Verify the MCP server is reachable:
+   ```bash
+   curl -s -X POST http://localhost:14801/mcp \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | jq '.result.tools | length'
+   # Expected output: 18
+   ```
 
 ## Claude Desktop
 
@@ -20,6 +39,20 @@ Copy `claude-desktop.json` into your Claude Desktop configuration:
 
 Merge the `mcpServers` object with any existing servers in your config.
 
+## Claude Code
+
+Add to your project's `.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "crux": {
+      "url": "http://localhost:14801/mcp"
+    }
+  }
+}
+```
+
 ## Cursor
 
 Copy `cursor.json` into your project root as `.cursor/mcp.json`, or merge the
@@ -27,14 +60,24 @@ Copy `cursor.json` into your project root as `.cursor/mcp.json`, or merge the
 
 ## Custom Port
 
-If CoreCrux is running on a different port, update the `url` field accordingly:
+If CoreCrux is running on a different MCP port, update the `url` field:
 
 ```json
 {
   "mcpServers": {
     "crux": {
-      "url": "http://localhost:<your-port>/mcp"
+      "url": "http://localhost:<your-mcp-port>/mcp"
     }
   }
 }
 ```
+
+## After connecting
+
+Your agent's first 3 calls should be:
+
+1. `get_bootstrap("patterns")` — learn optimal usage patterns
+2. `store_fact(entity="test", key="hello", value="world")` — store a fact
+3. `query_facts(query="hello")` — retrieve it
+
+See `docs/agent-guide.md` for the full integration guide.

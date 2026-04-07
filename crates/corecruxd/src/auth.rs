@@ -52,13 +52,12 @@ impl AuthMode {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim() {
             "" | "off" | "OFF" => Some(Self::Off),
-            "dev" | "DEV" | "dev_scopes" | "DEV_SCOPES" | "devscopes" | "DEVSCOPES"
-            | "dev-scopes" | "DEV-SCOPES" => Some(Self::DevScopes),
-            "jwt" | "JWT" | "jwt_hs256" | "JWT_HS256" | "jwt-hs256" | "JWT-HS256" => {
-                Some(Self::JwtHs256)
+            "dev" | "DEV" | "dev_scopes" | "DEV_SCOPES" | "devscopes" | "DEVSCOPES" | "dev-scopes" | "DEV-SCOPES" => {
+                Some(Self::DevScopes)
             }
-            "jwt_jwks" | "JWT_JWKS" | "jwt-jwks" | "JWT-JWKS" | "jwks" | "JWKS" | "oidc"
-            | "OIDC" | "jwt_oidc" | "JWT_OIDC" | "jwt-oidc" | "JWT-OIDC" => Some(Self::JwtJwks),
+            "jwt" | "JWT" | "jwt_hs256" | "JWT_HS256" | "jwt-hs256" | "JWT-HS256" => Some(Self::JwtHs256),
+            "jwt_jwks" | "JWT_JWKS" | "jwt-jwks" | "JWT-JWKS" | "jwks" | "JWKS" | "oidc" | "OIDC" | "jwt_oidc"
+            | "JWT_OIDC" | "jwt-oidc" | "JWT-OIDC" => Some(Self::JwtJwks),
             _ => None,
         }
     }
@@ -145,8 +144,7 @@ impl Authz {
                 let issuer = std::env::var("CORECRUXD_JWT_ISS").ok();
                 let audience = std::env::var("CORECRUXD_JWT_AUD").ok();
 
-                let algorithms =
-                    parse_jwt_algs(std::env::var("CORECRUXD_JWT_ALGS").ok().as_deref())?;
+                let algorithms = parse_jwt_algs(std::env::var("CORECRUXD_JWT_ALGS").ok().as_deref())?;
 
                 let min_refresh_secs = std::env::var("CORECRUXD_JWT_JWKS_MIN_REFRESH_SECONDS")
                     .ok()
@@ -171,14 +169,8 @@ impl Authz {
                     .ok()
                     .or_else(|| std::env::var("CORECRUXD_OIDC_DISCOVERY_URL").ok());
 
-                let (resolved_issuer, resolved_jwks_url, keys) = resolve_initial_jwks(
-                    &agent,
-                    issuer,
-                    jwks_json,
-                    jwks_path,
-                    jwks_url,
-                    oidc_discovery_url,
-                )?;
+                let (resolved_issuer, resolved_jwks_url, keys) =
+                    resolve_initial_jwks(&agent, issuer, jwks_json, jwks_path, jwks_url, oidc_discovery_url)?;
 
                 Ok(Self {
                     mode,
@@ -235,25 +227,18 @@ fn extract_bearer_token_http(headers: &HeaderMap) -> Option<String> {
     let auth = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())?;
-    let token = auth
-        .strip_prefix("Bearer ")
-        .or_else(|| auth.strip_prefix("bearer "))?;
+    let token = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer "))?;
     Some(token.trim().to_string())
 }
 
 fn extract_bearer_token_grpc(meta: &MetadataMap) -> Option<String> {
     let auth = meta.get("authorization").and_then(|v| v.to_str().ok())?;
-    let token = auth
-        .strip_prefix("Bearer ")
-        .or_else(|| auth.strip_prefix("bearer "))?;
+    let token = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer "))?;
     Some(token.trim().to_string())
 }
 
 fn extract_scopes_http_dev(headers: &HeaderMap) -> Option<BTreeSet<String>> {
-    if let Some(v) = headers
-        .get("x-corecrux-scopes")
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(v) = headers.get("x-corecrux-scopes").and_then(|v| v.to_str().ok()) {
         return Some(parse_scopes(v));
     }
     extract_bearer_token_http(headers).map(|t| parse_scopes(&t))
@@ -362,12 +347,8 @@ fn verify_jwt_hs256(cfg: &JwtHs256Config, token: &str) -> Result<AuthContext, St
         validation.set_audience(&[aud]);
     }
 
-    let data = decode::<serde_json::Value>(
-        token,
-        &DecodingKey::from_secret(cfg.secret.as_slice()),
-        &validation,
-    )
-    .map_err(|e| format!("jwt decode failed: {e}"))?;
+    let data = decode::<serde_json::Value>(token, &DecodingKey::from_secret(cfg.secret.as_slice()), &validation)
+        .map_err(|e| format!("jwt decode failed: {e}"))?;
 
     let scopes = scopes_from_claims(&data.claims);
     let tenants = tenants_from_claims(&data.claims);
@@ -442,8 +423,7 @@ fn resolve_initial_jwks(
     oidc_discovery_url: Option<String>,
 ) -> Result<InitialJwks, String> {
     if let Some(json) = jwks_json {
-        let jwks: Jwks = serde_json::from_str(&json)
-            .map_err(|e| format!("invalid CORECRUXD_JWT_JWKS_JSON: {e}"))?;
+        let jwks: Jwks = serde_json::from_str(&json).map_err(|e| format!("invalid CORECRUXD_JWT_JWKS_JSON: {e}"))?;
         let keys = parse_jwks_keys(&jwks)?;
         return Ok((issuer_env, None, keys));
     }
@@ -471,8 +451,7 @@ fn resolve_initial_jwks(
 
     let Some(jwks_url) = jwks_url else {
         return Err(
-            "missing JWKS source: set CORECRUXD_JWT_JWKS_JSON|PATH|URL or CORECRUXD_JWT_OIDC_DISCOVERY_URL"
-                .to_string(),
+            "missing JWKS source: set CORECRUXD_JWT_JWKS_JSON|PATH|URL or CORECRUXD_JWT_OIDC_DISCOVERY_URL".to_string(),
         );
     };
 
@@ -489,8 +468,7 @@ fn fetch_json(agent: &ureq::Agent, url: &str) -> Result<serde_json::Value, Strin
         .set("accept", "application/json")
         .call()
         .map_err(|e| format!("{e}"))?;
-    resp.into_json::<serde_json::Value>()
-        .map_err(|e| format!("{e}"))
+    resp.into_json::<serde_json::Value>().map_err(|e| format!("{e}"))
 }
 
 fn parse_jwks_keys(jwks: &Jwks) -> Result<HashMap<String, jsonwebtoken::DecodingKey>, String> {
@@ -512,16 +490,14 @@ fn parse_jwks_keys(jwks: &Jwks) -> Result<HashMap<String, jsonwebtoken::Decoding
                 let (Some(n), Some(e)) = (k.n.as_deref(), k.e.as_deref()) else {
                     continue;
                 };
-                let dk = DecodingKey::from_rsa_components(n, e)
-                    .map_err(|e| format!("bad rsa jwk: {e}"))?;
+                let dk = DecodingKey::from_rsa_components(n, e).map_err(|e| format!("bad rsa jwk: {e}"))?;
                 out.insert(kid.to_string(), dk);
             }
             "EC" => {
                 let (Some(x), Some(y)) = (k.x.as_deref(), k.y.as_deref()) else {
                     continue;
                 };
-                let dk = DecodingKey::from_ec_components(x, y)
-                    .map_err(|e| format!("bad ec jwk: {e}"))?;
+                let dk = DecodingKey::from_ec_components(x, y).map_err(|e| format!("bad ec jwk: {e}"))?;
                 out.insert(kid.to_string(), dk);
             }
             _ => {}
@@ -556,8 +532,7 @@ fn verify_jwt_jwks(cfg: &JwtJwksConfig, token: &str) -> Result<AuthContext, Stri
     }
 
     let key = resolve_jwks_key(cfg, kid)?;
-    let data = decode::<serde_json::Value>(token, &key, &validation)
-        .map_err(|e| format!("jwt decode failed: {e}"))?;
+    let data = decode::<serde_json::Value>(token, &key, &validation).map_err(|e| format!("jwt decode failed: {e}"))?;
 
     let scopes = scopes_from_claims(&data.claims);
     let tenants = tenants_from_claims(&data.claims);
@@ -569,22 +544,16 @@ fn verify_jwt_jwks(cfg: &JwtJwksConfig, token: &str) -> Result<AuthContext, Stri
     })
 }
 
-fn resolve_jwks_key(
-    cfg: &JwtJwksConfig,
-    kid: Option<&str>,
-) -> Result<jsonwebtoken::DecodingKey, String> {
+fn resolve_jwks_key(cfg: &JwtJwksConfig, kid: Option<&str>) -> Result<jsonwebtoken::DecodingKey, String> {
     // 1) Fast path: check cache.
     {
-        let state = cfg
-            .state
-            .lock()
-            .map_err(|_| "jwks lock poisoned".to_string())?;
+        let state = cfg.state.lock().map_err(|_| "jwks lock poisoned".to_string())?;
         if let Some(kid) = kid {
             if let Some(k) = state.keys.get(kid) {
                 return Ok(k.clone());
             }
-        } else if state.keys.len() == 1 {
-            return Ok(state.keys.values().next().unwrap().clone());
+        } else if let Some(only_key) = state.keys.values().next().filter(|_| state.keys.len() == 1) {
+            return Ok(only_key.clone());
         }
     }
 
@@ -598,23 +567,15 @@ fn resolve_jwks_key(
 
     let now = Instant::now();
     {
-        let mut state = cfg
-            .state
-            .lock()
-            .map_err(|_| "jwks lock poisoned".to_string())?;
+        let mut state = cfg.state.lock().map_err(|_| "jwks lock poisoned".to_string())?;
         if let Some(prev) = state.last_refresh_attempt {
             if now.duration_since(prev) < cfg.min_refresh_interval {
-                let last_ok_age = state
-                    .last_refresh_ok
-                    .map(|t| now.duration_since(t).as_secs());
+                let last_ok_age = state.last_refresh_ok.map(|t| now.duration_since(t).as_secs());
                 let last_err = state.last_error.clone();
                 return Err(match kid {
                     Some(k) => format!("jwt kid {k} not found (jwks refresh rate-limited)"),
                     None => "jwt missing kid and jwks has multiple keys".to_string(),
-                } + &format!(
-                    " (last_ok_age_s={:?} last_error={:?})",
-                    last_ok_age, last_err
-                ));
+                } + &format!(" (last_ok_age_s={:?} last_error={:?})", last_ok_age, last_err));
             }
         }
         state.last_refresh_attempt = Some(now);
@@ -625,36 +586,27 @@ fn resolve_jwks_key(
         .and_then(|jwks| parse_jwks_keys(&jwks))
     {
         Ok(new_keys) => {
-            let mut state = cfg
-                .state
-                .lock()
-                .map_err(|_| "jwks lock poisoned".to_string())?;
+            let mut state = cfg.state.lock().map_err(|_| "jwks lock poisoned".to_string())?;
             state.keys = new_keys;
             state.last_refresh_ok = Some(now);
             state.last_error = None;
         }
         Err(err) => {
-            let mut state = cfg
-                .state
-                .lock()
-                .map_err(|_| "jwks lock poisoned".to_string())?;
+            let mut state = cfg.state.lock().map_err(|_| "jwks lock poisoned".to_string())?;
             state.last_error = Some(err.clone());
             return Err(format!("jwks refresh failed: {err}"));
         }
     }
 
-    let state = cfg
-        .state
-        .lock()
-        .map_err(|_| "jwks lock poisoned".to_string())?;
+    let state = cfg.state.lock().map_err(|_| "jwks lock poisoned".to_string())?;
     if let Some(kid) = kid {
         if let Some(k) = state.keys.get(kid) {
             return Ok(k.clone());
         }
         return Err(format!("jwt kid {kid} not found after jwks refresh"));
     }
-    if state.keys.len() == 1 {
-        return Ok(state.keys.values().next().unwrap().clone());
+    if let Some(only_key) = state.keys.values().next().filter(|_| state.keys.len() == 1) {
+        return Ok(only_key.clone());
     }
     Err("jwt missing kid and jwks has multiple keys".to_string())
 }
@@ -672,18 +624,13 @@ fn missing_scopes<'a>(scopes: &BTreeSet<String>, required: &'a [&'a str]) -> Vec
 fn tenant_binding_string(tenant_allow: &TenantAllow) -> Option<String> {
     match tenant_allow {
         TenantAllow::Any => Some("*".to_string()),
-        TenantAllow::Only(set) if !set.is_empty() => {
-            Some(set.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","))
-        }
+        TenantAllow::Only(set) if !set.is_empty() => Some(set.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")),
         TenantAllow::Only(_) | TenantAllow::Missing => None,
     }
 }
 
 #[allow(clippy::result_large_err)]
-fn require_tenant_allowed(
-    tenant_allow: &TenantAllow,
-    tenant_id: &str,
-) -> Result<(), ProblemResponse> {
+fn require_tenant_allowed(tenant_allow: &TenantAllow, tenant_id: &str) -> Result<(), ProblemResponse> {
     match tenant_allow {
         TenantAllow::Any => Ok(()),
         TenantAllow::Only(set) => {
@@ -691,21 +638,17 @@ fn require_tenant_allowed(
                 Ok(())
             } else {
                 Err(ProblemResponse(
-                    ProblemDetails::forbidden("tenant not allowed").with_extensions(
-                        serde_json::json!({
-                            "code": "TENANT_FORBIDDEN",
-                            "tenantId": tenant_id,
-                        }),
-                    ),
+                    ProblemDetails::forbidden("tenant not allowed").with_extensions(serde_json::json!({
+                        "code": "TENANT_FORBIDDEN",
+                        "tenantId": tenant_id,
+                    })),
                 ))
             }
         }
         TenantAllow::Missing => Err(ProblemResponse(
-            ProblemDetails::forbidden("token missing tenant_id/tenants claim").with_extensions(
-                serde_json::json!({
-                    "code": "TENANT_CLAIM_MISSING",
-                }),
-            ),
+            ProblemDetails::forbidden("token missing tenant_id/tenants claim").with_extensions(serde_json::json!({
+                "code": "TENANT_CLAIM_MISSING",
+            })),
         )),
     }
 }
@@ -720,14 +663,12 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
         }),
         AuthMode::DevScopes => {
             let scopes = extract_scopes_http_dev(headers).ok_or_else(|| {
-                ProblemResponse(
-                    ProblemDetails::unauthorized("missing auth scopes").with_extensions(
-                        serde_json::json!({
-                            "code": "UNAUTHENTICATED",
-                            "hint": "set X-Corecrux-Scopes or Authorization: Bearer <scopes>"
-                        }),
-                    ),
-                )
+                ProblemResponse(ProblemDetails::unauthorized("missing auth scopes").with_extensions(
+                    serde_json::json!({
+                        "code": "UNAUTHENTICATED",
+                        "hint": "set X-Corecrux-Scopes or Authorization: Bearer <scopes>"
+                    }),
+                ))
             })?;
             Ok(AuthContext {
                 subject: None,
@@ -743,24 +684,20 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
                 )
             })?;
             let token = extract_bearer_token_http(headers).ok_or_else(|| {
-                ProblemResponse(
-                    ProblemDetails::unauthorized("missing bearer token").with_extensions(
-                        serde_json::json!({
-                            "code": "UNAUTHENTICATED",
-                            "hint": "set Authorization: Bearer <jwt>"
-                        }),
-                    ),
-                )
+                ProblemResponse(ProblemDetails::unauthorized("missing bearer token").with_extensions(
+                    serde_json::json!({
+                        "code": "UNAUTHENTICATED",
+                        "hint": "set Authorization: Bearer <jwt>"
+                    }),
+                ))
             })?;
             let ctx = verify_jwt_hs256(cfg, &token).map_err(|msg| {
-                ProblemResponse(
-                    ProblemDetails::unauthorized("invalid bearer token").with_extensions(
-                        serde_json::json!({
-                            "code": "UNAUTHENTICATED",
-                            "details": msg,
-                        }),
-                    ),
-                )
+                ProblemResponse(ProblemDetails::unauthorized("invalid bearer token").with_extensions(
+                    serde_json::json!({
+                        "code": "UNAUTHENTICATED",
+                        "details": msg,
+                    }),
+                ))
             })?;
             Ok(ctx)
         }
@@ -772,24 +709,20 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
                 )
             })?;
             let token = extract_bearer_token_http(headers).ok_or_else(|| {
-                ProblemResponse(
-                    ProblemDetails::unauthorized("missing bearer token").with_extensions(
-                        serde_json::json!({
-                            "code": "UNAUTHENTICATED",
-                            "hint": "set Authorization: Bearer <jwt>"
-                        }),
-                    ),
-                )
+                ProblemResponse(ProblemDetails::unauthorized("missing bearer token").with_extensions(
+                    serde_json::json!({
+                        "code": "UNAUTHENTICATED",
+                        "hint": "set Authorization: Bearer <jwt>"
+                    }),
+                ))
             })?;
             let ctx = verify_jwt_jwks(cfg, &token).map_err(|msg| {
-                ProblemResponse(
-                    ProblemDetails::unauthorized("invalid bearer token").with_extensions(
-                        serde_json::json!({
-                            "code": "UNAUTHENTICATED",
-                            "details": msg,
-                        }),
-                    ),
-                )
+                ProblemResponse(ProblemDetails::unauthorized("invalid bearer token").with_extensions(
+                    serde_json::json!({
+                        "code": "UNAUTHENTICATED",
+                        "details": msg,
+                    }),
+                ))
             })?;
             Ok(ctx)
         }
@@ -879,10 +812,7 @@ fn grpc_ctx(auth: &Authz, meta: &MetadataMap) -> Result<AuthContext, Status> {
 }
 
 #[allow(clippy::result_large_err)]
-pub fn describe_http_evidence(
-    auth: &Authz,
-    headers: &HeaderMap,
-) -> Result<EvidenceAuthContextV1, ProblemResponse> {
+pub fn describe_http_evidence(auth: &Authz, headers: &HeaderMap) -> Result<EvidenceAuthContextV1, ProblemResponse> {
     let ctx = http_ctx(auth, headers)?;
     Ok(EvidenceAuthContextV1 {
         mode: auth.mode.as_str().to_string(),
@@ -893,11 +823,7 @@ pub fn describe_http_evidence(
 }
 
 #[allow(clippy::result_large_err)]
-pub fn require_http_scopes(
-    auth: &Authz,
-    headers: &HeaderMap,
-    required: &[&str],
-) -> Result<(), ProblemResponse> {
+pub fn require_http_scopes(auth: &Authz, headers: &HeaderMap, required: &[&str]) -> Result<(), ProblemResponse> {
     if auth.mode == AuthMode::Off {
         return Ok(());
     }
@@ -942,12 +868,8 @@ pub fn require_http_scopes_for_tenant(
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
-pub fn require_grpc_scopes(
-    auth: &Authz,
-    meta: &MetadataMap,
-    required: &[&str],
-) -> Result<(), Status> {
+#[allow(clippy::result_large_err, dead_code)]
+pub fn require_grpc_scopes(auth: &Authz, meta: &MetadataMap, required: &[&str]) -> Result<(), Status> {
     if auth.mode == AuthMode::Off {
         return Ok(());
     }
@@ -1067,15 +989,12 @@ mod tests {
             format!("Bearer {token}").parse().unwrap(),
         );
 
-        require_http_scopes_for_tenant(&auth, &headers, &["exports:read", "receipts:read"], "t1")
-            .expect("ok");
+        require_http_scopes_for_tenant(&auth, &headers, &["exports:read", "receipts:read"], "t1").expect("ok");
 
-        let err =
-            require_http_scopes_for_tenant(&auth, &headers, &["receipts:read"], "t2").unwrap_err();
+        let err = require_http_scopes_for_tenant(&auth, &headers, &["receipts:read"], "t2").unwrap_err();
         assert_eq!(err.0.status, 403);
 
-        let err =
-            require_http_scopes_for_tenant(&auth, &headers, &["admin:read"], "t1").unwrap_err();
+        let err = require_http_scopes_for_tenant(&auth, &headers, &["admin:read"], "t1").unwrap_err();
         assert_eq!(err.0.status, 403);
     }
 
@@ -1191,15 +1110,12 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
             format!("Bearer {token}").parse().unwrap(),
         );
 
-        require_http_scopes_for_tenant(&auth, &headers, &["exports:read", "receipts:read"], "t1")
-            .expect("ok");
+        require_http_scopes_for_tenant(&auth, &headers, &["exports:read", "receipts:read"], "t1").expect("ok");
 
-        let err =
-            require_http_scopes_for_tenant(&auth, &headers, &["receipts:read"], "t2").unwrap_err();
+        let err = require_http_scopes_for_tenant(&auth, &headers, &["receipts:read"], "t2").unwrap_err();
         assert_eq!(err.0.status, 403);
 
-        let err =
-            require_http_scopes_for_tenant(&auth, &headers, &["admin:read"], "t1").unwrap_err();
+        let err = require_http_scopes_for_tenant(&auth, &headers, &["admin:read"], "t1").unwrap_err();
         assert_eq!(err.0.status, 403);
     }
 
@@ -1255,8 +1171,8 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     #[test]
     fn auth_mode_parse_jwt_jwks_aliases() {
         for alias in &[
-            "jwt_jwks", "JWT_JWKS", "jwt-jwks", "JWT-JWKS", "jwks", "JWKS", "oidc", "OIDC",
-            "jwt_oidc", "JWT_OIDC", "jwt-oidc", "JWT-OIDC",
+            "jwt_jwks", "JWT_JWKS", "jwt-jwks", "JWT-JWKS", "jwks", "JWKS", "oidc", "OIDC", "jwt_oidc", "JWT_OIDC",
+            "jwt-oidc", "JWT-OIDC",
         ] {
             assert_eq!(
                 AuthMode::parse(alias),
@@ -1345,27 +1261,15 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     #[test]
     fn extract_bearer_token_http_with_bearer_prefix() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "Bearer mytoken123".parse().unwrap(),
-        );
-        assert_eq!(
-            extract_bearer_token_http(&headers),
-            Some("mytoken123".to_string())
-        );
+        headers.insert(axum::http::header::AUTHORIZATION, "Bearer mytoken123".parse().unwrap());
+        assert_eq!(extract_bearer_token_http(&headers), Some("mytoken123".to_string()));
     }
 
     #[test]
     fn extract_bearer_token_http_lowercase_bearer() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "bearer mytoken".parse().unwrap(),
-        );
-        assert_eq!(
-            extract_bearer_token_http(&headers),
-            Some("mytoken".to_string())
-        );
+        headers.insert(axum::http::header::AUTHORIZATION, "bearer mytoken".parse().unwrap());
+        assert_eq!(extract_bearer_token_http(&headers), Some("mytoken".to_string()));
     }
 
     #[test]
@@ -1377,10 +1281,7 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     #[test]
     fn extract_bearer_token_http_non_bearer_scheme() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "Basic abc123".parse().unwrap(),
-        );
+        headers.insert(axum::http::header::AUTHORIZATION, "Basic abc123".parse().unwrap());
         assert_eq!(extract_bearer_token_http(&headers), None);
     }
 
@@ -1411,10 +1312,7 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     fn extract_scopes_http_dev_x_corecrux_takes_precedence() {
         let mut headers = HeaderMap::new();
         headers.insert("x-corecrux-scopes", "a:read".parse().unwrap());
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "Bearer b:read".parse().unwrap(),
-        );
+        headers.insert(axum::http::header::AUTHORIZATION, "Bearer b:read".parse().unwrap());
         let scopes = extract_scopes_http_dev(&headers).unwrap();
         assert!(scopes.contains("a:read"));
         assert!(!scopes.contains("b:read"));
@@ -1518,20 +1416,14 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     #[test]
     fn tenants_from_claims_missing() {
         let claims = serde_json::json!({});
-        assert!(matches!(
-            tenants_from_claims(&claims),
-            TenantAllow::Missing
-        ));
+        assert!(matches!(tenants_from_claims(&claims), TenantAllow::Missing));
     }
 
     #[test]
     fn tenants_from_claims_empty_string() {
         let claims = serde_json::json!({ "tenant_id": "" });
         // Empty tenant_id falls through to Missing
-        assert!(matches!(
-            tenants_from_claims(&claims),
-            TenantAllow::Missing
-        ));
+        assert!(matches!(tenants_from_claims(&claims), TenantAllow::Missing));
     }
 
     #[test]
@@ -1582,8 +1474,7 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
 
     #[test]
     fn missing_scopes_all_present() {
-        let scopes: BTreeSet<String> =
-            ["a:read", "b:write"].iter().map(|s| s.to_string()).collect();
+        let scopes: BTreeSet<String> = ["a:read", "b:write"].iter().map(|s| s.to_string()).collect();
         let missing = missing_scopes(&scopes, &["a:read", "b:write"]);
         assert!(missing.is_empty());
     }
@@ -1613,10 +1504,7 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
 
     #[test]
     fn tenant_binding_string_any() {
-        assert_eq!(
-            tenant_binding_string(&TenantAllow::Any),
-            Some("*".to_string())
-        );
+        assert_eq!(tenant_binding_string(&TenantAllow::Any), Some("*".to_string()));
     }
 
     #[test]
@@ -1635,10 +1523,7 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
 
     #[test]
     fn tenant_binding_string_empty_only() {
-        assert_eq!(
-            tenant_binding_string(&TenantAllow::Only(BTreeSet::new())),
-            None
-        );
+        assert_eq!(tenant_binding_string(&TenantAllow::Only(BTreeSet::new())), None);
     }
 
     // ── require_tenant_allowed ────────────────────────────────────────────
@@ -1682,10 +1567,7 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         let algs = parse_jwt_algs(Some("RS256,ES256")).unwrap();
         assert_eq!(
             algs,
-            vec![
-                jsonwebtoken::Algorithm::RS256,
-                jsonwebtoken::Algorithm::ES256,
-            ]
+            vec![jsonwebtoken::Algorithm::RS256, jsonwebtoken::Algorithm::ES256,]
         );
     }
 
@@ -1694,10 +1576,7 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         let algs = parse_jwt_algs(Some("RS256 ES384")).unwrap();
         assert_eq!(
             algs,
-            vec![
-                jsonwebtoken::Algorithm::RS256,
-                jsonwebtoken::Algorithm::ES384,
-            ]
+            vec![jsonwebtoken::Algorithm::RS256, jsonwebtoken::Algorithm::ES384,]
         );
     }
 
@@ -1798,10 +1677,7 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     fn extract_bearer_token_grpc_with_bearer_prefix() {
         let mut meta = MetadataMap::new();
         meta.insert("authorization", "Bearer grpc-token".parse().unwrap());
-        assert_eq!(
-            extract_bearer_token_grpc(&meta),
-            Some("grpc-token".to_string())
-        );
+        assert_eq!(extract_bearer_token_grpc(&meta), Some("grpc-token".to_string()));
     }
 
     #[test]

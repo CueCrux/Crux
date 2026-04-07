@@ -6,16 +6,12 @@ use ciborium::value::Value;
 
 const SCALE: f64 = 1_000_000.0;
 
-pub(crate) fn parse_stored_candidate_digest_bytes_v1(
-    retrieval_trace: &[(Value, Value)],
-) -> Option<[u8; 32]> {
+pub(crate) fn parse_stored_candidate_digest_bytes_v1(retrieval_trace: &[(Value, Value)]) -> Option<[u8; 32]> {
     let digest = get_val(retrieval_trace, &["candidate_digest", "candidateDigest"])?;
     parse_digest_bytes(digest)
 }
 
-pub(crate) fn recompute_candidate_digest_bytes_v1(
-    retrieval_trace: &[(Value, Value)],
-) -> Result<[u8; 32], String> {
+pub(crate) fn recompute_candidate_digest_bytes_v1(retrieval_trace: &[(Value, Value)]) -> Result<[u8; 32], String> {
     let lanes_used = parse_lanes_used(retrieval_trace)?;
     let candidates = parse_candidates(retrieval_trace)?;
     compute_candidate_digest_bytes_v1(&lanes_used, &candidates)
@@ -193,16 +189,10 @@ struct QScore {
 
 fn q_score(x: Option<f64>) -> QScore {
     let Some(x) = x else {
-        return QScore {
-            q: 0,
-            is_null: true,
-        };
+        return QScore { q: 0, is_null: true };
     };
     if x.is_nan() {
-        return QScore {
-            q: 0,
-            is_null: true,
-        };
+        return QScore { q: 0, is_null: true };
     }
 
     let clamped = x.clamp(-4.0, 4.0);

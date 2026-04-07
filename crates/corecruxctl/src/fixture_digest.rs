@@ -2,15 +2,15 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::PathBuf;
 use corecrux_frame::{compute_header_hash, compute_payload_hash};
 use corecrux_segment::decode_frame_v1;
 use corecrux_storage::{
-    encode_manifest_add_segment_v1, encode_manifest_header_v1, frame_manifest_record, SegmentMeta,
-    ShardPaths, ShardStorage, ShardStorageOptions,
+    encode_manifest_add_segment_v1, encode_manifest_header_v1, frame_manifest_record, SegmentMeta, ShardPaths,
+    ShardStorage, ShardStorageOptions,
 };
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
 
 #[derive(Debug, serde::Serialize)]
 pub struct FixtureDigestReport {
@@ -27,14 +27,10 @@ pub struct FixtureDigestReport {
 }
 
 fn repo_root() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()?)
+    Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize()?)
 }
 
-pub fn fixture_segment_path(
-    fixture: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+pub fn fixture_segment_path(fixture: &str) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let root = repo_root()?;
     Ok(root
         .join("tests/fixtures_segments")
@@ -129,12 +125,7 @@ pub fn segment_replay_digest_from_segment_path(
     let cuda_driver_version: Option<String> = None;
     let device_name: Option<String> = None;
 
-    let storage = ShardStorage::open(
-        root,
-        shard_id,
-        epoch,
-        ShardStorageOptions::default(),
-    )?;
+    let storage = ShardStorage::open(root, shard_id, epoch, ShardStorageOptions::default())?;
 
     let (frames, end) = storage.replay_from(None, 0)?;
     if end.is_some() {

@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod audit_pack;
+pub mod benchmark;
 pub mod evidence;
 pub mod explain;
 pub mod fixture_digest;
@@ -12,6 +13,7 @@ pub mod inspect_receipt;
 pub mod ops;
 pub mod parity;
 pub mod projections;
+pub mod quickstart;
 pub mod receipts;
 pub mod reconcile;
 pub mod replay;

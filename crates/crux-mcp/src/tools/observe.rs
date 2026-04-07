@@ -19,10 +19,7 @@ const OPS_COVERAGE_PREFIX: &str = "__ops__::coverage";
 /// facts are written by `crux-observe` when it detects coverage holes,
 /// unanswered queries, or low-confidence retrieval passes.
 pub async fn handle_get_gaps(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let filter = args
-        .get("query")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let filter = args.get("query").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let q = FactQuery {
         query: filter.clone(),
@@ -80,9 +77,7 @@ mod tests {
     #[tokio::test]
     async fn get_gaps_with_filter_empty() {
         let ctx = test_ctx();
-        let result = handle_get_gaps(&json!({"query": "terraform"}), &ctx)
-            .await
-            .unwrap();
+        let result = handle_get_gaps(&json!({"query": "terraform"}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("no gaps matching 'terraform'"));
     }
@@ -139,9 +134,7 @@ mod tests {
             });
         }
 
-        let result = handle_get_gaps(&json!({"query": "terraform"}), &ctx)
-            .await
-            .unwrap();
+        let result = handle_get_gaps(&json!({"query": "terraform"}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("terraform"));
         assert!(!text.contains("kubernetes"));

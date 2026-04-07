@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use corecruxctl::{
-    admin, audit_pack, evidence, explain, fixture_digest, gaps, inspect_receipt,
-    parity, projections, receipts, reconcile, replay, shard, shardmap, smoke, snapshot,
-    stage1_import, storage, structured_log, tooling_env, verify_store,
+    admin, audit_pack, evidence, explain, fixture_digest, gaps, inspect_receipt, parity, projections, receipts,
+    reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import, storage, structured_log, tooling_env,
+    verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -336,6 +336,34 @@ enum Command {
         since: Option<String>,
     },
 
+    /// Interactive quickstart wizard for new users.
+    Quickstart {
+        /// CoreCrux HTTP base URL.
+        #[arg(long, default_value = "http://localhost:14800")]
+        http: String,
+        /// Skip prompts and use defaults.
+        #[arg(long)]
+        non_interactive: bool,
+    },
+
+    /// Run CruxScore Lite benchmark and optionally upload results.
+    Benchmark {
+        /// Benchmark suite: quick (50 docs, ships in binary) or standard (200 docs, downloaded).
+        #[arg(long, default_value = "quick")]
+        suite: String,
+        /// CoreCrux HTTP base URL.
+        #[arg(long, default_value = "http://localhost:14800")]
+        http: String,
+        /// Upload results to scorecrux.com after completion.
+        #[arg(long)]
+        upload: bool,
+        /// Output file for the JSON report.
+        #[arg(long)]
+        output: Option<String>,
+        /// Compare two previous benchmark reports.
+        #[arg(long)]
+        compare: Option<Vec<String>>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -970,9 +998,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Some("INVALID_ARGUMENT"),
                     Some("unsupported replay mode"),
                 );
-                return Err(
-                    format!("unsupported mode: {mode} (Phase 0 supports only 'audit')").into(),
-                );
+                return Err(format!("unsupported mode: {mode} (Phase 0 supports only 'audit')").into());
             }
             if let Some(pack) = pack {
                 match replay::replay_digest_from_pack(&pack, strict) {
@@ -982,11 +1008,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             "replay",
                             if report.ok { "ok" } else { "fail" },
                             started.elapsed().as_millis() as u64,
-                            if report.ok {
-                                None
-                            } else {
-                                Some("DRIFT_SOURCE_CHANGE")
-                            },
+                            if report.ok { None } else { Some("DRIFT_SOURCE_CHANGE") },
                             None,
                         );
                         return Ok(());
@@ -1053,8 +1075,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let mode = verify_store::VerifyMode::parse(&mode)
                 .ok_or_else(|| format!("invalid --mode value '{mode}' (expected sampled|full)"))?;
             let sample_rate = sample_rate.clamp(0.0, 1.0);
-            let default_dir = std::env::var("CORECRUXD_DATA_DIR")
-                .unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+            let default_dir = std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
             let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
             let report = verify_store::verify_store(&verify_store::VerifyStoreOptions {
                 data_dir,
@@ -1076,27 +1097,25 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
                 return Err("verify-store detected integrity failures".into());
             }
-            structured_log::emit_command_log(
-                "verify_store",
-                "ok",
-                started.elapsed().as_millis() as u64,
-                None,
-                None,
-            );
+            structured_log::emit_command_log("verify_store", "ok", started.elapsed().as_millis() as u64, None, None);
             Ok(())
         }
         Command::Ccxi { command } => match command {
             CcxiCommand::Verify { data_dir, shard } => {
-                let default_dir = std::env::var("CORECRUXD_DATA_DIR")
-                    .unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                let default_dir =
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
                 let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
                 let report = ccxi_verify(&data_dir, shard)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
-            CcxiCommand::Rebuild { data_dir, shard, segment_seq } => {
-                let default_dir = std::env::var("CORECRUXD_DATA_DIR")
-                    .unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+            CcxiCommand::Rebuild {
+                data_dir,
+                shard,
+                segment_seq,
+            } => {
+                let default_dir =
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
                 let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
                 let report = ccxi_rebuild(&data_dir, shard, segment_seq)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1121,8 +1140,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 scopes,
                 node_id,
             } => {
-                let default_dir = std::env::var("CORECRUXD_DATA_DIR")
-                    .unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                let default_dir =
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
                 let environment = tooling_env::ToolingEnvironment::resolve(environment)?;
                 let report = storage::offload_segments(&storage::StorageOffloadOptions {
                     data_dir: data_dir.unwrap_or_else(|| PathBuf::from(default_dir)),
@@ -1162,8 +1181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if !postgres {
                 return Err("reconcile currently requires --postgres".into());
             }
-            let default_dir = std::env::var("CORECRUXD_DATA_DIR")
-                .unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+            let default_dir = std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
             let report = reconcile::reconcile_postgres(&reconcile::ReconcilePostgresOptions {
                 data_dir: data_dir.unwrap_or_else(|| PathBuf::from(default_dir)),
                 connection_string,
@@ -1190,10 +1208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
-        Command::FixtureDigest {
-            fixture,
-            device_index,
-        } => {
+        Command::FixtureDigest { fixture, device_index } => {
             let report = fixture_digest::segment_fixture_replay_digest(&fixture, device_index)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
@@ -1318,8 +1333,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 shard: shard_filter,
                 job_id,
             } => {
-                let report =
-                    shard::status(&coordinator, shard_filter.as_deref(), job_id.as_deref())?;
+                let report = shard::status(&coordinator, shard_filter.as_deref(), job_id.as_deref())?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
@@ -1513,13 +1527,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     params: Some(params),
                 })?;
                 println!("{}", serde_json::to_string_pretty(&v)?);
-                structured_log::emit_command_log(
-                    "admin_seal",
-                    "ok",
-                    started.elapsed().as_millis() as u64,
-                    None,
-                    None,
-                );
+                structured_log::emit_command_log("admin_seal", "ok", started.elapsed().as_millis() as u64, None, None);
                 Ok(())
             }
             AdminCommand::OpsLog {
@@ -1549,15 +1557,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 device_index,
                 batch_frames,
             } => {
-                let default_dir = std::env::var("CORECRUXD_DATA_DIR")
-                    .unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                let default_dir =
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
                 let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
-                let report = projections::rebuild_projections_v1(
-                    &data_dir,
-                    shard,
-                    device_index,
-                    batch_frames,
-                )?;
+                let report = projections::rebuild_projections_v1(&data_dir, shard, device_index, batch_frames)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
@@ -1568,16 +1571,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 min_age_seconds,
                 max_delete,
             } => {
-                let default_dir = std::env::var("CORECRUXD_DATA_DIR")
-                    .unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                let default_dir =
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
                 let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
-                let report = projections::gc_orphan_cold_segments_v1(
-                    &data_dir,
-                    shard,
-                    dry_run,
-                    min_age_seconds,
-                    max_delete,
-                )?;
+                let report =
+                    projections::gc_orphan_cold_segments_v1(&data_dir, shard, dry_run, min_age_seconds, max_delete)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
@@ -1588,8 +1586,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 artifact_id,
                 device_index,
             } => {
-                let default_dir = std::env::var("CORECRUXD_DATA_DIR")
-                    .unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                let default_dir =
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
                 let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
                 let report = projections::seed_minimal_projection_events_v1(
                     &data_dir,
@@ -1611,14 +1609,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 engine_api_key,
                 corecrux,
             } => {
-                let report = parity::parity_living_v1(
-                    &tenant_id,
-                    &seed,
-                    sample,
-                    &engine,
-                    &engine_api_key,
-                    &corecrux,
-                )?;
+                let report = parity::parity_living_v1(&tenant_id, &seed, sample, &engine, &engine_api_key, &corecrux)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
@@ -1668,13 +1659,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 receipt_id,
                 device_index,
             } => {
-                let report = receipts::seed_minimal_receipt_v1(
-                    &data_dir,
-                    shard,
-                    &tenant_id,
-                    &receipt_id,
-                    device_index,
-                )?;
+                let report =
+                    receipts::seed_minimal_receipt_v1(&data_dir, shard, &tenant_id, &receipt_id, device_index)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
@@ -1685,33 +1671,26 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 device_index,
                 batch_frames,
             } => {
-                let report = receipts::backfill_subject_index_v1(
-                    &data_dir,
-                    shard,
-                    dry_run,
-                    device_index,
-                    batch_frames,
-                )?;
+                let report =
+                    receipts::backfill_subject_index_v1(&data_dir, shard, dry_run, device_index, batch_frames)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
         },
         Command::Snapshot { command } => match command {
             SnapshotCommand::List { data_dir, shard } => {
-                let default_dir = std::env::var("CORECRUXD_DATA_DIR")
-                    .unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                let default_dir =
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
                 let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
-                let report =
-                    snapshot::list_snapshots(&snapshot::SnapshotOptions { data_dir, shard })?;
+                let report = snapshot::list_snapshots(&snapshot::SnapshotOptions { data_dir, shard })?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
             SnapshotCommand::Verify { data_dir, shard } => {
-                let default_dir = std::env::var("CORECRUXD_DATA_DIR")
-                    .unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                let default_dir =
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
                 let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
-                let report =
-                    snapshot::verify_snapshots(&snapshot::SnapshotOptions { data_dir, shard })?;
+                let report = snapshot::verify_snapshots(&snapshot::SnapshotOptions { data_dir, shard })?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 if !report.ok {
                     return Err("snapshot verification failed".into());
@@ -1727,8 +1706,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 device_index,
                 batch_frames,
             } => {
-                let default_dir = std::env::var("CORECRUXD_DATA_DIR")
-                    .unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                let default_dir =
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
                 let report = evidence::control_verify(&evidence::ControlVerifyOptions {
                     data_dir: data_dir.unwrap_or_else(|| PathBuf::from(default_dir)),
                     hosted_only,
@@ -1838,6 +1817,31 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             gaps::run(&dd, since.as_deref())?;
             Ok(())
         }
+
+        Command::Quickstart { http, non_interactive } => {
+            corecruxctl::quickstart::run(&http, non_interactive)?;
+            Ok(())
+        }
+
+        Command::Benchmark {
+            suite,
+            http,
+            upload,
+            output,
+            compare,
+        } => {
+            if let Some(files) = compare {
+                if files.len() == 2 {
+                    corecruxctl::benchmark::compare(&files[0], &files[1])?;
+                } else {
+                    eprintln!("--compare requires exactly 2 file paths");
+                    std::process::exit(1);
+                }
+            } else {
+                corecruxctl::benchmark::run(&http, &suite, upload, output.as_deref())?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1912,17 +1916,15 @@ fn ccxi_verify(
 
             // Verify BLAKE3 integrity
             match std::fs::read(&ccxi_path) {
-                Ok(bytes) => {
-                    match corecrux_index::CcxiReader::from_bytes(&bytes) {
-                        Ok(_) => {
-                            report.segments_with_ccxi += 1;
-                        }
-                        Err(e) => {
-                            report.segments_corrupt_ccxi += 1;
-                            report.corrupt.push(format!("{dir_name}/{stem}: {e}"));
-                        }
+                Ok(bytes) => match corecrux_index::CcxiReader::from_bytes(&bytes) {
+                    Ok(_) => {
+                        report.segments_with_ccxi += 1;
                     }
-                }
+                    Err(e) => {
+                        report.segments_corrupt_ccxi += 1;
+                        report.corrupt.push(format!("{dir_name}/{stem}: {e}"));
+                    }
+                },
                 Err(e) => {
                     report.segments_corrupt_ccxi += 1;
                     report.corrupt.push(format!("{dir_name}/{stem}: read error: {e}"));
@@ -2063,8 +2065,7 @@ fn rebuild_ccxi_from_segment(
     let seg_bytes = std::fs::read(seg_path)?;
 
     // Decode the sealed segment: validates hashes and extracts TOC entries
-    let (header, toc_header, toc_entries, footer) =
-        corecrux_segment::decode_segment_v1(&seg_bytes)?;
+    let (header, toc_header, toc_entries, footer) = corecrux_segment::decode_segment_v1(&seg_bytes)?;
 
     let record_off = footer.record_area_offset as usize;
     let record_len = footer.record_area_len as usize;
@@ -2101,9 +2102,8 @@ fn rebuild_ccxi_from_segment(
 
         // Parse frame: magic(4) + ver(2) + header_len(2) + payload_len(4) + header + payload + crc(4)
         let header_len = u16::from_le_bytes([frame_bytes[6], frame_bytes[7]]) as usize;
-        let payload_len = u32::from_le_bytes([
-            frame_bytes[8], frame_bytes[9], frame_bytes[10], frame_bytes[11],
-        ]) as usize;
+        let payload_len =
+            u32::from_le_bytes([frame_bytes[8], frame_bytes[9], frame_bytes[10], frame_bytes[11]]) as usize;
         let payload_start = 12 + header_len;
         let payload_end = payload_start + payload_len;
         if payload_end > frame_bytes.len() {
@@ -2154,13 +2154,7 @@ mod tests {
 
     #[test]
     fn parse_verify_store_defaults() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "verify-store",
-            "--data-dir",
-            "/tmp/test",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "verify-store", "--data-dir", "/tmp/test"]).unwrap();
         match cli.command {
             Command::VerifyStore {
                 data_dir,
@@ -2198,7 +2192,11 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::VerifyStore {
-                shard, scope, mode, sample_rate, ..
+                shard,
+                scope,
+                mode,
+                sample_rate,
+                ..
             } => {
                 assert_eq!(shard, Some(3));
                 assert_eq!(scope, "all");
@@ -2211,14 +2209,7 @@ mod tests {
 
     #[test]
     fn parse_replay_pack() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "replay",
-            "--pack",
-            "/tmp/pack",
-            "--strict",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "replay", "--pack", "/tmp/pack", "--strict"]).unwrap();
         match cli.command {
             Command::Replay {
                 pack,
@@ -2247,7 +2238,9 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::Replay { pack, input, strict, .. } => {
+            Command::Replay {
+                pack, input, strict, ..
+            } => {
                 assert!(pack.is_none());
                 assert_eq!(input, Some(PathBuf::from("/tmp/events.jsonl")));
                 assert!(!strict);
@@ -2278,8 +2271,7 @@ mod tests {
 
     #[test]
     fn parse_smoke() {
-        let cli =
-            Cli::try_parse_from(["corecruxctl", "smoke", "--device-index", "2"]).unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "smoke", "--device-index", "2"]).unwrap();
         match cli.command {
             Command::Smoke { device_index } => assert_eq!(device_index, 2),
             other => panic!("unexpected command: {other:?}"),
@@ -2307,10 +2299,7 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::FixtureDigest {
-                fixture,
-                device_index,
-            } => {
+            Command::FixtureDigest { fixture, device_index } => {
                 assert_eq!(fixture, "large");
                 assert_eq!(device_index, 1);
             }
@@ -2320,16 +2309,8 @@ mod tests {
 
     #[test]
     fn parse_ccxi_verify() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "ccxi",
-            "verify",
-            "--data-dir",
-            "/data",
-            "--shard",
-            "2",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["corecruxctl", "ccxi", "verify", "--data-dir", "/data", "--shard", "2"]).unwrap();
         match cli.command {
             Command::Ccxi {
                 command: CcxiCommand::Verify { data_dir, shard },
@@ -2357,7 +2338,12 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::Ccxi {
-                command: CcxiCommand::Rebuild { data_dir, shard, segment_seq },
+                command:
+                    CcxiCommand::Rebuild {
+                        data_dir,
+                        shard,
+                        segment_seq,
+                    },
             } => {
                 assert_eq!(data_dir, Some(PathBuf::from("/data")));
                 assert_eq!(shard, Some(1));
@@ -2369,14 +2355,7 @@ mod tests {
 
     #[test]
     fn parse_shardmap_init() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "shardmap",
-            "init",
-            "--shards",
-            "4",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "shardmap", "init", "--shards", "4"]).unwrap();
         match cli.command {
             Command::ShardMap {
                 command:
@@ -2418,7 +2397,14 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::ShardMap {
-                command: ShardMapCommand::Split { file, shard, at, new_shard, out },
+                command:
+                    ShardMapCommand::Split {
+                        file,
+                        shard,
+                        at,
+                        new_shard,
+                        out,
+                    },
             } => {
                 assert_eq!(file, PathBuf::from("/tmp/map.json"));
                 assert_eq!(shard, "shard-0002");
@@ -2432,14 +2418,7 @@ mod tests {
 
     #[test]
     fn parse_shardmap_validate() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "shardmap",
-            "validate",
-            "--file",
-            "/tmp/map.json",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "shardmap", "validate", "--file", "/tmp/map.json"]).unwrap();
         match cli.command {
             Command::ShardMap {
                 command: ShardMapCommand::Validate { file },
@@ -2489,7 +2468,13 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::ShardMap {
-                command: ShardMapCommand::SetGpu { file, shard, gpu_id, out },
+                command:
+                    ShardMapCommand::SetGpu {
+                        file,
+                        shard,
+                        gpu_id,
+                        out,
+                    },
             } => {
                 assert_eq!(file, PathBuf::from("/tmp/map.json"));
                 assert_eq!(shard, "shard-0001");
@@ -2542,17 +2527,15 @@ mod tests {
 
     #[test]
     fn parse_shard_status() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "shard",
-            "status",
-            "--shard",
-            "shard-0001",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "shard", "status", "--shard", "shard-0001"]).unwrap();
         match cli.command {
             Command::Shard {
-                command: ShardCommand::Status { coordinator, shard, job_id },
+                command:
+                    ShardCommand::Status {
+                        coordinator,
+                        shard,
+                        job_id,
+                    },
             } => {
                 assert_eq!(coordinator, "http://127.0.0.1:4008");
                 assert_eq!(shard, Some("shard-0001".to_string()));
@@ -2822,14 +2805,7 @@ mod tests {
 
     #[test]
     fn parse_snapshot_list() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "snapshot",
-            "list",
-            "--shard",
-            "2",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "snapshot", "list", "--shard", "2"]).unwrap();
         match cli.command {
             Command::Snapshot {
                 command: SnapshotCommand::List { data_dir, shard },
@@ -2843,14 +2819,7 @@ mod tests {
 
     #[test]
     fn parse_snapshot_verify() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "snapshot",
-            "verify",
-            "--data-dir",
-            "/data",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "snapshot", "verify", "--data-dir", "/data"]).unwrap();
         match cli.command {
             Command::Snapshot {
                 command: SnapshotCommand::Verify { data_dir, shard },
@@ -2864,14 +2833,8 @@ mod tests {
 
     #[test]
     fn parse_evidence_control_verify() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "evidence",
-            "control-verify",
-            "--json",
-            "--hosted-only",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["corecruxctl", "evidence", "control-verify", "--json", "--hosted-only"]).unwrap();
         match cli.command {
             Command::Evidence {
                 command:
@@ -2905,7 +2868,12 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::Evidence {
-                command: EvidenceCommand::Verify { pack_dir, strict, device_index },
+                command:
+                    EvidenceCommand::Verify {
+                        pack_dir,
+                        strict,
+                        device_index,
+                    },
             } => {
                 assert_eq!(pack_dir, PathBuf::from("/tmp/pack"));
                 assert!(strict);
@@ -2936,12 +2904,7 @@ mod tests {
 
     #[test]
     fn parse_explain() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "explain",
-            "some-receipt-id",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "explain", "some-receipt-id"]).unwrap();
         match cli.command {
             Command::Explain { receipt_id, data_dir } => {
                 assert_eq!(receipt_id, "some-receipt-id");
@@ -2953,13 +2916,7 @@ mod tests {
 
     #[test]
     fn parse_gaps() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "gaps",
-            "--since",
-            "2026-01-01",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "gaps", "--since", "2026-01-01"]).unwrap();
         match cli.command {
             Command::Gaps { data_dir, since } => {
                 assert!(data_dir.is_none());
@@ -2971,12 +2928,7 @@ mod tests {
 
     #[test]
     fn parse_audit_pack_minimal() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "audit-pack",
-            "--offline",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "audit-pack", "--offline"]).unwrap();
         match cli.command {
             Command::AuditPack {
                 offline,
@@ -3095,12 +3047,7 @@ mod tests {
     #[test]
     fn parse_fails_missing_required_arg() {
         // reconcile requires --connection-string and --tenant
-        assert!(Cli::try_parse_from([
-            "corecruxctl",
-            "reconcile",
-            "--postgres",
-        ])
-        .is_err());
+        assert!(Cli::try_parse_from(["corecruxctl", "reconcile", "--postgres",]).is_err());
     }
 
     #[test]
@@ -3255,7 +3202,11 @@ mod tests {
         let seg_dir = tmp.path().join("shard-0001/segments");
         fs::create_dir_all(&seg_dir).unwrap();
         // Write a truncated/invalid .ccxseg — rebuild_ccxi_from_segment will fail
-        fs::write(seg_dir.join("seg-00000000000000000001-abcd.ccxseg"), b"not-a-real-segment").unwrap();
+        fs::write(
+            seg_dir.join("seg-00000000000000000001-abcd.ccxseg"),
+            b"not-a-real-segment",
+        )
+        .unwrap();
 
         let report = ccxi_rebuild(tmp.path(), None, None).unwrap();
         assert_eq!(report.shards_scanned, 1);
@@ -3305,11 +3256,7 @@ mod tests {
             let seg_dir = tmp.path().join(format!("shard-{i:04}/segments"));
             fs::create_dir_all(&seg_dir).unwrap();
             // One segment per shard, all missing .ccxi
-            fs::write(
-                seg_dir.join(format!("seg-{:020}-ffff.ccxseg", i)),
-                b"fake",
-            )
-            .unwrap();
+            fs::write(seg_dir.join(format!("seg-{:020}-ffff.ccxseg", i)), b"fake").unwrap();
         }
         let report = ccxi_verify(tmp.path(), None).unwrap();
         assert_eq!(report.shards_scanned, 3);
@@ -3325,11 +3272,7 @@ mod tests {
         let seg_dir = tmp.path().join("shard-0001/segments");
         fs::create_dir_all(&seg_dir).unwrap();
         for i in 1..=5 {
-            fs::write(
-                seg_dir.join(format!("seg-{:020}-{:04x}.ccxseg", i, i)),
-                b"fake",
-            )
-            .unwrap();
+            fs::write(seg_dir.join(format!("seg-{:020}-{:04x}.ccxseg", i, i)), b"fake").unwrap();
         }
         let report = ccxi_verify(tmp.path(), None).unwrap();
         assert_eq!(report.shards_scanned, 1);
@@ -3481,15 +3424,7 @@ mod tests {
     #[test]
     fn dispatch_replay_unsupported_mode() {
         // The match arm for Command::Replay checks mode != "audit" first
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "replay",
-            "--pack",
-            "/tmp/pack",
-            "--mode",
-            "debug",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "replay", "--pack", "/tmp/pack", "--mode", "debug"]).unwrap();
         match cli.command {
             Command::Replay { mode, .. } => {
                 assert_eq!(mode, "debug");
@@ -3500,13 +3435,7 @@ mod tests {
 
     #[test]
     fn dispatch_replay_neither_pack_nor_input() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "replay",
-            "--mode",
-            "audit",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "replay", "--mode", "audit"]).unwrap();
         match cli.command {
             Command::Replay { pack, input, .. } => {
                 assert!(pack.is_none());
@@ -3744,15 +3673,7 @@ mod tests {
 
     #[test]
     fn parse_admin_action_status() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "admin",
-            "action",
-            "status",
-            "--action-id",
-            "act-42",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "admin", "action", "status", "--action-id", "act-42"]).unwrap();
         match cli.command {
             Command::Admin {
                 command:
@@ -3882,7 +3803,12 @@ mod tests {
         let cli = Cli::try_parse_from(["corecruxctl", "ccxi", "rebuild"]).unwrap();
         match cli.command {
             Command::Ccxi {
-                command: CcxiCommand::Rebuild { data_dir, shard, segment_seq },
+                command:
+                    CcxiCommand::Rebuild {
+                        data_dir,
+                        shard,
+                        segment_seq,
+                    },
             } => {
                 assert!(data_dir.is_none());
                 assert!(shard.is_none());
@@ -4107,7 +4033,11 @@ mod tests {
         let seg_dir = dir.path().join("shard-0001/segments");
         fs::create_dir_all(&seg_dir).unwrap();
         // Create segment + valid ccxi
-        fs::write(seg_dir.join("seg-00000000000000000042-abcd.ccxseg"), b"invalid-seg-data").unwrap();
+        fs::write(
+            seg_dir.join("seg-00000000000000000042-abcd.ccxseg"),
+            b"invalid-seg-data",
+        )
+        .unwrap();
         let builder = corecrux_index::CcxiBuilder::new(1, 42, 0);
         fs::write(seg_dir.join("seg-00000000000000000042-abcd.ccxi"), &builder.build()).unwrap();
 
@@ -4254,10 +4184,7 @@ mod tests {
 
     #[test]
     fn dispatch_replay_pack_nonexistent_path() {
-        let result = replay::replay_digest_from_pack(
-            &PathBuf::from("/tmp/__nonexistent_replay_pack__"),
-            false,
-        );
+        let result = replay::replay_digest_from_pack(&PathBuf::from("/tmp/__nonexistent_replay_pack__"), false);
         assert!(result.is_err());
     }
 
@@ -4275,15 +4202,9 @@ mod tests {
 
     #[test]
     fn dispatch_shardmap_init() {
-        let map = shardmap::init_dev_shard_map_v1(
-            2,
-            "test-cluster",
-            "node-test",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map =
+            shardmap::init_dev_shard_map_v1(2, "test-cluster", "node-test", "127.0.0.1:4006", "127.0.0.1:4007", None)
+                .unwrap();
         assert_eq!(map.shards.len(), 2);
         assert_eq!(map.cluster_id, "test-cluster");
         // Validate it
@@ -4310,15 +4231,8 @@ mod tests {
     fn dispatch_shardmap_init_write_and_read() {
         let dir = TempDir::new().unwrap();
         let out = dir.path().join("map.json");
-        let map = shardmap::init_dev_shard_map_v1(
-            4,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map =
+            shardmap::init_dev_shard_map_v1(4, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         shardmap::write_shard_map_v1(&out, &map).unwrap();
         let loaded = shardmap::read_shard_map_v1(&out).unwrap();
         assert_eq!(loaded.version, map.version);
@@ -4329,15 +4243,8 @@ mod tests {
 
     #[test]
     fn dispatch_shardmap_validate_ok() {
-        let map = shardmap::init_dev_shard_map_v1(
-            2,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map =
+            shardmap::init_dev_shard_map_v1(2, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         corecrux_types::validate_shard_map_v1(&map).unwrap();
     }
 
@@ -4347,15 +4254,8 @@ mod tests {
     fn dispatch_shardmap_publish_and_load() {
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path();
-        let map = shardmap::init_dev_shard_map_v1(
-            2,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map =
+            shardmap::init_dev_shard_map_v1(2, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         shardmap::publish_shard_map_v1(data_dir, &map).unwrap();
         // Verify the file was written
         let routing_dir = data_dir.join("meta").join("routing");
@@ -4366,15 +4266,8 @@ mod tests {
 
     #[test]
     fn dispatch_shardmap_split() {
-        let map = shardmap::init_dev_shard_map_v1(
-            2,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map =
+            shardmap::init_dev_shard_map_v1(2, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         let shard_id = &map.shards[0].shard_id;
         let split_map = shardmap::split_shard_map_v1(&map, shard_id, "0x4000000000000000", None);
         assert!(split_map.is_ok());
@@ -4387,15 +4280,8 @@ mod tests {
 
     #[test]
     fn dispatch_shardmap_set_gpu() {
-        let map = shardmap::init_dev_shard_map_v1(
-            2,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map =
+            shardmap::init_dev_shard_map_v1(2, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         let shard_id = &map.shards[0].shard_id;
         let result = shardmap::set_shard_gpu_id_v1(&map, shard_id, 3);
         assert!(result.is_ok());
@@ -4439,10 +4325,8 @@ mod tests {
     #[test]
     fn dispatch_import_v1_nonexistent_file() {
         let dir = TempDir::new().unwrap();
-        let result = stage1_import::import_stage1_events_log(
-            &PathBuf::from("/tmp/__nonexistent_events_log__"),
-            dir.path(),
-        );
+        let result =
+            stage1_import::import_stage1_events_log(&PathBuf::from("/tmp/__nonexistent_events_log__"), dir.path());
         assert!(result.is_err());
     }
 
@@ -4706,13 +4590,7 @@ mod tests {
     fn dispatch_projections_rebuild_empty() {
         let dir = TempDir::new().unwrap();
         fs::create_dir_all(dir.path().join("shards")).unwrap();
-        let report = projections::rebuild_projections_v1(
-            dir.path(),
-            None,
-            0,
-            1024,
-        )
-        .unwrap();
+        let report = projections::rebuild_projections_v1(dir.path(), None, 0, 1024).unwrap();
         assert!(report.shards.is_empty());
     }
 
@@ -4720,14 +4598,7 @@ mod tests {
     fn dispatch_projections_gc_empty() {
         let dir = TempDir::new().unwrap();
         fs::create_dir_all(dir.path().join("shards")).unwrap();
-        let report = projections::gc_orphan_cold_segments_v1(
-            dir.path(),
-            None,
-            true,
-            600,
-            0,
-        )
-        .unwrap();
+        let report = projections::gc_orphan_cold_segments_v1(dir.path(), None, true, 600, 0).unwrap();
         assert!(report.shards.is_empty());
     }
 
@@ -4736,13 +4607,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let shard_dir = dir.path().join("shards/shard-0001");
         fs::create_dir_all(&shard_dir).unwrap();
-        let result = projections::gc_orphan_cold_segments_v1(
-            dir.path(),
-            Some(1),
-            true,
-            0,
-            10,
-        );
+        let result = projections::gc_orphan_cold_segments_v1(dir.path(), Some(1), true, 0, 10);
         // Exercises the code path; may error if shard has no projections dir.
         let _ = result;
     }
@@ -4754,13 +4619,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let shard_dir = dir.path().join("shards/shard-0001");
         fs::create_dir_all(&shard_dir).unwrap();
-        let report = receipts::seed_minimal_receipt_v1(
-            dir.path(),
-            1,
-            "tenant-test",
-            "receipt-test-abc",
-            0,
-        );
+        let report = receipts::seed_minimal_receipt_v1(dir.path(), 1, "tenant-test", "receipt-test-abc", 0);
         // May succeed or fail depending on shard store init; either way it exercises the path.
         let _ = report;
     }
@@ -4769,14 +4628,7 @@ mod tests {
     fn dispatch_receipts_backfill_empty() {
         let dir = TempDir::new().unwrap();
         fs::create_dir_all(dir.path().join("shards")).unwrap();
-        let report = receipts::backfill_subject_index_v1(
-            dir.path(),
-            None,
-            true,
-            0,
-            8192,
-        )
-        .unwrap();
+        let report = receipts::backfill_subject_index_v1(dir.path(), None, true, 0, 8192).unwrap();
         assert_eq!(report.totals.indexed, 0);
     }
 
@@ -4820,18 +4672,13 @@ mod tests {
 
     #[test]
     fn dispatch_replay_strict_mode_nonexistent() {
-        let result = replay::replay_digest_from_pack(
-            &PathBuf::from("/tmp/__nonexistent_strict_pack__"),
-            true,
-        );
+        let result = replay::replay_digest_from_pack(&PathBuf::from("/tmp/__nonexistent_strict_pack__"), true);
         assert!(result.is_err());
     }
 
     #[test]
     fn dispatch_replay_jsonl_nonexistent() {
-        let result = replay::replay_digest_from_jsonl(
-            &PathBuf::from("/tmp/__nonexistent_events_jsonl__"),
-        );
+        let result = replay::replay_digest_from_jsonl(&PathBuf::from("/tmp/__nonexistent_events_jsonl__"));
         assert!(result.is_err());
     }
 
@@ -4869,9 +4716,18 @@ mod tests {
 
     #[test]
     fn tooling_env_parse() {
-        assert_eq!(tooling_env::ToolingEnvironment::parse("local"), Some(tooling_env::ToolingEnvironment::Local));
-        assert_eq!(tooling_env::ToolingEnvironment::parse("staging"), Some(tooling_env::ToolingEnvironment::Staging));
-        assert_eq!(tooling_env::ToolingEnvironment::parse("production"), Some(tooling_env::ToolingEnvironment::Production));
+        assert_eq!(
+            tooling_env::ToolingEnvironment::parse("local"),
+            Some(tooling_env::ToolingEnvironment::Local)
+        );
+        assert_eq!(
+            tooling_env::ToolingEnvironment::parse("staging"),
+            Some(tooling_env::ToolingEnvironment::Staging)
+        );
+        assert_eq!(
+            tooling_env::ToolingEnvironment::parse("production"),
+            Some(tooling_env::ToolingEnvironment::Production)
+        );
         assert_eq!(tooling_env::ToolingEnvironment::parse("unknown"), None);
     }
 
@@ -4926,22 +4782,10 @@ mod tests {
 
     #[test]
     fn dispatch_shardmap_split_with_custom_new_shard() {
-        let map = shardmap::init_dev_shard_map_v1(
-            2,
-            "dev",
-            "node-dev",
-            "127.0.0.1:4006",
-            "127.0.0.1:4007",
-            None,
-        )
-        .unwrap();
+        let map =
+            shardmap::init_dev_shard_map_v1(2, "dev", "node-dev", "127.0.0.1:4006", "127.0.0.1:4007", None).unwrap();
         let shard_id = &map.shards[0].shard_id;
-        let result = shardmap::split_shard_map_v1(
-            &map,
-            shard_id,
-            "0x4000000000000000",
-            Some("shard-0099".to_string()),
-        );
+        let result = shardmap::split_shard_map_v1(&map, shard_id, "0x4000000000000000", Some("shard-0099".to_string()));
         assert!(result.is_ok());
         let split = result.unwrap();
         assert!(split.shards.iter().any(|s| s.shard_id == "shard-0099"));
@@ -4983,13 +4827,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let shard_dir = dir.path().join("shards/shard-0001");
         fs::create_dir_all(&shard_dir).unwrap();
-        let result = projections::seed_minimal_projection_events_v1(
-            dir.path(),
-            1,
-            "tenant-test",
-            1,
-            0,
-        );
+        let result = projections::seed_minimal_projection_events_v1(dir.path(), 1, "tenant-test", 1, 0);
         // Exercises the function path; may error because no shard store.
         let _ = result;
     }
@@ -5001,13 +4839,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let shard_dir = dir.path().join("shards/shard-0001");
         fs::create_dir_all(&shard_dir).unwrap();
-        let result = receipts::backfill_subject_index_v1(
-            dir.path(),
-            Some(1),
-            true,
-            0,
-            4096,
-        );
+        let result = receipts::backfill_subject_index_v1(dir.path(), Some(1), true, 0, 4096);
         // Exercises the path; may error because no manifest.
         let _ = result;
     }
@@ -5141,7 +4973,12 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::AuditPack { offline, tenant_id, max_events, .. } => {
+            Command::AuditPack {
+                offline,
+                tenant_id,
+                max_events,
+                ..
+            } => {
                 assert!(offline);
                 assert_eq!(tenant_id, Some("t1".to_string()));
                 assert_eq!(max_events, 500);
@@ -5154,14 +4991,7 @@ mod tests {
 
     #[test]
     fn parse_inspect_receipt_with_data_dir() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "inspect-receipt",
-            "rcpt-abc",
-            "--data-dir",
-            "/mydata",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "inspect-receipt", "rcpt-abc", "--data-dir", "/mydata"]).unwrap();
         match cli.command {
             Command::InspectReceipt { receipt_id, data_dir } => {
                 assert_eq!(receipt_id, "rcpt-abc");
@@ -5175,12 +5005,7 @@ mod tests {
 
     #[test]
     fn parse_explain_defaults() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "explain",
-            "rcpt-xyz",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["corecruxctl", "explain", "rcpt-xyz"]).unwrap();
         match cli.command {
             Command::Explain { receipt_id, data_dir } => {
                 assert_eq!(receipt_id, "rcpt-xyz");
@@ -5194,15 +5019,8 @@ mod tests {
 
     #[test]
     fn parse_gaps_with_data_dir() {
-        let cli = Cli::try_parse_from([
-            "corecruxctl",
-            "gaps",
-            "--data-dir",
-            "/mydata",
-            "--since",
-            "2026-01-01",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["corecruxctl", "gaps", "--data-dir", "/mydata", "--since", "2026-01-01"]).unwrap();
         match cli.command {
             Command::Gaps { data_dir, since } => {
                 assert_eq!(data_dir, Some("/mydata".to_string()));
@@ -5219,15 +5037,29 @@ mod tests {
         let cli = Cli::try_parse_from([
             "corecruxctl",
             "parity-pack",
-            "--out", "/tmp/pp",
-            "--tenant-id", "t1",
-            "--engine", "http://engine:3000",
-            "--engine-api-key", "key",
-            "--corecrux", "http://corecrux:4006",
+            "--out",
+            "/tmp/pp",
+            "--tenant-id",
+            "t1",
+            "--engine",
+            "http://engine:3000",
+            "--engine-api-key",
+            "key",
+            "--corecrux",
+            "http://corecrux:4006",
         ])
         .unwrap();
         match cli.command {
-            Command::ParityPack { out, tenant_id, engine, engine_api_key, corecrux, seed, sample_size, .. } => {
+            Command::ParityPack {
+                out,
+                tenant_id,
+                engine,
+                engine_api_key,
+                corecrux,
+                seed,
+                sample_size,
+                ..
+            } => {
                 assert_eq!(out, PathBuf::from("/tmp/pp"));
                 assert_eq!(tenant_id, "t1");
                 assert_eq!(engine, "http://engine:3000");

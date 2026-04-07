@@ -47,9 +47,7 @@ pub async fn append_ops_event<T: serde::Serialize>(
         payload: payload_bytes,
     };
 
-    let (_decision, store) = pool
-        .store_for_stream("system", "__ops__", node_id, None)
-        .await?;
+    let (_decision, store) = pool.store_for_stream("system", "__ops__", node_id, None).await?;
     let store = store.read().await;
     let _ = store
         .append_batch("system", "__ops__", node_id, 0, None, &[event])
@@ -87,10 +85,7 @@ mod tests {
         assert_eq!(ctx.node_id, "node-42");
         assert_eq!(ctx.build.version, "1.2.3");
         assert_eq!(ctx.build.commit, "abc123");
-        assert_eq!(
-            ctx.http_listen_addr.as_deref(),
-            Some("0.0.0.0:14800")
-        );
+        assert_eq!(ctx.http_listen_addr.as_deref(), Some("0.0.0.0:14800"));
         assert!(ctx.grpc_listen_addr.is_none());
     }
 
@@ -106,14 +101,8 @@ mod tests {
             Some("0.0.0.0:14800".to_string()),
             Some("0.0.0.0:14801".to_string()),
         );
-        assert_eq!(
-            ctx.http_listen_addr.as_deref(),
-            Some("0.0.0.0:14800")
-        );
-        assert_eq!(
-            ctx.grpc_listen_addr.as_deref(),
-            Some("0.0.0.0:14801")
-        );
+        assert_eq!(ctx.http_listen_addr.as_deref(), Some("0.0.0.0:14800"));
+        assert_eq!(ctx.grpc_listen_addr.as_deref(), Some("0.0.0.0:14801"));
     }
 
     #[test]

@@ -119,13 +119,9 @@ fn cat12_bm25_recall() {
     for (qi, q) in corpus.queries.iter().enumerate() {
         let hits = bm25_score(&reader, &q.query, q.top_k, Some(tenant_lo16), &params);
 
-        let retrieved_ids: Vec<String> = hits
-            .iter()
-            .filter_map(|h| idx_to_id.get(&h.doc_id).cloned())
-            .collect();
+        let retrieved_ids: Vec<String> = hits.iter().filter_map(|h| idx_to_id.get(&h.doc_id).cloned()).collect();
 
-        let expected_set: std::collections::HashSet<&str> =
-            q.expected_doc_ids.iter().map(|s| s.as_str()).collect();
+        let expected_set: std::collections::HashSet<&str> = q.expected_doc_ids.iter().map(|s| s.as_str()).collect();
 
         let hits_in_expected = retrieved_ids
             .iter()
@@ -186,11 +182,7 @@ fn cat12_bm25_recall() {
     eprintln!("Overall precision: {:.3} (target ≥0.80)", avg_precision);
     eprintln!("\nPer-theme recall:");
     for (theme, (hits, total)) in &theme_hits {
-        let tr = if *total > 0 {
-            *hits as f64 / *total as f64
-        } else {
-            1.0
-        };
+        let tr = if *total > 0 { *hits as f64 / *total as f64 } else { 1.0 };
         eprintln!("  {:<25} {}/{} = {:.3}", theme, hits, total, tr);
     }
 
@@ -227,8 +219,7 @@ fn cat12_fused_retrieve() {
     // Build a simple graph boost function from relations
     let mut relation_map: HashMap<u32, Vec<u32>> = HashMap::new();
     for rel in &corpus.relations {
-        if let (Some(&src), Some(&dst)) = (id_to_idx.get(&rel.src_id), id_to_idx.get(&rel.dst_id))
-        {
+        if let (Some(&src), Some(&dst)) = (id_to_idx.get(&rel.src_id), id_to_idx.get(&rel.dst_id)) {
             relation_map.entry(src).or_default().push(dst);
             relation_map.entry(dst).or_default().push(src);
         }
@@ -274,8 +265,7 @@ fn cat12_fused_retrieve() {
             .filter_map(|h| idx_to_id.get(&h.doc_id).cloned())
             .collect();
 
-        let expected_set: std::collections::HashSet<&str> =
-            q.expected_doc_ids.iter().map(|s| s.as_str()).collect();
+        let expected_set: std::collections::HashSet<&str> = q.expected_doc_ids.iter().map(|s| s.as_str()).collect();
 
         let hits_in_expected = retrieved_ids
             .iter()

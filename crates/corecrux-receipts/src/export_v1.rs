@@ -285,11 +285,9 @@ pub fn build_receipt_export_v1(
                 });
             }
             ReceiptExportIncludeV1::TraceSummary => {
-                let bytes = input
-                    .trace_summary_json
-                    .ok_or_else(|| ExportError::Precondition {
-                        msg: "trace_summary requested but unavailable".to_string(),
-                    })?;
+                let bytes = input.trace_summary_json.ok_or_else(|| ExportError::Precondition {
+                    msg: "trace_summary requested but unavailable".to_string(),
+                })?;
                 files.push(ArchiveEntry {
                     path: trace_path,
                     bytes,
@@ -301,11 +299,9 @@ pub fn build_receipt_export_v1(
                 });
             }
             ReceiptExportIncludeV1::SubjectLinks => {
-                let bytes = input
-                    .subject_links_json
-                    .ok_or_else(|| ExportError::Precondition {
-                        msg: "subject_links requested but unavailable".to_string(),
-                    })?;
+                let bytes = input.subject_links_json.ok_or_else(|| ExportError::Precondition {
+                    msg: "subject_links requested but unavailable".to_string(),
+                })?;
                 files.push(ArchiveEntry {
                     path: subject_path,
                     bytes,
@@ -317,11 +313,9 @@ pub fn build_receipt_export_v1(
                 });
             }
             ReceiptExportIncludeV1::LinkedReceipts => {
-                let bytes = input
-                    .lineage_json
-                    .ok_or_else(|| ExportError::Precondition {
-                        msg: "linked_receipts requested but unavailable".to_string(),
-                    })?;
+                let bytes = input.lineage_json.ok_or_else(|| ExportError::Precondition {
+                    msg: "linked_receipts requested but unavailable".to_string(),
+                })?;
                 files.push(ArchiveEntry {
                     path: lineage_path,
                     bytes,
@@ -404,8 +398,7 @@ fn build_zip_deterministic(entries: &[ArchiveEntry<'_>]) -> Result<Vec<u8>, Expo
     {
         let mut zw = zip::ZipWriter::new(&mut cursor);
 
-        let ts =
-            zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).expect("static zip timestamp");
+        let ts = zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).expect("static zip timestamp");
         let opts = FileOptions::default()
             .compression_method(zip::CompressionMethod::Stored)
             .last_modified_time(ts)
@@ -444,8 +437,7 @@ fn build_tar_zst_deterministic(entries: &[ArchiveEntry<'_>]) -> Result<Vec<u8>, 
         tb.finish().map_err(|e| ExportError::Tar(e.to_string()))?;
     }
 
-    let mut enc = zstd::Encoder::new(Vec::new(), /*level=*/ 3)
-        .map_err(|e| ExportError::Zstd(e.to_string()))?;
+    let mut enc = zstd::Encoder::new(Vec::new(), /*level=*/ 3).map_err(|e| ExportError::Zstd(e.to_string()))?;
     enc.write_all(&tar_bytes)
         .map_err(|e| ExportError::Zstd(e.to_string()))?;
     enc.finish().map_err(|e| ExportError::Zstd(e.to_string()))

@@ -113,9 +113,7 @@ pub fn canonical_header_bytes_v1(header: &CanonicalHeaderV1) -> Vec<u8> {
     out
 }
 
-pub fn decode_canonical_header_bytes_v1(
-    input: &[u8],
-) -> Result<CanonicalHeaderV1, DecodeHeaderError> {
+pub fn decode_canonical_header_bytes_v1(input: &[u8]) -> Result<CanonicalHeaderV1, DecodeHeaderError> {
     let mut cursor = 0usize;
     let tag = read_u16(input, &mut cursor)?;
     if tag != CANONICAL_HEADER_V1_TAG {
@@ -152,18 +150,12 @@ pub fn decode_canonical_header_bytes_v1(
     })
 }
 
-pub fn stream_hash_xxhash64(
-    tenant_id: &str,
-    stream_type: &str,
-    stream_id: &str,
-) -> Result<u64, StreamHashError> {
+pub fn stream_hash_xxhash64(tenant_id: &str, stream_type: &str, stream_id: &str) -> Result<u64, StreamHashError> {
     if tenant_id.is_empty() {
         return Err(StreamHashError::Empty { field: "tenant_id" });
     }
     if stream_type.is_empty() {
-        return Err(StreamHashError::Empty {
-            field: "stream_type",
-        });
+        return Err(StreamHashError::Empty { field: "stream_type" });
     }
     if stream_id.is_empty() {
         return Err(StreamHashError::Empty { field: "stream_id" });
@@ -173,9 +165,7 @@ pub fn stream_hash_xxhash64(
         return Err(StreamHashError::Whitespace { field: "tenant_id" });
     }
     if stream_type.trim() != stream_type {
-        return Err(StreamHashError::Whitespace {
-            field: "stream_type",
-        });
+        return Err(StreamHashError::Whitespace { field: "stream_type" });
     }
     if stream_id.trim() != stream_id {
         return Err(StreamHashError::Whitespace { field: "stream_id" });
@@ -185,9 +175,7 @@ pub fn stream_hash_xxhash64(
         return Err(StreamHashError::NulByte { field: "tenant_id" });
     }
     if stream_type.as_bytes().contains(&0) {
-        return Err(StreamHashError::NulByte {
-            field: "stream_type",
-        });
+        return Err(StreamHashError::NulByte { field: "stream_type" });
     }
     if stream_id.as_bytes().contains(&0) {
         return Err(StreamHashError::NulByte { field: "stream_id" });
@@ -211,9 +199,7 @@ fn write_str(out: &mut Vec<u8>, value: &str) {
 }
 
 fn read_u16(input: &[u8], cursor: &mut usize) -> Result<u16, DecodeHeaderError> {
-    let end = cursor
-        .checked_add(2)
-        .ok_or(DecodeHeaderError::BufferTooSmall)?;
+    let end = cursor.checked_add(2).ok_or(DecodeHeaderError::BufferTooSmall)?;
     if end > input.len() {
         return Err(DecodeHeaderError::BufferTooSmall);
     }
@@ -224,9 +210,7 @@ fn read_u16(input: &[u8], cursor: &mut usize) -> Result<u16, DecodeHeaderError> 
 }
 
 fn read_u32(input: &[u8], cursor: &mut usize) -> Result<u32, DecodeHeaderError> {
-    let end = cursor
-        .checked_add(4)
-        .ok_or(DecodeHeaderError::BufferTooSmall)?;
+    let end = cursor.checked_add(4).ok_or(DecodeHeaderError::BufferTooSmall)?;
     if end > input.len() {
         return Err(DecodeHeaderError::BufferTooSmall);
     }
@@ -237,9 +221,7 @@ fn read_u32(input: &[u8], cursor: &mut usize) -> Result<u32, DecodeHeaderError> 
 }
 
 fn read_u64(input: &[u8], cursor: &mut usize) -> Result<u64, DecodeHeaderError> {
-    let end = cursor
-        .checked_add(8)
-        .ok_or(DecodeHeaderError::BufferTooSmall)?;
+    let end = cursor.checked_add(8).ok_or(DecodeHeaderError::BufferTooSmall)?;
     if end > input.len() {
         return Err(DecodeHeaderError::BufferTooSmall);
     }
@@ -250,9 +232,7 @@ fn read_u64(input: &[u8], cursor: &mut usize) -> Result<u64, DecodeHeaderError> 
 }
 
 fn read_32(input: &[u8], cursor: &mut usize) -> Result<[u8; 32], DecodeHeaderError> {
-    let end = cursor
-        .checked_add(32)
-        .ok_or(DecodeHeaderError::BufferTooSmall)?;
+    let end = cursor.checked_add(32).ok_or(DecodeHeaderError::BufferTooSmall)?;
     if end > input.len() {
         return Err(DecodeHeaderError::BufferTooSmall);
     }
@@ -262,11 +242,7 @@ fn read_32(input: &[u8], cursor: &mut usize) -> Result<[u8; 32], DecodeHeaderErr
     Ok(buf)
 }
 
-fn read_str(
-    input: &[u8],
-    cursor: &mut usize,
-    field: &'static str,
-) -> Result<String, DecodeHeaderError> {
+fn read_str(input: &[u8], cursor: &mut usize, field: &'static str) -> Result<String, DecodeHeaderError> {
     let len = read_u32(input, cursor)? as usize;
     let end = cursor
         .checked_add(len)
@@ -294,10 +270,7 @@ mod tests {
     #[test]
     fn stream_hash_rejects_nul() {
         let err = stream_hash_xxhash64("te\0nant", "answers", "stream-1").unwrap_err();
-        assert!(matches!(
-            err,
-            StreamHashError::NulByte { field: "tenant_id" }
-        ));
+        assert!(matches!(err, StreamHashError::NulByte { field: "tenant_id" }));
     }
 
     #[test]
@@ -309,10 +282,7 @@ mod tests {
     #[test]
     fn stream_hash_rejects_leading_whitespace() {
         let err = stream_hash_xxhash64(" tenant", "answers", "stream-1").unwrap_err();
-        assert!(matches!(
-            err,
-            StreamHashError::Whitespace { field: "tenant_id" }
-        ));
+        assert!(matches!(err, StreamHashError::Whitespace { field: "tenant_id" }));
     }
 
     #[test]
@@ -345,12 +315,7 @@ mod tests {
             ("system", "corecrux", "routing", 0xa1bd681575d90236),
             ("tenant-a", "receipt", "REC_0001", 0x0becae63d4163ce5),
             ("t", "s", "i", 0xc914fbcba10ad4bc),
-            (
-                "tenant-123",
-                "events",
-                "stream-00000001",
-                0x7742a907f2ffad91,
-            ),
+            ("tenant-123", "events", "stream-00000001", 0x7742a907f2ffad91),
         ];
 
         for (tenant, stype, sid, expected) in vectors {

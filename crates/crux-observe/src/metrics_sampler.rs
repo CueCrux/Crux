@@ -228,13 +228,8 @@ mod tests {
     #[test]
     fn custom_config() {
         let store = Arc::new(RwLock::new(FactStore::new()));
-        let sampler = MetricsSampler::with_config(
-            store,
-            "n2".to_string(),
-            false,
-            60,
-            vec!["custom_metric".to_string()],
-        );
+        let sampler =
+            MetricsSampler::with_config(store, "n2".to_string(), false, 60, vec!["custom_metric".to_string()]);
         assert_eq!(sampler.interval_secs(), 60);
         assert!(!sampler.is_enabled());
         assert_eq!(sampler.allowlist(), &["custom_metric".to_string()]);

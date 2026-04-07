@@ -18,8 +18,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::pfordelta::{pfordelta_decode, pfordelta_encode};
 use crate::tokenizer::tokenize;
-use crate::pfordelta::{pfordelta_encode, pfordelta_decode};
 use crate::IndexError;
 
 pub const CCXI_MAGIC: u32 = 0x4343_5849; // "CCXI"
@@ -51,7 +51,7 @@ pub struct VocabEntry {
 
 #[derive(Debug, Clone, Copy)]
 pub struct DocEntry {
-    pub frame_offset: u32,     // offset within segment record area
+    pub frame_offset: u32, // offset within segment record area
     pub doc_length_tokens: u16,
     pub tenant_hash_lo16: u16, // fast-path filter in BM25 postings scan
     pub tenant_hash_full: u64, // exact tenant isolation — prevents lo16 collision leaks
@@ -84,13 +84,7 @@ impl CcxiBuilder {
     /// `text` is the payload content to tokenize.
     /// `frame_offset` is the byte offset in the segment record area.
     /// `tenant_hash` is the full tenant hash (we store low 16 bits).
-    pub fn add_document(
-        &mut self,
-        doc_id: u32,
-        text: &str,
-        frame_offset: u32,
-        tenant_hash: u64,
-    ) {
+    pub fn add_document(&mut self, doc_id: u32, text: &str, frame_offset: u32, tenant_hash: u64) {
         let tokens = tokenize(text);
         let doc_len = tokens.len() as u16;
 
@@ -102,10 +96,7 @@ impl CcxiBuilder {
 
         // Add to posting lists
         for (token_hash, tf) in tf_map {
-            self.postings
-                .entry(token_hash)
-                .or_default()
-                .push((doc_id, tf));
+            self.postings.entry(token_hash).or_default().push((doc_id, tf));
         }
 
         // Add doc entry
@@ -206,9 +197,7 @@ impl CcxiBuilder {
 
         // === Footer (64 bytes) ===
         let vocab_hash = blake3::hash(&out[CCXI_HEADER_LEN..CCXI_HEADER_LEN + vocab_len]);
-        let postings_hash = blake3::hash(
-            &out[CCXI_HEADER_LEN + vocab_len..CCXI_HEADER_LEN + vocab_len + postings_len],
-        );
+        let postings_hash = blake3::hash(&out[CCXI_HEADER_LEN + vocab_len..CCXI_HEADER_LEN + vocab_len + postings_len]);
 
         let mut footer = vec![0u8; CCXI_FOOTER_LEN];
         footer[0..32].copy_from_slice(vocab_hash.as_bytes());
@@ -527,8 +516,7 @@ mod proptest_tests {
 
     /// Generate a document as space-separated words.
     fn doc_strategy(words_per_doc: usize) -> impl Strategy<Value = String> {
-        prop::collection::vec(word_strategy(), 1..=words_per_doc)
-            .prop_map(|words| words.join(" "))
+        prop::collection::vec(word_strategy(), 1..=words_per_doc).prop_map(|words| words.join(" "))
     }
 
     proptest! {

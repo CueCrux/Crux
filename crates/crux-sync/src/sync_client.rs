@@ -17,10 +17,7 @@ pub struct SyncResult {
 }
 
 /// Build the contributions push request body.
-pub fn build_contributions_body(
-    contributions: &[serde_json::Value],
-    sync_cursor: &str,
-) -> serde_json::Value {
+pub fn build_contributions_body(contributions: &[serde_json::Value], sync_cursor: &str) -> serde_json::Value {
     serde_json::json!({
         "contributions": contributions,
         "sync_cursor": sync_cursor

@@ -15,11 +15,9 @@ pub struct ProblemResponse(pub ProblemDetails);
 
 impl IntoResponse for ProblemResponse {
     fn into_response(self) -> Response {
-        let status =
-            StatusCode::from_u16(self.0.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = StatusCode::from_u16(self.0.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let body = serde_json::to_string(&self.0).unwrap_or_else(|_| {
-            r#"{"type":"https://errors.cuecrux.com/internal","title":"Serialization Error","status":500}"#
-                .to_string()
+            r#"{"type":"https://errors.cuecrux.com/internal","title":"Serialization Error","status":500}"#.to_string()
         });
         let mut response = (status, body).into_response();
         response.headers_mut().insert(
@@ -46,11 +44,7 @@ mod tests {
 
     #[tokio::test]
     async fn problem_response_sets_status_and_content_type() {
-        let pd = ProblemDetails::new(
-            404,
-            "https://errors.cuecrux.com/not-found",
-            "Not Found",
-        );
+        let pd = ProblemDetails::new(404, "https://errors.cuecrux.com/not-found", "Not Found");
         let resp = ProblemResponse(pd).into_response();
         assert_eq!(resp.status().as_u16(), 404);
         assert_eq!(
@@ -81,11 +75,7 @@ mod tests {
 
     #[tokio::test]
     async fn problem_response_from_trait() {
-        let pd = ProblemDetails::new(
-            400,
-            "https://errors.cuecrux.com/bad-request",
-            "Bad Request",
-        );
+        let pd = ProblemDetails::new(400, "https://errors.cuecrux.com/bad-request", "Bad Request");
         let pr: ProblemResponse = pd.into();
         let resp = pr.into_response();
         assert_eq!(resp.status().as_u16(), 400);
@@ -93,11 +83,7 @@ mod tests {
 
     #[tokio::test]
     async fn problem_response_with_detail_and_instance() {
-        let mut pd = ProblemDetails::new(
-            422,
-            "https://errors.cuecrux.com/validation",
-            "Validation Error",
-        );
+        let mut pd = ProblemDetails::new(422, "https://errors.cuecrux.com/validation", "Validation Error");
         pd.detail = Some("Field 'name' is required".to_string());
         pd.instance = Some("/streams/abc".to_string());
 

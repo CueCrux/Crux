@@ -1,16 +1,44 @@
 #!/bin/bash
 # CoreCrux Quick Start
-# Starts the daemon, stores a fact, queries it, then cleans up.
+# Builds (if needed), starts the daemon, runs through the core APIs, then cleans up.
+#
+# Usage: ./examples/scripts/quickstart.sh
 
 set -euo pipefail
 
 CORECRUXD_DATA_DIR=/tmp/crux-demo
 CORECRUXD_HTTP_PORT=14800
+CORECRUXD_AUTH_MODE=off   # Local demo only — use jwt_hs256 or jwt_jwks in production.
+BASE="http://localhost:${CORECRUXD_HTTP_PORT}"
+
+# ── Pre-flight checks ─────────────────────────────────────────────
+
+for cmd in curl jq; do
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "ERROR: '$cmd' is required but not found. Install it and try again."
+    exit 1
+  fi
+done
+
+if lsof -i ":${CORECRUXD_HTTP_PORT}" &>/dev/null 2>&1; then
+  echo "ERROR: Port ${CORECRUXD_HTTP_PORT} is already in use."
+  echo "  Kill the process or set CORECRUXD_HTTP_PORT to a different port."
+  exit 1
+fi
+
+BINARY="./target/release/corecruxd"
+if [ ! -f "$BINARY" ]; then
+  echo "==> Binary not found at $BINARY. Building (this takes a few minutes)..."
+  cargo build --release --bin corecruxd
+fi
+
+# ── Start daemon ───────────────────────────────────────────────────
 
 echo "==> Starting corecruxd..."
-CORECRUXD_DATA_DIR="$CORECRUXD_DATA_DIR" ./target/release/corecruxd &
+CORECRUXD_DATA_DIR="$CORECRUXD_DATA_DIR" \
+  CORECRUXD_AUTH_MODE="$CORECRUXD_AUTH_MODE" \
+  "$BINARY" &
 DAEMON_PID=$!
-sleep 2
 
 cleanup() {
   echo "==> Shutting down..."
@@ -19,12 +47,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
-BASE="http://localhost:${CORECRUXD_HTTP_PORT}"
+# ── Wait for readiness ─────────────────────────────────────────────
 
+echo "==> Waiting for daemon to be ready..."
+for i in $(seq 1 30); do
+  if curl -sf "$BASE/readyz" &>/dev/null; then
+    echo "    Ready after ${i}s."
+    break
+  fi
+  if [ "$i" -eq 30 ]; then
+    echo "ERROR: Daemon did not become ready within 30 seconds."
+    exit 1
+  fi
+  sleep 1
+done
+
+# ── Health check ───────────────────────────────────────────────────
+
+echo ""
 echo "==> Health check"
 curl -s "$BASE/healthz" | jq .
-echo
 
+# ── Store a fact ───────────────────────────────────────────────────
+
+echo ""
 echo "==> Store a fact"
 curl -s -X PUT "$BASE/v1/facts" \
   -H 'Content-Type: application/json' \
@@ -34,12 +80,35 @@ curl -s -X PUT "$BASE/v1/facts" \
     "value": "Phase 1 complete",
     "confidence": 0.95
   }' | jq .
-echo
 
+# ── Query facts ────────────────────────────────────────────────────
+
+echo ""
 echo "==> Query facts"
 curl -s "$BASE/v1/facts?query=project" | jq .
-echo
 
+# ── Update the fact (version 2) ───────────────────────────────────
+
+echo ""
+echo "==> Update the fact (creates version 2)"
+curl -s -X PUT "$BASE/v1/facts" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "entity": "project",
+    "key": "status",
+    "value": "Phase 2 in progress — 3 milestones remaining",
+    "confidence": 0.90
+  }' | jq .
+
+# ── View fact history ──────────────────────────────────────────────
+
+echo ""
+echo "==> Fact history (shows both versions)"
+curl -s "$BASE/v1/facts/entity/project/key/status/history" | jq .
+
+# ── Append events ──────────────────────────────────────────────────
+
+echo ""
 echo "==> Append events"
 curl -s -X POST "$BASE/v1/append" \
   -H 'Content-Type: application/json' \
@@ -53,6 +122,10 @@ curl -s -X POST "$BASE/v1/append" \
       }
     ]
   }' | jq .
-echo
 
-echo "==> Done!"
+# ── Done ───────────────────────────────────────────────────────────
+
+echo ""
+echo "==> Done! CoreCrux is running at $BASE"
+echo "    Try: curl $BASE/healthz"
+echo "    Stop: kill $DAEMON_PID"

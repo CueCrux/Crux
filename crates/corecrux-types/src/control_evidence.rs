@@ -6,16 +6,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BuildInfo, EvidenceStatusV1, EvidenceSubjectScopeV1, KnowledgeAuthorityV1};
 
-pub const CONTROL_EVIDENCE_CONTENT_TYPE_V1: &str =
-    "application/json; profile=corecrux-control-evidence-v1";
+pub const CONTROL_EVIDENCE_CONTENT_TYPE_V1: &str = "application/json; profile=corecrux-control-evidence-v1";
 pub const OPS_EVIDENCE_CONTENT_TYPE_V1: &str = "application/json; profile=corecrux-ops-evidence-v1";
 
-pub const EVT_CONTROL_ADMIN_ACTION_SUBMITTED_V1: &str =
-    "corecrux.control.admin_action_submitted.v1";
+pub const EVT_CONTROL_ADMIN_ACTION_SUBMITTED_V1: &str = "corecrux.control.admin_action_submitted.v1";
 pub const EVT_CONTROL_ADMIN_ACTION_FINISHED_V1: &str = "corecrux.control.admin_action_finished.v1";
 pub const EVT_CONTROL_STATE_MUTATION_V1: &str = "corecrux.control.state_mutation.v1";
-pub const EVT_CONTROL_CHECKPOINT_MATERIALIZED_V1: &str =
-    "corecrux.control.checkpoint_materialized.v1";
+pub const EVT_CONTROL_CHECKPOINT_MATERIALIZED_V1: &str = "corecrux.control.checkpoint_materialized.v1";
 pub const EVT_AUDIT_PACK_GENERATED_V1: &str = "corecrux.audit_pack.generated.v1";
 pub const EVT_SCHEMA_EVOLUTION_RECORDED_V1: &str = "corecrux.ops.schema_evolution_recorded.v1";
 pub const EVT_SHARD_REBALANCE_RECORDED_V1: &str = "corecrux.ops.shard_rebalance_recorded.v1";
@@ -135,16 +132,9 @@ pub struct ControlStateMutationV1 {
     pub control_before: ControlStateDigestV1,
     #[serde(rename = "controlAfter")]
     pub control_after: ControlStateDigestV1,
-    #[serde(
-        rename = "valveChanges",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "valveChanges", default, skip_serializing_if = "Vec::is_empty")]
     pub valve_changes: Vec<ValveChangeV1>,
-    #[serde(
-        rename = "knowledgeAuthorityChange",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "knowledgeAuthorityChange", skip_serializing_if = "Option::is_none")]
     pub knowledge_authority_change: Option<KnowledgeAuthorityChangeV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
@@ -212,11 +202,7 @@ pub struct AuditPackGeneratedV1 {
     pub pack_index_blake3: String,
     #[serde(rename = "packIndexSizeBytes")]
     pub pack_index_size_bytes: u64,
-    #[serde(
-        rename = "missingCapabilities",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(rename = "missingCapabilities", default, skip_serializing_if = "Vec::is_empty")]
     pub missing_capabilities: Vec<String>,
 }
 

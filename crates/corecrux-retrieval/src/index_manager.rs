@@ -222,7 +222,9 @@ impl IndexManager {
                 } else {
                     // Cooldown: don't evict segments that were recently promoted
                     let protected = seg.tier == IndexTier::Hot
-                        && seg.promoted_at.map_or(false, |t| now.duration_since(t) < self.min_residency);
+                        && seg
+                            .promoted_at
+                            .map_or(false, |t| now.duration_since(t) < self.min_residency);
                     if protected {
                         // Keep in hot tier despite budget pressure
                         self.hot_bytes += seg.size_bytes;
@@ -282,9 +284,7 @@ pub struct TierStats {
 // Implement From<std::io::Error> for RetrievalError
 impl From<std::io::Error> for crate::RetrievalError {
     fn from(e: std::io::Error) -> Self {
-        crate::RetrievalError::Internal {
-            msg: e.to_string(),
-        }
+        crate::RetrievalError::Internal { msg: e.to_string() }
     }
 }
 
@@ -492,9 +492,7 @@ mod tests {
         // Write two .ccxi files
         for seq in [1u64, 2] {
             let data = build_test_ccxi(0, seq);
-            let path = tmp
-                .path()
-                .join(format!("seg-{seq:020}-abcdef.ccxi"));
+            let path = tmp.path().join(format!("seg-{seq:020}-abcdef.ccxi"));
             std::fs::write(&path, &data).unwrap();
         }
 
@@ -512,9 +510,7 @@ mod tests {
     fn scan_and_load_skips_already_loaded() {
         let tmp = TempDir::new().unwrap();
         let data = build_test_ccxi(0, 1);
-        let path = tmp
-            .path()
-            .join("seg-00000000000000000001-abcdef.ccxi");
+        let path = tmp.path().join("seg-00000000000000000001-abcdef.ccxi");
         std::fs::write(&path, &data).unwrap();
 
         let mut mgr = IndexManager::new();
@@ -531,14 +527,8 @@ mod tests {
 
     #[test]
     fn extract_segment_seq_valid() {
-        assert_eq!(
-            extract_segment_seq("seg-00000000000000000001-abcdef"),
-            Some(1)
-        );
-        assert_eq!(
-            extract_segment_seq("seg-00000000000000000042-xyz"),
-            Some(42)
-        );
+        assert_eq!(extract_segment_seq("seg-00000000000000000001-abcdef"), Some(1));
+        assert_eq!(extract_segment_seq("seg-00000000000000000042-xyz"), Some(42));
     }
 
     #[test]

@@ -16,9 +16,7 @@ use tracing::Subscriber;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
-use crate::schema::{
-    ops_entity, OpsErrorEvent, OpsWarningEvent, EVT_OPS_ERROR_V1, EVT_OPS_WARNING_V1,
-};
+use crate::schema::{ops_entity, OpsErrorEvent, OpsWarningEvent, EVT_OPS_ERROR_V1, EVT_OPS_WARNING_V1};
 
 /// A `tracing_subscriber::Layer` that captures WARN and ERROR span events and
 /// writes them as facts to a [`FactStore`].
@@ -35,12 +33,7 @@ pub struct OpsObserveLayer {
 
 impl OpsObserveLayer {
     /// Create a new layer.
-    pub fn new(
-        fact_store: Arc<RwLock<FactStore>>,
-        node_id: String,
-        max_facts: usize,
-        enabled: bool,
-    ) -> Self {
+    pub fn new(fact_store: Arc<RwLock<FactStore>>, node_id: String, max_facts: usize, enabled: bool) -> Self {
         Self {
             fact_store,
             fact_ids: Arc::new(std::sync::Mutex::new(VecDeque::new())),
@@ -79,32 +72,24 @@ impl Visit for FieldVisitor {
         if field.name() == "message" {
             self.message = Some(value.to_string());
         } else {
-            self.fields.insert(
-                field.name().to_string(),
-                serde_json::Value::String(value.to_string()),
-            );
+            self.fields
+                .insert(field.name().to_string(), serde_json::Value::String(value.to_string()));
         }
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.fields.insert(
-            field.name().to_string(),
-            serde_json::Value::Number(value.into()),
-        );
+        self.fields
+            .insert(field.name().to_string(), serde_json::Value::Number(value.into()));
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.fields.insert(
-            field.name().to_string(),
-            serde_json::Value::Number(value.into()),
-        );
+        self.fields
+            .insert(field.name().to_string(), serde_json::Value::Number(value.into()));
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.fields.insert(
-            field.name().to_string(),
-            serde_json::Value::Bool(value),
-        );
+        self.fields
+            .insert(field.name().to_string(), serde_json::Value::Bool(value));
     }
 }
 
@@ -218,10 +203,7 @@ mod tests {
             None,
             None,
             None,
-            tracing::field::FieldSet::new(
-                &["message", "extra"],
-                tracing::callsite::Identifier(&DUMMY_CALLSITE),
-            ),
+            tracing::field::FieldSet::new(&["message", "extra"], tracing::callsite::Identifier(&DUMMY_CALLSITE)),
             tracing::metadata::Kind::EVENT,
         );
 

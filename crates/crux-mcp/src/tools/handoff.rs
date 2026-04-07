@@ -12,25 +12,12 @@ use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
 
 /// `create_handoff` — package session state (and optionally facts) into a
 /// signed handoff bundle for another agent.
-pub async fn handle_create_handoff(
-    args: &Value,
-    ctx: &McpContext,
-) -> Result<Value, JsonRpcError> {
+pub async fn handle_create_handoff(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let session_id = require_str(args, "session_id")?;
-    let include_facts = args
-        .get("include_facts")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let message = args
-        .get("message")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let include_facts = args.get("include_facts").and_then(|v| v.as_bool()).unwrap_or(false);
+    let message = args.get("message").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    let agent_name = ctx
-        .agent
-        .as_ref()
-        .map(|a| a.name.as_str())
-        .unwrap_or("anonymous");
+    let agent_name = ctx.agent.as_ref().map(|a| a.name.as_str()).unwrap_or("anonymous");
 
     let session_store = ctx.session_store.read().await;
     let fact_store = ctx.fact_store.read().await;
@@ -65,38 +52,26 @@ pub async fn handle_create_handoff(
 
 /// `accept_handoff` — accept a signed handoff package, verify it, and load
 /// session state and facts into local stores.
-pub async fn handle_accept_handoff(
-    args: &Value,
-    ctx: &McpContext,
-) -> Result<Value, JsonRpcError> {
+pub async fn handle_accept_handoff(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let package_str = require_str(args, "package")?;
 
-    let signed: handoff::SignedHandoff =
-        serde_json::from_str(package_str).map_err(|e| JsonRpcError {
-            code: INVALID_PARAMS,
-            message: format!("invalid handoff package JSON: {e}"),
-            data: None,
-        })?;
+    let signed: handoff::SignedHandoff = serde_json::from_str(package_str).map_err(|e| JsonRpcError {
+        code: INVALID_PARAMS,
+        message: format!("invalid handoff package JSON: {e}"),
+        data: None,
+    })?;
 
-    let agent_name = ctx
-        .agent
-        .as_ref()
-        .map(|a| a.name.as_str())
-        .unwrap_or("anonymous");
+    let agent_name = ctx.agent.as_ref().map(|a| a.name.as_str()).unwrap_or("anonymous");
 
     let mut session_store = ctx.session_store.write().await;
     let mut fact_store = ctx.fact_store.write().await;
 
-    let result = handoff::accept_handoff(
-        &mut session_store,
-        &mut fact_store,
-        &signed,
-        agent_name,
-    )
-    .map_err(|e| JsonRpcError {
-        code: INTERNAL_ERROR,
-        message: format!("handoff acceptance failed: {e}"),
-        data: None,
+    let result = handoff::accept_handoff(&mut session_store, &mut fact_store, &signed, agent_name).map_err(|e| {
+        JsonRpcError {
+            code: INTERNAL_ERROR,
+            message: format!("handoff acceptance failed: {e}"),
+            data: None,
+        }
     })?;
 
     Ok(json!({
@@ -112,13 +87,11 @@ pub async fn handle_accept_handoff(
 
 /// Extract a required string parameter or return an `INVALID_PARAMS` error.
 fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, JsonRpcError> {
-    args.get(field)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| JsonRpcError {
-            code: INVALID_PARAMS,
-            message: format!("missing required param: {field}"),
-            data: None,
-        })
+    args.get(field).and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
+        code: INVALID_PARAMS,
+        message: format!("missing required param: {field}"),
+        data: None,
+    })
 }
 
 #[cfg(test)]
@@ -147,12 +120,9 @@ mod tests {
     #[tokio::test]
     async fn accept_handoff_invalid_json() {
         let ctx = test_ctx();
-        let err = handle_accept_handoff(
-            &json!({"package": "not valid json"}),
-            &ctx,
-        )
-        .await
-        .unwrap_err();
+        let err = handle_accept_handoff(&json!({"package": "not valid json"}), &ctx)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
@@ -184,12 +154,9 @@ mod tests {
 
         // Accept handoff into the same context (stores are shared, but the
         // test validates the full dispatch path).
-        let result = handle_accept_handoff(
-            &json!({"package": package_json}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let result = handle_accept_handoff(&json!({"package": package_json}), &ctx)
+            .await
+            .unwrap();
 
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("session_loaded=true"));
