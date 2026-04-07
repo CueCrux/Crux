@@ -397,7 +397,8 @@ pub fn tool_output_docs() -> Value {
 pub async fn handle_get_agent_identity(_args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let name = ctx
         .agent
-        .as_ref().map_or_else(|| "anonymous".to_string(), |a| a.name.clone());
+        .as_ref()
+        .map_or_else(|| "anonymous".to_string(), |a| a.name.clone());
 
     Ok(json!({
         "content": [{

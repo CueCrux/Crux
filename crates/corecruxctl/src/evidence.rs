@@ -2247,11 +2247,13 @@ mod tests {
         }
         let after_digest = control_state_digest_v1(&after);
 
-        let valve_names = ["pause_ingest",
+        let valve_names = [
+            "pause_ingest",
             "pause_compaction",
             "throttle",
             "read_only",
-            "emergency_brake"];
+            "emergency_brake",
+        ];
         let valve_changes: Vec<corecrux_types::ValveChangeV1> = valve_names
             .iter()
             .map(|name| corecrux_types::ValveChangeV1 {

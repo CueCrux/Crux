@@ -261,7 +261,10 @@ pub(super) async fn get_proj_artifact_relations(
     let rels = rows
         .into_iter()
         .map(|r| {
-            let rt = corecrux_projections::RelationTypeV1::from_u8(r.relation_type).map_or_else(|| format!("unknown({})", r.relation_type), |t| t.as_engine_str().to_string());
+            let rt = corecrux_projections::RelationTypeV1::from_u8(r.relation_type).map_or_else(
+                || format!("unknown({})", r.relation_type),
+                |t| t.as_engine_str().to_string(),
+            );
             Rel {
                 src_artifact_id: r.src_artifact_id,
                 dst_artifact_id: r.dst_artifact_id,
@@ -355,7 +358,10 @@ pub(super) async fn get_proj_artifact_dependents(
     let dependents = rows
         .into_iter()
         .map(|r| Dep {
-            dependent_type: corecrux_projections::DependentTypeV1::from_u8(r.dependent_type).map_or_else(|| format!("unknown({})", r.dependent_type), |t| t.as_engine_str().to_string()),
+            dependent_type: corecrux_projections::DependentTypeV1::from_u8(r.dependent_type).map_or_else(
+                || format!("unknown({})", r.dependent_type),
+                |t| t.as_engine_str().to_string(),
+            ),
             dependent_id: r.dependent_id,
             last_seen_at_micros: r.last_seen_at_micros,
             usage_weight: corecrux_projections::dequantize_confidence_f32(r.usage_weight_q16),

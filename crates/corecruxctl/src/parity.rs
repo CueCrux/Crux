@@ -2110,7 +2110,8 @@ mod tests {
 
     #[test]
     fn canonical_relation_key_v1_sort_order() {
-        let mut keys = [CanonicalRelationKeyV1 {
+        let mut keys = [
+            CanonicalRelationKeyV1 {
                 src_artifact_id: 2,
                 dst_artifact_id: 3,
                 relation_type: "cites".to_string(),
@@ -2124,7 +2125,8 @@ mod tests {
                 src_artifact_id: 1,
                 dst_artifact_id: 3,
                 relation_type: "cites".to_string(),
-            }];
+            },
+        ];
         keys.sort();
         assert_eq!(keys[0].src_artifact_id, 1);
         assert_eq!(keys[0].dst_artifact_id, 3);
@@ -2137,7 +2139,8 @@ mod tests {
 
     #[test]
     fn canonical_dependent_key_v1_sort_order() {
-        let mut keys = [CanonicalDependentKeyV1 {
+        let mut keys = [
+            CanonicalDependentKeyV1 {
                 dependent_type: "query".to_string(),
                 dependent_id: "q2".to_string(),
             },
@@ -2148,7 +2151,8 @@ mod tests {
             CanonicalDependentKeyV1 {
                 dependent_type: "query".to_string(),
                 dependent_id: "q1".to_string(),
-            }];
+            },
+        ];
         keys.sort();
         assert_eq!(keys[0].dependent_type, "answer");
         assert_eq!(keys[1].dependent_id, "q1");

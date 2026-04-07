@@ -42,10 +42,7 @@ pub(super) async fn get_receipt_body_v1(
     let mut body = None;
     for e in events {
         if e.event_type == EVT_RECEIPT_BODY_V1
-            && body
-                .as_ref()
-                .map_or(0, |b: &corecrux_storage::StoredEvent| b.seq)
-                <= e.seq
+            && body.as_ref().map_or(0, |b: &corecrux_storage::StoredEvent| b.seq) <= e.seq
         {
             body = Some(e);
         }
@@ -616,8 +613,10 @@ pub(super) async fn get_stream_export_v1(
         total_events: u64,
     }
 
-    let generated_at = events
-        .last().map_or_else(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true), |e| e.ingested_at.clone());
+    let generated_at = events.last().map_or_else(
+        || chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        |e| e.ingested_at.clone(),
+    );
 
     // Compute included file digests.
     let mut included_files: Vec<corecrux_receipts::ExportFileV1> = Vec::new();
@@ -768,10 +767,7 @@ pub(super) async fn export_receipt_bundle_v1(
     let mut sig = None;
     for e in events {
         if e.event_type == EVT_RECEIPT_BODY_V1
-            && body
-                .as_ref()
-                .map_or(0, |b: &corecrux_storage::StoredEvent| b.seq)
-                <= e.seq
+            && body.as_ref().map_or(0, |b: &corecrux_storage::StoredEvent| b.seq) <= e.seq
         {
             body = Some(e);
         } else if e.event_type == EVT_RECEIPT_SIG_V1

@@ -128,8 +128,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .copied()
             .or_else(|| panic_info.payload().downcast_ref::<String>().map(|s| s.as_str()))
             .unwrap_or("unknown");
-        let location = panic_info
-            .location().map_or_else(|| "unknown".to_string(), |l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+        let location = panic_info.location().map_or_else(
+            || "unknown".to_string(),
+            |l| format!("{}:{}:{}", l.file(), l.line(), l.column()),
+        );
         tracing::error!(
             panic.payload = payload,
             panic.location = %location,
@@ -606,9 +608,7 @@ async fn reconcile_control_checkpoint_with_evidence(
         }
 
         let batch_len = batch.len();
-        from_seq = batch
-            .last()
-            .map_or(from_seq, |event| event.seq.saturating_add(1));
+        from_seq = batch.last().map_or(from_seq, |event| event.seq.saturating_add(1));
 
         for event in batch {
             match event.event_type.as_str() {

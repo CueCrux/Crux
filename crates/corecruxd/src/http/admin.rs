@@ -575,8 +575,10 @@ pub(super) async fn execute_admin_action(
             })
         }
         "runtime-knob-update" => {
-            let actor = read_param_str(params, "actor").map_or_else(|| "admin-action-runtime-knob-update".to_string(), ToOwned::to_owned);
-            let reason = read_param_str(params, "reason").map_or_else(|| "runtime knob update action".to_string(), ToOwned::to_owned);
+            let actor = read_param_str(params, "actor")
+                .map_or_else(|| "admin-action-runtime-knob-update".to_string(), ToOwned::to_owned);
+            let reason = read_param_str(params, "reason")
+                .map_or_else(|| "runtime knob update action".to_string(), ToOwned::to_owned);
             let now = control::now_unix_ns();
 
             let mut control_state = state.control.write().await;
@@ -1173,7 +1175,8 @@ pub(super) async fn post_admin_action(
         .action_id
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty()).map_or_else(|| format!("act_{}", uuid::Uuid::new_v4()), ToOwned::to_owned);
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| format!("act_{}", uuid::Uuid::new_v4()), ToOwned::to_owned);
     if action_id.len() > 128 {
         return problem_response(StatusCode::BAD_REQUEST, "actionId must be <= 128 characters");
     }
@@ -2003,10 +2006,9 @@ pub(super) async fn get_replication_status(State(state): State<AppState>, header
             "unassigned"
         };
 
-        let follower_targets = shard
-            .followers
-            .as_ref()
-            .map_or(0, |followers| followers.iter().filter(|f| f.node_id != state.node_id).count());
+        let follower_targets = shard.followers.as_ref().map_or(0, |followers| {
+            followers.iter().filter(|f| f.node_id != state.node_id).count()
+        });
         let topology_ok = follower_targets > 0;
         if is_leader && !matches!(shard.state, corecrux_types::ShardState::Retired) {
             local_leader_shards = local_leader_shards.saturating_add(1);

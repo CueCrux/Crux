@@ -2057,8 +2057,7 @@ impl Metrics {
     }
 
     pub fn set_knowledge_parity_outcome(&self, outcome: Option<&KnowledgeParityOutcomeV1>) {
-        let status = outcome
-            .map_or(KnowledgeParityStatusV1::Unknown, |entry| entry.status);
+        let status = outcome.map_or(KnowledgeParityStatusV1::Unknown, |entry| entry.status);
         for candidate in [
             KnowledgeParityStatusV1::Unknown,
             KnowledgeParityStatusV1::Pass,
