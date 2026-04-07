@@ -21,7 +21,7 @@ pub(super) async fn query_ops_facts(
     headers: HeaderMap,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if let Err(_) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
             return problem.into_response();
         }
@@ -53,7 +53,7 @@ pub(super) async fn query_ops_errors(
     headers: HeaderMap,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if let Err(_) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
             return problem.into_response();
         }
@@ -94,7 +94,7 @@ pub(super) async fn query_ops_errors(
 }
 
 pub(super) async fn get_ops_health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(_) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
             return problem.into_response();
         }
@@ -149,7 +149,7 @@ pub(super) async fn post_bootstrap_pull(
     headers: HeaderMap,
     Json(body): Json<BootstrapPullBody>,
 ) -> impl IntoResponse {
-    if let Err(_) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
             return problem.into_response();
         }
@@ -171,7 +171,7 @@ pub(super) async fn post_bootstrap_pull(
 }
 
 pub(super) async fn get_bootstrap_status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(_) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
             return problem.into_response();
         }

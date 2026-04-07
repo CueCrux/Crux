@@ -586,8 +586,7 @@ impl ProjectionStoreV1 {
         let created_at_unix_ns = 0u64;
         let (cursor_segment_seq, cursor_offset) = cursor_after
             .as_ref()
-            .map(|c| (c.segment_seq, c.offset))
-            .unwrap_or((0, 0));
+            .map_or((0, 0), |c| (c.segment_seq, c.offset));
 
         // Snapshot 1: artifact_living_state (hot rows).
         let living_rows = encode_living_rows_v1(&self.state.living);

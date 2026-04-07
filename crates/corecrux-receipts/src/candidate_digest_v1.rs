@@ -115,7 +115,7 @@ fn compute_candidate_digest_bytes_v1(
 
     // lanes_used
     write_u32_le(&mut buf, lanes.len() as u32)?;
-    for lk in lanes.iter() {
+    for lk in &lanes {
         write_str(&mut buf, lk)?;
     }
 
@@ -157,7 +157,7 @@ fn compute_candidate_digest_bytes_v1(
         bit += 1;
 
         let mut lane_qs: Vec<i32> = Vec::with_capacity(lanes.len());
-        for lk in lanes.iter() {
+        for lk in &lanes {
             let v = c.lane_scores.get(lk).copied().flatten();
             let q = q_score(v);
             if q.is_null {

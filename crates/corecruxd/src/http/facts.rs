@@ -9,7 +9,7 @@ pub(super) async fn put_fact(
     headers: HeaderMap,
     Json(body): Json<corecrux_memory::fact_store::StoreFact>,
 ) -> impl IntoResponse {
-    if let Err(_) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
             return problem.into_response();
         }
@@ -23,7 +23,7 @@ pub(super) async fn put_facts_bulk(
     headers: HeaderMap,
     Json(body): Json<Vec<corecrux_memory::fact_store::StoreFact>>,
 ) -> impl IntoResponse {
-    if let Err(_) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
             return problem.into_response();
         }
@@ -37,7 +37,7 @@ pub(super) async fn get_fact(
     headers: HeaderMap,
     Path(fact_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(_) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
             return problem.into_response();
         }
@@ -45,7 +45,7 @@ pub(super) async fn get_fact(
     let store = state.fact_store.read().await;
     match store.get(&fact_id) {
         Some(fact) => (StatusCode::OK, axum::Json(serde_json::json!(fact))).into_response(),
-        None => problem_response(StatusCode::NOT_FOUND, &format!("fact '{}' not found", fact_id)),
+        None => problem_response(StatusCode::NOT_FOUND, format!("fact '{}' not found", fact_id)),
     }
 }
 
@@ -54,7 +54,7 @@ pub(super) async fn delete_fact(
     headers: HeaderMap,
     Path(fact_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(_) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
             return problem.into_response();
         }
@@ -63,7 +63,7 @@ pub(super) async fn delete_fact(
     if deleted {
         (StatusCode::OK, axum::Json(serde_json::json!({"deleted": true}))).into_response()
     } else {
-        problem_response(StatusCode::NOT_FOUND, &format!("fact '{}' not found", fact_id))
+        problem_response(StatusCode::NOT_FOUND, format!("fact '{}' not found", fact_id))
     }
 }
 
@@ -72,7 +72,7 @@ pub(super) async fn get_facts_by_entity(
     headers: HeaderMap,
     Path(entity): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(_) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
             return problem.into_response();
         }
@@ -87,7 +87,7 @@ pub(super) async fn query_facts(
     headers: HeaderMap,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if let Err(_) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
             return problem.into_response();
         }
@@ -119,7 +119,7 @@ pub(super) async fn put_session_state(
     Path(session_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    if let Err(_) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
             return problem.into_response();
         }
@@ -133,7 +133,7 @@ pub(super) async fn get_session_state(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(_) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
             return problem.into_response();
         }
@@ -141,6 +141,6 @@ pub(super) async fn get_session_state(
     let store = state.session_store.read().await;
     match store.get(&session_id) {
         Some(session) => (StatusCode::OK, axum::Json(serde_json::json!(session))).into_response(),
-        None => problem_response(StatusCode::NOT_FOUND, &format!("session '{}' not found", session_id)),
+        None => problem_response(StatusCode::NOT_FOUND, format!("session '{}' not found", session_id)),
     }
 }

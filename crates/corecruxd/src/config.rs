@@ -195,8 +195,7 @@ pub fn load_config() -> Config {
         .unwrap_or(1000);
     let routing_strict_client_version = std::env::var("CORECRUXD_ROUTING_STRICT_CLIENT_VERSION")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false);
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let dev_split_shards = std::env::var("CORECRUXD_DEV_SPLIT_SHARDS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -217,8 +216,7 @@ pub fn load_config() -> Config {
         .clamp(100, 120_000);
     let replicated_commit_require_all_followers = std::env::var("CORECRUXD_REPLICATED_COMMIT_REQUIRE_ALL_FOLLOWERS")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(true);
+        .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
 
     let auth_mode = std::env::var("CORECRUXD_AUTH_MODE")
         .ok()
@@ -229,13 +227,11 @@ pub fn load_config() -> Config {
 
     let build_ccxi = std::env::var("CORECRUXD_BUILD_CCXI")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false);
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
 
     let projections_enabled = std::env::var("CORECRUXD_PROJECTIONS_ENABLED")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false);
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let projections_batch_frames = std::env::var("CORECRUXD_PROJECTIONS_BATCH_FRAMES")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -247,17 +243,14 @@ pub fn load_config() -> Config {
 
     let admin_force_seal_enabled = std::env::var("CORECRUXD_ADMIN_FORCE_SEAL")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false);
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
 
     let receipts_verify_enabled = std::env::var("CORECRUXD_RECEIPTS_VERIFY_ENABLED")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(true);
+        .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let receipts_recompute_candidate_digest = std::env::var("CORECRUXD_RECEIPTS_RECOMPUTE_CANDIDATE_DIGEST")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false);
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let receipts_keyring_path = std::env::var("CORECRUXD_RECEIPTS_KEYRING_PATH").ok().map(PathBuf::from);
     let receipts_keyring_json = std::env::var("CORECRUXD_RECEIPTS_KEYRING_JSON").ok();
     let replay_batch_max_events = std::env::var("CORECRUXD_REPLAY_BATCH_MAX_EVENTS")
@@ -277,8 +270,7 @@ pub fn load_config() -> Config {
         .max(1);
     let replay_use_batched_rpc_default = std::env::var("CORECRUXD_REPLAY_USE_BATCHED_RPC_DEFAULT")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(true);
+        .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let store_lock_strategy = std::env::var("CORECRUXD_STORE_LOCK_STRATEGY")
         .ok()
         .as_deref()
@@ -286,8 +278,7 @@ pub fn load_config() -> Config {
         .unwrap_or(StoreLockStrategy::Sharded);
     let append_lane_enabled = std::env::var("CORECRUXD_APPEND_LANE_ENABLED")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(true);
+        .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let append_lane_scope = std::env::var("CORECRUXD_APPEND_LANE_SCOPE")
         .ok()
         .as_deref()
@@ -295,8 +286,7 @@ pub fn load_config() -> Config {
         .unwrap_or(AppendLaneScope::Global);
     let tail_cache_enabled = std::env::var("CORECRUXD_TAIL_CACHE_ENABLED")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(true);
+        .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let read_retry_failed_readyz_threshold = std::env::var("CORECRUXD_READ_RETRY_FAILED_READYZ_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -333,8 +323,7 @@ pub fn load_config() -> Config {
 
     let scrub_scheduler_enabled = std::env::var("CORECRUXD_SCRUB_SCHEDULER_ENABLED")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false);
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let scrub_interval_secs = std::env::var("CORECRUXD_SCRUB_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -349,8 +338,7 @@ pub fn load_config() -> Config {
         .clamp(0.0, 1.0);
     let capacity_guard_enabled = std::env::var("CORECRUXD_CAPACITY_GUARD_ENABLED")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(true);
+        .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let capacity_guard_interval_secs = std::env::var("CORECRUXD_CAPACITY_GUARD_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -484,8 +472,7 @@ pub fn load_config() -> Config {
         .unwrap_or(0),
         enable_directory_compaction: std::env::var("CORECRUXD_ENABLE_DIRECTORY_COMPACTION")
             .ok()
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false),
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
         dir_l0_max_runs: std::env::var("CORECRUXD_DIR_L0_MAX_RUNS")
             .ok()
             .and_then(|s| s.parse().ok())

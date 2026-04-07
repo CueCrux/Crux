@@ -239,8 +239,7 @@ impl FactStore {
             .filter(|entity| {
                 self.entity_index
                     .get(*entity)
-                    .map(|ids| ids.iter().any(|id| self.facts.get(id).map_or(false, |f| !f.deleted)))
-                    .unwrap_or(false)
+                    .is_some_and(|ids| ids.iter().any(|id| self.facts.get(id).is_some_and(|f| !f.deleted)))
             })
             .cloned()
             .collect();
@@ -277,7 +276,7 @@ pub struct FactQueryResult {
 
 /// Estimate token count from text (bytes / 4 approximation).
 fn estimate_tokens(text: &str) -> usize {
-    (text.len() + 3) / 4
+    text.len().div_ceil(4)
 }
 
 #[cfg(test)]
@@ -668,7 +667,7 @@ mod tests {
 
     #[test]
     fn default_top_k_via_serde() {
-        let json = r#"{}"#;
+        let json = r"{}";
         let fq: FactQuery = serde_json::from_str(json).unwrap();
         assert_eq!(fq.top_k, 10);
         assert!(fq.query.is_none());

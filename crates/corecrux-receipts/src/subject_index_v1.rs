@@ -109,8 +109,7 @@ pub fn update_subject_index_v1(
             if cur
                 .latest_verified
                 .as_ref()
-                .map(|v| candidate.ingested_at > v.ingested_at)
-                .unwrap_or(true)
+                .is_none_or(|v| candidate.ingested_at > v.ingested_at)
             {
                 cur.latest_verified = Some(candidate.clone());
             }
@@ -119,8 +118,7 @@ pub fn update_subject_index_v1(
             if cur
                 .latest_audit
                 .as_ref()
-                .map(|v| candidate.ingested_at > v.ingested_at)
-                .unwrap_or(true)
+                .is_none_or(|v| candidate.ingested_at > v.ingested_at)
             {
                 cur.latest_audit = Some(candidate.clone());
             }

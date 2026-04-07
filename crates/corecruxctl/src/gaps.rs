@@ -42,10 +42,10 @@ pub fn run(data_dir: &str, since: Option<&str>) -> Result<(), Box<dyn std::error
         for seg_entry in std::fs::read_dir(&path)? {
             let seg_entry = seg_entry?;
             let seg_path = seg_entry.path();
-            if seg_path.extension().map(|e| e == "ccxseg").unwrap_or(false) {
+            if seg_path.extension().is_some_and(|e| e == "ccxseg") {
                 total_segments += 1;
             }
-            if seg_path.extension().map(|e| e == "ccxi").unwrap_or(false) {
+            if seg_path.extension().is_some_and(|e| e == "ccxi") {
                 indexed_segments += 1;
 
                 // Parse CCXI header for doc count

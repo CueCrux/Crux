@@ -475,7 +475,7 @@ fn parse_jwks_keys(jwks: &Jwks) -> Result<HashMap<String, jsonwebtoken::Decoding
     use jsonwebtoken::DecodingKey;
 
     let mut out = HashMap::new();
-    for k in jwks.keys.iter() {
+    for k in &jwks.keys {
         if let Some(use_) = k.use_.as_deref() {
             if use_ != "sig" {
                 continue;
@@ -1021,7 +1021,7 @@ mod tests {
     fn jwt_jwks_rs256_enforces_scopes_and_tenant() {
         use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 
-        const PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+        const PRIVATE_KEY_PEM: &str = r"-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDNwDIf8ZW0CSCT
 utqQBPxrWFmk6Djs1jldflnhw13y0p7iFbx/RlJHwmpmQu9AgjfyRI7nYafoFh/q
 IXmnWFbO7Gln9s1GP1t5ASuJse5LBFYRfk3h+hvDROhk92ZgYLI3JpiaXsdGcwa5
@@ -1048,7 +1048,7 @@ zpcWz8u5Rk8Unot+03uaArK+htdm7Gb5kJMnrnQZDEg1WvjbE1VALxX/8jxOKPRU
 qyuNpgqT7xnXjqHpRxvxCLFe5WXO7GBqZM9ihRkANg1sDA4Pk8UHEfVmNhT1Wjig
 2K9jwjyru7ACsXa+/mkMohSaaeclntPn26K6587SWSsidOF4l4wz+Ys4VroYI6jH
 rG+Vg0mnrwArNdy2hX9Qkwc=
------END PRIVATE KEY-----"#;
+-----END PRIVATE KEY-----";
 
         const JWKS_JSON: &str = r#"{
   "keys": [
@@ -1474,14 +1474,14 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
 
     #[test]
     fn missing_scopes_all_present() {
-        let scopes: BTreeSet<String> = ["a:read", "b:write"].iter().map(|s| s.to_string()).collect();
+        let scopes: BTreeSet<String> = ["a:read", "b:write"].iter().map(|s| (*s).to_string()).collect();
         let missing = missing_scopes(&scopes, &["a:read", "b:write"]);
         assert!(missing.is_empty());
     }
 
     #[test]
     fn missing_scopes_some_missing() {
-        let scopes: BTreeSet<String> = ["a:read"].iter().map(|s| s.to_string()).collect();
+        let scopes: BTreeSet<String> = ["a:read"].iter().map(|s| (*s).to_string()).collect();
         let missing = missing_scopes(&scopes, &["a:read", "b:write"]);
         assert_eq!(missing, vec!["b:write"]);
     }
@@ -1495,7 +1495,7 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
 
     #[test]
     fn missing_scopes_empty_required() {
-        let scopes: BTreeSet<String> = ["a:read"].iter().map(|s| s.to_string()).collect();
+        let scopes: BTreeSet<String> = ["a:read"].iter().map(|s| (*s).to_string()).collect();
         let missing = missing_scopes(&scopes, &[]);
         assert!(missing.is_empty());
     }

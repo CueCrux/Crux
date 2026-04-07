@@ -214,7 +214,7 @@ pub fn seed_minimal_projection_events_v1(
     {
         let mut event_ids: Vec<String> = Vec::new();
         let mut payloads: Vec<Vec<u8>> = Vec::new();
-        for (_et, payload) in events.iter() {
+        for (_et, payload) in &events {
             event_ids.push(format!(
                 "seed:{}:{}:{}",
                 shard_id,
@@ -375,7 +375,7 @@ mod tests {
     fn read_epoch_too_small() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("MANIFEST");
-        fs::write(&path, &[0u8; 10]).unwrap();
+        fs::write(&path, [0u8; 10]).unwrap();
 
         let err = read_epoch_from_manifest(&path).unwrap_err();
         assert!(err.to_string().contains("manifest too small"));

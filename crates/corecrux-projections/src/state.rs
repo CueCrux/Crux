@@ -372,7 +372,7 @@ impl ProjectionState {
                     current_value: p.object_value.clone(),
                     occurred_at_micros: p.occurred_at_micros,
                     previous_value: prev.as_ref().map(|(v, _)| v.clone()),
-                    previous_occurred_at_micros: prev.map(|(_, t)| t).unwrap_or(0),
+                    previous_occurred_at_micros: prev.map_or(0, |(_, t)| t),
                 },
             );
         }
@@ -491,11 +491,11 @@ impl ProjectionState {
         // Determine the full set of artifact keys to update (living is sparse, but counts should be
         // consistent for any present rows).
         let mut touched: BTreeSet<(u64, u32)> = BTreeSet::new();
-        touched.extend(self.living.keys().cloned());
-        touched.extend(rel_out.keys().cloned());
-        touched.extend(rel_in.keys().cloned());
-        touched.extend(deps.keys().cloned());
-        touched.extend(pressure_by_artifact.keys().cloned());
+        touched.extend(self.living.keys().copied());
+        touched.extend(rel_out.keys().copied());
+        touched.extend(rel_in.keys().copied());
+        touched.extend(deps.keys().copied());
+        touched.extend(pressure_by_artifact.keys().copied());
 
         for key in touched {
             let row = self.living.entry(key).or_default();

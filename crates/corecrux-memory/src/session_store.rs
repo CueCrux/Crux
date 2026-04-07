@@ -81,7 +81,7 @@ impl SessionStore {
         let expired: Vec<String> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.expires_at.map_or(false, |exp| now >= exp))
+            .filter(|(_, s)| s.expires_at.is_some_and(|exp| now >= exp))
             .map(|(id, _)| id.clone())
             .collect();
         let count = expired.len();
@@ -103,7 +103,7 @@ impl SessionStore {
 /// Estimate tokens from a JSON value (serialized bytes / 4).
 fn estimate_tokens(value: &serde_json::Value) -> usize {
     let bytes = serde_json::to_string(value).map(|s| s.len()).unwrap_or(0);
-    (bytes + 3) / 4
+    bytes.div_ceil(4)
 }
 
 #[cfg(test)]
@@ -160,7 +160,7 @@ mod tests {
         store.put("sess_b", json!({"b": 2}), None);
 
         let mut ids = store.list();
-        ids.sort();
+        ids.sort_unstable();
         assert_eq!(ids, vec!["sess_a", "sess_b"]);
     }
 

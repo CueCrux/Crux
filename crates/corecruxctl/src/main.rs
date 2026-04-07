@@ -1900,7 +1900,7 @@ fn ccxi_verify(
         for seg_entry in std::fs::read_dir(&segments_dir)? {
             let seg_entry = seg_entry?;
             let seg_path = seg_entry.path();
-            if seg_path.extension().map_or(true, |e| e != "ccxseg") {
+            if seg_path.extension().is_none_or(|e| e != "ccxseg") {
                 continue;
             }
 
@@ -1991,7 +1991,7 @@ fn ccxi_rebuild(
         for seg_entry in std::fs::read_dir(&segments_dir)? {
             let seg_entry = seg_entry?;
             let seg_path = seg_entry.path();
-            if seg_path.extension().map_or(true, |e| e != "ccxseg") {
+            if seg_path.extension().is_none_or(|e| e != "ccxseg") {
                 continue;
             }
 
@@ -4016,7 +4016,7 @@ mod tests {
         // Add a segment with valid companion
         fs::write(seg_dir.join("seg-00000000000000000002-efgh.ccxseg"), b"fake2").unwrap();
         let builder = corecrux_index::CcxiBuilder::new(1, 2, 0);
-        fs::write(seg_dir.join("seg-00000000000000000002-efgh.ccxi"), &builder.build()).unwrap();
+        fs::write(seg_dir.join("seg-00000000000000000002-efgh.ccxi"), builder.build()).unwrap();
 
         let report = ccxi_verify(dir.path(), None).unwrap();
         assert_eq!(report.shards_scanned, 1);
@@ -4039,7 +4039,7 @@ mod tests {
         )
         .unwrap();
         let builder = corecrux_index::CcxiBuilder::new(1, 42, 0);
-        fs::write(seg_dir.join("seg-00000000000000000042-abcd.ccxi"), &builder.build()).unwrap();
+        fs::write(seg_dir.join("seg-00000000000000000042-abcd.ccxi"), builder.build()).unwrap();
 
         // With explicit segment_seq filter, it forces rebuild even with valid ccxi
         // Rebuild will fail because the segment is fake data, but it exercises the path
@@ -4341,7 +4341,7 @@ mod tests {
         fs::create_dir_all(&seg1).unwrap();
         fs::write(seg1.join("seg-00000000000000000001-aaaa.ccxseg"), b"s1").unwrap();
         let builder = corecrux_index::CcxiBuilder::new(1, 1, 0);
-        fs::write(seg1.join("seg-00000000000000000001-aaaa.ccxi"), &builder.build()).unwrap();
+        fs::write(seg1.join("seg-00000000000000000001-aaaa.ccxi"), builder.build()).unwrap();
 
         // Shard 2: segment missing ccxi + segment with corrupt ccxi
         let seg2 = dir.path().join("shard-0002/segments");
@@ -4391,20 +4391,20 @@ mod tests {
     #[test]
     fn verify_scope_serde_roundtrip() {
         let scope = verify_store::VerifyScope::All;
-        let json = serde_json::to_value(&scope).unwrap();
+        let json = serde_json::to_value(scope).unwrap();
         assert_eq!(json, "all");
         let scope = verify_store::VerifyScope::Recent;
-        let json = serde_json::to_value(&scope).unwrap();
+        let json = serde_json::to_value(scope).unwrap();
         assert_eq!(json, "recent");
     }
 
     #[test]
     fn verify_mode_serde_roundtrip() {
         let mode = verify_store::VerifyMode::Full;
-        let json = serde_json::to_value(&mode).unwrap();
+        let json = serde_json::to_value(mode).unwrap();
         assert_eq!(json, "full");
         let mode = verify_store::VerifyMode::Sampled;
-        let json = serde_json::to_value(&mode).unwrap();
+        let json = serde_json::to_value(mode).unwrap();
         assert_eq!(json, "sampled");
     }
 

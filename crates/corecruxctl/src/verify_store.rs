@@ -518,7 +518,7 @@ mod tests {
     fn parse_manifest_epoch_too_short() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("MANIFEST");
-        fs::write(&path, &[0u8; 10]).unwrap();
+        fs::write(&path, [0u8; 10]).unwrap();
         let result = parse_manifest_epoch(&path);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too short"));
@@ -629,7 +629,7 @@ mod tests {
         let shard_dir = tmp.path().join("shards").join("shard-0000");
         fs::create_dir_all(&shard_dir).unwrap();
         // Write a too-short manifest
-        fs::write(shard_dir.join("MANIFEST"), &[0u8; 4]).unwrap();
+        fs::write(shard_dir.join("MANIFEST"), [0u8; 4]).unwrap();
 
         let opts = VerifyStoreOptions {
             data_dir: tmp.path().to_path_buf(),
@@ -654,7 +654,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let shard_dir = tmp.path().join("shards").join("shard-0005");
         fs::create_dir_all(&shard_dir).unwrap();
-        fs::write(shard_dir.join("MANIFEST"), &[0u8; 2]).unwrap();
+        fs::write(shard_dir.join("MANIFEST"), [0u8; 2]).unwrap();
 
         let opts = VerifyStoreOptions {
             data_dir: tmp.path().to_path_buf(),

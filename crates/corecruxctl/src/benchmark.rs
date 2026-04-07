@@ -155,7 +155,7 @@ fn run_quick(
         latencies.push(latency_ms);
 
         let body: serde_json::Value = resp.into_json()?;
-        let facts = body["facts"].as_array().map(|a| a.to_vec()).unwrap_or_default();
+        let facts = body["facts"].as_array().cloned().unwrap_or_default();
 
         // Extract doc_ids from returned facts (entity = __benchmark__::{doc_id})
         let returned_ids: Vec<String> = facts
@@ -177,8 +177,7 @@ fn run_quick(
         let first_rank = returned_ids
             .iter()
             .position(|id| q.expected_doc_ids.contains(id))
-            .map(|pos| 1.0 / (pos as f64 + 1.0))
-            .unwrap_or(0.0);
+            .map_or(0.0, |pos| 1.0 / (pos as f64 + 1.0));
         mrr_sum += first_rank;
 
         // Coverage: simple term coverage
@@ -189,8 +188,7 @@ fn run_quick(
                 facts.iter().any(|f| {
                     f["value"]
                         .as_str()
-                        .map(|v| v.to_lowercase().contains(&t.to_lowercase()))
-                        .unwrap_or(false)
+                        .is_some_and(|v| v.to_lowercase().contains(&t.to_lowercase()))
                 })
             })
             .count();
@@ -235,7 +233,7 @@ fn run_quick(
     ))
     .call()?
     .into_json()?;
-    let found = resp["facts"].as_array().map(|a| a.len()).unwrap_or(0);
+    let found = resp["facts"].as_array().map_or(0, |a| a.len());
     let fact_recall = found as f32 / (fact_test_count + 1) as f32; // +1 for the update
 
     // Check version chain
@@ -244,7 +242,7 @@ fn run_quick(
     ))
     .call()?
     .into_json()?;
-    let chain_depth = history_resp["versions"].as_array().map(|a| a.len()).unwrap_or(1);
+    let chain_depth = history_resp["versions"].as_array().map_or(1, |a| a.len());
 
     eprintln!("{} facts, chain depth {}", fact_test_count, chain_depth);
 

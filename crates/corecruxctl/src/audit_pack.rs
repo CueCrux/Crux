@@ -726,9 +726,7 @@ pub fn generate_audit_pack_v1(opts: &AuditPackOptionsV1) -> Result<AuditPackInde
     let replay_input_path = fixture_digest::fixture_segment_path(&opts.replay_fixture)?;
     let replay_input_bytes = std::fs::read(&replay_input_path)?;
     let replay_input_name = replay_input_path
-        .file_name()
-        .map(|v| v.to_string_lossy().to_string())
-        .unwrap_or_else(|| format!("{}.ccxseg", opts.replay_fixture));
+        .file_name().map_or_else(|| format!("{}.ccxseg", opts.replay_fixture), |v| v.to_string_lossy().to_string());
     let replay_input_copy_path = out_dir.join(replay_input_name);
     let replay_input_meta = write_bytes(&replay_input_copy_path, &replay_input_bytes)?;
     register_manifest_artifact(
@@ -893,9 +891,7 @@ fn default_out_dir() -> PathBuf {
 }
 
 fn file_name_string(path: &Path) -> String {
-    path.file_name()
-        .map(|v| v.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string())
+    path.file_name().map_or_else(|| path.display().to_string(), |v| v.to_string_lossy().to_string())
 }
 
 fn write_pretty_json<T: Serialize>(path: &Path, value: &T) -> Result<FileArtifactMeta, DynError> {
@@ -1273,9 +1269,7 @@ fn add_snapshot_evidence_artifacts(
             let dst = out_dir.join(format!(
                 "shard-{:04}-{}",
                 shard.shard_id,
-                src.file_name()
-                    .map(|v| v.to_string_lossy().to_string())
-                    .unwrap_or_else(|| projection.projection.clone())
+                src.file_name().map_or_else(|| projection.projection.clone(), |v| v.to_string_lossy().to_string())
             ));
             let dst_meta = write_bytes(&dst, &bytes)?;
             let projection_key = format!("projection_snapshot_{}_{}", shard.shard_id, projection.projection);

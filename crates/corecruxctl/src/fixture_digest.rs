@@ -42,9 +42,7 @@ fn replay_digest(frames: &[(corecrux_storage::FrameLocation, Vec<u8>)]) -> (u64,
     let mut hasher = blake3::Hasher::new();
     for (loc, frame) in frames {
         let decoded = decode_frame_v1(frame).expect("decode frame");
-        if decoded.header_bytes.len() < 32 {
-            panic!("stored frame header_bytes too small");
-        }
+        assert!((decoded.header_bytes.len() >= 32), "stored frame header_bytes too small");
         let canonical_len = decoded.header_bytes.len() - 32;
         let canonical_bytes = &decoded.header_bytes[..canonical_len];
         let header_hash = compute_header_hash(canonical_bytes);
@@ -71,9 +69,7 @@ pub fn segment_replay_digest_from_segment_path(
     let seg_bytes = std::fs::read(&fixture_seg)?;
     let (_h, _toc_h, _entries, footer) = corecrux_segment::decode_segment_v1(&seg_bytes)?;
     let fixture_name = fixture_seg
-        .file_stem()
-        .map(|v| v.to_string_lossy().to_string())
-        .unwrap_or_else(|| "fixture".to_string());
+        .file_stem().map_or_else(|| "fixture".to_string(), |v| v.to_string_lossy().to_string());
 
     let dir = tempfile::tempdir()?;
     let root = dir.path();
@@ -135,9 +131,7 @@ pub fn segment_replay_digest_from_segment_path(
     let (total_frames, digest_blake3) = replay_digest(&frames);
     Ok(FixtureDigestReport {
         fixture: fixture_seg
-            .file_stem()
-            .map(|v| v.to_string_lossy().to_string())
-            .unwrap_or_else(|| fixture_seg.display().to_string()),
+            .file_stem().map_or_else(|| fixture_seg.display().to_string(), |v| v.to_string_lossy().to_string()),
         shard_id,
         epoch,
         segment_seq: footer.segment_seq,

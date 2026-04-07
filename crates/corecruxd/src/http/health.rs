@@ -75,8 +75,7 @@ pub(super) fn evaluate_replicated_commit_topology(
         let follower_count = shard
             .followers
             .as_ref()
-            .map(|followers| followers.iter().filter(|f| f.node_id != node_id).count())
-            .unwrap_or(0);
+            .map_or(0, |followers| followers.iter().filter(|f| f.node_id != node_id).count());
         if follower_count == 0 {
             status.missing_followers.push(shard.shard_id.clone());
         }
@@ -301,7 +300,7 @@ pub(super) fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Resp
     let msg = if let Some(s) = err.downcast_ref::<String>() {
         s.clone()
     } else if let Some(s) = err.downcast_ref::<&str>() {
-        s.to_string()
+        (*s).to_string()
     } else {
         "unknown panic".to_string()
     };

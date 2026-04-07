@@ -397,9 +397,7 @@ pub fn tool_output_docs() -> Value {
 pub async fn handle_get_agent_identity(_args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let name = ctx
         .agent
-        .as_ref()
-        .map(|a| a.name.clone())
-        .unwrap_or_else(|| "anonymous".to_string());
+        .as_ref().map_or_else(|| "anonymous".to_string(), |a| a.name.clone());
 
     Ok(json!({
         "content": [{
@@ -494,7 +492,7 @@ mod tests {
     fn tool_names_unique() {
         let tools = list_tools();
         let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        names.sort();
+        names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), TOOL_COUNT, "tool names must be unique");
     }

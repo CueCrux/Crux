@@ -116,7 +116,7 @@ pub(super) async fn route_v1(
         );
     };
 
-    let default_gpu_id = state.dataplane_pool.as_ref().map(|p| p.default_gpu_id()).unwrap_or(0);
+    let default_gpu_id = state.dataplane_pool.as_ref().map_or(0, |p| p.default_gpu_id());
     let owner_gpu_id = decision.gpu_id.unwrap_or(default_gpu_id);
 
     let mut worker_up = false;
@@ -185,7 +185,7 @@ pub(super) async fn get_shards(State(state): State<AppState>, headers: HeaderMap
     }
 
     let routing = state.routing.read().await.clone();
-    let default_gpu_id = state.dataplane_pool.as_ref().map(|p| p.default_gpu_id()).unwrap_or(0);
+    let default_gpu_id = state.dataplane_pool.as_ref().map_or(0, |p| p.default_gpu_id());
 
     let mut hosted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut workers_up: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();

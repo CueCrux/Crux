@@ -180,7 +180,7 @@ impl IndexManager {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "ccxi") {
+            if path.extension().is_some_and(|e| e == "ccxi") {
                 // Skip if already loaded
                 if let Some(seq_str) = path.file_stem().and_then(|s| s.to_str()) {
                     if let Some(seq) = extract_segment_seq(seq_str) {
@@ -224,7 +224,7 @@ impl IndexManager {
                     let protected = seg.tier == IndexTier::Hot
                         && seg
                             .promoted_at
-                            .map_or(false, |t| now.duration_since(t) < self.min_residency);
+                            .is_some_and(|t| now.duration_since(t) < self.min_residency);
                     if protected {
                         // Keep in hot tier despite budget pressure
                         self.hot_bytes += seg.size_bytes;
