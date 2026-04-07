@@ -20,6 +20,8 @@
 //! Agents authenticate via `CRUX_AGENT_TOKEN` (Bearer token). The token is
 //! validated in the [`agent`] module before any tool dispatch.
 
+#![deny(clippy::unwrap_used)]
+
 pub mod agent;
 pub mod dispatch;
 pub mod handoff;

@@ -55,7 +55,7 @@ pub struct DataPlanePool {
 // unconstructable in the Community Edition. They exist only so that code
 // paths behind `if let Some(pool) = ... { ... }` guards type-check without
 // requiring every caller to be gutted.
-#[allow(dead_code, unused_variables)]
+#[allow(dead_code, unused_variables, clippy::unused_async)]
 impl DataPlanePool {
     pub fn default_gpu_id(&self) -> i32 {
         unreachable!()

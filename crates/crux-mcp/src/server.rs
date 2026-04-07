@@ -79,6 +79,7 @@ async fn handle_mcp_get(State(_ctx): State<Arc<McpContext>>) -> impl IntoRespons
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use axum::body::Body;

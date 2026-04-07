@@ -156,6 +156,7 @@ pub async fn handle_sync_status(_args: &Value, ctx: &McpContext) -> Result<Value
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::dispatch::McpContext;

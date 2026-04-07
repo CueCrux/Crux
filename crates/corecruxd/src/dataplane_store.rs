@@ -196,7 +196,7 @@ pub struct DataPlaneStore {
     _private: (),
 }
 
-#[allow(dead_code, unused_variables)]
+#[allow(dead_code, unused_variables, clippy::unused_async)]
 impl DataPlaneStore {
     pub async fn read_stream(
         &self,

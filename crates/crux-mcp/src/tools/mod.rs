@@ -443,6 +443,7 @@ pub fn tool_output_docs() -> Value {
 }
 
 /// `get_agent_identity` — return the calling agent's name.
+#[allow(clippy::unused_async)] // Async required by MCP tool dispatch signature.
 pub async fn handle_get_agent_identity(_args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let name = ctx
         .agent
@@ -490,6 +491,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::agent::AgentIdentity;

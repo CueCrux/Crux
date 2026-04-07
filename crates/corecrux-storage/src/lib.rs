@@ -19,6 +19,8 @@
 //! - Integrity verification (`verify-store` walks all segments and checks BLAKE3 hashes)
 //! - Epoch-based shard ownership for safe rebalancing
 
+#![deny(clippy::unwrap_used)]
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{create_dir_all, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -323,6 +325,8 @@ fn encode_dir_extent_v1(e: DirExtentV1) -> [u8; DIREXTENT_LEN_V1] {
     out
 }
 
+// SAFETY: All try_into().unwrap() convert fixed-size byte slices to arrays of matching length.
+#[allow(clippy::unwrap_used)]
 fn decode_dir_extent_v1(bytes: &[u8]) -> Result<DirExtentV1> {
     if bytes.len() < DIREXTENT_LEN_V1 {
         return Err(StorageError::ManifestRecordInvalid {
@@ -435,6 +439,8 @@ fn encode_dir_run_v1(created_at_unix_ns: u64, extents: &[DirExtentV1]) -> Result
     Ok(out)
 }
 
+// SAFETY: All try_into().unwrap() convert fixed-size byte slices to arrays of matching length.
+#[allow(clippy::unwrap_used)]
 fn decode_dir_run_v1(bytes: &[u8]) -> Result<DirRunDecodedV1> {
     if bytes.len() < DIRRUN_HEADER_LEN {
         return Err(StorageError::ManifestRecordInvalid {
@@ -1064,6 +1070,8 @@ fn encode_commit_frame_v1(
     out
 }
 
+// SAFETY: All try_into().unwrap() convert fixed-size byte slices to arrays of matching length.
+#[allow(clippy::unwrap_used)]
 fn decode_commit_frame_v1(bytes: &[u8]) -> Result<CommitFrameV1> {
     if bytes.len() < COMMIT_FRAME_LEN_V1 {
         return Err(StorageError::ManifestRecordInvalid {
@@ -1278,6 +1286,7 @@ mod manifest;
 mod read;
 mod replication;
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests;
 
 // Re-export manifest items that were previously pub at crate root.
@@ -1778,6 +1787,8 @@ fn read_selected_frames_codec_none_from_entries(
     read_selected_frames_codec_none_host(file, &plans, entries.len())
 }
 
+// SAFETY: All try_into().unwrap() convert fixed-size byte slices to arrays of matching length.
+#[allow(clippy::unwrap_used)]
 fn read_frame_bytes_physical(path: &Path, offset: u64) -> Result<Vec<u8>> {
     let mut file = File::open(path).map_err(io_err)?;
     file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
@@ -2128,6 +2139,8 @@ struct CoalescedReadPlan {
     parts: Vec<(u32, usize, usize, usize)>,
 }
 
+// SAFETY: All try_into().unwrap() convert fixed-size byte slices to arrays of matching length.
+#[allow(clippy::unwrap_used)]
 fn scan_frames_v1_block_bytes(block: &[u8]) -> Result<u32> {
     let mut pos: usize = 0;
     let mut frames: u32 = 0;
