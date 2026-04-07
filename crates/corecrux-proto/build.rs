@@ -16,6 +16,6 @@ fn main() -> anyhow::Result<()> {
     println!("cargo:rerun-if-changed={}", dataplane_proto.display());
     println!("cargo:rerun-if-changed={}", observe_proto.display());
 
-    tonic_build::configure().compile_protos(&[dataplane_proto, observe_proto], &[&proto_dir])?;
+    tonic_prost_build::configure().compile_protos(&[dataplane_proto, observe_proto], &[proto_dir])?;
     Ok(())
 }
