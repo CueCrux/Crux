@@ -17,7 +17,7 @@
 
 fn main() {
     let base = std::env::var("CORECRUX_URL").unwrap_or_else(|_| "http://localhost:14800".into());
-    let agent = ureq::Agent::new();
+    let agent = ureq::Agent::new_with_defaults();
 
     // ── 1. Health check ─────────────────────────────────────────────────
     println!("1. Checking health...");

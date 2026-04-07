@@ -4,10 +4,17 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+# Standalone — not part of the parent workspace.
+[workspace]
+
 [[example]]
 name = "append_and_query"
 path = "append_and_query.rs"
 
+[[example]]
+name = "mcp_workflow"
+path = "mcp_workflow.rs"
+
 [dependencies]
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 serde_json = "1"
