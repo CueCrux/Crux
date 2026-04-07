@@ -9,11 +9,7 @@ no-default-features = false
 # ── Advisories ──────────────────────────────────────────────────────
 [advisories]
 ignore = [
-    # protobuf 2.28.0 via tonic/prost — upgrade requires tonic 0.14+ (breaking).
-    # Deadline: 2026-06-01. Upgrade path: tonic 0.12 → 0.14 (breaking: new
-    # codegen, `Request<T>` changes, `prost` 0.14). Blocker: prost-build API
-    # changes require regenerating all proto stubs. Tracked: #22.
-    "RUSTSEC-2024-0437",
+    # Resolved: protobuf 2.28.0 eliminated by tonic 0.14 upgrade + prometheus default-features=false.
 ]
 
 # ── Licenses ────────────────────────────────────────────────────────
