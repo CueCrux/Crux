@@ -4,6 +4,7 @@
 
 use std::process::Command;
 
+#[allow(clippy::unnecessary_wraps)] // anyhow::Result keeps build.rs consistent across crates
 fn main() -> anyhow::Result<()> {
     // Best-effort: embed short git SHA for /healthz and build_info labels.
     let sha = Command::new("git")

@@ -112,7 +112,9 @@ pub struct Authz {
 
 impl std::fmt::Debug for Authz {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Authz").field("mode", &self.mode).finish()
+        f.debug_struct("Authz")
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
     }
 }
 
@@ -520,7 +522,7 @@ fn verify_jwt_jwks(cfg: &JwtJwksConfig, token: &str) -> Result<AuthContext, Stri
     let kid = header.kid.as_deref();
 
     let mut validation = Validation::new(cfg.algorithms[0]);
-    validation.algorithms = cfg.algorithms.clone();
+    validation.algorithms.clone_from(&cfg.algorithms);
     validation.validate_exp = true;
     validation.validate_nbf = true;
     validation.leeway = 30;

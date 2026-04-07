@@ -1821,6 +1821,7 @@ pub fn bloom_maybe_contains_stream_hash_v1(
     true
 }
 
+#[allow(clippy::unnecessary_wraps)] // Result return kept for consistency with other encode_*_payload fns
 fn encode_blk1_payload(blocks: &[BlockMetaV1]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(16 + blocks.len() * BLOCK_META_V1_LEN);
     out.extend_from_slice(&RECORD_BLOCK_UNCOMPRESSED_MAX_LEN_V1.to_le_bytes());
@@ -1876,6 +1877,7 @@ fn decode_blk1_payload(payload: &[u8]) -> Result<(u32, u32, u32, Vec<BlockMetaV1
     ))
 }
 
+#[allow(clippy::unnecessary_wraps)] // Result return kept for consistency with other encode_*_payload fns
 fn encode_tbo1_payload(entries: &[TocByOffsetEntryV1]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(8 + entries.len().checked_mul(TOC_BY_OFFSET_ENTRY_V1_LEN).unwrap_or(0));
     out.extend_from_slice(&(TOC_BY_OFFSET_ENTRY_V1_LEN as u32).to_le_bytes());
@@ -1918,6 +1920,7 @@ fn decode_tbo1_payload(payload: &[u8]) -> Result<Vec<TocByOffsetEntryV1>> {
     Ok(entries)
 }
 
+#[allow(clippy::unnecessary_wraps)] // Result return kept for consistency with other encode_*_payload fns
 fn encode_tsi1_payload(sorted_idx: &[u32]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(8 + sorted_idx.len() * 4);
     out.extend_from_slice(&(sorted_idx.len() as u32).to_le_bytes());
@@ -2249,6 +2252,7 @@ fn encode_toc_payload_v1(
     )
 }
 
+#[allow(clippy::unnecessary_wraps)] // Result return kept for consistency with other encode_*_payload fns
 fn encode_toc_payload_v1_with_hash(
     entry_count: u64,
     record_area_offset: u64,

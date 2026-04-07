@@ -281,7 +281,7 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
         }
     };
 
-    sig_info.alg = sig.alg.clone();
+    sig_info.alg.clone_from(&sig.alg);
     sig_info.key_id = Some(sig.key_id.clone());
 
     if sig.alg != "ed25519" {
@@ -353,6 +353,8 @@ pub fn verify_receipt_v1(input: VerifyReceiptInput<'_>) -> Result<VerificationRe
             "signed_payload_hash mismatch: expected {} got {}",
             hex32(&input.stored_body_payload_hash),
             if sig.signed_payload_hash.len() == 32 {
+                // SAFETY: Length is checked to be exactly 32 on the line above.
+                #[allow(clippy::unwrap_used)]
                 hex32(sig.signed_payload_hash.as_slice().try_into().unwrap())
             } else {
                 format!("len({})", sig.signed_payload_hash.len())

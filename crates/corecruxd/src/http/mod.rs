@@ -60,6 +60,7 @@ use crate::control::{self, ValveDecision};
 use crate::dataplane_store::AppendError;
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_field_names)] // Fields share the "control_evidence" domain prefix intentionally
 pub struct Readiness {
     pub control_evidence_hosted: bool,
     pub control_evidence_ok: bool,

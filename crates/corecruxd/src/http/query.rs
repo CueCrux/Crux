@@ -364,7 +364,7 @@ pub(super) async fn post_query_text_search(
         return problem_response(StatusCode::BAD_REQUEST, "query must not be empty");
     }
 
-    let limit = body.limit.min(100).max(1);
+    let limit = body.limit.clamp(1, 100);
     let is_scan_mode = body.mode.as_deref() == Some("scan");
 
     let t0 = std::time::Instant::now();

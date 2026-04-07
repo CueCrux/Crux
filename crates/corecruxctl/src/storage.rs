@@ -598,6 +598,7 @@ fn verify_target_copy(target: &OffloadTarget, target_path: &str) -> Result<Strin
 fn blake3_file_hex(path: &Path) -> Result<String, DynError> {
     let mut hasher = blake3::Hasher::new();
     let mut file = File::open(path)?;
+    #[allow(clippy::large_stack_arrays)] // 1 MiB read buffer; acceptable for I/O-bound hashing
     let mut buf = [0u8; 1024 * 1024];
     loop {
         let read = file.read(&mut buf)?;

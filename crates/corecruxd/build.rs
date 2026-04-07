@@ -4,6 +4,7 @@
 
 use std::process::Command;
 
+#[allow(clippy::unnecessary_wraps)] // anyhow::Result keeps build.rs consistent across crates
 fn main() -> anyhow::Result<()> {
     let sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])

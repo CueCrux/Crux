@@ -3,6 +3,8 @@
 // See LICENCE.md in the repository root.
 
 #![deny(clippy::unwrap_used)]
+// CLI tool — printing to stdout/stderr is correct behaviour.
+#![allow(clippy::print_stdout, clippy::print_stderr)]
 
 pub mod admin;
 pub mod audit_pack;

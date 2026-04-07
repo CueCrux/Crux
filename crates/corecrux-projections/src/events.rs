@@ -113,6 +113,8 @@ impl EntityFactV1 {
     }
 
     pub fn encode_json(&self) -> Vec<u8> {
+        // SAFETY: EntityFactV1 fields are all primitive/String types — serialization cannot fail.
+        #[allow(clippy::expect_used)]
         serde_json::to_vec(self).expect("EntityFactV1 serialization should not fail")
     }
 

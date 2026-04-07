@@ -55,7 +55,7 @@ pub async fn handle_sync_pull(_args: &Value, ctx: &McpContext) -> Result<Value, 
     };
 
     let mut store = ctx.fact_store.write().await;
-    match client.pull(&mut *store) {
+    match client.pull(&mut store) {
         Ok(result) => {
             let cursor = client.load_cursor();
             let text = serde_json::to_string_pretty(&json!({
@@ -88,7 +88,7 @@ pub async fn handle_sync_push(args: &Value, ctx: &McpContext) -> Result<Value, J
     if !confirm {
         // Preview mode — show what would be pushed without actually pushing.
         let store = ctx.fact_store.read().await;
-        let preview = client.push_preview(&*store);
+        let preview = client.push_preview(&store);
         let text = serde_json::to_string_pretty(&json!({
             "mode": "preview",
             "would_push": preview.pushable_count,
@@ -104,7 +104,7 @@ pub async fn handle_sync_push(args: &Value, ctx: &McpContext) -> Result<Value, J
     }
 
     let store = ctx.fact_store.read().await;
-    match client.push(&*store) {
+    match client.push(&store) {
         Ok(result) => {
             let cursor = client.load_cursor();
             let text = serde_json::to_string_pretty(&json!({

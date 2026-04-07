@@ -254,7 +254,7 @@ impl std::fmt::Debug for IndexManager {
             .field("hot_bytes", &self.hot_bytes)
             .field("hot_budget_bytes", &self.hot_budget_bytes)
             .field("eviction_count", &self.eviction_count)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

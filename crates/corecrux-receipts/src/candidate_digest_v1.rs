@@ -202,11 +202,13 @@ fn q_score(x: Option<f64>) -> QScore {
     QScore { q, is_null: false }
 }
 
+#[allow(clippy::unnecessary_wraps)] // Result return kept for consistency with write_str and caller `?` chains
 fn write_u32_le(buf: &mut Vec<u8>, n: u32) -> Result<(), String> {
     buf.extend_from_slice(&n.to_le_bytes());
     Ok(())
 }
 
+#[allow(clippy::unnecessary_wraps)] // Result return kept for consistency with write_str and caller `?` chains
 fn write_i32_le(buf: &mut Vec<u8>, n: i32) -> Result<(), String> {
     buf.extend_from_slice(&n.to_le_bytes());
     Ok(())

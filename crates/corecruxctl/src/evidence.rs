@@ -922,8 +922,8 @@ fn apply_control_state_mutation_v1(
 
 fn apply_valve_state(target: &mut LocalValveV1, value: &corecrux_types::ControlValveStateV1) {
     target.enabled = value.enabled;
-    target.actor = value.actor.clone();
-    target.reason = value.reason.clone();
+    target.actor.clone_from(&value.actor);
+    target.reason.clone_from(&value.reason);
     target.updated_at_unix_ns = value.updated_at_unix_ns;
     target.retry_after_ms = value.retry_after_ms;
     target.events_per_sec = value.events_per_sec;

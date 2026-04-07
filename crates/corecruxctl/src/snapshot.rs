@@ -196,10 +196,7 @@ pub fn verify_snapshots(
                 actual_blake3: None,
             };
 
-            if expected.is_none() {
-                item.ok = false;
-                item.reason = Some("MISSING_SNAPSHOT".to_string());
-            } else if !path.exists() {
+            if expected.is_none() || !path.exists() {
                 item.ok = false;
                 item.reason = Some("MISSING_SNAPSHOT".to_string());
             } else {

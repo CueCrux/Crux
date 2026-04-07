@@ -16,11 +16,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 
 impl ShardStorage {
+    #[allow(clippy::unnecessary_wraps)] // Result return kept for caller ergonomics with `?` chains
     pub(crate) fn rebuild_tail_locator_from_directory(&mut self) -> Result<()> {
         self.tail_locator_by_stream.clear();
         self.tail_pointer_by_stream.clear();
         let mut pointer_rebuild_streams: Vec<u64> = Vec::new();
-        for (&stream_hash, refs) in self.directory_by_stream.iter() {
+        for (&stream_hash, refs) in &self.directory_by_stream {
             let cut = self.stream_cut_seq(stream_hash);
             let mut desc: Vec<StreamTailLocatorEntry> = Vec::new();
             for r in refs.iter().rev() {
@@ -75,8 +76,8 @@ impl ShardStorage {
 
         let mut entries_desc = locator.entries_asc.clone();
         entries_desc.reverse();
-        let latest_segment_seq = entries_desc.first().map(|e| e.segment_seq).unwrap_or(0);
-        let latest_seq = entries_desc.first().map(|e| e.entry.seq).unwrap_or(0);
+        let latest_segment_seq = entries_desc.first().map_or(0, |e| e.segment_seq);
+        let latest_seq = entries_desc.first().map_or(0, |e| e.entry.seq);
         let mut grouped_desc: Vec<StreamTailPointerGroup> = Vec::new();
         for entry in &entries_desc {
             if let Some(group) = grouped_desc
@@ -308,7 +309,7 @@ impl ShardStorage {
             stats.add_io_elapsed(io_start.elapsed());
 
             let decode_start = std::time::Instant::now();
-            for e in selected.iter() {
+            for e in selected {
                 let bid = e.block_id as usize;
                 let Some(buf) = blocks.get(bid).and_then(|v| v.as_ref()) else {
                     return Err(StorageError::ManifestRecordInvalid {
@@ -1140,7 +1141,7 @@ impl ShardStorage {
 
         let sealed_len = self.segments_in_order.len();
         let has_head = self.head.is_some();
-        let total_segments = sealed_len + if has_head { 1 } else { 0 };
+        let total_segments = sealed_len + usize::from(has_head);
 
         let (mut seg_idx, mut offset) = match cursor {
             None => {
@@ -1179,6 +1180,8 @@ impl ShardStorage {
         while seg_idx < total_segments && out.len() < limit {
             // Special final "segment": the currently-appending head segment (if enabled).
             if seg_idx == sealed_len {
+                // SAFETY: seg_idx == sealed_len is only reachable when has_head is true.
+                #[allow(clippy::expect_used)]
                 let head = self.head.as_ref().expect("head exists when seg_idx==sealed_len");
                 let record_end = (corecrux_segment::SEGMENT_HEADER_LEN as u64).saturating_add(head.record_len);
 
@@ -1390,6 +1393,8 @@ impl ShardStorage {
                         return Ok((out, None));
                     }
                     if seg_idx == sealed_len {
+                        // SAFETY: seg_idx == sealed_len implies head is Some.
+                        #[allow(clippy::expect_used)]
                         let head = self.head.as_ref().expect("head exists");
                         return Ok((
                             out,
@@ -1558,8 +1563,7 @@ impl ShardStorage {
                     let (block_idx, in_block_offset) = logical_offset_to_block(&head.blocks, loc.offset)?;
                     let needs_reload = cached_head_block
                         .as_ref()
-                        .map(|(cached_idx, _)| *cached_idx != block_idx as u32)
-                        .unwrap_or(true);
+                        .is_none_or(|(cached_idx, _)| *cached_idx != block_idx as u32);
                     if needs_reload {
                         let blocks = read_blocks_cpu(&head.file, &head.blocks, &[block_idx as u32])?;
                         let Some(buf) = blocks.get(block_idx).and_then(|v| v.as_ref()) else {
@@ -1569,11 +1573,10 @@ impl ShardStorage {
                         };
                         cached_head_block = Some((block_idx as u32, buf.clone()));
                     }
-                    let frame = extract_frame(
-                        &cached_head_block.as_ref().expect("cached head block just loaded").1,
-                        in_block_offset as usize,
-                        "head",
-                    )?;
+                    // SAFETY: cached_head_block is set to Some in the reload block above.
+                    #[allow(clippy::expect_used)]
+                    let cached_head_ref = &cached_head_block.as_ref().expect("cached head block just loaded").1;
+                    let frame = extract_frame(cached_head_ref, in_block_offset as usize, "head")?;
                     push_frame(
                         &frame,
                         &mut frames_blob,
@@ -1595,18 +1598,19 @@ impl ShardStorage {
             if let Some(ti) = self.segment_trailers_by_seq.get(&loc.segment_seq) {
                 let (block_idx, in_block_offset) = logical_offset_to_block(&ti.blocks, loc.offset)?;
                 let block_idx_u32 = block_idx as u32;
-                let needs_reload = cached_sealed_block
+                let needs_reload = !cached_sealed_block
                     .as_ref()
-                    .map(|(cached_seg, cached_block, _)| {
-                        *cached_seg != loc.segment_seq || *cached_block != block_idx_u32
-                    })
-                    .unwrap_or(true);
+                    .is_some_and(|(cached_seg, cached_block, _)| {
+                        *cached_seg == loc.segment_seq && *cached_block == block_idx_u32
+                    });
                 if needs_reload {
                     let file_seq = cached_sealed_file.as_ref().map(|(seq, _)| *seq);
                     if file_seq != Some(loc.segment_seq) {
                         let file = File::open(&seg_path).map_err(io_err)?;
                         cached_sealed_file = Some((loc.segment_seq, file));
                     }
+                    // SAFETY: cached_sealed_file is set to Some in the block above.
+                    #[allow(clippy::expect_used)]
                     let file_ref = &cached_sealed_file.as_ref().expect("cached sealed file just loaded").1;
                     let blocks = read_blocks_cpu(file_ref, &ti.blocks, &[block_idx_u32])?;
                     let Some(buf) = blocks.get(block_idx).and_then(|v| v.as_ref()) else {
@@ -1616,11 +1620,10 @@ impl ShardStorage {
                     };
                     cached_sealed_block = Some((loc.segment_seq, block_idx_u32, buf.clone()));
                 }
-                let frame = extract_frame(
-                    &cached_sealed_block.as_ref().expect("cached sealed block just loaded").2,
-                    in_block_offset as usize,
-                    "sealed",
-                )?;
+                // SAFETY: cached_sealed_block is set to Some in the reload block above.
+                #[allow(clippy::expect_used)]
+                let cached_block_ref = &cached_sealed_block.as_ref().expect("cached sealed block just loaded").2;
+                let frame = extract_frame(cached_block_ref, in_block_offset as usize, "sealed")?;
                 push_frame(
                     &frame,
                     &mut frames_blob,
