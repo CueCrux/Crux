@@ -997,6 +997,7 @@ fn list_shards(shard_root: &Path) -> Result<Vec<u32>, DynError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use std::collections::BTreeMap;
 

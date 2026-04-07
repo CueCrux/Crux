@@ -237,6 +237,7 @@ pub fn verify_snapshots(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::fs;

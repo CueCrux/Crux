@@ -342,6 +342,7 @@ pub fn gc_orphan_cold_segments_v1(
     })
 }
 
+#[allow(clippy::unwrap_used)] // SAFETY: try_into().unwrap() on bytes[16..24] is exactly 8 bytes after bounds check
 fn read_epoch_from_manifest(path: &Path) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let bytes = std::fs::read(path)?;
     if bytes.len() < MANIFEST_HEADER_LEN {

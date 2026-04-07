@@ -230,6 +230,7 @@ pub fn replay_digest_from_jsonl(path: &Path) -> Result<ReplayDigest, Box<dyn std
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::{load_expected_digest_from_pack, replay_digest_from_pack, resolve_pack_input_jsonl};
 

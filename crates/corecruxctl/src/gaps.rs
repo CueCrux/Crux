@@ -102,6 +102,7 @@ pub fn run(data_dir: &str, since: Option<&str>) -> Result<(), Box<dyn std::error
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::fs;

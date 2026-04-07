@@ -48,6 +48,7 @@ pub fn emit_command_log(op: &str, outcome: &str, took_ms: u64, error_code: Optio
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::{payload_hash_prefix, CommandLogEvent};
 

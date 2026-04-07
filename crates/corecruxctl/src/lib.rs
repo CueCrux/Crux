@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+#![deny(clippy::unwrap_used)]
+
 pub mod admin;
 pub mod audit_pack;
 pub mod benchmark;

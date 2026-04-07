@@ -1549,6 +1549,7 @@ fn stream_headers_jsonl(headers: &[StreamHeaderLineV1]) -> Result<Vec<u8>, DynEr
     Ok(out)
 }
 
+#[allow(clippy::unwrap_used)] // SAFETY: .last().expect() is guarded by headers.len() > 1
 fn stream_header_source_refs(opts: &AuditPackOptionsV1, headers: &[StreamHeaderLineV1]) -> Vec<EvidenceSourceRefV1> {
     let Some(tenant_id) = opts.tenant_id.as_ref() else {
         return Vec::new();

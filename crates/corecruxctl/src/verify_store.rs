@@ -312,6 +312,7 @@ pub fn verify_store(opts: &VerifyStoreOptions) -> Result<VerifyStoreReport, Box<
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::fs;
