@@ -11,69 +11,71 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_HOME: /home/gha-runner/.cargo
   CARGO_INCREMENTAL: 0
 
 jobs:
-  lint:
-    name: Lint (${{ matrix.name }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: self-hosted
-            runner: [self-hosted, ci]
-            needs_setup: false
-          - name: github
-            runner: ubuntu-latest
-            needs_setup: true
+  # ── Lint: two runners, gate passes if EITHER succeeds ────────────────
+  lint-selfhosted:
+    name: Lint (self-hosted)
+    runs-on: [self-hosted, ci]
+    continue-on-error: true
+    env:
+      CARGO_HOME: /home/gha-runner/.cargo
     steps:
       - uses: actions/checkout@v6
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - run: cargo fmt --check
+      - run: typos
+      - run: cargo clippy --workspace
 
-      - name: Install Rust
-        if: matrix.needs_setup
-        uses: dtolnay/rust-toolchain@stable
+  lint-github:
+    name: Lint (github)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - name: Install protoc
-        if: matrix.needs_setup
-        uses: arduino/setup-protoc@v3
+      - uses: arduino/setup-protoc@v3
         with:
           version: "25.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: cargo install typos-cli
+      - run: cargo fmt --check
+      - run: typos
+      - run: cargo clippy --workspace
 
-      - name: Install typos
-        if: matrix.needs_setup
-        run: cargo install typos-cli
+  lint-gate:
+    name: Lint
+    needs: [lint-selfhosted, lint-github]
+    runs-on: [self-hosted, ci]
+    if: always()
+    steps:
+      - name: Require at least one lint pass
+        run: |
+          echo "self-hosted: ${{ needs.lint-selfhosted.result }}"
+          echo "github: ${{ needs.lint-github.result }}"
+          if [[ "${{ needs.lint-selfhosted.result }}" == "success" ]] || \
+             [[ "${{ needs.lint-github.result }}" == "success" ]]; then
+            echo "Lint passed on at least one runner"
+          else
+            echo "::error::Lint failed on BOTH runners"
+            exit 1
+          fi
 
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Check for typos
-        run: typos
-
-      - name: Clippy (workspace lint config)
-        run: cargo clippy --workspace
-
+  # ── Test, MSRV, Coverage: self-hosted ────────────────────────────────
   test:
     name: Test
     runs-on: [self-hosted, ci]
+    env:
+      CARGO_HOME: /home/gha-runner/.cargo
     steps:
       - uses: actions/checkout@v6
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-
-      - name: Build (includes daemon for integration tests)
-        run: cargo build --workspace
-
-      - name: Test
-        run: cargo test --workspace
-
-      - name: Build release
-        run: cargo build --release
-
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+      - run: cargo build --release
       - name: Smoke test
         run: |
           CORECRUXD_DATA_DIR=/tmp/crux-smoke-${{ github.run_id }} ./target/release/corecruxd &
@@ -88,31 +90,25 @@ jobs:
   msrv:
     name: MSRV (1.88.0)
     runs-on: [self-hosted, ci]
+    env:
+      CARGO_HOME: /home/gha-runner/.cargo
     steps:
       - uses: actions/checkout@v6
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-
-      - name: Build with MSRV
-        run: cargo +1.88.0 build --workspace
+      - run: cargo +1.88.0 build --workspace
 
   coverage:
     name: Coverage
     runs-on: [self-hosted, ci]
     env:
+      CARGO_HOME: /home/gha-runner/.cargo
       COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs)$'
     steps:
       - uses: actions/checkout@v6
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-
-      - name: Build daemon for integration tests
-        run: cargo build --bin corecruxd
-
-      - name: Generate coverage report
-        run: cargo llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --lcov --output-path lcov.info
-
-      - name: Coverage summary
-        run: cargo llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --summary-only
-
+      - run: cargo build --bin corecruxd
+      - run: cargo llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --lcov --output-path lcov.info
+      - run: cargo llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --summary-only
       - name: Enforce coverage thresholds
         run: |
           SUMMARY=$(cargo llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --summary-only 2>&1)
@@ -121,13 +117,11 @@ jobs:
 
           FAILED=0
 
-          # Workspace floor: 81% (ratchets up as tests are added)
           if (( $(echo "$TOTAL < 81" | bc -l) )); then
             echo "::error::Workspace coverage ${TOTAL}% is below 81% floor"
             FAILED=1
           fi
 
-          # New crate floor: 95%
           for crate in corecrux-memory crux-sync crux-contrib; do
             COV=$(echo "$SUMMARY" | grep "^${crate}/" | awk '{sum+=$1; missed+=$2} END {if(sum>0) printf "%.1f", (1-missed/sum)*100; else print "100.0"}')
             echo "${crate}: ${COV}%"
@@ -137,7 +131,6 @@ jobs:
             fi
           done
 
-          # Phase 1 code floor: 90%
           for file in corecruxd/src/config.rs corecruxd/src/control.rs corecruxd/src/structured_log.rs corecruxd/src/problem.rs; do
             COV=$(echo "$SUMMARY" | grep "^${file}" | awk '{print $4}' | tr -d '%')
             echo "${file}: ${COV}%"
@@ -151,8 +144,7 @@ jobs:
             exit 1
           fi
           echo "All coverage thresholds met."
-
-      - name: Upload coverage to GitHub
+      - name: Upload coverage
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v7
         with:
