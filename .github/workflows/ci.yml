@@ -49,7 +49,7 @@ jobs:
   lint-gate:
     name: Lint
     needs: [lint-selfhosted, lint-github]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci]
     if: always()
     steps:
       - name: Require at least one lint pass
