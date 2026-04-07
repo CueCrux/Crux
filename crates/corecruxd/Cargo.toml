@@ -43,7 +43,7 @@ opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true
 opentelemetry-otlp = { version = "0.27", features = ["tonic"], optional = true }
 uuid = { version = "1.16.0", features = ["v4"] }
 zstd = "0.11.2"
-zip = "0.6.6"
+zip = "8.5.0"
 
 corecrux-frame = { path = "../corecrux-frame" }
 corecrux-memory = { path = "../corecrux-memory" }
