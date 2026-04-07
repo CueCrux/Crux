@@ -81,6 +81,9 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-test-
 
+      - name: Build (includes daemon for integration tests)
+        run: cargo build --workspace
+
       - name: Test
         run: cargo test --workspace
 
