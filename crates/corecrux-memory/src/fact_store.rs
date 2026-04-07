@@ -9,9 +9,21 @@
 //! keyword search over fact values and soft-delete via tombstone events.
 
 use std::collections::HashMap;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Journal event for fact persistence.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "op")]
+enum JournalEvent {
+    #[serde(rename = "store")]
+    Store { fact: Fact },
+    #[serde(rename = "delete")]
+    Delete { fact_id: String, deleted_at: String },
+}
 
 /// A single fact in the store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,18 +81,97 @@ fn default_top_k() -> usize {
     10
 }
 
-/// In-memory fact store with keyword search.
+/// In-memory fact store with keyword search and optional JSONL persistence.
 #[derive(Debug, Default)]
 pub struct FactStore {
     facts: HashMap<String, Fact>,
     entity_index: HashMap<String, Vec<String>>,
     /// Index of (entity, key) → ordered list of fact_ids (version chain).
     key_index: HashMap<(String, String), Vec<String>>,
+    /// Path to the JSONL journal file. `None` for pure in-memory mode.
+    journal_path: Option<PathBuf>,
 }
 
 impl FactStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a fact store backed by a JSONL journal in `data_dir`.
+    ///
+    /// If `data_dir/facts.jsonl` exists, it is replayed to rebuild in-memory
+    /// state. Subsequent `store()` and `delete()` calls append to the journal.
+    pub fn with_persistence(data_dir: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(data_dir)?;
+        let journal_path = data_dir.join("facts.jsonl");
+        let mut store = Self {
+            facts: HashMap::new(),
+            entity_index: HashMap::new(),
+            key_index: HashMap::new(),
+            journal_path: Some(journal_path.clone()),
+        };
+        if journal_path.exists() {
+            store.replay_journal(&journal_path)?;
+        }
+        Ok(store)
+    }
+
+    /// Append a journal event to the JSONL file. Best-effort: logs a warning
+    /// on IO error but never panics or propagates the error.
+    fn append_journal(&self, event: &JournalEvent) {
+        if let Some(path) = &self.journal_path {
+            let result = (|| -> std::io::Result<()> {
+                let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+                let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+                writeln!(file, "{}", line)?;
+                Ok(())
+            })();
+            if let Err(err) = result {
+                tracing::warn!(?err, path = %path.display(), "fact-journal-append-failed");
+            }
+        }
+    }
+
+    /// Replay a JSONL journal file to rebuild in-memory state.
+    /// Corrupted or blank lines are skipped with a warning.
+    fn replay_journal(&mut self, path: &Path) -> std::io::Result<()> {
+        let file = std::fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        for (line_no, line) in reader.lines().enumerate() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<JournalEvent>(trimmed) {
+                Ok(JournalEvent::Store { fact }) => {
+                    self.replay_journal_insert(fact);
+                }
+                Ok(JournalEvent::Delete { fact_id, .. }) => {
+                    if let Some(fact) = self.facts.get_mut(&fact_id) {
+                        fact.deleted = true;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(line_no = line_no + 1, ?err, "fact-journal-parse-skip");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Insert a fact directly into the HashMap and indexes WITHOUT appending
+    /// to the journal. Used during replay to avoid re-writing events.
+    fn replay_journal_insert(&mut self, fact: Fact) {
+        let fact_id = fact.fact_id.clone();
+        let entity = fact.entity.clone();
+        let key = fact.key.clone();
+        self.entity_index
+            .entry(entity.clone())
+            .or_default()
+            .push(fact_id.clone());
+        self.key_index.entry((entity, key)).or_default().push(fact_id.clone());
+        self.facts.insert(fact_id, fact);
     }
 
     /// Store a fact and return it. If a fact with the same (entity, key) already
@@ -123,6 +214,8 @@ impl FactStore {
         self.key_index.entry(key_pair).or_default().push(fact_id.clone());
         self.facts.insert(fact_id, fact.clone());
 
+        self.append_journal(&JournalEvent::Store { fact: fact.clone() });
+
         fact
     }
 
@@ -135,6 +228,10 @@ impl FactStore {
     pub fn delete(&mut self, fact_id: &str) -> bool {
         if let Some(fact) = self.facts.get_mut(fact_id) {
             fact.deleted = true;
+            self.append_journal(&JournalEvent::Delete {
+                fact_id: fact_id.to_string(),
+                deleted_at: Utc::now().to_rfc3339(),
+            });
             true
         } else {
             false
@@ -252,6 +349,75 @@ impl FactStore {
         self.facts.values().filter(|f| !f.deleted).count()
     }
 
+    /// Return an iterator over ALL facts (including deleted).
+    pub fn all_facts(&self) -> impl Iterator<Item = &Fact> {
+        self.facts.values()
+    }
+
+    /// Paginated export of ALL facts (including deleted tombstones) for sync.
+    ///
+    /// Facts are sorted by `(stored_at, fact_id)` ascending. If `since` is set,
+    /// only facts with `stored_at >= since` are included. If `cursor` is set,
+    /// items are skipped until the fact with `fact_id == cursor` is found, then
+    /// the export starts from the next item. Returns at most `limit` facts.
+    pub fn export(&self, since: Option<DateTime<Utc>>, cursor: Option<&str>, limit: usize) -> FactExportResult {
+        // 1. Collect ALL facts (including deleted).
+        let mut all: Vec<&Fact> = self.facts.values().collect();
+
+        // 2. Sort by (stored_at, fact_id) ascending.
+        all.sort_by(|a, b| a.stored_at.cmp(&b.stored_at).then_with(|| a.fact_id.cmp(&b.fact_id)));
+
+        // 3. Filter by `since` if set.
+        if let Some(since_dt) = since {
+            all.retain(|f| f.stored_at >= since_dt);
+        }
+
+        // 4. Skip past cursor if set.
+        let start = if let Some(cursor_id) = cursor {
+            match all.iter().position(|f| f.fact_id == cursor_id) {
+                Some(pos) => pos + 1,
+                None => 0, // cursor not found — start from beginning
+            }
+        } else {
+            0
+        };
+
+        let remaining = &all[start..];
+
+        // 5. Take `limit` items.
+        let has_more = remaining.len() > limit;
+        let taken: Vec<Fact> = remaining.iter().take(limit).map(|f| (*f).clone()).collect();
+        let next_cursor = if has_more {
+            taken.last().map(|f| f.fact_id.clone())
+        } else {
+            None
+        };
+
+        FactExportResult {
+            facts: taken,
+            next_cursor,
+            has_more,
+        }
+    }
+
+    /// Insert a fact directly with its original identity (fact_id, version,
+    /// timestamps). Used for facts arriving from a remote sync — skips version
+    /// chain logic but DOES append to the journal for persistence.
+    pub fn store_synced(&mut self, fact: Fact) {
+        let fact_id = fact.fact_id.clone();
+        let entity = fact.entity.clone();
+        let key = fact.key.clone();
+
+        self.entity_index
+            .entry(entity.clone())
+            .or_default()
+            .push(fact_id.clone());
+        self.key_index.entry((entity, key)).or_default().push(fact_id.clone());
+        self.facts.insert(fact_id, fact.clone());
+
+        self.append_journal(&JournalEvent::Store { fact });
+    }
+
     /// Return all versions of a fact for a given (entity, key) pair, ordered by
     /// version ascending. Includes deleted (superseded) versions for audit trail.
     pub fn fact_history(&self, entity: &str, key: &str) -> Vec<&Fact> {
@@ -272,6 +438,14 @@ impl FactStore {
 pub struct FactQueryResult {
     pub facts: Vec<Fact>,
     pub total_tokens: usize,
+}
+
+/// Result of a paginated fact export (includes deleted facts for sync tombstones).
+#[derive(Debug, Serialize)]
+pub struct FactExportResult {
+    pub facts: Vec<Fact>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
 }
 
 /// Estimate token count from text (bytes / 4 approximation).
@@ -699,5 +873,290 @@ mod tests {
         assert_eq!(estimate_tokens("a"), 1); // (1+3)/4 = 1
         assert_eq!(estimate_tokens("abcd"), 1); // (4+3)/4 = 1
         assert_eq!(estimate_tokens("abcde"), 2); // (5+3)/4 = 2
+    }
+
+    // ── Persistence tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_persistence_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids: Vec<String>;
+
+        // Store 3 facts, then drop the store.
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let f1 = store.store(StoreFact {
+                entity: "proj".into(),
+                key: "name".into(),
+                value: "alpha".into(),
+                source_receipt: None,
+                confidence: 0.9,
+            });
+            let f2 = store.store(StoreFact {
+                entity: "proj".into(),
+                key: "status".into(),
+                value: "active".into(),
+                source_receipt: Some("r1".into()),
+                confidence: 1.0,
+            });
+            let f3 = store.store(StoreFact {
+                entity: "other".into(),
+                key: "info".into(),
+                value: "details".into(),
+                source_receipt: None,
+                confidence: 0.5,
+            });
+            ids = vec![f1.fact_id, f2.fact_id, f3.fact_id];
+            assert_eq!(store.count(), 3);
+        }
+
+        // Rebuild from the same directory.
+        {
+            let store = FactStore::with_persistence(dir.path()).unwrap();
+            assert_eq!(store.count(), 3);
+            for id in &ids {
+                assert!(store.get(id).is_some(), "fact {} should exist after replay", id);
+            }
+            let fact = store.get(&ids[0]).unwrap();
+            assert_eq!(fact.entity, "proj");
+            assert_eq!(fact.key, "name");
+            assert_eq!(fact.value, "alpha");
+        }
+    }
+
+    #[test]
+    fn test_persistence_delete_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let fact_id: String;
+
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let fact = store.store(StoreFact {
+                entity: "e".into(),
+                key: "k".into(),
+                value: "v".into(),
+                source_receipt: None,
+                confidence: 1.0,
+            });
+            fact_id = fact.fact_id;
+            store.delete(&fact_id);
+            assert_eq!(store.count(), 0);
+        }
+
+        {
+            let store = FactStore::with_persistence(dir.path()).unwrap();
+            assert_eq!(store.count(), 0);
+            assert!(store.get(&fact_id).is_none());
+            // The fact should exist in the map but be deleted.
+            assert!(store.facts.get(&fact_id).is_some());
+            assert!(store.facts.get(&fact_id).unwrap().deleted);
+        }
+    }
+
+    #[test]
+    fn test_persistence_versioning() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let v1 = store.store(StoreFact {
+                entity: "proj".into(),
+                key: "status".into(),
+                value: "draft".into(),
+                source_receipt: None,
+                confidence: 0.8,
+            });
+            let v2 = store.store(StoreFact {
+                entity: "proj".into(),
+                key: "status".into(),
+                value: "active".into(),
+                source_receipt: None,
+                confidence: 0.9,
+            });
+            assert_eq!(v1.version, 1);
+            assert_eq!(v2.version, 2);
+            assert_eq!(v2.supersedes, Some(v1.fact_id.clone()));
+        }
+
+        {
+            let store = FactStore::with_persistence(dir.path()).unwrap();
+            let history = store.fact_history("proj", "status");
+            assert_eq!(history.len(), 2);
+            assert_eq!(history[0].version, 1);
+            assert_eq!(history[0].value, "draft");
+            assert_eq!(history[1].version, 2);
+            assert_eq!(history[1].value, "active");
+            assert_eq!(history[1].supersedes, Some(history[0].fact_id.clone()));
+        }
+    }
+
+    #[test]
+    fn test_in_memory_mode_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("facts.jsonl");
+
+        let mut store = FactStore::new();
+        store.store(StoreFact {
+            entity: "e".into(),
+            key: "k".into(),
+            value: "v".into(),
+            source_receipt: None,
+            confidence: 1.0,
+        });
+        store.delete("nonexistent");
+
+        assert!(!journal_path.exists(), "in-memory mode should not create journal files");
+    }
+
+    // ── Export tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_export_basic() {
+        let mut store = FactStore::new();
+        for i in 0..5 {
+            store.store(StoreFact {
+                entity: format!("e{i}"),
+                key: "k".into(),
+                value: format!("v{i}"),
+                source_receipt: None,
+                confidence: 1.0,
+            });
+        }
+
+        let result = store.export(None, None, 100);
+        assert_eq!(result.facts.len(), 5);
+        assert!(!result.has_more);
+        assert!(result.next_cursor.is_none());
+
+        // Verify ascending stored_at order
+        for w in result.facts.windows(2) {
+            assert!(w[0].stored_at <= w[1].stored_at);
+        }
+    }
+
+    #[test]
+    fn test_export_with_cursor() {
+        let mut store = FactStore::new();
+        for i in 0..5 {
+            store.store(StoreFact {
+                entity: format!("e{i}"),
+                key: "k".into(),
+                value: format!("v{i}"),
+                source_receipt: None,
+                confidence: 1.0,
+            });
+        }
+
+        // First page: get 2
+        let page1 = store.export(None, None, 2);
+        assert_eq!(page1.facts.len(), 2);
+        assert!(page1.has_more);
+        assert!(page1.next_cursor.is_some());
+
+        // Second page: use cursor from first page
+        let page2 = store.export(None, page1.next_cursor.as_deref(), 2);
+        assert_eq!(page2.facts.len(), 2);
+        assert!(page2.has_more);
+
+        // Third page: remaining 1
+        let page3 = store.export(None, page2.next_cursor.as_deref(), 2);
+        assert_eq!(page3.facts.len(), 1);
+        assert!(!page3.has_more);
+        assert!(page3.next_cursor.is_none());
+
+        // Verify no duplicates across pages
+        let all_ids: Vec<String> = page1
+            .facts
+            .iter()
+            .chain(page2.facts.iter())
+            .chain(page3.facts.iter())
+            .map(|f| f.fact_id.clone())
+            .collect();
+        assert_eq!(all_ids.len(), 5);
+        let deduped: std::collections::HashSet<_> = all_ids.iter().collect();
+        assert_eq!(deduped.len(), 5);
+    }
+
+    #[test]
+    fn test_export_with_since() {
+        let mut store = FactStore::new();
+
+        // Store 2 facts, capture a timestamp, then store 3 more
+        store.store(StoreFact {
+            entity: "e0".into(),
+            key: "k".into(),
+            value: "v0".into(),
+            source_receipt: None,
+            confidence: 1.0,
+        });
+        store.store(StoreFact {
+            entity: "e1".into(),
+            key: "k".into(),
+            value: "v1".into(),
+            source_receipt: None,
+            confidence: 1.0,
+        });
+
+        // All facts stored with Utc::now() so they share the same timestamp
+        // (sub-millisecond). To test since filtering properly, we modify
+        // stored_at on the first two facts to be in the past.
+        let past = Utc::now() - chrono::Duration::hours(1);
+        let all_ids: Vec<String> = store.all_facts().map(|f| f.fact_id.clone()).collect();
+        for id in &all_ids {
+            if let Some(f) = store.facts.get_mut(id) {
+                f.stored_at = past;
+            }
+        }
+
+        let cutoff = Utc::now() - chrono::Duration::minutes(30);
+
+        // Store 3 more (these will have stored_at = now)
+        for i in 2..5 {
+            store.store(StoreFact {
+                entity: format!("e{i}"),
+                key: "k".into(),
+                value: format!("v{i}"),
+                source_receipt: None,
+                confidence: 1.0,
+            });
+        }
+
+        let result = store.export(Some(cutoff), None, 100);
+        assert_eq!(result.facts.len(), 3);
+        for f in &result.facts {
+            assert!(f.stored_at >= cutoff);
+        }
+    }
+
+    #[test]
+    fn test_export_includes_deleted() {
+        let mut store = FactStore::new();
+
+        let f1 = store.store(StoreFact {
+            entity: "e".into(),
+            key: "k1".into(),
+            value: "v1".into(),
+            source_receipt: None,
+            confidence: 1.0,
+        });
+        store.store(StoreFact {
+            entity: "e".into(),
+            key: "k2".into(),
+            value: "v2".into(),
+            source_receipt: None,
+            confidence: 1.0,
+        });
+
+        store.delete(&f1.fact_id);
+
+        // Export should include the deleted fact as a tombstone
+        let result = store.export(None, None, 100);
+        assert_eq!(result.facts.len(), 2);
+
+        let deleted_fact = result.facts.iter().find(|f| f.fact_id == f1.fact_id).unwrap();
+        assert!(deleted_fact.deleted);
+
+        let live_fact = result.facts.iter().find(|f| f.fact_id != f1.fact_id).unwrap();
+        assert!(!live_fact.deleted);
     }
 }

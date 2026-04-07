@@ -8,9 +8,21 @@
 //! and resume later without replaying the full conversation history.
 
 use std::collections::HashMap;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Journal event for session persistence.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "op")]
+enum SessionJournalEvent {
+    #[serde(rename = "store")]
+    Store { session: SessionState },
+    #[serde(rename = "delete")]
+    Delete { session_id: String },
+}
 
 /// Session state container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,15 +35,76 @@ pub struct SessionState {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
-/// In-memory session store.
+/// In-memory session store with optional JSONL persistence.
 #[derive(Debug, Default)]
 pub struct SessionStore {
     sessions: HashMap<String, SessionState>,
+    /// Path to the JSONL journal file. `None` for pure in-memory mode.
+    journal_path: Option<PathBuf>,
 }
 
 impl SessionStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a session store backed by a JSONL journal in `data_dir`.
+    ///
+    /// If `data_dir/sessions.jsonl` exists, it is replayed to rebuild in-memory
+    /// state. Subsequent `put()` and `delete()` calls append to the journal.
+    pub fn with_persistence(data_dir: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(data_dir)?;
+        let journal_path = data_dir.join("sessions.jsonl");
+        let mut store = Self {
+            sessions: HashMap::new(),
+            journal_path: Some(journal_path.clone()),
+        };
+        if journal_path.exists() {
+            store.replay_journal(&journal_path)?;
+        }
+        Ok(store)
+    }
+
+    /// Append a journal event to the JSONL file. Best-effort: logs a warning
+    /// on IO error but never panics or propagates the error.
+    fn append_journal(&self, event: &SessionJournalEvent) {
+        if let Some(path) = &self.journal_path {
+            let result = (|| -> std::io::Result<()> {
+                let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+                let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+                writeln!(file, "{}", line)?;
+                Ok(())
+            })();
+            if let Err(err) = result {
+                tracing::warn!(?err, path = %path.display(), "session-journal-append-failed");
+            }
+        }
+    }
+
+    /// Replay a JSONL journal file to rebuild in-memory state.
+    /// Corrupted or blank lines are skipped with a warning.
+    fn replay_journal(&mut self, path: &Path) -> std::io::Result<()> {
+        let file = std::fs::File::open(path)?;
+        let reader = std::io::BufReader::new(file);
+        for (line_no, line) in reader.lines().enumerate() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<SessionJournalEvent>(trimmed) {
+                Ok(SessionJournalEvent::Store { session }) => {
+                    self.sessions.insert(session.session_id.clone(), session);
+                }
+                Ok(SessionJournalEvent::Delete { session_id }) => {
+                    self.sessions.remove(&session_id);
+                }
+                Err(err) => {
+                    tracing::warn!(line_no = line_no + 1, ?err, "session-journal-parse-skip");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Create or update session state.
@@ -51,6 +124,11 @@ impl SessionStore {
         };
 
         self.sessions.insert(session_id.to_string(), session.clone());
+
+        self.append_journal(&SessionJournalEvent::Store {
+            session: session.clone(),
+        });
+
         session
     }
 
@@ -61,7 +139,13 @@ impl SessionStore {
 
     /// Delete a session.
     pub fn delete(&mut self, session_id: &str) -> bool {
-        self.sessions.remove(session_id).is_some()
+        let removed = self.sessions.remove(session_id).is_some();
+        if removed {
+            self.append_journal(&SessionJournalEvent::Delete {
+                session_id: session_id.to_string(),
+            });
+        }
+        removed
     }
 
     /// List all session IDs.
@@ -275,5 +359,81 @@ mod tests {
         let reaped = store.reap_expired();
         assert_eq!(reaped, 0);
         assert!(store.get("no_ttl").is_some());
+    }
+
+    // ── Persistence tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_persistence_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let mut store = SessionStore::with_persistence(dir.path()).unwrap();
+            store.put("s1", json!({"step": 1}), None);
+            store.put("s2", json!({"decisions": ["a", "b"]}), None);
+            store.put("s3", json!({"context": "building CE"}), Some(3600));
+            assert_eq!(store.count(), 3);
+        }
+
+        {
+            let store = SessionStore::with_persistence(dir.path()).unwrap();
+            assert_eq!(store.count(), 3);
+            assert_eq!(store.get("s1").unwrap().state, json!({"step": 1}));
+            assert_eq!(store.get("s2").unwrap().state, json!({"decisions": ["a", "b"]}));
+            assert_eq!(store.get("s3").unwrap().state, json!({"context": "building CE"}));
+            assert!(store.get("s3").unwrap().expires_at.is_some());
+        }
+    }
+
+    #[test]
+    fn test_persistence_delete_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let mut store = SessionStore::with_persistence(dir.path()).unwrap();
+            store.put("s1", json!({"x": 1}), None);
+            store.put("s2", json!({"y": 2}), None);
+            store.delete("s1");
+            assert_eq!(store.count(), 1);
+        }
+
+        {
+            let store = SessionStore::with_persistence(dir.path()).unwrap();
+            assert_eq!(store.count(), 1);
+            assert!(store.get("s1").is_none());
+            assert!(store.get("s2").is_some());
+        }
+    }
+
+    #[test]
+    fn test_persistence_update_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let mut store = SessionStore::with_persistence(dir.path()).unwrap();
+            store.put("s1", json!({"step": 1}), None);
+            store.put("s1", json!({"step": 2, "done": true}), None);
+            assert_eq!(store.count(), 1);
+        }
+
+        {
+            let store = SessionStore::with_persistence(dir.path()).unwrap();
+            assert_eq!(store.count(), 1);
+            let s = store.get("s1").unwrap();
+            assert_eq!(s.state["step"], 2);
+            assert_eq!(s.state["done"], true);
+        }
+    }
+
+    #[test]
+    fn test_in_memory_mode_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("sessions.jsonl");
+
+        let mut store = SessionStore::new();
+        store.put("s1", json!({}), None);
+        store.delete("nonexistent");
+
+        assert!(!journal_path.exists(), "in-memory mode should not create journal files");
     }
 }

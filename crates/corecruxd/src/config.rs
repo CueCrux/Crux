@@ -163,6 +163,15 @@ pub struct Config {
     // Phase 6 directory LSM compaction.
     pub enable_directory_compaction: bool,
     pub dir_l0_max_runs: usize,
+
+    // JSONL persistence for FactStore and SessionStore.
+    pub fact_persistence_enabled: bool,
+
+    // Background sync: pull/push facts to a remote CoreCrux instance.
+    pub sync_enabled: bool,
+    pub sync_remote_url: String,
+    pub sync_api_key: String,
+    pub sync_interval_secs: u64,
 }
 
 pub fn load_config() -> Config {
@@ -477,6 +486,22 @@ pub fn load_config() -> Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8),
+
+        fact_persistence_enabled: std::env::var("CORECRUXD_FACT_PERSISTENCE")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(true),
+
+        sync_enabled: std::env::var("CORECRUXD_SYNC_ENABLED")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
+        sync_remote_url: std::env::var("CORECRUXD_SYNC_REMOTE_URL").unwrap_or_default(),
+        sync_api_key: std::env::var("CORECRUXD_SYNC_API_KEY").unwrap_or_default(),
+        sync_interval_secs: std::env::var("CORECRUXD_SYNC_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300)
+            .max(10),
     }
 }
 

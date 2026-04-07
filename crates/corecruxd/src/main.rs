@@ -300,8 +300,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             Arc::new(RwLock::new(idx))
         },
-        fact_store: Arc::new(RwLock::new(corecrux_memory::FactStore::new())),
-        session_store: Arc::new(RwLock::new(corecrux_memory::SessionStore::new())),
+        fact_store: Arc::new(RwLock::new(if config.fact_persistence_enabled {
+            corecrux_memory::FactStore::with_persistence(&config.data_dir)?
+        } else {
+            corecrux_memory::FactStore::new()
+        })),
+        session_store: Arc::new(RwLock::new(if config.fact_persistence_enabled {
+            corecrux_memory::SessionStore::with_persistence(&config.data_dir)?
+        } else {
+            corecrux_memory::SessionStore::new()
+        })),
     };
 
     // Bootstrap: always seed agent-facing documentation on startup (idempotent).
@@ -316,8 +324,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    // Clone session_store handle before state is moved into the router.
+    // Clone handles before state is moved into the router.
     let session_store_handle = state.session_store.clone();
+    let sync_fact_store_handle = state.fact_store.clone();
 
     let app: Router = http::router(state).layer(TraceLayer::new_for_http());
 
@@ -342,6 +351,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         });
+    }
+
+    // Background sync — pulls then pushes facts on a configurable interval.
+    if config.sync_enabled && !config.sync_remote_url.is_empty() {
+        let sync_fact_store = sync_fact_store_handle;
+        let sync_remote_url = config.sync_remote_url.clone();
+        let sync_api_key = config.sync_api_key.clone();
+        let sync_data_dir = config.data_dir.clone();
+        let sync_interval = config.sync_interval_secs;
+        let mut rx = shutdown_tx.subscribe();
+
+        tokio::spawn(async move {
+            // Initial delay to let daemon fully start.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(sync_interval));
+            // Consume the first (immediate) tick so the loop starts after one interval.
+            interval.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let client = corecrux_memory::sync::SyncClient::new(
+                            &sync_remote_url,
+                            &sync_api_key,
+                            &sync_data_dir,
+                        );
+
+                        // Pull first.
+                        match client.pull(&mut *sync_fact_store.write().await) {
+                            Ok(result) => {
+                                if result.facts_pulled > 0 {
+                                    tracing::info!(pulled = result.facts_pulled, "sync: pulled facts from remote");
+                                }
+                            }
+                            Err(e) => tracing::warn!(error = %e, "sync: pull failed"),
+                        }
+
+                        // Then push.
+                        match client.push(&*sync_fact_store.read().await) {
+                            Ok(result) => {
+                                if result.facts_pushed > 0 {
+                                    tracing::info!(pushed = result.facts_pushed, "sync: pushed facts to remote");
+                                }
+                            }
+                            Err(e) => tracing::warn!(error = %e, "sync: push failed"),
+                        }
+                    }
+                    _ = rx.recv() => break,
+                }
+            }
+        });
+
+        info!(
+            remote = %config.sync_remote_url,
+            interval_secs = config.sync_interval_secs,
+            "sync: background sync enabled"
+        );
     }
 
     let http_addr = config.http_addr;

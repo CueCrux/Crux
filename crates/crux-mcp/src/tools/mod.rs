@@ -14,6 +14,7 @@ pub mod handoff;
 pub mod observe;
 pub mod query;
 pub mod sessions;
+pub mod sync;
 
 use serde_json::{json, Value};
 
@@ -28,7 +29,7 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
-/// Return the full tool catalogue (17 tools) advertised to MCP clients.
+/// Return the full tool catalogue (21 tools) advertised to MCP clients.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         // ── Retrieval ──────────────────────────────────────────────
@@ -347,6 +348,47 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 ]
             }),
         },
+        // ── Sync ──────────────────────────────────────────────────
+        ToolDefinition {
+            name: "sync_pull".to_string(),
+            description: "Pull latest facts from a remote CoreCrux instance. Resumes \
+                          from the last pull cursor. Requires CORECRUXD_SYNC_REMOTE_URL \
+                          and CORECRUXD_SYNC_API_KEY to be configured."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity_prefix": {
+                        "type": "string",
+                        "description": "Optional entity prefix filter (reserved for future use)"
+                    }
+                },
+                "examples": [{}]
+            }),
+        },
+        ToolDefinition {
+            name: "sync_push".to_string(),
+            description: "Push local facts to a remote CoreCrux instance. Only pushes \
+                          facts that were created locally (not previously synced). \
+                          Requires CORECRUXD_SYNC_REMOTE_URL and CORECRUXD_SYNC_API_KEY."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "examples": [{}]
+            }),
+        },
+        ToolDefinition {
+            name: "sync_status".to_string(),
+            description: "Show sync configuration and last sync state including pull/push \
+                          counts, timestamps, and local fact count."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "examples": [{}]
+            }),
+        },
     ]
 }
 
@@ -389,7 +431,10 @@ pub fn tool_output_docs() -> Value {
         { "tool": "get_agent_identity", "output": "{ agent_name: string }" },
         { "tool": "create_handoff",     "output": "{ handoff_id, content_hash, signature, facts_count, total_tokens }" },
         { "tool": "accept_handoff",     "output": "{ session_id, facts_imported, verified: bool }" },
-        { "tool": "record_decision",    "output": "{ decision_id, decision_hash, entity, action }" }
+        { "tool": "record_decision",    "output": "{ decision_id, decision_hash, entity, action }" },
+        { "tool": "sync_pull",          "output": "{ facts_pulled, cursor, total_pull_count }" },
+        { "tool": "sync_push",          "output": "{ facts_pushed, total_push_count }" },
+        { "tool": "sync_status",        "output": "{ configured, remote_url, last_pull_at, last_push_at, pull_count, push_count, local_fact_count }" }
     ])
 }
 
@@ -429,6 +474,9 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "create_handoff" => handoff::handle_create_handoff(args, ctx).await,
         "accept_handoff" => handoff::handle_accept_handoff(args, ctx).await,
         "record_decision" => decision::handle_record_decision(args, ctx).await,
+        "sync_pull" => sync::handle_sync_pull(args, ctx).await,
+        "sync_push" => sync::handle_sync_push(args, ctx).await,
+        "sync_status" => sync::handle_sync_status(args, ctx).await,
         _ => Err(JsonRpcError {
             code: crate::protocol::METHOD_NOT_FOUND,
             message: format!("unknown tool: {name}"),
@@ -443,7 +491,7 @@ mod tests {
     use crate::agent::AgentIdentity;
     use crate::dispatch::McpContext;
 
-    const TOOL_COUNT: usize = 18;
+    const TOOL_COUNT: usize = 21;
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
@@ -528,6 +576,10 @@ mod tests {
         assert!(names.contains(&"list_sessions".to_string()));
         assert!(names.contains(&"delete_session".to_string()));
         assert!(names.contains(&"get_agent_identity".to_string()));
+        // Sync tools (3)
+        assert!(names.contains(&"sync_pull".to_string()));
+        assert!(names.contains(&"sync_push".to_string()));
+        assert!(names.contains(&"sync_status".to_string()));
     }
 
     #[test]
@@ -647,5 +699,36 @@ mod tests {
         let result = call_tool("get_agent_identity", &json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert_eq!(text, "anonymous");
+    }
+
+    // ── sync dispatch integration tests ────────────────────────────
+
+    #[tokio::test]
+    async fn call_tool_sync_pull_not_configured() {
+        std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
+        std::env::remove_var("CORECRUXD_SYNC_API_KEY");
+        let ctx = test_ctx();
+        let result = call_tool("sync_pull", &json!({}), &ctx).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("sync not configured"));
+    }
+
+    #[tokio::test]
+    async fn call_tool_sync_push_not_configured() {
+        std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
+        std::env::remove_var("CORECRUXD_SYNC_API_KEY");
+        let ctx = test_ctx();
+        let result = call_tool("sync_push", &json!({}), &ctx).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("sync not configured"));
+    }
+
+    #[tokio::test]
+    async fn call_tool_sync_status() {
+        std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
+        let ctx = test_ctx();
+        let result = call_tool("sync_status", &json!({}), &ctx).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"configured\": false"));
     }
 }

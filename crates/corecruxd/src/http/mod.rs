@@ -245,6 +245,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/facts/{factId}", get(self::facts::get_fact))
         .route("/v1/facts/{factId}", axum::routing::delete(self::facts::delete_fact))
         .route("/v1/facts/entity/{entity}", get(self::facts::get_facts_by_entity))
+        .route("/v1/facts/export", get(self::facts::export_facts))
         .route("/v1/sessions/{sessionId}/state", axum::routing::put(self::facts::put_session_state))
         .route("/v1/sessions/{sessionId}/state", get(self::facts::get_session_state))
         // Self-observation (crux-observe)
