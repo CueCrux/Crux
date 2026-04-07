@@ -95,6 +95,7 @@ mod tests {
                 value: "no results for terraform drift detection".to_string(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
             // A non-ops fact should not appear.
             store.store(StoreFact {
@@ -103,6 +104,7 @@ mod tests {
                 value: "CueCrux".to_string(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
 
@@ -124,6 +126,7 @@ mod tests {
                 value: "terraform drift missing".to_string(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
             store.store(StoreFact {
                 entity: "__ops__::coverage::retrieval".to_string(),
@@ -131,6 +134,7 @@ mod tests {
                 value: "kubernetes scheduling unindexed".to_string(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
 

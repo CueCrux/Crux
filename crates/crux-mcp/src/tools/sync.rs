@@ -73,11 +73,35 @@ pub async fn handle_sync_pull(_args: &Value, ctx: &McpContext) -> Result<Value, 
 }
 
 /// `sync_push` — push local facts to the remote CoreCrux instance.
-pub async fn handle_sync_push(_args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+///
+/// Without `confirm: true`, returns a preview of what would be pushed
+/// (entities, count, skipped private count). With `confirm: true`, actually
+/// pushes the facts.
+pub async fn handle_sync_push(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let client = match build_sync_client() {
         Ok(c) => c,
         Err(msg) => return Ok(sync_error_content(&msg)),
     };
+
+    let confirm = args.get("confirm").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if !confirm {
+        // Preview mode — show what would be pushed without actually pushing.
+        let store = ctx.fact_store.read().await;
+        let preview = client.push_preview(&*store);
+        let text = serde_json::to_string_pretty(&json!({
+            "mode": "preview",
+            "would_push": preview.pushable_count,
+            "skipped_private": preview.private_count,
+            "skipped_synced": preview.synced_count,
+            "entities": preview.entity_summary,
+            "note": "Call sync_push with confirm=true to actually push these facts."
+        }))
+        .unwrap_or_default();
+        return Ok(json!({
+            "content": [{ "type": "text", "text": text }]
+        }));
+    }
 
     let store = ctx.fact_store.read().await;
     match client.push(&*store) {
@@ -189,6 +213,7 @@ mod tests {
                 value: "v".to_string(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
 

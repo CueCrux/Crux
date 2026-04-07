@@ -520,6 +520,7 @@ pub(super) async fn post_query_text_search(
                 value: json,
                 source_receipt: None,
                 confidence: score,
+                private: false,
             });
         });
     }

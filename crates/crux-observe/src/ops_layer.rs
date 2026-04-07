@@ -163,6 +163,7 @@ where
                 value,
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
 
             // Ring buffer eviction.
@@ -283,6 +284,7 @@ mod tests {
                 value: format!("error {i}"),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
             all_ids.push(fact.fact_id.clone());
 

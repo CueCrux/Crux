@@ -59,6 +59,7 @@ pub async fn handle_record_decision(args: &Value, ctx: &McpContext) -> Result<Va
         value: canonical,
         source_receipt: None,
         confidence,
+        private: false,
     };
 
     let mut store = ctx.fact_store.write().await;

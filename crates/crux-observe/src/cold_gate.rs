@@ -90,6 +90,7 @@ mod tests {
                 value: "Segment file read failed on shard 3".to_string(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
 

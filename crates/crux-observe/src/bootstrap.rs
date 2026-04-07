@@ -126,6 +126,7 @@ impl BootstrapSeeder {
                 value: doc.content.clone(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
 
@@ -136,6 +137,7 @@ impl BootstrapSeeder {
                 value: pat.content.clone(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
 
@@ -146,6 +148,7 @@ impl BootstrapSeeder {
                 value: res.content.clone(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
 
@@ -156,6 +159,7 @@ impl BootstrapSeeder {
                 value: to.output.clone(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
 
@@ -171,6 +175,7 @@ impl BootstrapSeeder {
             value: Utc::now().to_rfc3339(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
 
         info!(facts_created = count, "bootstrap seed complete");

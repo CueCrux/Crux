@@ -43,6 +43,9 @@ pub struct Fact {
     /// The fact_id this fact supersedes (previous version of the same entity+key).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<String>,
+    /// Private facts are never pushed to a remote during sync.
+    #[serde(default)]
+    pub private: bool,
 }
 
 fn default_version() -> u32 {
@@ -58,6 +61,9 @@ pub struct StoreFact {
     pub source_receipt: Option<String>,
     #[serde(default = "default_confidence")]
     pub confidence: f32,
+    /// If true, this fact will never be pushed to a remote during sync.
+    #[serde(default)]
+    pub private: bool,
 }
 
 fn default_confidence() -> f32 {
@@ -208,6 +214,7 @@ impl FactStore {
             deleted: false,
             version,
             supersedes,
+            private: req.private,
         };
 
         self.entity_index.entry(req.entity).or_default().push(fact_id.clone());
@@ -361,8 +368,8 @@ impl FactStore {
     /// items are skipped until the fact with `fact_id == cursor` is found, then
     /// the export starts from the next item. Returns at most `limit` facts.
     pub fn export(&self, since: Option<DateTime<Utc>>, cursor: Option<&str>, limit: usize) -> FactExportResult {
-        // 1. Collect ALL facts (including deleted).
-        let mut all: Vec<&Fact> = self.facts.values().collect();
+        // 1. Collect all facts EXCEPT private ones (private facts never leave this node).
+        let mut all: Vec<&Fact> = self.facts.values().filter(|f| !f.private).collect();
 
         // 2. Sort by (stored_at, fact_id) ascending.
         all.sort_by(|a, b| a.stored_at.cmp(&b.stored_at).then_with(|| a.fact_id.cmp(&b.fact_id)));
@@ -467,6 +474,7 @@ mod tests {
             value: "canary deployment with evaluator programme".to_string(),
             source_receipt: Some("crx_123".to_string()),
             confidence: 0.95,
+            private: false,
         });
 
         assert!(fact.fact_id.starts_with("f_"));
@@ -487,6 +495,7 @@ mod tests {
             value: "canary deployment".to_string(),
             source_receipt: None,
             confidence: 0.9,
+            private: false,
         });
         store.store(StoreFact {
             entity: "testing".to_string(),
@@ -494,6 +503,7 @@ mod tests {
             value: "integration tests with real database".to_string(),
             source_receipt: None,
             confidence: 0.8,
+            private: false,
         });
 
         let result = store.query(&FactQuery {
@@ -518,6 +528,7 @@ mod tests {
             value: "value".to_string(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
 
         assert_eq!(store.count(), 1);
@@ -538,6 +549,7 @@ mod tests {
                 value: format!("this is a value with about forty bytes here-{:02}", i),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
 
@@ -569,6 +581,7 @@ mod tests {
             value: "alpha".to_string(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
         store.store(StoreFact {
             entity: "proj".to_string(),
@@ -576,6 +589,7 @@ mod tests {
             value: "active".to_string(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
 
         store.delete(&f1.fact_id);
@@ -595,6 +609,7 @@ mod tests {
                 value: "v1".to_string(),
                 source_receipt: None,
                 confidence: 0.5,
+                private: false,
             },
             StoreFact {
                 entity: "b".to_string(),
@@ -602,6 +617,7 @@ mod tests {
                 value: "v2".to_string(),
                 source_receipt: Some("rcpt".to_string()),
                 confidence: 0.9,
+                private: false,
             },
         ];
 
@@ -622,6 +638,7 @@ mod tests {
             value: "shared keyword here".to_string(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
         store.store(StoreFact {
             entity: "beta".to_string(),
@@ -629,6 +646,7 @@ mod tests {
             value: "shared keyword here".to_string(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
 
         let result = store.query(&FactQuery {
@@ -654,6 +672,7 @@ mod tests {
                 value: format!("val{}", i),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
 
@@ -706,6 +725,7 @@ mod tests {
             value: "unrelated text".to_string(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
 
         // Query matching key name
@@ -739,6 +759,7 @@ mod tests {
             value: "some value".to_string(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
 
         let result = store.query(&FactQuery {
@@ -761,6 +782,7 @@ mod tests {
             value: "match low".to_string(),
             source_receipt: None,
             confidence: 0.5,
+            private: false,
         });
         store.store(StoreFact {
             entity: "e".to_string(),
@@ -768,6 +790,7 @@ mod tests {
             value: "match high".to_string(),
             source_receipt: None,
             confidence: 0.9,
+            private: false,
         });
 
         let result = store.query(&FactQuery {
@@ -793,6 +816,7 @@ mod tests {
                 value: format!("shared term {}", i),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
 
@@ -818,6 +842,7 @@ mod tests {
             value: "a".repeat(100), // 25 tokens
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
 
         // Token budget smaller than the single fact — should still include it
@@ -858,6 +883,7 @@ mod tests {
             value: "v".to_string(),
             source_receipt: Some("r".to_string()),
             confidence: 0.75,
+            private: false,
         });
 
         let json = serde_json::to_string(&fact).unwrap();
@@ -891,6 +917,7 @@ mod tests {
                 value: "alpha".into(),
                 source_receipt: None,
                 confidence: 0.9,
+                private: false,
             });
             let f2 = store.store(StoreFact {
                 entity: "proj".into(),
@@ -898,6 +925,7 @@ mod tests {
                 value: "active".into(),
                 source_receipt: Some("r1".into()),
                 confidence: 1.0,
+                private: false,
             });
             let f3 = store.store(StoreFact {
                 entity: "other".into(),
@@ -905,6 +933,7 @@ mod tests {
                 value: "details".into(),
                 source_receipt: None,
                 confidence: 0.5,
+                private: false,
             });
             ids = vec![f1.fact_id, f2.fact_id, f3.fact_id];
             assert_eq!(store.count(), 3);
@@ -937,6 +966,7 @@ mod tests {
                 value: "v".into(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
             fact_id = fact.fact_id;
             store.delete(&fact_id);
@@ -965,6 +995,7 @@ mod tests {
                 value: "draft".into(),
                 source_receipt: None,
                 confidence: 0.8,
+                private: false,
             });
             let v2 = store.store(StoreFact {
                 entity: "proj".into(),
@@ -972,6 +1003,7 @@ mod tests {
                 value: "active".into(),
                 source_receipt: None,
                 confidence: 0.9,
+                private: false,
             });
             assert_eq!(v1.version, 1);
             assert_eq!(v2.version, 2);
@@ -1002,6 +1034,7 @@ mod tests {
             value: "v".into(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
         store.delete("nonexistent");
 
@@ -1020,6 +1053,7 @@ mod tests {
                 value: format!("v{i}"),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
 
@@ -1044,6 +1078,7 @@ mod tests {
                 value: format!("v{i}"),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
 
@@ -1088,6 +1123,7 @@ mod tests {
             value: "v0".into(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
         store.store(StoreFact {
             entity: "e1".into(),
@@ -1095,6 +1131,7 @@ mod tests {
             value: "v1".into(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
 
         // All facts stored with Utc::now() so they share the same timestamp
@@ -1118,6 +1155,7 @@ mod tests {
                 value: format!("v{i}"),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
 
@@ -1138,6 +1176,7 @@ mod tests {
             value: "v1".into(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
         store.store(StoreFact {
             entity: "e".into(),
@@ -1145,6 +1184,7 @@ mod tests {
             value: "v2".into(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
 
         store.delete(&f1.fact_id);
