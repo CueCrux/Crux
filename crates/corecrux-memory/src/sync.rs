@@ -13,12 +13,33 @@ use serde::{Deserialize, Serialize};
 
 use crate::fact_store::{Fact, FactStore};
 
+/// Default entity prefixes that are never pushed to remote. Users can add
+/// more via `CORECRUXD_SYNC_PRIVATE_PREFIXES`.
+const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
+    "finance:",
+    "health:",
+    "medical:",
+    "personal:",
+    "private:",
+    "salary:",
+    "tax:",
+    "password:",
+    "credential:",
+    "secret:",
+    "ssn:",
+    "bank:",
+    "__ops__::",
+    "__bootstrap__::",
+];
+
 /// Client that synchronises facts between a local FactStore and a remote
 /// CoreCrux HTTP API.
 pub struct SyncClient {
     remote_url: String,
     api_key: String,
     cursor_path: PathBuf,
+    /// Entity prefixes that are never pushed to the remote.
+    private_prefixes: Vec<String>,
 }
 
 /// Persisted cursor tracking pull/push progress.
@@ -44,6 +65,19 @@ pub struct SyncPushResult {
     pub facts_pushed: usize,
 }
 
+/// Preview of what a push would send — no data leaves the machine.
+#[derive(Debug)]
+pub struct SyncPushPreview {
+    /// Number of facts that would be pushed.
+    pub pushable_count: usize,
+    /// Number of facts skipped because they are private (flag or prefix).
+    pub private_count: usize,
+    /// Number of facts skipped because they came from sync (not locally created).
+    pub synced_count: usize,
+    /// Summary of entities that would be pushed (entity name → count).
+    pub entity_summary: Vec<(String, usize)>,
+}
+
 impl SyncClient {
     /// Create a new sync client.
     ///
@@ -51,11 +85,35 @@ impl SyncClient {
     /// * `api_key` — bearer token for authentication
     /// * `data_dir` — directory where `sync-cursor.json` is persisted
     pub fn new(remote_url: &str, api_key: &str, data_dir: &std::path::Path) -> Self {
+        // Merge default private prefixes with user-configured ones.
+        let mut prefixes: Vec<String> = DEFAULT_PRIVATE_PREFIXES.iter().map(|s| (*s).to_string()).collect();
+        if let Ok(extra) = std::env::var("CORECRUXD_SYNC_PRIVATE_PREFIXES") {
+            for p in extra.split(',') {
+                let p = p.trim();
+                if !p.is_empty() {
+                    prefixes.push(p.to_string());
+                }
+            }
+        }
         Self {
             remote_url: remote_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             cursor_path: data_dir.join("sync-cursor.json"),
+            private_prefixes: prefixes,
         }
+    }
+
+    /// Check whether a fact should be excluded from sync push.
+    fn is_private(&self, fact: &Fact) -> bool {
+        // Explicit private flag
+        if fact.private {
+            return true;
+        }
+        // Entity prefix blocklist
+        let entity_lower = fact.entity.to_lowercase();
+        self.private_prefixes
+            .iter()
+            .any(|prefix| entity_lower.starts_with(&prefix.to_lowercase()))
     }
 
     // ── Cursor persistence ───────────────────────────────────────────
@@ -152,6 +210,50 @@ impl SyncClient {
 
     // ── Push ─────────────────────────────────────────────────────────
 
+    /// Preview what a push would send. No data leaves the machine.
+    pub fn push_preview(&self, store: &FactStore) -> SyncPushPreview {
+        let cursor = self.load_cursor();
+        let since = cursor
+            .last_push_at
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+
+        let mut pushable_count = 0usize;
+        let mut private_count = 0usize;
+        let mut synced_count = 0usize;
+        let mut entity_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+        for fact in store.all_facts() {
+            if fact.deleted {
+                continue;
+            }
+            if since.is_some_and(|s| fact.stored_at <= s) {
+                continue;
+            }
+            if fact.source_receipt.as_deref().is_some_and(|r| r.starts_with("sync:")) {
+                synced_count += 1;
+                continue;
+            }
+            if self.is_private(fact) {
+                private_count += 1;
+                continue;
+            }
+            pushable_count += 1;
+            *entity_counts.entry(fact.entity.clone()).or_default() += 1;
+        }
+
+        let mut entity_summary: Vec<(String, usize)> = entity_counts.into_iter().collect();
+        entity_summary.sort_by(|a, b| b.1.cmp(&a.1));
+
+        SyncPushPreview {
+            pushable_count,
+            private_count,
+            synced_count,
+            entity_summary,
+        }
+    }
+
     /// Push local-only facts to the remote `/v1/facts/bulk` endpoint.
     ///
     /// Only non-deleted facts that were NOT received via sync (i.e. whose
@@ -164,10 +266,11 @@ impl SyncClient {
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
 
-        // Get local-only facts (source_receipt doesn't start with "sync:")
+        // Get local-only, non-private facts (source_receipt doesn't start with "sync:")
         let local_facts: Vec<&Fact> = store
             .all_facts()
             .filter(|f| !f.deleted)
+            .filter(|f| !self.is_private(f))
             .filter(|f| f.source_receipt.as_deref().map_or(true, |r| !r.starts_with("sync:")))
             .filter(|f| since.map_or(true, |s| f.stored_at > s))
             .collect();
@@ -265,6 +368,7 @@ mod tests {
             deleted: false,
             version: 3,
             supersedes: Some("f_remote_prev".to_string()),
+            private: false,
         };
 
         store.store_synced(fact);
@@ -300,6 +404,7 @@ mod tests {
                 deleted: false,
                 version: 1,
                 supersedes: None,
+                private: false,
             };
             store.store_synced(fact);
             assert_eq!(store.count(), 1);
@@ -348,6 +453,7 @@ mod tests {
             value: "v".to_string(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         });
 
         // Store a synced fact (should be excluded from push)
@@ -363,6 +469,7 @@ mod tests {
             deleted: false,
             version: 1,
             supersedes: None,
+            private: false,
         };
         store.store_synced(synced);
 

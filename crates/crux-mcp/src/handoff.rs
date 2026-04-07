@@ -209,6 +209,7 @@ pub fn accept_handoff(
             value: fact.value,
             source_receipt: fact.source_receipt,
             confidence: fact.confidence,
+            private: false,
         });
     }
 
@@ -243,6 +244,7 @@ mod tests {
             value: "canary with evaluator".to_string(),
             source_receipt: Some("rcpt_001".to_string()),
             confidence: 0.95,
+            private: false,
         });
         facts.store(StoreFact {
             entity: "testing".to_string(),
@@ -250,6 +252,7 @@ mod tests {
             value: "integration tests".to_string(),
             source_receipt: None,
             confidence: 0.8,
+            private: false,
         });
 
         (sessions, facts)

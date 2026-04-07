@@ -963,6 +963,7 @@ mod tests {
             value: "database primary".to_string(),
             source_receipt: Some("crx_abc".to_string()),
             confidence: 0.95,
+            private: false,
         };
 
         let resp = facts::put_fact(State(state), HeaderMap::new(), Json(body))
@@ -989,6 +990,7 @@ mod tests {
             value: "canary".to_string(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         };
 
         let create_resp = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
@@ -1028,6 +1030,7 @@ mod tests {
             value: "v".to_string(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         };
 
         let create_resp = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
@@ -1076,6 +1079,7 @@ mod tests {
                 value: value.to_string(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             };
             let _ = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
                 .await
@@ -1115,6 +1119,7 @@ mod tests {
                 value: "v1".to_string(),
                 source_receipt: None,
                 confidence: 0.8,
+                private: false,
             },
             corecrux_memory::fact_store::StoreFact {
                 entity: "b".to_string(),
@@ -1122,6 +1127,7 @@ mod tests {
                 value: "v2".to_string(),
                 source_receipt: Some("rcpt".to_string()),
                 confidence: 0.9,
+                private: false,
             },
         ];
 
@@ -1155,6 +1161,7 @@ mod tests {
                 value: value.to_string(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             };
             let _ = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
                 .await
@@ -1185,6 +1192,7 @@ mod tests {
                 value: format!("val{}", i),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             };
             let _ = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
                 .await
@@ -1584,6 +1592,7 @@ mod tests {
             value: "v".to_string(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         };
         let resp = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
             .await
@@ -1597,6 +1606,7 @@ mod tests {
             value: "v".to_string(),
             source_receipt: None,
             confidence: 1.0,
+            private: false,
         };
         let resp2 = put_fact(State(state.clone()), dev_scope_headers("query:read"), Json(body2))
             .await
@@ -4272,6 +4282,7 @@ mod tests {
                 value: "something went wrong".to_string(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
         let headers = dev_scope_headers("admin:read");
@@ -4298,6 +4309,7 @@ mod tests {
                 value: "degraded".to_string(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
             store.store(corecrux_memory::fact_store::StoreFact {
                 entity: "__ops__::health:shard_store".to_string(),
@@ -4305,6 +4317,7 @@ mod tests {
                 value: "healthy".to_string(),
                 source_receipt: None,
                 confidence: 1.0,
+                private: false,
             });
         }
         let headers = dev_scope_headers("admin:read");

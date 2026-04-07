@@ -370,12 +370,16 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             name: "sync_push".to_string(),
             description: "Push local facts to a remote CoreCrux instance. Only pushes \
                           facts that were created locally (not previously synced). \
+                          Private facts and sensitive entity prefixes are never pushed. \
+                          Call without confirm=true to preview what would be pushed. \
                           Requires CORECRUXD_SYNC_REMOTE_URL and CORECRUXD_SYNC_API_KEY."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {},
-                "examples": [{}]
+                "properties": {
+                    "confirm": { "type": "boolean", "description": "Set to true to actually push. Without this, returns a preview of facts that would be pushed.", "default": false }
+                },
+                "examples": [{}, { "confirm": true }]
             }),
         },
         ToolDefinition {
