@@ -79,8 +79,7 @@ impl SyncClient {
     pub fn save_cursor(&self, cursor: &SyncCursor) {
         let result = (|| -> std::io::Result<()> {
             let tmp = self.cursor_path.with_extension("json.tmp");
-            let data = serde_json::to_string_pretty(cursor)
-                .map_err(std::io::Error::other)?;
+            let data = serde_json::to_string_pretty(cursor).map_err(std::io::Error::other)?;
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(data.as_bytes())?;
             f.sync_all()?;
@@ -118,17 +117,14 @@ impl SyncClient {
                 .call()
                 .map_err(|e| format!("sync pull failed: {e}"))?;
 
-            let body: serde_json::Value = resp
-                .into_json()
-                .map_err(|e| format!("sync pull parse error: {e}"))?;
+            let body: serde_json::Value = resp.into_json().map_err(|e| format!("sync pull parse error: {e}"))?;
 
-            let facts: Vec<Fact> = serde_json::from_value(body["facts"].clone())
-                .map_err(|e| format!("sync facts parse: {e}"))?;
+            let facts: Vec<Fact> =
+                serde_json::from_value(body["facts"].clone()).map_err(|e| format!("sync facts parse: {e}"))?;
 
             for mut fact in facts {
                 // Tag as synced so we don't push it back
-                fact.source_receipt =
-                    Some(format!("sync:{}:{}", self.remote_url, fact.fact_id));
+                fact.source_receipt = Some(format!("sync:{}:{}", self.remote_url, fact.fact_id));
                 store.store_synced(fact);
                 total_pulled += 1;
             }
@@ -172,11 +168,7 @@ impl SyncClient {
         let local_facts: Vec<&Fact> = store
             .all_facts()
             .filter(|f| !f.deleted)
-            .filter(|f| {
-                f.source_receipt
-                    .as_deref()
-                    .map_or(true, |r| !r.starts_with("sync:"))
-            })
+            .filter(|f| f.source_receipt.as_deref().map_or(true, |r| !r.starts_with("sync:")))
             .filter(|f| since.map_or(true, |s| f.stored_at > s))
             .collect();
 
@@ -214,9 +206,7 @@ impl SyncClient {
         cursor.push_count += pushed as u64;
         self.save_cursor(&cursor);
 
-        Ok(SyncPushResult {
-            facts_pushed: pushed,
-        })
+        Ok(SyncPushResult { facts_pushed: pushed })
     }
 }
 
@@ -382,11 +372,7 @@ mod tests {
         let local_only: Vec<_> = store
             .all_facts()
             .filter(|f| !f.deleted)
-            .filter(|f| {
-                f.source_receipt
-                    .as_deref()
-                    .map_or(true, |r| !r.starts_with("sync:"))
-            })
+            .filter(|f| f.source_receipt.as_deref().map_or(true, |r| !r.starts_with("sync:")))
             .collect();
         assert_eq!(local_only.len(), 1);
         assert_eq!(local_only[0].entity, "local");

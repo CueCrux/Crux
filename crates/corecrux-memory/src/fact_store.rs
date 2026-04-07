@@ -121,12 +121,8 @@ impl FactStore {
     fn append_journal(&self, event: &JournalEvent) {
         if let Some(path) = &self.journal_path {
             let result = (|| -> std::io::Result<()> {
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)?;
-                let line = serde_json::to_string(event)
-                    .map_err(std::io::Error::other)?;
+                let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+                let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
                 writeln!(file, "{}", line)?;
                 Ok(())
             })();
@@ -170,7 +166,10 @@ impl FactStore {
         let fact_id = fact.fact_id.clone();
         let entity = fact.entity.clone();
         let key = fact.key.clone();
-        self.entity_index.entry(entity.clone()).or_default().push(fact_id.clone());
+        self.entity_index
+            .entry(entity.clone())
+            .or_default()
+            .push(fact_id.clone());
         self.key_index.entry((entity, key)).or_default().push(fact_id.clone());
         self.facts.insert(fact_id, fact);
     }
@@ -361,21 +360,12 @@ impl FactStore {
     /// only facts with `stored_at >= since` are included. If `cursor` is set,
     /// items are skipped until the fact with `fact_id == cursor` is found, then
     /// the export starts from the next item. Returns at most `limit` facts.
-    pub fn export(
-        &self,
-        since: Option<DateTime<Utc>>,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> FactExportResult {
+    pub fn export(&self, since: Option<DateTime<Utc>>, cursor: Option<&str>, limit: usize) -> FactExportResult {
         // 1. Collect ALL facts (including deleted).
         let mut all: Vec<&Fact> = self.facts.values().collect();
 
         // 2. Sort by (stored_at, fact_id) ascending.
-        all.sort_by(|a, b| {
-            a.stored_at
-                .cmp(&b.stored_at)
-                .then_with(|| a.fact_id.cmp(&b.fact_id))
-        });
+        all.sort_by(|a, b| a.stored_at.cmp(&b.stored_at).then_with(|| a.fact_id.cmp(&b.fact_id)));
 
         // 3. Filter by `since` if set.
         if let Some(since_dt) = since {
@@ -422,10 +412,7 @@ impl FactStore {
             .entry(entity.clone())
             .or_default()
             .push(fact_id.clone());
-        self.key_index
-            .entry((entity, key))
-            .or_default()
-            .push(fact_id.clone());
+        self.key_index.entry((entity, key)).or_default().push(fact_id.clone());
         self.facts.insert(fact_id, fact.clone());
 
         self.append_journal(&JournalEvent::Store { fact });

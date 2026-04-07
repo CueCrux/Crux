@@ -495,10 +495,8 @@ pub fn load_config() -> Config {
         sync_enabled: std::env::var("CORECRUXD_SYNC_ENABLED")
             .ok()
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
-        sync_remote_url: std::env::var("CORECRUXD_SYNC_REMOTE_URL")
-            .unwrap_or_default(),
-        sync_api_key: std::env::var("CORECRUXD_SYNC_API_KEY")
-            .unwrap_or_default(),
+        sync_remote_url: std::env::var("CORECRUXD_SYNC_REMOTE_URL").unwrap_or_default(),
+        sync_api_key: std::env::var("CORECRUXD_SYNC_API_KEY").unwrap_or_default(),
         sync_interval_secs: std::env::var("CORECRUXD_SYNC_INTERVAL_SECS")
             .ok()
             .and_then(|s| s.parse().ok())

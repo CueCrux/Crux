@@ -29,9 +29,8 @@ fn build_sync_client() -> Result<SyncClient, String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "sync not configured: CORECRUXD_SYNC_API_KEY is not set".to_string())?;
 
-    let data_dir = PathBuf::from(
-        std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string()),
-    );
+    let data_dir =
+        PathBuf::from(std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string()));
 
     Ok(SyncClient::new(&remote_url, &api_key, &data_dir))
 }
@@ -104,16 +103,11 @@ pub async fn handle_sync_status(_args: &Value, ctx: &McpContext) -> Result<Value
         .filter(|s| !s.is_empty());
     let configured = remote_url.is_some();
 
-    let data_dir = PathBuf::from(
-        std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string()),
-    );
+    let data_dir =
+        PathBuf::from(std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string()));
 
     let cursor = if configured {
-        let client = SyncClient::new(
-            remote_url.as_deref().unwrap_or(""),
-            "",
-            &data_dir,
-        );
+        let client = SyncClient::new(remote_url.as_deref().unwrap_or(""), "", &data_dir);
         client.load_cursor()
     } else {
         corecrux_memory::sync::SyncCursor::default()

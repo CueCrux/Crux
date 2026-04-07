@@ -70,12 +70,8 @@ impl SessionStore {
     fn append_journal(&self, event: &SessionJournalEvent) {
         if let Some(path) = &self.journal_path {
             let result = (|| -> std::io::Result<()> {
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)?;
-                let line = serde_json::to_string(event)
-                    .map_err(std::io::Error::other)?;
+                let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+                let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
                 writeln!(file, "{}", line)?;
                 Ok(())
             })();
@@ -129,7 +125,9 @@ impl SessionStore {
 
         self.sessions.insert(session_id.to_string(), session.clone());
 
-        self.append_journal(&SessionJournalEvent::Store { session: session.clone() });
+        self.append_journal(&SessionJournalEvent::Store {
+            session: session.clone(),
+        });
 
         session
     }
