@@ -14,11 +14,10 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # ── Lint: two runners, gate passes if EITHER succeeds ────────────────
-  lint-selfhosted:
-    name: Lint (self-hosted)
+  # ── Lint ─────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
     runs-on: [self-hosted, ci]
-    continue-on-error: true
     env:
       CARGO_HOME: /home/gha-runner/.cargo
     steps:
@@ -27,42 +26,6 @@ jobs:
       - run: cargo fmt --check
       - run: typos
       - run: cargo clippy --workspace
-
-  lint-github:
-    name: Lint (github)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "25.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo install typos-cli
-      - run: cargo fmt --check
-      - run: typos
-      - run: cargo clippy --workspace
-
-  lint-gate:
-    name: Lint
-    needs: [lint-selfhosted, lint-github]
-    runs-on: [self-hosted, ci]
-    if: always()
-    steps:
-      - name: Require at least one lint pass
-        run: |
-          echo "self-hosted: ${{ needs.lint-selfhosted.result }}"
-          echo "github: ${{ needs.lint-github.result }}"
-          if [[ "${{ needs.lint-selfhosted.result }}" == "success" ]] || \
-             [[ "${{ needs.lint-github.result }}" == "success" ]]; then
-            echo "Lint passed on at least one runner"
-          else
-            echo "::error::Lint failed on BOTH runners"
-            exit 1
-          fi
 
   # ── Test, MSRV, Coverage: self-hosted ────────────────────────────────
   test:
