@@ -90,6 +90,7 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
         routing: Arc::new(RwLock::new(test_routing())),
         routing_errors: Arc::new(RwLock::new(Vec::new())),
         dataplane_pool: None,
+        http_dataplane: pool_backed_http_dataplane(None),
         readiness: Arc::new(RwLock::new(Readiness::default())),
         control: Arc::new(RwLock::new(control::ControlV1::default())),
         control_path,
@@ -138,6 +139,214 @@ async fn json_body(resp: Response) -> serde_json::Value {
 async fn mark_ready_except_control(state: &AppState) {
     // No GPU fields to set; Readiness::default() is already ready for CPU-only.
     let _ = state.readiness.read().await;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FakeAppendCall {
+    tenant_id: String,
+    stream_type: String,
+    stream_id: String,
+    expected_next_seq: u64,
+    event_ids: Vec<String>,
+}
+
+#[derive(Default)]
+struct FakeHttpDataplane {
+    enabled: bool,
+    append_calls: std::sync::Mutex<Vec<FakeAppendCall>>,
+    read_stream_events: Vec<corecrux_storage::StoredEvent>,
+    verification_report: Option<corecrux_receipts::VerificationReportV1>,
+    graph_expand_response: Option<corecrux_projections::query::graph_expand::GraphExpandResponse>,
+    projection_meta: Option<corecrux_projections::ProjectionsMetaV1>,
+}
+
+#[tonic::async_trait]
+impl HttpDataplane for FakeHttpDataplane {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    async fn append_batch(
+        &self,
+        tenant_id: &str,
+        stream_type: &str,
+        stream_id: &str,
+        expected_next_seq: u64,
+        events: &[AppendEvent],
+    ) -> Result<(), HttpDataplaneError> {
+        self.append_calls.lock().unwrap().push(FakeAppendCall {
+            tenant_id: tenant_id.to_string(),
+            stream_type: stream_type.to_string(),
+            stream_id: stream_id.to_string(),
+            expected_next_seq,
+            event_ids: events.iter().map(|event| event.event_id.clone()).collect(),
+        });
+        Ok(())
+    }
+
+    async fn read_stream(
+        &self,
+        _tenant_id: &str,
+        _stream_type: &str,
+        _stream_id: &str,
+        _from_seq: u64,
+        _max_events: u32,
+    ) -> Result<Vec<corecrux_storage::StoredEvent>, HttpDataplaneError> {
+        Ok(self.read_stream_events.clone())
+    }
+
+    async fn read_tail(
+        &self,
+        _tenant_id: &str,
+        _stream_type: &str,
+        _stream_id: &str,
+        _count: u32,
+    ) -> Result<Vec<corecrux_storage::StoredEvent>, HttpDataplaneError> {
+        Ok(Vec::new())
+    }
+
+    async fn verify_receipt_stream(
+        &self,
+        _tenant_id: &str,
+        _receipt_id: &str,
+        _shard_id_hint: Option<u32>,
+    ) -> Result<Option<corecrux_receipts::VerificationReportV1>, HttpDataplaneError> {
+        Ok(self.verification_report.clone())
+    }
+
+    async fn graph_expand(
+        &self,
+        _tenant_id: &str,
+        _seed_artifact_ids: &[u32],
+        _edge_types: &[String],
+        _max_hops: u32,
+        _budget: usize,
+        _min_confidence: f32,
+        _include_state: bool,
+    ) -> Result<corecrux_projections::query::graph_expand::GraphExpandResponse, HttpDataplaneError> {
+        Ok(self.graph_expand_response.clone().unwrap_or(
+            corecrux_projections::query::graph_expand::GraphExpandResponse {
+                artifacts: Vec::new(),
+                stats: Default::default(),
+            },
+        ))
+    }
+
+    async fn time_range(
+        &self,
+        _tenant_id: &str,
+        _start_micros: i64,
+        _end_micros: i64,
+        _artifact_ids: &[u32],
+        _include_relations: bool,
+        _limit: usize,
+    ) -> Result<corecrux_projections::query::time_range::TimeRangeResponse, HttpDataplaneError> {
+        Ok(corecrux_projections::query::time_range::TimeRangeResponse {
+            artifacts: Vec::new(),
+            stats: Default::default(),
+        })
+    }
+
+    async fn projection_meta(
+        &self,
+        _shard_id: &str,
+    ) -> Result<Option<corecrux_projections::ProjectionsMetaV1>, HttpDataplaneError> {
+        Ok(self.projection_meta.clone())
+    }
+
+    async fn projection_artifact_state(
+        &self,
+        _tenant_id: &str,
+        _artifact_id: u32,
+    ) -> Result<Option<corecrux_projections::LivingStateRowV1>, HttpDataplaneError> {
+        Ok(None)
+    }
+
+    async fn projection_relations(
+        &self,
+        _tenant_id: &str,
+        _artifact_id: u32,
+        _direction: &str,
+        _relation_type: Option<&str>,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<crate::dataplane_store::ProjectionRelationRowV1>, HttpDataplaneError> {
+        Ok(Vec::new())
+    }
+
+    async fn projection_dependents(
+        &self,
+        _tenant_id: &str,
+        _artifact_id: u32,
+        _dependent_type: Option<&str>,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<crate::dataplane_store::ProjectionDependentRowV1>, HttpDataplaneError> {
+        Ok(Vec::new())
+    }
+
+    async fn projection_pressure_events(
+        &self,
+        _tenant_id: &str,
+        _artifact_id: u32,
+        _open_only: bool,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<crate::dataplane_store::ProjectionPressureEventRowV1>, HttpDataplaneError> {
+        Ok(Vec::new())
+    }
+
+    async fn rebuild_projections_online(
+        &self,
+        _max_frames: u32,
+    ) -> Result<Vec<(String, Result<crate::dataplane_store::ForceSealAndTickResult, String>)>, HttpDataplaneError> {
+        Ok(Vec::new())
+    }
+
+    async fn entity_count(
+        &self,
+        _tenant_id: &str,
+        _entity_type: &str,
+        _predicate: &str,
+    ) -> Result<Vec<String>, HttpDataplaneError> {
+        Ok(Vec::new())
+    }
+
+    async fn entity_timeline(
+        &self,
+        _tenant_id: &str,
+        _entity_type: &str,
+        _predicate: &str,
+    ) -> Result<Vec<(String, String, i64)>, HttpDataplaneError> {
+        Ok(Vec::new())
+    }
+
+    async fn entity_current_state(
+        &self,
+        _tenant_id: &str,
+        _entity_name: &str,
+        _predicate: &str,
+    ) -> Result<Option<(String, i64, Option<String>, Option<i64>)>, HttpDataplaneError> {
+        Ok(None)
+    }
+}
+
+fn fake_stored_event(seq: u64, event_type: &str, content_type: &str, payload: &[u8]) -> corecrux_storage::StoredEvent {
+    corecrux_storage::StoredEvent {
+        seq,
+        event_id: format!("evt-{seq}"),
+        occurred_at: "2026-04-08T12:00:00Z".to_string(),
+        ingested_at: "2026-04-08T12:00:01Z".to_string(),
+        event_type: event_type.to_string(),
+        content_type: content_type.to_string(),
+        payload: payload.to_vec(),
+        location: corecrux_storage::FrameLocation {
+            shard_id: 1,
+            epoch: 1,
+            segment_seq: 1,
+            offset: seq * 16,
+        },
+    }
 }
 
 #[tokio::test]
@@ -721,6 +930,101 @@ async fn query_facts_no_params_returns_all() {
     assert_eq!(facts.len(), 3);
 }
 
+#[tokio::test]
+async fn query_facts_accepts_admin_read_fallback_in_dev_scopes_mode() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "deploy".to_string(),
+        key: "status".to_string(),
+        value: "green".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let _ = facts::put_fact(State(state.clone()), dev_scope_headers("admin:read"), Json(body))
+        .await
+        .into_response();
+
+    let mut params = std::collections::HashMap::new();
+    params.insert("query".to_string(), "green".to_string());
+    let resp = facts::query_facts(State(state), dev_scope_headers("admin:read"), Query(params))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["facts"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn export_facts_handles_invalid_since_and_limit_and_skips_private() {
+    let state = test_app_state(16);
+    {
+        let mut store = state.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "public".to_string(),
+            key: "status".to_string(),
+            value: "green".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "secret".to_string(),
+            key: "salary".to_string(),
+            value: "redacted".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+        });
+    }
+
+    let mut params = std::collections::HashMap::new();
+    params.insert("since".to_string(), "not-a-date".to_string());
+    params.insert("limit".to_string(), "not-a-number".to_string());
+
+    let resp = facts::export_facts(State(state), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let facts = body["facts"].as_array().unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0]["entity"], "public");
+    assert_eq!(body["has_more"], false);
+}
+
+#[tokio::test]
+async fn export_facts_honors_cursor_and_reports_next_cursor() {
+    let state = test_app_state(16);
+    let mut fact_ids = Vec::new();
+    for value in ["one", "two", "three"] {
+        let mut store = state.fact_store.write().await;
+        let fact = store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "deploy".to_string(),
+            key: value.to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+        fact_ids.push(fact.fact_id);
+    }
+
+    let mut params = std::collections::HashMap::new();
+    params.insert("cursor".to_string(), fact_ids[0].clone());
+    params.insert("limit".to_string(), "1".to_string());
+
+    let resp = facts::export_facts(State(state), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let facts = body["facts"].as_array().unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(body["has_more"], true);
+    assert_eq!(body["next_cursor"], facts[0]["fact_id"]);
+}
+
 // ── Session Store (PUT /v1/sessions/{sessionId}/state) ──────────
 
 #[tokio::test]
@@ -780,6 +1084,30 @@ async fn get_session_state_not_found() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = json_body(resp).await;
     assert!(body["detail"].as_str().unwrap_or_default().contains("no-session"));
+}
+
+#[tokio::test]
+async fn get_session_state_accepts_admin_read_fallback_in_dev_scopes_mode() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let _ = facts::put_session_state(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Path("sess-admin".to_string()),
+        Json(serde_json::json!({"step": 2})),
+    )
+    .await
+    .into_response();
+
+    let resp = facts::get_session_state(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Path("sess-admin".to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["state"]["step"], 2);
 }
 
 #[tokio::test]
@@ -1360,6 +1688,36 @@ async fn get_receipt_body_returns_501_without_dataplane() {
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
 }
 
+#[tokio::test]
+async fn get_receipt_body_uses_http_dataplane_fake() {
+    let fake = Arc::new(FakeHttpDataplane {
+        enabled: true,
+        read_stream_events: vec![
+            fake_stored_event(1, EVT_RECEIPT_BODY_V1, "application/json", br#"{"ok":false}"#),
+            fake_stored_event(2, EVT_RECEIPT_BODY_V1, "application/json", br#"{"ok":true}"#),
+        ],
+        ..Default::default()
+    });
+    let mut state = test_app_state(16);
+    state.http_dataplane = fake;
+
+    let resp = receipts::get_receipt_body_v1(
+        State(state),
+        Path("crx_live".to_string()),
+        Query(TenantQuery {
+            tenant_id: "tenant-a".to_string(),
+        }),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["receipt_id"], "crx_live");
+    assert_eq!(body["contentType"], "application/json");
+    assert_eq!(body["seq"], 2);
+}
+
 // ── get_receipt_signature_v1 (no dataplane) ─────────────────────
 
 #[tokio::test]
@@ -1394,6 +1752,68 @@ async fn get_receipt_verification_returns_501_without_dataplane() {
     .await
     .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn get_receipt_verification_uses_http_dataplane_fake() {
+    let fake = Arc::new(FakeHttpDataplane {
+        enabled: true,
+        verification_report: Some(
+            serde_json::from_value(serde_json::json!({
+                "schema": "cuecrux.receipt.verify.v1",
+                "receipt_id": "crx_verified",
+                "tenant_id": "tenant-a",
+                "payload_hash": "abcd",
+                "signature": {
+                    "alg": "ed25519",
+                    "key_id": "kid-1"
+                },
+                "integrity": {
+                    "payload_hash_matches": true,
+                    "canonical_bytes_parse_ok": true
+                },
+                "trace_checks": {
+                    "retrieval_trace_present": false,
+                    "lanes_used_present": false,
+                    "candidate_generation_present": false,
+                    "filters_present": false,
+                    "normalisation_present": false,
+                    "fusion_present": false,
+                    "priors_applied_present": false,
+                    "anchors_present": false,
+                    "anchors_ids_present": false,
+                    "anchors_derivation_method_present": false,
+                    "rerank_present": false,
+                    "candidates_present": false,
+                    "candidate_digest_present": false
+                },
+                "signature_valid": true,
+                "pubkey_fingerprint": "fp",
+                "error_code": "OK",
+                "verified_at": "2026-04-08T12:00:00Z",
+                "verifier_build": "test"
+            }))
+            .expect("verification report"),
+        ),
+        ..Default::default()
+    });
+    let mut state = test_app_state(16);
+    state.http_dataplane = fake;
+
+    let resp = receipts::get_receipt_verification_v1(
+        State(state),
+        Path("crx_verified".to_string()),
+        Query(TenantQuery {
+            tenant_id: "tenant-a".to_string(),
+        }),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["receipt_id"], "crx_verified");
+    assert_eq!(body["signature_valid"], true);
 }
 
 // ── get_receipt_export_v1 (no dataplane) ────────────────────────
@@ -1727,6 +2147,40 @@ async fn post_admin_append_requires_auth_in_dev_mode() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn post_admin_append_uses_http_dataplane_fake() {
+    let fake = Arc::new(FakeHttpDataplane {
+        enabled: true,
+        ..Default::default()
+    });
+    let mut state = test_app_state(16);
+    state.http_dataplane = fake.clone();
+
+    let body = append::AppendBody {
+        tenant_id: "tenant-a".to_string(),
+        stream_type: "test".to_string(),
+        stream_id: "stream-1".to_string(),
+        expected_next_seq: 4,
+        events: vec![append::AppendEventBody {
+            event_id: "ev1".to_string(),
+            occurred_at: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "test.v1".to_string(),
+            content_type: "application/json".to_string(),
+            payload: "{\"ok\":true}".to_string(),
+        }],
+    };
+    let resp = append::post_admin_append(State(state), HeaderMap::new(), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp).await;
+    assert_eq!(body["appended"], 1);
+    let calls = fake.append_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].expected_next_seq, 4);
+    assert_eq!(calls[0].event_ids, vec!["ev1".to_string()]);
+}
+
 // ── post_query_graph_expand (feature gate + no dataplane) ───────
 
 #[tokio::test]
@@ -1746,6 +2200,51 @@ async fn post_query_graph_expand_returns_not_found_when_disabled() {
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[allow(deprecated)]
+#[tokio::test]
+async fn post_query_graph_expand_uses_http_dataplane_fake() {
+    std::env::set_var("CORECRUXD_QUERY_GRAPH_EXPAND", "1");
+    let fake = Arc::new(FakeHttpDataplane {
+        enabled: true,
+        graph_expand_response: Some(corecrux_projections::query::graph_expand::GraphExpandResponse {
+            artifacts: vec![corecrux_projections::query::graph_expand::GraphExpandArtifact {
+                artifact_id: 42,
+                score: 0.9,
+                hop_distance: 1,
+                edge_types_used: vec![corecrux_projections::RelationTypeV1::Supports],
+                state: None,
+            }],
+            stats: corecrux_projections::query::graph_expand::GraphExpandStats {
+                nodes_visited: 3,
+                hops_used: 1,
+                budget_remaining: 49,
+                edges_traversed: 2,
+            },
+        }),
+        ..Default::default()
+    });
+    let mut state = test_app_state(16);
+    state.http_dataplane = fake;
+
+    let body = query::GraphExpandBody {
+        tenant_id: "tenant-a".to_string(),
+        seed_artifact_ids: vec![1],
+        edge_types: vec![],
+        max_hops: 2,
+        budget: 50,
+        min_confidence: 0.0,
+        include_state: false,
+    };
+    let resp = query::post_query_graph_expand(State(state), HeaderMap::new(), Json(body))
+        .await
+        .into_response();
+    std::env::remove_var("CORECRUXD_QUERY_GRAPH_EXPAND");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["artifacts"][0]["artifact_id"], 42);
+    assert_eq!(body["traversal_stats"]["nodes_visited"], 3);
 }
 
 // ── post_query_time_range (feature gate + validation) ───────────
@@ -1782,6 +2281,32 @@ async fn get_proj_meta_returns_501_without_dataplane() {
     .await
     .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn get_proj_meta_uses_http_dataplane_fake() {
+    let mut meta = corecrux_projections::ProjectionsMetaV1::empty_now();
+    meta.commit_id = 7;
+    let fake = Arc::new(FakeHttpDataplane {
+        enabled: true,
+        projection_meta: Some(meta),
+        ..Default::default()
+    });
+    let mut state = test_app_state(16);
+    state.http_dataplane = fake;
+
+    let resp = get_proj_meta(
+        State(state),
+        Query(ProjMetaQuery {
+            shard_id: "shard-0001".to_string(),
+        }),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["commitId"], 7);
 }
 
 // ── post_projection_rebuild (no dataplane) ──────────────────────

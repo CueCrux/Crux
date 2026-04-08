@@ -63,54 +63,31 @@ pub(super) async fn post_query_graph_expand(
         return problem_response(StatusCode::NOT_FOUND, "graph-expand query not enabled");
     }
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
+    }
 
     if body.seed_artifact_ids.is_empty() {
         return problem_response(StatusCode::BAD_REQUEST, "seed_artifact_ids must not be empty");
     }
 
-    let edge_types: Vec<corecrux_projections::RelationTypeV1> = body
-        .edge_types
-        .iter()
-        .filter_map(|s| corecrux_projections::RelationTypeV1::from_engine_str(s))
-        .collect();
-
     let t0 = std::time::Instant::now();
-    let gpu_ids = pool.gpu_ids();
-    let mut combined = corecrux_projections::query::graph_expand::GraphExpandResponse {
-        artifacts: Vec::new(),
-        stats: Default::default(),
-    };
-
-    for gpu_id in gpu_ids {
-        let Some(store) = pool.store_for_gpu_id(gpu_id) else {
-            continue;
-        };
-        let guard = store.read().await;
-        let resp = guard.query_graph_expand(
+    let combined = match state
+        .http_dataplane
+        .graph_expand(
             &body.tenant_id,
             &body.seed_artifact_ids,
-            &edge_types,
+            &body.edge_types,
             body.max_hops,
             body.budget,
             body.min_confidence,
             body.include_state,
-        );
-        combined.stats.nodes_visited += resp.stats.nodes_visited;
-        combined.stats.edges_traversed += resp.stats.edges_traversed;
-        combined.stats.hops_used = combined.stats.hops_used.max(resp.stats.hops_used);
-        combined.artifacts.extend(resp.artifacts);
-    }
-
-    // Final dedup + re-rank across GPU stores
-    combined
-        .artifacts
-        .sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    combined.artifacts.dedup_by_key(|a| a.artifact_id);
-    combined.artifacts.truncate(body.budget);
-    combined.stats.budget_remaining = body.budget.saturating_sub(combined.artifacts.len());
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => return map_http_dataplane_error(err),
+    };
 
     state
         .metrics
@@ -145,6 +122,7 @@ pub(super) async fn post_query_graph_expand(
         edges_traversed: u64,
     }
 
+    let stats = combined.stats;
     let artifacts: Vec<ArtifactResp> = combined
         .artifacts
         .into_iter()
@@ -174,10 +152,10 @@ pub(super) async fn post_query_graph_expand(
         Json(Resp {
             artifacts,
             traversal_stats: StatsResp {
-                nodes_visited: combined.stats.nodes_visited,
-                hops_used: combined.stats.hops_used,
-                budget_remaining: combined.stats.budget_remaining,
-                edges_traversed: combined.stats.edges_traversed,
+                nodes_visited: stats.nodes_visited,
+                hops_used: stats.hops_used,
+                budget_remaining: stats.budget_remaining,
+                edges_traversed: stats.edges_traversed,
             },
         }),
     )
@@ -200,9 +178,9 @@ pub(super) async fn post_query_time_range(
         return problem_response(StatusCode::NOT_FOUND, "time-range query not enabled");
     }
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
+    }
 
     if body.start_micros >= body.end_micros {
         return problem_response(StatusCode::BAD_REQUEST, "start_micros must be less than end_micros");
@@ -215,41 +193,25 @@ pub(super) async fn post_query_time_range(
     }
 
     let t0 = std::time::Instant::now();
-    let gpu_ids = pool.gpu_ids();
-    let mut all_artifacts = Vec::new();
-    let mut stats = corecrux_projections::query::time_range::TimeRangeStats::default();
-
-    for gpu_id in gpu_ids {
-        let Some(store) = pool.store_for_gpu_id(gpu_id) else {
-            continue;
-        };
-        let guard = store.read().await;
-        let resp = guard.query_time_range(
+    let response = match state
+        .http_dataplane
+        .time_range(
             &body.tenant_id,
             body.start_micros,
             body.end_micros,
             &body.artifact_ids,
             body.include_relations,
             body.limit,
-        );
-        stats.artifacts_scanned += resp.stats.artifacts_scanned;
-        stats.relations_scanned += resp.stats.relations_scanned;
-        stats.total_changes += resp.stats.total_changes;
-        all_artifacts.extend(resp.artifacts);
-    }
-
-    // Final dedup + sort across GPU stores
-    all_artifacts.sort_by(|a, b| {
-        b.current_state
-            .updated_at_micros
-            .cmp(&a.current_state.updated_at_micros)
-    });
-    all_artifacts.dedup_by_key(|a| a.artifact_id);
-    all_artifacts.truncate(body.limit);
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => return map_http_dataplane_error(err),
+    };
 
     state
         .metrics
-        .observe_time_range(t0.elapsed().as_secs_f64(), stats.artifacts_scanned);
+        .observe_time_range(t0.elapsed().as_secs_f64(), response.stats.artifacts_scanned);
 
     #[derive(serde::Serialize)]
     struct Resp {
@@ -281,7 +243,9 @@ pub(super) async fn post_query_time_range(
         total_changes: u32,
     }
 
-    let artifacts_changed: Vec<ArtifactChanged> = all_artifacts
+    let stats = response.stats;
+    let artifacts_changed: Vec<ArtifactChanged> = response
+        .artifacts
         .into_iter()
         .map(|a| ArtifactChanged {
             artifact_id: a.artifact_id,

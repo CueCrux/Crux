@@ -4,6 +4,7 @@
 
 mod admin;
 mod append;
+mod dataplane;
 mod facts;
 mod health;
 mod observe;
@@ -13,6 +14,7 @@ mod receipts;
 mod routing;
 
 pub(crate) use admin::AdminActionRecord;
+pub(crate) use dataplane::{pool_backed_http_dataplane, HttpDataplane, HttpDataplaneError, SharedHttpDataplane};
 // Receipt export helpers (build_lineage_json_v1, etc.) only used by proprietary ExportReceiptBundle.
 #[allow(unused_imports)]
 pub(crate) use receipts::{build_lineage_json_v1, build_subject_links_json_v1, build_trace_summary_json_v1};
@@ -40,7 +42,7 @@ use corecrux_receipts::{
     ReceiptExportOptionsV1, SubjectResolveModeV1, EVT_RECEIPT_BODY_V1, EVT_RECEIPT_SIG_V1, STREAM_TYPE_RECEIPT,
 };
 use corecrux_types::{
-    format_u64_hex, parse_shard_id_u32, CompatContract, ControlAdminActionFinishedV1, ControlAdminActionSubmittedV1,
+    format_u64_hex, CompatContract, ControlAdminActionFinishedV1, ControlAdminActionSubmittedV1,
     ControlCheckpointMaterializedV1, ControlStateMutationV1, EvidenceAuthContextV1, EvidenceNodeContextV1,
     EvidenceRequestContextV1, KnowledgeAuthorityModeV1, KnowledgeParityOutcomeV1, KnowledgeParityStatusV1,
     KnowledgeRolloutStageV1, ProblemDetails, RoutingInfo, ShardMapV1, CONTROL_EVIDENCE_CONTENT_TYPE_V1,
@@ -121,6 +123,7 @@ pub struct AppState {
     pub routing: Arc<RwLock<RoutingTable>>,
     pub routing_errors: Arc<RwLock<Vec<String>>>,
     pub dataplane_pool: Option<crate::pool::DataPlanePool>,
+    pub http_dataplane: SharedHttpDataplane,
     pub readiness: Arc<RwLock<Readiness>>,
     pub control: Arc<RwLock<control::ControlV1>>,
     pub control_path: PathBuf,
@@ -384,6 +387,13 @@ fn map_store_error_http(err: AppendError) -> ProblemResponse {
         })),
     };
     ProblemResponse(pd)
+}
+
+fn map_http_dataplane_error(err: HttpDataplaneError) -> Response {
+    match err {
+        HttpDataplaneError::Disabled => problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled"),
+        HttpDataplaneError::Store(err) => map_store_error_http(err).into_response(),
+    }
 }
 
 fn problem_for_status(status: StatusCode, detail: impl Into<String>) -> ProblemResponse {
