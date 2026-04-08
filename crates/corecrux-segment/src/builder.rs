@@ -9,16 +9,14 @@ use crate::frame::encode_frame_v1;
 use crate::header::encode_segment_header_v1;
 use crate::toc::{compute_toc_payload_hash, encode_toc_payload_v1, encode_toc_payload_v1_with_hash};
 use crate::trailer::{
-    build_record_blocks_and_trailer_index_parts_v1, encode_trailer_index_v1,
-    encode_trailer_index_v1_from_parts,
+    build_record_blocks_and_trailer_index_parts_v1, encode_trailer_index_v1, encode_trailer_index_v1_from_parts,
 };
 use crate::types::FrameMetaTmp;
 use crate::util::{block_crc32c, is_sorted_toc};
 use crate::{
-    FrameInput, Result, SegmentBuildOutput, SegmentError, SegmentFooterV1, SegmentHeaderV1,
-    SegmentId, TocEntryV1, TocHeaderV1,
-    DEFAULT_RECORD_BLOCK_SIZE, DEFAULT_TOC_BLOCK_SIZE, RECORD_BLOCK_CODEC_NONE_V1,
-    SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, TOC_ENTRY_LEN, TOC_HEADER_LEN,
+    FrameInput, Result, SegmentBuildOutput, SegmentError, SegmentFooterV1, SegmentHeaderV1, SegmentId, TocEntryV1,
+    TocHeaderV1, DEFAULT_RECORD_BLOCK_SIZE, DEFAULT_TOC_BLOCK_SIZE, RECORD_BLOCK_CODEC_NONE_V1, SEGMENT_FOOTER_LEN,
+    SEGMENT_HEADER_LEN, TOC_ENTRY_LEN, TOC_HEADER_LEN,
 };
 
 pub fn build_segment_v1(
@@ -554,8 +552,7 @@ mod tests {
     use crate::trailer::decode_trailer_index_v1;
     use crate::util::is_sorted_toc;
     use crate::{
-        BLOOM_BYTES_PER_BLOCK_V1, RECORD_BLOCK_CODEC_LZ4_V1,
-        RECORD_BLOCK_UNCOMPRESSED_MAX_LEN_V1, TOC_HEADER_LEN,
+        BLOOM_BYTES_PER_BLOCK_V1, RECORD_BLOCK_CODEC_LZ4_V1, RECORD_BLOCK_UNCOMPRESSED_MAX_LEN_V1, TOC_HEADER_LEN,
     };
     use corecrux_frame::{compute_header_hash, compute_payload_hash};
 

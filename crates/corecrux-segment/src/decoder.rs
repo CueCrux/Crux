@@ -9,8 +9,8 @@ use crate::header::decode_segment_header_v1;
 use crate::toc::{compute_toc_payload_hash, decode_toc_entry_v1, decode_toc_header_v1};
 use crate::util::{is_sorted_toc, read_u64};
 use crate::{
-    Result, SegmentError, SegmentFooterV1, SegmentHeaderV1, TocEntryV1, TocHeaderV1,
-    SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, TOC_ENTRY_LEN, TOC_HEADER_LEN,
+    Result, SegmentError, SegmentFooterV1, SegmentHeaderV1, TocEntryV1, TocHeaderV1, SEGMENT_FOOTER_LEN,
+    SEGMENT_HEADER_LEN, TOC_ENTRY_LEN, TOC_HEADER_LEN,
 };
 
 pub fn decode_segment_v1(bytes: &[u8]) -> Result<(SegmentHeaderV1, TocHeaderV1, Vec<TocEntryV1>, SegmentFooterV1)> {

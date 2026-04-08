@@ -4,9 +4,8 @@
 
 use crate::util::{read_u16, read_u32, read_u64};
 use crate::{
-    Result, SegmentError, TocEntryV1, TocHeaderV1,
-    DEFAULT_RECORD_BLOCK_SIZE, DEFAULT_TOC_BLOCK_SIZE, TOC_ENTRY_LEN, TOC_HEADER_LEN,
-    TOC_MAGIC_TOC1,
+    Result, SegmentError, TocEntryV1, TocHeaderV1, DEFAULT_RECORD_BLOCK_SIZE, DEFAULT_TOC_BLOCK_SIZE, TOC_ENTRY_LEN,
+    TOC_HEADER_LEN, TOC_MAGIC_TOC1,
 };
 
 pub(crate) fn encode_toc_payload_v1(

@@ -110,8 +110,8 @@ pub type Result<T> = std::result::Result<T, SegmentError>;
 
 // Types (from types.rs)
 pub use types::{
-    BlockMetaV1, FrameInput, FrameMetaV1, FrameV1Decoded, SegmentBuildOutput, SegmentFooterV1,
-    SegmentHeaderV1, SegmentId, TocByOffsetEntryV1, TocEntryV1, TocHeaderV1, TrailerIndexV1,
+    BlockMetaV1, FrameInput, FrameMetaV1, FrameV1Decoded, SegmentBuildOutput, SegmentFooterV1, SegmentHeaderV1,
+    SegmentId, TocByOffsetEntryV1, TocEntryV1, TocHeaderV1, TrailerIndexV1,
 };
 
 // Frame encode/decode

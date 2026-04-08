@@ -1191,13 +1191,9 @@ async fn fact_and_session_endpoints_accept_admin_read_fallback_in_dev_scopes_mod
     let bulk_body = json_body(bulk_resp).await;
     assert_eq!(bulk_body["facts"].as_array().unwrap().len(), 2);
 
-    let get_resp = facts::get_fact(
-        State(state.clone()),
-        admin_headers.clone(),
-        Path(fact_id.clone()),
-    )
-    .await
-    .into_response();
+    let get_resp = facts::get_fact(State(state.clone()), admin_headers.clone(), Path(fact_id.clone()))
+        .await
+        .into_response();
     assert_eq!(get_resp.status(), StatusCode::OK);
 
     let entity_resp = facts::get_facts_by_entity(
@@ -1211,13 +1207,9 @@ async fn fact_and_session_endpoints_accept_admin_read_fallback_in_dev_scopes_mod
     let entity_body = json_body(entity_resp).await;
     assert_eq!(entity_body["facts"].as_array().unwrap().len(), 2);
 
-    let delete_resp = facts::delete_fact(
-        State(state.clone()),
-        admin_headers.clone(),
-        Path(fact_id.clone()),
-    )
-    .await
-    .into_response();
+    let delete_resp = facts::delete_fact(State(state.clone()), admin_headers.clone(), Path(fact_id.clone()))
+        .await
+        .into_response();
     assert_eq!(delete_resp.status(), StatusCode::OK);
 
     let mut export_params = std::collections::HashMap::new();
@@ -1226,13 +1218,9 @@ async fn fact_and_session_endpoints_accept_admin_read_fallback_in_dev_scopes_mod
         (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
     );
     export_params.insert("limit".to_string(), "20000".to_string());
-    let export_resp = facts::export_facts(
-        State(state.clone()),
-        admin_headers.clone(),
-        Query(export_params),
-    )
-    .await
-    .into_response();
+    let export_resp = facts::export_facts(State(state.clone()), admin_headers.clone(), Query(export_params))
+        .await
+        .into_response();
     assert_eq!(export_resp.status(), StatusCode::OK);
     let export_body = json_body(export_resp).await;
     assert!(export_body["facts"].as_array().unwrap().is_empty());

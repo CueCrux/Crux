@@ -2,17 +2,17 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-use crate::block::{decode_block_meta_v1, decode_toc_by_offset_entry_v1, encode_block_meta_v1, encode_toc_by_offset_entry_v1};
+use crate::block::{
+    decode_block_meta_v1, decode_toc_by_offset_entry_v1, encode_block_meta_v1, encode_toc_by_offset_entry_v1,
+};
 use crate::bloom::bloom_insert_stream_hash_v1;
 use crate::types::{FrameMetaTmp, RecordBlocksAndTrailerIndexPartsV1};
 use crate::util::align_up;
 use crate::{
-    BlockMetaV1, Result, SegmentError, TocByOffsetEntryV1, TocHeaderV1, TrailerIndexV1,
-    BLOCK_META_V1_LEN, BLOOM_BYTES_PER_BLOCK_V1, BLOOM_HASH_K_V1,
-    RECORD_BLOCK_CODEC_LZ4_V1, RECORD_BLOCK_CODEC_NONE_V1,
-    RECORD_BLOCK_UNCOMPRESSED_MAX_LEN_V1, SEGMENT_HEADER_LEN,
-    TOC_BY_OFFSET_ENTRY_V1_LEN, TRAILER_MAGIC_BLK1, TRAILER_MAGIC_TBO1,
-    TRAILER_MAGIC_TSI1, TRAILER_SECTION_HEADER_LEN_V1,
+    BlockMetaV1, Result, SegmentError, TocByOffsetEntryV1, TocHeaderV1, TrailerIndexV1, BLOCK_META_V1_LEN,
+    BLOOM_BYTES_PER_BLOCK_V1, BLOOM_HASH_K_V1, RECORD_BLOCK_CODEC_LZ4_V1, RECORD_BLOCK_CODEC_NONE_V1,
+    RECORD_BLOCK_UNCOMPRESSED_MAX_LEN_V1, SEGMENT_HEADER_LEN, TOC_BY_OFFSET_ENTRY_V1_LEN, TRAILER_MAGIC_BLK1,
+    TRAILER_MAGIC_TBO1, TRAILER_MAGIC_TSI1, TRAILER_SECTION_HEADER_LEN_V1,
 };
 
 #[allow(clippy::unwrap_used)] // SAFETY: all try_into().unwrap() are on fixed-size slices after bounds checks

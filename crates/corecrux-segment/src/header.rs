@@ -4,8 +4,8 @@
 
 use crate::util::{read_u16, read_u32, read_u64};
 use crate::{
-    Result, SegmentError, SegmentHeaderV1, SegmentId,
-    SEGMENT_HEADER_LEN, SEGMENT_MAGIC_CCS3, SEGMENT_MAJOR, SEGMENT_MINOR,
+    Result, SegmentError, SegmentHeaderV1, SegmentId, SEGMENT_HEADER_LEN, SEGMENT_MAGIC_CCS3, SEGMENT_MAJOR,
+    SEGMENT_MINOR,
 };
 
 pub fn encode_segment_header_v1(h: &SegmentHeaderV1) -> Result<Vec<u8>> {

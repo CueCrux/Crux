@@ -3,8 +3,8 @@
 // See LICENCE.md in the repository root.
 
 use crate::{
-    BlockMetaV1, Result, SegmentError, TocByOffsetEntryV1,
-    BLOCK_META_V1_LEN, BLOOM_BYTES_PER_BLOCK_V1, TOC_BY_OFFSET_ENTRY_V1_LEN,
+    BlockMetaV1, Result, SegmentError, TocByOffsetEntryV1, BLOCK_META_V1_LEN, BLOOM_BYTES_PER_BLOCK_V1,
+    TOC_BY_OFFSET_ENTRY_V1_LEN,
 };
 
 pub fn encode_block_meta_v1(b: &BlockMetaV1) -> [u8; BLOCK_META_V1_LEN] {

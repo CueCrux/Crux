@@ -4,8 +4,8 @@
 
 use crate::util::{read_u16, read_u32, read_u64};
 use crate::{
-    Result, SegmentError, SegmentFooterV1, SegmentId,
-    SEGMENT_FOOTER_LEN, SEGMENT_MAGIC_CCF3, SEGMENT_MAJOR, SEGMENT_MINOR,
+    Result, SegmentError, SegmentFooterV1, SegmentId, SEGMENT_FOOTER_LEN, SEGMENT_MAGIC_CCF3, SEGMENT_MAJOR,
+    SEGMENT_MINOR,
 };
 
 pub fn encode_segment_footer_v1(f: &SegmentFooterV1) -> Result<[u8; SEGMENT_FOOTER_LEN]> {

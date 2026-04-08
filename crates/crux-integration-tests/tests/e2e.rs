@@ -37,17 +37,11 @@ fn fact_lifecycle() {
         .into_json()
         .unwrap();
     assert_eq!(created["entity"], "e2e_lifecycle_project");
-    let fact_id = created["fact_id"]
-        .as_str()
-        .expect("response must contain fact_id");
+    let fact_id = created["fact_id"].as_str().expect("response must contain fact_id");
     assert!(fact_id.starts_with("f_"), "fact_id should start with f_");
 
     // Retrieve the fact by ID.
-    let fetched: serde_json::Value = d
-        .get(&format!("/v1/facts/{fact_id}"))
-        .unwrap()
-        .into_json()
-        .unwrap();
+    let fetched: serde_json::Value = d.get(&format!("/v1/facts/{fact_id}")).unwrap().into_json().unwrap();
     assert_eq!(fetched["entity"], "e2e_lifecycle_project");
     assert_eq!(fetched["key"], "status");
     assert_eq!(fetched["value"], "Phase 1");
@@ -66,9 +60,7 @@ fn fact_lifecycle() {
         .unwrap()
         .into_json()
         .unwrap();
-    let fact_id_v2 = v2["fact_id"]
-        .as_str()
-        .expect("second put must return fact_id");
+    let fact_id_v2 = v2["fact_id"].as_str().expect("second put must return fact_id");
 
     // List facts for the entity — both versions should be present.
     let by_entity: serde_json::Value = d
@@ -86,22 +78,14 @@ fn fact_lifecycle() {
     );
 
     // Query facts by value substring.
-    let queried: serde_json::Value = d
-        .get("/v1/facts?query=Phase")
-        .unwrap()
-        .into_json()
-        .unwrap();
+    let queried: serde_json::Value = d.get("/v1/facts?query=Phase").unwrap().into_json().unwrap();
     // The query endpoint should return results (either as "facts" array or "results").
-    let has_results = queried["facts"].is_array()
-        || queried["results"].is_array()
-        || queried["total_tokens"].is_number();
+    let has_results =
+        queried["facts"].is_array() || queried["results"].is_array() || queried["total_tokens"].is_number();
     assert!(has_results, "query should return results: {queried}");
 
     // Delete the first fact.
-    assert_eq!(
-        d.delete(&format!("/v1/facts/{fact_id}")).unwrap().status(),
-        200
-    );
+    assert_eq!(d.delete(&format!("/v1/facts/{fact_id}")).unwrap().status(), 200);
 
     // Verify it is gone.
     match d.get(&format!("/v1/facts/{fact_id}")) {
@@ -191,19 +175,10 @@ fn fact_bulk_insert() {
         let facts = by_entity["facts"]
             .as_array()
             .unwrap_or_else(|| panic!("entity {entity} should return facts array"));
-        assert!(
-            !facts.is_empty(),
-            "entity {entity} should have at least one fact"
-        );
+        assert!(!facts.is_empty(), "entity {entity} should have at least one fact");
         // Verify the value matches what we inserted.
-        let values: Vec<&str> = facts
-            .iter()
-            .filter_map(|f| f["value"].as_str())
-            .collect();
-        assert!(
-            !values.is_empty(),
-            "entity {entity} facts should have value fields"
-        );
+        let values: Vec<&str> = facts.iter().filter_map(|f| f["value"].as_str()).collect();
+        assert!(!values.is_empty(), "entity {entity} facts should have value fields");
     }
 
     // Clean up.
