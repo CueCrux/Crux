@@ -39,9 +39,9 @@ pub(super) async fn post_admin_append(
         return problem.into_response();
     }
 
-    let Some(pool) = state.dataplane_pool.clone() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
+    }
 
     if body.events.is_empty() {
         return problem_response(StatusCode::BAD_REQUEST, "events must not be empty");
@@ -62,27 +62,18 @@ pub(super) async fn post_admin_append(
         })
         .collect();
 
-    let (_decision, store) = match pool
-        .store_for_stream(&body.tenant_id, &body.stream_type, &body.stream_id, None)
-        .await
-    {
-        Ok(pair) => pair,
-        Err(err) => return map_store_error_http(err).into_response(),
-    };
-
-    let store = store.read().await;
-    if let Err(err) = store
+    if let Err(err) = state
+        .http_dataplane
         .append_batch(
             &body.tenant_id,
             &body.stream_type,
             &body.stream_id,
             body.expected_next_seq,
-            None,
             &events,
         )
         .await
     {
-        return map_store_error_http(err).into_response();
+        return map_http_dataplane_error(err);
     }
 
     // Reload .ccxi indexes after append (seal + ccxi build happens synchronously in Phase 2 mode).

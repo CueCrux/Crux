@@ -504,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn list_tools_returns_sixteen() {
+    fn list_tools_returns_expected_count() {
         let tools = list_tools();
         assert_eq!(tools.len(), TOOL_COUNT);
     }

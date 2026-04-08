@@ -3,9 +3,8 @@
 // See LICENCE.md in the repository root.
 
 use super::{
-    hex16, map_store_error_http, parse_shard_id_u32, problem_response, require_http_scopes, stream_hash_xxhash64,
-    AppState, DependentsQuery, HeaderMap, IntoResponse, Json, Path, PressureQuery, ProjMetaQuery, Query,
-    RelationsQuery, State, StatusCode, TenantQuery,
+    hex16, map_http_dataplane_error, problem_response, require_http_scopes, AppState, DependentsQuery, HeaderMap,
+    IntoResponse, Json, Path, PressureQuery, ProjMetaQuery, Query, RelationsQuery, State, StatusCode, TenantQuery,
 };
 
 pub(super) async fn get_proj_meta(
@@ -17,21 +16,13 @@ pub(super) async fn get_proj_meta(
         return problem.into_response();
     }
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
+    }
+    let meta = match state.http_dataplane.projection_meta(&q.shard_id).await {
+        Ok(meta) => meta,
+        Err(err) => return map_http_dataplane_error(err),
     };
-    let shard_id_u32 = match parse_shard_id_u32(&q.shard_id) {
-        Ok(v) => v,
-        Err(e) => return problem_response(StatusCode::BAD_REQUEST, e.to_string()),
-    };
-    let (_owner_gpu_id, store) = match pool.store_for_shard_id(&q.shard_id).await {
-        Ok(ok) => ok,
-        Err(err) => {
-            return map_store_error_http(err).into_response();
-        }
-    };
-    let guard = store.read().await;
-    let meta = guard.projections_meta_for_shard(shard_id_u32);
     match meta {
         Some(m) => (StatusCode::OK, Json(m)).into_response(),
         None => problem_response(StatusCode::NOT_FOUND, "projection meta not found"),
@@ -46,11 +37,14 @@ pub(super) async fn post_projection_rebuild(State(state): State<AppState>, heade
         return problem.into_response();
     }
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
+    }
 
-    let results = pool.rebuild_projections_online(1024).await;
+    let results = match state.http_dataplane.rebuild_projections_online(1024).await {
+        Ok(results) => results,
+        Err(err) => return map_http_dataplane_error(err),
+    };
     let mut shards = Vec::new();
     let mut any_failed = false;
     for (shard_label, result) in results {
@@ -95,27 +89,17 @@ pub(super) async fn get_proj_artifact_state(
         return problem.into_response();
     }
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
+    }
+    let row = match state
+        .http_dataplane
+        .projection_artifact_state(&q.tenant_id, artifact_id)
+        .await
+    {
+        Ok(row) => row,
+        Err(err) => return map_http_dataplane_error(err),
     };
-
-    let stream_hash = match stream_hash_xxhash64(&q.tenant_id, "artifact", &artifact_id.to_string()) {
-        Ok(v) => v,
-        Err(e) => return problem_response(StatusCode::BAD_REQUEST, e.to_string()),
-    };
-    let (decision, store) = match pool.store_for_stream_hash(stream_hash, None).await {
-        Ok(ok) => ok,
-        Err(err) => {
-            return map_store_error_http(err).into_response();
-        }
-    };
-    let shard_id_u32 = match parse_shard_id_u32(&decision.shard_id) {
-        Ok(v) => v,
-        Err(e) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-
-    let guard = store.read().await;
-    let row = guard.projections_living_state_row(shard_id_u32, &q.tenant_id, artifact_id);
 
     #[derive(serde::Serialize)]
     struct Resp {
@@ -195,43 +179,29 @@ pub(super) async fn get_proj_artifact_relations(
         return problem.into_response();
     }
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
+    }
     let tenant_id = q.tenant_id.clone();
     let direction = q.direction.as_deref().unwrap_or("out");
-    let relation_type_u8 = q
-        .relation_type
-        .as_deref()
-        .and_then(|s| corecrux_projections::RelationTypeV1::from_engine_str(s).map(|t| t.to_u8()));
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let offset = q.offset.unwrap_or(0);
 
-    let stream_hash = match stream_hash_xxhash64(&tenant_id, "artifact", &artifact_id.to_string()) {
-        Ok(v) => v,
-        Err(e) => return problem_response(StatusCode::BAD_REQUEST, e.to_string()),
+    let rows = match state
+        .http_dataplane
+        .projection_relations(
+            &tenant_id,
+            artifact_id,
+            direction,
+            q.relation_type.as_deref(),
+            limit,
+            offset,
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => return map_http_dataplane_error(err),
     };
-    let (decision, store) = match pool.store_for_stream_hash(stream_hash, None).await {
-        Ok(ok) => ok,
-        Err(err) => {
-            return map_store_error_http(err).into_response();
-        }
-    };
-    let shard_id_u32 = match parse_shard_id_u32(&decision.shard_id) {
-        Ok(v) => v,
-        Err(e) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-
-    let guard = store.read().await;
-    let rows = guard.projections_list_relations(
-        shard_id_u32,
-        &tenant_id,
-        artifact_id,
-        direction,
-        relation_type_u8,
-        limit,
-        offset,
-    );
 
     #[derive(serde::Serialize)]
     struct Resp {
@@ -305,34 +275,21 @@ pub(super) async fn get_proj_artifact_dependents(
         return problem.into_response();
     }
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
+    }
     let tenant_id = q.tenant_id.clone();
-    let dt_u8 = q
-        .dependent_type
-        .as_deref()
-        .and_then(|s| corecrux_projections::DependentTypeV1::from_engine_str(s).map(|t| t.to_u8()));
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let offset = q.offset.unwrap_or(0);
 
-    let stream_hash = match stream_hash_xxhash64(&tenant_id, "artifact", &artifact_id.to_string()) {
-        Ok(v) => v,
-        Err(e) => return problem_response(StatusCode::BAD_REQUEST, e.to_string()),
+    let rows = match state
+        .http_dataplane
+        .projection_dependents(&tenant_id, artifact_id, q.dependent_type.as_deref(), limit, offset)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => return map_http_dataplane_error(err),
     };
-    let (decision, store) = match pool.store_for_stream_hash(stream_hash, None).await {
-        Ok(ok) => ok,
-        Err(err) => {
-            return map_store_error_http(err).into_response();
-        }
-    };
-    let shard_id_u32 = match parse_shard_id_u32(&decision.shard_id) {
-        Ok(v) => v,
-        Err(e) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-
-    let guard = store.read().await;
-    let rows = guard.projections_list_dependents(shard_id_u32, &tenant_id, artifact_id, dt_u8, limit, offset);
 
     #[derive(serde::Serialize)]
     struct Resp {
@@ -395,31 +352,22 @@ pub(super) async fn get_proj_artifact_pressure_events(
         return problem.into_response();
     }
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
+    }
     let tenant_id = q.tenant_id.clone();
     let open_only = q.open_only.unwrap_or(false);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let offset = q.offset.unwrap_or(0);
 
-    let stream_hash = match stream_hash_xxhash64(&tenant_id, "artifact", &artifact_id.to_string()) {
-        Ok(v) => v,
-        Err(e) => return problem_response(StatusCode::BAD_REQUEST, e.to_string()),
+    let rows = match state
+        .http_dataplane
+        .projection_pressure_events(&tenant_id, artifact_id, open_only, limit, offset)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => return map_http_dataplane_error(err),
     };
-    let (decision, store) = match pool.store_for_stream_hash(stream_hash, None).await {
-        Ok(ok) => ok,
-        Err(err) => {
-            return map_store_error_http(err).into_response();
-        }
-    };
-    let shard_id_u32 = match parse_shard_id_u32(&decision.shard_id) {
-        Ok(v) => v,
-        Err(e) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-
-    let guard = store.read().await;
-    let rows = guard.projections_list_pressure_events(shard_id_u32, &tenant_id, artifact_id, open_only, limit, offset);
 
     #[derive(serde::Serialize)]
     struct Resp {
@@ -486,21 +434,18 @@ pub(super) async fn get_entity_count(
     let entity_type = params.get("entity_type").cloned().unwrap_or_default();
     let predicate = params.get("predicate").cloned().unwrap_or_default();
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
-
-    let mut all_items: Vec<String> = Vec::new();
-    for gpu_id in pool.gpu_ids() {
-        let Some(store) = pool.store_for_gpu_id(gpu_id) else {
-            continue;
-        };
-        let guard = store.read().await;
-        let items = guard.query_entity_count(&tenant_id, &entity_type, &predicate);
-        all_items.extend(items);
     }
-    all_items.sort();
-    all_items.dedup();
+
+    let all_items = match state
+        .http_dataplane
+        .entity_count(&tenant_id, &entity_type, &predicate)
+        .await
+    {
+        Ok(items) => items,
+        Err(err) => return map_http_dataplane_error(err),
+    };
 
     Json(serde_json::json!({
         "tenant_id": tenant_id,
@@ -520,28 +465,29 @@ pub(super) async fn get_entity_timeline(
     let entity_type = params.get("entity_type").cloned().unwrap_or_default();
     let predicate = params.get("predicate").cloned().unwrap_or_default();
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
+    }
 
     let mut all_events: Vec<serde_json::Value> = Vec::new();
-    for gpu_id in pool.gpu_ids() {
-        let Some(store) = pool.store_for_gpu_id(gpu_id) else {
-            continue;
-        };
-        let guard = store.read().await;
-        let events = guard.query_entity_timeline(&tenant_id, &entity_type, &predicate);
-        for (name, value, micros) in events {
-            let ts_secs = micros / 1_000_000;
-            let date_str = chrono::DateTime::from_timestamp(ts_secs, 0)
-                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-                .unwrap_or_default();
-            all_events.push(serde_json::json!({
-                "entity_name": name,
-                "object_value": value,
-                "occurred_at": date_str,
-            }));
-        }
+    let events = match state
+        .http_dataplane
+        .entity_timeline(&tenant_id, &entity_type, &predicate)
+        .await
+    {
+        Ok(events) => events,
+        Err(err) => return map_http_dataplane_error(err),
+    };
+    for (name, value, micros) in events {
+        let ts_secs = micros / 1_000_000;
+        let date_str = chrono::DateTime::from_timestamp(ts_secs, 0)
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .unwrap_or_default();
+        all_events.push(serde_json::json!({
+            "entity_name": name,
+            "object_value": value,
+            "occurred_at": date_str,
+        }));
     }
 
     Json(serde_json::json!({
@@ -562,32 +508,31 @@ pub(super) async fn get_entity_current_state(
     let entity_name = params.get("entity_name").cloned().unwrap_or_default();
     let predicate = params.get("predicate").cloned().unwrap_or_default();
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
+    }
 
-    for gpu_id in pool.gpu_ids() {
-        let Some(store) = pool.store_for_gpu_id(gpu_id) else {
-            continue;
-        };
-        let guard = store.read().await;
-        if let Some((current_value, occurred_at_micros, previous_value, _prev_at)) =
-            guard.query_entity_current_state(&tenant_id, &entity_name, &predicate)
-        {
-            let ts_secs = occurred_at_micros / 1_000_000;
-            let date_str = chrono::DateTime::from_timestamp(ts_secs, 0)
-                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-                .unwrap_or_default();
-            return Json(serde_json::json!({
-                "tenant_id": tenant_id,
-                "entity_name": entity_name,
-                "predicate": predicate,
-                "current_value": current_value,
-                "occurred_at": date_str,
-                "previous_value": previous_value,
-            }))
-            .into_response();
-        }
+    if let Some((current_value, occurred_at_micros, previous_value, _prev_at)) = match state
+        .http_dataplane
+        .entity_current_state(&tenant_id, &entity_name, &predicate)
+        .await
+    {
+        Ok(row) => row,
+        Err(err) => return map_http_dataplane_error(err),
+    } {
+        let ts_secs = occurred_at_micros / 1_000_000;
+        let date_str = chrono::DateTime::from_timestamp(ts_secs, 0)
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .unwrap_or_default();
+        return Json(serde_json::json!({
+            "tenant_id": tenant_id,
+            "entity_name": entity_name,
+            "predicate": predicate,
+            "current_value": current_value,
+            "occurred_at": date_str,
+            "previous_value": previous_value,
+        }))
+        .into_response();
     }
 
     Json(serde_json::json!({

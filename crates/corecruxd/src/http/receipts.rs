@@ -15,27 +15,18 @@ pub(super) async fn get_receipt_body_v1(
         return problem.into_response();
     }
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
+    }
 
-    let (_decision, store) = match pool
-        .store_for_stream(&q.tenant_id, STREAM_TYPE_RECEIPT, &receipt_id, None)
-        .await
-    {
-        Ok(ok) => ok,
-        Err(err) => {
-            return map_store_error_http(err).into_response();
-        }
-    };
-    let store = store.read().await;
-    let events = match store
-        .read_stream(&q.tenant_id, STREAM_TYPE_RECEIPT, &receipt_id, 0, 16, None)
+    let events = match state
+        .http_dataplane
+        .read_stream(&q.tenant_id, STREAM_TYPE_RECEIPT, &receipt_id, 0, 16)
         .await
     {
         Ok(v) => v,
         Err(err) => {
-            return map_store_error_http(err).into_response();
+            return map_http_dataplane_error(err);
         }
     };
 
@@ -106,27 +97,18 @@ pub(super) async fn get_receipt_signature_v1(
         return problem.into_response();
     }
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
+    }
 
-    let (_decision, store) = match pool
-        .store_for_stream(&q.tenant_id, STREAM_TYPE_RECEIPT, &receipt_id, None)
-        .await
-    {
-        Ok(ok) => ok,
-        Err(err) => {
-            return map_store_error_http(err).into_response();
-        }
-    };
-    let store = store.read().await;
-    let events = match store
-        .read_stream(&q.tenant_id, STREAM_TYPE_RECEIPT, &receipt_id, 0, 16, None)
+    let events = match state
+        .http_dataplane
+        .read_stream(&q.tenant_id, STREAM_TYPE_RECEIPT, &receipt_id, 0, 16)
         .await
     {
         Ok(v) => v,
         Err(err) => {
-            return map_store_error_http(err).into_response();
+            return map_http_dataplane_error(err);
         }
     };
 
@@ -197,30 +179,18 @@ pub(super) async fn get_receipt_verification_v1(
         return problem.into_response();
     }
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
+    }
 
-    let stream_hash = match stream_hash_xxhash64(&q.tenant_id, STREAM_TYPE_RECEIPT, &receipt_id) {
-        Ok(v) => v,
-        Err(e) => return problem_response(StatusCode::BAD_REQUEST, e.to_string()),
-    };
-    let (decision, store) = match pool.store_for_stream_hash(stream_hash, None).await {
-        Ok(ok) => ok,
-        Err(err) => {
-            return map_store_error_http(err).into_response();
-        }
-    };
-    let shard_id_u32 = match parse_shard_id_u32(&decision.shard_id) {
-        Ok(v) => v,
-        Err(e) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-
-    let store = store.read().await;
-    match store.verify_receipt_stream_v1(shard_id_u32, &q.tenant_id, &receipt_id) {
+    match state
+        .http_dataplane
+        .verify_receipt_stream(&q.tenant_id, &receipt_id, None)
+        .await
+    {
         Ok(Some(report)) => (StatusCode::OK, Json(report)).into_response(),
         Ok(None) => problem_response(StatusCode::NOT_FOUND, "receipt body not found"),
-        Err(err) => map_store_error_http(err).into_response(),
+        Err(err) => map_http_dataplane_error(err),
     }
 }
 
@@ -367,19 +337,9 @@ pub(super) async fn get_stream_export_v1(
         return problem.into_response();
     }
 
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
-
-    let (_decision, store) = match pool
-        .store_for_stream(&q.tenant_id, &stream_type, &stream_id, None)
-        .await
-    {
-        Ok(ok) => ok,
-        Err(err) => {
-            return map_store_error_http(err).into_response();
-        }
-    };
+    }
 
     let format = match q.format.as_deref() {
         None => ExportFormatV1::Zip,
@@ -436,40 +396,38 @@ pub(super) async fn get_stream_export_v1(
     let max_events_total = q.max_events.unwrap_or(10_000).min(50_000);
 
     let mut events: Vec<corecrux_storage::StoredEvent> = Vec::new();
-    {
-        let store = store.read().await;
-        let mut cur = from_seq;
-        while (events.len() as u32) < max_events_total {
-            let remaining = max_events_total - (events.len() as u32);
-            let batch = remaining.min(1024);
-            let batch_events = match store
-                .read_stream(&q.tenant_id, &stream_type, &stream_id, cur, batch, None)
-                .await
-            {
-                Ok(v) => v,
-                Err(err) => {
-                    return map_store_error_http(err).into_response();
+    let mut cur = from_seq;
+    while (events.len() as u32) < max_events_total {
+        let remaining = max_events_total - (events.len() as u32);
+        let batch = remaining.min(1024);
+        let batch_events = match state
+            .http_dataplane
+            .read_stream(&q.tenant_id, &stream_type, &stream_id, cur, batch)
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return map_http_dataplane_error(err);
+            }
+        };
+        if batch_events.is_empty() {
+            break;
+        }
+        for ev in batch_events {
+            if let Some(to) = to_seq {
+                if ev.seq > to {
+                    break;
                 }
-            };
-            if batch_events.is_empty() {
+            }
+            cur = ev.seq.saturating_add(1);
+            events.push(ev);
+            if (events.len() as u32) >= max_events_total {
                 break;
             }
-            for ev in batch_events {
-                if let Some(to) = to_seq {
-                    if ev.seq > to {
-                        break;
-                    }
-                }
-                cur = ev.seq.saturating_add(1);
-                events.push(ev);
-                if (events.len() as u32) >= max_events_total {
-                    break;
-                }
-            }
-            if let Some(to) = to_seq {
-                if cur > to {
-                    break;
-                }
+        }
+        if let Some(to) = to_seq {
+            if cur > to {
+                break;
             }
         }
     }
@@ -738,28 +696,18 @@ pub(super) async fn export_receipt_bundle_v1(
     receipt_id: &str,
     opts: ReceiptExportOptionsV1,
 ) -> axum::response::Response {
-    let Some(pool) = state.dataplane_pool.as_ref() else {
+    if !state.http_dataplane.enabled() {
         return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
-    };
-
-    let (_decision, store) = match pool
-        .store_for_stream(tenant_id, STREAM_TYPE_RECEIPT, receipt_id, None)
-        .await
-    {
-        Ok(ok) => ok,
-        Err(err) => {
-            return map_store_error_http(err).into_response();
-        }
-    };
-    let store = store.read().await;
-    let events = match store
-        .read_tail(tenant_id, STREAM_TYPE_RECEIPT, receipt_id, 32, None)
+    }
+    let events = match state
+        .http_dataplane
+        .read_tail(tenant_id, STREAM_TYPE_RECEIPT, receipt_id, 32)
         .await
     {
         Ok(v) => v,
         Err(err) => {
             state.metrics.inc_receipt_export_total("error");
-            return map_store_error_http(err).into_response();
+            return map_http_dataplane_error(err);
         }
     };
 
@@ -829,7 +777,11 @@ pub(super) async fn export_receipt_bundle_v1(
             return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "shard_id out of range");
         }
     };
-    let report = match store.verify_receipt_stream_v1(shard_id_u32, tenant_id, receipt_id) {
+    let report = match state
+        .http_dataplane
+        .verify_receipt_stream(tenant_id, receipt_id, Some(shard_id_u32))
+        .await
+    {
         Ok(Some(r)) => r,
         Ok(None) => {
             state.metrics.inc_receipt_export_total("not_found");
@@ -837,7 +789,7 @@ pub(super) async fn export_receipt_bundle_v1(
         }
         Err(err) => {
             state.metrics.inc_receipt_export_total("error");
-            return problem_response(StatusCode::BAD_REQUEST, err.to_string());
+            return map_http_dataplane_error(err);
         }
     };
 
