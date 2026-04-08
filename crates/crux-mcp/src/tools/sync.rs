@@ -318,7 +318,7 @@ mod tests {
     async fn sync_pull_and_push_report_network_errors() {
         clear_sync_env();
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("CORECRUXD_SYNC_REMOTE_URL", "http://127.0.0.1:1");
+        std::env::set_var("CORECRUXD_SYNC_REMOTE_URL", "http://[::1");
         std::env::set_var("CORECRUXD_SYNC_API_KEY", "test-key");
         std::env::set_var("CORECRUXD_DATA_DIR", dir.path());
 
