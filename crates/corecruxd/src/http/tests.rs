@@ -1140,6 +1140,156 @@ async fn put_session_state_overwrites() {
     assert_eq!(body["state"]["extra"], true);
 }
 
+#[tokio::test]
+async fn fact_and_session_endpoints_accept_admin_read_fallback_in_dev_scopes_mode() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let admin_headers = dev_scope_headers("admin:read");
+
+    let create_resp = facts::put_fact(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(corecrux_memory::fact_store::StoreFact {
+            entity: "proj-admin".to_string(),
+            key: "status".to_string(),
+            value: "green".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    let created_fact = json_body(create_resp).await;
+    let fact_id = created_fact["fact_id"].as_str().unwrap().to_string();
+
+    let bulk_resp = facts::put_facts_bulk(
+        State(state.clone()),
+        admin_headers.clone(),
+        Json(vec![
+            corecrux_memory::fact_store::StoreFact {
+                entity: "proj-admin".to_string(),
+                key: "owner".to_string(),
+                value: "ops".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+            },
+            corecrux_memory::fact_store::StoreFact {
+                entity: "proj-admin:beta".to_string(),
+                key: "status".to_string(),
+                value: "yellow".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+            },
+        ]),
+    )
+    .await
+    .into_response();
+    assert_eq!(bulk_resp.status(), StatusCode::CREATED);
+    let bulk_body = json_body(bulk_resp).await;
+    assert_eq!(bulk_body["facts"].as_array().unwrap().len(), 2);
+
+    let get_resp = facts::get_fact(
+        State(state.clone()),
+        admin_headers.clone(),
+        Path(fact_id.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+
+    let entity_resp = facts::get_facts_by_entity(
+        State(state.clone()),
+        admin_headers.clone(),
+        Path("proj-admin".to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(entity_resp.status(), StatusCode::OK);
+    let entity_body = json_body(entity_resp).await;
+    assert_eq!(entity_body["facts"].as_array().unwrap().len(), 2);
+
+    let delete_resp = facts::delete_fact(
+        State(state.clone()),
+        admin_headers.clone(),
+        Path(fact_id.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    let mut export_params = std::collections::HashMap::new();
+    export_params.insert(
+        "since".to_string(),
+        (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
+    );
+    export_params.insert("limit".to_string(), "20000".to_string());
+    let export_resp = facts::export_facts(
+        State(state.clone()),
+        admin_headers.clone(),
+        Query(export_params),
+    )
+    .await
+    .into_response();
+    assert_eq!(export_resp.status(), StatusCode::OK);
+    let export_body = json_body(export_resp).await;
+    assert!(export_body["facts"].as_array().unwrap().is_empty());
+
+    let session_resp = facts::put_session_state(
+        State(state.clone()),
+        admin_headers.clone(),
+        Path("sess-admin-write".to_string()),
+        Json(serde_json::json!({"step": 3, "owner": "admin"})),
+    )
+    .await
+    .into_response();
+    assert_eq!(session_resp.status(), StatusCode::OK);
+    let session_body = json_body(session_resp).await;
+    assert_eq!(session_body["session_id"], "sess-admin-write");
+}
+
+#[tokio::test]
+async fn query_facts_supports_entity_prefix_top_k_and_token_budget() {
+    let state = test_app_state(16);
+    for (entity, key, value) in [
+        ("proj-a", "status", "green deploy"),
+        ("proj-a:beta", "owner", "ops team"),
+        ("proj-b", "status", "red deploy"),
+    ] {
+        let _ = facts::put_fact(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(corecrux_memory::fact_store::StoreFact {
+                entity: entity.to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+            }),
+        )
+        .await
+        .into_response();
+    }
+
+    let mut params = std::collections::HashMap::new();
+    params.insert("entity_prefix".to_string(), "proj-a".to_string());
+    params.insert("top_k".to_string(), "99".to_string());
+    params.insert("token_budget".to_string(), "1".to_string());
+
+    let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let facts = body["facts"].as_array().unwrap();
+    assert_eq!(facts.len(), 1);
+    assert!(facts[0]["entity"].as_str().unwrap().starts_with("proj-a"));
+    assert!(body["total_tokens"].as_u64().unwrap() > 0);
+}
+
 // ── Text Search (POST /v1/query/text-search) ────────────────────
 //
 // NOTE: text-search tests rely on the CORECRUXD_QUERY_TEXT_SEARCH env var
@@ -2183,6 +2333,7 @@ async fn post_admin_append_uses_http_dataplane_fake() {
 
 // ── post_query_graph_expand (feature gate + no dataplane) ───────
 
+#[serial_test::serial]
 #[tokio::test]
 async fn post_query_graph_expand_returns_not_found_when_disabled() {
     // Feature gate is off by default
@@ -2203,6 +2354,7 @@ async fn post_query_graph_expand_returns_not_found_when_disabled() {
 }
 
 #[allow(deprecated)]
+#[serial_test::serial]
 #[tokio::test]
 async fn post_query_graph_expand_uses_http_dataplane_fake() {
     std::env::set_var("CORECRUXD_QUERY_GRAPH_EXPAND", "1");

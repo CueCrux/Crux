@@ -209,7 +209,7 @@ CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 
 ```mermaid
 graph TD
-    cruxmcp[crux-mcp<br/>MCP Server<br/>18 tools]
+    cruxmcp[crux-mcp<br/>MCP Server<br/>21 tools]
     observe[crux-observe<br/>Self-Observation]
     sync[crux-sync<br/>Outbox Sync]
     contrib[crux-contrib<br/>Contributions]
@@ -268,7 +268,7 @@ See `config.example.env` for the full list with descriptions.
 
 ## MCP Server (for AI Agents)
 
-CoreCrux includes a built-in MCP server on port **14801** with 18 tools for retrieval, fact storage, sessions, decisions, and multi-agent handoff.
+CoreCrux includes a built-in MCP server on port **14801** with 21 tools for retrieval, fact storage, sessions, sync, decisions, and multi-agent handoff.
 
 ### Connect an agent
 

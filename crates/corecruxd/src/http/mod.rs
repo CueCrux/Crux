@@ -14,6 +14,8 @@ mod receipts;
 mod routing;
 
 pub(crate) use admin::AdminActionRecord;
+// HttpDataplane trait re-exported for test fakes (FakeHttpDataplane in tests.rs).
+#[allow(unused_imports)]
 pub(crate) use dataplane::{pool_backed_http_dataplane, HttpDataplane, HttpDataplaneError, SharedHttpDataplane};
 // Receipt export helpers (build_lineage_json_v1, etc.) only used by proprietary ExportReceiptBundle.
 #[allow(unused_imports)]

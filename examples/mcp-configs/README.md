@@ -9,7 +9,7 @@ CoreCrux runs two servers:
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | **14800** | HTTP/REST | Human-facing API (`/healthz`, `/v1/facts`, `/v1/query/*`) |
-| **14801** | MCP (JSON-RPC) | Agent-facing API (18 tools for retrieval, facts, sessions, decisions) |
+| **14801** | MCP (JSON-RPC) | Agent-facing API (21 tools for retrieval, facts, sessions, sync, decisions) |
 
 Your MCP client connects to `http://localhost:14801/mcp`.
 
