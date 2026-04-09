@@ -22,6 +22,9 @@ jobs:
       CARGO_HOME: /home/gha-runner/.cargo
     steps:
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: cargo fmt --check
       - run: typos
@@ -35,6 +38,7 @@ jobs:
       CARGO_HOME: /home/gha-runner/.cargo
     steps:
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: cargo build --workspace
       - run: cargo test --workspace
@@ -74,8 +78,9 @@ jobs:
       CARGO_HOME: /home/gha-runner/.cargo
     steps:
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.88.0
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - run: cargo +1.88.0 build --workspace
+      - run: cargo build --workspace
 
   coverage:
     name: Coverage
@@ -85,6 +90,9 @@ jobs:
       COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/http/append\.rs|.*/corecruxd/src/http/query\.rs|.*/corecruxd/src/http/projections\.rs|.*/corecruxd/src/http/receipts\.rs)$'
     steps:
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: cargo build --bin corecruxd
       - run: cargo llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --lcov --output-path lcov.info

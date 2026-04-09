@@ -16,6 +16,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - name: Check semver
         run: cargo semver-checks check-release --workspace || echo "::warning::Semver check failed (expected for first release or missing baseline)"
