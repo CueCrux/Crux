@@ -122,7 +122,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "query_facts".to_string(),
             description: "Query the fact store by keyword, entity, or both. Results are \
-                          ranked by confidence."
+                          ranked by confidence. Private facts are visible only to \
+                          their owning agent."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -203,7 +204,9 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // ── Sessions ───────────────────────────────────────────────
         ToolDefinition {
             name: "get_session".to_string(),
-            description: "Retrieve session state by ID. Returns the full JSON state object.".to_string(),
+            description: "Retrieve your session state by ID. Authenticated agents see \
+                          only their own session namespace."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -217,7 +220,9 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "save_session".to_string(),
-            description: "Create or update session state. Overwrites the previous state.".to_string(),
+            description: "Create or update your session state. Authenticated agents write \
+                          into their own session namespace."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -234,7 +239,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "list_sessions".to_string(),
-            description: "List all active session IDs. Returns a sorted list.".to_string(),
+            description: "List active session IDs visible to you. Returns a sorted list.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -243,7 +248,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "delete_session".to_string(),
-            description: "Delete a session by ID. Returns confirmation or not-found.".to_string(),
+            description: "Delete one of your sessions by ID. Returns confirmation or not-found.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -288,31 +293,32 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // ── Handoff ────────────────────────────────────────────────
         ToolDefinition {
             name: "create_handoff".to_string(),
-            description: "Package session state (and optionally facts) into a handoff \
-                          bundle for another agent."
+            description: "Package session state and relevant non-private facts into a \
+                          server-authenticated handoff bundle for another agent."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "session_id":    { "type": "string",  "description": "Session to hand off" },
                     "include_facts": { "type": "boolean", "description": "Include relevant facts in the package", "default": false },
+                    "target_agent":  { "type": "string",  "description": "Optional receiving agent name. If set, only that agent may accept the package." },
                     "message":       { "type": "string",  "description": "Free-text message for the receiving agent" }
                 },
                 "required": ["session_id"],
                 "examples": [
-                    { "session_id": "session-42", "include_facts": true, "message": "Architecture review complete, one open question." }
+                    { "session_id": "session-42", "include_facts": true, "target_agent": "implementer", "message": "Architecture review complete, one open question." }
                 ]
             }),
         },
         ToolDefinition {
             name: "accept_handoff".to_string(),
-            description: "Accept a handoff package from another agent, restoring session \
-                          state and facts."
+            description: "Accept a server-authenticated handoff package from another \
+                          agent, restoring session state and facts into your namespace."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "package": { "type": "string", "description": "Base64-encoded handoff package" }
+                    "package": { "type": "string", "description": "JSON-encoded handoff package returned by create_handoff" }
                 },
                 "required": ["package"],
                 "examples": [
@@ -433,8 +439,8 @@ pub fn tool_output_docs() -> Value {
         { "tool": "delete_session",     "output": "{ deleted: bool, session_id }" },
         { "tool": "get_gaps",           "output": "{ gaps: [{entity, key, value, stored_at}], total_tokens }" },
         { "tool": "get_agent_identity", "output": "{ agent_name: string }" },
-        { "tool": "create_handoff",     "output": "{ handoff_id, content_hash, signature, facts_count, total_tokens }" },
-        { "tool": "accept_handoff",     "output": "{ session_id, facts_imported, verified: bool }" },
+        { "tool": "create_handoff",     "output": "{ package_json, content_hash, signature, relevant_fact_count }" },
+        { "tool": "accept_handoff",     "output": "{ session_loaded, facts_loaded, verified: bool }" },
         { "tool": "record_decision",    "output": "{ decision_id, decision_hash, entity, action }" },
         { "tool": "sync_pull",          "output": "{ facts_pulled, cursor, total_pull_count }" },
         { "tool": "sync_push",          "output": "{ facts_pushed, total_push_count }" },
@@ -491,11 +497,26 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) fn clear_sync_env() {
+        std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
+        std::env::remove_var("CORECRUXD_SYNC_API_KEY");
+        std::env::remove_var("CORECRUXD_DATA_DIR");
+    }
+
+    pub(crate) fn sync_env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::agent::AgentIdentity;
     use crate::dispatch::McpContext;
+    use crate::tools::test_support::{clear_sync_env, sync_env_lock};
 
     const TOOL_COUNT: usize = 21;
 
@@ -711,8 +732,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_sync_pull_not_configured() {
-        std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
-        std::env::remove_var("CORECRUXD_SYNC_API_KEY");
+        let _guard = sync_env_lock().lock().await;
+        clear_sync_env();
         let ctx = test_ctx();
         let result = call_tool("sync_pull", &json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -721,8 +742,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_sync_push_not_configured() {
-        std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
-        std::env::remove_var("CORECRUXD_SYNC_API_KEY");
+        let _guard = sync_env_lock().lock().await;
+        clear_sync_env();
         let ctx = test_ctx();
         let result = call_tool("sync_push", &json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -731,7 +752,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_sync_status() {
-        std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
+        let _guard = sync_env_lock().lock().await;
+        clear_sync_env();
         let ctx = test_ctx();
         let result = call_tool("sync_status", &json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();

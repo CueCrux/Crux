@@ -31,7 +31,7 @@ pub fn run(http_base: &str, non_interactive: bool) -> Result<(), Box<dyn std::er
         eprintln!("    Using defaults (non-interactive): data_dir=./data, auth=off, ccxi=Y");
     } else {
         data_dir = prompt("Data directory", "./data");
-        auth_mode = prompt("Auth mode (off / token)", "off");
+        auth_mode = prompt("Auth mode (off / dev_scopes / jwt_hs256 / jwt_jwks)", "off");
         build_ccxi = prompt("Build CCXI companion indexes?", "Y");
     }
 
@@ -119,7 +119,7 @@ pub fn run(http_base: &str, non_interactive: bool) -> Result<(), Box<dyn std::er
     eprintln!("  Quickstart complete! Next steps:");
     eprintln!();
     eprintln!("    HTTP API       {base}/v1/");
-    eprintln!("    MCP endpoint   http://localhost:14801/");
+    eprintln!("    MCP endpoint   http://localhost:14801/mcp");
     eprintln!("    Docs           https://docs.cuecrux.com/corecrux/");
     eprintln!("    Benchmark      corecruxctl audit-pack --offline");
     eprintln!("    Playground     {base}/playground");
@@ -171,9 +171,9 @@ mod tests {
         assert!(content.contains("CORECRUXD_AUTH_MODE=off"));
         assert!(content.contains("CORECRUXD_BUILD_CCXI=true"));
 
-        let content_no = build_config_env("/srv/corecrux", "token", "N");
+        let content_no = build_config_env("/srv/corecrux", "dev_scopes", "N");
         assert!(content_no.contains("CORECRUXD_DATA_DIR=/srv/corecrux"));
-        assert!(content_no.contains("CORECRUXD_AUTH_MODE=token"));
+        assert!(content_no.contains("CORECRUXD_AUTH_MODE=dev_scopes"));
         assert!(content_no.contains("CORECRUXD_BUILD_CCXI=false"));
     }
 

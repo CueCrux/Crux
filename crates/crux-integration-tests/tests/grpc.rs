@@ -3,6 +3,7 @@
 // See LICENCE.md in the repository root.
 
 //! gRPC integration tests for CoreCrux Community Edition.
+//! Run: ./scripts/run-integration-tests.sh --test grpc -- --test-threads=1
 //!
 //! These tests verify that the gRPC server is listening, that all data-plane
 //! RPCs correctly return `UNIMPLEMENTED` in Community Edition, and that the

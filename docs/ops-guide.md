@@ -9,7 +9,7 @@ Deploy behind a reverse proxy (nginx, Caddy, Envoy) with rate limits configured.
 
 | Endpoint | Recommended limit | Rationale |
 |----------|-------------------|-----------|
-| POST /v1/append | 100 req/s | Write path; disk I/O bound |
+| POST /v1/admin/append (+ `/v1/append` alias) | 100 req/s | Write path; disk I/O bound |
 | POST /v1/query/* | 200 req/s | Read path; CPU-bound BM25 |
 | PUT /v1/facts | 50 req/s | In-memory + journal write |
 | GET /v1/facts/export | 10 req/s | Full scan; expensive |
@@ -23,7 +23,7 @@ Use the `rate_limit` directive from the
 
 ```caddyfile
 :14800 {
-    reverse_proxy localhost:14801
+    reverse_proxy localhost:14800
 
     rate_limit {
         zone append {
@@ -43,7 +43,7 @@ Use the `rate_limit` directive from the
         }
     }
 
-    @append  path /v1/append
+    @append  path /v1/admin/append /v1/append
     @query   path /v1/query/*
     @export  path /v1/facts/export
 
@@ -67,38 +67,43 @@ http {
     server {
         listen 14800;
 
-        location /v1/append {
+        location = /v1/admin/append {
             limit_req zone=append burst=20 nodelay;
-            proxy_pass http://127.0.0.1:14801;
+            proxy_pass http://127.0.0.1:14800;
+        }
+
+        location = /v1/append {
+            limit_req zone=append burst=20 nodelay;
+            proxy_pass http://127.0.0.1:14800;
         }
 
         location /v1/query/ {
             limit_req zone=query burst=40 nodelay;
-            proxy_pass http://127.0.0.1:14801;
+            proxy_pass http://127.0.0.1:14800;
         }
 
         location = /v1/facts {
             limit_req zone=facts_w burst=10 nodelay;
-            proxy_pass http://127.0.0.1:14801;
+            proxy_pass http://127.0.0.1:14800;
         }
 
         location = /v1/facts/export {
             limit_req zone=export burst=2 nodelay;
-            proxy_pass http://127.0.0.1:14801;
+            proxy_pass http://127.0.0.1:14800;
         }
 
         location = /healthz {
             # No rate limit — health probes must always succeed.
-            proxy_pass http://127.0.0.1:14801;
+            proxy_pass http://127.0.0.1:14800;
         }
 
         location = /metrics {
             limit_req zone=metrics burst=2 nodelay;
-            proxy_pass http://127.0.0.1:14801;
+            proxy_pass http://127.0.0.1:14800;
         }
 
         location / {
-            proxy_pass http://127.0.0.1:14801;
+            proxy_pass http://127.0.0.1:14800;
         }
     }
 }

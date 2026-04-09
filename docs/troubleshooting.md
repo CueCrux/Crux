@@ -71,7 +71,8 @@ curl -s -X PUT http://localhost:14800/v1/facts \
 
 ### Can't connect to MCP server
 
-**Cause:** MCP runs on port **14801**, not 14800. The HTTP API is on 14800.
+**Cause:** The built-in MCP server runs on port **14801**, not 14800. The HTTP
+API is on 14800, and MCP can be disabled with `CORECRUXD_MCP_ENABLED=false`.
 
 **Fix:** Check your MCP client config points to `http://localhost:14801/mcp`.
 
@@ -79,7 +80,7 @@ curl -s -X PUT http://localhost:14800/v1/facts \
 
 **Cause:** Tool name is misspelled or not in the catalogue.
 
-**Fix:** Call `tools/list` to see all 18 available tools:
+**Fix:** Call `tools/list` to see all 21 available tools:
 ```bash
 curl -s -X POST http://localhost:14801/mcp \
   -H "Content-Type: application/json" \
@@ -88,16 +89,34 @@ curl -s -X POST http://localhost:14801/mcp \
 
 ### Agent identity shows "anonymous"
 
-**Cause:** No `CRUX_AGENT_TOKEN` configured.
+**Cause:** The server is allowing anonymous MCP access because
+`CRUX_AGENT_TOKEN` / `CRUX_AGENT_TOKENS` is not configured, or your client is
+not sending a bearer token in anonymous mode.
 
 **Fix:**
 ```bash
 # Generate a token:
 openssl rand -hex 32
 
-# Set it as env var for the agent:
+# Configure it on the server and in the MCP client:
 export CRUX_AGENT_TOKEN="your-generated-token"
 ```
+
+If you configure agent tokens on the server, unauthenticated `POST /mcp`
+requests return `401 Unauthorized` instead of silently downgrading to
+anonymous access.
+
+### Handoff verification fails after restart or on another replica
+
+**Cause:** `CRUX_MCP_HANDOFF_SECRET` is unset, so handoff package verification
+keys are process-local and rotate on restart.
+
+**Fix:**
+```bash
+export CRUX_MCP_HANDOFF_SECRET="$(openssl rand -hex 32)"
+```
+
+Use the same secret on every replica that needs to accept MCP handoff packages.
 
 ## Health check failures
 
@@ -135,7 +154,7 @@ docker compose logs corecrux
 # The docker-compose.yml should set CORECRUXD_AUTH_MODE.
 # If not, add it:
 #   environment:
-#     - CORECRUXD_AUTH_MODE=off
+#     - CORECRUXD_AUTH_MODE=dev_scopes
 ```
 
 ### Build takes too long

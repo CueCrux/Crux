@@ -1,6 +1,10 @@
 # API Reference
 
-CoreCrux Community Edition exposes an HTTP API (default port 14800) and a gRPC API (default port 14801).
+CoreCrux Community Edition exposes three network surfaces by default:
+
+- HTTP API on `14800`
+- gRPC API on `4007`
+- Built-in MCP server on `14801` when `CORECRUXD_MCP_ENABLED=true` (default)
 
 ## HTTP Endpoints
 
@@ -28,12 +32,15 @@ CoreCrux Community Edition exposes an HTTP API (default port 14800) and a gRPC A
 
 | Method | Path | Description | Auth Scope |
 |--------|------|-------------|------------|
-| PUT | `/v1/facts` | Store or update a fact (entity + key + value + confidence) | `query:read` |
+| PUT | `/v1/facts` | Store or update a shared fact (entity + key + value + confidence) | `query:read` |
 | PUT | `/v1/facts/bulk` | Bulk-store multiple facts | `query:read` |
 | GET | `/v1/facts` | Query facts by text with token budget | `query:read` |
 | GET | `/v1/facts/{factId}` | Retrieve a specific fact by ID | `query:read` |
 | DELETE | `/v1/facts/{factId}` | Delete a fact | `query:read` |
 | GET | `/v1/facts/entity/{entity}` | List all facts for an entity | `query:read` |
+
+HTTP fact writes do not support `private=true`. Private facts and per-agent
+visibility are MCP-only features.
 
 ### Session Store
 
@@ -46,7 +53,7 @@ CoreCrux Community Edition exposes an HTTP API (default port 14800) and a gRPC A
 
 | Method | Path | Description | Auth Scope |
 |--------|------|-------------|------------|
-| POST | `/v1/admin/append` | Append events to a stream | `admin:write` * |
+| POST | `/v1/admin/append` | Append events to a stream (`/v1/append` compatibility alias) | `admin:write` * |
 
 \* Requires proprietary edition data-plane. Returns 501 in Community Edition.
 
@@ -126,7 +133,7 @@ CoreCrux Community Edition exposes an HTTP API (default port 14800) and a gRPC A
 
 ## gRPC Services
 
-Default port: 14801. Proto files in `proto/`.
+Default port: `4007`. Proto files in `proto/`.
 
 ### CoreCruxDataPlaneV1
 
@@ -161,6 +168,24 @@ Returns `UNIMPLEMENTED` in Community Edition.
 | `GetOpsHealth` | `GetOpsHealthRequest` | `GetOpsHealthResponse` | Health summary (JSON) |
 | `BootstrapPull` | `BootstrapPullRequest` | `BootstrapPullResponse` | Bootstrap fact pull with token budget |
 | `GetBootstrapStatus` | `GetBootstrapStatusRequest` | `GetBootstrapStatusResponse` | Seeded state and fact count |
+
+---
+
+## MCP (JSON-RPC over HTTP)
+
+Endpoint: `GET/POST http://<host>:14801/mcp`
+
+- `GET /mcp` returns server info and protocol metadata.
+- `POST /mcp` serves JSON-RPC 2.0 requests such as `tools/list` and
+  `tools/call`.
+- If `CRUX_AGENT_TOKEN` or `CRUX_AGENT_TOKENS` is configured, MCP requests
+  must include `Authorization: Bearer <token>`.
+- Private facts, agent-scoped sessions, and handoff workflows are available
+  through MCP tools, not the HTTP `/v1/facts` surface.
+
+See [agent-guide.md](/home/myles/CueCrux/Crux/docs/agent-guide.md) and
+[examples/mcp-configs/README.md](/home/myles/CueCrux/Crux/examples/mcp-configs/README.md)
+for JSON-RPC examples and client configs.
 
 ---
 

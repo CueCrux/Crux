@@ -5,7 +5,7 @@
 //! End-to-end integration tests exercising the full Community Edition workflow:
 //! store facts, query facts, store sessions.
 //!
-//! Run: cargo test -p crux-integration-tests --test e2e -- --test-threads=1
+//! Run: ./scripts/run-integration-tests.sh --test e2e -- --test-threads=1
 
 use crux_integration_tests::TestDaemon;
 use serde_json::json;
@@ -212,6 +212,10 @@ fn health_and_version() {
     assert!(
         has_build_info,
         "version endpoint should contain build metadata: {version}"
+    );
+    assert_eq!(
+        version["features"]["mcp"], true,
+        "built-in MCP should be enabled in the default test daemon"
     );
 
     // /metrics — should return 200 with Prometheus-format text.

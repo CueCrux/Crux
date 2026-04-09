@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
 use serde_json::json;
@@ -27,13 +27,24 @@ pub fn router(ctx: McpContext) -> axum::Router {
 }
 
 /// `POST /mcp` — JSON-RPC 2.0 endpoint (MCP Streamable HTTP).
-async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap, body: String) -> impl IntoResponse {
+async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap, body: String) -> Response {
     // Extract optional bearer token for agent lookup.
     let agent = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|auth| auth.strip_prefix("Bearer "))
         .and_then(|token| ctx.agent_registry.lookup(token).cloned());
+
+    if !ctx.agent_registry.is_empty() && agent.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "unauthorized",
+                "hint": "set Authorization: Bearer <CRUX_AGENT_TOKEN>"
+            })),
+        )
+            .into_response();
+    }
 
     // Build a per-request context with the agent identity attached (if any).
     let req_ctx = if let Some(identity) = agent {
@@ -46,6 +57,7 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
             agent_registry: ctx.agent_registry.clone(),
             agent: None,
             node_id: ctx.node_id.clone(),
+            handoff_key: ctx.handoff_key,
         }
     };
 
@@ -55,14 +67,14 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
         Err(e) => {
             warn!(error = %e, "failed to parse JSON-RPC request");
             let resp = JsonRpcResponse::error(None, PARSE_ERROR, format!("invalid JSON: {e}"));
-            return (StatusCode::OK, Json(resp));
+            return (StatusCode::OK, Json(resp)).into_response();
         }
     };
 
     info!(method = %req.method, id = ?req.id, "mcp request");
 
     let resp = dispatch::dispatch(req, &req_ctx, None).await;
-    (StatusCode::OK, Json(resp))
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 /// `GET /mcp` — server info discovery (MCP Streamable HTTP spec).
@@ -88,7 +100,10 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_app() -> axum::Router {
-        let ctx = McpContext::new_default("test-node");
+        router(McpContext::new_default("test-node"))
+    }
+
+    fn test_app_with_ctx(ctx: McpContext) -> axum::Router {
         router(ctx)
     }
 
@@ -154,5 +169,54 @@ mod tests {
         let info: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(info["serverInfo"]["name"], SERVER_NAME);
         assert_eq!(info["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn post_requires_auth_when_registry_configured() {
+        let mut ctx = McpContext::new_default("test-node");
+        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token("secret-token");
+        let app = test_app_with_ctx(ctx);
+        let body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn post_accepts_valid_token_when_registry_configured() {
+        let mut ctx = McpContext::new_default("test-node");
+        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token("secret-token");
+        let app = test_app_with_ctx(ctx);
+        let body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret-token")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

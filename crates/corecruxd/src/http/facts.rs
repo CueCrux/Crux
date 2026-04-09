@@ -51,6 +51,12 @@ pub(super) async fn put_fact(
             return problem.into_response();
         }
     }
+    if body.private {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "private facts require MCP agent identity; HTTP /v1/facts does not support private=true",
+        );
+    }
     let fact = state.fact_store.write().await.store(body);
     (StatusCode::CREATED, axum::Json(serde_json::json!(fact))).into_response()
 }
@@ -75,6 +81,12 @@ pub(super) async fn put_facts_bulk(
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
             return problem.into_response();
         }
+    }
+    if body.iter().any(|fact| fact.private) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "private facts require MCP agent identity; HTTP /v1/facts/bulk does not support private=true",
+        );
     }
     let facts = state.fact_store.write().await.store_bulk(body);
     (StatusCode::CREATED, axum::Json(serde_json::json!({"facts": facts}))).into_response()

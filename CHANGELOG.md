@@ -26,17 +26,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Split `corecruxd/src/http.rs` (10k LOC) into 10 handler sub-modules
 - Migrated CI to self-hosted Hetzner runners
 - Stripped all GPU/CUDA data-plane code (~10k LOC removed) — Community Edition is CPU-only
+- Built-in MCP support is now part of the supported `corecruxd` runtime path, quickstarts/examples/docs, and CI smoke checks
+- Standalone integration-test runs now have a dedicated helper script that builds `corecruxd`, exports `CORECRUXD_BINARY`, and runs the integration crate consistently
 
 ### Fixed
 
 - Flaky `crux-observe` config test (env-var race condition)
 - `SessionStore::put` TTL parameter across all callers
 - `arduino/setup-protoc` GitHub API rate limit (added `repo-token`)
+- Handoff import/export privacy and authenticity handling for MCP agent transfers
+- MCP agent/session scoping across fact queries, entity listing, and session operations
+- HTTP `private=true` fact writes are now rejected instead of implying unsupported caller scoping
+- Runtime/docs/example drift around append compatibility, text-search request shapes, and CE-default feature surfaces
+- Integration harness startup and readiness behavior across HTTP, gRPC, and MCP listeners
 
 ### Security
 
 - Fact sync privacy: sensitive entity prefixes (`finance:`, `health:`, `personal:`, etc.) are never pushed upstream
 - Sync push requires explicit `confirm: true` via MCP tool — preview mode by default
+- MCP bearer-token enforcement now returns `401` instead of silently accepting anonymous POSTs when agent tokens are configured
 
 ## [0.1.0] - 2026-04-03
 

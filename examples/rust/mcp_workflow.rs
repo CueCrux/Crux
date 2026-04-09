@@ -2,18 +2,24 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! Demonstrates the fact store + sync MCP tool workflow via the HTTP API.
+//! Demonstrates the built-in MCP endpoint with fact, entity, and session tools.
 //!
-//! This example shows how to: store facts (including private), query by keyword,
-//! list entities, export with pagination, and verify that private facts are
-//! excluded from export — the same operations that the MCP `store_fact`,
-//! `query_facts`, `list_entities`, and `sync_push` tools perform internally.
+//! This example shows how to:
+//! - discover the MCP server
+//! - list tools
+//! - store public facts
+//! - optionally store a private fact when `CRUX_AGENT_TOKEN` is configured
+//! - query facts and list entities
+//! - save and retrieve session state through MCP
 //!
-//! Prerequisites: `corecruxd` running on `localhost:14800` (see README.md).
+//! Prerequisites:
+//! - `corecruxd` running with the built-in MCP server on `localhost:14801`
+//! - optionally, `CRUX_AGENT_TOKEN` configured on both the server and client to
+//!   exercise private facts
 //!
 //! ```bash
 //! # Terminal 1 — start the daemon
-//! CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
+//! CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 //!
 //! # Terminal 2 — run this example
 //! cd examples/rust
@@ -21,28 +27,46 @@
 //! ```
 
 fn main() {
-    let base = std::env::var("CORECRUX_URL").unwrap_or_else(|_| "http://localhost:14800".into());
+    let mcp_url = std::env::var("CORECRUX_MCP_URL").unwrap_or_else(|_| "http://localhost:14801/mcp".into());
+    let agent_token = std::env::var("CRUX_AGENT_TOKEN").ok();
     let agent = ureq::Agent::new_with_defaults();
 
-    // ── 1. Health check ─────────────────────────────────────────────────
-    println!("1. Health check...");
+    // ── 1. Server info ──────────────────────────────────────────────────
+    println!("1. MCP server info...");
     let resp: serde_json::Value = agent
-        .get(&format!("{base}/healthz"))
+        .get(&mcp_url)
         .call()
-        .expect("corecruxd not reachable — is it running on port 14800?")
+        .expect("MCP endpoint not reachable — is corecruxd running on port 14801?")
         .body_mut()
         .read_json()
-        .expect("invalid JSON from /healthz");
-    println!("   status: {}", resp["status"]);
+        .expect("invalid JSON from GET /mcp");
+    println!(
+        "   server={} protocol={}",
+        resp["serverInfo"]["name"], resp["protocolVersion"]
+    );
 
-    // ── 2. Store 3 facts: 2 public, 1 private ──────────────────────────
-    println!("\n2. Storing 3 facts (2 public, 1 private)...");
+    // ── 2. List tools ───────────────────────────────────────────────────
+    println!("\n2. Listing tools...");
+    let tools: serde_json::Value = mcp_post(
+        &agent,
+        &mcp_url,
+        agent_token.as_deref(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        }),
+    );
+    let tool_count = tools["result"]["tools"].as_array().map_or(0, |items| items.len());
+    println!("   tool_count: {tool_count}");
 
-    let public_facts = vec![
+    // ── 3. Store public facts ───────────────────────────────────────────
+    println!("\n3. Storing public facts...");
+    for body in [
         serde_json::json!({
             "entity": "project",
             "key": "language",
-            "value": "The project is written in Rust with 17 workspace crates.",
+            "value": "The project is written in Rust with multiple workspace crates.",
             "confidence": 0.95
         }),
         serde_json::json!({
@@ -51,134 +75,130 @@ fn main() {
             "value": "Retrieval uses fused BM25 and graph signal scoring on the CPU path.",
             "confidence": 0.9
         }),
-    ];
-
-    let private_fact = serde_json::json!({
-        "entity": "agent_notes",
-        "key": "draft_plan",
-        "value": "Internal draft: migrate storage layer to io_uring in Q3.",
-        "confidence": 0.8,
-        "private": true
-    });
-
-    let mut stored_ids: Vec<String> = Vec::new();
-
-    for (i, body) in public_facts.iter().enumerate() {
-        let resp: serde_json::Value = agent
-            .put(&format!("{base}/v1/facts"))
-            .send_json(body)
-            .expect("fact store failed")
-            .body_mut()
-            .read_json()
-            .expect("invalid JSON from PUT /v1/facts");
-        let fid = resp["fact_id"].as_str().unwrap_or("unknown").to_string();
-        println!("   public  fact {}: {} (entity={})", i + 1, fid, resp["entity"]);
-        stored_ids.push(fid);
+    ] {
+        let resp = mcp_tool_call(&agent, &mcp_url, agent_token.as_deref(), "store_fact", body);
+        println!("   {}", content_text(&resp));
     }
 
-    let resp: serde_json::Value = agent
-        .put(&format!("{base}/v1/facts"))
-        .send_json(&private_fact)
-        .expect("private fact store failed")
-        .body_mut()
-        .read_json()
-        .expect("invalid JSON from PUT /v1/facts");
-    let private_id = resp["fact_id"].as_str().unwrap_or("unknown").to_string();
-    println!("   private fact 3: {} (entity={}, private={})", private_id, resp["entity"], resp["private"]);
-    stored_ids.push(private_id.clone());
-
-    // ── 3. Query facts by keyword ───────────────────────────────────────
-    println!("\n3. Querying facts for keyword 'Rust'...");
-    let resp: serde_json::Value = agent
-        .get(&format!("{base}/v1/facts?query=Rust&top_k=10"))
-        .call()
-        .expect("fact query failed")
-        .body_mut()
-        .read_json()
-        .expect("invalid JSON from GET /v1/facts");
-    let facts = resp["facts"].as_array().expect("expected facts array");
-    println!("   matched: {} fact(s), total_tokens: {}", facts.len(), resp["total_tokens"]);
-    for f in facts {
-        println!(
-            "     - [{}] {}/{} (confidence: {})",
-            f["fact_id"].as_str().unwrap_or("?"),
-            f["entity"].as_str().unwrap_or("?"),
-            f["key"].as_str().unwrap_or("?"),
-            f["confidence"]
+    // ── 4. Optionally store a private fact ──────────────────────────────
+    println!("\n4. Storing a private fact...");
+    if let Some(token) = agent_token.as_deref() {
+        let resp = mcp_tool_call(
+            &agent,
+            &mcp_url,
+            Some(token),
+            "store_fact",
+            serde_json::json!({
+                "entity": "agent_notes",
+                "key": "draft_plan",
+                "value": "Internal draft: migrate storage layer to io_uring in Q3.",
+                "confidence": 0.8,
+                "private": true
+            }),
         );
-    }
-
-    // ── 4. List entities (via query with no filter) ─────────────────────
-    println!("\n4. Listing entities (query all facts, extract unique entities)...");
-    let resp: serde_json::Value = agent
-        .get(&format!("{base}/v1/facts?top_k=100"))
-        .call()
-        .expect("fact query failed")
-        .body_mut()
-        .read_json()
-        .expect("invalid JSON from GET /v1/facts");
-    let all_facts = resp["facts"].as_array().expect("expected facts array");
-    let mut entities: Vec<String> = all_facts
-        .iter()
-        .filter_map(|f| f["entity"].as_str().map(String::from))
-        .collect();
-    entities.sort();
-    entities.dedup();
-    println!("   entities: {:?}", entities);
-
-    // ── 5. Export facts (pagination) — private fact excluded ────────────
-    println!("\n5. Exporting facts (limit=2 to show pagination)...");
-    let resp: serde_json::Value = agent
-        .get(&format!("{base}/v1/facts/export?limit=2"))
-        .call()
-        .expect("export failed")
-        .body_mut()
-        .read_json()
-        .expect("invalid JSON from GET /v1/facts/export");
-
-    let exported = resp["facts"].as_array().expect("expected facts array");
-    let has_more = resp["has_more"].as_bool().unwrap_or(false);
-    let next_cursor = resp["next_cursor"].as_str().unwrap_or("none");
-    println!("   page 1: {} fact(s), has_more: {}, next_cursor: {}", exported.len(), has_more, next_cursor);
-    for f in exported {
-        println!(
-            "     - [{}] {}/{} (private: {})",
-            f["fact_id"].as_str().unwrap_or("?"),
-            f["entity"].as_str().unwrap_or("?"),
-            f["key"].as_str().unwrap_or("?"),
-            f["private"]
-        );
-    }
-
-    // Verify the private fact is absent from the full export
-    println!("\n   Verifying private fact exclusion from export...");
-    let resp: serde_json::Value = agent
-        .get(&format!("{base}/v1/facts/export?limit=10000"))
-        .call()
-        .expect("export failed")
-        .body_mut()
-        .read_json()
-        .expect("invalid JSON from GET /v1/facts/export");
-    let all_exported = resp["facts"].as_array().expect("expected facts array");
-    let private_in_export = all_exported
-        .iter()
-        .any(|f| f["fact_id"].as_str() == Some(private_id.as_str()));
-    if private_in_export {
-        println!("   FAIL: private fact {} found in export!", private_id);
+        println!("   {}", content_text(&resp));
     } else {
-        println!("   OK: private fact {} correctly excluded from export.", private_id);
+        println!("   skipped: set CRUX_AGENT_TOKEN to exercise private MCP facts.");
     }
 
-    // ── 6. Summary ──────────────────────────────────────────────────────
-    println!("\n6. Summary");
-    println!("   Facts stored:      {} (2 public + 1 private)", stored_ids.len());
-    println!("   Query hits:        {}", facts.len());
-    println!("   Entities found:    {}", entities.len());
-    println!("   Exported (page 1): {} fact(s)", exported.len());
-    println!("   Private excluded:  {}", !private_in_export);
-    println!(
-        "\n   The MCP tools (store_fact, query_facts, list_entities, sync_push)"
+    // ── 5. Query facts by keyword ───────────────────────────────────────
+    println!("\n5. Querying facts for keyword 'Rust'...");
+    let resp = mcp_tool_call(
+        &agent,
+        &mcp_url,
+        agent_token.as_deref(),
+        "query_facts",
+        serde_json::json!({
+            "query": "Rust",
+            "top_k": 10
+        }),
     );
-    println!("   use the same HTTP endpoints demonstrated above.");
+    println!("   {}", content_text(&resp));
+
+    // ── 6. List visible entities ────────────────────────────────────────
+    println!("\n6. Listing entities...");
+    let resp = mcp_tool_call(
+        &agent,
+        &mcp_url,
+        agent_token.as_deref(),
+        "list_entities",
+        serde_json::json!({}),
+    );
+    println!("   {}", content_text(&resp));
+
+    // ── 7. Save and read a session via MCP ──────────────────────────────
+    println!("\n7. Saving and retrieving session state...");
+    let resp = mcp_tool_call(
+        &agent,
+        &mcp_url,
+        agent_token.as_deref(),
+        "save_session",
+        serde_json::json!({
+            "session_id": "demo-session",
+            "state": {
+                "decisions": ["Use MCP for agent-private memory"],
+                "open_questions": ["Should we enable authenticated MCP in dev?"]
+            }
+        }),
+    );
+    println!("   {}", content_text(&resp));
+
+    let resp = mcp_tool_call(
+        &agent,
+        &mcp_url,
+        agent_token.as_deref(),
+        "get_session",
+        serde_json::json!({
+            "session_id": "demo-session"
+        }),
+    );
+    println!("   session: {}", content_text(&resp));
+
     println!("\nDone.");
+}
+
+fn mcp_tool_call(
+    agent: &ureq::Agent,
+    mcp_url: &str,
+    agent_token: Option<&str>,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    mcp_post(
+        agent,
+        mcp_url,
+        agent_token,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments
+            }
+        }),
+    )
+}
+
+fn mcp_post(
+    agent: &ureq::Agent,
+    mcp_url: &str,
+    agent_token: Option<&str>,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    let request = agent.post(mcp_url);
+    let mut response = match agent_token {
+        Some(token) => request
+            .header("Authorization", format!("Bearer {token}"))
+            .send_json(&body),
+        None => request.send_json(&body),
+    }
+    .expect("MCP request failed");
+    response.body_mut().read_json().expect("invalid MCP JSON response")
+}
+
+fn content_text(resp: &serde_json::Value) -> &str {
+    resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("<missing content>")
 }

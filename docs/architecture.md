@@ -52,12 +52,15 @@ graph TD
 
 ### Append Path
 
-1. Client sends events via HTTP `POST /v1/append` or gRPC `AppendBatch`.
+1. Client sends events via HTTP `POST /v1/admin/append` (or compatibility alias `POST /v1/append`) or gRPC `AppendBatch`.
 2. `corecruxd` routes to shard via `stream_hash(tenant_id, stream_type, stream_id)`.
 3. Events encoded as frames (`corecrux-frame`) and appended to shard (`corecrux-storage`).
 4. When segment fills, it is sealed with BLAKE3 integrity hash.
 5. `.ccxi` companion index built at seal time (`corecrux-index`).
 6. CROWN receipt generated for every event (`corecrux-receipts`).
+
+In the default Community Edition runtime, the dataplane is disabled, so append
+requires a dataplane-enabled deployment.
 
 ### Query Path
 
@@ -70,7 +73,7 @@ graph TD
 
 ### Memory Path
 
-1. Agent stores facts via `PUT /v1/facts` or MCP `store_fact`.
+1. Shared facts are stored via `PUT /v1/facts`; private or agent-scoped facts are stored via MCP `store_fact`.
 2. Facts indexed in-memory (`corecrux-memory` FactStore).
 3. BM25 keyword search over fact values.
 4. Token-budgeted retrieval of facts.
@@ -98,12 +101,12 @@ graph TD
 
 ### Server Layer
 
-- **corecruxd** -- HTTP (axum, port 14800) and gRPC (tonic) daemon. Manages shard lifecycle, routes requests, serves Prometheus metrics at `/metrics`, and provides health/readiness endpoints.
+- **corecruxd** -- HTTP (axum, port 14800), gRPC (tonic, port 4007), and built-in MCP (port 14801 by default) daemon. Manages shard lifecycle, routes requests, serves Prometheus metrics at `/metrics`, and provides health/readiness endpoints.
 - **corecruxctl** -- CLI tool with subcommands: `verify-store` (cryptographic integrity check), `replay` (deterministic replay with drift classification), `receipts` (receipt tooling and export), `ccxi` (companion index inspection), `projections` (projection state management).
 
 ### Community Layer
 
-- **crux-mcp** -- MCP server exposing 21 tools for agent interaction. Handles agent identity, tool routing, and handoffs.
+- **crux-mcp** -- MCP router and tool surface exposing 21 tools for agent interaction. Handles agent identity, tool routing, and handoffs.
 - **crux-observe** -- Self-observation subsystem. Provides ops monitoring, bootstrap sequencing, and cold gate logic.
 - **crux-sync** -- Outbox sync with VaultCrux. Manages event replication to external systems.
 - **crux-contrib** -- Contribution manifest builder. Tracks and packages community contributions.

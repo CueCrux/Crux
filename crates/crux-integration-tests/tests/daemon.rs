@@ -3,7 +3,7 @@
 // See LICENCE.md in the repository root.
 
 //! Integration tests against a running corecruxd daemon.
-//! Run: cargo test -p crux-integration-tests -- --test-threads=1
+//! Run: ./scripts/run-integration-tests.sh -- --test-threads=1
 
 use crux_integration_tests::TestDaemon;
 use serde_json::json;
@@ -49,6 +49,48 @@ fn replication() {
 #[test]
 fn routing_status() {
     assert_eq!(daemon().get("/v1/routing/status").unwrap().status(), 200);
+}
+
+#[test]
+fn mcp_server_info() {
+    let body: serde_json::Value = daemon().mcp_get().unwrap().into_json().unwrap();
+    assert_eq!(body["serverInfo"]["name"], "crux");
+    assert!(body["protocolVersion"].is_string());
+}
+
+#[test]
+fn mcp_tools_list() {
+    let body: serde_json::Value = daemon()
+        .mcp_post_json(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 21);
+}
+
+#[test]
+fn mcp_requires_auth_when_agent_token_configured() {
+    let daemon = TestDaemon::start_with_agent_token("secret-token");
+
+    match daemon.mcp_post_json(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})) {
+        Err(ureq::Error::Status(401, _)) => {}
+        other => panic!("expected 401 from unauthenticated MCP request, got {other:?}"),
+    }
+
+    let body: serde_json::Value = daemon
+        .mcp_post_json_with_token(
+            json!({
+                "jsonrpc":"2.0",
+                "id":2,
+                "method":"tools/call",
+                "params":{"name":"get_agent_identity","arguments":{}}
+            }),
+            "secret-token",
+        )
+        .unwrap()
+        .into_json()
+        .unwrap();
+    assert_eq!(body["result"]["content"][0]["text"], "default");
 }
 
 #[test]
@@ -125,6 +167,27 @@ fn text_search_bad_query() {
 }
 
 #[test]
+fn append_compat_alias_returns_not_implemented_without_dataplane() {
+    match daemon().post_json(
+        "/v1/append",
+        json!({
+            "tenant_id":"t",
+            "stream_type":"docs",
+            "stream_id":"example",
+            "events":[{
+                "event_id":"evt-1",
+                "occurred_at":"2026-04-09T12:00:00Z",
+                "event_type":"doc.created",
+                "payload":"{\"title\":\"hello\"}"
+            }]
+        }),
+    ) {
+        Err(ureq::Error::Status(501, _)) => {}
+        other => panic!("expected 501 from append alias without dataplane, got {other:?}"),
+    }
+}
+
+#[test]
 fn fact_crud() {
     let d = daemon();
     let f: serde_json::Value = d
@@ -165,6 +228,17 @@ fn fact_bulk() {
         .into_json()
         .unwrap();
     assert_eq!(b["facts"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn fact_private_true_rejected_over_http() {
+    match daemon().put_json(
+        "/v1/facts",
+        json!({"entity":"agent","key":"secret","value":"hidden","private":true}),
+    ) {
+        Err(ureq::Error::Status(400, _)) => {}
+        other => panic!("expected 400 from private HTTP fact write, got {other:?}"),
+    }
 }
 
 #[test]

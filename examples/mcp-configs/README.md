@@ -4,7 +4,7 @@ Example configuration files for connecting MCP clients to a running CoreCrux ins
 
 ## How it works
 
-CoreCrux runs two servers:
+For MCP clients, the relevant network surfaces are:
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
@@ -26,8 +26,13 @@ Your MCP client connects to `http://localhost:14801/mcp`.
    curl -s -X POST http://localhost:14801/mcp \
      -H "Content-Type: application/json" \
      -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | jq '.result.tools | length'
-   # Expected output: 18
+   # Expected output: 21
    ```
+
+If the server is configured with `CRUX_AGENT_TOKEN` or `CRUX_AGENT_TOKENS`,
+send the matching `Authorization: Bearer <token>` header on MCP requests.
+If you rely on handoff packages across restarts or multiple replicas, configure
+the same `CRUX_MCP_HANDOFF_SECRET` on every instance.
 
 ## Claude Desktop
 

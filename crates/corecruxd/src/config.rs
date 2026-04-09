@@ -86,6 +86,8 @@ impl AppendLaneScope {
 pub struct Config {
     pub http_addr: SocketAddr,
     pub grpc_addr: SocketAddr,
+    pub mcp_addr: SocketAddr,
+    pub mcp_enabled: bool,
     pub data_dir: PathBuf,
     pub log_level: String,
     pub service_name: String,
@@ -99,6 +101,7 @@ pub struct Config {
     pub replicated_commit_timeout_ms: u64,
     pub replicated_commit_require_all_followers: bool,
     pub auth_mode: AuthMode,
+    pub auth_mode_explicitly_set: bool,
 
     // IO backend selection.
     pub io_backend: String,
@@ -192,6 +195,17 @@ pub fn load_config() -> Config {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4007);
+    let mcp_host: IpAddr = std::env::var("CORECRUXD_MCP_HOST")
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
+        .parse()
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let mcp_port: u16 = std::env::var("CORECRUXD_MCP_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(14801);
+    let mcp_enabled = std::env::var("CORECRUXD_MCP_ENABLED")
+        .ok()
+        .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
 
     let data_dir = std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
     let log_level = std::env::var("CORECRUXD_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
@@ -227,9 +241,11 @@ pub fn load_config() -> Config {
         .ok()
         .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
 
-    let auth_mode = std::env::var("CORECRUXD_AUTH_MODE")
-        .ok()
-        .and_then(|s| AuthMode::parse(&s))
+    let auth_mode_raw = std::env::var("CORECRUXD_AUTH_MODE").ok();
+    let auth_mode_explicitly_set = auth_mode_raw.is_some();
+    let auth_mode = auth_mode_raw
+        .as_deref()
+        .and_then(AuthMode::parse)
         .unwrap_or(AuthMode::DevScopes);
 
     let io_backend = std::env::var("CORECRUXD_IO_BACKEND").unwrap_or_else(|_| "cpu".to_string());
@@ -387,6 +403,8 @@ pub fn load_config() -> Config {
     Config {
         http_addr: SocketAddr::new(http_host, http_port),
         grpc_addr: SocketAddr::new(grpc_host, grpc_port),
+        mcp_addr: SocketAddr::new(mcp_host, mcp_port),
+        mcp_enabled,
         data_dir: PathBuf::from(data_dir),
         log_level,
         service_name,
@@ -400,6 +418,7 @@ pub fn load_config() -> Config {
         replicated_commit_timeout_ms,
         replicated_commit_require_all_followers,
         auth_mode,
+        auth_mode_explicitly_set,
 
         io_backend,
 
@@ -697,6 +716,9 @@ mod tests {
         assert_eq!(cfg.http_addr.ip().to_string(), "127.0.0.1");
         assert_eq!(cfg.grpc_addr.port(), 4007);
         assert_eq!(cfg.grpc_addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(cfg.mcp_addr.port(), 14801);
+        assert_eq!(cfg.mcp_addr.ip().to_string(), "127.0.0.1");
+        assert!(cfg.mcp_enabled);
         assert_eq!(cfg.data_dir.to_str().unwrap(), "../CoreCruxData/v3");
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.service_name, "corecruxd");
@@ -711,6 +733,7 @@ mod tests {
         assert_eq!(cfg.replicated_commit_timeout_ms, 5000);
         assert!(cfg.replicated_commit_require_all_followers);
         assert_eq!(cfg.auth_mode, crate::auth::AuthMode::DevScopes);
+        assert!(!cfg.auth_mode_explicitly_set);
         assert_eq!(cfg.io_backend, "cpu");
         assert!(!cfg.build_ccxi);
         assert!(!cfg.projections_enabled);
@@ -770,6 +793,9 @@ mod tests {
         std::env::set_var("CORECRUXD_HTTP_PORT", "9999");
         std::env::set_var("CORECRUXD_GRPC_HOST", "0.0.0.0");
         std::env::set_var("CORECRUXD_GRPC_PORT", "9998");
+        std::env::set_var("CORECRUXD_MCP_HOST", "0.0.0.0");
+        std::env::set_var("CORECRUXD_MCP_PORT", "9997");
+        std::env::set_var("CORECRUXD_MCP_ENABLED", "false");
         std::env::set_var("CORECRUXD_DATA_DIR", "/tmp/test-data");
         std::env::set_var("CORECRUXD_LOG_LEVEL", "debug");
         std::env::set_var("CORECRUXD_SERVICE", "test-svc");
@@ -810,6 +836,9 @@ mod tests {
         assert_eq!(cfg.http_addr.ip().to_string(), "0.0.0.0");
         assert_eq!(cfg.grpc_addr.port(), 9998);
         assert_eq!(cfg.grpc_addr.ip().to_string(), "0.0.0.0");
+        assert_eq!(cfg.mcp_addr.port(), 9997);
+        assert_eq!(cfg.mcp_addr.ip().to_string(), "0.0.0.0");
+        assert!(!cfg.mcp_enabled);
         assert_eq!(cfg.data_dir.to_str().unwrap(), "/tmp/test-data");
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.service_name, "test-svc");
@@ -823,6 +852,7 @@ mod tests {
         assert_eq!(cfg.replicated_commit_timeout_ms, 10000);
         assert!(!cfg.replicated_commit_require_all_followers);
         assert_eq!(cfg.auth_mode, crate::auth::AuthMode::Off);
+        assert!(cfg.auth_mode_explicitly_set);
         // io_backend from CORECRUXD_IO_BACKEND env (test sets "gpu-gds", kept for compatibility)
         assert_eq!(cfg.io_backend, "gpu-gds");
         assert!(cfg.build_ccxi);

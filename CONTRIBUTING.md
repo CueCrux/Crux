@@ -21,12 +21,15 @@ The binaries are at `target/release/corecruxd` and `target/release/corecruxctl`.
 
 ```bash
 cargo test --workspace                    # All unit tests
-cargo test -p crux-integration-tests      # HTTP + gRPC integration tests
+./scripts/run-integration-tests.sh        # HTTP + gRPC + MCP integration tests
 ```
 
-Integration tests spawn a `corecruxd` process, so build the debug binary first:
+The helper builds `corecruxd`, exports `CORECRUXD_BINARY`, and then runs the
+integration crate. You can still invoke Cargo directly if you want, but then
+you need to build the daemon binary first:
 ```bash
 cargo build --bin corecruxd
+CORECRUXD_BINARY=target/debug/corecruxd cargo test -p crux-integration-tests
 ```
 
 ## Code Style

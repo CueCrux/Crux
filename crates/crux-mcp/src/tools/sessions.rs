@@ -9,13 +9,15 @@ use serde_json::{json, Value};
 
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INVALID_PARAMS};
+use crate::scope;
 
 /// `get_session` — retrieve session state by ID.
 pub async fn handle_get_session(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let session_id = require_str(args, "session_id")?;
+    let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
 
     let store = ctx.session_store.read().await;
-    match store.get(session_id) {
+    match store.get(&stored_session_id) {
         Some(session) => Ok(json!({
             "content": [{
                 "type": "text",
@@ -42,14 +44,15 @@ pub async fn handle_save_session(args: &Value, ctx: &McpContext) -> Result<Value
     })?;
 
     let ttl_seconds = args.get("ttl_seconds").and_then(|v| v.as_u64());
+    let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
 
     let mut store = ctx.session_store.write().await;
-    let session = store.put(session_id, state, ttl_seconds);
+    let session = store.put(&stored_session_id, state, ttl_seconds);
 
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": format!("saved session {} ({} tokens)", session.session_id, session.total_tokens)
+            "text": format!("saved session {} ({} tokens)", session_id, session.total_tokens)
         }]
     }))
 }
@@ -57,7 +60,11 @@ pub async fn handle_save_session(args: &Value, ctx: &McpContext) -> Result<Value
 /// `list_sessions` — list all session IDs.
 pub async fn handle_list_sessions(_args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let store = ctx.session_store.read().await;
-    let mut ids = store.list().iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+    let mut ids = store
+        .list()
+        .into_iter()
+        .filter_map(|session_id| scope::visible_session_for_agent(session_id, scope::agent_name(ctx.agent.as_ref())))
+        .collect::<Vec<_>>();
     ids.sort();
 
     if ids.is_empty() {
@@ -75,9 +82,10 @@ pub async fn handle_list_sessions(_args: &Value, ctx: &McpContext) -> Result<Val
 /// `delete_session` — delete a session by ID.
 pub async fn handle_delete_session(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let session_id = require_str(args, "session_id")?;
+    let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
 
     let mut store = ctx.session_store.write().await;
-    let deleted = store.delete(session_id);
+    let deleted = store.delete(&stored_session_id);
 
     if deleted {
         Ok(json!({
@@ -112,6 +120,7 @@ fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, JsonRpcError
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::agent::AgentIdentity;
     use crate::dispatch::McpContext;
 
     fn test_ctx() -> McpContext {
@@ -177,6 +186,36 @@ mod tests {
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"v\": 2"));
         assert!(text.contains("\"extra\": true"));
+    }
+
+    #[tokio::test]
+    async fn sessions_are_scoped_per_agent() {
+        let ctx = test_ctx();
+        let alice_ctx = ctx.with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        let bob_ctx = ctx.with_agent(AgentIdentity {
+            name: "bob".to_string(),
+            token_hash: [1u8; 32],
+        });
+
+        handle_save_session(
+            &json!({"session_id": "shared", "state": {"owner": "alice"}}),
+            &alice_ctx,
+        )
+        .await
+        .unwrap();
+
+        let alice = handle_get_session(&json!({"session_id": "shared"}), &alice_ctx)
+            .await
+            .unwrap();
+        assert!(alice["content"][0]["text"].as_str().unwrap().contains("alice"));
+
+        let bob = handle_get_session(&json!({"session_id": "shared"}), &bob_ctx)
+            .await
+            .unwrap();
+        assert_eq!(bob["content"][0]["text"].as_str().unwrap(), "no session found: shared");
     }
 
     // ── list_sessions tests ─────────────────────────────────────────

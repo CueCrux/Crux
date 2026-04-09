@@ -32,6 +32,17 @@ pub(crate) fn pool_backed_http_dataplane(pool: Option<crate::pool::DataPlanePool
     Arc::new(PoolBackedHttpDataplane { pool })
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct GraphExpandRequest<'a> {
+    pub tenant_id: &'a str,
+    pub seed_artifact_ids: &'a [u32],
+    pub edge_types: &'a [String],
+    pub max_hops: u32,
+    pub budget: usize,
+    pub min_confidence: f32,
+    pub include_state: bool,
+}
+
 #[tonic::async_trait]
 pub(crate) trait HttpDataplane: Send + Sync {
     fn enabled(&self) -> bool;
@@ -71,13 +82,7 @@ pub(crate) trait HttpDataplane: Send + Sync {
 
     async fn graph_expand(
         &self,
-        tenant_id: &str,
-        seed_artifact_ids: &[u32],
-        edge_types: &[String],
-        max_hops: u32,
-        budget: usize,
-        min_confidence: f32,
-        include_state: bool,
+        req: GraphExpandRequest<'_>,
     ) -> Result<corecrux_projections::query::graph_expand::GraphExpandResponse, HttpDataplaneError>;
 
     async fn time_range(
@@ -267,15 +272,10 @@ impl HttpDataplane for PoolBackedHttpDataplane {
 
     async fn graph_expand(
         &self,
-        tenant_id: &str,
-        seed_artifact_ids: &[u32],
-        edge_types: &[String],
-        max_hops: u32,
-        budget: usize,
-        min_confidence: f32,
-        include_state: bool,
+        req: GraphExpandRequest<'_>,
     ) -> Result<corecrux_projections::query::graph_expand::GraphExpandResponse, HttpDataplaneError> {
-        let edge_types: Vec<corecrux_projections::RelationTypeV1> = edge_types
+        let edge_types: Vec<corecrux_projections::RelationTypeV1> = req
+            .edge_types
             .iter()
             .filter_map(|value| corecrux_projections::RelationTypeV1::from_engine_str(value))
             .collect();
@@ -291,13 +291,13 @@ impl HttpDataplane for PoolBackedHttpDataplane {
             };
             let store = store.read().await;
             let response = store.query_graph_expand(
-                tenant_id,
-                seed_artifact_ids,
+                req.tenant_id,
+                req.seed_artifact_ids,
                 &edge_types,
-                max_hops,
-                budget,
-                min_confidence,
-                include_state,
+                req.max_hops,
+                req.budget,
+                req.min_confidence,
+                req.include_state,
             );
             combined.stats.nodes_visited += response.stats.nodes_visited;
             combined.stats.edges_traversed += response.stats.edges_traversed;
@@ -312,8 +312,8 @@ impl HttpDataplane for PoolBackedHttpDataplane {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         combined.artifacts.dedup_by_key(|artifact| artifact.artifact_id);
-        combined.artifacts.truncate(budget);
-        combined.stats.budget_remaining = budget.saturating_sub(combined.artifacts.len());
+        combined.artifacts.truncate(req.budget);
+        combined.stats.budget_remaining = req.budget.saturating_sub(combined.artifacts.len());
 
         Ok(combined)
     }

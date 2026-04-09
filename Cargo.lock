@@ -768,6 +768,7 @@ dependencies = [
  "corecrux-storage",
  "corecrux-types",
  "crc32fast",
+ "crux-mcp",
  "crux-observe",
  "ed25519-dalek",
  "fs2",
@@ -952,7 +953,6 @@ dependencies = [
  "corecrux-memory",
  "corecrux-retrieval",
  "crux-observe",
- "ed25519-dalek",
  "http-body-util",
  "rand 0.8.5",
  "serde",
@@ -1137,7 +1137,6 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
- "rand_core 0.6.4",
  "serde",
  "sha2 0.10.9",
  "subtle",

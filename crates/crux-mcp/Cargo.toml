@@ -8,7 +8,6 @@ license.workspace = true
 axum = "0.8.1"
 blake3 = "1.5.1"
 chrono = { version = "0.4.40", default-features = false, features = ["clock", "serde"] }
-ed25519-dalek = { version = "2.2.0", features = ["std", "rand_core"] }
 base64 = "0.22.1"
 rand = "0.8.5"
 serde = { version = "1.0.218", features = ["derive"] }
