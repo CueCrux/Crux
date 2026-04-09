@@ -1,0 +1,16 @@
+version: v2
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: gen/go
+    opt: paths=source_relative
+  - remote: buf.build/grpc/go
+    out: gen/go
+    opt: paths=source_relative
+  - remote: buf.build/protocolbuffers/python
+    out: gen/python
+  - remote: buf.build/grpc/python
+    out: gen/python
+  - remote: buf.build/bufbuild/es
+    out: gen/ts
+  - remote: buf.build/connectrpc/es
+    out: gen/ts

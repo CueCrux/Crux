@@ -1,0 +1,12 @@
+apiVersion: v2
+name: corecrux
+description: CoreCrux Community Edition — append-only event store with BM25 retrieval and CROWN receipts
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/CueCrux/Crux
+sources:
+  - https://github.com/CueCrux/Crux
+maintainers:
+  - name: CueCrux
+    url: https://github.com/CueCrux

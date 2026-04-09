@@ -4,6 +4,43 @@
 
 use super::*;
 
+/// Query parameters for the GET /v1/facts endpoint.
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub(super) struct QueryFactsParams {
+    /// Free-text BM25 query over fact values.
+    pub query: Option<String>,
+    /// Exact entity match.
+    pub entity: Option<String>,
+    /// Entity prefix filter (e.g. `__ops__::`)
+    pub entity_prefix: Option<String>,
+    /// Maximum number of results to return (default 10).
+    pub top_k: Option<usize>,
+    /// Token budget — fill results by descending score until exhausted.
+    pub token_budget: Option<usize>,
+}
+
+/// Query parameters for the GET /v1/facts/export endpoint.
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub(super) struct ExportFactsParams {
+    /// Only include facts stored after this RFC 3339 timestamp.
+    pub since: Option<String>,
+    /// Cursor for pagination (from previous response).
+    pub cursor: Option<String>,
+    /// Maximum number of facts to return (default 1000, max 10000).
+    pub limit: Option<u32>,
+}
+
+#[utoipa::path(
+    put,
+    path = "/v1/facts",
+    tag = "Facts",
+    request_body = corecrux_memory::fact_store::StoreFact,
+    responses(
+        (status = 201, description = "Fact created", body = corecrux_memory::fact_store::Fact),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub(super) async fn put_fact(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -18,6 +55,17 @@ pub(super) async fn put_fact(
     (StatusCode::CREATED, axum::Json(serde_json::json!(fact))).into_response()
 }
 
+#[utoipa::path(
+    put,
+    path = "/v1/facts/bulk",
+    tag = "Facts",
+    request_body = Vec<corecrux_memory::fact_store::StoreFact>,
+    responses(
+        (status = 201, description = "Facts created"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub(super) async fn put_facts_bulk(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -32,6 +80,18 @@ pub(super) async fn put_facts_bulk(
     (StatusCode::CREATED, axum::Json(serde_json::json!({"facts": facts}))).into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/facts/{factId}",
+    tag = "Facts",
+    params(("factId" = String, Path, description = "Fact identifier")),
+    responses(
+        (status = 200, description = "Fact found", body = corecrux_memory::fact_store::Fact),
+        (status = 404, description = "Fact not found"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub(super) async fn get_fact(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -49,6 +109,18 @@ pub(super) async fn get_fact(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/v1/facts/{factId}",
+    tag = "Facts",
+    params(("factId" = String, Path, description = "Fact identifier")),
+    responses(
+        (status = 200, description = "Fact deleted"),
+        (status = 404, description = "Fact not found"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub(super) async fn delete_fact(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -67,6 +139,17 @@ pub(super) async fn delete_fact(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/facts/entity/{entity}",
+    tag = "Facts",
+    params(("entity" = String, Path, description = "Entity name")),
+    responses(
+        (status = 200, description = "Facts for entity"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub(super) async fn get_facts_by_entity(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -82,10 +165,21 @@ pub(super) async fn get_facts_by_entity(
     (StatusCode::OK, axum::Json(serde_json::json!({"facts": facts}))).into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/facts",
+    tag = "Facts",
+    params(QueryFactsParams),
+    responses(
+        (status = 200, description = "Matching facts"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub(super) async fn query_facts(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+    Query(params): Query<QueryFactsParams>,
 ) -> impl IntoResponse {
     if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
@@ -93,11 +187,11 @@ pub(super) async fn query_facts(
         }
     }
     let q = corecrux_memory::fact_store::FactQuery {
-        query: params.get("query").cloned(),
-        entity: params.get("entity").cloned(),
-        entity_prefix: params.get("entity_prefix").cloned(),
-        top_k: params.get("top_k").and_then(|v| v.parse().ok()).unwrap_or(10),
-        token_budget: params.get("token_budget").and_then(|v| v.parse().ok()),
+        query: params.query,
+        entity: params.entity,
+        entity_prefix: params.entity_prefix,
+        top_k: params.top_k.unwrap_or(10),
+        token_budget: params.token_budget,
     };
     let store = state.fact_store.read().await;
     let result = store.query(&q);
@@ -111,10 +205,21 @@ pub(super) async fn query_facts(
         .into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/facts/export",
+    tag = "Facts",
+    params(ExportFactsParams),
+    responses(
+        (status = 200, description = "Exported facts"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub(super) async fn export_facts(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+    Query(params): Query<ExportFactsParams>,
 ) -> impl IntoResponse {
     if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
         if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
@@ -123,16 +228,14 @@ pub(super) async fn export_facts(
     }
 
     let since = params
-        .get("since")
+        .since
+        .as_deref()
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc));
 
-    let cursor = params.get("cursor").map(|s| s.as_str());
+    let cursor = params.cursor.as_deref();
 
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.parse::<u32>().ok())
-        .map_or(1000, |v| v.min(10000) as usize);
+    let limit = params.limit.map_or(1000, |v| v.min(10000) as usize);
 
     let store = state.fact_store.read().await;
     let result = store.export(since, cursor, limit);
@@ -151,6 +254,18 @@ pub(super) async fn export_facts(
 
 // ── Session Store API (Phase 1.5) ──────────────────────────────────
 
+#[utoipa::path(
+    put,
+    path = "/v1/sessions/{sessionId}/state",
+    tag = "Sessions",
+    params(("sessionId" = String, Path, description = "Session identifier")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Session state stored", body = corecrux_memory::session_store::SessionState),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub(super) async fn put_session_state(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -166,6 +281,18 @@ pub(super) async fn put_session_state(
     (StatusCode::OK, axum::Json(serde_json::json!(session))).into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/sessions/{sessionId}/state",
+    tag = "Sessions",
+    params(("sessionId" = String, Path, description = "Session identifier")),
+    responses(
+        (status = 200, description = "Session state found", body = corecrux_memory::session_store::SessionState),
+        (status = 404, description = "Session not found"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub(super) async fn get_session_state(
     State(state): State<AppState>,
     headers: HeaderMap,

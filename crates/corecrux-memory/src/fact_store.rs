@@ -26,7 +26,7 @@ enum JournalEvent {
 }
 
 /// A single fact in the store.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Fact {
     pub fact_id: String,
     pub entity: String,
@@ -53,7 +53,7 @@ fn default_version() -> u32 {
 }
 
 /// Request to store a new fact.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct StoreFact {
     pub entity: String,
     pub key: String,
@@ -71,7 +71,7 @@ fn default_confidence() -> f32 {
 }
 
 /// Query parameters for fact retrieval.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct FactQuery {
     pub query: Option<String>,
     pub entity: Option<String>,
@@ -96,11 +96,18 @@ pub struct FactStore {
     key_index: HashMap<(String, String), Vec<String>>,
     /// Path to the JSONL journal file. `None` for pure in-memory mode.
     journal_path: Option<PathBuf>,
+    /// Optional event bus for real-time mutation notifications.
+    event_bus: Option<crate::events::EventBus>,
 }
 
 impl FactStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach an event bus so that `store()` and `delete()` emit real-time events.
+    pub fn set_event_bus(&mut self, bus: crate::events::EventBus) {
+        self.event_bus = Some(bus);
     }
 
     /// Create a fact store backed by a JSONL journal in `data_dir`.
@@ -115,6 +122,7 @@ impl FactStore {
             entity_index: HashMap::new(),
             key_index: HashMap::new(),
             journal_path: Some(journal_path.clone()),
+            event_bus: None,
         };
         if journal_path.exists() {
             store.replay_journal(&journal_path)?;
@@ -223,6 +231,14 @@ impl FactStore {
 
         self.append_journal(&JournalEvent::Store { fact: fact.clone() });
 
+        if let Some(bus) = &self.event_bus {
+            bus.emit(crate::events::CruxEvent::FactStored {
+                fact_id: fact.fact_id.clone(),
+                entity: fact.entity.clone(),
+                key: fact.key.clone(),
+            });
+        }
+
         fact
     }
 
@@ -239,6 +255,11 @@ impl FactStore {
                 fact_id: fact_id.to_string(),
                 deleted_at: Utc::now().to_rfc3339(),
             });
+            if let Some(bus) = &self.event_bus {
+                bus.emit(crate::events::CruxEvent::FactDeleted {
+                    fact_id: fact_id.to_string(),
+                });
+            }
             true
         } else {
             false
@@ -441,14 +462,14 @@ impl FactStore {
 }
 
 /// Result of a fact query.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct FactQueryResult {
     pub facts: Vec<Fact>,
     pub total_tokens: usize,
 }
 
 /// Result of a paginated fact export (includes deleted facts for sync tombstones).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct FactExportResult {
     pub facts: Vec<Fact>,
     pub next_cursor: Option<String>,

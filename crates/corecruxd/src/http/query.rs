@@ -4,7 +4,7 @@
 
 use super::*;
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub(super) struct GraphExpandBody {
     pub(super) tenant_id: String,
     pub(super) seed_artifact_ids: Vec<u32>,
@@ -27,7 +27,7 @@ pub(super) fn default_budget() -> usize {
     50
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub(super) struct TimeRangeBody {
     pub(super) tenant_id: String,
     pub(super) start_micros: i64,
@@ -46,6 +46,19 @@ pub(super) fn default_time_range_limit() -> usize {
 
 // ── v4.2 query handlers ──────────────────────────────────────────────────
 
+#[utoipa::path(
+    post,
+    path = "/v1/query/graph-expand",
+    tag = "Query",
+    request_body = GraphExpandBody,
+    responses(
+        (status = 200, description = "Graph expand results"),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Feature not enabled"),
+    ),
+    security(("bearer_auth" = []))
+)]
 #[tracing::instrument(level = "info", skip(state, headers, body), fields(tenant_id = %body.tenant_id))]
 pub(super) async fn post_query_graph_expand(
     State(state): State<AppState>,
@@ -162,6 +175,19 @@ pub(super) async fn post_query_graph_expand(
         .into_response()
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/query/time-range",
+    tag = "Query",
+    request_body = TimeRangeBody,
+    responses(
+        (status = 200, description = "Time range results"),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Feature not enabled"),
+    ),
+    security(("bearer_auth" = []))
+)]
 #[tracing::instrument(level = "info", skip(state, headers, body), fields(tenant_id = %body.tenant_id))]
 pub(super) async fn post_query_time_range(
     State(state): State<AppState>,
@@ -284,7 +310,7 @@ pub(super) async fn post_query_time_range(
 
 // ── v5 general-purpose HTTP append ──────────────────────────────────
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub(super) struct TextSearchBody {
     pub(super) tenant_id: String,
     pub(super) query: String,
@@ -308,6 +334,19 @@ pub(super) fn default_text_search_limit() -> usize {
     10
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/query/text-search",
+    tag = "Query",
+    request_body = TextSearchBody,
+    responses(
+        (status = 200, description = "Text search results"),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Feature not enabled"),
+    ),
+    security(("bearer_auth" = []))
+)]
 #[tracing::instrument(level = "info", skip(state, headers, body))]
 pub(super) async fn post_query_text_search(
     State(state): State<AppState>,
@@ -494,7 +533,7 @@ pub(super) async fn post_query_text_search(
 
 // ── Progressive retrieval: expand ──────────────────────────────────────
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub(super) struct TextSearchExpandBody {
     /// Tenant ID for the expand request (must match original scan).
     #[allow(dead_code)] // Deserialized from request; tenant validation planned for multi-tenant expand.
@@ -503,12 +542,24 @@ pub(super) struct TextSearchExpandBody {
     pub(super) result_ids: Vec<ExpandResultId>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 pub(super) struct ExpandResultId {
     pub(super) segment_index: usize,
     pub(super) doc_id: u32,
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/query/text-search/expand",
+    tag = "Query",
+    request_body = TextSearchExpandBody,
+    responses(
+        (status = 200, description = "Expanded text search results"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Feature not enabled"),
+    ),
+    security(("bearer_auth" = []))
+)]
 #[tracing::instrument(level = "info", skip(state, headers, body))]
 pub(super) async fn post_query_text_search_expand(
     State(state): State<AppState>,

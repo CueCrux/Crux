@@ -9,6 +9,14 @@ use super::{
     Response, RoutingInfo, RoutingTable, State, StatusCode, ValvesInfo,
 };
 
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "Health",
+    responses(
+        (status = 200, description = "Node health status"),
+    )
+)]
 pub(super) async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let _ = state.commit_level;
     let routing = state.routing.read().await.clone();
@@ -83,6 +91,15 @@ pub(super) fn evaluate_replicated_commit_topology(
     status
 }
 
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    tag = "Health",
+    responses(
+        (status = 200, description = "Node ready"),
+        (status = 503, description = "Node not ready"),
+    )
+)]
 pub(super) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     // Phase 3 readiness: lock held + routing table loaded + control evidence + capacity checks.
     let routing = state.routing.read().await;
@@ -280,6 +297,14 @@ pub(super) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::SERVICE_UNAVAILABLE, Json(ReadyFail { ok: false, checks })).into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    tag = "Health",
+    responses(
+        (status = 200, description = "Prometheus metrics", content_type = "text/plain"),
+    )
+)]
 pub(super) async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     match state.metrics.render() {
         Ok(body) => {
@@ -316,6 +341,14 @@ pub(super) fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Resp
 
 // ── Production hardening: /v1/version endpoint ──────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/v1/version",
+    tag = "Health",
+    responses(
+        (status = 200, description = "Build version and feature flags"),
+    )
+)]
 pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "version": state.build.version,

@@ -105,6 +105,7 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
         retrieval_index: Arc::new(RwLock::new(corecrux_retrieval::IndexManager::new())),
         fact_store: Arc::new(RwLock::new(corecrux_memory::FactStore::new())),
         session_store: Arc::new(RwLock::new(corecrux_memory::SessionStore::new())),
+        event_bus: corecrux_memory::events::EventBus::new(16),
         capacity: Arc::new(RwLock::new(CapacityState {
             total_bytes: 100,
             free_bytes: 80,

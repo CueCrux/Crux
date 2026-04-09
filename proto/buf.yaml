@@ -1,0 +1,19 @@
+version: v2
+modules:
+  - path: .
+    name: buf.build/cuecrux/corecrux
+lint:
+  use:
+    - STANDARD
+  except:
+    # Package names are already versioned: corecrux.dataplane.v1, corecrux.observe.v1
+    - PACKAGE_VERSION_SUFFIX
+    # Enum values use short names (APPENDED, DECODED) rather than TYPE_PREFIXED_NAME
+    - ENUM_VALUE_PREFIX
+    # Zero values are semantically meaningful (e.g. APPENDED=0, DECODED=0), not _UNSPECIFIED
+    - ENUM_ZERO_VALUE_SUFFIX
+    # Services use product naming (CoreCruxDataPlaneV1) not the generic "Service" suffix
+    - SERVICE_SUFFIX
+breaking:
+  use:
+    - FILE
