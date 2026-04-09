@@ -8,12 +8,20 @@ lint:
   except:
     # Package names are already versioned: corecrux.dataplane.v1, corecrux.observe.v1
     - PACKAGE_VERSION_SUFFIX
+    # Proto files are flat (not in corecrux/dataplane/v1/ subdirs) — pre-existing layout
+    - PACKAGE_DIRECTORY_MATCH
+    # Multiple packages in one directory — dataplane + observe share proto/
+    - PACKAGE_SAME_DIRECTORY
     # Enum values use short names (APPENDED, DECODED) rather than TYPE_PREFIXED_NAME
     - ENUM_VALUE_PREFIX
     # Zero values are semantically meaningful (e.g. APPENDED=0, DECODED=0), not _UNSPECIFIED
     - ENUM_ZERO_VALUE_SUFFIX
     # Services use product naming (CoreCruxDataPlaneV1) not the generic "Service" suffix
     - SERVICE_SUFFIX
+    # Some RPCs share request/response types (e.g. ReadStreamBatchedRequest used by multiple RPCs)
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+    - RPC_REQUEST_RESPONSE_UNIQUE
 breaking:
   use:
     - FILE
