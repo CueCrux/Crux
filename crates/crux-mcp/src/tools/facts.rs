@@ -278,17 +278,19 @@ const BOOTSTRAP_PREFIX: &str = "__bootstrap__::";
 /// `get_bootstrap` — query bootstrap knowledge at runtime.
 ///
 /// Accepts an optional `topic` parameter ("patterns", "docs", "errors") to
-/// filter bootstrap facts by sub-entity.
+/// filter bootstrap facts by sub-entity, plus an optional `query` term to
+/// narrow the result set.
 pub async fn handle_get_bootstrap(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let topic = args.get("topic").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let query = args.get("query").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let prefix = match &topic {
-        Some(t) => format!("{BOOTSTRAP_PREFIX}{t}"),
+        Some(t) => format!("{BOOTSTRAP_PREFIX}{}:", normalize_bootstrap_topic(t)),
         None => BOOTSTRAP_PREFIX.to_string(),
     };
 
     let q = FactQuery {
-        query: None,
+        query,
         entity: None,
         entity_prefix: Some(prefix),
         top_k: 100,
@@ -318,6 +320,17 @@ pub async fn handle_get_bootstrap(args: &Value, ctx: &McpContext) -> Result<Valu
     Ok(json!({
         "content": [{ "type": "text", "text": text }]
     }))
+}
+
+fn normalize_bootstrap_topic(topic: &str) -> String {
+    let trimmed = topic.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "doc" | "docs" => "doc".to_string(),
+        "pattern" | "patterns" => "pattern".to_string(),
+        "error" | "errors" | "resolution" | "resolutions" => "resolution".to_string(),
+        "tool" | "tool-output" | "tool-outputs" => "tool-output".to_string(),
+        _ => trimmed.to_string(),
+    }
 }
 
 /// Extract a required string parameter or return an INVALID_PARAMS error.
@@ -544,13 +557,19 @@ mod tests {
         let ctx = test_ctx();
         // Store bootstrap facts.
         handle_store_fact(
-            &json!({"entity": "__bootstrap__::patterns", "key": "retry", "value": "exponential backoff"}),
+            &json!({"entity": "__bootstrap__::pattern:retry", "key": "Retry Pattern", "value": "exponential backoff"}),
             &ctx,
         )
         .await
         .unwrap();
         handle_store_fact(
-            &json!({"entity": "__bootstrap__::errors", "key": "oom", "value": "increase memory"}),
+            &json!({"entity": "__bootstrap__::resolution:oom", "key": "OOM Recovery", "value": "increase memory"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        handle_store_fact(
+            &json!({"entity": "__bootstrap__::doc:onboarding", "key": "Human-Assisted Integration", "value": "share the HTTP and MCP endpoints with the operator"}),
             &ctx,
         )
         .await
@@ -572,6 +591,13 @@ mod tests {
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("exponential backoff"));
         assert!(!text.contains("increase memory"));
+
+        let result = handle_get_bootstrap(&json!({"topic": "docs", "query": "Human-Assisted"}), &ctx)
+            .await
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Human-Assisted Integration"));
+        assert!(!text.contains("exponential backoff"));
     }
 
     // ── structured error data test ──────────────────────────────────

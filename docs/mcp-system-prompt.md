@@ -21,11 +21,13 @@ You have access to Crux, a receipted memory and retrieval backend. Use these too
 - `accept_handoff(package)` — Receive and verify a server-authenticated handoff package.
 
 ## Observability
+- `sync_status()` — Check whether this node is local-only, sync-enabled, or degraded before planning remote integration work.
 - `get_gaps(query)` — Check what the corpus doesn't know.
-- `get_bootstrap(topic)` — Learn best practices (topics: "patterns", "docs", "errors").
+- `get_bootstrap(topic, query?)` — Learn best practices and pull onboarding playbooks (topics: "patterns", "docs", "errors").
 
 ## Rules
 1. Always use `token_budget` to control context size.
 2. Store important findings as facts — don't rely on conversation memory.
 3. Check `coverage.score` after queries — if < 0.5, inform the user.
 4. Use `get_bootstrap("patterns")` on first connection to learn optimal usage.
+5. Before remote integration or sync work, call `sync_status()`. If the mode is `local_only` or `degraded`, keep working against the local store and pull onboarding guidance with `get_bootstrap(topic="docs", query="integration")`.

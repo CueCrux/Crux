@@ -133,9 +133,10 @@ pub async fn dispatch(req: JsonRpcRequest, ctx: &McpContext, _agent: Option<&Age
                     "version": SERVER_VERSION
                 },
                 "_welcome": {
-                    "hint": "Call get_bootstrap(\"patterns\") to learn optimal usage patterns.",
+                    "hint": "Call get_bootstrap(\"patterns\") to learn usage patterns, then sync_status() before any remote integration work.",
                     "quickstart": [
                         "get_bootstrap(\"patterns\") — learn usage patterns",
+                        "sync_status() — check whether this node is local-only or remote-sync capable",
                         "store_fact(entity, key, value) — store a fact",
                         "query_facts(query) — search facts"
                     ],

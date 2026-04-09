@@ -4692,6 +4692,9 @@ async fn panic_handler_handles_string_panic() {
 #[serial_test::serial]
 #[tokio::test]
 async fn version_endpoint_returns_build_info_and_features() {
+    std::env::remove_var("CORECRUXD_SYNC_ENABLED");
+    std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
+    std::env::remove_var("CORECRUXD_SYNC_API_KEY");
     let state = test_app_state(16);
     let resp = get_version(State(state)).await.into_response();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -4705,4 +4708,32 @@ async fn version_endpoint_returns_build_info_and_features() {
     assert!(body["features"]["graph_expand"].is_boolean());
     assert!(body["features"]["self_observe"].is_boolean());
     assert!(body["features"]["mcp"].is_boolean());
+    assert_eq!(body["sync"]["mode"], "local_only");
+    assert_eq!(body["sync"]["configured"], false);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn version_endpoint_reports_degraded_sync_when_remote_is_incomplete() {
+    std::env::set_var("CORECRUXD_SYNC_ENABLED", "true");
+    std::env::set_var("CORECRUXD_SYNC_REMOTE_URL", "http://example.test:14800");
+    std::env::remove_var("CORECRUXD_SYNC_API_KEY");
+
+    let state = test_app_state(16);
+    let resp = get_version(State(state)).await.into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["sync"]["mode"], "degraded");
+    assert_eq!(body["sync"]["configured"], false);
+    assert_eq!(body["sync"]["background_sync_enabled"], true);
+    assert_eq!(body["sync"]["remote_url"], "http://example.test:14800");
+    assert_eq!(body["sync"]["api_key_configured"], false);
+    assert!(body["sync"]["degraded_reason"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("CORECRUXD_SYNC_API_KEY"));
+
+    std::env::remove_var("CORECRUXD_SYNC_ENABLED");
+    std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
+    std::env::remove_var("CORECRUXD_SYNC_API_KEY");
 }

@@ -28,6 +28,32 @@ New to CoreCrux? Start here:
 
 That's it — you're connected and working. Read on for authentication, tool selection, and advanced patterns.
 
+## Platform Availability and Onboarding
+
+Community Edition is local-first. The local fact store and session store are
+available even when no upstream CoreCrux platform is online yet.
+
+When you are connecting Crux to another system, start with:
+
+```
+1. sync_status()
+   → Inspect whether this node is running local_only, manual_sync, sync_enabled, or degraded.
+
+2. get_bootstrap(topic="docs", query="integration")
+   → Pull the current onboarding playbooks from the seeded bootstrap docs.
+```
+
+Use the returned mode like this:
+
+- `local_only`: keep working against the local HTTP + MCP surfaces and tell the human that remote sync is optional follow-up work.
+- `degraded`: keep working locally, surface the degraded reason, and ask the human to fix the remote sync config only if they actually need upstream sync.
+- `manual_sync` or `sync_enabled`: proceed with automated integration and verify end-to-end behavior.
+
+The onboarding playbooks are maintained in-repo at
+`crates/crux-observe/bootstrap_data/docs.json`, then seeded into the local fact
+store on startup so agents can pull them at runtime without a hosted
+dependency.
+
 ## Authentication
 
 HTTP and MCP use different authentication models:
@@ -54,6 +80,14 @@ curl -s -X POST http://localhost:14801/mcp \
   -H "Authorization: Bearer $CRUX_AGENT_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_agent_identity","arguments":{}}}'
 ```
+
+## Human-Guided vs Automatic Integration
+
+Choose the integration style that matches the environment:
+
+- Human-guided: pull `get_bootstrap(topic="docs", query="Human-Assisted Integration")`, then tell the operator which endpoint, token, and verification call they need to run.
+- Automatic: pull `get_bootstrap(topic="docs", query="Automatic Integration")`, write the HTTP/MCP config into the host system, reload it, and verify with `/v1/version`, `tools/list`, `store_fact`, and `query_facts`.
+- Mixed mode: use HTTP for shared application state and MCP for private facts, agent-scoped sessions, and handoff.
 
 ## Tool Decision Tree
 

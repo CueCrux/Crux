@@ -89,12 +89,19 @@ CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./target/release/corecr
        "graph_expand": false,
        "self_observe": false,
        "mcp": true
+     },
+     "sync": {
+       "mode": "local_only",
+       "configured": false,
+       "background_sync_enabled": false
      }
    }
    ```
    `text_search` and append/data-plane features are deployment-dependent. The
    fact store, sessions, health endpoints, and built-in MCP server work in the
-   default Community Edition runtime.
+   default Community Edition runtime. `sync.mode` tells you whether the node is
+   running local-only, manual sync, full background sync, or a degraded remote
+   sync configuration.
 
 4. **Store a fact:**
    ```bash
@@ -153,6 +160,12 @@ CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./target/release/corecr
    ```bash
    corecruxctl verify-store --data-dir ./data --scope recent
    ```
+
+If you are integrating CoreCrux into another system, agents can pull the
+seeded onboarding playbooks at runtime with
+`get_bootstrap(topic="docs", query="integration")`. Those playbooks live in
+[`crates/crux-observe/bootstrap_data/docs.json`](crates/crux-observe/bootstrap_data/docs.json)
+and can be updated in-repo without adding a hosted onboarding dependency.
 
 ## API Reference
 

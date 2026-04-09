@@ -15,7 +15,7 @@ CoreCrux Community Edition exposes three network surfaces by default:
 | GET | `/healthz` | Health check with build metadata | None |
 | GET | `/readyz` | Readiness probe (lock held, routing loaded, capacity OK) | None |
 | GET | `/metrics` | Prometheus metrics | None |
-| GET | `/v1/version` | Build version and compat contract | None |
+| GET | `/v1/version` | Build version, feature flags, and sync posture (`local_only`, `manual_sync`, `sync_enabled`, or `degraded`) | None |
 
 ### Query & Retrieval
 
@@ -182,6 +182,8 @@ Endpoint: `GET/POST http://<host>:14801/mcp`
   must include `Authorization: Bearer <token>`.
 - Private facts, agent-scoped sessions, and handoff workflows are available
   through MCP tools, not the HTTP `/v1/facts` surface.
+- `sync_status` tells agents whether the node is local-only, sync-enabled, or
+  degraded before they attempt hosted-platform integration.
 
 See [agent-guide.md](/home/myles/CueCrux/Crux/docs/agent-guide.md) and
 [examples/mcp-configs/README.md](/home/myles/CueCrux/Crux/examples/mcp-configs/README.md)
