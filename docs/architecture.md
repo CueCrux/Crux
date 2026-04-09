@@ -4,7 +4,7 @@
 
 ```mermaid
 graph TD
-    cruxmcp[crux-mcp<br/>MCP Server<br/>21 tools]
+    cruxmcp[crux-mcp<br/>MCP Server<br/>22 tools]
     observe[crux-observe<br/>Self-Observation]
     sync[crux-sync<br/>Outbox Sync]
     contrib[crux-contrib<br/>Contributions]
@@ -106,7 +106,7 @@ requires a dataplane-enabled deployment.
 
 ### Community Layer
 
-- **crux-mcp** -- MCP router and tool surface exposing 21 tools for agent interaction. Handles agent identity, tool routing, and handoffs.
+- **crux-mcp** -- MCP router and tool surface exposing 22 tools for agent interaction. Handles agent identity, tool routing, update awareness, and handoffs.
 - **crux-observe** -- Self-observation subsystem. Provides ops monitoring, bootstrap sequencing, and cold gate logic.
 - **crux-sync** -- Outbox sync with VaultCrux. Manages event replication to external systems.
 - **crux-contrib** -- Contribution manifest builder. Tracks and packages community contributions.

@@ -7,6 +7,7 @@
   {"tool": "delete_fact", "output": "{ deleted: bool, fact_id }"},
   {"tool": "list_entities", "output": "{ entities: [string] }"},
   {"tool": "get_bootstrap", "output": "{ facts: [{entity, key, value}], total_tokens }"},
+  {"tool": "fact_history", "output": "{ versions: [{fact_id, value, version, supersedes, confidence, stored_at, deleted}] }"},
   {"tool": "get_session", "output": "{ session_id, state, updated_at, total_tokens }"},
   {"tool": "save_session", "output": "{ session_id, updated_at }"},
   {"tool": "list_sessions", "output": "{ sessions: [string] }"},
@@ -14,5 +15,10 @@
   {"tool": "get_gaps", "output": "{ gaps: [{entity, key, value, stored_at}], total_tokens }"},
   {"tool": "get_agent_identity", "output": "{ agent_name: string }"},
   {"tool": "create_handoff", "output": "{ handoff_id, content_hash, signature, facts_count, total_tokens }"},
-  {"tool": "accept_handoff", "output": "{ session_id, facts_imported, verified: bool }"}
+  {"tool": "accept_handoff", "output": "{ session_id, facts_imported, verified: bool }"},
+  {"tool": "record_decision", "output": "{ decision_id, decision_hash, entity, action }"},
+  {"tool": "sync_pull", "output": "{ facts_pulled, cursor, total_pull_count }"},
+  {"tool": "sync_push", "output": "{ facts_pushed, total_push_count }"},
+  {"tool": "sync_status", "output": "{ mode, configured, background_sync_enabled, remote_url, api_key_configured, platform_online, degraded, degraded_reason, onboarding_hint, last_pull_at, last_push_at, pull_count, push_count, local_fact_count }"},
+  {"tool": "update_status", "output": "{ enabled, state, tracking_ref, current_commit, latest_commit, ahead_by, behind_by, checked_at, error, upgrade_hint, upgrade_playbook_query, backup_playbook_query }"}
 ]

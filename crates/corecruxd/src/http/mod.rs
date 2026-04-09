@@ -147,6 +147,8 @@ pub struct AppState {
     pub fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
     /// Community edition: session store (scoped state per session).
     pub session_store: Arc<RwLock<corecrux_memory::SessionStore>>,
+    /// Cached git-based update posture for humans and agents.
+    pub update_status: Arc<RwLock<corecrux_types::UpdateStatus>>,
     /// Real-time event bus for SSE streaming of store mutations.
     pub event_bus: corecrux_memory::events::EventBus,
 }

@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn bootstrap_tool_outputs_deserialises() {
         let entries: Vec<ToolOutputEntry> = serde_json::from_str(BOOTSTRAP_TOOL_OUTPUTS).unwrap();
-        assert_eq!(entries.len(), 16);
+        assert_eq!(entries.len(), 22);
         for e in &entries {
             assert!(!e.tool.is_empty());
             assert!(!e.output.is_empty());

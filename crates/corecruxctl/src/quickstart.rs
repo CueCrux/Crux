@@ -120,6 +120,7 @@ pub fn run(http_base: &str, non_interactive: bool) -> Result<(), Box<dyn std::er
     eprintln!();
     eprintln!("    HTTP API       {base}/v1/");
     eprintln!("    MCP endpoint   http://localhost:14801/mcp");
+    eprintln!("    Update status  {base}/v1/version");
     eprintln!("    Docs           https://docs.cuecrux.com/corecrux/");
     eprintln!("    Benchmark      corecruxctl audit-pack --offline");
     eprintln!("    Playground     {base}/playground");

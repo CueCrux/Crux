@@ -106,6 +106,7 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
         retrieval_index: Arc::new(RwLock::new(corecrux_retrieval::IndexManager::new())),
         fact_store: Arc::new(RwLock::new(corecrux_memory::FactStore::new())),
         session_store: Arc::new(RwLock::new(corecrux_memory::SessionStore::new())),
+        update_status: Arc::new(RwLock::new(corecrux_types::UpdateStatus::default())),
         event_bus: corecrux_memory::events::EventBus::new(16),
         capacity: Arc::new(RwLock::new(CapacityState {
             total_bytes: 100,
@@ -4696,6 +4697,21 @@ async fn version_endpoint_returns_build_info_and_features() {
     std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
     std::env::remove_var("CORECRUXD_SYNC_API_KEY");
     let state = test_app_state(16);
+    *state.update_status.write().await = corecrux_types::UpdateStatus {
+        enabled: true,
+        state: corecrux_types::UpdateCheckState::Current,
+        remote: "origin".to_string(),
+        ref_name: "main".to_string(),
+        tracking_ref: "origin/main".to_string(),
+        repo_dir: Some("/tmp/crux".to_string()),
+        current_commit: Some("abc123".to_string()),
+        latest_commit: Some("abc123".to_string()),
+        ahead_by: 0,
+        behind_by: 0,
+        checked_at: Some("2026-04-09T12:00:00Z".to_string()),
+        error: None,
+        upgrade_hint: "current".to_string(),
+    };
     let resp = get_version(State(state)).await.into_response();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
@@ -4710,6 +4726,11 @@ async fn version_endpoint_returns_build_info_and_features() {
     assert!(body["features"]["mcp"].is_boolean());
     assert_eq!(body["sync"]["mode"], "local_only");
     assert_eq!(body["sync"]["configured"], false);
+    assert_eq!(body["update"]["state"], "current");
+    assert_eq!(body["update"]["tracking_ref"], "origin/main");
+    assert_eq!(body["update"]["current_commit"], "abc123");
+    assert!(body["update"]["repo_dir"].is_null());
+    assert!(body["update"]["error"].is_null());
 }
 
 #[serial_test::serial]

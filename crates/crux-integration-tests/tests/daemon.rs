@@ -28,6 +28,13 @@ fn metrics() {
     let t = daemon().get("/metrics").unwrap().into_string().unwrap();
     assert!(t.contains("build_info"));
 }
+
+#[test]
+fn version_includes_update_status() {
+    let body: serde_json::Value = daemon().get("/v1/version").unwrap().into_json().unwrap();
+    assert!(body["update"]["state"].is_string());
+    assert!(body["update"]["upgrade_hint"].is_string());
+}
 #[test]
 fn shards() {
     let b: serde_json::Value = daemon().get("/v1/shards").unwrap().into_json().unwrap();
@@ -65,7 +72,24 @@ fn mcp_tools_list() {
         .unwrap()
         .into_json()
         .unwrap();
-    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 21);
+    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 22);
+}
+
+#[test]
+fn mcp_update_status_tool() {
+    let body: serde_json::Value = daemon()
+        .mcp_post_json(json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{"name":"update_status","arguments":{}}
+        }))
+        .unwrap()
+        .into_json()
+        .unwrap();
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("\"state\""));
+    assert!(text.contains("upgrade_playbook_query"));
 }
 
 #[test]

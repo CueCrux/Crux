@@ -351,6 +351,7 @@ pub(super) fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Resp
 )]
 pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoResponse {
     let sync_status = sync_runtime_status();
+    let update_status = state.update_status.read().await.public_view();
     Json(serde_json::json!({
         "version": state.build.version,
         "commit": state.build.commit,
@@ -369,7 +370,8 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
             "api_key_configured": sync_status.api_key_configured,
             "degraded": sync_status.degraded,
             "degraded_reason": sync_status.degraded_reason,
-        }
+        },
+        "update": update_status
     }))
 }
 

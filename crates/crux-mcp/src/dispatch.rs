@@ -14,6 +14,7 @@ use tracing::warn;
 
 use corecrux_memory::{FactStore, SessionStore};
 use corecrux_retrieval::IndexManager;
+use corecrux_types::UpdateStatus;
 
 use crate::agent::{AgentIdentity, AgentRegistry};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, INVALID_PARAMS, METHOD_NOT_FOUND};
@@ -27,6 +28,8 @@ pub struct McpContext {
     pub session_store: Arc<RwLock<SessionStore>>,
     /// Retrieval index (BM25 + graph fusion).
     pub retrieval_index: Arc<RwLock<IndexManager>>,
+    /// Cached git-based update posture shared with HTTP surfaces.
+    pub update_status: Arc<RwLock<UpdateStatus>>,
     /// Agent token registry for bearer-token auth.
     pub agent_registry: AgentRegistry,
     /// Identity of the calling agent for the current request (if authenticated).
@@ -45,6 +48,7 @@ impl McpContext {
             fact_store: Arc::new(RwLock::new(FactStore::new())),
             session_store: Arc::new(RwLock::new(SessionStore::new())),
             retrieval_index: Arc::new(RwLock::new(IndexManager::new())),
+            update_status: Arc::new(RwLock::new(UpdateStatus::default())),
             agent_registry: AgentRegistry::empty(),
             agent: None,
             handoff_key: default_handoff_key(&node_id),
@@ -58,6 +62,7 @@ impl McpContext {
         fact_store: Arc<RwLock<FactStore>>,
         session_store: Arc<RwLock<SessionStore>>,
         retrieval_index: Arc<RwLock<IndexManager>>,
+        update_status: Arc<RwLock<UpdateStatus>>,
         agent_registry: AgentRegistry,
     ) -> Self {
         let node_id = node_id.into();
@@ -65,6 +70,7 @@ impl McpContext {
             fact_store,
             session_store,
             retrieval_index,
+            update_status,
             agent_registry,
             agent: None,
             handoff_key: default_handoff_key(&node_id),
@@ -78,6 +84,7 @@ impl McpContext {
             fact_store: Arc::clone(&self.fact_store),
             session_store: Arc::clone(&self.session_store),
             retrieval_index: Arc::clone(&self.retrieval_index),
+            update_status: Arc::clone(&self.update_status),
             agent_registry: self.agent_registry.clone(),
             agent: Some(agent),
             node_id: self.node_id.clone(),
@@ -133,10 +140,11 @@ pub async fn dispatch(req: JsonRpcRequest, ctx: &McpContext, _agent: Option<&Age
                     "version": SERVER_VERSION
                 },
                 "_welcome": {
-                    "hint": "Call get_bootstrap(\"patterns\") to learn usage patterns, then sync_status() before any remote integration work.",
+                    "hint": "Call get_bootstrap(\"patterns\") to learn usage patterns, then sync_status() before remote integration work and update_status() before maintenance work.",
                     "quickstart": [
                         "get_bootstrap(\"patterns\") — learn usage patterns",
                         "sync_status() — check whether this node is local-only or remote-sync capable",
+                        "update_status() — check whether this checkout is behind or diverged before an upgrade",
                         "store_fact(entity, key, value) — store a fact",
                         "query_facts(query) — search facts"
                     ],
@@ -236,6 +244,7 @@ mod tests {
         assert!(names.contains(&"store_fact"));
         assert!(names.contains(&"query_facts"));
         assert!(names.contains(&"get_session"));
+        assert!(names.contains(&"update_status"));
     }
 
     #[tokio::test]

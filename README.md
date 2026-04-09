@@ -153,7 +153,7 @@ CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./target/release/corecr
    ```
    Expected output:
    ```text
-   21
+   22
    ```
 
 7. **Verify store integrity:**
@@ -163,7 +163,10 @@ CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./target/release/corecr
 
 If you are integrating CoreCrux into another system, agents can pull the
 seeded onboarding playbooks at runtime with
-`get_bootstrap(topic="docs", query="integration")`. Those playbooks live in
+`get_bootstrap(topic="docs", query="integration")`. For upgrades and rollback
+planning, pair `update_status()` or `/v1/version.update` with
+`get_bootstrap(topic="docs", query="upgrade")` and
+`get_bootstrap(topic="docs", query="backup")`. Those playbooks live in
 [`crates/crux-observe/bootstrap_data/docs.json`](crates/crux-observe/bootstrap_data/docs.json)
 and can be updated in-repo without adding a hosted onboarding dependency.
 
@@ -199,7 +202,7 @@ and can be updated in-repo without adding a hosted onboarding dependency.
 
 ```mermaid
 graph TD
-    cruxmcp[crux-mcp<br/>MCP Server<br/>21 tools]
+    cruxmcp[crux-mcp<br/>MCP Server<br/>22 tools]
     observe[crux-observe<br/>Self-Observation]
     sync[crux-sync<br/>Outbox Sync]
     contrib[crux-contrib<br/>Contributions]
@@ -256,12 +259,15 @@ CoreCrux is configured via environment variables:
 | `CORECRUXD_MCP_ENABLED` | `true` | Enable built-in MCP server |
 | `CORECRUXD_BUILD_CCXI` | `0` | Build `.ccxi` indexes at seal time |
 | `CORECRUX_LOG_FORMAT` | `text` | Log format (`text` or `json`) |
+| `CORECRUXD_UPDATE_CHECK_ENABLED` | `true` | Background git-based update checks |
+| `CORECRUXD_UPDATE_CHECK_REMOTE` | `origin` | Tracked git remote for update checks |
+| `CORECRUXD_UPDATE_CHECK_REF` | `main` | Tracked branch for update checks |
 
 See `config.example.env` for the full list with descriptions.
 
 ## MCP Server (for AI Agents)
 
-CoreCrux includes a built-in MCP server on port **14801** with 21 tools for retrieval, fact storage, sessions, sync, decisions, and multi-agent handoff.
+CoreCrux includes a built-in MCP server on port **14801** with 22 tools for retrieval, fact storage, sessions, sync, update status, decisions, and multi-agent handoff.
 
 ### Connect an agent
 
@@ -274,7 +280,7 @@ CoreCrux includes a built-in MCP server on port **14801** with 21 tools for retr
 curl -s -X POST http://localhost:14801/mcp \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | jq '.result.tools | length'
-# Expected: 21
+# Expected: 22
 ```
 
 If you configure `CRUX_AGENT_TOKEN` or `CRUX_AGENT_TOKENS`, send the matching
@@ -286,6 +292,12 @@ multiple replicas, also set `CRUX_MCP_HANDOFF_SECRET`.
 1. `get_bootstrap("patterns")` — learn usage patterns
 2. `store_fact(entity="test", key="hello", value="world")` — store your first fact
 3. `query_facts(query="hello")` — retrieve it
+
+For maintenance and onboarding:
+
+- `update_status()` or `/v1/version.update` tells humans and agents whether the checkout is `current`, `behind`, `ahead`, `diverged`, `disabled`, or `unavailable`.
+- Use `get_bootstrap(topic="docs", query="upgrade")` for the upgrade playbook.
+- Use `get_bootstrap(topic="docs", query="backup")` for current backup and rollback options.
 
 See `docs/agent-guide.md` for the full agent integration guide.
 

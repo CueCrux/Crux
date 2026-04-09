@@ -68,11 +68,12 @@ jobs:
           curl -sf http://localhost:14800/readyz
           curl -sf http://localhost:14800/metrics | head -5
           curl -sf http://localhost:14800/v1/version | jq -e '.features.mcp == true' >/dev/null
+          curl -sf http://localhost:14800/v1/version | jq -e '.update.state | type == "string"' >/dev/null
           curl -sf http://localhost:14801/mcp | jq -e '.serverInfo.name == "crux"' >/dev/null
           curl -sf -X POST http://localhost:14801/mcp \
             -H "Content-Type: application/json" \
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-            | jq -e '.result.tools | length == 21' >/dev/null
+            | jq -e '.result.tools | length == 22' >/dev/null
 
   msrv:
     name: MSRV (1.88.0)
