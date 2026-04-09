@@ -25,6 +25,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: typos-cli
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: cargo fmt --check
       - run: typos
@@ -93,6 +96,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: cargo build --bin corecruxd
       - run: cargo llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --lcov --output-path lcov.info
