@@ -1,0 +1,42 @@
+name: Proto
+
+on:
+  push:
+    branches: [main]
+    paths: ['proto/**']
+  pull_request:
+    paths: ['proto/**']
+  release:
+    types: [published]
+
+jobs:
+  lint:
+    name: Lint & Breaking
+    runs-on: [self-hosted, ci]
+    # Proto files use flat directory layout (two packages in proto/).
+    # buf lint enforces one-package-per-directory which we can't change
+    # without breaking the existing wire format. Non-blocking until
+    # proto files are reorganised into subdirectories.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+      - run: buf lint proto/
+      - run: buf breaking proto/ --against 'https://github.com/CueCrux/Crux.git#branch=main,subdir=proto'
+        if: github.event_name == 'pull_request'
+
+  push:
+    name: Push to BSR
+    runs-on: [self-hosted, ci]
+    if: github.event_name == 'release'
+    needs: lint
+    steps:
+      - uses: actions/checkout@v6
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+      - run: buf push proto/
+        env:
+          BUF_TOKEN: ${{ secrets.BUF_TOKEN }}

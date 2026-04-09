@@ -105,6 +105,7 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
         retrieval_index: Arc::new(RwLock::new(corecrux_retrieval::IndexManager::new())),
         fact_store: Arc::new(RwLock::new(corecrux_memory::FactStore::new())),
         session_store: Arc::new(RwLock::new(corecrux_memory::SessionStore::new())),
+        event_bus: corecrux_memory::events::EventBus::new(16),
         capacity: Arc::new(RwLock::new(CapacityState {
             total_bytes: 100,
             free_bytes: 80,
@@ -889,8 +890,13 @@ async fn query_facts_by_keyword() {
             .into_response();
     }
 
-    let mut params = std::collections::HashMap::new();
-    params.insert("query".to_string(), "canary".to_string());
+    let params = QueryFactsParams {
+        query: Some("canary".to_string()),
+        entity: None,
+        entity_prefix: None,
+        top_k: None,
+        token_budget: None,
+    };
 
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
         .await
@@ -920,7 +926,13 @@ async fn query_facts_no_params_returns_all() {
             .into_response();
     }
 
-    let params = std::collections::HashMap::new();
+    let params = QueryFactsParams {
+        query: None,
+        entity: None,
+        entity_prefix: None,
+        top_k: None,
+        token_budget: None,
+    };
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
         .await
         .into_response();
@@ -945,8 +957,13 @@ async fn query_facts_accepts_admin_read_fallback_in_dev_scopes_mode() {
         .await
         .into_response();
 
-    let mut params = std::collections::HashMap::new();
-    params.insert("query".to_string(), "green".to_string());
+    let params = QueryFactsParams {
+        query: Some("green".to_string()),
+        entity: None,
+        entity_prefix: None,
+        top_k: None,
+        token_budget: None,
+    };
     let resp = facts::query_facts(State(state), dev_scope_headers("admin:read"), Query(params))
         .await
         .into_response();
@@ -978,9 +995,11 @@ async fn export_facts_handles_invalid_since_and_limit_and_skips_private() {
         });
     }
 
-    let mut params = std::collections::HashMap::new();
-    params.insert("since".to_string(), "not-a-date".to_string());
-    params.insert("limit".to_string(), "not-a-number".to_string());
+    let params = ExportFactsParams {
+        since: Some("not-a-date".to_string()),
+        cursor: None,
+        limit: None,
+    };
 
     let resp = facts::export_facts(State(state), HeaderMap::new(), Query(params))
         .await
@@ -1010,9 +1029,11 @@ async fn export_facts_honors_cursor_and_reports_next_cursor() {
         fact_ids.push(fact.fact_id);
     }
 
-    let mut params = std::collections::HashMap::new();
-    params.insert("cursor".to_string(), fact_ids[0].clone());
-    params.insert("limit".to_string(), "1".to_string());
+    let params = ExportFactsParams {
+        since: None,
+        cursor: Some(fact_ids[0].clone()),
+        limit: Some(1),
+    };
 
     let resp = facts::export_facts(State(state), HeaderMap::new(), Query(params))
         .await
@@ -1212,12 +1233,11 @@ async fn fact_and_session_endpoints_accept_admin_read_fallback_in_dev_scopes_mod
         .into_response();
     assert_eq!(delete_resp.status(), StatusCode::OK);
 
-    let mut export_params = std::collections::HashMap::new();
-    export_params.insert(
-        "since".to_string(),
-        (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
-    );
-    export_params.insert("limit".to_string(), "20000".to_string());
+    let export_params = ExportFactsParams {
+        since: Some((chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339()),
+        cursor: None,
+        limit: Some(20000),
+    };
     let export_resp = facts::export_facts(State(state.clone()), admin_headers.clone(), Query(export_params))
         .await
         .into_response();
@@ -1262,10 +1282,13 @@ async fn query_facts_supports_entity_prefix_top_k_and_token_budget() {
         .into_response();
     }
 
-    let mut params = std::collections::HashMap::new();
-    params.insert("entity_prefix".to_string(), "proj-a".to_string());
-    params.insert("top_k".to_string(), "99".to_string());
-    params.insert("token_budget".to_string(), "1".to_string());
+    let params = QueryFactsParams {
+        query: None,
+        entity: None,
+        entity_prefix: Some("proj-a".to_string()),
+        top_k: Some(99),
+        token_budget: Some(1),
+    };
 
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
         .await

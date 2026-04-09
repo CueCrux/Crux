@@ -25,7 +25,7 @@ enum SessionJournalEvent {
 }
 
 /// Session state container.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SessionState {
     pub session_id: String,
     pub state: serde_json::Value,
@@ -41,11 +41,18 @@ pub struct SessionStore {
     sessions: HashMap<String, SessionState>,
     /// Path to the JSONL journal file. `None` for pure in-memory mode.
     journal_path: Option<PathBuf>,
+    /// Optional event bus for real-time mutation notifications.
+    event_bus: Option<crate::events::EventBus>,
 }
 
 impl SessionStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach an event bus so that `put()` and `delete()` emit real-time events.
+    pub fn set_event_bus(&mut self, bus: crate::events::EventBus) {
+        self.event_bus = Some(bus);
     }
 
     /// Create a session store backed by a JSONL journal in `data_dir`.
@@ -58,6 +65,7 @@ impl SessionStore {
         let mut store = Self {
             sessions: HashMap::new(),
             journal_path: Some(journal_path.clone()),
+            event_bus: None,
         };
         if journal_path.exists() {
             store.replay_journal(&journal_path)?;
@@ -129,6 +137,12 @@ impl SessionStore {
             session: session.clone(),
         });
 
+        if let Some(bus) = &self.event_bus {
+            bus.emit(crate::events::CruxEvent::SessionStored {
+                session_id: session.session_id.clone(),
+            });
+        }
+
         session
     }
 
@@ -144,6 +158,11 @@ impl SessionStore {
             self.append_journal(&SessionJournalEvent::Delete {
                 session_id: session_id.to_string(),
             });
+            if let Some(bus) = &self.event_bus {
+                bus.emit(crate::events::CruxEvent::SessionDeleted {
+                    session_id: session_id.to_string(),
+                });
+            }
         }
         removed
     }

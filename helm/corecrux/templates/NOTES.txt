@@ -1,0 +1,14 @@
+CoreCrux Community Edition has been deployed.
+
+1. Get the application URL:
+{{- if .Values.ingress.enabled }}
+  http{{ if .Values.ingress.tls }}s{{ end }}://{{ (first .Values.ingress.hosts).host }}
+{{- else }}
+  kubectl port-forward svc/{{ include "corecrux.fullname" . }} 14800:{{ .Values.service.port }}
+  http://localhost:14800/healthz
+{{- end }}
+
+2. Store your first fact:
+  curl -X PUT http://localhost:14800/v1/facts \
+    -H "Content-Type: application/json" \
+    -d '{"entity":"test","key":"hello","value":"world","confidence":0.9}'

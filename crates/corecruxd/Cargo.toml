@@ -16,6 +16,7 @@ otel = [
 
 [dependencies]
 axum = "0.8.1"
+utoipa = { version = "5", features = ["axum_extras"] }
 base64 = "0.22.1"
 blake3 = "1.5.1"
 chrono = { version = "0.4.40", default-features = false, features = ["clock"] }
@@ -30,7 +31,7 @@ serde_json = "1.0.139"
 xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
 tar = "0.4.44"
 tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "signal"] }
-tokio-stream = "0.1.15"
+tokio-stream = { version = "0.1.15", features = ["sync"] }
 tonic = "0.14.5"
 tower-http = { version = "0.6.2", features = ["catch-panic", "cors", "timeout", "trace"] }
 thiserror = "2.0.12"

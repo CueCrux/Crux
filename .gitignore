@@ -17,6 +17,14 @@ Thumbs.db
 # GPU logs
 cufile.log
 
+# Generated proto code
+proto/gen/
+
 # Environment
 .env
 .env.local
+sdks/typescript/node_modules/
+sdks/typescript/dist/
+sdks/python/dist/
+__pycache__/
+*.pyc

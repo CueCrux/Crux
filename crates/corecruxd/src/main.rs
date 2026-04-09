@@ -311,7 +311,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             corecrux_memory::SessionStore::new()
         })),
+        event_bus: corecrux_memory::events::EventBus::new(1024),
     };
+
+    // Wire the shared event bus into both stores so mutations emit SSE events.
+    state.fact_store.write().await.set_event_bus(state.event_bus.clone());
+    state.session_store.write().await.set_event_bus(state.event_bus.clone());
 
     // Bootstrap: always seed agent-facing documentation on startup (idempotent).
     // Self-observation (ops error/warning capture) still requires CRUX_SELF_OBSERVE=true.
@@ -2982,6 +2987,7 @@ mod tests {
             retrieval_index: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_retrieval::IndexManager::new())),
             fact_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::FactStore::new())),
             session_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::SessionStore::new())),
+            event_bus: corecrux_memory::events::EventBus::new(16),
         };
 
         let router: axum::Router = crate::http::router(state);

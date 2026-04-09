@@ -1,0 +1,10 @@
+version: v2
+modules:
+  - path: .
+    name: buf.build/cuecrux/corecrux
+lint:
+  use:
+    - MINIMAL
+breaking:
+  use:
+    - FILE

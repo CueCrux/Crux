@@ -1,0 +1,82 @@
+# CoreCrux Community Edition — default values
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/cuecrux/corecrux-community
+  # -- Overrides the image tag; defaults to the chart appVersion
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 14800
+
+persistence:
+  enabled: true
+  size: 10Gi
+  # -- Leave empty to use the cluster default StorageClass
+  storageClass: ""
+  accessMode: ReadWriteOnce
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 2Gi
+  limits:
+    memory: 4Gi
+
+# -- Authentication mode: off | dev_scopes | jwt_hs256 | jwt_jwks
+auth:
+  mode: "off"
+
+config:
+  logFormat: "json"
+  buildCcxi: "1"
+
+# -- Extra environment variables injected into the container
+# Example:
+#   env:
+#     - name: CORECRUXD_SOME_SETTING
+#       value: "true"
+env: []
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: corecrux.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: corecrux-tls
+  #    hosts:
+  #      - corecrux.local
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  # -- Additional labels for Prometheus Operator discovery
+  additionalLabels: {}
+
+podAnnotations: {}
+
+podSecurityContext:
+  fsGroup: 1000
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  readOnlyRootFilesystem: true
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}

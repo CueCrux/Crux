@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "corecrux-client"
+version = "0.1.0"
+description = "Python client for CoreCrux Community Edition"
+readme = "README.md"
+license = "LicenseRef-CCL-1.0"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.27"]
+
+[project.urls]
+Homepage = "https://github.com/CueCrux/Crux"
+Documentation = "https://github.com/CueCrux/Crux/tree/main/sdks/python"
+Repository = "https://github.com/CueCrux/Crux"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/corecrux_client"]

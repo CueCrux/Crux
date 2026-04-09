@@ -5,9 +5,11 @@
 mod admin;
 mod append;
 mod dataplane;
+mod events;
 mod facts;
 mod health;
 mod observe;
+mod openapi;
 mod projections;
 mod query;
 mod receipts;
@@ -144,6 +146,8 @@ pub struct AppState {
     pub fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
     /// Community edition: session store (scoped state per session).
     pub session_store: Arc<RwLock<corecrux_memory::SessionStore>>,
+    /// Real-time event bus for SSE streaming of store mutations.
+    pub event_bus: corecrux_memory::events::EventBus,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -254,6 +258,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/facts/export", get(self::facts::export_facts))
         .route("/v1/sessions/{sessionId}/state", axum::routing::put(self::facts::put_session_state))
         .route("/v1/sessions/{sessionId}/state", get(self::facts::get_session_state))
+        // Real-time event stream (SSE)
+        .route("/v1/events/stream", get(self::events::event_stream))
         // Self-observation (crux-observe)
         .route("/v1/ops/facts", get(self::observe::query_ops_facts))
         .route("/v1/ops/errors", get(self::observe::query_ops_errors))
@@ -262,6 +268,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/bootstrap/status", get(self::observe::get_bootstrap_status))
         // Production hardening: version endpoint
         .route("/v1/version", get(self::health::get_version))
+        // OpenAPI spec
+        .route("/v1/openapi.json", get(self::openapi::openapi_json))
         .with_state(state)
         // Built-in web playground (stateless, merged after with_state)
         .merge(crate::playground::routes())
