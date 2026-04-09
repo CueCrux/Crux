@@ -87,15 +87,15 @@ pub(super) async fn post_query_graph_expand(
     let t0 = std::time::Instant::now();
     let combined = match state
         .http_dataplane
-        .graph_expand(
-            &body.tenant_id,
-            &body.seed_artifact_ids,
-            &body.edge_types,
-            body.max_hops,
-            body.budget,
-            body.min_confidence,
-            body.include_state,
-        )
+        .graph_expand(super::dataplane::GraphExpandRequest {
+            tenant_id: &body.tenant_id,
+            seed_artifact_ids: &body.seed_artifact_ids,
+            edge_types: &body.edge_types,
+            max_hops: body.max_hops,
+            budget: body.budget,
+            min_confidence: body.min_confidence,
+            include_state: body.include_state,
+        })
         .await
     {
         Ok(response) => response,
@@ -314,7 +314,7 @@ pub(super) async fn post_query_time_range(
 pub(super) struct TextSearchBody {
     pub(super) tenant_id: String,
     pub(super) query: String,
-    #[serde(default = "default_text_search_limit")]
+    #[serde(default = "default_text_search_limit", alias = "top_k")]
     pub(super) limit: usize,
     /// Token budget: if set, fill results by descending score until budget is exhausted.
     /// Overrides `limit` when provided.

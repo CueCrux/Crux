@@ -26,5 +26,6 @@ pub mod agent;
 pub mod dispatch;
 pub mod handoff;
 pub mod protocol;
+pub mod scope;
 pub mod server;
 pub mod tools;

@@ -83,6 +83,7 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
         sdk_version: DEFAULT_SDK_VERSION.to_string(),
         auth,
         data_dir: root.clone(),
+        mcp_enabled: true,
         read_retry_failed_readyz_threshold: 0,
         commit_level: CommitLevel::LocalCommit,
         metrics,
@@ -217,13 +218,7 @@ impl HttpDataplane for FakeHttpDataplane {
 
     async fn graph_expand(
         &self,
-        _tenant_id: &str,
-        _seed_artifact_ids: &[u32],
-        _edge_types: &[String],
-        _max_hops: u32,
-        _budget: usize,
-        _min_confidence: f32,
-        _include_state: bool,
+        _req: super::dataplane::GraphExpandRequest<'_>,
     ) -> Result<corecrux_projections::query::graph_expand::GraphExpandResponse, HttpDataplaneError> {
         Ok(self.graph_expand_response.clone().unwrap_or(
             corecrux_projections::query::graph_expand::GraphExpandResponse {
@@ -699,6 +694,62 @@ async fn put_fact_returns_created() {
     assert_eq!(body["value"], "database primary");
     assert_eq!(body["source_receipt"], "crx_abc");
     assert_eq!(body["deleted"], false);
+}
+
+#[tokio::test]
+async fn put_fact_rejects_private_true_over_http() {
+    let state = test_app_state(16);
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "server".to_string(),
+        key: "internal".to_string(),
+        value: "secret".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: true,
+    };
+
+    let resp = facts::put_fact(State(state), HeaderMap::new(), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp).await;
+    assert!(body["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("private facts require MCP agent identity"));
+}
+
+#[tokio::test]
+async fn put_facts_bulk_rejects_private_true_over_http() {
+    let state = test_app_state(16);
+    let body = vec![
+        corecrux_memory::fact_store::StoreFact {
+            entity: "server".to_string(),
+            key: "role".to_string(),
+            value: "primary".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        },
+        corecrux_memory::fact_store::StoreFact {
+            entity: "server".to_string(),
+            key: "internal".to_string(),
+            value: "secret".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+        },
+    ];
+
+    let resp = facts::put_facts_bulk(State(state), HeaderMap::new(), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp).await;
+    assert!(body["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("private facts require MCP agent identity"));
 }
 
 // ── Fact Store (GET /v1/facts/{factId}) ─────────────────────────

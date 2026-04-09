@@ -7,18 +7,18 @@ You have access to Crux, a receipted memory and retrieval backend. Use these too
 - `query_scan(tenant_id, query)` then `query_expand(tenant_id, result_ids)` — Two-pass: scan metadata first, then expand only what you need.
 
 ## Memory
-- `store_fact(entity, key, value)` — Store key insights. 12 tokens per fact vs 3000 for conversation replay.
+- `store_fact(entity, key, value)` — Store key insights. Private facts require an authenticated agent identity.
 - `query_facts(query, token_budget)` — Retrieve stored facts.
 - `delete_fact(fact_id)` — Clean up obsolete facts.
 
 ## Sessions
-- `save_session(session_id, state)` — Save structured state between turns.
-- `get_session(session_id)` — Resume from where you left off.
-- `list_sessions()` — See all active sessions.
+- `save_session(session_id, state)` — Save structured state between turns in your agent namespace.
+- `get_session(session_id)` — Resume from where you left off in your agent namespace.
+- `list_sessions()` — See the active sessions visible to you.
 
 ## Coordination
-- `create_handoff(session_id, include_facts)` — Bundle context for another agent.
-- `accept_handoff(package)` — Receive and verify a handoff package.
+- `create_handoff(session_id, include_facts, target_agent?)` — Bundle session state plus relevant non-private facts for another agent.
+- `accept_handoff(package)` — Receive and verify a server-authenticated handoff package.
 
 ## Observability
 - `get_gaps(query)` — Check what the corpus doesn't know.

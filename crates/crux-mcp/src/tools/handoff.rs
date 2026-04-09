@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use crate::dispatch::McpContext;
 use crate::handoff;
 use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
+use crate::scope;
 
 /// `create_handoff` — package session state (and optionally facts) into a
 /// signed handoff bundle for another agent.
@@ -16,8 +17,10 @@ pub async fn handle_create_handoff(args: &Value, ctx: &McpContext) -> Result<Val
     let session_id = require_str(args, "session_id")?;
     let include_facts = args.get("include_facts").and_then(|v| v.as_bool()).unwrap_or(false);
     let message = args.get("message").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let target_agent = args.get("target_agent").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let agent_name = ctx.agent.as_ref().map_or("anonymous", |a| a.name.as_str());
+    let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
 
     let session_store = ctx.session_store.read().await;
     let fact_store = ctx.fact_store.read().await;
@@ -25,10 +28,15 @@ pub async fn handle_create_handoff(args: &Value, ctx: &McpContext) -> Result<Val
     let signed = handoff::create_handoff(
         &session_store,
         &fact_store,
-        session_id,
-        include_facts,
-        agent_name,
-        message,
+        handoff::CreateHandoffRequest {
+            session_id,
+            stored_session_id: &stored_session_id,
+            include_facts,
+            source_agent: agent_name,
+            target_agent,
+            message,
+        },
+        &ctx.handoff_key,
     )
     .map_err(|e| JsonRpcError {
         code: INTERNAL_ERROR,
@@ -61,17 +69,22 @@ pub async fn handle_accept_handoff(args: &Value, ctx: &McpContext) -> Result<Val
         data: None,
     })?;
 
-    let agent_name = ctx.agent.as_ref().map_or("anonymous", |a| a.name.as_str());
+    let receiver_agent = scope::agent_name(ctx.agent.as_ref());
 
     let mut session_store = ctx.session_store.write().await;
     let mut fact_store = ctx.fact_store.write().await;
 
-    let result = handoff::accept_handoff(&mut session_store, &mut fact_store, &signed, agent_name).map_err(|e| {
-        JsonRpcError {
-            code: INTERNAL_ERROR,
-            message: format!("handoff acceptance failed: {e}"),
-            data: None,
-        }
+    let result = handoff::accept_handoff(
+        &mut session_store,
+        &mut fact_store,
+        &signed,
+        receiver_agent,
+        &ctx.handoff_key,
+    )
+    .map_err(|e| JsonRpcError {
+        code: INTERNAL_ERROR,
+        message: format!("handoff acceptance failed: {e}"),
+        data: None,
     })?;
 
     Ok(json!({
@@ -90,7 +103,7 @@ fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, JsonRpcError
     args.get(field).and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
         code: INVALID_PARAMS,
         message: format!("missing required param: {field}"),
-        data: None,
+        data: Some(json!({"param": field, "required": true})),
     })
 }
 

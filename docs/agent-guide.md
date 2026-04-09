@@ -1,6 +1,15 @@
 # Using Crux as Your Memory & Retrieval Backend
 
-CoreCrux provides agents with append-only event storage, BM25 full-text retrieval, a receipted fact store, session persistence, and multi-agent handoff — all from a single binary on port 14800 (HTTP) and port 14801 (MCP).
+CoreCrux gives agents three distinct surfaces:
+
+- HTTP on `14800` for the shared REST API (`/v1/query/*`, `/v1/facts`,
+  `/v1/sessions/*`, health/metrics).
+- gRPC on `4007` for the data plane.
+- MCP on `14801` for agent-facing tools such as private facts, agent-scoped
+  sessions, and handoff.
+
+Use HTTP for shared application data. Use MCP when you need agent identity,
+private memory, or handoff between agents.
 
 ## Your First 3 Calls
 
@@ -21,16 +30,30 @@ That's it — you're connected and working. Read on for authentication, tool sel
 
 ## Authentication
 
-Set the `CRUX_AGENT_TOKEN` environment variable. Every HTTP request must include it as a Bearer token:
+HTTP and MCP use different authentication models:
+
+- HTTP auth is controlled by `CORECRUXD_AUTH_MODE`.
+- MCP auth is controlled by `CRUX_AGENT_TOKEN` / `CRUX_AGENT_TOKENS`.
+
+### HTTP
+
+Set `CORECRUXD_AUTH_MODE` on the server. If the selected mode requires bearer
+tokens, send `Authorization: Bearer <token>` on HTTP requests.
+
+### MCP
+
+If the server has no MCP agent tokens configured, MCP requests may run as
+`anonymous`. If the server sets `CRUX_AGENT_TOKEN` or `CRUX_AGENT_TOKENS`,
+every `POST /mcp` request must include the matching bearer token.
 
 ```bash
 export CRUX_AGENT_TOKEN="your-token-here"
 
-curl -H "Authorization: Bearer $CRUX_AGENT_TOKEN" \
-  http://localhost:14800/v1/facts?query=project
+curl -s -X POST http://localhost:14801/mcp \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CRUX_AGENT_TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_agent_identity","arguments":{}}}'
 ```
-
-If the token is missing or invalid, the server returns `401 Unauthorized`.
 
 ## Tool Decision Tree
 
@@ -64,9 +87,10 @@ Do you need full document content right now?
 
 ## Fact Store Patterns
 
-The fact store is a receipted key-value memory scoped by entity. Each fact costs ~12 tokens vs ~3000 tokens for replaying the original conversation.
+The fact store is a receipted key-value memory scoped by entity. Each fact
+costs about 12 tokens versus replaying the original conversation.
 
-### Store a fact
+### Shared facts over HTTP
 
 ```bash
 curl -X PUT http://localhost:14800/v1/facts \
@@ -96,25 +120,41 @@ curl "http://localhost:14800/v1/facts?query=project+status&token_budget=500"
 
 Returns facts matching the query, fitted within your token budget.
 
-### Private facts
+HTTP `/v1/facts` is a shared surface. It does not support `private=true`.
 
-Set `private: true` to scope a fact to your agent only. Other agents sharing the same tenant cannot see private facts.
+### Private facts over MCP
+
+Set `private: true` with the `store_fact` MCP tool to scope a fact to your
+authenticated agent only. Other agents cannot see it, and handoff packages do
+not export private facts.
 
 ```bash
-curl -X PUT http://localhost:14800/v1/facts \
+curl -s -X POST http://localhost:14801/mcp \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CRUX_AGENT_TOKEN" \
   -d '{
-    "entity": "my-agent",
-    "key": "internal_state",
-    "value": "Waiting for user confirmation on budget",
-    "confidence": 1.0,
-    "private": true
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "store_fact",
+      "arguments": {
+        "entity": "my-agent",
+        "key": "internal_state",
+        "value": "Waiting for user confirmation on budget",
+        "confidence": 1.0,
+        "private": true
+      }
+    }
   }'
 ```
 
 ## Session Persistence Patterns
 
-Sessions store structured state (decisions, open questions, constraints) at ~87 tokens vs ~15K tokens for replaying the full conversation.
+Sessions store structured state such as decisions, open questions, and
+constraints.
+
+### Shared sessions over HTTP
 
 ### Save session state
 
@@ -137,48 +177,85 @@ curl http://localhost:14800/v1/sessions/session-42/state
 
 Returns the full session state, ready to inject into your context window.
 
-## Multi-Agent Handoff Workflow
+### Agent-scoped sessions over MCP
+
+When you access sessions through MCP, authenticated agents read and write
+inside their own session namespace:
+
+```bash
+curl -s -X POST http://localhost:14801/mcp \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CRUX_AGENT_TOKEN" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "save_session",
+      "arguments": {
+        "session_id": "session-42",
+        "state": {
+          "decisions": ["Use PostgreSQL for primary store"],
+          "open_questions": ["Which caching layer?"],
+          "context": "Architecture review for Project Alpha"
+        }
+      }
+    }
+  }'
+```
+
+## Multi-Agent Handoff Workflow (MCP Only)
 
 When Agent A finishes a task and needs to pass context to Agent B:
 
 ### Agent A: Create handoff package
 
 ```bash
-curl -X POST http://localhost:14800/v1/handoff \
+PACKAGE_JSON=$(curl -s -X POST http://localhost:14801/mcp \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CRUX_AGENT_TOKEN" \
   -d '{
-    "session_id": "session-42",
-    "include_facts": true,
-    "summary": "Completed architecture review. Three decisions made, one open question remaining."
-  }'
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "create_handoff",
+      "arguments": {
+        "session_id": "session-42",
+        "include_facts": true,
+        "target_agent": "agent-b",
+        "message": "Completed architecture review. Three decisions made, one open question remaining."
+      }
+    }
+  }' | jq -r '.result.content[0].text')
 ```
 
-Response:
-```json
-{
-  "handoff_id": "ho_01J...",
-  "package": {
-    "session_state": { "..." },
-    "facts": [ "..." ],
-    "summary": "Completed architecture review..."
-  }
-}
-```
-
-Pass `handoff_id` to Agent B (e.g., via a shared channel or orchestrator).
+Pass `PACKAGE_JSON` to Agent B. The package is server-authenticated and
+includes only relevant non-private facts.
 
 ### Agent B: Accept handoff
 
 ```bash
-curl -X POST http://localhost:14800/v1/handoff/accept \
+curl -s -X POST http://localhost:14801/mcp \
   -H "Content-Type: application/json" \
-  -d '{
-    "handoff_id": "ho_01J...",
-    "agent_id": "agent-b"
-  }'
+  -H "Authorization: Bearer $CRUX_AGENT_TOKEN" \
+  -d "$(jq -nc --arg package "$PACKAGE_JSON" '{
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: {
+      name: "accept_handoff",
+      arguments: {
+        package: $package
+      }
+    }
+  }')"
 ```
 
 Agent B now has full session state and facts from Agent A's work.
+
+If handoff packages must survive daemon restarts or move between replicas, set
+the same `CRUX_MCP_HANDOFF_SECRET` on every server instance.
 
 ## Coverage Awareness
 
@@ -259,14 +336,24 @@ curl -X PUT http://localhost:14800/v1/sessions/research-42/state \
     "context": "Researching DB migration strategy for Project Alpha"
   }'
 
-# 4. Handoff to implementation agent
-curl -X POST http://localhost:14800/v1/handoff \
+# 4. Handoff to implementation agent via MCP
+curl -s -X POST http://localhost:14801/mcp \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CRUX_AGENT_TOKEN" \
   -d '{
-    "session_id": "research-42",
-    "include_facts": true,
-    "summary": "Research complete. Two key decisions made. See facts for details."
+    "jsonrpc": "2.0",
+    "id": 4,
+    "method": "tools/call",
+    "params": {
+      "name": "create_handoff",
+      "arguments": {
+        "session_id": "research-42",
+        "include_facts": true,
+        "target_agent": "implementer",
+        "message": "Research complete. Two key decisions made. See facts for details."
+      }
+    }
   }'
-# Pass the handoff_id to the implementation agent
 ```
 
 ## Rate Limiting

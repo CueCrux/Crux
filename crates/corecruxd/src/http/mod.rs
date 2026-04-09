@@ -120,6 +120,7 @@ pub struct AppState {
     pub sdk_version: String,
     pub auth: Authz,
     pub data_dir: PathBuf,
+    pub mcp_enabled: bool,
     pub read_retry_failed_readyz_threshold: u64,
     pub commit_level: CommitLevel,
     pub metrics: Metrics,
@@ -236,6 +237,10 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(self::query::post_query_time_range),
         )
         // ── v5 append + text retrieval endpoints ─────────────────────
+        .route(
+            "/v1/append",
+            axum::routing::post(self::append::post_admin_append),
+        )
         .route(
             "/v1/admin/append",
             axum::routing::post(self::append::post_admin_append),

@@ -30,7 +30,7 @@ CoreCrux is an append-only event store with fused BM25 + graph signal retrieval 
 | **Tenant isolation** | Per-tenant hash partitioning across shards |
 | **CLI tooling** | `verify-store`, `replay`, receipt inspection, and more |
 | **Prometheus metrics** | Built-in `/metrics` endpoint for observability |
-| **gRPC + HTTP API** | Dual protocol support for append, read, query, and export |
+| **HTTP + gRPC + MCP** | Human API, data-plane API, and built-in agent tooling |
 
 ## Quickstart
 
@@ -40,13 +40,16 @@ CoreCrux is an append-only event store with fused BM25 + graph signal retrieval 
 docker compose up -d
 ```
 
+The bundled compose stack is for local development and publishes `14800`
+(HTTP) and `14801` (built-in MCP) on host loopback only.
+
 ### Binary
 
 ```bash
 # Linux (x86_64)
 curl -sSL https://github.com/CueCrux/Crux/releases/latest/download/corecruxd-linux-amd64 -o corecruxd
 chmod +x corecruxd
-CORECRUXD_DATA_DIR=./data ./corecruxd
+CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./corecruxd
 ```
 
 ### Build from Source
@@ -55,7 +58,7 @@ CORECRUXD_DATA_DIR=./data ./corecruxd
 git clone https://github.com/CueCrux/Crux.git
 cd Crux
 cargo build --release
-CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
+CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 ```
 
 ## Five-Minute Walkthrough
@@ -63,7 +66,7 @@ CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 1. **Start the server:**
    ```bash
    docker compose up -d
-   # or: source config.example.env && ./corecruxd
+   # or: source config.example.env && ./target/release/corecruxd
    ```
 
 2. **Verify it's ready:**
@@ -72,68 +75,28 @@ CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
    ```
    Wait for `{"ok": true}` before sending requests. `/healthz` checks if the process is alive; `/readyz` checks if it can serve traffic.
 
-3. **Append events:**
+3. **Inspect enabled features:**
    ```bash
-   curl -s -X POST http://localhost:14800/v1/append \
-     -H "Content-Type: application/json" \
-     -d '{
-       "stream_id": "docs",
-       "events": [
-         {
-           "event_type": "doc.created",
-           "content_type": "text/plain",
-           "payload": "CoreCrux provides append-only event storage with fused BM25 and graph signal retrieval."
-         },
-         {
-           "event_type": "doc.created",
-           "content_type": "text/plain",
-           "payload": "Every query result is signed with a CROWN receipt and every gap in coverage is reported."
-         }
-       ]
-     }'
+   curl -s http://localhost:14800/v1/version | jq .
    ```
    Response:
    ```json
    {
-     "results": [
-       {"seq": 1, "status": "appended", "receipt_id": "rcpt_01J..."},
-       {"seq": 2, "status": "appended", "receipt_id": "rcpt_01J..."}
-     ],
-     "shard_map_version": 1
+     "version": "0.1.0",
+     "commit": "abc1234",
+     "features": {
+       "text_search": false,
+       "graph_expand": false,
+       "self_observe": false,
+       "mcp": true
+     }
    }
    ```
+   `text_search` and append/data-plane features are deployment-dependent. The
+   fact store, sessions, health endpoints, and built-in MCP server work in the
+   default Community Edition runtime.
 
-4. **Query with BM25:**
-   ```bash
-   curl -s -X POST http://localhost:14800/v1/query/text-search \
-     -H "Content-Type: application/json" \
-     -d '{
-       "query": "coverage gap reporting",
-       "top_k": 5,
-       "token_budget": 4000
-     }'
-   ```
-   Response:
-   ```json
-   {
-     "hits": [
-       {
-         "doc_id": 1,
-         "score": 2.41,
-         "segment_index": 0,
-         "content": "Every query result is signed with a CROWN receipt and every gap in coverage is reported."
-       }
-     ],
-     "coverage": {
-       "score": 0.67,
-       "missing_tokens": ["reporting"],
-       "below_floor": 0
-     },
-     "total_candidates": 2
-   }
-   ```
-
-5. **Store a fact:**
+4. **Store a fact:**
    ```bash
    curl -s -X PUT http://localhost:14800/v1/facts \
      -H "Content-Type: application/json" \
@@ -148,12 +111,14 @@ CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
    ```json
    {
      "fact_id": "f_01J...",
-     "receipt_id": "rcpt_01J...",
-     "created_at": "2026-04-03T10:00:00Z"
+     "entity": "project",
+     "key": "status",
+     "value": "Phase 1 complete — 12 milestones delivered",
+     "confidence": 0.95
    }
    ```
 
-6. **Query facts:**
+5. **Query facts:**
    ```bash
    curl -s "http://localhost:14800/v1/facts?query=project+status&token_budget=500"
    ```
@@ -166,12 +131,22 @@ CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
          "entity": "project",
          "key": "status",
          "value": "Phase 1 complete — 12 milestones delivered",
-         "confidence": 0.95,
-         "created_at": "2026-04-03T10:00:00Z"
+         "confidence": 0.95
        }
      ],
-     "token_count": 28
+     "total_tokens": 28
    }
+   ```
+
+6. **Inspect the built-in MCP server:**
+   ```bash
+   curl -s -X POST http://localhost:14801/mcp \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | jq '.result.tools | length'
+   ```
+   Expected output:
+   ```text
+   21
    ```
 
 7. **Verify store integrity:**
@@ -188,10 +163,12 @@ CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 | GET | `/healthz` | Health check with build metadata |
 | GET | `/readyz` | Readiness check |
 | GET | `/metrics` | Prometheus metrics |
-| POST | `/v1/append` | Append events to a stream |
+| POST | `/v1/admin/append` | Append events to a stream (`/v1/append` compatibility alias) |
 | POST | `/v1/query/text-search` | BM25 + graph signal retrieval |
 | POST | `/v1/query/graph-expand` | Graph traversal with budget |
 | POST | `/v1/query/time-range` | Temporal range queries |
+| PUT | `/v1/facts` | Store a shared fact |
+| GET | `/v1/facts` | Query shared facts |
 | GET | `/v1/receipts/{id}` | Retrieve a CROWN receipt |
 | GET | `/v1/receipts/{id}/verification` | Verify receipt signature |
 
@@ -261,6 +238,9 @@ CoreCrux is configured via environment variables:
 |---|---|---|
 | `CORECRUXD_DATA_DIR` | `../CoreCruxData/v3` | Data directory for segments |
 | `CORECRUXD_HTTP_PORT` | `14800` | HTTP API port |
+| `CORECRUXD_GRPC_PORT` | `4007` | gRPC API port |
+| `CORECRUXD_MCP_PORT` | `14801` | Built-in MCP port |
+| `CORECRUXD_MCP_ENABLED` | `true` | Enable built-in MCP server |
 | `CORECRUXD_BUILD_CCXI` | `0` | Build `.ccxi` indexes at seal time |
 | `CORECRUX_LOG_FORMAT` | `text` | Log format (`text` or `json`) |
 
@@ -281,8 +261,12 @@ CoreCrux includes a built-in MCP server on port **14801** with 21 tools for retr
 curl -s -X POST http://localhost:14801/mcp \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | jq '.result.tools | length'
-# Expected: 18
+# Expected: 21
 ```
+
+If you configure `CRUX_AGENT_TOKEN` or `CRUX_AGENT_TOKENS`, send the matching
+Bearer token on MCP requests. If you rely on handoff packages across restarts or
+multiple replicas, also set `CRUX_MCP_HANDOFF_SECRET`.
 
 ### Agent quickstart (first 3 calls)
 

@@ -8,7 +8,8 @@ services:
     image: cuecrux/corecrux-community:latest
     build: .
     ports:
-      - "14800:14800"
+      - "127.0.0.1:14800:14800"
+      - "127.0.0.1:14801:14801"
     volumes:
       - corecrux-data:/data
     healthcheck:
@@ -22,8 +23,18 @@ services:
           memory: 4G
     environment:
       - CORECRUXD_DATA_DIR=/data
+      - CORECRUXD_AUTH_MODE=dev_scopes
+      - CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1
+      - CORECRUXD_HTTP_HOST=0.0.0.0
+      - CORECRUXD_GRPC_HOST=0.0.0.0
+      - CORECRUXD_MCP_HOST=0.0.0.0
+      - CORECRUXD_MCP_PORT=14801
       - CORECRUXD_BUILD_CCXI=1
       - CORECRUX_LOG_FORMAT=json
+      # Optional: require authenticated MCP agent identities.
+      # - CRUX_AGENT_TOKEN=replace-me
+      # Optional: keep MCP handoff verification stable across restarts.
+      # - CRUX_MCP_HANDOFF_SECRET=replace-me
       # Optional: enable commons sync
       # - CORECRUX_SYNC_TOKEN=vcx_...
       # - CORECRUX_SYNC_ENDPOINT=https://vaultcrux.com/api/v1/community/sync

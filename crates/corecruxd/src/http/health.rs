@@ -358,7 +358,7 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
             "text_search": is_query_feature_enabled("CORECRUXD_QUERY_TEXT_SEARCH"),
             "graph_expand": is_query_feature_enabled("CORECRUXD_QUERY_GRAPH_EXPAND"),
             "self_observe": crux_observe::config::self_observe_enabled(),
-            "mcp": std::env::var("CRUX_MCP_ENABLED").map(|v| v == "true" || v == "1").unwrap_or(false),
+            "mcp": state.mcp_enabled,
         }
     }))
 }

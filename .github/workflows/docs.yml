@@ -23,6 +23,7 @@ jobs:
       CARGO_HOME: /home/gha-runner/.cargo
     steps:
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Build documentation

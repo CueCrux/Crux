@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
+use rand::RngCore;
 use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -31,18 +33,42 @@ pub struct McpContext {
     pub agent: Option<AgentIdentity>,
     /// Node identifier for this server instance.
     pub node_id: String,
+    /// Server-local MAC key used to authenticate handoff packages.
+    pub handoff_key: [u8; 32],
 }
 
 impl McpContext {
     /// Create a context with default (empty) stores — useful for tests.
     pub fn new_default(node_id: impl Into<String>) -> Self {
+        let node_id = node_id.into();
         Self {
             fact_store: Arc::new(RwLock::new(FactStore::new())),
             session_store: Arc::new(RwLock::new(SessionStore::new())),
             retrieval_index: Arc::new(RwLock::new(IndexManager::new())),
             agent_registry: AgentRegistry::empty(),
             agent: None,
-            node_id: node_id.into(),
+            handoff_key: default_handoff_key(&node_id),
+            node_id,
+        }
+    }
+
+    /// Create a context backed by shared stores from another runtime.
+    pub fn new_shared(
+        node_id: impl Into<String>,
+        fact_store: Arc<RwLock<FactStore>>,
+        session_store: Arc<RwLock<SessionStore>>,
+        retrieval_index: Arc<RwLock<IndexManager>>,
+        agent_registry: AgentRegistry,
+    ) -> Self {
+        let node_id = node_id.into();
+        Self {
+            fact_store,
+            session_store,
+            retrieval_index,
+            agent_registry,
+            agent: None,
+            handoff_key: default_handoff_key(&node_id),
+            node_id,
         }
     }
 
@@ -55,6 +81,7 @@ impl McpContext {
             agent_registry: self.agent_registry.clone(),
             agent: Some(agent),
             node_id: self.node_id.clone(),
+            handoff_key: self.handoff_key,
         }
     }
 }
@@ -65,6 +92,20 @@ impl std::fmt::Debug for McpContext {
             .field("node_id", &self.node_id)
             .finish_non_exhaustive()
     }
+}
+
+fn default_handoff_key(node_id: &str) -> [u8; 32] {
+    if let Ok(secret) = std::env::var("CRUX_MCP_HANDOFF_SECRET") {
+        return blake3::hash(secret.as_bytes()).into();
+    }
+
+    let mut seed = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut seed);
+    let material = format!(
+        "crux-mcp-handoff:{node_id}:{}",
+        base64::engine::general_purpose::STANDARD.encode(seed)
+    );
+    blake3::hash(material.as_bytes()).into()
 }
 
 /// Protocol version advertised in `initialize` response.

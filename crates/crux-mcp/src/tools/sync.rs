@@ -158,6 +158,7 @@ pub async fn handle_sync_status(_args: &Value, ctx: &McpContext) -> Result<Value
 mod tests {
     use super::*;
     use crate::dispatch::McpContext;
+    use crate::tools::test_support::{clear_sync_env, sync_env_lock};
     use corecrux_memory::fact_store::StoreFact;
     use std::collections::HashMap;
     use std::io::{Read, Write};
@@ -303,17 +304,6 @@ mod tests {
             .expect("receive recorded requests");
         handle.join().expect("mock server join");
         requests
-    }
-
-    fn clear_sync_env() {
-        std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
-        std::env::remove_var("CORECRUXD_SYNC_API_KEY");
-        std::env::remove_var("CORECRUXD_DATA_DIR");
-    }
-
-    fn sync_env_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     fn test_ctx() -> McpContext {

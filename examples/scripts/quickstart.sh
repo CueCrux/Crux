@@ -9,7 +9,9 @@ set -euo pipefail
 CORECRUXD_DATA_DIR=/tmp/crux-demo
 CORECRUXD_HTTP_PORT=14800
 CORECRUXD_AUTH_MODE=off   # Local demo only — use jwt_hs256 or jwt_jwks in production.
+CORECRUXD_QUERY_TEXT_SEARCH=1
 BASE="http://localhost:${CORECRUXD_HTTP_PORT}"
+MCP_URL="http://localhost:14801/mcp"
 
 # ── Pre-flight checks ─────────────────────────────────────────────
 
@@ -37,6 +39,7 @@ fi
 echo "==> Starting corecruxd..."
 CORECRUXD_DATA_DIR="$CORECRUXD_DATA_DIR" \
   CORECRUXD_AUTH_MODE="$CORECRUXD_AUTH_MODE" \
+  CORECRUXD_QUERY_TEXT_SEARCH="$CORECRUXD_QUERY_TEXT_SEARCH" \
   "$BINARY" &
 DAEMON_PID=$!
 
@@ -106,22 +109,47 @@ echo ""
 echo "==> Fact history (shows both versions)"
 curl -s "$BASE/v1/facts/entity/project/key/status/history" | jq .
 
-# ── Append events ──────────────────────────────────────────────────
+# ── Feature flags ──────────────────────────────────────────────────
 
 echo ""
-echo "==> Append events"
-curl -s -X POST "$BASE/v1/append" \
+echo "==> Runtime feature flags"
+curl -s "$BASE/v1/version" | jq .
+
+# ── MCP discovery ──────────────────────────────────────────────────
+
+echo ""
+echo "==> MCP tool catalogue"
+curl -s -X POST "$MCP_URL" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools | length'
+
+# ── Append events (best-effort: dataplane may be disabled) ─────────
+
+echo ""
+echo "==> Append events (if dataplane enabled)"
+APPEND_STATUS=$(curl -s -o /tmp/crux-append.json -w '%{http_code}' -X POST "$BASE/v1/append" \
   -H 'Content-Type: application/json' \
   -d '{
+    "tenant_id": "demo",
+    "stream_type": "docs",
     "stream_id": "docs",
     "events": [
       {
+        "event_id": "evt-quickstart-1",
+        "occurred_at": "2026-04-09T12:00:00Z",
         "event_type": "doc.created",
         "content_type": "text/plain",
         "payload": "CoreCrux provides append-only event storage with BM25 retrieval."
       }
     ]
-  }' | jq .
+  }')
+if [ "$APPEND_STATUS" = "201" ]; then
+  jq . /tmp/crux-append.json
+else
+  echo "    Append skipped or unavailable (HTTP $APPEND_STATUS)"
+  jq . /tmp/crux-append.json
+fi
+rm -f /tmp/crux-append.json
 
 # ── Done ───────────────────────────────────────────────────────────
 

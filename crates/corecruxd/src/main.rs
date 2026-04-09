@@ -61,8 +61,16 @@ use crate::shard_map::{RoutingTable, ShardMapStore};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = load_config();
+    if !config.auth_mode_explicitly_set {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CORECRUXD_AUTH_MODE must be set explicitly; see config.example.env",
+        )
+        .into());
+    }
     let auth = crate::auth::Authz::from_env(config.auth_mode)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mcp_agent_registry = crux_mcp::agent::AgentRegistry::from_env();
     validate_network_auth_posture(
         config.auth_mode,
         config.http_addr,
@@ -70,6 +78,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.commit_level,
         insecure_dev_auth_bind_allowed(),
         replication_auth_bearer_configured(),
+    )
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    validate_mcp_bind_posture(
+        config.mcp_enabled,
+        config.mcp_addr,
+        mcp_agent_registry.is_empty(),
+        insecure_dev_auth_bind_allowed(),
     )
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     // Keep config fields live on CPU-only builds for future use.
@@ -262,6 +277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         sdk_version: DEFAULT_SDK_VERSION.to_string(),
         auth: auth.clone(),
         data_dir: config.data_dir.clone(),
+        mcp_enabled: config.mcp_enabled,
         read_retry_failed_readyz_threshold: config.read_retry_failed_readyz_threshold,
         commit_level: config.commit_level,
         metrics: metrics.clone(),
@@ -333,6 +349,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Clone handles before state is moved into the router.
     let session_store_handle = state.session_store.clone();
     let sync_fact_store_handle = state.fact_store.clone();
+    let mcp_app = if config.mcp_enabled {
+        Some(crux_mcp::server::router(crux_mcp::dispatch::McpContext::new_shared(
+            node_id.clone(),
+            state.fact_store.clone(),
+            state.session_store.clone(),
+            state.retrieval_index.clone(),
+            mcp_agent_registry.clone(),
+        )))
+    } else {
+        None
+    };
 
     let app: Router = http::router(state).layer(TraceLayer::new_for_http());
 
@@ -419,10 +446,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let http_addr = config.http_addr;
     let grpc_addr = config.grpc_addr;
+    let mcp_addr = config.mcp_addr;
 
     info!(
         http_addr = %http_addr,
         grpc_addr = %grpc_addr,
+        mcp_enabled = config.mcp_enabled,
+        mcp_addr = %mcp_addr,
         data_dir = %config.data_dir.display(),
         commit_level = config.commit_level.as_str(),
         append_lane_enabled = config.append_lane_enabled,
@@ -467,20 +497,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
     };
 
-    let http_res = http_task.await?;
-    if let Err(err) = http_res {
-        error!(err = %err, "http server exited with error");
-        return Err(err.into());
-    }
+    let mcp_task = mcp_app.map(|mcp_app| {
+        let mut rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            serve_http(mcp_addr, mcp_app, async move {
+                let _ = rx.recv().await;
+            })
+            .await
+        })
+    });
 
-    let grpc_res = grpc_task.await?;
-    if let Err(err) = grpc_res {
-        error!(err = %err, "grpc server exited with error");
-        return Err(err);
+    let http_runner = wait_for_http_task("http", http_task);
+    let grpc_runner = wait_for_server_task("grpc", grpc_task);
+
+    if let Some(mcp_task) = mcp_task {
+        let mcp_runner = wait_for_http_task("mcp", mcp_task);
+        tokio::try_join!(http_runner, grpc_runner, mcp_runner)?;
+    } else {
+        tokio::try_join!(http_runner, grpc_runner)?;
     }
 
     drop(lock_file);
     Ok(())
+}
+
+async fn wait_for_http_task(
+    name: &'static str,
+    task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match task.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            error!(server = name, err = %err, "server exited with error");
+            Err(err.into())
+        }
+        Err(err) => {
+            error!(server = name, err = %err, "server task join error");
+            Err(Box::new(err))
+        }
+    }
+}
+
+async fn wait_for_server_task(
+    name: &'static str,
+    task: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match task.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            error!(server = name, err = %err, "server exited with error");
+            Err(err)
+        }
+        Err(err) => {
+            error!(server = name, err = %err, "server task join error");
+            Err(Box::new(err))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -852,6 +924,21 @@ fn validate_network_auth_posture(
     }
 
     Ok(())
+}
+
+fn validate_mcp_bind_posture(
+    mcp_enabled: bool,
+    mcp_addr: SocketAddr,
+    agent_registry_empty: bool,
+    allow_insecure_dev_auth_bind: bool,
+) -> Result<(), String> {
+    if !mcp_enabled || mcp_addr.ip().is_loopback() || !agent_registry_empty || allow_insecure_dev_auth_bind {
+        return Ok(());
+    }
+
+    Err(format!(
+        "MCP may not bind to non-loopback address ({mcp_addr}) without CRUX_AGENT_TOKEN/CRUX_AGENT_TOKENS or CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1"
+    ))
 }
 
 fn init_tracing(level: &str) {
@@ -1309,8 +1396,8 @@ fn spawn_capacity_guard(
 #[cfg(test)]
 mod tests {
     use super::{
-        reconcile_control_from_evidence, shard_map_advertise_addr, validate_network_auth_posture,
-        ControlCheckpointRecord, ControlMutationRecord,
+        reconcile_control_from_evidence, shard_map_advertise_addr, validate_mcp_bind_posture,
+        validate_network_auth_posture, ControlCheckpointRecord, ControlMutationRecord,
     };
     use crate::auth::AuthMode;
     use crate::config::CommitLevel;
@@ -1587,6 +1674,40 @@ mod tests {
         )
         .expect_err("mixed loopback/non-loopback should fail");
         assert!(err.contains("CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND"));
+    }
+
+    #[test]
+    fn mcp_non_loopback_without_agent_tokens_fails() {
+        let err = validate_mcp_bind_posture(
+            true,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 14801),
+            true,
+            false,
+        )
+        .expect_err("non-loopback MCP without tokens should fail");
+        assert!(err.contains("CRUX_AGENT_TOKEN"));
+    }
+
+    #[test]
+    fn mcp_non_loopback_with_agent_tokens_is_ok() {
+        validate_mcp_bind_posture(
+            true,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 14801),
+            false,
+            false,
+        )
+        .expect("configured MCP tokens should allow non-loopback bind");
+    }
+
+    #[test]
+    fn mcp_disabled_skips_bind_validation() {
+        validate_mcp_bind_posture(
+            false,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 14801),
+            true,
+            false,
+        )
+        .expect("disabled MCP should skip validation");
     }
 
     // ── shard_map_advertise_addr additional cases ────────────────────────
@@ -2964,6 +3085,7 @@ mod tests {
             sdk_version: corecrux_types::DEFAULT_SDK_VERSION.to_string(),
             auth,
             data_dir: tmp.path().to_path_buf(),
+            mcp_enabled: true,
             read_retry_failed_readyz_threshold: 0,
             commit_level: crate::config::CommitLevel::LocalCommit,
             metrics: metrics.clone(),
