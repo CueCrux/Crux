@@ -361,6 +361,7 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
             "graph_expand": is_query_feature_enabled("CORECRUXD_QUERY_GRAPH_EXPAND"),
             "self_observe": crux_observe::config::self_observe_enabled(),
             "mcp": state.mcp_enabled,
+            "embeddings": state.fact_store.read().await.embeddings_enabled(),
         },
         "sync": {
             "mode": sync_status.mode,

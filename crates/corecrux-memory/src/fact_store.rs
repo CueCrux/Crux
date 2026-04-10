@@ -98,6 +98,10 @@ pub struct FactStore {
     journal_path: Option<PathBuf>,
     /// Optional event bus for real-time mutation notifications.
     event_bus: Option<crate::events::EventBus>,
+    /// Optional embedding client for dense vector retrieval.
+    embedding_client: Option<crate::embeddings::EmbeddingClient>,
+    /// Stored embeddings keyed by fact_id.
+    embeddings: HashMap<String, Vec<f32>>,
 }
 
 impl FactStore {
@@ -108,6 +112,23 @@ impl FactStore {
     /// Attach an event bus so that `store()` and `delete()` emit real-time events.
     pub fn set_event_bus(&mut self, bus: crate::events::EventBus) {
         self.event_bus = Some(bus);
+    }
+
+    /// Attach an embedding client for dense vector retrieval.
+    /// When set, facts are embedded at store time and queries use cosine
+    /// similarity blended with keyword matching for ranking.
+    pub fn set_embedding_client(&mut self, client: crate::embeddings::EmbeddingClient) {
+        tracing::info!(
+            model = %client.model(),
+            base_url = %client.base_url(),
+            "fact-store-embeddings-enabled"
+        );
+        self.embedding_client = Some(client);
+    }
+
+    /// Returns true if an embedding client is configured.
+    pub fn embeddings_enabled(&self) -> bool {
+        self.embedding_client.is_some()
     }
 
     /// Create a fact store backed by a JSONL journal in `data_dir`.
@@ -123,6 +144,8 @@ impl FactStore {
             key_index: HashMap::new(),
             journal_path: Some(journal_path.clone()),
             event_bus: None,
+            embedding_client: None,
+            embeddings: HashMap::new(),
         };
         if journal_path.exists() {
             store.replay_journal(&journal_path)?;
@@ -231,6 +254,19 @@ impl FactStore {
 
         self.append_journal(&JournalEvent::Store { fact: fact.clone() });
 
+        // Embed the fact value if an embedding client is configured.
+        if let Some(client) = &self.embedding_client {
+            let text = format!("{} {} {}", fact.entity, fact.key, fact.value);
+            match client.embed_one(&text) {
+                Ok(vec) => {
+                    self.embeddings.insert(fact.fact_id.clone(), vec);
+                }
+                Err(err) => {
+                    tracing::warn!(?err, fact_id = %fact.fact_id, "fact-embed-failed");
+                }
+            }
+        }
+
         if let Some(bus) = &self.event_bus {
             bus.emit(crate::events::CruxEvent::FactStored {
                 fact_id: fact.fact_id.clone(),
@@ -305,6 +341,11 @@ impl FactStore {
                 true
             })
             .filter(|f| {
+                // When embeddings are enabled, skip keyword filtering — cosine
+                // similarity handles relevance ranking instead.
+                if self.embedding_client.is_some() {
+                    return true;
+                }
                 if let Some(query) = &q.query {
                     let query_lower = query.to_lowercase();
                     let terms: Vec<&str> = query_lower.split_whitespace().collect();
@@ -320,13 +361,51 @@ impl FactStore {
             })
             .collect();
 
-        // Sort by confidence descending, then by stored_at descending
-        results.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.stored_at.cmp(&a.stored_at))
-        });
+        // If embeddings are available and a query is provided, compute cosine
+        // similarity and blend it with confidence for ranking. Otherwise fall
+        // back to confidence + recency.
+        let query_embedding = match (&self.embedding_client, &q.query) {
+            (Some(client), Some(query_text)) if !query_text.is_empty() => {
+                match client.embed_one(query_text) {
+                    Ok(vec) => Some(vec),
+                    Err(err) => {
+                        tracing::warn!(?err, "query-embed-failed");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(ref qe) = query_embedding {
+            // Score = 0.6 * cosine_similarity + 0.4 * confidence
+            results.sort_by(|a, b| {
+                let sim_a = self
+                    .embeddings
+                    .get(&a.fact_id)
+                    .map(|v| crate::embeddings::cosine_similarity(v, qe))
+                    .unwrap_or(0.0);
+                let sim_b = self
+                    .embeddings
+                    .get(&b.fact_id)
+                    .map(|v| crate::embeddings::cosine_similarity(v, qe))
+                    .unwrap_or(0.0);
+                let score_a = 0.6 * sim_a + 0.4 * a.confidence;
+                let score_b = 0.6 * sim_b + 0.4 * b.confidence;
+                score_b
+                    .partial_cmp(&score_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.stored_at.cmp(&a.stored_at))
+            });
+        } else {
+            // Fallback: confidence descending, then recency descending
+            results.sort_by(|a, b| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.stored_at.cmp(&a.stored_at))
+            });
+        }
 
         // Apply token budget or top_k
         let (selected, total_tokens) = if let Some(budget) = q.token_budget {

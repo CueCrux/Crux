@@ -170,6 +170,10 @@ pub struct Config {
     // JSONL persistence for FactStore and SessionStore.
     pub fact_persistence_enabled: bool,
 
+    // Optional embedding endpoint for dense vector retrieval on facts.
+    pub embedding_url: Option<String>,
+    pub embedding_model: String,
+
     // Background sync: pull/push facts to a remote CoreCrux instance.
     pub sync_enabled: bool,
     pub sync_remote_url: String,
@@ -214,7 +218,7 @@ pub fn load_config() -> Config {
         .ok()
         .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
 
-    let data_dir = std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+    let data_dir = std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
     let log_level = std::env::var("CORECRUXD_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
     let service_name = std::env::var("CORECRUXD_SERVICE").unwrap_or_else(|_| "corecruxd".to_string());
     let cluster_id = std::env::var("CORECRUXD_CLUSTER_ID").unwrap_or_else(|_| "dev".to_string());
@@ -517,6 +521,10 @@ pub fn load_config() -> Config {
             .ok()
             .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
 
+        embedding_url: std::env::var("CORECRUXD_EMBEDDING_URL").ok().filter(|s| !s.is_empty()),
+        embedding_model: std::env::var("CORECRUXD_EMBEDDING_MODEL")
+            .unwrap_or_else(|_| "nomic-embed-text".to_string()),
+
         sync_enabled: std::env::var("CORECRUXD_SYNC_ENABLED")
             .ok()
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
@@ -740,7 +748,7 @@ mod tests {
         assert_eq!(cfg.mcp_addr.port(), 14801);
         assert_eq!(cfg.mcp_addr.ip().to_string(), "127.0.0.1");
         assert!(cfg.mcp_enabled);
-        assert_eq!(cfg.data_dir.to_str().unwrap(), "../CoreCruxData/v3");
+        assert_eq!(cfg.data_dir.to_str().unwrap(), "../CoreCruxData/v1");
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.service_name, "corecruxd");
         assert_eq!(cfg.cluster_id, "dev");

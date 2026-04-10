@@ -45,7 +45,7 @@ fn sync_error_content(msg: &str) -> Value {
 }
 
 fn sync_data_dir() -> PathBuf {
-    PathBuf::from(std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string()))
+    PathBuf::from(std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string()))
 }
 
 fn sync_background_enabled() -> bool {
@@ -416,7 +416,7 @@ mod tests {
     fn sync_data_dir_defaults_and_honors_override() {
         let _guard = sync_env_lock().blocking_lock();
         clear_sync_env();
-        assert_eq!(sync_data_dir(), PathBuf::from("../CoreCruxData/v3"));
+        assert_eq!(sync_data_dir(), PathBuf::from("../CoreCruxData/v1"));
 
         std::env::set_var("CORECRUXD_DATA_DIR", "/tmp/crux-sync");
         assert_eq!(sync_data_dir(), PathBuf::from("/tmp/crux-sync"));
