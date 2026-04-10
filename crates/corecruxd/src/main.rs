@@ -347,6 +347,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     state.fact_store.write().await.set_event_bus(state.event_bus.clone());
     state.session_store.write().await.set_event_bus(state.event_bus.clone());
 
+    // Wire optional embedding client for dense vector retrieval on facts.
+    if let Some(ref embedding_url) = config.embedding_url {
+        let client = corecrux_memory::embeddings::EmbeddingClient::new(corecrux_memory::embeddings::EmbeddingConfig {
+            base_url: embedding_url.clone(),
+            model: config.embedding_model.clone(),
+            dimensions: 0, // auto-detect
+        });
+        info!(
+            embedding_url = %embedding_url,
+            embedding_model = %config.embedding_model,
+            "embedding-client-configured"
+        );
+        state.fact_store.write().await.set_embedding_client(client);
+    }
+
     // Bootstrap: always seed agent-facing documentation on startup (idempotent).
     // Self-observation (ops error/warning capture) still requires CRUX_SELF_OBSERVE=true.
     {

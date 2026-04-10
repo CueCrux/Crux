@@ -1,17 +1,15 @@
 # Copyright (c) 2026 CueCrux Ltd. All rights reserved.
 # Licensed under the CueCrux Community Licence (CCL v1.0).
 
-version: "3.8"
-
 services:
-  corecrux:
-    image: cuecrux/corecrux-community:latest
+  crux:
+    image: cuecrux/crux-community:latest
     build: .
     ports:
       - "127.0.0.1:14800:14800"
       - "127.0.0.1:14801:14801"
     volumes:
-      - corecrux-data:/data
+      - crux-data:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:14800/readyz"]
       interval: 10s
@@ -31,13 +29,30 @@ services:
       - CORECRUXD_MCP_PORT=14801
       - CORECRUXD_BUILD_CCXI=1
       - CORECRUX_LOG_FORMAT=json
-      # Optional: require authenticated MCP agent identities.
-      # - CRUX_AGENT_TOKEN=replace-me
-      # Optional: keep MCP handoff verification stable across restarts.
-      # - CRUX_MCP_HANDOFF_SECRET=replace-me
-      # Optional: enable commons sync
-      # - CORECRUX_SYNC_TOKEN=vcx_...
-      # - CORECRUX_SYNC_ENDPOINT=https://vaultcrux.com/api/v1/community/sync
+      # Optional: point at an Ollama instance for dense vector retrieval.
+      # - CORECRUXD_EMBEDDING_URL=http://ollama:11434
+      # - CORECRUXD_EMBEDDING_MODEL=nomic-embed-text
+
+  # ── Optional: local Ollama for embeddings ──────────────────────
+  # Start with:  docker compose --profile embeddings up -d
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["embeddings"]
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Pull the embedding model on first start.
+    # Remove or change this if you use a different model.
+    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 3 && ollama pull nomic-embed-text && wait"]
 
 volumes:
-  corecrux-data:
+  crux-data:
+  ollama-models:

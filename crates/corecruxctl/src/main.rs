@@ -146,7 +146,7 @@ enum Command {
     /// Verify on-disk shard store integrity (Phase 5 hardening surface).
     #[command(name = "verify-store")]
     VerifyStore {
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Optional shard numeric id (e.g. 1 for shard-0001). If omitted, scans scoped shard set.
@@ -204,7 +204,7 @@ enum Command {
         /// Maximum number of newest eligible segments to scan.
         #[arg(long)]
         max_segments: Option<usize>,
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Postgres fetch batch size.
@@ -314,7 +314,7 @@ enum Command {
     InspectReceipt {
         /// Receipt ID to inspect.
         receipt_id: String,
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<String>,
     },
@@ -324,7 +324,7 @@ enum Command {
     Explain {
         /// Receipt ID to explain.
         receipt_id: String,
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<String>,
     },
@@ -332,7 +332,7 @@ enum Command {
     /// Aggregated low-coverage report: queries where the corpus couldn't provide strong answers.
     #[command(name = "gaps")]
     Gaps {
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<String>,
         /// Only show gaps since this date (ISO 8601).
@@ -427,7 +427,7 @@ enum ShardMapCommand {
         /// Shard map JSON file to publish.
         #[arg(long)]
         file: PathBuf,
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
@@ -721,7 +721,7 @@ enum ValvesCommand {
 enum CcxiCommand {
     /// Verify .ccxi companions exist for all sealed segments and BLAKE3 hashes are valid.
     Verify {
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Optional shard numeric id (e.g. 1 for shard-0001). If omitted, checks all shards.
@@ -731,7 +731,7 @@ enum CcxiCommand {
 
     /// Rebuild .ccxi companion index from sealed segment(s).
     Rebuild {
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Optional shard numeric id.
@@ -747,7 +747,7 @@ enum CcxiCommand {
 enum ProjectionsCommand {
     /// Rebuild all projections from genesis (pure replay) and write CCXS snapshots + meta.
     Rebuild {
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Optional shard numeric id (e.g. 1 for shard-0001). If omitted, rebuild all shards.
@@ -767,7 +767,7 @@ enum ProjectionsCommand {
     /// - This is safe to run while corecruxd is stopped. If run while serving, you must ensure
     ///   no concurrent readers depend on old snapshot versions.
     Gc {
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Optional shard numeric id (e.g. 1 for shard-0001). If omitted, GC all shards.
@@ -789,7 +789,7 @@ enum ProjectionsCommand {
     /// This is intended for local operator smoke: run corecruxd with projections enabled and
     /// confirm ticks produce snapshots under shards/shard-*/projections.
     SeedMinimal {
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Shard numeric id to seed (default 1 for shard-0001).
@@ -842,7 +842,7 @@ enum StorageCommand {
         /// Remove the local segment after a verified copy.
         #[arg(long, default_value_t = false)]
         delete_source: bool,
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Optional report output path.
@@ -887,8 +887,8 @@ enum ReceiptsCommand {
     /// Seed a minimal receipt body+sig into a shard directory (offline, dev-only).
     #[command(name = "seed-minimal")]
     SeedMinimal {
-        /// CoreCrux data dir (defaults to ../CoreCruxData/v3).
-        #[arg(long, default_value = "../CoreCruxData/v3")]
+        /// CoreCrux data dir (defaults to ../CoreCruxData/v1).
+        #[arg(long, default_value = "../CoreCruxData/v1")]
         data_dir: PathBuf,
         /// Shard ID (numeric) under data_dir/shards/shard-XXXX.
         #[arg(long, default_value_t = 1)]
@@ -909,8 +909,8 @@ enum ReceiptsCommand {
     /// This is an offline operator tool: run it while corecruxd is stopped (it takes shard locks).
     #[command(name = "backfill-subject-index")]
     BackfillSubjectIndex {
-        /// CoreCrux data dir (defaults to ../CoreCruxData/v3).
-        #[arg(long, default_value = "../CoreCruxData/v3")]
+        /// CoreCrux data dir (defaults to ../CoreCruxData/v1).
+        #[arg(long, default_value = "../CoreCruxData/v1")]
         data_dir: PathBuf,
         /// Optional shard numeric id (e.g. 1 for shard-0001). If omitted, scan all shards.
         #[arg(long)]
@@ -931,7 +931,7 @@ enum ReceiptsCommand {
 enum SnapshotCommand {
     /// List projection snapshots and metadata by shard.
     List {
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Optional shard numeric id (e.g. 1 for shard-0001).
@@ -940,7 +940,7 @@ enum SnapshotCommand {
     },
     /// Verify projection snapshot hashes against projections.meta.json.
     Verify {
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Optional shard numeric id (e.g. 1 for shard-0001).
@@ -954,7 +954,7 @@ enum EvidenceCommand {
     /// Rebuild and verify CONTROL.json against the local control evidence stream.
     #[command(name = "control-verify")]
     ControlVerify {
-        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v3).
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Fail if the control evidence stream is not hosted locally.
@@ -1079,7 +1079,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let mode = verify_store::VerifyMode::parse(&mode)
                 .ok_or_else(|| format!("invalid --mode value '{mode}' (expected sampled|full)"))?;
             let sample_rate = sample_rate.clamp(0.0, 1.0);
-            let default_dir = std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+            let default_dir = std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
             let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
             let report = verify_store::verify_store(&verify_store::VerifyStoreOptions {
                 data_dir,
@@ -1107,7 +1107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Ccxi { command } => match command {
             CcxiCommand::Verify { data_dir, shard } => {
                 let default_dir =
-                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
                 let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
                 let report = ccxi_verify(&data_dir, shard)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1119,7 +1119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 segment_seq,
             } => {
                 let default_dir =
-                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
                 let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
                 let report = ccxi_rebuild(&data_dir, shard, segment_seq)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1145,7 +1145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 node_id,
             } => {
                 let default_dir =
-                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
                 let environment = tooling_env::ToolingEnvironment::resolve(environment)?;
                 let report = storage::offload_segments(&storage::StorageOffloadOptions {
                     data_dir: data_dir.unwrap_or_else(|| PathBuf::from(default_dir)),
@@ -1185,7 +1185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if !postgres {
                 return Err("reconcile currently requires --postgres".into());
             }
-            let default_dir = std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+            let default_dir = std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
             let report = reconcile::reconcile_postgres(&reconcile::ReconcilePostgresOptions {
                 data_dir: data_dir.unwrap_or_else(|| PathBuf::from(default_dir)),
                 connection_string,
@@ -1268,7 +1268,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let map = shardmap::read_shard_map_v1(&file)?;
                 let data_dir = data_dir
                     .or_else(|| std::env::var("CORECRUXD_DATA_DIR").ok().map(PathBuf::from))
-                    .unwrap_or_else(|| PathBuf::from("../CoreCruxData/v3"));
+                    .unwrap_or_else(|| PathBuf::from("../CoreCruxData/v1"));
                 shardmap::publish_shard_map_v1(&data_dir, &map)?;
                 println!("OK");
                 Ok(())
@@ -1562,7 +1562,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 batch_frames,
             } => {
                 let default_dir =
-                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
                 let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
                 let report = projections::rebuild_projections_v1(&data_dir, shard, device_index, batch_frames)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1576,7 +1576,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 max_delete,
             } => {
                 let default_dir =
-                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
                 let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
                 let report =
                     projections::gc_orphan_cold_segments_v1(&data_dir, shard, dry_run, min_age_seconds, max_delete)?;
@@ -1591,7 +1591,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 device_index,
             } => {
                 let default_dir =
-                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
                 let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
                 let report = projections::seed_minimal_projection_events_v1(
                     &data_dir,
@@ -1684,7 +1684,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Snapshot { command } => match command {
             SnapshotCommand::List { data_dir, shard } => {
                 let default_dir =
-                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
                 let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
                 let report = snapshot::list_snapshots(&snapshot::SnapshotOptions { data_dir, shard })?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1692,7 +1692,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             SnapshotCommand::Verify { data_dir, shard } => {
                 let default_dir =
-                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
                 let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
                 let report = snapshot::verify_snapshots(&snapshot::SnapshotOptions { data_dir, shard })?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1711,7 +1711,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 batch_frames,
             } => {
                 let default_dir =
-                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string());
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
                 let report = evidence::control_verify(&evidence::ControlVerifyOptions {
                     data_dir: data_dir.unwrap_or_else(|| PathBuf::from(default_dir)),
                     hosted_only,
@@ -1800,7 +1800,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         Command::InspectReceipt { receipt_id, data_dir } => {
             let dd = data_dir.unwrap_or_else(|| {
-                std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string())
+                std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string())
             });
             inspect_receipt::run(&dd, &receipt_id)?;
             Ok(())
@@ -1808,7 +1808,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         Command::Explain { receipt_id, data_dir } => {
             let dd = data_dir.unwrap_or_else(|| {
-                std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string())
+                std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string())
             });
             explain::run(&dd, &receipt_id)?;
             Ok(())
@@ -1816,7 +1816,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         Command::Gaps { data_dir, since } => {
             let dd = data_dir.unwrap_or_else(|| {
-                std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string())
+                std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string())
             });
             gaps::run(&dd, since.as_deref())?;
             Ok(())

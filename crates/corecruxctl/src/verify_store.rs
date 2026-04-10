@@ -109,6 +109,9 @@ pub struct VerifyStoreReport {
 }
 
 fn list_shards(shard_root: &Path) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
+    if !shard_root.exists() {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::<u32>::new();
     for ent in std::fs::read_dir(shard_root)? {
         let ent = ent?;
@@ -588,7 +591,7 @@ mod tests {
     // ── verify_store with missing shards dir ─────────────────────────
 
     #[test]
-    fn verify_store_missing_shard_root_errors() {
+    fn verify_store_missing_shard_root_returns_ok_empty() {
         let tmp = TempDir::new().unwrap();
         let opts = VerifyStoreOptions {
             data_dir: tmp.path().to_path_buf(),
@@ -599,9 +602,12 @@ mod tests {
             budget_bytes: 1024 * 1024,
             device_index: 0,
         };
-        // No "shards" dir => read_dir should fail
-        let result = verify_store(&opts);
-        assert!(result.is_err());
+        // No "shards" dir => treated as empty (fresh instance).
+        let report = verify_store(&opts).unwrap();
+        assert!(report.ok);
+        assert_eq!(report.scanned_shards, 0);
+        assert_eq!(report.failed_shards, 0);
+        assert!(report.shards.is_empty());
     }
 
     #[test]
