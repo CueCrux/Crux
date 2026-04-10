@@ -381,13 +381,11 @@ impl FactStore {
                 let sim_a = self
                     .embeddings
                     .get(&a.fact_id)
-                    .map(|v| crate::embeddings::cosine_similarity(v, qe))
-                    .unwrap_or(0.0);
+                    .map_or(0.0, |v| crate::embeddings::cosine_similarity(v, qe));
                 let sim_b = self
                     .embeddings
                     .get(&b.fact_id)
-                    .map(|v| crate::embeddings::cosine_similarity(v, qe))
-                    .unwrap_or(0.0);
+                    .map_or(0.0, |v| crate::embeddings::cosine_similarity(v, qe));
                 let score_a = 0.6 * sim_a + 0.4 * a.confidence;
                 let score_b = 0.6 * sim_b + 0.4 * b.confidence;
                 score_b

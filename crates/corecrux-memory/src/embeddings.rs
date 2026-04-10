@@ -46,7 +46,7 @@ impl std::fmt::Debug for EmbeddingClient {
         f.debug_struct("EmbeddingClient")
             .field("base_url", &self.config.base_url)
             .field("model", &self.config.model)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
