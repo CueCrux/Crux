@@ -84,6 +84,10 @@ tr:hover td { background: rgba(76,201,240,0.05); }
       <div class="label">/readyz</div>
       <div id="readyz-status">--</div>
     </div>
+    <div class="health-card">
+      <div class="label">Update Status</div>
+      <div id="update-status">--</div>
+    </div>
   </div>
   <h3>Version Info</h3>
   <div class="result" id="health-version">loading...</div>
@@ -223,6 +227,13 @@ function badge(ok) {
   return '<span class="status-badge ' + (ok ? 'ok' : 'fail') + '">' + (ok ? 'OK' : 'FAIL') + '</span>';
 }
 
+function updateBadge(state) {
+  var okStates = ['current'];
+  var css = okStates.indexOf(state) !== -1 ? 'ok' : 'fail';
+  if (!state) state = 'unknown';
+  return '<span class="status-badge ' + css + '">' + state.toUpperCase() + '</span>';
+}
+
 async function api(method, path, body) {
   var opts = { method: method, headers: {} };
   if (body !== undefined) {
@@ -254,9 +265,18 @@ async function refreshHealth() {
   try {
     var ver = await api('GET', '/v1/version');
     document.getElementById('health-version').textContent = JSON.stringify(ver, null, 2);
-    document.getElementById('version-display').textContent = 'v' + (ver.version || '?') + ' (' + (ver.commit || '?').slice(0, 8) + ')';
+    var update = ver.update || {};
+    var state = update.state || 'unknown';
+    var updateText = updateBadge(state);
+    if (update.behind_by) updateText += ' <span style="color:var(--text-dim)">behind ' + update.behind_by + '</span>';
+    if (update.ahead_by) updateText += ' <span style="color:var(--text-dim)">ahead ' + update.ahead_by + '</span>';
+    document.getElementById('update-status').innerHTML = updateText;
+    document.getElementById('version-display').textContent =
+      'v' + (ver.version || '?') + ' (' + (ver.commit || '?').slice(0, 8) + ')' +
+      (state === 'behind' ? ' update available' : state === 'diverged' ? ' diverged' : '');
   } catch(e) {
     document.getElementById('health-version').textContent = 'Failed to load version info';
+    document.getElementById('update-status').innerHTML = badge(false) + ' <span style="color:var(--error)">unavailable</span>';
     document.getElementById('version-display').textContent = 'offline';
   }
 }

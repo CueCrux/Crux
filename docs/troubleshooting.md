@@ -80,7 +80,7 @@ API is on 14800, and MCP can be disabled with `CORECRUXD_MCP_ENABLED=false`.
 
 **Cause:** Tool name is misspelled or not in the catalogue.
 
-**Fix:** Call `tools/list` to see all 21 available tools:
+**Fix:** Call `tools/list` to see all 22 available tools:
 ```bash
 curl -s -X POST http://localhost:14801/mcp \
   -H "Content-Type: application/json" \

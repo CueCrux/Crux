@@ -7,6 +7,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,114 @@ pub struct SyncPushPreview {
     pub synced_count: usize,
     /// Summary of entities that would be pushed (entity name → count).
     pub entity_summary: Vec<(String, usize)>,
+}
+
+/// Runtime sync posture exposed to operators and agents.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncRuntimeStatus {
+    /// High-level operating mode: `local_only`, `manual_sync`, `sync_enabled`, or `degraded`.
+    pub mode: String,
+    /// Whether the remote sync target is fully configured.
+    pub configured: bool,
+    /// Whether the daemon background sync loop is enabled.
+    pub background_sync_enabled: bool,
+    /// Remote CoreCrux base URL when configured.
+    pub remote_url: String,
+    /// Whether an API key is configured for remote sync.
+    pub api_key_configured: bool,
+    /// Best-effort remote platform reachability probe result.
+    pub platform_online: Option<bool>,
+    /// Whether the node is operating in a degraded sync mode.
+    pub degraded: bool,
+    /// Human-readable reason when operating in a degraded or local-only mode.
+    pub degraded_reason: Option<String>,
+}
+
+impl SyncRuntimeStatus {
+    pub fn from_settings(background_sync_enabled: bool, remote_url: Option<&str>, api_key_configured: bool) -> Self {
+        let remote_url = remote_url.unwrap_or_default().trim().to_string();
+        let has_remote = !remote_url.is_empty();
+
+        if !has_remote {
+            return Self {
+                mode: "local_only".to_string(),
+                configured: false,
+                background_sync_enabled,
+                remote_url,
+                api_key_configured,
+                platform_online: None,
+                degraded: false,
+                degraded_reason: Some(
+                    "remote sync is not configured; continuing with the local fact and session store only".to_string(),
+                ),
+            };
+        }
+
+        if !api_key_configured {
+            return Self {
+                mode: "degraded".to_string(),
+                configured: false,
+                background_sync_enabled,
+                remote_url,
+                api_key_configured,
+                platform_online: None,
+                degraded: true,
+                degraded_reason: Some(
+                    "sync remote is configured but CORECRUXD_SYNC_API_KEY is missing; continuing local-only"
+                        .to_string(),
+                ),
+            };
+        }
+
+        Self {
+            mode: if background_sync_enabled {
+                "sync_enabled".to_string()
+            } else {
+                "manual_sync".to_string()
+            },
+            configured: true,
+            background_sync_enabled,
+            remote_url,
+            api_key_configured,
+            platform_online: None,
+            degraded: false,
+            degraded_reason: None,
+        }
+    }
+
+    pub fn with_probe_result(mut self, probe: Result<(), String>) -> Self {
+        if self.remote_url.is_empty() {
+            return self;
+        }
+
+        match probe {
+            Ok(()) => {
+                self.platform_online = Some(true);
+            }
+            Err(err) => {
+                self.platform_online = Some(false);
+                self.mode = "degraded".to_string();
+                self.degraded = true;
+                self.degraded_reason = Some(format!(
+                    "remote platform health check failed: {err}; continuing with the local fact and session store"
+                ));
+            }
+        }
+        self
+    }
+}
+
+/// Best-effort health probe for a remote CoreCrux node.
+pub fn probe_remote_health(remote_url: &str) -> Result<(), String> {
+    let health_url = format!("{}/healthz", remote_url.trim_end_matches('/'));
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
+        .timeout_read(Duration::from_secs(2))
+        .build()
+        .get(&health_url)
+        .call()
+        .map(|_| ())
+        .map_err(|err| err.to_string())
 }
 
 impl SyncClient {

@@ -249,6 +249,14 @@ mod tests {
         BootstrapSeeder::new(Arc::new(RwLock::new(FactStore::new())))
     }
 
+    fn bootstrap_counts() -> (usize, usize, usize, usize) {
+        let docs: Vec<DocEntry> = serde_json::from_str(BOOTSTRAP_DOCS).unwrap();
+        let patterns: Vec<PatternEntry> = serde_json::from_str(BOOTSTRAP_PATTERNS).unwrap();
+        let resolutions: Vec<ResolutionEntry> = serde_json::from_str(BOOTSTRAP_RESOLUTIONS).unwrap();
+        let tool_outputs: Vec<ToolOutputEntry> = serde_json::from_str(BOOTSTRAP_TOOL_OUTPUTS).unwrap();
+        (docs.len(), patterns.len(), resolutions.len(), tool_outputs.len())
+    }
+
     #[test]
     fn bootstrap_docs_deserialises() {
         let docs: Vec<DocEntry> = serde_json::from_str(BOOTSTRAP_DOCS).unwrap();
@@ -274,7 +282,7 @@ mod tests {
     #[test]
     fn bootstrap_tool_outputs_deserialises() {
         let entries: Vec<ToolOutputEntry> = serde_json::from_str(BOOTSTRAP_TOOL_OUTPUTS).unwrap();
-        assert_eq!(entries.len(), 16);
+        assert_eq!(entries.len(), 22);
         for e in &entries {
             assert!(!e.tool.is_empty());
             assert!(!e.output.is_empty());
@@ -296,12 +304,12 @@ mod tests {
     async fn seed_creates_facts_on_empty_store() {
         let seeder = make_seeder();
         let result = seeder.seed().await;
+        let (docs, patterns, resolutions, tool_outputs) = bootstrap_counts();
 
         assert!(!result.already_seeded);
         assert!(result.facts_created > 0);
 
-        // 7 docs + 8 patterns + 12 resolutions + 16 tool-outputs = 43
-        assert_eq!(result.facts_created, 43);
+        assert_eq!(result.facts_created, docs + patterns + resolutions + tool_outputs);
     }
 
     #[tokio::test]
@@ -330,15 +338,16 @@ mod tests {
     async fn status_returns_correct_counts() {
         let seeder = make_seeder();
         seeder.seed().await;
+        let (docs, patterns, resolutions, tool_outputs) = bootstrap_counts();
+        let expected_total = docs + patterns + resolutions + tool_outputs;
 
         let status = seeder.status().await;
         assert!(status.seeded);
-        // 43 data facts + 1 sentinel = 44
-        assert_eq!(status.fact_count, 44);
-        assert_eq!(status.categories.get("doc"), Some(&7));
-        assert_eq!(status.categories.get("pattern"), Some(&8));
-        assert_eq!(status.categories.get("resolution"), Some(&12));
-        assert_eq!(status.categories.get("tool-output"), Some(&16));
+        assert_eq!(status.fact_count, expected_total + 1);
+        assert_eq!(status.categories.get("doc"), Some(&docs));
+        assert_eq!(status.categories.get("pattern"), Some(&patterns));
+        assert_eq!(status.categories.get("resolution"), Some(&resolutions));
+        assert_eq!(status.categories.get("tool-output"), Some(&tool_outputs));
         assert!(status.last_seed_at.is_some());
     }
 }

@@ -9,7 +9,7 @@ For MCP clients, the relevant network surfaces are:
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | **14800** | HTTP/REST | Human-facing API (`/healthz`, `/v1/facts`, `/v1/query/*`) |
-| **14801** | MCP (JSON-RPC) | Agent-facing API (21 tools for retrieval, facts, sessions, sync, decisions) |
+| **14801** | MCP (JSON-RPC) | Agent-facing API (22 tools for retrieval, facts, sessions, sync, updates, decisions) |
 
 Your MCP client connects to `http://localhost:14801/mcp`.
 
@@ -26,7 +26,7 @@ Your MCP client connects to `http://localhost:14801/mcp`.
    curl -s -X POST http://localhost:14801/mcp \
      -H "Content-Type: application/json" \
      -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | jq '.result.tools | length'
-   # Expected output: 21
+   # Expected output: 22
    ```
 
 If the server is configured with `CRUX_AGENT_TOKEN` or `CRUX_AGENT_TOKENS`,
@@ -84,5 +84,9 @@ Your agent's first 3 calls should be:
 1. `get_bootstrap("patterns")` — learn optimal usage patterns
 2. `store_fact(entity="test", key="hello", value="world")` — store a fact
 3. `query_facts(query="hello")` — retrieve it
+
+Before maintenance work, call `update_status()` and pull
+`get_bootstrap(topic="docs", query="upgrade")` plus
+`get_bootstrap(topic="docs", query="backup")`.
 
 See `docs/agent-guide.md` for the full integration guide.

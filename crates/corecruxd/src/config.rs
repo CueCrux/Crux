@@ -175,6 +175,13 @@ pub struct Config {
     pub sync_remote_url: String,
     pub sync_api_key: String,
     pub sync_interval_secs: u64,
+
+    // Background update checks against a tracked git ref.
+    pub update_check_enabled: bool,
+    pub update_check_remote: String,
+    pub update_check_ref: String,
+    pub update_check_interval_secs: u64,
+    pub update_check_repo_dir: Option<PathBuf>,
 }
 
 pub fn load_config() -> Config {
@@ -520,6 +527,20 @@ pub fn load_config() -> Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(300)
             .max(10),
+        update_check_enabled: std::env::var("CORECRUXD_UPDATE_CHECK_ENABLED")
+            .ok()
+            .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
+        update_check_remote: std::env::var("CORECRUXD_UPDATE_CHECK_REMOTE").unwrap_or_else(|_| "origin".to_string()),
+        update_check_ref: std::env::var("CORECRUXD_UPDATE_CHECK_REF").unwrap_or_else(|_| "main".to_string()),
+        update_check_interval_secs: std::env::var("CORECRUXD_UPDATE_CHECK_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3600)
+            .clamp(60, 86_400),
+        update_check_repo_dir: std::env::var("CORECRUXD_UPDATE_CHECK_REPO_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty()),
     }
 }
 

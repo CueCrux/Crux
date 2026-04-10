@@ -15,6 +15,7 @@ pub mod observe;
 pub mod query;
 pub mod sessions;
 pub mod sync;
+pub mod update;
 
 use serde_json::{json, Value};
 
@@ -29,7 +30,7 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
-/// Return the full tool catalogue (21 tools) advertised to MCP clients.
+/// Return the full tool catalogue (22 tools) advertised to MCP clients.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         // ── Retrieval ──────────────────────────────────────────────
@@ -168,7 +169,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             name: "get_bootstrap".to_string(),
             description: "Query bootstrap knowledge at runtime. Returns facts stored under \
                           the `__bootstrap__::` entity prefix. Use `topic` to filter by \
-                          sub-category (e.g. \"patterns\", \"docs\", \"errors\")."
+                          sub-category (e.g. \"patterns\", \"docs\", \"errors\") and \
+                          `query` to narrow onboarding or troubleshooting guidance."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -176,10 +178,15 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "topic": {
                         "type": "string",
                         "description": "Optional topic filter: \"patterns\", \"docs\", \"errors\", etc."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional search term to narrow the matching bootstrap facts."
                     }
                 },
                 "examples": [
                     { "topic": "patterns" },
+                    { "topic": "docs", "query": "integration" },
                     { "topic": "errors" }
                 ]
             }),
@@ -390,8 +397,21 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "sync_status".to_string(),
-            description: "Show sync configuration and last sync state including pull/push \
-                          counts, timestamps, and local fact count."
+            description: "Show whether this node is running local-only, manual sync, \
+                          full background sync, or degraded sync. Includes remote reachability, \
+                          pull/push timestamps, and local fact count."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "examples": [{}]
+            }),
+        },
+        ToolDefinition {
+            name: "update_status".to_string(),
+            description: "Show whether this checkout is current, behind, ahead, \
+                          diverged, disabled, or unavailable relative to the tracked \
+                          git branch. Includes an upgrade hint plus backup playbook pointers."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -444,7 +464,8 @@ pub fn tool_output_docs() -> Value {
         { "tool": "record_decision",    "output": "{ decision_id, decision_hash, entity, action }" },
         { "tool": "sync_pull",          "output": "{ facts_pulled, cursor, total_pull_count }" },
         { "tool": "sync_push",          "output": "{ facts_pushed, total_push_count }" },
-        { "tool": "sync_status",        "output": "{ configured, remote_url, last_pull_at, last_push_at, pull_count, push_count, local_fact_count }" }
+        { "tool": "sync_status",        "output": "{ mode, configured, background_sync_enabled, remote_url, api_key_configured, platform_online, degraded, degraded_reason, onboarding_hint, last_pull_at, last_push_at, pull_count, push_count, local_fact_count }" },
+        { "tool": "update_status",      "output": "{ enabled, state, tracking_ref, current_commit, latest_commit, ahead_by, behind_by, checked_at, error, upgrade_hint, upgrade_playbook_query, backup_playbook_query }" }
     ])
 }
 
@@ -488,6 +509,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "sync_pull" => sync::handle_sync_pull(args, ctx).await,
         "sync_push" => sync::handle_sync_push(args, ctx).await,
         "sync_status" => sync::handle_sync_status(args, ctx).await,
+        "update_status" => update::handle_update_status(args, ctx).await,
         _ => Err(JsonRpcError {
             code: crate::protocol::METHOD_NOT_FOUND,
             message: format!("unknown tool: {name}"),
@@ -518,7 +540,7 @@ mod tests {
     use crate::dispatch::McpContext;
     use crate::tools::test_support::{clear_sync_env, sync_env_lock};
 
-    const TOOL_COUNT: usize = 21;
+    const TOOL_COUNT: usize = 22;
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
@@ -603,10 +625,11 @@ mod tests {
         assert!(names.contains(&"list_sessions".to_string()));
         assert!(names.contains(&"delete_session".to_string()));
         assert!(names.contains(&"get_agent_identity".to_string()));
-        // Sync tools (3)
+        // Sync + update tools (4)
         assert!(names.contains(&"sync_pull".to_string()));
         assert!(names.contains(&"sync_push".to_string()));
         assert!(names.contains(&"sync_status".to_string()));
+        assert!(names.contains(&"update_status".to_string()));
     }
 
     #[test]
@@ -758,5 +781,13 @@ mod tests {
         let result = call_tool("sync_status", &json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"configured\": false"));
+    }
+
+    #[tokio::test]
+    async fn call_tool_update_status() {
+        let ctx = test_ctx();
+        let result = call_tool("update_status", &json!({}), &ctx).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"state\": \"disabled\""));
     }
 }

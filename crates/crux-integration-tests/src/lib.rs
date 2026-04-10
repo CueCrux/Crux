@@ -11,11 +11,78 @@ use std::fs::OpenOptions;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
 const START_ATTEMPTS: usize = 3;
+
+fn repo_root() -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    std::path::Path::new(manifest_dir)
+        .parent()
+        .expect("crates directory")
+        .parent()
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn build_corecruxd_binary(repo_root: &std::path::Path) -> Result<PathBuf, String> {
+    let output = Command::new("cargo")
+        .current_dir(repo_root)
+        .args(["build", "--message-format=json", "--bin", "corecruxd"])
+        .output()
+        .map_err(|err| format!("build corecruxd: {err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            format!("cargo build --bin corecruxd exited with status {}", output.status)
+        } else {
+            format!(
+                "cargo build --bin corecruxd exited with status {}: {detail}",
+                output.status
+            )
+        });
+    }
+
+    let mut executable = None;
+    for line in stdout.lines() {
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if message["reason"] != "compiler-artifact" || message["target"]["name"] != "corecruxd" {
+            continue;
+        }
+        if let Some(path) = message["executable"].as_str() {
+            executable = Some(PathBuf::from(path));
+        }
+    }
+
+    executable.ok_or_else(|| {
+        if stderr.trim().is_empty() {
+            "cargo build did not report a corecruxd executable path".to_string()
+        } else {
+            format!(
+                "cargo build did not report a corecruxd executable path: {}",
+                stderr.trim()
+            )
+        }
+    })
+}
+
+fn default_binary_path() -> Result<PathBuf, String> {
+    static BUILD_RESULT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    BUILD_RESULT
+        .get_or_init(|| {
+            let repo_root = repo_root();
+            build_corecruxd_binary(&repo_root)
+        })
+        .clone()
+}
 
 /// A running corecruxd instance for integration tests.
 pub struct TestDaemon {
@@ -78,11 +145,7 @@ impl TestDaemon {
         let binary = if let Ok(path) = std::env::var("CORECRUXD_BINARY") {
             std::path::PathBuf::from(path)
         } else {
-            let manifest_dir = env!("CARGO_MANIFEST_DIR");
-            std::path::Path::new(manifest_dir)
-                .parent().unwrap()  // crates/
-                .parent().unwrap()  // Crux/
-                .join("target/debug/corecruxd")
+            default_binary_path()?
         };
         let stderr_log_path = data_dir.path().join("corecruxd.stderr.log");
         let stderr_log = OpenOptions::new()
@@ -107,6 +170,7 @@ impl TestDaemon {
             .env("CORECRUXD_QUERY_GRAPH_EXPAND", "1")
             .env("CORECRUXD_QUERY_TIME_RANGE", "1")
             .env("CORECRUXD_BUILD_CCXI", "1")
+            .env("CORECRUXD_UPDATE_CHECK_ENABLED", "0")
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_log));
 

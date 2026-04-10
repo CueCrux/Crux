@@ -103,6 +103,84 @@ pub struct BuildInfo {
     pub commit: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateCheckState {
+    Disabled,
+    Current,
+    Behind,
+    Ahead,
+    Diverged,
+    Unavailable,
+    Error,
+}
+
+impl UpdateCheckState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Current => "current",
+            Self::Behind => "behind",
+            Self::Ahead => "ahead",
+            Self::Diverged => "diverged",
+            Self::Unavailable => "unavailable",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateStatus {
+    pub enabled: bool,
+    pub state: UpdateCheckState,
+    pub remote: String,
+    #[serde(rename = "ref")]
+    pub ref_name: String,
+    pub tracking_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_commit: Option<String>,
+    pub ahead_by: u64,
+    pub behind_by: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub upgrade_hint: String,
+}
+
+impl UpdateStatus {
+    pub fn public_view(&self) -> Self {
+        let mut status = self.clone();
+        status.repo_dir = None;
+        status.error = None;
+        status
+    }
+}
+
+impl Default for UpdateStatus {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            state: UpdateCheckState::Disabled,
+            remote: String::new(),
+            ref_name: String::new(),
+            tracking_ref: String::new(),
+            repo_dir: None,
+            current_commit: None,
+            latest_commit: None,
+            ahead_by: 0,
+            behind_by: 0,
+            checked_at: None,
+            error: None,
+            upgrade_hint: "Update checks are disabled.".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompatContract {
     pub requires: String,

@@ -155,6 +155,13 @@ Reports any segment with mismatched BLAKE3 hashes, truncated frames, or missing 
 - Monitor the `corecrux_segment_corrupt_total` Prometheus metric
 - Enable capacity guards (`CORECRUXD_CAPACITY_GUARD_ENABLED=1`) to prevent writes when disk is low
 
+### Before upgrades
+
+- Check `/v1/version` or the MCP `update_status` tool before changing a running node.
+- If the update state is `behind`, take a snapshot of `CORECRUXD_DATA_DIR` or an equivalent volume backup before pulling and rebuilding.
+- If the update state is `ahead` or `diverged`, do not blind-pull. Review local commits first and use a human-approved merge or rebase flow.
+- After the upgrade, rerun `corecruxctl verify-store --data-dir ./data --scope recent` and confirm the update state has moved to `current` or the expected tracked position.
+
 ### What data is lost
 
 Sealed segments are immutable — corruption in a sealed segment means those events are unrecoverable from this node. Use receipt export (`/v1/replay/exports/receipts/{id}`) to verify which events had receipts issued before the corruption window.

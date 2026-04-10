@@ -350,6 +350,8 @@ pub(super) fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Resp
     )
 )]
 pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoResponse {
+    let sync_status = sync_runtime_status();
+    let update_status = state.update_status.read().await.public_view();
     Json(serde_json::json!({
         "version": state.build.version,
         "commit": state.build.commit,
@@ -359,6 +361,34 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
             "graph_expand": is_query_feature_enabled("CORECRUXD_QUERY_GRAPH_EXPAND"),
             "self_observe": crux_observe::config::self_observe_enabled(),
             "mcp": state.mcp_enabled,
-        }
+        },
+        "sync": {
+            "mode": sync_status.mode,
+            "configured": sync_status.configured,
+            "background_sync_enabled": sync_status.background_sync_enabled,
+            "remote_url": sync_status.remote_url,
+            "api_key_configured": sync_status.api_key_configured,
+            "degraded": sync_status.degraded,
+            "degraded_reason": sync_status.degraded_reason,
+        },
+        "update": update_status
     }))
+}
+
+fn sync_runtime_status() -> corecrux_memory::sync::SyncRuntimeStatus {
+    let background_sync_enabled = std::env::var("CORECRUXD_SYNC_ENABLED")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+    let remote_url = std::env::var("CORECRUXD_SYNC_REMOTE_URL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let api_key_configured = std::env::var("CORECRUXD_SYNC_API_KEY")
+        .ok()
+        .is_some_and(|value| !value.is_empty());
+
+    corecrux_memory::sync::SyncRuntimeStatus::from_settings(
+        background_sync_enabled,
+        remote_url.as_deref(),
+        api_key_configured,
+    )
 }

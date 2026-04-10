@@ -217,6 +217,7 @@ fn health_and_version() {
         version["features"]["mcp"], true,
         "built-in MCP should be enabled in the default test daemon"
     );
+    assert!(version["update"]["state"].is_string());
 
     // /metrics — should return 200 with Prometheus-format text.
     let metrics_resp = d.get("/metrics").unwrap();

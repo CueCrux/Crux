@@ -110,6 +110,37 @@ export interface VersionResponse {
     self_observe: boolean;
     mcp: boolean;
   };
+  sync?: {
+    mode: string;
+    configured: boolean;
+    background_sync_enabled: boolean;
+    remote_url: string;
+    api_key_configured: boolean;
+    degraded: boolean;
+    degraded_reason?: string | null;
+  };
+  update?: {
+    enabled: boolean;
+    state:
+      | "disabled"
+      | "current"
+      | "behind"
+      | "ahead"
+      | "diverged"
+      | "unavailable"
+      | "error";
+    remote: string;
+    ref: string;
+    tracking_ref: string;
+    repo_dir?: string | null;
+    current_commit?: string | null;
+    latest_commit?: string | null;
+    ahead_by: number;
+    behind_by: number;
+    checked_at?: string | null;
+    error?: string | null;
+    upgrade_hint: string;
+  };
 }
 
 // ── Query: Text Search ──────────────────────────────────────────────

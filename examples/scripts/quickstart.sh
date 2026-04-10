@@ -122,6 +122,8 @@ echo "==> MCP tool catalogue"
 curl -s -X POST "$MCP_URL" \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools | length'
+echo "==> Cached git update status"
+curl -s "$BASE/v1/version" | jq '.update'
 
 # ── Append events (best-effort: dataplane may be disabled) ─────────
 

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
-use corecrux_memory::sync::SyncClient;
+use corecrux_memory::sync::{probe_remote_health, SyncClient, SyncRuntimeStatus};
 
 use crate::dispatch::McpContext;
 use crate::protocol::JsonRpcError;
@@ -48,6 +48,38 @@ fn sync_data_dir() -> PathBuf {
     PathBuf::from(std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v3".to_string()))
 }
 
+fn sync_background_enabled() -> bool {
+    std::env::var("CORECRUXD_SYNC_ENABLED")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn sync_runtime_status() -> SyncRuntimeStatus {
+    let remote_url = std::env::var("CORECRUXD_SYNC_REMOTE_URL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let api_key_configured = std::env::var("CORECRUXD_SYNC_API_KEY")
+        .ok()
+        .is_some_and(|value| !value.is_empty());
+
+    let status = SyncRuntimeStatus::from_settings(sync_background_enabled(), remote_url.as_deref(), api_key_configured);
+
+    if status.remote_url.is_empty() || !status.configured {
+        return status;
+    }
+
+    let probe_url = status.remote_url.clone();
+    status.with_probe_result(probe_remote_health(&probe_url))
+}
+
+fn onboarding_hint(status: &SyncRuntimeStatus) -> &'static str {
+    if status.degraded || status.mode == "local_only" {
+        "Continue local-first. Pull onboarding guidance with get_bootstrap(topic=\"docs\", query=\"integration\") and share the human or automatic integration playbook that matches the environment."
+    } else {
+        "Remote sync is available. Use get_bootstrap(topic=\"docs\", query=\"automatic integration\") for system hookup steps, then verify with store_fact/query_facts or sync_pull/sync_push."
+    }
+}
+
 /// `sync_pull` — pull latest facts from the remote CoreCrux instance.
 pub async fn handle_sync_pull(_args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let client = match build_sync_client() {
@@ -69,7 +101,9 @@ pub async fn handle_sync_pull(_args: &Value, ctx: &McpContext) -> Result<Value, 
                 "content": [{ "type": "text", "text": text }]
             }))
         }
-        Err(e) => Ok(sync_error_content(&format!("sync pull failed: {e}"))),
+        Err(e) => Ok(sync_error_content(&format!(
+            "{e}. Local fact and session storage on this node remain available."
+        ))),
     }
 }
 
@@ -117,29 +151,36 @@ pub async fn handle_sync_push(args: &Value, ctx: &McpContext) -> Result<Value, J
                 "content": [{ "type": "text", "text": text }]
             }))
         }
-        Err(e) => Ok(sync_error_content(&format!("sync push failed: {e}"))),
+        Err(e) => Ok(sync_error_content(&format!(
+            "{e}. Local fact and session storage on this node remain available."
+        ))),
     }
 }
 
 /// `sync_status` — show sync configuration and last sync state.
 pub async fn handle_sync_status(_args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let remote_url = std::env::var("CORECRUXD_SYNC_REMOTE_URL")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let configured = remote_url.is_some();
+    let status = sync_runtime_status();
+    let onboarding_hint = onboarding_hint(&status);
 
-    let cursor = if configured {
-        let client = SyncClient::new(remote_url.as_deref().unwrap_or(""), "", &sync_data_dir());
-        client.load_cursor()
-    } else {
+    let cursor = if status.remote_url.is_empty() {
         corecrux_memory::sync::SyncCursor::default()
+    } else {
+        let client = SyncClient::new(&status.remote_url, "", &sync_data_dir());
+        client.load_cursor()
     };
 
     let local_fact_count = ctx.fact_store.read().await.count();
 
     let text = serde_json::to_string_pretty(&json!({
-        "configured": configured,
-        "remote_url": remote_url.unwrap_or_default(),
+        "mode": status.mode,
+        "configured": status.configured,
+        "background_sync_enabled": status.background_sync_enabled,
+        "remote_url": status.remote_url,
+        "api_key_configured": status.api_key_configured,
+        "platform_online": status.platform_online,
+        "degraded": status.degraded,
+        "degraded_reason": status.degraded_reason,
+        "onboarding_hint": onboarding_hint,
         "last_pull_at": cursor.last_pull_at,
         "last_push_at": cursor.last_push_at,
         "pull_count": cursor.pull_count,
@@ -344,6 +385,7 @@ mod tests {
         let result = handle_sync_status(&json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"configured\": false"));
+        assert!(text.contains("\"mode\": \"local_only\""));
     }
 
     #[tokio::test]
@@ -406,7 +448,8 @@ mod tests {
         let _guard = sync_env_lock().lock().await;
         clear_sync_env();
         let dir = tempfile::tempdir().unwrap();
-        let client = SyncClient::new("http://example.test:14800", "ignored", dir.path());
+        let (remote_url, rx, handle) = start_mock_server(vec![MockResponse::json(json!({"ok": true}))]);
+        let client = SyncClient::new(&remote_url, "ignored", dir.path());
         client.save_cursor(&corecrux_memory::sync::SyncCursor {
             last_pull_at: Some("2026-04-08T10:11:12Z".to_string()),
             last_pull_cursor: Some("cursor-123".to_string()),
@@ -414,16 +457,36 @@ mod tests {
             pull_count: 7,
             push_count: 3,
         });
-        std::env::set_var("CORECRUXD_SYNC_REMOTE_URL", "http://example.test:14800");
+        std::env::set_var("CORECRUXD_SYNC_REMOTE_URL", &remote_url);
+        std::env::set_var("CORECRUXD_SYNC_API_KEY", "test-key");
         std::env::set_var("CORECRUXD_DATA_DIR", dir.path());
 
         let ctx = test_ctx();
         let result = handle_sync_status(&json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("\"configured\": true"));
-        assert!(text.contains("\"remote_url\": \"http://example.test:14800\""));
+        assert!(text.contains("\"mode\": \"manual_sync\""));
+        assert!(text.contains(&format!("\"remote_url\": \"{remote_url}\"")));
+        assert!(text.contains("\"platform_online\": true"));
         assert!(text.contains("\"pull_count\": 7"));
         assert!(text.contains("\"push_count\": 3"));
+        assert_eq!(rx.recv().unwrap().len(), 1);
+        handle.join().unwrap();
+        clear_sync_env();
+    }
+
+    #[tokio::test]
+    async fn sync_status_reports_degraded_when_api_key_missing() {
+        let _guard = sync_env_lock().lock().await;
+        clear_sync_env();
+        std::env::set_var("CORECRUXD_SYNC_REMOTE_URL", "http://example.test:14800");
+
+        let ctx = test_ctx();
+        let result = handle_sync_status(&json!({}), &ctx).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"mode\": \"degraded\""));
+        assert!(text.contains("\"api_key_configured\": false"));
+        assert!(text.contains("CORECRUXD_SYNC_API_KEY is missing"));
         clear_sync_env();
     }
 

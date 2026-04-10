@@ -30,6 +30,7 @@ mod pool;
 mod problem;
 mod shard_map;
 mod structured_log;
+mod update;
 
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
@@ -133,6 +134,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.projections_enabled,
         config.projections_batch_frames,
         config.projections_tick_interval_ms,
+        config.update_check_enabled,
+        &config.update_check_remote,
+        &config.update_check_ref,
+        config.update_check_interval_secs,
+        &config.update_check_repo_dir,
     );
     init_tracing(&config.log_level);
 
@@ -268,6 +274,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }
 
+    let update_status = Arc::new(RwLock::new(update::initial_status(&config)));
+
+    let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
+    spawn_shutdown_signal(shutdown_tx.clone());
+    update::spawn_update_checker(config.clone(), update_status.clone(), shutdown_tx.subscribe());
+
     let state = AppState {
         lock_held: true,
         build: build.clone(),
@@ -327,6 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             corecrux_memory::SessionStore::new()
         })),
+        update_status: update_status.clone(),
         event_bus: corecrux_memory::events::EventBus::new(1024),
     };
 
@@ -355,6 +368,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             state.fact_store.clone(),
             state.session_store.clone(),
             state.retrieval_index.clone(),
+            state.update_status.clone(),
             mcp_agent_registry.clone(),
         )))
     } else {
@@ -362,9 +376,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     let app: Router = http::router(state).layer(TraceLayer::new_for_http());
-
-    let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
-    spawn_shutdown_signal(shutdown_tx.clone());
 
     // Session TTL reaper — runs every 60s, removes expired sessions.
     {
@@ -3109,6 +3120,7 @@ mod tests {
             retrieval_index: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_retrieval::IndexManager::new())),
             fact_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::FactStore::new())),
             session_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::SessionStore::new())),
+            update_status: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_types::UpdateStatus::default())),
             event_bus: corecrux_memory::events::EventBus::new(16),
         };
 
