@@ -365,15 +365,13 @@ impl FactStore {
         // similarity and blend it with confidence for ranking. Otherwise fall
         // back to confidence + recency.
         let query_embedding = match (&self.embedding_client, &q.query) {
-            (Some(client), Some(query_text)) if !query_text.is_empty() => {
-                match client.embed_one(query_text) {
-                    Ok(vec) => Some(vec),
-                    Err(err) => {
-                        tracing::warn!(?err, "query-embed-failed");
-                        None
-                    }
+            (Some(client), Some(query_text)) if !query_text.is_empty() => match client.embed_one(query_text) {
+                Ok(vec) => Some(vec),
+                Err(err) => {
+                    tracing::warn!(?err, "query-embed-failed");
+                    None
                 }
-            }
+            },
             _ => None,
         };
 

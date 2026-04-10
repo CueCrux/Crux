@@ -349,13 +349,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Wire optional embedding client for dense vector retrieval on facts.
     if let Some(ref embedding_url) = config.embedding_url {
-        let client = corecrux_memory::embeddings::EmbeddingClient::new(
-            corecrux_memory::embeddings::EmbeddingConfig {
-                base_url: embedding_url.clone(),
-                model: config.embedding_model.clone(),
-                dimensions: 0, // auto-detect
-            },
-        );
+        let client = corecrux_memory::embeddings::EmbeddingClient::new(corecrux_memory::embeddings::EmbeddingConfig {
+            base_url: embedding_url.clone(),
+            model: config.embedding_model.clone(),
+            dimensions: 0, // auto-detect
+        });
         info!(
             embedding_url = %embedding_url,
             embedding_model = %config.embedding_model,

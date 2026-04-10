@@ -522,8 +522,7 @@ pub fn load_config() -> Config {
             .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
 
         embedding_url: std::env::var("CORECRUXD_EMBEDDING_URL").ok().filter(|s| !s.is_empty()),
-        embedding_model: std::env::var("CORECRUXD_EMBEDDING_MODEL")
-            .unwrap_or_else(|_| "nomic-embed-text".to_string()),
+        embedding_model: std::env::var("CORECRUXD_EMBEDDING_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string()),
 
         sync_enabled: std::env::var("CORECRUXD_SYNC_ENABLED")
             .ok()
