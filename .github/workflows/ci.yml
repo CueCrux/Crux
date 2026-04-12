@@ -82,7 +82,7 @@ jobs:
       CARGO_HOME: /home/gha-runner/.cargo
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: cargo build --workspace
 
