@@ -41,7 +41,7 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 ureq = { version = "2.12.1", features = ["json"] }
 opentelemetry = { version = "0.31", optional = true }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.27", features = ["tonic"], optional = true }
+opentelemetry-otlp = { version = "0.31", features = ["tonic"], optional = true }
 uuid = { version = "1.16.0", features = ["v4"] }
 zstd = "0.13.3"
 zip = "2.4.2"
