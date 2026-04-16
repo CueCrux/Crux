@@ -8,10 +8,12 @@
 //! specification. [`list_tools`] returns the full catalogue advertised to
 //! MCP clients via the `tools/list` response.
 
+pub mod constraint;
 pub mod decision;
 pub mod facts;
 pub mod handoff;
 pub mod observe;
+pub mod passport;
 pub mod query;
 pub mod sessions;
 pub mod sync;
@@ -30,7 +32,7 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
-/// Return the full tool catalogue (22 tools) advertised to MCP clients.
+/// Return the full tool catalogue (27 tools) advertised to MCP clients.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         // ── Retrieval ──────────────────────────────────────────────
@@ -361,6 +363,123 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 ]
             }),
         },
+        // ── Constraints ────────────────────────────────────────────
+        ToolDefinition {
+            name: "declare_constraint".to_string(),
+            description: "Declare an organisational constraint (boundary, relationship, \
+                          policy, or context flag) that agents must respect. Constraints \
+                          are stored as facts and queryable via get_constraints."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "constraint_type": {
+                        "type": "string",
+                        "enum": ["boundary", "relationship", "policy", "context_flag"],
+                        "description": "The kind of constraint"
+                    },
+                    "assertion": {
+                        "type": "string",
+                        "description": "The constraint statement in natural language"
+                    },
+                    "severity": {
+                        "type": "string",
+                        "enum": ["critical", "high", "medium", "low"],
+                        "description": "Severity level. Critical constraints block actions.",
+                        "default": "medium"
+                    }
+                },
+                "required": ["constraint_type", "assertion"],
+                "examples": [
+                    { "constraint_type": "policy", "assertion": "All API keys must be rotated every 90 days", "severity": "high" },
+                    { "constraint_type": "boundary", "assertion": "No direct database access from application code", "severity": "critical" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "get_constraints".to_string(),
+            description: "List active organisational constraints, optionally filtered by \
+                          type or status. Returns constraints sorted by severity."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "constraint_type": {
+                        "type": "string",
+                        "enum": ["boundary", "relationship", "policy", "context_flag"],
+                        "description": "Filter by constraint type"
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["active", "suspended"],
+                        "description": "Filter by status",
+                        "default": "active"
+                    }
+                },
+                "examples": [
+                    {},
+                    { "constraint_type": "policy" },
+                    { "status": "active" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "check_constraints".to_string(),
+            description: "Check a proposed action against all active constraints. Returns \
+                          a verdict (pass, warn, or block) based on keyword matching \
+                          against constraint assertions. Critical matches block, high \
+                          matches warn."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action_description": {
+                        "type": "string",
+                        "description": "Description of the action to check against constraints"
+                    }
+                },
+                "required": ["action_description"],
+                "examples": [
+                    { "action_description": "Delete all user records from the production database" },
+                    { "action_description": "Deploy updated API to staging environment" }
+                ]
+            }),
+        },
+        // ── Passport ───────────────────────────────────────────────
+        ToolDefinition {
+            name: "issue_passport".to_string(),
+            description: "Issue an agent passport for the calling agent. Requires an \
+                          authenticated agent identity. The passport tracks lineage \
+                          (sponsor), reputation tier, and receipt count. Sync operations \
+                          require a minimum tier."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "sponsor_id": {
+                        "type": "string",
+                        "description": "Optional sponsor/voucher for this agent"
+                    }
+                },
+                "examples": [
+                    {},
+                    { "sponsor_id": "platform-admin" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "get_passport".to_string(),
+            description: "Return the calling agent's passport with current reputation \
+                          tier and receipt count. Automatically upgrades the tier if \
+                          new receipt thresholds are met. Tiers: unverified, basic (10+), \
+                          established (100+), trusted (500+), elite (2000+)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "examples": [{}]
+            }),
+        },
         // ── Sync ──────────────────────────────────────────────────
         ToolDefinition {
             name: "sync_pull".to_string(),
@@ -462,6 +581,11 @@ pub fn tool_output_docs() -> Value {
         { "tool": "create_handoff",     "output": "{ package_json, content_hash, signature, relevant_fact_count }" },
         { "tool": "accept_handoff",     "output": "{ session_loaded, facts_loaded, verified: bool }" },
         { "tool": "record_decision",    "output": "{ decision_id, decision_hash, entity, action }" },
+        { "tool": "declare_constraint", "output": "{ constraint_id, constraint_hash, constraint_type, assertion }" },
+        { "tool": "get_constraints",    "output": "{ constraints: [{constraint_id, constraint_type, assertion, severity, status, created_at}], count }" },
+        { "tool": "check_constraints",  "output": "{ verdict: pass|warn|block, matched_constraints: [{constraint_id, assertion, severity, match_score}] }" },
+        { "tool": "issue_passport",     "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id }" },
+        { "tool": "get_passport",       "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id, issued_at, passport_hash }" },
         { "tool": "sync_pull",          "output": "{ facts_pulled, cursor, total_pull_count }" },
         { "tool": "sync_push",          "output": "{ facts_pushed, total_push_count }" },
         { "tool": "sync_status",        "output": "{ mode, configured, background_sync_enabled, remote_url, api_key_configured, platform_online, degraded, degraded_reason, onboarding_hint, last_pull_at, last_push_at, pull_count, push_count, local_fact_count }" },
@@ -506,6 +630,11 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "create_handoff" => handoff::handle_create_handoff(args, ctx).await,
         "accept_handoff" => handoff::handle_accept_handoff(args, ctx).await,
         "record_decision" => decision::handle_record_decision(args, ctx).await,
+        "declare_constraint" => constraint::handle_declare_constraint(args, ctx).await,
+        "get_constraints" => constraint::handle_get_constraints(args, ctx).await,
+        "check_constraints" => constraint::handle_check_constraints(args, ctx).await,
+        "issue_passport" => passport::handle_issue_passport(args, ctx).await,
+        "get_passport" => passport::handle_get_passport(args, ctx).await,
         "sync_pull" => sync::handle_sync_pull(args, ctx).await,
         "sync_push" => sync::handle_sync_push(args, ctx).await,
         "sync_status" => sync::handle_sync_status(args, ctx).await,
@@ -540,7 +669,7 @@ mod tests {
     use crate::dispatch::McpContext;
     use crate::tools::test_support::{clear_sync_env, sync_env_lock};
 
-    const TOOL_COUNT: usize = 22;
+    const TOOL_COUNT: usize = 27;
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
@@ -625,6 +754,13 @@ mod tests {
         assert!(names.contains(&"list_sessions".to_string()));
         assert!(names.contains(&"delete_session".to_string()));
         assert!(names.contains(&"get_agent_identity".to_string()));
+        // Constraint tools (3)
+        assert!(names.contains(&"declare_constraint".to_string()));
+        assert!(names.contains(&"get_constraints".to_string()));
+        assert!(names.contains(&"check_constraints".to_string()));
+        // Passport tools (2)
+        assert!(names.contains(&"issue_passport".to_string()));
+        assert!(names.contains(&"get_passport".to_string()));
         // Sync + update tools (4)
         assert!(names.contains(&"sync_pull".to_string()));
         assert!(names.contains(&"sync_push".to_string()));
@@ -751,26 +887,81 @@ mod tests {
         assert_eq!(text, "anonymous");
     }
 
+    // ── passport dispatch integration tests ─────────────────────────
+
+    #[tokio::test]
+    async fn call_tool_issue_passport_requires_agent() {
+        let ctx = test_ctx();
+        let result = call_tool("issue_passport", &json!({}), &ctx).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn call_tool_get_passport() {
+        let ctx = test_ctx();
+        let result = call_tool("get_passport", &json!({}), &ctx).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no agent identity"));
+    }
+
+    // ── constraint dispatch integration tests ───────────────────────
+
+    #[tokio::test]
+    async fn call_tool_declare_constraint() {
+        let ctx = test_ctx();
+        let result = call_tool(
+            "declare_constraint",
+            &json!({"constraint_type": "policy", "assertion": "Rotate API keys"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("constraint declared: c_"));
+    }
+
+    #[tokio::test]
+    async fn call_tool_get_constraints() {
+        let ctx = test_ctx();
+        let result = call_tool("get_constraints", &json!({}), &ctx).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "no constraints found");
+    }
+
+    #[tokio::test]
+    async fn call_tool_check_constraints() {
+        let ctx = test_ctx();
+        let result = call_tool(
+            "check_constraints",
+            &json!({"action_description": "Deploy to production"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("verdict: pass"));
+    }
+
     // ── sync dispatch integration tests ────────────────────────────
 
     #[tokio::test]
-    async fn call_tool_sync_pull_not_configured() {
+    async fn call_tool_sync_pull_requires_passport() {
         let _guard = sync_env_lock().lock().await;
         clear_sync_env();
         let ctx = test_ctx();
         let result = call_tool("sync_pull", &json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("sync not configured"));
+        assert!(text.contains("authenticated agent identity"));
     }
 
     #[tokio::test]
-    async fn call_tool_sync_push_not_configured() {
+    async fn call_tool_sync_push_requires_passport() {
         let _guard = sync_env_lock().lock().await;
         clear_sync_env();
         let ctx = test_ctx();
         let result = call_tool("sync_push", &json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("sync not configured"));
+        assert!(text.contains("authenticated agent identity"));
     }
 
     #[tokio::test]
