@@ -36,7 +36,7 @@ tonic = "0.14.5"
 tower-http = { version = "0.6.2", features = ["catch-panic", "cors", "timeout", "trace"] }
 thiserror = "2.0.12"
 tracing = "0.1.41"
-tracing-opentelemetry = { version = "0.28", optional = true }
+tracing-opentelemetry = { version = "0.32", optional = true }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 ureq = { version = "2.12.1", features = ["json"] }
 opentelemetry = { version = "0.31", optional = true }
