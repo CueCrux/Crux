@@ -328,6 +328,15 @@ impl ProjectionState {
                 self.apply_entity_fact(tenant_hash, &p);
                 stats.entity_facts = 1;
             }
+            // Session-handshake events (M2) are consumed by a dedicated
+            // session_plans_by_principal projection elsewhere in the
+            // workspace. They're no-ops for the Living Objects / Entity
+            // projection state maintained here.
+            ProjectionEventV1::SessionPlanSealed(_)
+            | ProjectionEventV1::SessionClosed(_)
+            | ProjectionEventV1::SessionRevoked(_)
+            | ProjectionEventV1::InvocationReceipted(_)
+            | ProjectionEventV1::CeInstallImported(_) => {}
         }
         stats
     }

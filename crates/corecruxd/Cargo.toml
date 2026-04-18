@@ -23,6 +23,7 @@ chrono = { version = "0.4.40", default-features = false, features = ["clock"] }
 crc32fast = "1.4.2"
 ed25519-dalek = { version = "2.2.0", features = ["std"] }
 fs2 = "0.4.3"
+hex = "0.4.3"
 jsonwebtoken = "9.3.0"
 prometheus = { version = "0.13.4", default-features = false }
 prost = "0.14.3"
@@ -57,6 +58,7 @@ corecrux-storage = { path = "../corecrux-storage" }
 corecrux-types = { path = "../corecrux-types" }
 crux-observe = { path = "../crux-observe" }
 crux-mcp = { path = "../crux-mcp" }
+crux-session = { path = "../crux-session" }
 
 [dev-dependencies]
 corecrux-index = { path = "../corecrux-index" }

@@ -8,12 +8,15 @@ mod dataplane;
 mod events;
 mod facts;
 mod health;
+pub mod invocation;
 mod observe;
+pub mod session_metrics;
 mod openapi;
 mod projections;
 mod query;
 mod receipts;
 mod routing;
+pub mod session;
 
 pub(crate) use admin::AdminActionRecord;
 // HttpDataplane trait re-exported for test fakes (FakeHttpDataplane in tests.rs).
@@ -151,6 +154,11 @@ pub struct AppState {
     pub update_status: Arc<RwLock<corecrux_types::UpdateStatus>>,
     /// Real-time event bus for SSE streaming of store mutations.
     pub event_bus: corecrux_memory::events::EventBus,
+    /// Session-handshake services (M1). `None` disables `POST /session`,
+    /// which then returns 503. Hosted and CE populate this differently; see
+    /// [`session::SessionServices::local_default`] for the CE-friendly
+    /// out-of-the-box wiring.
+    pub session: Option<Arc<session::SessionServices>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -273,6 +281,13 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/ops/health", get(self::observe::get_ops_health))
         .route("/v1/bootstrap/pull", axum::routing::post(self::observe::post_bootstrap_pull))
         .route("/v1/bootstrap/status", get(self::observe::get_bootstrap_status))
+        // Session handshake (master-plan §5.1): CE uses /session, not /v1/session.
+        .route("/session", axum::routing::post(self::session::post_session))
+        // Invocation verification (master-plan §8).
+        .route(
+            "/invocation/verify",
+            axum::routing::post(self::invocation::post_invocation_verify),
+        )
         // Production hardening: version endpoint
         .route("/v1/version", get(self::health::get_version))
         // OpenAPI spec

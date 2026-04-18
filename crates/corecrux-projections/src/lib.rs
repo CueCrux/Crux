@@ -16,6 +16,7 @@ mod events;
 mod meta;
 pub mod query;
 mod runner;
+pub mod session_plans_by_principal;
 mod state;
 
 pub use ccxs::CCXS_BLOCK_STATS_V1;
@@ -31,6 +32,21 @@ pub use events::{
     EVT_DEPENDENT_EVIDENCE_UPSERT_V1, EVT_LIVING_STATE_UPDATE_V1, EVT_PRESSURE_UPSERT_V1, EVT_RELATION_DELETE_V1,
     EVT_RELATION_UPSERT_V1,
 };
+// Session-handshake events (M2; master-plan §7.2). Re-export so corecruxd /
+// VaultCrux can mint events without reaching into `events` directly.
+pub use events::{
+    CONTENT_TYPE_SESSION_BIN_V1, EVT_INVOCATION_RECEIPTED_V1, EVT_SESSION_CLOSED_V1,
+    EVT_SESSION_PLAN_SEALED_V1, EVT_SESSION_REVOKED_V1, InvocationReceiptedV1, SessionClosedV1,
+    SessionPlanSealedV1, SessionRevokedV1,
+};
+// CE → Core migration (M8).
+pub use events::{CeInstallImportedV1, EVT_CE_INSTALL_IMPORTED_V1};
+pub use session_plans_by_principal::{PlanEntryV1, PrincipalKey, SessionPlansByPrincipalV1};
+// Access to the events module for downstream crates (corecruxd / tests) that
+// need to reach event structs + dispatcher together.
+pub mod events_api {
+    pub use crate::events::*;
+}
 pub use meta::{
     load_projections_meta_v1, store_projections_meta_v1, ProjectionCursorV1, ProjectionMetaV1, ProjectionsMetaV1,
 };

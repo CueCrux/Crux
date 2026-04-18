@@ -341,6 +341,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })),
         update_status: update_status.clone(),
         event_bus: corecrux_memory::events::EventBus::new(1024),
+        session: {
+            // Durable CE wiring: persistent install UUID + file registry +
+            // file sealer under the configured data_dir. Falls back to the
+            // ephemeral (in-memory) wiring only if opening any of the three
+            // fails — tests are the expected consumer of the ephemeral
+            // path. Either way, the route is live.
+            let mcp_url = format!("http://{}/mcp", config.http_addr);
+            let session_metrics = Arc::new(
+                crate::http::session_metrics::SessionMetrics::new(&metrics.registry()),
+            );
+            match crate::http::session::SessionServices::local_durable(
+                &config.data_dir,
+                node_id.clone(),
+                mcp_url,
+            ) {
+                Ok(services) => Some(Arc::new(services.with_metrics(session_metrics))),
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "durable session wiring failed; falling back to ephemeral"
+                    );
+                    Some(Arc::new(
+                        crate::http::session::SessionServices::local_default(node_id.clone())
+                            .with_metrics(session_metrics),
+                    ))
+                }
+            }
+        },
     };
 
     // Wire the shared event bus into both stores so mutations emit SSE events.
@@ -378,14 +406,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let session_store_handle = state.session_store.clone();
     let sync_fact_store_handle = state.fact_store.clone();
     let mcp_app = if config.mcp_enabled {
-        Some(crux_mcp::server::router(crux_mcp::dispatch::McpContext::new_shared(
-            node_id.clone(),
-            state.fact_store.clone(),
-            state.session_store.clone(),
-            state.retrieval_index.clone(),
-            state.update_status.clone(),
-            mcp_agent_registry.clone(),
-        )))
+        // Loopback URL the cuecrux_session tool uses to call corecruxd's
+        // POST /session. This mirrors master-plan §6.2 ("POST to the
+        // Layer 1 handshake endpoint internally").
+        let daemon_base = format!("http://127.0.0.1:{}", config.http_addr.port());
+        Some(crux_mcp::server::router(
+            crux_mcp::dispatch::McpContext::new_shared(
+                node_id.clone(),
+                state.fact_store.clone(),
+                state.session_store.clone(),
+                state.retrieval_index.clone(),
+                state.update_status.clone(),
+                mcp_agent_registry.clone(),
+            )
+            .with_daemon_base_url(daemon_base),
+        ))
     } else {
         None
     };
@@ -3137,6 +3172,7 @@ mod tests {
             session_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::SessionStore::new())),
             update_status: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_types::UpdateStatus::default())),
             event_bus: corecrux_memory::events::EventBus::new(16),
+            session: None,
         };
 
         let router: axum::Router = crate::http::router(state);

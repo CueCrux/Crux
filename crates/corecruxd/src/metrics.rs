@@ -2126,6 +2126,14 @@ impl Metrics {
         encoder.encode(&metric_families, &mut buf)?;
         Ok(String::from_utf8_lossy(&buf).to_string())
     }
+
+    /// Expose the shared registry so sub-systems (e.g. the session
+    /// handshake M9 metrics) can register their own handles against the
+    /// same `/metrics` endpoint without plumbing their fields through
+    /// this struct.
+    pub fn registry(&self) -> Arc<prometheus::Registry> {
+        self.registry.clone()
+    }
 }
 
 #[cfg(test)]

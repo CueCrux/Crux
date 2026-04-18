@@ -38,6 +38,10 @@ pub struct McpContext {
     pub node_id: String,
     /// Server-local MAC key used to authenticate handoff packages.
     pub handoff_key: [u8; 32],
+    /// Loopback URL of the corecruxd daemon for internal HTTP calls
+    /// (currently only the `cuecrux_session` tool in M3). `None` disables
+    /// loopback and the tool reports `service_unavailable`.
+    pub daemon_base_url: Option<String>,
 }
 
 impl McpContext {
@@ -53,6 +57,7 @@ impl McpContext {
             agent: None,
             handoff_key: default_handoff_key(&node_id),
             node_id,
+            daemon_base_url: None,
         }
     }
 
@@ -75,6 +80,7 @@ impl McpContext {
             agent: None,
             handoff_key: default_handoff_key(&node_id),
             node_id,
+            daemon_base_url: None,
         }
     }
 
@@ -89,7 +95,15 @@ impl McpContext {
             agent: Some(agent),
             node_id: self.node_id.clone(),
             handoff_key: self.handoff_key,
+            daemon_base_url: self.daemon_base_url.clone(),
         }
+    }
+
+    /// Configure the loopback URL used by tools that call back into the
+    /// corecruxd HTTP server (e.g., `cuecrux_session`).
+    pub fn with_daemon_base_url(mut self, url: impl Into<String>) -> Self {
+        self.daemon_base_url = Some(url.into());
+        self
     }
 }
 

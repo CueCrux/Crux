@@ -15,6 +15,7 @@ serde_json = "1.0.139"
 thiserror = "2.0.12"
 tokio = { version = "1.51.1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1.41"
+ureq = { version = "2.12.1", features = ["json"] }
 uuid = { version = "1.16.0", features = ["v4"] }
 corecrux-memory = { path = "../corecrux-memory" }
 corecrux-retrieval = { path = "../corecrux-retrieval" }

@@ -9,6 +9,7 @@
 //! MCP clients via the `tools/list` response.
 
 pub mod constraint;
+pub mod cuecrux_session;
 pub mod decision;
 pub mod facts;
 pub mod handoff;
@@ -32,9 +33,32 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
-/// Return the full tool catalogue (27 tools) advertised to MCP clients.
+/// Non-breaking pointer added to every legacy tool's description at
+/// `list_tools()` time (master-plan §6.4 + Phase 10). Tools remain
+/// functionally identical — agents that call them directly still work.
+/// The hint exists so agents browsing the catalogue see the collapsed
+/// entry point. Deprecation timeline is not set here; it's a separate
+/// decision.
+const CUECRUX_SESSION_HINT: &str =
+    "\n\nTip: `cuecrux_session` returns a typed capability plan that includes this tool's \
+preferred routing, min-tier, and cost class. Call it once per session for the collapsed surface.";
+
+/// Return the full tool catalogue advertised to MCP clients.
+///
+/// `cuecrux_session` is listed first per master-plan §6.3 so agents that
+/// stop reading at the top of the list still discover the collapsed-surface
+/// entry point. Every OTHER tool is augmented at emit time with
+/// [`CUECRUX_SESSION_HINT`] so the pointer is visible in each tool's
+/// description — cheap affordance for agents that skip the hint at the
+/// head of the list.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
+        // ── Session Handshake (master-plan §6) ────────────────────
+        ToolDefinition {
+            name: "cuecrux_session".to_string(),
+            description: cuecrux_session::CUECRUX_SESSION_DESCRIPTION.to_string(),
+            input_schema: cuecrux_session::tool_input_schema(),
+        },
         // ── Retrieval ──────────────────────────────────────────────
         ToolDefinition {
             name: "query".to_string(),
@@ -539,6 +563,14 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             }),
         },
     ]
+    .into_iter()
+    .map(|mut t: ToolDefinition| {
+        if t.name != "cuecrux_session" {
+            t.description.push_str(CUECRUX_SESSION_HINT);
+        }
+        t
+    })
+    .collect()
 }
 
 /// Serialise the tool list into the MCP `tools/list` response shape.
@@ -563,6 +595,7 @@ pub fn list_tools_json() -> Value {
 /// shape. Included in the `get_bootstrap` response for agent discoverability.
 pub fn tool_output_docs() -> Value {
     json!([
+        { "tool": "cuecrux_session",    "output": "SessionPlan (see agents.cuecrux.com/schemas/SessionPlan.v1). Contains plan_id, session_id, passport, channels {bulk?, mcp}, capability_graph[], receipt {hash, signature?, signer_kid?, mode}, budget, minted_at, session_ttl_s." },
         { "tool": "query",              "output": "{ results: [{doc_id, score, segment_index, token_count}], coverage: {score, gaps, below_floor}, meta: {backend, took_ms, segments_searched} }" },
         { "tool": "query_scan",         "output": "{ results: [{doc_id, score, token_count}], meta: {took_ms, segments_searched} }" },
         { "tool": "query_expand",       "output": "{ results: [{doc_id, content, token_count}] }" },
@@ -612,6 +645,7 @@ pub async fn handle_get_agent_identity(_args: &Value, ctx: &McpContext) -> Resul
 /// Dispatch a tool call by name. Returns the MCP `content` array.
 pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     match name {
+        "cuecrux_session" => cuecrux_session::handle_cuecrux_session(args, ctx).await,
         "query" => query::handle_query(args, ctx).await,
         "query_scan" => query::handle_query_scan(args, ctx).await,
         "query_expand" => query::handle_query_expand(args, ctx).await,
@@ -669,7 +703,7 @@ mod tests {
     use crate::dispatch::McpContext;
     use crate::tools::test_support::{clear_sync_env, sync_env_lock};
 
-    const TOOL_COUNT: usize = 27;
+    const TOOL_COUNT: usize = 28; // 27 pre-M3 tools + cuecrux_session
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
@@ -809,6 +843,43 @@ mod tests {
         assert!(by_name("query_scan").description.contains("scores and token counts"));
         assert!(by_name("get_gaps").description.contains("low-coverage queries"));
         assert!(by_name("store_fact").description.contains("private: true"));
+    }
+
+    #[test]
+    fn legacy_tools_carry_cuecrux_session_hint_but_session_tool_does_not() {
+        // M10 gate: every legacy tool's description points at
+        // cuecrux_session; the collapsed entry tool does NOT hint at
+        // itself (would be tautological + drown out its own description).
+        let tools = list_tools();
+        let by_name = |n: &str| tools.iter().find(|t| t.name == n).expect(n);
+        let hint_fragment = "cuecrux_session";
+
+        assert!(
+            !by_name("cuecrux_session").description.ends_with(CUECRUX_SESSION_HINT),
+            "cuecrux_session must not hint at itself"
+        );
+        for legacy in [
+            "query",
+            "query_scan",
+            "store_fact",
+            "query_facts",
+            "get_session",
+            "list_sessions",
+            "get_agent_identity",
+            "create_handoff",
+            "record_decision",
+            "declare_constraint",
+            "issue_passport",
+            "sync_pull",
+            "update_status",
+        ] {
+            let desc = &by_name(legacy).description;
+            assert!(
+                desc.contains(hint_fragment),
+                "`{legacy}` description missing cuecrux_session hint"
+            );
+            assert!(desc.ends_with(CUECRUX_SESSION_HINT));
+        }
     }
 
     // ── get_agent_identity tests ────────────────────────────────────

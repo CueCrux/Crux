@@ -20,7 +20,22 @@ pub const EVT_DEPENDENT_EVIDENCE_UPSERT_V1: &str = "corecrux.proj.dependent.evid
 pub const EVT_ENTITY_FACT_V1: &str = "corecrux.proj.entity.fact.v1";
 pub const CONTENT_TYPE_ENTITY_JSON_V1: &str = "application/x-corecrux-entity-json-v1";
 
+// Session-handshake events (master-plan §7.2). These record the existence
+// and lifecycle of every session plan issued by VaultCrux / Crux CE, so
+// that the segment log remains the authoritative truth even when the hot
+// registry is lost or rebuilt. Plan bodies are stored in `plan_bytes_cbor`
+// exactly as produced by the `crux-session` canonical encoder.
+pub const EVT_SESSION_PLAN_SEALED_V1: &str = "corecrux.session.plan_sealed.v1";
+pub const EVT_SESSION_CLOSED_V1: &str = "corecrux.session.closed.v1";
+pub const EVT_SESSION_REVOKED_V1: &str = "corecrux.session.revoked.v1";
+pub const EVT_INVOCATION_RECEIPTED_V1: &str = "corecrux.session.invocation_receipted.v1";
+// CE → Core import (master-plan §9; M8). The countersignature event that
+// vouches for imported CE segments being carried intact into a hosted
+// tenant.
+pub const EVT_CE_INSTALL_IMPORTED_V1: &str = "corecrux.session.ce_install_imported.v1";
+
 pub const CONTENT_TYPE_PROJ_BIN_V1: &str = "application/x-corecrux-proj-bin-v1";
+pub const CONTENT_TYPE_SESSION_BIN_V1: &str = "application/x-corecrux-session-bin-v1";
 
 #[derive(Debug, Clone)]
 pub enum ProjectionEventV1 {
@@ -31,6 +46,13 @@ pub enum ProjectionEventV1 {
     DependentEvidenceUpsert(DependentEvidenceUpsertV1),
     // Phase 6: Entity fact event — carries a structured entity relation
     EntityFact(EntityFactV1),
+    // Session-handshake events (M2; master-plan §7.2). Additive.
+    SessionPlanSealed(SessionPlanSealedV1),
+    SessionClosed(SessionClosedV1),
+    SessionRevoked(SessionRevokedV1),
+    InvocationReceipted(InvocationReceiptedV1),
+    // CE → Core migration (M8; master-plan §9.3).
+    CeInstallImported(CeInstallImportedV1),
 }
 
 /// Phase 6: Entity fact event — a single (subject, predicate, object) relation
@@ -463,6 +485,23 @@ pub fn parse_projection_event(
                 ProjectionEventV1::EntityFact(EntityFactV1::decode_bin(payload)?)
             }
         }
+        // Session events are binary-only in M2. A hex-encoded JSON form may
+        // be added later; for now we route everything through decode_bin.
+        EVT_SESSION_PLAN_SEALED_V1 => {
+            ProjectionEventV1::SessionPlanSealed(SessionPlanSealedV1::decode_bin(payload)?)
+        }
+        EVT_SESSION_CLOSED_V1 => {
+            ProjectionEventV1::SessionClosed(SessionClosedV1::decode_bin(payload)?)
+        }
+        EVT_SESSION_REVOKED_V1 => {
+            ProjectionEventV1::SessionRevoked(SessionRevokedV1::decode_bin(payload)?)
+        }
+        EVT_INVOCATION_RECEIPTED_V1 => {
+            ProjectionEventV1::InvocationReceipted(InvocationReceiptedV1::decode_bin(payload)?)
+        }
+        EVT_CE_INSTALL_IMPORTED_V1 => {
+            ProjectionEventV1::CeInstallImported(CeInstallImportedV1::decode_bin(payload)?)
+        }
         _ => return Ok(None),
     };
 
@@ -526,6 +565,408 @@ impl<'a> Cursor<'a> {
         String::from_utf8(bytes.to_vec()).map_err(|e| ProjectionError::InvalidEvent {
             msg: format!("invalid UTF-8 in string field: {e}"),
         })
+    }
+
+    fn read_array16(&mut self) -> Result<[u8; 16]> {
+        let b = self.read_exact(16)?;
+        let mut out = [0u8; 16];
+        out.copy_from_slice(b);
+        Ok(out)
+    }
+
+    fn read_array32(&mut self) -> Result<[u8; 32]> {
+        let b = self.read_exact(32)?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(b);
+        Ok(out)
+    }
+
+    fn read_opt_array32(&mut self) -> Result<Option<[u8; 32]>> {
+        let flag = self.read_u8()?;
+        match flag {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_array32()?)),
+            _ => Err(ProjectionError::InvalidEvent {
+                msg: format!("invalid option flag {flag} for bytes(32)"),
+            }),
+        }
+    }
+
+    fn read_opt_array64(&mut self) -> Result<Option<[u8; 64]>> {
+        let flag = self.read_u8()?;
+        match flag {
+            0 => Ok(None),
+            1 => {
+                let b = self.read_exact(64)?;
+                let mut out = [0u8; 64];
+                out.copy_from_slice(b);
+                Ok(Some(out))
+            }
+            _ => Err(ProjectionError::InvalidEvent {
+                msg: format!("invalid option flag {flag} for bytes(64)"),
+            }),
+        }
+    }
+}
+
+// ─── Session-handshake events (M2; master-plan §7.2) ──────────────────────
+//
+// Binary encodings use the same length-prefix + LE-integer patterns as the
+// other projection events in this file, plus:
+//   - fixed-size byte arrays written in-place (no length prefix)
+//   - `option<bytes(N)>` written as `presence: u8 | (0x00|0x01)` + bytes(N)
+//     when present; `0x00` alone otherwise.
+//   - `bytes(var)` (plan CBOR) written as u32 LE length + bytes.
+//
+// See `Crux/crates/crux-session/src/plan.rs` for the source types.
+
+#[derive(Debug, Clone)]
+pub struct SessionPlanSealedV1 {
+    pub event_id: [u8; 16],
+    pub plan_id: [u8; 16],
+    pub session_id: [u8; 16],
+    pub principal_id: String,
+    pub origin: String,
+    pub origin_install: Option<[u8; 32]>,
+    pub minted_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub plan_receipt_hash: [u8; 32],
+    pub plan_receipt_signature: Option<[u8; 64]>,
+    pub capability_graph_hash: [u8; 32],
+    pub plan_bytes_cbor: Vec<u8>,
+}
+
+impl SessionPlanSealedV1 {
+    pub const V: u16 = 1;
+
+    pub fn encode_bin(&self) -> Vec<u8> {
+        let mut out =
+            Vec::with_capacity(2 + 48 + 2 * (2 + 32) + 32 + 64 + 32 + 16 + 4 + self.plan_bytes_cbor.len());
+        out.extend_from_slice(&Self::V.to_le_bytes());
+        out.extend_from_slice(&self.event_id);
+        out.extend_from_slice(&self.plan_id);
+        out.extend_from_slice(&self.session_id);
+        write_str(&mut out, &self.principal_id);
+        write_str(&mut out, &self.origin);
+        write_opt_bytes_32(&mut out, self.origin_install.as_ref());
+        out.extend_from_slice(&self.minted_at_ms.to_le_bytes());
+        out.extend_from_slice(&self.expires_at_ms.to_le_bytes());
+        out.extend_from_slice(&self.plan_receipt_hash);
+        write_opt_bytes_64(&mut out, self.plan_receipt_signature.as_ref());
+        out.extend_from_slice(&self.capability_graph_hash);
+        let cbor_len = u32::try_from(self.plan_bytes_cbor.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&cbor_len.to_le_bytes());
+        out.extend_from_slice(&self.plan_bytes_cbor[..cbor_len as usize]);
+        out
+    }
+
+    pub fn decode_bin(payload: &[u8]) -> Result<Self> {
+        let mut c = Cursor::new(payload);
+        let v = c.read_u16()?;
+        if v != Self::V {
+            return Err(ProjectionError::InvalidEvent {
+                msg: format!("SessionPlanSealedV1 unsupported version {v}"),
+            });
+        }
+        let event_id = c.read_array16()?;
+        let plan_id = c.read_array16()?;
+        let session_id = c.read_array16()?;
+        let principal_id = c.read_str()?;
+        let origin = c.read_str()?;
+        let origin_install = c.read_opt_array32()?;
+        let minted_at_ms = c.read_i64()?;
+        let expires_at_ms = c.read_i64()?;
+        let plan_receipt_hash = c.read_array32()?;
+        let plan_receipt_signature = c.read_opt_array64()?;
+        let capability_graph_hash = c.read_array32()?;
+        let cbor_len = c.read_u32()? as usize;
+        let plan_bytes_cbor = c.read_exact(cbor_len)?.to_vec();
+        Ok(Self {
+            event_id,
+            plan_id,
+            session_id,
+            principal_id,
+            origin,
+            origin_install,
+            minted_at_ms,
+            expires_at_ms,
+            plan_receipt_hash,
+            plan_receipt_signature,
+            capability_graph_hash,
+            plan_bytes_cbor,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionClosedV1 {
+    pub event_id: [u8; 16],
+    pub session_id: [u8; 16],
+    pub reason: String, // "ttl_expired" | "client_closed" | "admin_closed"
+    pub closed_at_ms: i64,
+}
+
+impl SessionClosedV1 {
+    pub const V: u16 = 1;
+
+    pub fn encode_bin(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + 16 + 16 + 2 + 16 + 8);
+        out.extend_from_slice(&Self::V.to_le_bytes());
+        out.extend_from_slice(&self.event_id);
+        out.extend_from_slice(&self.session_id);
+        write_str(&mut out, &self.reason);
+        out.extend_from_slice(&self.closed_at_ms.to_le_bytes());
+        out
+    }
+
+    pub fn decode_bin(payload: &[u8]) -> Result<Self> {
+        let mut c = Cursor::new(payload);
+        let v = c.read_u16()?;
+        if v != Self::V {
+            return Err(ProjectionError::InvalidEvent {
+                msg: format!("SessionClosedV1 unsupported version {v}"),
+            });
+        }
+        Ok(Self {
+            event_id: c.read_array16()?,
+            session_id: c.read_array16()?,
+            reason: c.read_str()?,
+            closed_at_ms: c.read_i64()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRevokedV1 {
+    pub event_id: [u8; 16],
+    pub session_id: [u8; 16],
+    pub reason: String,
+    pub revoked_at_ms: i64,
+    pub revocation_receipt_hash: [u8; 32],
+}
+
+impl SessionRevokedV1 {
+    pub const V: u16 = 1;
+
+    pub fn encode_bin(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + 16 + 16 + 2 + 32 + 8 + 32);
+        out.extend_from_slice(&Self::V.to_le_bytes());
+        out.extend_from_slice(&self.event_id);
+        out.extend_from_slice(&self.session_id);
+        write_str(&mut out, &self.reason);
+        out.extend_from_slice(&self.revoked_at_ms.to_le_bytes());
+        out.extend_from_slice(&self.revocation_receipt_hash);
+        out
+    }
+
+    pub fn decode_bin(payload: &[u8]) -> Result<Self> {
+        let mut c = Cursor::new(payload);
+        let v = c.read_u16()?;
+        if v != Self::V {
+            return Err(ProjectionError::InvalidEvent {
+                msg: format!("SessionRevokedV1 unsupported version {v}"),
+            });
+        }
+        Ok(Self {
+            event_id: c.read_array16()?,
+            session_id: c.read_array16()?,
+            reason: c.read_str()?,
+            revoked_at_ms: c.read_i64()?,
+            revocation_receipt_hash: c.read_array32()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InvocationReceiptedV1 {
+    pub event_id: [u8; 16],
+    pub session_id: [u8; 16],
+    pub capability: String,
+    pub channel: String, // "bulk" | "mcp"
+    pub invocation_at_ms: i64,
+    pub invocation_receipt_hash: [u8; 32],
+    pub parent_plan_receipt_hash: [u8; 32],
+}
+
+impl InvocationReceiptedV1 {
+    pub const V: u16 = 1;
+
+    pub fn encode_bin(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + 16 + 16 + 2 + 64 + 2 + 8 + 8 + 32 + 32);
+        out.extend_from_slice(&Self::V.to_le_bytes());
+        out.extend_from_slice(&self.event_id);
+        out.extend_from_slice(&self.session_id);
+        write_str(&mut out, &self.capability);
+        write_str(&mut out, &self.channel);
+        out.extend_from_slice(&self.invocation_at_ms.to_le_bytes());
+        out.extend_from_slice(&self.invocation_receipt_hash);
+        out.extend_from_slice(&self.parent_plan_receipt_hash);
+        out
+    }
+
+    pub fn decode_bin(payload: &[u8]) -> Result<Self> {
+        let mut c = Cursor::new(payload);
+        let v = c.read_u16()?;
+        if v != Self::V {
+            return Err(ProjectionError::InvalidEvent {
+                msg: format!("InvocationReceiptedV1 unsupported version {v}"),
+            });
+        }
+        Ok(Self {
+            event_id: c.read_array16()?,
+            session_id: c.read_array16()?,
+            capability: c.read_str()?,
+            channel: c.read_str()?,
+            invocation_at_ms: c.read_i64()?,
+            invocation_receipt_hash: c.read_array32()?,
+            parent_plan_receipt_hash: c.read_array32()?,
+        })
+    }
+}
+
+/// CE → Core import countersignature event (master-plan §9.3 step 3).
+///
+/// Emitted on the hosted side when a CE install's sessions are accepted
+/// into a tenant. The event's `import_receipt_signature` is the only new
+/// signature over the whole bundle — individual CE receipts retain their
+/// original `mode: "local"` + BLAKE3 hashes; this event vouches for them
+/// en masse.
+#[derive(Debug, Clone)]
+pub struct CeInstallImportedV1 {
+    pub event_id: [u8; 16],
+    pub origin_install: [u8; 32],
+    pub tenant_id: String,
+    pub ce_principal_id: String,
+    pub core_principal_id: String,
+    /// BLAKE3 hashes of each plan carried in the bundle. The hashes must
+    /// match a later `SessionPlanSealedV1` that replayed the CE plan's
+    /// canonical bytes — that's the chain-verification step.
+    pub imported_plan_hashes: Vec<[u8; 32]>,
+    /// Number of invocation receipts carried in the bundle. Used only
+    /// for telemetry; individual receipts are re-sealed separately.
+    pub imported_invocation_count: u32,
+    pub imported_at_ms: i64,
+    /// BLAKE3 over canonical-CBOR of this event with
+    /// `import_receipt_hash` + `import_receipt_signature` zeroed.
+    pub import_receipt_hash: [u8; 32],
+    /// ed25519 over `import_receipt_hash`; hosted-only. None in local
+    /// dev / test paths.
+    pub import_receipt_signature: Option<[u8; 64]>,
+    pub signer_kid: Option<String>,
+}
+
+impl CeInstallImportedV1 {
+    pub const V: u16 = 1;
+
+    pub fn encode_bin(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + 16 + 32 + 2 * 64 + 4 + 4 + 8 + 32 + 64);
+        out.extend_from_slice(&Self::V.to_le_bytes());
+        out.extend_from_slice(&self.event_id);
+        out.extend_from_slice(&self.origin_install);
+        write_str(&mut out, &self.tenant_id);
+        write_str(&mut out, &self.ce_principal_id);
+        write_str(&mut out, &self.core_principal_id);
+        let count = u32::try_from(self.imported_plan_hashes.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&count.to_le_bytes());
+        for h in &self.imported_plan_hashes[..count as usize] {
+            out.extend_from_slice(h);
+        }
+        out.extend_from_slice(&self.imported_invocation_count.to_le_bytes());
+        out.extend_from_slice(&self.imported_at_ms.to_le_bytes());
+        out.extend_from_slice(&self.import_receipt_hash);
+        write_opt_bytes_64(&mut out, self.import_receipt_signature.as_ref());
+        match &self.signer_kid {
+            Some(s) => {
+                out.push(1);
+                write_str(&mut out, s);
+            }
+            None => out.push(0),
+        }
+        out
+    }
+
+    pub fn decode_bin(payload: &[u8]) -> Result<Self> {
+        let mut c = Cursor::new(payload);
+        let v = c.read_u16()?;
+        if v != Self::V {
+            return Err(ProjectionError::InvalidEvent {
+                msg: format!("CeInstallImportedV1 unsupported version {v}"),
+            });
+        }
+        let event_id = c.read_array16()?;
+        let origin_install = c.read_array32()?;
+        let tenant_id = c.read_str()?;
+        let ce_principal_id = c.read_str()?;
+        let core_principal_id = c.read_str()?;
+        let count = c.read_u32()? as usize;
+        let mut imported_plan_hashes = Vec::with_capacity(count);
+        for _ in 0..count {
+            imported_plan_hashes.push(c.read_array32()?);
+        }
+        let imported_invocation_count = c.read_u32()?;
+        let imported_at_ms = c.read_i64()?;
+        let import_receipt_hash = c.read_array32()?;
+        let import_receipt_signature = c.read_opt_array64()?;
+        let has_kid = c.read_u8()?;
+        let signer_kid = match has_kid {
+            0 => None,
+            1 => Some(c.read_str()?),
+            _ => {
+                return Err(ProjectionError::InvalidEvent {
+                    msg: format!("invalid flag {has_kid} for signer_kid"),
+                })
+            }
+        };
+        Ok(Self {
+            event_id,
+            origin_install,
+            tenant_id,
+            ce_principal_id,
+            core_principal_id,
+            imported_plan_hashes,
+            imported_invocation_count,
+            imported_at_ms,
+            import_receipt_hash,
+            import_receipt_signature,
+            signer_kid,
+        })
+    }
+
+    /// BLAKE3 over the canonical binary encoding with
+    /// `import_receipt_hash` + `import_receipt_signature` + `signer_kid`
+    /// zeroed. This is the value that goes in `import_receipt_hash` and
+    /// (on hosted) is signed to produce `import_receipt_signature`.
+    pub fn compute_hash(&self) -> [u8; 32] {
+        let mut zeroed = self.clone();
+        zeroed.import_receipt_hash = [0u8; 32];
+        zeroed.import_receipt_signature = None;
+        zeroed.signer_kid = None;
+        let bytes = zeroed.encode_bin();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&bytes);
+        *hasher.finalize().as_bytes()
+    }
+}
+
+// ─── helpers for the four session events ──────────────────────────────────
+
+fn write_opt_bytes_32(buf: &mut Vec<u8>, value: Option<&[u8; 32]>) {
+    match value {
+        Some(v) => {
+            buf.push(1);
+            buf.extend_from_slice(v);
+        }
+        None => buf.push(0),
+    }
+}
+
+fn write_opt_bytes_64(buf: &mut Vec<u8>, value: Option<&[u8; 64]>) {
+    match value {
+        Some(v) => {
+            buf.push(1);
+            buf.extend_from_slice(v);
+        }
+        None => buf.push(0),
     }
 }
 
@@ -1040,5 +1481,240 @@ mod tests {
         buf.extend_from_slice(&[0xFF, 0xFE, 0xFD]); // Invalid UTF-8
         let mut c = Cursor::new(&buf);
         assert!(c.read_str().is_err());
+    }
+
+    // ---- Session-handshake events (M2) ----
+
+    fn sample_session_plan_sealed() -> SessionPlanSealedV1 {
+        SessionPlanSealedV1 {
+            event_id: [0xA1; 16],
+            plan_id: [0xB2; 16],
+            session_id: [0xC3; 16],
+            principal_id: "tenant:cuecrux_ltd:myles".into(),
+            origin: "core".into(),
+            origin_install: None,
+            minted_at_ms: 1_745_000_000_000,
+            expires_at_ms: 1_745_000_003_600_000,
+            plan_receipt_hash: [0xD4; 32],
+            plan_receipt_signature: Some([0xE5; 64]),
+            capability_graph_hash: [0xF6; 32],
+            plan_bytes_cbor: vec![0xa0, 0x01, 0x02, 0x03, 0x04],
+        }
+    }
+
+    #[test]
+    fn session_plan_sealed_bin_roundtrip() {
+        let orig = sample_session_plan_sealed();
+        let bytes = orig.encode_bin();
+        let decoded = SessionPlanSealedV1::decode_bin(&bytes).unwrap();
+        assert_eq!(decoded.event_id, orig.event_id);
+        assert_eq!(decoded.plan_id, orig.plan_id);
+        assert_eq!(decoded.session_id, orig.session_id);
+        assert_eq!(decoded.principal_id, orig.principal_id);
+        assert_eq!(decoded.origin, orig.origin);
+        assert_eq!(decoded.origin_install, orig.origin_install);
+        assert_eq!(decoded.minted_at_ms, orig.minted_at_ms);
+        assert_eq!(decoded.expires_at_ms, orig.expires_at_ms);
+        assert_eq!(decoded.plan_receipt_hash, orig.plan_receipt_hash);
+        assert_eq!(decoded.plan_receipt_signature, orig.plan_receipt_signature);
+        assert_eq!(decoded.capability_graph_hash, orig.capability_graph_hash);
+        assert_eq!(decoded.plan_bytes_cbor, orig.plan_bytes_cbor);
+    }
+
+    #[test]
+    fn session_plan_sealed_ce_roundtrip_no_signature() {
+        let orig = SessionPlanSealedV1 {
+            origin: "ce".into(),
+            origin_install: Some([0x11; 32]),
+            plan_receipt_signature: None,
+            ..sample_session_plan_sealed()
+        };
+        let bytes = orig.encode_bin();
+        let decoded = SessionPlanSealedV1::decode_bin(&bytes).unwrap();
+        assert_eq!(decoded.origin, "ce");
+        assert_eq!(decoded.origin_install, Some([0x11; 32]));
+        assert!(decoded.plan_receipt_signature.is_none());
+    }
+
+    #[test]
+    fn session_plan_sealed_version_guard() {
+        let mut bytes = sample_session_plan_sealed().encode_bin();
+        // Corrupt the version.
+        bytes[0] = 0xff;
+        bytes[1] = 0xff;
+        assert!(SessionPlanSealedV1::decode_bin(&bytes).is_err());
+    }
+
+    #[test]
+    fn session_closed_bin_roundtrip() {
+        let orig = SessionClosedV1 {
+            event_id: [0x0A; 16],
+            session_id: [0x0B; 16],
+            reason: "ttl_expired".into(),
+            closed_at_ms: 2_000_000,
+        };
+        let bytes = orig.encode_bin();
+        let decoded = SessionClosedV1::decode_bin(&bytes).unwrap();
+        assert_eq!(decoded.event_id, orig.event_id);
+        assert_eq!(decoded.session_id, orig.session_id);
+        assert_eq!(decoded.reason, orig.reason);
+        assert_eq!(decoded.closed_at_ms, orig.closed_at_ms);
+    }
+
+    #[test]
+    fn session_revoked_bin_roundtrip() {
+        let orig = SessionRevokedV1 {
+            event_id: [0x0C; 16],
+            session_id: [0x0D; 16],
+            reason: "admin_revoked".into(),
+            revoked_at_ms: 3_000_000,
+            revocation_receipt_hash: [0x0E; 32],
+        };
+        let bytes = orig.encode_bin();
+        let decoded = SessionRevokedV1::decode_bin(&bytes).unwrap();
+        assert_eq!(decoded.event_id, orig.event_id);
+        assert_eq!(decoded.reason, orig.reason);
+        assert_eq!(decoded.revoked_at_ms, orig.revoked_at_ms);
+        assert_eq!(decoded.revocation_receipt_hash, orig.revocation_receipt_hash);
+    }
+
+    #[test]
+    fn invocation_receipted_bin_roundtrip() {
+        let orig = InvocationReceiptedV1 {
+            event_id: [0x10; 16],
+            session_id: [0x11; 16],
+            capability: "retrieve".into(),
+            channel: "bulk".into(),
+            invocation_at_ms: 4_000_000,
+            invocation_receipt_hash: [0x12; 32],
+            parent_plan_receipt_hash: [0x13; 32],
+        };
+        let bytes = orig.encode_bin();
+        let decoded = InvocationReceiptedV1::decode_bin(&bytes).unwrap();
+        assert_eq!(decoded.capability, "retrieve");
+        assert_eq!(decoded.channel, "bulk");
+        assert_eq!(decoded.invocation_at_ms, orig.invocation_at_ms);
+        assert_eq!(decoded.invocation_receipt_hash, orig.invocation_receipt_hash);
+        assert_eq!(decoded.parent_plan_receipt_hash, orig.parent_plan_receipt_hash);
+    }
+
+    #[test]
+    fn dispatcher_decodes_session_events() {
+        let sealed = sample_session_plan_sealed();
+        let bytes = sealed.encode_bin();
+        let parsed = parse_projection_event(EVT_SESSION_PLAN_SEALED_V1, CONTENT_TYPE_SESSION_BIN_V1, &bytes)
+            .expect("parse")
+            .expect("some");
+        match parsed {
+            ProjectionEventV1::SessionPlanSealed(s) => {
+                assert_eq!(s.principal_id, sealed.principal_id);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn dispatcher_returns_none_for_unknown_event() {
+        let parsed = parse_projection_event("corecrux.unknown.v1", "application/octet-stream", &[])
+            .expect("parse");
+        assert!(parsed.is_none());
+    }
+
+    // ---- CeInstallImportedV1 (M8) ----
+
+    fn sample_ce_install_imported() -> CeInstallImportedV1 {
+        CeInstallImportedV1 {
+            event_id: [0x20; 16],
+            origin_install: [0x21; 32],
+            tenant_id: "cuecrux_ltd".into(),
+            ce_principal_id: "ce:a4f3b1c2:myles".into(),
+            core_principal_id: "tenant:cuecrux_ltd:myles".into(),
+            imported_plan_hashes: vec![[0x30; 32], [0x31; 32], [0x32; 32]],
+            imported_invocation_count: 42,
+            imported_at_ms: 1_745_500_000_000,
+            import_receipt_hash: [0x40; 32],
+            import_receipt_signature: Some([0x50; 64]),
+            signer_kid: Some("vault-transit://cuecrux-ce-import-signer-v1".into()),
+        }
+    }
+
+    #[test]
+    fn ce_install_imported_bin_roundtrip() {
+        let orig = sample_ce_install_imported();
+        let bytes = orig.encode_bin();
+        let decoded = CeInstallImportedV1::decode_bin(&bytes).unwrap();
+        assert_eq!(decoded.event_id, orig.event_id);
+        assert_eq!(decoded.origin_install, orig.origin_install);
+        assert_eq!(decoded.tenant_id, orig.tenant_id);
+        assert_eq!(decoded.ce_principal_id, orig.ce_principal_id);
+        assert_eq!(decoded.core_principal_id, orig.core_principal_id);
+        assert_eq!(decoded.imported_plan_hashes, orig.imported_plan_hashes);
+        assert_eq!(decoded.imported_invocation_count, orig.imported_invocation_count);
+        assert_eq!(decoded.imported_at_ms, orig.imported_at_ms);
+        assert_eq!(decoded.import_receipt_hash, orig.import_receipt_hash);
+        assert_eq!(decoded.import_receipt_signature, orig.import_receipt_signature);
+        assert_eq!(decoded.signer_kid, orig.signer_kid);
+    }
+
+    #[test]
+    fn ce_install_imported_without_signature_roundtrip() {
+        let orig = CeInstallImportedV1 {
+            import_receipt_signature: None,
+            signer_kid: None,
+            imported_plan_hashes: vec![],
+            imported_invocation_count: 0,
+            ..sample_ce_install_imported()
+        };
+        let bytes = orig.encode_bin();
+        let decoded = CeInstallImportedV1::decode_bin(&bytes).unwrap();
+        assert!(decoded.import_receipt_signature.is_none());
+        assert!(decoded.signer_kid.is_none());
+        assert!(decoded.imported_plan_hashes.is_empty());
+    }
+
+    #[test]
+    fn ce_install_imported_version_guard() {
+        let mut bytes = sample_ce_install_imported().encode_bin();
+        bytes[0] = 0xff;
+        bytes[1] = 0xff;
+        assert!(CeInstallImportedV1::decode_bin(&bytes).is_err());
+    }
+
+    #[test]
+    fn ce_install_imported_compute_hash_stable_and_ignores_own_fields() {
+        let a = sample_ce_install_imported();
+        // Flipping `import_receipt_hash` must NOT affect compute_hash (zeroed).
+        let mut b = a.clone();
+        b.import_receipt_hash = [0xFF; 32];
+        let mut c = a.clone();
+        c.import_receipt_signature = None;
+        c.signer_kid = None;
+        assert_eq!(a.compute_hash(), b.compute_hash());
+        assert_eq!(a.compute_hash(), c.compute_hash());
+
+        // But flipping a content field DOES change the hash.
+        let mut d = a.clone();
+        d.imported_invocation_count = 99;
+        assert_ne!(a.compute_hash(), d.compute_hash());
+    }
+
+    #[test]
+    fn dispatcher_decodes_ce_install_imported_event() {
+        let event = sample_ce_install_imported();
+        let bytes = event.encode_bin();
+        let parsed = parse_projection_event(
+            EVT_CE_INSTALL_IMPORTED_V1,
+            CONTENT_TYPE_SESSION_BIN_V1,
+            &bytes,
+        )
+        .expect("parse")
+        .expect("some");
+        match parsed {
+            ProjectionEventV1::CeInstallImported(s) => {
+                assert_eq!(s.tenant_id, "cuecrux_ltd");
+                assert_eq!(s.imported_plan_hashes.len(), 3);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

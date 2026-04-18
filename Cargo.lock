@@ -493,7 +493,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "corecrux-frame"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "hex",
@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-index"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "corecrux-frame",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-memory"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-projections"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -551,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "prost",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-receipts"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "blake3",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-retrieval"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "corecrux-index",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-segment"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "corecrux-frame",
@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "corecrux-frame",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "corecrux-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -645,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "corecruxctl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "corecruxd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -701,8 +701,10 @@ dependencies = [
  "crc32fast",
  "crux-mcp",
  "crux-observe",
+ "crux-session",
  "ed25519-dalek",
  "fs2",
+ "hex",
  "jsonwebtoken",
  "opentelemetry 0.31.0",
  "opentelemetry-otlp",
@@ -849,7 +851,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crux-contrib"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -860,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "crux-integration-tests"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "corecrux-proto",
  "portpicker",
@@ -875,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "crux-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64",
@@ -894,12 +896,13 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "ureq",
  "uuid",
 ]
 
 [[package]]
 name = "crux-observe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "corecrux-memory",
@@ -912,8 +915,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "crux-session"
+version = "0.2.0"
+dependencies = [
+ "blake3",
+ "corecrux-projections",
+ "ed25519-dalek",
+ "hex",
+ "hex-literal",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "crux-sync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -1069,6 +1087,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
  "serde",
  "sha2 0.10.9",
  "subtle",
@@ -1364,6 +1383,12 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hex-literal"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fe2267d4ed49bc07b63801559be28c718ea06c4738b7a03c94df7386d2cde46"
 
 [[package]]
 name = "hmac"
@@ -2915,6 +2940,7 @@ version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",

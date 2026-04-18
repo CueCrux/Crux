@@ -14,6 +14,7 @@ members = [
   "crates/crux-contrib",
   "crates/crux-observe",
   "crates/crux-mcp",
+  "crates/crux-session",
   "crates/corecruxd",
   "crates/corecruxctl",
   "crates/crux-integration-tests",
@@ -22,7 +23,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "0.2.0"
 license = "LicenseRef-CCL-1.0"
 rust-version = "1.88.0"
 

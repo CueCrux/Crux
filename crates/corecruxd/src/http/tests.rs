@@ -118,6 +118,7 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
             auto_paused: false,
             error: None,
         })),
+        session: None,
     }
 }
 
