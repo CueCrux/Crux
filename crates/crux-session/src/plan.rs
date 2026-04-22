@@ -73,7 +73,7 @@ pub struct Capability {
     pub cap: String,
     /// "bulk" | "mcp"
     pub prefer: String,
-    /// Payload shape, e.g. "stream<Chunk>", "Receipt", "Snapshot".
+    /// Payload shape, e.g. `stream<Chunk>`, `Receipt`, `Snapshot`.
     pub shape: String,
     pub min_tier: Option<String>,
     /// "free" | "metered" | "heavy"

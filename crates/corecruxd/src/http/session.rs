@@ -4,7 +4,7 @@
 
 //! CE session-handshake endpoint.
 //!
-//! `POST /session` — accepts a [`SessionHandshakeRequest`] in JSON or CBOR,
+//! `POST /session` — accepts a `SessionHandshakeRequest` in JSON or CBOR,
 //! mints a [`crux_session::SessionPlan`], writes it to the registry, and
 //! returns the plan in the negotiated content type.
 //!
@@ -320,8 +320,8 @@ pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, bod
 }
 
 /// Translate a freshly-minted sealed plan into the
-/// [`corecrux_projections::events::SessionPlanSealedV1`] event that lands in
-/// the segment log. Payload is the binary encoding produced by that
+/// `corecrux_projections::events::SessionPlanSealedV1` event that lands
+/// in the segment log. Payload is the binary encoding produced by that
 /// event's `encode_bin()`.
 fn build_sealed_event_for_plan(sealed: &handshake::SealedPlan) -> SealedEvent {
     let plan = &sealed.plan;

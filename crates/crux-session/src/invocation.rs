@@ -13,8 +13,8 @@
 //! - [`verify_invocation_receipt`] — returns a [`InvocationVerdict`] per
 //!   master-plan §8.2. Violations of the `capability` / `channel` checks
 //!   are **flagged, not rejected** — audit must see the attempt.
-//! - [`build_invocation_sealed_event`] — builds a
-//!   [`crate::sealer::SealedEvent`] ready to hand to a [`PlanSealer`] so
+//! - `build_invocation_sealed_event` — builds a
+//!   [`crate::sealer::SealedEvent`] ready to hand to a segment sealer so
 //!   the invocation lands in the segment log.
 
 use crate::plan::{SessionPlan, HASH_LEN, ULID_LEN};
@@ -137,7 +137,7 @@ pub fn verify_invocation_receipt(receipt: &InvocationReceipt, plan: &SessionPlan
 /// `corecrux-projections::InvocationReceiptedV1` schema.
 ///
 /// This is the event that lands in the segment log after a tool call
-/// completes. The caller ties it through their [`PlanSealer`]; we keep
+/// completes. The caller ties it through their segment sealer; we keep
 /// the encoding decoupled from the projection crate here and leave the
 /// actual wire-format encoding to the caller (corecruxd / VaultCrux).
 /// A small helper in each of those crates turns this `InvocationReceipt`
