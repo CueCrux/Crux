@@ -993,11 +993,11 @@ fn get_engine_json<T: for<'de> Deserialize<'de>>(
     path: &str,
 ) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{}{}", engine_base.trim_end_matches('/'), path);
-    let resp = ureq::get(&url)
-        .set("x-api-key", api_key)
+    let mut resp = ureq::get(&url)
+        .header("x-api-key", api_key)
         .call()
         .map_err(|e| format!("engine GET {url} failed: {e}"))?;
-    Ok(resp.into_json()?)
+    Ok(resp.body_mut().read_json()?)
 }
 
 fn get_corecrux_json<T: for<'de> Deserialize<'de>>(
@@ -1005,10 +1005,10 @@ fn get_corecrux_json<T: for<'de> Deserialize<'de>>(
     path: &str,
 ) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{}{}", corecrux_base.trim_end_matches('/'), path);
-    let resp = ureq::get(&url)
+    let mut resp = ureq::get(&url)
         .call()
         .map_err(|e| format!("corecrux GET {url} failed: {e}"))?;
-    Ok(resp.into_json()?)
+    Ok(resp.body_mut().read_json()?)
 }
 
 #[cfg(test)]

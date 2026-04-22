@@ -22,8 +22,7 @@ impl AdminClient {
 
     pub fn get_control(&self) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let url = self.url("/v1/admin/control");
-        let resp = ureq::get(&url).call()?;
-        let text = resp.into_string()?;
+        let text = ureq::get(&url).call()?.into_body().read_to_string()?;
         Ok(serde_json::from_str(&text)?)
     }
 
@@ -33,8 +32,7 @@ impl AdminClient {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let url = self.url("/v1/admin/valves");
         let body = serde_json::to_value(req)?;
-        let resp = ureq::post(&url).send_json(body)?;
-        let text = resp.into_string()?;
+        let text = ureq::post(&url).send_json(body)?.into_body().read_to_string()?;
         Ok(serde_json::from_str(&text)?)
     }
 
@@ -44,8 +42,7 @@ impl AdminClient {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let url = self.url("/v1/admin/stream-meta");
         let body = serde_json::to_value(req)?;
-        let resp = ureq::post(&url).send_json(body)?;
-        let text = resp.into_string()?;
+        let text = ureq::post(&url).send_json(body)?.into_body().read_to_string()?;
         Ok(serde_json::from_str(&text)?)
     }
 
@@ -55,8 +52,7 @@ impl AdminClient {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let url = self.url("/v1/admin/actions");
         let body = serde_json::to_value(req)?;
-        let resp = ureq::post(&url).send_json(body)?;
-        let text = resp.into_string()?;
+        let text = ureq::post(&url).send_json(body)?.into_body().read_to_string()?;
         Ok(serde_json::from_str(&text)?)
     }
 
@@ -65,8 +61,7 @@ impl AdminClient {
         action_id: &str,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let url = self.url(&format!("/v1/admin/actions/{action_id}"));
-        let resp = ureq::get(&url).call()?;
-        let text = resp.into_string()?;
+        let text = ureq::get(&url).call()?.into_body().read_to_string()?;
         Ok(serde_json::from_str(&text)?)
     }
 
@@ -82,13 +77,12 @@ impl AdminClient {
             req = req.query("until", until);
         }
         if let Some(from_seq) = query.from_seq {
-            req = req.query("fromSeq", &from_seq.to_string());
+            req = req.query("fromSeq", from_seq.to_string());
         }
         if let Some(max_events) = query.max_events {
-            req = req.query("maxEvents", &max_events.to_string());
+            req = req.query("maxEvents", max_events.to_string());
         }
-        let resp = req.call()?;
-        let text = resp.into_string()?;
+        let text = req.call()?.into_body().read_to_string()?;
         Ok(serde_json::from_str(&text)?)
     }
 }

@@ -70,11 +70,11 @@ pub fn run(http_base: &str, non_interactive: bool) -> Result<(), Box<dyn std::er
         "confidence": 1.0
     });
 
-    let put_resp = ureq::put(&facts_url)
+    let mut put_resp = ureq::put(&facts_url)
         .send_json(body)
         .map_err(|e| format!("PUT {facts_url} failed: {e}"))?;
 
-    let put_json: serde_json::Value = put_resp.into_json()?;
+    let put_json: serde_json::Value = put_resp.body_mut().read_json()?;
     let fact_id = put_json
         .get("fact_id")
         .and_then(|v| v.as_str())
@@ -94,8 +94,8 @@ pub fn run(http_base: &str, non_interactive: bool) -> Result<(), Box<dyn std::er
 
     let query_url = format!("{base}/v1/facts?query=quickstart+greeting");
     match ureq::get(&query_url).call() {
-        Ok(resp) => {
-            let query_json: serde_json::Value = resp.into_json()?;
+        Ok(mut resp) => {
+            let query_json: serde_json::Value = resp.body_mut().read_json()?;
             eprintln!("    Query result: {query_json}");
         }
         Err(e) => {

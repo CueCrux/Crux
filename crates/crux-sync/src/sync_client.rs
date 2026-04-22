@@ -48,9 +48,10 @@ pub fn push_contributions(
     let body = build_contributions_body(contributions, sync_cursor);
     let url = api_url(endpoint, "/api/v1/community/contributions");
     let resp: SyncResult = ureq::post(&url)
-        .set("Authorization", &format!("Bearer {}", sync_token))
+        .header("Authorization", &format!("Bearer {}", sync_token))
         .send_json(body)?
-        .into_json()?;
+        .into_body()
+        .read_json()?;
 
     Ok(resp)
 }
@@ -65,9 +66,10 @@ pub fn query_commons(
     let body = build_commons_query_body(query, top_k);
     let url = api_url(endpoint, "/api/v1/community/query");
     let resp: serde_json::Value = ureq::post(&url)
-        .set("Authorization", &format!("Bearer {}", sync_token))
+        .header("Authorization", &format!("Bearer {}", sync_token))
         .send_json(body)?
-        .into_json()?;
+        .into_body()
+        .read_json()?;
 
     Ok(resp)
 }
@@ -174,7 +176,10 @@ mod tests {
         let mock = server
             .mock("POST", "/api/v1/community/contributions")
             .match_header("authorization", "Bearer vcx_tok")
-            .match_header("content-type", "application/json")
+            .match_header(
+                "content-type",
+                mockito::Matcher::Regex("application/json.*".to_string()),
+            )
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"accepted": 2, "rejected": 0, "quarantined": 0, "credits_awarded": 5, "new_sync_cursor": "cur_new"}"#)
@@ -216,7 +221,10 @@ mod tests {
         let mock = server
             .mock("POST", "/api/v1/community/query")
             .match_header("authorization", "Bearer vcx_tok")
-            .match_header("content-type", "application/json")
+            .match_header(
+                "content-type",
+                mockito::Matcher::Regex("application/json.*".to_string()),
+            )
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"results": [], "remaining_queries_today": 95}"#)

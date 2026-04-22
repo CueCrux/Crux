@@ -153,10 +153,12 @@ impl Authz {
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(30);
 
-                let agent = ureq::builder()
-                    .timeout_connect(Duration::from_secs(2))
-                    .timeout_read(Duration::from_secs(5))
-                    .build();
+                let agent: ureq::Agent = ureq::Agent::config_builder()
+                    .timeout_connect(Some(Duration::from_secs(2)))
+                    .timeout_recv_response(Some(Duration::from_secs(5)))
+                    .timeout_recv_body(Some(Duration::from_secs(5)))
+                    .build()
+                    .into();
 
                 let jwks_json = std::env::var("CORECRUXD_JWT_JWKS_JSON")
                     .ok()
@@ -465,12 +467,14 @@ fn resolve_initial_jwks(
 }
 
 fn fetch_json(agent: &ureq::Agent, url: &str) -> Result<serde_json::Value, String> {
-    let resp = agent
+    let mut resp = agent
         .get(url)
-        .set("accept", "application/json")
+        .header("accept", "application/json")
         .call()
         .map_err(|e| format!("{e}"))?;
-    resp.into_json::<serde_json::Value>().map_err(|e| format!("{e}"))
+    resp.body_mut()
+        .read_json::<serde_json::Value>()
+        .map_err(|e| format!("{e}"))
 }
 
 fn parse_jwks_keys(jwks: &Jwks) -> Result<HashMap<String, jsonwebtoken::DecodingKey>, String> {

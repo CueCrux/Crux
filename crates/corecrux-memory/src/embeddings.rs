@@ -77,13 +77,14 @@ impl EmbeddingClient {
             input: texts,
         };
 
-        let resp = ureq::post(&url)
-            .set("Content-Type", "application/json")
+        let mut resp = ureq::post(&url)
+            .header("Content-Type", "application/json")
             .send_json(serde_json::to_value(&body).map_err(|e| EmbeddingError::Serialize(e.to_string()))?)
             .map_err(|e| EmbeddingError::Network(e.to_string()))?;
 
         let parsed: OllamaEmbedResponse = resp
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|e| EmbeddingError::Deserialize(e.to_string()))?;
 
         if parsed.embeddings.len() != texts.len() {

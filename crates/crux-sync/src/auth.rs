@@ -33,7 +33,8 @@ pub fn authenticate(endpoint: &str, email: &str) -> Result<SyncToken, Box<dyn st
             "email": email,
             "grant_type": "community_sync"
         }))?
-        .into_json()?;
+        .into_body()
+        .read_json()?;
 
     Ok(parse_auth_response(&resp))
 }
@@ -142,7 +143,10 @@ mod tests {
         let mut server = mockito::Server::new();
         let mock = server
             .mock("POST", "/api/v1/community/auth")
-            .match_header("content-type", "application/json")
+            .match_header(
+                "content-type",
+                mockito::Matcher::Regex("application/json.*".to_string()),
+            )
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"sync_token": "vcx_test", "scopes": ["sync"], "expires_at": "2027-01-01T00:00:00Z"}"#)

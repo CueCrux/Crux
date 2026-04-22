@@ -879,20 +879,23 @@ async fn send_replication_segment_http(
     let authorization = replication_auth_bearer_value();
 
     let result = tokio::task::spawn_blocking(move || {
-        let agent = ureq::builder()
-            .timeout_connect(Duration::from_millis(connect_timeout_ms))
-            .timeout_read(Duration::from_millis(read_timeout_ms))
-            .build();
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_millis(connect_timeout_ms)))
+            .timeout_recv_response(Some(Duration::from_millis(read_timeout_ms)))
+            .timeout_recv_body(Some(Duration::from_millis(read_timeout_ms)))
+            .build()
+            .into();
 
         match agent
             .post(&url)
-            .set("content-type", "application/json")
-            .set("authorization", &authorization)
+            .header("content-type", "application/json")
+            .header("authorization", &authorization)
             .send_json(body)
         {
-            Ok(resp) => {
-                if resp.status() == 200 {
-                    let body = resp.into_string().unwrap_or_default();
+            Ok(mut resp) => {
+                let status = resp.status().as_u16();
+                if status == 200 {
+                    let body = resp.body_mut().read_to_string().unwrap_or_default();
                     let applied_segment_seq = serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|v| {
                         v.get("result")
                             .and_then(|r| r.get("segmentSeq"))
@@ -900,7 +903,7 @@ async fn send_replication_segment_http(
                     });
                     Ok(ReplicationSendResult { applied_segment_seq })
                 } else {
-                    Err(format!("http status {}", resp.status()))
+                    Err(format!("http status {status}"))
                 }
             }
             Err(err) => Err(err.to_string()),

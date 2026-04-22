@@ -177,14 +177,13 @@ impl SyncRuntimeStatus {
 /// Best-effort health probe for a remote CoreCrux node.
 pub fn probe_remote_health(remote_url: &str) -> Result<(), String> {
     let health_url = format!("{}/healthz", remote_url.trim_end_matches('/'));
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(2))
-        .timeout_read(Duration::from_secs(2))
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(2)))
+        .timeout_recv_response(Some(Duration::from_secs(2)))
+        .timeout_recv_body(Some(Duration::from_secs(2)))
         .build()
-        .get(&health_url)
-        .call()
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+        .into();
+    agent.get(&health_url).call().map(|_| ()).map_err(|err| err.to_string())
 }
 
 impl SyncClient {
@@ -281,12 +280,15 @@ impl SyncClient {
                 let _ = write!(url, "&cursor={c}");
             }
 
-            let resp = ureq::get(&url)
-                .set("Authorization", &format!("Bearer {}", self.api_key))
+            let mut resp = ureq::get(&url)
+                .header("Authorization", &format!("Bearer {}", self.api_key))
                 .call()
                 .map_err(|e| format!("sync pull failed: {e}"))?;
 
-            let body: serde_json::Value = resp.into_json().map_err(|e| format!("sync pull parse error: {e}"))?;
+            let body: serde_json::Value = resp
+                .body_mut()
+                .read_json()
+                .map_err(|e| format!("sync pull parse error: {e}"))?;
 
             let facts: Vec<Fact> =
                 serde_json::from_value(body["facts"].clone()).map_err(|e| format!("sync facts parse: {e}"))?;
@@ -408,7 +410,7 @@ impl SyncClient {
         let mut pushed = 0;
         for batch in store_facts.chunks(500) {
             ureq::put(&format!("{}/v1/facts/bulk", self.remote_url))
-                .set("Authorization", &format!("Bearer {}", self.api_key))
+                .header("Authorization", &format!("Bearer {}", self.api_key))
                 .send_json(serde_json::Value::Array(batch.to_vec()))
                 .map_err(|e| format!("sync push failed: {e}"))?;
             pushed += batch.len();
