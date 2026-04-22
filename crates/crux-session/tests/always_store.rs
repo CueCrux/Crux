@@ -21,13 +21,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use corecrux_projections::{
-    SessionPlanSealedV1, SessionPlansByPrincipalV1, CONTENT_TYPE_SESSION_BIN_V1,
-    EVT_SESSION_PLAN_SEALED_V1,
+    SessionPlanSealedV1, SessionPlansByPrincipalV1, CONTENT_TYPE_SESSION_BIN_V1, EVT_SESSION_PLAN_SEALED_V1,
 };
 use crux_session::{
-    mint, plan::ReceiptMode, Budget, Channels, FailingSealer, GraphHints, HandshakeInputs,
-    HandshakeRequest, InMemoryRegistry, InMemorySealer, LocalPassportConfig, NullSigner,
-    PlanSealer, RegistryEntry, SealedEvent, SessionRegistry, DEFAULT_CATALOG,
+    mint, plan::ReceiptMode, Budget, Channels, FailingSealer, GraphHints, HandshakeInputs, HandshakeRequest,
+    InMemoryRegistry, InMemorySealer, LocalPassportConfig, NullSigner, PlanSealer, RegistryEntry, SealedEvent,
+    SessionRegistry, DEFAULT_CATALOG,
 };
 
 fn handshake_once(
@@ -48,7 +47,11 @@ fn handshake_once(
             bulk: None,
             mcp: "http://localhost:14800/mcp".into(),
         },
-        hints: GraphHints { prefer_bulk: true, intent: None, max_capabilities: None },
+        hints: GraphHints {
+            prefer_bulk: true,
+            intent: None,
+            max_capabilities: None,
+        },
         session_ttl_s: 1800,
         budget: Budget {
             tokens_cap: None,

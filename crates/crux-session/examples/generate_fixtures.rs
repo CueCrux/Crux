@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use ed25519_dalek::{Signer, SigningKey};
 
 use crux_session::plan::{
-    Budget, Capability, Channels, ImplPath, Passport, ReceiptEnvelope, ReceiptMode, SessionPlan,
-    HASH_LEN, SESSION_PLAN_VERSION, SIGNATURE_LEN, ULID_LEN,
+    Budget, Capability, Channels, ImplPath, Passport, ReceiptEnvelope, ReceiptMode, SessionPlan, HASH_LEN,
+    SESSION_PLAN_VERSION, SIGNATURE_LEN, ULID_LEN,
 };
 use crux_session::receipt::plan_receipt_hash;
 
@@ -31,7 +31,7 @@ fn main() {
     let specs = all_fixtures();
     let mut index_lines = Vec::new();
     for spec in specs {
-        let dir = fixtures_dir.join(&spec.name);
+        let dir = fixtures_dir.join(spec.name);
         fs::create_dir_all(&dir).expect("create fixture dir");
         let plan = spec.build();
         let cbor = plan.to_canonical_cbor();
@@ -58,11 +58,7 @@ fn main() {
         ));
     }
 
-    fs::write(
-        fixtures_dir.join("INDEX.txt"),
-        format!("{}\n", index_lines.join("\n")),
-    )
-    .expect("write INDEX.txt");
+    fs::write(fixtures_dir.join("INDEX.txt"), format!("{}\n", index_lines.join("\n"))).expect("write INDEX.txt");
     println!("wrote {} fixtures to {}", index_lines.len(), fixtures_dir.display());
 }
 
@@ -259,12 +255,33 @@ fn ce_minimal(_: &mut Context) -> SessionPlan {
             mcp: "http://localhost:14801/mcp".to_string(),
         },
         capability_graph: vec![
-            cap("retrieve", "bulk", "stream<Chunk>", None, "free",
-                Some("retrieve_local"), Some("/v2/retrieve")),
-            cap("session_context", "bulk", "Snapshot", None, "free",
-                Some("session_ctx_local"), Some("/v2/session/context")),
-            cap("journal_append", "mcp", "Receipt", None, "free",
-                Some("journal_local"), Some("/mcp/vault#journal_append")),
+            cap(
+                "retrieve",
+                "bulk",
+                "stream<Chunk>",
+                None,
+                "free",
+                Some("retrieve_local"),
+                Some("/v2/retrieve"),
+            ),
+            cap(
+                "session_context",
+                "bulk",
+                "Snapshot",
+                None,
+                "free",
+                Some("session_ctx_local"),
+                Some("/v2/session/context"),
+            ),
+            cap(
+                "journal_append",
+                "mcp",
+                "Receipt",
+                None,
+                "free",
+                Some("journal_local"),
+                Some("/mcp/vault#journal_append"),
+            ),
         ],
         capability_graph_hash: hash32(0xC1),
         budget: Budget {
@@ -319,10 +336,24 @@ fn hosted_free(_: &mut Context) -> SessionPlan {
             mcp: "https://vault.cuecrux.com/mcp/vault".to_string(),
         },
         capability_graph: vec![
-            cap("retrieve", "bulk", "stream<Chunk>", Some("free"), "metered",
-                None, Some("/v2/retrieve")),
-            cap("session_context", "mcp", "Snapshot", Some("free"), "free",
-                None, Some("/mcp/vault#session_context")),
+            cap(
+                "retrieve",
+                "bulk",
+                "stream<Chunk>",
+                Some("free"),
+                "metered",
+                None,
+                Some("/v2/retrieve"),
+            ),
+            cap(
+                "session_context",
+                "mcp",
+                "Snapshot",
+                Some("free"),
+                "free",
+                None,
+                Some("/mcp/vault#session_context"),
+            ),
         ],
         capability_graph_hash: hash32(0xC2),
         budget: Budget {
@@ -354,7 +385,13 @@ fn hosted_team(_: &mut Context) -> SessionPlan {
                 &format!("cap_{i:02}"),
                 if i % 2 == 0 { "bulk" } else { "mcp" },
                 "Receipt",
-                Some(if i < 5 { "free" } else if i < 10 { "starter" } else { "team" }),
+                Some(if i < 5 {
+                    "free"
+                } else if i < 10 {
+                    "starter"
+                } else {
+                    "team"
+                }),
                 if i % 4 == 0 { "heavy" } else { "metered" },
                 None,
                 Some(&format!("/v2/cap_{i:02}")),
@@ -432,12 +469,7 @@ fn intent_shaped(_: &mut Context) -> SessionPlan {
     plan.session_id = ulid(20);
     plan.intent_hint = Some("audit_review".to_string());
     // Reorder: push audit-related caps to the front.
-    plan.capability_graph.sort_by_key(|c| {
-        if c.cap.starts_with("cap_0") {
-            0
-        } else {
-            1
-        }
-    });
+    plan.capability_graph
+        .sort_by_key(|c| i32::from(!c.cap.starts_with("cap_0")));
     plan
 }

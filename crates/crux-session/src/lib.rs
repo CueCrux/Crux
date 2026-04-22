@@ -38,20 +38,19 @@ pub mod sealer;
 pub mod signer;
 
 pub use catalog::{tier_meets, CatalogEntry, DEFAULT_CATALOG};
-pub use export::{
-    build_bundle, decode_plan_entry, CeExportBundle, ExportedInvocation, ExportedPlan,
-    ExportedReceiptWire, BUNDLE_SCHEMA_VERSION,
-};
 pub use error::SessionError;
+pub use export::{
+    build_bundle, decode_plan_entry, CeExportBundle, ExportedInvocation, ExportedPlan, ExportedReceiptWire,
+    BUNDLE_SCHEMA_VERSION,
+};
 pub use generator::{generate_default, generate_graph, GenerateInput, GeneratedGraph, GraphHints};
 pub use handshake::{mint, HandshakeInputs, HandshakeRequest, SealedPlan};
 pub use intent::{
-    apply_intent_shaping_with_affinity, default_intent_table, hash_capability_graph_with_intent,
-    IntentTable,
+    apply_intent_shaping_with_affinity, default_intent_table, hash_capability_graph_with_intent, IntentTable,
 };
 pub use invocation::{
-    invocation_event_key, mint_invocation_receipt, verify_invocation_receipt, InvocationEventKey,
-    InvocationVerdict, MintInvocation,
+    invocation_event_key, mint_invocation_receipt, verify_invocation_receipt, InvocationEventKey, InvocationVerdict,
+    MintInvocation,
 };
 pub use passport::LocalPassportConfig;
 pub use plan::{
@@ -59,10 +58,6 @@ pub use plan::{
     INVOCATION_RECEIPT_VERSION, SESSION_PLAN_VERSION,
 };
 pub use receipt::{plan_receipt_hash, verify_plan_signature, InvocationReceipt};
-pub use registry::{
-    FileSessionRegistry, InMemoryRegistry, RegistryEntry, RegistryError, SessionRegistry,
-};
-pub use sealer::{
-    FailingSealer, FileSealer, InMemorySealer, NoopSealer, PlanSealer, SealedEvent, StoredEvent,
-};
+pub use registry::{FileSessionRegistry, InMemoryRegistry, RegistryEntry, RegistryError, SessionRegistry};
+pub use sealer::{FailingSealer, FileSealer, InMemorySealer, NoopSealer, PlanSealer, SealedEvent, StoredEvent};
 pub use signer::{InProcessEd25519Signer, NullSigner, PlanSigner, Signed};

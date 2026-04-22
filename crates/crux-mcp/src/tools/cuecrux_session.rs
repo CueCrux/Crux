@@ -54,16 +54,12 @@ pub fn tool_input_schema() -> Value {
     })
 }
 
-pub async fn handle_cuecrux_session(
-    args: &Value,
-    ctx: &McpContext,
-) -> Result<Value, JsonRpcError> {
+pub async fn handle_cuecrux_session(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let Some(base_url) = ctx.daemon_base_url.as_deref() else {
         return Err(JsonRpcError {
             code: INTERNAL_ERROR,
-            message:
-                "cuecrux_session: daemon_base_url not configured; the MCP server was not wired to corecruxd"
-                    .to_string(),
+            message: "cuecrux_session: daemon_base_url not configured; the MCP server was not wired to corecruxd"
+                .to_string(),
             data: None,
         });
     };
@@ -201,8 +197,7 @@ mod tests {
 
     #[tokio::test]
     async fn errors_when_hints_not_object() {
-        let ctx = McpContext::new_default("test-node")
-            .with_daemon_base_url("http://127.0.0.1:14800");
+        let ctx = McpContext::new_default("test-node").with_daemon_base_url("http://127.0.0.1:14800");
         let result = handle_cuecrux_session(&json!({ "hints": "not-an-object" }), &ctx).await;
         let err = result.expect_err("must reject non-object hints");
         assert_eq!(err.code, INVALID_PARAMS);
@@ -212,8 +207,7 @@ mod tests {
     async fn errors_cleanly_on_loopback_connection_refused() {
         // Point at a port that is (almost certainly) not listening. The
         // tool must return a clear INTERNAL_ERROR, not panic.
-        let ctx = McpContext::new_default("test-node")
-            .with_daemon_base_url("http://127.0.0.1:1");
+        let ctx = McpContext::new_default("test-node").with_daemon_base_url("http://127.0.0.1:1");
         let result = handle_cuecrux_session(&json!({}), &ctx).await;
         let err = result.expect_err("must fail on refused connection");
         assert!(err.message.contains("loopback request failed"));

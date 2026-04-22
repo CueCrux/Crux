@@ -33,22 +33,18 @@
 use std::collections::HashMap;
 
 use corecrux_projections::{
-    InvocationReceiptedV1, SessionPlanSealedV1, CONTENT_TYPE_SESSION_BIN_V1,
-    EVT_INVOCATION_RECEIPTED_V1, EVT_SESSION_PLAN_SEALED_V1,
+    InvocationReceiptedV1, SessionPlanSealedV1, CONTENT_TYPE_SESSION_BIN_V1, EVT_INVOCATION_RECEIPTED_V1,
+    EVT_SESSION_PLAN_SEALED_V1,
 };
 use crux_session::{
-    build_bundle, handshake::random_ulid, invocation::MintInvocation, mint as mint_plan,
-    mint_invocation_receipt, plan::ReceiptMode, plan_receipt_hash, verify_invocation_receipt,
-    Budget, CeExportBundle, Channels, FileSealer, FileSessionRegistry, GraphHints,
-    HandshakeInputs, HandshakeRequest, LocalPassportConfig, NullSigner, PlanSealer, RegistryEntry,
-    SealedEvent, SessionPlan, SessionRegistry, DEFAULT_CATALOG,
+    build_bundle, handshake::random_ulid, invocation::MintInvocation, mint as mint_plan, mint_invocation_receipt,
+    plan::ReceiptMode, plan_receipt_hash, verify_invocation_receipt, Budget, CeExportBundle, Channels, FileSealer,
+    FileSessionRegistry, GraphHints, HandshakeInputs, HandshakeRequest, LocalPassportConfig, NullSigner, PlanSealer,
+    RegistryEntry, SealedEvent, SessionPlan, SessionRegistry, DEFAULT_CATALOG,
 };
 
 fn tempdir() -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "crux-session-ce-migrate-{}",
-        rand::random::<u64>()
-    ));
+    let p = std::env::temp_dir().join(format!("crux-session-ce-migrate-{}", rand::random::<u64>()));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
@@ -80,11 +76,7 @@ fn seal_plan(plan: &SessionPlan, plan_cbor: &[u8], sealer: &dyn PlanSealer) {
         .expect("seal plan");
 }
 
-fn seal_invocation(
-    plan: &SessionPlan,
-    receipt: &crux_session::receipt::InvocationReceipt,
-    sealer: &dyn PlanSealer,
-) {
+fn seal_invocation(plan: &SessionPlan, receipt: &crux_session::receipt::InvocationReceipt, sealer: &dyn PlanSealer) {
     let event = InvocationReceiptedV1 {
         event_id: random_ulid(),
         session_id: plan.session_id,
@@ -119,8 +111,7 @@ fn ce_install_exports_verifiable_bundle() {
     let sealer = FileSealer::open(&data_dir).unwrap();
 
     let mut plans_minted: Vec<(SessionPlan, Vec<u8>)> = Vec::with_capacity(PLANS);
-    let mut all_invocations: HashMap<[u8; 16], Vec<crux_session::receipt::InvocationReceipt>> =
-        HashMap::new();
+    let mut all_invocations: HashMap<[u8; 16], Vec<crux_session::receipt::InvocationReceipt>> = HashMap::new();
 
     for i in 0..PLANS {
         let (passport, origin_install) = passport_cfg.synthesise();
@@ -157,10 +148,7 @@ fn ce_install_exports_verifiable_bundle() {
         .unwrap();
         seal_plan(&sealed.plan, &sealed.canonical_cbor, &sealer);
         registry
-            .insert(RegistryEntry::from_plan(
-                &sealed.plan,
-                sealed.canonical_cbor.clone(),
-            ))
+            .insert(RegistryEntry::from_plan(&sealed.plan, sealed.canonical_cbor.clone()))
             .unwrap();
 
         let mut receipts_this_session = Vec::with_capacity(INVOCATIONS_PER_PLAN);
@@ -187,8 +175,7 @@ fn ce_install_exports_verifiable_bundle() {
     }
 
     // ── Build the export bundle ───────────────────────────────────────
-    let bundle =
-        build_bundle(&passport_cfg, &registry, &sealer, 1_745_900_000_000).expect("build bundle");
+    let bundle = build_bundle(&passport_cfg, &registry, &sealer, 1_745_900_000_000).expect("build bundle");
     assert_eq!(bundle.schema_version, crux_session::BUNDLE_SCHEMA_VERSION);
     assert_eq!(bundle.install_uuid, passport_cfg.install_uuid);
     assert_eq!(
@@ -248,16 +235,9 @@ fn ce_install_exports_verifiable_bundle() {
 
     assert_eq!(verified_plans, PLANS);
     assert_eq!(verified_invocations, PLANS * INVOCATIONS_PER_PLAN);
-    assert_eq!(
-        principals.len(),
-        1,
-        "CE install should have exactly one principal"
-    );
+    assert_eq!(principals.len(), 1, "CE install should have exactly one principal");
     let principal = principals.iter().next().unwrap();
-    assert!(
-        principal.starts_with("ce:"),
-        "expected CE principal, got {principal}"
-    );
+    assert!(principal.starts_with("ce:"), "expected CE principal, got {principal}");
 
     std::fs::remove_dir_all(&data_dir).ok();
 }
@@ -309,10 +289,7 @@ fn bundle_mixing_two_principals_is_rejected_by_verifier() {
     .unwrap();
     seal_plan(&sealed.plan, &sealed.canonical_cbor, &sealer);
     registry
-        .insert(RegistryEntry::from_plan(
-            &sealed.plan,
-            sealed.canonical_cbor.clone(),
-        ))
+        .insert(RegistryEntry::from_plan(&sealed.plan, sealed.canonical_cbor.clone()))
         .unwrap();
 
     let mut bundle = build_bundle(&passport_cfg, &registry, &sealer, 1_745_900_000_000).unwrap();
@@ -323,8 +300,7 @@ fn bundle_mixing_two_principals_is_rejected_by_verifier() {
     second.principal_id = "ce:different_install:bob".into();
     bundle.plans.push(second);
 
-    let principals: std::collections::HashSet<&str> =
-        bundle.plans.iter().map(|p| p.principal_id.as_str()).collect();
+    let principals: std::collections::HashSet<&str> = bundle.plans.iter().map(|p| p.principal_id.as_str()).collect();
     assert_eq!(principals.len(), 2, "we spliced in a second principal");
     // The hosted verifier's guard: `principalSet.size !== 1 → reject`.
     // We assert the precondition here; the TS-side route enforces the

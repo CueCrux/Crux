@@ -23,19 +23,16 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{body::Bytes, Json};
 use serde::{Deserialize, Serialize};
 
-use corecrux_projections::{
-    SessionPlanSealedV1, CONTENT_TYPE_SESSION_BIN_V1, EVT_SESSION_PLAN_SEALED_V1,
-};
+use corecrux_projections::{SessionPlanSealedV1, CONTENT_TYPE_SESSION_BIN_V1, EVT_SESSION_PLAN_SEALED_V1};
 use crux_session::{
-    generator::GraphHints, handshake, Budget, Channels, FileSealer, FileSessionRegistry,
-    HandshakeInputs, HandshakeRequest, InMemoryRegistry, InMemorySealer, LocalPassportConfig,
-    NullSigner, PlanSealer, PlanSigner, RegistryEntry, SealedEvent, SessionRegistry,
-    DEFAULT_CATALOG,
+    generator::GraphHints, handshake, Budget, Channels, FileSealer, FileSessionRegistry, HandshakeInputs,
+    HandshakeRequest, InMemoryRegistry, InMemorySealer, LocalPassportConfig, NullSigner, PlanSealer, PlanSigner,
+    RegistryEntry, SealedEvent, SessionRegistry, DEFAULT_CATALOG,
 };
 use uuid::Uuid;
 
@@ -45,8 +42,7 @@ use corecrux_types::ProblemDetails;
 
 pub(super) fn problem(status: StatusCode, title: &str, detail: impl Into<String>) -> Response {
     ProblemResponse(
-        ProblemDetails::new(status.as_u16(), "https://errors.cuecrux.com/session", title)
-            .with_detail(detail),
+        ProblemDetails::new(status.as_u16(), "https://errors.cuecrux.com/session", title).with_detail(detail),
     )
     .into_response()
 }
@@ -111,10 +107,9 @@ impl SessionServices {
         mcp_url: impl Into<String>,
     ) -> Result<Self, String> {
         let user = std::env::var("USER").unwrap_or_else(|_| "local".into());
-        let passport_cfg = LocalPassportConfig::from_data_dir(data_dir, user)
-            .map_err(|e| format!("persistent passport: {e}"))?;
-        let registry = FileSessionRegistry::open(data_dir)
-            .map_err(|e| format!("file registry: {e}"))?;
+        let passport_cfg =
+            LocalPassportConfig::from_data_dir(data_dir, user).map_err(|e| format!("persistent passport: {e}"))?;
+        let registry = FileSessionRegistry::open(data_dir).map_err(|e| format!("file registry: {e}"))?;
         let sealer = FileSealer::open(data_dir).map_err(|e| format!("file sealer: {e}"))?;
         let _ = node_id; // retained for future node-scoped wiring
         Ok(Self {
@@ -186,11 +181,7 @@ fn bad_request(message: impl Into<String>) -> Response {
 
 /// `POST /session` — mint a session plan.
 #[tracing::instrument(level = "info", skip(state, headers, body))]
-pub async fn post_session(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let start = std::time::Instant::now();
     let services = match state.session.as_ref() {
         Some(s) => s.clone(),
@@ -280,16 +271,7 @@ pub async fn post_session(
     // ALWAYS-STORE: seal the SessionPlanSealed event to the durable log
     // BEFORE writing to the registry. Any failure here is fatal — the
     // registry must never hold a row that has no matching sealed event.
-    let event = match build_sealed_event_for_plan(&sealed) {
-        Ok(evt) => evt,
-        Err(e) => {
-            return problem(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                format!("failed to build seal event: {e}"),
-            );
-        }
-    };
+    let event = build_sealed_event_for_plan(&sealed);
     if let Err(e) = services.sealer.seal(&event) {
         if let Some(m) = services.metrics.as_ref() {
             m.handshake_seal_failure("ce");
@@ -341,7 +323,7 @@ pub async fn post_session(
 /// [`corecrux_projections::events::SessionPlanSealedV1`] event that lands in
 /// the segment log. Payload is the binary encoding produced by that
 /// event's `encode_bin()`.
-fn build_sealed_event_for_plan(sealed: &handshake::SealedPlan) -> Result<SealedEvent, String> {
+fn build_sealed_event_for_plan(sealed: &handshake::SealedPlan) -> SealedEvent {
     let plan = &sealed.plan;
     let expires_at_ms = plan.minted_at.saturating_add(plan.session_ttl_s * 1000);
 
@@ -360,14 +342,14 @@ fn build_sealed_event_for_plan(sealed: &handshake::SealedPlan) -> Result<SealedE
         plan_bytes_cbor: sealed.canonical_cbor.clone(),
     };
 
-    Ok(SealedEvent {
+    SealedEvent {
         event_type: EVT_SESSION_PLAN_SEALED_V1,
         content_type: CONTENT_TYPE_SESSION_BIN_V1,
         tenant_id: plan.origin.clone(),
         stream_type: "session-plans".to_string(),
         stream_id: plan.passport.principal_id.clone(),
         payload: event.encode_bin(),
-    })
+    }
 }
 
 fn build_plan_response(sealed: &handshake::SealedPlan, prefer_cbor: bool) -> Response {
@@ -395,14 +377,15 @@ fn build_plan_response(sealed: &handshake::SealedPlan, prefer_cbor: bool) -> Res
             .into_response()
     };
     let headers = response.headers_mut();
-    headers.insert(
-        "X-CueCrux-Session-Id",
-        session_id_hex.parse().expect("valid ascii"),
-    );
-    headers.insert(
-        "X-CueCrux-Plan-Hash",
-        plan_hash_hex.parse().expect("valid ascii"),
-    );
+    // hex::encode output is guaranteed ASCII, so HeaderValue::from_str can
+    // only fail on future refactors that change the source to non-ASCII; we
+    // fall back to dropping the header rather than panicking in that case.
+    if let Ok(hv) = HeaderValue::from_str(&session_id_hex) {
+        headers.insert("X-CueCrux-Session-Id", hv);
+    }
+    if let Ok(hv) = HeaderValue::from_str(&plan_hash_hex) {
+        headers.insert("X-CueCrux-Plan-Hash", hv);
+    }
     response
 }
 
@@ -413,8 +396,7 @@ fn should_prefer_cbor(headers: &HeaderMap, accepts: &[String]) -> bool {
     headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.contains("application/cbor"))
-        .unwrap_or(false)
+        .is_some_and(|s| s.contains("application/cbor"))
 }
 
 fn now_ms() -> u64 {
@@ -434,9 +416,9 @@ fn to_json_value(value: &crux_session::canonical::CborValue) -> Option<serde_jso
         CborValue::Uint(n) => serde_json::Value::Number((*n).into()),
         CborValue::Bytes(b) => serde_json::Value::String(hex::encode(b)),
         CborValue::Text(s) => serde_json::Value::String(s.clone()),
-        CborValue::Array(items) => serde_json::Value::Array(
-            items.iter().map(to_json_value).collect::<Option<Vec<_>>>()?,
-        ),
+        CborValue::Array(items) => {
+            serde_json::Value::Array(items.iter().map(to_json_value).collect::<Option<Vec<_>>>()?)
+        }
         CborValue::Map(pairs) => {
             let mut map = serde_json::Map::with_capacity(pairs.len());
             for (k, v) in pairs {

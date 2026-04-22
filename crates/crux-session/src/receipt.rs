@@ -10,9 +10,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 use crate::canonical::CborValue;
 use crate::error::SessionError;
-use crate::plan::{
-    ReceiptMode, SessionPlan, HASH_LEN, INVOCATION_RECEIPT_VERSION, SIGNATURE_LEN, ULID_LEN,
-};
+use crate::plan::{ReceiptMode, SessionPlan, HASH_LEN, INVOCATION_RECEIPT_VERSION, SIGNATURE_LEN, ULID_LEN};
 
 /// Compute BLAKE3(canonical CBOR of plan with receipt.hash/signature/signer_kid zeroed).
 ///
@@ -32,24 +30,18 @@ pub fn plan_receipt_hash(plan: &SessionPlan) -> [u8; HASH_LEN] {
 /// digests rather than arbitrary-length messages.
 pub fn verify_plan_signature(plan: &SessionPlan, public_key: &[u8]) -> Result<(), SessionError> {
     if plan.receipt.mode != ReceiptMode::Verified {
-        return Err(SessionError::UnsupportedMode(
-            plan.receipt.mode.as_str().to_string(),
-        ));
+        return Err(SessionError::UnsupportedMode(plan.receipt.mode.as_str().to_string()));
     }
 
-    let signature_bytes = plan
-        .receipt
-        .signature
-        .as_ref()
-        .ok_or(SessionError::SignatureAbsent)?;
+    let signature_bytes = plan.receipt.signature.as_ref().ok_or(SessionError::SignatureAbsent)?;
 
     if public_key.len() != 32 {
         return Err(SessionError::PublicKeyLength(public_key.len()));
     }
     let mut pk_arr = [0u8; 32];
     pk_arr.copy_from_slice(public_key);
-    let verifying_key = VerifyingKey::from_bytes(&pk_arr)
-        .map_err(|e| SessionError::Decode(format!("bad public key: {e}")))?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&pk_arr).map_err(|e| SessionError::Decode(format!("bad public key: {e}")))?;
 
     let signature = Signature::from_bytes(signature_bytes);
 

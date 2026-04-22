@@ -84,10 +84,7 @@ pub trait SessionRegistry: Send + Sync {
     /// the full plan (to inspect the capability graph, compare channels,
     /// etc.). Default: linear scan — registries with an index can
     /// override for efficiency.
-    fn get_by_plan_hash(
-        &self,
-        plan_receipt_hash: &[u8; HASH_LEN],
-    ) -> Result<Option<RegistryEntry>, RegistryError> {
+    fn get_by_plan_hash(&self, plan_receipt_hash: &[u8; HASH_LEN]) -> Result<Option<RegistryEntry>, RegistryError> {
         // Default impl: the trait has no iteration API without changing
         // its shape. Concrete impls override; the default returns None so
         // a registry without the index fails safe (verifier reports
@@ -133,10 +130,7 @@ impl SessionRegistry for InMemoryRegistry {
         Ok(map.values().filter(|e| !e.closed).count())
     }
 
-    fn get_by_plan_hash(
-        &self,
-        plan_receipt_hash: &[u8; HASH_LEN],
-    ) -> Result<Option<RegistryEntry>, RegistryError> {
+    fn get_by_plan_hash(&self, plan_receipt_hash: &[u8; HASH_LEN]) -> Result<Option<RegistryEntry>, RegistryError> {
         let map = self.inner.lock()?;
         Ok(map
             .values()
@@ -165,8 +159,7 @@ pub struct FileSessionRegistry {
 impl FileSessionRegistry {
     pub fn open(data_dir: &Path) -> Result<Self, RegistryError> {
         let root = data_dir.join("sessions");
-        fs::create_dir_all(&root)
-            .map_err(|e| RegistryError::Io(format!("create sessions dir: {e}")))?;
+        fs::create_dir_all(&root).map_err(|e| RegistryError::Io(format!("create sessions dir: {e}")))?;
         let cache = load_all_entries(&root)?;
         Ok(Self {
             root,
@@ -182,8 +175,7 @@ impl FileSessionRegistry {
         let path = self.path_for(&entry.session_id);
         let tmp = path.with_extension("json.tmp");
         let wire = wire_from_entry(entry);
-        let bytes = serde_json::to_vec_pretty(&wire)
-            .map_err(|e| RegistryError::Io(format!("serialise entry: {e}")))?;
+        let bytes = serde_json::to_vec_pretty(&wire).map_err(|e| RegistryError::Io(format!("serialise entry: {e}")))?;
         fs::write(&tmp, bytes).map_err(|e| RegistryError::Io(format!("write temp: {e}")))?;
         fs::rename(&tmp, &path).map_err(|e| RegistryError::Io(format!("atomic rename: {e}")))?;
         Ok(())
@@ -219,10 +211,7 @@ impl SessionRegistry for FileSessionRegistry {
         Ok(cache.values().filter(|e| !e.closed).count())
     }
 
-    fn get_by_plan_hash(
-        &self,
-        plan_receipt_hash: &[u8; HASH_LEN],
-    ) -> Result<Option<RegistryEntry>, RegistryError> {
+    fn get_by_plan_hash(&self, plan_receipt_hash: &[u8; HASH_LEN]) -> Result<Option<RegistryEntry>, RegistryError> {
         let cache = self.cache.lock()?;
         Ok(cache
             .values()
@@ -266,11 +255,7 @@ fn entry_from_wire(wire: RegistryEntryWire) -> Result<RegistryEntry, RegistryErr
     fn hex_fixed<const N: usize>(s: &str, field: &str) -> Result<[u8; N], RegistryError> {
         let bytes = hex::decode(s).map_err(|e| RegistryError::Io(format!("{field} hex: {e}")))?;
         if bytes.len() != N {
-            return Err(RegistryError::Io(format!(
-                "{field} length {} != {}",
-                bytes.len(),
-                N
-            )));
+            return Err(RegistryError::Io(format!("{field} length {} != {}", bytes.len(), N)));
         }
         let mut out = [0u8; N];
         out.copy_from_slice(&bytes);
@@ -280,10 +265,7 @@ fn entry_from_wire(wire: RegistryEntryWire) -> Result<RegistryEntry, RegistryErr
     Ok(RegistryEntry {
         session_id: hex_fixed::<16>(&wire.session_id, "session_id")?,
         principal_id: wire.principal_id,
-        capability_graph_hash: hex_fixed::<HASH_LEN>(
-            &wire.capability_graph_hash,
-            "capability_graph_hash",
-        )?,
+        capability_graph_hash: hex_fixed::<HASH_LEN>(&wire.capability_graph_hash, "capability_graph_hash")?,
         plan_receipt_hash: hex_fixed::<HASH_LEN>(&wire.plan_receipt_hash, "plan_receipt_hash")?,
         minted_at: wire.minted_at,
         expires_at: wire.expires_at,
@@ -292,8 +274,7 @@ fn entry_from_wire(wire: RegistryEntryWire) -> Result<RegistryEntry, RegistryErr
             .origin_install
             .map(|s| hex_fixed::<HASH_LEN>(&s, "origin_install"))
             .transpose()?,
-        plan_cbor: hex::decode(&wire.plan_cbor)
-            .map_err(|e| RegistryError::Io(format!("plan_cbor hex: {e}")))?,
+        plan_cbor: hex::decode(&wire.plan_cbor).map_err(|e| RegistryError::Io(format!("plan_cbor hex: {e}")))?,
         closed: wire.closed,
         close_reason: wire.close_reason,
     })
@@ -314,11 +295,11 @@ fn load_all_entries(root: &Path) -> Result<HashMap<[u8; 16], RegistryEntry>, Reg
         let bytes = match fs::read(&path) {
             Ok(b) => b,
             Err(e) => {
-                return Err(RegistryError::Io(format!("read {:?}: {e}", path)));
+                return Err(RegistryError::Io(format!("read {}: {e}", path.display())));
             }
         };
-        let wire: RegistryEntryWire = serde_json::from_slice(&bytes)
-            .map_err(|e| RegistryError::Io(format!("parse {:?}: {e}", path)))?;
+        let wire: RegistryEntryWire =
+            serde_json::from_slice(&bytes).map_err(|e| RegistryError::Io(format!("parse {}: {e}", path.display())))?;
         let parsed = entry_from_wire(wire)?;
         out.insert(parsed.session_id, parsed);
     }
@@ -409,7 +390,7 @@ mod tests {
     #[test]
     fn file_registry_ignores_malformed_files() {
         let tmp = std::env::temp_dir().join(format!("crux-session-file-{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&tmp.join("sessions")).unwrap();
+        std::fs::create_dir_all(tmp.join("sessions")).unwrap();
         // Drop a garbage non-json file + a json file with invalid JSON.
         std::fs::write(tmp.join("sessions/README.txt"), b"ignored").unwrap();
         std::fs::write(tmp.join("sessions/bad.json"), b"not json").unwrap();

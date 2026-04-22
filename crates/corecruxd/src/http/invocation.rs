@@ -25,8 +25,8 @@ use crux_session::{
     verify_invocation_receipt, InvocationVerdict,
 };
 
-use super::AppState;
 use super::session::problem;
+use super::AppState;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct InvocationReceiptWire {
@@ -75,10 +75,7 @@ impl From<(InvocationVerdict, bool, Option<String>)> for VerifyResponse {
 }
 
 #[tracing::instrument(level = "info", skip(state, body))]
-pub async fn post_invocation_verify(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> Response {
+pub async fn post_invocation_verify(State(state): State<AppState>, body: Bytes) -> Response {
     let services = match state.session.as_ref() {
         Some(s) => s.clone(),
         None => {
@@ -155,11 +152,7 @@ pub async fn post_invocation_verify(
     }
     (
         StatusCode::OK,
-        Json(VerifyResponse::from((
-            verdict,
-            true,
-            Some(plan.passport.principal_id),
-        ))),
+        Json(VerifyResponse::from((verdict, true, Some(plan.passport.principal_id)))),
     )
         .into_response()
 }
@@ -196,10 +189,7 @@ fn wire_to_receipt(w: &InvocationReceiptWire) -> Result<InvocationReceipt, Strin
 fn decode_ulid(s: &str, field: &str) -> Result<[u8; ULID_LEN], String> {
     let bytes = hex::decode(s).map_err(|e| format!("{field} hex decode: {e}"))?;
     if bytes.len() != ULID_LEN {
-        return Err(format!(
-            "{field} must decode to {ULID_LEN} bytes, got {}",
-            bytes.len()
-        ));
+        return Err(format!("{field} must decode to {ULID_LEN} bytes, got {}", bytes.len()));
     }
     let mut out = [0u8; ULID_LEN];
     out.copy_from_slice(&bytes);
@@ -209,10 +199,7 @@ fn decode_ulid(s: &str, field: &str) -> Result<[u8; ULID_LEN], String> {
 fn decode_hash(s: &str, field: &str) -> Result<[u8; HASH_LEN], String> {
     let bytes = hex::decode(s).map_err(|e| format!("{field} hex decode: {e}"))?;
     if bytes.len() != HASH_LEN {
-        return Err(format!(
-            "{field} must decode to {HASH_LEN} bytes, got {}",
-            bytes.len()
-        ));
+        return Err(format!("{field} must decode to {HASH_LEN} bytes, got {}", bytes.len()));
     }
     let mut out = [0u8; HASH_LEN];
     out.copy_from_slice(&bytes);

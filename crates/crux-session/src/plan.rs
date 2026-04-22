@@ -291,11 +291,7 @@ fn capability_to_cbor(c: &Capability) -> CborValue {
 }
 
 fn receipt_to_cbor(r: &ReceiptEnvelope, zero: bool) -> CborValue {
-    let hash = if zero {
-        vec![0u8; HASH_LEN]
-    } else {
-        r.hash.to_vec()
-    };
+    let hash = if zero { vec![0u8; HASH_LEN] } else { r.hash.to_vec() };
     let signature = if zero {
         CborValue::Null
     } else {
@@ -313,9 +309,7 @@ fn receipt_to_cbor(r: &ReceiptEnvelope, zero: bool) -> CborValue {
         }
     };
     let parent_chain = match &r.parent_chain {
-        Some(list) => CborValue::Array(
-            list.iter().map(|h| CborValue::Bytes(h.to_vec())).collect(),
-        ),
+        Some(list) => CborValue::Array(list.iter().map(|h| CborValue::Bytes(h.to_vec())).collect()),
         None => CborValue::Null,
     };
     CborValue::Map(vec![
@@ -415,9 +409,7 @@ fn receipt_from_cbor(v: &CborValue) -> Result<ReceiptEnvelope, SessionError> {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
                 let CborValue::Bytes(b) = item else {
-                    return Err(SessionError::Decode(
-                        "parent_chain item not bytes".to_string(),
-                    ));
+                    return Err(SessionError::Decode("parent_chain item not bytes".to_string()));
                 };
                 if b.len() != HASH_LEN {
                     return Err(SessionError::HashLength(b.len()));
@@ -428,9 +420,7 @@ fn receipt_from_cbor(v: &CborValue) -> Result<ReceiptEnvelope, SessionError> {
             }
             Some(out)
         }
-        _ => return Err(SessionError::Decode(
-            "parent_chain must be array or null".to_string(),
-        )),
+        _ => return Err(SessionError::Decode("parent_chain must be array or null".to_string())),
     };
     Ok(ReceiptEnvelope {
         mode,
@@ -491,10 +481,7 @@ fn take_text_opt(map: &[Pair], key: &'static str) -> Result<Option<String>, Sess
     }
 }
 
-fn take_bytes_fixed<const N: usize>(
-    map: &[Pair],
-    key: &'static str,
-) -> Result<[u8; N], SessionError> {
+fn take_bytes_fixed<const N: usize>(map: &[Pair], key: &'static str) -> Result<[u8; N], SessionError> {
     match get(map, key)? {
         CborValue::Bytes(b) => {
             if b.len() != N {
@@ -512,10 +499,7 @@ fn take_bytes_fixed<const N: usize>(
     }
 }
 
-fn take_bytes_fixed_opt<const N: usize>(
-    map: &[Pair],
-    key: &'static str,
-) -> Result<Option<[u8; N]>, SessionError> {
+fn take_bytes_fixed_opt<const N: usize>(map: &[Pair], key: &'static str) -> Result<Option<[u8; N]>, SessionError> {
     match get(map, key)? {
         CborValue::Null => Ok(None),
         CborValue::Bytes(b) => {
