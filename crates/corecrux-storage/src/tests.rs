@@ -1331,7 +1331,7 @@ mod tests {
         let confirmation = stats.write_confirmation.expect("write confirmation");
 
         let mut hasher = blake3::Hasher::new();
-        for outcome in outcomes.iter() {
+        for outcome in &outcomes {
             let loc = outcome.location.expect("appended frame location");
             let frame = storage
                 .read_frame_bytes(loc.segment_seq, loc.offset)
@@ -2612,9 +2612,10 @@ mod tests {
         let mut hasher = blake3::Hasher::new();
         for (loc, frame) in frames {
             let decoded = decode_frame_v1(frame).expect("decode frame");
-            if decoded.header_bytes.len() < 32 {
-                panic!("stored frame header_bytes too small");
-            }
+            assert!(
+                !(decoded.header_bytes.len() < 32),
+                "stored frame header_bytes too small"
+            );
             let canonical_len = decoded.header_bytes.len() - 32;
             let canonical_bytes = &decoded.header_bytes[..canonical_len];
             let header_hash = compute_header_hash(canonical_bytes);
@@ -3608,7 +3609,7 @@ mod tests {
                 }
 
                 // Range.
-                let max_seq = truth.last().map(|e| e.seq).unwrap_or(0);
+                let max_seq = truth.last().map_or(0, |e| e.seq);
                 let from_seq = (rng.gen_range_u32((max_seq as u32).saturating_add(5)) as u64) + 1;
                 let limit = rng.gen_range_u32(40);
                 let got = storage
@@ -4219,8 +4220,8 @@ mod tests {
             code: "X".into(),
             msg: "Y".into(),
         };
-        assert!(e.to_string().contains("X"));
-        assert!(e.to_string().contains("Y"));
+        assert!(e.to_string().contains('X'));
+        assert!(e.to_string().contains('Y'));
 
         let e2 = StorageError::ResourceExhausted {
             code: "BP".into(),
@@ -4432,15 +4433,8 @@ mod tests {
         std::fs::create_dir_all(shard_dir.join("tmp")).expect("tmp dir");
         std::fs::create_dir_all(shard_dir.join("segments")).expect("segments dir");
 
-        let (frame_a, mut meta_a, _) = build_ccxi_test_frame(
-            "tenant-a",
-            "artifact",
-            "stream-a",
-            1,
-            "evt-a",
-            br#"alpha alpha beta"#,
-            0,
-        );
+        let (frame_a, mut meta_a, _) =
+            build_ccxi_test_frame("tenant-a", "artifact", "stream-a", 1, "evt-a", br"alpha alpha beta", 0);
 
         let fallback_stream_hash = 0xABCD_EF01_2345_6789;
         let (frame_b, mut meta_b) =

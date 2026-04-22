@@ -12,9 +12,9 @@
 use std::collections::HashSet;
 
 use crux_session::{
-    mint, plan_receipt_hash, verify_plan_signature, Budget, Channels, GraphHints,
-    HandshakeInputs, HandshakeRequest, InMemoryRegistry, InProcessEd25519Signer, LocalPassportConfig,
-    NullSigner, ReceiptMode, RegistryEntry, SessionPlan, SessionRegistry, DEFAULT_CATALOG,
+    mint, plan_receipt_hash, verify_plan_signature, Budget, Channels, GraphHints, HandshakeInputs, HandshakeRequest,
+    InMemoryRegistry, InProcessEd25519Signer, LocalPassportConfig, NullSigner, ReceiptMode, RegistryEntry, SessionPlan,
+    SessionRegistry, DEFAULT_CATALOG,
 };
 
 fn ce_handshake(signer: &dyn crux_session::PlanSigner) -> (SessionPlan, Vec<u8>) {
@@ -30,7 +30,11 @@ fn ce_handshake(signer: &dyn crux_session::PlanSigner) -> (SessionPlan, Vec<u8>)
             bulk: Some("h2://localhost:14801/v2".into()),
             mcp: "http://localhost:14800/mcp".into(),
         },
-        hints: GraphHints { prefer_bulk: true, intent: None, max_capabilities: None },
+        hints: GraphHints {
+            prefer_bulk: true,
+            intent: None,
+            max_capabilities: None,
+        },
         session_ttl_s: 1800,
         budget: Budget {
             tokens_cap: None,
@@ -98,7 +102,11 @@ fn hosted_handshake_full_flow_with_signature() {
     // Tampering: flipping a capability's prefer field must invalidate the hash.
     let mut tampered = plan.clone();
     if let Some(first) = tampered.capability_graph.first_mut() {
-        first.prefer = if first.prefer == "bulk" { "mcp".into() } else { "bulk".into() };
+        first.prefer = if first.prefer == "bulk" {
+            "mcp".into()
+        } else {
+            "bulk".into()
+        };
     }
     let recomputed = plan_receipt_hash(&tampered);
     assert_ne!(recomputed, plan.receipt.hash);

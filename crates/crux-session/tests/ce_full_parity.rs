@@ -28,22 +28,18 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use corecrux_projections::{
-    InvocationReceiptedV1, SessionPlanSealedV1, CONTENT_TYPE_SESSION_BIN_V1,
-    EVT_INVOCATION_RECEIPTED_V1, EVT_SESSION_PLAN_SEALED_V1,
+    InvocationReceiptedV1, SessionPlanSealedV1, CONTENT_TYPE_SESSION_BIN_V1, EVT_INVOCATION_RECEIPTED_V1,
+    EVT_SESSION_PLAN_SEALED_V1,
 };
 use crux_session::{
-    handshake::random_ulid, invocation::MintInvocation, mint as mint_plan, mint_invocation_receipt,
-    plan::ReceiptMode, verify_invocation_receipt, Budget, Channels, FileSealer,
-    FileSessionRegistry, GraphHints, HandshakeInputs, HandshakeRequest, LocalPassportConfig,
-    NullSigner, PlanSealer, RegistryEntry, SealedEvent, SessionPlan, SessionRegistry,
-    DEFAULT_CATALOG,
+    handshake::random_ulid, invocation::MintInvocation, mint as mint_plan, mint_invocation_receipt, plan::ReceiptMode,
+    verify_invocation_receipt, Budget, Channels, FileSealer, FileSessionRegistry, GraphHints, HandshakeInputs,
+    HandshakeRequest, LocalPassportConfig, NullSigner, PlanSealer, RegistryEntry, SealedEvent, SessionPlan,
+    SessionRegistry, DEFAULT_CATALOG,
 };
 
 fn tempdir() -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "crux-session-ce-parity-{}",
-        rand::random::<u64>()
-    ));
+    let p = std::env::temp_dir().join(format!("crux-session-ce-parity-{}", rand::random::<u64>()));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
@@ -75,11 +71,7 @@ fn seal_plan(plan: &SessionPlan, plan_cbor: &[u8], sealer: &dyn PlanSealer) {
         .expect("seal plan event");
 }
 
-fn seal_invocation(
-    plan: &SessionPlan,
-    receipt: &crux_session::receipt::InvocationReceipt,
-    sealer: &dyn PlanSealer,
-) {
+fn seal_invocation(plan: &SessionPlan, receipt: &crux_session::receipt::InvocationReceipt, sealer: &dyn PlanSealer) {
     let event = InvocationReceiptedV1 {
         event_id: random_ulid(),
         session_id: plan.session_id,
@@ -118,7 +110,11 @@ fn ce_full_parity_open_session_10_invocations_restart_verify() {
                 bulk: None,
                 mcp: "http://localhost:14800/mcp".into(),
             },
-            hints: GraphHints { prefer_bulk: true, intent: None, max_capabilities: None },
+            hints: GraphHints {
+                prefer_bulk: true,
+                intent: None,
+                max_capabilities: None,
+            },
             session_ttl_s: 3600,
             budget: Budget {
                 tokens_cap: None,
@@ -183,10 +179,7 @@ fn ce_full_parity_open_session_10_invocations_restart_verify() {
 
     // Registry must recover the session.
     let registry = FileSessionRegistry::open(&data_dir).unwrap();
-    let entry = registry
-        .get(&session_id)
-        .unwrap()
-        .expect("session survived restart");
+    let entry = registry.get(&session_id).unwrap().expect("session survived restart");
     assert_eq!(entry.plan_cbor, plan_cbor);
 
     // Sealer must recover 11 events: 1 plan + 10 invocations.
@@ -205,10 +198,7 @@ fn ce_full_parity_open_session_10_invocations_restart_verify() {
     // Every invocation event must chain-verify against the sealed plan
     // pulled from the file registry.
     let plan = SessionPlan::from_canonical_cbor(&entry.plan_cbor).unwrap();
-    for event in events
-        .iter()
-        .filter(|e| e.event_type == EVT_INVOCATION_RECEIPTED_V1)
-    {
+    for event in events.iter().filter(|e| e.event_type == EVT_INVOCATION_RECEIPTED_V1) {
         let decoded = InvocationReceiptedV1::decode_bin(&event.payload).unwrap();
         assert_eq!(decoded.parent_plan_receipt_hash, plan.receipt.hash);
         // Re-mint the receipt from the event fields so the verifier has
@@ -263,7 +253,11 @@ fn ce_golden_handshake_mode_is_local_across_restart() {
                 bulk: None,
                 mcp: "http://localhost:14800/mcp".into(),
             },
-            hints: GraphHints { prefer_bulk: true, intent: None, max_capabilities: None },
+            hints: GraphHints {
+                prefer_bulk: true,
+                intent: None,
+                max_capabilities: None,
+            },
             session_ttl_s: 3600,
             budget: Budget {
                 tokens_cap: None,

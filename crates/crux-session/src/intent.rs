@@ -43,22 +43,13 @@ pub type IntentTable = HashMap<&'static str, Vec<(&'static str, i32)>>;
 /// through to the default order.
 pub fn default_intent_table() -> IntentTable {
     let mut t: IntentTable = HashMap::new();
-    t.insert(
-        "audit_review",
-        vec![("audit", 30), ("proof", 20), ("retrieval", 10)],
-    );
+    t.insert("audit_review", vec![("audit", 30), ("proof", 20), ("retrieval", 10)]);
     t.insert(
         "document_ingest",
         vec![("memory", 30), ("journal", 20), ("retrieval", 10)],
     );
-    t.insert(
-        "session_review",
-        vec![("session", 30), ("memory", 20), ("journal", 10)],
-    );
-    t.insert(
-        "compliance_export",
-        vec![("audit", 30), ("proof", 25), ("economy", 10)],
-    );
+    t.insert("session_review", vec![("session", 30), ("memory", 20), ("journal", 10)]);
+    t.insert("compliance_export", vec![("audit", 30), ("proof", 25), ("economy", 10)]);
     t.insert(
         "knowledge_query",
         vec![("retrieval", 30), ("memory", 20), ("session", 5)],
@@ -83,15 +74,11 @@ pub fn apply_intent_shaping_with_affinity(
     affinity_of: impl Fn(&Capability) -> &str,
 ) -> bool {
     let Some(intent_key) = intent else { return false };
-    let Some(biases) = table.get(intent_key) else { return false };
-
-    let bias_for = |affinity: &str| -> i32 {
-        biases
-            .iter()
-            .find(|(aff, _)| *aff == affinity)
-            .map(|(_, b)| *b)
-            .unwrap_or(0)
+    let Some(biases) = table.get(intent_key) else {
+        return false;
     };
+
+    let bias_for = |affinity: &str| -> i32 { biases.iter().find(|(aff, _)| *aff == affinity).map_or(0, |(_, b)| *b) };
 
     // Decorate each capability with (bias, original_index) so the sort
     // is stable by catalogue order on ties — deterministic output.
@@ -127,10 +114,7 @@ pub fn apply_intent_shaping_with_affinity(
 /// `Some("x")` it encodes as the text string. Two distinct intents can
 /// never collapse to the same hash even if they happen to produce the
 /// same capability list.
-pub fn hash_capability_graph_with_intent(
-    caps: &[Capability],
-    intent: Option<&str>,
-) -> [u8; HASH_LEN] {
+pub fn hash_capability_graph_with_intent(caps: &[Capability], intent: Option<&str>) -> [u8; HASH_LEN] {
     let intent_value = match intent {
         Some(s) => CborValue::Text(s.to_string()),
         None => CborValue::Null,
@@ -173,10 +157,7 @@ pub fn hash_capability_graph_with_intent(
             })
             .collect(),
     );
-    let tree = CborValue::Map(vec![
-        ("intent".into(), intent_value),
-        ("caps".into(), cap_array),
-    ]);
+    let tree = CborValue::Map(vec![("intent".into(), intent_value), ("caps".into(), cap_array)]);
     let encoded = tree.encode();
     let mut hasher = Hasher::new();
     hasher.update(&encoded);
@@ -214,19 +195,12 @@ mod tests {
     fn audit_review_puts_audit_first() {
         let table = default_intent_table();
         let with_aff = caps_with_affinity();
-        let affinity_map: HashMap<String, &'static str> = with_aff
-            .iter()
-            .map(|(c, a)| (c.cap.clone(), *a))
-            .collect();
+        let affinity_map: HashMap<String, &'static str> = with_aff.iter().map(|(c, a)| (c.cap.clone(), *a)).collect();
         let mut caps: Vec<Capability> = with_aff.iter().map(|(c, _)| c.clone()).collect();
 
-        let applied = apply_intent_shaping_with_affinity(
-            &mut caps,
-            &table,
-            Some("audit_review"),
-            None,
-            |c| affinity_map.get(&c.cap).copied().unwrap_or(""),
-        );
+        let applied = apply_intent_shaping_with_affinity(&mut caps, &table, Some("audit_review"), None, |c| {
+            affinity_map.get(&c.cap).copied().unwrap_or("")
+        });
         assert!(applied);
         assert_eq!(caps[0].cap, "audit_replay");
         assert_eq!(caps[1].cap, "proof_verify");
@@ -237,18 +211,11 @@ mod tests {
     fn max_capabilities_truncates_to_top_n() {
         let table = default_intent_table();
         let with_aff = caps_with_affinity();
-        let affinity_map: HashMap<String, &'static str> = with_aff
-            .iter()
-            .map(|(c, a)| (c.cap.clone(), *a))
-            .collect();
+        let affinity_map: HashMap<String, &'static str> = with_aff.iter().map(|(c, a)| (c.cap.clone(), *a)).collect();
         let mut caps: Vec<Capability> = with_aff.iter().map(|(c, _)| c.clone()).collect();
-        apply_intent_shaping_with_affinity(
-            &mut caps,
-            &table,
-            Some("audit_review"),
-            Some(2),
-            |c| affinity_map.get(&c.cap).copied().unwrap_or(""),
-        );
+        apply_intent_shaping_with_affinity(&mut caps, &table, Some("audit_review"), Some(2), |c| {
+            affinity_map.get(&c.cap).copied().unwrap_or("")
+        });
         assert_eq!(caps.len(), 2);
         assert_eq!(caps[0].cap, "audit_replay");
         assert_eq!(caps[1].cap, "proof_verify");
@@ -259,18 +226,11 @@ mod tests {
         let table = default_intent_table();
         let with_aff = caps_with_affinity();
         let original: Vec<String> = with_aff.iter().map(|(c, _)| c.cap.clone()).collect();
-        let affinity_map: HashMap<String, &'static str> = with_aff
-            .iter()
-            .map(|(c, a)| (c.cap.clone(), *a))
-            .collect();
+        let affinity_map: HashMap<String, &'static str> = with_aff.iter().map(|(c, a)| (c.cap.clone(), *a)).collect();
         let mut caps: Vec<Capability> = with_aff.iter().map(|(c, _)| c.clone()).collect();
-        let applied = apply_intent_shaping_with_affinity(
-            &mut caps,
-            &table,
-            Some("nonexistent_intent"),
-            None,
-            |c| affinity_map.get(&c.cap).copied().unwrap_or(""),
-        );
+        let applied = apply_intent_shaping_with_affinity(&mut caps, &table, Some("nonexistent_intent"), None, |c| {
+            affinity_map.get(&c.cap).copied().unwrap_or("")
+        });
         assert!(!applied);
         let after: Vec<String> = caps.iter().map(|c| c.cap.clone()).collect();
         assert_eq!(after, original);
@@ -280,20 +240,13 @@ mod tests {
     fn ordering_is_deterministic_across_runs() {
         let table = default_intent_table();
         let with_aff = caps_with_affinity();
-        let affinity_map: HashMap<String, &'static str> = with_aff
-            .iter()
-            .map(|(c, a)| (c.cap.clone(), *a))
-            .collect();
+        let affinity_map: HashMap<String, &'static str> = with_aff.iter().map(|(c, a)| (c.cap.clone(), *a)).collect();
 
         let run_once = || {
             let mut caps: Vec<Capability> = with_aff.iter().map(|(c, _)| c.clone()).collect();
-            apply_intent_shaping_with_affinity(
-                &mut caps,
-                &table,
-                Some("document_ingest"),
-                None,
-                |c| affinity_map.get(&c.cap).copied().unwrap_or(""),
-            );
+            apply_intent_shaping_with_affinity(&mut caps, &table, Some("document_ingest"), None, |c| {
+                affinity_map.get(&c.cap).copied().unwrap_or("")
+            });
             caps.into_iter().map(|c| c.cap).collect::<Vec<_>>()
         };
         assert_eq!(run_once(), run_once());

@@ -487,21 +487,13 @@ pub fn parse_projection_event(
         }
         // Session events are binary-only in M2. A hex-encoded JSON form may
         // be added later; for now we route everything through decode_bin.
-        EVT_SESSION_PLAN_SEALED_V1 => {
-            ProjectionEventV1::SessionPlanSealed(SessionPlanSealedV1::decode_bin(payload)?)
-        }
-        EVT_SESSION_CLOSED_V1 => {
-            ProjectionEventV1::SessionClosed(SessionClosedV1::decode_bin(payload)?)
-        }
-        EVT_SESSION_REVOKED_V1 => {
-            ProjectionEventV1::SessionRevoked(SessionRevokedV1::decode_bin(payload)?)
-        }
+        EVT_SESSION_PLAN_SEALED_V1 => ProjectionEventV1::SessionPlanSealed(SessionPlanSealedV1::decode_bin(payload)?),
+        EVT_SESSION_CLOSED_V1 => ProjectionEventV1::SessionClosed(SessionClosedV1::decode_bin(payload)?),
+        EVT_SESSION_REVOKED_V1 => ProjectionEventV1::SessionRevoked(SessionRevokedV1::decode_bin(payload)?),
         EVT_INVOCATION_RECEIPTED_V1 => {
             ProjectionEventV1::InvocationReceipted(InvocationReceiptedV1::decode_bin(payload)?)
         }
-        EVT_CE_INSTALL_IMPORTED_V1 => {
-            ProjectionEventV1::CeInstallImported(CeInstallImportedV1::decode_bin(payload)?)
-        }
+        EVT_CE_INSTALL_IMPORTED_V1 => ProjectionEventV1::CeInstallImported(CeInstallImportedV1::decode_bin(payload)?),
         _ => return Ok(None),
     };
 
@@ -640,8 +632,7 @@ impl SessionPlanSealedV1 {
     pub const V: u16 = 1;
 
     pub fn encode_bin(&self) -> Vec<u8> {
-        let mut out =
-            Vec::with_capacity(2 + 48 + 2 * (2 + 32) + 32 + 64 + 32 + 16 + 4 + self.plan_bytes_cbor.len());
+        let mut out = Vec::with_capacity(2 + 48 + 2 * (2 + 32) + 32 + 64 + 32 + 16 + 4 + self.plan_bytes_cbor.len());
         out.extend_from_slice(&Self::V.to_le_bytes());
         out.extend_from_slice(&self.event_id);
         out.extend_from_slice(&self.plan_id);
@@ -1615,8 +1606,7 @@ mod tests {
 
     #[test]
     fn dispatcher_returns_none_for_unknown_event() {
-        let parsed = parse_projection_event("corecrux.unknown.v1", "application/octet-stream", &[])
-            .expect("parse");
+        let parsed = parse_projection_event("corecrux.unknown.v1", "application/octet-stream", &[]).expect("parse");
         assert!(parsed.is_none());
     }
 
@@ -1702,13 +1692,9 @@ mod tests {
     fn dispatcher_decodes_ce_install_imported_event() {
         let event = sample_ce_install_imported();
         let bytes = event.encode_bin();
-        let parsed = parse_projection_event(
-            EVT_CE_INSTALL_IMPORTED_V1,
-            CONTENT_TYPE_SESSION_BIN_V1,
-            &bytes,
-        )
-        .expect("parse")
-        .expect("some");
+        let parsed = parse_projection_event(EVT_CE_INSTALL_IMPORTED_V1, CONTENT_TYPE_SESSION_BIN_V1, &bytes)
+            .expect("parse")
+            .expect("some");
         match parsed {
             ProjectionEventV1::CeInstallImported(s) => {
                 assert_eq!(s.tenant_id, "cuecrux_ltd");

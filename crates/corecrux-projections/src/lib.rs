@@ -35,9 +35,8 @@ pub use events::{
 // Session-handshake events (M2; master-plan §7.2). Re-export so corecruxd /
 // VaultCrux can mint events without reaching into `events` directly.
 pub use events::{
-    CONTENT_TYPE_SESSION_BIN_V1, EVT_INVOCATION_RECEIPTED_V1, EVT_SESSION_CLOSED_V1,
-    EVT_SESSION_PLAN_SEALED_V1, EVT_SESSION_REVOKED_V1, InvocationReceiptedV1, SessionClosedV1,
-    SessionPlanSealedV1, SessionRevokedV1,
+    InvocationReceiptedV1, SessionClosedV1, SessionPlanSealedV1, SessionRevokedV1, CONTENT_TYPE_SESSION_BIN_V1,
+    EVT_INVOCATION_RECEIPTED_V1, EVT_SESSION_CLOSED_V1, EVT_SESSION_PLAN_SEALED_V1, EVT_SESSION_REVOKED_V1,
 };
 // CE → Core migration (M8).
 pub use events::{CeInstallImportedV1, EVT_CE_INSTALL_IMPORTED_V1};

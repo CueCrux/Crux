@@ -125,10 +125,7 @@ pub fn decode(bytes: &[u8]) -> Result<CborValue, SessionError> {
     let mut cursor = Cursor { bytes, pos: 0 };
     let value = read_value(&mut cursor)?;
     if cursor.pos != bytes.len() {
-        return Err(SessionError::Decode(format!(
-            "trailing bytes at offset {}",
-            cursor.pos
-        )));
+        return Err(SessionError::Decode(format!("trailing bytes at offset {}", cursor.pos)));
     }
     Ok(value)
 }
@@ -177,8 +174,7 @@ fn read_value(c: &mut Cursor) -> Result<CborValue, SessionError> {
         }
         MAJOR_TEXT => {
             let slice = c.take(arg as usize)?.to_vec();
-            let s = String::from_utf8(slice)
-                .map_err(|e| SessionError::Decode(format!("invalid utf8: {e}")))?;
+            let s = String::from_utf8(slice).map_err(|e| SessionError::Decode(format!("invalid utf8: {e}")))?;
             Ok(CborValue::Text(s))
         }
         MAJOR_ARRAY => {
@@ -204,9 +200,7 @@ fn read_value(c: &mut Cursor) -> Result<CborValue, SessionError> {
             }
             Ok(CborValue::Map(pairs))
         }
-        _ => Err(SessionError::Decode(format!(
-            "unsupported major type {major}"
-        ))),
+        _ => Err(SessionError::Decode(format!("unsupported major type {major}"))),
     }
 }
 
@@ -220,9 +214,7 @@ fn read_arg(c: &mut Cursor, info: u8) -> Result<u64, SessionError> {
         }
         26 => {
             let bytes = c.take(4)?;
-            Ok(u64::from(u32::from_be_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-            ])))
+            Ok(u64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])))
         }
         27 => {
             let bytes = c.take(8)?;
@@ -248,7 +240,11 @@ pub fn to_canonical_json(value: &CborValue) -> String {
     // is responsible for supplying keys already sorted per JCS (UTF-16 order).
     // For the ASCII-only keys in our schema, UTF-16 order equals bytewise
     // order, so the same sort we use for CBOR works here.
-    serde_json::to_string(&json).expect("serde_json never fails on known value tree")
+    // serde_json::to_string only fails on non-string map keys / io errors —
+    // neither is reachable for a tree built from CborValue by to_json_value.
+    #[allow(clippy::expect_used)]
+    let out = serde_json::to_string(&json).expect("serde_json never fails on known value tree");
+    out
 }
 
 fn to_json_value(value: &CborValue) -> serde_json::Value {
@@ -256,9 +252,7 @@ fn to_json_value(value: &CborValue) -> serde_json::Value {
         CborValue::Uint(n) => serde_json::Value::Number((*n).into()),
         CborValue::Bytes(b) => serde_json::Value::String(hex::encode(b)),
         CborValue::Text(s) => serde_json::Value::String(s.clone()),
-        CborValue::Array(items) => {
-            serde_json::Value::Array(items.iter().map(to_json_value).collect())
-        }
+        CborValue::Array(items) => serde_json::Value::Array(items.iter().map(to_json_value).collect()),
         CborValue::Map(pairs) => {
             let mut sorted: Vec<(&String, &CborValue)> = pairs.iter().map(|(k, v)| (k, v)).collect();
             sorted.sort_by(|a, b| a.0.cmp(b.0));

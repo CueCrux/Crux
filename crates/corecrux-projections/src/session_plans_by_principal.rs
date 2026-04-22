@@ -15,7 +15,7 @@
 //! M2 ships a **pure in-memory projection** that replays the sealed-event
 //! stream on demand. The full `.ccxs`-backed, hot/cold, snapshot-durable
 //! variant (the pattern used by the four existing projections in
-//! [`ProjectionStoreV1`]) is a follow-up refinement once the dataplane
+//! `ProjectionStoreV1`) is a follow-up refinement once the dataplane
 //! sealer lands. The on-wire event format is already stable, so the
 //! snapshot upgrade is purely internal.
 
@@ -78,11 +78,7 @@ impl SessionPlansByPrincipalV1 {
             }
             ProjectionEventV1::SessionClosed(p) => {
                 if let Some((key, idx)) = self.by_session.get(&p.session_id).cloned() {
-                    if let Some(entry) = self
-                        .by_principal
-                        .get_mut(&key)
-                        .and_then(|v| v.get_mut(idx))
-                    {
+                    if let Some(entry) = self.by_principal.get_mut(&key).and_then(|v| v.get_mut(idx)) {
                         entry.closed = true;
                         entry.close_reason = Some(p.reason.clone());
                     }
@@ -90,11 +86,7 @@ impl SessionPlansByPrincipalV1 {
             }
             ProjectionEventV1::SessionRevoked(p) => {
                 if let Some((key, idx)) = self.by_session.get(&p.session_id).cloned() {
-                    if let Some(entry) = self
-                        .by_principal
-                        .get_mut(&key)
-                        .and_then(|v| v.get_mut(idx))
-                    {
+                    if let Some(entry) = self.by_principal.get_mut(&key).and_then(|v| v.get_mut(idx)) {
                         entry.revoked = true;
                         entry.close_reason = Some(p.reason.clone());
                     }
@@ -102,11 +94,7 @@ impl SessionPlansByPrincipalV1 {
             }
             ProjectionEventV1::InvocationReceipted(p) => {
                 if let Some((key, idx)) = self.by_session.get(&p.session_id).cloned() {
-                    if let Some(entry) = self
-                        .by_principal
-                        .get_mut(&key)
-                        .and_then(|v| v.get_mut(idx))
-                    {
+                    if let Some(entry) = self.by_principal.get_mut(&key).and_then(|v| v.get_mut(idx)) {
                         entry.invocation_count = entry.invocation_count.saturating_add(1);
                     }
                 }
@@ -132,8 +120,7 @@ impl SessionPlansByPrincipalV1 {
     pub fn plans_for(&self, principal_id: &str, origin_install: Option<[u8; 32]>) -> &[PlanEntryV1] {
         self.by_principal
             .get(&(principal_id.to_string(), origin_install))
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+            .map_or(&[], Vec::as_slice)
     }
 
     pub fn lookup_session(&self, session_id: &[u8; 16]) -> Option<&PlanEntryV1> {
@@ -154,9 +141,8 @@ impl SessionPlansByPrincipalV1 {
 mod tests {
     use super::*;
     use crate::events::{
-        InvocationReceiptedV1, SessionClosedV1, SessionPlanSealedV1, SessionRevokedV1,
-        CONTENT_TYPE_SESSION_BIN_V1, EVT_INVOCATION_RECEIPTED_V1, EVT_SESSION_CLOSED_V1,
-        EVT_SESSION_PLAN_SEALED_V1, EVT_SESSION_REVOKED_V1,
+        InvocationReceiptedV1, SessionClosedV1, SessionPlanSealedV1, SessionRevokedV1, CONTENT_TYPE_SESSION_BIN_V1,
+        EVT_INVOCATION_RECEIPTED_V1, EVT_SESSION_CLOSED_V1, EVT_SESSION_PLAN_SEALED_V1, EVT_SESSION_REVOKED_V1,
     };
 
     fn ev_sealed(principal: &str, session_id: u8, origin_install: Option<[u8; 32]>) -> ProjectionEventV1 {
@@ -165,7 +151,11 @@ mod tests {
             plan_id: [session_id; 16],
             session_id: [session_id; 16],
             principal_id: principal.to_string(),
-            origin: if origin_install.is_some() { "ce".into() } else { "core".into() },
+            origin: if origin_install.is_some() {
+                "ce".into()
+            } else {
+                "core".into()
+            },
             origin_install,
             minted_at_ms: 1_000_000,
             expires_at_ms: 2_000_000,

@@ -15,15 +15,15 @@ use std::sync::Arc;
 use prometheus::{CounterVec, Gauge, HistogramOpts, HistogramVec, Opts, Registry};
 
 pub struct SessionMetrics {
-    pub handshakes_total: CounterVec, // labels: origin, outcome
-    pub handshake_latency_seconds: HistogramVec, // labels: origin
-    pub capability_graph_size: HistogramVec, // labels: origin, tier
-    pub active: Gauge, // no labels on CE (single install)
-    pub expired_total: CounterVec, // labels: origin, reason
-    pub plan_bytes: HistogramVec, // labels: encoding (cbor|json)
-    pub invocation_receipts_total: CounterVec, // labels: channel, capability, outcome
+    pub handshakes_total: CounterVec,                     // labels: origin, outcome
+    pub handshake_latency_seconds: HistogramVec,          // labels: origin
+    pub capability_graph_size: HistogramVec,              // labels: origin, tier
+    pub active: Gauge,                                    // no labels on CE (single install)
+    pub expired_total: CounterVec,                        // labels: origin, reason
+    pub plan_bytes: HistogramVec,                         // labels: encoding (cbor|json)
+    pub invocation_receipts_total: CounterVec,            // labels: channel, capability, outcome
     pub invocation_receipt_latency_seconds: HistogramVec, // labels: channel, capability
-    pub invocation_verify_total: CounterVec, // labels: outcome (verified|flagged|not_found)
+    pub invocation_verify_total: CounterVec,              // labels: outcome (verified|flagged|not_found)
     pub plan_sealer_errors_total: Gauge,
     pub segment_seal_failures_total: Gauge,
 }
@@ -47,9 +47,7 @@ impl SessionMetrics {
                 "vaultcrux_session_handshake_latency_seconds",
                 "End-to-end handshake latency",
             )
-            .buckets(vec![
-                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
-            ]),
+            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]),
             &["origin"],
         )
         .expect("histogram");
@@ -75,9 +73,7 @@ impl SessionMetrics {
             "Currently-active sessions in the local registry",
         )
         .expect("gauge");
-        registry
-            .register(Box::new(active.clone()))
-            .expect("register active");
+        registry.register(Box::new(active.clone())).expect("register active");
 
         let expired_total = CounterVec::new(
             Opts::new(
@@ -92,13 +88,8 @@ impl SessionMetrics {
             .expect("register expired_total");
 
         let plan_bytes = HistogramVec::new(
-            HistogramOpts::new(
-                "vaultcrux_session_plan_bytes",
-                "Size of issued session plans",
-            )
-            .buckets(vec![
-                256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0,
-            ]),
+            HistogramOpts::new("vaultcrux_session_plan_bytes", "Size of issued session plans")
+                .buckets(vec![256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0]),
             &["encoding"],
         )
         .expect("histogram");
@@ -123,9 +114,7 @@ impl SessionMetrics {
                 "vaultcrux_invocation_receipt_latency_seconds",
                 "Per-capability invocation latency",
             )
-            .buckets(vec![
-                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
-            ]),
+            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]),
             &["channel", "capability"],
         )
         .expect("histogram");
@@ -134,10 +123,7 @@ impl SessionMetrics {
             .expect("register invocation_receipt_latency");
 
         let invocation_verify_total = CounterVec::new(
-            Opts::new(
-                "vaultcrux_invocation_verify_total",
-                "POST /invocation/verify outcomes",
-            ),
+            Opts::new("vaultcrux_invocation_verify_total", "POST /invocation/verify outcomes"),
             &["outcome"],
         )
         .expect("counter");
@@ -178,7 +164,15 @@ impl SessionMetrics {
         }
     }
 
-    pub fn handshake_ok(&self, origin: &str, latency_secs: f64, graph_size: usize, tier: &str, plan_bytes: usize, encoding: &str) {
+    pub fn handshake_ok(
+        &self,
+        origin: &str,
+        latency_secs: f64,
+        graph_size: usize,
+        tier: &str,
+        plan_bytes: usize,
+        encoding: &str,
+    ) {
         self.handshakes_total.with_label_values(&[origin, "ok"]).inc();
         self.handshake_latency_seconds
             .with_label_values(&[origin])
@@ -192,9 +186,7 @@ impl SessionMetrics {
     }
 
     pub fn handshake_failed(&self, origin: &str, reason: &str) {
-        self.handshakes_total
-            .with_label_values(&[origin, reason])
-            .inc();
+        self.handshakes_total.with_label_values(&[origin, reason]).inc();
     }
 
     pub fn handshake_seal_failure(&self, origin: &str) {
@@ -205,9 +197,7 @@ impl SessionMetrics {
     }
 
     pub fn invocation_verify(&self, outcome: &str) {
-        self.invocation_verify_total
-            .with_label_values(&[outcome])
-            .inc();
+        self.invocation_verify_total.with_label_values(&[outcome]).inc();
     }
 
     pub fn active_set(&self, n: i64) {
@@ -216,19 +206,36 @@ impl SessionMetrics {
 
     /// Histogram observe for a just-completed invocation. Use
     /// `outcome` ∈ {"ok","error","partial"} per master-plan §8.1.
-    pub fn invocation_observe(
-        &self,
-        channel: &str,
-        capability: &str,
-        outcome: &str,
-        latency_secs: f64,
-    ) {
+    // Wired up by the proprietary invocation receipt path (master-plan §8);
+    // kept in CE so the metric surface matches hosted.
+    #[allow(dead_code)]
+    pub fn invocation_observe(&self, channel: &str, capability: &str, outcome: &str, latency_secs: f64) {
         self.invocation_receipts_total
             .with_label_values(&[channel, capability, outcome])
             .inc();
         self.invocation_receipt_latency_seconds
             .with_label_values(&[channel, capability])
             .observe(latency_secs);
+    }
+}
+
+/// Allow `Clone` so call-sites can hold their own Arc-less handle — the
+/// prometheus handles are already cheap to clone (internal `Arc`s).
+impl Clone for SessionMetrics {
+    fn clone(&self) -> Self {
+        Self {
+            handshakes_total: self.handshakes_total.clone(),
+            handshake_latency_seconds: self.handshake_latency_seconds.clone(),
+            capability_graph_size: self.capability_graph_size.clone(),
+            active: self.active.clone(),
+            expired_total: self.expired_total.clone(),
+            plan_bytes: self.plan_bytes.clone(),
+            invocation_receipts_total: self.invocation_receipts_total.clone(),
+            invocation_receipt_latency_seconds: self.invocation_receipt_latency_seconds.clone(),
+            invocation_verify_total: self.invocation_verify_total.clone(),
+            plan_sealer_errors_total: self.plan_sealer_errors_total.clone(),
+            segment_seal_failures_total: self.segment_seal_failures_total.clone(),
+        }
     }
 }
 
@@ -265,26 +272,6 @@ mod tests {
                 rendered.contains(needle),
                 "expected `{needle}` in metrics output:\n{rendered}"
             );
-        }
-    }
-}
-
-/// Allow `Clone` so call-sites can hold their own Arc-less handle — the
-/// prometheus handles are already cheap to clone (internal `Arc`s).
-impl Clone for SessionMetrics {
-    fn clone(&self) -> Self {
-        Self {
-            handshakes_total: self.handshakes_total.clone(),
-            handshake_latency_seconds: self.handshake_latency_seconds.clone(),
-            capability_graph_size: self.capability_graph_size.clone(),
-            active: self.active.clone(),
-            expired_total: self.expired_total.clone(),
-            plan_bytes: self.plan_bytes.clone(),
-            invocation_receipts_total: self.invocation_receipts_total.clone(),
-            invocation_receipt_latency_seconds: self.invocation_receipt_latency_seconds.clone(),
-            invocation_verify_total: self.invocation_verify_total.clone(),
-            plan_sealer_errors_total: self.plan_sealer_errors_total.clone(),
-            segment_seal_failures_total: self.segment_seal_failures_total.clone(),
         }
     }
 }

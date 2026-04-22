@@ -29,8 +29,7 @@ use blake3::Hasher;
 use crate::canonical::CborValue;
 use crate::catalog::{tier_meets, CatalogEntry, DEFAULT_CATALOG};
 use crate::intent::{
-    apply_intent_shaping_with_affinity, default_intent_table, hash_capability_graph_with_intent,
-    IntentTable,
+    apply_intent_shaping_with_affinity, default_intent_table, hash_capability_graph_with_intent, IntentTable,
 };
 use crate::plan::{Capability, Passport, HASH_LEN};
 
@@ -134,14 +133,9 @@ pub fn generate_graph(input: GenerateInput<'_>) -> GeneratedGraph {
     // Unknown intents are silent no-ops (ignored, not rejected) so a
     // forward-compatible agent can try new intents on old servers.
     let mut caps: Vec<Capability> = decorated.iter().map(|(c, _)| c.clone()).collect();
-    let affinity_by_cap: std::collections::HashMap<String, &str> = decorated
-        .iter()
-        .map(|(c, a)| (c.cap.clone(), *a))
-        .collect();
-    let table = input
-        .intent_table
-        .map(|t| t.clone())
-        .unwrap_or_else(default_intent_table);
+    let affinity_by_cap: std::collections::HashMap<String, &str> =
+        decorated.iter().map(|(c, a)| (c.cap.clone(), *a)).collect();
+    let table = input.intent_table.cloned().unwrap_or_else(default_intent_table);
     apply_intent_shaping_with_affinity(
         &mut caps,
         &table,
@@ -242,7 +236,11 @@ mod tests {
     fn wildcard_affinity_includes_all_capabilities() {
         let pp = passport("local", &["*"]);
         let flags: HashSet<String> = HashSet::new();
-        let hints = GraphHints { prefer_bulk: true, intent: None, max_capabilities: None };
+        let hints = GraphHints {
+            prefer_bulk: true,
+            intent: None,
+            max_capabilities: None,
+        };
         let graph = generate_default(&pp, &hints, None, &flags);
         // CE should see every catalog entry (no tier blocks at local? yes it does
         // block — "local" is rank 0, "free" is rank 1, so min_tier = "free"
@@ -252,9 +250,7 @@ mod tests {
         for cap in &graph.capabilities {
             if let Some(required) = &cap.min_tier {
                 assert!(
-                    crate::catalog::tier_meets("local", required)
-                        || required == "free"
-                        || required.is_empty(),
+                    crate::catalog::tier_meets("local", required) || required == "free" || required.is_empty(),
                     "unexpected tier: {required}"
                 );
             }
@@ -265,7 +261,11 @@ mod tests {
     fn tier_filter_drops_capabilities_above_tier() {
         let free = passport("free", &["retrieval", "proof", "audit"]);
         let flags = HashSet::new();
-        let hints = GraphHints { prefer_bulk: true, intent: None, max_capabilities: None };
+        let hints = GraphHints {
+            prefer_bulk: true,
+            intent: None,
+            max_capabilities: None,
+        };
         let graph = generate_default(&free, &hints, None, &flags);
         // `proof_document` requires starter; `get_counterfactual_summary` requires pro.
         let names: Vec<&str> = graph.capabilities.iter().map(|c| c.cap.as_str()).collect();
@@ -278,7 +278,11 @@ mod tests {
     fn affinity_filter_drops_non_matching() {
         let pp = passport("pro", &["retrieval"]);
         let flags = HashSet::new();
-        let hints = GraphHints { prefer_bulk: true, intent: None, max_capabilities: None };
+        let hints = GraphHints {
+            prefer_bulk: true,
+            intent: None,
+            max_capabilities: None,
+        };
         let graph = generate_default(&pp, &hints, None, &flags);
         let names: Vec<&str> = graph.capabilities.iter().map(|c| c.cap.as_str()).collect();
         assert!(names.contains(&"retrieve"));
@@ -290,7 +294,11 @@ mod tests {
     fn budget_filter_drops_heavy_below_threshold() {
         let pp = passport("pro", &["proof", "audit"]);
         let flags = HashSet::new();
-        let hints = GraphHints { prefer_bulk: true, intent: None, max_capabilities: None };
+        let hints = GraphHints {
+            prefer_bulk: true,
+            intent: None,
+            max_capabilities: None,
+        };
         let with_budget = generate_default(&pp, &hints, Some(1), &flags);
         let without_budget = generate_default(&pp, &hints, None, &flags);
         let with_names: Vec<_> = with_budget.capabilities.iter().map(|c| c.cap.clone()).collect();
@@ -303,7 +311,11 @@ mod tests {
     fn prefer_bulk_false_rewrites_to_mcp() {
         let pp = passport("team", &["retrieval"]);
         let flags = HashSet::new();
-        let hints = GraphHints { prefer_bulk: false, intent: None, max_capabilities: None };
+        let hints = GraphHints {
+            prefer_bulk: false,
+            intent: None,
+            max_capabilities: None,
+        };
         let graph = generate_default(&pp, &hints, Some(100), &flags);
         for cap in &graph.capabilities {
             assert_eq!(cap.prefer, "mcp", "{}", cap.cap);
@@ -314,7 +326,11 @@ mod tests {
     fn graph_hash_is_deterministic_and_covers_order() {
         let pp = passport("team", &["retrieval", "memory"]);
         let flags = HashSet::new();
-        let hints = GraphHints { prefer_bulk: true, intent: None, max_capabilities: None };
+        let hints = GraphHints {
+            prefer_bulk: true,
+            intent: None,
+            max_capabilities: None,
+        };
         let g1 = generate_default(&pp, &hints, Some(100), &flags);
         let g2 = generate_default(&pp, &hints, Some(100), &flags);
         assert_eq!(g1.hash, g2.hash);

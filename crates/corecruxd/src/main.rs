@@ -348,20 +348,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // fails — tests are the expected consumer of the ephemeral
             // path. Either way, the route is live.
             let mcp_url = format!("http://{}/mcp", config.http_addr);
-            let session_metrics = Arc::new(
-                crate::http::session_metrics::SessionMetrics::new(&metrics.registry()),
-            );
-            match crate::http::session::SessionServices::local_durable(
-                &config.data_dir,
-                node_id.clone(),
-                mcp_url,
-            ) {
+            let session_metrics = Arc::new(crate::http::session_metrics::SessionMetrics::new(&metrics.registry()));
+            match crate::http::session::SessionServices::local_durable(&config.data_dir, node_id.clone(), mcp_url) {
                 Ok(services) => Some(Arc::new(services.with_metrics(session_metrics))),
                 Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        "durable session wiring failed; falling back to ephemeral"
-                    );
+                    tracing::warn!(?err, "durable session wiring failed; falling back to ephemeral");
                     Some(Arc::new(
                         crate::http::session::SessionServices::local_default(node_id.clone())
                             .with_metrics(session_metrics),

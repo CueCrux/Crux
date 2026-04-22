@@ -10,13 +10,17 @@ mod facts;
 mod health;
 pub mod invocation;
 mod observe;
-pub mod session_metrics;
 mod openapi;
 mod projections;
 mod query;
 mod receipts;
 mod routing;
 pub mod session;
+// session_metrics: Prometheus register!() at init — safe, panics only on
+// duplicate registration (programmer error caught in tests). Mirrors the
+// allow on `mod metrics` in main.rs.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+pub mod session_metrics;
 
 pub(crate) use admin::AdminActionRecord;
 // HttpDataplane trait re-exported for test fakes (FakeHttpDataplane in tests.rs).

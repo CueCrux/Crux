@@ -47,10 +47,10 @@ preferred routing, min-tier, and cost class. Call it once per session for the co
 ///
 /// `cuecrux_session` is listed first per master-plan §6.3 so agents that
 /// stop reading at the top of the list still discover the collapsed-surface
-/// entry point. Every OTHER tool is augmented at emit time with
-/// [`CUECRUX_SESSION_HINT`] so the pointer is visible in each tool's
-/// description — cheap affordance for agents that skip the hint at the
-/// head of the list.
+/// entry point. Every OTHER tool is augmented at emit time with the
+/// `CUECRUX_SESSION_HINT` (module-private) so the pointer is visible in
+/// each tool's description — cheap affordance for agents that skip the
+/// hint at the head of the list.
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         // ── Session Handshake (master-plan §6) ────────────────────

@@ -13,8 +13,8 @@
 //! - [`verify_invocation_receipt`] — returns a [`InvocationVerdict`] per
 //!   master-plan §8.2. Violations of the `capability` / `channel` checks
 //!   are **flagged, not rejected** — audit must see the attempt.
-//! - [`build_invocation_sealed_event`] — builds a
-//!   [`crate::sealer::SealedEvent`] ready to hand to a [`PlanSealer`] so
+//! - `build_invocation_sealed_event` — builds a
+//!   [`crate::sealer::SealedEvent`] ready to hand to a segment sealer so
 //!   the invocation lands in the segment log.
 
 use crate::plan::{SessionPlan, HASH_LEN, ULID_LEN};
@@ -83,10 +83,7 @@ impl InvocationVerdict {
     }
 }
 
-pub fn verify_invocation_receipt(
-    receipt: &InvocationReceipt,
-    plan: &SessionPlan,
-) -> InvocationVerdict {
+pub fn verify_invocation_receipt(receipt: &InvocationReceipt, plan: &SessionPlan) -> InvocationVerdict {
     let mut faults: Vec<String> = Vec::new();
 
     // (1) Receipt's own hash must match a re-encode with the hash/sig/kid zeroed.
@@ -103,10 +100,7 @@ pub fn verify_invocation_receipt(
     }
 
     // (3) capability must be in the plan's capability_graph.
-    let cap = plan
-        .capability_graph
-        .iter()
-        .find(|c| c.cap == receipt.capability);
+    let cap = plan.capability_graph.iter().find(|c| c.cap == receipt.capability);
     let capability_ok = cap.is_some();
     if !capability_ok {
         faults.push(format!("capability_not_in_graph:{}", receipt.capability));
@@ -143,7 +137,7 @@ pub fn verify_invocation_receipt(
 /// `corecrux-projections::InvocationReceiptedV1` schema.
 ///
 /// This is the event that lands in the segment log after a tool call
-/// completes. The caller ties it through their [`PlanSealer`]; we keep
+/// completes. The caller ties it through their segment sealer; we keep
 /// the encoding decoupled from the projection crate here and leave the
 /// actual wire-format encoding to the caller (corecruxd / VaultCrux).
 /// A small helper in each of those crates turns this `InvocationReceipt`
@@ -170,8 +164,8 @@ mod tests {
     use super::*;
     use crate::handshake::random_ulid;
     use crate::plan::{
-        Budget, Capability, Channels, ImplPath, Passport, ReceiptEnvelope, ReceiptMode,
-        SessionPlan, SESSION_PLAN_VERSION,
+        Budget, Capability, Channels, ImplPath, Passport, ReceiptEnvelope, ReceiptMode, SessionPlan,
+        SESSION_PLAN_VERSION,
     };
     use crate::receipt::plan_receipt_hash;
 
@@ -321,9 +315,6 @@ mod tests {
         receipt.receipt_hash[0] ^= 0x01;
         let verdict = verify_invocation_receipt(&receipt, &plan);
         assert!(!verdict.integrity_ok);
-        assert!(verdict
-            .governance_faults
-            .iter()
-            .any(|f| f == "receipt_hash_mismatch"));
+        assert!(verdict.governance_faults.iter().any(|f| f == "receipt_hash_mismatch"));
     }
 }

@@ -61,15 +61,15 @@ fn read_or_init_install_uuid(path: &Path) -> Result<String, SessionError> {
             let trimmed = content.trim().to_string();
             if trimmed.is_empty() {
                 return Err(SessionError::Encode(format!(
-                    "install-uuid file {path:?} is empty"
+                    "install-uuid file {} is empty",
+                    path.display()
                 )));
             }
             Ok(trimmed)
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| SessionError::Encode(format!("create data_dir: {e}")))?;
+                fs::create_dir_all(parent).map_err(|e| SessionError::Encode(format!("create data_dir: {e}")))?;
             }
             // Use a simple UUIDv4-like 32-char hex. The installation ID is
             // hashed with BLAKE3 before it ever leaves this machine (see
@@ -78,8 +78,7 @@ fn read_or_init_install_uuid(path: &Path) -> Result<String, SessionError> {
             let mut bytes = [0u8; 16];
             rand::Rng::fill(&mut rand::thread_rng(), &mut bytes[..]);
             let uuid = hex::encode(bytes);
-            fs::write(path, &uuid)
-                .map_err(|e| SessionError::Encode(format!("write install-uuid: {e}")))?;
+            fs::write(path, &uuid).map_err(|e| SessionError::Encode(format!("write install-uuid: {e}")))?;
             Ok(uuid)
         }
         Err(e) => Err(SessionError::Encode(format!("read install-uuid: {e}"))),

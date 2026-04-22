@@ -72,7 +72,7 @@ fn mcp_tools_list() {
         .unwrap()
         .into_json()
         .unwrap();
-    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 27);
+    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 28);
 }
 
 #[test]

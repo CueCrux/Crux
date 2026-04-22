@@ -12,14 +12,14 @@
 use std::collections::HashSet;
 
 use corecrux_projections::{
-    CONTENT_TYPE_SESSION_BIN_V1, EVT_INVOCATION_RECEIPTED_V1, EVT_SESSION_PLAN_SEALED_V1,
-    InvocationReceiptedV1, SessionPlanSealedV1,
+    InvocationReceiptedV1, SessionPlanSealedV1, CONTENT_TYPE_SESSION_BIN_V1, EVT_INVOCATION_RECEIPTED_V1,
+    EVT_SESSION_PLAN_SEALED_V1,
 };
 use crux_session::{
-    handshake::random_ulid, invocation::MintInvocation, mint as mint_plan, mint_invocation_receipt,
-    plan::ReceiptMode, verify_invocation_receipt, Budget, Channels, GraphHints, HandshakeInputs,
-    HandshakeRequest, InMemoryRegistry, InMemorySealer, InProcessEd25519Signer, Passport,
-    PlanSealer, RegistryEntry, SealedEvent, SessionPlan, SessionRegistry, DEFAULT_CATALOG,
+    handshake::random_ulid, invocation::MintInvocation, mint as mint_plan, mint_invocation_receipt, plan::ReceiptMode,
+    verify_invocation_receipt, Budget, Channels, GraphHints, HandshakeInputs, HandshakeRequest, InMemoryRegistry,
+    InMemorySealer, InProcessEd25519Signer, Passport, PlanSealer, RegistryEntry, SealedEvent, SessionPlan,
+    SessionRegistry, DEFAULT_CATALOG,
 };
 
 fn build_plan() -> (SessionPlan, Vec<u8>) {
@@ -35,7 +35,11 @@ fn build_plan() -> (SessionPlan, Vec<u8>) {
             bulk: Some("h2://localhost:14801/v2".into()),
             mcp: "http://localhost:14800/mcp".into(),
         },
-        hints: GraphHints { prefer_bulk: true, intent: None, max_capabilities: None },
+        hints: GraphHints {
+            prefer_bulk: true,
+            intent: None,
+            max_capabilities: None,
+        },
         session_ttl_s: 3600,
         budget: Budget {
             tokens_cap: Some(100_000),
@@ -185,10 +189,7 @@ fn registry_reverse_lookup_finds_parent_plan() {
     assert_eq!(found.session_id, plan.session_id);
     assert_eq!(found.plan_cbor, plan_cbor);
 
-    let not_found = registry
-        .get_by_plan_hash(&[0u8; 32])
-        .expect("lookup")
-        .is_none();
+    let not_found = registry.get_by_plan_hash(&[0u8; 32]).expect("lookup").is_none();
     assert!(not_found);
 }
 

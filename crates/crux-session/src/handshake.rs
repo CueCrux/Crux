@@ -28,9 +28,7 @@ use rand::RngCore;
 use crate::catalog::CatalogEntry;
 use crate::error::SessionError;
 use crate::generator::{generate_graph, GenerateInput, GraphHints};
-use crate::plan::{
-    Budget, Channels, Passport, ReceiptEnvelope, SessionPlan, SESSION_PLAN_VERSION, ULID_LEN,
-};
+use crate::plan::{Budget, Channels, Passport, ReceiptEnvelope, SessionPlan, SESSION_PLAN_VERSION, ULID_LEN};
 use crate::receipt::plan_receipt_hash;
 use crate::signer::PlanSigner;
 
@@ -59,10 +57,7 @@ pub struct SealedPlan {
     pub canonical_cbor: Vec<u8>,
 }
 
-pub fn mint(
-    request: HandshakeRequest,
-    inputs: HandshakeInputs<'_>,
-) -> Result<SealedPlan, SessionError> {
+pub fn mint(request: HandshakeRequest, inputs: HandshakeInputs<'_>) -> Result<SealedPlan, SessionError> {
     let graph = generate_graph(GenerateInput {
         catalog: inputs.catalog,
         passport: &request.passport,
@@ -111,10 +106,7 @@ pub fn mint(
     }
 
     let canonical_cbor = plan.to_canonical_cbor();
-    Ok(SealedPlan {
-        plan,
-        canonical_cbor,
-    })
+    Ok(SealedPlan { plan, canonical_cbor })
 }
 
 /// Rough ULID: timestamp component omitted; 16 random bytes. Good enough
@@ -140,7 +132,11 @@ mod tests {
                 bulk: Some("h2://localhost:14801/v2".into()),
                 mcp: "http://localhost:14801/mcp".into(),
             },
-            hints: GraphHints { prefer_bulk: true, intent: None, max_capabilities: None },
+            hints: GraphHints {
+                prefer_bulk: true,
+                intent: None,
+                max_capabilities: None,
+            },
             session_ttl_s: 3600,
             budget: Budget {
                 tokens_cap: None,
@@ -204,7 +200,6 @@ mod tests {
         assert_eq!(sealed.plan.receipt.signer_kid.as_deref(), Some("test-kid"));
 
         // Signature must verify against the signer's public key.
-        crate::receipt::verify_plan_signature(&sealed.plan, &signer.verifying_key_bytes())
-            .expect("signature verify");
+        crate::receipt::verify_plan_signature(&sealed.plan, &signer.verifying_key_bytes()).expect("signature verify");
     }
 }

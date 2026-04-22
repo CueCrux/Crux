@@ -17,7 +17,7 @@
 //! migration payload, not a hot-path wire format. An operator can
 //! inspect the bundle with `jq` before uploading.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -118,10 +118,7 @@ impl TryFrom<&ExportedReceiptWire> for InvocationReceipt {
         Ok(InvocationReceipt {
             invocation_id: fixed::<16>(&w.invocation_id, "invocation_id")?,
             session_id: fixed::<16>(&w.session_id, "session_id")?,
-            parent_plan_receipt_hash: fixed::<HASH_LEN>(
-                &w.parent_plan_receipt_hash,
-                "parent_plan_receipt_hash",
-            )?,
+            parent_plan_receipt_hash: fixed::<HASH_LEN>(&w.parent_plan_receipt_hash, "parent_plan_receipt_hash")?,
             capability: w.capability.clone(),
             channel: w.channel.clone(),
             invoked_at: w.invoked_at,
@@ -169,7 +166,7 @@ pub fn build_bundle(
 
     let mut plans: Vec<ExportedPlan> = Vec::new();
     let invocations: BTreeMap<String, Vec<ExportedInvocation>> = BTreeMap::new();
-    let mut seen_sessions: BTreeMap<String, ()> = BTreeMap::new();
+    let mut seen_sessions: BTreeSet<String> = BTreeSet::new();
 
     for event in events {
         if event.event_type == "corecrux.session.plan_sealed.v1" {
@@ -181,11 +178,9 @@ pub fn build_bundle(
             }
             let session_id: [u8; 16] = event.payload[34..50]
                 .try_into()
-                .map_err(|e: std::array::TryFromSliceError| {
-                    SessionError::Decode(format!("slice session_id: {e}"))
-                })?;
+                .map_err(|e: std::array::TryFromSliceError| SessionError::Decode(format!("slice session_id: {e}")))?;
             let session_hex = hex::encode(session_id);
-            if seen_sessions.contains_key(&session_hex) {
+            if seen_sessions.contains(&session_hex) {
                 continue; // only emit once per session even if there are multiple events
             }
             if let Some(entry) = registry
@@ -198,7 +193,7 @@ pub fn build_bundle(
                     plan_receipt_hash_hex: hex::encode(entry.plan_receipt_hash),
                     plan_cbor_hex: hex::encode(&entry.plan_cbor),
                 });
-                seen_sessions.insert(session_hex, ());
+                seen_sessions.insert(session_hex);
             }
         }
     }

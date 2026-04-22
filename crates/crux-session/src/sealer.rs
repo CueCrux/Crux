@@ -119,8 +119,7 @@ pub struct FileSealer {
 
 impl FileSealer {
     pub fn open(data_dir: &Path) -> Result<Self, SessionError> {
-        fs::create_dir_all(data_dir)
-            .map_err(|e| SessionError::Encode(format!("create data_dir: {e}")))?;
+        fs::create_dir_all(data_dir).map_err(|e| SessionError::Encode(format!("create data_dir: {e}")))?;
         Ok(Self {
             path: data_dir.join("session-events.jsonl"),
             write_lock: Mutex::new(()),
@@ -146,9 +145,8 @@ impl FileSealer {
             if line.trim().is_empty() {
                 continue;
             }
-            let wire: SealedEventWire = serde_json::from_str(line).map_err(|e| {
-                SessionError::Decode(format!("line {} of events log: {e}", i + 1))
-            })?;
+            let wire: SealedEventWire = serde_json::from_str(line)
+                .map_err(|e| SessionError::Decode(format!("line {} of events log: {e}", i + 1)))?;
             out.push(StoredEvent {
                 event_type: wire.event_type,
                 content_type: wire.content_type,
@@ -186,18 +184,17 @@ impl PlanSealer for FileSealer {
             stream_id: event.stream_id.clone(),
             payload_hex: hex::encode(&event.payload),
         };
-        let line = serde_json::to_string(&wire)
-            .map_err(|e| SessionError::Encode(format!("serialise event: {e}")))?;
-        let _guard = self.write_lock.lock().map_err(|_: PoisonError<_>| {
-            SessionError::Encode("sealer write-lock poisoned".into())
-        })?;
+        let line = serde_json::to_string(&wire).map_err(|e| SessionError::Encode(format!("serialise event: {e}")))?;
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_: PoisonError<_>| SessionError::Encode("sealer write-lock poisoned".into()))?;
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .map_err(|e| SessionError::Encode(format!("open events file: {e}")))?;
-        writeln!(f, "{line}")
-            .map_err(|e| SessionError::Encode(format!("write event: {e}")))?;
+        writeln!(f, "{line}").map_err(|e| SessionError::Encode(format!("write event: {e}")))?;
         f.sync_all()
             .map_err(|e| SessionError::Encode(format!("fsync events file: {e}")))?;
         Ok(())
