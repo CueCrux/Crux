@@ -16,51 +16,59 @@ fn daemon() -> &'static TestDaemon {
 
 #[test]
 fn healthz() {
-    let b: serde_json::Value = daemon().get("/healthz").unwrap().into_json().unwrap();
+    let b: serde_json::Value = daemon().get("/healthz").unwrap().into_body().read_json().unwrap();
     assert_eq!(b["ok"], true);
 }
 #[test]
 fn readyz() {
-    assert_eq!(daemon().get("/readyz").unwrap().status(), 200);
+    assert_eq!(daemon().get("/readyz").unwrap().status().as_u16(), 200);
 }
 #[test]
 fn metrics() {
-    let t = daemon().get("/metrics").unwrap().into_string().unwrap();
+    let t = daemon().get("/metrics").unwrap().into_body().read_to_string().unwrap();
     assert!(t.contains("build_info"));
 }
 
 #[test]
 fn version_includes_update_status() {
-    let body: serde_json::Value = daemon().get("/v1/version").unwrap().into_json().unwrap();
+    let body: serde_json::Value = daemon().get("/v1/version").unwrap().into_body().read_json().unwrap();
     assert!(body["update"]["state"].is_string());
     assert!(body["update"]["upgrade_hint"].is_string());
 }
 #[test]
 fn shards() {
-    let b: serde_json::Value = daemon().get("/v1/shards").unwrap().into_json().unwrap();
+    let b: serde_json::Value = daemon().get("/v1/shards").unwrap().into_body().read_json().unwrap();
     assert!(b["shards"].is_array());
 }
 #[test]
 fn shard_map() {
-    assert_eq!(daemon().get("/v1/shard-map").unwrap().status(), 200);
+    assert_eq!(daemon().get("/v1/shard-map").unwrap().status().as_u16(), 200);
 }
 #[test]
 fn admin_control() {
-    let b: serde_json::Value = daemon().get("/v1/admin/control").unwrap().into_json().unwrap();
+    let b: serde_json::Value = daemon()
+        .get("/v1/admin/control")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
     assert!(b["valves"].is_object());
 }
 #[test]
 fn replication() {
-    assert_eq!(daemon().get("/v1/admin/replication/status").unwrap().status(), 200);
+    assert_eq!(
+        daemon().get("/v1/admin/replication/status").unwrap().status().as_u16(),
+        200
+    );
 }
 #[test]
 fn routing_status() {
-    assert_eq!(daemon().get("/v1/routing/status").unwrap().status(), 200);
+    assert_eq!(daemon().get("/v1/routing/status").unwrap().status().as_u16(), 200);
 }
 
 #[test]
 fn mcp_server_info() {
-    let body: serde_json::Value = daemon().mcp_get().unwrap().into_json().unwrap();
+    let body: serde_json::Value = daemon().mcp_get().unwrap().into_body().read_json().unwrap();
     assert_eq!(body["serverInfo"]["name"], "crux");
     assert!(body["protocolVersion"].is_string());
 }
@@ -70,7 +78,8 @@ fn mcp_tools_list() {
     let body: serde_json::Value = daemon()
         .mcp_post_json(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 28);
 }
@@ -85,7 +94,8 @@ fn mcp_update_status_tool() {
             "params":{"name":"update_status","arguments":{}}
         }))
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("\"state\""));
@@ -97,7 +107,7 @@ fn mcp_requires_auth_when_agent_token_configured() {
     let daemon = TestDaemon::start_with_agent_token("secret-token");
 
     match daemon.mcp_post_json(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})) {
-        Err(ureq::Error::Status(401, _)) => {}
+        Err(ureq::Error::StatusCode(401)) => {}
         other => panic!("expected 401 from unauthenticated MCP request, got {other:?}"),
     }
 
@@ -112,7 +122,8 @@ fn mcp_requires_auth_when_agent_token_configured() {
             "secret-token",
         )
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     assert_eq!(body["result"]["content"][0]["text"], "default");
 }
@@ -125,7 +136,8 @@ fn text_search_empty() {
             json!({"tenant_id":"t","query":"hello","limit":10}),
         )
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     assert!(b["results"].is_array());
     assert!(b["coverage"]["score"].is_number());
@@ -139,7 +151,8 @@ fn text_search_token_budget() {
             json!({"tenant_id":"t","query":"test","token_budget":4000}),
         )
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     // Empty index returns early without tokens_used; just verify 200 OK with results array
     assert!(b["results"].is_array());
@@ -153,7 +166,8 @@ fn text_search_min_score() {
             json!({"tenant_id":"t","query":"x","min_score":0.5}),
         )
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     assert!(b["results"].is_array());
 }
@@ -166,7 +180,8 @@ fn text_search_scan_mode() {
             json!({"tenant_id":"t","query":"scan","mode":"scan"}),
         )
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     // Empty index returns early response without scan_mode field
     assert!(b["results"].is_array());
@@ -177,7 +192,8 @@ fn text_search_expand() {
     let b: serde_json::Value = daemon()
         .post_json("/v1/query/text-search/expand", json!({"tenant_id":"t","result_ids":[]}))
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     assert_eq!(b["tokens_loaded"], 0);
 }
@@ -185,7 +201,7 @@ fn text_search_expand() {
 #[test]
 fn text_search_bad_query() {
     match daemon().post_json("/v1/query/text-search", json!({"tenant_id":"t","query":"  "})) {
-        Err(ureq::Error::Status(400, _)) => {}
+        Err(ureq::Error::StatusCode(400)) => {}
         other => panic!("expected 400: {other:?}"),
     }
 }
@@ -206,7 +222,7 @@ fn append_compat_alias_returns_not_implemented_without_dataplane() {
             }]
         }),
     ) {
-        Err(ureq::Error::Status(501, _)) => {}
+        Err(ureq::Error::StatusCode(501)) => {}
         other => panic!("expected 501 from append alias without dataplane, got {other:?}"),
     }
 }
@@ -220,23 +236,29 @@ fn fact_crud() {
             json!({"entity":"e","key":"k","value":"v","confidence":0.9}),
         )
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     let id = f["fact_id"].as_str().unwrap();
     assert!(id.starts_with("f_"));
 
-    let g: serde_json::Value = d.get(&format!("/v1/facts/{id}")).unwrap().into_json().unwrap();
+    let g: serde_json::Value = d
+        .get(&format!("/v1/facts/{id}"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
     assert_eq!(g["entity"], "e");
 
-    let e: serde_json::Value = d.get("/v1/facts/entity/e").unwrap().into_json().unwrap();
+    let e: serde_json::Value = d.get("/v1/facts/entity/e").unwrap().into_body().read_json().unwrap();
     assert!(!e["facts"].as_array().unwrap().is_empty());
 
-    let q: serde_json::Value = d.get("/v1/facts?query=v").unwrap().into_json().unwrap();
+    let q: serde_json::Value = d.get("/v1/facts?query=v").unwrap().into_body().read_json().unwrap();
     assert!(q["total_tokens"].is_number());
 
-    assert_eq!(d.delete(&format!("/v1/facts/{id}")).unwrap().status(), 200);
+    assert_eq!(d.delete(&format!("/v1/facts/{id}")).unwrap().status().as_u16(), 200);
     match d.get(&format!("/v1/facts/{id}")) {
-        Err(ureq::Error::Status(404, _)) => {}
+        Err(ureq::Error::StatusCode(404)) => {}
         other => panic!("{other:?}"),
     }
 }
@@ -249,7 +271,8 @@ fn fact_bulk() {
             json!([{"entity":"a","key":"k","value":"v"},{"entity":"b","key":"k","value":"v"}]),
         )
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     assert_eq!(b["facts"].as_array().unwrap().len(), 2);
 }
@@ -260,7 +283,7 @@ fn fact_private_true_rejected_over_http() {
         "/v1/facts",
         json!({"entity":"agent","key":"secret","value":"hidden","private":true}),
     ) {
-        Err(ureq::Error::Status(400, _)) => {}
+        Err(ureq::Error::StatusCode(400)) => {}
         other => panic!("expected 400 from private HTTP fact write, got {other:?}"),
     }
 }
@@ -271,23 +294,24 @@ fn session_crud() {
     let s: serde_json::Value = d
         .put_json("/v1/sessions/s1/state", json!({"step":1}))
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     assert_eq!(s["session_id"], "s1");
     assert!(s["total_tokens"].as_u64().unwrap() > 0);
 
-    let g: serde_json::Value = d.get("/v1/sessions/s1/state").unwrap().into_json().unwrap();
+    let g: serde_json::Value = d.get("/v1/sessions/s1/state").unwrap().into_body().read_json().unwrap();
     assert_eq!(g["state"]["step"], 1);
 
     d.put_json("/v1/sessions/s1/state", json!({"step":2})).unwrap();
-    let g2: serde_json::Value = d.get("/v1/sessions/s1/state").unwrap().into_json().unwrap();
+    let g2: serde_json::Value = d.get("/v1/sessions/s1/state").unwrap().into_body().read_json().unwrap();
     assert_eq!(g2["state"]["step"], 2);
 }
 
 #[test]
 fn session_not_found() {
     match daemon().get("/v1/sessions/nonexistent/state") {
-        Err(ureq::Error::Status(404, _)) => {}
+        Err(ureq::Error::StatusCode(404)) => {}
         other => panic!("{other:?}"),
     }
 }
@@ -296,7 +320,7 @@ fn session_not_found() {
 fn graceful_shutdown_on_sigterm() {
     let mut daemon = TestDaemon::start();
     // Verify the daemon is alive and responding.
-    let b: serde_json::Value = daemon.get("/healthz").unwrap().into_json().unwrap();
+    let b: serde_json::Value = daemon.get("/healthz").unwrap().into_body().read_json().unwrap();
     assert_eq!(b["ok"], true);
 
     // Send SIGTERM via the kill command (avoids unsafe block).
@@ -340,8 +364,8 @@ fn receipt_not_found() {
         "/v1/receipts/fake/verification",
     ] {
         match daemon().get(p) {
-            Err(ureq::Error::Status(c, _)) if c == 400 || c == 404 || c == 501 || c == 412 => {}
-            Ok(r) if [200, 400, 404, 412, 501].contains(&r.status()) => {}
+            Err(ureq::Error::StatusCode(c)) if c == 400 || c == 404 || c == 501 || c == 412 => {}
+            Ok(r) if [200, 400, 404, 412, 501].contains(&r.status().as_u16()) => {}
             other => panic!("{p}: {other:?}"),
         }
     }

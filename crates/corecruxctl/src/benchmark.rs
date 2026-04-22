@@ -130,7 +130,7 @@ fn run_quick(
             "confidence": 1.0
         });
         ureq::put(&format!("{http_base}/v1/facts"))
-            .set("Content-Type", "application/json")
+            .header("Content-Type", "application/json")
             .send_json(body)?;
     }
     let ingest_ms = ingest_start.elapsed().as_millis();
@@ -146,7 +146,7 @@ fn run_quick(
 
     for q in &queries {
         let start = Instant::now();
-        let resp = ureq::get(&format!(
+        let mut resp = ureq::get(&format!(
             "{http_base}/v1/facts?query={}&top_k=5",
             urlencoding::encode(&q.query)
         ))
@@ -154,7 +154,7 @@ fn run_quick(
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
         latencies.push(latency_ms);
 
-        let body: serde_json::Value = resp.into_json()?;
+        let body: serde_json::Value = resp.body_mut().read_json()?;
         let facts = body["facts"].as_array().cloned().unwrap_or_default();
 
         // Extract doc_ids from returned facts (entity = __benchmark__::{doc_id})
@@ -209,9 +209,10 @@ fn run_quick(
             "confidence": 0.9
         });
         let resp: serde_json::Value = ureq::put(&format!("{http_base}/v1/facts"))
-            .set("Content-Type", "application/json")
+            .header("Content-Type", "application/json")
             .send_json(body)?
-            .into_json()?;
+            .into_body()
+            .read_json()?;
         if let Some(id) = resp["fact_id"].as_str() {
             fact_ids.push(id.to_string());
         }
@@ -224,7 +225,7 @@ fn run_quick(
         "confidence": 0.95
     });
     ureq::put(&format!("{http_base}/v1/facts"))
-        .set("Content-Type", "application/json")
+        .header("Content-Type", "application/json")
         .send_json(body)?;
 
     // Query back
@@ -232,7 +233,8 @@ fn run_quick(
         "{http_base}/v1/facts?query=test+value&entity=__benchmark__::fact_test&top_k=20"
     ))
     .call()?
-    .into_json()?;
+    .into_body()
+    .read_json()?;
     let found = resp["facts"].as_array().map_or(0, |a| a.len());
     let fact_recall = found as f32 / (fact_test_count + 1) as f32; // +1 for the update
 
@@ -241,7 +243,8 @@ fn run_quick(
         "{http_base}/v1/facts/entity/__benchmark__::fact_test/key/key_0/history"
     ))
     .call()?
-    .into_json()?;
+    .into_body()
+    .read_json()?;
     let chain_depth = history_resp["versions"].as_array().map_or(1, |a| a.len());
 
     eprintln!("{} facts, chain depth {}", fact_test_count, chain_depth);
@@ -308,7 +311,8 @@ fn run_quick(
         "{http_base}/v1/facts?entity=__benchmark__::fact_test&top_k=100"
     ))
     .call()?
-    .into_json()?;
+    .into_body()
+    .read_json()?;
     if let Some(facts) = cleanup_resp["facts"].as_array() {
         for f in facts {
             if let Some(id) = f["fact_id"].as_str() {
@@ -324,7 +328,8 @@ fn run_quick(
             urlencoding::encode(&entity)
         ))
         .call()?
-        .into_json()?;
+        .into_body()
+        .read_json()?;
         if let Some(facts) = resp["facts"].as_array() {
             for f in facts {
                 if let Some(id) = f["fact_id"].as_str() {
@@ -339,11 +344,11 @@ fn run_quick(
     if upload {
         eprint!("\n  Uploading to scorecrux.com... ");
         match ureq::post("https://scorecrux.com/api/v1/submit")
-            .set("Content-Type", "application/json")
+            .header("Content-Type", "application/json")
             .send_json(serde_json::json!(report))
         {
-            Ok(resp) => {
-                let body: serde_json::Value = resp.into_json().unwrap_or_default();
+            Ok(mut resp) => {
+                let body: serde_json::Value = resp.body_mut().read_json().unwrap_or_default();
                 if let Some(url) = body["url"].as_str() {
                     eprintln!("uploaded!");
                     eprintln!("  View at: {url}");

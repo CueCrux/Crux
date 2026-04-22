@@ -1024,7 +1024,7 @@ fn observe_corecrux_identity(opts: &AuditPackOptionsV1) -> (BuildInfo, CompatCon
     let base = opts.corecrux_base.trim_end_matches('/');
     let health_url = format!("{base}/healthz");
     match ureq::get(&health_url).call() {
-        Ok(resp) => match resp.into_json::<HealthzResponse>() {
+        Ok(mut resp) => match resp.body_mut().read_json::<HealthzResponse>() {
             Ok(v) => (v.build, v.compat),
             Err(_) => (fallback_build, fallback_compat),
         },
@@ -1526,9 +1526,9 @@ fn fetch_receipt_export_bundle(
     let url = format!(
         "{base}/v1/replay/exports/{kind}/{value}?tenant_id={tenant_id}&format=zip&redaction=none&include=body,sig,verification,trace_summary,subject_links,linked_receipts"
     );
-    let resp = ureq::get(&url).call()?;
+    let mut resp = ureq::get(&url).call()?;
     let mut bytes = Vec::new();
-    resp.into_reader().read_to_end(&mut bytes)?;
+    resp.body_mut().as_reader().read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -1772,10 +1772,9 @@ fn fetch_stream_headers_v1(
     let url = format!(
         "{base}/v1/replay/exports/streams/{stream_type}/{stream_id}?tenant_id={tenant_id}&fromSeq={from_seq}&maxEvents={max_events}&include=headers&redaction=metadata_only&format=zip"
     );
-    let resp = ureq::get(&url).call()?;
+    let mut resp = ureq::get(&url).call()?;
     let mut zip_bytes: Vec<u8> = Vec::new();
-    let mut reader = resp.into_reader();
-    reader.read_to_end(&mut zip_bytes)?;
+    resp.body_mut().as_reader().read_to_end(&mut zip_bytes)?;
 
     let mut zip = zip::ZipArchive::new(Cursor::new(zip_bytes))?;
     let mut headers_file = zip.by_name("events/headers.jsonl")?;
@@ -2245,7 +2244,7 @@ fn build_integrity_scan_report(opts: &AuditPackOptionsV1) -> IntegrityScanReport
     let mut checks: Vec<IntegrityCheckV1> = Vec::new();
 
     let health_ok = match health_result {
-        Ok(resp) => match resp.into_json::<serde_json::Value>() {
+        Ok(mut resp) => match resp.body_mut().read_json::<serde_json::Value>() {
             Ok(v) => {
                 let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
                 let build_ok = v.get("build").is_some();
@@ -2282,7 +2281,7 @@ fn build_integrity_scan_report(opts: &AuditPackOptionsV1) -> IntegrityScanReport
     };
 
     let ready_ok = match ready_result {
-        Ok(resp) => match resp.into_json::<serde_json::Value>() {
+        Ok(mut resp) => match resp.body_mut().read_json::<serde_json::Value>() {
             Ok(v) => {
                 let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
                 checks.push(IntegrityCheckV1 {
@@ -2312,8 +2311,8 @@ fn build_integrity_scan_report(opts: &AuditPackOptionsV1) -> IntegrityScanReport
     };
 
     let metrics_build_info_present = match metrics_result {
-        Ok(resp) => {
-            let text = resp.into_string().unwrap_or_default();
+        Ok(mut resp) => {
+            let text = resp.body_mut().read_to_string().unwrap_or_default();
             let present = text.lines().any(|l| l.starts_with("build_info"));
             checks.push(IntegrityCheckV1 {
                 name: "metrics_build_info".to_string(),

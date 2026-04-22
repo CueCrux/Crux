@@ -94,15 +94,16 @@ pub async fn handle_cuecrux_session(args: &Value, ctx: &McpContext) -> Result<Va
     // The HTTP round-trip is blocking; move it off the async runtime via
     // spawn_blocking so we don't stall the tokio reactor.
     let response = tokio::task::spawn_blocking(move || {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(10))
-            .build();
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(10)))
+            .build()
+            .into();
         agent
             .post(&url)
-            .set("Content-Type", "application/json")
-            .set("Accept", "application/json")
-            .send_string(&payload.to_string())
-            .map(|r| (r.status(), r.into_string().unwrap_or_default()))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .send(payload.to_string())
+            .map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()))
             .map_err(|e| e.to_string())
     })
     .await

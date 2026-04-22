@@ -34,14 +34,20 @@ fn fact_lifecycle() {
             }),
         )
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     assert_eq!(created["entity"], "e2e_lifecycle_project");
     let fact_id = created["fact_id"].as_str().expect("response must contain fact_id");
     assert!(fact_id.starts_with("f_"), "fact_id should start with f_");
 
     // Retrieve the fact by ID.
-    let fetched: serde_json::Value = d.get(&format!("/v1/facts/{fact_id}")).unwrap().into_json().unwrap();
+    let fetched: serde_json::Value = d
+        .get(&format!("/v1/facts/{fact_id}"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
     assert_eq!(fetched["entity"], "e2e_lifecycle_project");
     assert_eq!(fetched["key"], "status");
     assert_eq!(fetched["value"], "Phase 1");
@@ -58,7 +64,8 @@ fn fact_lifecycle() {
             }),
         )
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     let fact_id_v2 = v2["fact_id"].as_str().expect("second put must return fact_id");
 
@@ -66,7 +73,8 @@ fn fact_lifecycle() {
     let by_entity: serde_json::Value = d
         .get("/v1/facts/entity/e2e_lifecycle_project")
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     let facts = by_entity["facts"]
         .as_array()
@@ -78,18 +86,21 @@ fn fact_lifecycle() {
     );
 
     // Query facts by value substring.
-    let queried: serde_json::Value = d.get("/v1/facts?query=Phase").unwrap().into_json().unwrap();
+    let queried: serde_json::Value = d.get("/v1/facts?query=Phase").unwrap().into_body().read_json().unwrap();
     // The query endpoint should return results (either as "facts" array or "results").
     let has_results =
         queried["facts"].is_array() || queried["results"].is_array() || queried["total_tokens"].is_number();
     assert!(has_results, "query should return results: {queried}");
 
     // Delete the first fact.
-    assert_eq!(d.delete(&format!("/v1/facts/{fact_id}")).unwrap().status(), 200);
+    assert_eq!(
+        d.delete(&format!("/v1/facts/{fact_id}")).unwrap().status().as_u16(),
+        200
+    );
 
     // Verify it is gone.
     match d.get(&format!("/v1/facts/{fact_id}")) {
-        Err(ureq::Error::Status(404, _)) => {} // expected
+        Err(ureq::Error::StatusCode(404)) => {} // expected
         other => panic!("expected 404 after delete, got: {other:?}"),
     }
 
@@ -111,7 +122,8 @@ fn session_lifecycle() {
             json!({"step": 3, "data": "hello"}),
         )
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     assert_eq!(resp["session_id"], session_id);
 
@@ -119,7 +131,8 @@ fn session_lifecycle() {
     let state: serde_json::Value = d
         .get(&format!("/v1/sessions/{session_id}/state"))
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     assert_eq!(state["state"]["step"], 3);
     assert_eq!(state["state"]["data"], "hello");
@@ -135,7 +148,8 @@ fn session_lifecycle() {
     let updated: serde_json::Value = d
         .get(&format!("/v1/sessions/{session_id}/state"))
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
     assert_eq!(updated["state"]["step"], 4);
     assert_eq!(updated["state"]["data"], "updated");
@@ -157,7 +171,8 @@ fn fact_bulk_insert() {
             ]),
         )
         .unwrap()
-        .into_json()
+        .into_body()
+        .read_json()
         .unwrap();
 
     let created = bulk_resp["facts"]
@@ -170,7 +185,8 @@ fn fact_bulk_insert() {
         let by_entity: serde_json::Value = d
             .get(&format!("/v1/facts/entity/{entity}"))
             .unwrap()
-            .into_json()
+            .into_body()
+            .read_json()
             .unwrap();
         let facts = by_entity["facts"]
             .as_array()
@@ -196,15 +212,15 @@ fn health_and_version() {
     let d = daemon();
 
     // /healthz — should return 200 with a status/ok field.
-    let health: serde_json::Value = d.get("/healthz").unwrap().into_json().unwrap();
+    let health: serde_json::Value = d.get("/healthz").unwrap().into_body().read_json().unwrap();
     let has_status = health["ok"].is_boolean() || health["status"].is_string();
     assert!(has_status, "healthz should have ok or status field: {health}");
 
     // /readyz — should return 200.
-    assert_eq!(d.get("/readyz").unwrap().status(), 200);
+    assert_eq!(d.get("/readyz").unwrap().status().as_u16(), 200);
 
     // /v1/version — should return 200 with build metadata.
-    let version: serde_json::Value = d.get("/v1/version").unwrap().into_json().unwrap();
+    let version: serde_json::Value = d.get("/v1/version").unwrap().into_body().read_json().unwrap();
     let has_build_info = version["version"].is_string()
         || version["build"].is_object()
         || version["commit"].is_string()
@@ -220,9 +236,9 @@ fn health_and_version() {
     assert!(version["update"]["state"].is_string());
 
     // /metrics — should return 200 with Prometheus-format text.
-    let metrics_resp = d.get("/metrics").unwrap();
-    assert_eq!(metrics_resp.status(), 200);
-    let metrics_text = metrics_resp.into_string().unwrap();
+    let mut metrics_resp = d.get("/metrics").unwrap();
+    assert_eq!(metrics_resp.status().as_u16(), 200);
+    let metrics_text = metrics_resp.body_mut().read_to_string().unwrap();
     assert!(
         metrics_text.contains("build_info") || metrics_text.contains("# HELP") || metrics_text.contains("# TYPE"),
         "metrics should contain Prometheus format markers"

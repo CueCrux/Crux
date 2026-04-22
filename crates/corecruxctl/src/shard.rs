@@ -23,8 +23,7 @@ impl CoordinatorClient {
 
     fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
         let url = self.url(path);
-        let resp = ureq::get(&url).call()?;
-        let text = resp.into_string()?;
+        let text = ureq::get(&url).call()?.into_body().read_to_string()?;
         Ok(serde_json::from_str(&text)?)
     }
 
@@ -34,8 +33,10 @@ impl CoordinatorClient {
         body: &B,
     ) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
         let url = self.url(path);
-        let resp = ureq::post(&url).send_json(serde_json::to_value(body)?)?;
-        let text = resp.into_string()?;
+        let text = ureq::post(&url)
+            .send_json(serde_json::to_value(body)?)?
+            .into_body()
+            .read_to_string()?;
         Ok(serde_json::from_str(&text)?)
     }
 
@@ -85,8 +86,7 @@ impl CoreCruxClient {
 
     pub fn get_shard_map(&self) -> Result<corecrux_types::ShardMapV1, Box<dyn std::error::Error + Send + Sync>> {
         let url = self.url("/v1/shard-map");
-        let resp = ureq::get(&url).call()?;
-        let text = resp.into_string()?;
+        let text = ureq::get(&url).call()?.into_body().read_to_string()?;
         let parsed: ShardMapResponse = serde_json::from_str(&text)?;
         Ok(parsed.shard_map)
     }

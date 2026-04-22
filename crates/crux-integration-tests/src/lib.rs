@@ -236,33 +236,43 @@ impl TestDaemon {
     }
 
     fn agent() -> ureq::Agent {
-        ureq::builder()
-            .timeout_connect(REQUEST_TIMEOUT)
-            .timeout_read(REQUEST_TIMEOUT)
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(REQUEST_TIMEOUT))
+            .timeout_recv_response(Some(REQUEST_TIMEOUT))
+            .timeout_recv_body(Some(REQUEST_TIMEOUT))
             .build()
+            .into()
     }
 
-    pub fn get(&self, path: &str) -> Result<ureq::Response, ureq::Error> {
+    pub fn get(&self, path: &str) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         Self::agent().get(&format!("{}{path}", self.base_url)).call()
     }
 
-    pub fn post_json(&self, path: &str, body: serde_json::Value) -> Result<ureq::Response, ureq::Error> {
+    pub fn post_json(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         Self::agent().post(&format!("{}{path}", self.base_url)).send_json(body)
     }
 
-    pub fn put_json(&self, path: &str, body: serde_json::Value) -> Result<ureq::Response, ureq::Error> {
+    pub fn put_json(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         Self::agent().put(&format!("{}{path}", self.base_url)).send_json(body)
     }
 
-    pub fn delete(&self, path: &str) -> Result<ureq::Response, ureq::Error> {
+    pub fn delete(&self, path: &str) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         Self::agent().delete(&format!("{}{path}", self.base_url)).call()
     }
 
-    pub fn mcp_get(&self) -> Result<ureq::Response, ureq::Error> {
+    pub fn mcp_get(&self) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         Self::agent().get(&format!("{}/mcp", self.mcp_base_url)).call()
     }
 
-    pub fn mcp_post_json(&self, body: serde_json::Value) -> Result<ureq::Response, ureq::Error> {
+    pub fn mcp_post_json(&self, body: serde_json::Value) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         Self::agent()
             .post(&format!("{}/mcp", self.mcp_base_url))
             .send_json(body)
@@ -272,10 +282,10 @@ impl TestDaemon {
         &self,
         body: serde_json::Value,
         token: &str,
-    ) -> Result<ureq::Response, ureq::Error> {
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         Self::agent()
             .post(&format!("{}/mcp", self.mcp_base_url))
-            .set("Authorization", &format!("Bearer {token}"))
+            .header("Authorization", &format!("Bearer {token}"))
             .send_json(body)
     }
 }
