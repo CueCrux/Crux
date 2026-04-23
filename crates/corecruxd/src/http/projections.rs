@@ -544,3 +544,167 @@ pub(super) async fn get_entity_current_state(
     }))
     .into_response()
 }
+
+// ── stateful-extraction-flywheel M1 — chunk extraction cache lookup ────────
+
+/// Request body for `POST /v1/projections/lookup`.
+///
+/// `mode` = "key" is the only supported value in M1; "vector" and "key_or_vector"
+/// are reserved for optional M13 (semantic near-hit cache) and return 400 until
+/// that flag ships.
+///
+/// Fields marked `#[allow(dead_code)]` are intentionally unused in the M1 stub
+/// — they're part of the stable contract that VaultCrux clients write against,
+/// and ship alongside the materializer in M1.b.
+#[allow(dead_code)]
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct LookupRequest {
+    /// Projection name. Only "extraction_cache_current" is recognized today.
+    pub projection: String,
+    /// Lookup mode — "key" | "vector" | "key_or_vector".
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    /// Hex-encoded cache_key (required for mode=key and mode=key_or_vector).
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Embedding vector (required for mode=vector and mode=key_or_vector).
+    /// Rejected in M1 because semantic near-hit is gated by M13.
+    #[serde(default)]
+    pub vector: Option<Vec<f32>>,
+    /// Cosine-similarity threshold for vector modes. Defaults to 0.98.
+    #[serde(default = "default_threshold")]
+    pub similarity_threshold: f32,
+}
+
+fn default_mode() -> String {
+    "key".to_string()
+}
+
+fn default_threshold() -> f32 {
+    0.98
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct BatchLookupRequest {
+    pub projection: String,
+    /// List of hex-encoded cache_keys. Batched to amortize HTTP overhead when
+    /// a session ingests multiple chunks at once.
+    pub keys: Vec<String>,
+}
+
+/// `POST /v1/projections/lookup` — key-based projection read.
+///
+/// Reads from `state.extraction_cache` — an in-memory `ExtractionCacheMaterializer`
+/// fed by the append handler when it observes `corecrux.proj.extraction.*` events.
+///
+/// Scopes: `admin:read` (tenant-agnostic by design; the cache stream is `__global__`).
+pub(super) async fn post_projection_lookup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<LookupRequest>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+
+    if req.projection != "extraction_cache_current" {
+        return problem_response(
+            StatusCode::NOT_FOUND,
+            &format!("unknown projection: {}", req.projection),
+        );
+    }
+
+    match req.mode.as_str() {
+        "key" => {
+            let Some(key) = req.key.as_ref() else {
+                return problem_response(StatusCode::BAD_REQUEST, "mode=key requires 'key' field");
+            };
+            let cache = state.extraction_cache.read().await;
+            match cache.get(key) {
+                Some(row) => Json(serde_json::json!({
+                    "hit": true,
+                    "materialized": true,
+                    "projection": req.projection,
+                    "cache_key": row.cache_key,
+                    "chunk_hash": row.chunk_hash,
+                    "prompt_hash": row.prompt_hash,
+                    "model": row.model,
+                    "grammar_version": row.grammar_version,
+                    "entities": row.entities,
+                    "verifier_score": row.verifier_score,
+                    "verifier_model": row.verifier_model,
+                    "confidence_mean": row.confidence_mean,
+                    "source_tenant_id": row.source_tenant_id,
+                    "hit_count": row.hit_count,
+                    "created_at_micros": row.created_at_micros,
+                    "last_hit_at_micros": row.last_hit_at_micros,
+                }))
+                .into_response(),
+                None => Json(serde_json::json!({
+                    "hit": false,
+                    "materialized": true,
+                    "projection": req.projection,
+                    "total_rows": cache.len(),
+                }))
+                .into_response(),
+            }
+        }
+        "vector" | "key_or_vector" => problem_response(
+            StatusCode::BAD_REQUEST,
+            "vector lookup is gated by M13 (semantic near-hit cache). Use mode=key in M1.",
+        ),
+        other => problem_response(StatusCode::BAD_REQUEST, &format!("unknown mode: {other}")),
+    }
+}
+
+/// `POST /v1/projections/batch_lookup` — N-key projection read in one round-trip.
+pub(super) async fn post_projection_batch_lookup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<BatchLookupRequest>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+
+    if req.projection != "extraction_cache_current" {
+        return problem_response(
+            StatusCode::NOT_FOUND,
+            &format!("unknown projection: {}", req.projection),
+        );
+    }
+
+    let cache = state.extraction_cache.read().await;
+    let results: Vec<serde_json::Value> = req
+        .keys
+        .iter()
+        .map(|k| match cache.get(k) {
+            Some(row) => serde_json::json!({
+                "hit": true,
+                "materialized": true,
+                "cache_key": row.cache_key,
+                "entities": row.entities,
+                "model": row.model,
+                "grammar_version": row.grammar_version,
+                "verifier_score": row.verifier_score,
+                "confidence_mean": row.confidence_mean,
+            }),
+            None => serde_json::json!({
+                "hit": false,
+                "materialized": true,
+            }),
+        })
+        .collect();
+
+    let hits = results.iter().filter(|r| r["hit"] == serde_json::Value::Bool(true)).count();
+
+    Json(serde_json::json!({
+        "projection": req.projection,
+        "materialized": true,
+        "count": req.keys.len(),
+        "hits": hits,
+        "misses": req.keys.len() - hits,
+        "results": results,
+    }))
+    .into_response()
+}

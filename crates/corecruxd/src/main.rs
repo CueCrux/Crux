@@ -360,6 +360,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         },
+        extraction_cache: Arc::new(tokio::sync::RwLock::new(
+            corecrux_projections::ExtractionCacheMaterializer::new(),
+        )),
     };
 
     // Wire the shared event bus into both stores so mutations emit SSE events.
@@ -3164,6 +3167,9 @@ mod tests {
             update_status: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_types::UpdateStatus::default())),
             event_bus: corecrux_memory::events::EventBus::new(16),
             session: None,
+            extraction_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                corecrux_projections::ExtractionCacheMaterializer::new(),
+            )),
         };
 
         let router: axum::Router = crate::http::router(state);
