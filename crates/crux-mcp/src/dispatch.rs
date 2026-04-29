@@ -5,8 +5,10 @@
 //! MCP method dispatcher — routes JSON-RPC requests to handlers.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
+use crux_router::{CallContext, RcxRouter};
 use rand::RngCore;
 use serde_json::json;
 use tokio::sync::RwLock;
@@ -19,6 +21,8 @@ use corecrux_types::UpdateStatus;
 use crate::agent::{AgentIdentity, AgentRegistry};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, INVALID_PARAMS, METHOD_NOT_FOUND};
 use crate::tools;
+
+pub const CAPABILITY_DENIED: i32 = -32030;
 
 /// Shared state passed to every MCP handler.
 pub struct McpContext {
@@ -42,6 +46,8 @@ pub struct McpContext {
     /// (currently only the `cuecrux_session` tool in M3). `None` disables
     /// loopback and the tool reports `service_unavailable`.
     pub daemon_base_url: Option<String>,
+    /// Optional RCX router for token-gated MCP catalogue and tool dispatch.
+    pub rcx_router: Option<Arc<RcxRouter>>,
 }
 
 impl McpContext {
@@ -58,6 +64,7 @@ impl McpContext {
             handoff_key: default_handoff_key(&node_id),
             node_id,
             daemon_base_url: None,
+            rcx_router: None,
         }
     }
 
@@ -81,6 +88,7 @@ impl McpContext {
             handoff_key: default_handoff_key(&node_id),
             node_id,
             daemon_base_url: None,
+            rcx_router: None,
         }
     }
 
@@ -96,6 +104,7 @@ impl McpContext {
             node_id: self.node_id.clone(),
             handoff_key: self.handoff_key,
             daemon_base_url: self.daemon_base_url.clone(),
+            rcx_router: self.rcx_router.clone(),
         }
     }
 
@@ -103,6 +112,16 @@ impl McpContext {
     /// corecruxd HTTP server (e.g., `cuecrux_session`).
     pub fn with_daemon_base_url(mut self, url: impl Into<String>) -> Self {
         self.daemon_base_url = Some(url.into());
+        self
+    }
+
+    pub fn with_rcx_router(mut self, router: RcxRouter) -> Self {
+        self.rcx_router = Some(Arc::new(router));
+        self
+    }
+
+    pub fn with_shared_rcx_router(mut self, router: Arc<RcxRouter>) -> Self {
+        self.rcx_router = Some(router);
         self
     }
 }
@@ -172,7 +191,12 @@ pub async fn dispatch(req: JsonRpcRequest, ctx: &McpContext, _agent: Option<&Age
         "notifications/initialized" => JsonRpcResponse::success(req.id, json!(null)),
 
         // ── Tool surface ───────────────────────────────────────────────
-        "tools/list" => JsonRpcResponse::success(req.id, tools::list_tools_json()),
+        "tools/list" => {
+            let result = ctx.rcx_router.as_ref().map_or_else(tools::list_tools_json, |router| {
+                tools::list_tools_json_for_rcx_router(router, current_unix_seconds())
+            });
+            JsonRpcResponse::success(req.id, result)
+        }
 
         "tools/call" => dispatch_tool_call(req.id.clone(), &req.params, ctx).await,
 
@@ -197,6 +221,10 @@ async fn dispatch_tool_call(
         }
     };
 
+    if let Some(resp) = enforce_rcx_tool_capability(id.clone(), name, ctx) {
+        return resp;
+    }
+
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
 
     match tools::call_tool(name, &args, ctx).await {
@@ -205,16 +233,93 @@ async fn dispatch_tool_call(
     }
 }
 
+fn enforce_rcx_tool_capability(id: Option<serde_json::Value>, name: &str, ctx: &McpContext) -> Option<JsonRpcResponse> {
+    let router = ctx.rcx_router.as_ref()?;
+    let tool = tools::rcx_mcp_tool_capability(name);
+    let decision = router.decide(
+        &CallContext {
+            capability: tool.capability,
+            preferred_backend: Some(tool.backend_id),
+            data_egress_classes: tool.data_egress_classes,
+            estimated_credit_cost: 0,
+            backend_reachable: true,
+        },
+        current_unix_seconds(),
+    );
+
+    if decision.authorised {
+        return None;
+    }
+
+    let refusal_receipt = decision.refusal_receipt.as_ref().map(|receipt| {
+        json!({
+            "event_type": &receipt.event_type,
+            "token_id": &receipt.token_id,
+            "token_hash": &receipt.token_hash,
+            "capability": &receipt.capability,
+            "backend_id": &receipt.backend_id,
+            "data_egress_classes": &receipt.data_egress_classes,
+            "reason_code": &receipt.reason_code,
+            "receipt_class": &receipt.receipt_class,
+        })
+    });
+    Some(JsonRpcResponse::error_with_data(
+        id,
+        CAPABILITY_DENIED,
+        format!(
+            "RCX capability denied: {}",
+            decision.reason_code.as_deref().unwrap_or("denied:unknown")
+        ),
+        json!({
+            "reason_code": decision.reason_code,
+            "mode": decision.mode.as_str(),
+            "token_id": decision.token_id,
+            "token_hash": decision.token_hash,
+            "stamp": {
+                "header": &decision.stamp.header_name,
+                "mode": &decision.stamp.mode,
+                "reason_code": &decision.stamp.reason_code,
+                "token_id": &decision.stamp.token_id,
+                "token_hash": &decision.stamp.token_hash,
+                "queue_ttl_seconds": &decision.stamp.queue_ttl_seconds,
+            },
+            "refusal_receipt": refusal_receipt,
+        }),
+    ))
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crux_router::{mint_free_local_token, RcxRouter};
+    use rcx_capability_token::RCX_CT_SIGNATURE_LEN;
     use serde_json::json;
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
+    }
+
+    fn rcx_ctx_with_capabilities(capabilities: Vec<&str>) -> McpContext {
+        let now = current_unix_seconds();
+        McpContext::new_default("test-node").with_rcx_router(RcxRouter::new(mint_free_local_token(
+            "p_0123456789abcdef0123456789abcdef",
+            "daemon_01HV0000000000000000000000",
+            "default",
+            capabilities.into_iter().map(str::to_string).collect(),
+            now.saturating_sub(60),
+            now.saturating_add(3600),
+            [0x22; RCX_CT_SIGNATURE_LEN],
+        )))
     }
 
     fn rpc(method: &str, params: serde_json::Value) -> JsonRpcRequest {
@@ -262,6 +367,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tools_list_filters_through_rcx_router() {
+        let ctx = rcx_ctx_with_capabilities(vec!["crux-mcp.store_fact"]);
+        let resp = dispatch(rpc("tools/list", json!({})), &ctx, None).await;
+        let result = resp.result.unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+
+        assert_eq!(names, vec!["store_fact"]);
+    }
+
+    #[tokio::test]
     async fn unknown_method_returns_error() {
         let ctx = test_ctx();
         let resp = dispatch(rpc("bogus/method", json!({})), &ctx, None).await;
@@ -276,6 +392,24 @@ mod tests {
         let resp = dispatch(rpc("tools/call", json!({"name": "get_gaps"})), &ctx, None).await;
         // get_gaps on empty store returns no-gaps message.
         assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn tools_call_denied_by_rcx_router_returns_refusal_receipt() {
+        let ctx = rcx_ctx_with_capabilities(vec!["crux-mcp.store_fact"]);
+        let resp = dispatch(rpc("tools/call", json!({"name": "sync_status"})), &ctx, None).await;
+        let err = resp.error.unwrap();
+
+        assert_eq!(err.code, CAPABILITY_DENIED);
+        let data = err.data.unwrap();
+        assert_eq!(data["reason_code"], "denied:capability_not_permitted");
+        assert_eq!(data["stamp"]["header"], "X-Crux-Mode");
+        assert_eq!(data["stamp"]["mode"], "refused");
+        assert_eq!(
+            data["refusal_receipt"]["event_type"],
+            "rcx.capability_token.call_refused.v1"
+        );
+        assert_eq!(data["refusal_receipt"]["capability"], "crux-mcp.sync_status");
     }
 
     #[tokio::test]

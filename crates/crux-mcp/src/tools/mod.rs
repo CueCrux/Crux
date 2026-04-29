@@ -21,9 +21,12 @@ pub mod sync;
 pub mod update;
 
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 use crate::dispatch::McpContext;
 use crate::protocol::JsonRpcError;
+use crux_router::{McpToolCapability, RcxRouter};
+use rcx_capability_token::RcxCapabilityToken;
 
 /// Describes a single MCP tool for the `tools/list` response.
 #[derive(Debug, Clone)]
@@ -575,7 +578,15 @@ pub fn list_tools() -> Vec<ToolDefinition> {
 
 /// Serialise the tool list into the MCP `tools/list` response shape.
 pub fn list_tools_json() -> Value {
-    let tools: Vec<Value> = list_tools()
+    tools_to_json(list_tools())
+}
+
+pub fn list_tools_json_for_rcx_router(router: &RcxRouter, now_unix_seconds: u64) -> Value {
+    tools_to_json(list_tools_for_rcx_router(router, now_unix_seconds))
+}
+
+fn tools_to_json(tools: Vec<ToolDefinition>) -> Value {
+    let tools: Vec<Value> = tools
         .into_iter()
         .map(|t| {
             json!({
@@ -586,6 +597,44 @@ pub fn list_tools_json() -> Value {
         })
         .collect();
     json!({ "tools": tools })
+}
+
+/// Return the MCP catalogue after applying an RCX Capability Token matrix.
+pub fn list_tools_for_rcx_token(token: &RcxCapabilityToken, now_unix_seconds: u64) -> Vec<ToolDefinition> {
+    let router = RcxRouter::new(token.clone());
+    list_tools_for_rcx_router(&router, now_unix_seconds)
+}
+
+pub fn list_tools_for_rcx_router(router: &RcxRouter, now_unix_seconds: u64) -> Vec<ToolDefinition> {
+    let tools = list_tools();
+    let capabilities: Vec<McpToolCapability> = tools.iter().map(|tool| rcx_mcp_tool_capability(&tool.name)).collect();
+    let allowed: HashSet<String> = router
+        .filter_mcp_tools(&capabilities, now_unix_seconds)
+        .into_iter()
+        .collect();
+    tools.into_iter().filter(|tool| allowed.contains(&tool.name)).collect()
+}
+
+pub fn rcx_mcp_tool_capability(tool_name: &str) -> McpToolCapability {
+    McpToolCapability::local_none(tool_name, rcx_capability_for_tool(tool_name))
+}
+
+pub fn rcx_local_capabilities() -> Vec<String> {
+    let mut seen = HashSet::new();
+    list_tools()
+        .into_iter()
+        .filter_map(|tool| {
+            let capability = rcx_capability_for_tool(&tool.name);
+            seen.insert(capability.clone()).then_some(capability)
+        })
+        .collect()
+}
+
+fn rcx_capability_for_tool(tool_name: &str) -> String {
+    match tool_name {
+        "query" | "query_scan" | "query_expand" => "corecrux.query.local".to_string(),
+        other => format!("crux-mcp.{other}"),
+    }
 }
 
 /// Return documentation of each tool's output format.
@@ -702,6 +751,8 @@ mod tests {
     use crate::agent::AgentIdentity;
     use crate::dispatch::McpContext;
     use crate::tools::test_support::{clear_sync_env, sync_env_lock};
+    use crux_router::mint_free_local_token;
+    use rcx_capability_token::RCX_CT_SIGNATURE_LEN;
 
     const TOOL_COUNT: usize = 28; // 27 pre-M3 tools + cuecrux_session
 
@@ -880,6 +931,29 @@ mod tests {
             );
             assert!(desc.ends_with(CUECRUX_SESSION_HINT));
         }
+    }
+
+    #[test]
+    fn list_tools_for_rcx_token_filters_unpermitted_tools() {
+        let token = mint_free_local_token(
+            "p_0123456789abcdef0123456789abcdef",
+            "daemon_01HV0000000000000000000000",
+            "default",
+            vec!["corecrux.query.local".to_string(), "crux-mcp.store_fact".to_string()],
+            1_776_989_600,
+            1_780_143_200,
+            [0x11; RCX_CT_SIGNATURE_LEN],
+        );
+        let names: Vec<String> = list_tools_for_rcx_token(&token, 1_776_989_601)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert!(names.contains(&"query".to_string()));
+        assert!(names.contains(&"query_scan".to_string()));
+        assert!(names.contains(&"query_expand".to_string()));
+        assert!(names.contains(&"store_fact".to_string()));
+        assert!(!names.contains(&"sync_pull".to_string()));
     }
 
     // ── get_agent_identity tests ────────────────────────────────────
