@@ -367,6 +367,11 @@ pub(super) async fn post_query_text_search(
         return problem_response(StatusCode::BAD_REQUEST, "query must not be empty");
     }
 
+    let rcx_decision = enforce_rcx_local_query(&state);
+    if let Some(decision) = rcx_decision.as_ref().filter(|decision| !decision.authorised) {
+        return rcx_refusal_response(decision);
+    }
+
     let limit = body.limit.clamp(1, 100);
     let is_scan_mode = body.mode.as_deref() == Some("scan");
 
@@ -383,20 +388,23 @@ pub(super) async fn post_query_text_search(
     let readers = index.readers();
 
     if readers.is_empty() {
-        return (
-            StatusCode::OK,
-            axum::Json(serde_json::json!({
-                "results": [],
-                "coverage": { "score": 0.0, "gaps": [], "below_floor": 0 },
-                "meta": {
-                    "backend": "corecrux-v5-bm25",
-                    "took_ms": t0.elapsed().as_millis(),
-                    "segments_searched": 0,
-                    "total_docs": 0,
-                }
-            })),
-        )
-            .into_response();
+        return response_with_rcx_mode(
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "results": [],
+                    "coverage": { "score": 0.0, "gaps": [], "below_floor": 0 },
+                    "meta": {
+                        "backend": "corecrux-v5-bm25",
+                        "took_ms": t0.elapsed().as_millis(),
+                        "segments_searched": 0,
+                        "total_docs": 0,
+                    }
+                })),
+            )
+                .into_response(),
+            rcx_decision.as_ref(),
+        );
     }
 
     // Use the extended search function with min_score and coverage tracking
@@ -528,7 +536,69 @@ pub(super) async fn post_query_text_search(
         });
     }
 
-    (StatusCode::OK, axum::Json(response)).into_response()
+    response_with_rcx_mode(
+        (StatusCode::OK, axum::Json(response)).into_response(),
+        rcx_decision.as_ref(),
+    )
+}
+
+fn enforce_rcx_local_query(state: &AppState) -> Option<crux_router::RouterDecision> {
+    state.rcx_router.as_ref().map(|router| {
+        router.decide(
+            &crux_router::CallContext::local("corecrux.query.local"),
+            current_unix_seconds(),
+        )
+    })
+}
+
+fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn rcx_refusal_response(decision: &crux_router::RouterDecision) -> Response {
+    let refusal_receipt = decision.refusal_receipt.as_ref().map(|receipt| {
+        serde_json::json!({
+            "event_type": &receipt.event_type,
+            "token_id": &receipt.token_id,
+            "token_hash": &receipt.token_hash,
+            "capability": &receipt.capability,
+            "backend_id": &receipt.backend_id,
+            "data_egress_classes": &receipt.data_egress_classes,
+            "required_attestations": &receipt.required_attestations,
+            "present_attestations": &receipt.present_attestations,
+            "reason_code": &receipt.reason_code,
+            "receipt_class": &receipt.receipt_class,
+        })
+    });
+    response_with_rcx_mode(
+        (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": "rcx_capability_denied",
+                "reason_code": decision.reason_code,
+                "mode": decision.mode.as_str(),
+                "token_id": decision.token_id,
+                "token_hash": decision.token_hash,
+                "refusal_receipt": refusal_receipt,
+            })),
+        )
+            .into_response(),
+        Some(decision),
+    )
+}
+
+fn response_with_rcx_mode(mut response: Response, decision: Option<&crux_router::RouterDecision>) -> Response {
+    if let Some(decision) = decision {
+        if let Ok(value) = HeaderValue::from_str(&decision.stamp.mode) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("x-crux-mode"), value);
+        }
+    }
+    response
 }
 
 // ── Progressive retrieval: expand ──────────────────────────────────────

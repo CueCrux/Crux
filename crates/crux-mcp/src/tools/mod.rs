@@ -578,25 +578,92 @@ pub fn list_tools() -> Vec<ToolDefinition> {
 
 /// Serialise the tool list into the MCP `tools/list` response shape.
 pub fn list_tools_json() -> Value {
-    tools_to_json(list_tools())
+    tools_to_json(list_tools(), None)
 }
 
 pub fn list_tools_json_for_rcx_router(router: &RcxRouter, now_unix_seconds: u64) -> Value {
-    tools_to_json(list_tools_for_rcx_router(router, now_unix_seconds))
+    tools_to_json(
+        list_tools_for_rcx_router(router, now_unix_seconds),
+        Some(ToolAuthMetadata::from_token(router.token())),
+    )
 }
 
-fn tools_to_json(tools: Vec<ToolDefinition>) -> Value {
+#[derive(Debug, Clone)]
+struct ToolAuthMetadata {
+    token_id: String,
+    token_hash: String,
+    receipt_class: String,
+    tier: String,
+}
+
+impl ToolAuthMetadata {
+    fn from_token(token: &RcxCapabilityToken) -> Self {
+        Self {
+            token_id: token.token_id.clone(),
+            token_hash: token.token_hash_hex(),
+            receipt_class: token.receipt_class.as_str().to_string(),
+            tier: token.tier.as_str().to_string(),
+        }
+    }
+}
+
+fn tools_to_json(tools: Vec<ToolDefinition>, auth: Option<ToolAuthMetadata>) -> Value {
     let tools: Vec<Value> = tools
         .into_iter()
         .map(|t| {
-            json!({
+            let mut input_schema = t.input_schema;
+            if let Some(auth) = &auth {
+                if let Some(schema) = input_schema.as_object_mut() {
+                    schema.insert(
+                        "x-crux-token-ref".to_string(),
+                        json!({
+                            "token_id": &auth.token_id,
+                            "token_hash": &auth.token_hash,
+                        }),
+                    );
+                    schema.insert("x-crux-receipt-class".to_string(), json!(&auth.receipt_class));
+                    schema.insert("x-crux-tier".to_string(), json!(&auth.tier));
+                }
+            }
+            let meta = auth.as_ref().map(|auth| {
+                json!({
+                    "crux": {
+                        "filtered_by": "rcx-capability-token",
+                        "token_ref": {
+                            "token_id": &auth.token_id,
+                            "token_hash": &auth.token_hash,
+                        },
+                        "receipt_class": &auth.receipt_class,
+                        "tier": &auth.tier,
+                    }
+                })
+            });
+            let mut tool = json!({
                 "name": t.name,
                 "description": t.description,
-                "inputSchema": t.input_schema,
-            })
+                "inputSchema": input_schema,
+            });
+            if let Some(meta) = meta {
+                tool["_meta"] = meta;
+            }
+            tool
         })
         .collect();
-    json!({ "tools": tools })
+    let mut response = json!({ "tools": tools });
+    if let Some(auth) = auth {
+        response["_meta"] = json!({
+            "crux": {
+                "filtered_by": "rcx-capability-token",
+                "token_ref": {
+                    "token_id": auth.token_id,
+                    "token_hash": auth.token_hash,
+                },
+                "receipt_class": auth.receipt_class,
+                "tier": auth.tier,
+            }
+        });
+    }
+    response
 }
 
 /// Return the MCP catalogue after applying an RCX Capability Token matrix.
@@ -751,7 +818,7 @@ mod tests {
     use crate::agent::AgentIdentity;
     use crate::dispatch::McpContext;
     use crate::tools::test_support::{clear_sync_env, sync_env_lock};
-    use crux_router::mint_free_local_token;
+    use crux_router::{mint_free_local_token, RcxRouter};
     use rcx_capability_token::RCX_CT_SIGNATURE_LEN;
 
     const TOOL_COUNT: usize = 28; // 27 pre-M3 tools + cuecrux_session
@@ -954,6 +1021,31 @@ mod tests {
         assert!(names.contains(&"query_expand".to_string()));
         assert!(names.contains(&"store_fact".to_string()));
         assert!(!names.contains(&"sync_pull".to_string()));
+    }
+
+    #[test]
+    fn list_tools_json_for_rcx_router_includes_token_metadata() {
+        let token = mint_free_local_token(
+            "p_0123456789abcdef0123456789abcdef",
+            "daemon_01HV0000000000000000000000",
+            "default",
+            vec!["corecrux.query.local".to_string()],
+            1_776_989_600,
+            1_780_143_200,
+            [0x11; RCX_CT_SIGNATURE_LEN],
+        );
+        let token_id = token.token_id.clone();
+        let token_hash = token.token_hash_hex();
+        let router = RcxRouter::new(token);
+
+        let listed = list_tools_json_for_rcx_router(&router, 1_776_989_601);
+        assert_eq!(listed["_meta"]["crux"]["token_ref"]["token_id"], token_id);
+        assert_eq!(listed["_meta"]["crux"]["token_ref"]["token_hash"], token_hash);
+        assert_eq!(listed["_meta"]["crux"]["receipt_class"], "verified");
+
+        let first_tool = listed["tools"].as_array().unwrap().first().unwrap();
+        assert_eq!(first_tool["_meta"]["crux"]["token_ref"]["token_id"], token_id);
+        assert_eq!(first_tool["inputSchema"]["x-crux-receipt-class"], "verified");
     }
 
     // ── get_agent_identity tests ────────────────────────────────────

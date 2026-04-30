@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{routing::get, Json, Router};
@@ -126,6 +126,7 @@ pub struct AppState {
     pub compat: CompatContract,
     pub sdk_version: String,
     pub auth: Authz,
+    pub rcx_router: Option<Arc<crux_router::RcxRouter>>,
     pub data_dir: PathBuf,
     pub mcp_enabled: bool,
     pub read_retry_failed_readyz_threshold: u64,

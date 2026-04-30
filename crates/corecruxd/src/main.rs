@@ -219,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         |hash| rcx_passport_key.sign_hash(hash),
     );
     let rcx_token_hash = rcx_token.token_hash_hex();
-    let rcx_router = crux_router::RcxRouter::new(rcx_token);
+    let rcx_router = Arc::new(crux_router::RcxRouter::new(rcx_token));
     info!(
         passport_fpr = %rcx_passport_key.passport_fpr(),
         public_key_hex = %rcx_passport_key.public_key_hex(),
@@ -330,6 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         },
         sdk_version: DEFAULT_SDK_VERSION.to_string(),
         auth: auth.clone(),
+        rcx_router: Some(rcx_router.clone()),
         data_dir: config.data_dir.clone(),
         mcp_enabled: config.mcp_enabled,
         read_retry_failed_readyz_threshold: config.read_retry_failed_readyz_threshold,
@@ -453,7 +454,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 mcp_agent_registry.clone(),
             )
             .with_daemon_base_url(daemon_base)
-            .with_rcx_router(rcx_router),
+            .with_shared_rcx_router(rcx_router),
         ))
     } else {
         None
@@ -3310,6 +3311,7 @@ mod tests {
             },
             sdk_version: corecrux_types::DEFAULT_SDK_VERSION.to_string(),
             auth,
+            rcx_router: None,
             data_dir: tmp.path().to_path_buf(),
             mcp_enabled: true,
             read_retry_failed_readyz_threshold: 0,

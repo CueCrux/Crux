@@ -82,6 +82,7 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
         },
         sdk_version: DEFAULT_SDK_VERSION.to_string(),
         auth,
+        rcx_router: None,
         data_dir: root.clone(),
         mcp_enabled: true,
         read_retry_failed_readyz_threshold: 0,
@@ -124,6 +125,22 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
 
 fn test_app_state(action_max_pending: usize) -> AppState {
     test_app_state_with_auth(action_max_pending, AuthMode::Off)
+}
+
+fn test_rcx_router(capabilities: Vec<&str>) -> std::sync::Arc<crux_router::RcxRouter> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_secs();
+    std::sync::Arc::new(crux_router::RcxRouter::new(crux_router::mint_free_local_token(
+        "p_0123456789abcdef0123456789abcdef",
+        "daemon_01HV0000000000000000000000",
+        "default",
+        capabilities.into_iter().map(str::to_string).collect(),
+        now.saturating_sub(60),
+        now.saturating_add(3600),
+        [0x22; 64],
+    )))
 }
 
 fn dev_scope_headers(scopes: &str) -> HeaderMap {
@@ -1405,6 +1422,56 @@ async fn text_search_empty_index_returns_empty_results() {
     assert_eq!(body["coverage"]["score"], 0.0);
     assert_eq!(body["meta"]["segments_searched"], 0);
     assert_eq!(body["meta"]["total_docs"], 0);
+}
+
+#[tokio::test]
+async fn text_search_with_rcx_router_sets_mode_header() {
+    enable_text_search();
+
+    let mut state = test_app_state(16);
+    state.rcx_router = Some(test_rcx_router(vec!["corecrux.query.local"]));
+    let body = query::TextSearchBody {
+        tenant_id: "tenant-a".to_string(),
+        query: "hello world".to_string(),
+        limit: 10,
+        token_budget: None,
+        min_score: None,
+        mode: None,
+        include_receipt: None,
+    };
+
+    let resp = query::post_query_text_search(State(state), HeaderMap::new(), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-crux-mode").unwrap(), "local");
+}
+
+#[tokio::test]
+async fn text_search_denied_by_rcx_router_returns_refusal_receipt() {
+    enable_text_search();
+
+    let mut state = test_app_state(16);
+    state.rcx_router = Some(test_rcx_router(vec!["crux-mcp.store_fact"]));
+    let body = query::TextSearchBody {
+        tenant_id: "tenant-a".to_string(),
+        query: "hello world".to_string(),
+        limit: 10,
+        token_budget: None,
+        min_score: None,
+        mode: None,
+        include_receipt: None,
+    };
+
+    let resp = query::post_query_text_search(State(state), HeaderMap::new(), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.headers().get("x-crux-mode").unwrap(), "refused");
+    let body = json_body(resp).await;
+    assert_eq!(body["error"], "rcx_capability_denied");
+    assert_eq!(body["reason_code"], "denied:capability_not_permitted");
+    assert_eq!(body["refusal_receipt"]["capability"], "corecrux.query.local");
 }
 
 #[tokio::test]
