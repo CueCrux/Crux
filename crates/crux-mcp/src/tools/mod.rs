@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use crate::dispatch::McpContext;
 use crate::protocol::JsonRpcError;
 use crux_router::{McpToolCapability, RcxRouter};
-use rcx_capability_token::RcxCapabilityToken;
+use rcx_capability_token::{DataEgressClass, RcxCapabilityToken};
 
 /// Describes a single MCP tool for the `tools/list` response.
 #[derive(Debug, Clone)]
@@ -568,6 +568,10 @@ pub fn list_tools() -> Vec<ToolDefinition> {
     ]
     .into_iter()
     .map(|mut t: ToolDefinition| {
+        let marker = vaultcrux_local::tool_surface::marker_for_tool(&t.name);
+        if !t.description.starts_with(marker) {
+            t.description = format!("{marker} {}", t.description);
+        }
         if t.name != "cuecrux_session" {
             t.description.push_str(CUECRUX_SESSION_HINT);
         }
@@ -683,7 +687,16 @@ pub fn list_tools_for_rcx_router(router: &RcxRouter, now_unix_seconds: u64) -> V
 }
 
 pub fn rcx_mcp_tool_capability(tool_name: &str) -> McpToolCapability {
-    McpToolCapability::local_none(tool_name, rcx_capability_for_tool(tool_name))
+    let capability = rcx_capability_for_tool(tool_name);
+    if vaultcrux_local::tool_surface::is_hosted_gated_tool(tool_name) {
+        return McpToolCapability {
+            tool_name: tool_name.to_string(),
+            capability,
+            backend_id: vaultcrux_local::tool_surface::HOSTED_BACKEND_ID.to_string(),
+            data_egress_classes: vec![DataEgressClass::None],
+        };
+    }
+    McpToolCapability::local_none(tool_name, capability)
 }
 
 pub fn rcx_local_capabilities() -> Vec<String> {
@@ -691,6 +704,9 @@ pub fn rcx_local_capabilities() -> Vec<String> {
     list_tools()
         .into_iter()
         .filter_map(|tool| {
+            if !vaultcrux_local::tool_surface::is_local_tool(&tool.name) {
+                return None;
+            }
             let capability = rcx_capability_for_tool(&tool.name);
             seen.insert(capability.clone()).then_some(capability)
         })
@@ -998,6 +1014,37 @@ mod tests {
             );
             assert!(desc.ends_with(CUECRUX_SESSION_HINT));
         }
+    }
+
+    #[test]
+    fn list_tools_marks_local_and_hosted_gated_surfaces() {
+        let tools = list_tools();
+        let by_name = |n: &str| tools.iter().find(|t| t.name == n).unwrap();
+
+        assert!(by_name("query").description.starts_with("[local]"));
+        assert!(by_name("sync_status").description.starts_with("[local]"));
+        assert!(by_name("issue_passport").description.starts_with("[hosted]"));
+        assert!(by_name("sync_pull").description.starts_with("[hosted]"));
+        assert!(by_name("sync_push").description.starts_with("[hosted]"));
+    }
+
+    #[test]
+    fn rcx_local_capabilities_excludes_hosted_gated_tools() {
+        let capabilities = rcx_local_capabilities();
+
+        assert!(capabilities.contains(&"corecrux.query.local".to_string()));
+        assert!(capabilities.contains(&"crux-mcp.sync_status".to_string()));
+        assert!(!capabilities.contains(&"crux-mcp.issue_passport".to_string()));
+        assert!(!capabilities.contains(&"crux-mcp.sync_pull".to_string()));
+        assert!(!capabilities.contains(&"crux-mcp.sync_push".to_string()));
+    }
+
+    #[test]
+    fn hosted_gated_tool_capability_uses_hosted_backend() {
+        let capability = rcx_mcp_tool_capability("sync_pull");
+
+        assert_eq!(capability.backend_id, vaultcrux_local::tool_surface::HOSTED_BACKEND_ID);
+        assert_eq!(capability.data_egress_classes, vec![DataEgressClass::None]);
     }
 
     #[test]

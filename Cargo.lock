@@ -765,6 +765,7 @@ dependencies = [
  "ureq",
  "utoipa",
  "uuid",
+ "vaultcrux-local",
  "xxhash-rust",
  "zip",
  "zstd",
@@ -930,6 +931,7 @@ dependencies = [
  "tracing",
  "ureq",
  "uuid",
+ "vaultcrux-local",
 ]
 
 [[package]]
@@ -3890,6 +3892,19 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vaultcrux-local"
+version = "0.2.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "version_check"

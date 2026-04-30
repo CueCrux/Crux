@@ -61,6 +61,7 @@ crux-observe = { path = "../crux-observe" }
 crux-mcp = { path = "../crux-mcp" }
 crux-router = { path = "../crux-router" }
 crux-session = { path = "../crux-session" }
+vaultcrux-local = { path = "../vaultcrux-local" }
 
 [dev-dependencies]
 corecrux-index = { path = "../corecrux-index" }

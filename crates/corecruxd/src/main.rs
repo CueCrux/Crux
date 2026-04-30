@@ -100,8 +100,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.replicated_commit_require_all_followers,
         &config.loaded_config_path,
         &config.state_dir,
-        &config.content_manifest_path,
-        config.content_verify_signatures,
         config.router_refresh_interval_seconds,
         config.router_cache_ttl_seconds,
         &config.router_fallback_policy,
@@ -153,6 +151,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &config.update_check_repo_dir,
     );
     init_tracing(&config.log_level);
+    if let Some(manifest_path) = config.content_manifest_path.as_deref() {
+        let report = vaultcrux_local::content::load_content_manifest(manifest_path, config.content_verify_signatures)?;
+        info!(
+            content_manifest = %report.manifest_path.display(),
+            issuer = %report.issuer,
+            files_verified = report.files_verified,
+            signature_verified = report.verified_signature,
+            "vaultcrux content manifest loaded"
+        );
+    }
 
     std::panic::set_hook(Box::new(|panic_info| {
         let payload = panic_info

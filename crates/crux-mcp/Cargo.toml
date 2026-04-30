@@ -23,6 +23,7 @@ corecrux-types = { path = "../corecrux-types" }
 crux-observe = { path = "../crux-observe" }
 crux-router = { path = "../crux-router" }
 rcx-capability-token = { path = "../rcx-capability-token" }
+vaultcrux-local = { path = "../vaultcrux-local" }
 
 [dev-dependencies]
 http-body-util = "0.1"
