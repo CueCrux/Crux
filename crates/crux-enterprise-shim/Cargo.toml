@@ -1,0 +1,12 @@
+[package]
+name = "crux-enterprise-shim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Enterprise customer-hosted RCX Capability Token validation shim contract."
+
+[dependencies]
+rcx-capability-token = { path = "../rcx-capability-token" }
+
+[lints]
+workspace = true

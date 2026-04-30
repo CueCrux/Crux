@@ -737,6 +737,7 @@ dependencies = [
  "crc32fast",
  "crux-mcp",
  "crux-observe",
+ "crux-router",
  "crux-session",
  "ed25519-dalek",
  "fs2",
@@ -882,6 +883,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "crux-enterprise-shim"
+version = "0.2.0"
+dependencies = [
+ "rcx-capability-token",
+]
+
+[[package]]
 name = "crux-integration-tests"
 version = "0.2.0"
 dependencies = [
@@ -908,8 +916,10 @@ dependencies = [
  "corecrux-retrieval",
  "corecrux-types",
  "crux-observe",
+ "crux-router",
  "http-body-util",
  "rand 0.8.6",
+ "rcx-capability-token",
  "serde",
  "serde_json",
  "tempfile",
@@ -933,6 +943,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "crux-router"
+version = "0.2.0"
+dependencies = [
+ "rcx-capability-token",
 ]
 
 [[package]]
@@ -2718,6 +2735,15 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rcx-capability-token"
+version = "0.2.0"
+dependencies = [
+ "blake3",
+ "crux-session",
+ "hex",
 ]
 
 [[package]]

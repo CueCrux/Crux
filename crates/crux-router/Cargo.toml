@@ -1,0 +1,12 @@
+[package]
+name = "crux-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Daemon-side RCX Capability Token router primitives."
+
+[dependencies]
+rcx-capability-token = { path = "../rcx-capability-token" }
+
+[lints]
+workspace = true

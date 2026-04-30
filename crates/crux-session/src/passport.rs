@@ -14,23 +14,46 @@
 //! Hosted does **not** use this module — the passport comes from VaultCrux's
 //! auth plugin and is resolved from a bearer JWT / API key.
 
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use blake3::Hasher;
+use ed25519_dalek::{Signer as DalekSigner, SigningKey};
 
 use crate::error::SessionError;
-use crate::plan::{Passport, HASH_LEN};
+use crate::plan::{Passport, HASH_LEN, SIGNATURE_LEN};
 
 /// Filename inside a CE data directory that holds the durable install
 /// UUID. First read on startup — generated + persisted if missing.
 pub const INSTALL_UUID_FILENAME: &str = ".install-uuid";
 
+/// Filename inside a CE data directory that holds the durable local Passport
+/// signing seed used for RCX free-local Capability Tokens.
+pub const PASSPORT_KEY_FILENAME: &str = "passport.key";
+
+const PASSPORT_FPR_BYTES: usize = 16;
+
 #[derive(Debug, Clone)]
 pub struct LocalPassportConfig {
     pub install_uuid: String,
     pub user: String,
+}
+
+#[derive(Clone)]
+pub struct LocalPassportKey {
+    signing_key: SigningKey,
+    passport_fpr: String,
+    public_key_hex: String,
+}
+
+impl std::fmt::Debug for LocalPassportKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalPassportKey")
+            .field("passport_fpr", &self.passport_fpr)
+            .field("public_key_hex", &self.public_key_hex)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LocalPassportConfig {
@@ -53,6 +76,10 @@ impl LocalPassportConfig {
 
 pub fn install_uuid_path(data_dir: &Path) -> PathBuf {
     data_dir.join(INSTALL_UUID_FILENAME)
+}
+
+pub fn passport_key_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(PASSPORT_KEY_FILENAME)
 }
 
 fn read_or_init_install_uuid(path: &Path) -> Result<String, SessionError> {
@@ -83,6 +110,109 @@ fn read_or_init_install_uuid(path: &Path) -> Result<String, SessionError> {
         }
         Err(e) => Err(SessionError::Encode(format!("read install-uuid: {e}"))),
     }
+}
+
+impl LocalPassportKey {
+    /// Load (or initialise) the local RCX Passport signing key from
+    /// `data_dir/passport.key`.
+    ///
+    /// The file stores only the 32-byte ed25519 seed as lowercase hex. The
+    /// public fingerprint is derived from the verifying key, so it stays
+    /// stable across daemon restarts without exposing private material.
+    pub fn from_data_dir(data_dir: &Path) -> Result<Self, SessionError> {
+        Self::from_seed(read_or_init_passport_seed(&passport_key_path(data_dir))?)
+    }
+
+    pub fn from_seed(seed: [u8; 32]) -> Result<Self, SessionError> {
+        let signing_key = SigningKey::from_bytes(&seed);
+        let verifying_key = signing_key.verifying_key();
+        let public_key = verifying_key.to_bytes();
+        let passport_fpr = passport_fpr_from_public_key(&public_key);
+        let public_key_hex = hex::encode(public_key);
+        Ok(Self {
+            signing_key,
+            passport_fpr,
+            public_key_hex,
+        })
+    }
+
+    pub fn passport_fpr(&self) -> &str {
+        &self.passport_fpr
+    }
+
+    pub fn public_key_hex(&self) -> &str {
+        &self.public_key_hex
+    }
+
+    pub fn sign_hash(&self, hash: &[u8; HASH_LEN]) -> [u8; SIGNATURE_LEN] {
+        let sig = self.signing_key.sign(hash);
+        let mut out = [0_u8; SIGNATURE_LEN];
+        out.copy_from_slice(&sig.to_bytes());
+        out
+    }
+}
+
+fn read_or_init_passport_seed(path: &Path) -> Result<[u8; 32], SessionError> {
+    match fs::read_to_string(path) {
+        Ok(content) => parse_passport_seed(path, &content),
+        Err(e) if e.kind() == ErrorKind::NotFound => write_new_passport_seed(path),
+        Err(e) => Err(SessionError::Encode(format!("read passport key: {e}"))),
+    }
+}
+
+fn parse_passport_seed(path: &Path, content: &str) -> Result<[u8; 32], SessionError> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err(SessionError::Encode(format!(
+            "passport key file {} is empty",
+            path.display()
+        )));
+    }
+    let decoded = hex::decode(trimmed)?;
+    if decoded.len() != 32 {
+        return Err(SessionError::ByteArrayLength {
+            field: "passport.key",
+            expected: 32,
+            actual: decoded.len(),
+        });
+    }
+    let mut seed = [0_u8; 32];
+    seed.copy_from_slice(&decoded);
+    Ok(seed)
+}
+
+fn write_new_passport_seed(path: &Path) -> Result<[u8; 32], SessionError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| SessionError::Encode(format!("create data_dir: {e}")))?;
+    }
+
+    let mut seed = [0_u8; 32];
+    rand::Rng::fill(&mut rand::thread_rng(), &mut seed[..]);
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(hex::encode(seed).as_bytes())
+                .map_err(|e| SessionError::Encode(format!("write passport key: {e}")))?;
+            file.write_all(b"\n")
+                .map_err(|e| SessionError::Encode(format!("write passport key: {e}")))?;
+            Ok(seed)
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => read_or_init_passport_seed(path),
+        Err(e) => Err(SessionError::Encode(format!("create passport key: {e}"))),
+    }
+}
+
+fn passport_fpr_from_public_key(public_key: &[u8; 32]) -> String {
+    let digest = blake3::hash(public_key);
+    format!("p_{}", hex::encode(&digest.as_bytes()[..PASSPORT_FPR_BYTES]))
 }
 
 impl LocalPassportConfig {
@@ -178,5 +308,33 @@ mod tests {
         assert_ne!(cfg1.install_uuid, cfg2.install_uuid);
         std::fs::remove_dir_all(&tmp1).ok();
         std::fs::remove_dir_all(&tmp2).ok();
+    }
+
+    #[test]
+    fn passport_key_initialises_and_persists_identity() {
+        let tmp = std::env::temp_dir().join(format!("crux-session-passport-key-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let key1 = LocalPassportKey::from_data_dir(&tmp).unwrap();
+        let key2 = LocalPassportKey::from_data_dir(&tmp).unwrap();
+
+        assert_eq!(key1.passport_fpr(), key2.passport_fpr());
+        assert_eq!(key1.public_key_hex(), key2.public_key_hex());
+        assert!(key1.passport_fpr().starts_with("p_"));
+        assert_eq!(key1.passport_fpr().len(), 34);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn passport_key_signs_hash_with_ed25519() {
+        use ed25519_dalek::Verifier as _;
+
+        let key = LocalPassportKey::from_seed([7_u8; 32]).unwrap();
+        let hash = [9_u8; HASH_LEN];
+        let signature = ed25519_dalek::Signature::from_bytes(&key.sign_hash(&hash));
+        key.signing_key
+            .verifying_key()
+            .verify(&hash, &signature)
+            .expect("signature should verify");
     }
 }

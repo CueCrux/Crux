@@ -8,6 +8,7 @@ pub const DECISION_EVENT_CONTENT_TYPE_V1: &str = "application/json; profile=core
 pub const EVT_AGENT_DECISION_RECORDED_V1: &str = "agent.decision.recorded.v1";
 pub const EVT_AGENT_ACTION_EXECUTED_V1: &str = "agent.action.executed.v1";
 pub const EVT_AGENT_ACTION_SUPERSEDED_V1: &str = "agent.action.superseded.v1";
+pub const EVT_AGENT_CHARACTER_DRIFT_DETECTED_V1: &str = "agent.character.drift_detected.v1";
 pub const EVT_KNOWLEDGE_STATE_RECONSTRUCTED_V1: &str = "knowledge.state.reconstructed.v1";
 
 // Enrichment receipt events (Agent Enrichment & Orchestration v1.0)
@@ -76,6 +77,20 @@ pub enum ToolParametersModeV1 {
     EncryptedRef,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CharacterDriftLayerV1 {
+    Hash,
+    Distribution,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CharacterDriftSeverityV1 {
+    Hard,
+    Soft,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentDecisionRecordedV1 {
     pub schema: String,
@@ -113,6 +128,30 @@ pub struct AgentDecisionRecordedV1 {
     pub decision_hash: String,
     #[serde(rename = "parentDecisionId", skip_serializing_if = "Option::is_none")]
     pub parent_decision_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentCharacterDriftDetectedV1 {
+    pub schema: String,
+    #[serde(rename = "eventId")]
+    pub event_id: String,
+    #[serde(rename = "tenantId")]
+    pub tenant_id: String,
+    #[serde(rename = "agentId")]
+    pub agent_id: String,
+    #[serde(rename = "kernelEntryId")]
+    pub kernel_entry_id: String,
+    #[serde(rename = "offendingDecisionId", skip_serializing_if = "Option::is_none")]
+    pub offending_decision_id: Option<String>,
+    pub layer: CharacterDriftLayerV1,
+    pub severity: CharacterDriftSeverityV1,
+    pub deviation: f64,
+    #[serde(rename = "windowStart", skip_serializing_if = "Option::is_none")]
+    pub window_start: Option<String>,
+    #[serde(rename = "windowEnd", skip_serializing_if = "Option::is_none")]
+    pub window_end: Option<String>,
+    #[serde(rename = "detectedAt")]
+    pub detected_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -465,6 +504,39 @@ mod tests {
         assert_eq!(encoded["toolParametersMode"], "encrypted_ref");
         assert!(encoded.get("toolParametersInline").is_none());
         assert!(encoded["toolParametersRef"].as_str().unwrap().starts_with("vault://"));
+    }
+
+    #[test]
+    fn character_drift_event_serializes_expected_fields() {
+        let event = AgentCharacterDriftDetectedV1 {
+            schema: EVT_AGENT_CHARACTER_DRIFT_DETECTED_V1.to_string(),
+            event_id: "evt-1".to_string(),
+            tenant_id: "tenant-1".to_string(),
+            agent_id: "agent-a".to_string(),
+            kernel_entry_id: "8d081dc4-7e78-414f-823b-29ea1cc1c5b7".to_string(),
+            offending_decision_id: Some("dec-1".to_string()),
+            layer: CharacterDriftLayerV1::Hash,
+            severity: CharacterDriftSeverityV1::Soft,
+            deviation: 1.0,
+            window_start: None,
+            window_end: None,
+            detected_at: "2026-04-27T12:00:00Z".to_string(),
+        };
+        let encoded = serde_json::to_value(&event).expect("encode drift event");
+        assert_eq!(encoded["schema"], EVT_AGENT_CHARACTER_DRIFT_DETECTED_V1);
+        assert_eq!(encoded["eventId"], "evt-1");
+        assert_eq!(encoded["kernelEntryId"], "8d081dc4-7e78-414f-823b-29ea1cc1c5b7");
+        assert_eq!(encoded["offendingDecisionId"], "dec-1");
+        assert_eq!(encoded["layer"], "hash");
+        assert_eq!(encoded["severity"], "soft");
+        assert_eq!(encoded["deviation"], 1.0);
+        assert!(encoded.get("windowStart").is_none());
+        assert!(encoded.get("windowEnd").is_none());
+
+        let decoded: AgentCharacterDriftDetectedV1 =
+            serde_json::from_value(encoded).expect("decode drift event");
+        assert_eq!(decoded.layer, CharacterDriftLayerV1::Hash);
+        assert_eq!(decoded.severity, CharacterDriftSeverityV1::Soft);
     }
 
     #[test]
