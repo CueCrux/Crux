@@ -608,10 +608,7 @@ pub(super) async fn post_projection_lookup(
     }
 
     if req.projection != "extraction_cache_current" {
-        return problem_response(
-            StatusCode::NOT_FOUND,
-            &format!("unknown projection: {}", req.projection),
-        );
+        return problem_response(StatusCode::NOT_FOUND, format!("unknown projection: {}", req.projection));
     }
 
     match req.mode.as_str() {
@@ -653,7 +650,7 @@ pub(super) async fn post_projection_lookup(
             StatusCode::BAD_REQUEST,
             "vector lookup is gated by M13 (semantic near-hit cache). Use mode=key in M1.",
         ),
-        other => problem_response(StatusCode::BAD_REQUEST, &format!("unknown mode: {other}")),
+        other => problem_response(StatusCode::BAD_REQUEST, format!("unknown mode: {other}")),
     }
 }
 
@@ -668,10 +665,7 @@ pub(super) async fn post_projection_batch_lookup(
     }
 
     if req.projection != "extraction_cache_current" {
-        return problem_response(
-            StatusCode::NOT_FOUND,
-            &format!("unknown projection: {}", req.projection),
-        );
+        return problem_response(StatusCode::NOT_FOUND, format!("unknown projection: {}", req.projection));
     }
 
     let cache = state.extraction_cache.read().await;
@@ -696,7 +690,10 @@ pub(super) async fn post_projection_batch_lookup(
         })
         .collect();
 
-    let hits = results.iter().filter(|r| r["hit"] == serde_json::Value::Bool(true)).count();
+    let hits = results
+        .iter()
+        .filter(|r| r["hit"] == serde_json::Value::Bool(true))
+        .count();
 
     Json(serde_json::json!({
         "projection": req.projection,

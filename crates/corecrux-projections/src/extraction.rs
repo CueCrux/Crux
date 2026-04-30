@@ -477,7 +477,10 @@ mod tests {
         let decoded = ExtractionConfidenceDeltaV1::decode_json(&bytes).unwrap();
         assert!((decoded.delta - -0.15).abs() < f32::EPSILON);
         assert_eq!(decoded.source, "judge_wrong");
-        assert_eq!(decoded.source_run_id.as_deref(), Some("lme-s-sonnet-4-6-F1-202604221028-c5a1d9"));
+        assert_eq!(
+            decoded.source_run_id.as_deref(),
+            Some("lme-s-sonnet-4-6-F1-202604221028-c5a1d9")
+        );
     }
 
     #[test]
