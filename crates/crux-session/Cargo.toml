@@ -16,7 +16,7 @@ thiserror = "2.0.12"
 
 [dev-dependencies]
 corecrux-projections = { path = "../corecrux-projections" }
-hex-literal = "0.4.1"
+hex-literal = "1.1.0"
 
 [lints]
 workspace = true
