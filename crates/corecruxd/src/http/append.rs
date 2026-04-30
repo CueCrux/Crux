@@ -76,6 +76,47 @@ pub(super) async fn post_admin_append(
         return map_http_dataplane_error(err);
     }
 
+    // stateful-extraction-flywheel M1.b — feed the extraction-cache materializer
+    // inline for any `corecrux.proj.extraction.*` events in this batch. This is
+    // the CE-friendly path: events are still persisted in the stream log, but
+    // we materialize in-process for immediate lookup availability. Proprietary
+    // deployments can upgrade to event-sourced replay from the sealed segments
+    // without changing the HTTP contract.
+    {
+        let mut cache = state.extraction_cache.write().await;
+        for event in &body.events {
+            let payload_bytes = event.payload.as_bytes();
+            match event.event_type.as_str() {
+                corecrux_projections::EVT_EXTRACTION_CACHE_INSERT_V1 => {
+                    if let Ok(ev) = corecrux_projections::ExtractionCacheInsertV1::decode_json(payload_bytes) {
+                        cache.apply_insert(&ev);
+                    }
+                }
+                corecrux_projections::EVT_EXTRACTION_CACHE_HIT_V1 => {
+                    if let Ok(ev) = corecrux_projections::ExtractionCacheHitV1::decode_json(payload_bytes) {
+                        cache.apply_hit(&ev);
+                    }
+                }
+                corecrux_projections::EVT_EXTRACTION_VERIFIER_SCORED_V1 => {
+                    if let Ok(ev) = corecrux_projections::ExtractionVerifierScoredV1::decode_json(payload_bytes) {
+                        cache.apply_verifier(&ev);
+                    }
+                }
+                corecrux_projections::EVT_EXTRACTION_CONFIDENCE_DELTA_V1 => {
+                    if let Ok(ev) = corecrux_projections::ExtractionConfidenceDeltaV1::decode_json(payload_bytes) {
+                        cache.apply_confidence(&ev);
+                    }
+                }
+                corecrux_projections::EVT_EXTRACTION_CACHE_INVALIDATE_V1 => {
+                    if let Ok(ev) = corecrux_projections::ExtractionCacheInvalidateV1::decode_json(payload_bytes) {
+                        cache.apply_invalidate(&ev);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Reload .ccxi indexes after append (seal + ccxi build happens synchronously in Phase 2 mode).
     {
         let idx = state.retrieval_index.clone();

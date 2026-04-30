@@ -58,6 +58,7 @@ corecrux-storage = { path = "../corecrux-storage" }
 corecrux-types = { path = "../corecrux-types" }
 crux-observe = { path = "../crux-observe" }
 crux-mcp = { path = "../crux-mcp" }
+crux-router = { path = "../crux-router" }
 crux-session = { path = "../crux-session" }
 
 [dev-dependencies]

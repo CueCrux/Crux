@@ -35,8 +35,9 @@ mod update;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use fs2::{available_space, total_space, FileExt};
@@ -58,6 +59,9 @@ use crate::http::{AppState, CapacityState, Readiness};
 use crate::metrics::Metrics;
 use crate::ops_events::{append_ops_event, build_node_context, now_unix_ms};
 use crate::shard_map::{RoutingTable, ShardMapStore};
+
+const DEFAULT_PASSPORT_CLAIM_ENDPOINT: &str = "https://passport.vaultcrux.com/v1/claim-anonymous";
+const PASSPORT_CLAIM_MARKER_FILENAME: &str = "passport.claimed";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -193,6 +197,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &build,
     )?;
     let node_id = node_meta.node_id.clone();
+
+    let rcx_passport_key = crux_session::LocalPassportKey::from_data_dir(&config.data_dir)?;
+    let rcx_issued_at = now_unix_ms() / 1000;
+    let rcx_token = crux_router::mint_signed_free_local_token(
+        rcx_passport_key.passport_fpr().to_string(),
+        node_id.clone(),
+        "local",
+        crux_mcp::tools::rcx_local_capabilities(),
+        rcx_issued_at,
+        rcx_issued_at.saturating_add(366 * 24 * 60 * 60),
+        |hash| rcx_passport_key.sign_hash(hash),
+    );
+    let rcx_token_hash = rcx_token.token_hash_hex();
+    let rcx_router = crux_router::RcxRouter::new(rcx_token);
+    info!(
+        passport_fpr = %rcx_passport_key.passport_fpr(),
+        public_key_hex = %rcx_passport_key.public_key_hex(),
+        token_hash = %rcx_token_hash,
+        "rcx free-local capability token minted"
+    );
+    spawn_anonymous_passport_claim(
+        config.data_dir.clone(),
+        rcx_passport_key.passport_fpr().to_string(),
+        rcx_passport_key.public_key_hex().to_string(),
+        format!("crux/{}", build.version),
+    );
 
     let http_leader = shard_map_advertise_addr(config.http_addr);
     let grpc_leader = shard_map_advertise_addr(config.grpc_addr);
@@ -360,6 +390,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         },
+        extraction_cache: Arc::new(tokio::sync::RwLock::new(
+            corecrux_projections::ExtractionCacheMaterializer::new(),
+        )),
     };
 
     // Wire the shared event bus into both stores so mutations emit SSE events.
@@ -410,7 +443,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 state.update_status.clone(),
                 mcp_agent_registry.clone(),
             )
-            .with_daemon_base_url(daemon_base),
+            .with_daemon_base_url(daemon_base)
+            .with_rcx_router(rcx_router),
         ))
     } else {
         None
@@ -1445,11 +1479,116 @@ fn spawn_capacity_guard(
     });
 }
 
+fn spawn_anonymous_passport_claim(
+    data_dir: PathBuf,
+    passport_fpr: String,
+    public_key_hex: String,
+    daemon_version: String,
+) {
+    let marker_path = data_dir.join(PASSPORT_CLAIM_MARKER_FILENAME);
+    if marker_path.exists() {
+        tracing::debug!(
+            passport_fpr = %passport_fpr,
+            marker = %marker_path.display(),
+            "anonymous Passport claim already recorded"
+        );
+        return;
+    }
+    let endpoint =
+        std::env::var("CRUX_PASSPORT_CLAIM_ENDPOINT").unwrap_or_else(|_| DEFAULT_PASSPORT_CLAIM_ENDPOINT.to_string());
+    tokio::spawn(async move {
+        let claim_fpr = passport_fpr.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            claim_anonymous_passport(&endpoint, &claim_fpr, &public_key_hex, &daemon_version)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(status)) => {
+                let marker = format!("passport_fpr={passport_fpr}\nstatus={status}\n");
+                if let Err(err) = std::fs::write(&marker_path, marker) {
+                    tracing::debug!(
+                        passport_fpr = %passport_fpr,
+                        marker = %marker_path.display(),
+                        error = %err,
+                        "anonymous Passport claim marker write failed"
+                    );
+                }
+                info!(
+                    passport_fpr = %passport_fpr,
+                    status = status,
+                    "anonymous Passport claim accepted"
+                );
+            }
+            Ok(Err(err)) => {
+                tracing::debug!(
+                    passport_fpr = %passport_fpr,
+                    error = %err,
+                    "anonymous Passport claim skipped"
+                );
+            }
+            Err(err) => {
+                tracing::debug!(
+                    passport_fpr = %passport_fpr,
+                    error = %err,
+                    "anonymous Passport claim task failed"
+                );
+            }
+        }
+    });
+}
+
+fn claim_anonymous_passport(
+    endpoint: &str,
+    passport_fpr: &str,
+    public_key_hex: &str,
+    daemon_version: &str,
+) -> Result<u16, String> {
+    let body = anonymous_passport_claim_body(public_key_hex, daemon_version)?;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(2)))
+        .timeout_recv_response(Some(Duration::from_secs(5)))
+        .timeout_recv_body(Some(Duration::from_secs(5)))
+        .build()
+        .into();
+    let resp = agent
+        .post(endpoint)
+        .content_type("application/cbor")
+        .header("accept", "application/cbor, application/json")
+        .send(body)
+        .map_err(|e| format!("{e}"))?;
+    let status = resp.status().as_u16();
+    if (200..300).contains(&status) {
+        Ok(status)
+    } else {
+        Err(format!("claim for {passport_fpr} returned HTTP {status}"))
+    }
+}
+
+fn anonymous_passport_claim_body(public_key_hex: &str, daemon_version: &str) -> Result<Vec<u8>, String> {
+    let pubkey = hex::decode(public_key_hex).map_err(|e| format!("decode Passport public key: {e}"))?;
+    if pubkey.len() != 32 {
+        return Err(format!("Passport public key must be 32 bytes, got {}", pubkey.len()));
+    }
+    Ok(crux_session::canonical::CborValue::Map(vec![
+        ("pubkey".to_string(), crux_session::canonical::CborValue::Bytes(pubkey)),
+        (
+            "daemon_version".to_string(),
+            crux_session::canonical::CborValue::Text(daemon_version.to_string()),
+        ),
+        (
+            "claim_proof".to_string(),
+            crux_session::canonical::CborValue::Text(String::new()),
+        ),
+    ])
+    .encode())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        reconcile_control_from_evidence, shard_map_advertise_addr, validate_mcp_bind_posture,
-        validate_network_auth_posture, ControlCheckpointRecord, ControlMutationRecord,
+        anonymous_passport_claim_body, reconcile_control_from_evidence, shard_map_advertise_addr,
+        validate_mcp_bind_posture, validate_network_auth_posture, ControlCheckpointRecord, ControlMutationRecord,
     };
     use crate::auth::AuthMode;
     use crate::config::CommitLevel;
@@ -1471,6 +1610,33 @@ mod tests {
             http_listen_addr: None,
             grpc_listen_addr: None,
         }
+    }
+
+    #[test]
+    fn anonymous_passport_claim_body_matches_spec_shape() {
+        let public_key_hex = "00".repeat(32);
+        let body = anonymous_passport_claim_body(&public_key_hex, "crux/0.1.0").expect("claim body");
+        let decoded = crux_session::canonical::decode(&body).expect("decode claim body");
+        let crux_session::canonical::CborValue::Map(pairs) = decoded else {
+            panic!("claim body must be a CBOR map");
+        };
+
+        let pubkey = pairs
+            .iter()
+            .find_map(|(key, value)| (key == "pubkey").then_some(value))
+            .expect("pubkey field");
+        let daemon_version = pairs
+            .iter()
+            .find_map(|(key, value)| (key == "daemon_version").then_some(value))
+            .expect("daemon_version field");
+        let claim_proof = pairs
+            .iter()
+            .find_map(|(key, value)| (key == "claim_proof").then_some(value))
+            .expect("claim_proof field");
+
+        assert!(matches!(pubkey, crux_session::canonical::CborValue::Bytes(bytes) if bytes.len() == 32));
+        assert!(matches!(daemon_version, crux_session::canonical::CborValue::Text(value) if value == "crux/0.1.0"));
+        assert!(matches!(claim_proof, crux_session::canonical::CborValue::Text(value) if value.is_empty()));
     }
 
     fn sample_auth() -> EvidenceAuthContextV1 {
@@ -3164,6 +3330,9 @@ mod tests {
             update_status: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_types::UpdateStatus::default())),
             event_bus: corecrux_memory::events::EventBus::new(16),
             session: None,
+            extraction_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+                corecrux_projections::ExtractionCacheMaterializer::new(),
+            )),
         };
 
         let router: axum::Router = crate::http::router(state);
