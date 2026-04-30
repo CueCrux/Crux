@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn error_code_variant_count_matches_constants() {
-        // Community edition: 11 error codes, no GPU variants.
+        // Crux Daemon: 11 error codes, no GPU variants.
         assert_eq!(corecrux_types::CORE_ERROR_CODES.len(), 11);
     }
 

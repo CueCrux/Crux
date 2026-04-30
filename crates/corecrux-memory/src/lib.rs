@@ -2,7 +2,7 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! `corecrux-memory` — Fact store and session store for CoreCrux Community Edition.
+//! `corecrux-memory` — Fact store and session store for Crux Daemon.
 //!
 //! Provides receipted key-value entity memory (fact store) and scoped session state.
 //! All writes produce CROWN-compatible receipts. Data is stored in-memory with

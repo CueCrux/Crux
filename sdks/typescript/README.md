@@ -1,6 +1,6 @@
 # @cuecrux/client
 
-TypeScript client for [CoreCrux Community Edition](https://github.com/CueCrux/Crux).
+TypeScript client for [Crux Daemon](https://github.com/CueCrux/Crux).
 
 Zero runtime dependencies -- uses native `fetch` (Node.js >= 18, all modern browsers).
 

@@ -38,7 +38,7 @@ pub use events::{
     InvocationReceiptedV1, SessionClosedV1, SessionPlanSealedV1, SessionRevokedV1, CONTENT_TYPE_SESSION_BIN_V1,
     EVT_INVOCATION_RECEIPTED_V1, EVT_SESSION_CLOSED_V1, EVT_SESSION_PLAN_SEALED_V1, EVT_SESSION_REVOKED_V1,
 };
-// CE → Core migration (M8).
+// Local-daemon to Core migration (M8).
 pub use events::{CeInstallImportedV1, EVT_CE_INSTALL_IMPORTED_V1};
 pub use session_plans_by_principal::{PlanEntryV1, PrincipalKey, SessionPlansByPrincipalV1};
 // Access to the events module for downstream crates (corecruxd / tests) that

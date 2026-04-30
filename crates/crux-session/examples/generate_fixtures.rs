@@ -125,13 +125,13 @@ fn all_fixtures() -> Vec<FixtureSpec> {
     vec![
         FixtureSpec {
             name: "001-ce-minimal",
-            description: "CE local plan with three capabilities, no intent, no parent chain.",
+            description: "Crux Daemon local plan with three capabilities, no intent, no parent chain.",
             signer_public_key_hex: None,
             builder: ce_minimal,
         },
         FixtureSpec {
             name: "002-ce-full",
-            description: "CE local plan with 12 capabilities, parent chain of 2, intent_hint set.",
+            description: "Crux Daemon local plan with 12 capabilities, parent chain of 2, intent_hint set.",
             signer_public_key_hex: None,
             builder: ce_full,
         },

@@ -18,7 +18,7 @@ pub struct SessionMetrics {
     pub handshakes_total: CounterVec,                     // labels: origin, outcome
     pub handshake_latency_seconds: HistogramVec,          // labels: origin
     pub capability_graph_size: HistogramVec,              // labels: origin, tier
-    pub active: Gauge,                                    // no labels on CE (single install)
+    pub active: Gauge,                                    // no labels on Crux Daemon (single install)
     pub expired_total: CounterVec,                        // labels: origin, reason
     pub plan_bytes: HistogramVec,                         // labels: encoding (cbor|json)
     pub invocation_receipts_total: CounterVec,            // labels: channel, capability, outcome
@@ -207,7 +207,7 @@ impl SessionMetrics {
     /// Histogram observe for a just-completed invocation. Use
     /// `outcome` ∈ {"ok","error","partial"} per master-plan §8.1.
     // Wired up by the proprietary invocation receipt path (master-plan §8);
-    // kept in CE so the metric surface matches hosted.
+    // kept in Crux Daemon so the metric surface matches hosted.
     #[allow(dead_code)]
     pub fn invocation_observe(&self, channel: &str, capability: &str, outcome: &str, latency_secs: f64) {
         self.invocation_receipts_total

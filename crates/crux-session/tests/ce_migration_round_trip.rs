@@ -2,16 +2,16 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! M8 CE → Core migration round-trip test.
+//! M8 local-daemon to Core migration round-trip test.
 //!
-//! Master-plan Phase 8 gate: "full round trip — stand up a CE install,
+//! Master-plan Phase 8 gate: "full round trip — stand up a local-daemon install,
 //! open 10 sessions, make 100 invocations, upload to hosted, verify all
 //! 100 invocations under the new tenant."
 //!
 //! We don't run a real hosted API here (the hosted verifier is in TS
 //! and the bundle schema is JSON). What we CAN do in pure Rust:
 //!
-//!   1. Stand up a real CE install (tempdir + durable services).
+//!   1. Stand up a real local-daemon install (tempdir + durable services).
 //!   2. Mint 10 plans + 100 invocations (10 per plan).
 //!   3. Build a [`CeExportBundle`] via
 //!      [`crux_session::export::build_bundle`].
@@ -23,7 +23,7 @@
 //!   7. For each invocation receipt stored against each plan:
 //!      - verify_invocation_receipt(receipt, plan) → verified_overall
 //!   8. Assert: 10 plans exported, 10 plans re-verify, 100 invocations
-//!      replayed from the CE event log, all chain-verify.
+//!      replayed from the local event log, all chain-verify.
 //!
 //! The actual ed25519 countersignature + `CeInstallImportedV1` event is
 //! minted on the hosted side inside the `/v1/ce-import` route; that's
@@ -105,7 +105,7 @@ fn ce_install_exports_verifiable_bundle() {
 
     let data_dir = tempdir();
 
-    // ── Build out a realistic CE install ──────────────────────────────
+    // Build out a realistic local-daemon install.
     let passport_cfg = LocalPassportConfig::from_data_dir(&data_dir, "myles").unwrap();
     let registry = FileSessionRegistry::open(&data_dir).unwrap();
     let sealer = FileSealer::open(&data_dir).unwrap();
@@ -217,7 +217,7 @@ fn ce_install_exports_verifiable_bundle() {
 
         // 3. Chain-verify every invocation receipt we sealed for this
         // session. We pull them from the in-test collection because our
-        // CE bundle builder currently emits plans only; the hosted side
+        // Local bundle builder currently emits plans only; the hosted side
         // will receive invocations via the same bundle once we extend
         // it. For the gate we assert the chain itself — the piping is
         // the extension.
@@ -235,9 +235,16 @@ fn ce_install_exports_verifiable_bundle() {
 
     assert_eq!(verified_plans, PLANS);
     assert_eq!(verified_invocations, PLANS * INVOCATIONS_PER_PLAN);
-    assert_eq!(principals.len(), 1, "CE install should have exactly one principal");
+    assert_eq!(
+        principals.len(),
+        1,
+        "local-daemon install should have exactly one principal"
+    );
     let principal = principals.iter().next().unwrap();
-    assert!(principal.starts_with("ce:"), "expected CE principal, got {principal}");
+    assert!(
+        principal.starts_with("ce:"),
+        "expected local compatibility principal, got {principal}"
+    );
 
     std::fs::remove_dir_all(&data_dir).ok();
 }

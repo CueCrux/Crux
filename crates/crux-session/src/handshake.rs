@@ -14,7 +14,7 @@
 //!     ─► sign (if available)   (receipt.signature / signer_kid)
 //!     ─► sealed plan           (returned)
 //!     ─► registry.insert       (caller's responsibility; see corecruxd
-//!                                route for the full CE wiring)
+//!                                route for the full local-daemon wiring)
 //! ```
 //!
 //! The service has **no I/O** — it's a pure function over its inputs plus

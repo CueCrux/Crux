@@ -533,8 +533,7 @@ mod tests {
         assert!(encoded.get("windowStart").is_none());
         assert!(encoded.get("windowEnd").is_none());
 
-        let decoded: AgentCharacterDriftDetectedV1 =
-            serde_json::from_value(encoded).expect("decode drift event");
+        let decoded: AgentCharacterDriftDetectedV1 = serde_json::from_value(encoded).expect("decode drift event");
         assert_eq!(decoded.layer, CharacterDriftLayerV1::Hash);
         assert_eq!(decoded.severity, CharacterDriftSeverityV1::Soft);
     }

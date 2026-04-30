@@ -59,7 +59,7 @@ graph TD
 5. `.ccxi` companion index built at seal time (`corecrux-index`).
 6. CROWN receipt generated for every event (`corecrux-receipts`).
 
-In the default Community Edition runtime, the dataplane is disabled, so append
+In the default Crux Daemon runtime, the dataplane is disabled, so append
 requires a dataplane-enabled deployment.
 
 ### Query Path
@@ -104,9 +104,9 @@ requires a dataplane-enabled deployment.
 - **corecruxd** -- HTTP (axum, port 14800), gRPC (tonic, port 4007), and built-in MCP (port 14801 by default) daemon. Manages shard lifecycle, routes requests, serves Prometheus metrics at `/metrics`, and provides health/readiness endpoints.
 - **corecruxctl** -- CLI tool with subcommands: `verify-store` (cryptographic integrity check), `replay` (deterministic replay with drift classification), `receipts` (receipt tooling and export), `ccxi` (companion index inspection), `projections` (projection state management).
 
-### Community Layer
+### Agent And Extension Layer
 
-- **crux-mcp** -- MCP router and token-filtered tool surface exposing 28 tools for agent interaction. Handles agent identity, tool routing, update awareness, constraints, passport, sync, and handoffs.
+- **crux-mcp** -- MCP router and token-filtered tool surface for agent interaction. Handles agent identity, tool routing, update awareness, constraints, passport, sync, and handoffs.
 - **crux-observe** -- Self-observation subsystem. Provides ops monitoring, bootstrap sequencing, and cold gate logic.
 - **crux-sync** -- Outbox sync with VaultCrux. Manages event replication to external systems.
 - **crux-contrib** -- Contribution manifest builder. Tracks and packages community contributions.

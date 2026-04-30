@@ -15,7 +15,7 @@
 //!   enforced. Disabled behind the default; production paths must wire a
 //!   real sealer.
 //! - [`InMemorySealer`]: records every sealed event in a `Vec`. Used by
-//!   M2 integration tests and by CE installs running without a full
+//!   M2 integration tests and by local-daemon installs running without a full
 //!   CoreCrux dataplane. Rebuildable on startup by replaying the Vec.
 //!
 //! A `DataplaneSealer` that calls `http_dataplane::append_batch(...)`
@@ -102,17 +102,17 @@ impl PlanSealer for InMemorySealer {
 // ─── FileSealer (M6): durable append-only event log on disk ──────────────
 //
 // Writes each sealed event as one JSON line in
-// `{data_dir}/session-events.jsonl`. This is the CE-grade stand-in for
+// `{data_dir}/session-events.jsonl`. This is the local-daemon stand-in for
 // the full CoreCrux segment log; the wire format is looser (JSON vs the
 // binary `SessionPlanSealedV1::encode_bin`) but the durability and
 // append-only semantics are identical. Rebuilding the projection after
 // a crash is a one-pass scan of the file.
 
-/// CE durable sealer: appends one JSON line per sealed event.
+/// Crux Daemon durable sealer: appends one JSON line per sealed event.
 pub struct FileSealer {
     path: PathBuf,
     /// Protects concurrent appenders. Each `seal` opens the file,
-    /// appends, fsyncs, and closes — coarse but adequate at CE scale
+    /// appends, fsyncs, and closes — coarse but adequate at local-daemon scale
     /// (hundreds of events per session, not millions).
     write_lock: Mutex<()>,
 }

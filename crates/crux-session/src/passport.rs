@@ -2,9 +2,9 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! Local passport synthesis for Crux CE (master-plan §3.2).
+//! Local passport synthesis for Crux Daemon (master-plan §3.2).
 //!
-//! On CE the passport is derived deterministically from:
+//! On Crux Daemon the passport is derived deterministically from:
 //! - an install UUID (per-install, stored on disk)
 //! - a local user identifier (hostname-hash or configured username)
 //!
@@ -24,11 +24,11 @@ use ed25519_dalek::{Signer as DalekSigner, SigningKey};
 use crate::error::SessionError;
 use crate::plan::{Passport, HASH_LEN, SIGNATURE_LEN};
 
-/// Filename inside a CE data directory that holds the durable install
+/// Filename inside a Crux Daemon data directory that holds the durable install
 /// UUID. First read on startup — generated + persisted if missing.
 pub const INSTALL_UUID_FILENAME: &str = ".install-uuid";
 
-/// Filename inside a CE data directory that holds the durable local Passport
+/// Filename inside a Crux Daemon data directory that holds the durable local Passport
 /// signing seed used for RCX free-local Capability Tokens.
 pub const PASSPORT_KEY_FILENAME: &str = "passport.key";
 
@@ -57,7 +57,7 @@ impl std::fmt::Debug for LocalPassportKey {
 }
 
 impl LocalPassportConfig {
-    /// Load (or initialise) the CE install UUID from `data_dir/.install-uuid`.
+    /// Load (or initialise) the Crux Daemon install UUID from `data_dir/.install-uuid`.
     ///
     /// On first call the file does not exist; we generate a new UUIDv4
     /// via the `uuid` crate and write it atomically. Subsequent calls

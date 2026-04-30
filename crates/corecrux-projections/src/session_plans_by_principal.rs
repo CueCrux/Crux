@@ -8,7 +8,7 @@
 //! Powers the three queries called out in the master plan:
 //!
 //! - **Audit:** every session a principal has ever opened.
-//! - **Migration (M8):** every CE session plan for install `X` that we need
+//! - **Migration (M8):** every local-daemon session plan for install `X` that we need
 //!   to import to hosted.
 //! - **Continuity:** the last N sessions this agent ran, as a timeline.
 //!

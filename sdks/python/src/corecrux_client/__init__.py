@@ -2,7 +2,7 @@
 # Licensed under the CueCrux Community Licence (CCL v1.0).
 # See LICENCE.md in the repository root.
 
-"""CoreCrux Community Edition Python client."""
+"""Crux Daemon Python client."""
 
 from .client import AsyncCoreCruxClient, CoreCruxClient
 from .errors import CoreCruxError

@@ -2,7 +2,7 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! `crux-mcp` — MCP server for agent integration with CoreCrux Community Edition.
+//! `crux-mcp` — MCP server for agent integration with Crux Daemon.
 //!
 //! Implements JSON-RPC 2.0 transport, tool dispatch, and an axum HTTP server
 //! that exposes CoreCrux capabilities over the MCP Streamable HTTP protocol.

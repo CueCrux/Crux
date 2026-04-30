@@ -1,4 +1,4 @@
-# cargo-deny configuration for CoreCrux Community Edition
+# cargo-deny configuration for Crux Daemon
 # Run: cargo deny check
 
 [graph]

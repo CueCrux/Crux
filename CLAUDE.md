@@ -1,4 +1,4 @@
-# CoreCrux Community Edition — Claude Code Instructions
+# Crux Daemon — Claude Code Instructions
 
 ## Scope
 
@@ -7,7 +7,7 @@ These rules apply when working inside the `Crux/` repository.
 ## Build & Test
 
 ```bash
-cargo build --release                    # Build community edition (CPU-only)
+cargo build --release                    # Build Crux Daemon (CPU-only)
 cargo test --workspace                   # Run all tests
 cargo fmt --check                        # Check formatting
 cargo clippy --workspace -- -D warnings  # Lint
@@ -21,14 +21,14 @@ cargo clippy --workspace -- -D warnings  # Lint
 - `corecrux-retrieval` — BM25 + graph signal fusion (CPU path)
 - `corecrux-storage` — Append-only shard store with sealed segments
 - `corecrux-receipts` — Ed25519 CROWN receipt signing
-- GPU/CUDA acceleration requires the proprietary edition (not included in this repo)
+- GPU/CUDA acceleration requires a dataplane-enabled distribution (not included in this repo)
 
 ## Key Rules
 
-- **No GPU/CUDA code.** Community edition is CPU-only. No `--features cuda`, no CUDA imports, no GPU readiness checks.
+- **No GPU/CUDA code.** Crux Daemon is CPU-only. No `--features cuda`, no CUDA imports, no GPU readiness checks.
 - **No proprietary crates.** `corecrux-analytics`, `corecrux-decision`, `corecrux-coordinator` do NOT exist in this repo.
 - **Licence headers.** Every `.rs` file must start with the CCL header. Run `grep -rL "Licensed under" crates/**/*.rs` to check.
-- **Port 14800.** The community edition HTTP port. Do not change this default.
+- **Port 14800.** The Crux Daemon HTTP port. Do not change this default.
 
 ## Licence
 

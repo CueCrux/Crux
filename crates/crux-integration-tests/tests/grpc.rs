@@ -2,11 +2,11 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! gRPC integration tests for CoreCrux Community Edition.
+//! gRPC integration tests for Crux Daemon.
 //! Run: ./scripts/run-integration-tests.sh --test grpc -- --test-threads=1
 //!
 //! These tests verify that the gRPC server is listening, that all data-plane
-//! RPCs correctly return `UNIMPLEMENTED` in Community Edition, and that the
+//! RPCs correctly return `UNIMPLEMENTED` in Crux Daemon, and that the
 //! observe service is accessible.
 
 use std::sync::OnceLock;
@@ -44,7 +44,7 @@ async fn export_service_connect() {
         .expect("Export service connection should succeed");
 }
 
-// ── DataPlane RPCs: all return UNIMPLEMENTED in Community Edition ────
+// ── DataPlane RPCs: all return UNIMPLEMENTED in Crux Daemon ────
 
 #[tokio::test]
 async fn append_batch_returns_unimplemented() {

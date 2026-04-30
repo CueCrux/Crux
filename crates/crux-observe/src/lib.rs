@@ -2,7 +2,7 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! `crux-observe` — Self-observation layer for CoreCrux Community Edition.
+//! `crux-observe` — Self-observation layer for Crux Daemon.
 //!
 //! Captures operational events (errors, warnings, metrics, health) and bootstrap
 //! documentation as facts in the CoreCrux memory subsystem. This enables the

@@ -15,8 +15,8 @@ mod control;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]
 mod dataplane_store;
-// gRPC service stubs: proprietary edition implements full RPCs; community
-// edition keeps the server skeleton. Suppress dead_code for stub internals.
+// gRPC service stubs: dataplane-enabled distributions implement full RPCs;
+// Crux Daemon keeps the server skeleton. Suppress dead_code for stub internals.
 #[allow(dead_code)]
 mod grpc;
 mod http;
@@ -287,7 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let readiness = Arc::new(RwLock::new(Readiness::default()));
 
-    // Community edition: no dataplane pool (requires proprietary edition).
+    // Crux Daemon: no dataplane pool (requires a dataplane-enabled distribution).
     let dataplane_pool: Option<crate::pool::DataPlanePool> = None;
 
     let control_evidence_status =
@@ -417,7 +417,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         update_status: update_status.clone(),
         event_bus: corecrux_memory::events::EventBus::new(1024),
         session: {
-            // Durable CE wiring: persistent install UUID + file registry +
+            // Durable local-daemon wiring: persistent install UUID + file registry +
             // file sealer under the configured data_dir. Falls back to the
             // ephemeral (in-memory) wiring only if opening any of the three
             // fails — tests are the expected consumer of the ephemeral

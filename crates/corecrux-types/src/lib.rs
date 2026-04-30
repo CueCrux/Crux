@@ -33,7 +33,7 @@ pub const SHARDMAP_V1: u32 = 1;
 pub const SHARDMAP_HASH_FN_V1: &str = "xxhash64-v1";
 pub const SHARDMAP_KEY_ENCODING_V1: &str = "utf8-nul-delimited-v1";
 
-// CoreCrux Community Edition error taxonomy (11/11 — GPU variants removed).
+// Crux Daemon error taxonomy (11/11 — GPU variants removed).
 pub const CORE_ERROR_IO_READ_FAILED: &str = "IO_READ_FAILED";
 pub const CORE_ERROR_IO_WRITE_FAILED: &str = "IO_WRITE_FAILED";
 pub const CORE_ERROR_IO_FSYNC_FAILED: &str = "IO_FSYNC_FAILED";
@@ -946,7 +946,7 @@ mod tests {
     // ── Error constant tests ───────────────────────────────────────
 
     #[test]
-    fn error_codes_array_length_matches_community_edition() {
+    fn error_codes_array_length_matches_crux_daemon() {
         assert_eq!(CORE_ERROR_CODES.len(), 11);
     }
 
@@ -955,7 +955,7 @@ mod tests {
         for code in &CORE_ERROR_CODES {
             assert!(
                 !code.starts_with("GPU_"),
-                "community edition must not contain GPU error code: {code}"
+                "Crux Daemon must not contain GPU error code: {code}"
             );
         }
     }

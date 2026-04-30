@@ -1,7 +1,7 @@
 # Threat Model
 
 This document describes the trust boundaries, adversary model, and security assumptions
-for the CoreCrux Community Edition.
+for the Crux Daemon.
 
 ## Trust Boundaries
 
@@ -30,7 +30,7 @@ for the CoreCrux Community Edition.
 - **Network:** The daemon binds to `127.0.0.1` by default. Non-loopback binding with
   `DevScopes` or `Off` auth modes is blocked unless `CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1`
   is explicitly set.
-- **TLS:** The community edition does **not** implement TLS natively. Deployments exposed
+- **TLS:** The Crux Daemon does **not** implement TLS natively. Deployments exposed
   beyond localhost **must** use a TLS-terminating reverse proxy (Caddy, nginx, Envoy).
 - **Auth:** Controlled by `CORECRUXD_AUTH_MODE` (required, no default):
   - `off` - No authentication. All scope checks bypassed. Use only for local development.
@@ -104,7 +104,7 @@ to include full details for debugging.
 
 ## Rate Limiting
 
-The community edition does not implement application-level rate limiting. Use your reverse
+The Crux Daemon does not implement application-level rate limiting. Use your reverse
 proxy (Caddy `rate_limit`, nginx `limit_req`, etc.) to protect against resource exhaustion.
 
 ## Dependency Security

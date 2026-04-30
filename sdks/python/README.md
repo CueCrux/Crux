@@ -1,6 +1,6 @@
 # CoreCrux Python Client
 
-Python client for the [CoreCrux Community Edition](https://github.com/CueCrux/Crux) HTTP API.
+Python client for the [Crux Daemon](https://github.com/CueCrux/Crux) HTTP API.
 
 Provides both synchronous and asynchronous interfaces using [httpx](https://www.python-httpx.org/).
 

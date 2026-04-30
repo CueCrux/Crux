@@ -2,7 +2,7 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! End-to-end integration tests exercising the full Community Edition workflow:
+//! End-to-end integration tests exercising the full Crux Daemon workflow:
 //! store facts, query facts, store sessions.
 //!
 //! Run: ./scripts/run-integration-tests.sh --test e2e -- --test-threads=1

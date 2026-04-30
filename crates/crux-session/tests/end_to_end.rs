@@ -4,7 +4,7 @@
 
 //! End-to-end integration test for the handshake pipeline.
 //!
-//! Mirrors the sequence that CE's `POST /session` and hosted's
+//! Mirrors the sequence that Crux Daemon's `POST /session` and hosted's
 //! `POST /v1/session` execute: synthesise (or accept) a passport, mint a
 //! plan, insert into the registry, re-decode from canonical CBOR, and
 //! verify the hash (+ signature, for verified mode).
@@ -119,7 +119,7 @@ fn hosted_handshake_full_flow_with_signature() {
 #[test]
 fn ce_capability_graph_is_local_scoped() {
     let (plan, _) = ce_handshake(&NullSigner);
-    // CE passport has affinities = ["*"] — every catalog entry that passes
+    // Crux Daemon passport has affinities = ["*"] — every catalog entry that passes
     // the tier filter should be visible. The `local` tier bars capabilities
     // requiring `free` or higher — confirm the graph is non-empty but does
     // not include pro/team-tier capabilities.

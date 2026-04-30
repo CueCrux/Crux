@@ -10,7 +10,7 @@
 //!
 //! Filter order (per master plan):
 //! 1. Affinity filter — drop if required affinity not in passport.affinities
-//!    (wildcard `"*"` in affinities matches everything; used by CE).
+//!    (wildcard `"*"` in affinities matches everything; used by Crux Daemon).
 //! 2. Tier filter — drop if `min_tier` exceeds passport.tier.
 //! 3. Feature-flag filter — drop if the gating flag is off.
 //! 4. Budget filter — drop `cost_class: "heavy"` if `budget.crux_cap` is
@@ -34,7 +34,7 @@ use crate::intent::{
 use crate::plan::{Capability, Passport, HASH_LEN};
 
 /// Threshold below which `heavy` capabilities are dropped. Callers with
-/// `budget.crux_cap = None` (CE) always keep heavy capabilities.
+/// `budget.crux_cap = None` (local daemon) always keep heavy capabilities.
 pub const HEAVY_COST_THRESHOLD: u64 = 5;
 
 #[derive(Debug, Clone)]
@@ -242,7 +242,7 @@ mod tests {
             max_capabilities: None,
         };
         let graph = generate_default(&pp, &hints, None, &flags);
-        // CE should see every catalog entry (no tier blocks at local? yes it does
+        // Crux Daemon should see every catalog entry (no tier blocks at local? yes it does
         // block — "local" is rank 0, "free" is rank 1, so min_tier = "free"
         // fails tier_meets when actual is "local"). Adjusting expectation:
         // wildcard affinity does not override the tier filter.

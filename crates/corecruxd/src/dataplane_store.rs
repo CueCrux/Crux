@@ -2,7 +2,7 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! Community Edition stub — the data-plane store requires the proprietary
+//! Crux Daemon stub — the data-plane store requires the proprietary
 //! edition. Only type definitions needed by other modules are retained here.
 
 // ---------------------------------------------------------------------------
@@ -78,7 +78,7 @@ pub type AppendStats = corecrux_storage::AppendStatsV1;
 pub type StoredEvent = corecrux_storage::StoredEvent;
 
 // ---------------------------------------------------------------------------
-// Struct stubs — fields preserved, impls removed (unconstructable in CE)
+// Struct stubs — fields preserved, impls removed in Crux Daemon
 // ---------------------------------------------------------------------------
 
 /// Result of a force-seal + projection tick operation on a single shard.
@@ -187,7 +187,7 @@ pub struct ProjectionSnapshotIssue {
     pub detail: String,
 }
 
-/// Community Edition stub — `DataPlaneStore` requires the proprietary edition.
+/// Crux Daemon stub — `DataPlaneStore` requires the proprietary edition.
 /// The struct is retained (unconstructable) so that `pool.rs` can reference it.
 ///
 /// All methods below are unreachable at runtime — they exist only so that code
