@@ -31,6 +31,7 @@ jobs:
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: cargo fmt --check
       - run: typos
+      - run: bash scripts/assert-daemon-release-boundary.sh
       - run: cargo clippy --workspace -- -D warnings
 
   # ── Test, MSRV, Coverage: self-hosted ────────────────────────────────

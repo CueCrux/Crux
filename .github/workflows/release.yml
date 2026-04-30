@@ -41,7 +41,9 @@ jobs:
           version: "25.x"
 
       - name: Run tests
-        run: cargo test --workspace
+        run: |
+          bash scripts/assert-daemon-release-boundary.sh
+          cargo test --workspace
 
       - name: Build release
         run: cargo build --release
@@ -51,6 +53,9 @@ jobs:
           mkdir -p dist
           cp target/release/corecruxd dist/corecruxd-${{ matrix.suffix }}
           cp target/release/corecruxctl dist/corecruxctl-${{ matrix.suffix }}
+          cp LICENCE-CODE.md LICENCE-CONTENT.md TRUST-CONTRACT.md dist/
+          mkdir -p dist/content
+          cp content/MANIFEST.json dist/content/MANIFEST.json
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7

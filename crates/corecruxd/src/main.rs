@@ -60,7 +60,6 @@ use crate::metrics::Metrics;
 use crate::ops_events::{append_ops_event, build_node_context, now_unix_ms};
 use crate::shard_map::{RoutingTable, ShardMapStore};
 
-const DEFAULT_PASSPORT_CLAIM_ENDPOINT: &str = "https://passport.vaultcrux.com/v1/claim-anonymous";
 const PASSPORT_CLAIM_MARKER_FILENAME: &str = "passport.claimed";
 
 #[tokio::main]
@@ -99,6 +98,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.follower_reads_enabled,
         config.replicated_commit_timeout_ms,
         config.replicated_commit_require_all_followers,
+        &config.loaded_config_path,
+        &config.state_dir,
+        &config.content_manifest_path,
+        config.content_verify_signatures,
+        config.router_refresh_interval_seconds,
+        config.router_cache_ttl_seconds,
+        &config.router_fallback_policy,
+        &config.llm_endpoint,
+        &config.llm_model,
         config.max_events_per_batch,
         config.max_batch_bytes,
         config.max_event_id_bytes,
@@ -164,6 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }));
 
+    create_dir_all(&config.state_dir)?;
     create_dir_all(&config.data_dir)?;
     let lock_file = acquire_lock(&config.data_dir)?;
 
@@ -198,7 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )?;
     let node_id = node_meta.node_id.clone();
 
-    let rcx_passport_key = crux_session::LocalPassportKey::from_data_dir(&config.data_dir)?;
+    let rcx_passport_key = crux_session::LocalPassportKey::from_path(&config.passport_key_path)?;
     let rcx_issued_at = now_unix_ms() / 1000;
     let rcx_token = crux_router::mint_signed_free_local_token(
         rcx_passport_key.passport_fpr().to_string(),
@@ -217,12 +226,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         token_hash = %rcx_token_hash,
         "rcx free-local capability token minted"
     );
-    spawn_anonymous_passport_claim(
-        config.data_dir.clone(),
-        rcx_passport_key.passport_fpr().to_string(),
-        rcx_passport_key.public_key_hex().to_string(),
-        format!("crux/{}", build.version),
-    );
+    if config.passport_claim_on_startup {
+        spawn_anonymous_passport_claim(
+            config.state_dir.clone(),
+            config.passport_claim_endpoint.clone(),
+            rcx_passport_key.passport_fpr().to_string(),
+            rcx_passport_key.public_key_hex().to_string(),
+            format!("crux/{}", build.version),
+        );
+    }
 
     let http_leader = shard_map_advertise_addr(config.http_addr);
     let grpc_leader = shard_map_advertise_addr(config.grpc_addr);
@@ -1477,12 +1489,13 @@ fn spawn_capacity_guard(
 }
 
 fn spawn_anonymous_passport_claim(
-    data_dir: PathBuf,
+    state_dir: PathBuf,
+    endpoint: String,
     passport_fpr: String,
     public_key_hex: String,
     daemon_version: String,
 ) {
-    let marker_path = data_dir.join(PASSPORT_CLAIM_MARKER_FILENAME);
+    let marker_path = state_dir.join(PASSPORT_CLAIM_MARKER_FILENAME);
     if marker_path.exists() {
         tracing::debug!(
             passport_fpr = %passport_fpr,
@@ -1491,8 +1504,6 @@ fn spawn_anonymous_passport_claim(
         );
         return;
     }
-    let endpoint =
-        std::env::var("CRUX_PASSPORT_CLAIM_ENDPOINT").unwrap_or_else(|_| DEFAULT_PASSPORT_CLAIM_ENDPOINT.to_string());
     tokio::spawn(async move {
         let claim_fpr = passport_fpr.clone();
         let result = tokio::task::spawn_blocking(move || {

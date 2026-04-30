@@ -121,6 +121,13 @@ cargo build --release
 CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 ```
 
+### YAML config
+
+Crux can also load daemon v2 config from `$XDG_CONFIG_HOME/crux/config.yaml`.
+Use [`config.example.yaml`](config.example.yaml) as the starting point. Environment
+variables such as `CORECRUXD_HTTP_PORT`, `CORECRUXD_DATA_DIR`, and
+`CORECRUXD_AUTH_MODE` override YAML values for local service-manager deployments.
+
 ## Five-Minute Walkthrough
 
 1. **Start the server:**

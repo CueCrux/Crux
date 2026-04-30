@@ -1,0 +1,13 @@
+{
+  "schema": "cuecrux.content.manifest.v1",
+  "status": "placeholder",
+  "issuer": "vaultcrux",
+  "licence": "LicenseRef-CueCrux-Content-1.0",
+  "generated_at": "2026-04-30T00:00:00Z",
+  "files": [],
+  "signature": {
+    "alg": "CROWN-Ed25519",
+    "kid": "pending",
+    "value": "pending"
+  }
+}
