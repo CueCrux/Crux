@@ -15,7 +15,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.88.0-orange)](rust-toolchain.toml)
 [![Docker](https://img.shields.io/badge/docker-ghcr.io%2Fcuecrux%2Fcrux-blue)](https://ghcr.io/cuecrux/crux-community)
 
-> **Naming:** This repository is **Crux**. The daemon binary is `corecruxd`, the CLI is `corecruxctl`, and all Rust crates use the `corecrux-` prefix. Environment variables start with `CORECRUXD_`. When you see "Crux" in prose and `corecrux` in code, they mean the same thing.
+> **Naming:** This repository is **Crux**. The canonical daemon binary is `corecruxd`; release bundles also publish a `crux-*` alias for user-facing installs. The CLI is `corecruxctl`, and Rust crates keep the `corecrux-` prefix. Environment variables start with `CORECRUXD_`. When you see "Crux" in prose and `corecrux` in code, they mean the same thing.
 
 ## What Crux Is
 
@@ -45,7 +45,7 @@ Not every feature in the architecture is enabled in every deployment. Here is wh
 | CROWN receipts (Ed25519 signed) | **yes** | | |
 | Fact store (entity/key/value + confidence) | **yes** | | |
 | Session store (scoped agent state) | **yes** | | |
-| Built-in MCP server (22 tools) | **yes** | | |
+| Built-in MCP server (28 token-filtered tools) | **yes** | | |
 | Prometheus `/metrics` endpoint | **yes** | | |
 | HTTP + gRPC APIs | **yes** | | |
 | CLI tooling (`verify-store`, `replay`, etc.) | **yes** | | |
@@ -107,9 +107,9 @@ CORECRUXD_EMBEDDING_MODEL=mxbai-embed-large docker compose --profile embeddings 
 ### Binary (Linux x86_64)
 
 ```bash
-curl -sSL https://github.com/CueCrux/Crux/releases/latest/download/corecruxd-linux-amd64 -o corecruxd
-chmod +x corecruxd
-CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./corecruxd
+curl -sSL https://github.com/CueCrux/Crux/releases/latest/download/crux-linux-amd64 -o crux
+chmod +x crux
+CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./crux
 ```
 
 ### Build from Source
@@ -274,7 +274,7 @@ When unset, Crux uses keyword matching only - no external dependencies required.
 
 ```mermaid
 graph TD
-    cruxmcp[crux-mcp<br/>MCP Server<br/>22 tools]
+    cruxmcp[crux-mcp<br/>MCP Server<br/>28 token-filtered tools]
     observe[crux-observe<br/>Self-Observation]
     sync[crux-sync<br/>Outbox Sync]
     contrib[crux-contrib<br/>Contributions]
@@ -342,7 +342,7 @@ See `config.example.env` for the full list with descriptions.
 
 ## MCP Server (for AI Agents)
 
-Crux includes a built-in MCP server on port **14801** with 22 tools for retrieval, fact storage, sessions, sync, update status, decisions, and multi-agent handoff.
+Crux includes a built-in MCP server on port **14801** with 28 token-filtered tools for retrieval, fact storage, sessions, sync, update status, decisions, constraints, passport, and multi-agent handoff.
 
 ### Connect an agent
 

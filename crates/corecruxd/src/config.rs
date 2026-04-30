@@ -6,6 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use crate::auth::AuthMode;
+use crux_enterprise_shim::EnterpriseTrustRoot;
 use serde::Deserialize;
 
 const DEFAULT_PASSPORT_CLAIM_ENDPOINT: &str = "https://passport.vaultcrux.com/v1/claim-anonymous";
@@ -115,6 +116,7 @@ pub struct Config {
     pub router_refresh_interval_seconds: u64,
     pub router_cache_ttl_seconds: u64,
     pub router_fallback_policy: String,
+    pub enterprise_trust_root: Option<EnterpriseTrustRoot>,
     pub llm_endpoint: Option<String>,
     pub llm_model: Option<String>,
 
@@ -210,6 +212,7 @@ struct FileConfig {
     passport: FilePassportConfig,
     content: FileContentConfig,
     router: FileRouterConfig,
+    enterprise: FileEnterpriseConfig,
     llm: FileLlmConfig,
 }
 
@@ -252,6 +255,18 @@ struct FileRouterConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+struct FileEnterpriseConfig {
+    enabled: Option<bool>,
+    customer_id: Option<String>,
+    backend_id: Option<String>,
+    trust_root_kid: Option<String>,
+    trusted_issuer_kids: Option<Vec<String>>,
+    airgap: Option<bool>,
+    allow_vaultcrux_cross_sign: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 struct FileLlmConfig {
     endpoint: Option<String>,
     model: Option<String>,
@@ -288,6 +303,17 @@ fn env_string(key: &str) -> Option<String> {
 
 fn env_bool(key: &str) -> Option<bool> {
     std::env::var(key).ok().map(|value| bool_value(&value))
+}
+
+fn env_csv(key: &str) -> Option<Vec<String>> {
+    env_string(key).map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    })
 }
 
 fn bool_value(value: &str) -> bool {
@@ -434,6 +460,29 @@ pub fn load_config() -> Config {
     let router_fallback_policy = env_string("CORECRUXD_ROUTER_FALLBACK_POLICY")
         .or(file_config.router.fallback_policy.clone())
         .unwrap_or_else(|| "degrade_to_local".to_string());
+    let enterprise_enabled = env_bool("CORECRUXD_ENTERPRISE_ENABLED")
+        .or(file_config.enterprise.enabled)
+        .unwrap_or(false);
+    let enterprise_trust_root = enterprise_enabled.then(|| EnterpriseTrustRoot {
+        customer_id: env_string("CORECRUXD_ENTERPRISE_CUSTOMER_ID")
+            .or(file_config.enterprise.customer_id.clone())
+            .unwrap_or_default(),
+        backend_id: env_string("CORECRUXD_ENTERPRISE_BACKEND_ID")
+            .or(file_config.enterprise.backend_id.clone())
+            .unwrap_or_default(),
+        trust_root_kid: env_string("CORECRUXD_ENTERPRISE_TRUST_ROOT_KID")
+            .or(file_config.enterprise.trust_root_kid.clone())
+            .unwrap_or_default(),
+        trusted_issuer_kids: env_csv("CORECRUXD_ENTERPRISE_TRUSTED_ISSUER_KIDS")
+            .or(file_config.enterprise.trusted_issuer_kids.clone())
+            .unwrap_or_default(),
+        airgap: env_bool("CORECRUXD_ENTERPRISE_AIRGAP")
+            .or(file_config.enterprise.airgap)
+            .unwrap_or(true),
+        allow_vaultcrux_cross_sign: env_bool("CORECRUXD_ENTERPRISE_ALLOW_VAULTCRUX_CROSS_SIGN")
+            .or(file_config.enterprise.allow_vaultcrux_cross_sign)
+            .unwrap_or(false),
+    });
     let llm_endpoint = env_string("CORECRUXD_LLM_ENDPOINT").or(file_config.llm.endpoint.clone());
     let llm_model = env_string("CORECRUXD_LLM_MODEL").or(file_config.llm.model.clone());
 
@@ -618,6 +667,7 @@ pub fn load_config() -> Config {
         router_refresh_interval_seconds,
         router_cache_ttl_seconds,
         router_fallback_policy,
+        enterprise_trust_root,
         llm_endpoint,
         llm_model,
 
@@ -971,6 +1021,7 @@ mod tests {
         assert_eq!(cfg.router_refresh_interval_seconds, 60);
         assert_eq!(cfg.router_cache_ttl_seconds, 60);
         assert_eq!(cfg.router_fallback_policy, "degrade_to_local");
+        assert!(cfg.enterprise_trust_root.is_none());
         assert_eq!(cfg.llm_endpoint, None);
         assert_eq!(cfg.llm_model, None);
         assert_eq!(cfg.io_backend, "cpu");
@@ -1060,6 +1111,16 @@ mod tests {
         std::env::set_var("CORECRUXD_ROUTER_REFRESH_INTERVAL_SECONDS", "15");
         std::env::set_var("CORECRUXD_ROUTER_CACHE_TTL_SECONDS", "20");
         std::env::set_var("CORECRUXD_ROUTER_FALLBACK_POLICY", "refuse");
+        std::env::set_var("CORECRUXD_ENTERPRISE_ENABLED", "true");
+        std::env::set_var("CORECRUXD_ENTERPRISE_CUSTOMER_ID", "customer-a");
+        std::env::set_var("CORECRUXD_ENTERPRISE_BACKEND_ID", "customer:cluster-a");
+        std::env::set_var("CORECRUXD_ENTERPRISE_TRUST_ROOT_KID", "customer-root-a");
+        std::env::set_var(
+            "CORECRUXD_ENTERPRISE_TRUSTED_ISSUER_KIDS",
+            "customer-issuer-a,customer-issuer-b",
+        );
+        std::env::set_var("CORECRUXD_ENTERPRISE_AIRGAP", "true");
+        std::env::set_var("CORECRUXD_ENTERPRISE_ALLOW_VAULTCRUX_CROSS_SIGN", "false");
         std::env::set_var("CORECRUXD_LLM_ENDPOINT", "http://localhost:11434/api/generate");
         std::env::set_var("CORECRUXD_LLM_MODEL", "llama3.2:3b");
         std::env::set_var("CORECRUXD_IO_BACKEND", "gpu-gds");
@@ -1118,6 +1179,16 @@ mod tests {
         assert_eq!(cfg.router_refresh_interval_seconds, 15);
         assert_eq!(cfg.router_cache_ttl_seconds, 20);
         assert_eq!(cfg.router_fallback_policy, "refuse");
+        let enterprise = cfg.enterprise_trust_root.as_ref().unwrap();
+        assert_eq!(enterprise.customer_id, "customer-a");
+        assert_eq!(enterprise.backend_id, "customer:cluster-a");
+        assert_eq!(enterprise.trust_root_kid, "customer-root-a");
+        assert_eq!(
+            enterprise.trusted_issuer_kids,
+            vec!["customer-issuer-a".to_string(), "customer-issuer-b".to_string()]
+        );
+        assert!(enterprise.airgap);
+        assert!(!enterprise.allow_vaultcrux_cross_sign);
         assert_eq!(cfg.llm_endpoint.as_deref(), Some("http://localhost:11434/api/generate"));
         assert_eq!(cfg.llm_model.as_deref(), Some("llama3.2:3b"));
         // io_backend from CORECRUXD_IO_BACKEND env (test sets "gpu-gds", kept for compatibility)
@@ -1181,6 +1252,15 @@ router:
   refresh_interval_seconds: 7
   cache_ttl_seconds: 9
   fallback_policy: "refuse"
+enterprise:
+  enabled: true
+  customer_id: "customer-yaml"
+  backend_id: "customer:yaml-cluster"
+  trust_root_kid: "yaml-root"
+  trusted_issuer_kids:
+    - "yaml-issuer"
+  airgap: true
+  allow_vaultcrux_cross_sign: true
 llm:
   endpoint: "http://localhost:11434/api/generate"
   model: "llama3.2:3b"
@@ -1219,6 +1299,13 @@ llm:
         assert_eq!(cfg.router_refresh_interval_seconds, 7);
         assert_eq!(cfg.router_cache_ttl_seconds, 9);
         assert_eq!(cfg.router_fallback_policy, "refuse");
+        let enterprise = cfg.enterprise_trust_root.as_ref().unwrap();
+        assert_eq!(enterprise.customer_id, "customer-yaml");
+        assert_eq!(enterprise.backend_id, "customer:yaml-cluster");
+        assert_eq!(enterprise.trust_root_kid, "yaml-root");
+        assert_eq!(enterprise.trusted_issuer_kids, vec!["yaml-issuer".to_string()]);
+        assert!(enterprise.airgap);
+        assert!(enterprise.allow_vaultcrux_cross_sign);
         assert_eq!(cfg.llm_endpoint.as_deref(), Some("http://localhost:11434/api/generate"));
         assert_eq!(cfg.llm_model.as_deref(), Some("llama3.2:3b"));
 

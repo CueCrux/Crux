@@ -735,6 +735,7 @@ dependencies = [
  "corecrux-storage",
  "corecrux-types",
  "crc32fast",
+ "crux-enterprise-shim",
  "crux-mcp",
  "crux-observe",
  "crux-router",

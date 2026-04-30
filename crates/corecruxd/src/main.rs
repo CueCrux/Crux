@@ -151,6 +151,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &config.update_check_repo_dir,
     );
     init_tracing(&config.log_level);
+    if let Some(trust_root) = &config.enterprise_trust_root {
+        let issues = crux_enterprise_shim::validate_enterprise_trust_root(trust_root);
+        if !issues.is_empty() {
+            let codes = issues
+                .iter()
+                .map(|issue| issue.code.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid enterprise trust root: {codes}"),
+            )
+            .into());
+        }
+        info!(
+            customer_id = %trust_root.customer_id,
+            backend_id = %trust_root.backend_id,
+            trust_root_kid = %trust_root.trust_root_kid,
+            airgap = trust_root.airgap,
+            trusted_issuer_count = trust_root.trusted_issuer_kids.len(),
+            allow_vaultcrux_cross_sign = trust_root.allow_vaultcrux_cross_sign,
+            "enterprise customer-hosted trust root configured"
+        );
+    }
     if let Some(manifest_path) = config.content_manifest_path.as_deref() {
         let report = vaultcrux_local::content::load_content_manifest(manifest_path, config.content_verify_signatures)?;
         info!(

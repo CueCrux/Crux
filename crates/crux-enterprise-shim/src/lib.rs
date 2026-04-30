@@ -25,6 +25,26 @@ pub struct EnterpriseTrustRoot {
     pub allow_vaultcrux_cross_sign: bool,
 }
 
+pub fn validate_enterprise_trust_root(root: &EnterpriseTrustRoot) -> Vec<TokenValidationIssue> {
+    let mut issues = Vec::new();
+    if root.customer_id.trim().is_empty() {
+        issues.push(issue("enterprise_customer_id_required"));
+    }
+    if !root.backend_id.starts_with(RCX_CUSTOMER_BACKEND_PREFIX) {
+        issues.push(issue("enterprise_backend_must_be_customer_hosted"));
+    }
+    if root.trust_root_kid.trim().is_empty() {
+        issues.push(issue("enterprise_trust_root_kid_required"));
+    }
+    if root.trusted_issuer_kids.is_empty() && !root.allow_vaultcrux_cross_sign {
+        issues.push(issue("enterprise_trusted_issuer_or_cross_sign_required"));
+    }
+    if root.airgap && root.backend_id == RCX_HOSTED_BACKEND_ID {
+        issues.push(issue("enterprise_airgap_cannot_use_hosted_backend"));
+    }
+    issues
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnterpriseShimCall {
     pub backend_id: String,
@@ -85,11 +105,11 @@ impl EnterpriseShim {
     ) -> EnterpriseShimDecision {
         let validation = token.validate_basic(now_unix_seconds);
         if !validation.valid {
-            return self.refuse(token, call, "token_invalid", validation.issues);
+            return Self::refuse(token, call, "token_invalid", validation.issues);
         }
 
         if token.tier != RcxTier::Enterprise {
-            return self.refuse(
+            return Self::refuse(
                 token,
                 call,
                 "capability_not_permitted",
@@ -98,7 +118,7 @@ impl EnterpriseShim {
         }
 
         let Some(scope) = &token.enterprise_scope else {
-            return self.refuse(token, call, "token_invalid", vec![issue("missing_enterprise_scope")]);
+            return Self::refuse(token, call, "token_invalid", vec![issue("missing_enterprise_scope")]);
         };
 
         let Some(scope_issue) = self.validate_scope(token, scope, call) else {
@@ -111,7 +131,7 @@ impl EnterpriseShim {
                 issues: Vec::new(),
             };
         };
-        self.refuse(token, call, scope_issue.refusal_code, vec![scope_issue.issue])
+        Self::refuse(token, call, scope_issue.refusal_code, vec![scope_issue.issue])
     }
 
     fn validate_scope(
@@ -169,7 +189,6 @@ impl EnterpriseShim {
     }
 
     fn refuse(
-        &self,
         token: &RcxCapabilityToken,
         call: &EnterpriseShimCall,
         refusal_code: &str,
@@ -306,6 +325,49 @@ mod tests {
         assert!(decision.allowed);
         assert_eq!(decision.mode, EnterpriseShimMode::CustomerHosted);
         assert_eq!(decision.backend_id.as_deref(), Some("customer:cluster-a"));
+    }
+
+    #[test]
+    fn validates_enterprise_trust_root_static_contract() {
+        let root = EnterpriseTrustRoot {
+            customer_id: "customer-a".to_string(),
+            backend_id: "customer:cluster-a".to_string(),
+            trust_root_kid: "customer-root-a".to_string(),
+            trusted_issuer_kids: vec!["customer-issuer-a".to_string()],
+            airgap: true,
+            allow_vaultcrux_cross_sign: false,
+        };
+
+        assert!(validate_enterprise_trust_root(&root).is_empty());
+    }
+
+    #[test]
+    fn refuses_invalid_enterprise_trust_root_static_contract() {
+        let root = EnterpriseTrustRoot {
+            customer_id: String::new(),
+            backend_id: "hosted.vaultcrux.com".to_string(),
+            trust_root_kid: String::new(),
+            trusted_issuer_kids: Vec::new(),
+            airgap: true,
+            allow_vaultcrux_cross_sign: false,
+        };
+        let issues = validate_enterprise_trust_root(&root);
+
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == "enterprise_customer_id_required"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == "enterprise_backend_must_be_customer_hosted"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == "enterprise_trust_root_kid_required"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == "enterprise_trusted_issuer_or_cross_sign_required"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == "enterprise_airgap_cannot_use_hosted_backend"));
     }
 
     #[test]

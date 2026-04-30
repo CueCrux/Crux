@@ -17,13 +17,24 @@ passport:
   claim_endpoint: "https://passport.vaultcrux.com/v1/claim-anonymous"
 
 content:
-  manifest_path: "./content/MANIFEST.json"
+  # Set only for signed content bundles. Placeholder source manifests are
+  # refused when verify_signatures is true.
+  manifest_path: null
   verify_signatures: true
 
 router:
   refresh_interval_seconds: 60
   cache_ttl_seconds: 60
   fallback_policy: "degrade_to_local"
+
+enterprise:
+  enabled: false
+  customer_id: ""
+  backend_id: "customer:example-cluster"
+  trust_root_kid: ""
+  trusted_issuer_kids: []
+  airgap: true
+  allow_vaultcrux_cross_sign: false
 
 llm:
   endpoint: "http://localhost:11434/api/generate"
