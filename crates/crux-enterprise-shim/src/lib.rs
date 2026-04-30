@@ -85,11 +85,11 @@ impl EnterpriseShim {
     ) -> EnterpriseShimDecision {
         let validation = token.validate_basic(now_unix_seconds);
         if !validation.valid {
-            return self.refuse(token, call, "token_invalid", validation.issues);
+            return Self::refuse(token, call, "token_invalid", validation.issues);
         }
 
         if token.tier != RcxTier::Enterprise {
-            return self.refuse(
+            return Self::refuse(
                 token,
                 call,
                 "capability_not_permitted",
@@ -98,7 +98,7 @@ impl EnterpriseShim {
         }
 
         let Some(scope) = &token.enterprise_scope else {
-            return self.refuse(token, call, "token_invalid", vec![issue("missing_enterprise_scope")]);
+            return Self::refuse(token, call, "token_invalid", vec![issue("missing_enterprise_scope")]);
         };
 
         let Some(scope_issue) = self.validate_scope(token, scope, call) else {
@@ -111,7 +111,7 @@ impl EnterpriseShim {
                 issues: Vec::new(),
             };
         };
-        self.refuse(token, call, scope_issue.refusal_code, vec![scope_issue.issue])
+        Self::refuse(token, call, scope_issue.refusal_code, vec![scope_issue.issue])
     }
 
     fn validate_scope(
@@ -169,7 +169,6 @@ impl EnterpriseShim {
     }
 
     fn refuse(
-        &self,
         token: &RcxCapabilityToken,
         call: &EnterpriseShimCall,
         refusal_code: &str,
