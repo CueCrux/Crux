@@ -15,7 +15,7 @@ otel = [
 ]
 
 [dependencies]
-axum = "0.8.1"
+axum = "0.8.9"
 utoipa = { version = "5", features = ["axum_extras"] }
 base64 = "0.22.1"
 blake3 = "1.8.5"
