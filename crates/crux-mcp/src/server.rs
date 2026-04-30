@@ -60,6 +60,7 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
             node_id: ctx.node_id.clone(),
             handoff_key: ctx.handoff_key,
             daemon_base_url: ctx.daemon_base_url.clone(),
+            rcx_router: ctx.rcx_router.clone(),
         }
     };
 

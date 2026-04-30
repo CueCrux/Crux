@@ -53,6 +53,12 @@ pub enum ProjectionEventV1 {
     InvocationReceipted(InvocationReceiptedV1),
     // CE → Core migration (M8; master-plan §9.3).
     CeInstallImported(CeInstallImportedV1),
+    // Extraction-cache events (stateful-extraction-flywheel M1). JSON-only.
+    ExtractionCacheInsert(crate::extraction::ExtractionCacheInsertV1),
+    ExtractionCacheHit(crate::extraction::ExtractionCacheHitV1),
+    ExtractionVerifierScored(crate::extraction::ExtractionVerifierScoredV1),
+    ExtractionConfidenceDelta(crate::extraction::ExtractionConfidenceDeltaV1),
+    ExtractionCacheInvalidate(crate::extraction::ExtractionCacheInvalidateV1),
 }
 
 /// Phase 6: Entity fact event — a single (subject, predicate, object) relation
@@ -494,6 +500,23 @@ pub fn parse_projection_event(
             ProjectionEventV1::InvocationReceipted(InvocationReceiptedV1::decode_bin(payload)?)
         }
         EVT_CE_INSTALL_IMPORTED_V1 => ProjectionEventV1::CeInstallImported(CeInstallImportedV1::decode_bin(payload)?),
+        // Extraction-cache events (stateful-extraction-flywheel M1). JSON-only —
+        // entities payload is arbitrary-shape JSON anyway, no binary layout wins.
+        crate::extraction::EVT_EXTRACTION_CACHE_INSERT_V1 => {
+            ProjectionEventV1::ExtractionCacheInsert(crate::extraction::ExtractionCacheInsertV1::decode_json(payload)?)
+        }
+        crate::extraction::EVT_EXTRACTION_CACHE_HIT_V1 => {
+            ProjectionEventV1::ExtractionCacheHit(crate::extraction::ExtractionCacheHitV1::decode_json(payload)?)
+        }
+        crate::extraction::EVT_EXTRACTION_VERIFIER_SCORED_V1 => ProjectionEventV1::ExtractionVerifierScored(
+            crate::extraction::ExtractionVerifierScoredV1::decode_json(payload)?,
+        ),
+        crate::extraction::EVT_EXTRACTION_CONFIDENCE_DELTA_V1 => ProjectionEventV1::ExtractionConfidenceDelta(
+            crate::extraction::ExtractionConfidenceDeltaV1::decode_json(payload)?,
+        ),
+        crate::extraction::EVT_EXTRACTION_CACHE_INVALIDATE_V1 => ProjectionEventV1::ExtractionCacheInvalidate(
+            crate::extraction::ExtractionCacheInvalidateV1::decode_json(payload)?,
+        ),
         _ => return Ok(None),
     };
 

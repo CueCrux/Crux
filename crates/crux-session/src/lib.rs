@@ -52,7 +52,7 @@ pub use invocation::{
     invocation_event_key, mint_invocation_receipt, verify_invocation_receipt, InvocationEventKey, InvocationVerdict,
     MintInvocation,
 };
-pub use passport::LocalPassportConfig;
+pub use passport::{LocalPassportConfig, LocalPassportKey};
 pub use plan::{
     Budget, Capability, Channels, ImplPath, Passport, ReceiptEnvelope, ReceiptMode, SessionPlan,
     INVOCATION_RECEIPT_VERSION, SESSION_PLAN_VERSION,
