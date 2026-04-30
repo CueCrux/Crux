@@ -6,8 +6,9 @@
 //!
 //! This crate is deliberately pure for Phase 1: it consumes an
 //! [`rcx_capability_token::RcxCapabilityToken`] and returns deterministic
-//! routing/refusal decisions. Network refresh, hosted debits, and revocation IO
-//! land in later phases.
+//! routing/refusal decisions. Network refresh and revocation IO land in later phases.
+
+pub mod hosted;
 
 use rcx_capability_token::{
     Backend, CreditRefill, Credits, DataEgressClass, FallbackAction, FallbackPolicy, Issuer, OverdraftPolicy,
@@ -208,12 +209,17 @@ impl RcxRouter {
             return self.refuse(call, DenialReason::AttestationMissing);
         }
 
-        let debitable =
-            capability.credit_cost.as_ref().is_some_and(|cost| cost.cost > 0) || call.estimated_credit_cost > 0;
+        let credit_cost = capability
+            .credit_cost
+            .as_ref()
+            .map_or(call.estimated_credit_cost, |cost| {
+                call.estimated_credit_cost.max(cost.cost)
+            });
+        let debitable = credit_cost > 0;
         if self.token.receipt_class == ReceiptClass::Replay && debitable {
             return self.refuse(call, DenialReason::ReceiptClassSideEffectDenied);
         }
-        if debitable && !has_credit(&self.token, call.estimated_credit_cost) {
+        if debitable && !has_credit(&self.token, credit_cost) {
             return self.apply_fallback_action(
                 call,
                 &self.token.fallback.on_credits_exhausted,
@@ -489,9 +495,18 @@ fn first_validation_reason(issues: &[TokenValidationIssue]) -> DenialReason {
 }
 
 fn has_credit(token: &RcxCapabilityToken, estimated_credit_cost: u64) -> bool {
-    match token.credits.balance {
-        Some(balance) => balance >= estimated_credit_cost,
-        None => token.tier == RcxTier::Free && estimated_credit_cost == 0,
+    if estimated_credit_cost == 0 {
+        return true;
+    }
+    let balance = token.credits.balance.unwrap_or(0);
+    if balance >= estimated_credit_cost {
+        return true;
+    }
+    match token.credits.overdraft {
+        OverdraftPolicy::Forbid => false,
+        OverdraftPolicy::Warn | OverdraftPolicy::AllowToLimit => {
+            balance.saturating_add(token.credits.overdraft_limit.unwrap_or(0)) >= estimated_credit_cost
+        }
     }
 }
 
@@ -679,6 +694,21 @@ mod tests {
         assert_eq!(decision.backend_id.as_deref(), Some("local"));
         assert_eq!(decision.reason_code.as_deref(), Some("denied:insufficient_credit"));
         assert_eq!(decision.stamp.mode, "degraded-local");
+    }
+
+    #[test]
+    fn hosted_credit_cost_is_enforced_when_call_estimate_is_zero() {
+        let decision = hosted_router(
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            None,
+            Some(0),
+        )
+        .decide(&hosted_retrieve_call(0, true), 1_776_989_601);
+
+        assert!(!decision.authorised);
+        assert_eq!(decision.reason_code.as_deref(), Some("denied:insufficient_credit"));
     }
 
     #[test]

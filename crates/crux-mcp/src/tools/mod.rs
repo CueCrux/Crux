@@ -835,7 +835,10 @@ mod tests {
     use crate::dispatch::McpContext;
     use crate::tools::test_support::{clear_sync_env, sync_env_lock};
     use crux_router::{mint_free_local_token, RcxRouter};
-    use rcx_capability_token::RCX_CT_SIGNATURE_LEN;
+    use rcx_capability_token::{
+        Backend, CreditCost, CreditCostUnit, CreditRefill, Credits, FallbackAction, FallbackPolicy, OverdraftPolicy,
+        PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
+    };
 
     const TOOL_COUNT: usize = 28; // 27 pre-M3 tools + cuecrux_session
 
@@ -1045,6 +1048,64 @@ mod tests {
 
         assert_eq!(capability.backend_id, vaultcrux_local::tool_surface::HOSTED_BACKEND_ID);
         assert_eq!(capability.data_egress_classes, vec![DataEgressClass::None]);
+    }
+
+    #[test]
+    fn pro_hosted_token_lists_hosted_gated_tools() {
+        let mut token = mint_free_local_token(
+            "p_0123456789abcdef0123456789abcdef",
+            "daemon_01HV0000000000000000000000",
+            "default",
+            rcx_local_capabilities(),
+            1_776_989_600,
+            1_780_143_200,
+            [0x11; RCX_CT_SIGNATURE_LEN],
+        );
+        token.tier = RcxTier::Pro;
+        token.credits = Credits {
+            balance: Some(100),
+            refill: CreditRefill {
+                period: rcx_capability_token::RefillPeriod::Monthly,
+                amount: Some(100),
+            },
+            overdraft: OverdraftPolicy::Forbid,
+            overdraft_limit: None,
+        };
+        token.fallback = FallbackPolicy {
+            on_backend_unreachable: FallbackAction::Queue,
+            on_credits_exhausted: FallbackAction::Refuse,
+            on_expiry: FallbackAction::Refuse,
+            queue_ttl_seconds: Some(120),
+        };
+        token.backends.push(Backend {
+            backend_id: vaultcrux_local::tool_surface::HOSTED_BACKEND_ID.to_string(),
+            trust_root_kid: "vaultcrux-hosted-root-v1".to_string(),
+            endpoint_url: Some("https://hosted.vaultcrux.com".to_string()),
+            permitted_capabilities: vaultcrux_local::tool_surface::hosted_gated_tool_names()
+                .into_iter()
+                .map(|tool_name| {
+                    let tool = rcx_mcp_tool_capability(tool_name);
+                    PermittedCapability {
+                        capability: tool.capability,
+                        data_egress_classes: tool.data_egress_classes,
+                        required_attestations: Vec::new(),
+                        credit_cost: Some(CreditCost {
+                            unit: CreditCostUnit::Call,
+                            cost: 1,
+                        }),
+                    }
+                })
+                .collect(),
+        });
+
+        let names: Vec<String> = list_tools_for_rcx_token(&token, 1_776_989_601)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert!(names.contains(&"issue_passport".to_string()));
+        assert!(names.contains(&"sync_pull".to_string()));
+        assert!(names.contains(&"sync_push".to_string()));
     }
 
     #[test]
