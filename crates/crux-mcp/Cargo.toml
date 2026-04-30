@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 axum = "0.8.1"
-blake3 = "1.5.1"
+blake3 = "1.8.5"
 chrono = { version = "0.4.40", default-features = false, features = ["clock", "serde"] }
 base64 = "0.22.1"
 rand = "0.8.5"
@@ -21,6 +21,8 @@ corecrux-memory = { path = "../corecrux-memory" }
 corecrux-retrieval = { path = "../corecrux-retrieval" }
 corecrux-types = { path = "../corecrux-types" }
 crux-observe = { path = "../crux-observe" }
+crux-router = { path = "../crux-router" }
+rcx-capability-token = { path = "../rcx-capability-token" }
 
 [dev-dependencies]
 http-body-util = "0.1"

@@ -13,6 +13,7 @@ mod ccxs;
 mod codec_v1;
 mod cold_segment_v1;
 mod events;
+pub mod extraction;
 mod meta;
 pub mod query;
 mod runner;
@@ -40,6 +41,15 @@ pub use events::{
 };
 // CE → Core migration (M8).
 pub use events::{CeInstallImportedV1, EVT_CE_INSTALL_IMPORTED_V1};
+// Extraction-cache events (stateful-extraction-flywheel M1). Re-exported so
+// corecruxd's HTTP layer and VaultCrux-side tooling can mint them without
+// reaching into the `extraction` module directly.
+pub use extraction::{
+    ExtractionCacheCurrentRowV1, ExtractionCacheHitV1, ExtractionCacheInsertV1, ExtractionCacheInvalidateV1,
+    ExtractionCacheMaterializer, ExtractionCacheStats, ExtractionConfidenceDeltaV1, ExtractionVerifierScoredV1,
+    CONTENT_TYPE_EXTRACTION_JSON_V1, EVT_EXTRACTION_CACHE_HIT_V1, EVT_EXTRACTION_CACHE_INSERT_V1,
+    EVT_EXTRACTION_CACHE_INVALIDATE_V1, EVT_EXTRACTION_CONFIDENCE_DELTA_V1, EVT_EXTRACTION_VERIFIER_SCORED_V1,
+};
 pub use session_plans_by_principal::{PlanEntryV1, PrincipalKey, SessionPlansByPrincipalV1};
 // Access to the events module for downstream crates (corecruxd / tests) that
 // need to reach event structs + dispatcher together.

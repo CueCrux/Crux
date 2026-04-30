@@ -263,9 +263,9 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
 name = "blake3"
-version = "1.8.4"
+version = "1.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d2d5991425dfd0785aed03aedcf0b321d61975c9b5b3689c774a2610ae0b51e"
+checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
 dependencies = [
  "arrayref",
  "arrayvec",
@@ -407,9 +407,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.0"
+version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b193af5b67834b676abd72466a96c1024e6a6ad978a1f484bd90b85c94041351"
+checksum = "1ddb117e43bbf7dacf0a4190fef4d345b9bad68dfc649cb349e7d17d28428e51"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -429,9 +429,9 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.0"
+version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1110bd8a634a1ab8cb04345d8d878267d57c3cf1b38d91b71af6686408bbca6a"
+checksum = "f2ce8604710f6733aa641a2b3731eaa1e8b3d9973d5e3565da11800813f997a9"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -738,6 +738,7 @@ dependencies = [
  "crc32fast",
  "crux-mcp",
  "crux-observe",
+ "crux-router",
  "crux-session",
  "ed25519-dalek",
  "fs2",
@@ -889,6 +890,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "crux-enterprise-shim"
+version = "0.2.0"
+dependencies = [
+ "rcx-capability-token",
+]
+
+[[package]]
 name = "crux-integration-tests"
 version = "0.2.0"
 dependencies = [
@@ -915,8 +923,10 @@ dependencies = [
  "corecrux-retrieval",
  "corecrux-types",
  "crux-observe",
+ "crux-router",
  "http-body-util",
  "rand 0.8.6",
+ "rcx-capability-token",
  "serde",
  "serde_json",
  "tempfile",
@@ -940,6 +950,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "crux-router"
+version = "0.2.0"
+dependencies = [
+ "rcx-capability-token",
 ]
 
 [[package]]
@@ -1423,9 +1440,9 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hex-literal"
-version = "0.4.1"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fe2267d4ed49bc07b63801559be28c718ea06c4738b7a03c94df7386d2cde46"
+checksum = "e712f64ec3850b98572bffac52e2c6f282b29fe6c5fa6d42334b30be438d95c1"
 
 [[package]]
 name = "hmac"
@@ -2716,6 +2733,15 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rcx-capability-token"
+version = "0.2.0"
+dependencies = [
+ "blake3",
+ "crux-session",
+ "hex",
 ]
 
 [[package]]

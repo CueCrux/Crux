@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-blake3 = "1.5.1"
+blake3 = "1.8.5"
 crc32c = "0.6.8"
 crc32fast = "1.4.2"
 lz4_flex = "0.13.0"

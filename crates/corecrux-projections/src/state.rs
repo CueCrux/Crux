@@ -337,6 +337,14 @@ impl ProjectionState {
             | ProjectionEventV1::SessionRevoked(_)
             | ProjectionEventV1::InvocationReceipted(_)
             | ProjectionEventV1::CeInstallImported(_) => {}
+            // Extraction-cache events (stateful-extraction-flywheel M1) land in a
+            // dedicated `extraction_cache_current` projection state, not the
+            // Living Objects state maintained here. No-op for this projection.
+            ProjectionEventV1::ExtractionCacheInsert(_)
+            | ProjectionEventV1::ExtractionCacheHit(_)
+            | ProjectionEventV1::ExtractionVerifierScored(_)
+            | ProjectionEventV1::ExtractionConfidenceDelta(_)
+            | ProjectionEventV1::ExtractionCacheInvalidate(_) => {}
         }
         stats
     }

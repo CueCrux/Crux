@@ -6,6 +6,7 @@ ccxs = "ccxs"
 corecrux = "corecrux"
 corecruxd = "corecruxd"
 corecruxctl = "corecruxctl"
+fpr = "fpr"
 pfordelta = "pfordelta"
 # NLP tokenizer: stemming test data (intentional substrings)
 ment = "ment"
