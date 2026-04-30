@@ -1,5 +1,5 @@
 name: Bug Report
-description: Report a bug in CoreCrux Community Edition
+description: Report a bug in Crux Daemon
 labels: ["bug"]
 body:
   - type: markdown
