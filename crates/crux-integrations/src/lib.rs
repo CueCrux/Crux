@@ -8,7 +8,10 @@
 //! CLI, file watcher, and webhook recipes, but they do not execute code inside
 //! the daemon process.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -16,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 pub const INTEGRATION_SCHEMA_V1: &str = "crux.integration.v1";
 pub const FIRST_PARTY_PASSPORT: &str = "cuecrux:first-party";
+pub const INTEGRATION_INDEX_SCHEMA_V1: &str = "crux.integration.index.v1";
 
 const ALLOWED_CAPABILITIES: &[&str] = &[
     "integrations:read",
@@ -58,6 +62,18 @@ pub enum IntegrationError {
     InvalidSignatureMaterial(String),
     #[error("signature verification failed")]
     SignatureInvalid,
+    #[error("pack '{pack_id}' version '{version}' is not installed")]
+    PackNotInstalled { pack_id: String, version: String },
+    #[error("grant for pack '{pack_id}' and passport '{passport_fpr}' was not found")]
+    GrantNotFound { pack_id: String, passport_fpr: String },
+    #[error("capability '{capability}' is not declared by pack '{pack_id}'")]
+    CapabilityNotDeclared { pack_id: String, capability: String },
+    #[error("invalid path component '{0}'")]
+    InvalidPathComponent(String),
+    #[error("invalid index schema '{0}'")]
+    InvalidIndexSchema(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
@@ -210,6 +226,69 @@ pub struct IntegrationPackDescriptor {
     pub risk_level: RiskLevel,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstalledPackRecord {
+    pub id: String,
+    pub version: String,
+    pub manifest_hash: String,
+    pub trust_tier: TrustTier,
+    pub installed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntegrationGrant {
+    pub passport_fpr: String,
+    pub pack_id: String,
+    pub version: String,
+    pub capabilities: Vec<String>,
+    pub enabled: bool,
+    pub granted_by_passport_fpr: String,
+    pub granted_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntegrationAuditEvent {
+    pub ts_unix_ms: u64,
+    pub action: String,
+    pub passport_fpr: String,
+    pub pack_id: String,
+    pub version: String,
+    pub capabilities: Vec<String>,
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntegrationLibrarySnapshot {
+    pub packs: Vec<IntegrationPackDescriptor>,
+    pub grants: Vec<IntegrationGrant>,
+    pub audit_tail: Vec<IntegrationAuditEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GrantPackRequest<'a> {
+    pub passport_fpr: &'a str,
+    pub granted_by_passport_fpr: &'a str,
+    pub pack_id: &'a str,
+    pub version: &'a str,
+    pub capabilities: &'a [String],
+    pub reason: Option<String>,
+    pub now_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct IntegrationIndex {
+    schema: String,
+    updated_at_unix_ms: u64,
+    #[serde(default)]
+    packs: Vec<InstalledPackRecord>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidationPolicy {
     pub allow_unsigned_first_party: bool,
@@ -326,6 +405,236 @@ pub fn builtin_packs() -> Result<Vec<IntegrationPackDescriptor>, IntegrationErro
     Ok(out)
 }
 
+pub fn integration_root(data_dir: impl AsRef<Path>) -> PathBuf {
+    data_dir.as_ref().join("integrations")
+}
+
+pub fn library_snapshot(
+    data_dir: impl AsRef<Path>,
+    passport_fpr: &str,
+    policy: &ValidationPolicy,
+) -> Result<IntegrationLibrarySnapshot, IntegrationError> {
+    let root = integration_root(data_dir);
+    let index = read_index(&root)?;
+    let grants = load_grants_from_root(&root, passport_fpr)?;
+    let enabled_keys: BTreeSet<(String, String)> = grants
+        .iter()
+        .filter(|grant| grant.enabled)
+        .map(|grant| (grant.pack_id.clone(), grant.version.clone()))
+        .collect();
+    let installed_keys: BTreeSet<(String, String)> = index
+        .packs
+        .iter()
+        .map(|record| (record.id.clone(), record.version.clone()))
+        .collect();
+
+    let mut descriptors = Vec::new();
+    for mut descriptor in builtin_packs()? {
+        let key = (descriptor.manifest.id.clone(), descriptor.manifest.version.clone());
+        descriptor.install_state = if enabled_keys.contains(&key) {
+            InstallState::Enabled
+        } else if installed_keys.contains(&key) {
+            InstallState::Installed
+        } else {
+            InstallState::Available
+        };
+        descriptors.push(descriptor);
+    }
+
+    let builtin_keys: BTreeSet<(String, String)> = descriptors
+        .iter()
+        .map(|descriptor| (descriptor.manifest.id.clone(), descriptor.manifest.version.clone()))
+        .collect();
+    for record in index.packs {
+        let key = (record.id.clone(), record.version.clone());
+        if builtin_keys.contains(&key) {
+            continue;
+        }
+        let manifest = read_installed_manifest(&root, &record.id, &record.version)?;
+        manifest.validate(policy)?;
+        let manifest_hash = manifest.manifest_hash()?;
+        let install_state = if enabled_keys.contains(&key) {
+            InstallState::Enabled
+        } else {
+            InstallState::Installed
+        };
+        descriptors.push(IntegrationPackDescriptor {
+            risk_level: risk_level(&manifest),
+            manifest,
+            manifest_hash,
+            trust_tier: record.trust_tier,
+            install_state,
+        });
+    }
+
+    descriptors.sort_by(|a, b| {
+        a.manifest
+            .id
+            .cmp(&b.manifest.id)
+            .then_with(|| a.manifest.version.cmp(&b.manifest.version))
+    });
+
+    Ok(IntegrationLibrarySnapshot {
+        packs: descriptors,
+        grants,
+        audit_tail: read_audit_tail(&root, 50)?,
+    })
+}
+
+pub fn install_pack(
+    data_dir: impl AsRef<Path>,
+    manifest: &IntegrationManifest,
+    trust_tier: TrustTier,
+    installed_at_unix_ms: u64,
+    policy: &ValidationPolicy,
+) -> Result<IntegrationPackDescriptor, IntegrationError> {
+    manifest.validate(policy)?;
+    let root = integration_root(data_dir);
+    let manifest_hash = manifest.manifest_hash()?;
+    let id_component = safe_path_component(&manifest.id)?;
+    let version_component = safe_path_component(&manifest.version)?;
+    let manifest_path = root
+        .join("packs")
+        .join(id_component)
+        .join(version_component)
+        .join("manifest.json");
+    write_json_atomic(&manifest_path, manifest)?;
+
+    let mut index = read_index(&root)?;
+    index.packs.retain(|record| {
+        !(record.id == manifest.id && record.version == manifest.version && record.manifest_hash != manifest_hash)
+    });
+    if let Some(existing) = index
+        .packs
+        .iter_mut()
+        .find(|record| record.id == manifest.id && record.version == manifest.version)
+    {
+        existing.manifest_hash.clone_from(&manifest_hash);
+        existing.trust_tier = trust_tier;
+        existing.installed_at_unix_ms = installed_at_unix_ms;
+    } else {
+        index.packs.push(InstalledPackRecord {
+            id: manifest.id.clone(),
+            version: manifest.version.clone(),
+            manifest_hash: manifest_hash.clone(),
+            trust_tier,
+            installed_at_unix_ms,
+        });
+    }
+    index.updated_at_unix_ms = installed_at_unix_ms;
+    index
+        .packs
+        .sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.version.cmp(&b.version)));
+    write_json_atomic(&root.join("index.json"), &index)?;
+    append_audit_event(
+        &root,
+        &IntegrationAuditEvent {
+            ts_unix_ms: installed_at_unix_ms,
+            action: "install".to_string(),
+            passport_fpr: manifest.publisher_passport_fpr.clone(),
+            pack_id: manifest.id.clone(),
+            version: manifest.version.clone(),
+            capabilities: manifest.capabilities.clone(),
+            outcome: "installed".to_string(),
+            detail: Some(format!("manifest_hash={manifest_hash}")),
+        },
+    )?;
+
+    Ok(IntegrationPackDescriptor {
+        risk_level: risk_level(manifest),
+        manifest: manifest.clone(),
+        manifest_hash,
+        trust_tier,
+        install_state: InstallState::Installed,
+    })
+}
+
+pub fn grant_pack(
+    data_dir: impl AsRef<Path>,
+    request: GrantPackRequest<'_>,
+) -> Result<IntegrationGrant, IntegrationError> {
+    let root = integration_root(data_dir);
+    let manifest = read_installed_manifest(&root, request.pack_id, request.version)?;
+    validate_capability_list(request.pack_id, request.capabilities)?;
+    for capability in request.capabilities {
+        if !manifest.capabilities.contains(capability) {
+            return Err(IntegrationError::CapabilityNotDeclared {
+                pack_id: request.pack_id.to_string(),
+                capability: capability.clone(),
+            });
+        }
+    }
+
+    let mut requested = request.capabilities.to_vec();
+    requested.sort();
+    requested.dedup();
+    let grant = IntegrationGrant {
+        passport_fpr: request.passport_fpr.to_string(),
+        pack_id: request.pack_id.to_string(),
+        version: request.version.to_string(),
+        capabilities: requested.clone(),
+        enabled: true,
+        granted_by_passport_fpr: request.granted_by_passport_fpr.to_string(),
+        granted_at_unix_ms: request.now_unix_ms,
+        disabled_at_unix_ms: None,
+        reason: request.reason,
+    };
+    write_json_atomic(&grant_path(&root, request.passport_fpr, request.pack_id)?, &grant)?;
+    append_audit_event(
+        &root,
+        &IntegrationAuditEvent {
+            ts_unix_ms: request.now_unix_ms,
+            action: "grant".to_string(),
+            passport_fpr: request.passport_fpr.to_string(),
+            pack_id: request.pack_id.to_string(),
+            version: request.version.to_string(),
+            capabilities: requested,
+            outcome: "enabled".to_string(),
+            detail: None,
+        },
+    )?;
+    Ok(grant)
+}
+
+pub fn disable_pack(
+    data_dir: impl AsRef<Path>,
+    passport_fpr: &str,
+    pack_id: &str,
+    reason: Option<String>,
+    now_unix_ms: u64,
+) -> Result<IntegrationGrant, IntegrationError> {
+    let root = integration_root(data_dir);
+    let path = grant_path(&root, passport_fpr, pack_id)?;
+    if !path.exists() {
+        return Err(IntegrationError::GrantNotFound {
+            pack_id: pack_id.to_string(),
+            passport_fpr: passport_fpr.to_string(),
+        });
+    }
+    let bytes = fs::read(&path)?;
+    let mut grant: IntegrationGrant = serde_json::from_slice(&bytes)?;
+    grant.enabled = false;
+    grant.disabled_at_unix_ms = Some(now_unix_ms);
+    if reason.is_some() {
+        grant.reason = reason;
+    }
+    write_json_atomic(&path, &grant)?;
+    append_audit_event(
+        &root,
+        &IntegrationAuditEvent {
+            ts_unix_ms: now_unix_ms,
+            action: "disable".to_string(),
+            passport_fpr: passport_fpr.to_string(),
+            pack_id: pack_id.to_string(),
+            version: grant.version.clone(),
+            capabilities: grant.capabilities.clone(),
+            outcome: "disabled".to_string(),
+            detail: None,
+        },
+    )?;
+    Ok(grant)
+}
+
 pub fn builtin_manifests() -> Vec<IntegrationManifest> {
     vec![
         IntegrationManifest {
@@ -409,6 +718,131 @@ pub fn builtin_manifests() -> Vec<IntegrationManifest> {
             signature: None,
         },
     ]
+}
+
+fn read_index(root: &Path) -> Result<IntegrationIndex, IntegrationError> {
+    let path = root.join("index.json");
+    if !path.exists() {
+        return Ok(IntegrationIndex {
+            schema: INTEGRATION_INDEX_SCHEMA_V1.to_string(),
+            updated_at_unix_ms: 0,
+            packs: Vec::new(),
+        });
+    }
+    let bytes = fs::read(path)?;
+    let index: IntegrationIndex = serde_json::from_slice(&bytes)?;
+    if index.schema != INTEGRATION_INDEX_SCHEMA_V1 {
+        return Err(IntegrationError::InvalidIndexSchema(index.schema));
+    }
+    Ok(index)
+}
+
+fn load_grants_from_root(root: &Path, passport_fpr: &str) -> Result<Vec<IntegrationGrant>, IntegrationError> {
+    let passport_dir = root.join("grants").join(safe_path_component(passport_fpr)?);
+    if !passport_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut grants = Vec::new();
+    for entry in fs::read_dir(passport_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && entry.path().extension().and_then(|extension| extension.to_str()) == Some("json")
+        {
+            let bytes = fs::read(entry.path())?;
+            grants.push(serde_json::from_slice(&bytes)?);
+        }
+    }
+    grants.sort_by(|a: &IntegrationGrant, b| a.pack_id.cmp(&b.pack_id).then_with(|| a.version.cmp(&b.version)));
+    Ok(grants)
+}
+
+fn read_installed_manifest(root: &Path, pack_id: &str, version: &str) -> Result<IntegrationManifest, IntegrationError> {
+    let path = root
+        .join("packs")
+        .join(safe_path_component(pack_id)?)
+        .join(safe_path_component(version)?)
+        .join("manifest.json");
+    if !path.exists() {
+        return Err(IntegrationError::PackNotInstalled {
+            pack_id: pack_id.to_string(),
+            version: version.to_string(),
+        });
+    }
+    let bytes = fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn read_audit_tail(root: &Path, max_events: usize) -> Result<Vec<IntegrationAuditEvent>, IntegrationError> {
+    let path = root.join("audit.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(path)?;
+    let lines: Vec<&str> = text.lines().rev().take(max_events).collect();
+    let mut events = Vec::new();
+    for line in lines.into_iter().rev() {
+        events.push(serde_json::from_str(line)?);
+    }
+    Ok(events)
+}
+
+fn append_audit_event(root: &Path, event: &IntegrationAuditEvent) -> Result<(), IntegrationError> {
+    fs::create_dir_all(root)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("audit.jsonl"))?;
+    serde_json::to_writer(&mut file, event)?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+fn grant_path(root: &Path, passport_fpr: &str, pack_id: &str) -> Result<PathBuf, IntegrationError> {
+    Ok(root
+        .join("grants")
+        .join(safe_path_component(passport_fpr)?)
+        .join(format!("{}.json", safe_path_component(pack_id)?)))
+}
+
+fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), IntegrationError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(value)?;
+    fs::write(&tmp, bytes)?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn safe_path_component(value: &str) -> Result<String, IntegrationError> {
+    let valid = !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if valid {
+        Ok(value.to_string())
+    } else {
+        Err(IntegrationError::InvalidPathComponent(value.to_string()))
+    }
+}
+
+fn validate_capability_list(pack_id: &str, capabilities: &[String]) -> Result<(), IntegrationError> {
+    for capability in capabilities {
+        if !ALLOWED_CAPABILITIES.contains(&capability.as_str()) {
+            return Err(IntegrationError::UnknownCapability(capability.clone()));
+        }
+        validate_non_empty("capability", capability)?;
+        if capability.contains('/') || capability.contains('\\') {
+            return Err(IntegrationError::CapabilityNotDeclared {
+                pack_id: pack_id.to_string(),
+                capability: capability.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_non_empty(field: &'static str, value: &str) -> Result<(), IntegrationError> {
@@ -513,6 +947,18 @@ mod tests {
         }
     }
 
+    fn temp_data_dir(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "crux-integrations-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp integration dir");
+        root
+    }
+
     #[test]
     fn builtin_manifests_validate() -> Result<(), IntegrationError> {
         let packs = builtin_packs()?;
@@ -602,6 +1048,101 @@ mod tests {
             })
             .err();
         assert!(matches!(err, Some(IntegrationError::SignatureInvalid)));
+        Ok(())
+    }
+
+    #[test]
+    fn install_grant_disable_roundtrip_persists() -> Result<(), IntegrationError> {
+        let root = temp_data_dir("grant-roundtrip");
+        let mut manifest = builtin_manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "github.pr-facts")
+            .expect("builtin manifest");
+        manifest.hashes.manifest = Some(manifest.manifest_hash()?);
+
+        let descriptor = install_pack(
+            &root,
+            &manifest,
+            TrustTier::FirstParty,
+            1_000,
+            &ValidationPolicy::default(),
+        )?;
+        assert_eq!(descriptor.install_state, InstallState::Installed);
+
+        let grant = grant_pack(
+            &root,
+            GrantPackRequest {
+                passport_fpr: "p_local",
+                granted_by_passport_fpr: "p_local",
+                pack_id: "github.pr-facts",
+                version: "0.1.0",
+                capabilities: &["facts:read".to_string(), "facts:write".to_string()],
+                reason: Some("test".to_string()),
+                now_unix_ms: 2_000,
+            },
+        )?;
+        assert!(grant.enabled);
+
+        let snapshot = library_snapshot(&root, "p_local", &ValidationPolicy::default())?;
+        let pack = snapshot
+            .packs
+            .iter()
+            .find(|pack| pack.manifest.id == "github.pr-facts")
+            .expect("installed pack in snapshot");
+        assert_eq!(pack.install_state, InstallState::Enabled);
+        assert_eq!(snapshot.grants.len(), 1);
+        assert_eq!(snapshot.audit_tail.len(), 2);
+
+        let disabled = disable_pack(&root, "p_local", "github.pr-facts", Some("off".to_string()), 3_000)?;
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.disabled_at_unix_ms, Some(3_000));
+
+        let snapshot = library_snapshot(&root, "p_local", &ValidationPolicy::default())?;
+        let pack = snapshot
+            .packs
+            .iter()
+            .find(|pack| pack.manifest.id == "github.pr-facts")
+            .expect("disabled pack in snapshot");
+        assert_eq!(pack.install_state, InstallState::Installed);
+        assert_eq!(snapshot.audit_tail.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn grant_rejects_capability_not_declared_by_pack() -> Result<(), IntegrationError> {
+        let root = temp_data_dir("capability-subset");
+        let manifest = builtin_manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "mcp.cursor")
+            .expect("builtin manifest");
+        install_pack(
+            &root,
+            &manifest,
+            TrustTier::FirstParty,
+            1_000,
+            &ValidationPolicy::default(),
+        )?;
+
+        let err = grant_pack(
+            &root,
+            GrantPackRequest {
+                passport_fpr: "p_local",
+                granted_by_passport_fpr: "p_local",
+                pack_id: "mcp.cursor",
+                version: "0.1.0",
+                capabilities: &["facts:write".to_string()],
+                reason: None,
+                now_unix_ms: 2_000,
+            },
+        )
+        .err();
+        assert!(matches!(
+            err,
+            Some(IntegrationError::CapabilityNotDeclared {
+                pack_id,
+                capability
+            }) if pack_id == "mcp.cursor" && capability == "facts:write"
+        ));
         Ok(())
     }
 }
