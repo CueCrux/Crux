@@ -17,12 +17,21 @@ jobs:
     runs-on: [self-hosted, ci]
     env:
       CARGO_HOME: /home/gha-runner/.cargo
+      CARGO_DENY_VERSION: 0.19.4
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deny
+      - name: Ensure cargo-deny
+        run: |
+          set -euo pipefail
+          mkdir -p "$CARGO_HOME/bin"
+          (
+            flock 9
+            if ! "$CARGO_HOME/bin/cargo-deny" --version | grep -q "cargo-deny $CARGO_DENY_VERSION"; then
+              cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
+            fi
+          ) 9>/tmp/cargo-deny-install.lock
+          "$CARGO_HOME/bin/cargo-deny" --version
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Check advisories
@@ -33,12 +42,21 @@ jobs:
     runs-on: [self-hosted, ci]
     env:
       CARGO_HOME: /home/gha-runner/.cargo
+      CARGO_DENY_VERSION: 0.19.4
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deny
+      - name: Ensure cargo-deny
+        run: |
+          set -euo pipefail
+          mkdir -p "$CARGO_HOME/bin"
+          (
+            flock 9
+            if ! "$CARGO_HOME/bin/cargo-deny" --version | grep -q "cargo-deny $CARGO_DENY_VERSION"; then
+              cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
+            fi
+          ) 9>/tmp/cargo-deny-install.lock
+          "$CARGO_HOME/bin/cargo-deny" --version
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Check licenses
