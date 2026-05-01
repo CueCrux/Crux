@@ -299,6 +299,63 @@ h1 {
 .badge.warn { background: #ffe0aa; color: #5a3300; }
 .badge.good { background: #c9efd9; color: #123d27; }
 .badge.bad { background: #f5c2bd; color: #641c15; }
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.65rem;
+}
+.action {
+  min-height: 44px;
+  border: 1px solid rgba(25, 24, 19, 0.16);
+  border-radius: 999px;
+  color: var(--graphite);
+  background: #fff9ea;
+  cursor: pointer;
+  padding: 0.55rem 0.85rem;
+}
+.action.primary {
+  border-color: transparent;
+  color: #fff9ea;
+  background: var(--graphite);
+}
+.action.warn {
+  border-color: rgba(182, 107, 0, 0.34);
+  color: #5a3300;
+  background: #ffe0aa;
+}
+.action:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.cap-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.55rem;
+}
+details {
+  margin-top: 0.65rem;
+}
+summary {
+  min-height: 44px;
+  cursor: pointer;
+  color: var(--graphite);
+  font-weight: 700;
+}
+.toast {
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  border: 1px solid rgba(0, 150, 166, 0.28);
+  border-radius: var(--radius-md);
+  color: #123d27;
+  background: #c9efd9;
+}
+.toast.bad {
+  border-color: rgba(182, 64, 53, 0.28);
+  color: #641c15;
+  background: #f5c2bd;
+}
 .panel { display: none; }
 .panel.active { display: contents; }
 pre {
@@ -355,7 +412,7 @@ pre {
     </nav>
     <div class="scope-box">
       <label for="scopeHeader">Optional X-Corecrux-Scopes header</label>
-      <input id="scopeHeader" value="admin:read,query:read,tenant:metadata:read" autocomplete="off">
+      <input id="scopeHeader" value="admin:read,tenant:chunks:read,tenant:content:preview,integrations:install,integrations:grant,integrations:disable" autocomplete="off">
     </div>
   </aside>
 
@@ -364,7 +421,7 @@ pre {
       <div class="hero-copy">
         <p class="eyebrow">Daemon-native, offline-first, CDN-free</p>
         <h1 id="title">Know what your agents can see.</h1>
-        <p>This console is served by the Crux Daemon. It is read-only in this slice, redacts sensitive surfaces, and keeps raw tenant content behind explicit preview scope.</p>
+        <p>This console is served by the Crux Daemon. It starts safe, redacts sensitive surfaces, and keeps integration grants and tenant previews behind explicit local scopes.</p>
       </div>
       <div class="status-strip" id="statusStrip" aria-live="polite"></div>
     </section>
@@ -389,8 +446,9 @@ pre {
         <article class="card wide">
           <span class="label">Integration Library</span>
           <h2>Declarative packs</h2>
-          <p class="muted">Installed packs are inert until a Passport grant exists. This first slice exposes built-in read-only packs only.</p>
+          <p class="muted">Installed packs are inert until a Passport grant exists. Review permissions, install declarative packs, grant exact capabilities, and disable grants locally.</p>
           <div class="list" id="integrationList"></div>
+          <div id="integrationToast" aria-live="polite"></div>
         </article>
       </div>
     </section>
@@ -426,7 +484,7 @@ pre {
         <article class="card wide">
           <span class="label">Tenants and chunks</span>
           <h2>Metadata-first visibility</h2>
-          <p class="muted">Chunk enumeration is wired as a safe console contract. Raw preview remains disabled until scoped dataplane preview is implemented.</p>
+          <p class="muted">Chunk enumeration is metadata-first. Redacted previews require <span class="mono">tenant:content:preview</span>; raw bytes are never returned by the console.</p>
           <div class="list" id="tenantList"></div>
         </article>
       </div>
@@ -451,7 +509,8 @@ var state = {
   passports: null,
   sessions: null,
   facts: null,
-  tenants: null
+  tenants: null,
+  chunks: {}
 };
 
 var panels = document.querySelectorAll(".panel");
@@ -473,6 +532,18 @@ var savedScopes = localStorage.getItem("crux-console-scopes");
 if (savedScopes) {
   document.getElementById("scopeHeader").value = savedScopes;
 }
+
+document.getElementById("integrationList").addEventListener("click", function(event) {
+  var button = event.target.closest("button[data-action]");
+  if (!button) { return; }
+  handleIntegrationAction(button);
+});
+
+document.getElementById("tenantList").addEventListener("click", function(event) {
+  var button = event.target.closest("button[data-tenant]");
+  if (!button) { return; }
+  loadTenantChunks(button.dataset.tenant);
+});
 
 function esc(value) {
   return String(value === undefined || value === null ? "" : value)
@@ -499,6 +570,23 @@ function headers() {
 
 async function api(path) {
   var response = await fetch(path, { headers: headers() });
+  var text = await response.text();
+  var data;
+  try { data = JSON.parse(text); } catch (err) { data = { text: text }; }
+  if (!response.ok) {
+    throw { status: response.status, data: data };
+  }
+  return data;
+}
+
+async function postApi(path, body) {
+  var merged = headers();
+  merged["Content-Type"] = "application/json";
+  var response = await fetch(path, {
+    method: "POST",
+    headers: merged,
+    body: JSON.stringify(body || {})
+  });
   var text = await response.text();
   var data;
   try { data = JSON.parse(text); } catch (err) { data = { text: text }; }
@@ -570,12 +658,95 @@ function renderOverview() {
 }
 
 function renderIntegrations() {
-  var packs = (state.integrations || {}).packs || [];
-  document.getElementById("integrationList").innerHTML = packs.length ? packs.map(function(pack) {
+  var data = state.integrations || {};
+  var packs = data.packs || [];
+  var audit = data.audit_tail || [];
+  var cards = packs.length ? packs.map(function(pack) {
     var m = pack.manifest || {};
-    var caps = (m.capabilities || []).join(", ") || "none";
-    return row(m.name || m.id, (m.summary || "") + " | " + caps, pack.risk_level || "low", pack.risk_level === "medium" ? "warn" : "good");
+    var caps = m.capabilities || [];
+    var network = ((m.network || {}).allowed_hosts || []).join(", ") || "local only";
+    var stateLabel = pack.install_state || "available";
+    var riskClass = pack.risk_level === "high" || pack.risk_level === "blocked" ? "bad" : (pack.risk_level === "medium" ? "warn" : "good");
+    return '<div class="row">' +
+      '<div class="row-head"><strong>' + esc(m.name || m.id) + '</strong>' +
+      badge(stateLabel, stateLabel === "enabled" ? "good" : (stateLabel === "blocked" ? "bad" : "")) + '</div>' +
+      '<div class="muted">' + esc(m.summary || "") + '</div>' +
+      '<div class="cap-list" aria-label="Requested capabilities">' + caps.map(function(cap) { return badge(cap, cap.indexOf(":write") > -1 ? "warn" : ""); }).join("") + '</div>' +
+      '<details><summary>Permission diff and setup snippet</summary>' +
+      row("Risk", "Trust=" + pack.trust_tier + "; risk=" + pack.risk_level + "; network=" + network, pack.risk_level || "low", riskClass) +
+      '<pre>' + esc(setupSnippet(m)) + '</pre></details>' +
+      integrationActions(m, stateLabel, caps) +
+      '</div>';
   }).join("") : row("No packs", "Integration library is disabled or empty", "empty", "warn");
+
+  var auditRows = audit.length ? '<details><summary>Recent integration audit</summary>' + audit.slice(-8).map(function(item) {
+    return row(item.action + " / " + item.pack_id, item.outcome + " at " + item.ts_unix_ms, item.version || "audit");
+  }).join("") + '</details>' : "";
+  document.getElementById("integrationList").innerHTML = cards + auditRows;
+}
+
+function integrationActions(manifest, stateLabel, caps) {
+  var id = esc(manifest.id || "");
+  var version = esc(manifest.version || "0.1.0");
+  var capAttr = esc((caps || []).join(","));
+  var install = stateLabel === "available" || stateLabel === "update_available";
+  var installed = stateLabel === "installed";
+  var enabled = stateLabel === "enabled";
+  return '<div class="actions">' +
+    '<button class="action primary" data-action="install" data-pack="' + id + '" data-version="' + version + '"' + (install ? "" : " disabled") + '>Install</button>' +
+    '<button class="action" data-action="grant" data-pack="' + id + '" data-version="' + version + '" data-caps="' + capAttr + '"' + (installed ? "" : " disabled") + '>Grant declared capabilities</button>' +
+    '<button class="action warn" data-action="disable" data-pack="' + id + '"' + (enabled ? "" : " disabled") + '>Disable grant</button>' +
+    '</div>';
+}
+
+function setupSnippet(manifest) {
+  var id = manifest.id || "pack";
+  var kind = (manifest.entry || {}).kind || "recipe";
+  if (kind === "mcp_config") {
+    return JSON.stringify({
+      mcpServers: {
+        crux: {
+          url: "http://localhost:14801/mcp",
+          headers: { Authorization: "Bearer <agent-token-if-configured>" }
+        }
+      }
+    }, null, 2);
+  }
+  if (kind === "sdk_recipe") {
+    return "npm install @cuecrux/sdk\nCRUX_BASE_URL=http://localhost:14800 node examples/" + id + ".mjs";
+  }
+  if (kind === "http_recipe") {
+    return "curl -s http://localhost:14800/v1/facts -H 'X-Corecrux-Scopes: facts:read'";
+  }
+  return "Install " + id + ", then follow the recipe at " + ((manifest.entry || {}).path || "manifest entry path");
+}
+
+async function handleIntegrationAction(button) {
+  var pack = button.dataset.pack;
+  var action = button.dataset.action;
+  var version = button.dataset.version || "0.1.0";
+  var caps = (button.dataset.caps || "").split(",").filter(Boolean);
+  var body = {};
+  if (action === "grant") {
+    body = { version: version, capabilities: caps, reason: "Granted from Crux Console" };
+  }
+  if (action === "disable") {
+    body = { reason: "Disabled from Crux Console" };
+  }
+  button.disabled = true;
+  try {
+    await postApi("/v1/console/integrations/" + encodeURIComponent(pack) + "/" + action, body);
+    showIntegrationToast(action + " succeeded for " + pack, false);
+    await loadAll();
+  } catch (err) {
+    showIntegrationToast(action + " failed: " + JSON.stringify(err.data || err), true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function showIntegrationToast(message, bad) {
+  document.getElementById("integrationToast").innerHTML = '<div class="toast ' + (bad ? "bad" : "") + '">' + esc(message) + '</div>';
 }
 
 function renderIdentity() {
@@ -600,8 +771,34 @@ function renderFacts() {
 function renderTenants() {
   var tenants = (state.tenants || {}).tenants || [];
   document.getElementById("tenantList").innerHTML = tenants.map(function(tenant) {
-    return row(tenant.tenant_id, tenant.chunk_visibility + "; content preview=" + tenant.content_preview, "metadata", "good");
+    var chunks = state.chunks[tenant.tenant_id];
+    var chunkRows = chunks ? chunks.map(function(chunk) {
+      return row(chunk.stream_type + "/" + chunk.stream_id + " #" + chunk.seq, chunk.chunk_digest + " | " + chunk.content_type + " | bytes=" + chunk.payload_bytes, chunk.preview_available ? "preview" : "metadata", chunk.preview_available ? "warn" : "good");
+    }).join("") : "";
+    return '<div class="row"><div class="row-head"><strong>' + esc(tenant.tenant_id) + '</strong>' + badge("metadata", "good") + '</div>' +
+      '<div class="muted mono">' + esc(tenant.chunk_visibility + "; content preview=" + tenant.content_preview) + '</div>' +
+      '<div class="actions"><button class="action" data-tenant="' + esc(tenant.tenant_id) + '">Load chunks</button></div>' +
+      chunkRows + '</div>';
   }).join("");
+}
+
+async function loadTenantChunks(tenantId) {
+  try {
+    var data = await api("/v1/console/tenants/" + encodeURIComponent(tenantId) + "/chunks?limit=50");
+    state.chunks[tenantId] = data.chunks || [];
+    renderTenants();
+  } catch (err) {
+    state.chunks[tenantId] = [{
+      stream_type: "error",
+      stream_id: tenantId,
+      seq: 0,
+      chunk_digest: JSON.stringify(err.data || err),
+      content_type: "application/problem+json",
+      payload_bytes: 0,
+      preview_available: false
+    }];
+    renderTenants();
+  }
 }
 
 function renderError(err) {
