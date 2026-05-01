@@ -6,7 +6,7 @@ license.workspace = true
 description = "RCX Capability Token v1.0 schema, canonical bytes, and validation result types."
 
 [dependencies]
-blake3 = "1.5.1"
+blake3 = "1.8.5"
 crux-session = { path = "../crux-session" }
 hex = "0.4.3"
 

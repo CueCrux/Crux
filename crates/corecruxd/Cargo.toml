@@ -15,10 +15,10 @@ otel = [
 ]
 
 [dependencies]
-axum = "0.8.1"
+axum = "0.8.9"
 utoipa = { version = "5", features = ["axum_extras"] }
 base64 = "0.22.1"
-blake3 = "1.5.1"
+blake3 = "1.8.5"
 chrono = { version = "0.4.40", default-features = false, features = ["clock"] }
 crc32fast = "1.4.2"
 ed25519-dalek = { version = "2.2.0", features = ["std"] }
@@ -44,9 +44,9 @@ ureq = { version = "3.3.0", features = ["json"] }
 opentelemetry = { version = "0.31", optional = true }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.31", features = ["tonic"], optional = true }
-uuid = { version = "1.16.0", features = ["v4"] }
+uuid = { version = "1.23.1", features = ["v4"] }
 zstd = "0.13.3"
-zip = "8.5.1"
+zip = "8.6.0"
 
 corecrux-frame = { path = "../corecrux-frame" }
 corecrux-memory = { path = "../corecrux-memory" }

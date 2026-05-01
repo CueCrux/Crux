@@ -585,7 +585,7 @@ fn subject_to_cbor(subject: &Subject) -> CborValue {
         ),
         (
             "daemon_instance_id".to_string(),
-            opt_text_to_cbor(subject.daemon_instance_id.as_ref()),
+            opt_text_to_cbor(subject.daemon_instance_id.as_deref()),
         ),
     ])
 }
@@ -595,7 +595,7 @@ fn tenant_scope_to_cbor(scope: &TenantScope) -> CborValue {
         ("tenant_id".to_string(), CborValue::Text(scope.tenant_id.clone())),
         (
             "display_name".to_string(),
-            opt_text_to_cbor(scope.display_name.as_ref()),
+            opt_text_to_cbor(scope.display_name.as_deref()),
         ),
     ])
 }
@@ -603,7 +603,7 @@ fn tenant_scope_to_cbor(scope: &TenantScope) -> CborValue {
 fn team_scope_to_cbor(scope: &TeamScope) -> CborValue {
     CborValue::Map(vec![
         ("team_id".to_string(), CborValue::Text(scope.team_id.clone())),
-        ("seat_id".to_string(), opt_text_to_cbor(scope.seat_id.as_ref())),
+        ("seat_id".to_string(), opt_text_to_cbor(scope.seat_id.as_deref())),
         (
             "seat_role".to_string(),
             match &scope.seat_role {
@@ -631,7 +631,10 @@ fn team_scope_to_cbor(scope: &TeamScope) -> CborValue {
 fn enterprise_scope_to_cbor(scope: &EnterpriseScope) -> CborValue {
     CborValue::Map(vec![
         ("customer_id".to_string(), CborValue::Text(scope.customer_id.clone())),
-        ("contract_id".to_string(), opt_text_to_cbor(scope.contract_id.as_ref())),
+        (
+            "contract_id".to_string(),
+            opt_text_to_cbor(scope.contract_id.as_deref()),
+        ),
         ("backend_id".to_string(), CborValue::Text(scope.backend_id.clone())),
         ("endpoint_url".to_string(), CborValue::Text(scope.endpoint_url.clone())),
         (
@@ -655,7 +658,7 @@ fn backend_to_cbor(backend: &Backend) -> CborValue {
         ),
         (
             "endpoint_url".to_string(),
-            opt_text_to_cbor(backend.endpoint_url.as_ref()),
+            opt_text_to_cbor(backend.endpoint_url.as_deref()),
         ),
         (
             "permitted_capabilities".to_string(),
@@ -744,10 +747,10 @@ fn fallback_to_cbor(fallback: &FallbackPolicy) -> CborValue {
 
 fn revocation_to_cbor(revocation: &Revocation) -> CborValue {
     CborValue::Map(vec![
-        ("crl_url".to_string(), opt_text_to_cbor(revocation.crl_url.as_ref())),
+        ("crl_url".to_string(), opt_text_to_cbor(revocation.crl_url.as_deref())),
         (
             "push_channel".to_string(),
-            opt_text_to_cbor(revocation.push_channel.as_ref()),
+            opt_text_to_cbor(revocation.push_channel.as_deref()),
         ),
     ])
 }
@@ -767,9 +770,9 @@ fn signature_to_cbor(signature: &Signature, zero_signature: bool) -> CborValue {
     ])
 }
 
-fn opt_text_to_cbor(value: Option<&String>) -> CborValue {
+fn opt_text_to_cbor(value: Option<&str>) -> CborValue {
     match value {
-        Some(value) => CborValue::Text(value.clone()),
+        Some(value) => CborValue::Text(value.to_owned()),
         None => CborValue::Null,
     }
 }

@@ -120,6 +120,9 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
             error: None,
         })),
         session: None,
+        extraction_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
+            corecrux_projections::ExtractionCacheMaterializer::new(),
+        )),
     }
 }
 

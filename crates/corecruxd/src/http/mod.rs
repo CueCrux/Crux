@@ -164,6 +164,17 @@ pub struct AppState {
     /// this differently; see [`session::SessionServices::local_default`] for
     /// the local out-of-the-box wiring.
     pub session: Option<Arc<session::SessionServices>>,
+    /// stateful-extraction-flywheel M1.b — in-memory materializer for the
+    /// `extraction_cache_current` projection. Updated by the append handler
+    /// when it observes `corecrux.proj.extraction.*` events; read by the
+    /// `/v1/projections/lookup` handler. Shared across router clones; the
+    /// RwLock is cheap because reads dominate writes (every chunk ingest is
+    /// one write + many reads across the pilot).
+    ///
+    /// CE-friendly: lives entirely in-process, no proprietary storage
+    /// dependency. Proprietary deployments can swap this for an event-sourced
+    /// replay-from-log implementation without changing the HTTP contract.
+    pub extraction_cache: Arc<RwLock<corecrux_projections::ExtractionCacheMaterializer>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -239,6 +250,17 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/admin/projections/rebuild",
             axum::routing::post(self::projections::post_projection_rebuild),
+        )
+        // stateful-extraction-flywheel M1 — chunk extraction cache lookup.
+        // `mode=key` is the only live path in M1; `vector` / `key_or_vector` are
+        // reserved for optional M13 (semantic near-hit). Materializer ships next.
+        .route(
+            "/v1/projections/lookup",
+            axum::routing::post(self::projections::post_projection_lookup),
+        )
+        .route(
+            "/v1/projections/batch_lookup",
+            axum::routing::post(self::projections::post_projection_batch_lookup),
         )
         .route("/v1/routing/route", get(self::routing::route_debug))
         .route("/v1/routing/status", get(self::routing::routing_status))
