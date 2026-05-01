@@ -679,6 +679,170 @@ async fn shard_map_requires_admin_scope_in_dev_mode() {
     assert_eq!(authorized.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn console_read_endpoints_require_admin_scope_in_dev_mode() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let missing = console::get_console_summary(State(state.clone()), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong_scope = console::get_console_summary(State(state.clone()), dev_scope_headers("facts:read"))
+        .await
+        .into_response();
+    assert_eq!(wrong_scope.status(), StatusCode::FORBIDDEN);
+
+    let allowed = console::get_console_summary(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(allowed.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn console_redacts_private_facts_and_session_state() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut facts = state.fact_store.write().await;
+        facts.store(corecrux_memory::fact_store::StoreFact {
+            entity: "tenant-a::service".to_string(),
+            key: "public".to_string(),
+            value: "safe value".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+        facts.store(corecrux_memory::fact_store::StoreFact {
+            entity: "tenant-a::service".to_string(),
+            key: "api_key".to_string(),
+            value: "secret-token-123".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+        });
+    }
+    state.session_store.write().await.put(
+        "sess-secret",
+        serde_json::json!({"token": "secret-session-token"}),
+        None,
+    );
+
+    let facts_resp = console::get_console_facts(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(facts_resp.status(), StatusCode::OK);
+    let facts_body = json_body(facts_resp).await;
+    assert_eq!(facts_body["private_facts_hidden"], true);
+    assert_eq!(facts_body["visible_count"], 1);
+    let facts_text = serde_json::to_string(&facts_body).expect("facts json");
+    assert!(!facts_text.contains("secret-token-123"));
+
+    let sessions_resp = console::get_console_sessions(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(sessions_resp.status(), StatusCode::OK);
+    let sessions_body = json_body(sessions_resp).await;
+    assert_eq!(sessions_body["raw_state_exposed"], false);
+    assert_eq!(sessions_body["sessions"][0], "sess-secret");
+    let sessions_text = serde_json::to_string(&sessions_body).expect("sessions json");
+    assert!(!sessions_text.contains("secret-session-token"));
+}
+
+#[tokio::test]
+async fn console_integration_install_grant_disable_roundtrip() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let install = console::post_console_integration_install(
+        State(state.clone()),
+        Path("mcp.cursor".to_string()),
+        dev_scope_headers("integrations:install"),
+        Json(console::InstallIntegrationBody {
+            manifest: None,
+            pack_id: None,
+            version: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(install.status(), StatusCode::CREATED);
+
+    let grant = console::post_console_integration_grant(
+        State(state.clone()),
+        Path("mcp.cursor".to_string()),
+        dev_scope_headers("integrations:grant"),
+        Json(console::GrantIntegrationBody {
+            version: "0.1.0".to_string(),
+            capabilities: vec!["integrations:read".to_string(), "passport:read".to_string()],
+            reason: Some("test grant".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(grant.status(), StatusCode::OK);
+    let grant_body = json_body(grant).await;
+    assert_eq!(grant_body["enabled"], true);
+
+    let snapshot = console::get_console_integrations(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(snapshot.status(), StatusCode::OK);
+    let snapshot_body = json_body(snapshot).await;
+    let cursor = snapshot_body["packs"]
+        .as_array()
+        .expect("packs array")
+        .iter()
+        .find(|pack| pack["manifest"]["id"] == "mcp.cursor")
+        .expect("cursor pack");
+    assert_eq!(cursor["install_state"], "enabled");
+    assert_eq!(snapshot_body["grants"].as_array().expect("grants array").len(), 1);
+
+    let disabled = console::post_console_integration_disable(
+        State(state.clone()),
+        Path("mcp.cursor".to_string()),
+        dev_scope_headers("integrations:disable"),
+        Json(console::DisableIntegrationBody {
+            reason: Some("test disable".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(disabled.status(), StatusCode::OK);
+    let disabled_body = json_body(disabled).await;
+    assert_eq!(disabled_body["enabled"], false);
+}
+
+#[tokio::test]
+async fn console_integration_grant_requires_specific_scope() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let install = console::post_console_integration_install(
+        State(state.clone()),
+        Path("mcp.cursor".to_string()),
+        dev_scope_headers("integrations:install"),
+        Json(console::InstallIntegrationBody {
+            manifest: None,
+            pack_id: None,
+            version: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(install.status(), StatusCode::CREATED);
+
+    let rejected = console::post_console_integration_grant(
+        State(state),
+        Path("mcp.cursor".to_string()),
+        dev_scope_headers("admin:read"),
+        Json(console::GrantIntegrationBody {
+            version: "0.1.0".to_string(),
+            capabilities: vec!["integrations:read".to_string()],
+            reason: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+}
+
 // ── Phase 1 / 1.5 endpoint tests ─────────────────────────────────
 
 // ── Fact Store (PUT /v1/facts) ──────────────────────────────────

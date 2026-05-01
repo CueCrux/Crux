@@ -333,6 +333,18 @@ pub fn router(state: AppState) -> Router {
             "/v1/console/integrations",
             get(self::console::get_console_integrations),
         )
+        .route(
+            "/v1/console/integrations/{packId}/install",
+            axum::routing::post(self::console::post_console_integration_install),
+        )
+        .route(
+            "/v1/console/integrations/{packId}/grant",
+            axum::routing::post(self::console::post_console_integration_grant),
+        )
+        .route(
+            "/v1/console/integrations/{packId}/disable",
+            axum::routing::post(self::console::post_console_integration_disable),
+        )
         .route("/v1/console/passports", get(self::console::get_console_passports))
         .route("/v1/console/sessions", get(self::console::get_console_sessions))
         .route("/v1/console/facts", get(self::console::get_console_facts))

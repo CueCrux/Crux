@@ -2,13 +2,36 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! Read-only aggregation endpoints for the embedded Crux Console.
+//! Aggregation and guarded mutation endpoints for the embedded Crux Console.
 
 use std::collections::BTreeSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
     problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
 };
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct InstallIntegrationBody {
+    pub(super) manifest: Option<crux_integrations::IntegrationManifest>,
+    pub(super) pack_id: Option<String>,
+    pub(super) version: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct GrantIntegrationBody {
+    pub(super) version: String,
+    #[serde(default)]
+    pub(super) capabilities: Vec<String>,
+    #[serde(default)]
+    pub(super) reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct DisableIntegrationBody {
+    #[serde(default)]
+    pub(super) reason: Option<String>,
+}
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct ConsoleChunksQuery {
@@ -27,7 +50,7 @@ pub(super) async fn get_console_summary(State(state): State<AppState>, headers: 
     let update = state.update_status.read().await.clone();
     let fact_count = state.fact_store.read().await.count();
     let session_count = state.session_store.read().await.count();
-    let integration_count = crux_integrations::builtin_packs().map_or(0, |packs| packs.len());
+    let integration_count = integration_snapshot(&state).map_or(0, |snapshot| snapshot.packs.len());
 
     (
         StatusCode::OK,
@@ -100,10 +123,11 @@ pub(super) async fn get_console_integrations(State(state): State<AppState>, head
             .into_response();
     }
 
-    let packs = match crux_integrations::builtin_packs() {
-        Ok(packs) => packs,
-        Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    let snapshot = match integration_snapshot(&state) {
+        Ok(snapshot) => snapshot,
+        Err(err) => return integration_problem(err),
     };
+    let packs = apply_safe_mode(snapshot.packs, state.integrations_safe_mode);
 
     (
         StatusCode::OK,
@@ -112,10 +136,109 @@ pub(super) async fn get_console_integrations(State(state): State<AppState>, head
             "safe_mode": state.integrations_safe_mode,
             "allow_executable_helpers": state.integrations_allow_executable_helpers,
             "allowed_capabilities": crux_integrations::allowed_capabilities(),
-            "packs": packs
+            "packs": packs,
+            "grants": snapshot.grants,
+            "audit_tail": snapshot.audit_tail
         })),
     )
         .into_response()
+}
+
+pub(super) async fn post_console_integration_install(
+    State(state): State<AppState>,
+    Path(pack_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<InstallIntegrationBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["integrations:install"]) {
+        return problem.into_response();
+    }
+    if !state.integrations_enabled {
+        return problem_response(StatusCode::FORBIDDEN, "integrations are disabled");
+    }
+    if state.integrations_safe_mode {
+        return problem_response(StatusCode::FORBIDDEN, "integration safe mode blocks install");
+    }
+
+    let manifest = match resolve_install_manifest(&pack_id, body) {
+        Ok(manifest) => manifest,
+        Err((status, detail)) => return problem_response(status, detail),
+    };
+    let trust_tier = manifest_trust_tier(&manifest);
+    let descriptor = match crux_integrations::install_pack(
+        &state.data_dir,
+        &manifest,
+        trust_tier,
+        now_unix_ms(),
+        &validation_policy(&state),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(err) => return integration_problem(err),
+    };
+
+    (StatusCode::CREATED, Json(descriptor)).into_response()
+}
+
+pub(super) async fn post_console_integration_grant(
+    State(state): State<AppState>,
+    Path(pack_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GrantIntegrationBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["integrations:grant"]) {
+        return problem.into_response();
+    }
+    if !state.integrations_enabled {
+        return problem_response(StatusCode::FORBIDDEN, "integrations are disabled");
+    }
+    if state.integrations_safe_mode {
+        return problem_response(StatusCode::FORBIDDEN, "integration safe mode blocks grants");
+    }
+    if body.capabilities.is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "capabilities must not be empty");
+    }
+
+    let grant = match crux_integrations::grant_pack(
+        &state.data_dir,
+        crux_integrations::GrantPackRequest {
+            passport_fpr: &state.passport_fpr,
+            granted_by_passport_fpr: &state.passport_fpr,
+            pack_id: &pack_id,
+            version: &body.version,
+            capabilities: &body.capabilities,
+            reason: body.reason,
+            now_unix_ms: now_unix_ms(),
+        },
+    ) {
+        Ok(grant) => grant,
+        Err(err) => return integration_problem(err),
+    };
+
+    (StatusCode::OK, Json(grant)).into_response()
+}
+
+pub(super) async fn post_console_integration_disable(
+    State(state): State<AppState>,
+    Path(pack_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<DisableIntegrationBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["integrations:disable"]) {
+        return problem.into_response();
+    }
+
+    let grant = match crux_integrations::disable_pack(
+        &state.data_dir,
+        &state.passport_fpr,
+        &pack_id,
+        body.reason,
+        now_unix_ms(),
+    ) {
+        Ok(grant) => grant,
+        Err(err) => return integration_problem(err),
+    };
+
+    (StatusCode::OK, Json(grant)).into_response()
 }
 
 pub(super) async fn get_console_passports(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -316,4 +439,90 @@ pub(super) async fn get_console_chunk_preview(
 #[allow(clippy::result_large_err)]
 fn require_console_read(state: &AppState, headers: &HeaderMap) -> Result<(), crate::problem::ProblemResponse> {
     require_http_scopes(&state.auth, headers, &["admin:read"])
+}
+
+fn validation_policy(state: &AppState) -> crux_integrations::ValidationPolicy {
+    crux_integrations::ValidationPolicy {
+        allow_executable_helpers: state.integrations_allow_executable_helpers,
+        ..crux_integrations::ValidationPolicy::default()
+    }
+}
+
+fn integration_snapshot(
+    state: &AppState,
+) -> Result<crux_integrations::IntegrationLibrarySnapshot, crux_integrations::IntegrationError> {
+    crux_integrations::library_snapshot(&state.data_dir, &state.passport_fpr, &validation_policy(state))
+}
+
+fn apply_safe_mode(
+    packs: Vec<crux_integrations::IntegrationPackDescriptor>,
+    safe_mode: bool,
+) -> Vec<crux_integrations::IntegrationPackDescriptor> {
+    if !safe_mode {
+        return packs;
+    }
+    packs
+        .into_iter()
+        .map(|mut pack| {
+            if pack.trust_tier != crux_integrations::TrustTier::FirstParty
+                && pack.install_state == crux_integrations::InstallState::Enabled
+            {
+                pack.install_state = crux_integrations::InstallState::Blocked;
+            }
+            pack
+        })
+        .collect()
+}
+
+fn resolve_install_manifest(
+    path_pack_id: &str,
+    body: InstallIntegrationBody,
+) -> Result<crux_integrations::IntegrationManifest, (StatusCode, &'static str)> {
+    if let Some(manifest) = body.manifest {
+        if manifest.id != path_pack_id {
+            return Err((StatusCode::BAD_REQUEST, "manifest id must match path pack id"));
+        }
+        return Ok(manifest);
+    }
+
+    let version = body.version.unwrap_or_else(|| "0.1.0".to_string());
+    let manifest = crux_integrations::builtin_manifests()
+        .into_iter()
+        .find(|manifest| manifest.id == path_pack_id && manifest.version == version)
+        .ok_or((StatusCode::NOT_FOUND, "integration pack not found"))?;
+    if let Some(body_pack_id) = body.pack_id {
+        if body_pack_id != path_pack_id {
+            return Err((StatusCode::BAD_REQUEST, "body pack_id must match path pack id"));
+        }
+    }
+    Ok(manifest)
+}
+
+fn manifest_trust_tier(manifest: &crux_integrations::IntegrationManifest) -> crux_integrations::TrustTier {
+    if manifest.publisher_passport_fpr == crux_integrations::FIRST_PARTY_PASSPORT {
+        crux_integrations::TrustTier::FirstParty
+    } else if manifest.signature.is_some() {
+        crux_integrations::TrustTier::LocallySigned
+    } else {
+        crux_integrations::TrustTier::Unknown
+    }
+}
+
+fn integration_problem(err: crux_integrations::IntegrationError) -> axum::response::Response {
+    let status = match err {
+        crux_integrations::IntegrationError::PackNotInstalled { .. }
+        | crux_integrations::IntegrationError::GrantNotFound { .. } => StatusCode::NOT_FOUND,
+        crux_integrations::IntegrationError::ExternalHelperDisabled => StatusCode::FORBIDDEN,
+        crux_integrations::IntegrationError::Io(_) | crux_integrations::IntegrationError::Json(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        _ => StatusCode::BAD_REQUEST,
+    };
+    problem_response(status, err.to_string())
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
 }
