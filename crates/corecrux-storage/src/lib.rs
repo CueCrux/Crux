@@ -1874,10 +1874,35 @@ fn parse_segment_seq_from_filename(name: &str) -> Option<u64> {
     seq_str.parse::<u64>().ok()
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_FAILPOINT: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_test_failpoint(name: &str) {
+    TEST_FAILPOINT.with(|failpoint| {
+        *failpoint.borrow_mut() = Some(name.to_string());
+    });
+}
+
+#[cfg(test)]
+fn clear_test_failpoint() {
+    TEST_FAILPOINT.with(|failpoint| {
+        *failpoint.borrow_mut() = None;
+    });
+}
+
+#[cfg(not(test))]
 fn failpoint_active(name: &str) -> bool {
     std::env::var("CORECRUX_STORAGE_FAILPOINT")
         .ok()
         .is_some_and(|v| v == name)
+}
+
+#[cfg(test)]
+fn failpoint_active(name: &str) -> bool {
+    TEST_FAILPOINT.with(|failpoint| failpoint.borrow().as_deref() == Some(name))
 }
 
 fn decode_stored_event_from_frame_bytes(
