@@ -23,7 +23,7 @@ tonic = { version = "0.14.5", features = ["transport"] }
 ureq = { version = "3.3.0", features = ["json"] }
 url = "2.5.7"
 urlencoding = "2.1"
-uuid = { version = "1.16.0", features = ["v4"] }
+uuid = { version = "1.23.1", features = ["v4"] }
 xxhash-rust = { version = "0.8.10", features = ["xxh64"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 
