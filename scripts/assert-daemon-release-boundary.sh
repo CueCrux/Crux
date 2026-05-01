@@ -26,7 +26,13 @@ done
 scan_output="$(mktemp)"
 trap 'rm -f "$scan_output"' EXIT
 
-if rg -in '(cuda|cudart|nvcc|libcuda|corecrux-gpu)' "$root/Cargo.toml" "$root/crates" --glob 'Cargo.toml' >"$scan_output"; then
+if command -v rg >/dev/null 2>&1; then
+  scan_cmd=(rg -in '(cuda|cudart|nvcc|libcuda|corecrux-gpu)' "$root/Cargo.toml" "$root/crates" --glob 'Cargo.toml')
+else
+  scan_cmd=(grep -RInEi --include 'Cargo.toml' '(cuda|cudart|nvcc|libcuda|corecrux-gpu)' "$root/Cargo.toml" "$root/crates")
+fi
+
+if "${scan_cmd[@]}" >"$scan_output"; then
   cat "$scan_output" >&2
   echo "daemon distribution boundary violation: hosted GPU/CUDA surface found" >&2
   exit 1
@@ -45,7 +51,7 @@ for needle in \
   "docs/release-packaging.md" \
   "content/MANIFEST.json" \
   "RELEASE-MANIFEST"; do
-  if ! rg -q "$needle" "$package_script"; then
+  if ! grep -Fq -- "$needle" "$package_script"; then
     echo "daemon release package script missing required artifact marker: $needle" >&2
     exit 1
   fi
