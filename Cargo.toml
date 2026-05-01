@@ -13,6 +13,7 @@ members = [
   "crates/crux-sync",
   "crates/crux-contrib",
   "crates/crux-observe",
+  "crates/vaultcrux-local",
   "crates/crux-mcp",
   "crates/crux-session",
   "crates/rcx-capability-token",

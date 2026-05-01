@@ -163,7 +163,7 @@ First Rust build downloads and compiles all dependencies (~5 minutes).
 
 **Fix:** Use the pre-built image if available:
 ```yaml
-image: ghcr.io/cuecrux/corecrux-community:latest
+image: ghcr.io/cuecrux/crux-daemon:latest
 ```
 
 ## Store integrity errors

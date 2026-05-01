@@ -1,4 +1,4 @@
-```
+```text
  ██████╗██████╗ ██╗   ██╗██╗  ██╗
 ██╔════╝██╔══██╗██║   ██║╚██╗██╔╝
 ██║     ██████╔╝██║   ██║ ╚███╔╝
@@ -7,112 +7,84 @@
  ╚═════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝
 ```
 
-# Crux - Community Edition
+# Crux Daemon
 
 [![CI](https://github.com/CueCrux/Crux/actions/workflows/ci.yml/badge.svg)](https://github.com/CueCrux/Crux/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-82%25-green)](https://github.com/CueCrux/Crux)
 [![Licence: CCL-1.0 (source-available)](https://img.shields.io/badge/licence-CCL--1.0_(source--available)-blue)](LICENCE.md)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88.0-orange)](rust-toolchain.toml)
-[![Docker](https://img.shields.io/badge/docker-ghcr.io%2Fcuecrux%2Fcrux-blue)](https://ghcr.io/cuecrux/crux-community)
 
-> **Naming:** This repository is **Crux**. The daemon binary is `corecruxd`, the CLI is `corecruxctl`, and all Rust crates use the `corecrux-` prefix. Environment variables start with `CORECRUXD_`. When you see "Crux" in prose and `corecrux` in code, they mean the same thing.
+Crux Daemon is a local-first memory, retrieval, and receipt daemon for agents
+and applications. It gives you an HTTP API, a built-in MCP server, append-only
+storage, local facts and sessions, BM25 retrieval, CROWN receipts, Prometheus
+metrics, and optional bring-your-own embeddings.
 
-## What Crux Is
+The daemon is designed to run cleanly on a laptop, workstation, VM, or container.
+It is source-available under the CueCrux Community Licence, but it is not
+open-source. Read [Licence](#licence) before redistributing or offering a hosted
+service.
 
-A source-available, single-binary retrieval engine with built-in cryptographic receipts.
+## Naming
 
-Crux is an append-only event store with BM25 + graph signal retrieval and CROWN receipts baked into every operation. Every query result is signed, every retrieval path is auditable, and every gap in coverage is reported. Optionally, connect a local embedding model (Ollama, vLLM, TEI, or any OpenAI-compatible endpoint) for dense vector retrieval you pick the hardware.
-
-## Licence (read this first)
-
-Crux is **source-available, not open-source.** It is licensed under the [CueCrux Community Licence (CCL v1.0)](LICENCE.md).
-
-| | |
+| Name | Meaning |
 |---|---|
-| **Permitted** | Run internally (commercial OK), read/audit source, modify for internal use, contribute back, academic research, build internal tooling on the APIs |
-| **Prohibited** | Redistribute as a competing product, offer as a managed/hosted/cloud service |
-| **Change clause** | Three years after each versioned release, the code converts to Apache 2.0 |
+| `Crux` | Product and repository name. |
+| `Crux Daemon` | The local daemon distribution documented here. |
+| `corecruxd` | Canonical daemon binary built by Cargo. |
+| `crux` | User-facing release alias for `corecruxd`. |
+| `corecruxctl` | CLI for verification, replay, receipts, and operations. |
+| `CORECRUXD_*` | Environment-variable prefix for daemon config. |
 
-If you see "open-source" mentioned anywhere outside this repo, that is incorrect. CCL v1.0 grants broad internal-use rights but reserves commercial redistribution.
+## What You Get
 
-## What's Included vs. What's Not
-
-Not every feature in the architecture is enabled in every deployment. Here is what you get out of the box:
-
-| Feature | Community Edition | Optional (bring your own) | Hosted / Proprietary only |
+| Capability | Local daemon | Bring your own | Hosted / managed |
 |---|:---:|:---:|:---:|
-| Append-only event store (BLAKE3 integrity) | **yes** | | |
-| CROWN receipts (Ed25519 signed) | **yes** | | |
-| Fact store (entity/key/value + confidence) | **yes** | | |
-| Session store (scoped agent state) | **yes** | | |
-| Built-in MCP server (22 tools) | **yes** | | |
-| Prometheus `/metrics` endpoint | **yes** | | |
-| HTTP + gRPC APIs | **yes** | | |
-| CLI tooling (`verify-store`, `replay`, etc.) | **yes** | | |
-| BM25 text search (`.ccxi` companion indexes) | **yes** | | |
-| Dense vector retrieval (embeddings) | | Ollama / vLLM / TEI | |
-| Graph signal fusion | | | **proprietary** |
-| GPU/CUDA acceleration | | | **proprietary** |
-| Self-observation (ops error capture) | | | **proprietary** |
-| Remote sync (hosted platform) | | | **proprietary** |
+| Append-only event store with BLAKE3 integrity | yes | | |
+| CROWN receipts and receipt verification | yes | | |
+| Local fact store | yes | | |
+| Local session store | yes | | |
+| Built-in MCP server | yes | | |
+| Token-filtered local MCP tools | yes | | |
+| HTTP, gRPC, health, readiness, and metrics | yes | | |
+| `corecruxctl` verification and replay tooling | yes | | |
+| BM25 text search with `.ccxi` companion indexes | yes | | |
+| Dense fact retrieval via embeddings | | Ollama, vLLM, TEI, llama.cpp, LiteLLM | |
+| Hosted team sync, billing, marketplace, credential broker | | | yes |
+| GPU/CUDA fused retrieval | | | yes |
+| Cross-principal aggregation and hosted Signals | | | yes |
 
-The `features` section of `/v1/version` tells you exactly what is active on a running instance.
+The `/v1/version` response reports which runtime features are active on the
+current process.
 
-## Platform Support
+## Requirements
 
-| Platform | Docker | Binary | Build from source |
-|---|:---:|:---:|:---:|
-| Linux x86_64 | **yes** | **yes** | **yes** |
-| Linux aarch64 | **yes** | planned | **yes** |
-| macOS (Apple Silicon) | **yes** (Rosetta or native) | planned | **yes** |
-| macOS (Intel) | **yes** | planned | **yes** |
-| Windows (WSL2) | **yes** | - | **yes** (via WSL2) |
-| Windows (native) | - | - | not supported |
-
-**Docker is the recommended path** for all platforms. It works everywhere Docker Desktop runs. Build-from-source requires Rust 1.88+ and `protobuf-compiler`.
+| Path | Requirements |
+|---|---|
+| Docker | Docker or Docker Desktop. |
+| Build from source | Rust 1.88+, `protobuf-compiler`, and a C toolchain. |
+| Shell examples | `curl`; `jq` is recommended for readable JSON. |
+| Embeddings | Optional local or remote embedding endpoint. |
 
 ## Quickstart
 
-### Docker (recommended)
+### 1. Start With Docker
 
 ```bash
 docker compose up -d
 ```
 
-The bundled compose stack publishes `14800` (HTTP) and `14801` (MCP) on host loopback only.
+The compose stack binds HTTP on `127.0.0.1:14800` and MCP on
+`127.0.0.1:14801`.
 
-### Docker with Ollama (dense vector retrieval)
-
-If you have an Ollama instance already running on your host:
-
-```bash
-# Tell Crux where to find it
-CORECRUXD_EMBEDDING_URL=http://host.docker.internal:11434 docker compose up -d
-```
-
-Or start Ollama alongside Crux (auto-pulls `nomic-embed-text`):
+Check the daemon:
 
 ```bash
-docker compose --profile embeddings up -d
+curl -sf http://localhost:14800/healthz | jq .
+curl -sf http://localhost:14800/readyz | jq .
+curl -sf http://localhost:14800/v1/version | jq .
 ```
 
-This starts Ollama with GPU passthrough and pulls the `nomic-embed-text` model automatically. Ollama handles hardware detection - it works on NVIDIA, AMD, Apple Silicon, and CPU-only machines. You choose the model; Crux just calls the endpoint.
-
-To use a different model:
-
-```bash
-CORECRUXD_EMBEDDING_MODEL=mxbai-embed-large docker compose --profile embeddings up -d
-```
-
-### Binary (Linux x86_64)
-
-```bash
-curl -sSL https://github.com/CueCrux/Crux/releases/latest/download/corecruxd-linux-amd64 -o corecruxd
-chmod +x corecruxd
-CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./corecruxd
-```
-
-### Build from Source
+### 2. Build From Source
 
 ```bash
 git clone https://github.com/CueCrux/Crux.git
@@ -121,264 +93,308 @@ cargo build --release
 CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 ```
 
-## Five-Minute Walkthrough
+`CORECRUXD_AUTH_MODE` is required. Use `off` only for local development.
 
-1. **Start the server:**
-   ```bash
-   docker compose up -d
-   ```
+### 3. Install From A Release
 
-2. **Verify it's ready:**
-   ```bash
-   curl -sf http://localhost:14800/readyz
-   ```
-   Expected: `{"ok":true}`. The `/healthz` endpoint checks if the process is alive; `/readyz` checks if it can serve traffic.
+Release bundles publish both names:
 
-3. **Inspect enabled features:**
-   ```bash
-   curl -s http://localhost:14800/v1/version | jq .features
-   ```
-   ```json
-   {
-     "text_search": false,
-     "graph_expand": false,
-     "self_observe": false,
-     "mcp": true,
-     "embeddings": false
-   }
-   ```
-   `embeddings` becomes `true` when you set `CORECRUXD_EMBEDDING_URL`. `text_search` and `graph_expand` require the data-plane store (sealed segments with `.ccxi` indexes). The fact store, sessions, MCP server, and health endpoints work immediately.
+- `crux-<platform>` for users.
+- `corecruxd-<platform>` for service managers and compatibility.
 
-4. **Store a fact:**
-
-   The default Docker stack runs with `CORECRUXD_AUTH_MODE=dev_scopes`, which requires a scopes header on every request. For quick local testing, you can start with `CORECRUXD_AUTH_MODE=off` instead. With `dev_scopes`:
-
-   ```bash
-   curl -s -X PUT http://localhost:14800/v1/facts \
-     -H "Content-Type: application/json" \
-     -H "X-Corecrux-Scopes: facts:write,facts:read,admin:read" \
-     -d '{
-       "entity": "project",
-       "key": "status",
-       "value": "Phase 1 complete - 12 milestones delivered",
-       "confidence": 0.95
-     }' | jq .
-   ```
-   Response:
-   ```json
-   {
-     "fact_id": "f_01J...",
-     "entity": "project",
-     "key": "status",
-     "value": "Phase 1 complete - 12 milestones delivered",
-     "confidence": 0.95,
-     "version": 1
-   }
-   ```
-
-5. **Query facts:**
-   ```bash
-   curl -s "http://localhost:14800/v1/facts?query=project+status&token_budget=500" \
-     -H "X-Corecrux-Scopes: facts:read,admin:read" | jq .facts
-   ```
-
-6. **Inspect the built-in MCP server:**
-   ```bash
-   curl -s -X POST http://localhost:14801/mcp \
-     -H "Content-Type: application/json" \
-     -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | jq '.result.tools | length'
-   ```
-   Expected: `22`
-
-7. **Verify store integrity:**
-   ```bash
-   docker exec crux-crux-1 corecruxctl verify-store --data-dir /data --scope recent
-   ```
-   On a fresh instance with no sealed segments, this returns `{"ok": true, "scannedShards": 0}`. After appending events and sealing segments, it will scan BLAKE3 hashes and frame checksums.
-
-If you are integrating Crux into another system, agents can pull the seeded onboarding playbooks at runtime with `get_bootstrap(topic="docs", query="integration")`. For upgrades, pair `update_status()` with `get_bootstrap(topic="docs", query="upgrade")` and `get_bootstrap(topic="docs", query="backup")`. Those playbooks live in [`crates/crux-observe/bootstrap_data/docs.json`](crates/crux-observe/bootstrap_data/docs.json).
-
-## Embedding Models
-
-Crux does not ship an embedding model. Instead, it connects to any service that exposes an Ollama-compatible `/api/embed` endpoint. This means **you choose the model and hardware**:
-
-| Provider | GPU support | Install |
-|---|---|---|
-| [Ollama](https://ollama.com) | NVIDIA, AMD, Apple Silicon, CPU | `ollama pull nomic-embed-text` |
-| [vLLM](https://docs.vllm.ai) | NVIDIA | `vllm serve nomic-embed-text` |
-| [TEI](https://github.com/huggingface/text-embeddings-inference) | NVIDIA | Docker image |
-| [llama.cpp](https://github.com/ggml-org/llama.cpp) | NVIDIA, AMD, Apple Silicon, Vulkan, CPU | Build from source |
-| [LiteLLM](https://docs.litellm.ai) | Proxy to any provider | `pip install litellm` |
-
-### Configuration
-
-Set two environment variables:
+Linux x86_64 example:
 
 ```bash
-CORECRUXD_EMBEDDING_URL=http://localhost:11434   # Ollama default
-CORECRUXD_EMBEDDING_MODEL=nomic-embed-text       # or any model your endpoint serves
+curl -sSL https://github.com/CueCrux/Crux/releases/latest/download/crux-linux-amd64 -o crux
+chmod +x crux
+CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./crux
 ```
 
-When set, Crux will:
-- Embed each fact at store time (entity + key + value concatenated)
-- Embed the query string at query time
-- Rank results by `0.6 * cosine_similarity + 0.4 * confidence` instead of keyword matching
+## First Five Minutes
 
-When unset, Crux uses keyword matching only - no external dependencies required.
+### Store A Fact
 
-### Recommended models
+The Docker stack defaults to `CORECRUXD_AUTH_MODE=dev_scopes`, so examples
+include scope headers. If you started the binary with `CORECRUXD_AUTH_MODE=off`,
+you can omit `X-Corecrux-Scopes`.
 
-| Model | Dimensions | Good for |
-|---|---|---|
-| `nomic-embed-text` | 768 | General purpose, fast, good quality/size ratio |
-| `mxbai-embed-large` | 1024 | Higher quality, more memory |
-| `all-minilm` | 384 | Smallest footprint, fastest inference |
+```bash
+curl -s -X PUT http://localhost:14800/v1/facts \
+  -H "Content-Type: application/json" \
+  -H "X-Corecrux-Scopes: facts:write,facts:read,admin:read" \
+  -d '{
+    "entity": "project",
+    "key": "status",
+    "value": "Crux Daemon is running locally",
+    "confidence": 0.95
+  }' | jq .
+```
 
-## API Reference
+### Query Facts
 
-### Core Endpoints
+```bash
+curl -s "http://localhost:14800/v1/facts?query=Crux+Daemon&token_budget=500" \
+  -H "X-Corecrux-Scopes: facts:read,admin:read" | jq .
+```
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/healthz` | Health check with build metadata |
-| GET | `/readyz` | Readiness check |
-| GET | `/metrics` | Prometheus metrics |
-| GET | `/v1/version` | Version, features, sync, and update status |
-| POST | `/v1/admin/append` | Append events to a stream |
-| POST | `/v1/query/text-search` | BM25 + graph signal retrieval |
-| POST | `/v1/query/graph-expand` | Graph traversal with budget |
-| POST | `/v1/query/time-range` | Temporal range queries |
-| PUT | `/v1/facts` | Store a shared fact |
-| GET | `/v1/facts` | Query shared facts |
-| GET | `/v1/receipts/{id}` | Retrieve a CROWN receipt |
-| GET | `/v1/receipts/{id}/verification` | Verify receipt signature |
+### List MCP Tools
 
-### CLI Tools
+```bash
+curl -s -X POST http://localhost:14801/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  | jq '.result.tools[] | {name, description}'
+```
 
-| Command | Description |
+The catalogue is token-filtered:
+
+- Local daemon token: local tools only.
+- Hosted-authorised token: hosted-gated tools are visible too.
+- Tool descriptions are marked with `[local]` or `[hosted]`.
+
+### Verify Store Integrity
+
+```bash
+docker exec crux-crux-1 corecruxctl verify-store --data-dir /data --scope recent
+```
+
+Fresh data dirs return an empty successful scan. After appends and seals,
+`corecruxctl` verifies frame checksums, BLAKE3 hashes, and receipt material.
+
+## Configuration
+
+Crux Daemon supports environment variables and YAML config.
+
+| Config path | Use |
 |---|---|
-| `corecruxctl verify-store` | Cryptographic integrity check on corpus |
-| `corecruxctl replay` | Deterministic replay with drift classification |
-| `corecruxctl receipts` | Receipt tooling and export |
-| `corecruxctl ccxi` | Companion index inspection |
-| `corecruxctl projections` | Projection state management |
+| `config.example.env` | Copy into a shell or service environment. |
+| `config.example.yaml` | Copy to `$XDG_CONFIG_HOME/crux/config.yaml`. |
+| Environment variables | Override YAML values for service managers. |
+
+Core settings:
+
+| Variable | Default | Description |
+|---|---|---|
+| `CORECRUXD_AUTH_MODE` | required | `off`, `dev_scopes`, `jwt_hs256`, or `jwt_jwks`. |
+| `CORECRUXD_DATA_DIR` | `../CoreCruxData/v1` | Data directory. |
+| `CORECRUXD_HTTP_PORT` | `14800` | HTTP API port. |
+| `CORECRUXD_GRPC_PORT` | `4007` | gRPC API port. |
+| `CORECRUXD_MCP_PORT` | `14801` | MCP server port. |
+| `CORECRUXD_MCP_ENABLED` | `true` | Enable the built-in MCP server. |
+| `CORECRUXD_BUILD_CCXI` | `0` | Build `.ccxi` indexes at seal time. |
+| `CORECRUXD_EMBEDDING_URL` | unset | Enables dense fact retrieval. |
+| `CORECRUXD_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model name. |
+
+Security defaults:
+
+- Loopback binds are safe for local development.
+- Non-loopback HTTP binds require a real auth mode unless explicitly overridden.
+- Non-loopback MCP binds should set `CRUX_AGENT_TOKEN` or `CRUX_AGENT_TOKENS`.
+- Set `CRUX_MCP_HANDOFF_SECRET` if handoff packages must survive restarts.
+
+## Authentication Modes
+
+| Mode | Use case |
+|---|---|
+| `off` | Local development only. |
+| `dev_scopes` | Tests and local demos using `X-Corecrux-Scopes`. |
+| `jwt_hs256` | Small deployments with shared-secret JWTs. |
+| `jwt_jwks` | Production-style OIDC/JWKS verification. |
+
+The daemon refuses to start unless `CORECRUXD_AUTH_MODE` is explicit.
+
+## Embeddings
+
+Crux Daemon does not ship an embedding model. Point it at an endpoint you
+control:
+
+```bash
+CORECRUXD_EMBEDDING_URL=http://localhost:11434
+CORECRUXD_EMBEDDING_MODEL=nomic-embed-text
+```
+
+Supported patterns:
+
+| Provider | Notes |
+|---|---|
+| Ollama | Easy local setup; CPU, NVIDIA, AMD, and Apple Silicon. |
+| vLLM | Good for NVIDIA deployments. |
+| TEI | Hugging Face Text Embeddings Inference. |
+| llama.cpp | Broad hardware support. |
+| LiteLLM | Proxy to other providers. |
+
+When embeddings are unset, fact queries use keyword matching and confidence
+ranking only.
+
+## MCP Server For Agents
+
+The MCP server is available at `http://localhost:14801/mcp`.
+
+Connectors:
+
+- Claude Desktop / Claude Code: use `examples/mcp-configs/claude-desktop.json`.
+- Cursor: use `examples/mcp-configs/cursor.json`.
+- See `examples/mcp-configs/README.md` for platform-specific paths.
+
+Recommended first calls:
+
+1. `cuecrux_session` - get the typed capability plan.
+2. `get_bootstrap(topic="patterns")` - learn current agent patterns.
+3. `store_fact(entity="test", key="hello", value="world")`.
+4. `query_facts(query="hello")`.
+5. `update_status()` before upgrades.
+
+For agent guidance, see `docs/agent-guide.md`.
+
+## HTTP API
+
+Common endpoints:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/healthz` | Process health. |
+| `GET` | `/readyz` | Serving readiness. |
+| `GET` | `/metrics` | Prometheus metrics. |
+| `GET` | `/v1/version` | Build, features, sync, and update state. |
+| `PUT` | `/v1/facts` | Store a fact. |
+| `GET` | `/v1/facts` | Query facts. |
+| `POST` | `/v1/admin/append` | Append events. |
+| `POST` | `/v1/query/text-search` | BM25 text retrieval. |
+| `POST` | `/v1/query/graph-expand` | Graph expansion where dataplane support exists. |
+| `GET` | `/v1/receipts/{id}` | Fetch a receipt. |
+| `GET` | `/v1/receipts/{id}/verification` | Verify a receipt. |
+
+Full route notes live in `docs/api-reference.md`.
+
+## CLI
+
+`corecruxctl` is the operations companion.
+
+| Command | Purpose |
+|---|---|
+| `verify-store` | Check data-dir integrity. |
+| `replay` | Replay logs and classify drift. |
+| `receipts` | Inspect and export receipts. |
+| `ccxi` | Inspect companion indexes. |
+| `projections` | Inspect projection state. |
+
+Run:
+
+```bash
+./target/release/corecruxctl --help
+```
+
+## Backups And Upgrades
+
+Before upgrading:
+
+1. Stop the daemon cleanly.
+2. Snapshot or copy `CORECRUXD_DATA_DIR`.
+3. Run `corecruxctl verify-store --data-dir <dir> --scope recent`.
+4. Keep the previous binary until the new one passes `/readyz`.
+5. Check `update_status()` or `/v1/version.update`.
+
+Rollback is restoring the data-dir snapshot and restarting the previous binary.
+Do not delete live shard data by hand.
+
+Agents can retrieve upgrade and backup playbooks with:
+
+- `get_bootstrap(topic="docs", query="upgrade")`
+- `get_bootstrap(topic="docs", query="backup")`
+
+## Release Packages
+
+Release bundles are built with `scripts/package-daemon-release.sh` and include:
+
+- `corecruxd-<platform>`
+- `crux-<platform>`
+- `corecruxctl-<platform>`
+- `LICENCE-CODE.md`
+- `LICENCE-CONTENT.md`
+- `TRUST-CONTRACT.md`
+- `config.example.env`
+- `config.example.yaml`
+- `content/MANIFEST.json`
+- `content/README.md`
+- `docs/release-packaging.md`
+- `RELEASE-MANIFEST-<platform>.txt`
+
+See `docs/release-packaging.md`.
+
+## Troubleshooting
+
+Fast checks:
+
+```bash
+curl -sf http://localhost:14800/healthz | jq .
+curl -sf http://localhost:14800/readyz | jq .
+curl -sf http://localhost:14800/metrics | head
+curl -s http://localhost:14800/v1/version | jq .
+```
+
+Common fixes:
+
+| Symptom | Check |
+|---|---|
+| Daemon exits at startup | Set `CORECRUXD_AUTH_MODE`. |
+| HTTP works but MCP does not | Check `CORECRUXD_MCP_ENABLED` and port `14801`. |
+| Non-loopback bind refused | Use `jwt_hs256` or `jwt_jwks`, or keep loopback. |
+| Text search has no results | Enable `.ccxi` build and ensure sealed/indexed data exists. |
+| Embeddings are inactive | Set `CORECRUXD_EMBEDDING_URL` and model. |
+| Store verification fails | Stop the daemon, snapshot data, then inspect with `corecruxctl`. |
+
+More detail: `docs/troubleshooting.md`, `docs/ops-guide.md`, and
+`docs/agent-guide.md`.
 
 ## Architecture
 
 ```mermaid
 graph TD
-    cruxmcp[crux-mcp<br/>MCP Server<br/>22 tools]
-    observe[crux-observe<br/>Self-Observation]
-    sync[crux-sync<br/>Outbox Sync]
-    contrib[crux-contrib<br/>Contributions]
-    corecruxd[corecruxd<br/>HTTP + gRPC Daemon]
-    corecruxctl[corecruxctl<br/>CLI Tool]
-    retrieval[corecrux-retrieval<br/>BM25 + Graph Fusion]
-    memory[corecrux-memory<br/>Fact + Session Store<br/>+ Embeddings]
-    projections[corecrux-projections<br/>Entity State]
-    receipts[corecrux-receipts<br/>CROWN Receipts]
-    storage[corecrux-storage<br/>Shard Store]
-    index[corecrux-index<br/>.ccxi Indexes]
-    segment[corecrux-segment<br/>Sealed Segments]
-    frame[corecrux-frame<br/>Frame Encoding]
-    types[corecrux-types<br/>Core Types]
-    proto[corecrux-proto<br/>gRPC Proto]
-    ollama[Ollama / vLLM / TEI<br/>Embedding Endpoint]
+    mcp[crux-mcp<br/>MCP server]
+    daemon[corecruxd<br/>HTTP + gRPC daemon]
+    ctl[corecruxctl<br/>operations CLI]
+    router[crux-router<br/>RCX policy]
+    vault[vaultcrux-local<br/>local tool/content boundary]
+    memory[corecrux-memory<br/>facts + sessions]
+    retrieval[corecrux-retrieval<br/>BM25 retrieval]
+    projections[corecrux-projections<br/>derived state]
+    receipts[corecrux-receipts<br/>CROWN receipts]
+    storage[corecrux-storage<br/>shards]
+    segment[corecrux-segment<br/>sealed segments]
+    index[corecrux-index<br/>.ccxi indexes]
+    embeddings[embedding endpoint<br/>optional]
 
-    cruxmcp --> memory
-    cruxmcp --> retrieval
-    cruxmcp --> observe
-    observe --> memory
-    corecruxd --> cruxmcp
-    corecruxd --> observe
-    corecruxd --> memory
-    corecruxd --> retrieval
-    corecruxd --> projections
-    corecruxd --> receipts
-    corecruxd --> storage
-    corecruxd --> proto
-    corecruxctl --> storage
-    corecruxctl --> receipts
+    daemon --> mcp
+    daemon --> router
+    daemon --> vault
+    daemon --> memory
+    daemon --> retrieval
+    daemon --> projections
+    daemon --> receipts
+    daemon --> storage
+    ctl --> storage
+    ctl --> receipts
+    mcp --> router
+    mcp --> memory
+    mcp --> retrieval
     retrieval --> index
     retrieval --> projections
-    projections --> storage
-    projections --> segment
     storage --> segment
-    storage --> frame
     index --> segment
-    index --> frame
-    segment --> frame
-    receipts --> types
-    frame --> types
-    memory -.->|optional| ollama
+    memory -.-> embeddings
 ```
 
-## Configuration
-
-Crux is configured via environment variables:
-
-| Variable | Default | Description |
-|---|---|---|
-| `CORECRUXD_DATA_DIR` | `../CoreCruxData/v1` | Data directory for segments |
-| `CORECRUXD_HTTP_PORT` | `14800` | HTTP API port |
-| `CORECRUXD_GRPC_PORT` | `4007` | gRPC API port |
-| `CORECRUXD_MCP_PORT` | `14801` | Built-in MCP port |
-| `CORECRUXD_MCP_ENABLED` | `true` | Enable built-in MCP server |
-| `CORECRUXD_BUILD_CCXI` | `0` | Build `.ccxi` indexes at seal time |
-| `CORECRUXD_AUTH_MODE` | *(required)* | `off`, `dev_scopes`, `jwt_hs256`, or `jwt_jwks` |
-| `CORECRUXD_EMBEDDING_URL` | *(unset)* | Embedding endpoint URL (enables dense retrieval) |
-| `CORECRUXD_EMBEDDING_MODEL` | `nomic-embed-text` | Model name for the embedding endpoint |
-| `CORECRUX_LOG_FORMAT` | `text` | Log format (`text` or `json`) |
-| `CORECRUXD_UPDATE_CHECK_ENABLED` | `true` | Background git-based update checks |
-
-See `config.example.env` for the full list with descriptions.
-
-## MCP Server (for AI Agents)
-
-Crux includes a built-in MCP server on port **14801** with 22 tools for retrieval, fact storage, sessions, sync, update status, decisions, and multi-agent handoff.
-
-### Connect an agent
-
-**Claude Desktop / Claude Code:** Copy `examples/mcp-configs/claude-desktop.json` into your Claude config. See `examples/mcp-configs/README.md` for paths.
-
-**Cursor:** Copy `examples/mcp-configs/cursor.json` to `.cursor/mcp.json`.
-
-**Verify the connection:**
-```bash
-curl -s -X POST http://localhost:14801/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | jq '.result.tools | length'
-# Expected: 22
-```
-
-If you configure `CRUX_AGENT_TOKEN` or `CRUX_AGENT_TOKENS`, send the matching Bearer token on MCP requests. If you rely on handoff packages across restarts or multiple replicas, also set `CRUX_MCP_HANDOFF_SECRET`.
-
-### Agent quickstart (first 3 calls)
-
-1. `get_bootstrap("patterns")` - learn usage patterns
-2. `store_fact(entity="test", key="hello", value="world")` - store your first fact
-3. `query_facts(query="hello")` - retrieve it
-
-For maintenance and onboarding:
-
-- `update_status()` or `/v1/version.update` tells humans and agents whether the checkout is `current`, `behind`, `ahead`, `diverged`, `disabled`, or `unavailable`.
-- Use `get_bootstrap(topic="docs", query="upgrade")` for the upgrade playbook.
-- Use `get_bootstrap(topic="docs", query="backup")` for current backup and rollback options.
-
-See `docs/agent-guide.md` for the full agent integration guide.
-
-## Troubleshooting
-
-See `docs/troubleshooting.md` for common issues and fixes.
+More detail: `docs/architecture.md`.
 
 ## Licence
 
-Crux Community Edition is licensed under the [CueCrux Community Licence (CCL v1.0)](LICENCE.md).
+Crux Daemon is source-available under the
+[CueCrux Community Licence (CCL v1.0)](LICENCE.md).
 
-- **Source-available, not open-source**
-- Free to use, read, audit, modify, and build on for internal use
-- Contributions welcome via the published process
-- Three years after each release, the code converts to Apache 2.0
-- GPU acceleration and hosted platform features are not included
+- Internal commercial use is permitted.
+- Reading, auditing, and internal modification are permitted.
+- Offering Crux as a competing managed service is prohibited.
+- Three years after each versioned release, the code converts to Apache 2.0.
+- Curated content is covered separately by `LICENCE-CONTENT.md`.
 
 Copyright (c) 2026 CueCrux Ltd. All rights reserved.

@@ -6,6 +6,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use crate::auth::AuthMode;
+use crux_enterprise_shim::EnterpriseTrustRoot;
+use serde::Deserialize;
+
+const DEFAULT_PASSPORT_CLAIM_ENDPOINT: &str = "https://passport.vaultcrux.com/v1/claim-anonymous";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitLevel {
@@ -84,10 +88,12 @@ impl AppendLaneScope {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub loaded_config_path: Option<PathBuf>,
     pub http_addr: SocketAddr,
     pub grpc_addr: SocketAddr,
     pub mcp_addr: SocketAddr,
     pub mcp_enabled: bool,
+    pub state_dir: PathBuf,
     pub data_dir: PathBuf,
     pub log_level: String,
     pub service_name: String,
@@ -102,6 +108,17 @@ pub struct Config {
     pub replicated_commit_require_all_followers: bool,
     pub auth_mode: AuthMode,
     pub auth_mode_explicitly_set: bool,
+    pub passport_key_path: PathBuf,
+    pub passport_claim_on_startup: bool,
+    pub passport_claim_endpoint: String,
+    pub content_manifest_path: Option<PathBuf>,
+    pub content_verify_signatures: bool,
+    pub router_refresh_interval_seconds: u64,
+    pub router_cache_ttl_seconds: u64,
+    pub router_fallback_policy: String,
+    pub enterprise_trust_root: Option<EnterpriseTrustRoot>,
+    pub llm_endpoint: Option<String>,
+    pub llm_model: Option<String>,
 
     // IO backend selection.
     pub io_backend: String,
@@ -188,41 +205,195 @@ pub struct Config {
     pub update_check_repo_dir: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct FileConfig {
+    daemon: FileDaemonConfig,
+    passport: FilePassportConfig,
+    content: FileContentConfig,
+    router: FileRouterConfig,
+    enterprise: FileEnterpriseConfig,
+    llm: FileLlmConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct FileDaemonConfig {
+    instance_id: Option<String>,
+    state_dir: Option<String>,
+    data_dir: Option<String>,
+    listen_addr: Option<String>,
+    http_port: Option<u16>,
+    grpc_port: Option<u16>,
+    mcp_port: Option<u16>,
+    mcp_enabled: Option<bool>,
+    auth_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct FilePassportConfig {
+    key_path: Option<String>,
+    claim_on_startup: Option<bool>,
+    claim_endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct FileContentConfig {
+    manifest_path: Option<String>,
+    verify_signatures: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct FileRouterConfig {
+    refresh_interval_seconds: Option<u64>,
+    cache_ttl_seconds: Option<u64>,
+    fallback_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct FileEnterpriseConfig {
+    enabled: Option<bool>,
+    customer_id: Option<String>,
+    backend_id: Option<String>,
+    trust_root_kid: Option<String>,
+    trusted_issuer_kids: Option<Vec<String>>,
+    airgap: Option<bool>,
+    allow_vaultcrux_cross_sign: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct FileLlmConfig {
+    endpoint: Option<String>,
+    model: Option<String>,
+}
+
+fn load_file_config() -> (Option<PathBuf>, FileConfig) {
+    let Some(path) = configured_config_path() else {
+        return (None, FileConfig::default());
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => match serde_yaml::from_str::<FileConfig>(&raw) {
+            Ok(config) => (Some(path), config),
+            Err(_err) => (Some(path), FileConfig::default()),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (Some(path), FileConfig::default()),
+        Err(_err) => (Some(path), FileConfig::default()),
+    }
+}
+
+fn configured_config_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("CORECRUXD_CONFIG_PATH") {
+        let trimmed = path.trim();
+        return (!trimmed.is_empty()).then(|| expand_path(trimmed));
+    }
+    std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|base| PathBuf::from(base).join("crux").join("config.yaml"))
+}
+
+fn env_string(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
+}
+
+fn env_bool(key: &str) -> Option<bool> {
+    std::env::var(key).ok().map(|value| bool_value(&value))
+}
+
+fn env_csv(key: &str) -> Option<Vec<String>> {
+    env_string(key).map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    })
+}
+
+fn bool_value(value: &str) -> bool {
+    matches!(value, "1" | "true" | "TRUE" | "yes" | "YES")
+}
+
+fn expand_path(raw: &str) -> PathBuf {
+    PathBuf::from(expand_config_value(raw))
+}
+
+fn expand_config_value(raw: &str) -> String {
+    let mut value = raw.to_string();
+    if let Some(state_home) = std::env::var("XDG_STATE_HOME").ok().filter(|value| !value.is_empty()) {
+        value = value.replace("$XDG_STATE_HOME", &state_home);
+    }
+    if let Some(config_home) = std::env::var("XDG_CONFIG_HOME").ok().filter(|value| !value.is_empty()) {
+        value = value.replace("$XDG_CONFIG_HOME", &config_home);
+    }
+    if let Some(home) = std::env::var("HOME").ok().filter(|value| !value.is_empty()) {
+        value = value.replace("$HOME", &home);
+        if let Some(rest) = value.strip_prefix("~/") {
+            value = format!("{home}/{rest}");
+        }
+    }
+    value
+}
+
 pub fn load_config() -> Config {
-    let http_host: IpAddr = std::env::var("CORECRUXD_HTTP_HOST")
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
+    let (config_path, file_config) = load_file_config();
+    let listen_addr = file_config.daemon.listen_addr.as_deref();
+    let http_host: IpAddr = env_string("CORECRUXD_HTTP_HOST")
+        .or_else(|| listen_addr.map(ToString::to_string))
+        .unwrap_or_else(|| "127.0.0.1".to_string())
         .parse()
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let http_port: u16 = std::env::var("CORECRUXD_HTTP_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
+        .or(file_config.daemon.http_port)
         .unwrap_or(14800);
 
-    let grpc_host: IpAddr = std::env::var("CORECRUXD_GRPC_HOST")
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
+    let grpc_host: IpAddr = env_string("CORECRUXD_GRPC_HOST")
+        .or_else(|| listen_addr.map(ToString::to_string))
+        .unwrap_or_else(|| "127.0.0.1".to_string())
         .parse()
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let grpc_port: u16 = std::env::var("CORECRUXD_GRPC_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
+        .or(file_config.daemon.grpc_port)
         .unwrap_or(4007);
-    let mcp_host: IpAddr = std::env::var("CORECRUXD_MCP_HOST")
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
+    let mcp_host: IpAddr = env_string("CORECRUXD_MCP_HOST")
+        .or_else(|| listen_addr.map(ToString::to_string))
+        .unwrap_or_else(|| "127.0.0.1".to_string())
         .parse()
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let mcp_port: u16 = std::env::var("CORECRUXD_MCP_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
+        .or(file_config.daemon.mcp_port)
         .unwrap_or(14801);
-    let mcp_enabled = std::env::var("CORECRUXD_MCP_ENABLED")
-        .ok()
-        .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+    let mcp_enabled = env_bool("CORECRUXD_MCP_ENABLED")
+        .or(file_config.daemon.mcp_enabled)
+        .unwrap_or(true);
 
-    let data_dir = std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
+    let file_state_dir = file_config.daemon.state_dir.as_deref().map(expand_path);
+    let file_data_dir = file_config.daemon.data_dir.as_deref().map(expand_path);
+    let data_dir = env_string("CORECRUXD_DATA_DIR")
+        .map(|value| expand_path(&value))
+        .or(file_data_dir)
+        .or_else(|| file_state_dir.clone())
+        .unwrap_or_else(|| PathBuf::from("../CoreCruxData/v1"));
+    let state_dir = env_string("CORECRUXD_STATE_DIR")
+        .map(|value| expand_path(&value))
+        .or(file_state_dir)
+        .unwrap_or_else(|| data_dir.clone());
     let log_level = std::env::var("CORECRUXD_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
     let service_name = std::env::var("CORECRUXD_SERVICE").unwrap_or_else(|_| "corecruxd".to_string());
     let cluster_id = std::env::var("CORECRUXD_CLUSTER_ID").unwrap_or_else(|_| "dev".to_string());
-    let node_id_override = std::env::var("CORECRUXD_NODE_ID").ok();
+    let node_id_override = env_string("CORECRUXD_NODE_ID").or(file_config.daemon.instance_id.clone());
     let routing_reload_interval_ms = std::env::var("CORECRUXD_ROUTING_RELOAD_INTERVAL_MS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -252,12 +423,68 @@ pub fn load_config() -> Config {
         .ok()
         .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
 
-    let auth_mode_raw = std::env::var("CORECRUXD_AUTH_MODE").ok();
+    let auth_mode_raw = env_string("CORECRUXD_AUTH_MODE").or(file_config.daemon.auth_mode.clone());
     let auth_mode_explicitly_set = auth_mode_raw.is_some();
     let auth_mode = auth_mode_raw
         .as_deref()
         .and_then(AuthMode::parse)
         .unwrap_or(AuthMode::DevScopes);
+    let passport_key_path = env_string("CORECRUXD_PASSPORT_KEY_PATH")
+        .or_else(|| file_config.passport.key_path.clone())
+        .map_or_else(|| state_dir.join("passport.key"), |value| expand_path(&value));
+    let passport_claim_on_startup = env_bool("CORECRUXD_PASSPORT_CLAIM_ON_STARTUP")
+        .or(file_config.passport.claim_on_startup)
+        .unwrap_or(true);
+    let passport_claim_endpoint = env_string("CRUX_PASSPORT_CLAIM_ENDPOINT")
+        .or_else(|| env_string("CORECRUXD_PASSPORT_CLAIM_ENDPOINT"))
+        .or(file_config.passport.claim_endpoint.clone())
+        .unwrap_or_else(|| DEFAULT_PASSPORT_CLAIM_ENDPOINT.to_string());
+    let content_manifest_path = env_string("CORECRUXD_CONTENT_MANIFEST_PATH")
+        .or(file_config.content.manifest_path.clone())
+        .map(|value| expand_path(&value));
+    let content_verify_signatures = env_bool("CORECRUXD_CONTENT_VERIFY_SIGNATURES")
+        .or(file_config.content.verify_signatures)
+        .unwrap_or(true);
+    let router_refresh_interval_seconds = std::env::var("CORECRUXD_ROUTER_REFRESH_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or(file_config.router.refresh_interval_seconds)
+        .unwrap_or(60)
+        .clamp(1, 86_400);
+    let router_cache_ttl_seconds = std::env::var("CORECRUXD_ROUTER_CACHE_TTL_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or(file_config.router.cache_ttl_seconds)
+        .unwrap_or(60)
+        .clamp(1, 86_400);
+    let router_fallback_policy = env_string("CORECRUXD_ROUTER_FALLBACK_POLICY")
+        .or(file_config.router.fallback_policy.clone())
+        .unwrap_or_else(|| "degrade_to_local".to_string());
+    let enterprise_enabled = env_bool("CORECRUXD_ENTERPRISE_ENABLED")
+        .or(file_config.enterprise.enabled)
+        .unwrap_or(false);
+    let enterprise_trust_root = enterprise_enabled.then(|| EnterpriseTrustRoot {
+        customer_id: env_string("CORECRUXD_ENTERPRISE_CUSTOMER_ID")
+            .or(file_config.enterprise.customer_id.clone())
+            .unwrap_or_default(),
+        backend_id: env_string("CORECRUXD_ENTERPRISE_BACKEND_ID")
+            .or(file_config.enterprise.backend_id.clone())
+            .unwrap_or_default(),
+        trust_root_kid: env_string("CORECRUXD_ENTERPRISE_TRUST_ROOT_KID")
+            .or(file_config.enterprise.trust_root_kid.clone())
+            .unwrap_or_default(),
+        trusted_issuer_kids: env_csv("CORECRUXD_ENTERPRISE_TRUSTED_ISSUER_KIDS")
+            .or(file_config.enterprise.trusted_issuer_kids.clone())
+            .unwrap_or_default(),
+        airgap: env_bool("CORECRUXD_ENTERPRISE_AIRGAP")
+            .or(file_config.enterprise.airgap)
+            .unwrap_or(true),
+        allow_vaultcrux_cross_sign: env_bool("CORECRUXD_ENTERPRISE_ALLOW_VAULTCRUX_CROSS_SIGN")
+            .or(file_config.enterprise.allow_vaultcrux_cross_sign)
+            .unwrap_or(false),
+    });
+    let llm_endpoint = env_string("CORECRUXD_LLM_ENDPOINT").or(file_config.llm.endpoint.clone());
+    let llm_model = env_string("CORECRUXD_LLM_MODEL").or(file_config.llm.model.clone());
 
     let io_backend = std::env::var("CORECRUXD_IO_BACKEND").unwrap_or_else(|_| "cpu".to_string());
 
@@ -412,11 +639,13 @@ pub fn load_config() -> Config {
     }
 
     Config {
+        loaded_config_path: config_path,
         http_addr: SocketAddr::new(http_host, http_port),
         grpc_addr: SocketAddr::new(grpc_host, grpc_port),
         mcp_addr: SocketAddr::new(mcp_host, mcp_port),
         mcp_enabled,
-        data_dir: PathBuf::from(data_dir),
+        state_dir,
+        data_dir,
         log_level,
         service_name,
         cluster_id,
@@ -430,6 +659,17 @@ pub fn load_config() -> Config {
         replicated_commit_require_all_followers,
         auth_mode,
         auth_mode_explicitly_set,
+        passport_key_path,
+        passport_claim_on_startup,
+        passport_claim_endpoint,
+        content_manifest_path,
+        content_verify_signatures,
+        router_refresh_interval_seconds,
+        router_cache_ttl_seconds,
+        router_fallback_policy,
+        enterprise_trust_root,
+        llm_endpoint,
+        llm_model,
 
         io_backend,
 
@@ -729,6 +969,9 @@ mod tests {
         for k in vars {
             std::env::remove_var(&k);
         }
+        std::env::remove_var("CRUX_PASSPORT_CLAIM_ENDPOINT");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("XDG_STATE_HOME");
     }
 
     #[test]
@@ -740,6 +983,7 @@ mod tests {
 
         let cfg = super::load_config();
 
+        assert_eq!(cfg.loaded_config_path, None);
         assert_eq!(cfg.http_addr.port(), 14800);
         assert_eq!(cfg.http_addr.ip().to_string(), "127.0.0.1");
         assert_eq!(cfg.grpc_addr.port(), 4007);
@@ -747,6 +991,7 @@ mod tests {
         assert_eq!(cfg.mcp_addr.port(), 14801);
         assert_eq!(cfg.mcp_addr.ip().to_string(), "127.0.0.1");
         assert!(cfg.mcp_enabled);
+        assert_eq!(cfg.state_dir.to_str().unwrap(), "../CoreCruxData/v1");
         assert_eq!(cfg.data_dir.to_str().unwrap(), "../CoreCruxData/v1");
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.service_name, "corecruxd");
@@ -762,6 +1007,23 @@ mod tests {
         assert!(cfg.replicated_commit_require_all_followers);
         assert_eq!(cfg.auth_mode, crate::auth::AuthMode::DevScopes);
         assert!(!cfg.auth_mode_explicitly_set);
+        assert_eq!(
+            cfg.passport_key_path.to_str().unwrap(),
+            "../CoreCruxData/v1/passport.key"
+        );
+        assert!(cfg.passport_claim_on_startup);
+        assert_eq!(
+            cfg.passport_claim_endpoint,
+            "https://passport.vaultcrux.com/v1/claim-anonymous"
+        );
+        assert_eq!(cfg.content_manifest_path, None);
+        assert!(cfg.content_verify_signatures);
+        assert_eq!(cfg.router_refresh_interval_seconds, 60);
+        assert_eq!(cfg.router_cache_ttl_seconds, 60);
+        assert_eq!(cfg.router_fallback_policy, "degrade_to_local");
+        assert!(cfg.enterprise_trust_root.is_none());
+        assert_eq!(cfg.llm_endpoint, None);
+        assert_eq!(cfg.llm_model, None);
         assert_eq!(cfg.io_backend, "cpu");
         assert!(!cfg.build_ccxi);
         assert!(!cfg.projections_enabled);
@@ -837,6 +1099,30 @@ mod tests {
         std::env::set_var("CORECRUXD_REPLICATED_COMMIT_TIMEOUT_MS", "10000");
         std::env::set_var("CORECRUXD_REPLICATED_COMMIT_REQUIRE_ALL_FOLLOWERS", "false");
         std::env::set_var("CORECRUXD_AUTH_MODE", "off");
+        std::env::set_var("CORECRUXD_STATE_DIR", "/tmp/test-state");
+        std::env::set_var("CORECRUXD_PASSPORT_KEY_PATH", "/tmp/test-state/passport.key");
+        std::env::set_var("CORECRUXD_PASSPORT_CLAIM_ON_STARTUP", "false");
+        std::env::set_var(
+            "CORECRUXD_PASSPORT_CLAIM_ENDPOINT",
+            "https://passport.example.test/claim",
+        );
+        std::env::set_var("CORECRUXD_CONTENT_MANIFEST_PATH", "/opt/crux/content/MANIFEST.json");
+        std::env::set_var("CORECRUXD_CONTENT_VERIFY_SIGNATURES", "false");
+        std::env::set_var("CORECRUXD_ROUTER_REFRESH_INTERVAL_SECONDS", "15");
+        std::env::set_var("CORECRUXD_ROUTER_CACHE_TTL_SECONDS", "20");
+        std::env::set_var("CORECRUXD_ROUTER_FALLBACK_POLICY", "refuse");
+        std::env::set_var("CORECRUXD_ENTERPRISE_ENABLED", "true");
+        std::env::set_var("CORECRUXD_ENTERPRISE_CUSTOMER_ID", "customer-a");
+        std::env::set_var("CORECRUXD_ENTERPRISE_BACKEND_ID", "customer:cluster-a");
+        std::env::set_var("CORECRUXD_ENTERPRISE_TRUST_ROOT_KID", "customer-root-a");
+        std::env::set_var(
+            "CORECRUXD_ENTERPRISE_TRUSTED_ISSUER_KIDS",
+            "customer-issuer-a,customer-issuer-b",
+        );
+        std::env::set_var("CORECRUXD_ENTERPRISE_AIRGAP", "true");
+        std::env::set_var("CORECRUXD_ENTERPRISE_ALLOW_VAULTCRUX_CROSS_SIGN", "false");
+        std::env::set_var("CORECRUXD_LLM_ENDPOINT", "http://localhost:11434/api/generate");
+        std::env::set_var("CORECRUXD_LLM_MODEL", "llama3.2:3b");
         std::env::set_var("CORECRUXD_IO_BACKEND", "gpu-gds");
         std::env::set_var("CORECRUXD_BUILD_CCXI", "true");
         std::env::set_var("CORECRUXD_PROJECTIONS_ENABLED", "1");
@@ -881,6 +1167,30 @@ mod tests {
         assert!(!cfg.replicated_commit_require_all_followers);
         assert_eq!(cfg.auth_mode, crate::auth::AuthMode::Off);
         assert!(cfg.auth_mode_explicitly_set);
+        assert_eq!(cfg.state_dir.to_str().unwrap(), "/tmp/test-state");
+        assert_eq!(cfg.passport_key_path.to_str().unwrap(), "/tmp/test-state/passport.key");
+        assert!(!cfg.passport_claim_on_startup);
+        assert_eq!(cfg.passport_claim_endpoint, "https://passport.example.test/claim");
+        assert_eq!(
+            cfg.content_manifest_path.as_ref().unwrap().to_str().unwrap(),
+            "/opt/crux/content/MANIFEST.json"
+        );
+        assert!(!cfg.content_verify_signatures);
+        assert_eq!(cfg.router_refresh_interval_seconds, 15);
+        assert_eq!(cfg.router_cache_ttl_seconds, 20);
+        assert_eq!(cfg.router_fallback_policy, "refuse");
+        let enterprise = cfg.enterprise_trust_root.as_ref().unwrap();
+        assert_eq!(enterprise.customer_id, "customer-a");
+        assert_eq!(enterprise.backend_id, "customer:cluster-a");
+        assert_eq!(enterprise.trust_root_kid, "customer-root-a");
+        assert_eq!(
+            enterprise.trusted_issuer_kids,
+            vec!["customer-issuer-a".to_string(), "customer-issuer-b".to_string()]
+        );
+        assert!(enterprise.airgap);
+        assert!(!enterprise.allow_vaultcrux_cross_sign);
+        assert_eq!(cfg.llm_endpoint.as_deref(), Some("http://localhost:11434/api/generate"));
+        assert_eq!(cfg.llm_model.as_deref(), Some("llama3.2:3b"));
         // io_backend from CORECRUXD_IO_BACKEND env (test sets "gpu-gds", kept for compatibility)
         assert_eq!(cfg.io_backend, "gpu-gds");
         assert!(cfg.build_ccxi);
@@ -904,6 +1214,101 @@ mod tests {
         assert_eq!(cfg.dir_l0_max_runs, 16);
 
         // Clean up
+        clear_corecruxd_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_config_reads_xdg_yaml_and_env_overrides() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        clear_corecruxd_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_home = tmp.path().join("config");
+        let state_home = tmp.path().join("state");
+        let config_dir = config_home.join("crux");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.yaml"),
+            r#"
+daemon:
+  instance_id: "daemon-from-yaml"
+  state_dir: "$XDG_STATE_HOME/crux"
+  listen_addr: "127.0.0.2"
+  http_port: 15000
+  grpc_port: 15002
+  mcp_port: 15001
+  mcp_enabled: false
+  auth_mode: "off"
+passport:
+  key_path: "$XDG_STATE_HOME/crux/passport.key"
+  claim_on_startup: false
+  claim_endpoint: "https://passport.example.test/v1/claim"
+content:
+  manifest_path: "$XDG_STATE_HOME/crux/content/MANIFEST.json"
+  verify_signatures: false
+router:
+  refresh_interval_seconds: 7
+  cache_ttl_seconds: 9
+  fallback_policy: "refuse"
+enterprise:
+  enabled: true
+  customer_id: "customer-yaml"
+  backend_id: "customer:yaml-cluster"
+  trust_root_kid: "yaml-root"
+  trusted_issuer_kids:
+    - "yaml-issuer"
+  airgap: true
+  allow_vaultcrux_cross_sign: true
+llm:
+  endpoint: "http://localhost:11434/api/generate"
+  model: "llama3.2:3b"
+"#,
+        )
+        .unwrap();
+
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::set_var("XDG_STATE_HOME", &state_home);
+        std::env::set_var("CORECRUXD_HTTP_PORT", "16000");
+
+        let cfg = super::load_config();
+
+        assert_eq!(
+            cfg.loaded_config_path.as_ref().unwrap(),
+            &config_dir.join("config.yaml")
+        );
+        assert_eq!(cfg.http_addr.ip().to_string(), "127.0.0.2");
+        assert_eq!(cfg.http_addr.port(), 16000);
+        assert_eq!(cfg.grpc_addr.port(), 15002);
+        assert_eq!(cfg.mcp_addr.port(), 15001);
+        assert!(!cfg.mcp_enabled);
+        assert_eq!(cfg.state_dir, state_home.join("crux"));
+        assert_eq!(cfg.data_dir, state_home.join("crux"));
+        assert_eq!(cfg.node_id_override.as_deref(), Some("daemon-from-yaml"));
+        assert_eq!(cfg.auth_mode, crate::auth::AuthMode::Off);
+        assert!(cfg.auth_mode_explicitly_set);
+        assert_eq!(cfg.passport_key_path, state_home.join("crux").join("passport.key"));
+        assert!(!cfg.passport_claim_on_startup);
+        assert_eq!(cfg.passport_claim_endpoint, "https://passport.example.test/v1/claim");
+        assert_eq!(
+            cfg.content_manifest_path.as_ref().unwrap(),
+            &state_home.join("crux").join("content").join("MANIFEST.json")
+        );
+        assert!(!cfg.content_verify_signatures);
+        assert_eq!(cfg.router_refresh_interval_seconds, 7);
+        assert_eq!(cfg.router_cache_ttl_seconds, 9);
+        assert_eq!(cfg.router_fallback_policy, "refuse");
+        let enterprise = cfg.enterprise_trust_root.as_ref().unwrap();
+        assert_eq!(enterprise.customer_id, "customer-yaml");
+        assert_eq!(enterprise.backend_id, "customer:yaml-cluster");
+        assert_eq!(enterprise.trust_root_kid, "yaml-root");
+        assert_eq!(enterprise.trusted_issuer_kids, vec!["yaml-issuer".to_string()]);
+        assert!(enterprise.airgap);
+        assert!(enterprise.allow_vaultcrux_cross_sign);
+        assert_eq!(cfg.llm_endpoint.as_deref(), Some("http://localhost:11434/api/generate"));
+        assert_eq!(cfg.llm_model.as_deref(), Some("llama3.2:3b"));
+
         clear_corecruxd_env();
     }
 

@@ -1,0 +1,41 @@
+# Crux daemon v2 configuration example.
+# Copy to $XDG_CONFIG_HOME/crux/config.yaml and keep env vars for overrides.
+
+daemon:
+  instance_id: "local"
+  state_dir: "$XDG_STATE_HOME/crux"
+  listen_addr: "127.0.0.1"
+  http_port: 14800
+  grpc_port: 4007
+  mcp_port: 14801
+  mcp_enabled: true
+  auth_mode: "off"
+
+passport:
+  key_path: "$XDG_STATE_HOME/crux/passport.key"
+  claim_on_startup: true
+  claim_endpoint: "https://passport.vaultcrux.com/v1/claim-anonymous"
+
+content:
+  # Set only for signed content bundles. Placeholder source manifests are
+  # refused when verify_signatures is true.
+  manifest_path: null
+  verify_signatures: true
+
+router:
+  refresh_interval_seconds: 60
+  cache_ttl_seconds: 60
+  fallback_policy: "degrade_to_local"
+
+enterprise:
+  enabled: false
+  customer_id: ""
+  backend_id: "customer:example-cluster"
+  trust_root_kid: ""
+  trusted_issuer_kids: []
+  airgap: true
+  allow_vaultcrux_cross_sign: false
+
+llm:
+  endpoint: "http://localhost:11434/api/generate"
+  model: "llama3.2:3b"

@@ -2,20 +2,20 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! CE session-handshake endpoint.
+//! Crux Daemon session-handshake endpoint.
 //!
 //! `POST /session` — accepts a `SessionHandshakeRequest` in JSON or CBOR,
 //! mints a [`crux_session::SessionPlan`], writes it to the registry, and
 //! returns the plan in the negotiated content type.
 //!
-//! This is the CE analogue of VaultCrux's hosted `POST /v1/session`. Both
+//! This is the local-daemon analogue of VaultCrux's hosted `POST /v1/session`. Both
 //! share the same schema and encoder (via the [`crux_session`] crate);
-//! the CE implementation differs only in:
+//! the Crux Daemon implementation differs only in:
 //! - passport source (synthesised from the install UUID rather than JWT)
 //! - signer (NullSigner by default → BLAKE3-only plan)
 //! - registry (in-memory rather than Postgres)
 //!
-//! The endpoint is localhost-only by default. No auth is required in the CE
+//! The endpoint is localhost-only by default. No auth is required in the local-daemon
 //! threat model (master-plan §5.3).
 
 use std::collections::HashSet;
@@ -72,7 +72,7 @@ pub struct SessionServices {
 }
 
 impl SessionServices {
-    /// Ephemeral CE wiring — `NullSigner` + `InMemorySealer` + `InMemoryRegistry`.
+    /// Ephemeral local-daemon wiring — `NullSigner` + `InMemorySealer` + `InMemoryRegistry`.
     /// Pre-M6 default; used only when the caller has no durable data
     /// directory (tests, smoke scripts). Sessions do not survive restart.
     pub fn local_default(node_id: impl Into<String>) -> Self {
@@ -93,7 +93,7 @@ impl SessionServices {
         }
     }
 
-    /// Durable CE wiring — persistent install UUID + file-backed
+    /// Durable local-daemon wiring — persistent install UUID + file-backed
     /// registry (`data_dir/sessions/*.json`) + file-backed sealer
     /// (`data_dir/session-events.jsonl`). Sessions survive restart;
     /// the segment log is operator-inspectable with `jq`.

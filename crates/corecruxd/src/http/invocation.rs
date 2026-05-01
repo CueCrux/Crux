@@ -2,7 +2,7 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! `POST /invocation/verify` — CE endpoint for the invocation-verify
+//! `POST /invocation/verify` — Crux Daemon endpoint for the invocation-verify
 //! protocol (master-plan §8).
 //!
 //! Accepts an `InvocationReceipt` as JSON (hex-encoded byte arrays),

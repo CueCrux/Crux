@@ -2,7 +2,7 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! `crux-sync` — Outbox sync client for VaultCrux community edition.
+//! `crux-sync` — Outbox sync client for VaultCrux Crux Daemon.
 //!
 //! Implements the offline-first sync pattern: contributions are written to a
 //! local outbox, then pushed to VaultCrux API on connectivity. The sync client

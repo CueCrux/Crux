@@ -2,7 +2,7 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! Integration test harness for CoreCrux Community Edition.
+//! Integration test harness for Crux Daemon.
 
 // Test harness: panics, unwraps, expects, and large error types are acceptable.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::result_large_err)]

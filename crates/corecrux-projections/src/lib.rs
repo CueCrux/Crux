@@ -39,7 +39,7 @@ pub use events::{
     InvocationReceiptedV1, SessionClosedV1, SessionPlanSealedV1, SessionRevokedV1, CONTENT_TYPE_SESSION_BIN_V1,
     EVT_INVOCATION_RECEIPTED_V1, EVT_SESSION_CLOSED_V1, EVT_SESSION_PLAN_SEALED_V1, EVT_SESSION_REVOKED_V1,
 };
-// CE → Core migration (M8).
+// Local-daemon to Core migration (M8).
 pub use events::{CeInstallImportedV1, EVT_CE_INSTALL_IMPORTED_V1};
 // Extraction-cache events (stateful-extraction-flywheel M1). Re-exported so
 // corecruxd's HTTP layer and VaultCrux-side tooling can mint them without

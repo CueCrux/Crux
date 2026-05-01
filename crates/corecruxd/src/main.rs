@@ -15,8 +15,8 @@ mod control;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]
 mod dataplane_store;
-// gRPC service stubs: proprietary edition implements full RPCs; community
-// edition keeps the server skeleton. Suppress dead_code for stub internals.
+// gRPC service stubs: dataplane-enabled distributions implement full RPCs;
+// Crux Daemon keeps the server skeleton. Suppress dead_code for stub internals.
 #[allow(dead_code)]
 mod grpc;
 mod http;
@@ -60,7 +60,6 @@ use crate::metrics::Metrics;
 use crate::ops_events::{append_ops_event, build_node_context, now_unix_ms};
 use crate::shard_map::{RoutingTable, ShardMapStore};
 
-const DEFAULT_PASSPORT_CLAIM_ENDPOINT: &str = "https://passport.vaultcrux.com/v1/claim-anonymous";
 const PASSPORT_CLAIM_MARKER_FILENAME: &str = "passport.claimed";
 
 #[tokio::main]
@@ -99,6 +98,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.follower_reads_enabled,
         config.replicated_commit_timeout_ms,
         config.replicated_commit_require_all_followers,
+        &config.loaded_config_path,
+        &config.state_dir,
+        config.router_refresh_interval_seconds,
+        config.router_cache_ttl_seconds,
+        &config.router_fallback_policy,
+        &config.llm_endpoint,
+        &config.llm_model,
         config.max_events_per_batch,
         config.max_batch_bytes,
         config.max_event_id_bytes,
@@ -145,6 +151,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &config.update_check_repo_dir,
     );
     init_tracing(&config.log_level);
+    if let Some(trust_root) = &config.enterprise_trust_root {
+        let issues = crux_enterprise_shim::validate_enterprise_trust_root(trust_root);
+        if !issues.is_empty() {
+            let codes = issues
+                .iter()
+                .map(|issue| issue.code.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid enterprise trust root: {codes}"),
+            )
+            .into());
+        }
+        info!(
+            customer_id = %trust_root.customer_id,
+            backend_id = %trust_root.backend_id,
+            trust_root_kid = %trust_root.trust_root_kid,
+            airgap = trust_root.airgap,
+            trusted_issuer_count = trust_root.trusted_issuer_kids.len(),
+            allow_vaultcrux_cross_sign = trust_root.allow_vaultcrux_cross_sign,
+            "enterprise customer-hosted trust root configured"
+        );
+    }
+    if let Some(manifest_path) = config.content_manifest_path.as_deref() {
+        let report = vaultcrux_local::content::load_content_manifest(manifest_path, config.content_verify_signatures)?;
+        info!(
+            content_manifest = %report.manifest_path.display(),
+            issuer = %report.issuer,
+            files_verified = report.files_verified,
+            signature_verified = report.verified_signature,
+            "vaultcrux content manifest loaded"
+        );
+    }
 
     std::panic::set_hook(Box::new(|panic_info| {
         let payload = panic_info
@@ -164,6 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }));
 
+    create_dir_all(&config.state_dir)?;
     create_dir_all(&config.data_dir)?;
     let lock_file = acquire_lock(&config.data_dir)?;
 
@@ -198,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )?;
     let node_id = node_meta.node_id.clone();
 
-    let rcx_passport_key = crux_session::LocalPassportKey::from_data_dir(&config.data_dir)?;
+    let rcx_passport_key = crux_session::LocalPassportKey::from_path(&config.passport_key_path)?;
     let rcx_issued_at = now_unix_ms() / 1000;
     let rcx_token = crux_router::mint_signed_free_local_token(
         rcx_passport_key.passport_fpr().to_string(),
@@ -210,19 +251,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         |hash| rcx_passport_key.sign_hash(hash),
     );
     let rcx_token_hash = rcx_token.token_hash_hex();
-    let rcx_router = crux_router::RcxRouter::new(rcx_token);
+    let rcx_router = Arc::new(crux_router::RcxRouter::new(rcx_token));
     info!(
         passport_fpr = %rcx_passport_key.passport_fpr(),
         public_key_hex = %rcx_passport_key.public_key_hex(),
         token_hash = %rcx_token_hash,
         "rcx free-local capability token minted"
     );
-    spawn_anonymous_passport_claim(
-        config.data_dir.clone(),
-        rcx_passport_key.passport_fpr().to_string(),
-        rcx_passport_key.public_key_hex().to_string(),
-        format!("crux/{}", build.version),
-    );
+    if config.passport_claim_on_startup {
+        spawn_anonymous_passport_claim(
+            config.state_dir.clone(),
+            config.passport_claim_endpoint.clone(),
+            rcx_passport_key.passport_fpr().to_string(),
+            rcx_passport_key.public_key_hex().to_string(),
+            format!("crux/{}", build.version),
+        );
+    }
 
     let http_leader = shard_map_advertise_addr(config.http_addr);
     let grpc_leader = shard_map_advertise_addr(config.grpc_addr);
@@ -243,7 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let readiness = Arc::new(RwLock::new(Readiness::default()));
 
-    // Community edition: no dataplane pool (requires proprietary edition).
+    // Crux Daemon: no dataplane pool (requires a dataplane-enabled distribution).
     let dataplane_pool: Option<crate::pool::DataPlanePool> = None;
 
     let control_evidence_status =
@@ -318,6 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         },
         sdk_version: DEFAULT_SDK_VERSION.to_string(),
         auth: auth.clone(),
+        rcx_router: Some(rcx_router.clone()),
         data_dir: config.data_dir.clone(),
         mcp_enabled: config.mcp_enabled,
         read_retry_failed_readyz_threshold: config.read_retry_failed_readyz_threshold,
@@ -372,7 +417,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         update_status: update_status.clone(),
         event_bus: corecrux_memory::events::EventBus::new(1024),
         session: {
-            // Durable CE wiring: persistent install UUID + file registry +
+            // Durable local-daemon wiring: persistent install UUID + file registry +
             // file sealer under the configured data_dir. Falls back to the
             // ephemeral (in-memory) wiring only if opening any of the three
             // fails — tests are the expected consumer of the ephemeral
@@ -444,7 +489,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 mcp_agent_registry.clone(),
             )
             .with_daemon_base_url(daemon_base)
-            .with_rcx_router(rcx_router),
+            .with_shared_rcx_router(rcx_router),
         ))
     } else {
         None
@@ -1480,12 +1525,13 @@ fn spawn_capacity_guard(
 }
 
 fn spawn_anonymous_passport_claim(
-    data_dir: PathBuf,
+    state_dir: PathBuf,
+    endpoint: String,
     passport_fpr: String,
     public_key_hex: String,
     daemon_version: String,
 ) {
-    let marker_path = data_dir.join(PASSPORT_CLAIM_MARKER_FILENAME);
+    let marker_path = state_dir.join(PASSPORT_CLAIM_MARKER_FILENAME);
     if marker_path.exists() {
         tracing::debug!(
             passport_fpr = %passport_fpr,
@@ -1494,8 +1540,6 @@ fn spawn_anonymous_passport_claim(
         );
         return;
     }
-    let endpoint =
-        std::env::var("CRUX_PASSPORT_CLAIM_ENDPOINT").unwrap_or_else(|_| DEFAULT_PASSPORT_CLAIM_ENDPOINT.to_string());
     tokio::spawn(async move {
         let claim_fpr = passport_fpr.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -3302,6 +3346,7 @@ mod tests {
             },
             sdk_version: corecrux_types::DEFAULT_SDK_VERSION.to_string(),
             auth,
+            rcx_router: None,
             data_dir: tmp.path().to_path_buf(),
             mcp_enabled: true,
             read_retry_failed_readyz_threshold: 0,

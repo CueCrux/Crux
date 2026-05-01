@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "corecrux-client"
 version = "0.1.0"
-description = "Python client for CoreCrux Community Edition"
+description = "Python client for Crux Daemon"
 readme = "README.md"
 license = "LicenseRef-CCL-1.0"
 requires-python = ">=3.10"

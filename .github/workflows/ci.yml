@@ -31,6 +31,7 @@ jobs:
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: cargo fmt --check
       - run: typos
+      - run: bash scripts/assert-daemon-release-boundary.sh
       - run: cargo clippy --workspace -- -D warnings
 
   # ── Test, MSRV, Coverage: self-hosted ────────────────────────────────
@@ -73,7 +74,7 @@ jobs:
           curl -sf -X POST http://localhost:14801/mcp \
             -H "Content-Type: application/json" \
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-            | jq -e '.result.tools | length == 28' >/dev/null
+            | jq -e '.result.tools | length == 25' >/dev/null
 
   msrv:
     name: MSRV (1.88.0)
@@ -102,11 +103,14 @@ jobs:
           tool: cargo-llvm-cov
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: cargo build --bin corecruxd
-      - run: cargo llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --lcov --output-path lcov.info
-      - run: cargo llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --summary-only
+      - name: Generate coverage reports
+        run: |
+          set -euo pipefail
+          cargo llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --lcov --output-path lcov.info
+          cargo llvm-cov report --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --summary-only | tee coverage-summary.txt
       - name: Enforce coverage thresholds
         run: |
-          SUMMARY=$(cargo llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --summary-only 2>&1)
+          SUMMARY=$(cat coverage-summary.txt)
           TOTAL=$(echo "$SUMMARY" | grep "^TOTAL" | awk '{print $4}' | tr -d '%')
           echo "::notice::Total workspace coverage: ${TOTAL}%"
 

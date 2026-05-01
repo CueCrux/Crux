@@ -2,14 +2,14 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! M6 CE full-parity integration test.
+//! M6 Crux Daemon full-parity integration test.
 //!
-//! Master-plan Phase 6 gate: "CE binary passes the same golden handshake
-//! tests as hosted with `mode: 'local'` substitutions. CE integration
+//! Master-plan Phase 6 gate: "Crux Daemon binary passes the same golden handshake
+//! tests as hosted with `mode: 'local'` substitutions. Crux Daemon integration
 //! test: open session → make 10 invocations → inspect segment log →
 //! verify all receipts."
 //!
-//! Exercises the full CE path using the durable (file-backed) wiring:
+//! Exercises the full Crux Daemon path using the durable (file-backed) wiring:
 //!
 //!   1. Open a persistent `LocalPassportConfig` + `FileSessionRegistry`
 //!      + `FileSealer` under a tempdir.
@@ -137,7 +137,7 @@ fn ce_full_parity_open_session_10_invocations_restart_verify() {
         .unwrap();
 
         // Seal the plan and record in the registry (always-store order:
-        // seal before insert, same as the CE HTTP route).
+        // seal before insert, same as the Crux Daemon HTTP route).
         seal_plan(&sealed.plan, &sealed.canonical_cbor, &sealer);
         registry
             .insert(RegistryEntry::from_plan(&sealed.plan, sealed.canonical_cbor.clone()))

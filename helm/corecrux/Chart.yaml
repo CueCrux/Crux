@@ -1,6 +1,6 @@
 apiVersion: v2
 name: corecrux
-description: CoreCrux Community Edition — append-only event store with BM25 retrieval and CROWN receipts
+description: Crux Daemon — append-only event store with BM25 retrieval and CROWN receipts
 type: application
 version: 0.1.0
 appVersion: "0.1.0"

@@ -30,7 +30,7 @@ That's it — you're connected and working. Read on for authentication, tool sel
 
 ## Platform Availability and Onboarding
 
-Community Edition is local-first. The local fact store and session store are
+Crux Daemon is local-first. The local fact store and session store are
 available even when no upstream CoreCrux platform is online yet.
 
 When you are connecting Crux to another system, start with:
@@ -106,7 +106,7 @@ Use the same central bootstrap docs for maintenance:
 - Automatic upgrade: only when `update_status().state == behind`, the repo is writable, and a backup path exists. Pull `get_bootstrap(topic="docs", query="Automatic Upgrade")`.
 - Backup options: pull `get_bootstrap(topic="docs", query="backup")` before changing the checkout or restarting the service.
 
-Current CE backup rails are operator-level rather than one-click automation:
+Current Crux Daemon backup rails are operator-level rather than one-click automation:
 
 - Filesystem or volume snapshots of `CORECRUXD_DATA_DIR`
 - `corecruxctl verify-store --data-dir ./data --scope recent` before and after upgrades

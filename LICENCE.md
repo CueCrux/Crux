@@ -3,7 +3,7 @@
 ## Parameters
 
 - **Licensor:** CueCrux Ltd
-- **Software:** CoreCrux Community Edition
+- **Software:** Crux Daemon
 - **Change Date:** Three years after each versioned release
 - **Change Licence:** Apache Licence, Version 2.0
 

@@ -23,7 +23,7 @@ pub const CUECRUX_SESSION_DESCRIPTION: &str = concat!(
     "Opens a CueCrux session. Returns a capability plan covering retrieval, proofing, ",
     "memory, journaling, and audit across VaultCrux and MemoryCrux. ",
     "Call this first. All subsequent work flows through the plan's channels. ",
-    "Works identically for local Crux CE installations and the hosted CueCrux platform. ",
+    "Works identically for local Crux Daemon installations and the hosted CueCrux platform. ",
     "The plan includes typed routing hints so bulk-capable agents use the HTTP/2 binary channel transparently; ",
     "MCP-only agents use the MCP fallback URLs in the plan.",
 );
@@ -170,7 +170,7 @@ mod tests {
             "audit",
             "VaultCrux",
             "MemoryCrux",
-            "Crux CE",
+            "Crux Daemon",
             "Call this first",
         ] {
             assert!(desc.contains(needle), "description missing `{needle}`");

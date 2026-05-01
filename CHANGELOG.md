@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Split `corecrux-storage/src/lib.rs` (13k LOC) into 9 domain modules
 - Split `corecruxd/src/http.rs` (10k LOC) into 10 handler sub-modules
 - Migrated CI to self-hosted Hetzner runners
-- Stripped all GPU/CUDA data-plane code (~10k LOC removed) — Community Edition is CPU-only
+- Stripped all GPU/CUDA data-plane code (~10k LOC removed) — Crux Daemon is CPU-only
 - Built-in MCP support is now part of the supported `corecruxd` runtime path, quickstarts/examples/docs, and CI smoke checks
 - Standalone integration-test runs now have a dedicated helper script that builds `corecruxd`, exports `CORECRUXD_BINARY`, and runs the integration crate consistently
 
@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Handoff import/export privacy and authenticity handling for MCP agent transfers
 - MCP agent/session scoping across fact queries, entity listing, and session operations
 - HTTP `private=true` fact writes are now rejected instead of implying unsupported caller scoping
-- Runtime/docs/example drift around append compatibility, text-search request shapes, and CE-default feature surfaces
+- Runtime/docs/example drift around append compatibility, text-search request shapes, and local-daemon feature surfaces
 - Integration harness startup and readiness behavior across HTTP, gRPC, and MCP listeners
 
 ### Security

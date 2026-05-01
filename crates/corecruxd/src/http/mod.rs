@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{routing::get, Json, Router};
@@ -126,6 +126,7 @@ pub struct AppState {
     pub compat: CompatContract,
     pub sdk_version: String,
     pub auth: Authz,
+    pub rcx_router: Option<Arc<crux_router::RcxRouter>>,
     pub data_dir: PathBuf,
     pub mcp_enabled: bool,
     pub read_retry_failed_readyz_threshold: u64,
@@ -150,18 +151,18 @@ pub struct AppState {
     pub admin_force_seal_enabled: bool,
     /// CoreCrux v5: loaded .ccxi companion indexes for BM25 text retrieval.
     pub retrieval_index: Arc<RwLock<corecrux_retrieval::IndexManager>>,
-    /// Community edition: fact store (receipted entity memory).
+    /// Crux Daemon fact store (receipted entity memory).
     pub fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
-    /// Community edition: session store (scoped state per session).
+    /// Crux Daemon session store (scoped state per session).
     pub session_store: Arc<RwLock<corecrux_memory::SessionStore>>,
     /// Cached git-based update posture for humans and agents.
     pub update_status: Arc<RwLock<corecrux_types::UpdateStatus>>,
     /// Real-time event bus for SSE streaming of store mutations.
     pub event_bus: corecrux_memory::events::EventBus,
     /// Session-handshake services (M1). `None` disables `POST /session`,
-    /// which then returns 503. Hosted and CE populate this differently; see
-    /// [`session::SessionServices::local_default`] for the CE-friendly
-    /// out-of-the-box wiring.
+    /// which then returns 503. Hosted and local-daemon deployments populate
+    /// this differently; see [`session::SessionServices::local_default`] for
+    /// the local out-of-the-box wiring.
     pub session: Option<Arc<session::SessionServices>>,
     /// stateful-extraction-flywheel M1.b — in-memory materializer for the
     /// `extraction_cache_current` projection. Updated by the append handler
@@ -307,7 +308,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/ops/health", get(self::observe::get_ops_health))
         .route("/v1/bootstrap/pull", axum::routing::post(self::observe::post_bootstrap_pull))
         .route("/v1/bootstrap/status", get(self::observe::get_bootstrap_status))
-        // Session handshake (master-plan §5.1): CE uses /session, not /v1/session.
+        // Session handshake (master-plan §5.1): Crux Daemon uses /session, not /v1/session.
         .route("/session", axum::routing::post(self::session::post_session))
         // Invocation verification (master-plan §8).
         .route(

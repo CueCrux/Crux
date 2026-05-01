@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
@@ -77,7 +77,7 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
     info!(method = %req.method, id = ?req.id, "mcp request");
 
     let resp = dispatch::dispatch(req, &req_ctx, None).await;
-    (StatusCode::OK, Json(resp)).into_response()
+    json_rpc_response_with_crux_mode(resp)
 }
 
 /// `GET /mcp` — server info discovery (MCP Streamable HTTP spec).
@@ -91,6 +91,24 @@ async fn handle_mcp_get(State(_ctx): State<Arc<McpContext>>) -> impl IntoRespons
     }))
 }
 
+fn json_rpc_response_with_crux_mode(resp: JsonRpcResponse) -> Response {
+    let crux_mode = resp
+        .error
+        .as_ref()
+        .and_then(|error| error.data.as_ref())
+        .and_then(|data| data.get("stamp"))
+        .and_then(|stamp| stamp.get("mode"))
+        .and_then(|mode| mode.as_str())
+        .and_then(|mode| HeaderValue::from_str(mode).ok());
+    let mut response = (StatusCode::OK, Json(resp)).into_response();
+    if let Some(crux_mode) = crux_mode {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-crux-mode"), crux_mode);
+    }
+    response
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -99,7 +117,9 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use crux_router::{mint_free_local_token, RcxRouter};
     use http_body_util::BodyExt;
+    use rcx_capability_token::RCX_CT_SIGNATURE_LEN;
     use tower::ServiceExt;
 
     fn test_app() -> axum::Router {
@@ -221,5 +241,46 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_denied_tool_sets_crux_mode_header() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token = mint_free_local_token(
+            "p_0123456789abcdef0123456789abcdef",
+            "daemon_01HV0000000000000000000000",
+            "default",
+            vec!["crux-mcp.store_fact".to_string()],
+            now.saturating_sub(60),
+            now.saturating_add(3600),
+            [0x22; RCX_CT_SIGNATURE_LEN],
+        );
+        let ctx = McpContext::new_default("test-node").with_rcx_router(RcxRouter::new(token));
+        let app = test_app_with_ctx(ctx);
+        let body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "sync_status", "arguments": {}}
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-crux-mode").unwrap(), "refused");
+
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(rpc_resp.error.unwrap().data.unwrap()["mode"], "refused");
     }
 }

@@ -1,4 +1,4 @@
-# Contributing to CoreCrux Community Edition
+# Contributing to Crux Daemon
 
 Thank you for your interest in contributing to CoreCrux.
 

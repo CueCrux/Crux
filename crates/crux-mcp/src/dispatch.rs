@@ -241,6 +241,7 @@ fn enforce_rcx_tool_capability(id: Option<serde_json::Value>, name: &str, ctx: &
             capability: tool.capability,
             preferred_backend: Some(tool.backend_id),
             data_egress_classes: tool.data_egress_classes,
+            present_attestations: Vec::new(),
             estimated_credit_cost: 0,
             backend_reachable: true,
         },
@@ -259,6 +260,8 @@ fn enforce_rcx_tool_capability(id: Option<serde_json::Value>, name: &str, ctx: &
             "capability": &receipt.capability,
             "backend_id": &receipt.backend_id,
             "data_egress_classes": &receipt.data_egress_classes,
+            "required_attestations": &receipt.required_attestations,
+            "present_attestations": &receipt.present_attestations,
             "reason_code": &receipt.reason_code,
             "receipt_class": &receipt.receipt_class,
         })
