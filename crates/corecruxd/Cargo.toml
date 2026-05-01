@@ -43,7 +43,7 @@ ureq = { version = "3.3.0", features = ["json"] }
 opentelemetry = { version = "0.31", optional = true }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.31", features = ["tonic"], optional = true }
-uuid = { version = "1.16.0", features = ["v4"] }
+uuid = { version = "1.23.1", features = ["v4"] }
 zstd = "0.13.3"
 zip = "8.6.0"
 
