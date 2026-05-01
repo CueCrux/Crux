@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
+    problem_response, require_http_scopes, require_http_scopes_for_tenant, AppState, HeaderMap, IntoResponse, Json,
+    Path, Query, State, StatusCode,
 };
 
 #[derive(Debug, serde::Deserialize)]
@@ -337,6 +338,9 @@ pub(super) async fn get_console_tenants(State(state): State<AppState>, headers: 
             }
         }
     }
+    if let Ok(indexed_tenants) = crate::console_index::list_tenants(&state.data_dir) {
+        tenants.extend(indexed_tenants);
+    }
 
     let tenants: Vec<_> = tenants
         .into_iter()
@@ -370,24 +374,28 @@ pub(super) async fn get_console_tenant_chunks(
     Query(query): Query<ConsoleChunksQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_console_read(&state, &headers) {
+    if let Err(problem) = require_http_scopes_for_tenant(&state.auth, &headers, &["tenant:chunks:read"], &tenant_id) {
         return problem.into_response();
     }
 
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let page = match crate::console_index::list_chunks(&state.data_dir, &tenant_id, limit, query.cursor.as_deref()) {
+        Ok(page) => page,
+        Err(err) => return problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "tenant_id": tenant_id,
-            "chunks": [],
+            "chunks": page.chunks,
             "page": {
                 "limit": limit,
                 "cursor": query.cursor,
-                "next_cursor": null
+                "next_cursor": page.next_cursor
             },
             "visibility": "metadata_only",
             "dataplane_enabled": state.http_dataplane.enabled(),
-            "detail": "chunk metadata explorer is wired; dataplane-backed chunk enumeration is not available in this build"
+            "detail": "chunk metadata is populated from HTTP append metadata when available; raw content remains gated by preview scope"
         })),
     )
         .into_response()
@@ -402,14 +410,22 @@ pub(super) async fn get_console_chunk(
         return problem.into_response();
     }
 
+    let Some(chunk) = (match crate::console_index::find_chunk(&state.data_dir, &chunk_digest) {
+        Ok(chunk) => chunk,
+        Err(err) => return problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }) else {
+        return problem_response(StatusCode::NOT_FOUND, "chunk metadata not found");
+    };
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "chunk_digest": chunk_digest,
-            "present": false,
+            "present": true,
             "visibility": "metadata_only",
             "dataplane_enabled": state.http_dataplane.enabled(),
-            "detail": "chunk lookup requires dataplane-backed metadata"
+            "metadata": chunk,
+            "detail": "raw content preview requires tenant:content:preview scope"
         })),
     )
         .into_response()
@@ -420,17 +436,28 @@ pub(super) async fn get_console_chunk_preview(
     Path(chunk_digest): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["tenant:content:preview"]) {
+    let Some(chunk) = (match crate::console_index::find_chunk(&state.data_dir, &chunk_digest) {
+        Ok(chunk) => chunk,
+        Err(err) => return problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }) else {
+        return problem_response(StatusCode::NOT_FOUND, "chunk metadata not found");
+    };
+
+    if let Err(problem) =
+        require_http_scopes_for_tenant(&state.auth, &headers, &["tenant:content:preview"], &chunk.tenant_id)
+    {
         return problem.into_response();
     }
 
     (
-        StatusCode::NOT_IMPLEMENTED,
+        StatusCode::OK,
         Json(serde_json::json!({
             "chunk_digest": chunk_digest,
-            "preview": null,
+            "tenant_id": chunk.tenant_id,
+            "preview": chunk.redacted_preview,
+            "preview_available": chunk.preview_available,
             "redacted": true,
-            "detail": "raw chunk preview is disabled until tenant-scoped dataplane preview is implemented"
+            "detail": "console preview is redacted; raw chunk bytes are not returned by this endpoint"
         })),
     )
         .into_response()

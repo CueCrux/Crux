@@ -11,6 +11,7 @@
 
 mod auth;
 mod config;
+mod console_index;
 mod control;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]

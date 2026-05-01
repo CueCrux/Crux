@@ -843,6 +843,88 @@ async fn console_integration_grant_requires_specific_scope() {
     assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
 }
 
+#[tokio::test]
+async fn console_chunk_index_lists_metadata_and_scoped_redacted_preview() {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.http_dataplane = Arc::new(FakeHttpDataplane {
+        enabled: true,
+        ..Default::default()
+    });
+    let body = append::AppendBody {
+        tenant_id: "tenant-a".to_string(),
+        stream_type: "artifact".to_string(),
+        stream_id: "stream-a".to_string(),
+        expected_next_seq: 7,
+        events: vec![append::AppendEventBody {
+            event_id: "evt-secret".to_string(),
+            occurred_at: "2026-05-01T12:00:00Z".to_string(),
+            event_type: "artifact.updated".to_string(),
+            content_type: "application/json".to_string(),
+            payload: r#"{"token":"secret-value","ok":true}"#.to_string(),
+        }],
+    };
+    let append_resp = append::post_admin_append(State(state.clone()), dev_scope_headers("admin:write"), Json(body))
+        .await
+        .into_response();
+    assert_eq!(append_resp.status(), StatusCode::CREATED);
+
+    let denied_list = console::get_console_tenant_chunks(
+        State(state.clone()),
+        Path("tenant-a".to_string()),
+        Query(console::ConsoleChunksQuery {
+            limit: Some(10),
+            cursor: None,
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(denied_list.status(), StatusCode::FORBIDDEN);
+
+    let list_resp = console::get_console_tenant_chunks(
+        State(state.clone()),
+        Path("tenant-a".to_string()),
+        Query(console::ConsoleChunksQuery {
+            limit: Some(10),
+            cursor: None,
+        }),
+        dev_scope_headers("tenant:chunks:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_body = json_body(list_resp).await;
+    assert_eq!(list_body["chunks"].as_array().expect("chunks array").len(), 1);
+    assert_eq!(list_body["chunks"][0]["seq"], 7);
+    let chunk_digest = list_body["chunks"][0]["chunk_digest"]
+        .as_str()
+        .expect("chunk digest")
+        .to_string();
+    let list_text = serde_json::to_string(&list_body).expect("chunks json");
+    assert!(!list_text.contains("secret-value"));
+
+    let preview_denied = console::get_console_chunk_preview(
+        State(state.clone()),
+        Path(chunk_digest.clone()),
+        dev_scope_headers("tenant:chunks:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(preview_denied.status(), StatusCode::FORBIDDEN);
+
+    let preview = console::get_console_chunk_preview(
+        State(state),
+        Path(chunk_digest),
+        dev_scope_headers("tenant:content:preview"),
+    )
+    .await
+    .into_response();
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview_body = json_body(preview).await;
+    assert_eq!(preview_body["redacted"], true);
+    assert_eq!(preview_body["preview"], "[redacted secret-like content]");
+}
+
 // ── Phase 1 / 1.5 endpoint tests ─────────────────────────────────
 
 // ── Fact Store (PUT /v1/facts) ──────────────────────────────────
