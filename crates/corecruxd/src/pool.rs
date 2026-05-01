@@ -2,7 +2,7 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! Community Edition stub — the data-plane pool requires the proprietary
+//! Crux Daemon stub — the data-plane pool requires the proprietary
 //! edition. Only type definitions needed by other modules are retained here.
 
 use std::sync::Arc;
@@ -43,7 +43,7 @@ pub struct ReplicatedCommitObservationInput {
     pub min_follower_acked_segment_seq: u64,
 }
 
-/// Community Edition stub — `DataPlanePool` requires the proprietary edition.
+/// Crux Daemon stub — `DataPlanePool` requires the proprietary edition.
 /// The struct is retained (unconstructable) so that `Option<DataPlanePool>` can
 /// be `None` everywhere.
 #[derive(Clone)]
@@ -52,7 +52,7 @@ pub struct DataPlanePool {
 }
 
 // All methods below are unreachable at runtime because `DataPlanePool` is
-// unconstructable in the Community Edition. They exist only so that code
+// unconstructable in the Crux Daemon. They exist only so that code
 // paths behind `if let Some(pool) = ... { ... }` guards type-check without
 // requiring every caller to be gutted.
 #[allow(dead_code, unused_variables, clippy::unused_async, clippy::unused_self)]

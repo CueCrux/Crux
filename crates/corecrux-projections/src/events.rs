@@ -21,7 +21,7 @@ pub const EVT_ENTITY_FACT_V1: &str = "corecrux.proj.entity.fact.v1";
 pub const CONTENT_TYPE_ENTITY_JSON_V1: &str = "application/x-corecrux-entity-json-v1";
 
 // Session-handshake events (master-plan §7.2). These record the existence
-// and lifecycle of every session plan issued by VaultCrux / Crux CE, so
+// and lifecycle of every session plan issued by VaultCrux / Crux Daemon, so
 // that the segment log remains the authoritative truth even when the hot
 // registry is lost or rebuilt. Plan bodies are stored in `plan_bytes_cbor`
 // exactly as produced by the `crux-session` canonical encoder.
@@ -29,8 +29,8 @@ pub const EVT_SESSION_PLAN_SEALED_V1: &str = "corecrux.session.plan_sealed.v1";
 pub const EVT_SESSION_CLOSED_V1: &str = "corecrux.session.closed.v1";
 pub const EVT_SESSION_REVOKED_V1: &str = "corecrux.session.revoked.v1";
 pub const EVT_INVOCATION_RECEIPTED_V1: &str = "corecrux.session.invocation_receipted.v1";
-// CE → Core import (master-plan §9; M8). The countersignature event that
-// vouches for imported CE segments being carried intact into a hosted
+// Local-daemon to Core import (master-plan §9; M8). The countersignature event that
+// vouches for imported local segments being carried intact into a hosted
 // tenant.
 pub const EVT_CE_INSTALL_IMPORTED_V1: &str = "corecrux.session.ce_install_imported.v1";
 
@@ -51,7 +51,7 @@ pub enum ProjectionEventV1 {
     SessionClosed(SessionClosedV1),
     SessionRevoked(SessionRevokedV1),
     InvocationReceipted(InvocationReceiptedV1),
-    // CE → Core migration (M8; master-plan §9.3).
+    // Local-daemon to Core migration (M8; master-plan §9.3).
     CeInstallImported(CeInstallImportedV1),
     // Extraction-cache events (stateful-extraction-flywheel M1). JSON-only.
     ExtractionCacheInsert(crate::extraction::ExtractionCacheInsertV1),
@@ -838,11 +838,11 @@ impl InvocationReceiptedV1 {
     }
 }
 
-/// CE → Core import countersignature event (master-plan §9.3 step 3).
+/// Local-daemon to Core import countersignature event (master-plan §9.3 step 3).
 ///
-/// Emitted on the hosted side when a CE install's sessions are accepted
+/// Emitted on the hosted side when a local-daemon install's sessions are accepted
 /// into a tenant. The event's `import_receipt_signature` is the only new
-/// signature over the whole bundle — individual CE receipts retain their
+/// signature over the whole bundle — individual local receipts retain their
 /// original `mode: "local"` + BLAKE3 hashes; this event vouches for them
 /// en masse.
 #[derive(Debug, Clone)]
@@ -853,7 +853,7 @@ pub struct CeInstallImportedV1 {
     pub ce_principal_id: String,
     pub core_principal_id: String,
     /// BLAKE3 hashes of each plan carried in the bundle. The hashes must
-    /// match a later `SessionPlanSealedV1` that replayed the CE plan's
+    /// match a later `SessionPlanSealedV1` that replayed the local plan's
     /// canonical bytes — that's the chain-verification step.
     pub imported_plan_hashes: Vec<[u8; 32]>,
     /// Number of invocation receipts carried in the bundle. Used only

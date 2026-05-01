@@ -8,7 +8,7 @@ use utoipa::OpenApi;
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title = "CoreCrux Community Edition API",
+        title = "Crux Daemon API",
         version = env!("CARGO_PKG_VERSION"),
         description = "Append-only event store with BM25 retrieval, CROWN receipts, and fact memory.",
         license(name = "CCL v1.0", url = "https://github.com/CueCrux/Crux/blob/main/LICENCE.md")

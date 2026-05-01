@@ -2,16 +2,16 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! CE → Core export bundle (M8).
+//! Local-daemon to Core export bundle (M8).
 //!
-//! A `CeExportBundle` is a snapshot of a CE install's session state:
+//! A `CeExportBundle` is a snapshot of a local-daemon install's session state:
 //!
 //! - `install_uuid` — the raw string under `data_dir/.install-uuid`.
 //! - `plans` — every session row (one per file under `data_dir/sessions/`).
-//!   Each plan carries the canonical-CBOR bytes exactly as the CE sealer
+//!   Each plan carries the canonical-CBOR bytes exactly as the local sealer
 //!   stored them — the hosted side re-hashes these to verify.
 //! - `invocations` — hex-encoded `InvocationReceiptedV1` payloads from the
-//!   CE event log, keyed by the session they belong to.
+//!   local event log, keyed by the session they belong to.
 //!
 //! The format is JSON (not CBOR) for simplicity — this is a one-off
 //! migration payload, not a hot-path wire format. An operator can
@@ -32,7 +32,7 @@ pub struct CeExportBundle {
     pub schema_version: u16,
     pub install_uuid: String,
     /// One entry per sealed session. `plan_cbor_hex` is the byte-exact
-    /// canonical-CBOR of the plan as emitted by `mint()` on CE.
+    /// canonical-CBOR of the plan as emitted by `mint()` on the local daemon.
     pub plans: Vec<ExportedPlan>,
     /// Invocation receipts grouped by session_id (hex).
     pub invocations: BTreeMap<String, Vec<ExportedInvocation>>,
@@ -146,7 +146,7 @@ pub fn decode_plan_entry(entry: &ExportedPlan) -> Result<SessionPlan, SessionErr
     SessionPlan::from_canonical_cbor(&bytes)
 }
 
-/// Build an export bundle from a CE install's durable state. Reads the
+/// Build an export bundle from a local-daemon install's durable state. Reads the
 /// persistent install UUID, every registry row, and the full event log;
 /// emits a self-contained [`CeExportBundle`] ready to POST to the hosted
 /// `/v1/ce-import` endpoint.

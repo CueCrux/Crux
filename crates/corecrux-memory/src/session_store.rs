@@ -221,7 +221,7 @@ mod tests {
         let state = json!({
             "decisions_made": ["chose canary over blue-green"],
             "open_questions": ["GPU timing"],
-            "context_summary": "Building community edition."
+            "context_summary": "Building Crux Daemon."
         });
 
         let session = store.put("sess_001", state.clone(), None);
@@ -390,7 +390,7 @@ mod tests {
             let mut store = SessionStore::with_persistence(dir.path()).unwrap();
             store.put("s1", json!({"step": 1}), None);
             store.put("s2", json!({"decisions": ["a", "b"]}), None);
-            store.put("s3", json!({"context": "building CE"}), Some(3600));
+            store.put("s3", json!({"context": "building Crux Daemon"}), Some(3600));
             assert_eq!(store.count(), 3);
         }
 
@@ -399,7 +399,10 @@ mod tests {
             assert_eq!(store.count(), 3);
             assert_eq!(store.get("s1").unwrap().state, json!({"step": 1}));
             assert_eq!(store.get("s2").unwrap().state, json!({"decisions": ["a", "b"]}));
-            assert_eq!(store.get("s3").unwrap().state, json!({"context": "building CE"}));
+            assert_eq!(
+                store.get("s3").unwrap().state,
+                json!({"context": "building Crux Daemon"})
+            );
             assert!(store.get("s3").unwrap().expires_at.is_some());
         }
     }

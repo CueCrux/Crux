@@ -2,7 +2,7 @@
 
 ## Rate Limiting
 
-CoreCrux Community Edition does not include application-level rate limiting.
+Crux Daemon does not include application-level rate limiting.
 Deploy behind a reverse proxy (nginx, Caddy, Envoy) with rate limits configured.
 
 ### Recommended Limits

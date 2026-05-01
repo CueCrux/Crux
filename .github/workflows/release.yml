@@ -41,16 +41,16 @@ jobs:
           version: "25.x"
 
       - name: Run tests
-        run: cargo test --workspace
+        run: |
+          bash scripts/assert-daemon-release-boundary.sh
+          bash scripts/assert-hosted-bridge-contract.sh
+          cargo test --workspace
 
       - name: Build release
         run: cargo build --release
 
       - name: Package binaries
-        run: |
-          mkdir -p dist
-          cp target/release/corecruxd dist/corecruxd-${{ matrix.suffix }}
-          cp target/release/corecruxctl dist/corecruxctl-${{ matrix.suffix }}
+        run: bash scripts/package-daemon-release.sh ${{ matrix.suffix }} dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
@@ -72,5 +72,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          files: dist/*
+          files: |
+            dist/*
+            dist/content/*
+            dist/docs/*
           generate_release_notes: true

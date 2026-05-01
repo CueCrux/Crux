@@ -4,7 +4,7 @@
 
 //! Pluggable signer trait for plan receipts.
 //!
-//! - CE uses [`NullSigner`]: BLAKE3-only, no signature.
+//! - Crux Daemon uses [`NullSigner`]: BLAKE3-only, no signature.
 //! - Hosted uses a Vault-Transit-backed signer (separate crate / TS
 //!   implementation). The trait here exists so the handshake service has a
 //!   single code path; the hosted signer wraps whatever Vault exposes.
@@ -32,7 +32,7 @@ pub trait PlanSigner: Send + Sync {
     fn sign(&self, hash: &[u8; HASH_LEN]) -> Result<Option<Signed>, SessionError>;
 }
 
-/// The CE signer: does nothing.
+/// The local signer: does nothing.
 #[derive(Debug, Default, Clone)]
 pub struct NullSigner;
 

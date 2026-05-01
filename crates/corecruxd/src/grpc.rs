@@ -714,13 +714,13 @@ fn resolve_batch_limits(req: &ReadStreamBatchedRequest, cfg: &DataPlaneServiceCo
     (max_events_per_message, max_bytes_per_message)
 }
 
-// ── Community Edition gRPC behaviour ──────────────────────────────────────
+// ── Crux Daemon gRPC behaviour ──────────────────────────────────────
 //
-// In the Community Edition, `self.pool` is always `None`.
+// In the Crux Daemon, `self.pool` is always `None`.
 // All data-plane RPCs that require the DataPlanePool return
 // `Status::UNIMPLEMENTED` with a descriptive message. This is intentional:
-// the gRPC surface is defined so that proprietary and Community builds share
-// the same proto contract, but Community callers should use the HTTP API for
+// the gRPC surface is defined so that dataplane-enabled and Crux Daemon builds
+// share the same proto contract, but Crux Daemon callers should use the HTTP API for
 // append, query, and retrieval operations.
 //
 // Affected RPCs: AppendBatch, ReadStream, ReadStreamBatched,
@@ -914,7 +914,7 @@ async fn send_replication_segment_http(
     result
 }
 
-// Community Edition: ExportReceiptBundle requires the proprietary edition pool.
+// Crux Daemon: ExportReceiptBundle requires the proprietary edition pool.
 #[tonic::async_trait]
 impl CoreCruxExportV1 for ExportService {
     type ExportReceiptBundleStream = tokio_stream::wrappers::ReceiverStream<Result<ExportChunk, Status>>;
@@ -1572,7 +1572,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_frames_returns_unimplemented() {
-        // Community Edition: method returns Unimplemented before auth checks.
+        // Crux Daemon: method returns Unimplemented before auth checks.
         let svc = test_service_with_auth("node-a", AuthMode::DevScopes);
         let status = svc
             .read_frames(Request::new(ReadFramesRequest { locations: vec![] }))
@@ -2459,7 +2459,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_stream_batched_returns_unimplemented() {
-        // Community Edition: method returns Unimplemented before validation.
+        // Crux Daemon: method returns Unimplemented before validation.
         let svc = test_service_with_auth("node-a", AuthMode::Off);
         let status = svc
             .read_stream_batched(Request::new(ReadStreamBatchedRequest {
@@ -2910,7 +2910,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_stream_batched_requires_proprietary_edition() {
-        // Community Edition: method returns Unimplemented before auth checks.
+        // Crux Daemon: method returns Unimplemented before auth checks.
         let svc = test_service_with_auth("node-a", AuthMode::DevScopes);
         let base = ReadStreamRequest {
             tenant_id: "t".to_string(),
@@ -2932,7 +2932,7 @@ mod tests {
         assert_eq!(status.code(), Code::Unimplemented);
     }
 
-    // ── read_stream_batched_unary: Community Edition returns Unimplemented ──
+    // ── read_stream_batched_unary: Crux Daemon returns Unimplemented ──
 
     #[tokio::test]
     async fn read_stream_batched_unary_returns_unimplemented() {
@@ -2948,7 +2948,7 @@ mod tests {
         assert_eq!(status.code(), Code::Unimplemented);
     }
 
-    // ── read_frames_batched_unary: Community Edition returns Unimplemented ──
+    // ── read_frames_batched_unary: Crux Daemon returns Unimplemented ──
 
     #[tokio::test]
     async fn read_frames_batched_unary_returns_unimplemented() {
@@ -3455,11 +3455,11 @@ mod tests {
         assert_eq!(status.code(), Code::PermissionDenied);
     }
 
-    // Community Edition: read_stream_batched and read_stream_batched_unary
+    // Crux Daemon: read_stream_batched and read_stream_batched_unary
     // return Unimplemented before reaching auth/validation checks.
     // Auth enforcement tests for these RPCs are in the proprietary test suite.
 
-    // Community Edition: read_frames_batched_unary returns Unimplemented
+    // Crux Daemon: read_frames_batched_unary returns Unimplemented
     // before reaching validation. See read_frames_batched_unary_returns_unimplemented above.
 
     // ── read_many_batched_unary empty reads ──────────────────────────

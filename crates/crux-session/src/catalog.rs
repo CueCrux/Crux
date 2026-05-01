@@ -6,12 +6,12 @@
 //!
 //! The catalog lists every capability the CueCrux platform surfaces. Each
 //! entry declares the required affinity tag, minimum tier, cost class, and
-//! the CE + Core `impl_path`. The generator at [`crate::generator`] filters
+//! the local + Core `impl_path`. The generator at [`crate::generator`] filters
 //! this catalog per passport.
 //!
 //! This module is the single source of truth for what capabilities exist.
 //! When adding a new capability to the platform, add it here; the generator
-//! picks it up automatically on both CE and hosted.
+//! picks it up automatically on both Crux Daemon and hosted.
 
 use crate::plan::{Capability, ImplPath};
 

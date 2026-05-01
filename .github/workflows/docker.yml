@@ -14,7 +14,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: cuecrux/corecrux-community
+  IMAGE_NAME: cuecrux/crux-daemon
 
 jobs:
   build-and-push:

@@ -8,9 +8,9 @@
 //! segment log (M2). A cache miss on lookup must be satisfiable by walking
 //! the log and rehydrating — the trait is shaped to allow either.
 //!
-//! Hosted uses a Postgres-backed implementation (M1 TS side). CE uses the
-//! in-memory implementation here (sufficient because CoreCrux-segment-log
-//! persistence lands in M2).
+//! Hosted uses a Postgres-backed implementation (M1 TS side). Crux Daemon
+//! uses the in-memory implementation here (sufficient because
+//! CoreCrux-segment-log persistence lands in M2).
 
 use std::collections::HashMap;
 use std::fs;
@@ -141,9 +141,9 @@ impl SessionRegistry for InMemoryRegistry {
 
 // ─── File-backed registry (M6) ─────────────────────────────────────────────
 
-/// CE durable registry: one JSON file per session under `{root}/sessions/`.
+/// Crux Daemon durable registry: one JSON file per session under `{root}/sessions/`.
 ///
-/// The file format is intentionally human-readable — a CE operator can
+/// The file format is intentionally human-readable — a local operator can
 /// `cat data_dir/sessions/*.json | jq` to inspect live sessions without
 /// spinning up a database. Bytes fields are stored as hex strings; the
 /// raw canonical-CBOR plan body is hex-encoded too.

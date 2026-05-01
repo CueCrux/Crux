@@ -15,7 +15,7 @@ otel = [
 ]
 
 [dependencies]
-axum = "0.8.1"
+axum = "0.8.9"
 utoipa = { version = "5", features = ["axum_extras"] }
 base64 = "0.22.1"
 blake3 = "1.8.5"
@@ -29,6 +29,7 @@ prometheus = { version = "0.13.4", default-features = false }
 prost = "0.14.3"
 serde = { version = "1.0.218", features = ["derive"] }
 serde_json = "1.0.139"
+serde_yaml = "0.9.34"
 xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
 tar = "0.4.44"
 tokio = { version = "1.51.1", features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
@@ -61,6 +62,8 @@ crux-integrations = { path = "../crux-integrations" }
 crux-mcp = { path = "../crux-mcp" }
 crux-router = { path = "../crux-router" }
 crux-session = { path = "../crux-session" }
+crux-enterprise-shim = { path = "../crux-enterprise-shim" }
+vaultcrux-local = { path = "../vaultcrux-local" }
 
 [dev-dependencies]
 corecrux-index = { path = "../corecrux-index" }

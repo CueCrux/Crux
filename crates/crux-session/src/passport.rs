@@ -2,9 +2,9 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! Local passport synthesis for Crux CE (master-plan §3.2).
+//! Local passport synthesis for Crux Daemon (master-plan §3.2).
 //!
-//! On CE the passport is derived deterministically from:
+//! On Crux Daemon the passport is derived deterministically from:
 //! - an install UUID (per-install, stored on disk)
 //! - a local user identifier (hostname-hash or configured username)
 //!
@@ -24,11 +24,11 @@ use ed25519_dalek::{Signer as DalekSigner, SigningKey};
 use crate::error::SessionError;
 use crate::plan::{Passport, HASH_LEN, SIGNATURE_LEN};
 
-/// Filename inside a CE data directory that holds the durable install
+/// Filename inside a Crux Daemon data directory that holds the durable install
 /// UUID. First read on startup — generated + persisted if missing.
 pub const INSTALL_UUID_FILENAME: &str = ".install-uuid";
 
-/// Filename inside a CE data directory that holds the durable local Passport
+/// Filename inside a Crux Daemon data directory that holds the durable local Passport
 /// signing seed used for RCX free-local Capability Tokens.
 pub const PASSPORT_KEY_FILENAME: &str = "passport.key";
 
@@ -57,7 +57,7 @@ impl std::fmt::Debug for LocalPassportKey {
 }
 
 impl LocalPassportConfig {
-    /// Load (or initialise) the CE install UUID from `data_dir/.install-uuid`.
+    /// Load (or initialise) the Crux Daemon install UUID from `data_dir/.install-uuid`.
     ///
     /// On first call the file does not exist; we generate a new UUIDv4
     /// via the `uuid` crate and write it atomically. Subsequent calls
@@ -121,6 +121,13 @@ impl LocalPassportKey {
     /// stable across daemon restarts without exposing private material.
     pub fn from_data_dir(data_dir: &Path) -> Result<Self, SessionError> {
         Self::from_seed(read_or_init_passport_seed(&passport_key_path(data_dir))?)
+    }
+
+    /// Load (or initialise) the local RCX Passport signing key from an
+    /// explicit path. This supports the daemon v2 config topology where the
+    /// Passport key may live outside the segment data directory.
+    pub fn from_path(path: &Path) -> Result<Self, SessionError> {
+        Self::from_seed(read_or_init_passport_seed(path)?)
     }
 
     pub fn from_seed(seed: [u8; 32]) -> Result<Self, SessionError> {
@@ -321,6 +328,20 @@ mod tests {
         assert_eq!(key1.public_key_hex(), key2.public_key_hex());
         assert!(key1.passport_fpr().starts_with("p_"));
         assert_eq!(key1.passport_fpr().len(), 34);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn passport_key_initialises_from_explicit_path() {
+        let tmp = std::env::temp_dir().join(format!("crux-session-passport-path-{}", rand::random::<u64>()));
+        let key_path = tmp.join("keys").join("passport.key");
+        let key1 = LocalPassportKey::from_path(&key_path).unwrap();
+        let key2 = LocalPassportKey::from_path(&key_path).unwrap();
+
+        assert_eq!(key1.passport_fpr(), key2.passport_fpr());
+        assert_eq!(key1.public_key_hex(), key2.public_key_hex());
+        assert!(key_path.exists());
 
         std::fs::remove_dir_all(&tmp).ok();
     }

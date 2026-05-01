@@ -6,8 +6,9 @@
 //!
 //! This crate is deliberately pure for Phase 1: it consumes an
 //! [`rcx_capability_token::RcxCapabilityToken`] and returns deterministic
-//! routing/refusal decisions. Network refresh, hosted debits, and revocation IO
-//! land in later phases.
+//! routing/refusal decisions. Network refresh and revocation IO land in later phases.
+
+pub mod hosted;
 
 use rcx_capability_token::{
     Backend, CreditRefill, Credits, DataEgressClass, FallbackAction, FallbackPolicy, Issuer, OverdraftPolicy,
@@ -46,6 +47,7 @@ pub enum DenialReason {
     TokenExpired,
     CapabilityNotPermitted,
     EgressNotPermitted,
+    AttestationMissing,
     InsufficientCredit,
     ReceiptClassSideEffectDenied,
     BackendUnavailable,
@@ -58,6 +60,7 @@ impl DenialReason {
             Self::TokenExpired => "denied:token_expired",
             Self::CapabilityNotPermitted => "denied:capability_not_permitted",
             Self::EgressNotPermitted => "denied:egress_not_permitted",
+            Self::AttestationMissing => "denied:attestation_missing",
             Self::InsufficientCredit => "denied:insufficient_credit",
             Self::ReceiptClassSideEffectDenied => "denied:receipt_class_side_effect_denied",
             Self::BackendUnavailable => "denied:backend_unavailable",
@@ -70,6 +73,7 @@ pub struct CallContext {
     pub capability: String,
     pub preferred_backend: Option<String>,
     pub data_egress_classes: Vec<DataEgressClass>,
+    pub present_attestations: Vec<String>,
     pub estimated_credit_cost: u64,
     pub backend_reachable: bool,
 }
@@ -80,6 +84,7 @@ impl CallContext {
             capability: capability.into(),
             preferred_backend: Some("local".to_string()),
             data_egress_classes: vec![DataEgressClass::None],
+            present_attestations: Vec::new(),
             estimated_credit_cost: 0,
             backend_reachable: true,
         }
@@ -116,6 +121,8 @@ pub struct RefusalReceipt {
     pub capability: String,
     pub backend_id: Option<String>,
     pub data_egress_classes: Vec<String>,
+    pub required_attestations: Vec<String>,
+    pub present_attestations: Vec<String>,
     pub reason_code: String,
     pub receipt_class: String,
 }
@@ -194,13 +201,25 @@ impl RcxRouter {
         }) {
             return self.refuse(call, DenialReason::EgressNotPermitted);
         }
+        if capability
+            .required_attestations
+            .iter()
+            .any(|required| !call.present_attestations.iter().any(|present| present == required))
+        {
+            return self.refuse(call, DenialReason::AttestationMissing);
+        }
 
-        let debitable =
-            capability.credit_cost.as_ref().is_some_and(|cost| cost.cost > 0) || call.estimated_credit_cost > 0;
+        let credit_cost = capability
+            .credit_cost
+            .as_ref()
+            .map_or(call.estimated_credit_cost, |cost| {
+                call.estimated_credit_cost.max(cost.cost)
+            });
+        let debitable = credit_cost > 0;
         if self.token.receipt_class == ReceiptClass::Replay && debitable {
             return self.refuse(call, DenialReason::ReceiptClassSideEffectDenied);
         }
-        if debitable && !has_credit(&self.token, call.estimated_credit_cost) {
+        if debitable && !has_credit(&self.token, credit_cost) {
             return self.apply_fallback_action(
                 call,
                 &self.token.fallback.on_credits_exhausted,
@@ -237,6 +256,7 @@ impl RcxRouter {
                         capability: tool.capability.clone(),
                         preferred_backend: Some(tool.backend_id.clone()),
                         data_egress_classes: tool.data_egress_classes.clone(),
+                        present_attestations: Vec::new(),
                         estimated_credit_cost: 0,
                         backend_reachable: true,
                     },
@@ -335,6 +355,17 @@ impl RcxRouter {
                     .iter()
                     .map(|class| class.as_str().to_string())
                     .collect(),
+                required_attestations: self
+                    .select_backend(call)
+                    .and_then(|backend| {
+                        backend
+                            .permitted_capabilities
+                            .iter()
+                            .find(|capability| capability.capability == call.capability)
+                    })
+                    .map(|capability| capability.required_attestations.clone())
+                    .unwrap_or_default(),
+                present_attestations: call.present_attestations.clone(),
                 reason_code,
                 receipt_class: self.token.receipt_class.as_str().to_string(),
             }),
@@ -464,9 +495,18 @@ fn first_validation_reason(issues: &[TokenValidationIssue]) -> DenialReason {
 }
 
 fn has_credit(token: &RcxCapabilityToken, estimated_credit_cost: u64) -> bool {
-    match token.credits.balance {
-        Some(balance) => balance >= estimated_credit_cost,
-        None => token.tier == RcxTier::Free && estimated_credit_cost == 0,
+    if estimated_credit_cost == 0 {
+        return true;
+    }
+    let balance = token.credits.balance.unwrap_or(0);
+    if balance >= estimated_credit_cost {
+        return true;
+    }
+    match token.credits.overdraft {
+        OverdraftPolicy::Forbid => false,
+        OverdraftPolicy::Warn | OverdraftPolicy::AllowToLimit => {
+            balance.saturating_add(token.credits.overdraft_limit.unwrap_or(0)) >= estimated_credit_cost
+        }
     }
 }
 
@@ -537,6 +577,7 @@ mod tests {
             capability: "vaultcrux.retrieve".to_string(),
             preferred_backend: Some("hosted.vaultcrux.com".to_string()),
             data_egress_classes: vec![DataEgressClass::Vectors, DataEgressClass::ReceiptHashes],
+            present_attestations: vec!["passport_bound".to_string()],
             estimated_credit_cost,
             backend_reachable,
         }
@@ -569,6 +610,7 @@ mod tests {
                 capability: "corecrux.query.local".to_string(),
                 preferred_backend: Some("local".to_string()),
                 data_egress_classes: vec![DataEgressClass::Text],
+                present_attestations: Vec::new(),
                 estimated_credit_cost: 0,
                 backend_reachable: true,
             },
@@ -576,6 +618,27 @@ mod tests {
         );
         assert!(!decision.authorised);
         assert_eq!(decision.reason_code.as_deref(), Some("denied:egress_not_permitted"));
+    }
+
+    #[test]
+    fn refuses_when_required_attestation_is_missing() {
+        let mut call = hosted_retrieve_call(1, true);
+        call.present_attestations.clear();
+
+        let decision = hosted_router(
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            None,
+            Some(10),
+        )
+        .decide(&call, 1_776_989_601);
+
+        assert!(!decision.authorised);
+        assert_eq!(decision.reason_code.as_deref(), Some("denied:attestation_missing"));
+        let receipt = decision.refusal_receipt.expect("refusal receipt");
+        assert_eq!(receipt.required_attestations, vec!["passport_bound".to_string()]);
+        assert!(receipt.present_attestations.is_empty());
     }
 
     #[test]
@@ -631,6 +694,21 @@ mod tests {
         assert_eq!(decision.backend_id.as_deref(), Some("local"));
         assert_eq!(decision.reason_code.as_deref(), Some("denied:insufficient_credit"));
         assert_eq!(decision.stamp.mode, "degraded-local");
+    }
+
+    #[test]
+    fn hosted_credit_cost_is_enforced_when_call_estimate_is_zero() {
+        let decision = hosted_router(
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            None,
+            Some(0),
+        )
+        .decide(&hosted_retrieve_call(0, true), 1_776_989_601);
+
+        assert!(!decision.authorised);
+        assert_eq!(decision.reason_code.as_deref(), Some("denied:insufficient_credit"));
     }
 
     #[test]

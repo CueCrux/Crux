@@ -15,7 +15,7 @@ pub struct SmokeReport {
 }
 
 pub fn run(_device_index: i32) -> Result<SmokeReport, Box<dyn std::error::Error + Send + Sync>> {
-    Err("corecruxctl was built without CUDA support (community edition is CPU-only)".into())
+    Err("corecruxctl was built without CUDA support (Crux Daemon is CPU-only)".into())
 }
 
 #[cfg(test)]

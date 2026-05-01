@@ -18,7 +18,7 @@ pub const HASH_LEN: usize = 32;
 pub const SIGNATURE_LEN: usize = 64;
 pub const ULID_LEN: usize = 16;
 
-/// Receipt mode. `"local"` = BLAKE3 only (CE). `"verified"` = BLAKE3 + ed25519
+/// Receipt mode. `"local"` = BLAKE3 only. `"verified"` = BLAKE3 + ed25519
 /// (hosted). `"audit"` = reserved for future audit-grade signing policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 
@@ -43,7 +43,7 @@ pub struct Passport {
     pub principal_id: String,
     pub tier: String,
     pub affinities: Vec<String>,
-    /// BLAKE3 of the source passport record; hosted only. None on CE.
+    /// BLAKE3 of the source passport record; hosted only. None on Crux Daemon.
     pub passport_receipt: Option<[u8; HASH_LEN]>,
 }
 

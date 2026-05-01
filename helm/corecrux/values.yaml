@@ -1,9 +1,9 @@
-# CoreCrux Community Edition — default values
+# Crux Daemon — default values
 
 replicaCount: 1
 
 image:
-  repository: ghcr.io/cuecrux/corecrux-community
+  repository: ghcr.io/cuecrux/crux-daemon
   # -- Overrides the image tag; defaults to the chart appVersion
   tag: ""
   pullPolicy: IfNotPresent

@@ -1,4 +1,4 @@
-CoreCrux Community Edition has been deployed.
+Crux Daemon has been deployed.
 
 1. Get the application URL:
 {{- if .Values.ingress.enabled }}

@@ -1,8 +1,8 @@
-# Session Handshake (Crux CE)
+# Session Handshake (Crux Daemon)
 
-Crux CE supports the VaultCrux Session Handshake v1 protocol — one endpoint
+Crux Daemon supports the VaultCrux Session Handshake v1 protocol — one endpoint
 and one MCP tool that together give an agent a receipted plan describing
-what it's allowed to do. This document covers the CE-specific bits:
+what it's allowed to do. This document covers the local-daemon specifics:
 where state lives on disk, what the wire formats look like, and how to
 verify a session plan or invocation receipt outside the daemon.
 
@@ -12,11 +12,11 @@ the execution history lives in
 [vaultcrux-session-handshake-2026-04-17.md](../../PlanCrux/.agent/execplans/vaultcrux-session-handshake-2026-04-17.md).
 What follows is the operator-facing summary.
 
-## What CE gives you
+## What Crux Daemon Gives You
 
 - **One MCP tool:** `cuecrux_session`. Registered at the head of the
   `tools/list` catalogue; collapses per-service discovery into one call.
-- **One HTTP endpoint:** `POST /session` (unversioned path; CE-specific,
+- **One HTTP endpoint:** `POST /session` (unversioned path; local-daemon specific,
   matches master-plan §5.1).
 - **One verification endpoint:** `POST /invocation/verify`. Decodes a
   hex-encoded invocation receipt and returns the governance verdict.
@@ -26,14 +26,14 @@ What follows is the operator-facing summary.
   - `session-events.jsonl` — append-only sealed-event log (one JSON line
     per `SessionPlanSealed` or `InvocationReceipted` event).
 
-Plans on CE run in `"local"` receipt mode: BLAKE3 hash over canonical
+Plans on Crux Daemon run in `"local"` receipt mode: BLAKE3 hash over canonical
 CBOR, no ed25519 signature. Local mode covers integrity; signed plans
-are a hosted-only thing because CE's threat model trusts the local
+are a hosted-only thing because the local-daemon threat model trusts the local
 machine.
 
 ## Opening a session
 
-```
+```http
 POST /session HTTP/1.1
 Host: localhost:14800
 Content-Type: application/json
@@ -50,7 +50,7 @@ Accept: application/json
 
 Response:
 
-```
+```http
 HTTP/1.1 200 OK
 Content-Type: application/json
 X-CueCrux-Session-Id: 0102030405060708090a0b0c0d0e0f10
@@ -74,16 +74,16 @@ Fields an agent should care about:
 | `session_id` | Opaque 16-byte ULID; used as the bearer for subsequent calls. |
 | `capability_graph` | Array of `{cap, prefer, shape, min_tier, cost_class, impl_path}`. Everything the passport is entitled to invoke this session. |
 | `capability_graph_hash` | BLAKE3 over the canonical-CBOR of `capability_graph`. Exposed so MemoryCrux + audit tools can index by surface. |
-| `channels` | `{bulk, mcp}` — where to route calls. `bulk` is null on CE until Layer 2 ships. |
+| `channels` | `{bulk, mcp}` — where to route calls. `bulk` is null on Crux Daemon until Layer 2 ships. |
 | `receipt.hash` | BLAKE3 over canonical-CBOR of the plan with `hash`/`signature`/`signer_kid` zeroed. |
-| `receipt.mode` | `"local"` on CE. `"verified"` on hosted, with an `ed25519` signature over the hash. |
+| `receipt.mode` | `"local"` on Crux Daemon. `"verified"` on hosted, with an `ed25519` signature over the hash. |
 | `intent_hint` | Echoes back the `intent` field from the request, if supplied. |
 
-CE's capability graph is shaped by:
+The Crux Daemon capability graph is shaped by:
 
 1. **Affinity** — the passport has `["*"]` so every catalogue entry
    passes the affinity filter.
-2. **Tier** — CE runs at tier `"local"`. Catalogue entries with
+2. **Tier** — Crux Daemon runs at tier `"local"`. Catalogue entries with
    `min_tier: "free"` or above are filtered out. Baseline free
    capabilities (`session_context`, `journal_append`, etc.) are in;
    `retrieve` / `proof_document` / `audit_replay` are hosted-only.
@@ -96,7 +96,7 @@ Every call made under an active session should produce an
 
 To verify one:
 
-```
+```http
 POST /invocation/verify HTTP/1.1
 Host: localhost:14800
 Content-Type: application/json
@@ -137,7 +137,7 @@ enforcement to apply.
 
 ## On-disk format
 
-CE is designed so that an operator can `jq` through state without
+Crux Daemon is designed so that an operator can `jq` through state without
 spinning up a database:
 
 ```bash
@@ -174,18 +174,20 @@ canonical CBOR, so the same receipt verifies in either runtime.
 
 ## Feature flags
 
-CE has no plan-level feature flags at M6 — everything is always on. On
+Crux Daemon has no plan-level feature flags at M6 — everything is always on. On
 hosted the session feature is gated behind `FEATURE_SESSION_HANDSHAKE`
-per tenant; CE ships with it enabled by default.
+per tenant; Crux Daemon ships with it enabled by default.
 
 ## What's missing (follow-ups)
 
-- **Layer 2 bulk channel.** CE surfaces `channels.bulk: null`; the HTTP/2
-  + CBOR bulk transport is a separate plan.
+- **Layer 2 bulk channel.** Crux Daemon surfaces `channels.bulk: null`;
+  the HTTP/2 + CBOR bulk transport is a separate plan.
 - **Automatic MCP interceptor.** Invocation receipts are minted by an
   agent that chooses to chain them; there is no built-in trap-door that
   silently mints one for every tool call. See the M4 deferred-to-follow-up
   note in the ExecPlan.
-- **CE → Core migration.** The `CeInstallImported` event type and the
+- **Hosted import migration.** The import event type and the
   `imported_principal_map` table are pre-positioned for Phase 8; the
-  actual upload pipeline is not yet wired.
+  actual upload pipeline is not yet wired. The persisted `ce:` principal
+  prefix remains as a wire-compatibility identifier for existing local
+  receipts.

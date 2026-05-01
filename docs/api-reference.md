@@ -1,6 +1,6 @@
 # API Reference
 
-CoreCrux Community Edition exposes three network surfaces by default:
+Crux Daemon exposes three network surfaces by default:
 
 - HTTP API on `14800`
 - gRPC API on `4007`
@@ -26,7 +26,7 @@ CoreCrux Community Edition exposes three network surfaces by default:
 | POST | `/v1/query/graph-expand` | Graph traversal from seed artifacts with budget | `query:read` * |
 | POST | `/v1/query/time-range` | Temporal range query over artifact state changes | `query:read` * |
 
-\* Requires proprietary edition data-plane. Returns 501 in Community Edition.
+\* Requires a dataplane-enabled deployment. Returns 501 in Crux Daemon.
 
 ### Fact Store
 
@@ -55,7 +55,7 @@ visibility are MCP-only features.
 |--------|------|-------------|------------|
 | POST | `/v1/admin/append` | Append events to a stream (`/v1/append` compatibility alias) | `admin:write` * |
 
-\* Requires proprietary edition data-plane. Returns 501 in Community Edition.
+\* Requires a dataplane-enabled deployment. Returns 501 in Crux Daemon.
 
 ### CROWN Receipts
 
@@ -98,7 +98,7 @@ visibility are MCP-only features.
 | GET | `/v1/admin/projections/artifacts/{artifactId}/dependents` | Artifact dependents | `admin:read` * |
 | GET | `/v1/admin/projections/artifacts/{artifactId}/pressure-events` | Artifact pressure events | `admin:read` * |
 
-\* Requires proprietary edition data-plane. Returns 501 in Community Edition.
+\* Requires a dataplane-enabled deployment. Returns 501 in Crux Daemon.
 
 ### Routing & Shards
 
@@ -111,7 +111,7 @@ visibility are MCP-only features.
 | GET | `/v1/routing/status` | Routing table version and reload status | `admin:read` |
 | GET | `/v1/gpus` | GPU inventory | `admin:read` * |
 
-\* Requires proprietary edition. Returns 501 in Community Edition.
+\* Requires a dataplane-enabled deployment. Returns 501 in Crux Daemon.
 
 ### Admin & Operations
 
@@ -127,7 +127,7 @@ visibility are MCP-only features.
 | POST | `/v1/admin/stream-meta` | Update stream metadata | `admin:write` * |
 | POST | `/v1/internal/replication/segments` | Receive replicated segments | `admin:write` * |
 
-\* Requires proprietary edition data-plane. Returns 501 in Community Edition.
+\* Requires a dataplane-enabled deployment. Returns 501 in Crux Daemon.
 
 ---
 
@@ -137,7 +137,7 @@ Default port: `4007`. Proto files in `proto/`.
 
 ### CoreCruxDataPlaneV1
 
-All RPCs return `UNIMPLEMENTED` in Community Edition (requires proprietary edition).
+All RPCs return `UNIMPLEMENTED` in Crux Daemon and require a dataplane-enabled deployment.
 
 | RPC | Request | Response | Description |
 |-----|---------|----------|-------------|
@@ -157,7 +157,7 @@ All RPCs return `UNIMPLEMENTED` in Community Edition (requires proprietary editi
 |-----|---------|----------|-------------|
 | `ExportReceiptBundle` | `ExportReceiptBundleRequest` | stream `ExportChunk` | Stream large export bundles |
 
-Returns `UNIMPLEMENTED` in Community Edition.
+Returns `UNIMPLEMENTED` in Crux Daemon.
 
 ### CoreCruxObserveV1
 

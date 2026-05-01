@@ -3,7 +3,7 @@
 
 services:
   crux:
-    image: cuecrux/crux-community:latest
+    image: cuecrux/crux-daemon:latest
     build: .
     ports:
       - "127.0.0.1:14800:14800"

@@ -1,6 +1,6 @@
 # MCP Client Configuration Examples
 
-Example configuration files for connecting MCP clients to a running CoreCrux instance.
+Example configuration files for connecting MCP clients to a running Crux Daemon instance.
 
 ## How it works
 
@@ -9,24 +9,27 @@ For MCP clients, the relevant network surfaces are:
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | **14800** | HTTP/REST | Human-facing API (`/healthz`, `/v1/facts`, `/v1/query/*`) |
-| **14801** | MCP (JSON-RPC) | Agent-facing API (22 tools for retrieval, facts, sessions, sync, updates, decisions) |
+| **14801** | MCP (JSON-RPC) | Agent-facing API with token-filtered tools for retrieval, facts, sessions, sync, updates, and decisions |
 
 Your MCP client connects to `http://localhost:14801/mcp`.
 
 ## Prerequisites
 
-1. CoreCrux must be running:
+1. Crux Daemon must be running:
+
    ```bash
    docker compose up -d
    # or: source config.example.env && ./corecruxd
    ```
 
 2. Verify the MCP server is reachable:
+
    ```bash
    curl -s -X POST http://localhost:14801/mcp \
      -H "Content-Type: application/json" \
-     -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | jq '.result.tools | length'
-   # Expected output: 22
+     -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' \
+     | jq '.result.tools[].name'
+   # Expected output includes query, store_fact, query_facts, and cuecrux_session
    ```
 
 If the server is configured with `CRUX_AGENT_TOKEN` or `CRUX_AGENT_TOKENS`,
@@ -65,7 +68,7 @@ Copy `cursor.json` into your project root as `.cursor/mcp.json`, or merge the
 
 ## Custom Port
 
-If CoreCrux is running on a different MCP port, update the `url` field:
+If Crux Daemon is running on a different MCP port, update the `url` field:
 
 ```json
 {
