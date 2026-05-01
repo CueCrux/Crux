@@ -2,7 +2,7 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-use axum::response::{Html, IntoResponse};
+use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::get;
 use axum::Router;
 use tower_http::cors::CorsLayer;
@@ -13,12 +13,17 @@ async fn serve_console() -> impl IntoResponse {
     Html(PLAYGROUND_HTML)
 }
 
+async fn redirect_to_console() -> impl IntoResponse {
+    Redirect::to("/console")
+}
+
 pub fn routes(enabled: bool) -> Router {
     if !enabled {
         return Router::new();
     }
 
     Router::new()
+        .route("/", get(redirect_to_console))
         .route("/console", get(serve_console))
         .route("/playground", get(serve_console))
         .layer(CorsLayer::permissive())
