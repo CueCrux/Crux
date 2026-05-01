@@ -737,6 +737,7 @@ dependencies = [
  "corecrux-types",
  "crc32fast",
  "crux-enterprise-shim",
+ "crux-integrations",
  "crux-mcp",
  "crux-observe",
  "crux-router",
@@ -912,6 +913,19 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "ureq",
+]
+
+[[package]]
+name = "crux-integrations"
+version = "0.2.0"
+dependencies = [
+ "base64",
+ "blake3",
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -93,6 +93,7 @@ pub struct Config {
     pub grpc_addr: SocketAddr,
     pub mcp_addr: SocketAddr,
     pub mcp_enabled: bool,
+    pub console_enabled: bool,
     pub state_dir: PathBuf,
     pub data_dir: PathBuf,
     pub log_level: String,
@@ -203,6 +204,11 @@ pub struct Config {
     pub update_check_ref: String,
     pub update_check_interval_secs: u64,
     pub update_check_repo_dir: Option<PathBuf>,
+
+    // Embedded console + declarative integration library.
+    pub integrations_enabled: bool,
+    pub integrations_safe_mode: bool,
+    pub integrations_allow_executable_helpers: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -378,6 +384,7 @@ pub fn load_config() -> Config {
     let mcp_enabled = env_bool("CORECRUXD_MCP_ENABLED")
         .or(file_config.daemon.mcp_enabled)
         .unwrap_or(true);
+    let console_enabled = env_bool("CORECRUXD_CONSOLE_ENABLED").unwrap_or(true);
 
     let file_state_dir = file_config.daemon.state_dir.as_deref().map(expand_path);
     let file_data_dir = file_config.daemon.data_dir.as_deref().map(expand_path);
@@ -644,6 +651,7 @@ pub fn load_config() -> Config {
         grpc_addr: SocketAddr::new(grpc_host, grpc_port),
         mcp_addr: SocketAddr::new(mcp_host, mcp_port),
         mcp_enabled,
+        console_enabled,
         state_dir,
         data_dir,
         log_level,
@@ -788,6 +796,15 @@ pub fn load_config() -> Config {
             .ok()
             .map(PathBuf::from)
             .filter(|path| !path.as_os_str().is_empty()),
+        integrations_enabled: std::env::var("CORECRUXD_INTEGRATIONS_ENABLED")
+            .ok()
+            .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
+        integrations_safe_mode: std::env::var("CORECRUXD_INTEGRATIONS_SAFE_MODE")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
+        integrations_allow_executable_helpers: std::env::var("CORECRUXD_INTEGRATIONS_ALLOW_EXECUTABLE_HELPERS")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
     }
 }
 

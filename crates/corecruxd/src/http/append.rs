@@ -76,6 +76,18 @@ pub(super) async fn post_admin_append(
         return map_http_dataplane_error(err);
     }
 
+    if let Err(err) = crate::console_index::record_appended_events(
+        &state.data_dir,
+        &body.tenant_id,
+        &body.stream_type,
+        &body.stream_id,
+        body.expected_next_seq,
+        &events,
+        crate::ops_events::now_unix_ms(),
+    ) {
+        tracing::warn!(?err, "console chunk metadata indexing failed");
+    }
+
     // stateful-extraction-flywheel M1.b — feed the extraction-cache materializer
     // inline for any `corecrux.proj.extraction.*` events in this batch. This is
     // the CE-friendly path: events are still persisted in the stream log, but

@@ -1734,7 +1734,7 @@ mod tests {
         let stream_id = "a";
         let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
-        std::env::set_var("CORECRUX_STORAGE_FAILPOINT", "after_manifest_commit");
+        set_test_failpoint("after_manifest_commit");
         let err = storage
             .append_batch(
                 stream_hash,
@@ -1753,7 +1753,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(format!("{err}").contains("after_manifest_commit"));
-        std::env::remove_var("CORECRUX_STORAGE_FAILPOINT");
+        clear_test_failpoint();
         drop(storage);
 
         let mut reopened = ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
@@ -1796,7 +1796,7 @@ mod tests {
         let stream_id = "a";
         let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
-        std::env::set_var("CORECRUX_STORAGE_FAILPOINT", "after_manifest_commit");
+        set_test_failpoint("after_manifest_commit");
         let err = storage
             .append_batch(
                 stream_hash,
@@ -1815,7 +1815,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(format!("{err}").contains("after_manifest_commit"));
-        std::env::remove_var("CORECRUX_STORAGE_FAILPOINT");
+        clear_test_failpoint();
         drop(storage);
 
         let mut reopened = ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
@@ -1864,7 +1864,7 @@ mod tests {
         let stream_id = "a";
         let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
-        std::env::set_var("CORECRUX_STORAGE_FAILPOINT", "after_rename_before_manifest");
+        set_test_failpoint("after_rename_before_manifest");
         let err = storage
             .append_batch(
                 stream_hash,
@@ -1883,7 +1883,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(format!("{err}").contains("after_rename_before_manifest"));
-        std::env::remove_var("CORECRUX_STORAGE_FAILPOINT");
+        clear_test_failpoint();
         drop(storage);
 
         let mut reopened = ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
@@ -2006,7 +2006,7 @@ mod tests {
         let stream_id = "a";
         let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
 
-        std::env::set_var("CORECRUX_STORAGE_FAILPOINT", "after_head_commit_fence_before_ack");
+        set_test_failpoint("after_head_commit_fence_before_ack");
         let err = storage
             .append_batch(
                 stream_hash,
@@ -2025,7 +2025,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(format!("{err}").contains("after_head_commit_fence_before_ack"));
-        std::env::remove_var("CORECRUX_STORAGE_FAILPOINT");
+        clear_test_failpoint();
         drop(storage);
 
         let mut reopened = ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
@@ -3991,7 +3991,7 @@ mod tests {
 
     #[test]
     fn failpoint_active_returns_false_by_default() {
-        std::env::remove_var("CORECRUX_STORAGE_FAILPOINT");
+        clear_test_failpoint();
         assert!(!failpoint_active("whatever"));
     }
 
