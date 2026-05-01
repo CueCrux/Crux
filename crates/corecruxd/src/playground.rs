@@ -9,12 +9,17 @@ use tower_http::cors::CorsLayer;
 
 const PLAYGROUND_HTML: &str = include_str!("../playground/index.html");
 
-async fn serve_playground() -> impl IntoResponse {
+async fn serve_console() -> impl IntoResponse {
     Html(PLAYGROUND_HTML)
 }
 
-pub fn routes() -> Router {
+pub fn routes(enabled: bool) -> Router {
+    if !enabled {
+        return Router::new();
+    }
+
     Router::new()
-        .route("/playground", get(serve_playground))
+        .route("/console", get(serve_console))
+        .route("/playground", get(serve_console))
         .layer(CorsLayer::permissive())
 }

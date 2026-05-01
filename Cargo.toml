@@ -12,6 +12,7 @@ members = [
   "crates/corecrux-memory",
   "crates/crux-sync",
   "crates/crux-contrib",
+  "crates/crux-integrations",
   "crates/crux-observe",
   "crates/crux-mcp",
   "crates/crux-session",

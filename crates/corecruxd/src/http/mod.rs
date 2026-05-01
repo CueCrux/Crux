@@ -4,6 +4,7 @@
 
 mod admin;
 mod append;
+mod console;
 mod dataplane;
 mod events;
 mod facts;
@@ -128,10 +129,17 @@ pub struct AppState {
     pub auth: Authz,
     pub data_dir: PathBuf,
     pub mcp_enabled: bool,
+    pub console_enabled: bool,
+    pub integrations_enabled: bool,
+    pub integrations_safe_mode: bool,
+    pub integrations_allow_executable_helpers: bool,
     pub read_retry_failed_readyz_threshold: u64,
     pub commit_level: CommitLevel,
     pub metrics: Metrics,
     pub node_id: String,
+    pub passport_fpr: String,
+    pub passport_public_key_hex: String,
+    pub mcp_agent_count: usize,
     pub routing: Arc<RwLock<RoutingTable>>,
     pub routing_errors: Arc<RwLock<Vec<String>>>,
     pub dataplane_pool: Option<crate::pool::DataPlanePool>,
@@ -177,6 +185,7 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
+    let console_enabled = state.console_enabled;
     Router::new()
         .route("/healthz", get(self::health::healthz))
         .route("/readyz", get(self::health::readyz))
@@ -318,9 +327,28 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/version", get(self::health::get_version))
         // OpenAPI spec
         .route("/v1/openapi.json", get(self::openapi::openapi_json))
+        // Read-only console aggregation APIs.
+        .route("/v1/console/summary", get(self::console::get_console_summary))
+        .route(
+            "/v1/console/integrations",
+            get(self::console::get_console_integrations),
+        )
+        .route("/v1/console/passports", get(self::console::get_console_passports))
+        .route("/v1/console/sessions", get(self::console::get_console_sessions))
+        .route("/v1/console/facts", get(self::console::get_console_facts))
+        .route("/v1/console/tenants", get(self::console::get_console_tenants))
+        .route(
+            "/v1/console/tenants/{tenantId}/chunks",
+            get(self::console::get_console_tenant_chunks),
+        )
+        .route("/v1/console/chunks/{chunkDigest}", get(self::console::get_console_chunk))
+        .route(
+            "/v1/console/chunks/{chunkDigest}/preview",
+            get(self::console::get_console_chunk_preview),
+        )
         .with_state(state)
         // Built-in web playground (stateless, merged after with_state)
-        .merge(crate::playground::routes())
+        .merge(crate::playground::routes(console_enabled))
         .layer(CatchPanicLayer::custom(self::health::handle_panic))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(30)))
         .layer(middleware::from_fn(traceparent_middleware))

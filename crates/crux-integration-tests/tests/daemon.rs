@@ -35,6 +35,50 @@ fn version_includes_update_status() {
     assert!(body["update"]["state"].is_string());
     assert!(body["update"]["upgrade_hint"].is_string());
 }
+
+#[test]
+fn console_shell_renders() {
+    let html = daemon().get("/console").unwrap().into_body().read_to_string().unwrap();
+    assert!(html.contains("Crux Console"));
+    assert!(!html.contains("https://"));
+
+    let alias = daemon()
+        .get("/playground")
+        .unwrap()
+        .into_body()
+        .read_to_string()
+        .unwrap();
+    assert!(alias.contains("Crux Console"));
+}
+
+#[test]
+fn console_summary_api() {
+    let body: serde_json::Value = daemon()
+        .get("/v1/console/summary")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(body["console"]["route"], "/console");
+    assert_eq!(body["daemon"]["mcp_enabled"], true);
+    assert!(body["integrations"]["builtin_pack_count"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn console_integrations_api() {
+    let body: serde_json::Value = daemon()
+        .get("/v1/console/integrations")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(body["enabled"], true);
+    assert!(body["packs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|pack| { pack["manifest"]["id"] == "mcp.cursor" }));
+}
 #[test]
 fn shards() {
     let b: serde_json::Value = daemon().get("/v1/shards").unwrap().into_body().read_json().unwrap();

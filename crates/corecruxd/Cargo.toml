@@ -57,6 +57,7 @@ corecrux-segment = { path = "../corecrux-segment" }
 corecrux-storage = { path = "../corecrux-storage" }
 corecrux-types = { path = "../corecrux-types" }
 crux-observe = { path = "../crux-observe" }
+crux-integrations = { path = "../crux-integrations" }
 crux-mcp = { path = "../crux-mcp" }
 crux-router = { path = "../crux-router" }
 crux-session = { path = "../crux-session" }
