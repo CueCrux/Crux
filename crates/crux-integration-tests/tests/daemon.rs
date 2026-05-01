@@ -42,6 +42,9 @@ fn console_shell_renders() {
     assert!(html.contains("Crux Console"));
     assert!(!html.contains("https://"));
 
+    let root = daemon().get("/").unwrap().into_body().read_to_string().unwrap();
+    assert!(root.contains("Crux Console"));
+
     let alias = daemon()
         .get("/playground")
         .unwrap()
