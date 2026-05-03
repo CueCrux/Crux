@@ -79,10 +79,12 @@ jobs:
             -H 'X-Corecrux-Scopes: admin:read' \
             | jq -e '.packs | type == "array"' >/dev/null
           curl -sf http://localhost:14801/mcp | jq -e '.serverInfo.name == "crux"' >/dev/null
+          # Lower-bound assertion so the smoke test doesn't break each time
+          # we add a tool. Exact count pinned by crux_mcp::tools::tests::TOOL_COUNT.
           curl -sf -X POST http://localhost:14801/mcp \
             -H "Content-Type: application/json" \
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-            | jq -e '.result.tools | length == 25' >/dev/null
+            | jq -e '.result.tools | length >= 35' >/dev/null
 
   msrv:
     name: MSRV (1.88.0)

@@ -42,8 +42,8 @@ async fn serve_console_asset(AxumPath(name): AxumPath<String>) -> Response {
     if name.contains('/') || name.contains("..") {
         return (axum::http::StatusCode::BAD_REQUEST, "invalid asset name").into_response();
     }
-    // Dev override wins when present so designers can drop new PNGs in without
-    // a rebuild.
+    // Dev override wins when present so designers can drop new PNG / SVG /
+    // WebP files in without a rebuild.
     if let Some(dev_path) = std::env::var(CONSOLE_DEV_PATH_ENV)
         .ok()
         .filter(|s| !s.trim().is_empty())
