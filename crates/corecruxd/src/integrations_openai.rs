@@ -152,9 +152,7 @@ pub fn verify_api_key(api_key: &str, organization_id: Option<&str>) -> Result<Ve
             req = req.header("OpenAI-Organization", org);
         }
     }
-    let mut response = req
-        .call()
-        .map_err(|e| OpenAiIntegrationError::Network(e.to_string()))?;
+    let mut response = req.call().map_err(|e| OpenAiIntegrationError::Network(e.to_string()))?;
     let status = response.status().as_u16();
     let body = response
         .body_mut()
@@ -179,7 +177,9 @@ pub fn verify_api_key(api_key: &str, organization_id: Option<&str>) -> Result<Ve
     // Sort for stable display; cap to 64 to keep credential file small.
     models.sort();
     models.truncate(64);
-    Ok(VerifiedKey { available_models: models })
+    Ok(VerifiedKey {
+        available_models: models,
+    })
 }
 
 fn credentials_path(data_dir: &Path) -> PathBuf {

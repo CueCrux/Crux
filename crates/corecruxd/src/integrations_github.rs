@@ -13,6 +13,8 @@
 //!
 //! Future (G2): `selected_repos.json` for the operator-selected repo set.
 
+#![allow(dead_code)] // integration scaffolding kept for upcoming PAT-rotation flow
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -138,15 +140,18 @@ pub fn verify_pat(pat: &str) -> Result<VerifiedUser, GithubIntegrationError> {
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .header("User-Agent", "crux-daemon");
-    let mut response = req
-        .call()
-        .map_err(|e| GithubIntegrationError::Network(e.to_string()))?;
+    let mut response = req.call().map_err(|e| GithubIntegrationError::Network(e.to_string()))?;
     let status = response.status().as_u16();
     let scopes = response
         .headers()
         .get("x-oauth-scopes")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect::<Vec<_>>())
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let body = response
         .body_mut()
@@ -209,7 +214,10 @@ pub fn list_selected_repos(data_dir: &Path) -> Vec<SelectedRepo> {
     if !path.exists() {
         return Vec::new();
     }
-    match fs::read(&path).ok().and_then(|b| serde_json::from_slice::<SelectedReposFile>(&b).ok()) {
+    match fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<SelectedReposFile>(&b).ok())
+    {
         Some(file) => file.repos,
         None => Vec::new(),
     }
@@ -230,7 +238,7 @@ pub fn select_repo(
         if private && !existing.private {
             let mut upgraded = existing.clone();
             upgraded.private = true;
-            for r in repos.iter_mut() {
+            for r in &mut repos {
                 if r.owner == owner && r.repo == repo {
                     *r = upgraded.clone();
                 }
@@ -264,9 +272,11 @@ pub fn set_planning_repo(
     let target = repos
         .iter_mut()
         .find(|r| r.owner == owner && r.repo == repo)
-        .ok_or_else(|| GithubIntegrationError::VerifyFailed(format!(
-            "repo {owner}/{repo} is not in the selected set; select it first"
-        )))?;
+        .ok_or_else(|| {
+            GithubIntegrationError::VerifyFailed(format!(
+                "repo {owner}/{repo} is not in the selected set; select it first"
+            ))
+        })?;
     target.planning = planning;
     let updated = target.clone();
     write_selected_repos(data_dir, &repos)?;

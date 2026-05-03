@@ -98,7 +98,11 @@ fn filter_by_entity_prefix(body: &str, prefix: &str, top_k: usize) -> Value {
         .unwrap_or_default();
     let filtered: Vec<Value> = facts
         .into_iter()
-        .filter(|f| f.get("entity").and_then(|e| e.as_str()).is_some_and(|e| e.starts_with(prefix)))
+        .filter(|f| {
+            f.get("entity")
+                .and_then(|e| e.as_str())
+                .is_some_and(|e| e.starts_with(prefix))
+        })
         .take(top_k)
         .collect();
     json!({ "count": filtered.len(), "facts": filtered })
@@ -133,10 +137,7 @@ pub async fn handle_github_search(args: &Value, ctx: &McpContext) -> Result<Valu
     let repo = args.get("repo").and_then(|v| v.as_str());
     let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(20).min(200) as usize;
     let base = loopback_base(ctx)?;
-    let url = format!(
-        "{base}/v1/console/facts?q={}&top_k={top_k}",
-        urlencoding(q)
-    );
+    let url = format!("{base}/v1/console/facts?q={}&top_k={top_k}", urlencoding(q));
     let body = loopback_get(url).await?;
     let prefix = match repo {
         Some(r) => format!("github::{r}::"),
@@ -154,7 +155,11 @@ pub async fn handle_github_recent_commits(args: &Value, ctx: &McpContext) -> Res
         urlencoding(&format!("github::{repo}::commit"))
     );
     let body = loopback_get(url).await?;
-    Ok(text_content(filter_by_entity_prefix(&body, &format!("github::{repo}::commit/"), limit)))
+    Ok(text_content(filter_by_entity_prefix(
+        &body,
+        &format!("github::{repo}::commit/"),
+        limit,
+    )))
 }
 
 pub async fn handle_github_open_prs(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
@@ -232,7 +237,11 @@ pub async fn handle_github_comments_since(args: &Value, ctx: &McpContext) -> Res
     let url = format!("{base}/v1/console/facts?q=github::&top_k=500");
     let body = loopback_get(url).await?;
     let parsed: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
-    let facts = parsed.get("facts").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let facts = parsed
+        .get("facts")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     let comments: Vec<Value> = facts
         .into_iter()
         .filter(|f| {

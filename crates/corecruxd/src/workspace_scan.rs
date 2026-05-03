@@ -189,9 +189,9 @@ pub struct FileReference {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteHit {
-    pub method: String,            // GET / POST / PATCH / DELETE / PUT
-    pub path: String,              // "/v1/projects/{id}"
-    pub handler_fn: String,        // post_project
+    pub method: String,     // GET / POST / PATCH / DELETE / PUT
+    pub path: String,       // "/v1/projects/{id}"
+    pub handler_fn: String, // post_project
     /// Where the handler function is defined. None if the symbol couldn't be
     /// resolved (e.g. handler comes from a re-exported module behind a macro).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -274,8 +274,8 @@ pub fn run_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
     // ── 1. Find crates by walking for Cargo.toml files. ───────────────
     let mut cargo_files: Vec<PathBuf> = Vec::new();
     walk_dir(root, root, &mut |rel_path, abs_path| {
-        if abs_path.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml")
-            && rel_path != Path::new("Cargo.toml") // skip workspace root manifest
+        if abs_path.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml") && rel_path != Path::new("Cargo.toml")
+        // skip workspace root manifest
         {
             cargo_files.push(abs_path.to_path_buf());
         }
@@ -321,15 +321,17 @@ pub fn run_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
     // ── 2. Per-crate: parse files, extract symbols + deps + stubs ─────
     let mut all_pub_symbols: HashMap<String, Vec<usize>> = HashMap::new(); // name → indices into scan.symbols
     for (cname, files) in &files_by_crate {
-        let crate_root = crate_dirs.get(cname).expect("dir present").clone();
+        // crate_dirs was populated from the same files_by_crate keys above —
+        // the missing-key branch is structurally unreachable but we handle it
+        // gracefully rather than panic.
+        let Some(crate_root) = crate_dirs.get(cname).cloned() else {
+            continue;
+        };
         let mut crate_loc = 0usize;
         let mut crate_file_count = 0usize;
 
         for abs in files {
-            let rel = abs
-                .strip_prefix(root)
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|_| abs.clone());
+            let rel = abs.strip_prefix(root).map_or_else(|_| abs.clone(), |p| p.to_path_buf());
             let rel_str = rel.display().to_string();
             let module_path = infer_module_path(cname, &crate_root, abs);
 
@@ -416,8 +418,7 @@ pub fn run_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
             name: cname.clone(),
             rel_path: crate_root
                 .strip_prefix(root)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| crate_root.display().to_string()),
+                .map_or_else(|_| crate_root.display().to_string(), |p| p.display().to_string()),
             internal_deps: crate_internal_deps.remove(cname).unwrap_or_default(),
             file_count: crate_file_count,
             total_loc: crate_loc,
@@ -481,7 +482,7 @@ pub fn run_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
 
         for (cname, files) in &files_by_crate {
             for abs in files {
-                let rel = abs.strip_prefix(root).map(|p| p.to_path_buf()).unwrap_or_else(|_| abs.clone());
+                let rel = abs.strip_prefix(root).map_or_else(|_| abs.clone(), |p| p.to_path_buf());
                 let rel_str = rel.display().to_string();
                 let from_idx = match file_idx_by_path.get(&rel_str) {
                     Some(i) => *i,
@@ -572,12 +573,10 @@ pub fn run_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
                             .iter()
                             .filter(|i| scan.symbols[**i].file_rel_path == rel_str)
                             .collect();
-                        let target_idx = if same_file.len() == 1 {
-                            Some(*same_file[0])
-                        } else if same_file.len() > 1 {
-                            // Multiple definitions of the same fn name in one
-                            // file is rare (usually a test mod) — resolve to
-                            // the first.
+                        let target_idx = if !same_file.is_empty() {
+                            // Resolve to first same-file match. Single hit is
+                            // the common case; multiple-in-one-file is rare
+                            // and usually a test mod reusing the fn name.
                             Some(*same_file[0])
                         } else {
                             let same_crate: Vec<&usize> = candidates
@@ -622,11 +621,7 @@ pub fn run_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
                                     }
                                 })
                                 .unwrap_or_default();
-                            let key = (
-                                target.file_rel_path.clone(),
-                                target.name.clone(),
-                                from_symbol,
-                            );
+                            let key = (target.file_rel_path.clone(), target.name.clone(), from_symbol);
                             *per_file_edges.entry(from_idx).or_default().entry(key).or_insert(0) += 1;
                         }
                     }
@@ -640,7 +635,11 @@ pub fn run_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
             let from_path = scan.files[from_idx].rel_path.clone();
             for ((to_file, to_symbol, from_symbol), call_count) in edges {
                 let same_file = to_file == from_path;
-                let from_symbol = if from_symbol.is_empty() { None } else { Some(from_symbol) };
+                let from_symbol = if from_symbol.is_empty() {
+                    None
+                } else {
+                    Some(from_symbol)
+                };
                 scan.files[from_idx].references.push(FileReference {
                     to_file,
                     to_symbol,
@@ -676,9 +675,8 @@ pub fn run_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
     // Skip names that are too short / common (`new`, `len`, `is_empty`, ...) —
     // they would hit everywhere and produce no signal.
     let common_names: BTreeSet<&str> = [
-        "new", "default", "len", "is_empty", "from", "into", "as_str", "as_ref",
-        "clone", "drop", "fmt", "next", "iter", "build", "ok", "err", "some",
-        "none", "main", "init",
+        "new", "default", "len", "is_empty", "from", "into", "as_str", "as_ref", "clone", "drop", "fmt", "next",
+        "iter", "build", "ok", "err", "some", "none", "main", "init",
     ]
     .iter()
     .copied()
@@ -727,7 +725,8 @@ pub fn run_scan_at(root: &Path) -> Result<WorkspaceScan, ScanError> {
                 kind: sym.kind.clone(),
                 name: sym.name.clone(),
                 confidence: 0.6,
-                note: "no other references found in workspace (regex-based; may miss macro / dynamic dispatch)".to_string(),
+                note: "no other references found in workspace (regex-based; may miss macro / dynamic dispatch)"
+                    .to_string(),
             });
         }
         let _ = idx; // keep clippy quiet
@@ -861,8 +860,7 @@ pub fn compose_storyline_for_file(
     entry_symbol: Option<&str>,
     include_tests: bool,
 ) -> Option<Storyline> {
-    let by_path: HashMap<&str, &FileInfo> =
-        scan.files.iter().map(|f| (f.rel_path.as_str(), f)).collect();
+    let by_path: HashMap<&str, &FileInfo> = scan.files.iter().map(|f| (f.rel_path.as_str(), f)).collect();
     let root_info = by_path.get(root_file).copied()?;
     let mut total = 1usize;
     let mut truncated_branches = 0usize;
@@ -898,11 +896,7 @@ pub fn compose_storyline_for_file(
 }
 
 /// Convenience wrapper: compose a storyline rooted at a route's handler.
-pub fn compose_storyline_for_route(
-    scan: &WorkspaceScan,
-    route: &RouteHit,
-    include_tests: bool,
-) -> Option<Storyline> {
+pub fn compose_storyline_for_route(scan: &WorkspaceScan, route: &RouteHit, include_tests: bool) -> Option<Storyline> {
     let handler_file = route.handler_file.as_deref()?;
     let mut s = compose_storyline_for_file(scan, handler_file, Some(&route.handler_fn), include_tests)?;
     s.route = Some(route.clone());
@@ -957,7 +951,9 @@ fn expand_node(
                 }
                 matched_any = true;
             }
-            let entry = by_target.entry(r.to_file.clone()).or_insert((Vec::new(), 0, r.same_file));
+            let entry = by_target
+                .entry(r.to_file.clone())
+                .or_insert((Vec::new(), 0, r.same_file));
             if !entry.0.contains(&r.to_symbol) {
                 entry.0.push(r.to_symbol.clone());
             }
@@ -975,7 +971,9 @@ fn expand_node(
                         }
                     }
                 }
-                let entry = by_target.entry(r.to_file.clone()).or_insert((Vec::new(), 0, r.same_file));
+                let entry = by_target
+                    .entry(r.to_file.clone())
+                    .or_insert((Vec::new(), 0, r.same_file));
                 if !entry.0.contains(&r.to_symbol) {
                     entry.0.push(r.to_symbol.clone());
                 }
@@ -983,7 +981,9 @@ fn expand_node(
             }
         }
         // Sort by aggregate weight desc so the biggest dependencies bubble up.
-        let mut ordered: Vec<(String, (Vec<String>, usize, bool))> = by_target.into_iter().collect();
+        // Each entry: target_file -> (distinct symbols called, sum of call counts, same_file flag).
+        type AggregatedEdge = (String, (Vec<String>, usize, bool));
+        let mut ordered: Vec<AggregatedEdge> = by_target.into_iter().collect();
         ordered.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
         for (target_file, (symbols, count, same)) in ordered {
             if *total >= STORYLINE_MAX_NODES {
@@ -1056,21 +1056,24 @@ fn expand_node(
 /// `<prefix><branch> file::symbol[s] (count)  — doc_summary`. Designed to be
 /// round-tripped through a text-only context window.
 pub fn format_storyline_tree(s: &Storyline) -> String {
+    use std::fmt::Write;
     let mut out = String::new();
     if let Some(route) = &s.route {
-        out.push_str(&format!("{} {}\n", route.method, route.path));
+        let _ = writeln!(out, "{} {}", route.method, route.path);
     } else {
-        out.push_str(&format!("ROOT {}\n", s.root_file));
+        let _ = writeln!(out, "ROOT {}", s.root_file);
     }
     render_node(&s.root, "", true, &mut out, true);
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         "\n[{} files, max depth {}, {} truncated branch(es)]\n",
         s.stats.total_nodes, s.stats.max_depth_reached, s.stats.truncated_branches
-    ));
+    );
     out
 }
 
 fn render_node(node: &StorylineNode, prefix: &str, is_root: bool, out: &mut String, is_last: bool) {
+    use std::fmt::Write;
     if is_root {
         let branch = "└─";
         let display_symbols = if node.edge_symbols.is_empty() {
@@ -1078,15 +1081,19 @@ fn render_node(node: &StorylineNode, prefix: &str, is_root: bool, out: &mut Stri
         } else {
             node.edge_symbols.join(", ")
         };
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "{}{} {}::{}",
-            prefix, branch, short_file(&node.file), display_symbols
-        ));
+            prefix,
+            branch,
+            short_file(&node.file),
+            display_symbols
+        );
         if let Some(doc) = &node.doc_summary {
-            out.push_str(&format!("  — {}", doc));
+            let _ = write!(out, "  — {doc}");
         }
         out.push('\n');
-        let new_prefix = format!("{}   ", prefix);
+        let new_prefix = format!("{prefix}   ");
         let n = node.children.len();
         for (i, c) in node.children.iter().enumerate() {
             render_node(c, &new_prefix, false, out, i + 1 == n);
@@ -1095,7 +1102,8 @@ fn render_node(node: &StorylineNode, prefix: &str, is_root: bool, out: &mut Stri
         let branch = if is_last { "└─" } else { "├─" };
         let same = if node.same_file { " (intra)" } else { "" };
         let weight = format_call_weight(node.edge_call_count);
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "{}{} {}::{}{}{}",
             prefix,
             branch,
@@ -1103,9 +1111,9 @@ fn render_node(node: &StorylineNode, prefix: &str, is_root: bool, out: &mut Stri
             node.edge_symbols.join(", "),
             weight,
             same,
-        ));
+        );
         if let Some(doc) = &node.doc_summary {
-            out.push_str(&format!("  — {}", doc));
+            let _ = write!(out, "  — {doc}");
         }
         if node.cycle {
             out.push_str("  [cycle]");
@@ -1178,7 +1186,7 @@ pub fn storyline_compact_json(scan: &WorkspaceScan, include_tests: bool) -> serd
     }
     let mut routes_block = Vec::new();
     for route in &scan.routes {
-        let chain: Vec<usize> = match (&route.handler_file).as_ref() {
+        let chain: Vec<usize> = match route.handler_file.as_ref() {
             Some(hf) => {
                 if let Some(s) = compose_storyline_for_route(scan, route, include_tests) {
                     let mut ids = Vec::new();
@@ -1219,11 +1227,8 @@ fn collect_chain_ids(node: &StorylineNode, id_by_path: &HashMap<String, usize>, 
 // ────────────────────────── Internal helpers ──────────────────────────
 
 /// Recursive-but-cheap directory walker. Skips `target/` and dot-dirs.
-fn walk_dir<F: FnMut(&Path, &Path)>(
-    root: &Path,
-    base: &Path,
-    visit: &mut F,
-) -> Result<(), ScanError> {
+#[allow(clippy::unnecessary_wraps)] // Result kept for symmetry + future fallibility (e.g. fs error propagation if we stop swallowing read_dir failures).
+fn walk_dir<F: FnMut(&Path, &Path)>(root: &Path, base: &Path, visit: &mut F) -> Result<(), ScanError> {
     let mut stack = vec![base.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
@@ -1285,10 +1290,7 @@ fn parse_internal_path_deps(toml: &str) -> Vec<String> {
         if let Some(eq_pos) = line.find('=') {
             let name = line[..eq_pos].trim();
             let rest = line[eq_pos + 1..].trim();
-            if !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
+            if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
                 continue;
             }
             if rest.contains("path =") || rest.contains("path=") || rest.contains("workspace = true") {
@@ -1307,10 +1309,7 @@ fn infer_module_path(crate_name: &str, crate_root: &Path, file: &Path) -> String
         Err(_) => return crate_name.to_string(),
     };
     let mut parts: Vec<String> = vec![crate_name.replace('-', "_")];
-    let mut comps: Vec<&str> = rel
-        .iter()
-        .map(|s| s.to_str().unwrap_or(""))
-        .collect();
+    let mut comps: Vec<&str> = rel.iter().map(|s| s.to_str().unwrap_or("")).collect();
     if let Some(last) = comps.last_mut() {
         if *last == "lib.rs" || *last == "main.rs" {
             comps.pop();
@@ -1319,7 +1318,7 @@ fn infer_module_path(crate_name: &str, crate_root: &Path, file: &Path) -> String
             // `mod.rs` semantics: keep the directory name only.
         }
     }
-    if comps.last().map(|s| *s) == Some("mod") {
+    if comps.last().copied() == Some("mod") {
         comps.pop();
     }
     for c in comps {
@@ -1377,9 +1376,7 @@ fn parse_symbol_line(line: &str) -> Option<(&'static str, String, bool)> {
 /// - filename ends with `_tests.rs` or is exactly `tests.rs`,
 /// - first non-blank, non-comment line is `#![cfg(test)]` (rare, but legal).
 fn looks_like_test_file(rel_path: &str, src: &str) -> bool {
-    let path_match = rel_path.contains("/tests/")
-        || rel_path.ends_with("/tests.rs")
-        || rel_path.ends_with("_tests.rs");
+    let path_match = rel_path.contains("/tests/") || rel_path.ends_with("/tests.rs") || rel_path.ends_with("_tests.rs");
     if path_match {
         return true;
     }
@@ -1653,7 +1650,7 @@ fn scan_call_sites(line: &str) -> Vec<String> {
             // Actually `start..end` is the identifier (alnum/_/:), so we need
             // to check `bytes[end..i]` for `!`.
             let between = &bytes[end..i];
-            if between.iter().any(|&b| b == b'!') {
+            if between.contains(&b'!') {
                 i += 1;
                 continue;
             }
@@ -1666,8 +1663,8 @@ fn scan_call_sites(line: &str) -> Vec<String> {
             // typically PascalCase, but we can't filter on case alone (some
             // crates use snake_case for closures). Just block obvious keywords.
             const BLOCKED: &[&str] = &[
-                "if", "while", "match", "for", "return", "let", "move",
-                "loop", "break", "continue", "else", "as", "ref", "mut",
+                "if", "while", "match", "for", "return", "let", "move", "loop", "break", "continue", "else", "as",
+                "ref", "mut",
             ];
             if !last.is_empty() && !BLOCKED.contains(&last) {
                 out.push(last.to_string());
@@ -1699,11 +1696,7 @@ fn parse_stub_line(line: &str) -> Option<(&'static str, String)> {
     None
 }
 
-fn parse_use_target(
-    line: &str,
-    from_crate: &str,
-    known_crates: &BTreeSet<String>,
-) -> Option<String> {
+fn parse_use_target(line: &str, from_crate: &str, known_crates: &BTreeSet<String>) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.starts_with("//") {
         return None;
@@ -1769,10 +1762,22 @@ mod tests {
 
     #[test]
     fn parses_pub_fn_and_struct_lines() {
-        assert_eq!(parse_symbol_line("pub fn hello(x: u32) {").unwrap(), ("fn", "hello".into(), true));
-        assert_eq!(parse_symbol_line("pub struct Foo {").unwrap(), ("struct", "Foo".into(), true));
-        assert_eq!(parse_symbol_line("    pub(super) async fn run() {").unwrap(), ("fn", "run".into(), true));
-        assert_eq!(parse_symbol_line("fn private() {}").unwrap(), ("fn", "private".into(), false));
+        assert_eq!(
+            parse_symbol_line("pub fn hello(x: u32) {").unwrap(),
+            ("fn", "hello".into(), true)
+        );
+        assert_eq!(
+            parse_symbol_line("pub struct Foo {").unwrap(),
+            ("struct", "Foo".into(), true)
+        );
+        assert_eq!(
+            parse_symbol_line("    pub(super) async fn run() {").unwrap(),
+            ("fn", "run".into(), true)
+        );
+        assert_eq!(
+            parse_symbol_line("fn private() {}").unwrap(),
+            ("fn", "private".into(), false)
+        );
         assert!(parse_symbol_line("// pub fn comment").is_none());
         assert!(parse_symbol_line("let x = 1;").is_none());
     }
@@ -1780,8 +1785,14 @@ mod tests {
     #[test]
     fn detects_stub_calls() {
         assert_eq!(parse_stub_line("    todo!()").unwrap().0, "todo");
-        assert_eq!(parse_stub_line("    unimplemented!(\"later\")").unwrap().0, "unimplemented");
-        assert_eq!(parse_stub_line("panic!(\"not yet implemented\")").unwrap().0, "panic_not_implemented");
+        assert_eq!(
+            parse_stub_line("    unimplemented!(\"later\")").unwrap().0,
+            "unimplemented"
+        );
+        assert_eq!(
+            parse_stub_line("panic!(\"not yet implemented\")").unwrap().0,
+            "panic_not_implemented"
+        );
         assert!(parse_stub_line("// todo!() in a comment").is_none());
         assert!(parse_stub_line("let x = 1;").is_none());
     }
@@ -1815,9 +1826,18 @@ mod tests {
     #[test]
     fn module_path_inference() {
         let p = Path::new("/x");
-        assert_eq!(infer_module_path("corecruxd", Path::new("/x"), Path::new("/x/src/main.rs")), "corecruxd");
-        assert_eq!(infer_module_path("corecruxd", p, Path::new("/x/src/http/admin.rs")), "corecruxd::http::admin");
-        assert_eq!(infer_module_path("corecruxd", p, Path::new("/x/src/http/mod.rs")), "corecruxd::http");
+        assert_eq!(
+            infer_module_path("corecruxd", Path::new("/x"), Path::new("/x/src/main.rs")),
+            "corecruxd"
+        );
+        assert_eq!(
+            infer_module_path("corecruxd", p, Path::new("/x/src/http/admin.rs")),
+            "corecruxd::http::admin"
+        );
+        assert_eq!(
+            infer_module_path("corecruxd", p, Path::new("/x/src/http/mod.rs")),
+            "corecruxd::http"
+        );
         assert_eq!(infer_module_path("crux-mcp", p, Path::new("/x/src/lib.rs")), "crux_mcp");
     }
 
@@ -1889,23 +1909,14 @@ version = "0.1.0"
     #[test]
     fn parses_route_chunk_and_full_source() {
         // Single-line, simple namespace.
-        let r = parse_route_chunk(
-            r#""/v1/projects", get(self::projects::get_projects))"#,
-            "x",
-            1,
-        )
-        .expect("matches");
+        let r = parse_route_chunk(r#""/v1/projects", get(self::projects::get_projects))"#, "x", 1).expect("matches");
         assert_eq!(r.method, "GET");
         assert_eq!(r.path, "/v1/projects");
         assert_eq!(r.handler_fn, "get_projects");
 
         // Namespaced method (axum::routing::post) with PATCH method.
-        let r2 = parse_route_chunk(
-            r#""/v1/work/{id}", axum::routing::patch(work::patch_work))"#,
-            "x",
-            1,
-        )
-        .expect("matches");
+        let r2 =
+            parse_route_chunk(r#""/v1/work/{id}", axum::routing::patch(work::patch_work))"#, "x", 1).expect("matches");
         assert_eq!(r2.method, "PATCH");
         assert_eq!(r2.handler_fn, "patch_work");
 
@@ -1928,8 +1939,12 @@ fn build() {
 "#;
         let routes = parse_routes_in_source(src, "x.rs");
         assert_eq!(routes.len(), 2);
-        assert!(routes.iter().any(|r| r.path == "/v1/workspace/scan" && r.method == "POST"));
-        assert!(routes.iter().any(|r| r.path == "/v1/workspace/scan" && r.method == "GET"));
+        assert!(routes
+            .iter()
+            .any(|r| r.path == "/v1/workspace/scan" && r.method == "POST"));
+        assert!(routes
+            .iter()
+            .any(|r| r.path == "/v1/workspace/scan" && r.method == "GET"));
     }
 
     #[test]
@@ -1997,7 +2012,9 @@ fn build() {
         // The workspace.rs handler file has `post_scan` which calls
         // `run_scan` (in workspace_scan.rs). Verify the cursor attributes
         // that edge to `post_scan` rather than leaving from_symbol = None.
-        let workspace_http = scan.files.iter()
+        let workspace_http = scan
+            .files
+            .iter()
             .find(|f| f.rel_path.ends_with("corecruxd/src/http/workspace.rs"))
             .expect("http/workspace.rs");
         let edges_with_from: Vec<&FileReference> = workspace_http
@@ -2109,7 +2126,10 @@ fn build() {
         } else {
             100 * scan.stats.doc_coverage_files / scan.stats.file_count
         };
-        assert!(scan.stats.doc_coverage_files > 0, "expected some files with //! headers");
+        assert!(
+            scan.stats.doc_coverage_files > 0,
+            "expected some files with //! headers"
+        );
         assert!(pct >= 40, "doc coverage suspiciously low ({pct}%)");
         // Cross-check: the count must match a fresh re-filter.
         let re_count = scan.files.iter().filter(|f| f.doc_summary.is_some()).count();
@@ -2128,16 +2148,29 @@ fn build() {
             return;
         }
         let scan = run_scan_at(&root).expect("scan");
-        assert!(scan.routes.len() > 20,
-            "expected >20 routes (corecruxd has ~80), got {}", scan.routes.len());
+        assert!(
+            scan.routes.len() > 20,
+            "expected >20 routes (corecruxd has ~80), got {}",
+            scan.routes.len()
+        );
         // Spot-check a known route.
-        assert!(scan.routes.iter().any(|r| r.path == "/v1/workspace/scan" && r.method == "POST"),
-            "POST /v1/workspace/scan should be detected");
+        assert!(
+            scan.routes
+                .iter()
+                .any(|r| r.path == "/v1/workspace/scan" && r.method == "POST"),
+            "POST /v1/workspace/scan should be detected"
+        );
         // file_reference_count > 0 — we have ~thousands of internal calls.
-        assert!(scan.stats.file_reference_count > 100,
-            "expected >100 file references, got {}", scan.stats.file_reference_count);
+        assert!(
+            scan.stats.file_reference_count > 100,
+            "expected >100 file references, got {}",
+            scan.stats.file_reference_count
+        );
         // doc_summary present on workspace_scan.rs (its own header).
-        let me = scan.files.iter().find(|f| f.rel_path.ends_with("corecruxd/src/workspace_scan.rs"));
+        let me = scan
+            .files
+            .iter()
+            .find(|f| f.rel_path.ends_with("corecruxd/src/workspace_scan.rs"));
         assert!(me.is_some(), "scan should include workspace_scan.rs");
         assert!(me.unwrap().doc_summary.is_some(), "workspace_scan.rs has a //! header");
     }

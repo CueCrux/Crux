@@ -2613,7 +2613,7 @@ mod tests {
         for (loc, frame) in frames {
             let decoded = decode_frame_v1(frame).expect("decode frame");
             assert!(
-                !(decoded.header_bytes.len() < 32),
+                (decoded.header_bytes.len() >= 32),
                 "stored frame header_bytes too small"
             );
             let canonical_len = decoded.header_bytes.len() - 32;

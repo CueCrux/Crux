@@ -2071,10 +2071,7 @@ pub(super) async fn get_replication_status(State(state): State<AppState>, header
 /// state: which prefixes are forced-private, share-overrides, fact counts
 /// (private vs pushable), and whether remote sync is configured. Used by
 /// the AX → Activity "Sharing posture" card.
-pub(super) async fn get_sharing_posture(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub(super) async fn get_sharing_posture(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }
@@ -2103,8 +2100,7 @@ pub(super) async fn get_sharing_posture(
         let bucket = fact
             .entity
             .split_once("::")
-            .map(|(b, _)| b.to_string())
-            .unwrap_or_else(|| "(no prefix)".to_string());
+            .map_or_else(|| "(no prefix)".to_string(), |(b, _)| b.to_string());
         let entry = by_prefix.entry(bucket).or_insert((0, 0));
         if fact.private {
             entry.0 += 1;
@@ -2119,7 +2115,7 @@ pub(super) async fn get_sharing_posture(
         }
     }
     let sync_remote_url = std::env::var("CORECRUXD_SYNC_REMOTE_URL").ok();
-    let sync_configured = sync_remote_url.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let sync_configured = sync_remote_url.as_deref().is_some_and(|s| !s.trim().is_empty());
     drop(store);
 
     (
@@ -2189,18 +2185,15 @@ pub(super) async fn post_sharing_backfill(
     };
 
     if !body.confirm {
-        let by_prefix: std::collections::BTreeMap<String, usize> = candidates.iter().fold(
-            Default::default(),
-            |mut acc, f| {
+        let by_prefix: std::collections::BTreeMap<String, usize> =
+            candidates.iter().fold(Default::default(), |mut acc, f| {
                 let bucket = f
                     .entity
                     .split_once("::")
-                    .map(|(b, _)| b.to_string())
-                    .unwrap_or_else(|| "(no prefix)".to_string());
+                    .map_or_else(|| "(no prefix)".to_string(), |(b, _)| b.to_string());
                 *acc.entry(bucket).or_insert(0) += 1;
                 acc
-            },
-        );
+            });
         return (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -2252,10 +2245,7 @@ pub(super) async fn post_sharing_backfill(
 /// up; bare-metal / `cargo run` users see the daemon stop and must restart it
 /// manually. We schedule the exit on a background task so the HTTP response
 /// has time to flush before the process disappears.
-pub(super) async fn post_restart_daemon(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub(super) async fn post_restart_daemon(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }

@@ -94,7 +94,13 @@ pub(super) async fn post_disconnect(State(state): State<AppState>, headers: Head
     if let Err(err) = crate::integrations_github::delete_credentials(&state.data_dir) {
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
     }
-    if let Err(err) = std::fs::remove_file(state.data_dir.join("integrations").join("github").join("selected_repos.json")) {
+    if let Err(err) = std::fs::remove_file(
+        state
+            .data_dir
+            .join("integrations")
+            .join("github")
+            .join("selected_repos.json"),
+    ) {
         if err.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(?err, "failed to remove selected_repos.json on disconnect");
         }
@@ -108,14 +114,18 @@ pub(super) async fn get_accessible_repos(State(state): State<AppState>, headers:
     }
     let creds = match crate::integrations_github::read_credentials(&state.data_dir) {
         Ok(c) => c,
-        Err(_) => return problem_response(StatusCode::PRECONDITION_FAILED, "GitHub not connected; POST /v1/integrations/github/connect first"),
+        Err(_) => {
+            return problem_response(
+                StatusCode::PRECONDITION_FAILED,
+                "GitHub not connected; POST /v1/integrations/github/connect first",
+            )
+        }
     };
     let pat = match crate::integrations_github::decrypt_pat(&creds, state.integration_encryption_key.as_ref()) {
         Ok(p) => p,
         Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("decrypt failed: {err}")),
     };
-    let result = tokio::task::spawn_blocking(move || crate::integrations_github::fetch_accessible_repos(&pat, 5))
-        .await;
+    let result = tokio::task::spawn_blocking(move || crate::integrations_github::fetch_accessible_repos(&pat, 5)).await;
     match result {
         Ok(Ok(repos)) => {
             let selected = crate::integrations_github::list_selected_repos(&state.data_dir);
@@ -159,9 +169,12 @@ pub(super) async fn post_select_repo(
                 .await
                 .ok()
                 .and_then(|res| res.ok())
-                .and_then(|repos| repos.into_iter().find(|r| r.owner == owner_clone && r.repo == repo_clone))
-                .map(|r| r.private)
-                .unwrap_or(true) // unknown → treat as private
+                .and_then(|repos| {
+                    repos
+                        .into_iter()
+                        .find(|r| r.owner == owner_clone && r.repo == repo_clone)
+                })
+                .is_none_or(|r| r.private) // unknown → treat as private
         }
         Err(_) => true,
     };
@@ -215,9 +228,11 @@ pub(super) async fn post_sync(State(state): State<AppState>, headers: HeaderMap)
     let result = tokio::task::spawn_blocking(move || {
         let mut store = match fact_store.try_write() {
             Ok(g) => g,
-            Err(_) => return Err(crate::integrations_github::GithubIntegrationError::Network(
-                "fact store busy; retry shortly".to_string(),
-            )),
+            Err(_) => {
+                return Err(crate::integrations_github::GithubIntegrationError::Network(
+                    "fact store busy; retry shortly".to_string(),
+                ))
+            }
         };
         crate::integrations_github_sync::run_sync_with_key(&data_dir, &mut store, key.as_ref(), now_unix_ms())
     })

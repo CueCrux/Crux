@@ -163,10 +163,7 @@ pub(super) async fn post_expand(
         match RelationTypeV1::from_engine_str(raw.trim().to_ascii_lowercase().as_str()) {
             Some(t) => edge_types.push(t),
             None => {
-                return problem_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("unknown edge_type '{raw}'"),
-                );
+                return problem_response(StatusCode::BAD_REQUEST, format!("unknown edge_type '{raw}'"));
             }
         }
     }

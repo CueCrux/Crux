@@ -23,8 +23,6 @@ mod grpc;
 mod http;
 // metrics: Prometheus register!() macros use expect() at init — safe, panics
 // only on duplicate registration (programmer error caught in tests).
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod metrics;
 mod context_graph;
 mod dossier;
 mod encrypted_secrets;
@@ -33,25 +31,27 @@ mod fact_privacy;
 mod integrations_github;
 mod integrations_github_sync;
 mod integrations_openai;
-mod presence;
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod metrics;
 mod onboarding;
 mod ops_events;
 mod passports;
 mod plane_layer_sync;
 mod planes;
-mod project_repo_links;
 mod playground;
+mod pool;
+mod presence;
+mod problem;
+mod project_repo_links;
 mod projects;
-mod storybook;
-mod workspace_scan;
 mod relations;
 mod session_bindings;
-mod work;
-mod pool;
-mod problem;
 mod shard_map;
+mod storybook;
 mod structured_log;
 mod update;
+mod work;
+mod workspace_scan;
 
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
@@ -478,9 +478,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )),
         http_bind_loopback: config.http_addr.ip().is_loopback(),
         allow_insecure_dev_auth_bind: insecure_dev_auth_bind_allowed(),
-        integration_encryption_key: Arc::new(
-            rcx_passport_key.derive_subkey("integration-token-encryption-v1"),
-        ),
+        integration_encryption_key: Arc::new(rcx_passport_key.derive_subkey("integration-token-encryption-v1")),
         presence: presence::PresenceTracker::new(),
         privacy_policy: {
             let p = fact_privacy::PrivacyPolicy::from_env();
@@ -548,7 +546,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if want_seed {
             match crate::passports::seed_defaults_if_missing(&config.data_dir, &mut store, now_ms) {
                 Ok(0) => tracing::debug!("passport defaults already present"),
-                Ok(n) => info!(seeded = n, "default passports seeded (opt-in via CORECRUXD_SEED_DEFAULT_PASSPORTS)"),
+                Ok(n) => info!(
+                    seeded = n,
+                    "default passports seeded (opt-in via CORECRUXD_SEED_DEFAULT_PASSPORTS)"
+                ),
                 Err(err) => tracing::warn!(?err, "failed to seed default passports"),
             }
         } else {
@@ -3531,9 +3532,7 @@ mod tests {
             extraction_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 corecrux_projections::ExtractionCacheMaterializer::new(),
             )),
-            onboarding: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::onboarding::OnboardingState::default(),
-            )),
+            onboarding: std::sync::Arc::new(tokio::sync::RwLock::new(crate::onboarding::OnboardingState::default())),
             http_bind_loopback: true,
             allow_insecure_dev_auth_bind: false,
             projection_state: std::sync::Arc::new(tokio::sync::RwLock::new(

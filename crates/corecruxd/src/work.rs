@@ -13,6 +13,9 @@
 //! - `__work_transition__::{work_id}::{ts_micros}-{tx_id}` key=`record` — audit.
 //! - `__work_gate__::{action_id}` key=`record` — pending gated actions.
 
+#![allow(clippy::option_option)] // PATCH tri-state semantics: outer Some=present, inner None=clear, inner Some=set
+#![allow(clippy::assigning_clones)] // plain `x = y.clone()` is more obvious than `clone_from`
+
 use corecrux_memory::fact_store::{FactQuery, FactStore, StoreFact};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -23,14 +26,7 @@ pub const WORK_TRANSITION_ENTITY_PREFIX: &str = "__work_transition__";
 pub const WORK_GATE_ENTITY_PREFIX: &str = "__work_gate__";
 pub const RECORD_KEY: &str = "record";
 
-pub const WORK_STATES: &[&str] = &[
-    "planned",
-    "in_progress",
-    "blocked",
-    "archive",
-    "complete",
-    "deployed",
-];
+pub const WORK_STATES: &[&str] = &["planned", "in_progress", "blocked", "archive", "complete", "deployed"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkError {
@@ -193,9 +189,9 @@ pub fn list_work(
             continue;
         }
         if let Ok(item) = serde_json::from_str::<WorkItem>(&fact.value) {
-            if state_filter.map_or(true, |s| item.state == s)
-                && tenant_filter.map_or(true, |t| item.tenant_id.as_deref() == Some(t))
-                && assignee_filter.map_or(true, |a| item.assignee_passport.as_deref() == Some(a))
+            if state_filter.is_none_or(|s| item.state == s)
+                && tenant_filter.is_none_or(|t| item.tenant_id.as_deref() == Some(t))
+                && assignee_filter.is_none_or(|a| item.assignee_passport.as_deref() == Some(a))
             {
                 out.push(item);
             }
@@ -206,7 +202,9 @@ pub fn list_work(
 }
 
 pub fn get_work(store: &FactStore, id: &str) -> Option<WorkItem> {
-    list_work(store, None, None, None, None).into_iter().find(|w| w.id == id)
+    list_work(store, None, None, None, None)
+        .into_iter()
+        .find(|w| w.id == id)
 }
 
 pub struct UpdateWorkInput {
@@ -248,7 +246,9 @@ pub fn update_work(
             && input
                 .blocker_reason
                 .as_ref()
-                .map_or(item.blocker_reason.is_none(), |r| r.is_none() || r.as_deref().map_or(true, str::is_empty))
+                .map_or(item.blocker_reason.is_none(), |r| {
+                    r.is_none() || r.as_deref().is_none_or(str::is_empty)
+                })
         {
             return Err(WorkError::MissingBlockerReason);
         }
@@ -423,9 +423,7 @@ pub fn list_pending_gates(store: &FactStore, by_passport_filter: Option<&str>) -
             continue;
         }
         if let Ok(p) = serde_json::from_str::<PendingGateAction>(&fact.value) {
-            if p.status == "pending"
-                && by_passport_filter.map_or(true, |f| p.requested_by_passport == f)
-            {
+            if p.status == "pending" && by_passport_filter.is_none_or(|f| p.requested_by_passport == f) {
                 out.push(p);
             }
         }
@@ -447,7 +445,11 @@ pub fn resolve_gate(
     }
     let item = get_work(store, &pending.work_id).ok_or_else(|| WorkError::NotFound(pending.work_id.clone()))?;
 
-    pending.status = if approve { "approved".to_string() } else { "rejected".to_string() };
+    pending.status = if approve {
+        "approved".to_string()
+    } else {
+        "rejected".to_string()
+    };
     pending.resolved_at_unix_ms = Some(now_unix_ms);
     pending.resolved_by_passport = Some(approver_passport.to_string());
     write_gate(store, &pending)?;
@@ -614,11 +616,24 @@ mod tests {
                 &mut store,
                 &item.id,
                 UpdateWorkInput {
-                    title: None, body: None, state: Some(state.to_string()),
-                    assignee_passport: None, tenant_id: None, linked_pr: None, linked_issue: None,
-                    blocker_reason: if !reason.is_empty() { Some(Some(reason.to_string())) } else { None },
+                    title: None,
+                    body: None,
+                    state: Some((*state).to_string()),
+                    assignee_passport: None,
+                    tenant_id: None,
+                    linked_pr: None,
+                    linked_issue: None,
+                    blocker_reason: if !reason.is_empty() {
+                        Some(Some(reason.to_string()))
+                    } else {
+                        None
+                    },
                 },
-                UpdateWorkContext { by_passport: "personal-default".to_string(), passport_gated: false, now_unix_ms: now },
+                UpdateWorkContext {
+                    by_passport: "personal-default".to_string(),
+                    passport_gated: false,
+                    now_unix_ms: now,
+                },
             )
             .expect("update");
             assert!(matches!(outcome, UpdateOutcome::Applied(_)));
@@ -639,11 +654,20 @@ mod tests {
             &mut store,
             &item.id,
             UpdateWorkInput {
-                title: None, body: None, state: Some("blocked".to_string()),
-                assignee_passport: None, tenant_id: None, linked_pr: None, linked_issue: None,
+                title: None,
+                body: None,
+                state: Some("blocked".to_string()),
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
                 blocker_reason: None,
             },
-            UpdateWorkContext { by_passport: "personal-default".to_string(), passport_gated: false, now_unix_ms: 2_000 },
+            UpdateWorkContext {
+                by_passport: "personal-default".to_string(),
+                passport_gated: false,
+                now_unix_ms: 2_000,
+            },
         )
         .expect_err("should reject");
         assert!(matches!(err, WorkError::MissingBlockerReason));
@@ -658,11 +682,20 @@ mod tests {
             &mut store,
             &item.id,
             UpdateWorkInput {
-                title: None, body: None, state: Some("in_progress".to_string()),
-                assignee_passport: None, tenant_id: None, linked_pr: None, linked_issue: None,
+                title: None,
+                body: None,
+                state: Some("in_progress".to_string()),
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
                 blocker_reason: None,
             },
-            UpdateWorkContext { by_passport: "personal-default".to_string(), passport_gated: true, now_unix_ms: 2_000 },
+            UpdateWorkContext {
+                by_passport: "personal-default".to_string(),
+                passport_gated: true,
+                now_unix_ms: 2_000,
+            },
         )
         .expect("queued");
         let pending = match outcome {
@@ -672,8 +705,7 @@ mod tests {
         let still_planned = get_work(&store, &item.id).expect("item");
         assert_eq!(still_planned.state, "planned");
         assert_eq!(list_pending_gates(&store, None).len(), 1);
-        let approved = resolve_gate(&mut store, &pending.action_id, "operator-passport", true, 3_000)
-            .expect("resolve");
+        let approved = resolve_gate(&mut store, &pending.action_id, "operator-passport", true, 3_000).expect("resolve");
         assert_eq!(approved.state, "in_progress");
         assert!(list_pending_gates(&store, None).is_empty(), "no longer pending");
         let _ = std::fs::remove_dir_all(&dir);
@@ -687,19 +719,27 @@ mod tests {
             &mut store,
             &item.id,
             UpdateWorkInput {
-                title: None, body: None, state: Some("complete".to_string()),
-                assignee_passport: None, tenant_id: None, linked_pr: None, linked_issue: None,
+                title: None,
+                body: None,
+                state: Some("complete".to_string()),
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
                 blocker_reason: None,
             },
-            UpdateWorkContext { by_passport: "personal-default".to_string(), passport_gated: true, now_unix_ms: 2_000 },
+            UpdateWorkContext {
+                by_passport: "personal-default".to_string(),
+                passport_gated: true,
+                now_unix_ms: 2_000,
+            },
         )
         .expect("queued");
         let pending = match outcome {
             UpdateOutcome::Queued(p) => p,
             UpdateOutcome::Applied(_) => panic!("expected queued"),
         };
-        let _ = resolve_gate(&mut store, &pending.action_id, "operator-passport", false, 3_000)
-            .expect("rejected");
+        let _ = resolve_gate(&mut store, &pending.action_id, "operator-passport", false, 3_000).expect("rejected");
         let still_planned = get_work(&store, &item.id).expect("item");
         assert_eq!(still_planned.state, "planned");
         let _ = std::fs::remove_dir_all(&dir);
@@ -728,12 +768,22 @@ mod tests {
             &mut store,
             &w2.id,
             UpdateWorkInput {
-                title: None, body: None, state: Some("in_progress".to_string()),
+                title: None,
+                body: None,
+                state: Some("in_progress".to_string()),
                 assignee_passport: Some(Some("work-default".to_string())),
-                tenant_id: None, linked_pr: None, linked_issue: None, blocker_reason: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
+                blocker_reason: None,
             },
-            UpdateWorkContext { by_passport: "work-default".to_string(), passport_gated: false, now_unix_ms: 2_000 },
-        ).expect("update");
+            UpdateWorkContext {
+                by_passport: "work-default".to_string(),
+                passport_gated: false,
+                now_unix_ms: 2_000,
+            },
+        )
+        .expect("update");
         let in_progress = list_work(&store, Some("default"), Some("in_progress"), None, None);
         assert_eq!(in_progress.len(), 1);
         let work_assigned = list_work(&store, None, None, None, Some("work-default"));
@@ -748,12 +798,18 @@ mod tests {
             &mut store,
             CreateWorkInput {
                 project_id: "ghost".to_string(),
-                title: "x".to_string(), body: None, state: None,
-                assignee_passport: None, tenant_id: None, linked_pr: None, linked_issue: None,
+                title: "x".to_string(),
+                body: None,
+                state: None,
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
                 created_by_passport: "personal-default".to_string(),
             },
             1_000,
-        ).expect_err("rejected");
+        )
+        .expect_err("rejected");
         assert!(matches!(err, WorkError::ProjectNotFound(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -14,7 +14,9 @@
 //! `__storybook__::{project_id}::{ts}` key=`content`. The privacy gate covers
 //! `__storybook__::*` so they're never push-eligible without explicit opt-in.
 
-use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode};
+use super::{
+    problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
+};
 
 const STORYBOOK_PREFIX: &str = "__storybook__";
 const STORYBOOK_KEY: &str = "content";
@@ -147,7 +149,12 @@ pub(super) async fn get_latest(
     let versions = list_storybook_versions_internal(&state.fact_store, &project_id).await;
     let latest_ts = match versions.first() {
         Some(t) => *t,
-        None => return problem_response(StatusCode::NOT_FOUND, "no readout yet — POST /v1/projects/{id}/storybook to generate one"),
+        None => {
+            return problem_response(
+                StatusCode::NOT_FOUND,
+                "no readout yet — POST /v1/projects/{id}/storybook to generate one",
+            )
+        }
     };
     match load_storybook(&state.fact_store, &project_id, latest_ts).await {
         Some(d) => (StatusCode::OK, Json(d)).into_response(),

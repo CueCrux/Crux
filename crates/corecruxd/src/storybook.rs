@@ -14,6 +14,10 @@
 //! - Operator: read it like a project brief.
 //! - Agent: parse the section headers + tables to update its mental model.
 
+#![allow(clippy::format_push_string)] // markdown-narrative builder — heavy push_str(&format!(...)) usage by design
+#![allow(clippy::unwrap_used)] // narrative-builder code on data we just constructed; .unwrap() panic is impossible by construction
+#![allow(clippy::unnecessary_get_then_check)] // minor stylistic, builder-local
+
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -46,10 +50,7 @@ pub struct GenerateInput<'a> {
 }
 
 /// Build the storybook from current store state. Synchronous; no LLM calls.
-pub fn generate(
-    store: &corecrux_memory::FactStore,
-    input: GenerateInput<'_>,
-) -> Option<StorybookDocument> {
+pub fn generate(store: &corecrux_memory::FactStore, input: GenerateInput<'_>) -> Option<StorybookDocument> {
     let project = crate::projects::get_project_detail(store, input.project_id)?;
     let planes = crate::planes::list_planes(store, input.project_id);
     let project_layers = read_project_layers(store, input.project_id);
@@ -74,11 +75,7 @@ pub fn generate(
         now_iso,
         input.by_passport,
         project.record.id,
-        project
-            .record
-            .planning_target
-            .as_deref()
-            .unwrap_or("(none)"),
+        project.record.planning_target.as_deref().unwrap_or("(none)"),
         if project.members.is_empty() {
             "(none)".into()
         } else {
@@ -192,8 +189,16 @@ pub fn generate(
         let mut dead_in_match = 0usize;
         if let Some(ws) = &workspace_scan {
             let crate_set: HashSet<&str> = candidate_modules.iter().map(|s| s.as_str()).collect();
-            stubs_in_match = ws.stubs.iter().filter(|s| crate_set.contains(s.crate_name.as_str())).count();
-            dead_in_match = ws.dead_code.iter().filter(|d| crate_set.contains(d.crate_name.as_str())).count();
+            stubs_in_match = ws
+                .stubs
+                .iter()
+                .filter(|s| crate_set.contains(s.crate_name.as_str()))
+                .count();
+            dead_in_match = ws
+                .dead_code
+                .iter()
+                .filter(|d| crate_set.contains(d.crate_name.as_str()))
+                .count();
         }
 
         let members_str = match &detail {
@@ -217,7 +222,11 @@ pub fn generate(
 
         // Vision overlap with project vision (signal of how aligned the plane is to the parent goal).
         let overlap = jaccard(&plane_kws, &vision_keywords);
-        let alignment_marker = if overlap >= 0.10 { format!(" · vision-aligned ({:.2})", overlap) } else { String::new() };
+        let alignment_marker = if overlap >= 0.10 {
+            format!(" · vision-aligned ({:.2})", overlap)
+        } else {
+            String::new()
+        };
 
         let mut sec = format!(
             "### {} `{}`{}\n\n\
@@ -236,7 +245,9 @@ pub fn generate(
             sec.push_str(&truncate_for_quote(v, 280));
             sec.push('\n');
         } else {
-            sec.push_str("- **Plane vision**: *(none — set with `PUT /v1/projects/{id}/planes/{plane}/layers/vision`)*\n");
+            sec.push_str(
+                "- **Plane vision**: *(none — set with `PUT /v1/projects/{id}/planes/{plane}/layers/vision`)*\n",
+            );
         }
         if !candidate_modules.is_empty() {
             sec.push_str(&format!(
@@ -269,12 +280,28 @@ pub fn generate(
         let ws = workspace_scan.as_ref().unwrap();
         for plane in &planes {
             let plane_layers = read_plane_layers(store, input.project_id, &plane.id);
-            let v = if plane_layers.contains_key("vision") { "✓" } else { "—" };
-            let g = if plane_layers.contains_key("goals") { "✓" } else { "—" };
+            let v = if plane_layers.contains_key("vision") {
+                "✓"
+            } else {
+                "—"
+            };
+            let g = if plane_layers.contains_key("goals") {
+                "✓"
+            } else {
+                "—"
+            };
             let mods = plane_module_map.get(&plane.id).cloned().unwrap_or_default();
             let crate_set: HashSet<&str> = mods.iter().map(|s| s.as_str()).collect();
-            let stubs = ws.stubs.iter().filter(|s| crate_set.contains(s.crate_name.as_str())).count();
-            let dead = ws.dead_code.iter().filter(|d| crate_set.contains(d.crate_name.as_str())).count();
+            let stubs = ws
+                .stubs
+                .iter()
+                .filter(|s| crate_set.contains(s.crate_name.as_str()))
+                .count();
+            let dead = ws
+                .dead_code
+                .iter()
+                .filter(|d| crate_set.contains(d.crate_name.as_str()))
+                .count();
             let gap = if mods.is_empty() {
                 "**no crates mapped**".to_string()
             } else if v == "—" && g == "—" {
@@ -287,7 +314,11 @@ pub fn generate(
                 plane.id,
                 v,
                 g,
-                if mods.is_empty() { "—".into() } else { mods.iter().map(|m| format!("`{}`", m)).collect::<Vec<_>>().join(", ") },
+                if mods.is_empty() {
+                    "—".into()
+                } else {
+                    mods.iter().map(|m| format!("`{}`", m)).collect::<Vec<_>>().join(", ")
+                },
                 stubs,
                 dead,
                 gap,
@@ -303,11 +334,7 @@ pub fn generate(
         let mut hs = String::from("## Workspace health\n\n");
         hs.push_str(&format!(
             "**{}** crates · **{}** files · **{}** LOC · **{}** pub symbols · **{}** internal use deps\n\n",
-            ws.stats.crate_count,
-            ws.stats.file_count,
-            ws.stats.total_loc,
-            ws.stats.symbol_count,
-            ws.stats.dep_count,
+            ws.stats.crate_count, ws.stats.file_count, ws.stats.total_loc, ws.stats.symbol_count, ws.stats.dep_count,
         ));
 
         // Stubs grouped by crate.
@@ -378,14 +405,21 @@ pub fn generate(
         alerts.push_str(&format!(
             "- ⚠ **{} planes have no mapped crates** (no keyword overlap with workspace modules): {}\n",
             orphan_planes.len(),
-            orphan_planes.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
+            orphan_planes
+                .iter()
+                .map(|p| format!("`{p}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
         alert_count += orphan_planes.len();
     }
-    let planes_without_vision = planes.iter().filter(|p| {
-        let pl = read_plane_layers(store, input.project_id, &p.id);
-        !pl.contains_key("vision")
-    }).count();
+    let planes_without_vision = planes
+        .iter()
+        .filter(|p| {
+            let pl = read_plane_layers(store, input.project_id, &p.id);
+            !pl.contains_key("vision")
+        })
+        .count();
     if planes_without_vision > 0 {
         alerts.push_str(&format!(
             "- ⚠ **{} planes have no vision layer** — the storybook can't describe them in their own terms.\n",
@@ -425,9 +459,9 @@ pub fn generate(
         planes_with_vision,
         planes_with_mapped_modules: planes_with_modules,
         orphan_planes,
-        workspace_loc: workspace_scan.as_ref().map(|w| w.stats.total_loc).unwrap_or(0),
-        stub_count: workspace_scan.as_ref().map(|w| w.stats.stub_count).unwrap_or(0),
-        dead_code_count: workspace_scan.as_ref().map(|w| w.stats.dead_code_count).unwrap_or(0),
+        workspace_loc: workspace_scan.as_ref().map_or(0, |w| w.stats.total_loc),
+        stub_count: workspace_scan.as_ref().map_or(0, |w| w.stats.stub_count),
+        dead_code_count: workspace_scan.as_ref().map_or(0, |w| w.stats.dead_code_count),
         bytes: md.len(),
     };
 
@@ -495,10 +529,7 @@ pub fn match_plane_to_modules_pub(
 
 // ────────────────────────── Helpers ──────────────────────────
 
-fn read_project_layers(
-    store: &corecrux_memory::FactStore,
-    project_id: &str,
-) -> BTreeMap<String, String> {
+fn read_project_layers(store: &corecrux_memory::FactStore, project_id: &str) -> BTreeMap<String, String> {
     let prefix = format!("__project_layer__::{project_id}::");
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
         query: Some(prefix.clone()),
@@ -519,11 +550,7 @@ fn read_project_layers(
     out
 }
 
-fn read_plane_layers(
-    store: &corecrux_memory::FactStore,
-    project_id: &str,
-    plane_id: &str,
-) -> BTreeMap<String, String> {
+fn read_plane_layers(store: &corecrux_memory::FactStore, project_id: &str, plane_id: &str) -> BTreeMap<String, String> {
     let prefix = format!("__plane_layer__::{project_id}::{plane_id}::");
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
         query: Some(prefix.clone()),
@@ -545,19 +572,139 @@ fn read_plane_layers(
 }
 
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "this", "that", "from", "into", "are", "was", "have", "has",
-    "you", "your", "our", "their", "but", "not", "all", "any", "can", "will", "just", "yet",
-    "one", "two", "more", "less", "must", "may", "would", "should", "could", "what", "where",
-    "when", "which", "who", "why", "how", "between", "across", "every", "some", "those",
-    "these", "such", "rather", "than", "also", "they", "them", "his", "her", "its", "about",
-    "over", "under", "out", "off", "very", "much", "still", "even", "only", "now", "here",
-    "there", "then", "than", "into", "onto", "upon", "without", "within", "while", "until",
-    "since", "because", "though", "although", "however", "moreover", "therefore", "hence",
-    "into", "have", "had", "been", "being", "does", "did", "doing", "done", "make", "made",
-    "making", "use", "used", "using", "uses", "get", "got", "getting", "set", "setting",
-    "let", "letting", "see", "seen", "saw", "look", "looking", "looked", "find", "found",
-    "finding", "give", "given", "giving", "take", "taken", "taking", "come", "coming",
-    "came", "go", "going", "went", "gone", "one", "two", "three",
+    "the",
+    "and",
+    "for",
+    "with",
+    "this",
+    "that",
+    "from",
+    "into",
+    "are",
+    "was",
+    "have",
+    "has",
+    "you",
+    "your",
+    "our",
+    "their",
+    "but",
+    "not",
+    "all",
+    "any",
+    "can",
+    "will",
+    "just",
+    "yet",
+    "one",
+    "two",
+    "more",
+    "less",
+    "must",
+    "may",
+    "would",
+    "should",
+    "could",
+    "what",
+    "where",
+    "when",
+    "which",
+    "who",
+    "why",
+    "how",
+    "between",
+    "across",
+    "every",
+    "some",
+    "those",
+    "these",
+    "such",
+    "rather",
+    "than",
+    "also",
+    "they",
+    "them",
+    "his",
+    "her",
+    "its",
+    "about",
+    "over",
+    "under",
+    "out",
+    "off",
+    "very",
+    "much",
+    "still",
+    "even",
+    "only",
+    "now",
+    "here",
+    "there",
+    "then",
+    "than",
+    "into",
+    "onto",
+    "upon",
+    "without",
+    "within",
+    "while",
+    "until",
+    "since",
+    "because",
+    "though",
+    "although",
+    "however",
+    "moreover",
+    "therefore",
+    "hence",
+    "into",
+    "have",
+    "had",
+    "been",
+    "being",
+    "does",
+    "did",
+    "doing",
+    "done",
+    "make",
+    "made",
+    "making",
+    "use",
+    "used",
+    "using",
+    "uses",
+    "get",
+    "got",
+    "getting",
+    "set",
+    "setting",
+    "let",
+    "letting",
+    "see",
+    "seen",
+    "saw",
+    "look",
+    "looking",
+    "looked",
+    "find",
+    "found",
+    "finding",
+    "give",
+    "given",
+    "giving",
+    "take",
+    "taken",
+    "taking",
+    "come",
+    "coming",
+    "came",
+    "go",
+    "going",
+    "went",
+    "gone",
+    "one",
+    "two",
+    "three",
 ];
 
 fn extract_keywords(text: &str) -> HashSet<String> {
@@ -596,17 +743,14 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
 /// using overlap with the crate name + tokenized module paths. Return crate
 /// names whose overlap is meaningful (>= 2 shared keywords with normalised
 /// score >= 0.05).
-fn match_plane_to_modules(
-    plane_kws: &HashSet<String>,
-    scan: &crate::workspace_scan::WorkspaceScan,
-) -> Vec<String> {
+fn match_plane_to_modules(plane_kws: &HashSet<String>, scan: &crate::workspace_scan::WorkspaceScan) -> Vec<String> {
     if plane_kws.is_empty() {
         return Vec::new();
     }
     let mut crate_keywords: BTreeMap<String, HashSet<String>> = BTreeMap::new();
     for c in &scan.crates {
         let mut kws: HashSet<String> = HashSet::new();
-        for tok in c.name.split(|x: char| x == '-' || x == '_') {
+        for tok in c.name.split(['-', '_']) {
             if tok.len() >= 3 {
                 kws.insert(tok.to_lowercase());
             }
@@ -655,8 +799,7 @@ fn unix_ms_to_iso(ms: u64) -> String {
     let secs = (ms / 1000) as i64;
     let nanos = ((ms % 1000) * 1_000_000) as u32;
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos)
-        .map(|d| d.to_rfc3339())
-        .unwrap_or_else(|| format!("{ms}ms-since-epoch"))
+        .map_or_else(|| format!("{ms}ms-since-epoch"), |d| d.to_rfc3339())
 }
 
 fn truncate_iso(iso: &str) -> String {
@@ -690,8 +833,8 @@ mod tests {
 
     #[test]
     fn jaccard_basic() {
-        let a: HashSet<String> = ["x", "y", "z"].iter().map(|s| s.to_string()).collect();
-        let b: HashSet<String> = ["y", "z", "w"].iter().map(|s| s.to_string()).collect();
+        let a: HashSet<String> = ["x", "y", "z"].iter().map(|s| (*s).to_string()).collect();
+        let b: HashSet<String> = ["y", "z", "w"].iter().map(|s| (*s).to_string()).collect();
         // intersection {y,z}=2, union {x,y,z,w}=4 → 0.5
         assert_eq!(jaccard(&a, &b), 0.5);
         let empty: HashSet<String> = HashSet::new();
@@ -708,12 +851,20 @@ mod tests {
         b_sections.insert("10_vision".to_string(), "vision text".to_string());
         b_sections.insert("20_goals".to_string(), "added goals".to_string());
         let a = StorybookDocument {
-            project_id: "p".into(), generated_at_unix_ms: 1, generated_by_passport: "x".into(),
-            markdown: "abc".into(), sections: a_sections, stats: Default::default(),
+            project_id: "p".into(),
+            generated_at_unix_ms: 1,
+            generated_by_passport: "x".into(),
+            markdown: "abc".into(),
+            sections: a_sections,
+            stats: Default::default(),
         };
         let b = StorybookDocument {
-            project_id: "p".into(), generated_at_unix_ms: 2, generated_by_passport: "x".into(),
-            markdown: "abcdefgh".into(), sections: b_sections, stats: Default::default(),
+            project_id: "p".into(),
+            generated_at_unix_ms: 2,
+            generated_by_passport: "x".into(),
+            markdown: "abcdefgh".into(),
+            sections: b_sections,
+            stats: Default::default(),
         };
         let d = diff_documents(&a, &b);
         assert!(d.added_sections.contains(&"20_goals".to_string()));

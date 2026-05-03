@@ -7,6 +7,9 @@
 //! a tokio task on a fixed cadence and triggerable by hand via
 //! `POST /v1/integrations/github/sync`.
 
+#![allow(dead_code)] // sync constants + helpers used conditionally
+#![allow(clippy::format_push_string)] // builder pattern
+
 use std::path::Path;
 
 use corecrux_memory::fact_store::{FactStore, StoreFact};
@@ -238,9 +241,8 @@ fn fetch_commits_paginated(
         .into();
     let mut out = Vec::new();
     for page in 1..=PER_REPO_MAX_PAGES {
-        let mut url = format!(
-            "https://api.github.com/repos/{owner}/{repo}/commits?per_page={PER_REPO_PAGE_SIZE}&page={page}"
-        );
+        let mut url =
+            format!("https://api.github.com/repos/{owner}/{repo}/commits?per_page={PER_REPO_PAGE_SIZE}&page={page}");
         if let Some(since) = since_iso {
             url.push_str(&format!("&since={}", urlencoding(since)));
         }
@@ -390,9 +392,7 @@ fn fetch_paginated_json(
         .into();
     let mut out = Vec::new();
     for page in 1..=max_pages.max(1) {
-        let url = format!(
-            "https://api.github.com/repos/{owner}/{repo}/{path}?per_page=100&page={page}&{extra_qs}"
-        );
+        let url = format!("https://api.github.com/repos/{owner}/{repo}/{path}?per_page=100&page={page}&{extra_qs}");
         let mut response = agent
             .get(&url)
             .header("Authorization", &format!("Bearer {}", pat.trim()))
@@ -431,7 +431,11 @@ fn parse_pr(v: &serde_json::Value) -> Option<PrRecord> {
         number,
         title: v.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         state: v.get("state").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        author_login: v.get("user").and_then(|u| u.get("login")).and_then(|x| x.as_str()).map(str::to_string),
+        author_login: v
+            .get("user")
+            .and_then(|u| u.get("login"))
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
         created_at: v.get("created_at").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         updated_at: v.get("updated_at").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         merged_at: v.get("merged_at").and_then(|x| x.as_str()).map(str::to_string),
@@ -468,7 +472,11 @@ fn parse_issue(v: &serde_json::Value) -> Option<IssueRecord> {
         number,
         title: v.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         state: v.get("state").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        author_login: v.get("user").and_then(|u| u.get("login")).and_then(|x| x.as_str()).map(str::to_string),
+        author_login: v
+            .get("user")
+            .and_then(|u| u.get("login"))
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
         created_at: v.get("created_at").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         updated_at: v.get("updated_at").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         closed_at: v.get("closed_at").and_then(|x| x.as_str()).map(str::to_string),
@@ -481,13 +489,14 @@ fn parse_issue(v: &serde_json::Value) -> Option<IssueRecord> {
 fn parse_comment(v: &serde_json::Value) -> Option<CommentRecord> {
     let id = v.get("id").and_then(|x| x.as_u64())?;
     let issue_url = v.get("issue_url").and_then(|x| x.as_str()).unwrap_or("");
-    let parent_number = issue_url
-        .rsplit('/')
-        .next()
-        .and_then(|s| s.parse::<u64>().ok());
+    let parent_number = issue_url.rsplit('/').next().and_then(|s| s.parse::<u64>().ok());
     Some(CommentRecord {
         id,
-        author_login: v.get("user").and_then(|u| u.get("login")).and_then(|x| x.as_str()).map(str::to_string),
+        author_login: v
+            .get("user")
+            .and_then(|u| u.get("login"))
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
         body: v.get("body").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         posted_at: v.get("created_at").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         html_url: v.get("html_url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
@@ -507,7 +516,9 @@ pub fn parse_work_mentions(text: &str) -> Vec<String> {
             if let Some(close) = rest.find(']') {
                 let candidate = &rest[..close];
                 if !candidate.is_empty()
-                    && candidate.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                    && candidate
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
                 {
                     out.push(candidate.to_string());
                     i += 6 + close + 1;
@@ -538,11 +549,19 @@ fn parse_commit(v: &serde_json::Value) -> Option<CommitRecord> {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    let author_login = v.get("author").and_then(|a| a.get("login")).and_then(|x| x.as_str()).map(str::to_string);
+    let author_login = v
+        .get("author")
+        .and_then(|a| a.get("login"))
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
     let parents = v
         .get("parents")
         .and_then(|p| p.as_array())
-        .map(|arr| arr.iter().filter_map(|p| p.get("sha").and_then(|s| s.as_str()).map(str::to_string)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.get("sha").and_then(|s| s.as_str()).map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     let html_url = v.get("html_url").and_then(|x| x.as_str()).unwrap_or("").to_string();
     Some(CommitRecord {

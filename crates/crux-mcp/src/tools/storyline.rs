@@ -51,10 +51,7 @@ pub fn input_schema() -> Value {
     })
 }
 
-pub async fn handle_get_workspace_storyline(
-    args: &Value,
-    ctx: &McpContext,
-) -> Result<Value, JsonRpcError> {
+pub async fn handle_get_workspace_storyline(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let Some(base_url) = ctx.daemon_base_url.as_deref() else {
         return Err(JsonRpcError {
             code: INTERNAL_ERROR,
@@ -65,11 +62,7 @@ pub async fn handle_get_workspace_storyline(
         });
     };
 
-    let format = args
-        .get("format")
-        .and_then(Value::as_str)
-        .unwrap_or("tree")
-        .to_string();
+    let format = args.get("format").and_then(Value::as_str).unwrap_or("tree").to_string();
     if !matches!(format.as_str(), "tree" | "json") {
         return Err(JsonRpcError {
             code: INVALID_PARAMS,
@@ -77,10 +70,7 @@ pub async fn handle_get_workspace_storyline(
             data: None,
         });
     }
-    let endpoint = args
-        .get("endpoint")
-        .and_then(Value::as_str)
-        .map(|s| s.to_string());
+    let endpoint = args.get("endpoint").and_then(Value::as_str).map(|s| s.to_string());
     let include_tests = args.get("include_tests").and_then(Value::as_bool).unwrap_or(false);
 
     // Build the URL with manual query encoding (no extra dep needed).
@@ -103,7 +93,8 @@ pub async fn handle_get_workspace_storyline(
                 _ => c.to_string(),
             })
             .collect();
-        url.push_str(&format!("&root={}", encoded));
+        use std::fmt::Write;
+        let _ = write!(url, "&root={encoded}");
     }
 
     let response = tokio::task::spawn_blocking(move || {
@@ -209,12 +200,9 @@ mod tests {
         // Need daemon_base_url set, otherwise we get a different error first.
         let mut ctx = ctx;
         ctx.daemon_base_url = Some("http://127.0.0.1:1".to_string());
-        let err = handle_get_workspace_storyline(
-            &json!({ "format": "xml" }),
-            &ctx,
-        )
-        .await
-        .expect_err("must reject");
+        let err = handle_get_workspace_storyline(&json!({ "format": "xml" }), &ctx)
+            .await
+            .expect_err("must reject");
         assert!(err.message.contains("format must be"), "msg was: {}", err.message);
     }
 }

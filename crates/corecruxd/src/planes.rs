@@ -16,6 +16,9 @@
 //!
 //! Plane id rules mirror project id rules: lowercase, alphanumerics + `-` `_`, max 64 chars.
 
+#![allow(dead_code)] // API constants exported for sibling crates that consume planes via FFI
+#![allow(clippy::unnecessary_wraps)] // kept Result<T> for symmetry with sibling fns + future fallibility
+
 use corecrux_memory::fact_store::{FactQuery, FactStore, StoreFact};
 use serde::{Deserialize, Serialize};
 
@@ -119,10 +122,7 @@ pub fn list_planes(store: &FactStore, project_id: &str) -> Vec<PlaneRecord> {
             continue;
         }
         // Only top-level plane records — skip the `::passport::` and `::tenant::` sub-records.
-        let suffix = fact
-            .entity
-            .strip_prefix(&prefix)
-            .unwrap_or("");
+        let suffix = fact.entity.strip_prefix(&prefix).unwrap_or("");
         if suffix.contains("::") {
             continue;
         }
@@ -187,7 +187,11 @@ pub fn get_plane_detail(store: &FactStore, project_id: &str, plane_id: &str) -> 
     let record = get_plane(store, project_id, plane_id)?;
     let members = list_members(store, project_id, plane_id);
     let tenants = list_tenants(store, project_id, plane_id);
-    Some(PlaneDetail { record, members, tenants })
+    Some(PlaneDetail {
+        record,
+        members,
+        tenants,
+    })
 }
 
 pub fn create_plane(
@@ -202,7 +206,11 @@ pub fn create_plane(
     let record = PlaneRecord {
         project_id: input.project_id.clone(),
         id: input.id.clone(),
-        name: if input.name.trim().is_empty() { input.id.clone() } else { input.name },
+        name: if input.name.trim().is_empty() {
+            input.id.clone()
+        } else {
+            input.name
+        },
         description: input.description.filter(|s| !s.trim().is_empty()),
         default_passport_id: input.default_passport_id.filter(|s| !s.trim().is_empty()),
         created_at_unix_ms: now_unix_ms,
@@ -211,11 +219,7 @@ pub fn create_plane(
     Ok(record)
 }
 
-pub fn delete_plane(
-    store: &mut FactStore,
-    project_id: &str,
-    plane_id: &str,
-) -> Result<(), PlanesError> {
+pub fn delete_plane(store: &mut FactStore, project_id: &str, plane_id: &str) -> Result<(), PlanesError> {
     if get_plane(store, project_id, plane_id).is_none() {
         return Err(PlanesError::NotFound(project_id.to_string(), plane_id.to_string()));
     }
@@ -235,9 +239,7 @@ pub fn delete_plane(
     });
     let latest = crate::fact_helpers::dedup_latest(result.facts);
     for fact in latest {
-        if fact.entity == prefixes[0]
-            || fact.entity.starts_with(&prefixes[1])
-            || fact.entity.starts_with(&prefixes[2])
+        if fact.entity == prefixes[0] || fact.entity.starts_with(&prefixes[1]) || fact.entity.starts_with(&prefixes[2])
         {
             let mut sf = StoreFact {
                 entity: fact.entity,
@@ -265,7 +267,11 @@ pub fn add_member(
     if get_plane(store, project_id, plane_id).is_none() {
         return Err(PlanesError::NotFound(project_id.to_string(), plane_id.to_string()));
     }
-    let role = if role.trim().is_empty() { "contributor".to_string() } else { role.to_string() };
+    let role = if role.trim().is_empty() {
+        "contributor".to_string()
+    } else {
+        role.to_string()
+    };
     let member = PlaneMember {
         passport_id: passport_id.to_string(),
         role,

@@ -526,17 +526,17 @@ pub(super) async fn post_query_text_search(
             let entity = crux_observe::schema::ops_entity("coverage", &uuid::Uuid::new_v4().to_string());
             let mut store = fs.write().await;
             {
-        let mut sf = corecrux_memory::fact_store::StoreFact {
-                entity,
-                key: crux_observe::schema::EVT_OPS_QUERY_COVERAGE_V1.to_string(),
-                value: json,
-                source_receipt: None,
-                confidence: score,
-                private: false,
+                let mut sf = corecrux_memory::fact_store::StoreFact {
+                    entity,
+                    key: crux_observe::schema::EVT_OPS_QUERY_COVERAGE_V1.to_string(),
+                    value: json,
+                    source_receipt: None,
+                    confidence: score,
+                    private: false,
+                };
+                crate::fact_privacy::enforce_global(&mut sf);
+                store.store(sf);
             };
-        crate::fact_privacy::enforce_global(&mut sf);
-        store.store(sf);
-    };
         });
     }
 

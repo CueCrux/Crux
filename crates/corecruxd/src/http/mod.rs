@@ -6,6 +6,7 @@ mod admin;
 mod append;
 mod console;
 mod dataplane;
+mod dossier;
 mod events;
 mod facts;
 mod health;
@@ -14,19 +15,18 @@ mod integrations_openai;
 pub mod invocation;
 mod observe;
 mod openapi;
-mod projections;
 mod passports;
-mod dossier;
 mod planes;
+mod projections;
 mod projects;
-mod storybook;
-mod workspace;
 mod query;
 mod receipts;
 mod relations;
 mod routing;
-mod work;
 pub mod session;
+mod storybook;
+mod work;
+mod workspace;
 // session_metrics: Prometheus register!() at init — safe, panics only on
 // duplicate registration (programmer error caught in tests). Mirrors the
 // allow on `mod metrics` in main.rs.

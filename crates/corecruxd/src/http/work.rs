@@ -4,7 +4,11 @@
 
 //! HTTP CRUD for work items, comments, transitions, and gated actions.
 
-use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode};
+#![allow(clippy::option_option)] // PATCH tri-state semantics
+
+use super::{
+    problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
+};
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct ListWorkQuery {
@@ -178,9 +182,7 @@ pub(super) async fn post_work(
     drop(store);
     match result {
         Ok(w) => (StatusCode::CREATED, Json(w)).into_response(),
-        Err(crate::work::WorkError::ProjectNotFound(_)) => {
-            problem_response(StatusCode::NOT_FOUND, "project not found")
-        }
+        Err(crate::work::WorkError::ProjectNotFound(_)) => problem_response(StatusCode::NOT_FOUND, "project not found"),
         Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
@@ -196,9 +198,7 @@ pub(super) async fn patch_work(
     }
     // Look up the calling passport's gate flag to decide whether state moves are gated.
     let mut store = state.fact_store.write().await;
-    let passport_gated = crate::passports::get_passport(&store, &body.by_passport)
-        .map(|p| p.agent_work_gate)
-        .unwrap_or(false);
+    let passport_gated = crate::passports::get_passport(&store, &body.by_passport).is_some_and(|p| p.agent_work_gate);
     let result = crate::work::update_work(
         &mut store,
         &id,
@@ -220,19 +220,15 @@ pub(super) async fn patch_work(
     );
     drop(store);
     match result {
-        Ok(crate::work::UpdateOutcome::Applied(w)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"applied": true, "work": w})),
-        )
-            .into_response(),
+        Ok(crate::work::UpdateOutcome::Applied(w)) => {
+            (StatusCode::OK, Json(serde_json::json!({"applied": true, "work": w}))).into_response()
+        }
         Ok(crate::work::UpdateOutcome::Queued(p)) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({"applied": false, "queued": p})),
         )
             .into_response(),
-        Err(crate::work::WorkError::NotFound(_)) => {
-            problem_response(StatusCode::NOT_FOUND, "work item not found")
-        }
+        Err(crate::work::WorkError::NotFound(_)) => problem_response(StatusCode::NOT_FOUND, "work item not found"),
         Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
@@ -254,9 +250,7 @@ pub(super) async fn post_comment(
     drop(store);
     match result {
         Ok(c) => (StatusCode::CREATED, Json(c)).into_response(),
-        Err(crate::work::WorkError::NotFound(_)) => {
-            problem_response(StatusCode::NOT_FOUND, "work item not found")
-        }
+        Err(crate::work::WorkError::NotFound(_)) => problem_response(StatusCode::NOT_FOUND, "work item not found"),
         Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }

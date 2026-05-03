@@ -1079,7 +1079,13 @@ mod tests {
         assert_eq!(snapshot.grants.len(), 1);
         assert_eq!(snapshot.audit_tail.len(), 2);
 
-        let disabled = disable_pack(&root, "p_local", "sdk.typescript.quickstart", Some("off".to_string()), 3_000)?;
+        let disabled = disable_pack(
+            &root,
+            "p_local",
+            "sdk.typescript.quickstart",
+            Some("off".to_string()),
+            3_000,
+        )?;
         assert!(!disabled.enabled);
         assert_eq!(disabled.disabled_at_unix_ms, Some(3_000));
 

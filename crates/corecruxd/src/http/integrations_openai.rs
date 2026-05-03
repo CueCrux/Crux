@@ -127,11 +127,19 @@ pub(super) async fn patch_settings(
     };
     if let Some(model) = body.default_model {
         let trimmed = model.trim();
-        creds.default_model = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+        creds.default_model = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
     }
     if let Some(org) = body.organization_id {
         let trimmed = org.trim();
-        creds.organization_id = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+        creds.organization_id = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
     }
     if let Err(err) = crate::integrations_openai::write_credentials(&state.data_dir, &creds) {
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
@@ -168,13 +176,19 @@ pub(super) async fn post_chat(
     }
     let creds = match crate::integrations_openai::read_credentials(&state.data_dir) {
         Ok(c) => c,
-        Err(_) => return problem_response(StatusCode::PRECONDITION_FAILED, "OpenAI not connected; POST /v1/integrations/openai/connect first"),
+        Err(_) => {
+            return problem_response(
+                StatusCode::PRECONDITION_FAILED,
+                "OpenAI not connected; POST /v1/integrations/openai/connect first",
+            )
+        }
     };
     let api_key = match crate::integrations_openai::decrypt_api_key(&creds, state.integration_encryption_key.as_ref()) {
         Ok(k) => k,
         Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("decrypt failed: {err}")),
     };
-    let model = body.model
+    let model = body
+        .model
         .clone()
         .or_else(|| creds.default_model.clone())
         .unwrap_or_else(|| "gpt-4o-mini".to_string());
@@ -207,12 +221,12 @@ pub(super) async fn post_chat(
         }
         let mut response = req.send_json(payload).map_err(|e| e.to_string())?;
         let status = response.status().as_u16();
-        let text = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| e.to_string())?;
+        let text = response.body_mut().read_to_string().map_err(|e| e.to_string())?;
         if status != 200 {
-            return Err(format!("openai returned {status}: {}", text.chars().take(512).collect::<String>()));
+            return Err(format!(
+                "openai returned {status}: {}",
+                text.chars().take(512).collect::<String>()
+            ));
         }
         serde_json::from_str::<serde_json::Value>(&text).map_err(|e| e.to_string())
     })

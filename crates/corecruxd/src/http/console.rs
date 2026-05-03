@@ -123,16 +123,15 @@ pub(super) struct UpdateSettingsBody {
     pub embedding_model: Option<String>,
 }
 
-pub(super) async fn get_console_settings(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub(super) async fn get_console_settings(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
     }
     let onboarding = state.onboarding.read().await;
     let env_embedding_url = std::env::var("CORECRUXD_EMBEDDING_URL").ok().filter(|s| !s.is_empty());
-    let env_embedding_model = std::env::var("CORECRUXD_EMBEDDING_MODEL").ok().filter(|s| !s.is_empty());
+    let env_embedding_model = std::env::var("CORECRUXD_EMBEDDING_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty());
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -294,30 +293,20 @@ fn probe_embedding_url(url: &str) -> Result<EmbeddingProbeResult, String> {
         .build()
         .into();
 
-    let probe_endpoints: [(&str, &str); 2] = [
-        ("ollama", "/api/tags"),
-        ("openai-compat", "/v1/models"),
-    ];
+    let probe_endpoints: [(&str, &str); 2] = [("ollama", "/api/tags"), ("openai-compat", "/v1/models")];
     let mut last_error = String::new();
 
     for candidate in &candidates {
         for (shape, path) in probe_endpoints {
             let probe_url = format!("{candidate}{path}");
-            match agent
-                .get(&probe_url)
-                .header("Accept", "application/json")
-                .call()
-            {
+            match agent.get(&probe_url).header("Accept", "application/json").call() {
                 Ok(mut response) => {
                     let status = response.status().as_u16();
                     if status != 200 {
                         last_error = format!("{shape} ({probe_url}) returned {status}");
                         continue;
                     }
-                    let text = response
-                        .body_mut()
-                        .read_to_string()
-                        .map_err(|e| e.to_string())?;
+                    let text = response.body_mut().read_to_string().map_err(|e| e.to_string())?;
                     let parsed: serde_json::Value = match serde_json::from_str(&text) {
                         Ok(v) => v,
                         Err(e) => {
@@ -417,9 +406,7 @@ fn build_probe_candidates(url: &str) -> Vec<String> {
     let mut out = vec![trimmed.clone()];
     let lower = trimmed.to_lowercase();
 
-    let is_localhost = lower.contains("//localhost")
-        || lower.contains("//127.0.0.1")
-        || lower.contains("//0.0.0.0");
+    let is_localhost = lower.contains("//localhost") || lower.contains("//127.0.0.1") || lower.contains("//0.0.0.0");
 
     if is_localhost {
         for host in ["host.docker.internal", "crux-ollama-1"] {
@@ -806,7 +793,12 @@ pub(super) async fn get_console_facts(
         return problem.into_response();
     }
 
-    let q = query.q.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string);
+    let q = query
+        .q
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let top_k = query.top_k.unwrap_or(50).clamp(1, 200);
 
     let store = state.fact_store.read().await;

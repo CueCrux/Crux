@@ -193,10 +193,7 @@ fn bad_request(message: impl Into<String>) -> Response {
 /// (most recent first). Returns the resolved `(project_id, tenant_id,
 /// passport_id)` triple per session — does NOT include the cryptographically-
 /// signed session plan, that's still a `POST /session` round trip.
-pub async fn get_active_sessions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn get_active_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(problem) = crate::auth::require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }
@@ -371,7 +368,10 @@ pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, bod
     let binding = match binding_result {
         Ok(b) => Some(b),
         Err(err) => {
-            tracing::warn!(?err, "session binding resolution failed; session minted without binding");
+            tracing::warn!(
+                ?err,
+                "session binding resolution failed; session minted without binding"
+            );
             None
         }
     };

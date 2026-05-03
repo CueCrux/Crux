@@ -18,6 +18,8 @@
 //! members/tenants, project layers, plane layers, indexed GitHub commits.
 //! Source-tree extraction and vision↔module inference land in Phase 2.
 
+#![allow(dead_code)] // graph-fold helpers staged for the AX Graph panel — kept for symmetry with sibling renderers
+
 use corecrux_memory::fact_store::{FactQuery, FactStore};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -158,11 +160,7 @@ pub fn build_for_project(store: &FactStore, project_id: &str) -> ContextGraph {
     build_for_project_with_opts(store, project_id, &GraphOptions::default())
 }
 
-pub fn build_for_project_with_opts(
-    store: &FactStore,
-    project_id: &str,
-    opts: &GraphOptions,
-) -> ContextGraph {
+pub fn build_for_project_with_opts(store: &FactStore, project_id: &str, opts: &GraphOptions) -> ContextGraph {
     let mut g = ContextGraph {
         project_id: project_id.to_string(),
         generated_at_unix_ms: std::time::SystemTime::now()
@@ -407,10 +405,16 @@ pub fn build_for_project_with_opts(
 
     // ── Stats + orphan detection ──────────────────────────────────────
     for n in &g.nodes {
-        *g.stats.node_count_by_kind.entry(n.kind.snake().to_string()).or_insert(0) += 1;
+        *g.stats
+            .node_count_by_kind
+            .entry(n.kind.snake().to_string())
+            .or_insert(0) += 1;
     }
     for e in &g.edges {
-        *g.stats.edge_count_by_kind.entry(e.kind.snake().to_string()).or_insert(0) += 1;
+        *g.stats
+            .edge_count_by_kind
+            .entry(e.kind.snake().to_string())
+            .or_insert(0) += 1;
         let conf_key = match &e.confidence {
             Confidence::Extracted => "extracted",
             Confidence::Inferred(_) => "inferred",
@@ -436,11 +440,7 @@ pub fn build_for_project_with_opts(
     g
 }
 
-fn query_prefix(
-    store: &FactStore,
-    prefix: &str,
-    top_k: usize,
-) -> Vec<corecrux_memory::fact_store::Fact> {
+fn query_prefix(store: &FactStore, prefix: &str, top_k: usize) -> Vec<corecrux_memory::fact_store::Fact> {
     store
         .query(&FactQuery {
             query: Some(prefix.to_string()),
@@ -479,11 +479,7 @@ fn load_latest_workspace_blocking(store: &FactStore) -> Option<crate::workspace_
 
 /// Fold a workspace scan into the project graph. Adds module / file (and
 /// optionally symbol) nodes plus depends_on / stubs / dead_code edges.
-fn fold_workspace_into_graph(
-    g: &mut ContextGraph,
-    scan: &crate::workspace_scan::WorkspaceScan,
-    include_symbols: bool,
-) {
+fn fold_workspace_into_graph(g: &mut ContextGraph, scan: &crate::workspace_scan::WorkspaceScan, include_symbols: bool) {
     use std::collections::HashSet;
     let module_node = |crate_name: &str| format!("module:{crate_name}");
     let file_node = |rel: &str| format!("file:{rel}");
@@ -528,13 +524,11 @@ fn fold_workspace_into_graph(
         g.nodes.push(Node {
             id: id.clone(),
             kind: NodeKind::File,
-            label: f
-                .rel_path
-                .rsplit('/')
-                .next()
-                .unwrap_or(&f.rel_path)
-                .to_string(),
-            sublabel: Some(format!("{} · {} loc · {} symbols", f.module_path, f.loc, f.symbol_count)),
+            label: f.rel_path.rsplit('/').next().unwrap_or(&f.rel_path).to_string(),
+            sublabel: Some(format!(
+                "{} · {} loc · {} symbols",
+                f.module_path, f.loc, f.symbol_count
+            )),
             meta: serde_json::json!({
                 "rel_path": f.rel_path,
                 "module_path": f.module_path,
@@ -598,8 +592,7 @@ fn fold_workspace_into_graph(
             .crates
             .iter()
             .find(|c| c.name.replace('-', "_") == target_first)
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| target_first.to_string());
+            .map_or_else(|| target_first.to_string(), |c| c.name.clone());
         let key = (d.from_crate.clone(), to_crate_orig.clone());
         if emitted_crate_deps.insert(key.clone()) {
             g.edges.push(Edge {
@@ -725,9 +718,18 @@ mod tests {
         crate::planes::add_tenant(&mut store, "p", "x", "work::p::x", None, 4_000).unwrap();
 
         let g = build_for_project(&store, "p");
-        assert!(g.nodes.iter().any(|n| matches!(n.kind, NodeKind::Project) && n.label == "P"));
-        assert!(g.nodes.iter().any(|n| matches!(n.kind, NodeKind::Plane) && n.label == "Plane X"));
-        assert!(g.nodes.iter().any(|n| matches!(n.kind, NodeKind::Passport) && n.label == "agent-claude"));
+        assert!(g
+            .nodes
+            .iter()
+            .any(|n| matches!(n.kind, NodeKind::Project) && n.label == "P"));
+        assert!(g
+            .nodes
+            .iter()
+            .any(|n| matches!(n.kind, NodeKind::Plane) && n.label == "Plane X"));
+        assert!(g
+            .nodes
+            .iter()
+            .any(|n| matches!(n.kind, NodeKind::Passport) && n.label == "agent-claude"));
         assert!(g.nodes.iter().any(|n| matches!(n.kind, NodeKind::Tenant)));
         assert!(g.nodes.iter().any(|n| matches!(n.kind, NodeKind::GithubRepo)));
         // Plane belongs_to project.
@@ -736,10 +738,7 @@ mod tests {
             .iter()
             .any(|e| matches!(e.kind, EdgeKind::BelongsTo) && e.from.starts_with("plane:")));
         // Project planning_target -> github_repo.
-        assert!(g
-            .edges
-            .iter()
-            .any(|e| matches!(e.kind, EdgeKind::PlanningTarget)));
+        assert!(g.edges.iter().any(|e| matches!(e.kind, EdgeKind::PlanningTarget)));
         // Stats are populated.
         assert!(g.stats.node_count_by_kind.contains_key("project"));
         assert!(g.stats.edge_count_by_kind.contains_key("belongs_to"));

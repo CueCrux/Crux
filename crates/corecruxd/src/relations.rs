@@ -11,6 +11,8 @@
 //! in a `ProjectionState` and appends to `data_dir/relations.jsonl`. The file
 //! is replayed on startup so the graph survives container restarts.
 
+#![allow(clippy::type_complexity)] // BTreeMap<(String,String,String), Vec<RelationFact>> is the natural shape; alias would obscure
+
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -121,11 +123,11 @@ pub fn apply_record(state: &mut ProjectionState, record: &RelationRecord) -> Res
     Ok(())
 }
 
-pub fn list_outgoing<'a>(
-    state: &'a ProjectionState,
+pub fn list_outgoing(
+    state: &ProjectionState,
     tenant_hash: u64,
     from_id: u32,
-) -> Vec<((u64, u32, u32, u8), &'a RelationEdgeV1)> {
+) -> Vec<((u64, u32, u32, u8), &RelationEdgeV1)> {
     state
         .relations
         .range((tenant_hash, from_id, 0u32, 0u8)..=(tenant_hash, from_id, u32::MAX, u8::MAX))

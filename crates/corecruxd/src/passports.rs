@@ -15,6 +15,8 @@
 //! per tenant category (`personal-default`, `work-default`, `public-default`)
 //! — so the rest of the system always has a working default to fall back to.
 
+#![allow(clippy::option_option)] // PATCH tri-state semantics: outer Some=present, inner None=clear, inner Some=set
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -94,7 +96,9 @@ pub fn validate_id(id: &str) -> Result<(), PassportsError> {
     if id.is_empty() || id.len() > 64 {
         return Err(PassportsError::InvalidId(id.to_string()));
     }
-    let ok = id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    let ok = id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
     if !ok {
         return Err(PassportsError::InvalidId(id.to_string()));
     }
@@ -131,7 +135,7 @@ pub fn list_passports(store: &FactStore, category_filter: Option<&str>) -> Vec<P
             continue;
         }
         if let Ok(rec) = serde_json::from_str::<PassportRecord>(&fact.value) {
-            if category_filter.map_or(true, |c| rec.category == c) {
+            if category_filter.is_none_or(|c| rec.category == c) {
                 out.push(rec);
             }
         }
@@ -237,8 +241,7 @@ pub fn seed_defaults_if_missing(
     store: &mut FactStore,
     now_unix_ms: u64,
 ) -> Result<usize, PassportsError> {
-    let existing: std::collections::BTreeSet<String> =
-        list_passports(store, None).into_iter().map(|p| p.id).collect();
+    let existing: std::collections::BTreeSet<String> = list_passports(store, None).into_iter().map(|p| p.id).collect();
     let mut created = 0usize;
     for category in SUPPORTED_CATEGORIES {
         let id = format!("{category}-default");
@@ -382,7 +385,10 @@ mod tests {
         let categories: std::collections::BTreeSet<_> = listed.iter().map(|p| p.category.as_str()).collect();
         assert_eq!(
             categories,
-            ["personal", "work", "public"].iter().copied().collect::<std::collections::BTreeSet<_>>()
+            ["personal", "work", "public"]
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
         );
         for p in &listed {
             assert!(p.is_default_for_category);
@@ -394,14 +400,32 @@ mod tests {
     fn setting_default_clears_others_in_same_category() {
         let dir = temp_dir("default-flip");
         let mut store = FactStore::new();
-        create_passport(&dir, &mut store, CreatePassportInput {
-            id: "personal-a".to_string(), category: "personal".to_string(),
-            sponsor_id: None, agent_work_gate: false, is_default_for_category: true,
-        }, 1).expect("a");
-        create_passport(&dir, &mut store, CreatePassportInput {
-            id: "personal-b".to_string(), category: "personal".to_string(),
-            sponsor_id: None, agent_work_gate: false, is_default_for_category: false,
-        }, 2).expect("b");
+        create_passport(
+            &dir,
+            &mut store,
+            CreatePassportInput {
+                id: "personal-a".to_string(),
+                category: "personal".to_string(),
+                sponsor_id: None,
+                agent_work_gate: false,
+                is_default_for_category: true,
+            },
+            1,
+        )
+        .expect("a");
+        create_passport(
+            &dir,
+            &mut store,
+            CreatePassportInput {
+                id: "personal-b".to_string(),
+                category: "personal".to_string(),
+                sponsor_id: None,
+                agent_work_gate: false,
+                is_default_for_category: false,
+            },
+            2,
+        )
+        .expect("b");
 
         update_passport(
             &mut store,
@@ -445,10 +469,19 @@ mod tests {
     fn delete_removes_record() {
         let dir = temp_dir("del");
         let mut store = FactStore::new();
-        create_passport(&dir, &mut store, CreatePassportInput {
-            id: "alice".to_string(), category: "personal".to_string(),
-            sponsor_id: None, agent_work_gate: false, is_default_for_category: false,
-        }, 1).expect("create");
+        create_passport(
+            &dir,
+            &mut store,
+            CreatePassportInput {
+                id: "alice".to_string(),
+                category: "personal".to_string(),
+                sponsor_id: None,
+                agent_work_gate: false,
+                is_default_for_category: false,
+            },
+            1,
+        )
+        .expect("create");
         delete_passport(&mut store, "alice").expect("delete");
         assert!(get_passport(&store, "alice").is_none());
         let _ = fs::remove_dir_all(&dir);
@@ -458,14 +491,32 @@ mod tests {
     fn default_for_category_returns_explicit_default_if_present() {
         let dir = temp_dir("def-cat");
         let mut store = FactStore::new();
-        create_passport(&dir, &mut store, CreatePassportInput {
-            id: "personal-a".to_string(), category: "personal".to_string(),
-            sponsor_id: None, agent_work_gate: false, is_default_for_category: false,
-        }, 1).expect("a");
-        create_passport(&dir, &mut store, CreatePassportInput {
-            id: "personal-b".to_string(), category: "personal".to_string(),
-            sponsor_id: None, agent_work_gate: false, is_default_for_category: true,
-        }, 2).expect("b");
+        create_passport(
+            &dir,
+            &mut store,
+            CreatePassportInput {
+                id: "personal-a".to_string(),
+                category: "personal".to_string(),
+                sponsor_id: None,
+                agent_work_gate: false,
+                is_default_for_category: false,
+            },
+            1,
+        )
+        .expect("a");
+        create_passport(
+            &dir,
+            &mut store,
+            CreatePassportInput {
+                id: "personal-b".to_string(),
+                category: "personal".to_string(),
+                sponsor_id: None,
+                agent_work_gate: false,
+                is_default_for_category: true,
+            },
+            2,
+        )
+        .expect("b");
         let def = default_for_category(&store, "personal").expect("default");
         assert_eq!(def.id, "personal-b");
         let _ = fs::remove_dir_all(&dir);

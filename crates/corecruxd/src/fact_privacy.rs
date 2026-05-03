@@ -31,13 +31,15 @@
 //! - `__ax_session::`        — AX session-scoped state
 //! - `decisions::`           — legacy decision log entries (if any)
 //! - `github::`              — GitHub-ingested commits/PRs/issues (most are
-//!                            from private repos; keep local until operator
-//!                            explicitly shares a specific repo)
+//!   from private repos; keep local until operator explicitly shares a specific
+//!   repo)
 //!
 //! Anything else (manually-added facts, bootstrapped public data) is push-
 //! eligible by default — but `sync_push` is already tier-gated and requires
 //! `confirm=true` and a configured remote URL, so the actual push surface
 //! has multiple defences.
+
+#![allow(dead_code)] // privacy-policy helpers held for richer scope rules; not all wired yet
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -135,17 +137,11 @@ impl PrivacyPolicy {
     /// `true` if the entity is covered by an always-private prefix that
     /// hasn't been explicitly overridden to share.
     pub fn is_always_private(&self, entity: &str) -> bool {
-        let private_match = self
-            .private_prefixes
-            .iter()
-            .any(|p| entity.starts_with(p));
+        let private_match = self.private_prefixes.iter().any(|p| entity.starts_with(p));
         if !private_match {
             return false;
         }
-        let share_match = self
-            .share_overrides
-            .iter()
-            .any(|p| entity.starts_with(p));
+        let share_match = self.share_overrides.iter().any(|p| entity.starts_with(p));
         !share_match
     }
 
@@ -191,7 +187,7 @@ mod tests {
     #[test]
     fn defaults_cover_known_internal_prefixes() {
         let p = PrivacyPolicy::from_prefixes(
-            DEFAULT_PRIVATE_PREFIXES.iter().map(|s| s.to_string()).collect(),
+            DEFAULT_PRIVATE_PREFIXES.iter().map(|s| (*s).to_string()).collect(),
             vec![],
         );
         assert!(p.is_always_private("__ax__::decision::42"));
@@ -204,7 +200,7 @@ mod tests {
     #[test]
     fn unrelated_entity_is_not_forced_private() {
         let p = PrivacyPolicy::from_prefixes(
-            DEFAULT_PRIVATE_PREFIXES.iter().map(|s| s.to_string()).collect(),
+            DEFAULT_PRIVATE_PREFIXES.iter().map(|s| (*s).to_string()).collect(),
             vec![],
         );
         assert!(!p.is_always_private("personal::scratch::note"));
@@ -225,10 +221,7 @@ mod tests {
 
     #[test]
     fn enforce_sets_private_when_matched() {
-        let p = PrivacyPolicy::from_prefixes(
-            vec!["__ax__::".into()],
-            vec![],
-        );
+        let p = PrivacyPolicy::from_prefixes(vec!["__ax__::".into()], vec![]);
         let mut f = make("__ax__::decision::42");
         enforce(&p, &mut f);
         assert!(f.private);
@@ -236,10 +229,7 @@ mod tests {
 
     #[test]
     fn enforce_leaves_private_alone_when_not_matched() {
-        let p = PrivacyPolicy::from_prefixes(
-            vec!["__ax__::".into()],
-            vec![],
-        );
+        let p = PrivacyPolicy::from_prefixes(vec!["__ax__::".into()], vec![]);
         let mut f = make("personal::scratch");
         enforce(&p, &mut f);
         assert!(!f.private);

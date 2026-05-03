@@ -176,11 +176,14 @@ pub async fn handle_list_projects(_args: &Value, ctx: &McpContext) -> Result<Val
 }
 
 pub async fn handle_get_project_context(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let id = args.get("project_id").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
-        code: INVALID_PARAMS,
-        message: "get_project_context: project_id is required".to_string(),
-        data: None,
-    })?;
+    let id = args
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "get_project_context: project_id is required".to_string(),
+            data: None,
+        })?;
     let base = loopback_base(ctx)?;
     let (_, body) = loopback_get(format!("{base}/v1/projects/{id}")).await?;
     Ok(text_content(serde_json::from_str(&body).unwrap_or(Value::String(body))))
@@ -193,59 +196,86 @@ pub async fn handle_list_work(args: &Value, ctx: &McpContext) -> Result<Value, J
             params.push(format!("{key}={}", urlencoding(v)));
         }
     }
-    let qs = if params.is_empty() { String::new() } else { format!("?{}", params.join("&")) };
+    let qs = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    };
     let base = loopback_base(ctx)?;
     let (_, body) = loopback_get(format!("{base}/v1/work{qs}")).await?;
     Ok(text_content(serde_json::from_str(&body).unwrap_or(Value::String(body))))
 }
 
 pub async fn handle_create_work(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let project_id = args.get("project_id").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
-        code: INVALID_PARAMS,
-        message: "create_work: project_id is required".to_string(),
-        data: None,
-    })?;
+    let project_id = args
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "create_work: project_id is required".to_string(),
+            data: None,
+        })?;
     let title = args.get("title").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
         code: INVALID_PARAMS,
         message: "create_work: title is required".to_string(),
         data: None,
     })?;
-    let created_by = args.get("created_by_passport").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
-        code: INVALID_PARAMS,
-        message: "create_work: created_by_passport is required (use the passport bound to your session)".to_string(),
-        data: None,
-    })?;
+    let created_by = args
+        .get("created_by_passport")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "create_work: created_by_passport is required (use the passport bound to your session)"
+                .to_string(),
+            data: None,
+        })?;
     let mut body = json!({
         "project_id": project_id,
         "title": title,
         "created_by_passport": created_by,
     });
-    for key in ["body", "state", "assignee_passport", "tenant_id", "linked_pr", "linked_issue"] {
+    for key in [
+        "body",
+        "state",
+        "assignee_passport",
+        "tenant_id",
+        "linked_pr",
+        "linked_issue",
+    ] {
         if let Some(v) = args.get(key) {
             body[key] = v.clone();
         }
     }
     let base = loopback_base(ctx)?;
     let (_, resp_body) = loopback_post(format!("{base}/v1/work"), body, true).await?;
-    Ok(text_content(serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body))))
+    Ok(text_content(
+        serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body)),
+    ))
 }
 
 pub async fn handle_update_work_state(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let id = args.get("work_id").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
-        code: INVALID_PARAMS,
-        message: "update_work_state: work_id is required".to_string(),
-        data: None,
-    })?;
+    let id = args
+        .get("work_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "update_work_state: work_id is required".to_string(),
+            data: None,
+        })?;
     let new_state = args.get("state").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
         code: INVALID_PARAMS,
-        message: "update_work_state: state is required (planned|in_progress|blocked|archive|complete|deployed)".to_string(),
+        message: "update_work_state: state is required (planned|in_progress|blocked|archive|complete|deployed)"
+            .to_string(),
         data: None,
     })?;
-    let by = args.get("by_passport").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
-        code: INVALID_PARAMS,
-        message: "update_work_state: by_passport is required".to_string(),
-        data: None,
-    })?;
+    let by = args
+        .get("by_passport")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "update_work_state: by_passport is required".to_string(),
+            data: None,
+        })?;
     let mut body = json!({
         "state": new_state,
         "by_passport": by,
@@ -255,20 +285,28 @@ pub async fn handle_update_work_state(args: &Value, ctx: &McpContext) -> Result<
     }
     let base = loopback_base(ctx)?;
     let (_, resp_body) = loopback_patch(format!("{base}/v1/work/{id}"), body).await?;
-    Ok(text_content(serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body))))
+    Ok(text_content(
+        serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body)),
+    ))
 }
 
 pub async fn handle_comment_on_work(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let id = args.get("work_id").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
-        code: INVALID_PARAMS,
-        message: "comment_on_work: work_id is required".to_string(),
-        data: None,
-    })?;
-    let author = args.get("author_passport").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
-        code: INVALID_PARAMS,
-        message: "comment_on_work: author_passport is required".to_string(),
-        data: None,
-    })?;
+    let id = args
+        .get("work_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "comment_on_work: work_id is required".to_string(),
+            data: None,
+        })?;
+    let author = args
+        .get("author_passport")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "comment_on_work: author_passport is required".to_string(),
+            data: None,
+        })?;
     let body_text = args.get("body").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
         code: INVALID_PARAMS,
         message: "comment_on_work: body is required".to_string(),
@@ -280,7 +318,9 @@ pub async fn handle_comment_on_work(args: &Value, ctx: &McpContext) -> Result<Va
     });
     let base = loopback_base(ctx)?;
     let (_, resp_body) = loopback_post(format!("{base}/v1/work/{id}/comments"), payload, true).await?;
-    Ok(text_content(serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body))))
+    Ok(text_content(
+        serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body)),
+    ))
 }
 
 fn urlencoding(s: &str) -> String {

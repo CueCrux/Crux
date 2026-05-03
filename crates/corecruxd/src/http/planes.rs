@@ -123,9 +123,7 @@ pub(super) async fn post_plane(
         Err(crate::planes::PlanesError::DuplicateId(_, _)) => {
             problem_response(StatusCode::CONFLICT, "plane id already exists in this project")
         }
-        Err(crate::planes::PlanesError::InvalidId(_)) => {
-            problem_response(StatusCode::BAD_REQUEST, "invalid plane id")
-        }
+        Err(crate::planes::PlanesError::InvalidId(_)) => problem_response(StatusCode::BAD_REQUEST, "invalid plane id"),
         Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
@@ -143,9 +141,7 @@ pub(super) async fn delete_plane(
     drop(store);
     match result {
         Ok(()) => (StatusCode::NO_CONTENT, ()).into_response(),
-        Err(crate::planes::PlanesError::NotFound(_, _)) => {
-            problem_response(StatusCode::NOT_FOUND, "plane not found")
-        }
+        Err(crate::planes::PlanesError::NotFound(_, _)) => problem_response(StatusCode::NOT_FOUND, "plane not found"),
         Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
@@ -160,13 +156,18 @@ pub(super) async fn post_plane_member(
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
-    let result = crate::planes::add_member(&mut store, &project_id, &plane_id, &body.passport_id, &body.role, now_unix_ms());
+    let result = crate::planes::add_member(
+        &mut store,
+        &project_id,
+        &plane_id,
+        &body.passport_id,
+        &body.role,
+        now_unix_ms(),
+    );
     drop(store);
     match result {
         Ok(m) => (StatusCode::CREATED, Json(m)).into_response(),
-        Err(crate::planes::PlanesError::NotFound(_, _)) => {
-            problem_response(StatusCode::NOT_FOUND, "plane not found")
-        }
+        Err(crate::planes::PlanesError::NotFound(_, _)) => problem_response(StatusCode::NOT_FOUND, "plane not found"),
         Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
@@ -198,13 +199,18 @@ pub(super) async fn post_plane_tenant(
         return problem.into_response();
     }
     let mut store = state.fact_store.write().await;
-    let result = crate::planes::add_tenant(&mut store, &project_id, &plane_id, &body.tenant_id, body.default_passport_id, now_unix_ms());
+    let result = crate::planes::add_tenant(
+        &mut store,
+        &project_id,
+        &plane_id,
+        &body.tenant_id,
+        body.default_passport_id,
+        now_unix_ms(),
+    );
     drop(store);
     match result {
         Ok(t) => (StatusCode::CREATED, Json(t)).into_response(),
-        Err(crate::planes::PlanesError::NotFound(_, _)) => {
-            problem_response(StatusCode::NOT_FOUND, "plane not found")
-        }
+        Err(crate::planes::PlanesError::NotFound(_, _)) => problem_response(StatusCode::NOT_FOUND, "plane not found"),
         Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
@@ -262,12 +268,15 @@ pub(super) async fn get_plane_layers(
         if fact.value.is_empty() {
             continue;
         }
-        layers.insert(layer_name, serde_json::json!({
-            "content": fact.value,
-            "version": fact.version,
-            "stored_at": fact.stored_at.to_rfc3339(),
-            "fact_id": fact.fact_id,
-        }));
+        layers.insert(
+            layer_name,
+            serde_json::json!({
+                "content": fact.value,
+                "version": fact.version,
+                "stored_at": fact.stored_at.to_rfc3339(),
+                "fact_id": fact.fact_id,
+            }),
+        );
     }
     drop(store);
     (
@@ -366,15 +375,18 @@ pub(super) async fn post_sync_layers(
     drop(store);
     match result {
         Ok(report) => (StatusCode::OK, Json(report)).into_response(),
-        Err(crate::plane_layer_sync::SyncError::NotAllowed(_, _)) => {
-            problem_response(StatusCode::BAD_REQUEST, "source_path is outside the allowed roots (CORECRUXD_SOURCE_ROOTS)")
-        }
-        Err(crate::plane_layer_sync::SyncError::PathMissing(p)) => {
-            problem_response(StatusCode::BAD_REQUEST, format!("source path '{p}' does not exist inside the daemon"))
-        }
-        Err(crate::plane_layer_sync::SyncError::InvalidLayer(l)) => {
-            problem_response(StatusCode::BAD_REQUEST, format!("layer must be 'vision' or 'goals'; got '{l}'"))
-        }
+        Err(crate::plane_layer_sync::SyncError::NotAllowed(_, _)) => problem_response(
+            StatusCode::BAD_REQUEST,
+            "source_path is outside the allowed roots (CORECRUXD_SOURCE_ROOTS)",
+        ),
+        Err(crate::plane_layer_sync::SyncError::PathMissing(p)) => problem_response(
+            StatusCode::BAD_REQUEST,
+            format!("source path '{p}' does not exist inside the daemon"),
+        ),
+        Err(crate::plane_layer_sync::SyncError::InvalidLayer(l)) => problem_response(
+            StatusCode::BAD_REQUEST,
+            format!("layer must be 'vision' or 'goals'; got '{l}'"),
+        ),
         Err(err) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }

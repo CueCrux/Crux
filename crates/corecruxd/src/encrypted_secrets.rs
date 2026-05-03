@@ -8,6 +8,8 @@
 //! passport rotation invalidates existing envelopes — desirable behaviour
 //! (forces operator to reconnect, never silently consumes a stale token).
 
+#![allow(clippy::expect_used)] // cryptographic invariants: AEAD nonce/tag sizes are constants — .expect on these is a sound assertion, not a runtime panic
+
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::RngCore;

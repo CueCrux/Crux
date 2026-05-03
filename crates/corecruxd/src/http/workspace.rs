@@ -8,6 +8,8 @@
 //! latest scan is stored as a single fact `__workspace_scan__::latest::content`
 //! so the context-graph endpoint can fold it into the graph.
 
+#![allow(clippy::format_push_string)] // builder pattern: many appends to one String — write! macro hurts readability vs push_str(&format!(..))
+
 use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, State, StatusCode};
 
 const LATEST_SCAN_ENTITY: &str = "__workspace_scan__::latest";
@@ -16,10 +18,7 @@ const SCAN_KEY: &str = "content";
 /// `POST /v1/workspace/scan` — kick off a scan of the configured workspace
 /// path. Returns the scan summary (no file contents) inline; full payload is
 /// persisted as a fact.
-pub(super) async fn post_scan(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub(super) async fn post_scan(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }
@@ -74,21 +73,20 @@ pub(super) async fn post_scan(
 /// main HTTP port (14800) so the in-browser console can read it without
 /// crossing CORS to the MCP port (14801). Returns the same shape as the
 /// JSON-RPC tools/list result, minus the JSON-RPC envelope.
-pub(super) async fn get_mcp_tools(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub(super) async fn get_mcp_tools(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }
     let tools = crux_mcp::tools::list_tools();
     let serialised: Vec<serde_json::Value> = tools
         .into_iter()
-        .map(|t| serde_json::json!({
-            "name": t.name,
-            "description": t.description,
-            "inputSchema": t.input_schema,
-        }))
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": t.input_schema,
+            })
+        })
         .collect();
     (
         StatusCode::OK,
@@ -101,10 +99,7 @@ pub(super) async fn get_mcp_tools(
 }
 
 /// `GET /v1/workspace/scan` — return the latest persisted scan in full.
-pub(super) async fn get_scan(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub(super) async fn get_scan(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }
@@ -161,10 +156,12 @@ pub(super) async fn get_storyline(
     }
     let scan = match crate::workspace_scan::load_latest(&state.fact_store).await {
         Some(s) => s,
-        None => return problem_response(
-            StatusCode::NOT_FOUND,
-            "no scan found. POST /v1/workspace/scan to run one.",
-        ),
+        None => {
+            return problem_response(
+                StatusCode::NOT_FOUND,
+                "no scan found. POST /v1/workspace/scan to run one.",
+            )
+        }
     };
 
     let format = q.format.as_deref().unwrap_or("tree");
@@ -189,10 +186,7 @@ pub(super) async fn get_storyline(
             let route_match = root.split_once(' ').and_then(|(method, path)| {
                 let m = method.to_ascii_uppercase();
                 let p = path.trim();
-                scan.routes
-                    .iter()
-                    .find(|r| r.method == m && r.path == p)
-                    .cloned()
+                scan.routes.iter().find(|r| r.method == m && r.path == p).cloned()
             });
             if let Some(route) = route_match {
                 if let Some(s) = crate::workspace_scan::compose_storyline_for_route(&scan, &route, include_tests) {
@@ -203,13 +197,11 @@ pub(super) async fn get_storyline(
                         format!("route '{root}' has no resolvable handler file"),
                     );
                 }
-            } else if let Some(s) = crate::workspace_scan::compose_storyline_for_file(&scan, root, None, include_tests) {
+            } else if let Some(s) = crate::workspace_scan::compose_storyline_for_file(&scan, root, None, include_tests)
+            {
                 out.push_str(&crate::workspace_scan::format_storyline_tree(&s));
             } else {
-                return problem_response(
-                    StatusCode::NOT_FOUND,
-                    format!("no route or file matched '{root}'"),
-                );
+                return problem_response(StatusCode::NOT_FOUND, format!("no route or file matched '{root}'"));
             }
         }
         _ => {
@@ -217,7 +209,7 @@ pub(super) async fn get_storyline(
             // output bounded.
             for (i, route) in scan.routes.iter().take(80).enumerate() {
                 if i > 0 {
-                    out.push_str("\n");
+                    out.push('\n');
                 }
                 if let Some(s) = crate::workspace_scan::compose_storyline_for_route(&scan, route, include_tests) {
                     out.push_str(&crate::workspace_scan::format_storyline_tree(&s));
@@ -231,9 +223,5 @@ pub(super) async fn get_storyline(
             }
         }
     }
-    (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        out,
-    )
-        .into_response()
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], out).into_response()
 }

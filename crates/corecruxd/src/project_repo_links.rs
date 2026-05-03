@@ -17,6 +17,8 @@
 //! records the *project-scoped semantics* of "which linked repos belong to
 //! which project, and which plane within that project."
 
+#![allow(dead_code)] // API helper kept for symmetry; may be wired by future endpoint
+
 use corecrux_memory::fact_store::{FactQuery, FactStore, StoreFact};
 use serde::{Deserialize, Serialize};
 
@@ -105,11 +107,7 @@ pub fn link_repo(
     Ok(link)
 }
 
-pub fn unlink_repo(
-    store: &mut FactStore,
-    project_id: &str,
-    repo_slug: &str,
-) -> Result<(), RepoLinkError> {
+pub fn unlink_repo(store: &mut FactStore, project_id: &str, repo_slug: &str) -> Result<(), RepoLinkError> {
     let (owner, repo) = validate_repo_slug(repo_slug)?;
     let mut sf = StoreFact {
         entity: entity(project_id, &owner, &repo),
@@ -141,11 +139,7 @@ pub fn list_links(store: &FactStore, project_id: &str) -> Vec<RepoLink> {
         .collect()
 }
 
-pub fn list_links_for_plane(
-    store: &FactStore,
-    project_id: &str,
-    plane_id: &str,
-) -> Vec<RepoLink> {
+pub fn list_links_for_plane(store: &FactStore, project_id: &str, plane_id: &str) -> Vec<RepoLink> {
     list_links(store, project_id)
         .into_iter()
         .filter(|l| l.plane_id.as_deref() == Some(plane_id))
@@ -156,11 +150,16 @@ pub fn list_links_for_plane(
 mod tests {
     use super::*;
 
-    fn store() -> FactStore { FactStore::new() }
+    fn store() -> FactStore {
+        FactStore::new()
+    }
 
     #[test]
     fn validate_repo_slug_accepts_owner_slash_repo() {
-        assert_eq!(validate_repo_slug("CueCrux/PlanCrux").unwrap(), ("CueCrux".into(), "PlanCrux".into()));
+        assert_eq!(
+            validate_repo_slug("CueCrux/PlanCrux").unwrap(),
+            ("CueCrux".into(), "PlanCrux".into())
+        );
         assert!(validate_repo_slug("nope").is_err());
         assert!(validate_repo_slug("a/").is_err());
         assert!(validate_repo_slug("/b").is_err());
@@ -169,8 +168,26 @@ mod tests {
     #[test]
     fn link_then_list_round_trips_with_plane_scope() {
         let mut s = store();
-        link_repo(&mut s, "p", "CueCrux/PlanCrux", Some("daemon".into()), "planning", Some("agent-claude".into()), 1_000).unwrap();
-        link_repo(&mut s, "p", "CueCrux/Crux", None, "work", Some("agent-claude".into()), 1_001).unwrap();
+        link_repo(
+            &mut s,
+            "p",
+            "CueCrux/PlanCrux",
+            Some("daemon".into()),
+            "planning",
+            Some("agent-claude".into()),
+            1_000,
+        )
+        .unwrap();
+        link_repo(
+            &mut s,
+            "p",
+            "CueCrux/Crux",
+            None,
+            "work",
+            Some("agent-claude".into()),
+            1_001,
+        )
+        .unwrap();
         let all = list_links(&s, "p");
         assert_eq!(all.len(), 2);
         let plane_only = list_links_for_plane(&s, "p", "daemon");

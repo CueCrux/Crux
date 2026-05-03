@@ -67,8 +67,7 @@ pub fn resolve(store: &FactStore, input: ResolveInput<'_>) -> Result<SessionBind
     let category = classify_tenant(&tenant_id);
 
     let passport = if let Some(id) = input.passport_id {
-        crate::passports::get_passport(store, &id)
-            .ok_or_else(|| SessionBindingsError::PassportNotFound(id))?
+        crate::passports::get_passport(store, &id).ok_or(SessionBindingsError::PassportNotFound(id))?
     } else {
         crate::passports::default_for_category(store, category)
             .or_else(|| crate::passports::default_for_category(store, "personal"))

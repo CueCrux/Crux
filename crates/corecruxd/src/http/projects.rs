@@ -4,7 +4,11 @@
 
 //! HTTP CRUD for projects + members + tenants.
 
-use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode};
+#![allow(clippy::option_option)] // PATCH tri-state semantics
+
+use super::{
+    problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
+};
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct CreateProjectBody {
@@ -277,7 +281,9 @@ pub(super) struct LinkRepoBody {
     pub role: String,
 }
 
-fn default_link_role() -> String { "work".to_string() }
+fn default_link_role() -> String {
+    "work".to_string()
+}
 
 fn extract_link_passport(headers: &HeaderMap) -> Option<String> {
     headers
@@ -341,9 +347,10 @@ pub(super) async fn post_project_repo(
         Err(crate::project_repo_links::RepoLinkError::InvalidRepo(_)) => {
             problem_response(StatusCode::BAD_REQUEST, "repo must look like 'owner/repo'")
         }
-        Err(crate::project_repo_links::RepoLinkError::InvalidRole(_)) => {
-            problem_response(StatusCode::BAD_REQUEST, "role must be one of: planning, work, reference")
-        }
+        Err(crate::project_repo_links::RepoLinkError::InvalidRole(_)) => problem_response(
+            StatusCode::BAD_REQUEST,
+            "role must be one of: planning, work, reference",
+        ),
         Err(err) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }
@@ -451,12 +458,15 @@ pub(super) async fn get_project_layers(
         if fact.value.is_empty() {
             continue;
         }
-        layers.insert(layer_name, serde_json::json!({
-            "content": fact.value,
-            "version": fact.version,
-            "stored_at": fact.stored_at.to_rfc3339(),
-            "fact_id": fact.fact_id,
-        }));
+        layers.insert(
+            layer_name,
+            serde_json::json!({
+                "content": fact.value,
+                "version": fact.version,
+                "stored_at": fact.stored_at.to_rfc3339(),
+                "fact_id": fact.fact_id,
+            }),
+        );
     }
     drop(store);
     (

@@ -44,7 +44,10 @@ async fn serve_console_asset(AxumPath(name): AxumPath<String>) -> Response {
     }
     // Dev override wins when present so designers can drop new PNGs in without
     // a rebuild.
-    if let Some(dev_path) = std::env::var(CONSOLE_DEV_PATH_ENV).ok().filter(|s| !s.trim().is_empty()) {
+    if let Some(dev_path) = std::env::var(CONSOLE_DEV_PATH_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
         let file_path = resolve_dev_html_path(Path::new(dev_path.trim()))
             .with_file_name("assets")
             .join(&name);
@@ -59,10 +62,20 @@ async fn serve_console_asset(AxumPath(name): AxumPath<String>) -> Response {
 }
 
 fn asset_response(name: &str, bytes: Vec<u8>) -> Response {
-    let content_type = if name.ends_with(".png") { "image/png" }
-        else if name.ends_with(".svg") { "image/svg+xml" }
-        else if name.ends_with(".webp") { "image/webp" }
-        else { "application/octet-stream" };
+    let ext_eq = |want: &str| {
+        Path::new(name)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(want))
+    };
+    let content_type = if ext_eq("png") {
+        "image/png"
+    } else if ext_eq("svg") {
+        "image/svg+xml"
+    } else if ext_eq("webp") {
+        "image/webp"
+    } else {
+        "application/octet-stream"
+    };
     (
         [
             (header::CONTENT_TYPE, content_type),

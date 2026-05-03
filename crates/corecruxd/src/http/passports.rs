@@ -4,7 +4,11 @@
 
 //! HTTP CRUD for the multi-passport store.
 
-use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode};
+#![allow(clippy::option_option)] // PATCH tri-state semantics
+
+use super::{
+    problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
+};
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct ListPassportsQuery {
@@ -58,14 +62,14 @@ pub(super) async fn get_passports(
     }
     if let Some(cat) = query.category.as_deref() {
         if cat != "all" && crate::passports::validate_category(cat).is_err() {
-            return problem_response(StatusCode::BAD_REQUEST, "category must be one of personal, work, public, all");
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "category must be one of personal, work, public, all",
+            );
         }
     }
     let store = state.fact_store.read().await;
-    let cat_filter = query
-        .category
-        .as_deref()
-        .filter(|c| *c != "all");
+    let cat_filter = query.category.as_deref().filter(|c| *c != "all");
     let passports = crate::passports::list_passports(&store, cat_filter);
     drop(store);
     (
@@ -183,10 +187,7 @@ pub(super) async fn delete_passport(
 /// `GET /v1/passports/presence` — multi-agent presence snapshot. Returns the
 /// list of passports the daemon has observed in the last process lifetime,
 /// most-recently-seen first. In-memory only; never touches disk.
-pub(super) async fn get_presence(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub(super) async fn get_presence(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }

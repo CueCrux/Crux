@@ -14,6 +14,10 @@
 //! Auto-seeds a `default` project on first boot so the rest of the system
 //! always has a project to fall back to.
 
+#![allow(dead_code)] // archived field on ProjectRecord is part of the JSON contract; not all callers read it yet
+#![allow(clippy::option_option)] // PATCH tri-state semantics: outer Some=present, inner None=clear, inner Some=set
+#![allow(clippy::unnecessary_wraps)] // kept Result<T> for symmetry with sibling fns + future fallibility
+
 use corecrux_memory::fact_store::{FactQuery, FactStore, StoreFact};
 use serde::{Deserialize, Serialize};
 
@@ -99,7 +103,9 @@ pub fn validate_id(id: &str) -> Result<(), ProjectsError> {
     if id.is_empty() || id.len() > 64 {
         return Err(ProjectsError::InvalidId(id.to_string()));
     }
-    let ok = id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    let ok = id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
     if !ok {
         return Err(ProjectsError::InvalidId(id.to_string()));
     }
@@ -131,7 +137,10 @@ pub fn list_projects(store: &FactStore) -> Vec<ProjectRecord> {
             continue;
         }
         // Skip sub-entities (membership / tenant rows) — they have additional `::` segments.
-        let suffix = fact.entity.strip_prefix(&format!("{PROJECT_ENTITY_PREFIX}::")).unwrap_or("");
+        let suffix = fact
+            .entity
+            .strip_prefix(&format!("{PROJECT_ENTITY_PREFIX}::"))
+            .unwrap_or("");
         if suffix.contains("::") {
             continue;
         }
@@ -223,7 +232,11 @@ pub fn create_project(
 
     let record = ProjectRecord {
         id: input.id.clone(),
-        name: if input.name.is_empty() { input.id.clone() } else { input.name },
+        name: if input.name.is_empty() {
+            input.id.clone()
+        } else {
+            input.name
+        },
         planning_target: input.planning_target,
         default_passport_id: input.default_passport_id.clone(),
         created_at_unix_ms: now_unix_ms,
@@ -233,7 +246,13 @@ pub fn create_project(
     write_record(store, &record)?;
     add_member(store, &record.id, &input.default_passport_id, "owner", now_unix_ms)?;
     for tenant in input.working_tenants {
-        add_tenant(store, &record.id, &tenant, Some(input.default_passport_id.clone()), now_unix_ms)?;
+        add_tenant(
+            store,
+            &record.id,
+            &tenant,
+            Some(input.default_passport_id.clone()),
+            now_unix_ms,
+        )?;
     }
     Ok(record)
 }
@@ -318,10 +337,13 @@ pub fn delete_project(store: &mut FactStore, id: &str) -> Result<(), ProjectsErr
             token_budget: None,
         });
         for fact in result.facts {
-            // For the bare id prefix, only delete the project record itself, not sub-entities.
-            if prefix.ends_with("::passport::") || prefix.ends_with("::tenant::") {
-                store.delete(&fact.fact_id);
-            } else if fact.entity == format!("{PROJECT_ENTITY_PREFIX}::{id}") && fact.key == PROJECT_RECORD_KEY {
+            // For the sub-entity prefixes, delete every match. For the bare
+            // id prefix, restrict to the project record itself (sub-entities
+            // share the same prefix and are handled via their own pass).
+            let is_sub_entity_prefix = prefix.ends_with("::passport::") || prefix.ends_with("::tenant::");
+            let is_bare_record =
+                fact.entity == format!("{PROJECT_ENTITY_PREFIX}::{id}") && fact.key == PROJECT_RECORD_KEY;
+            if is_sub_entity_prefix || is_bare_record {
                 store.delete(&fact.fact_id);
             }
         }
@@ -546,10 +568,18 @@ mod tests {
     #[test]
     fn add_unknown_passport_rejected() {
         let (dir, mut store) = seeded_store();
-        create_project(&mut store, CreateProjectInput {
-            id: "alpha".to_string(), name: "Alpha".to_string(), planning_target: None,
-            default_passport_id: "personal-default".to_string(), working_tenants: vec![],
-        }, 1).expect("create");
+        create_project(
+            &mut store,
+            CreateProjectInput {
+                id: "alpha".to_string(),
+                name: "Alpha".to_string(),
+                planning_target: None,
+                default_passport_id: "personal-default".to_string(),
+                working_tenants: vec![],
+            },
+            1,
+        )
+        .expect("create");
         let err = add_member(&mut store, "alpha", "ghost-passport", "contributor", 2).expect_err("rejected");
         assert!(matches!(err, ProjectsError::PassportNotFound(_)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -558,30 +588,44 @@ mod tests {
     #[test]
     fn create_project_is_atomic_when_default_passport_missing() {
         let (dir, mut store) = seeded_store();
-        let err = create_project(&mut store, CreateProjectInput {
-            id: "should-not-exist".to_string(),
-            name: "Half-built".to_string(),
-            planning_target: None,
-            default_passport_id: "definitely-not-a-passport".to_string(),
-            working_tenants: vec![],
-        }, 1).expect_err("must fail when default passport is missing");
+        let err = create_project(
+            &mut store,
+            CreateProjectInput {
+                id: "should-not-exist".to_string(),
+                name: "Half-built".to_string(),
+                planning_target: None,
+                default_passport_id: "definitely-not-a-passport".to_string(),
+                working_tenants: vec![],
+            },
+            1,
+        )
+        .expect_err("must fail when default passport is missing");
         assert!(matches!(err, ProjectsError::PassportNotFound(_)));
         // The project record must NOT have been written. Pre-fix, the partial
         // write would leave it readable via get_project even though the create
         // call returned an error.
-        assert!(get_project(&store, "should-not-exist").is_none(),
-            "project record was written despite failed validation");
+        assert!(
+            get_project(&store, "should-not-exist").is_none(),
+            "project record was written despite failed validation"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn delete_removes_project_and_subentities() {
         let (dir, mut store) = seeded_store();
-        create_project(&mut store, CreateProjectInput {
-            id: "alpha".to_string(), name: "Alpha".to_string(), planning_target: None,
-            default_passport_id: "personal-default".to_string(),
-            working_tenants: vec!["personal::alpha".to_string()],
-        }, 1).expect("create");
+        create_project(
+            &mut store,
+            CreateProjectInput {
+                id: "alpha".to_string(),
+                name: "Alpha".to_string(),
+                planning_target: None,
+                default_passport_id: "personal-default".to_string(),
+                working_tenants: vec!["personal::alpha".to_string()],
+            },
+            1,
+        )
+        .expect("create");
         delete_project(&mut store, "alpha").expect("delete");
         assert!(get_project(&store, "alpha").is_none());
         assert!(list_members(&store, "alpha").is_empty());
@@ -605,16 +649,30 @@ mod tests {
     #[test]
     fn members_and_tenants_filtered_by_project() {
         let (dir, mut store) = seeded_store();
-        create_project(&mut store, CreateProjectInput {
-            id: "alpha".to_string(), name: "Alpha".to_string(), planning_target: None,
-            default_passport_id: "personal-default".to_string(),
-            working_tenants: vec!["personal::a".to_string()],
-        }, 1).expect("a");
-        create_project(&mut store, CreateProjectInput {
-            id: "beta".to_string(), name: "Beta".to_string(), planning_target: None,
-            default_passport_id: "work-default".to_string(),
-            working_tenants: vec!["work::b".to_string()],
-        }, 2).expect("b");
+        create_project(
+            &mut store,
+            CreateProjectInput {
+                id: "alpha".to_string(),
+                name: "Alpha".to_string(),
+                planning_target: None,
+                default_passport_id: "personal-default".to_string(),
+                working_tenants: vec!["personal::a".to_string()],
+            },
+            1,
+        )
+        .expect("a");
+        create_project(
+            &mut store,
+            CreateProjectInput {
+                id: "beta".to_string(),
+                name: "Beta".to_string(),
+                planning_target: None,
+                default_passport_id: "work-default".to_string(),
+                working_tenants: vec!["work::b".to_string()],
+            },
+            2,
+        )
+        .expect("b");
         let alpha_members = list_members(&store, "alpha");
         let beta_members = list_members(&store, "beta");
         assert_eq!(alpha_members.len(), 1);

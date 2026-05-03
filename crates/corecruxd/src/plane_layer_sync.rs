@@ -127,12 +127,7 @@ pub fn pick_main_doc(plane_dir: &Path, layer: &str) -> Option<PathBuf> {
     }
     md_files.sort();
 
-    let lower = |p: &Path| -> String {
-        p.file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_lowercase()
-    };
+    let lower = |p: &Path| -> String { p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase() };
     if layer == "vision" {
         // Priority 1: *Master*Plan*.md (PlanCrux convention).
         if let Some(p) = md_files.iter().find(|p| {
@@ -242,8 +237,7 @@ pub fn run_sync(
             .find(|p| {
                 p.file_name()
                     .and_then(|s| s.to_str())
-                    .map(|n| n.to_lowercase() == plane_id_lower)
-                    .unwrap_or(false)
+                    .is_some_and(|n| n.to_lowercase() == plane_id_lower)
             })
             .cloned()
             .unwrap_or_else(|| base.join(&plane.id));
@@ -253,7 +247,11 @@ pub fn run_sync(
                 status: "skipped".into(),
                 source_file: None,
                 bytes_extracted: None,
-                note: Some(format!("no directory matching '{}' (case-insensitive) under {}", plane.id, base.display())),
+                note: Some(format!(
+                    "no directory matching '{}' (case-insensitive) under {}",
+                    plane.id,
+                    base.display()
+                )),
                 preview: None,
             });
             continue;
@@ -307,7 +305,11 @@ pub fn run_sync(
         }
         report.planes.push(PlaneSyncOutcome {
             plane_id: plane.id.clone(),
-            status: if confirm { "applied".into() } else { "would_apply".into() },
+            status: if confirm {
+                "applied".into()
+            } else {
+                "would_apply".into()
+            },
             source_file: Some(file.display().to_string()),
             bytes_extracted: Some(payload.len()),
             note: None,

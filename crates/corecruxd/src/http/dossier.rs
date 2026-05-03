@@ -15,7 +15,9 @@
 //! `__dossier__::{project_id}::{dossier_id}` key=`content`. The privacy gate
 //! covers `__dossier__::*` so dossiers are never push-eligible.
 
-use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode};
+use super::{
+    problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
+};
 
 const DOSSIER_PREFIX: &str = "__dossier__";
 const DOSSIER_KEY: &str = "content";
@@ -104,7 +106,10 @@ pub(super) async fn post_publish(
     if dossier.project_id != project_id {
         return problem_response(
             StatusCode::BAD_REQUEST,
-            format!("dossier project_id '{}' does not match URL '{project_id}'", dossier.project_id),
+            format!(
+                "dossier project_id '{}' does not match URL '{project_id}'",
+                dossier.project_id
+            ),
         );
     }
     if dossier.dossier_id.is_empty() {
@@ -116,12 +121,16 @@ pub(super) async fn post_publish(
     if let Err(err) = persist_dossier(&state.fact_store, &dossier).await {
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
-    (StatusCode::CREATED, Json(serde_json::json!({
-        "stored": true,
-        "dossier_id": dossier.dossier_id,
-        "agent": dossier.agent_passport,
-        "claim_count": dossier.claims.len(),
-    }))).into_response()
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "stored": true,
+            "dossier_id": dossier.dossier_id,
+            "agent": dossier.agent_passport,
+            "claim_count": dossier.claims.len(),
+        })),
+    )
+        .into_response()
 }
 
 async fn list_dossier_ids_internal(
@@ -190,11 +199,13 @@ pub(super) async fn list_dossiers(
     let ids = list_dossier_ids_internal(&state.fact_store, &project_id).await;
     let summaries: Vec<serde_json::Value> = ids
         .into_iter()
-        .map(|(id, ts, agent)| serde_json::json!({
-            "dossier_id": id,
-            "generated_at_unix_ms": ts,
-            "agent_passport": agent,
-        }))
+        .map(|(id, ts, agent)| {
+            serde_json::json!({
+                "dossier_id": id,
+                "generated_at_unix_ms": ts,
+                "agent_passport": agent,
+            })
+        })
         .collect();
     (
         StatusCode::OK,
@@ -259,8 +270,7 @@ pub(super) async fn get_reconciliation(
     // For reconciliation, prefer the LATEST dossier per agent (so an agent
     // that re-published after learning more wins over its older self).
     let ids = list_dossier_ids_internal(&state.fact_store, &project_id).await;
-    let mut latest_per_agent: std::collections::BTreeMap<String, (String, u64)> =
-        std::collections::BTreeMap::new();
+    let mut latest_per_agent: std::collections::BTreeMap<String, (String, u64)> = std::collections::BTreeMap::new();
     for (id, ts, agent) in ids {
         latest_per_agent
             .entry(agent.clone())
@@ -272,7 +282,7 @@ pub(super) async fn get_reconciliation(
             .or_insert((id, ts));
     }
     let mut dossiers: Vec<crate::dossier::Dossier> = Vec::new();
-    for (_, (id, _)) in &latest_per_agent {
+    for (id, _) in latest_per_agent.values() {
         if let Some(d) = load_dossier(&state.fact_store, &project_id, id).await {
             dossiers.push(d);
         }

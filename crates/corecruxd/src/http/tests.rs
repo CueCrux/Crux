@@ -753,7 +753,11 @@ async fn console_redacts_private_facts_and_session_state() {
 
     let facts_resp = console::get_console_facts(
         State(state.clone()),
-        Query(console::ConsoleFactsQuery { q: None, top_k: None, as_of_unix_ms: None }),
+        Query(console::ConsoleFactsQuery {
+            q: None,
+            top_k: None,
+            as_of_unix_ms: None,
+        }),
         dev_scope_headers("admin:read"),
     )
     .await
@@ -5221,7 +5225,9 @@ async fn console_fact_add_then_search_round_trip() {
     assert_eq!(body["query"], "ultraviolet");
     let facts = body["facts"].as_array().expect("facts array");
     assert!(
-        facts.iter().any(|f| f["value"] == "ultraviolet" && f["entity"] == "personal::project"),
+        facts
+            .iter()
+            .any(|f| f["value"] == "ultraviolet" && f["entity"] == "personal::project"),
         "expected newly added fact in search results: {body}"
     );
 }
@@ -5567,10 +5573,16 @@ async fn relation_expand_walks_two_hops() {
         .collect();
     // graph_expand returns reached neighbours (seed itself is excluded by design).
     // 2 hops from seed 1 reaches 2 and 3 but not 4.
-    assert!(!artifact_ids.contains(&1), "seed itself is not in result by graph_expand contract");
+    assert!(
+        !artifact_ids.contains(&1),
+        "seed itself is not in result by graph_expand contract"
+    );
     assert!(artifact_ids.contains(&2), "1-hop neighbour in result");
     assert!(artifact_ids.contains(&3), "2-hop neighbour in result");
-    assert!(!artifact_ids.contains(&4), "3-hop neighbour NOT in result with max_hops=2");
+    assert!(
+        !artifact_ids.contains(&4),
+        "3-hop neighbour NOT in result with max_hops=2"
+    );
 }
 
 #[tokio::test]
@@ -5621,10 +5633,9 @@ async fn console_onboarding_restart_clears_completed_marker() {
         current.chosen_auth_mode = Some("dev_scopes".to_string());
         crate::onboarding::write_state(&state.data_dir, &current).expect("seed write");
     }
-    let resp =
-        console::post_console_onboarding_restart(State(state.clone()), dev_scope_headers("admin:read"))
-            .await
-            .into_response();
+    let resp = console::post_console_onboarding_restart(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
     assert_eq!(resp.status(), StatusCode::OK);
     let reloaded = crate::onboarding::read_state(&state.data_dir).expect("reload");
     assert!(reloaded.completed_at_unix_ms.is_none());
@@ -5710,13 +5721,10 @@ async fn passports_post_round_trip_to_get() {
     .into_response();
     assert_eq!(post_resp.status(), StatusCode::CREATED);
 
-    let get_resp = super::passports::get_passport(
-        State(state),
-        Path("alice".to_string()),
-        dev_scope_headers("admin:read"),
-    )
-    .await
-    .into_response();
+    let get_resp =
+        super::passports::get_passport(State(state), Path("alice".to_string()), dev_scope_headers("admin:read"))
+            .await
+            .into_response();
     assert_eq!(get_resp.status(), StatusCode::OK);
     let body = json_body(get_resp).await;
     assert_eq!(body["id"], "alice");
@@ -5734,22 +5742,14 @@ async fn passports_post_duplicate_id_returns_409() {
         agent_work_gate: false,
         is_default_for_category: false,
     };
-    let first = super::passports::post_passport(
-        State(state.clone()),
-        dev_scope_headers("admin:read"),
-        Json(mk()),
-    )
-    .await
-    .into_response();
+    let first = super::passports::post_passport(State(state.clone()), dev_scope_headers("admin:read"), Json(mk()))
+        .await
+        .into_response();
     assert_eq!(first.status(), StatusCode::CREATED);
 
-    let second = super::passports::post_passport(
-        State(state),
-        dev_scope_headers("admin:read"),
-        Json(mk()),
-    )
-    .await
-    .into_response();
+    let second = super::passports::post_passport(State(state), dev_scope_headers("admin:read"), Json(mk()))
+        .await
+        .into_response();
     assert_eq!(second.status(), StatusCode::CONFLICT);
 }
 
@@ -5813,13 +5813,10 @@ async fn passports_delete_removes_record() {
     .await
     .into_response();
     assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
-    let get_resp = super::passports::get_passport(
-        State(state),
-        Path("alice".to_string()),
-        dev_scope_headers("admin:read"),
-    )
-    .await
-    .into_response();
+    let get_resp =
+        super::passports::get_passport(State(state), Path("alice".to_string()), dev_scope_headers("admin:read"))
+            .await
+            .into_response();
     assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -5843,8 +5840,7 @@ async fn active_sessions_returns_seeded_bindings() {
         crate::session_bindings::write_binding(&mut store, &b).expect("write");
     }
 
-    let resp = super::session::get_active_sessions(State(state), dev_scope_headers("admin:read"))
-        .await;
+    let resp = super::session::get_active_sessions(State(state), dev_scope_headers("admin:read")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
     assert_eq!(body["count"], 1);
@@ -5894,13 +5890,10 @@ async fn projects_create_then_list_then_get() {
     let projects = list_body["projects"].as_array().expect("projects");
     assert_eq!(projects.len(), 1);
 
-    let get_resp = super::projects::get_project(
-        State(state),
-        Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
-    )
-    .await
-    .into_response();
+    let get_resp =
+        super::projects::get_project(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
+            .await
+            .into_response();
     let detail = json_body(get_resp).await;
     assert_eq!(detail["id"], "alpha");
     assert_eq!(detail["members"].as_array().expect("members").len(), 1);
@@ -5996,13 +5989,9 @@ async fn projects_delete_removes_subentities() {
     .await
     .into_response();
     assert_eq!(del.status(), StatusCode::NO_CONTENT);
-    let get = super::projects::get_project(
-        State(state),
-        Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
-    )
-    .await
-    .into_response();
+    let get = super::projects::get_project(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
     assert_eq!(get.status(), StatusCode::NOT_FOUND);
 }
 
@@ -6074,13 +6063,9 @@ async fn work_post_then_list_then_patch_state_round_trip() {
     assert_eq!(patched["applied"], true);
     assert_eq!(patched["work"]["state"], "in_progress");
 
-    let txn_resp = super::work::get_transitions(
-        State(state),
-        Path(work_id),
-        dev_scope_headers("admin:read"),
-    )
-    .await
-    .into_response();
+    let txn_resp = super::work::get_transitions(State(state), Path(work_id), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
     let txn_body = json_body(txn_resp).await;
     let txns = txn_body["transitions"].as_array().expect("transitions");
     assert_eq!(txns.len(), 2, "create + transition");
@@ -6190,19 +6175,16 @@ async fn github_connect_with_skip_verify_persists_then_status_reports_connected(
     .into_response();
     assert_eq!(connect_resp.status(), StatusCode::OK);
 
-    let status_resp = super::integrations_github::get_status(
-        State(state.clone()),
-        dev_scope_headers("admin:read"),
-    )
-    .await
-    .into_response();
+    let status_resp = super::integrations_github::get_status(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
     let body = json_body(status_resp).await;
     assert_eq!(body["connected"], true);
     assert_eq!(body["username"], "smoke-test-user");
 
     let creds = crate::integrations_github::read_credentials(&state.data_dir).expect("read creds");
-    let pat = crate::integrations_github::decrypt_pat(&creds, state.integration_encryption_key.as_ref())
-        .expect("decrypt");
+    let pat =
+        crate::integrations_github::decrypt_pat(&creds, state.integration_encryption_key.as_ref()).expect("decrypt");
     assert_eq!(pat, "github_pat_test_value_xyz");
 }
 
@@ -6256,20 +6238,15 @@ async fn github_disconnect_clears_credentials() {
     .await
     .into_response();
 
-    let resp = super::integrations_github::post_disconnect(
-        State(state.clone()),
-        dev_scope_headers("integrations:disable"),
-    )
-    .await
-    .into_response();
+    let resp =
+        super::integrations_github::post_disconnect(State(state.clone()), dev_scope_headers("integrations:disable"))
+            .await
+            .into_response();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-    let status_resp = super::integrations_github::get_status(
-        State(state),
-        dev_scope_headers("admin:read"),
-    )
-    .await
-    .into_response();
+    let status_resp = super::integrations_github::get_status(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
     let body = json_body(status_resp).await;
     assert_eq!(body["connected"], false);
 }
@@ -6278,12 +6255,9 @@ async fn github_disconnect_clears_credentials() {
 async fn github_repo_selection_requires_connection() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     // Not connected — accessible should fail with 412.
-    let resp = super::integrations_github::get_accessible_repos(
-        State(state.clone()),
-        dev_scope_headers("admin:read"),
-    )
-    .await
-    .into_response();
+    let resp = super::integrations_github::get_accessible_repos(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
     assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
 
     // Same for select.
@@ -6357,20 +6331,28 @@ async fn github_disconnect_clears_selected_repos_too() {
         State(state.clone()),
         dev_scope_headers("integrations:install"),
         Json(super::integrations_github::ConnectGithubBody {
-            pat: "x".to_string(), skip_verify: true, username_override: Some("u".to_string()),
+            pat: "x".to_string(),
+            skip_verify: true,
+            username_override: Some("u".to_string()),
         }),
-    ).await.into_response();
+    )
+    .await
+    .into_response();
     super::integrations_github::post_select_repo(
         State(state.clone()),
         Path(("a".to_string(), "b".to_string())),
         dev_scope_headers("integrations:install"),
-    ).await.into_response();
+    )
+    .await
+    .into_response();
 
     super::integrations_github::post_disconnect(State(state.clone()), dev_scope_headers("integrations:disable"))
-        .await.into_response();
+        .await
+        .into_response();
 
     let list = super::integrations_github::get_selected_repos(State(state), dev_scope_headers("admin:read"))
-        .await.into_response();
+        .await
+        .into_response();
     let body = json_body(list).await;
     assert_eq!(body["count"], 0);
 }
@@ -6378,12 +6360,9 @@ async fn github_disconnect_clears_selected_repos_too() {
 #[tokio::test]
 async fn github_sync_returns_412_when_not_connected() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
-    let resp = super::integrations_github::post_sync(
-        State(state),
-        dev_scope_headers("integrations:install"),
-    )
-    .await
-    .into_response();
+    let resp = super::integrations_github::post_sync(State(state), dev_scope_headers("integrations:install"))
+        .await
+        .into_response();
     assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
 }
 
@@ -6406,7 +6385,9 @@ async fn embedding_probe_rejects_non_http_url() {
     let resp = console::post_console_embedding_probe(
         State(state),
         dev_scope_headers("admin:read"),
-        Json(console::ProbeEmbeddingBody { url: "ftp://example.com".to_string() }),
+        Json(console::ProbeEmbeddingBody {
+            url: "ftp://example.com".to_string(),
+        }),
     )
     .await
     .into_response();
@@ -6419,7 +6400,9 @@ async fn embedding_probe_requires_admin_read() {
     let resp = console::post_console_embedding_probe(
         State(state),
         HeaderMap::new(),
-        Json(console::ProbeEmbeddingBody { url: "http://localhost:11434".to_string() }),
+        Json(console::ProbeEmbeddingBody {
+            url: "http://localhost:11434".to_string(),
+        }),
     )
     .await
     .into_response();

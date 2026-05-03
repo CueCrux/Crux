@@ -1876,7 +1876,7 @@ fn parse_segment_seq_from_filename(name: &str) -> Option<u64> {
 
 #[cfg(test)]
 thread_local! {
-    static TEST_FAILPOINT: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+    static TEST_FAILPOINT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]

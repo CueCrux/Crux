@@ -32,6 +32,9 @@
 //! `agreement` (multiple agents concur), `disagreement` (multiple agents,
 //! conflicting object for same subject), or `unique` (only one agent has it).
 
+#![allow(clippy::struct_field_names)] // narrow API; field names are part of the JSON shape contract
+#![allow(clippy::unwrap_used)] // .unwrap on data we constructed in the same fn — panic-free by construction
+
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -109,10 +112,7 @@ pub struct AutoInput<'a> {
 /// Build a dossier deterministically by walking the storybook (if present),
 /// the latest workspace scan (if present), and the context graph. No LLM
 /// calls — every claim has explicit evidence.
-pub fn generate_auto(
-    store: &corecrux_memory::FactStore,
-    input: AutoInput<'_>,
-) -> Option<Dossier> {
+pub fn generate_auto(store: &corecrux_memory::FactStore, input: AutoInput<'_>) -> Option<Dossier> {
     let project = crate::projects::get_project_detail(store, input.project_id)?;
     let planes = crate::planes::list_planes(store, input.project_id);
     let workspace = crate::context_graph::load_latest_workspace_blocking_pub(store);
@@ -126,10 +126,7 @@ pub fn generate_auto(
         },
     );
 
-    let dossier_id = format!("dsr_{}_{}",
-        input.now_unix_ms,
-        sanitise_id_token(input.agent_passport),
-    );
+    let dossier_id = format!("dsr_{}_{}", input.now_unix_ms, sanitise_id_token(input.agent_passport),);
     let mut d = Dossier {
         dossier_id: dossier_id.clone(),
         project_id: input.project_id.to_string(),
@@ -299,10 +296,13 @@ pub fn generate_auto(
             "No storybook readout yet. POST /v1/projects/{id}/storybook to anchor the dossier to a narrative.".into(),
         );
     }
-    let planes_no_vision = planes.iter().filter(|p| {
-        let pl = read_plane_layers(store, input.project_id, &p.id);
-        !pl.contains_key("vision")
-    }).count();
+    let planes_no_vision = planes
+        .iter()
+        .filter(|p| {
+            let pl = read_plane_layers(store, input.project_id, &p.id);
+            !pl.contains_key("vision")
+        })
+        .count();
     if planes_no_vision > 0 {
         d.open_questions.push(format!(
             "{planes_no_vision} planes have no vision layer. Run POST /v1/projects/{}/planes/sync-layers to import from a mounted source.",
@@ -311,7 +311,12 @@ pub fn generate_auto(
     }
 
     // ── Stats roll-up ──────────────────────────────────────────────────
-    d.stats = compute_stats(&d.claims, d.uncertainties.len(), d.contradictions.len(), d.open_questions.len());
+    d.stats = compute_stats(
+        &d.claims,
+        d.uncertainties.len(),
+        d.contradictions.len(),
+        d.open_questions.len(),
+    );
     Some(d)
 }
 
@@ -320,9 +325,13 @@ fn compute_stats(claims: &[Claim], uncert: usize, contr: usize, open: usize) -> 
     let mut by_conf: BTreeMap<String, usize> = BTreeMap::new();
     for c in claims {
         *by_kind.entry(c.kind.clone()).or_insert(0) += 1;
-        let bucket = if c.confidence >= 0.85 { "high" }
-            else if c.confidence >= 0.50 { "med" }
-            else { "low" };
+        let bucket = if c.confidence >= 0.85 {
+            "high"
+        } else if c.confidence >= 0.50 {
+            "med"
+        } else {
+            "low"
+        };
         *by_conf.entry(bucket.to_string()).or_insert(0) += 1;
     }
     DossierStats {
@@ -366,11 +375,15 @@ pub fn diff_dossiers(a: &Dossier, b: &Dossier) -> DossierDiff {
     let a_index: BTreeMap<_, &Claim> = a.claims.iter().map(|c| (key(c), c)).collect();
     let b_index: BTreeMap<_, &Claim> = b.claims.iter().map(|c| (key(c), c)).collect();
 
-    let added: Vec<Claim> = b.claims.iter()
+    let added: Vec<Claim> = b
+        .claims
+        .iter()
         .filter(|c| !a_index.contains_key(&key(c)))
         .cloned()
         .collect();
-    let removed: Vec<Claim> = a.claims.iter()
+    let removed: Vec<Claim> = a
+        .claims
+        .iter()
         .filter(|c| !b_index.contains_key(&key(c)))
         .cloned()
         .collect();
@@ -552,8 +565,7 @@ pub fn reconcile(dossiers: &[Dossier], now_unix_ms: u64) -> ReconciliationReport
             .filter(|obj| agent_to_objs.values().all(|set| set.contains(*obj)))
             .cloned()
             .collect();
-        let asymmetric: BTreeSet<Option<String>> =
-            all_objects.difference(&agreed_objects).cloned().collect();
+        let asymmetric: BTreeSet<Option<String>> = all_objects.difference(&agreed_objects).cloned().collect();
         if asymmetric.is_empty() {
             continue;
         }
@@ -602,11 +614,7 @@ pub fn reconcile(dossiers: &[Dossier], now_unix_ms: u64) -> ReconciliationReport
 
 // ────────────────────────── Helpers ──────────────────────────
 
-fn read_plane_layers(
-    store: &corecrux_memory::FactStore,
-    project_id: &str,
-    plane_id: &str,
-) -> BTreeMap<String, String> {
+fn read_plane_layers(store: &corecrux_memory::FactStore, project_id: &str, plane_id: &str) -> BTreeMap<String, String> {
     let prefix = format!("__plane_layer__::{project_id}::{plane_id}::");
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
         query: Some(prefix.clone()),
@@ -627,10 +635,7 @@ fn read_plane_layers(
     out
 }
 
-fn build_plane_text_pool(
-    plane: &crate::planes::PlaneRecord,
-    plane_layers: &BTreeMap<String, String>,
-) -> String {
+fn build_plane_text_pool(plane: &crate::planes::PlaneRecord, plane_layers: &BTreeMap<String, String>) -> String {
     let mut pool = String::new();
     pool.push_str(&plane.id);
     pool.push(' ');
@@ -667,7 +672,13 @@ fn latest_storybook_ts(store: &corecrux_memory::FactStore, project_id: &str) -> 
 
 fn sanitise_id_token(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -705,12 +716,8 @@ mod tests {
 
     #[test]
     fn reconcile_identifies_agreement_when_two_agents_concur() {
-        let a = make_dossier("alpha", vec![
-            claim("implements", "plane:p:x", Some("module:foo"), 0.8),
-        ]);
-        let b = make_dossier("beta", vec![
-            claim("implements", "plane:p:x", Some("module:foo"), 0.9),
-        ]);
+        let a = make_dossier("alpha", vec![claim("implements", "plane:p:x", Some("module:foo"), 0.8)]);
+        let b = make_dossier("beta", vec![claim("implements", "plane:p:x", Some("module:foo"), 0.9)]);
         let r = reconcile(&[a, b], 2_000);
         assert_eq!(r.agreement.len(), 1);
         assert_eq!(r.agreement[0].agreed_by_agents.len(), 2);
@@ -721,12 +728,8 @@ mod tests {
 
     #[test]
     fn reconcile_identifies_disagreement_when_objects_differ() {
-        let a = make_dossier("alpha", vec![
-            claim("implements", "plane:p:x", Some("module:foo"), 0.8),
-        ]);
-        let b = make_dossier("beta", vec![
-            claim("implements", "plane:p:x", Some("module:bar"), 0.7),
-        ]);
+        let a = make_dossier("alpha", vec![claim("implements", "plane:p:x", Some("module:foo"), 0.8)]);
+        let b = make_dossier("beta", vec![claim("implements", "plane:p:x", Some("module:bar"), 0.7)]);
         let r = reconcile(&[a, b], 2_000);
         // Each (kind, subject, object) is a logical claim; since neither
         // overlaps, both become `unique`. The disagreement group is a
@@ -742,14 +745,20 @@ mod tests {
         // alpha: implements x → {foo, bar}; beta: implements x → {foo, baz}.
         // foo is agreed; bar + baz each unique to one agent and surface as
         // a single disagreement group with 2 asymmetric variants.
-        let a = make_dossier("alpha", vec![
-            claim("implements", "plane:p:x", Some("module:foo"), 0.8),
-            claim("implements", "plane:p:x", Some("module:bar"), 0.6),
-        ]);
-        let b = make_dossier("beta", vec![
-            claim("implements", "plane:p:x", Some("module:foo"), 0.9),
-            claim("implements", "plane:p:x", Some("module:baz"), 0.7),
-        ]);
+        let a = make_dossier(
+            "alpha",
+            vec![
+                claim("implements", "plane:p:x", Some("module:foo"), 0.8),
+                claim("implements", "plane:p:x", Some("module:bar"), 0.6),
+            ],
+        );
+        let b = make_dossier(
+            "beta",
+            vec![
+                claim("implements", "plane:p:x", Some("module:foo"), 0.9),
+                claim("implements", "plane:p:x", Some("module:baz"), 0.7),
+            ],
+        );
         let r = reconcile(&[a, b], 1);
         assert_eq!(r.agreement.len(), 1, "agreement on foo expected");
         assert_eq!(r.agreement[0].object.as_deref(), Some("module:foo"));
@@ -764,13 +773,14 @@ mod tests {
 
     #[test]
     fn reconcile_marks_single_agent_claim_as_unique() {
-        let a = make_dossier("alpha", vec![
-            claim("stub", "file:foo.rs:42", None, 0.95),
-            claim("implements", "plane:p:x", Some("module:foo"), 0.8),
-        ]);
-        let b = make_dossier("beta", vec![
-            claim("implements", "plane:p:x", Some("module:foo"), 0.8),
-        ]);
+        let a = make_dossier(
+            "alpha",
+            vec![
+                claim("stub", "file:foo.rs:42", None, 0.95),
+                claim("implements", "plane:p:x", Some("module:foo"), 0.8),
+            ],
+        );
+        let b = make_dossier("beta", vec![claim("implements", "plane:p:x", Some("module:foo"), 0.8)]);
         let r = reconcile(&[a, b], 2_000);
         assert_eq!(r.agreement.len(), 1);
         assert_eq!(r.unique.len(), 1);
@@ -780,15 +790,21 @@ mod tests {
 
     #[test]
     fn diff_finds_added_removed_and_confidence_changes() {
-        let a = make_dossier("a", vec![
-            claim("stub", "f:1", None, 0.9),
-            claim("implements", "p:x", Some("m:foo"), 0.8),
-        ]);
-        let b = make_dossier("a", vec![
-            claim("stub", "f:1", None, 0.9),                              // same
-            claim("implements", "p:x", Some("m:foo"), 0.95),              // confidence ↑
-            claim("dead_code_likely", "s:1", None, 0.6),                  // added
-        ]);
+        let a = make_dossier(
+            "a",
+            vec![
+                claim("stub", "f:1", None, 0.9),
+                claim("implements", "p:x", Some("m:foo"), 0.8),
+            ],
+        );
+        let b = make_dossier(
+            "a",
+            vec![
+                claim("stub", "f:1", None, 0.9),                 // same
+                claim("implements", "p:x", Some("m:foo"), 0.95), // confidence ↑
+                claim("dead_code_likely", "s:1", None, 0.6),     // added
+            ],
+        );
         let d = diff_dossiers(&a, &b);
         assert_eq!(d.added_claims.len(), 1);
         assert_eq!(d.added_claims[0].kind, "dead_code_likely");
