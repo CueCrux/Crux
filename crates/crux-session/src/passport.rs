@@ -157,6 +157,16 @@ impl LocalPassportKey {
         out.copy_from_slice(&sig.to_bytes());
         out
     }
+
+    /// Derive a 32-byte subkey from this passport's seed for a domain-separated
+    /// purpose (e.g. encrypting integration secrets at rest). Uses
+    /// `blake3::derive_key` which is HKDF-style. The seed never leaves the
+    /// `LocalPassportKey` instance — callers receive a domain-specific output
+    /// they can use as a symmetric key.
+    pub fn derive_subkey(&self, context: &str) -> [u8; 32] {
+        let seed = self.signing_key.to_bytes();
+        blake3::derive_key(context, &seed)
+    }
 }
 
 fn read_or_init_passport_seed(path: &Path) -> Result<[u8; 32], SessionError> {

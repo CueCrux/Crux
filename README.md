@@ -74,14 +74,27 @@ docker compose up -d
 ```
 
 The compose stack binds HTTP on `127.0.0.1:14800` and MCP on
-`127.0.0.1:14801`.
+`127.0.0.1:14801`. Open `http://127.0.0.1:14800` in your browser — the
+embedded Crux Console walks you through a one-time setup (auth posture,
+health check) and then becomes your local dashboard for facts, packs,
+tenants, and posture.
 
-Check the daemon:
+Prefer the command line? Health and version probes:
 
 ```bash
 curl -sf http://localhost:14800/healthz | jq .
 curl -sf http://localhost:14800/readyz | jq .
 curl -sf http://localhost:14800/v1/version | jq .
+```
+
+#### Live-edit the embedded console (developers only)
+
+To iterate on the console UI without rebuilding the image, start the
+optional dev overlay; edits to `crates/corecruxd/playground/index.html`
+appear on the next browser refresh:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 ```
 
 ### 2. Build From Source

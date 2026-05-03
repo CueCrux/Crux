@@ -25,8 +25,28 @@ mod http;
 // only on duplicate registration (programmer error caught in tests).
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod metrics;
+mod context_graph;
+mod dossier;
+mod encrypted_secrets;
+mod fact_helpers;
+mod fact_privacy;
+mod integrations_github;
+mod integrations_github_sync;
+mod integrations_openai;
+mod presence;
+mod onboarding;
 mod ops_events;
+mod passports;
+mod plane_layer_sync;
+mod planes;
+mod project_repo_links;
 mod playground;
+mod projects;
+mod storybook;
+mod workspace_scan;
+mod relations;
+mod session_bindings;
+mod work;
 mod pool;
 mod problem;
 mod shard_map;
@@ -450,6 +470,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         extraction_cache: Arc::new(tokio::sync::RwLock::new(
             corecrux_projections::ExtractionCacheMaterializer::new(),
         )),
+        onboarding: Arc::new(RwLock::new(
+            crate::onboarding::read_state(&config.data_dir).unwrap_or_else(|err| {
+                tracing::warn!(?err, "console settings unreadable; starting with defaults");
+                crate::onboarding::OnboardingState::default()
+            }),
+        )),
+        http_bind_loopback: config.http_addr.ip().is_loopback(),
+        allow_insecure_dev_auth_bind: insecure_dev_auth_bind_allowed(),
+        integration_encryption_key: Arc::new(
+            rcx_passport_key.derive_subkey("integration-token-encryption-v1"),
+        ),
+        presence: presence::PresenceTracker::new(),
+        privacy_policy: {
+            let p = fact_privacy::PrivacyPolicy::from_env();
+            // Install the same policy globally so every fact write path
+            // (even ones that don't have AppState in scope) can call
+            // fact_privacy::enforce_global(&mut fact).
+            fact_privacy::install_global(p.clone());
+            p
+        },
+        projection_state: {
+            let mut ps = corecrux_projections::ProjectionState::default();
+            match crate::relations::load_into_state(&config.data_dir, &mut ps) {
+                Ok(n) => tracing::info!(loaded = n, "relations.jsonl replayed into ProjectionState"),
+                Err(err) => tracing::warn!(?err, "relations replay failed; starting empty"),
+            }
+            Arc::new(RwLock::new(ps))
+        },
     };
 
     // Wire the shared event bus into both stores so mutations emit SSE events.
@@ -483,9 +531,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    // Multi-passport: auto-seed personal-default / work-default / public-default
+    // on first boot. Idempotent — skipped if any of those ids already exist.
+    // Default-passport seeding is OFF by default so a fresh data dir has no
+    // identities until the operator/agent issues one explicitly. Set
+    // `CORECRUXD_SEED_DEFAULT_PASSPORTS=true` to restore the legacy behaviour
+    // (handy for tests + bring-your-own-onboarding flows).
+    {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let mut store = state.fact_store.write().await;
+        let want_seed = std::env::var("CORECRUXD_SEED_DEFAULT_PASSPORTS")
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if want_seed {
+            match crate::passports::seed_defaults_if_missing(&config.data_dir, &mut store, now_ms) {
+                Ok(0) => tracing::debug!("passport defaults already present"),
+                Ok(n) => info!(seeded = n, "default passports seeded (opt-in via CORECRUXD_SEED_DEFAULT_PASSPORTS)"),
+                Err(err) => tracing::warn!(?err, "failed to seed default passports"),
+            }
+        } else {
+            tracing::info!("default-passport seeder disabled (set CORECRUXD_SEED_DEFAULT_PASSPORTS=true to re-enable)");
+        }
+        match crate::projects::seed_default_if_missing(&mut store, now_ms) {
+            Ok(false) => tracing::debug!("default project already present"),
+            Ok(true) => info!("default project seeded"),
+            Err(err) => tracing::warn!(?err, "failed to seed default project"),
+        }
+    }
+
     // Clone handles before state is moved into the router.
     let session_store_handle = state.session_store.clone();
     let sync_fact_store_handle = state.fact_store.clone();
+    let github_fact_store_handle = state.fact_store.clone();
+    let github_encryption_key = state.integration_encryption_key.clone();
     let mcp_app = if config.mcp_enabled {
         // Loopback URL the cuecrux_session tool uses to call corecruxd's
         // POST /session. This mirrors master-plan §6.2 ("POST to the
@@ -639,6 +719,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .await
         })
     };
+
+    // GitHub indexer polling loop (Plan B G3) — spawned unconditionally; skips
+    // its own work when GitHub isn't connected. Configurable via
+    // `CORECRUXD_GITHUB_SYNC_INTERVAL_SECS` (default 900s = 15 min). The
+    // manual `POST /v1/integrations/github/sync` runs the same code path.
+    {
+        let interval_secs = std::env::var("CORECRUXD_GITHUB_SYNC_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(900);
+        let data_dir = config.data_dir.clone();
+        let key = github_encryption_key.clone();
+        let fact_store = github_fact_store_handle.clone();
+        let mut rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            tick.tick().await; // burn the immediate tick — wait one full interval before first poll
+            loop {
+                tokio::select! {
+                    _ = rx.recv() => break,
+                    _ = tick.tick() => {
+                        let dd = data_dir.clone();
+                        let k = key.clone();
+                        let fs = fact_store.clone();
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis() as u64);
+                        let result = tokio::task::spawn_blocking(move || {
+                            let mut store = match fs.try_write() {
+                                Ok(g) => g,
+                                Err(_) => return Err(crate::integrations_github::GithubIntegrationError::Network(
+                                    "fact store busy".to_string(),
+                                )),
+                            };
+                            crate::integrations_github_sync::run_sync_with_key(&dd, &mut store, k.as_ref(), now_ms)
+                        }).await;
+                        match result {
+                            Ok(Ok(run)) => {
+                                let total_added: usize = run.repos.iter().map(|r| r.commits_added).sum();
+                                if !run.repos.is_empty() {
+                                    info!(repos = run.repos.len(), commits_added = total_added, "github-sync-tick");
+                                }
+                            }
+                            Ok(Err(crate::integrations_github::GithubIntegrationError::NotConnected)) => {
+                                tracing::trace!("github not connected; skipping sync tick");
+                            }
+                            Ok(Err(err)) => tracing::warn!(?err, "github-sync-tick-failed"),
+                            Err(err) => tracing::warn!(?err, "github-sync-task-join-error"),
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let mcp_task = mcp_app.map(|mcp_app| {
         let mut rx = shutdown_tx.subscribe();
@@ -3397,6 +3531,17 @@ mod tests {
             extraction_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 corecrux_projections::ExtractionCacheMaterializer::new(),
             )),
+            onboarding: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::onboarding::OnboardingState::default(),
+            )),
+            http_bind_loopback: true,
+            allow_insecure_dev_auth_bind: false,
+            projection_state: std::sync::Arc::new(tokio::sync::RwLock::new(
+                corecrux_projections::ProjectionState::default(),
+            )),
+            integration_encryption_key: std::sync::Arc::new([0u8; 32]),
+            presence: crate::presence::PresenceTracker::new(),
+            privacy_policy: crate::fact_privacy::PrivacyPolicy::from_env(),
         };
 
         let router: axum::Router = crate::http::router(state);

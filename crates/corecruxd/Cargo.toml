@@ -26,7 +26,9 @@ fs2 = "0.4.3"
 hex = "0.4.3"
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 prometheus = { version = "0.13.4", default-features = false }
+chacha20poly1305 = "0.10.1"
 prost = "0.14.3"
+rand = "0.8.5"
 serde = { version = "1.0.218", features = ["derive"] }
 serde_json = "1.0.139"
 serde_yaml = "0.9.34"

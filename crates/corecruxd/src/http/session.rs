@@ -156,6 +156,16 @@ pub struct SessionHandshakeRequestWire {
     pub intent: Option<String>,
     #[serde(default)]
     pub hints: HandshakeHintsWire,
+    /// Optional project the agent is acting in. Stored alongside the session
+    /// binding; not validated until the project store ships.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Optional tenant. Drives passport defaulting when `passport_id` is absent.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// Optional explicit passport. If present, must exist in the passport store.
+    #[serde(default)]
+    pub passport_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,6 +187,30 @@ fn bad_request(message: impl Into<String>) -> Response {
         },
     };
     (StatusCode::BAD_REQUEST, Json(body)).into_response()
+}
+
+/// `GET /v1/sessions/active` — list session bindings the daemon has minted
+/// (most recent first). Returns the resolved `(project_id, tenant_id,
+/// passport_id)` triple per session — does NOT include the cryptographically-
+/// signed session plan, that's still a `POST /session` round trip.
+pub async fn get_active_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(problem) = crate::auth::require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let store = state.fact_store.read().await;
+    let bindings = crate::session_bindings::list_bindings(&store);
+    drop(store);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "count": bindings.len(),
+            "sessions": bindings,
+        })),
+    )
+        .into_response()
 }
 
 /// `POST /session` — mint a session plan.
@@ -316,7 +350,39 @@ pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, bod
         }
     }
 
-    build_plan_response(&sealed, prefer_cbor)
+    // Multi-passport binding (M2): resolve the (project_id, tenant_id, passport_id)
+    // triple against the local passport store, persist as a fact keyed by the
+    // session id, surface in response headers so MCP/HTTP clients can read it
+    // without parsing the signed plan.
+    let session_id_hex = hex::encode(sealed.plan.session_id);
+    let binding_result = {
+        let store = state.fact_store.read().await;
+        crate::session_bindings::resolve(
+            &store,
+            crate::session_bindings::ResolveInput {
+                session_id_hex: &session_id_hex,
+                project_id: request.project_id.clone(),
+                tenant_id: request.tenant_id.clone(),
+                passport_id: request.passport_id.clone(),
+                now_unix_ms: now_ms(),
+            },
+        )
+    };
+    let binding = match binding_result {
+        Ok(b) => Some(b),
+        Err(err) => {
+            tracing::warn!(?err, "session binding resolution failed; session minted without binding");
+            None
+        }
+    };
+    if let Some(b) = binding.as_ref() {
+        let mut store = state.fact_store.write().await;
+        if let Err(err) = crate::session_bindings::write_binding(&mut store, b) {
+            tracing::warn!(?err, "failed to persist session binding fact");
+        }
+    }
+
+    build_plan_response(&sealed, prefer_cbor, binding.as_ref())
 }
 
 /// Translate a freshly-minted sealed plan into the
@@ -352,7 +418,11 @@ fn build_sealed_event_for_plan(sealed: &handshake::SealedPlan) -> SealedEvent {
     }
 }
 
-fn build_plan_response(sealed: &handshake::SealedPlan, prefer_cbor: bool) -> Response {
+fn build_plan_response(
+    sealed: &handshake::SealedPlan,
+    prefer_cbor: bool,
+    binding: Option<&crate::session_bindings::SessionBinding>,
+) -> Response {
     let session_id_hex = hex::encode(sealed.plan.session_id);
     let plan_hash_hex = hex::encode(sealed.plan.receipt.hash);
     let mut response = if prefer_cbor {
@@ -385,6 +455,26 @@ fn build_plan_response(sealed: &handshake::SealedPlan, prefer_cbor: bool) -> Res
     }
     if let Ok(hv) = HeaderValue::from_str(&plan_hash_hex) {
         headers.insert("X-CueCrux-Plan-Hash", hv);
+    }
+    if let Some(b) = binding {
+        if let Ok(hv) = HeaderValue::from_str(&b.passport_id) {
+            headers.insert("X-CueCrux-Passport-Id", hv);
+        }
+        if let Ok(hv) = HeaderValue::from_str(&b.tenant_id) {
+            headers.insert("X-CueCrux-Tenant-Id", hv);
+        }
+        if let Some(p) = &b.project_id {
+            if let Ok(hv) = HeaderValue::from_str(p) {
+                headers.insert("X-CueCrux-Project-Id", hv);
+            }
+        }
+        if let Ok(hv) = HeaderValue::from_str(&b.passport_category) {
+            headers.insert("X-CueCrux-Passport-Category", hv);
+        }
+        let gate = if b.agent_work_gate { "true" } else { "false" };
+        if let Ok(hv) = HeaderValue::from_str(gate) {
+            headers.insert("X-CueCrux-Agent-Work-Gate", hv);
+        }
     }
     response
 }

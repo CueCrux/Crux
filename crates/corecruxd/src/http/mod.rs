@@ -9,13 +9,23 @@ mod dataplane;
 mod events;
 mod facts;
 mod health;
+mod integrations_github;
+mod integrations_openai;
 pub mod invocation;
 mod observe;
 mod openapi;
 mod projections;
+mod passports;
+mod dossier;
+mod planes;
+mod projects;
+mod storybook;
+mod workspace;
 mod query;
 mod receipts;
+mod relations;
 mod routing;
+mod work;
 pub mod session;
 // session_metrics: Prometheus register!() at init — safe, panics only on
 // duplicate registration (programmer error caught in tests). Mirrors the
@@ -183,6 +193,34 @@ pub struct AppState {
     /// dependency. Proprietary deployments can swap this for an event-sourced
     /// replay-from-log implementation without changing the HTTP contract.
     pub extraction_cache: Arc<RwLock<corecrux_projections::ExtractionCacheMaterializer>>,
+    /// Persisted first-run state for the embedded console.
+    pub onboarding: Arc<RwLock<crate::onboarding::OnboardingState>>,
+    /// `true` if the HTTP listener bound to a loopback address. Onboarding
+    /// uses this to decide whether `auth_mode = off` is allowed.
+    pub http_bind_loopback: bool,
+    /// Mirror of `CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND`. When `true`, the
+    /// onboarding flow allows `auth_mode = off` even on a non-loopback bind.
+    pub allow_insecure_dev_auth_bind: bool,
+    /// In-memory graph projection state. Populated from `data_dir/relations.jsonl`
+    /// on startup; the `/v1/relations` and `/v1/query/graph-expand` endpoints
+    /// read and mutate it. Replaces the dataplane-stub graph surface in the
+    /// open Crux Daemon distribution.
+    pub projection_state: Arc<RwLock<corecrux_projections::ProjectionState>>,
+    /// 32-byte symmetric key derived from the daemon-root passport via
+    /// `LocalPassportKey::derive_subkey`. Used to seal/open integration
+    /// secrets at rest (GitHub PATs initially; future API keys). Rotating the
+    /// passport invalidates existing envelopes and forces re-connect — by
+    /// design.
+    pub integration_encryption_key: Arc<[u8; 32]>,
+    /// Multi-agent presence tracker (#9). Updated by middleware on every
+    /// request that carries `X-Corecrux-Passport-Id`; read by
+    /// `GET /v1/passports/presence`.
+    pub presence: crate::presence::PresenceTracker,
+    /// Belt-and-braces privacy gate (see `fact_privacy`). Every fact write
+    /// path runs `fact_privacy::enforce(&state.privacy_policy, &mut fact)`
+    /// before `store.store(fact)`, ensuring entities under reserved
+    /// prefixes are born `private=true` and never leak via `sync_push`.
+    pub privacy_policy: crate::fact_privacy::PrivacyPolicy,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -222,6 +260,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/shard-map", get(self::admin::get_shard_map))
         .route("/v1/admin/shard-map", axum::routing::post(self::admin::post_shard_map))
         .route("/v1/admin/control", get(self::admin::get_control))
+        .route("/v1/admin/restart", axum::routing::post(self::admin::post_restart_daemon))
+        .route("/v1/admin/sharing/posture", get(self::admin::get_sharing_posture))
+        .route("/v1/admin/sharing/backfill", axum::routing::post(self::admin::post_sharing_backfill))
         .route("/v1/admin/ops-log", get(self::admin::get_ops_log))
         .route("/v1/admin/valves", axum::routing::post(self::admin::post_valves))
         .route("/v1/admin/replication/status", get(self::admin::get_replication_status))
@@ -319,6 +360,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/bootstrap/status", get(self::observe::get_bootstrap_status))
         // Session handshake (master-plan §5.1): Crux Daemon uses /session, not /v1/session.
         .route("/session", axum::routing::post(self::session::post_session))
+        .route("/v1/sessions/active", get(self::session::get_active_sessions))
         // Invocation verification (master-plan §8).
         .route(
             "/invocation/verify",
@@ -328,8 +370,326 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/version", get(self::health::get_version))
         // OpenAPI spec
         .route("/v1/openapi.json", get(self::openapi::openapi_json))
+        // Work coordination — kanban over `__work__::*` facts.
+        .route("/v1/work", get(self::work::get_work))
+        .route("/v1/work", axum::routing::post(self::work::post_work))
+        .route("/v1/work/gate/pending", get(self::work::get_pending_gates))
+        .route(
+            "/v1/work/gate/{actionId}/approve",
+            axum::routing::post(self::work::post_gate_approve),
+        )
+        .route(
+            "/v1/work/gate/{actionId}/reject",
+            axum::routing::post(self::work::post_gate_reject),
+        )
+        .route("/v1/work/{id}", get(self::work::get_work_item))
+        .route("/v1/work/{id}", axum::routing::patch(self::work::patch_work))
+        .route(
+            "/v1/work/{id}/comments",
+            axum::routing::post(self::work::post_comment),
+        )
+        .route("/v1/work/{id}/comments", get(self::work::get_comments))
+        .route("/v1/work/{id}/transitions", get(self::work::get_transitions))
+        // Project endpoints.
+        .route("/v1/projects", get(self::projects::get_projects))
+        .route(
+            "/v1/projects",
+            axum::routing::post(self::projects::post_project),
+        )
+        .route("/v1/projects/{id}", get(self::projects::get_project))
+        .route(
+            "/v1/projects/{id}",
+            axum::routing::patch(self::projects::patch_project),
+        )
+        .route(
+            "/v1/projects/{id}",
+            axum::routing::delete(self::projects::delete_project),
+        )
+        .route(
+            "/v1/projects/{id}/passports",
+            axum::routing::post(self::projects::post_project_member),
+        )
+        .route(
+            "/v1/projects/{id}/passports/{passportId}",
+            axum::routing::delete(self::projects::delete_project_member),
+        )
+        .route(
+            "/v1/projects/{id}/tenants",
+            axum::routing::post(self::projects::post_project_tenant),
+        )
+        .route(
+            "/v1/projects/{id}/tenants/{tenantId}",
+            axum::routing::delete(self::projects::delete_project_tenant),
+        )
+        // Project layers (Vision, Goals, Manifesto, …) — content cards
+        // attached to a project. Backed by `__project_layer__::*` facts.
+        .route(
+            "/v1/projects/{id}/layers",
+            get(self::projects::get_project_layers),
+        )
+        .route(
+            "/v1/projects/{id}/layers/{layer}",
+            axum::routing::put(self::projects::put_project_layer),
+        )
+        .route(
+            "/v1/projects/{id}/layers/{layer}",
+            axum::routing::delete(self::projects::delete_project_layer),
+        )
+        // Project ↔ GitHub-repo links — replaces the old "select repos in
+        // Integrations panel" UX. Repos are now linked per-project (and
+        // optionally per-plane).
+        .route(
+            "/v1/projects/{id}/repos",
+            get(self::projects::get_project_repos),
+        )
+        .route(
+            "/v1/projects/{id}/repos",
+            axum::routing::post(self::projects::post_project_repo),
+        )
+        .route(
+            "/v1/projects/{id}/repos/{owner}/{repo}",
+            axum::routing::delete(self::projects::delete_project_repo),
+        )
+        .route(
+            "/v1/projects/{id}/planes/{planeId}/repos",
+            get(self::projects::get_plane_repos),
+        )
+        // Context graph — canonical {nodes, edges} for the agent-native view.
+        .route(
+            "/v1/projects/{id}/context-graph",
+            get(self::projects::get_context_graph),
+        )
+        // Workspace scan — Phase 2 of the context graph (modules, deps,
+        // stubs, dead code).
+        .route(
+            "/v1/workspace/scan",
+            axum::routing::post(self::workspace::post_scan),
+        )
+        .route(
+            "/v1/workspace/scan",
+            get(self::workspace::get_scan),
+        )
+        // Storyline — agent-friendly per-route call tree derived from the
+        // latest scan. Tree-art (default) for LLM consumption; compact JSON
+        // for agents that want to traverse the graph themselves.
+        .route(
+            "/v1/workspace/storyline",
+            get(self::workspace::get_storyline),
+        )
+        // MCP tool catalog proxy — same data the MCP server exposes via
+        // tools/list on :14801, but reachable from the in-browser console
+        // without crossing CORS to a different port.
+        .route(
+            "/v1/mcp/tools",
+            get(self::workspace::get_mcp_tools),
+        )
+        // Storybook readout — Phase 3 of the context graph.
+        .route(
+            "/v1/projects/{id}/storybook",
+            axum::routing::post(self::storybook::post_generate),
+        )
+        .route(
+            "/v1/projects/{id}/storybook",
+            get(self::storybook::get_latest),
+        )
+        .route(
+            "/v1/projects/{id}/storybook/versions",
+            get(self::storybook::list_versions),
+        )
+        .route(
+            "/v1/projects/{id}/storybook/diff",
+            get(self::storybook::get_diff),
+        )
+        .route(
+            "/v1/projects/{id}/storybook/{ts}",
+            get(self::storybook::get_version),
+        )
+        // Phase 4 — agent dossier exchange.
+        .route(
+            "/v1/projects/{id}/dossiers/auto",
+            axum::routing::post(self::dossier::post_auto),
+        )
+        .route(
+            "/v1/projects/{id}/dossiers",
+            axum::routing::post(self::dossier::post_publish),
+        )
+        .route(
+            "/v1/projects/{id}/dossiers",
+            get(self::dossier::list_dossiers),
+        )
+        .route(
+            "/v1/projects/{id}/dossiers/diff",
+            get(self::dossier::get_diff),
+        )
+        .route(
+            "/v1/projects/{id}/dossiers/reconcile",
+            get(self::dossier::get_reconciliation),
+        )
+        .route(
+            "/v1/projects/{id}/dossiers/{dossierId}",
+            get(self::dossier::get_dossier),
+        )
+        // Planes — sub-units inside a project. Each plane carries its own
+        // members, tenants, and layers (Vision/Goals/etc.).
+        .route(
+            "/v1/projects/{id}/planes",
+            get(self::planes::get_planes),
+        )
+        .route(
+            "/v1/projects/{id}/planes",
+            axum::routing::post(self::planes::post_plane),
+        )
+        .route(
+            "/v1/projects/{id}/planes/{planeId}",
+            get(self::planes::get_plane),
+        )
+        .route(
+            "/v1/projects/{id}/planes/{planeId}",
+            axum::routing::delete(self::planes::delete_plane),
+        )
+        .route(
+            "/v1/projects/{id}/planes/{planeId}/passports",
+            axum::routing::post(self::planes::post_plane_member),
+        )
+        .route(
+            "/v1/projects/{id}/planes/{planeId}/passports/{passportId}",
+            axum::routing::delete(self::planes::delete_plane_member),
+        )
+        .route(
+            "/v1/projects/{id}/planes/{planeId}/tenants",
+            axum::routing::post(self::planes::post_plane_tenant),
+        )
+        .route(
+            "/v1/projects/{id}/planes/{planeId}/tenants/{tenantId}",
+            axum::routing::delete(self::planes::delete_plane_tenant),
+        )
+        .route(
+            "/v1/projects/{id}/planes/{planeId}/layers",
+            get(self::planes::get_plane_layers),
+        )
+        .route(
+            "/v1/projects/{id}/planes/{planeId}/layers/{layer}",
+            axum::routing::put(self::planes::put_plane_layer),
+        )
+        .route(
+            "/v1/projects/{id}/planes/{planeId}/layers/{layer}",
+            axum::routing::delete(self::planes::delete_plane_layer),
+        )
+        // Phase 2B — bulk sync per-plane layers from a mounted source path.
+        .route(
+            "/v1/projects/{id}/planes/sync-layers",
+            axum::routing::post(self::planes::post_sync_layers),
+        )
+        // Multi-passport CRUD.
+        .route("/v1/passports/presence", get(self::passports::get_presence))
+        .route("/v1/passports", get(self::passports::get_passports))
+        .route(
+            "/v1/passports",
+            axum::routing::post(self::passports::post_passport),
+        )
+        .route("/v1/passports/{passportId}", get(self::passports::get_passport))
+        .route(
+            "/v1/passports/{passportId}",
+            axum::routing::patch(self::passports::patch_passport),
+        )
+        .route(
+            "/v1/passports/{passportId}",
+            axum::routing::delete(self::passports::delete_passport),
+        )
+        // GitHub integration — encrypted PAT + connect/disconnect/status (Plan B G1).
+        .route(
+            "/v1/integrations/github/status",
+            get(self::integrations_github::get_status),
+        )
+        .route(
+            "/v1/integrations/github/connect",
+            axum::routing::post(self::integrations_github::post_connect),
+        )
+        .route(
+            "/v1/integrations/github/disconnect",
+            axum::routing::post(self::integrations_github::post_disconnect),
+        )
+        .route(
+            "/v1/integrations/github/sync",
+            axum::routing::post(self::integrations_github::post_sync),
+        )
+        .route(
+            "/v1/integrations/github/repos",
+            get(self::integrations_github::get_selected_repos),
+        )
+        .route(
+            "/v1/integrations/github/repos/accessible",
+            get(self::integrations_github::get_accessible_repos),
+        )
+        .route(
+            "/v1/integrations/github/repos/{owner}/{repo}/select",
+            axum::routing::post(self::integrations_github::post_select_repo),
+        )
+        .route(
+            "/v1/integrations/github/repos/{owner}/{repo}/select",
+            axum::routing::delete(self::integrations_github::delete_selected_repo),
+        )
+        .route(
+            "/v1/integrations/github/repos/{owner}/{repo}/planning",
+            axum::routing::put(self::integrations_github::put_planning_flag),
+        )
+        // OpenAI integration — encrypted API key + connect/disconnect/status.
+        .route(
+            "/v1/integrations/openai/status",
+            get(self::integrations_openai::get_status),
+        )
+        .route(
+            "/v1/integrations/openai/connect",
+            axum::routing::post(self::integrations_openai::post_connect),
+        )
+        .route(
+            "/v1/integrations/openai/disconnect",
+            axum::routing::post(self::integrations_openai::post_disconnect),
+        )
+        .route(
+            "/v1/integrations/openai/settings",
+            axum::routing::patch(self::integrations_openai::patch_settings),
+        )
+        .route(
+            "/v1/integrations/openai/chat",
+            axum::routing::post(self::integrations_openai::post_chat),
+        )
+        // In-process relation graph (open-distribution surface for `corecrux-projections`).
+        .route(
+            "/v1/relations",
+            axum::routing::post(self::relations::post_relation),
+        )
+        .route("/v1/relations", get(self::relations::get_relations))
+        .route(
+            "/v1/relations/expand",
+            axum::routing::post(self::relations::post_expand),
+        )
+        // Console settings (auth posture + embedding config).
+        .route("/v1/console/settings", get(self::console::get_console_settings))
+        .route(
+            "/v1/console/settings",
+            axum::routing::put(self::console::put_console_settings),
+        )
+        .route(
+            "/v1/console/embedding/probe",
+            axum::routing::post(self::console::post_console_embedding_probe),
+        )
+        // First-run onboarding state for the embedded console.
+        .route("/v1/console/onboarding", get(self::console::get_console_onboarding))
+        .route(
+            "/v1/console/onboarding/complete",
+            axum::routing::post(self::console::post_console_onboarding_complete),
+        )
+        .route(
+            "/v1/console/onboarding/restart",
+            axum::routing::post(self::console::post_console_onboarding_restart),
+        )
         // Read-only console aggregation APIs.
         .route("/v1/console/summary", get(self::console::get_console_summary))
+        .route(
+            "/v1/console/storage-breakdown",
+            get(self::console::get_console_storage_breakdown),
+        )
         .route(
             "/v1/console/integrations",
             get(self::console::get_console_integrations),
@@ -349,6 +709,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/console/passports", get(self::console::get_console_passports))
         .route("/v1/console/sessions", get(self::console::get_console_sessions))
         .route("/v1/console/facts", get(self::console::get_console_facts))
+        .route(
+            "/v1/console/facts/add",
+            axum::routing::post(self::console::post_console_fact_add),
+        )
         .route("/v1/console/tenants", get(self::console::get_console_tenants))
         .route(
             "/v1/console/tenants/{tenantId}/chunks",
@@ -359,6 +723,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/console/chunks/{chunkDigest}/preview",
             get(self::console::get_console_chunk_preview),
         )
+        .layer(middleware::from_fn_with_state(state.clone(), presence_middleware))
         .with_state(state)
         // Built-in web playground (stateless, merged after with_state)
         .merge(crate::playground::routes(console_enabled))
@@ -366,6 +731,33 @@ pub fn router(state: AppState) -> Router {
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(30)))
         .layer(middleware::from_fn(traceparent_middleware))
         .layer(middleware::from_fn(request_id_middleware))
+}
+
+/// Updates the presence tracker on every request that carries
+/// `X-Corecrux-Passport-Id`. Cheap path: when the header is absent we don't
+/// touch the lock at all.
+async fn presence_middleware(
+    State(app_state): State<AppState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> impl IntoResponse {
+    let passport_id = req
+        .headers()
+        .get("x-corecrux-passport-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(pid) = passport_id {
+        let method = req.method().as_str().to_string();
+        let route = req.uri().path().to_string();
+        // Touch in the background so the request path doesn't pay for the
+        // RwLock acquire; the next snapshot will see this entry.
+        let tracker = app_state.presence.clone();
+        tokio::spawn(async move {
+            tracker.touch(&pid, &method, &route).await;
+        });
+    }
+    next.run(req).await
 }
 
 async fn traceparent_middleware(req: Request<axum::body::Body>, next: Next) -> impl IntoResponse {
@@ -507,6 +899,24 @@ fn problem_for_status(status: StatusCode, detail: impl Into<String>) -> ProblemR
             StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
             "https://errors.cuecrux.com/payload-too-large",
             "Payload Too Large",
+        )
+        .with_detail(detail),
+        StatusCode::CONFLICT => ProblemDetails::new(
+            StatusCode::CONFLICT.as_u16(),
+            "https://errors.cuecrux.com/conflict",
+            "Conflict",
+        )
+        .with_detail(detail),
+        StatusCode::BAD_GATEWAY => ProblemDetails::new(
+            StatusCode::BAD_GATEWAY.as_u16(),
+            "https://errors.cuecrux.com/bad-gateway",
+            "Bad Gateway",
+        )
+        .with_detail(detail),
+        StatusCode::NO_CONTENT => ProblemDetails::new(
+            StatusCode::NO_CONTENT.as_u16(),
+            "https://errors.cuecrux.com/no-content",
+            "No Content",
         )
         .with_detail(detail),
         _ => ProblemDetails::internal(detail),

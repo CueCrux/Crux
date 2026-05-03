@@ -9,14 +9,17 @@
 //! MCP clients via the `tools/list` response.
 
 pub mod constraint;
+pub mod coordination;
 pub mod cuecrux_session;
 pub mod decision;
 pub mod facts;
+pub mod github;
 pub mod handoff;
 pub mod observe;
 pub mod passport;
 pub mod query;
 pub mod sessions;
+pub mod storyline;
 pub mod sync;
 pub mod update;
 
@@ -565,6 +568,170 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "examples": [{}]
             }),
         },
+        // ── Coordination (Plan A M5) ───────────────────────────
+        ToolDefinition {
+            name: "list_projects".to_string(),
+            description: coordination::LIST_PROJECTS_DESCRIPTION.to_string(),
+            input_schema: json!({ "type": "object", "properties": {}, "examples": [{}] }),
+        },
+        ToolDefinition {
+            name: "get_project_context".to_string(),
+            description: coordination::GET_PROJECT_CONTEXT_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "project_id": { "type": "string" } },
+                "required": ["project_id"],
+                "examples": [{ "project_id": "default" }]
+            }),
+        },
+        ToolDefinition {
+            name: "list_work".to_string(),
+            description: coordination::LIST_WORK_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id":        { "type": "string" },
+                    "state":             { "type": "string", "enum": ["planned", "in_progress", "blocked", "archive", "complete", "deployed"] },
+                    "tenant_id":         { "type": "string" },
+                    "assignee_passport": { "type": "string" }
+                },
+                "examples": [
+                    { "state": "in_progress" },
+                    { "project_id": "default", "state": "planned" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "create_work".to_string(),
+            description: coordination::CREATE_WORK_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id":           { "type": "string" },
+                    "title":                { "type": "string" },
+                    "body":                 { "type": "string" },
+                    "state":                { "type": "string", "enum": ["planned", "in_progress", "blocked", "archive", "complete", "deployed"] },
+                    "assignee_passport":    { "type": "string" },
+                    "tenant_id":            { "type": "string" },
+                    "linked_pr":            { "type": "string" },
+                    "linked_issue":         { "type": "string" },
+                    "created_by_passport":  { "type": "string", "description": "The passport authoring this work item — typically your bound session passport." }
+                },
+                "required": ["project_id", "title", "created_by_passport"],
+                "examples": [
+                    { "project_id": "default", "title": "fix flaky test", "created_by_passport": "personal-default" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "update_work_state".to_string(),
+            description: coordination::UPDATE_WORK_STATE_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "work_id":         { "type": "string" },
+                    "state":           { "type": "string", "enum": ["planned", "in_progress", "blocked", "archive", "complete", "deployed"] },
+                    "by_passport":     { "type": "string" },
+                    "blocker_reason":  { "type": "string", "description": "Required when transitioning to 'blocked'." }
+                },
+                "required": ["work_id", "state", "by_passport"],
+                "examples": [
+                    { "work_id": "w_abc123", "state": "in_progress", "by_passport": "personal-default" },
+                    { "work_id": "w_abc123", "state": "blocked", "by_passport": "personal-default", "blocker_reason": "waiting on infra rotation" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "comment_on_work".to_string(),
+            description: coordination::COMMENT_ON_WORK_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "work_id":          { "type": "string" },
+                    "author_passport":  { "type": "string" },
+                    "body":             { "type": "string" }
+                },
+                "required": ["work_id", "author_passport", "body"],
+                "examples": [
+                    { "work_id": "w_abc123", "author_passport": "personal-default", "body": "tried option A; fails on env reload — recommending option B" }
+                ]
+            }),
+        },
+        // ── GitHub indexed corpus (Plan B G5) ───────────────────
+        ToolDefinition {
+            name: "github_search".to_string(),
+            description: github::GITHUB_SEARCH_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "repo":  { "type": "string", "description": "Optional `owner/repo` filter" },
+                    "top_k": { "type": "integer", "default": 20 }
+                },
+                "required": ["query"],
+                "examples": [
+                    { "query": "auth rotation", "top_k": 10 },
+                    { "query": "deploy", "repo": "cuecrux/Crux", "top_k": 20 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "github_recent_commits".to_string(),
+            description: github::GITHUB_RECENT_COMMITS_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo":  { "type": "string", "description": "owner/repo" },
+                    "limit": { "type": "integer", "default": 20 }
+                },
+                "required": ["repo"],
+                "examples": [{ "repo": "cuecrux/Crux", "limit": 10 }]
+            }),
+        },
+        ToolDefinition {
+            name: "github_open_prs".to_string(),
+            description: github::GITHUB_OPEN_PRS_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo":  { "type": "string" },
+                    "limit": { "type": "integer", "default": 20 }
+                },
+                "required": ["repo"],
+                "examples": [{ "repo": "cuecrux/Crux" }]
+            }),
+        },
+        ToolDefinition {
+            name: "github_open_issues".to_string(),
+            description: github::GITHUB_OPEN_ISSUES_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo":  { "type": "string" },
+                    "label": { "type": "string", "description": "Filter by exact label match" },
+                    "limit": { "type": "integer", "default": 20 }
+                },
+                "required": ["repo"],
+                "examples": [{ "repo": "cuecrux/Crux", "label": "bug" }]
+            }),
+        },
+        ToolDefinition {
+            name: "github_comments_since".to_string(),
+            description: github::GITHUB_COMMENTS_SINCE_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "default": 50 }
+                },
+                "examples": [{ "limit": 30 }]
+            }),
+        },
+        // ── Workspace storyline ──────────────────────────────────────
+        ToolDefinition {
+            name: "get_workspace_storyline".to_string(),
+            description: storyline::description().to_string(),
+            input_schema: storyline::input_schema(),
+        },
     ]
     .into_iter()
     .map(|mut t: ToolDefinition| {
@@ -754,7 +921,19 @@ pub fn tool_output_docs() -> Value {
         { "tool": "sync_pull",          "output": "{ facts_pulled, cursor, total_pull_count }" },
         { "tool": "sync_push",          "output": "{ facts_pushed, total_push_count }" },
         { "tool": "sync_status",        "output": "{ mode, configured, background_sync_enabled, remote_url, api_key_configured, platform_online, degraded, degraded_reason, onboarding_hint, last_pull_at, last_push_at, pull_count, push_count, local_fact_count }" },
-        { "tool": "update_status",      "output": "{ enabled, state, tracking_ref, current_commit, latest_commit, ahead_by, behind_by, checked_at, error, upgrade_hint, upgrade_playbook_query, backup_playbook_query }" }
+        { "tool": "update_status",      "output": "{ enabled, state, tracking_ref, current_commit, latest_commit, ahead_by, behind_by, checked_at, error, upgrade_hint, upgrade_playbook_query, backup_playbook_query }" },
+        { "tool": "list_projects",      "output": "{ projects: [{ id, name, planning_target?, default_passport_id, created_at_unix_ms }] }" },
+        { "tool": "get_project_context","output": "{ id, name, planning_target?, default_passport_id, members: [{ passport_id, role }], tenants: [{ tenant_id, default_passport_id? }] }" },
+        { "tool": "list_work",          "output": "{ count, work: [{ id, project_id, state, title, body, assignee_passport?, tenant_id?, linked_pr?, linked_issue?, blocker_reason?, created_by_passport, created_at_unix_ms, updated_at_unix_ms }] }" },
+        { "tool": "create_work",        "output": "WorkItem record (same shape as list_work entries, includes the freshly minted id)." },
+        { "tool": "update_work_state",  "output": "{ applied: bool, work?: WorkItem, queued?: { action_id, work_id, requested_by_passport, target_state, status: 'pending', requested_at_unix_ms } }" },
+        { "tool": "comment_on_work",    "output": "{ id, work_id, author_passport, body, posted_at_unix_ms }" },
+        { "tool": "github_search",         "output": "{ count, facts: [{ entity, key, value, ... }] } — value strings hold JSON-encoded CommitRecord / PrRecord / IssueRecord / CommentRecord depending on the entity prefix." },
+        { "tool": "github_recent_commits", "output": "{ count, facts: [Fact] } — entities are `github::owner/repo::commit/{sha}`; value JSON contains sha, message, author_name, author_login?, committed_at, parents[], html_url." },
+        { "tool": "github_open_prs",       "output": "{ count, facts: [Fact] } — entities are `github::owner/repo::pr/{number}`; value JSON contains title, state, author_login?, head_sha, base_branch, body, merged_at?, closed_at?, html_url." },
+        { "tool": "github_open_issues",    "output": "{ count, facts: [Fact] } — entities are `github::owner/repo::issue/{number}`; value JSON contains title, state, labels[], body, closed_at?, html_url." },
+        { "tool": "github_comments_since", "output": "{ count, facts: [Fact] } — entities are `github::owner/repo::comment/{id}`; value JSON contains author_login?, body, posted_at, parent_number, html_url." },
+        { "tool": "get_workspace_storyline", "output": "When format='tree': plaintext ASCII tree-art (one tree per route, or one if endpoint set), `text/plain`. When format='json': { files: [{p, c, m, d, f, t}], edges: [[from_id, to_id, count, to_symbol]], routes: [{m, p, h, f, chain: [file_ids]}] }." }
     ])
 }
 
@@ -805,6 +984,21 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "sync_push" => sync::handle_sync_push(args, ctx).await,
         "sync_status" => sync::handle_sync_status(args, ctx).await,
         "update_status" => update::handle_update_status(args, ctx).await,
+        // Coordination — projects + work kanban (Plan A M5).
+        "list_projects" => coordination::handle_list_projects(args, ctx).await,
+        "get_project_context" => coordination::handle_get_project_context(args, ctx).await,
+        "list_work" => coordination::handle_list_work(args, ctx).await,
+        "create_work" => coordination::handle_create_work(args, ctx).await,
+        "update_work_state" => coordination::handle_update_work_state(args, ctx).await,
+        "comment_on_work" => coordination::handle_comment_on_work(args, ctx).await,
+        // GitHub (Plan B G5).
+        "github_search" => github::handle_github_search(args, ctx).await,
+        "github_recent_commits" => github::handle_github_recent_commits(args, ctx).await,
+        "github_open_prs" => github::handle_github_open_prs(args, ctx).await,
+        "github_open_issues" => github::handle_github_open_issues(args, ctx).await,
+        "github_comments_since" => github::handle_github_comments_since(args, ctx).await,
+        // Workspace storyline (HTTP loopback to corecruxd).
+        "get_workspace_storyline" => storyline::handle_get_workspace_storyline(args, ctx).await,
         _ => Err(JsonRpcError {
             code: crate::protocol::METHOD_NOT_FOUND,
             message: format!("unknown tool: {name}"),
@@ -840,7 +1034,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 28; // 27 pre-M3 tools + cuecrux_session
+    const TOOL_COUNT: usize = 40; // 34 + 5 GitHub tools (Plan B G5) + get_workspace_storyline (workspace-scan storyline ExecPlan)
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

@@ -2066,3 +2066,211 @@ pub(super) async fn get_replication_status(State(state): State<AppState>, header
     )
         .into_response()
 }
+
+/// `GET /v1/admin/sharing/posture` — surface the current privacy gating
+/// state: which prefixes are forced-private, share-overrides, fact counts
+/// (private vs pushable), and whether remote sync is configured. Used by
+/// the AX → Activity "Sharing posture" card.
+pub(super) async fn get_sharing_posture(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let snapshot = state.privacy_policy.snapshot();
+    let store = state.fact_store.read().await;
+    let total_versions = store.count();
+    // Walk the latest version of every fact and bucket by privacy. The store
+    // returns all versions; dedup to latest per (entity, key) so the rollup
+    // reflects the *current* state, not the journal depth.
+    let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        query: None,
+        entity: None,
+        entity_prefix: None,
+        top_k: 200_000, // walk everything; this is read-only and rare.
+        token_budget: None,
+    });
+    let latest = crate::fact_helpers::dedup_latest(result.facts);
+    let total = latest.len();
+    let mut private_count = 0usize;
+    let mut pushable_count = 0usize;
+    let mut would_be_private_after_backfill = 0usize;
+    let mut by_prefix: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    for fact in &latest {
+        // Bucket by the first `::` segment of the entity so the UI gets a
+        // tidy rollup ("__ax__", "github", "personal", etc.).
+        let bucket = fact
+            .entity
+            .split_once("::")
+            .map(|(b, _)| b.to_string())
+            .unwrap_or_else(|| "(no prefix)".to_string());
+        let entry = by_prefix.entry(bucket).or_insert((0, 0));
+        if fact.private {
+            entry.0 += 1;
+            private_count += 1;
+        } else {
+            entry.1 += 1;
+            // Would the policy mark this private if we re-stored it?
+            if state.privacy_policy.is_always_private(&fact.entity) {
+                would_be_private_after_backfill += 1;
+            }
+            pushable_count += 1;
+        }
+    }
+    let sync_remote_url = std::env::var("CORECRUXD_SYNC_REMOTE_URL").ok();
+    let sync_configured = sync_remote_url.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    drop(store);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "policy": snapshot,
+            "facts": {
+                "total_count": total,
+                "total_versions_in_journal": total_versions,
+                "private_count": private_count,
+                "pushable_count": pushable_count,
+                "would_be_private_after_backfill": would_be_private_after_backfill,
+            },
+            "sync": {
+                "remote_url": sync_remote_url,
+                "configured": sync_configured,
+                "note": if sync_configured {
+                    "Remote sync is configured. `private=true` facts are filtered out by sync_push."
+                } else {
+                    "Remote sync is unconfigured (CORECRUXD_SYNC_REMOTE_URL is not set). No remote push possible."
+                },
+            },
+            "by_prefix": by_prefix.into_iter().map(|(p, (priv_n, push_n))|
+                serde_json::json!({"prefix": p, "private": priv_n, "pushable": push_n})
+            ).collect::<Vec<_>>(),
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub(super) struct BackfillBody {
+    /// When `true`, actually re-store matching facts with `private=true`.
+    /// When `false` (default), preview-only — counts but no writes.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+/// `POST /v1/admin/sharing/backfill` — sweep the fact store and re-store
+/// any non-private fact whose entity matches the policy as `private=true`.
+/// Append-only safe: each backfill creates a new fact version; the previous
+/// (non-private) version stays in the journal but the latest is private.
+/// Default is preview-mode; pass `{confirm: true}` to actually write.
+pub(super) async fn post_sharing_backfill(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<BackfillBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
+        return problem.into_response();
+    }
+    // Two passes: first read-only to find candidates, then optionally write.
+    let candidates: Vec<corecrux_memory::fact_store::Fact> = {
+        let store = state.fact_store.read().await;
+        let result = store.query(&corecrux_memory::fact_store::FactQuery {
+            query: None,
+            entity: None,
+            entity_prefix: None,
+            top_k: 100_000,
+            token_budget: None,
+        });
+        let latest = crate::fact_helpers::dedup_latest(result.facts);
+        latest
+            .into_iter()
+            .filter(|f| !f.private && state.privacy_policy.is_always_private(&f.entity))
+            .collect()
+    };
+
+    if !body.confirm {
+        let by_prefix: std::collections::BTreeMap<String, usize> = candidates.iter().fold(
+            Default::default(),
+            |mut acc, f| {
+                let bucket = f
+                    .entity
+                    .split_once("::")
+                    .map(|(b, _)| b.to_string())
+                    .unwrap_or_else(|| "(no prefix)".to_string());
+                *acc.entry(bucket).or_insert(0) += 1;
+                acc
+            },
+        );
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "mode": "preview",
+                "would_re_store": candidates.len(),
+                "by_prefix": by_prefix.into_iter().map(|(p, n)| serde_json::json!({"prefix": p, "count": n})).collect::<Vec<_>>(),
+                "note": "POST again with {\"confirm\": true} to actually re-store these facts as private. Append-only — original versions stay in the journal.",
+            })),
+        )
+            .into_response();
+    }
+
+    // Confirmed — re-store each candidate with private=true. This bumps the
+    // version for each (entity, key); the previous version stays for audit.
+    let mut store = state.fact_store.write().await;
+    let mut written = 0usize;
+    for fact in &candidates {
+        let mut sf = corecrux_memory::fact_store::StoreFact {
+            entity: fact.entity.clone(),
+            key: fact.key.clone(),
+            value: fact.value.clone(),
+            source_receipt: fact.source_receipt.clone(),
+            confidence: fact.confidence,
+            private: true,
+        };
+        crate::fact_privacy::enforce_global(&mut sf); // belt + braces — already true
+        store.store(sf);
+        written += 1;
+    }
+    drop(store);
+    tracing::warn!(
+        target: "corecruxd::admin",
+        rewritten = written,
+        "sharing-backfill confirmed: re-stored facts as private (append-only; old versions retained)"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "mode": "confirmed",
+            "re_stored_count": written,
+            "note": "Each fact now has a new private=true version. Previous non-private versions remain in the journal but are superseded.",
+        })),
+    )
+        .into_response()
+}
+
+/// Restart the daemon by exiting cleanly. Container orchestrators with a
+/// `restart: unless-stopped` (or `always`) policy will bring the process back
+/// up; bare-metal / `cargo run` users see the daemon stop and must restart it
+/// manually. We schedule the exit on a background task so the HTTP response
+/// has time to flush before the process disappears.
+pub(super) async fn post_restart_daemon(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    tracing::warn!(target: "corecruxd::admin", "restart requested via /v1/admin/restart");
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        // Exit code 0 = clean shutdown; container restart policy decides what happens next.
+        std::process::exit(0);
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "restarting",
+            "note": "process will exit in ~250ms; container restart policy must bring it back up",
+        })),
+    )
+        .into_response()
+}

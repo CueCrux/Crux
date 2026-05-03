@@ -1,0 +1,358 @@
+// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+// Licensed under the CueCrux Community Licence (CCL v1.0).
+// See LICENCE.md in the repository root.
+
+//! HTTP CRUD for work items, comments, transitions, and gated actions.
+
+use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode};
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ListWorkQuery {
+    pub project_id: Option<String>,
+    pub state: Option<String>,
+    pub tenant_id: Option<String>,
+    pub assignee_passport: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct CreateWorkBody {
+    pub project_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub assignee_passport: Option<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub linked_pr: Option<String>,
+    #[serde(default)]
+    pub linked_issue: Option<String>,
+    /// Required: which passport is creating the item. The HTTP layer accepts
+    /// it explicitly so callers without a session binding can still write.
+    /// Aliases: `by_passport`, `author_passport` (the other work routes use
+    /// these names; accepting all three reduces caller error).
+    #[serde(alias = "by_passport", alias = "author_passport")]
+    pub created_by_passport: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct UpdateWorkBody {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_some_option")]
+    pub assignee_passport: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_some_option")]
+    pub tenant_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_some_option")]
+    pub linked_pr: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_some_option")]
+    pub linked_issue: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_some_option")]
+    pub blocker_reason: Option<Option<String>>,
+    /// Identity making the change. Determines whether the change is gated.
+    /// Aliases: `created_by_passport`, `author_passport`.
+    #[serde(alias = "created_by_passport", alias = "author_passport")]
+    pub by_passport: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct CommentBody {
+    /// Aliases: `by_passport`, `created_by_passport`.
+    #[serde(alias = "by_passport", alias = "created_by_passport")]
+    pub author_passport: String,
+    pub body: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct GateResolutionBody {
+    pub approver_passport: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct GateListQuery {
+    pub by_passport: Option<String>,
+}
+
+fn deserialize_some_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    use serde::Deserialize;
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+pub(super) async fn get_work(
+    State(state): State<AppState>,
+    Query(q): Query<ListWorkQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    if let Some(s) = &q.state {
+        if crate::work::validate_state(s).is_err() {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "state must be one of {} (got '{}')",
+                    crate::work::WORK_STATES.join(", "),
+                    s
+                ),
+            );
+        }
+    }
+    let store = state.fact_store.read().await;
+    let items = crate::work::list_work(
+        &store,
+        q.project_id.as_deref(),
+        q.state.as_deref(),
+        q.tenant_id.as_deref(),
+        q.assignee_passport.as_deref(),
+    );
+    drop(store);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "count": items.len(),
+            "work": items,
+        })),
+    )
+        .into_response()
+}
+
+pub(super) async fn get_work_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let store = state.fact_store.read().await;
+    let item = crate::work::get_work(&store, &id);
+    drop(store);
+    match item {
+        Some(w) => (StatusCode::OK, Json(w)).into_response(),
+        None => problem_response(StatusCode::NOT_FOUND, format!("work item '{id}' not found")),
+    }
+}
+
+pub(super) async fn post_work(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateWorkBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["facts:write"]) {
+        return problem.into_response();
+    }
+    let mut store = state.fact_store.write().await;
+    let result = crate::work::create_work(
+        &mut store,
+        crate::work::CreateWorkInput {
+            project_id: body.project_id,
+            title: body.title,
+            body: body.body,
+            state: body.state,
+            assignee_passport: body.assignee_passport,
+            tenant_id: body.tenant_id,
+            linked_pr: body.linked_pr,
+            linked_issue: body.linked_issue,
+            created_by_passport: body.created_by_passport,
+        },
+        now_unix_ms(),
+    );
+    drop(store);
+    match result {
+        Ok(w) => (StatusCode::CREATED, Json(w)).into_response(),
+        Err(crate::work::WorkError::ProjectNotFound(_)) => {
+            problem_response(StatusCode::NOT_FOUND, "project not found")
+        }
+        Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+pub(super) async fn patch_work(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateWorkBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["facts:write"]) {
+        return problem.into_response();
+    }
+    // Look up the calling passport's gate flag to decide whether state moves are gated.
+    let mut store = state.fact_store.write().await;
+    let passport_gated = crate::passports::get_passport(&store, &body.by_passport)
+        .map(|p| p.agent_work_gate)
+        .unwrap_or(false);
+    let result = crate::work::update_work(
+        &mut store,
+        &id,
+        crate::work::UpdateWorkInput {
+            title: body.title,
+            body: body.body,
+            state: body.state,
+            assignee_passport: body.assignee_passport,
+            tenant_id: body.tenant_id,
+            linked_pr: body.linked_pr,
+            linked_issue: body.linked_issue,
+            blocker_reason: body.blocker_reason,
+        },
+        crate::work::UpdateWorkContext {
+            by_passport: body.by_passport,
+            passport_gated,
+            now_unix_ms: now_unix_ms(),
+        },
+    );
+    drop(store);
+    match result {
+        Ok(crate::work::UpdateOutcome::Applied(w)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"applied": true, "work": w})),
+        )
+            .into_response(),
+        Ok(crate::work::UpdateOutcome::Queued(p)) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"applied": false, "queued": p})),
+        )
+            .into_response(),
+        Err(crate::work::WorkError::NotFound(_)) => {
+            problem_response(StatusCode::NOT_FOUND, "work item not found")
+        }
+        Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+pub(super) async fn post_comment(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<CommentBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["facts:write"]) {
+        return problem.into_response();
+    }
+    if body.body.trim().is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "comment body must not be empty");
+    }
+    let mut store = state.fact_store.write().await;
+    let result = crate::work::add_comment(&mut store, &id, &body.author_passport, &body.body, now_unix_ms());
+    drop(store);
+    match result {
+        Ok(c) => (StatusCode::CREATED, Json(c)).into_response(),
+        Err(crate::work::WorkError::NotFound(_)) => {
+            problem_response(StatusCode::NOT_FOUND, "work item not found")
+        }
+        Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+pub(super) async fn get_comments(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let store = state.fact_store.read().await;
+    let comments = crate::work::list_comments(&store, &id);
+    drop(store);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"work_id": id, "comments": comments})),
+    )
+        .into_response()
+}
+
+pub(super) async fn get_transitions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let store = state.fact_store.read().await;
+    let txns = crate::work::list_transitions(&store, &id);
+    drop(store);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"work_id": id, "transitions": txns})),
+    )
+        .into_response()
+}
+
+pub(super) async fn get_pending_gates(
+    State(state): State<AppState>,
+    Query(q): Query<GateListQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let store = state.fact_store.read().await;
+    let pending = crate::work::list_pending_gates(&store, q.by_passport.as_deref());
+    drop(store);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"count": pending.len(), "pending": pending})),
+    )
+        .into_response()
+}
+
+pub(super) async fn post_gate_approve(
+    State(state): State<AppState>,
+    Path(action_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GateResolutionBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let mut store = state.fact_store.write().await;
+    let result = crate::work::resolve_gate(&mut store, &action_id, &body.approver_passport, true, now_unix_ms());
+    drop(store);
+    match result {
+        Ok(w) => (StatusCode::OK, Json(w)).into_response(),
+        Err(crate::work::WorkError::GateNotFound(_)) => {
+            problem_response(StatusCode::NOT_FOUND, "gated action not found")
+        }
+        Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+pub(super) async fn post_gate_reject(
+    State(state): State<AppState>,
+    Path(action_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<GateResolutionBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let mut store = state.fact_store.write().await;
+    let result = crate::work::resolve_gate(&mut store, &action_id, &body.approver_passport, false, now_unix_ms());
+    drop(store);
+    match result {
+        Ok(w) => (StatusCode::OK, Json(w)).into_response(),
+        Err(crate::work::WorkError::GateNotFound(_)) => {
+            problem_response(StatusCode::NOT_FOUND, "gated action not found")
+        }
+        Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}

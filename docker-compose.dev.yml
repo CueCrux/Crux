@@ -1,0 +1,33 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+#
+# Dev overlay for live-editing the embedded Crux Console.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# With this overlay, edits to crates/corecruxd/playground/index.html are
+# served on the next browser refresh — no Rust rebuild, no container restart.
+# The embedded include_str! copy is still compiled into the binary; the dev
+# path simply takes precedence at request time when the env var is set.
+
+services:
+  crux:
+    environment:
+      - CORECRUXD_CONSOLE_DEV_PATH=/console-dev
+      # Phase 2 — workspace scanner. Read-only mount of the workspace root so
+      # the daemon can build the context graph (modules, deps, stubs, dead
+      # code). Set to empty to disable.
+      - CORECRUXD_WORKSPACE_PATH=/src
+      # Phase 2B — plane-layer sync. Comma-separated allowlist of paths the
+      # /v1/projects/{id}/planes/sync-layers endpoint may read from. Anything
+      # outside these prefixes is rejected with 400.
+      - CORECRUXD_SOURCE_ROOTS=/sources,/src
+    volumes:
+      - ./crates/corecruxd/playground:/console-dev:ro
+      - ./crates:/src/crates:ro
+      - ./Cargo.toml:/src/Cargo.toml:ro
+      - ./Cargo.lock:/src/Cargo.lock:ro
+      # Phase 2B — sibling repos that own per-plane master-plan docs, mounted
+      # read-only so plane vision/goals layers can be auto-populated.
+      - ../PlanCrux:/sources/plancrux:ro
