@@ -9,6 +9,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **GitHub shared memory** — selected GitHub repos become a searchable corpus
+  any agent attached to the daemon can read (Plan B in
+  `PlanCrux/.agent/execplans/crux-github-shared-memory.md`):
+  - PAT-based connection; the token is encrypted at rest with XChaCha20-
+    Poly1305 using a key derived from the daemon-root passport via BLAKE3
+    KDF (`LocalPassportKey::derive_subkey`). Endpoints:
+    `GET /v1/integrations/github/status`,
+    `POST /v1/integrations/github/connect` (verifies via api.github.com),
+    `POST /v1/integrations/github/disconnect`.
+  - Repo selection: `GET /v1/integrations/github/repos[/accessible]`,
+    `POST/DELETE /v1/integrations/github/repos/{owner}/{repo}/select`.
+  - Background sync worker pulls commits + PRs + issues + comments into
+    facts under `github::owner/repo::{commit,pr,issue,comment}/{id}`.
+    Polling cadence configurable via
+    `CORECRUXD_GITHUB_SYNC_INTERVAL_SECS` (default 900s);
+    `POST /v1/integrations/github/sync` triggers immediately.
+  - Mention parser: `[work:<id>]` markers in PR/issue bodies link back to
+    Plan A work items.
+  - Five new MCP tools surface the indexed corpus to coding agents:
+    `github_search`, `github_recent_commits`, `github_open_prs`,
+    `github_open_issues`, `github_comments_since`.
+  - Console UI: GitHub section in Settings with PAT connect form, repo
+    picker, sync button, and per-repo selection. Project drawer surfaces
+    open issues inline when `planning_target = github://owner/repo`.
+- **Coordination** — multi-passport, projects, and a 6-state work kanban for
+  cross-agent coordination on the same daemon (see Plan A in
+  `PlanCrux/.agent/execplans/crux-coordination-multi-passport-projects.md`):
+  - `GET/POST/PATCH/DELETE /v1/passports` + `GET /v1/passports/{id}` — multi-
+    passport store; auto-seeds `personal-default` / `work-default` /
+    `public-default` on first boot. Per-passport `agent_work_gate` toggle
+    queues agent state changes for human approval when set.
+  - `POST /session` accepts new optional `project_id` / `tenant_id` /
+    `passport_id` and returns the resolved binding via `X-CueCrux-*` response
+    headers. `GET /v1/sessions/active` lists recent bindings.
+  - `GET/POST/DELETE /v1/projects` + `GET /v1/projects/{id}` + member/tenant
+    sub-routes. Auto-seeds a `default` project on first boot. `planning_target`
+    supports `tenant://` or `github://` URLs (the latter activates once Plan B
+    GitHub indexing ships).
+  - `GET/POST /v1/work` + `GET/PATCH /v1/work/{id}` + comments + transitions +
+    `POST /v1/work/gate/{id}/approve|reject`. Six work states: Planned ·
+    In Progress · Blocked · Archive · Complete · Deployed. PATCH returns 200
+    (applied) or 202 (queued behind a gate).
+  - Six new MCP tools: `list_projects`, `get_project_context`, `list_work`,
+    `create_work`, `update_work_state`, `comment_on_work`. Both Claude Code
+    sessions and other agents can read/write the same kanban from inside
+    their own session.
+  - Console UI: new `Projects` and `Work` panels, rebuilt `Passport` panel
+    with the six layers of agent self-knowledge (Identity + Rules filled;
+    Operator/Directive/Playbook/Continuity as "Available in CueCrux Cloud"
+    placeholders). Active-project picker in the rail.
+- In-process relation graph wired into the open Crux Daemon: new
+  `POST /v1/relations` (write edge — `facts:write` scope),
+  `GET /v1/relations?tenant_id=&from_id=` (list outgoing — `admin:read`),
+  `POST /v1/relations/expand` (multi-hop graph traversal — `admin:read`).
+  Edges persist as JSONL at `data_dir/relations.jsonl` and are replayed into
+  in-memory `ProjectionState` on startup. The `corecrux-projections::query::graph_expand`
+  algorithm is now usable from the open daemon without a dataplane stub.
+- Console settings page (cog icon, top-right of rail): persists chosen auth
+  mode, embedding endpoint URL, and model; surfaces `restart_required` when
+  changes need a daemon bounce. New endpoints: `GET/PUT /v1/console/settings`.
+- Storage-breakdown chart relabelled to Text Search / Projections / Embedding /
+  Graph, each with a hover tooltip explaining what populates it. Graph bar now
+  reads real edge counts from the new relation surface.
+- Overview hero condensed: daemon-posture and boundary-check facts are now
+  inline chips with custom CSS tooltips inside the hero band, replacing the
+  two stacked cards beneath.
+- Embedded Crux Console redesigned for non-technical users: first-run
+  onboarding flow with live healthz/readyz/version tiles and a 3-card auth
+  picker (off / dev_scopes / jwt_hs256), nav reordered (Passport before
+  Integrations), Add Fact form, fact search box, tenant Personal/Work/Public
+  tabs, and a hand-rolled SVG storage-breakdown bar chart with Chunks/Bytes
+  toggle. Aligned to the cuecrux palette. Single-file `playground/index.html`
+  stays under 100 KB with no external dependencies.
+- New console endpoints: `GET /v1/console/onboarding`,
+  `POST /v1/console/onboarding/complete`, `POST /v1/console/onboarding/restart`,
+  `GET /v1/console/storage-breakdown`, `POST /v1/console/facts/add`. Existing
+  `GET /v1/console/facts` accepts `q=` and `top_k=`; `GET /v1/console/tenants`
+  accepts `category=personal|work|public|all` and emits a `category` field per
+  tenant (prefix-based; `personal` is the default).
+- `CORECRUXD_CONSOLE_DEV_PATH` env: when set, the daemon serves the console
+  HTML from disk instead of the embedded `include_str!` copy. Bind-mount via
+  the new `docker-compose.dev.yml` overlay for instant browser-refresh
+  iteration without rebuilding the image.
+- Persistent console settings file at `data_dir/console/settings.json`
+  (atomic tmp+rename writes, schema-versioned).
 - JSONL persistence for fact store and session store — facts survive daemon restarts
 - Paginated fact export endpoint (`GET /v1/facts/export`) with cursor pagination
 - Bidirectional sync client — pull enriched facts from remote CoreCrux, push local facts back

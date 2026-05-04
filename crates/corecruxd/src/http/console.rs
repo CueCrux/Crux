@@ -40,6 +40,474 @@ pub(super) struct ConsoleChunksQuery {
     pub cursor: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct CompleteOnboardingBody {
+    pub auth_mode: String,
+    #[serde(default)]
+    pub hide_onboarding: bool,
+}
+
+const SUPPORTED_ONBOARDING_AUTH_MODES: &[&str] = &["off", "dev_scopes", "jwt_hs256", "jwt_jwks"];
+
+pub(super) async fn get_console_onboarding(State(state): State<AppState>) -> impl IntoResponse {
+    let onboarding = state.onboarding.read().await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "completed_at_unix_ms": onboarding.completed_at_unix_ms,
+            "chosen_auth_mode": onboarding.chosen_auth_mode,
+            "running_auth_mode": state.auth.mode().as_str(),
+            "bind_is_loopback": state.http_bind_loopback,
+            "allow_insecure_dev_auth_bind": state.allow_insecure_dev_auth_bind,
+            "supported_auth_modes": SUPPORTED_ONBOARDING_AUTH_MODES,
+        })),
+    )
+        .into_response()
+}
+
+pub(super) async fn post_console_onboarding_complete(
+    State(state): State<AppState>,
+    Json(body): Json<CompleteOnboardingBody>,
+) -> impl IntoResponse {
+    let chosen = body.auth_mode.trim().to_ascii_lowercase();
+    if !SUPPORTED_ONBOARDING_AUTH_MODES.contains(&chosen.as_str()) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "auth_mode must be one of off, dev_scopes, jwt_hs256, jwt_jwks",
+        );
+    }
+
+    if chosen == "off" && !state.http_bind_loopback && !state.allow_insecure_dev_auth_bind {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "auth_mode=off requires a loopback bind or CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1",
+        );
+    }
+
+    let running = state.auth.mode().as_str().to_string();
+    let restart_required = chosen != running;
+
+    let mut current = state.onboarding.write().await;
+    current.chosen_auth_mode = Some(chosen.clone());
+    if body.hide_onboarding {
+        current.completed_at_unix_ms = Some(now_unix_ms());
+    }
+    if let Err(err) = crate::onboarding::write_state(&state.data_dir, &current) {
+        return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+    let snapshot = current.clone();
+    drop(current);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "completed_at_unix_ms": snapshot.completed_at_unix_ms,
+            "chosen_auth_mode": snapshot.chosen_auth_mode,
+            "running_auth_mode": running,
+            "restart_required": restart_required,
+            "restart_command": "docker compose restart crux"
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct UpdateSettingsBody {
+    #[serde(default)]
+    pub auth_mode: Option<String>,
+    #[serde(default)]
+    pub embedding_enabled: Option<bool>,
+    #[serde(default)]
+    pub embedding_url: Option<String>,
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+}
+
+pub(super) async fn get_console_settings(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    let onboarding = state.onboarding.read().await;
+    let env_embedding_url = std::env::var("CORECRUXD_EMBEDDING_URL").ok().filter(|s| !s.is_empty());
+    let env_embedding_model = std::env::var("CORECRUXD_EMBEDDING_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "auth": {
+                "running_mode": state.auth.mode().as_str(),
+                "chosen_mode": onboarding.chosen_auth_mode,
+                "bind_is_loopback": state.http_bind_loopback,
+                "allow_insecure_dev_auth_bind": state.allow_insecure_dev_auth_bind,
+                "supported_modes": SUPPORTED_ONBOARDING_AUTH_MODES,
+            },
+            "embedding": {
+                "enabled_intent": onboarding.embedding_enabled,
+                "chosen_url": onboarding.chosen_embedding_url,
+                "chosen_model": onboarding.chosen_embedding_model,
+                "active_url": env_embedding_url,
+                "active_model": env_embedding_model,
+                "active": env_embedding_url.is_some(),
+            },
+            "onboarding": {
+                "completed_at_unix_ms": onboarding.completed_at_unix_ms,
+            }
+        })),
+    )
+        .into_response()
+}
+
+pub(super) async fn put_console_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateSettingsBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+
+    let mut onboarding = state.onboarding.write().await;
+    let mut restart_required = false;
+
+    if let Some(raw) = body.auth_mode {
+        let mode = raw.trim().to_ascii_lowercase();
+        if !SUPPORTED_ONBOARDING_AUTH_MODES.contains(&mode.as_str()) {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "auth_mode must be one of off, dev_scopes, jwt_hs256, jwt_jwks",
+            );
+        }
+        if mode == "off" && !state.http_bind_loopback && !state.allow_insecure_dev_auth_bind {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "auth_mode=off requires a loopback bind or CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1",
+            );
+        }
+        if state.auth.mode().as_str() != mode {
+            restart_required = true;
+        }
+        onboarding.chosen_auth_mode = Some(mode);
+    }
+
+    if let Some(enabled) = body.embedding_enabled {
+        if onboarding.embedding_enabled != Some(enabled) {
+            restart_required = true;
+        }
+        onboarding.embedding_enabled = Some(enabled);
+    }
+    if let Some(url) = body.embedding_url {
+        let trimmed = url.trim().to_string();
+        let new = if trimmed.is_empty() { None } else { Some(trimmed) };
+        if onboarding.chosen_embedding_url != new {
+            restart_required = true;
+        }
+        onboarding.chosen_embedding_url = new;
+    }
+    if let Some(model) = body.embedding_model {
+        let trimmed = model.trim().to_string();
+        let new = if trimmed.is_empty() { None } else { Some(trimmed) };
+        if onboarding.chosen_embedding_model != new {
+            restart_required = true;
+        }
+        onboarding.chosen_embedding_model = new;
+    }
+
+    if let Err(err) = crate::onboarding::write_state(&state.data_dir, &onboarding) {
+        return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+    let snapshot = onboarding.clone();
+    drop(onboarding);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "saved": {
+                "chosen_auth_mode": snapshot.chosen_auth_mode,
+                "chosen_embedding_url": snapshot.chosen_embedding_url,
+                "chosen_embedding_model": snapshot.chosen_embedding_model,
+                "embedding_enabled": snapshot.embedding_enabled,
+            },
+            "restart_required": restart_required,
+            "restart_command": "docker compose restart crux"
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ProbeEmbeddingBody {
+    pub url: String,
+}
+
+/// Probe an embedding endpoint URL for available models. Tries Ollama-style
+/// (`GET {url}/api/tags`) first, falls back to OpenAI-compatible
+/// (`GET {url}/v1/models`). Returns whichever shape parsed; the UI shows the
+/// flat list and lets the operator override manually if both probes fail.
+pub(super) async fn post_console_embedding_probe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ProbeEmbeddingBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    let url = body.url.trim().trim_end_matches('/').to_string();
+    if url.is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "url must not be empty");
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return problem_response(StatusCode::BAD_REQUEST, "url must start with http:// or https://");
+    }
+
+    let result = tokio::task::spawn_blocking(move || probe_embedding_url(&url))
+        .await
+        .map_err(|e| e.to_string());
+    match result {
+        Ok(Ok(probe)) => (StatusCode::OK, Json(probe)).into_response(),
+        Ok(Err(err)) => problem_response(StatusCode::BAD_GATEWAY, err),
+        Err(err) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("probe join failed: {err}")),
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct EmbeddingProbeResult {
+    shape: &'static str,
+    models: Vec<String>,
+    /// The actual URL the probe succeeded against — may differ from the
+    /// operator's input if a Docker-aware fallback (host.docker.internal,
+    /// sibling-service hostname) was used. UI surfaces this so the operator
+    /// can persist the working URL.
+    resolved_url: String,
+}
+
+fn probe_embedding_url(url: &str) -> Result<EmbeddingProbeResult, String> {
+    // Inside a Docker container, `localhost`/`127.0.0.1` from the daemon's
+    // perspective resolves to the daemon itself, NOT the user's host or a
+    // sibling container. We try the URL the operator gave us first; if that
+    // fails AND the URL points at localhost, we transparently retry with
+    // common Docker-aware fallbacks before giving up.
+    let candidates = build_probe_candidates(url);
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(6)))
+        .build()
+        .into();
+
+    let probe_endpoints: [(&str, &str); 2] = [("ollama", "/api/tags"), ("openai-compat", "/v1/models")];
+    let mut last_error = String::new();
+
+    for candidate in &candidates {
+        for (shape, path) in probe_endpoints {
+            let probe_url = format!("{candidate}{path}");
+            match agent.get(&probe_url).header("Accept", "application/json").call() {
+                Ok(mut response) => {
+                    let status = response.status().as_u16();
+                    if status != 200 {
+                        last_error = format!("{shape} ({probe_url}) returned {status}");
+                        continue;
+                    }
+                    let text = response.body_mut().read_to_string().map_err(|e| e.to_string())?;
+                    let parsed: serde_json::Value = match serde_json::from_str(&text) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            last_error = format!("{shape} returned non-JSON: {e}");
+                            continue;
+                        }
+                    };
+                    let models = match shape {
+                        "ollama" => parsed
+                            .get("models")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|m| m.get("name").and_then(|x| x.as_str()).map(str::to_string))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default(),
+                        "openai-compat" => parsed
+                            .get("data")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|m| m.get("id").and_then(|x| x.as_str()).map(str::to_string))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default(),
+                        _ => Vec::new(),
+                    };
+                    if models.is_empty() {
+                        last_error = format!("{shape} ({probe_url}) returned 200 but no models parsed");
+                        continue;
+                    }
+                    return Ok(EmbeddingProbeResult {
+                        shape,
+                        models,
+                        resolved_url: candidate.clone(),
+                    });
+                }
+                Err(err) => {
+                    last_error = format!("{shape} ({probe_url}): {err}");
+                }
+            }
+        }
+    }
+    Err(format!(
+        "no probe shape worked across {} candidate host(s). last error: {last_error}",
+        candidates.len()
+    ))
+}
+
+/// Given a user-supplied embedding URL, build the ordered list of hostnames
+/// to actually probe. The operator's URL is always first. When the URL points
+/// at localhost, we append `host.docker.internal` (Docker Desktop bridge) and
+/// the documented compose-sibling hostname `crux-ollama-1` (matches
+/// docker-compose.yml's `ollama` service when launched with the embeddings
+/// profile) so the operator's "obvious" URL Just Works from inside the daemon.
+#[cfg(test)]
+mod probe_candidate_tests {
+    use super::build_probe_candidates;
+
+    #[test]
+    fn non_localhost_url_returns_only_itself() {
+        let c = build_probe_candidates("http://api.example.com:8080");
+        assert_eq!(c, vec!["http://api.example.com:8080".to_string()]);
+    }
+
+    #[test]
+    fn localhost_appends_docker_aware_fallbacks() {
+        let c = build_probe_candidates("http://localhost:11434/");
+        assert_eq!(
+            c,
+            vec![
+                "http://localhost:11434".to_string(),
+                "http://host.docker.internal:11434".to_string(),
+                "http://crux-ollama-1:11434".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv4_loopback_also_gets_fallbacks() {
+        let c = build_probe_candidates("http://127.0.0.1:11434");
+        assert!(c.contains(&"http://host.docker.internal:11434".to_string()));
+        assert!(c.contains(&"http://crux-ollama-1:11434".to_string()));
+    }
+
+    #[test]
+    fn fallback_dedups_when_already_present() {
+        let c = build_probe_candidates("http://host.docker.internal:11434");
+        // Not localhost, so no rewrite.
+        assert_eq!(c, vec!["http://host.docker.internal:11434".to_string()]);
+    }
+}
+
+fn build_probe_candidates(url: &str) -> Vec<String> {
+    let trimmed = url.trim().trim_end_matches('/').to_string();
+    let mut out = vec![trimmed.clone()];
+    let lower = trimmed.to_lowercase();
+
+    let is_localhost = lower.contains("//localhost") || lower.contains("//127.0.0.1") || lower.contains("//0.0.0.0");
+
+    if is_localhost {
+        for host in ["host.docker.internal", "crux-ollama-1"] {
+            for needle in ["//localhost", "//127.0.0.1", "//0.0.0.0"] {
+                if lower.contains(needle) {
+                    let rewritten = trimmed.replace(needle.trim_start_matches("//"), host);
+                    if !out.contains(&rewritten) {
+                        out.push(rewritten);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(super) async fn get_console_storage_breakdown(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+
+    let retrieval = state.retrieval_index.read().await;
+    let sparse_chunks = retrieval.total_docs();
+    let tier_stats = retrieval.tier_stats();
+    let sparse_bytes = (tier_stats.hot_bytes as u64).saturating_add(tier_stats.warm_bytes as u64);
+    let sparse_segment_count = retrieval.segment_count();
+    drop(retrieval);
+
+    let extraction_rows = state.extraction_cache.read().await.len();
+    let graph_edges = state.projection_state.read().await.relations.len();
+    // Conservative byte estimate: each on-disk RelationRecord JSONL line is
+    // ~150 bytes (tenant_id + edge_type + ids + timestamps + JSON envelope).
+    let graph_bytes_est = (graph_edges as u64).saturating_mul(150);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "kinds": [
+                {
+                    "kind": "text_search",
+                    "label": "Text Search",
+                    "available": sparse_segment_count > 0,
+                    "chunks": sparse_chunks,
+                    "bytes": sparse_bytes,
+                    "tooltip": "BM25 keyword search over sealed .ccxi companion indexes. Build with CORECRUXD_BUILD_CCXI=1; documents are added when shards seal a segment."
+                },
+                {
+                    "kind": "projections",
+                    "label": "Projections",
+                    "available": extraction_rows > 0,
+                    "chunks": extraction_rows,
+                    "bytes": 0,
+                    "tooltip": "Materialised cache rows derived from append events (extraction_cache_current). Populated by the projection runner; raw byte size is not tracked in this distribution."
+                },
+                {
+                    "kind": "embedding",
+                    "label": "Embedding",
+                    "available": false,
+                    "chunks": 0,
+                    "bytes": 0,
+                    "tooltip": "Dense vector embeddings produced by an external endpoint (Ollama, vLLM, TEI, llama.cpp, LiteLLM). Configure via CORECRUXD_EMBEDDING_URL / CORECRUXD_EMBEDDING_MODEL. Storage and counts surface once the embedding pipeline is wired."
+                },
+                {
+                    "kind": "graph",
+                    "label": "Graph",
+                    "available": graph_edges > 0,
+                    "chunks": graph_edges,
+                    "bytes": graph_bytes_est,
+                    "tooltip": "Relation edges (supports / contradicts / cites / supersedes / elaborates / derived_from / duplicates / about_same_entity). Write via POST /v1/relations; read via GET /v1/relations or POST /v1/relations/expand. Persisted to relations.jsonl."
+                }
+            ]
+        })),
+    )
+        .into_response()
+}
+
+pub(super) async fn post_console_onboarding_restart(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let mut current = state.onboarding.write().await;
+    current.completed_at_unix_ms = None;
+    if let Err(err) = crate::onboarding::write_state(&state.data_dir, &current) {
+        return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "completed_at_unix_ms": null,
+            "chosen_auth_mode": current.chosen_auth_mode
+        })),
+    )
+        .into_response()
+}
+
 pub(super) async fn get_console_summary(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
@@ -294,26 +762,69 @@ pub(super) async fn get_console_sessions(State(state): State<AppState>, headers:
         .into_response()
 }
 
-pub(super) async fn get_console_facts(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ConsoleFactsQuery {
+    pub q: Option<String>,
+    pub top_k: Option<usize>,
+    /// AX time-machine (#6): when set, the response only includes facts whose
+    /// `stored_at` is <= this Unix-ms timestamp. Useful for "view facts as of T".
+    pub as_of_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ConsoleAddFactBody {
+    pub entity: String,
+    pub key: String,
+    pub value: String,
+    #[serde(default = "default_console_confidence")]
+    pub confidence: f32,
+}
+
+fn default_console_confidence() -> f32 {
+    1.0
+}
+
+pub(super) async fn get_console_facts(
+    State(state): State<AppState>,
+    Query(query): Query<ConsoleFactsQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
     }
 
+    let q = query
+        .q
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let top_k = query.top_k.unwrap_or(50).clamp(1, 200);
+
     let store = state.fact_store.read().await;
     let result = store.query(&corecrux_memory::fact_store::FactQuery {
-        query: None,
+        query: q.clone(),
         entity: None,
         entity_prefix: None,
-        top_k: 50,
+        top_k,
         token_budget: None,
     });
-    let visible_facts: Vec<_> = result.facts.into_iter().filter(|fact| !fact.private).collect();
+    let mut visible_facts: Vec<_> = result.facts.into_iter().filter(|fact| !fact.private).collect();
+
+    // #6 — server-side as-of filter. We compare against `stored_at` (DateTime<Utc>)
+    // converted to ms; facts created strictly after the cutoff are dropped.
+    if let Some(as_of) = query.as_of_unix_ms.filter(|t| *t > 0) {
+        visible_facts.retain(|fact| fact.stored_at.timestamp_millis() <= as_of);
+    }
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "count": store.count(),
             "visible_count": visible_facts.len(),
+            "query": q,
+            "top_k": top_k,
+            "as_of_unix_ms": query.as_of_unix_ms,
             "private_facts_hidden": true,
             "facts": visible_facts,
             "total_tokens": result.total_tokens
@@ -322,10 +833,82 @@ pub(super) async fn get_console_facts(State(state): State<AppState>, headers: He
         .into_response()
 }
 
-pub(super) async fn get_console_tenants(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+pub(super) async fn post_console_fact_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ConsoleAddFactBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["facts:write"]) {
+        return problem.into_response();
+    }
+
+    let entity = body.entity.trim();
+    let key = body.key.trim();
+    let value = body.value.trim();
+    if entity.is_empty() || key.is_empty() || value.is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "entity, key, and value must all be non-empty");
+    }
+    if !(0.0..=1.0).contains(&body.confidence) {
+        return problem_response(StatusCode::BAD_REQUEST, "confidence must be in [0.0, 1.0]");
+    }
+
+    let mut store = state.fact_store.write().await;
+    let mut sf = corecrux_memory::fact_store::StoreFact {
+        entity: entity.to_string(),
+        key: key.to_string(),
+        value: value.to_string(),
+        source_receipt: None,
+        confidence: body.confidence,
+        // Default false; the privacy gate below promotes to true for any
+        // entity matching an always-private prefix (__ax__::, __work__::,
+        // __project_layer__::, github::, etc.).
+        private: false,
+    };
+    crate::fact_privacy::enforce_global(&mut sf);
+    let stored = store.store(sf);
+
+    (StatusCode::CREATED, Json(stored)).into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ConsoleTenantsQuery {
+    pub category: Option<String>,
+}
+
+/// Tenant categorisation by id prefix. Personal is the safe default for any
+/// tenant id that doesn't carry a recognised prefix.
+fn classify_tenant(tenant_id: &str) -> &'static str {
+    let lower = tenant_id.to_ascii_lowercase();
+    if lower.starts_with("work::") || lower.starts_with("work-") || lower == "work" {
+        "work"
+    } else if lower.starts_with("public::") || lower.starts_with("public-") || lower == "public" {
+        "public"
+    } else {
+        "personal"
+    }
+}
+
+pub(super) async fn get_console_tenants(
+    State(state): State<AppState>,
+    Query(query): Query<ConsoleTenantsQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
     }
+
+    let category_filter = match query.category.as_deref() {
+        None | Some("") | Some("all") => None,
+        Some("personal") => Some("personal"),
+        Some("work") => Some("work"),
+        Some("public") => Some("public"),
+        Some(other) => {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                format!("category must be one of personal, work, public, all (got '{other}')"),
+            );
+        }
+    };
 
     let routing = state.routing.read().await;
     let store = state.fact_store.read().await;
@@ -342,22 +925,29 @@ pub(super) async fn get_console_tenants(State(state): State<AppState>, headers: 
         tenants.extend(indexed_tenants);
     }
 
-    let tenants: Vec<_> = tenants
+    let tenant_objects: Vec<_> = tenants
         .into_iter()
         .map(|tenant_id| {
+            let category = classify_tenant(&tenant_id);
             serde_json::json!({
                 "tenant_id": tenant_id,
+                "category": category,
                 "source": "local_metadata",
                 "chunk_visibility": "metadata_only",
                 "content_preview": false
             })
+        })
+        .filter(|t| match category_filter {
+            Some(filter) => t["category"] == filter,
+            None => true,
         })
         .collect();
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "tenants": tenants,
+            "tenants": tenant_objects,
+            "category_filter": category_filter,
             "routing": {
                 "shard_map_version": routing.current_version(),
                 "shard_count": routing.shard_count()

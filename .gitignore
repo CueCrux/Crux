@@ -28,3 +28,22 @@ sdks/typescript/dist/
 sdks/python/dist/
 __pycache__/
 *.pyc
+
+# Daemon data — NEVER commit. The fact store, passport keys, sealed
+# integration credentials, selected-repo lists and sync cursors all live
+# under the data dir. Default location is `./data/` when CORECRUXD_DATA_DIR
+# is unset (e.g. `cargo run` outside docker); the docker-compose stack uses
+# a named volume which is already outside the repo. Belt-and-braces here so
+# a stray `git add .` never pulls them in.
+/data/
+**/data/
+*.jsonl
+crux-data/
+passport.key
+passports/
+**/credentials.json
+**/selected_repos.json
+sync_cursor.json
+console/settings.json
+LOCK
+.install-uuid

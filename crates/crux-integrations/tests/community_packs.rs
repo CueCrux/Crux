@@ -126,5 +126,5 @@ fn is_safe_relative_path(value: &str) -> bool {
 }
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").to_path_buf()
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").clone()
 }

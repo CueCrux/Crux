@@ -40,7 +40,23 @@ fn version_includes_update_status() {
 fn console_shell_renders() {
     let html = daemon().get("/console").unwrap().into_body().read_to_string().unwrap();
     assert!(html.contains("Crux Console"));
-    assert!(!html.contains("https://"));
+    // Block runtime-loading of external assets (scripts/styles/iframes from
+    // CDNs or any remote host). Documentation `<a href="https://...">` links
+    // to ecosystem sites (cuecrux.com, vaultcrux.com, memorycrux.com,
+    // github.com, etc.) are FINE — they don't load anything until the user
+    // clicks them. Mirrors the unit-side check in
+    // `corecruxd::playground::tests::console_shell_has_no_external_runtime_dependencies`.
+    for blocked in [
+        r#"<script src="http"#,
+        r#"<link rel="stylesheet" href="http"#,
+        r#"<iframe src="http"#,
+        "unpkg.com",
+        "jsdelivr.net",
+        "cdnjs.cloudflare",
+        "cdn.jsdelivr",
+    ] {
+        assert!(!html.contains(blocked), "external runtime dependency found: {blocked}");
+    }
 
     let root = daemon().get("/").unwrap().into_body().read_to_string().unwrap();
     assert!(root.contains("Crux Console"));
@@ -128,7 +144,18 @@ fn mcp_tools_list() {
         .into_body()
         .read_json()
         .unwrap();
-    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 25);
+    // Lower-bound assertion so this test doesn't break every time we add a
+    // tool; the in-crate `crux_mcp::tools::tests::list_tools_returns_expected_count`
+    // pins the exact count via `TOOL_COUNT`. The integration daemon may
+    // gate a few config-dependent tools (e.g. sync_* without remote config),
+    // hence the lower bound below the in-crate TOOL_COUNT.
+    let tools = body["result"]["tools"].as_array().unwrap();
+    assert!(tools.len() >= 35, "expected ≥35 MCP tools, got {}", tools.len());
+    // Spot-check that the storyline tool registered (added 2026-05-03).
+    let has_storyline = tools
+        .iter()
+        .any(|t| t["name"].as_str() == Some("get_workspace_storyline"));
+    assert!(has_storyline, "get_workspace_storyline not in MCP catalogue");
 }
 
 #[test]

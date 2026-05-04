@@ -130,6 +130,13 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
         extraction_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
             corecrux_projections::ExtractionCacheMaterializer::new(),
         )),
+        onboarding: Arc::new(RwLock::new(crate::onboarding::OnboardingState::default())),
+        http_bind_loopback: true,
+        allow_insecure_dev_auth_bind: false,
+        projection_state: Arc::new(RwLock::new(corecrux_projections::ProjectionState::default())),
+        integration_encryption_key: Arc::new([0u8; 32]),
+        presence: crate::presence::PresenceTracker::new(),
+        privacy_policy: crate::fact_privacy::PrivacyPolicy::from_env(),
     }
 }
 
@@ -744,9 +751,17 @@ async fn console_redacts_private_facts_and_session_state() {
         None,
     );
 
-    let facts_resp = console::get_console_facts(State(state.clone()), dev_scope_headers("admin:read"))
-        .await
-        .into_response();
+    let facts_resp = console::get_console_facts(
+        State(state.clone()),
+        Query(console::ConsoleFactsQuery {
+            q: None,
+            top_k: None,
+            as_of_unix_ms: None,
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
     assert_eq!(facts_resp.status(), StatusCode::OK);
     let facts_body = json_body(facts_resp).await;
     assert_eq!(facts_body["private_facts_hidden"], true);
@@ -4413,14 +4428,19 @@ fn admin_action_error_wraps_multiple_messages() {
 
 #[tokio::test]
 async fn problem_response_returns_correct_status_and_content_type() {
+    // CONFLICT (409) is a recognised status — passes through directly.
     let resp = problem_response(StatusCode::CONFLICT, "conflict happened");
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR); // CONFLICT uses fallback -> internal
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
     let ct = resp
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     assert!(ct.contains("application/problem+json"));
+
+    // An unrecognised status (e.g., I_AM_A_TEAPOT 418) still falls back to 500.
+    let fallback = problem_response(StatusCode::IM_A_TEAPOT, "tea time");
+    assert_eq!(fallback.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 // ── hex16 ───────────────────────────────────────────────────────
@@ -5081,4 +5101,1615 @@ async fn version_endpoint_reports_degraded_sync_when_remote_is_incomplete() {
     std::env::remove_var("CORECRUXD_SYNC_ENABLED");
     std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
     std::env::remove_var("CORECRUXD_SYNC_API_KEY");
+}
+
+#[tokio::test]
+async fn console_onboarding_get_returns_default_state() {
+    let state = test_app_state(16);
+    let resp = console::get_console_onboarding(State(state)).await.into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert!(body["completed_at_unix_ms"].is_null());
+    assert!(body["chosen_auth_mode"].is_null());
+    assert_eq!(body["bind_is_loopback"], true);
+    assert_eq!(body["allow_insecure_dev_auth_bind"], false);
+    assert_eq!(body["running_auth_mode"], "off");
+}
+
+#[tokio::test]
+async fn console_onboarding_complete_persists_and_marks_restart_required() {
+    let state = test_app_state(16);
+    let resp = console::post_console_onboarding_complete(
+        State(state.clone()),
+        Json(console::CompleteOnboardingBody {
+            auth_mode: "dev_scopes".to_string(),
+            hide_onboarding: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["chosen_auth_mode"], "dev_scopes");
+    assert_eq!(body["restart_required"], true);
+    assert!(body["completed_at_unix_ms"].is_u64());
+
+    // Persisted to disk and reloads correctly.
+    let reloaded = crate::onboarding::read_state(&state.data_dir).expect("reload settings");
+    assert_eq!(reloaded.chosen_auth_mode.as_deref(), Some("dev_scopes"));
+    assert!(reloaded.completed_at_unix_ms.is_some());
+}
+
+#[tokio::test]
+async fn console_onboarding_complete_rejects_unknown_auth_mode() {
+    let state = test_app_state(16);
+    let resp = console::post_console_onboarding_complete(
+        State(state),
+        Json(console::CompleteOnboardingBody {
+            auth_mode: "magical".to_string(),
+            hide_onboarding: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn console_onboarding_complete_refuses_off_on_non_loopback() {
+    let mut state = test_app_state(16);
+    state.http_bind_loopback = false;
+    state.allow_insecure_dev_auth_bind = false;
+    let resp = console::post_console_onboarding_complete(
+        State(state),
+        Json(console::CompleteOnboardingBody {
+            auth_mode: "off".to_string(),
+            hide_onboarding: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn console_onboarding_complete_allows_off_when_insecure_bind_overridden() {
+    let mut state = test_app_state(16);
+    state.http_bind_loopback = false;
+    state.allow_insecure_dev_auth_bind = true;
+    let resp = console::post_console_onboarding_complete(
+        State(state),
+        Json(console::CompleteOnboardingBody {
+            auth_mode: "off".to_string(),
+            hide_onboarding: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn console_fact_add_then_search_round_trip() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    // Add via console endpoint.
+    let add_resp = console::post_console_fact_add(
+        State(state.clone()),
+        dev_scope_headers("facts:write"),
+        Json(console::ConsoleAddFactBody {
+            entity: "personal::project".to_string(),
+            key: "favourite_colour".to_string(),
+            value: "ultraviolet".to_string(),
+            confidence: 0.9,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(add_resp.status(), StatusCode::CREATED);
+
+    // Search returns the same fact.
+    let search_resp = console::get_console_facts(
+        State(state),
+        Query(console::ConsoleFactsQuery {
+            q: Some("ultraviolet".to_string()),
+            top_k: Some(10),
+            as_of_unix_ms: None,
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(search_resp.status(), StatusCode::OK);
+    let body = json_body(search_resp).await;
+    assert_eq!(body["query"], "ultraviolet");
+    let facts = body["facts"].as_array().expect("facts array");
+    assert!(
+        facts
+            .iter()
+            .any(|f| f["value"] == "ultraviolet" && f["entity"] == "personal::project"),
+        "expected newly added fact in search results: {body}"
+    );
+}
+
+#[tokio::test]
+async fn console_fact_add_requires_facts_write_scope() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::post_console_fact_add(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Json(console::ConsoleAddFactBody {
+            entity: "x".to_string(),
+            key: "y".to_string(),
+            value: "z".to_string(),
+            confidence: 1.0,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp_anon = console::post_console_fact_add(
+        State(state),
+        HeaderMap::new(),
+        Json(console::ConsoleAddFactBody {
+            entity: "x".to_string(),
+            key: "y".to_string(),
+            value: "z".to_string(),
+            confidence: 1.0,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp_anon.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn console_fact_add_validates_inputs() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    for (entity, key, value, confidence, label) in [
+        ("", "k", "v", 1.0, "empty entity"),
+        ("e", "", "v", 1.0, "empty key"),
+        ("e", "k", "", 1.0, "empty value"),
+        ("e", "k", "v", -0.1, "confidence too low"),
+        ("e", "k", "v", 1.1, "confidence too high"),
+    ] {
+        let resp = console::post_console_fact_add(
+            State(state.clone()),
+            dev_scope_headers("facts:write"),
+            Json(console::ConsoleAddFactBody {
+                entity: entity.to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
+                confidence,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "expected 400 for {label}");
+    }
+}
+
+#[tokio::test]
+async fn console_tenants_classify_by_prefix_and_filter() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut facts = state.fact_store.write().await;
+        for entity in [
+            "personal::notes::status",
+            "work::team::status",
+            "public::release::status",
+            "myproject::status", // unknown prefix → personal
+        ] {
+            facts.store(corecrux_memory::fact_store::StoreFact {
+                entity: entity.to_string(),
+                key: "x".to_string(),
+                value: "v".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+            });
+        }
+    }
+
+    // Default: all tenants returned with category field.
+    let resp = console::get_console_tenants(
+        State(state.clone()),
+        Query(console::ConsoleTenantsQuery { category: None }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let tenants = body["tenants"].as_array().expect("tenants");
+    let with_cat = |id: &str| -> &str {
+        tenants
+            .iter()
+            .find(|t| t["tenant_id"] == id)
+            .and_then(|t| t["category"].as_str())
+            .unwrap_or("MISSING")
+    };
+    assert_eq!(with_cat("personal"), "personal");
+    assert_eq!(with_cat("work"), "work");
+    assert_eq!(with_cat("public"), "public");
+    assert_eq!(with_cat("myproject"), "personal");
+    assert_eq!(with_cat("local"), "personal");
+
+    // ?category=work → only work tenants.
+    let resp = console::get_console_tenants(
+        State(state.clone()),
+        Query(console::ConsoleTenantsQuery {
+            category: Some("work".to_string()),
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    let only_work = body["tenants"].as_array().expect("tenants");
+    assert!(!only_work.is_empty());
+    for t in only_work {
+        assert_eq!(t["category"], "work");
+    }
+
+    // ?category=bogus → 400.
+    let resp = console::get_console_tenants(
+        State(state),
+        Query(console::ConsoleTenantsQuery {
+            category: Some("bogus".to_string()),
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn console_settings_get_returns_running_and_chosen_state() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::get_console_settings(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["auth"]["running_mode"], "dev_scopes");
+    assert!(body["embedding"]["active"].is_boolean());
+    assert!(body["onboarding"]["completed_at_unix_ms"].is_null());
+}
+
+#[tokio::test]
+async fn console_settings_put_persists_choices_and_flags_restart() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::put_console_settings(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Json(console::UpdateSettingsBody {
+            auth_mode: Some("jwt_hs256".to_string()),
+            embedding_enabled: Some(true),
+            embedding_url: Some("http://localhost:11434".to_string()),
+            embedding_model: Some("nomic-embed-text".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["restart_required"], true);
+    assert_eq!(body["saved"]["chosen_auth_mode"], "jwt_hs256");
+    assert_eq!(body["saved"]["chosen_embedding_url"], "http://localhost:11434");
+
+    let reloaded = crate::onboarding::read_state(&state.data_dir).expect("reload");
+    assert_eq!(reloaded.chosen_auth_mode.as_deref(), Some("jwt_hs256"));
+    assert_eq!(reloaded.chosen_embedding_model.as_deref(), Some("nomic-embed-text"));
+    assert_eq!(reloaded.embedding_enabled, Some(true));
+}
+
+#[tokio::test]
+async fn console_settings_put_rejects_off_on_non_loopback() {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.http_bind_loopback = false;
+    state.allow_insecure_dev_auth_bind = false;
+    let resp = console::put_console_settings(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Json(console::UpdateSettingsBody {
+            auth_mode: Some("off".to_string()),
+            embedding_enabled: None,
+            embedding_url: None,
+            embedding_model: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn console_storage_breakdown_returns_four_kinds_with_empty_defaults() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::get_console_storage_breakdown(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let kinds = body["kinds"].as_array().expect("kinds array");
+    let names: Vec<&str> = kinds.iter().map(|k| k["kind"].as_str().unwrap_or_default()).collect();
+    assert_eq!(names, vec!["text_search", "projections", "embedding", "graph"]);
+    for kind in kinds {
+        assert!(kind["chunks"].is_u64());
+        assert!(kind["bytes"].is_u64());
+        assert!(kind["available"].is_boolean());
+        assert!(kind["tooltip"].is_string());
+    }
+    // Embedding always unavailable in the open distribution.
+    let embedding = kinds.iter().find(|k| k["kind"] == "embedding").expect("embedding kind");
+    assert_eq!(embedding["available"], false);
+    // Graph empty by default — no relations posted yet.
+    let graph = kinds.iter().find(|k| k["kind"] == "graph").expect("graph kind");
+    assert_eq!(graph["chunks"], 0);
+    assert_eq!(graph["available"], false);
+}
+
+#[tokio::test]
+async fn console_storage_breakdown_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::get_console_storage_breakdown(State(state), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn relation_post_persists_then_list_returns_outgoing_edges() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let resp = super::relations::post_relation(
+        State(state.clone()),
+        dev_scope_headers("facts:write"),
+        Json(super::relations::PutRelationBody {
+            tenant_id: "alpha".to_string(),
+            from_id: 10,
+            to_id: 20,
+            edge_type: "cites".to_string(),
+            confidence: 0.5,
+            created_at_micros: None,
+            updated_at_micros: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // JSONL on disk is the source of truth across restarts.
+    let jsonl = state.data_dir.join("relations.jsonl");
+    let contents = std::fs::read_to_string(&jsonl).expect("read jsonl");
+    assert!(contents.contains("\"alpha\""), "edge should be persisted: {contents}");
+
+    let list_resp = super::relations::get_relations(
+        State(state.clone()),
+        Query(super::relations::ListRelationsQuery {
+            tenant_id: "alpha".to_string(),
+            from_id: 10,
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let body = json_body(list_resp).await;
+    let edges = body["edges"].as_array().expect("edges array");
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["to_id"], 20);
+    assert_eq!(edges[0]["edge_type"], "cites");
+}
+
+#[tokio::test]
+async fn relation_post_rejects_unknown_edge_type() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::relations::post_relation(
+        State(state),
+        dev_scope_headers("facts:write"),
+        Json(super::relations::PutRelationBody {
+            tenant_id: "alpha".to_string(),
+            from_id: 1,
+            to_id: 2,
+            edge_type: "loves".to_string(),
+            confidence: 1.0,
+            created_at_micros: None,
+            updated_at_micros: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn relation_expand_walks_two_hops() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // Build a small chain: 1 -supports-> 2 -supports-> 3 -supports-> 4
+    for (from, to) in [(1u32, 2u32), (2, 3), (3, 4)] {
+        let resp = super::relations::post_relation(
+            State(state.clone()),
+            dev_scope_headers("facts:write"),
+            Json(super::relations::PutRelationBody {
+                tenant_id: "alpha".to_string(),
+                from_id: from,
+                to_id: to,
+                edge_type: "supports".to_string(),
+                confidence: 1.0,
+                created_at_micros: None,
+                updated_at_micros: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let expand_resp = super::relations::post_expand(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Json(super::relations::ExpandRelationsBody {
+            tenant_id: "alpha".to_string(),
+            seed_artifact_ids: vec![1],
+            edge_types: vec![],
+            max_hops: 2,
+            budget: 50,
+            min_confidence: 0.0,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(expand_resp.status(), StatusCode::OK);
+    let body = json_body(expand_resp).await;
+    let artifact_ids: Vec<u64> = body["artifacts"]
+        .as_array()
+        .expect("artifacts")
+        .iter()
+        .map(|a| a["artifact_id"].as_u64().unwrap_or_default())
+        .collect();
+    // graph_expand returns reached neighbours (seed itself is excluded by design).
+    // 2 hops from seed 1 reaches 2 and 3 but not 4.
+    assert!(
+        !artifact_ids.contains(&1),
+        "seed itself is not in result by graph_expand contract"
+    );
+    assert!(artifact_ids.contains(&2), "1-hop neighbour in result");
+    assert!(artifact_ids.contains(&3), "2-hop neighbour in result");
+    assert!(
+        !artifact_ids.contains(&4),
+        "3-hop neighbour NOT in result with max_hops=2"
+    );
+}
+
+#[tokio::test]
+async fn console_storage_breakdown_graph_kind_reflects_relation_posts() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    // Post two relations through the public endpoint so the path mirrors prod usage.
+    for (from, to, edge_type) in [(1u32, 2u32, "supports"), (2, 3, "elaborates")] {
+        let resp = super::relations::post_relation(
+            State(state.clone()),
+            dev_scope_headers("facts:write"),
+            Json(super::relations::PutRelationBody {
+                tenant_id: "tenant-x".to_string(),
+                from_id: from,
+                to_id: to,
+                edge_type: edge_type.to_string(),
+                confidence: 0.9,
+                created_at_micros: None,
+                updated_at_micros: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let resp = console::get_console_storage_breakdown(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    let graph = body["kinds"]
+        .as_array()
+        .expect("kinds")
+        .iter()
+        .find(|k| k["kind"] == "graph")
+        .expect("graph kind");
+    assert_eq!(graph["chunks"], 2);
+    assert!(graph["bytes"].as_u64().expect("bytes int") > 0);
+    assert_eq!(graph["available"], true);
+}
+
+#[tokio::test]
+async fn console_onboarding_restart_clears_completed_marker() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut current = state.onboarding.write().await;
+        current.completed_at_unix_ms = Some(123);
+        current.chosen_auth_mode = Some("dev_scopes".to_string());
+        crate::onboarding::write_state(&state.data_dir, &current).expect("seed write");
+    }
+    let resp = console::post_console_onboarding_restart(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reloaded = crate::onboarding::read_state(&state.data_dir).expect("reload");
+    assert!(reloaded.completed_at_unix_ms.is_none());
+    assert_eq!(reloaded.chosen_auth_mode.as_deref(), Some("dev_scopes"));
+}
+
+#[tokio::test]
+async fn passports_list_after_seed_returns_three_defaults() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let resp = super::passports::get_passports(
+        State(state),
+        Query(super::passports::ListPassportsQuery { category: None }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let passports = body["passports"].as_array().expect("passports array");
+    assert_eq!(passports.len(), 3);
+    let ids: Vec<&str> = passports.iter().map(|p| p["id"].as_str().unwrap_or("")).collect();
+    assert!(ids.contains(&"personal-default"));
+    assert!(ids.contains(&"work-default"));
+    assert!(ids.contains(&"public-default"));
+}
+
+#[tokio::test]
+async fn passports_filter_by_category_returns_only_matching() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let resp = super::passports::get_passports(
+        State(state),
+        Query(super::passports::ListPassportsQuery {
+            category: Some("work".to_string()),
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    let passports = body["passports"].as_array().expect("passports array");
+    assert_eq!(passports.len(), 1);
+    assert_eq!(passports[0]["id"], "work-default");
+}
+
+#[tokio::test]
+async fn passports_filter_rejects_bogus_category() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::passports::get_passports(
+        State(state),
+        Query(super::passports::ListPassportsQuery {
+            category: Some("bogus".to_string()),
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn passports_post_round_trip_to_get() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let post_resp = super::passports::post_passport(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Json(super::passports::CreatePassportBody {
+            id: "alice".to_string(),
+            category: "personal".to_string(),
+            sponsor_id: None,
+            agent_work_gate: false,
+            is_default_for_category: false,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(post_resp.status(), StatusCode::CREATED);
+
+    let get_resp =
+        super::passports::get_passport(State(state), Path("alice".to_string()), dev_scope_headers("admin:read"))
+            .await
+            .into_response();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let body = json_body(get_resp).await;
+    assert_eq!(body["id"], "alice");
+    assert_eq!(body["category"], "personal");
+    assert!(body["principal_id"].as_str().unwrap_or("").starts_with("p_"));
+}
+
+#[tokio::test]
+async fn passports_post_duplicate_id_returns_409() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let mk = || super::passports::CreatePassportBody {
+        id: "alice".to_string(),
+        category: "personal".to_string(),
+        sponsor_id: None,
+        agent_work_gate: false,
+        is_default_for_category: false,
+    };
+    let first = super::passports::post_passport(State(state.clone()), dev_scope_headers("admin:read"), Json(mk()))
+        .await
+        .into_response();
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let second = super::passports::post_passport(State(state), dev_scope_headers("admin:read"), Json(mk()))
+        .await
+        .into_response();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn passports_patch_updates_gate_and_default_flag() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    super::passports::post_passport(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Json(super::passports::CreatePassportBody {
+            id: "alice".to_string(),
+            category: "personal".to_string(),
+            sponsor_id: None,
+            agent_work_gate: false,
+            is_default_for_category: false,
+        }),
+    )
+    .await
+    .into_response();
+    let resp = super::passports::patch_passport(
+        State(state),
+        Path("alice".to_string()),
+        dev_scope_headers("admin:read"),
+        Json(super::passports::UpdatePassportBody {
+            agent_work_gate: Some(true),
+            is_default_for_category: Some(true),
+            sponsor_id: None,
+            reputation_tier: None,
+            receipt_count: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["agent_work_gate"], true);
+    assert_eq!(body["is_default_for_category"], true);
+}
+
+#[tokio::test]
+async fn passports_delete_removes_record() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    super::passports::post_passport(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Json(super::passports::CreatePassportBody {
+            id: "alice".to_string(),
+            category: "personal".to_string(),
+            sponsor_id: None,
+            agent_work_gate: false,
+            is_default_for_category: false,
+        }),
+    )
+    .await
+    .into_response();
+    let del_resp = super::passports::delete_passport(
+        State(state.clone()),
+        Path("alice".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
+    let get_resp =
+        super::passports::get_passport(State(state), Path("alice".to_string()), dev_scope_headers("admin:read"))
+            .await
+            .into_response();
+    assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn active_sessions_returns_seeded_bindings() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+        let b = crate::session_bindings::resolve(
+            &store,
+            crate::session_bindings::ResolveInput {
+                session_id_hex: "deadbeef",
+                project_id: Some("proj-x".to_string()),
+                tenant_id: Some("work::team".to_string()),
+                passport_id: None,
+                now_unix_ms: 1_700_000_000_000,
+            },
+        )
+        .expect("resolve");
+        crate::session_bindings::write_binding(&mut store, &b).expect("write");
+    }
+
+    let resp = super::session::get_active_sessions(State(state), dev_scope_headers("admin:read")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["count"], 1);
+    let s = &body["sessions"][0];
+    assert_eq!(s["session_id_hex"], "deadbeef");
+    assert_eq!(s["passport_id"], "work-default");
+    assert_eq!(s["passport_category"], "work");
+    assert_eq!(s["tenant_id"], "work::team");
+    assert_eq!(s["project_id"], "proj-x");
+    assert_eq!(s["agent_work_gate"], false);
+}
+
+#[tokio::test]
+async fn active_sessions_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::session::get_active_sessions(State(state), HeaderMap::new()).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn projects_create_then_list_then_get() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+
+    let create_resp = super::projects::post_project(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Json(super::projects::CreateProjectBody {
+            id: "alpha".to_string(),
+            name: "Alpha".to_string(),
+            planning_target: Some("tenant://alpha-planning".to_string()),
+            default_passport_id: "personal-default".to_string(),
+            working_tenants: vec!["personal::alpha".to_string()],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    let list_resp = super::projects::get_projects(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let list_body = json_body(list_resp).await;
+    let projects = list_body["projects"].as_array().expect("projects");
+    assert_eq!(projects.len(), 1);
+
+    let get_resp =
+        super::projects::get_project(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
+            .await
+            .into_response();
+    let detail = json_body(get_resp).await;
+    assert_eq!(detail["id"], "alpha");
+    assert_eq!(detail["members"].as_array().expect("members").len(), 1);
+    assert_eq!(detail["tenants"].as_array().expect("tenants").len(), 1);
+}
+
+#[tokio::test]
+async fn projects_invalid_planning_target_returns_400() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let resp = super::projects::post_project(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Json(super::projects::CreateProjectBody {
+            id: "alpha".to_string(),
+            name: "Alpha".to_string(),
+            planning_target: Some("https://example.com".to_string()),
+            default_passport_id: "personal-default".to_string(),
+            working_tenants: vec![],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn projects_add_unknown_passport_returns_404() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    super::projects::post_project(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Json(super::projects::CreateProjectBody {
+            id: "alpha".to_string(),
+            name: "Alpha".to_string(),
+            planning_target: None,
+            default_passport_id: "personal-default".to_string(),
+            working_tenants: vec![],
+        }),
+    )
+    .await
+    .into_response();
+
+    let resp = super::projects::post_project_member(
+        State(state),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+        Json(super::projects::AddMemberBody {
+            passport_id: "ghost".to_string(),
+            role: "contributor".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    // Hardening: missing passport now returns 404 (PassportNotFound) not 400.
+    // Distinguishing "passport doesn't exist" from "exists but not allowed"
+    // makes API errors actionable without reading source.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn projects_delete_removes_subentities() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    super::projects::post_project(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Json(super::projects::CreateProjectBody {
+            id: "alpha".to_string(),
+            name: "Alpha".to_string(),
+            planning_target: None,
+            default_passport_id: "personal-default".to_string(),
+            working_tenants: vec!["personal::alpha".to_string()],
+        }),
+    )
+    .await
+    .into_response();
+    let del = super::projects::delete_project(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+    let get = super::projects::get_project(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn work_post_then_list_then_patch_state_round_trip() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("project seed");
+    }
+
+    let create_resp = super::work::post_work(
+        State(state.clone()),
+        dev_scope_headers("facts:write"),
+        Json(super::work::CreateWorkBody {
+            project_id: "default".to_string(),
+            title: "fix the thing".to_string(),
+            body: None,
+            state: None,
+            assignee_passport: Some("personal-default".to_string()),
+            tenant_id: Some("personal".to_string()),
+            linked_pr: None,
+            linked_issue: None,
+            created_by_passport: "personal-default".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    let created = json_body(create_resp).await;
+    let work_id = created["id"].as_str().expect("id").to_string();
+
+    let list_resp = super::work::get_work(
+        State(state.clone()),
+        Query(super::work::ListWorkQuery {
+            project_id: Some("default".to_string()),
+            state: Some("planned".to_string()),
+            tenant_id: None,
+            assignee_passport: None,
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let list_body = json_body(list_resp).await;
+    assert_eq!(list_body["count"], 1);
+
+    let patch_resp = super::work::patch_work(
+        State(state.clone()),
+        Path(work_id.clone()),
+        dev_scope_headers("facts:write"),
+        Json(super::work::UpdateWorkBody {
+            title: None,
+            body: None,
+            state: Some("in_progress".to_string()),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            by_passport: "personal-default".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(patch_resp.status(), StatusCode::OK);
+    let patched = json_body(patch_resp).await;
+    assert_eq!(patched["applied"], true);
+    assert_eq!(patched["work"]["state"], "in_progress");
+
+    let txn_resp = super::work::get_transitions(State(state), Path(work_id), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let txn_body = json_body(txn_resp).await;
+    let txns = txn_body["transitions"].as_array().expect("transitions");
+    assert_eq!(txns.len(), 2, "create + transition");
+    assert_eq!(txns[0]["from_state"], "(none)");
+    assert_eq!(txns[1]["to_state"], "in_progress");
+}
+
+#[tokio::test]
+async fn work_patch_with_gated_passport_returns_202_queued() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let work_id = {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("project seed");
+        // Flip the personal-default passport's gate ON.
+        crate::passports::update_passport(
+            &mut store,
+            "personal-default",
+            crate::passports::UpdatePassportInput {
+                agent_work_gate: Some(true),
+                is_default_for_category: None,
+                sponsor_id: None,
+                reputation_tier: None,
+                receipt_count: None,
+            },
+        )
+        .expect("flip gate");
+        let item = crate::work::create_work(
+            &mut store,
+            crate::work::CreateWorkInput {
+                project_id: "default".to_string(),
+                title: "x".to_string(),
+                body: None,
+                state: None,
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
+                created_by_passport: "personal-default".to_string(),
+            },
+            1_000,
+        )
+        .expect("create");
+        item.id
+    };
+
+    let patch_resp = super::work::patch_work(
+        State(state.clone()),
+        Path(work_id),
+        dev_scope_headers("facts:write"),
+        Json(super::work::UpdateWorkBody {
+            title: None,
+            body: None,
+            state: Some("in_progress".to_string()),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            by_passport: "personal-default".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(patch_resp.status(), StatusCode::ACCEPTED);
+    let body = json_body(patch_resp).await;
+    assert_eq!(body["applied"], false);
+    assert!(body["queued"]["action_id"].is_string());
+
+    let pending_resp = super::work::get_pending_gates(
+        State(state),
+        Query(super::work::GateListQuery { by_passport: None }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let pending_body = json_body(pending_resp).await;
+    assert_eq!(pending_body["count"], 1);
+}
+
+#[tokio::test]
+async fn github_status_reports_disconnected_by_default() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::integrations_github::get_status(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["connected"], false);
+    assert!(body["username"].is_null());
+}
+
+#[tokio::test]
+async fn github_connect_with_skip_verify_persists_then_status_reports_connected() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let connect_resp = super::integrations_github::post_connect(
+        State(state.clone()),
+        dev_scope_headers("integrations:install"),
+        Json(super::integrations_github::ConnectGithubBody {
+            pat: "github_pat_test_value_xyz".to_string(),
+            skip_verify: true,
+            username_override: Some("smoke-test-user".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(connect_resp.status(), StatusCode::OK);
+
+    let status_resp = super::integrations_github::get_status(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let body = json_body(status_resp).await;
+    assert_eq!(body["connected"], true);
+    assert_eq!(body["username"], "smoke-test-user");
+
+    let creds = crate::integrations_github::read_credentials(&state.data_dir).expect("read creds");
+    let pat =
+        crate::integrations_github::decrypt_pat(&creds, state.integration_encryption_key.as_ref()).expect("decrypt");
+    assert_eq!(pat, "github_pat_test_value_xyz");
+}
+
+#[tokio::test]
+async fn github_connect_rejects_empty_pat() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::integrations_github::post_connect(
+        State(state),
+        dev_scope_headers("integrations:install"),
+        Json(super::integrations_github::ConnectGithubBody {
+            pat: "   ".to_string(),
+            skip_verify: true,
+            username_override: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn github_connect_requires_install_scope() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::integrations_github::post_connect(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Json(super::integrations_github::ConnectGithubBody {
+            pat: "x".to_string(),
+            skip_verify: true,
+            username_override: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn github_disconnect_clears_credentials() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    super::integrations_github::post_connect(
+        State(state.clone()),
+        dev_scope_headers("integrations:install"),
+        Json(super::integrations_github::ConnectGithubBody {
+            pat: "x".to_string(),
+            skip_verify: true,
+            username_override: Some("u".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+
+    let resp =
+        super::integrations_github::post_disconnect(State(state.clone()), dev_scope_headers("integrations:disable"))
+            .await
+            .into_response();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let status_resp = super::integrations_github::get_status(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let body = json_body(status_resp).await;
+    assert_eq!(body["connected"], false);
+}
+
+#[tokio::test]
+async fn github_repo_selection_requires_connection() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // Not connected — accessible should fail with 412.
+    let resp = super::integrations_github::get_accessible_repos(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+
+    // Same for select.
+    let sel = super::integrations_github::post_select_repo(
+        State(state),
+        Path(("cuecrux".to_string(), "Crux".to_string())),
+        dev_scope_headers("integrations:install"),
+    )
+    .await
+    .into_response();
+    assert_eq!(sel.status(), StatusCode::PRECONDITION_FAILED);
+}
+
+#[tokio::test]
+async fn github_repo_select_then_list_then_delete_round_trip() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    // Connect first (skip_verify so no network).
+    super::integrations_github::post_connect(
+        State(state.clone()),
+        dev_scope_headers("integrations:install"),
+        Json(super::integrations_github::ConnectGithubBody {
+            pat: "fake-pat".to_string(),
+            skip_verify: true,
+            username_override: Some("u".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+
+    // Select a repo.
+    let sel = super::integrations_github::post_select_repo(
+        State(state.clone()),
+        Path(("cuecrux".to_string(), "Crux".to_string())),
+        dev_scope_headers("integrations:install"),
+    )
+    .await
+    .into_response();
+    assert_eq!(sel.status(), StatusCode::CREATED);
+
+    // List.
+    let list = super::integrations_github::get_selected_repos(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let body = json_body(list).await;
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["repos"][0]["owner"], "cuecrux");
+    assert_eq!(body["repos"][0]["repo"], "Crux");
+
+    // Delete.
+    let del = super::integrations_github::delete_selected_repo(
+        State(state.clone()),
+        Path(("cuecrux".to_string(), "Crux".to_string())),
+        dev_scope_headers("integrations:disable"),
+    )
+    .await
+    .into_response();
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+
+    let after = super::integrations_github::get_selected_repos(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let after_body = json_body(after).await;
+    assert_eq!(after_body["count"], 0);
+}
+
+#[tokio::test]
+async fn github_disconnect_clears_selected_repos_too() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    super::integrations_github::post_connect(
+        State(state.clone()),
+        dev_scope_headers("integrations:install"),
+        Json(super::integrations_github::ConnectGithubBody {
+            pat: "x".to_string(),
+            skip_verify: true,
+            username_override: Some("u".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    super::integrations_github::post_select_repo(
+        State(state.clone()),
+        Path(("a".to_string(), "b".to_string())),
+        dev_scope_headers("integrations:install"),
+    )
+    .await
+    .into_response();
+
+    super::integrations_github::post_disconnect(State(state.clone()), dev_scope_headers("integrations:disable"))
+        .await
+        .into_response();
+
+    let list = super::integrations_github::get_selected_repos(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let body = json_body(list).await;
+    assert_eq!(body["count"], 0);
+}
+
+#[tokio::test]
+async fn github_sync_returns_412_when_not_connected() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::integrations_github::post_sync(State(state), dev_scope_headers("integrations:install"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+}
+
+#[tokio::test]
+async fn embedding_probe_rejects_empty_url() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::post_console_embedding_probe(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Json(console::ProbeEmbeddingBody { url: "".to_string() }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn embedding_probe_rejects_non_http_url() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::post_console_embedding_probe(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Json(console::ProbeEmbeddingBody {
+            url: "ftp://example.com".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn embedding_probe_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::post_console_embedding_probe(
+        State(state),
+        HeaderMap::new(),
+        Json(console::ProbeEmbeddingBody {
+            url: "http://localhost:11434".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── Coverage-lift batch (PR #66) ───────────────────────────────────────────
+// These exercise the http/planes.rs and http/dossier.rs handlers, which
+// shipped at 0% test coverage. They mirror the projects:: test patterns
+// above — direct handler calls with dev-scope headers, asserting status +
+// shape only (deeper assertions live in the per-module unit tests).
+
+async fn seed_project_for_planes_tests(state: &AppState) {
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let resp = super::projects::post_project(
+        State(state.clone()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::projects::CreateProjectBody {
+            id: "alpha".to_string(),
+            name: "Alpha".to_string(),
+            planning_target: Some("tenant://alpha-planning".to_string()),
+            default_passport_id: "personal-default".to_string(),
+            working_tenants: vec![],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn planes_create_then_list_then_get() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_project_for_planes_tests(&state).await;
+
+    // Create a plane.
+    let create_resp = super::planes::post_plane(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::planes::CreatePlaneBody {
+            id: "daemon".to_string(),
+            name: "Crux Daemon".to_string(),
+            description: Some("Daemon plane".to_string()),
+            default_passport_id: Some("personal-default".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    // List planes.
+    let list_resp = super::planes::get_planes(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(list_resp).await;
+    assert_eq!(body["project_id"], "alpha");
+    assert_eq!(body["count"], 1);
+
+    // Get the specific plane.
+    let get_resp = super::planes::get_plane(
+        State(state),
+        Path(("alpha".to_string(), "daemon".to_string())),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let detail = json_body(get_resp).await;
+    assert_eq!(detail["id"], "daemon");
+    assert_eq!(detail["name"], "Crux Daemon");
+}
+
+#[tokio::test]
+async fn planes_list_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::planes::get_planes(State(state), Path("alpha".to_string()), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn planes_member_round_trip() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_project_for_planes_tests(&state).await;
+    super::planes::post_plane(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::planes::CreatePlaneBody {
+            id: "daemon".to_string(),
+            name: "Daemon".to_string(),
+            description: None,
+            default_passport_id: Some("personal-default".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+
+    // Add a second member, then remove it.
+    let add_resp = super::planes::post_plane_member(
+        State(state.clone()),
+        Path(("alpha".to_string(), "daemon".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::planes::PlaneMemberBody {
+            passport_id: "work-default".to_string(),
+            role: "contributor".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(add_resp.status(), StatusCode::CREATED);
+
+    let rm_resp = super::planes::delete_plane_member(
+        State(state),
+        Path(("alpha".to_string(), "daemon".to_string(), "work-default".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+    )
+    .await
+    .into_response();
+    assert_eq!(rm_resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn planes_layer_put_then_get_then_delete() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_project_for_planes_tests(&state).await;
+    super::planes::post_plane(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::planes::CreatePlaneBody {
+            id: "daemon".to_string(),
+            name: "Daemon".to_string(),
+            description: None,
+            default_passport_id: Some("personal-default".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+
+    let put_resp = super::planes::put_plane_layer(
+        State(state.clone()),
+        Path(("alpha".to_string(), "daemon".to_string(), "vision".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::planes::PutPlaneLayerBody {
+            content: "Daemon plane vision: local-first.".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert!(matches!(put_resp.status(), StatusCode::OK | StatusCode::CREATED));
+
+    let list_resp = super::planes::get_plane_layers(
+        State(state.clone()),
+        Path(("alpha".to_string(), "daemon".to_string())),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(list_resp).await;
+    let layers = body["layers"].as_object().expect("layers map");
+    assert!(layers.contains_key("vision"));
+    assert_eq!(body["count"], 1);
+
+    let del_resp = super::planes::delete_plane_layer(
+        State(state),
+        Path(("alpha".to_string(), "daemon".to_string(), "vision".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+    )
+    .await
+    .into_response();
+    // Some delete handlers return 200 with a body, others 204; both indicate
+    // success — assert non-erroring status code.
+    assert!(del_resp.status().is_success(), "delete: {}", del_resp.status());
+}
+
+#[tokio::test]
+async fn planes_delete_removes_record() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_project_for_planes_tests(&state).await;
+    super::planes::post_plane(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::planes::CreatePlaneBody {
+            id: "daemon".to_string(),
+            name: "Daemon".to_string(),
+            description: None,
+            default_passport_id: Some("personal-default".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+
+    let resp = super::planes::delete_plane(
+        State(state.clone()),
+        Path(("alpha".to_string(), "daemon".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+    )
+    .await
+    .into_response();
+    assert!(resp.status().is_success(), "delete: {}", resp.status());
+
+    let list_resp = super::planes::get_planes(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let body = json_body(list_resp).await;
+    assert_eq!(body["count"], 0);
+}
+
+#[tokio::test]
+async fn dossier_list_when_empty_returns_empty_array() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::dossier::list_dossiers(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert!(body["dossiers"].is_array());
+}
+
+#[tokio::test]
+async fn dossier_list_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::dossier::list_dossiers(State(state), Path("alpha".to_string()), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn storybook_post_generate_then_get_latest() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_project_for_planes_tests(&state).await;
+
+    let gen_resp = super::storybook::post_generate(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+    )
+    .await
+    .into_response();
+    assert!(gen_resp.status().is_success(), "post_generate: {}", gen_resp.status());
+
+    let latest_resp = super::storybook::get_latest(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert!(
+        latest_resp.status().is_success(),
+        "get_latest: {}",
+        latest_resp.status()
+    );
+
+    let versions_resp =
+        super::storybook::list_versions(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
+            .await
+            .into_response();
+    let body = json_body(versions_resp).await;
+    assert!(body["versions"].is_array());
+}
+
+#[tokio::test]
+async fn storybook_get_latest_when_none_returns_404() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::storybook::get_latest(
+        State(state),
+        Path("nonexistent".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn storybook_post_generate_requires_facts_write() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::storybook::post_generate(
+        State(state),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"), // missing facts:write
+    )
+    .await
+    .into_response();
+    assert!(resp.status() == StatusCode::FORBIDDEN || resp.status() == StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn dossier_get_unknown_returns_404() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::dossier::get_dossier(
+        State(state),
+        Path(("alpha".to_string(), "nonexistent".to_string())),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

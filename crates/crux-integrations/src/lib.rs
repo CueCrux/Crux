@@ -696,27 +696,11 @@ pub fn builtin_manifests() -> Vec<IntegrationManifest> {
             hashes: ManifestHashes::default(),
             signature: None,
         },
-        IntegrationManifest {
-            schema: INTEGRATION_SCHEMA_V1.to_string(),
-            id: "github.pr-facts".to_string(),
-            name: "GitHub PR Fact Capture".to_string(),
-            version: "0.1.0".to_string(),
-            publisher_passport_fpr: FIRST_PARTY_PASSPORT.to_string(),
-            summary: "Capture PR review decisions and release notes as receipted facts.".to_string(),
-            entry: IntegrationEntry {
-                kind: EntryKind::HttpRecipe,
-                path: "recipes/github/pr-facts.json".to_string(),
-            },
-            capabilities: vec!["facts:read".to_string(), "facts:write".to_string()],
-            network: NetworkAccess {
-                allowed_hosts: vec!["api.github.com".to_string()],
-                requires_user_token: true,
-            },
-            data_access: DataAccess::default(),
-            safety: SafetyPolicy::default(),
-            hashes: ManifestHashes::default(),
-            signature: None,
-        },
+        // Note: a `github.pr-facts` declarative recipe used to live here.
+        // Removed in favour of the live GitHub indexer integration which
+        // already pulls PRs (alongside commits + issues + comments) into
+        // the fact store via /v1/integrations/github/sync. The recipe
+        // entry was redundant and confusing in the Integrations panel.
     ]
 }
 
@@ -962,7 +946,9 @@ mod tests {
     #[test]
     fn builtin_manifests_validate() -> Result<(), IntegrationError> {
         let packs = builtin_packs()?;
-        assert_eq!(packs.len(), 4);
+        // 3 first-party packs ship by default after `github.pr-facts` was
+        // dropped (live GitHub indexer integration covers PR fact capture).
+        assert_eq!(packs.len(), 3);
         assert!(packs.iter().all(|pack| pack.trust_tier == TrustTier::FirstParty));
         Ok(())
     }
@@ -1056,7 +1042,7 @@ mod tests {
         let root = temp_data_dir("grant-roundtrip");
         let mut manifest = builtin_manifests()
             .into_iter()
-            .find(|manifest| manifest.id == "github.pr-facts")
+            .find(|manifest| manifest.id == "sdk.typescript.quickstart")
             .expect("builtin manifest");
         manifest.hashes.manifest = Some(manifest.manifest_hash()?);
 
@@ -1074,7 +1060,7 @@ mod tests {
             GrantPackRequest {
                 passport_fpr: "p_local",
                 granted_by_passport_fpr: "p_local",
-                pack_id: "github.pr-facts",
+                pack_id: "sdk.typescript.quickstart",
                 version: "0.1.0",
                 capabilities: &["facts:read".to_string(), "facts:write".to_string()],
                 reason: Some("test".to_string()),
@@ -1087,13 +1073,19 @@ mod tests {
         let pack = snapshot
             .packs
             .iter()
-            .find(|pack| pack.manifest.id == "github.pr-facts")
+            .find(|pack| pack.manifest.id == "sdk.typescript.quickstart")
             .expect("installed pack in snapshot");
         assert_eq!(pack.install_state, InstallState::Enabled);
         assert_eq!(snapshot.grants.len(), 1);
         assert_eq!(snapshot.audit_tail.len(), 2);
 
-        let disabled = disable_pack(&root, "p_local", "github.pr-facts", Some("off".to_string()), 3_000)?;
+        let disabled = disable_pack(
+            &root,
+            "p_local",
+            "sdk.typescript.quickstart",
+            Some("off".to_string()),
+            3_000,
+        )?;
         assert!(!disabled.enabled);
         assert_eq!(disabled.disabled_at_unix_ms, Some(3_000));
 
@@ -1101,7 +1093,7 @@ mod tests {
         let pack = snapshot
             .packs
             .iter()
-            .find(|pack| pack.manifest.id == "github.pr-facts")
+            .find(|pack| pack.manifest.id == "sdk.typescript.quickstart")
             .expect("disabled pack in snapshot");
         assert_eq!(pack.install_state, InstallState::Installed);
         assert_eq!(snapshot.audit_tail.len(), 3);

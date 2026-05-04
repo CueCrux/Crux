@@ -5,6 +5,10 @@ services:
   crux:
     image: cuecrux/crux-daemon:latest
     build: .
+    # `unless-stopped` lets the in-console "Restart daemon" button work — the
+    # process exits cleanly via POST /v1/admin/restart and Docker brings it
+    # back up. Manual `docker compose stop` still wins (won't auto-restart).
+    restart: unless-stopped
     ports:
       - "127.0.0.1:14800:14800"
       - "127.0.0.1:14801:14801"
