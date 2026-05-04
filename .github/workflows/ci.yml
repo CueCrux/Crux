@@ -71,7 +71,13 @@ jobs:
           curl -sf http://localhost:14800/metrics | head -5
           curl -sf http://localhost:14800/v1/version | jq -e '.features.mcp == true' >/dev/null
           curl -sf http://localhost:14800/v1/version | jq -e '.update.state | type == "string"' >/dev/null
-          curl -sf http://localhost:14800/console | grep -q 'Crux Console'
+          # Stage the HTML through a variable: `curl | grep -q` would race
+          # because grep exits as soon as it finds the title (line ~6) while
+          # curl is still streaming the rest of the 400+ KB console HTML.
+          # That triggers SIGPIPE on curl → exit 23 → set -e bails the
+          # smoke test even though the assertion logically passed.
+          HTML=$(curl -sf http://localhost:14800/console)
+          echo "$HTML" | grep -q 'Crux Console'
           curl -sf http://localhost:14800/v1/console/summary \
             -H 'X-Corecrux-Scopes: admin:read' \
             | jq -e '.console.route == "/console"' >/dev/null
