@@ -6485,13 +6485,9 @@ async fn planes_create_then_list_then_get() {
 #[tokio::test]
 async fn planes_list_requires_admin_read() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
-    let resp = super::planes::get_planes(
-        State(state),
-        Path("alpha".to_string()),
-        HeaderMap::new(),
-    )
-    .await
-    .into_response();
+    let resp = super::planes::get_planes(State(state), Path("alpha".to_string()), HeaderMap::new())
+        .await
+        .into_response();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -6618,13 +6614,9 @@ async fn planes_delete_removes_record() {
     .into_response();
     assert!(resp.status().is_success(), "delete: {}", resp.status());
 
-    let list_resp = super::planes::get_planes(
-        State(state),
-        Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
-    )
-    .await
-    .into_response();
+    let list_resp = super::planes::get_planes(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
     let body = json_body(list_resp).await;
     assert_eq!(body["count"], 0);
 }
@@ -6632,13 +6624,9 @@ async fn planes_delete_removes_record() {
 #[tokio::test]
 async fn dossier_list_when_empty_returns_empty_array() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
-    let resp = super::dossier::list_dossiers(
-        State(state),
-        Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
-    )
-    .await
-    .into_response();
+    let resp = super::dossier::list_dossiers(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
     let body = json_body(resp).await;
     assert!(body["dossiers"].is_array());
 }
@@ -6646,13 +6634,9 @@ async fn dossier_list_when_empty_returns_empty_array() {
 #[tokio::test]
 async fn dossier_list_requires_admin_read() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
-    let resp = super::dossier::list_dossiers(
-        State(state),
-        Path("alpha".to_string()),
-        HeaderMap::new(),
-    )
-    .await
-    .into_response();
+    let resp = super::dossier::list_dossiers(State(state), Path("alpha".to_string()), HeaderMap::new())
+        .await
+        .into_response();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -6677,15 +6661,16 @@ async fn storybook_post_generate_then_get_latest() {
     )
     .await
     .into_response();
-    assert!(latest_resp.status().is_success(), "get_latest: {}", latest_resp.status());
+    assert!(
+        latest_resp.status().is_success(),
+        "get_latest: {}",
+        latest_resp.status()
+    );
 
-    let versions_resp = super::storybook::list_versions(
-        State(state),
-        Path("alpha".to_string()),
-        dev_scope_headers("admin:read"),
-    )
-    .await
-    .into_response();
+    let versions_resp =
+        super::storybook::list_versions(State(state), Path("alpha".to_string()), dev_scope_headers("admin:read"))
+            .await
+            .into_response();
     let body = json_body(versions_resp).await;
     assert!(body["versions"].is_array());
 }
