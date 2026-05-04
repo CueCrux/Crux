@@ -6408,3 +6408,323 @@ async fn embedding_probe_requires_admin_read() {
     .into_response();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ── Coverage-lift batch (PR #66) ───────────────────────────────────────────
+// These exercise the http/planes.rs and http/dossier.rs handlers, which
+// shipped at 0% test coverage. They mirror the projects:: test patterns
+// above — direct handler calls with dev-scope headers, asserting status +
+// shape only (deeper assertions live in the per-module unit tests).
+
+async fn seed_project_for_planes_tests(state: &AppState) {
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let resp = super::projects::post_project(
+        State(state.clone()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::projects::CreateProjectBody {
+            id: "alpha".to_string(),
+            name: "Alpha".to_string(),
+            planning_target: Some("tenant://alpha-planning".to_string()),
+            default_passport_id: "personal-default".to_string(),
+            working_tenants: vec![],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn planes_create_then_list_then_get() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_project_for_planes_tests(&state).await;
+
+    // Create a plane.
+    let create_resp = super::planes::post_plane(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::planes::CreatePlaneBody {
+            id: "daemon".to_string(),
+            name: "Crux Daemon".to_string(),
+            description: Some("Daemon plane".to_string()),
+            default_passport_id: Some("personal-default".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    // List planes.
+    let list_resp = super::planes::get_planes(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(list_resp).await;
+    assert_eq!(body["project_id"], "alpha");
+    assert_eq!(body["count"], 1);
+
+    // Get the specific plane.
+    let get_resp = super::planes::get_plane(
+        State(state),
+        Path(("alpha".to_string(), "daemon".to_string())),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let detail = json_body(get_resp).await;
+    assert_eq!(detail["id"], "daemon");
+    assert_eq!(detail["name"], "Crux Daemon");
+}
+
+#[tokio::test]
+async fn planes_list_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::planes::get_planes(
+        State(state),
+        Path("alpha".to_string()),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn planes_member_round_trip() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_project_for_planes_tests(&state).await;
+    super::planes::post_plane(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::planes::CreatePlaneBody {
+            id: "daemon".to_string(),
+            name: "Daemon".to_string(),
+            description: None,
+            default_passport_id: Some("personal-default".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+
+    // Add a second member, then remove it.
+    let add_resp = super::planes::post_plane_member(
+        State(state.clone()),
+        Path(("alpha".to_string(), "daemon".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::planes::PlaneMemberBody {
+            passport_id: "work-default".to_string(),
+            role: "contributor".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(add_resp.status(), StatusCode::CREATED);
+
+    let rm_resp = super::planes::delete_plane_member(
+        State(state),
+        Path(("alpha".to_string(), "daemon".to_string(), "work-default".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+    )
+    .await
+    .into_response();
+    assert_eq!(rm_resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn planes_layer_put_then_get_then_delete() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_project_for_planes_tests(&state).await;
+    super::planes::post_plane(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::planes::CreatePlaneBody {
+            id: "daemon".to_string(),
+            name: "Daemon".to_string(),
+            description: None,
+            default_passport_id: Some("personal-default".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+
+    let put_resp = super::planes::put_plane_layer(
+        State(state.clone()),
+        Path(("alpha".to_string(), "daemon".to_string(), "vision".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::planes::PutPlaneLayerBody {
+            content: "Daemon plane vision: local-first.".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert!(matches!(put_resp.status(), StatusCode::OK | StatusCode::CREATED));
+
+    let list_resp = super::planes::get_plane_layers(
+        State(state.clone()),
+        Path(("alpha".to_string(), "daemon".to_string())),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(list_resp).await;
+    let layers = body["layers"].as_object().expect("layers map");
+    assert!(layers.contains_key("vision"));
+    assert_eq!(body["count"], 1);
+
+    let del_resp = super::planes::delete_plane_layer(
+        State(state),
+        Path(("alpha".to_string(), "daemon".to_string(), "vision".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+    )
+    .await
+    .into_response();
+    // Some delete handlers return 200 with a body, others 204; both indicate
+    // success — assert non-erroring status code.
+    assert!(del_resp.status().is_success(), "delete: {}", del_resp.status());
+}
+
+#[tokio::test]
+async fn planes_delete_removes_record() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_project_for_planes_tests(&state).await;
+    super::planes::post_plane(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::planes::CreatePlaneBody {
+            id: "daemon".to_string(),
+            name: "Daemon".to_string(),
+            description: None,
+            default_passport_id: Some("personal-default".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+
+    let resp = super::planes::delete_plane(
+        State(state.clone()),
+        Path(("alpha".to_string(), "daemon".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+    )
+    .await
+    .into_response();
+    assert!(resp.status().is_success(), "delete: {}", resp.status());
+
+    let list_resp = super::planes::get_planes(
+        State(state),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(list_resp).await;
+    assert_eq!(body["count"], 0);
+}
+
+#[tokio::test]
+async fn dossier_list_when_empty_returns_empty_array() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::dossier::list_dossiers(
+        State(state),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert!(body["dossiers"].is_array());
+}
+
+#[tokio::test]
+async fn dossier_list_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::dossier::list_dossiers(
+        State(state),
+        Path("alpha".to_string()),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn storybook_post_generate_then_get_latest() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_project_for_planes_tests(&state).await;
+
+    let gen_resp = super::storybook::post_generate(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+    )
+    .await
+    .into_response();
+    assert!(gen_resp.status().is_success(), "post_generate: {}", gen_resp.status());
+
+    let latest_resp = super::storybook::get_latest(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert!(latest_resp.status().is_success(), "get_latest: {}", latest_resp.status());
+
+    let versions_resp = super::storybook::list_versions(
+        State(state),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(versions_resp).await;
+    assert!(body["versions"].is_array());
+}
+
+#[tokio::test]
+async fn storybook_get_latest_when_none_returns_404() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::storybook::get_latest(
+        State(state),
+        Path("nonexistent".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn storybook_post_generate_requires_facts_write() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::storybook::post_generate(
+        State(state),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"), // missing facts:write
+    )
+    .await
+    .into_response();
+    assert!(resp.status() == StatusCode::FORBIDDEN || resp.status() == StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn dossier_get_unknown_returns_404() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::dossier::get_dossier(
+        State(state),
+        Path(("alpha".to_string(), "nonexistent".to_string())),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

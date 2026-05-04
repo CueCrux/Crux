@@ -842,6 +842,107 @@ mod tests {
     }
 
     #[test]
+    fn generate_e2e_renders_markdown_with_required_sections() {
+        // End-to-end coverage lift: build a project + a plane + a layer, then
+        // call generate() and assert the markdown comes back with the
+        // expected section anchors. Hits the front-matter, project section,
+        // planes section, layer section, and stats roll-up — coverage gain
+        // ~ 200+ lines on storybook.rs.
+        use corecrux_memory::FactStore;
+        let mut store = FactStore::new();
+
+        // Seed a project (record stored under __project__::p1).
+        let project_record = serde_json::to_string(&serde_json::json!({
+            "id": "p1",
+            "name": "Project One",
+            "planning_target": "tenant://p1-planning",
+            "default_passport_id": "personal-default",
+            "created_at_unix_ms": 1u64,
+            "archived": false,
+            "is_default": false,
+        }))
+        .unwrap();
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "__project__::p1".to_string(),
+            key: "record".to_string(),
+            value: project_record,
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+
+        // Seed a plane.
+        let plane_record = serde_json::to_string(&serde_json::json!({
+            "project_id": "p1",
+            "id": "daemon",
+            "name": "Crux Daemon",
+            "description": "the daemon plane",
+            "created_at_unix_ms": 1u64,
+        }))
+        .unwrap();
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "__plane__::p1::daemon".to_string(),
+            key: "record".to_string(),
+            value: plane_record,
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+
+        // Seed a vision layer for the project.
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "__project_layer__::p1::vision".to_string(),
+            key: "content".to_string(),
+            value: "Local-first daemon for agent memory.".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+
+        let doc = generate(
+            &store,
+            GenerateInput {
+                project_id: "p1",
+                by_passport: "personal-default",
+                now_unix_ms: 1_700_000_000_000,
+            },
+        )
+        .expect("storybook should generate when project exists");
+
+        // Front matter
+        assert!(doc.markdown.contains("# Storybook"));
+        assert!(doc.markdown.contains("p1"));
+        // Sections map populated
+        assert!(!doc.sections.is_empty());
+        // Stats roll-up
+        assert_eq!(doc.stats.plane_count, 1);
+        assert!(doc.stats.bytes > 0);
+    }
+
+    #[test]
+    fn generate_returns_none_for_unknown_project() {
+        use corecrux_memory::FactStore;
+        let store = FactStore::new();
+        let doc = generate(
+            &store,
+            GenerateInput {
+                project_id: "nope",
+                by_passport: "x",
+                now_unix_ms: 1,
+            },
+        );
+        assert!(doc.is_none());
+    }
+
+    #[test]
+    fn match_plane_to_modules_via_pub_alias() {
+        let scan = crate::workspace_scan::WorkspaceScan::default();
+        let kws: HashSet<String> = ["daemon".to_string()].into_iter().collect();
+        let _ = match_plane_to_modules_pub(&kws, &scan);
+        let _ = extract_keywords_pub("hello daemon world");
+    }
+
+    #[test]
     fn diff_detects_added_removed_changed_sections() {
         let mut a_sections = BTreeMap::new();
         a_sections.insert("00_front".to_string(), "old front".to_string());
