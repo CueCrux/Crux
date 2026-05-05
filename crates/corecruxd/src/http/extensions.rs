@@ -299,6 +299,149 @@ pub(super) async fn issue_grant(
     }
 }
 
+// ── Direct invoke (M4 — Phase A entry point before MCP dispatch lands in M5) ─
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct InvokeToolBody {
+    /// Caller's passport (the grant must be issued to this fpr). Defaults
+    /// to the `X-Corecrux-Passport-Id` header when absent from the body.
+    #[serde(default)]
+    pub passport_fpr: Option<String>,
+    /// Arbitrary args object forwarded as-is to the extension endpoint.
+    #[serde(default = "InvokeToolBody::empty_args")]
+    pub args: serde_json::Value,
+}
+
+impl InvokeToolBody {
+    fn empty_args() -> serde_json::Value {
+        serde_json::json!({})
+    }
+}
+
+fn make_request_id() -> String {
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("req-{now_ns}")
+}
+
+/// `POST /v1/extensions/{id}/tools/{tool_name}/invoke` — direct dispatch
+/// surface for an external-tool extension. Lets the operator (and the
+/// console "Test call" UI from M5) exercise the Phase A path without
+/// going through the MCP dispatcher (which lands in M5).
+pub(super) async fn invoke_extension_tool(
+    State(state): State<AppState>,
+    Path((extension_id, tool_name)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<InvokeToolBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
+        return problem.into_response();
+    }
+    let calling_passport = body.passport_fpr.clone().or_else(|| extract_passport_id(&headers));
+    let Some(calling_passport) = calling_passport else {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "passport_fpr required (body field or X-Corecrux-Passport-Id header)",
+        );
+    };
+
+    // Snapshot installed extension + grant out of the store before the
+    // outbound call so we can drop the read lock during the (potentially
+    // slow) network round-trip.
+    let (manifest, grant) = {
+        let store = state.fact_store.read().await;
+        let installed = match crate::extension_registry::get_extension(&store, &extension_id) {
+            Some(r) => r,
+            None => {
+                return problem_response(
+                    StatusCode::NOT_FOUND,
+                    format!("extension '{extension_id}' not installed"),
+                );
+            }
+        };
+        let grant = match crate::extension_grants::get_grant(&store, &extension_id, &calling_passport) {
+            Some(g) => g,
+            None => {
+                return problem_response(
+                    StatusCode::FORBIDDEN,
+                    format!("passport '{calling_passport}' has no grant for extension '{extension_id}'"),
+                );
+            }
+        };
+        (installed.manifest, grant)
+    };
+
+    // Run the outbound HTTP call off the async runtime — ureq is blocking.
+    let cfg = crate::extension_outbound::OutboundConfig::from_env();
+    let rate_table = state.extension_rate_table.clone();
+    let request_id = make_request_id();
+    let args = body.args;
+    let manifest_clone = manifest.clone();
+    let grant_clone = grant.clone();
+    let calling_clone = calling_passport.clone();
+    let rid = request_id.clone();
+    let dispatch_result = tokio::task::spawn_blocking(move || {
+        let transport = crate::extension_outbound::UreqTransport;
+        crate::extension_outbound::dispatch_external_tool(
+            &transport,
+            &rate_table,
+            &cfg,
+            &manifest_clone,
+            &grant_clone,
+            &tool_name,
+            &args,
+            &calling_clone,
+            &rid,
+            None, // M5 will pull the auth secret via `encrypted_secrets`
+        )
+    })
+    .await;
+
+    let (outcome, parsed) = match dispatch_result {
+        Ok(Ok((outcome, parsed))) => (outcome, parsed),
+        Ok(Err(crate::extension_outbound::OutboundError::NoGrant(_, _)))
+        | Ok(Err(crate::extension_outbound::OutboundError::ToolNotInGrant(_, _, _))) => {
+            return problem_response(StatusCode::FORBIDDEN, "scope violation".to_string());
+        }
+        Ok(Err(crate::extension_outbound::OutboundError::RateLimited(_, _, cap))) => {
+            return problem_response(StatusCode::TOO_MANY_REQUESTS, format!("rate limited (cap {cap}/min)"));
+        }
+        Ok(Err(err)) => {
+            return problem_response(StatusCode::BAD_GATEWAY, err.to_string());
+        }
+        Err(err) => {
+            return problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("dispatch join error: {err}"));
+        }
+    };
+
+    // Persist the accepted fact_writes (the dispatcher already filtered
+    // out-of-scope ones). Each write hits the privacy gate as a final
+    // belt-and-braces check; identical-shape entries that snuck through
+    // would still be marked private at storage time.
+    if outcome.accepted_fact_writes > 0 {
+        let mut store = state.fact_store.write().await;
+        for w in &parsed.fact_writes {
+            if !grant.allowed_prefixes_write.iter().any(|p| w.entity.starts_with(p)) {
+                continue; // already counted as dropped
+            }
+            let mut sf = corecrux_memory::fact_store::StoreFact {
+                entity: w.entity.clone(),
+                key: w.key.clone(),
+                value: w.value.clone(),
+                source_receipt: None,
+                confidence: w.confidence,
+                private: false,
+            };
+            crate::fact_privacy::enforce_global(&mut sf);
+            store.store(sf);
+        }
+        drop(store);
+    }
+
+    (StatusCode::OK, Json(outcome)).into_response()
+}
+
 /// `DELETE /v1/extensions/{id}/grants/{passport_fpr}` — revoke a grant.
 pub(super) async fn revoke_grant(
     State(state): State<AppState>,

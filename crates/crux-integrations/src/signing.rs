@@ -224,6 +224,8 @@ mod tests {
             safety: SafetyPolicy::default(),
             hashes: ManifestHashes::default(),
             signature: None,
+            external_tool_endpoint: None,
+            tools: Vec::new(),
         }
     }
 

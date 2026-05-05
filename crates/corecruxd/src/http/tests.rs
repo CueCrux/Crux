@@ -113,6 +113,7 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
         admin_force_seal_enabled: false,
         retrieval_index: Arc::new(RwLock::new(corecrux_retrieval::IndexManager::new())),
         fact_store: Arc::new(RwLock::new(corecrux_memory::FactStore::new())),
+        extension_rate_table: Arc::new(crate::extension_outbound::RateTable::new()),
         session_store: Arc::new(RwLock::new(corecrux_memory::SessionStore::new())),
         update_status: Arc::new(RwLock::new(corecrux_types::UpdateStatus::default())),
         event_bus: corecrux_memory::events::EventBus::new(16),
@@ -6742,6 +6743,8 @@ fn build_signed_manifest(
         safety: SafetyPolicy::default(),
         hashes: ManifestHashes::default(),
         signature: None,
+        external_tool_endpoint: None,
+        tools: Vec::new(),
     };
     sign_manifest(&mut manifest, signing_key, publisher_fpr).expect("sign");
     manifest
@@ -6856,6 +6859,8 @@ async fn extensions_register_unsigned_returns_400_with_dev_hint() {
         safety: SafetyPolicy::default(),
         hashes: ManifestHashes::default(),
         signature: None,
+        external_tool_endpoint: None,
+        tools: Vec::new(),
     };
     let resp = super::extensions::register_extension(
         State(state),
@@ -7130,4 +7135,76 @@ async fn grants_list_requires_admin_read() {
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn invoke_tool_requires_facts_write() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::extensions::invoke_extension_tool(
+        State(state),
+        Path(("ext.example.x".to_string(), "quote.daily".to_string())),
+        dev_scope_headers("admin:read"),
+        Json(super::extensions::InvokeToolBody {
+            passport_fpr: Some("p_alice".to_string()),
+            args: serde_json::json!({}),
+        }),
+    )
+    .await
+    .into_response();
+    assert!(matches!(
+        resp.status(),
+        StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+    ));
+}
+
+#[tokio::test]
+async fn invoke_tool_requires_passport_in_header_or_body() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::extensions::invoke_extension_tool(
+        State(state),
+        Path(("ext.example.x".to_string(), "quote.daily".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::InvokeToolBody {
+            passport_fpr: None,
+            args: serde_json::json!({}),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn invoke_tool_when_extension_not_installed_returns_404() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::extensions::invoke_extension_tool(
+        State(state),
+        Path(("ext.does-not-exist".to_string(), "quote.daily".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::InvokeToolBody {
+            passport_fpr: Some("p_alice".to_string()),
+            args: serde_json::json!({}),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn invoke_tool_without_grant_returns_403() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    install_test_extension_for_grants(&state, "ext.example.nogrant").await;
+    let resp = super::extensions::invoke_extension_tool(
+        State(state),
+        Path(("ext.example.nogrant".to_string(), "quote.daily".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::InvokeToolBody {
+            passport_fpr: Some("p_unauthorised".to_string()),
+            args: serde_json::json!({}),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

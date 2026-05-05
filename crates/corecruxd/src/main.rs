@@ -27,6 +27,7 @@ mod context_graph;
 mod dossier;
 mod encrypted_secrets;
 mod extension_grants;
+mod extension_outbound;
 mod extension_registry;
 mod fact_helpers;
 mod fact_privacy;
@@ -443,6 +444,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             corecrux_memory::FactStore::new()
         })),
+        extension_rate_table: Arc::new(crate::extension_outbound::RateTable::new()),
         session_store: Arc::new(RwLock::new(if config.fact_persistence_enabled {
             corecrux_memory::SessionStore::with_persistence(&config.data_dir)?
         } else {
@@ -3527,6 +3529,7 @@ mod tests {
             admin_force_seal_enabled: false,
             retrieval_index: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_retrieval::IndexManager::new())),
             fact_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::FactStore::new())),
+            extension_rate_table: std::sync::Arc::new(crate::extension_outbound::RateTable::new()),
             session_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::SessionStore::new())),
             update_status: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_types::UpdateStatus::default())),
             event_bus: corecrux_memory::events::EventBus::new(16),
