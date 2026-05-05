@@ -10,9 +10,7 @@
 
 pub mod signing;
 
-pub use signing::{
-    fingerprint_from_public_key, sign_manifest, TrustedKeyEntry, TrustedKeyring,
-};
+pub use signing::{fingerprint_from_public_key, sign_manifest, TrustedKeyEntry, TrustedKeyring};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -297,7 +295,17 @@ struct IntegrationIndex {
 
 #[derive(Debug, Clone)]
 pub struct ValidationPolicy {
+    /// When true (the original behaviour, kept for backwards compat),
+    /// unsigned manifests are accepted iff the publisher fingerprint
+    /// equals [`FIRST_PARTY_PASSPORT`]. The first-party packs baked into
+    /// the daemon binary rely on this.
     pub allow_unsigned_first_party: bool,
+    /// When true, unsigned manifests are accepted regardless of
+    /// publisher. Intended for development convenience only — the
+    /// daemon's HTTP layer maps this to the
+    /// `CORECRUXD_EXTENSIONS_ALLOW_UNSIGNED` environment knob and
+    /// requires it to be opt-in. Default false.
+    pub allow_unsigned: bool,
     pub allow_executable_helpers: bool,
     pub trusted_public_keys: BTreeMap<String, String>,
 }
@@ -306,6 +314,7 @@ impl Default for ValidationPolicy {
     fn default() -> Self {
         Self {
             allow_unsigned_first_party: true,
+            allow_unsigned: false,
             allow_executable_helpers: false,
             trusted_public_keys: BTreeMap::new(),
         }
@@ -361,7 +370,9 @@ impl IntegrationManifest {
 
         if let Some(signature) = &self.signature {
             verify_signature(self, signature, policy)?;
-        } else if !(policy.allow_unsigned_first_party && self.publisher_passport_fpr == FIRST_PARTY_PASSPORT) {
+        } else if !(policy.allow_unsigned
+            || policy.allow_unsigned_first_party && self.publisher_passport_fpr == FIRST_PARTY_PASSPORT)
+        {
             return Err(IntegrationError::SignatureRequired);
         }
 
@@ -968,6 +979,7 @@ mod tests {
                 allow_unsigned_first_party: false,
                 allow_executable_helpers: false,
                 trusted_public_keys: BTreeMap::new(),
+                ..ValidationPolicy::default()
             })
             .err();
         assert!(matches!(err, Some(IntegrationError::UnknownCapability(cap)) if cap == "secrets:read"));
@@ -982,6 +994,7 @@ mod tests {
                 allow_unsigned_first_party: false,
                 allow_executable_helpers: false,
                 trusted_public_keys: BTreeMap::new(),
+                ..ValidationPolicy::default()
             })
             .err();
         assert!(matches!(err, Some(IntegrationError::ExternalHelperDisabled)));
@@ -1015,6 +1028,7 @@ mod tests {
             allow_unsigned_first_party: false,
             allow_executable_helpers: false,
             trusted_public_keys,
+            ..ValidationPolicy::default()
         })?;
         Ok(())
     }
@@ -1037,6 +1051,7 @@ mod tests {
                 allow_unsigned_first_party: false,
                 allow_executable_helpers: false,
                 trusted_public_keys: BTreeMap::new(),
+                ..ValidationPolicy::default()
             })
             .err();
         assert!(matches!(err, Some(IntegrationError::SignatureInvalid)));

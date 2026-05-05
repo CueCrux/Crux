@@ -8,6 +8,7 @@ mod console;
 mod dataplane;
 mod dossier;
 mod events;
+mod extensions;
 mod facts;
 mod health;
 mod integrations_github;
@@ -482,6 +483,37 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/mcp/tools",
             get(self::workspace::get_mcp_tools),
+        )
+        // Community extensions registry (M2 of community-extensions plan).
+        // List/install/show/delete + trusted-key management. M3+M4 will add
+        // /grants/* (capability-token issuance) + tool dispatch on top.
+        .route(
+            "/v1/extensions",
+            get(self::extensions::list_extensions),
+        )
+        .route(
+            "/v1/extensions/register",
+            axum::routing::post(self::extensions::register_extension),
+        )
+        .route(
+            "/v1/extensions/keys",
+            get(self::extensions::list_trusted_keys),
+        )
+        .route(
+            "/v1/extensions/keys",
+            axum::routing::post(self::extensions::add_trusted_key),
+        )
+        .route(
+            "/v1/extensions/keys/{passport_fpr}",
+            axum::routing::delete(self::extensions::delete_trusted_key),
+        )
+        .route(
+            "/v1/extensions/{id}",
+            get(self::extensions::get_extension),
+        )
+        .route(
+            "/v1/extensions/{id}",
+            axum::routing::delete(self::extensions::delete_extension),
         )
         // Storybook readout — Phase 3 of the context graph.
         .route(

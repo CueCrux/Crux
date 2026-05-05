@@ -94,13 +94,12 @@ impl TrustedKeyring {
         // Validate every public key length once so misuse fails loudly at
         // load time rather than silently at first verification.
         for (fpr, entry) in &keyring.keys {
-            super::decode_fixed_hex::<32>(&entry.public_key_hex, "public key")
-                .map_err(|e| match e {
-                    IntegrationError::InvalidSignatureMaterial(msg) => {
-                        IntegrationError::InvalidSignatureMaterial(format!("{fpr}: {msg}"))
-                    }
-                    other => other,
-                })?;
+            super::decode_fixed_hex::<32>(&entry.public_key_hex, "public key").map_err(|e| match e {
+                IntegrationError::InvalidSignatureMaterial(msg) => {
+                    IntegrationError::InvalidSignatureMaterial(format!("{fpr}: {msg}"))
+                }
+                other => other,
+            })?;
         }
         Ok(keyring)
     }
@@ -193,17 +192,16 @@ pub fn fingerprint_from_public_key(verifying_key: &VerifyingKey) -> String {
 mod tests {
     use super::*;
     use crate::{
-        DataAccess, EntryKind, IntegrationEntry, ManifestHashes, NetworkAccess, SafetyPolicy,
-        ValidationPolicy, INTEGRATION_SCHEMA_V1,
+        DataAccess, EntryKind, IntegrationEntry, ManifestHashes, NetworkAccess, SafetyPolicy, ValidationPolicy,
+        INTEGRATION_SCHEMA_V1,
     };
     use ed25519_dalek::SigningKey;
 
     fn fixed_signing_key() -> SigningKey {
         // Deterministic key for tests so we don't depend on RNG.
         let seed: [u8; 32] = [
-            0x9f, 0x77, 0x14, 0x07, 0xb2, 0x5a, 0xc4, 0x88, 0xe9, 0xc4, 0x36, 0x40, 0x6e, 0xa3,
-            0xc0, 0xfb, 0xfa, 0x36, 0x99, 0x88, 0x55, 0xa9, 0xc4, 0x46, 0xfd, 0xa6, 0x06, 0xee,
-            0x6e, 0x9b, 0x82, 0x6b,
+            0x9f, 0x77, 0x14, 0x07, 0xb2, 0x5a, 0xc4, 0x88, 0xe9, 0xc4, 0x36, 0x40, 0x6e, 0xa3, 0xc0, 0xfb, 0xfa, 0x36,
+            0x99, 0x88, 0x55, 0xa9, 0xc4, 0x46, 0xfd, 0xa6, 0x06, 0xee, 0x6e, 0x9b, 0x82, 0x6b,
         ];
         SigningKey::from_bytes(&seed)
     }
@@ -252,12 +250,10 @@ mod tests {
             allow_unsigned_first_party: false,
             allow_executable_helpers: false,
             trusted_public_keys: keyring.as_trusted_public_keys(),
+            ..ValidationPolicy::default()
         };
         manifest.validate(&policy).expect("verify");
-        assert_eq!(
-            keyring.resolve_signature(&manifest),
-            TrustTier::CommunityReviewed
-        );
+        assert_eq!(keyring.resolve_signature(&manifest), TrustTier::CommunityReviewed);
     }
 
     #[test]
@@ -326,9 +322,7 @@ mod tests {
             trusted_public_keys: keyring.as_trusted_public_keys(),
             ..policy
         };
-        let err = manifest
-            .validate(&policy)
-            .expect_err("wrong key must fail");
+        let err = manifest.validate(&policy).expect_err("wrong key must fail");
         assert!(matches!(err, IntegrationError::SignatureInvalid));
     }
 

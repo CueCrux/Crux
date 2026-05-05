@@ -6713,3 +6713,257 @@ async fn dossier_get_unknown_returns_404() {
     .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ── Community extensions (M2) ──────────────────────────────────────────
+
+fn build_signed_manifest(
+    id: &str,
+    signing_key: &ed25519_dalek::SigningKey,
+    publisher_fpr: &str,
+) -> crux_integrations::IntegrationManifest {
+    use crux_integrations::{
+        sign_manifest, DataAccess, EntryKind, IntegrationEntry, IntegrationManifest, ManifestHashes, NetworkAccess,
+        SafetyPolicy, INTEGRATION_SCHEMA_V1,
+    };
+    let mut manifest = IntegrationManifest {
+        schema: INTEGRATION_SCHEMA_V1.to_string(),
+        id: id.to_string(),
+        name: "Quote of the Day".to_string(),
+        version: "0.1.0".to_string(),
+        publisher_passport_fpr: publisher_fpr.to_string(),
+        summary: "Returns a quote.".to_string(),
+        entry: IntegrationEntry {
+            kind: EntryKind::HttpRecipe,
+            path: "tools/quote.json".to_string(),
+        },
+        capabilities: vec!["facts:read".to_string()],
+        network: NetworkAccess::default(),
+        data_access: DataAccess::default(),
+        safety: SafetyPolicy::default(),
+        hashes: ManifestHashes::default(),
+        signature: None,
+    };
+    sign_manifest(&mut manifest, signing_key, publisher_fpr).expect("sign");
+    manifest
+}
+
+async fn add_test_key(state: &AppState, fpr: &str, public_key_hex: String) {
+    let key_resp = super::extensions::add_trusted_key(
+        State(state.clone()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::AddTrustedKeyBody {
+            passport_fpr: fpr.to_string(),
+            public_key_hex,
+            trust_tier: crux_integrations::TrustTier::CommunityReviewed,
+            added_by: "test".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(key_resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn extensions_list_when_empty_returns_zero_count() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::extensions::list_extensions(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["count"], 0);
+    assert!(body["extensions"].as_array().expect("array").is_empty());
+}
+
+#[tokio::test]
+async fn extensions_list_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::extensions::list_extensions(State(state), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn extensions_register_then_list_then_get_then_delete() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xab; 32]);
+    let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+    add_test_key(&state, "p_test_alice", public_key_hex).await;
+
+    let manifest = build_signed_manifest("ext.example.quote", &signing_key, "p_test_alice");
+    let reg_resp = super::extensions::register_extension(
+        State(state.clone()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::RegisterExtensionBody { manifest }),
+    )
+    .await
+    .into_response();
+    assert_eq!(reg_resp.status(), StatusCode::CREATED);
+
+    let list_resp = super::extensions::list_extensions(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let body = json_body(list_resp).await;
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["extensions"][0]["manifest"]["id"], "ext.example.quote");
+    assert_eq!(body["extensions"][0]["trust_tier"], "community_reviewed");
+
+    let get_resp = super::extensions::get_extension(
+        State(state.clone()),
+        Path("ext.example.quote".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+
+    let del_resp = super::extensions::delete_extension(
+        State(state.clone()),
+        Path("ext.example.quote".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+    )
+    .await
+    .into_response();
+    assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
+
+    let list2 = super::extensions::list_extensions(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(json_body(list2).await["count"], 0);
+}
+
+#[tokio::test]
+async fn extensions_register_unsigned_returns_400_with_dev_hint() {
+    use crux_integrations::{
+        DataAccess, EntryKind, IntegrationEntry, IntegrationManifest, ManifestHashes, NetworkAccess, SafetyPolicy,
+        INTEGRATION_SCHEMA_V1,
+    };
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let manifest = IntegrationManifest {
+        schema: INTEGRATION_SCHEMA_V1.to_string(),
+        id: "ext.example.unsigned".to_string(),
+        name: "Unsigned".to_string(),
+        version: "0.1.0".to_string(),
+        publisher_passport_fpr: "p_unsigned".to_string(),
+        summary: "Unsigned manifest.".to_string(),
+        entry: IntegrationEntry {
+            kind: EntryKind::HttpRecipe,
+            path: "tools/u.json".to_string(),
+        },
+        capabilities: vec![],
+        network: NetworkAccess::default(),
+        data_access: DataAccess::default(),
+        safety: SafetyPolicy::default(),
+        hashes: ManifestHashes::default(),
+        signature: None,
+    };
+    let resp = super::extensions::register_extension(
+        State(state),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::RegisterExtensionBody { manifest }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp).await;
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("CORECRUXD_EXTENSIONS_ALLOW_UNSIGNED"),
+        "expected dev-bypass hint in error, got: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn extensions_register_duplicate_returns_409() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xab; 32]);
+    let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+    add_test_key(&state, "p_test_alice", public_key_hex).await;
+
+    let manifest = build_signed_manifest("ext.example.dup", &signing_key, "p_test_alice");
+    let _ = super::extensions::register_extension(
+        State(state.clone()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::RegisterExtensionBody {
+            manifest: manifest.clone(),
+        }),
+    )
+    .await
+    .into_response();
+    let resp = super::extensions::register_extension(
+        State(state),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::RegisterExtensionBody { manifest }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn extensions_get_unknown_returns_404() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::extensions::get_extension(
+        State(state),
+        Path("ext.does-not-exist".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn extensions_keyring_add_list_remove_round_trip() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let pubkey_hex = "00".repeat(32);
+
+    let add_resp = super::extensions::add_trusted_key(
+        State(state.clone()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::AddTrustedKeyBody {
+            passport_fpr: "p_alice".to_string(),
+            public_key_hex: pubkey_hex.clone(),
+            trust_tier: crux_integrations::TrustTier::LocallySigned,
+            added_by: "operator-test".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(add_resp.status(), StatusCode::CREATED);
+
+    let list_resp = super::extensions::list_trusted_keys(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let body = json_body(list_resp).await;
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["keys"]["p_alice"]["public_key_hex"], pubkey_hex);
+    assert_eq!(body["keys"]["p_alice"]["trust_tier"], "locally_signed");
+
+    let del_resp = super::extensions::delete_trusted_key(
+        State(state.clone()),
+        Path("p_alice".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+    )
+    .await
+    .into_response();
+    assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
+
+    let list2 = super::extensions::list_trusted_keys(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(json_body(list2).await["count"], 0);
+}
+
+#[tokio::test]
+async fn extensions_keyring_delete_unknown_returns_404() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::extensions::delete_trusted_key(
+        State(state),
+        Path("p_nobody".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
