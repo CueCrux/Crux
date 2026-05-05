@@ -515,6 +515,20 @@ pub fn router(state: AppState) -> Router {
             "/v1/extensions/{id}",
             axum::routing::delete(self::extensions::delete_extension),
         )
+        // M3: per-passport grants. The dispatcher (M4) consults these when
+        // filtering the MCP catalog and validating per-call scope.
+        .route(
+            "/v1/extensions/{id}/grants",
+            get(self::extensions::list_grants),
+        )
+        .route(
+            "/v1/extensions/{id}/grants",
+            axum::routing::post(self::extensions::issue_grant),
+        )
+        .route(
+            "/v1/extensions/{id}/grants/{passport_fpr}",
+            axum::routing::delete(self::extensions::revoke_grant),
+        )
         // Storybook readout — Phase 3 of the context graph.
         .route(
             "/v1/projects/{id}/storybook",

@@ -26,6 +26,7 @@ mod http;
 mod context_graph;
 mod dossier;
 mod encrypted_secrets;
+mod extension_grants;
 mod extension_registry;
 mod fact_helpers;
 mod fact_privacy;

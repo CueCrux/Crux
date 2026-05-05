@@ -6967,3 +6967,167 @@ async fn extensions_keyring_delete_unknown_returns_404() {
     .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ── Per-passport grants (M3) ───────────────────────────────────────────
+
+async fn install_test_extension_for_grants(state: &AppState, id: &str) {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xab; 32]);
+    let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+    add_test_key(state, "p_test_alice", public_key_hex).await;
+    let manifest = build_signed_manifest(id, &signing_key, "p_test_alice");
+    let _ = super::extensions::register_extension(
+        State(state.clone()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::RegisterExtensionBody { manifest }),
+    )
+    .await
+    .into_response();
+}
+
+#[tokio::test]
+async fn grants_issue_then_list_then_revoke() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    install_test_extension_for_grants(&state, "ext.example.quote").await;
+
+    let issue_resp = super::extensions::issue_grant(
+        State(state.clone()),
+        Path("ext.example.quote".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::IssueGrantBody {
+            passport_fpr: "p_grantee".to_string(),
+            allowed_tool_names: vec!["quote.daily".to_string()],
+            allowed_prefixes_read: vec!["personal::quotes::".to_string()],
+            allowed_prefixes_write: vec!["personal::quotes::".to_string()],
+            rate_limit_per_min: Some(30),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(issue_resp.status(), StatusCode::CREATED);
+
+    let list_resp = super::extensions::list_grants(
+        State(state.clone()),
+        Path("ext.example.quote".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(list_resp).await;
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["grants"][0]["passport_fpr"], "p_grantee");
+
+    let revoke_resp = super::extensions::revoke_grant(
+        State(state.clone()),
+        Path(("ext.example.quote".to_string(), "p_grantee".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+    )
+    .await
+    .into_response();
+    assert_eq!(revoke_resp.status(), StatusCode::NO_CONTENT);
+
+    let list2 = super::extensions::list_grants(
+        State(state),
+        Path("ext.example.quote".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(json_body(list2).await["count"], 0);
+}
+
+#[tokio::test]
+async fn grants_issue_when_extension_not_installed_returns_404() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::extensions::issue_grant(
+        State(state),
+        Path("ext.does-not-exist".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::IssueGrantBody {
+            passport_fpr: "p_grantee".to_string(),
+            allowed_tool_names: vec![],
+            allowed_prefixes_read: vec![],
+            allowed_prefixes_write: vec![],
+            rate_limit_per_min: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn grants_issue_with_privacy_gated_prefix_returns_400() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    install_test_extension_for_grants(&state, "ext.example.bad").await;
+    let resp = super::extensions::issue_grant(
+        State(state),
+        Path("ext.example.bad".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::IssueGrantBody {
+            passport_fpr: "p_grantee".to_string(),
+            allowed_tool_names: vec![],
+            allowed_prefixes_read: vec![],
+            allowed_prefixes_write: vec!["__ax__::".to_string()],
+            rate_limit_per_min: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp).await;
+    assert!(body["detail"].as_str().unwrap_or_default().contains("privacy-gated"));
+}
+
+#[tokio::test]
+async fn grants_issue_duplicate_returns_409() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    install_test_extension_for_grants(&state, "ext.example.dup").await;
+    let body_fn = || {
+        Json(super::extensions::IssueGrantBody {
+            passport_fpr: "p_grantee".to_string(),
+            allowed_tool_names: vec![],
+            allowed_prefixes_read: vec![],
+            allowed_prefixes_write: vec![],
+            rate_limit_per_min: None,
+        })
+    };
+    let _ = super::extensions::issue_grant(
+        State(state.clone()),
+        Path("ext.example.dup".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        body_fn(),
+    )
+    .await
+    .into_response();
+    let resp = super::extensions::issue_grant(
+        State(state),
+        Path("ext.example.dup".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        body_fn(),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn grants_revoke_unknown_returns_404() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::extensions::revoke_grant(
+        State(state),
+        Path(("ext.example.x".to_string(), "p_nobody".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn grants_list_requires_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::extensions::list_grants(State(state), Path("ext.example.x".to_string()), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

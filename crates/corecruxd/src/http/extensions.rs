@@ -217,6 +217,110 @@ pub(super) async fn add_trusted_key(
         .into_response()
 }
 
+// ── Per-passport grants (M3) ────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct IssueGrantBody {
+    pub passport_fpr: String,
+    #[serde(default)]
+    pub allowed_tool_names: Vec<String>,
+    #[serde(default)]
+    pub allowed_prefixes_read: Vec<String>,
+    #[serde(default)]
+    pub allowed_prefixes_write: Vec<String>,
+    #[serde(default)]
+    pub rate_limit_per_min: Option<u32>,
+}
+
+/// `GET /v1/extensions/{id}/grants` — list grants for one extension.
+pub(super) async fn list_grants(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let store = state.fact_store.read().await;
+    let grants = crate::extension_grants::list_grants_for_extension(&store, &id);
+    drop(store);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "extension_id": id,
+            "count": grants.len(),
+            "grants": grants,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /v1/extensions/{id}/grants` — issue a grant to a passport.
+pub(super) async fn issue_grant(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<IssueGrantBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
+        return problem.into_response();
+    }
+    let granted_by = extract_passport_id(&headers);
+    let mut store = state.fact_store.write().await;
+    // Check the extension is installed *before* delegating; the grant
+    // module also asserts this but we surface a 404 (more specific than
+    // 400) here for clarity.
+    let installed = crate::extension_registry::get_extension(&store, &id).is_some();
+    if !installed {
+        drop(store);
+        return problem_response(StatusCode::NOT_FOUND, format!("extension '{id}' not installed"));
+    }
+    let result = crate::extension_grants::issue_grant(
+        &mut store,
+        true,
+        crate::extension_grants::IssueGrantInput {
+            extension_id: id.clone(),
+            passport_fpr: body.passport_fpr,
+            allowed_tool_names: body.allowed_tool_names,
+            allowed_prefixes_read: body.allowed_prefixes_read,
+            allowed_prefixes_write: body.allowed_prefixes_write,
+            rate_limit_per_min: body.rate_limit_per_min,
+            granted_by_passport: granted_by,
+        },
+        now_unix_ms(),
+    );
+    drop(store);
+    match result {
+        Ok(grant) => (StatusCode::CREATED, Json(grant)).into_response(),
+        Err(crate::extension_grants::GrantError::AlreadyGranted(_, _)) => {
+            problem_response(StatusCode::CONFLICT, "grant already exists; revoke first to replace")
+        }
+        Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+/// `DELETE /v1/extensions/{id}/grants/{passport_fpr}` — revoke a grant.
+pub(super) async fn revoke_grant(
+    State(state): State<AppState>,
+    Path((id, passport_fpr)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
+        return problem.into_response();
+    }
+    let mut store = state.fact_store.write().await;
+    let result = crate::extension_grants::revoke_grant(&mut store, &id, &passport_fpr);
+    drop(store);
+    match result {
+        Ok(()) => (StatusCode::NO_CONTENT, ()).into_response(),
+        Err(crate::extension_grants::GrantError::NotFound(_, _)) => problem_response(
+            StatusCode::NOT_FOUND,
+            format!("grant for '{id}' + '{passport_fpr}' not found"),
+        ),
+        Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
 /// `DELETE /v1/extensions/keys/{passport_fpr}` — revoke a trusted key.
 pub(super) async fn delete_trusted_key(
     State(state): State<AppState>,
