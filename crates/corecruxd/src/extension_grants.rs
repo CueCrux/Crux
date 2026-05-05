@@ -13,7 +13,7 @@
 //! ## Why facts, not tokens
 //!
 //! The original ExecPlan called for adding an `ExtensionTool` variant to
-//! [`rcx_capability_token::DataEgressClass`]. We chose facts instead:
+//! `rcx_capability_token::DataEgressClass`. We chose facts instead:
 //!
 //! 1. `DataEgressClass` is a flat enum (`None`, `Vectors`, `Text`, ...) —
 //!    consumed in many match arms across the workspace. Adding a struct
@@ -70,7 +70,7 @@ pub struct ExtensionGrant {
     pub allowed_prefixes_read: Vec<String>,
     /// Fact-prefix scopes this grant unlocks for the extension's
     /// `store_fact` calls. Privacy-gated prefixes (the
-    /// [`fact_privacy::DEFAULT_PRIVATE_PREFIXES`] list) are forbidden
+    /// `fact_privacy::DEFAULT_PRIVATE_PREFIXES` list) are forbidden
     /// regardless of grant — see [`is_prefix_grantable`].
     #[serde(default)]
     pub allowed_prefixes_write: Vec<String>,

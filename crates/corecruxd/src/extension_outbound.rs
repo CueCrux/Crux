@@ -10,8 +10,9 @@
 //! module:
 //!
 //! 1. Confirms the tool name is in the manifest's `tools[]` list.
-//! 2. Looks up the per-passport [`ExtensionGrant`] from the fact store
-//!    and verifies the calling passport is allowed to call this tool.
+//! 2. Looks up the per-passport `ExtensionGrant` (see [`super::extension_grants`])
+//!    from the fact store and verifies the calling passport is allowed
+//!    to call this tool.
 //! 3. Enforces the daemon-wide payload + rate limits + the per-grant
 //!    rate-limit override.
 //! 4. POSTs a JSON envelope `{ tool, args, calling_passport_id, request_id }`

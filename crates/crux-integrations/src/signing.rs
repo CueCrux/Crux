@@ -4,10 +4,10 @@
 
 //! Manifest signing + trusted keyring (M1 of community-extensions ExecPlan).
 //!
-//! The crate already shipped Ed25519 *verification* (see
-//! [`super::verify_signature`] + [`IntegrationManifest::validate`]) and a
-//! `trusted_public_keys` map on [`ValidationPolicy`]. This module adds the
-//! missing pieces a community-contribution flow needs:
+//! The crate already shipped Ed25519 *verification* (the module-private
+//! `verify_signature` helper + [`IntegrationManifest::validate`]) and a
+//! `trusted_public_keys` map on [`super::ValidationPolicy`]. This module
+//! adds the missing pieces a community-contribution flow needs:
 //!
 //! - [`sign_manifest`] — fill in a manifest's `signature` field given an
 //!   Ed25519 signing key + the passport fingerprint authoring the pack.
@@ -16,9 +16,9 @@
 //!   convention. Carries per-key [`TrustTier`] so the operator can mark a
 //!   given key as `CommunityReviewed` vs `LocallySigned` without rewriting
 //!   the manifest.
-//! - [`TrustedKeyring::policy`] — convenience to project the typed keyring
-//!   into the legacy `ValidationPolicy.trusted_public_keys` shape so every
-//!   existing consumer keeps working.
+//! - [`TrustedKeyring::as_trusted_public_keys`] — convenience to project
+//!   the typed keyring into the legacy `ValidationPolicy.trusted_public_keys`
+//!   shape so every existing consumer keeps working.
 //! - [`TrustedKeyring::resolve_signature`] — given a signed manifest, look
 //!   up the trust tier the matching key was added with. The
 //!   `extension_registry` (M2) uses this to decide what tier to record on

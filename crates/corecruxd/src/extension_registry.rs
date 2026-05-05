@@ -10,8 +10,8 @@
 //! installed records are never push-eligible to a remote.
 //!
 //! This module is intentionally pure-domain: it owns the persistence shape
-//! and validation flow, but knows nothing about HTTP. The HTTP surface is
-//! in [`crate::http::extensions`].
+//! and validation flow, but knows nothing about HTTP. The HTTP surface
+//! lives in `crate::http::extensions`.
 //!
 //! M3 (RCX token extension) and M4 (Phase A dispatch) build on top of this
 //! by adding per-extension grants and a tool dispatcher; both consume the
