@@ -1596,6 +1596,18 @@ pre {
   background: var(--card);
 }
 
+.ext-detail { display: grid; gap: 0.6rem; padding: 0.6rem 0.4rem 0.2rem; }
+.ext-detail h4 { margin: 0.6rem 0 0.2rem; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+.ext-meta { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 0.8rem; margin: 0; font-size: 0.85rem; }
+.ext-meta dt { color: var(--text-muted); }
+.ext-meta dd { margin: 0; }
+.ext-tool { padding: 0.55rem 0.7rem; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--card); display: grid; gap: 0.4rem; }
+.ext-tool-form .form-row { gap: 0.4rem; }
+.ext-tool-result { margin: 0; padding: 0.5rem 0.6rem; max-height: 200px; overflow: auto; background: rgba(15, 23, 42, 0.04); border-radius: var(--radius-sm); font-size: 0.78rem; }
+.ext-grants-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.ext-grants-head h4 { margin: 0.6rem 0 0.2rem; }
+.ext-section { display: grid; gap: 0.4rem; }
+
 .drawer {
   position: fixed;
   top: 0;
@@ -2137,6 +2149,7 @@ pre {
       <button data-panel="work" aria-label="Work"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="6" height="18"></rect><rect x="11" y="3" width="6" height="11"></rect><line x1="11" y1="18" x2="17" y2="18"></line></svg>Work</button>
       <button data-panel="passport" aria-label="Passport"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"></circle><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"></path></svg>Passport</button>
       <button data-panel="integrations" aria-label="Integrations"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="2" width="9" height="9"></rect><rect x="13" y="2" width="9" height="9"></rect><rect x="2" y="13" width="9" height="9"></rect><rect x="13" y="13" width="9" height="9"></rect></svg>Integrations</button>
+      <button data-panel="extensions" aria-label="Extensions"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6v3a3 3 0 0 0 6 0h0v6a3 3 0 0 0 0 6h0v3H9v-3a3 3 0 0 1-6 0v-6h3a3 3 0 0 0 0-6H3V3z"></path></svg>Extensions</button>
       <button data-panel="facts" aria-label="Facts"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="8" y1="13" x2="16" y2="13"></line><line x1="8" y1="17" x2="13" y2="17"></line></svg>Facts</button>
       <button data-panel="tenants" aria-label="Tenants"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 21h18"></path><path d="M5 21V7l7-4 7 4v14"></path><line x1="9" y1="9" x2="9" y2="9"></line><line x1="15" y1="9" x2="15" y2="9"></line><line x1="9" y1="13" x2="9" y2="13"></line><line x1="15" y1="13" x2="15" y2="13"></line></svg>Tenants</button>
       <button data-panel="raw" aria-label="Raw"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>Raw</button>
@@ -2362,6 +2375,80 @@ pre {
           </div>
           <div class="list" id="integrationList"></div>
           <div id="integrationToast" aria-live="polite"></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-extensions" aria-labelledby="extensions-title">
+      <div class="grid">
+        <article class="card wide">
+          <div class="facts-header">
+            <div>
+              <span class="label">Community packs</span>
+              <h2 id="extensions-title">Extensions</h2>
+            </div>
+            <div class="actions">
+              <button id="extensionsKeysToggle" class="action ghost sm" type="button">Trusted keys</button>
+              <button id="extensionsInstallToggle" class="action accent sm" type="button">+ Install</button>
+            </div>
+          </div>
+          <p class="helper">Install signed third-party manifests, then issue per-passport grants. Installation alone never grants tool access &mdash; an explicit grant must exist before any agent can dispatch through the extension.</p>
+
+          <div id="extensionsKeysWrap" hidden>
+            <h3 class="settings-h3">Trusted signing keys</h3>
+            <p class="helper">Manifests are verified against this keyring. The dev bypass <span class="mono">CORECRUXD_EXTENSIONS_ALLOW_UNSIGNED=1</span> lets unsigned manifests install for local testing only.</p>
+            <div id="extensionsKeyList" class="list"></div>
+            <form id="extensionsKeyForm" class="passport-create-form" novalidate>
+              <div class="form-row">
+                <div class="form-field">
+                  <label for="extKeyFpr">Passport fingerprint</label>
+                  <input id="extKeyFpr" class="text-input" type="text" autocomplete="off" placeholder="p_…" required>
+                </div>
+                <div class="form-field">
+                  <label for="extKeyTier">Trust tier</label>
+                  <select id="extKeyTier" class="text-input" required>
+                    <option value="FirstParty">FirstParty</option>
+                    <option value="LocallySigned" selected>LocallySigned</option>
+                    <option value="CommunityReviewed">CommunityReviewed</option>
+                    <option value="Unknown">Unknown</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-field">
+                <label for="extKeyPub">Public key (hex, 64 chars)</label>
+                <input id="extKeyPub" class="text-input mono" type="text" autocomplete="off" required>
+              </div>
+              <div class="form-field">
+                <label for="extKeyAddedBy">Added by (label)</label>
+                <input id="extKeyAddedBy" class="text-input" type="text" autocomplete="off" placeholder="operator">
+              </div>
+              <div class="actions">
+                <button id="extKeySubmit" class="action accent sm" type="submit">Add key</button>
+                <button id="extKeyReset" class="action ghost sm" type="reset">Clear form</button>
+              </div>
+              <div id="extKeyToast" aria-live="polite"></div>
+            </form>
+          </div>
+
+          <div id="extensionsInstallWrap" hidden>
+            <h3 class="settings-h3">Install manifest</h3>
+            <p class="helper">Paste a signed integration manifest as JSON. Required fields: <span class="mono">id, version, publisher, kind, signature</span>. For external-tool packs, also <span class="mono">external_tool_endpoint</span> and <span class="mono">tools[]</span>.</p>
+            <form id="extensionsInstallForm" class="passport-create-form" novalidate>
+              <div class="form-field">
+                <label for="extInstallManifest">Manifest JSON</label>
+                <textarea id="extInstallManifest" class="textarea-input mono" rows="10" required placeholder='{ "id": "quote.daily", "version": "0.1.0", "publisher": { ... }, "kind": "external_tool", "external_tool_endpoint": "https://…", "tools": [ ... ], "signature": { ... } }'></textarea>
+              </div>
+              <div class="actions">
+                <button id="extInstallSubmit" class="action accent sm" type="submit">Install</button>
+                <button id="extInstallReset" class="action ghost sm" type="reset">Clear</button>
+                <button id="extInstallCancel" class="action ghost sm" type="button">Close</button>
+              </div>
+              <div id="extInstallToast" aria-live="polite"></div>
+            </form>
+          </div>
+
+          <div class="list" id="extensionList"></div>
+          <div id="extensionsToast" aria-live="polite"></div>
         </article>
       </div>
     </section>
@@ -2695,6 +2782,12 @@ const state = {
   workComments: [],
   workTransitions: [],
   pendingGates: null,
+  extensions: null,
+  extensionDetail: {},
+  extensionGrants: {},
+  trustedKeys: null,
+  extensionInvoke: {},
+  ui_extensionOpen: {},
   ui: {
     activePanel: 'overview',
     chartMode: 'chunks',
@@ -3066,7 +3159,9 @@ async function loadAll() {
       api('/v1/projects'),
       api('/v1/passports'),
       api('/v1/work?project_id=' + encodeURIComponent(activeProj)),
-      api('/v1/work/gate/pending')
+      api('/v1/work/gate/pending'),
+      api('/v1/extensions'),
+      api('/v1/extensions/keys')
     ]);
     const get = (i) => results[i].status === 'fulfilled' ? results[i].value : { _error: results[i].reason };
     state.summary = get(0);
@@ -3080,6 +3175,8 @@ async function loadAll() {
     state.passportsList = get(8);
     state.work = get(9);
     state.pendingGates = get(10);
+    state.extensions = get(11);
+    state.trustedKeys = get(12);
     syncActiveProjectPicker();
     await loadFacts();
     render();
@@ -3148,6 +3245,7 @@ function render() {
   renderBoundPassportSwitcher();
   renderKanban();
   renderPendingGates();
+  renderExtensions();
   $('rawOutput').textContent = JSON.stringify(state, null, 2);
 }
 
@@ -8798,6 +8896,367 @@ document.addEventListener('click', async (e) => {
 // place within the Work panel).
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && state.workDetailOpenId) closeWorkInline();
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// Extensions panel (M5 — community packs)
+// ────────────────────────────────────────────────────────────────────────
+
+function tierBadgeClass(tier) {
+  switch ((tier || '').toLowerCase()) {
+    case 'firstparty':
+    case 'communityreviewed':
+      return 'good';
+    case 'locallysigned':
+      return 'neutral';
+    default:
+      return 'warn';
+  }
+}
+
+function renderExtensions() {
+  const list = $('extensionList');
+  if (!list) return;
+  const data = state.extensions || {};
+  if (data._error) {
+    list.innerHTML = '<div class="toast bad">Failed to load extensions: ' + esc(JSON.stringify(data._error.data || data._error)) + '</div>';
+    renderTrustedKeys();
+    return;
+  }
+  const items = data.extensions || [];
+  if (!items.length) {
+    list.innerHTML = '<div class="empty-state">No extensions installed yet. Click <strong>+ Install</strong> to register a signed manifest.</div>';
+  } else {
+    list.innerHTML = items.map((rec) => {
+      const m = rec.manifest || {};
+      const id = m.id || '';
+      const ver = m.version || '';
+      const kind = m.kind || '';
+      const tier = rec.trust_tier || 'Unknown';
+      const installed = rec.installed_at_unix_ms ? relativeTime(rec.installed_at_unix_ms) : '';
+      const signed = m.signature ? 'signed' : 'unsigned';
+      const open = !!state.ui_extensionOpen[id];
+      const detail = open ? renderExtensionDetail(rec) : '';
+      return '<details class="integration-row" data-ext-id="' + esc(id) + '"' + (open ? ' open' : '') + '>' +
+        '<summary>' +
+          '<div>' +
+            '<strong class="mono">' + esc(id) + '</strong> ' +
+            '<span class="hint">v' + esc(ver) + '</span> ' +
+            '<span class="badge">' + esc(kind) + '</span> ' +
+            '<span class="badge ' + tierBadgeClass(tier) + '">' + esc(tier) + '</span> ' +
+            '<span class="badge ' + (signed === 'signed' ? 'good' : 'warn') + '">' + signed + '</span>' +
+          '</div>' +
+          '<div class="hint">' + esc(installed) + '</div>' +
+        '</summary>' +
+        '<div class="ext-detail">' + detail + '</div>' +
+      '</details>';
+    }).join('');
+  }
+  renderTrustedKeys();
+}
+
+function renderTrustedKeys() {
+  const wrap = $('extensionsKeyList');
+  if (!wrap) return;
+  const data = state.trustedKeys || {};
+  if (data._error) {
+    wrap.innerHTML = '<div class="toast bad">Failed to load keyring: ' + esc(JSON.stringify(data._error.data || data._error)) + '</div>';
+    return;
+  }
+  const keys = data.keys || {};
+  const fprs = Object.keys(keys);
+  if (!fprs.length) {
+    wrap.innerHTML = '<div class="empty-state">No trusted keys yet. Add one below or set <span class="mono">CORECRUXD_EXTENSIONS_ALLOW_UNSIGNED=1</span> for local testing.</div>';
+    return;
+  }
+  wrap.innerHTML = fprs.map((fpr) => {
+    const k = keys[fpr] || {};
+    const tier = k.trust_tier || 'Unknown';
+    const added = k.added_at_unix_ms ? relativeTime(k.added_at_unix_ms) : '';
+    const by = k.added_by ? ' by ' + esc(k.added_by) : '';
+    return '<div class="integration-row">' +
+      '<div>' +
+        '<strong class="mono">' + esc(fpr) + '</strong> ' +
+        '<span class="badge ' + tierBadgeClass(tier) + '">' + esc(tier) + '</span> ' +
+        '<span class="hint">added ' + esc(added) + by + '</span>' +
+      '</div>' +
+      '<div class="actions">' +
+        '<button class="action warn sm" type="button" data-ext-key-revoke="' + esc(fpr) + '">Revoke</button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+
+function renderExtensionDetail(rec) {
+  const m = rec.manifest || {};
+  const id = m.id || '';
+  const tools = m.tools || [];
+  const grants = (state.extensionGrants[id] || {}).grants || [];
+  const endpoint = m.external_tool_endpoint || '';
+  const publisher = m.publisher || {};
+  const lastInvoke = state.extensionInvoke[id] || {};
+
+  const toolsHtml = tools.length
+    ? tools.map((t) => {
+        const name = t.name || '';
+        const desc = t.description || '';
+        const last = lastInvoke[name];
+        return '<div class="ext-tool">' +
+          '<div><strong class="mono">' + esc(name) + '</strong> <span class="hint">' + esc(desc) + '</span></div>' +
+          '<form class="ext-tool-form" data-ext-id="' + esc(id) + '" data-ext-tool="' + esc(name) + '">' +
+            '<div class="form-row">' +
+              '<div class="form-field" style="flex:1">' +
+                '<label>Args (JSON)</label>' +
+                '<textarea class="textarea-input mono ext-tool-args" rows="2">{}</textarea>' +
+              '</div>' +
+              '<div class="form-field">' +
+                '<label>Passport fpr</label>' +
+                '<input class="text-input mono ext-tool-fpr" type="text" placeholder="(uses bound)" autocomplete="off">' +
+              '</div>' +
+            '</div>' +
+            '<div class="actions">' +
+              '<button class="action accent sm" type="submit">Test call</button>' +
+            '</div>' +
+          '</form>' +
+          (last ? '<pre class="mono ext-tool-result">' + esc(JSON.stringify(last, null, 2)) + '</pre>' : '') +
+        '</div>';
+      }).join('')
+    : '<div class="empty-state">No tools declared.</div>';
+
+  const grantsHtml = grants.length
+    ? grants.map((g) => {
+        const tnames = (g.allowed_tool_names || []).join(', ') || '(none)';
+        const rate = g.rate_limit_per_min != null ? esc(String(g.rate_limit_per_min)) + '/min' : 'default';
+        return '<div class="integration-row">' +
+          '<div>' +
+            '<strong class="mono">' + esc(g.passport_fpr) + '</strong> ' +
+            '<span class="hint">tools: ' + esc(tnames) + ' · rate: ' + rate + '</span>' +
+          '</div>' +
+          '<div class="actions">' +
+            '<button class="action warn sm" type="button" data-ext-grant-revoke="' + esc(id) + ':' + esc(g.passport_fpr) + '">Revoke</button>' +
+          '</div>' +
+        '</div>';
+      }).join('')
+    : '<div class="empty-state">No grants issued. Issue one below to enable tool dispatch.</div>';
+
+  return '<div class="ext-section">' +
+    '<h4>Manifest</h4>' +
+    '<dl class="ext-meta">' +
+      '<dt>Publisher</dt><dd class="mono">' + esc(publisher.name || publisher.id || '(none)') + '</dd>' +
+      '<dt>Endpoint</dt><dd class="mono">' + esc(endpoint || '(none)') + '</dd>' +
+      '<dt>Hash</dt><dd class="mono">' + esc((rec.manifest_hash || '').slice(0, 16)) + (rec.manifest_hash ? '…' : '') + '</dd>' +
+    '</dl>' +
+    '<h4>Tools</h4>' + toolsHtml +
+    '<div class="ext-grants-head"><h4>Grants</h4><button class="action accent sm" type="button" data-ext-grant-toggle="' + esc(id) + '">+ Issue grant</button></div>' +
+    grantsHtml +
+    '<form class="ext-grant-form" data-ext-id="' + esc(id) + '" hidden>' +
+      '<div class="form-row">' +
+        '<div class="form-field" style="flex:1">' +
+          '<label>Passport fpr</label>' +
+          '<input class="text-input mono ext-grant-fpr" type="text" required autocomplete="off">' +
+        '</div>' +
+        '<div class="form-field">' +
+          '<label>Rate (per min)</label>' +
+          '<input class="text-input ext-grant-rate" type="number" min="1" placeholder="60">' +
+        '</div>' +
+      '</div>' +
+      '<div class="form-field">' +
+        '<label>Allowed tools (comma-sep, blank = all in manifest)</label>' +
+        '<input class="text-input mono ext-grant-tools" type="text" autocomplete="off">' +
+      '</div>' +
+      '<div class="form-row">' +
+        '<div class="form-field" style="flex:1">' +
+          '<label>Read prefixes (comma-sep)</label>' +
+          '<input class="text-input mono ext-grant-pread" type="text" autocomplete="off">' +
+        '</div>' +
+        '<div class="form-field" style="flex:1">' +
+          '<label>Write prefixes (comma-sep)</label>' +
+          '<input class="text-input mono ext-grant-pwrite" type="text" autocomplete="off">' +
+        '</div>' +
+      '</div>' +
+      '<div class="actions">' +
+        '<button class="action accent sm" type="submit">Issue grant</button>' +
+        '<button class="action ghost sm" type="reset">Clear</button>' +
+      '</div>' +
+    '</form>' +
+    '<div class="actions" style="margin-top:0.8rem">' +
+      '<button class="action warn sm" type="button" data-ext-delete="' + esc(id) + '">Delete extension</button>' +
+    '</div>' +
+  '</div>';
+}
+
+function showExtToast(message, bad) {
+  const el = $('extensionsToast');
+  if (!el) return;
+  el.innerHTML = '<div class="toast ' + (bad ? 'bad' : '') + '">' + esc(message) + '</div>';
+  if (!bad) setTimeout(() => { el.innerHTML = ''; }, 2500);
+}
+
+$('extensionList').addEventListener('toggle', async (e) => {
+  const det = e.target;
+  if (!det.matches || !det.matches('details[data-ext-id]')) return;
+  const id = det.dataset.extId;
+  state.ui_extensionOpen[id] = det.open;
+  if (det.open && !state.extensionGrants[id]) {
+    try {
+      state.extensionGrants[id] = await api('/v1/extensions/' + encodeURIComponent(id) + '/grants');
+    } catch (err) {
+      state.extensionGrants[id] = { _error: err };
+    }
+    renderExtensions();
+  }
+}, true);
+
+$('extensionsInstallToggle').addEventListener('click', () => {
+  const w = $('extensionsInstallWrap');
+  w.hidden = !w.hidden;
+  if (!w.hidden) $('extInstallManifest').focus();
+});
+$('extensionsKeysToggle').addEventListener('click', () => {
+  const w = $('extensionsKeysWrap');
+  w.hidden = !w.hidden;
+  if (!w.hidden) $('extKeyFpr').focus();
+});
+$('extInstallCancel').addEventListener('click', () => {
+  $('extensionsInstallWrap').hidden = true;
+});
+
+$('extensionsInstallForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const raw = $('extInstallManifest').value.trim();
+  if (!raw) return;
+  let manifest;
+  try { manifest = JSON.parse(raw); }
+  catch (err) {
+    $('extInstallToast').innerHTML = '<div class="toast bad">Invalid JSON: ' + esc(err.message) + '</div>';
+    return;
+  }
+  try {
+    await postApi('/v1/extensions/register', { manifest });
+    $('extInstallToast').innerHTML = '<div class="toast">Installed.</div>';
+    $('extInstallManifest').value = '';
+    await loadAll();
+  } catch (err) {
+    $('extInstallToast').innerHTML = '<div class="toast bad">Install failed: ' + esc(JSON.stringify(err.data || err)) + '</div>';
+  }
+});
+
+$('extensionsKeyForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const body = {
+    passport_fpr: $('extKeyFpr').value.trim(),
+    public_key_hex: $('extKeyPub').value.trim(),
+    trust_tier: $('extKeyTier').value,
+    added_by: $('extKeyAddedBy').value.trim()
+  };
+  if (!body.passport_fpr || !body.public_key_hex) return;
+  try {
+    await postApi('/v1/extensions/keys', body);
+    $('extKeyToast').innerHTML = '<div class="toast">Key added.</div>';
+    $('extensionsKeyForm').reset();
+    await loadAll();
+  } catch (err) {
+    $('extKeyToast').innerHTML = '<div class="toast bad">Add failed: ' + esc(JSON.stringify(err.data || err)) + '</div>';
+  }
+});
+
+document.addEventListener('click', async (e) => {
+  const revokeKey = e.target.closest('button[data-ext-key-revoke]');
+  if (revokeKey) {
+    const fpr = revokeKey.dataset.extKeyRevoke;
+    if (!confirm('Revoke trusted key ' + fpr + '?')) return;
+    try {
+      await deleteApi('/v1/extensions/keys/' + encodeURIComponent(fpr));
+      showExtToast('Key revoked.');
+      await loadAll();
+    } catch (err) { showExtToast('Revoke failed: ' + JSON.stringify(err.data || err), true); }
+    return;
+  }
+  const grantToggle = e.target.closest('button[data-ext-grant-toggle]');
+  if (grantToggle) {
+    const id = grantToggle.dataset.extGrantToggle;
+    const form = document.querySelector('form.ext-grant-form[data-ext-id="' + id.replace(/"/g, '\\"') + '"]');
+    if (form) form.hidden = !form.hidden;
+    return;
+  }
+  const grantRevoke = e.target.closest('button[data-ext-grant-revoke]');
+  if (grantRevoke) {
+    const parts = grantRevoke.dataset.extGrantRevoke.split(':');
+    const id = parts[0];
+    const fpr = parts.slice(1).join(':');
+    if (!confirm('Revoke grant for ' + fpr + ' on ' + id + '?')) return;
+    try {
+      await deleteApi('/v1/extensions/' + encodeURIComponent(id) + '/grants/' + encodeURIComponent(fpr));
+      delete state.extensionGrants[id];
+      showExtToast('Grant revoked.');
+      await loadAll();
+    } catch (err) { showExtToast('Revoke failed: ' + JSON.stringify(err.data || err), true); }
+    return;
+  }
+  const del = e.target.closest('button[data-ext-delete]');
+  if (del) {
+    const id = del.dataset.extDelete;
+    if (!confirm('Delete extension ' + id + '? Existing grants will be cleared.')) return;
+    try {
+      await deleteApi('/v1/extensions/' + encodeURIComponent(id));
+      delete state.extensionGrants[id];
+      delete state.ui_extensionOpen[id];
+      showExtToast('Extension deleted.');
+      await loadAll();
+    } catch (err) { showExtToast('Delete failed: ' + JSON.stringify(err.data || err), true); }
+    return;
+  }
+});
+
+document.addEventListener('submit', async (e) => {
+  const grantForm = e.target.closest('form.ext-grant-form');
+  if (grantForm) {
+    e.preventDefault();
+    const id = grantForm.dataset.extId;
+    const fpr = grantForm.querySelector('.ext-grant-fpr').value.trim();
+    if (!fpr) return;
+    const rate = grantForm.querySelector('.ext-grant-rate').value.trim();
+    const tools = grantForm.querySelector('.ext-grant-tools').value.split(',').map(s => s.trim()).filter(Boolean);
+    const pread = grantForm.querySelector('.ext-grant-pread').value.split(',').map(s => s.trim()).filter(Boolean);
+    const pwrite = grantForm.querySelector('.ext-grant-pwrite').value.split(',').map(s => s.trim()).filter(Boolean);
+    try {
+      await postApi('/v1/extensions/' + encodeURIComponent(id) + '/grants', {
+        passport_fpr: fpr,
+        allowed_tool_names: tools,
+        allowed_prefixes_read: pread,
+        allowed_prefixes_write: pwrite,
+        rate_limit_per_min: rate ? parseInt(rate, 10) : null
+      });
+      delete state.extensionGrants[id];
+      showExtToast('Grant issued.');
+      await loadAll();
+    } catch (err) { showExtToast('Issue grant failed: ' + JSON.stringify(err.data || err), true); }
+    return;
+  }
+  const toolForm = e.target.closest('form.ext-tool-form');
+  if (toolForm) {
+    e.preventDefault();
+    const id = toolForm.dataset.extId;
+    const tool = toolForm.dataset.extTool;
+    const argsRaw = toolForm.querySelector('.ext-tool-args').value.trim() || '{}';
+    const fpr = toolForm.querySelector('.ext-tool-fpr').value.trim();
+    let args;
+    try { args = JSON.parse(argsRaw); }
+    catch (err) { showExtToast('Args JSON invalid: ' + err.message, true); return; }
+    const body = { args };
+    if (fpr) body.passport_fpr = fpr;
+    try {
+      const res = await postApi('/v1/extensions/' + encodeURIComponent(id) + '/tools/' + encodeURIComponent(tool) + '/invoke', body);
+      state.extensionInvoke[id] = state.extensionInvoke[id] || {};
+      state.extensionInvoke[id][tool] = res;
+      renderExtensions();
+    } catch (err) {
+      state.extensionInvoke[id] = state.extensionInvoke[id] || {};
+      state.extensionInvoke[id][tool] = { _error: err.data || err };
+      renderExtensions();
+    }
+    return;
+  }
 });
 
 loadAll();

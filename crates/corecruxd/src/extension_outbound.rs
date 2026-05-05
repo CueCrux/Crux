@@ -274,9 +274,7 @@ pub fn dispatch_external_tool(
         .as_deref()
         .ok_or_else(|| OutboundError::NotExternalTool(manifest.id.clone()))?;
 
-    if !endpoint.starts_with("https://")
-        && (!endpoint.starts_with("http://") || !config.allow_plain_http)
-    {
+    if !endpoint.starts_with("https://") && (!endpoint.starts_with("http://") || !config.allow_plain_http) {
         return Err(OutboundError::PlainHttpBlocked);
     }
 
