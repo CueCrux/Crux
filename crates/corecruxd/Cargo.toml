@@ -13,6 +13,11 @@ otel = [
   "dep:opentelemetry-otlp",
   "dep:tracing-opentelemetry",
 ]
+# Phase B (community-extensions ExecPlan M6): enables the wasmtime-backed
+# host for `kind: wasm` extensions. Off by default so that operators who
+# only use Phase A external-tool extensions don't pay the wasmtime build
+# cost (~30s cold + ~60MB binary growth).
+wasm-extensions = ["dep:wasmtime"]
 
 [dependencies]
 axum = "0.8.9"
@@ -67,10 +72,13 @@ crux-session = { path = "../crux-session" }
 crux-enterprise-shim = { path = "../crux-enterprise-shim" }
 vaultcrux-local = { path = "../vaultcrux-local" }
 
+wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime"], optional = true }
+
 [dev-dependencies]
 corecrux-index = { path = "../corecrux-index" }
 serial_test = "3"
 tempfile = "3"
+wat = "1"
 
 [build-dependencies]
 anyhow = "1.0.97"

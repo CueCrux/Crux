@@ -53,6 +53,8 @@ mod shard_map;
 mod storybook;
 mod structured_log;
 mod update;
+#[cfg(feature = "wasm-extensions")]
+mod wasm_host;
 mod work;
 mod workspace_scan;
 
