@@ -8,6 +8,7 @@ mod console;
 mod dataplane;
 mod dossier;
 mod events;
+mod extensions;
 mod facts;
 mod health;
 mod integrations_github;
@@ -171,6 +172,10 @@ pub struct AppState {
     pub retrieval_index: Arc<RwLock<corecrux_retrieval::IndexManager>>,
     /// Crux Daemon fact store (receipted entity memory).
     pub fact_store: Arc<RwLock<corecrux_memory::FactStore>>,
+    /// Process-wide rate-limit table for community-extension dispatch
+    /// (M4 Phase A). Sliding 60-second window keyed by
+    /// (extension_id, passport_fpr); cap is per-grant or daemon default.
+    pub extension_rate_table: Arc<crate::extension_outbound::RateTable>,
     /// Crux Daemon session store (scoped state per session).
     pub session_store: Arc<RwLock<corecrux_memory::SessionStore>>,
     /// Cached git-based update posture for humans and agents.
@@ -482,6 +487,57 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/mcp/tools",
             get(self::workspace::get_mcp_tools),
+        )
+        // Community extensions registry (M2 of community-extensions plan).
+        // List/install/show/delete + trusted-key management. M3+M4 will add
+        // /grants/* (capability-token issuance) + tool dispatch on top.
+        .route(
+            "/v1/extensions",
+            get(self::extensions::list_extensions),
+        )
+        .route(
+            "/v1/extensions/register",
+            axum::routing::post(self::extensions::register_extension),
+        )
+        .route(
+            "/v1/extensions/keys",
+            get(self::extensions::list_trusted_keys),
+        )
+        .route(
+            "/v1/extensions/keys",
+            axum::routing::post(self::extensions::add_trusted_key),
+        )
+        .route(
+            "/v1/extensions/keys/{passport_fpr}",
+            axum::routing::delete(self::extensions::delete_trusted_key),
+        )
+        .route(
+            "/v1/extensions/{id}",
+            get(self::extensions::get_extension),
+        )
+        .route(
+            "/v1/extensions/{id}",
+            axum::routing::delete(self::extensions::delete_extension),
+        )
+        // M3: per-passport grants. The dispatcher (M4) consults these when
+        // filtering the MCP catalog and validating per-call scope.
+        .route(
+            "/v1/extensions/{id}/grants",
+            get(self::extensions::list_grants),
+        )
+        .route(
+            "/v1/extensions/{id}/grants",
+            axum::routing::post(self::extensions::issue_grant),
+        )
+        .route(
+            "/v1/extensions/{id}/grants/{passport_fpr}",
+            axum::routing::delete(self::extensions::revoke_grant),
+        )
+        // M4: direct external-tool invocation (Phase A entry point before
+        // the MCP dispatcher integration lands in M5).
+        .route(
+            "/v1/extensions/{id}/tools/{tool_name}/invoke",
+            axum::routing::post(self::extensions::invoke_extension_tool),
         )
         // Storybook readout — Phase 3 of the context graph.
         .route(
@@ -911,6 +967,24 @@ fn problem_for_status(status: StatusCode, detail: impl Into<String>) -> ProblemR
             StatusCode::BAD_GATEWAY.as_u16(),
             "https://errors.cuecrux.com/bad-gateway",
             "Bad Gateway",
+        )
+        .with_detail(detail),
+        StatusCode::FORBIDDEN => ProblemDetails::new(
+            StatusCode::FORBIDDEN.as_u16(),
+            "https://errors.cuecrux.com/forbidden",
+            "Forbidden",
+        )
+        .with_detail(detail),
+        StatusCode::UNAUTHORIZED => ProblemDetails::new(
+            StatusCode::UNAUTHORIZED.as_u16(),
+            "https://errors.cuecrux.com/unauthorized",
+            "Unauthorized",
+        )
+        .with_detail(detail),
+        StatusCode::TOO_MANY_REQUESTS => ProblemDetails::new(
+            StatusCode::TOO_MANY_REQUESTS.as_u16(),
+            "https://errors.cuecrux.com/rate-limited",
+            "Too Many Requests",
         )
         .with_detail(detail),
         StatusCode::NO_CONTENT => ProblemDetails::new(

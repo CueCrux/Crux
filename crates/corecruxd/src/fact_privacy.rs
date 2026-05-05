@@ -82,6 +82,8 @@ const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "__storybook__::",
     "__dossier__::",
     "__project_repo_link__::",
+    "__extension__::",
+    "__extension_grant__::",
     "__work__::",
     "__work_transition__::",
     "__passport__::",

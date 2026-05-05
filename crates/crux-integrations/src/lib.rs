@@ -8,6 +8,10 @@
 //! CLI, file watcher, and webhook recipes, but they do not execute code inside
 //! the daemon process.
 
+pub mod signing;
+
+pub use signing::{fingerprint_from_public_key, sign_manifest, TrustedKeyEntry, TrustedKeyring};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -99,6 +103,37 @@ pub struct IntegrationManifest {
     pub hashes: ManifestHashes,
     #[serde(default)]
     pub signature: Option<SignatureEnvelope>,
+    /// HTTPS endpoint the daemon POSTs `tools/call` payloads to when
+    /// `entry.kind == ExternalTool`. The daemon enforces this is the only
+    /// outbound destination for the extension (egress allowlist is
+    /// per-extension, not workspace-wide). Required for `ExternalTool`,
+    /// must be `None` for any other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_tool_endpoint: Option<String>,
+    /// Tools the extension exposes. Required + non-empty for
+    /// `ExternalTool`; ignored for other kinds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ExternalToolDefinition>,
+}
+
+/// One MCP-callable tool an external-tool extension exposes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalToolDefinition {
+    /// Fully-qualified MCP tool name (typically `"<extension_id>.<verb>"`,
+    /// e.g. `"ext.example.quote.daily"`). Globally unique across the
+    /// daemon's MCP catalog.
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the call's `arguments` object. Pass-through to MCP
+    /// `tools/list`; the daemon doesn't validate against it (the
+    /// extension endpoint is responsible for arg validation).
+    pub input_schema: serde_json::Value,
+    /// Optional shared-secret reference: id of an entry in the daemon's
+    /// `encrypted_secrets` store. The daemon decrypts this at dispatch
+    /// time and forwards as `Authorization: Bearer <decrypted>` to the
+    /// endpoint. None = no auth header sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_shared_secret_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,6 +152,11 @@ pub enum EntryKind {
     FileWatcher,
     WebhookAdapter,
     ExternalHelper,
+    /// Community Phase-A external tool — the daemon proxies MCP `tools/call`
+    /// out to the manifest's HTTPS endpoint with a per-call grant scope.
+    /// Manifests of this kind MUST set `external_tool_endpoint` and
+    /// declare at least one entry in `tools[]`.
+    ExternalTool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -291,7 +331,17 @@ struct IntegrationIndex {
 
 #[derive(Debug, Clone)]
 pub struct ValidationPolicy {
+    /// When true (the original behaviour, kept for backwards compat),
+    /// unsigned manifests are accepted iff the publisher fingerprint
+    /// equals [`FIRST_PARTY_PASSPORT`]. The first-party packs baked into
+    /// the daemon binary rely on this.
     pub allow_unsigned_first_party: bool,
+    /// When true, unsigned manifests are accepted regardless of
+    /// publisher. Intended for development convenience only — the
+    /// daemon's HTTP layer maps this to the
+    /// `CORECRUXD_EXTENSIONS_ALLOW_UNSIGNED` environment knob and
+    /// requires it to be opt-in. Default false.
+    pub allow_unsigned: bool,
     pub allow_executable_helpers: bool,
     pub trusted_public_keys: BTreeMap<String, String>,
 }
@@ -300,6 +350,7 @@ impl Default for ValidationPolicy {
     fn default() -> Self {
         Self {
             allow_unsigned_first_party: true,
+            allow_unsigned: false,
             allow_executable_helpers: false,
             trusted_public_keys: BTreeMap::new(),
         }
@@ -343,6 +394,41 @@ impl IntegrationManifest {
             return Err(IntegrationError::ExternalHelperDisabled);
         }
 
+        // External-tool kind: endpoint + tools[] are co-required. Reject
+        // either-without-the-other, and surface the requirement loudly so
+        // contributors see what's missing without grepping source.
+        if self.entry.kind == EntryKind::ExternalTool {
+            let endpoint = self
+                .external_tool_endpoint
+                .as_deref()
+                .ok_or(IntegrationError::MissingField("external_tool_endpoint"))?;
+            if endpoint.trim().is_empty() {
+                return Err(IntegrationError::MissingField("external_tool_endpoint"));
+            }
+            if !endpoint.starts_with("https://") && !endpoint.starts_with("http://") {
+                return Err(IntegrationError::InvalidIdentifier(format!(
+                    "external_tool_endpoint must be an http(s) URL, got '{endpoint}'"
+                )));
+            }
+            if self.tools.is_empty() {
+                return Err(IntegrationError::MissingField("tools"));
+            }
+            for tool in &self.tools {
+                if tool.name.trim().is_empty() {
+                    return Err(IntegrationError::MissingField("tools[].name"));
+                }
+                if tool.description.trim().is_empty() {
+                    return Err(IntegrationError::MissingField("tools[].description"));
+                }
+            }
+        } else if self.external_tool_endpoint.is_some() || !self.tools.is_empty() {
+            // Inverse rule: only `ExternalTool` may set these fields.
+            return Err(IntegrationError::InvalidIdentifier(format!(
+                "external_tool_endpoint and tools[] only valid when entry.kind=external_tool, got {:?}",
+                self.entry.kind
+            )));
+        }
+
         if let Some(expected) = &self.hashes.manifest {
             let actual = self.manifest_hash()?;
             if expected != &actual {
@@ -355,7 +441,9 @@ impl IntegrationManifest {
 
         if let Some(signature) = &self.signature {
             verify_signature(self, signature, policy)?;
-        } else if !(policy.allow_unsigned_first_party && self.publisher_passport_fpr == FIRST_PARTY_PASSPORT) {
+        } else if !(policy.allow_unsigned
+            || policy.allow_unsigned_first_party && self.publisher_passport_fpr == FIRST_PARTY_PASSPORT)
+        {
             return Err(IntegrationError::SignatureRequired);
         }
 
@@ -654,6 +742,8 @@ pub fn builtin_manifests() -> Vec<IntegrationManifest> {
             safety: SafetyPolicy::default(),
             hashes: ManifestHashes::default(),
             signature: None,
+            external_tool_endpoint: None,
+            tools: Vec::new(),
         },
         IntegrationManifest {
             schema: INTEGRATION_SCHEMA_V1.to_string(),
@@ -672,6 +762,8 @@ pub fn builtin_manifests() -> Vec<IntegrationManifest> {
             safety: SafetyPolicy::default(),
             hashes: ManifestHashes::default(),
             signature: None,
+            external_tool_endpoint: None,
+            tools: Vec::new(),
         },
         IntegrationManifest {
             schema: INTEGRATION_SCHEMA_V1.to_string(),
@@ -695,6 +787,8 @@ pub fn builtin_manifests() -> Vec<IntegrationManifest> {
             safety: SafetyPolicy::default(),
             hashes: ManifestHashes::default(),
             signature: None,
+            external_tool_endpoint: None,
+            tools: Vec::new(),
         },
         // Note: a `github.pr-facts` declarative recipe used to live here.
         // Removed in favour of the live GitHub indexer integration which
@@ -877,7 +971,7 @@ fn verify_signature(
         .map_err(|_| IntegrationError::SignatureInvalid)
 }
 
-fn decode_fixed_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N], IntegrationError> {
+pub(crate) fn decode_fixed_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N], IntegrationError> {
     let decoded =
         hex::decode(value).map_err(|e| IntegrationError::InvalidSignatureMaterial(format!("{label} hex: {e}")))?;
     decoded
@@ -928,6 +1022,8 @@ mod tests {
             safety: SafetyPolicy::default(),
             hashes: ManifestHashes::default(),
             signature: None,
+            external_tool_endpoint: None,
+            tools: Vec::new(),
         }
     }
 
@@ -962,6 +1058,7 @@ mod tests {
                 allow_unsigned_first_party: false,
                 allow_executable_helpers: false,
                 trusted_public_keys: BTreeMap::new(),
+                ..ValidationPolicy::default()
             })
             .err();
         assert!(matches!(err, Some(IntegrationError::UnknownCapability(cap)) if cap == "secrets:read"));
@@ -976,6 +1073,7 @@ mod tests {
                 allow_unsigned_first_party: false,
                 allow_executable_helpers: false,
                 trusted_public_keys: BTreeMap::new(),
+                ..ValidationPolicy::default()
             })
             .err();
         assert!(matches!(err, Some(IntegrationError::ExternalHelperDisabled)));
@@ -1009,6 +1107,7 @@ mod tests {
             allow_unsigned_first_party: false,
             allow_executable_helpers: false,
             trusted_public_keys,
+            ..ValidationPolicy::default()
         })?;
         Ok(())
     }
@@ -1031,6 +1130,7 @@ mod tests {
                 allow_unsigned_first_party: false,
                 allow_executable_helpers: false,
                 trusted_public_keys: BTreeMap::new(),
+                ..ValidationPolicy::default()
             })
             .err();
         assert!(matches!(err, Some(IntegrationError::SignatureInvalid)));
