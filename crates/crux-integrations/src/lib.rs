@@ -8,6 +8,12 @@
 //! CLI, file watcher, and webhook recipes, but they do not execute code inside
 //! the daemon process.
 
+pub mod signing;
+
+pub use signing::{
+    fingerprint_from_public_key, sign_manifest, TrustedKeyEntry, TrustedKeyring,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -877,7 +883,7 @@ fn verify_signature(
         .map_err(|_| IntegrationError::SignatureInvalid)
 }
 
-fn decode_fixed_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N], IntegrationError> {
+pub(crate) fn decode_fixed_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N], IntegrationError> {
     let decoded =
         hex::decode(value).map_err(|e| IntegrationError::InvalidSignatureMaterial(format!("{label} hex: {e}")))?;
     decoded
