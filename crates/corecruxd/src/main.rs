@@ -605,9 +605,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let reaped = session_store.write().await.reap_expired();
-                        if reaped > 0 {
-                            tracing::info!(reaped, "session-ttl-reaper");
+                        match session_store.write().await.try_reap_expired() {
+                            Ok(reaped) if reaped > 0 => tracing::info!(reaped, "session-ttl-reaper"),
+                            Ok(_) => {}
+                            Err(err) => tracing::warn!(?err, "session-ttl-reaper-journal-failed"),
                         }
                     }
                     _ = rx.recv() => break,
@@ -652,8 +653,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             Err(e) => tracing::warn!(error = %e, "sync: pull failed"),
                         }
 
-                        // Then push.
-                        match client.push(&*sync_fact_store.read().await) {
+                        // Then push from a short-lived snapshot so network I/O does not hold the store read lock.
+                        let pushable = {
+                            let store = sync_fact_store.read().await;
+                            client.pushable_facts(&store)
+                        };
+                        match client.push_facts(&pushable) {
                             Ok(result) => {
                                 if result.facts_pushed > 0 {
                                     tracing::info!(pushed = result.facts_pushed, "sync: pushed facts to remote");

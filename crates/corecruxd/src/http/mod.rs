@@ -80,7 +80,10 @@ use crate::problem::ProblemResponse;
 use crate::shard_map::RoutingTable;
 use crate::structured_log::{CorrelationIds, ErrorCode, StructuredOpLog};
 
-use crate::auth::{describe_http_evidence, require_http_scopes, require_http_scopes_for_tenant, Authz};
+use crate::auth::{
+    describe_http_evidence, http_scope_context, require_http_any_scope, require_http_scopes,
+    require_http_scopes_for_tenant, Authz,
+};
 use crate::control::{self, ValveDecision};
 use crate::dataplane_store::AppendError;
 

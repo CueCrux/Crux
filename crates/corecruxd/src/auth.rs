@@ -735,6 +735,37 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct HttpScopeContext {
+    pub scopes: Vec<String>,
+    pub passport_id: Option<String>,
+    scope_bypass: bool,
+}
+
+impl HttpScopeContext {
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.scope_bypass || self.scopes.iter().any(|s| s == scope)
+    }
+}
+
+pub fn http_passport_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-corecrux-passport-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[allow(clippy::result_large_err)]
+pub fn http_scope_context(auth: &Authz, headers: &HeaderMap) -> Result<HttpScopeContext, ProblemResponse> {
+    let ctx = http_ctx(auth, headers)?;
+    Ok(HttpScopeContext {
+        scopes: ctx.scopes.into_iter().collect(),
+        passport_id: http_passport_id(headers),
+        scope_bypass: auth.mode == AuthMode::Off,
+    })
+}
+
 #[allow(clippy::result_large_err)]
 fn grpc_ctx(auth: &Authz, meta: &MetadataMap) -> Result<AuthContext, Status> {
     match auth.mode {
@@ -844,6 +875,25 @@ pub fn require_http_scopes(auth: &Authz, headers: &HeaderMap, required: &[&str])
         ProblemDetails::forbidden("insufficient scopes").with_extensions(serde_json::json!({
             "code": "MISSING_SCOPE",
             "missingScopes": missing
+        })),
+    ))
+}
+
+#[allow(clippy::result_large_err)]
+pub fn require_http_any_scope(auth: &Authz, headers: &HeaderMap, any_of: &[&str]) -> Result<(), ProblemResponse> {
+    if auth.mode == AuthMode::Off {
+        return Ok(());
+    }
+
+    let ctx = http_ctx(auth, headers)?;
+    if any_of.iter().any(|scope| ctx.scopes.iter().any(|s| s == scope)) {
+        return Ok(());
+    }
+
+    Err(ProblemResponse(
+        ProblemDetails::forbidden("insufficient scopes").with_extensions(serde_json::json!({
+            "code": "MISSING_SCOPE",
+            "missingAnyScope": any_of
         })),
     ))
 }

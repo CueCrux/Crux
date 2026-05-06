@@ -73,20 +73,14 @@ impl SessionStore {
         Ok(store)
     }
 
-    /// Append a journal event to the JSONL file. Best-effort: logs a warning
-    /// on IO error but never panics or propagates the error.
-    fn append_journal(&self, event: &SessionJournalEvent) {
+    /// Append a journal event to the JSONL file.
+    fn append_journal(&self, event: &SessionJournalEvent) -> std::io::Result<()> {
         if let Some(path) = &self.journal_path {
-            let result = (|| -> std::io::Result<()> {
-                let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-                let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
-                writeln!(file, "{}", line)?;
-                Ok(())
-            })();
-            if let Err(err) = result {
-                tracing::warn!(?err, path = %path.display(), "session-journal-append-failed");
-            }
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+            let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+            writeln!(file, "{}", line)?;
         }
+        Ok(())
     }
 
     /// Replay a JSONL journal file to rebuild in-memory state.
@@ -120,30 +114,56 @@ impl SessionStore {
     /// If `ttl_seconds` is `Some`, the session will expire after the given
     /// duration and be reaped on the next cleanup pass.
     pub fn put(&mut self, session_id: &str, state: serde_json::Value, ttl_seconds: Option<u64>) -> SessionState {
+        let session = self.build_session(session_id, state, ttl_seconds);
+
+        self.sessions.insert(session_id.to_string(), session.clone());
+
+        if let Err(err) = self.append_journal(&SessionJournalEvent::Store {
+            session: session.clone(),
+        }) {
+            tracing::warn!(?err, "session-journal-append-failed");
+        }
+
+        self.emit_session_stored(&session);
+
+        session
+    }
+
+    /// Create or update session state only after its journal event has been durably appended.
+    pub fn try_put(
+        &mut self,
+        session_id: &str,
+        state: serde_json::Value,
+        ttl_seconds: Option<u64>,
+    ) -> std::io::Result<SessionState> {
+        let session = self.build_session(session_id, state, ttl_seconds);
+        self.append_journal(&SessionJournalEvent::Store {
+            session: session.clone(),
+        })?;
+        self.sessions.insert(session_id.to_string(), session.clone());
+        self.emit_session_stored(&session);
+        Ok(session)
+    }
+
+    fn build_session(&self, session_id: &str, state: serde_json::Value, ttl_seconds: Option<u64>) -> SessionState {
         let tokens = estimate_tokens(&state);
         let expires_at = ttl_seconds.map(|secs| Utc::now() + chrono::Duration::seconds(secs as i64));
 
-        let session = SessionState {
+        SessionState {
             session_id: session_id.to_string(),
             state,
             updated_at: Utc::now(),
             total_tokens: tokens,
             expires_at,
-        };
+        }
+    }
 
-        self.sessions.insert(session_id.to_string(), session.clone());
-
-        self.append_journal(&SessionJournalEvent::Store {
-            session: session.clone(),
-        });
-
+    fn emit_session_stored(&self, session: &SessionState) {
         if let Some(bus) = &self.event_bus {
             bus.emit(crate::events::CruxEvent::SessionStored {
                 session_id: session.session_id.clone(),
             });
         }
-
-        session
     }
 
     /// Get session state by ID.
@@ -155,9 +175,11 @@ impl SessionStore {
     pub fn delete(&mut self, session_id: &str) -> bool {
         let removed = self.sessions.remove(session_id).is_some();
         if removed {
-            self.append_journal(&SessionJournalEvent::Delete {
+            if let Err(err) = self.append_journal(&SessionJournalEvent::Delete {
                 session_id: session_id.to_string(),
-            });
+            }) {
+                tracing::warn!(?err, "session-journal-append-failed");
+            }
             if let Some(bus) = &self.event_bus {
                 bus.emit(crate::events::CruxEvent::SessionDeleted {
                     session_id: session_id.to_string(),
@@ -165,6 +187,25 @@ impl SessionStore {
             }
         }
         removed
+    }
+
+    /// Delete a session only after its tombstone has been durably appended.
+    pub fn try_delete(&mut self, session_id: &str) -> std::io::Result<bool> {
+        if !self.sessions.contains_key(session_id) {
+            return Ok(false);
+        }
+        self.append_journal(&SessionJournalEvent::Delete {
+            session_id: session_id.to_string(),
+        })?;
+        let removed = self.sessions.remove(session_id).is_some();
+        if removed {
+            if let Some(bus) = &self.event_bus {
+                bus.emit(crate::events::CruxEvent::SessionDeleted {
+                    session_id: session_id.to_string(),
+                });
+            }
+        }
+        Ok(removed)
     }
 
     /// List all session IDs.
@@ -192,6 +233,29 @@ impl SessionStore {
             self.sessions.remove(&id);
         }
         count
+    }
+
+    /// Remove expired sessions only after writing tombstones to the journal.
+    pub fn try_reap_expired(&mut self) -> std::io::Result<usize> {
+        let now = Utc::now();
+        let expired: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.expires_at.is_some_and(|exp| now >= exp))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &expired {
+            self.append_journal(&SessionJournalEvent::Delete { session_id: id.clone() })?;
+        }
+        let count = expired.len();
+        for id in expired {
+            if self.sessions.remove(&id).is_some() {
+                if let Some(bus) = &self.event_bus {
+                    bus.emit(crate::events::CruxEvent::SessionDeleted { session_id: id });
+                }
+            }
+        }
+        Ok(count)
     }
 
     /// Test helper: override `expires_at` for a session.
@@ -424,6 +488,26 @@ mod tests {
             assert_eq!(store.count(), 1);
             assert!(store.get("s1").is_none());
             assert!(store.get("s2").is_some());
+        }
+    }
+
+    #[test]
+    fn try_reap_expired_persists_delete_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let mut store = SessionStore::with_persistence(dir.path()).unwrap();
+            store.try_put("expired", json!({"x": 1}), Some(3600)).unwrap();
+            store.set_expires_at_for_test("expired", Utc::now() - chrono::Duration::seconds(10));
+            let reaped = store.try_reap_expired().unwrap();
+            assert_eq!(reaped, 1);
+            assert!(store.get("expired").is_none());
+        }
+
+        {
+            let store = SessionStore::with_persistence(dir.path()).unwrap();
+            assert!(store.get("expired").is_none());
+            assert_eq!(store.count(), 0);
         }
     }
 

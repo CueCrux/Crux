@@ -104,6 +104,7 @@ fn entity_for(id: &str) -> String {
 pub fn build_policy(data_dir: impl AsRef<Path>) -> Result<ValidationPolicy, ExtensionsError> {
     let keyring = TrustedKeyring::load(trusted_keys_path(&data_dir))?;
     Ok(ValidationPolicy {
+        allow_unsigned_first_party: false,
         trusted_public_keys: keyring.as_trusted_public_keys(),
         ..ValidationPolicy::default()
     })
@@ -132,6 +133,7 @@ pub fn install_extension(
     let keyring = TrustedKeyring::load(trusted_keys_path(&data_dir))?;
     let policy = ValidationPolicy {
         trusted_public_keys: keyring.as_trusted_public_keys(),
+        allow_unsigned_first_party: false,
         // Dev bypass tolerates unsigned manifests regardless of publisher.
         // Signed manifests are still verified.
         allow_unsigned: allow_unsigned_dev_bypass,
@@ -166,7 +168,7 @@ pub fn install_extension(
     // Force-private via the global gate (the `__extension__::` prefix is
     // in `fact_privacy::DEFAULT_PRIVATE_PREFIXES`).
     crate::fact_privacy::enforce_global(&mut sf);
-    store.store(sf);
+    store.try_store(sf)?;
     Ok(record)
 }
 
@@ -207,7 +209,7 @@ pub fn delete_extension(store: &mut FactStore, id: &str) -> Result<(), Extension
         private: false,
     };
     crate::fact_privacy::enforce_global(&mut sf);
-    store.store(sf);
+    store.try_store(sf)?;
     Ok(())
 }
 

@@ -950,11 +950,19 @@ fn verify_signature(
         return Err(IntegrationError::UnsupportedSignatureAlgorithm(signature.alg.clone()));
     }
 
-    let key_hex = signature
+    let key_hex = policy
+        .trusted_public_keys
+        .get(&signature.passport_fpr)
+        .ok_or_else(|| IntegrationError::MissingTrustedKey(signature.passport_fpr.clone()))?;
+    if signature
         .public_key_hex
         .as_ref()
-        .or_else(|| policy.trusted_public_keys.get(&signature.passport_fpr))
-        .ok_or_else(|| IntegrationError::MissingTrustedKey(signature.passport_fpr.clone()))?;
+        .is_some_and(|inline| !inline.eq_ignore_ascii_case(key_hex))
+    {
+        return Err(IntegrationError::InvalidSignatureMaterial(
+            "signature public_key_hex does not match trusted keyring entry".to_string(),
+        ));
+    }
     let public_key = decode_fixed_hex::<32>(key_hex, "public key")?;
     let verifying_key = VerifyingKey::from_bytes(&public_key)
         .map_err(|e| IntegrationError::InvalidSignatureMaterial(format!("public key: {e}")))?;
@@ -1116,6 +1124,7 @@ mod tests {
     fn rejects_tampered_signature() -> Result<(), IntegrationError> {
         let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
         let verifying_key = signing_key.verifying_key();
+        let public_key_hex = hex::encode(verifying_key.to_bytes());
         let mut manifest = sample_manifest();
         let signature = signing_key.sign(&manifest.signing_payload()?);
         manifest.summary = "Tampered after signing.".to_string();
@@ -1125,6 +1134,33 @@ mod tests {
             public_key_hex: Some(hex::encode(verifying_key.to_bytes())),
             sig: base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
         });
+        let mut trusted_public_keys = BTreeMap::new();
+        trusted_public_keys.insert("p_test".to_string(), public_key_hex);
+        let err = manifest
+            .validate(&ValidationPolicy {
+                allow_unsigned_first_party: false,
+                allow_executable_helpers: false,
+                trusted_public_keys,
+                ..ValidationPolicy::default()
+            })
+            .err();
+        assert!(matches!(err, Some(IntegrationError::SignatureInvalid)));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_signature_with_only_inline_public_key() -> Result<(), IntegrationError> {
+        let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let mut manifest = sample_manifest();
+        let signature = signing_key.sign(&manifest.signing_payload()?);
+        manifest.signature = Some(SignatureEnvelope {
+            alg: "ed25519".to_string(),
+            passport_fpr: "p_test".to_string(),
+            public_key_hex: Some(hex::encode(verifying_key.to_bytes())),
+            sig: base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
+        });
+
         let err = manifest
             .validate(&ValidationPolicy {
                 allow_unsigned_first_party: false,
@@ -1133,7 +1169,7 @@ mod tests {
                 ..ValidationPolicy::default()
             })
             .err();
-        assert!(matches!(err, Some(IntegrationError::SignatureInvalid)));
+        assert!(matches!(err, Some(IntegrationError::MissingTrustedKey(_))));
         Ok(())
     }
 

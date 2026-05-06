@@ -1146,6 +1146,7 @@ dependencies = [
  "ureq",
  "uuid",
  "vaultcrux-local",
+ "xxhash-rust",
 ]
 
 [[package]]

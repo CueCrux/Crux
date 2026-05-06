@@ -8,7 +8,7 @@
 use serde_json::{json, Value};
 
 use crate::dispatch::McpContext;
-use crate::protocol::{JsonRpcError, INVALID_PARAMS};
+use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
 use crate::scope;
 
 /// `get_session` — retrieve session state by ID.
@@ -47,7 +47,13 @@ pub async fn handle_save_session(args: &Value, ctx: &McpContext) -> Result<Value
     let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
 
     let mut store = ctx.session_store.write().await;
-    let session = store.put(&stored_session_id, state, ttl_seconds);
+    let session = store
+        .try_put(&stored_session_id, state, ttl_seconds)
+        .map_err(|err| JsonRpcError {
+            code: INTERNAL_ERROR,
+            message: "session journal append failed".to_string(),
+            data: Some(json!({"error": err.to_string()})),
+        })?;
 
     Ok(json!({
         "content": [{
@@ -85,7 +91,11 @@ pub async fn handle_delete_session(args: &Value, ctx: &McpContext) -> Result<Val
     let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
 
     let mut store = ctx.session_store.write().await;
-    let deleted = store.delete(&stored_session_id);
+    let deleted = store.try_delete(&stored_session_id).map_err(|err| JsonRpcError {
+        code: INTERNAL_ERROR,
+        message: "session journal append failed".to_string(),
+        data: Some(json!({"error": err.to_string()})),
+    })?;
 
     if deleted {
         Ok(json!({

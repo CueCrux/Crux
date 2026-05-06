@@ -372,6 +372,12 @@ impl SyncClient {
     /// Only non-deleted facts that were NOT received via sync (i.e. whose
     /// `source_receipt` does not start with `sync:`) are pushed.
     pub fn push(&self, store: &FactStore) -> Result<SyncPushResult, String> {
+        let local_facts = self.pushable_facts(store);
+        self.push_facts(&local_facts)
+    }
+
+    /// Snapshot pushable facts while the caller holds any store lock.
+    pub fn pushable_facts(&self, store: &FactStore) -> Vec<Fact> {
         let cursor = self.load_cursor();
         let since = cursor
             .last_push_at
@@ -379,15 +385,18 @@ impl SyncClient {
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
 
-        // Get local-only, non-private facts (source_receipt doesn't start with "sync:")
-        let local_facts: Vec<&Fact> = store
+        store
             .all_facts()
             .filter(|f| !f.deleted)
             .filter(|f| !self.is_private(f))
             .filter(|f| f.source_receipt.as_deref().is_none_or(|r| !r.starts_with("sync:")))
             .filter(|f| since.is_none_or(|s| f.stored_at > s))
-            .collect();
+            .cloned()
+            .collect()
+    }
 
+    /// Push an already-snapshotted set of facts without touching the store.
+    pub fn push_facts(&self, local_facts: &[Fact]) -> Result<SyncPushResult, String> {
         if local_facts.is_empty() {
             return Ok(SyncPushResult { facts_pushed: 0 });
         }

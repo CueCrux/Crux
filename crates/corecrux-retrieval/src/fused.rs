@@ -152,9 +152,8 @@ pub fn fused_retrieve(
         req.weights.clone()
     };
 
-    // Compute tenant filter: lo16 for BM25 fast-path, full hash for exact verification
+    // Compute tenant filter: BM25 receives the full hash and uses lo16 only as a fast precheck.
     let tenant_hash = xxhash_rust::xxh64::xxh64(req.tenant_id.as_bytes(), 0);
-    let tenant_lo16 = (tenant_hash & 0xFFFF) as u16;
 
     // Phase 1: BM25 scoring
     let bm25_params = Bm25Params::default();
@@ -165,13 +164,11 @@ pub fn fused_retrieve(
         &reader_refs,
         &req.query,
         bm25_pool_size,
-        Some(tenant_lo16),
+        Some(tenant_hash),
         &bm25_params,
     );
 
-    // Exact tenant isolation: lo16 is the fast-path filter in BM25 postings scan,
-    // but a 16-bit hash can collide (~1/65K per tenant pair). Filter surviving hits
-    // using the full 64-bit hash to guarantee zero cross-tenant leakage.
+    // Keep a defensive exact filter here in case older in-memory indexes are ever wired in.
     let bm25_hits: Vec<MergedBm25Hit> = bm25_hits
         .into_iter()
         .filter(|h| h.tenant_hash_full == tenant_hash)

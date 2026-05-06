@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::dispatch::McpContext;
-use crate::protocol::{JsonRpcError, INVALID_PARAMS};
+use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
 use crate::scope;
 use corecrux_memory::fact_store::{Fact, FactQuery, StoreFact};
 
@@ -53,7 +53,11 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     };
 
     let mut store = ctx.fact_store.write().await;
-    let fact = store.store(req);
+    let fact = store.try_store(req).map_err(|err| JsonRpcError {
+        code: INTERNAL_ERROR,
+        message: "fact journal append failed".to_string(),
+        data: Some(json!({"error": err.to_string()})),
+    })?;
     let display_entity = scope::visible_entity_for_agent(&fact, agent_name).unwrap_or_else(|| fact.entity.clone());
 
     let supersedes_msg = match &fact.supersedes {
@@ -162,7 +166,11 @@ pub async fn handle_delete_fact(args: &Value, ctx: &McpContext) -> Result<Value,
     let deleted = store
         .get(fact_id)
         .is_some_and(|fact| scope::fact_visible_to_agent(fact, agent_name))
-        && store.delete(fact_id);
+        && store.try_delete(fact_id).map_err(|err| JsonRpcError {
+            code: INTERNAL_ERROR,
+            message: "fact journal append failed".to_string(),
+            data: Some(json!({"error": err.to_string()})),
+        })?;
 
     if deleted {
         Ok(json!({

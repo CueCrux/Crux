@@ -170,6 +170,15 @@ fn dev_scope_headers(scopes: &str) -> HeaderMap {
     headers
 }
 
+fn dev_scope_passport_headers(scopes: &str, passport_id: &str) -> HeaderMap {
+    let mut headers = dev_scope_headers(scopes);
+    headers.insert(
+        "x-corecrux-passport-id",
+        HeaderValue::from_str(passport_id).expect("valid test passport header"),
+    );
+    headers
+}
+
 async fn json_body(resp: Response) -> serde_json::Value {
     let bytes = to_bytes(resp.into_body(), 1_048_576).await.expect("read body");
     serde_json::from_slice(&bytes).expect("json body")
@@ -1295,7 +1304,7 @@ async fn query_facts_accepts_admin_read_fallback_in_dev_scopes_mode() {
         confidence: 1.0,
         private: false,
     };
-    let _ = facts::put_fact(State(state.clone()), dev_scope_headers("admin:read"), Json(body))
+    let _ = facts::put_fact(State(state.clone()), dev_scope_headers("facts:write"), Json(body))
         .await
         .into_response();
 
@@ -1454,7 +1463,7 @@ async fn get_session_state_accepts_admin_read_fallback_in_dev_scopes_mode() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let _ = facts::put_session_state(
         State(state.clone()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("sessions:write"),
         Path("sess-admin".to_string()),
         Json(serde_json::json!({"step": 2})),
     )
@@ -1504,9 +1513,9 @@ async fn put_session_state_overwrites() {
 }
 
 #[tokio::test]
-async fn fact_and_session_endpoints_accept_admin_read_fallback_in_dev_scopes_mode() {
+async fn fact_and_session_endpoints_use_read_and_write_scopes_in_dev_scopes_mode() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
-    let admin_headers = dev_scope_headers("admin:read");
+    let admin_headers = dev_scope_headers("admin:read admin:write");
 
     let create_resp = facts::put_fact(
         State(state.clone()),
@@ -1643,6 +1652,138 @@ async fn query_facts_supports_entity_prefix_top_k_and_token_budget() {
     assert!(body["total_tokens"].as_u64().unwrap() > 0);
 }
 
+#[tokio::test]
+async fn query_facts_applies_passport_private_visibility() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "public".to_string(),
+            key: "status".to_string(),
+            value: "shared".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: crux_mcp::scope::private_entity_for_agent("alice", "notes"),
+            key: "secret".to_string(),
+            value: "alice-only".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+        });
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: crux_mcp::scope::private_entity_for_agent("bob", "notes"),
+            key: "secret".to_string(),
+            value: "bob-only".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+        });
+    }
+
+    let params = QueryFactsParams {
+        query: None,
+        entity: None,
+        entity_prefix: None,
+        top_k: Some(10),
+        token_budget: None,
+    };
+    let alice = facts::query_facts(
+        State(state.clone()),
+        dev_scope_passport_headers("query:read", "alice"),
+        Query(params),
+    )
+    .await
+    .into_response();
+    assert_eq!(alice.status(), StatusCode::OK);
+    let body = json_body(alice).await;
+    let text = serde_json::to_string(&body["facts"]).expect("facts json");
+    assert!(text.contains("alice-only"));
+    assert!(text.contains("\"entity\":\"notes\""));
+    assert!(!text.contains("bob-only"));
+
+    let anonymous_params = QueryFactsParams {
+        query: None,
+        entity: None,
+        entity_prefix: None,
+        top_k: Some(10),
+        token_budget: None,
+    };
+    let anonymous = facts::query_facts(
+        State(state.clone()),
+        dev_scope_headers("query:read"),
+        Query(anonymous_params),
+    )
+    .await
+    .into_response();
+    let body = json_body(anonymous).await;
+    let text = serde_json::to_string(&body["facts"]).expect("facts json");
+    assert!(text.contains("shared"));
+    assert!(!text.contains("alice-only"));
+    assert!(!text.contains("bob-only"));
+
+    let admin_params = QueryFactsParams {
+        query: None,
+        entity: None,
+        entity_prefix: None,
+        top_k: Some(10),
+        token_budget: None,
+    };
+    let admin = facts::query_facts(State(state), dev_scope_headers("admin:read"), Query(admin_params))
+        .await
+        .into_response();
+    let body = json_body(admin).await;
+    let text = serde_json::to_string(&body["facts"]).expect("facts json");
+    assert!(text.contains("__agent::alice::notes"));
+    assert!(text.contains("__agent::bob::notes"));
+}
+
+#[tokio::test]
+async fn http_session_state_with_passport_uses_mcp_session_scope() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let save = facts::put_session_state(
+        State(state.clone()),
+        dev_scope_passport_headers("sessions:write", "alice"),
+        Path("sess-42".to_string()),
+        Json(serde_json::json!({"step": 1})),
+    )
+    .await
+    .into_response();
+    assert_eq!(save.status(), StatusCode::OK);
+    let save_body = json_body(save).await;
+    assert_eq!(save_body["session_id"], "sess-42");
+    assert!(state
+        .session_store
+        .read()
+        .await
+        .get("__agent_session::alice::sess-42")
+        .is_some());
+
+    let bob = facts::get_session_state(
+        State(state.clone()),
+        dev_scope_passport_headers("query:read", "bob"),
+        Path("sess-42".to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(bob.status(), StatusCode::NOT_FOUND);
+
+    let alice = facts::get_session_state(
+        State(state),
+        dev_scope_passport_headers("query:read", "alice"),
+        Path("sess-42".to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(alice.status(), StatusCode::OK);
+    let alice_body = json_body(alice).await;
+    assert_eq!(alice_body["session_id"], "sess-42");
+    assert_eq!(alice_body["state"]["step"], 1);
+}
+
 // ── Text Search (POST /v1/query/text-search) ────────────────────
 //
 // NOTE: text-search tests rely on the CORECRUXD_QUERY_TEXT_SEARCH env var
@@ -1765,6 +1906,52 @@ async fn text_search_empty_query_returns_400() {
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn text_search_query_read_requires_non_empty_tenant_id() {
+    enable_text_search();
+
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let body = query::TextSearchBody {
+        tenant_id: String::new(),
+        query: "hello".to_string(),
+        limit: 10,
+        token_budget: None,
+        min_score: None,
+        mode: None,
+        include_receipt: None,
+    };
+
+    let resp = query::post_query_text_search(State(state), dev_scope_headers("query:read"), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn text_search_admin_can_explicitly_query_all_tenants() {
+    enable_text_search();
+
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let ccxi_bytes = build_test_ccxi(&["hello world test document"]);
+    load_test_index(&state, &ccxi_bytes).await;
+    let body = query::TextSearchBody {
+        tenant_id: "*".to_string(),
+        query: "hello".to_string(),
+        limit: 10,
+        token_budget: None,
+        min_score: None,
+        mode: None,
+        include_receipt: None,
+    };
+
+    let resp = query::post_query_text_search(State(state), dev_scope_headers("admin:read"), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["results"].as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -1992,7 +2179,7 @@ async fn fact_endpoints_require_auth_in_dev_scopes_mode() {
         .into_response();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    // PUT /v1/facts — with query:read → 201
+    // PUT /v1/facts — with query:read only → 403
     let body2 = corecrux_memory::fact_store::StoreFact {
         entity: "e".to_string(),
         key: "k".to_string(),
@@ -2004,7 +2191,7 @@ async fn fact_endpoints_require_auth_in_dev_scopes_mode() {
     let resp2 = put_fact(State(state.clone()), dev_scope_headers("query:read"), Json(body2))
         .await
         .into_response();
-    assert_eq!(resp2.status(), StatusCode::CREATED);
+    assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
 
     // GET /v1/sessions/{id}/state — no scopes → 401
     let resp3 = facts::get_session_state(State(state), HeaderMap::new(), Path("sess".to_string()))
@@ -5757,7 +5944,7 @@ async fn passports_post_duplicate_id_returns_409() {
 #[tokio::test]
 async fn passports_patch_updates_gate_and_default_flag() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
-    super::passports::post_passport(
+    let _ = super::passports::post_passport(
         State(state.clone()),
         dev_scope_headers("admin:read"),
         Json(super::passports::CreatePassportBody {
@@ -5793,7 +5980,7 @@ async fn passports_patch_updates_gate_and_default_flag() {
 #[tokio::test]
 async fn passports_delete_removes_record() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
-    super::passports::post_passport(
+    let _ = super::passports::post_passport(
         State(state.clone()),
         dev_scope_headers("admin:read"),
         Json(super::passports::CreatePassportBody {
@@ -5931,7 +6118,7 @@ async fn projects_add_unknown_passport_returns_404() {
         let mut store = state.fact_store.write().await;
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
     }
-    super::projects::post_project(
+    let _ = super::projects::post_project(
         State(state.clone()),
         dev_scope_headers("admin:read"),
         Json(super::projects::CreateProjectBody {
@@ -5969,7 +6156,7 @@ async fn projects_delete_removes_subentities() {
         let mut store = state.fact_store.write().await;
         crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
     }
-    super::projects::post_project(
+    let _ = super::projects::post_project(
         State(state.clone()),
         dev_scope_headers("admin:read"),
         Json(super::projects::CreateProjectBody {
@@ -6227,7 +6414,7 @@ async fn github_connect_requires_install_scope() {
 async fn github_disconnect_clears_credentials() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
 
-    super::integrations_github::post_connect(
+    let _ = super::integrations_github::post_connect(
         State(state.clone()),
         dev_scope_headers("integrations:install"),
         Json(super::integrations_github::ConnectGithubBody {
@@ -6277,7 +6464,7 @@ async fn github_repo_select_then_list_then_delete_round_trip() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
 
     // Connect first (skip_verify so no network).
-    super::integrations_github::post_connect(
+    let _ = super::integrations_github::post_connect(
         State(state.clone()),
         dev_scope_headers("integrations:install"),
         Json(super::integrations_github::ConnectGithubBody {
@@ -6328,7 +6515,7 @@ async fn github_repo_select_then_list_then_delete_round_trip() {
 #[tokio::test]
 async fn github_disconnect_clears_selected_repos_too() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
-    super::integrations_github::post_connect(
+    let _ = super::integrations_github::post_connect(
         State(state.clone()),
         dev_scope_headers("integrations:install"),
         Json(super::integrations_github::ConnectGithubBody {
@@ -6339,7 +6526,7 @@ async fn github_disconnect_clears_selected_repos_too() {
     )
     .await
     .into_response();
-    super::integrations_github::post_select_repo(
+    let _ = super::integrations_github::post_select_repo(
         State(state.clone()),
         Path(("a".to_string(), "b".to_string())),
         dev_scope_headers("integrations:install"),
@@ -6347,9 +6534,10 @@ async fn github_disconnect_clears_selected_repos_too() {
     .await
     .into_response();
 
-    super::integrations_github::post_disconnect(State(state.clone()), dev_scope_headers("integrations:disable"))
-        .await
-        .into_response();
+    let _ =
+        super::integrations_github::post_disconnect(State(state.clone()), dev_scope_headers("integrations:disable"))
+            .await
+            .into_response();
 
     let list = super::integrations_github::get_selected_repos(State(state), dev_scope_headers("admin:read"))
         .await
@@ -6496,7 +6684,7 @@ async fn planes_list_requires_admin_read() {
 async fn planes_member_round_trip() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     seed_project_for_planes_tests(&state).await;
-    super::planes::post_plane(
+    let _ = super::planes::post_plane(
         State(state.clone()),
         Path("alpha".to_string()),
         dev_scope_headers("admin:read facts:write"),
@@ -6538,7 +6726,7 @@ async fn planes_member_round_trip() {
 async fn planes_layer_put_then_get_then_delete() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     seed_project_for_planes_tests(&state).await;
-    super::planes::post_plane(
+    let _ = super::planes::post_plane(
         State(state.clone()),
         Path("alpha".to_string()),
         dev_scope_headers("admin:read facts:write"),
@@ -6592,7 +6780,7 @@ async fn planes_layer_put_then_get_then_delete() {
 async fn planes_delete_removes_record() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     seed_project_for_planes_tests(&state).await;
-    super::planes::post_plane(
+    let _ = super::planes::post_plane(
         State(state.clone()),
         Path("alpha".to_string()),
         dev_scope_headers("admin:read facts:write"),

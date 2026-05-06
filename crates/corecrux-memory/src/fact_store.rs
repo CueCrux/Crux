@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 enum JournalEvent {
     #[serde(rename = "store")]
     Store { fact: Fact },
+    #[serde(rename = "store_batch")]
+    StoreBatch { facts: Vec<Fact> },
     #[serde(rename = "delete")]
     Delete { fact_id: String, deleted_at: String },
 }
@@ -153,20 +155,14 @@ impl FactStore {
         Ok(store)
     }
 
-    /// Append a journal event to the JSONL file. Best-effort: logs a warning
-    /// on IO error but never panics or propagates the error.
-    fn append_journal(&self, event: &JournalEvent) {
+    /// Append a journal event to the JSONL file.
+    fn append_journal(&self, event: &JournalEvent) -> std::io::Result<()> {
         if let Some(path) = &self.journal_path {
-            let result = (|| -> std::io::Result<()> {
-                let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-                let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
-                writeln!(file, "{}", line)?;
-                Ok(())
-            })();
-            if let Err(err) = result {
-                tracing::warn!(?err, path = %path.display(), "fact-journal-append-failed");
-            }
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+            let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+            writeln!(file, "{}", line)?;
         }
+        Ok(())
     }
 
     /// Replay a JSONL journal file to rebuild in-memory state.
@@ -183,6 +179,11 @@ impl FactStore {
             match serde_json::from_str::<JournalEvent>(trimmed) {
                 Ok(JournalEvent::Store { fact }) => {
                     self.replay_journal_insert(fact);
+                }
+                Ok(JournalEvent::StoreBatch { facts }) => {
+                    for fact in facts {
+                        self.replay_journal_insert(fact);
+                    }
                 }
                 Ok(JournalEvent::Delete { fact_id, .. }) => {
                     if let Some(fact) = self.facts.get_mut(&fact_id) {
@@ -211,10 +212,7 @@ impl FactStore {
         self.facts.insert(fact_id, fact);
     }
 
-    /// Store a fact and return it. If a fact with the same (entity, key) already
-    /// exists, the new fact is assigned the next version number and links to the
-    /// previous version via `supersedes`.
-    pub fn store(&mut self, req: StoreFact) -> Fact {
+    fn build_fact(&self, req: StoreFact) -> Fact {
         let fact_id = format!("f_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let tokens = estimate_tokens(&req.value);
 
@@ -233,7 +231,7 @@ impl FactStore {
             None => (1, None),
         };
 
-        let fact = Fact {
+        Fact {
             fact_id: fact_id.clone(),
             entity: req.entity.clone(),
             key: req.key.clone(),
@@ -246,15 +244,22 @@ impl FactStore {
             version,
             supersedes,
             private: req.private,
-        };
+        }
+    }
 
-        self.entity_index.entry(req.entity).or_default().push(fact_id.clone());
-        self.key_index.entry(key_pair).or_default().push(fact_id.clone());
-        self.facts.insert(fact_id, fact.clone());
+    fn insert_fact_indexes(&mut self, fact: &Fact) {
+        self.entity_index
+            .entry(fact.entity.clone())
+            .or_default()
+            .push(fact.fact_id.clone());
+        self.key_index
+            .entry((fact.entity.clone(), fact.key.clone()))
+            .or_default()
+            .push(fact.fact_id.clone());
+        self.facts.insert(fact.fact_id.clone(), fact.clone());
+    }
 
-        self.append_journal(&JournalEvent::Store { fact: fact.clone() });
-
-        // Embed the fact value if an embedding client is configured.
+    fn after_fact_stored(&mut self, fact: &Fact) {
         if let Some(client) = &self.embedding_client {
             let text = format!("{} {} {}", fact.entity, fact.key, fact.value);
             match client.embed_one(&text) {
@@ -274,8 +279,28 @@ impl FactStore {
                 key: fact.key.clone(),
             });
         }
+    }
 
+    /// Store a fact and return it. If a fact with the same (entity, key) already
+    /// exists, the new fact is assigned the next version number and links to the
+    /// previous version via `supersedes`.
+    pub fn store(&mut self, req: StoreFact) -> Fact {
+        let fact = self.build_fact(req);
+        self.insert_fact_indexes(&fact);
+        if let Err(err) = self.append_journal(&JournalEvent::Store { fact: fact.clone() }) {
+            tracing::warn!(?err, "fact-journal-append-failed");
+        }
+        self.after_fact_stored(&fact);
         fact
+    }
+
+    /// Store a fact only after its journal event has been durably appended.
+    pub fn try_store(&mut self, req: StoreFact) -> std::io::Result<Fact> {
+        let fact = self.build_fact(req);
+        self.append_journal(&JournalEvent::Store { fact: fact.clone() })?;
+        self.insert_fact_indexes(&fact);
+        self.after_fact_stored(&fact);
+        Ok(fact)
     }
 
     /// Store multiple facts in a batch.
@@ -283,14 +308,27 @@ impl FactStore {
         reqs.into_iter().map(|r| self.store(r)).collect()
     }
 
+    /// Store multiple facts, aborting before mutation if any journal append fails.
+    pub fn try_store_bulk(&mut self, reqs: Vec<StoreFact>) -> std::io::Result<Vec<Fact>> {
+        let facts: Vec<Fact> = reqs.into_iter().map(|req| self.build_fact(req)).collect();
+        self.append_journal(&JournalEvent::StoreBatch { facts: facts.clone() })?;
+        for fact in &facts {
+            self.insert_fact_indexes(fact);
+            self.after_fact_stored(fact);
+        }
+        Ok(facts)
+    }
+
     /// Soft-delete a fact by ID. Returns true if the fact existed.
     pub fn delete(&mut self, fact_id: &str) -> bool {
         if let Some(fact) = self.facts.get_mut(fact_id) {
             fact.deleted = true;
-            self.append_journal(&JournalEvent::Delete {
+            if let Err(err) = self.append_journal(&JournalEvent::Delete {
                 fact_id: fact_id.to_string(),
                 deleted_at: Utc::now().to_rfc3339(),
-            });
+            }) {
+                tracing::warn!(?err, "fact-journal-append-failed");
+            }
             if let Some(bus) = &self.event_bus {
                 bus.emit(crate::events::CruxEvent::FactDeleted {
                     fact_id: fact_id.to_string(),
@@ -299,6 +337,28 @@ impl FactStore {
             true
         } else {
             false
+        }
+    }
+
+    /// Soft-delete a fact only after its tombstone has been durably appended.
+    pub fn try_delete(&mut self, fact_id: &str) -> std::io::Result<bool> {
+        if !self.facts.contains_key(fact_id) {
+            return Ok(false);
+        }
+        self.append_journal(&JournalEvent::Delete {
+            fact_id: fact_id.to_string(),
+            deleted_at: Utc::now().to_rfc3339(),
+        })?;
+        if let Some(fact) = self.facts.get_mut(fact_id) {
+            fact.deleted = true;
+            if let Some(bus) = &self.event_bus {
+                bus.emit(crate::events::CruxEvent::FactDeleted {
+                    fact_id: fact_id.to_string(),
+                });
+            }
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
@@ -518,7 +578,9 @@ impl FactStore {
         self.key_index.entry((entity, key)).or_default().push(fact_id.clone());
         self.facts.insert(fact_id, fact.clone());
 
-        self.append_journal(&JournalEvent::Store { fact });
+        if let Err(err) = self.append_journal(&JournalEvent::Store { fact }) {
+            tracing::warn!(?err, "fact-journal-append-failed");
+        }
     }
 
     /// Return all versions of a fact for a given (entity, key) pair, ordered by
@@ -1115,6 +1177,44 @@ mod tests {
             assert_eq!(history[1].version, 2);
             assert_eq!(history[1].value, "active");
             assert_eq!(history[1].supersedes, Some(history[0].fact_id.clone()));
+        }
+    }
+
+    #[test]
+    fn try_store_bulk_persists_as_one_replayable_batch() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let facts = store
+                .try_store_bulk(vec![
+                    StoreFact {
+                        entity: "a".into(),
+                        key: "k1".into(),
+                        value: "v1".into(),
+                        source_receipt: None,
+                        confidence: 1.0,
+                        private: false,
+                    },
+                    StoreFact {
+                        entity: "b".into(),
+                        key: "k2".into(),
+                        value: "v2".into(),
+                        source_receipt: None,
+                        confidence: 1.0,
+                        private: false,
+                    },
+                ])
+                .unwrap();
+            assert_eq!(facts.len(), 2);
+            assert_eq!(store.count(), 2);
+        }
+
+        {
+            let store = FactStore::with_persistence(dir.path()).unwrap();
+            assert_eq!(store.count(), 2);
+            assert_eq!(store.get_by_entity("a").len(), 1);
+            assert_eq!(store.get_by_entity("b").len(), 1);
         }
     }
 
