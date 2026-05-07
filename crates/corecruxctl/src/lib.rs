@@ -11,6 +11,7 @@ pub mod audit_pack;
 pub mod benchmark;
 pub mod evidence;
 pub mod explain;
+pub mod extensions;
 pub mod fixture_digest;
 pub mod gaps;
 pub mod inspect_receipt;

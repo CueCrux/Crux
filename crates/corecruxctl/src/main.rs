@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use corecruxctl::{
-    admin, audit_pack, evidence, explain, fixture_digest, gaps, inspect_receipt, parity, projections, receipts,
-    reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import, storage, structured_log, tooling_env,
+    admin, audit_pack, evidence, explain, extensions, fixture_digest, gaps, inspect_receipt, parity, projections,
+    receipts, reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import, storage, structured_log, tooling_env,
     verify_store,
 };
 
@@ -367,6 +367,44 @@ enum Command {
         /// Compare two previous benchmark reports.
         #[arg(long)]
         compare: Option<Vec<String>>,
+    },
+
+    /// Community-extensions registry tooling (M8 of community-extensions ExecPlan).
+    #[command(name = "extensions")]
+    Extensions {
+        #[command(subcommand)]
+        command: ExtensionsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ExtensionsCommand {
+    /// Download the curator-signed registry index, verify its
+    /// signature against the supplied curator public key, and cache
+    /// the verified bytes under `<data-dir>/extensions/registry/index.json`.
+    Sync {
+        /// HTTPS URL of the registry index (e.g.
+        /// `https://raw.githubusercontent.com/CueCrux/community-extensions/main/index.json`).
+        #[arg(long)]
+        url: String,
+        /// Curator passport fingerprint (the `passport_fpr` field on
+        /// the signed index).
+        #[arg(long)]
+        pubkey_fpr: String,
+        /// Curator public key, hex-encoded (64 lowercase chars).
+        #[arg(long)]
+        pubkey_hex: String,
+        /// Daemon data directory; the cache lands at
+        /// `<data-dir>/extensions/registry/index.json`.
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Pretty-print the cached registry from
+    /// `<data-dir>/extensions/registry/index.json`. Run `sync` first
+    /// to populate the cache.
+    ListRegistry {
+        #[arg(long)]
+        data_dir: PathBuf,
     },
 }
 
@@ -1846,6 +1884,52 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             Ok(())
         }
+        Command::Extensions { command } => match command {
+            ExtensionsCommand::Sync {
+                url,
+                pubkey_fpr,
+                pubkey_hex,
+                data_dir,
+            } => {
+                let index = extensions::sync(&url, &pubkey_fpr, &pubkey_hex, &data_dir)?;
+                println!("Verified registry index from {url}");
+                println!("  curator:        {}", index.curator_passport_fpr);
+                println!("  updated_at_ms:  {}", index.updated_at_unix_ms);
+                println!("  entries:        {}", index.entries.len());
+                println!(
+                    "  cached at:      {}",
+                    extensions::cached_index_path(&data_dir).display()
+                );
+                for entry in &index.entries {
+                    println!(
+                        "  - {:<32} v{}  {:?}  {:?}",
+                        entry.id, entry.version, entry.kind, entry.trust_tier
+                    );
+                }
+                Ok(())
+            }
+            ExtensionsCommand::ListRegistry { data_dir } => {
+                let index = extensions::list_registry(&data_dir)?;
+                let path = extensions::cached_index_path(&data_dir);
+                println!("Cached registry: {}", path.display());
+                println!("  curator:        {}", index.curator_passport_fpr);
+                println!("  updated_at_ms:  {}", index.updated_at_unix_ms);
+                println!("  entries:        {}", index.entries.len());
+                println!();
+                for entry in &index.entries {
+                    println!("• {} (v{})", entry.name, entry.version);
+                    println!("    id:           {}", entry.id);
+                    println!("    kind:         {:?}", entry.kind);
+                    println!("    trust_tier:   {:?}", entry.trust_tier);
+                    println!("    summary:      {}", entry.summary);
+                    println!("    repo:         {}", entry.repo_url);
+                    println!("    manifest_url: {}", entry.manifest_url);
+                    println!("    sha256:       {}", entry.manifest_sha256);
+                    println!();
+                }
+                Ok(())
+            }
+        },
     }
 }
 

@@ -25,6 +25,12 @@ pub const INTEGRATION_SCHEMA_V1: &str = "crux.integration.v1";
 pub const FIRST_PARTY_PASSPORT: &str = "cuecrux:first-party";
 pub const INTEGRATION_INDEX_SCHEMA_V1: &str = "crux.integration.index.v1";
 
+/// On-the-wire schema for the community-extensions registry index
+/// (M8 of the community-extensions ExecPlan). Curator-signed JSON
+/// document hosted at a stable URL (e.g.
+/// `https://raw.githubusercontent.com/CueCrux/community-extensions/main/index.json`).
+pub const COMMUNITY_REGISTRY_SCHEMA_V1: &str = "crux.community-extensions.index.v1";
+
 const ALLOWED_CAPABILITIES: &[&str] = &[
     "integrations:read",
     "integrations:install",
@@ -574,6 +580,148 @@ impl IntegrationManifest {
     pub fn manifest_hash(&self) -> Result<String, IntegrationError> {
         let bytes = self.signing_payload()?;
         Ok(format!("blake3:{}", blake3::hash(&bytes).to_hex()))
+    }
+}
+
+// ── Community-extensions registry index (M8) ────────────────────────────
+
+/// One row in a curator-signed [`CommunityExtensionsIndex`]. Carries
+/// enough metadata for the operator to decide whether to install,
+/// plus the content-addressable shas the daemon uses to verify the
+/// downloaded manifest + module bytes are exactly the ones the
+/// curator endorsed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityExtensionEntry {
+    /// Extension id (e.g. `ext.quote`, `ext.summarise`). Matches the
+    /// id inside the published manifest.
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub summary: String,
+    /// Public HTTPS URL the manifest can be fetched from.
+    pub manifest_url: String,
+    /// SHA-256 of the canonical manifest JSON bytes (lowercase hex).
+    pub manifest_sha256: String,
+    /// Homepage / source-code URL for humans.
+    pub repo_url: String,
+    /// What kind of extension this is. Lets the console render the
+    /// right "Phase A external-tool / Phase B WASM" badge before
+    /// download.
+    pub kind: EntryKind,
+    /// Trust tier the curator has assigned. Operators can override
+    /// at install time via their local keyring.
+    pub trust_tier: TrustTier,
+}
+
+/// Curator-signed registry index. Sync flow:
+/// 1. HTTPS GET the index from a configured URL.
+/// 2. Verify the signature against the curator's public key.
+/// 3. Cache the verified index under
+///    `<data_dir>/extensions/registry/index.json`.
+/// 4. `corecruxctl extensions list-registry` and the console render
+///    the cached entries; install is still explicit per-extension.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityExtensionsIndex {
+    pub schema: String,
+    pub updated_at_unix_ms: u64,
+    #[serde(default)]
+    pub curator_passport_fpr: String,
+    #[serde(default)]
+    pub entries: Vec<CommunityExtensionEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<SignatureEnvelope>,
+}
+
+#[derive(Debug, Serialize)]
+struct CommunityIndexSigningPayload<'a> {
+    schema: &'a str,
+    updated_at_unix_ms: u64,
+    curator_passport_fpr: &'a str,
+    entries: &'a [CommunityExtensionEntry],
+}
+
+impl CommunityExtensionsIndex {
+    pub fn new(curator_passport_fpr: impl Into<String>, now_unix_ms: u64) -> Self {
+        Self {
+            schema: COMMUNITY_REGISTRY_SCHEMA_V1.to_string(),
+            updated_at_unix_ms: now_unix_ms,
+            curator_passport_fpr: curator_passport_fpr.into(),
+            entries: Vec::new(),
+            signature: None,
+        }
+    }
+
+    fn signing_payload(&self) -> Result<Vec<u8>, IntegrationError> {
+        let payload = CommunityIndexSigningPayload {
+            schema: &self.schema,
+            updated_at_unix_ms: self.updated_at_unix_ms,
+            curator_passport_fpr: &self.curator_passport_fpr,
+            entries: &self.entries,
+        };
+        Ok(serde_json::to_vec(&payload)?)
+    }
+
+    /// Sign the index in place with the given Ed25519 key. The matching
+    /// public key (looked up by `curator_passport_fpr`) MUST be present
+    /// in the operator's `ValidationPolicy.trusted_public_keys` for
+    /// [`Self::verify`] to succeed.
+    pub fn sign(&mut self, signing_key: &ed25519_dalek::SigningKey) -> Result<(), IntegrationError> {
+        use ed25519_dalek::Signer as _;
+        if self.curator_passport_fpr.is_empty() {
+            return Err(IntegrationError::MissingField("curator_passport_fpr"));
+        }
+        let payload = self.signing_payload()?;
+        let signature = signing_key.sign(&payload);
+        let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+        self.signature = Some(SignatureEnvelope {
+            alg: "ed25519".to_string(),
+            passport_fpr: self.curator_passport_fpr.clone(),
+            public_key_hex: Some(public_key_hex),
+            sig: base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
+        });
+        Ok(())
+    }
+
+    /// Verify the signature against `policy.trusted_public_keys`. Same
+    /// semantics as [`IntegrationManifest::validate`]'s signature path:
+    /// inline `signature.public_key_hex` is permitted ONLY if it
+    /// matches the trusted-keyring entry for `passport_fpr`.
+    pub fn verify(&self, policy: &ValidationPolicy) -> Result<(), IntegrationError> {
+        if self.schema != COMMUNITY_REGISTRY_SCHEMA_V1 {
+            return Err(IntegrationError::InvalidSchema(self.schema.clone()));
+        }
+        let signature = self.signature.as_ref().ok_or(IntegrationError::SignatureRequired)?;
+        if signature.alg != "ed25519" {
+            return Err(IntegrationError::UnsupportedSignatureAlgorithm(signature.alg.clone()));
+        }
+        let key_hex = policy
+            .trusted_public_keys
+            .get(&signature.passport_fpr)
+            .ok_or_else(|| IntegrationError::MissingTrustedKey(signature.passport_fpr.clone()))?;
+        if signature
+            .public_key_hex
+            .as_ref()
+            .is_some_and(|inline| !inline.eq_ignore_ascii_case(key_hex))
+        {
+            return Err(IntegrationError::InvalidSignatureMaterial(
+                "signature public_key_hex does not match trusted keyring entry".to_string(),
+            ));
+        }
+        let pk_bytes = decode_fixed_hex::<32>(key_hex, "public key")?;
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
+            .map_err(|e| IntegrationError::InvalidSignatureMaterial(format!("public key: {e}")))?;
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&signature.sig)
+            .map_err(|e| IntegrationError::InvalidSignatureMaterial(format!("signature base64: {e}")))?;
+        let sig: [u8; 64] = sig_bytes
+            .try_into()
+            .map_err(|_| IntegrationError::InvalidSignatureMaterial("signature length".into()))?;
+        let signature_obj = ed25519_dalek::Signature::from_bytes(&sig);
+        let payload = self.signing_payload()?;
+        verifying_key
+            .verify_strict(&payload, &signature_obj)
+            .map_err(|_| IntegrationError::SignatureInvalid)?;
+        Ok(())
     }
 }
 
@@ -1387,6 +1535,109 @@ mod tests {
                 capability
             }) if pack_id == "mcp.cursor" && capability == "facts:write"
         ));
+        Ok(())
+    }
+
+    // ── M8: community-extensions registry index ────────────────────────
+
+    #[test]
+    fn community_index_sign_then_verify_round_trip() -> Result<(), IntegrationError> {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xab_u8; 32]);
+        let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+        let curator_fpr = "p_curator_test".to_string();
+
+        let mut index = CommunityExtensionsIndex::new(curator_fpr.clone(), 1_700_000_000_000);
+        index.entries.push(CommunityExtensionEntry {
+            id: "ext.quote".to_string(),
+            name: "Quote".to_string(),
+            version: "0.1.0".to_string(),
+            summary: "Reference Phase A external tool.".to_string(),
+            manifest_url: "https://example.com/manifest.json".to_string(),
+            manifest_sha256: "0".repeat(64),
+            repo_url: "https://github.com/CueCrux/example-extension-quote-of-the-day".to_string(),
+            kind: EntryKind::ExternalTool,
+            trust_tier: TrustTier::CommunityReviewed,
+        });
+
+        index.sign(&signing_key)?;
+        assert!(index.signature.is_some());
+
+        let mut policy = ValidationPolicy::default();
+        policy.trusted_public_keys.insert(curator_fpr.clone(), public_key_hex);
+        index.verify(&policy)?;
+        Ok(())
+    }
+
+    #[test]
+    fn community_index_rejects_tampered_entries_after_signing() -> Result<(), IntegrationError> {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xcd_u8; 32]);
+        let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+        let curator_fpr = "p_curator_test_tamper".to_string();
+
+        let mut index = CommunityExtensionsIndex::new(curator_fpr.clone(), 1_700_000_000_000);
+        index.entries.push(CommunityExtensionEntry {
+            id: "ext.quote".to_string(),
+            name: "Quote".to_string(),
+            version: "0.1.0".to_string(),
+            summary: "Original.".to_string(),
+            manifest_url: "https://example.com/manifest.json".to_string(),
+            manifest_sha256: "0".repeat(64),
+            repo_url: "https://github.com/x".to_string(),
+            kind: EntryKind::ExternalTool,
+            trust_tier: TrustTier::CommunityReviewed,
+        });
+        index.sign(&signing_key)?;
+
+        // Tamper a published field.
+        index.entries[0].manifest_url = "https://attacker.example.com/evil-manifest.json".to_string();
+
+        let mut policy = ValidationPolicy::default();
+        policy.trusted_public_keys.insert(curator_fpr, public_key_hex);
+        let err = index.verify(&policy).err().expect("verify must fail post-tamper");
+        assert!(matches!(err, IntegrationError::SignatureInvalid), "got {err:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn community_index_rejects_inline_pubkey_that_doesnt_match_keyring() -> Result<(), IntegrationError> {
+        let curator_key = ed25519_dalek::SigningKey::from_bytes(&[0xee_u8; 32]);
+        let curator_pub = hex::encode(curator_key.verifying_key().to_bytes());
+        let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0x11_u8; 32]);
+        let attacker_pub = hex::encode(attacker_key.verifying_key().to_bytes());
+        let curator_fpr = "p_curator_real".to_string();
+
+        let mut index = CommunityExtensionsIndex::new(curator_fpr.clone(), 1_700_000_000_000);
+        index.entries.push(CommunityExtensionEntry {
+            id: "ext.x".to_string(),
+            name: "X".to_string(),
+            version: "0.1.0".to_string(),
+            summary: "X.".to_string(),
+            manifest_url: "https://example.com/m.json".to_string(),
+            manifest_sha256: "0".repeat(64),
+            repo_url: "https://example.com/repo".to_string(),
+            kind: EntryKind::ExternalTool,
+            trust_tier: TrustTier::CommunityReviewed,
+        });
+        // Sign with the attacker key but fpr says it's the curator.
+        index.sign(&attacker_key)?;
+        // Override the signature's inline public_key_hex to claim
+        // it's the curator's. Verify must reject because the keyring
+        // entry doesn't match the inline value.
+        if let Some(sig) = &mut index.signature {
+            sig.public_key_hex = Some(attacker_pub.clone());
+            sig.passport_fpr = curator_fpr.clone();
+        }
+
+        let mut policy = ValidationPolicy::default();
+        policy.trusted_public_keys.insert(curator_fpr, curator_pub);
+        let err = index
+            .verify(&policy)
+            .err()
+            .expect("verify must reject mismatched inline pubkey");
+        assert!(
+            matches!(err, IntegrationError::InvalidSignatureMaterial(_)),
+            "got {err:?}"
+        );
         Ok(())
     }
 }
