@@ -89,6 +89,14 @@ pub(super) async fn get_extension(
 }
 
 /// `POST /v1/extensions/register` — install a (signed) manifest.
+///
+/// For `kind: wasm` manifests with `wasm_module_url` set, the daemon
+/// downloads the module bytes via HTTPS at install time, verifies them
+/// against `wasm_module_sha256`, caches the result under
+/// `<data_dir>/extensions/{id}/extension.wasm`, and rewrites the
+/// persisted manifest to use the cached path form. Once cached, the
+/// daemon never re-fetches; an extension that wants a new module
+/// version is uninstalled + re-installed.
 pub(super) async fn register_extension(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -98,12 +106,70 @@ pub(super) async fn register_extension(
         return problem.into_response();
     }
     let installed_by = extract_passport_id(&headers);
-    let mut store = state.fact_store.write().await;
     let bypass = allow_unsigned_dev();
+
+    // Phase B (M6.4): if the manifest declares `kind: wasm` with a URL,
+    // download + verify the module bytes BEFORE we touch the fact store,
+    // then rewrite the manifest to the cached path form. The validator
+    // already constrained the URL to https:// at this point.
+    // `mut` only used under the `wasm-extensions` feature; default
+    // builds bind it as immutable.
+    #[cfg(feature = "wasm-extensions")]
+    let mut manifest = body.manifest;
+    #[cfg(not(feature = "wasm-extensions"))]
+    let manifest = body.manifest;
+    #[cfg(feature = "wasm-extensions")]
+    {
+        if manifest.entry.kind == crux_integrations::EntryKind::Wasm
+            && manifest.wasm_module_url.is_some()
+            && manifest.wasm_module_path.is_none()
+        {
+            let url = manifest.wasm_module_url.clone().unwrap_or_default();
+            let sha = match manifest.wasm_module_sha256.clone() {
+                Some(s) => s,
+                None => {
+                    return problem_response(
+                        StatusCode::BAD_REQUEST,
+                        "kind=wasm manifest with wasm_module_url MUST also set wasm_module_sha256",
+                    );
+                }
+            };
+            let id = manifest.id.clone();
+            match crate::wasm_dispatcher::download_module_to_cache_async(url, sha, state.data_dir.clone(), id).await {
+                Ok(_path) => {
+                    // Rewrite to the path form so the persisted record
+                    // never carries a stale URL.
+                    manifest.wasm_module_path = Some("extension.wasm".to_string());
+                    manifest.wasm_module_url = None;
+                }
+                Err(crate::wasm_dispatcher::WasmDownloadError::Sha256Mismatch { expected, actual }) => {
+                    return problem_response(
+                        StatusCode::CONFLICT,
+                        format!("downloaded module sha256 mismatch: manifest={expected}, downloaded={actual}"),
+                    );
+                }
+                Err(crate::wasm_dispatcher::WasmDownloadError::TooLarge) => {
+                    return problem_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        format!(
+                            "wasm module exceeds the {}-byte cap",
+                            crate::wasm_dispatcher::WASM_MODULE_DOWNLOAD_LIMIT_BYTES
+                        ),
+                    );
+                }
+                Err(crate::wasm_dispatcher::WasmDownloadError::UpstreamStatus(s)) => {
+                    return problem_response(StatusCode::BAD_GATEWAY, format!("module URL returned status {s}"));
+                }
+                Err(err) => return problem_response(StatusCode::BAD_GATEWAY, err.to_string()),
+            }
+        }
+    }
+
+    let mut store = state.fact_store.write().await;
     let result = crate::extension_registry::install_extension(
         &mut store,
         &state.data_dir,
-        body.manifest,
+        manifest,
         installed_by,
         now_unix_ms(),
         bypass,

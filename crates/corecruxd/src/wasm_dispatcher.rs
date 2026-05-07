@@ -38,10 +38,10 @@ use crate::wasm_host::{
 pub enum WasmDispatchError {
     #[error("manifest entry.kind is not 'wasm' for extension '{0}'")]
     NotWasmKind(String),
-    #[error("wasm_module_path or wasm_module_url required (M6.4 will add url support); none set")]
+    #[error("wasm_module_path or wasm_module_url required; none set")]
     NoModuleSource,
-    #[error("wasm_module_url is set but URL download is not yet implemented (M6.4)")]
-    UrlDownloadNotYetImplemented,
+    #[error("wasm_module_url is set but never resolved to a cached path; install path may have skipped the M6.4 download step")]
+    UrlNotResolved,
     #[error("wasm_module_sha256 missing in manifest")]
     MissingSha256,
     #[error("wasm module file not found at '{0}'")]
@@ -101,14 +101,16 @@ pub async fn dispatch_wasm_via_http(
         .clone()
         .ok_or(WasmDispatchError::MissingSha256)?;
 
-    // M6.3 only handles the local-path case. The url case lands in M6.4
-    // (download + verify at install time, then this code path picks up
-    // the cached bytes the same way).
+    // The install handler (M6.4) resolves URL→path before persistence.
+    // By the time the dispatcher sees a manifest, `wasm_module_path`
+    // should always be set; `wasm_module_url` only sticks around if
+    // someone bypassed the install flow by writing the record directly,
+    // in which case we refuse rather than re-download mid-dispatch.
     let module_path = if manifest.wasm_module_path.is_some() {
         module_path_for(&data_dir, &extension_id, &manifest)
             .ok_or_else(|| WasmDispatchError::ModuleFileMissing(PathBuf::from("(invalid path)")))?
     } else if manifest.wasm_module_url.is_some() {
-        return Err(WasmDispatchError::UrlDownloadNotYetImplemented);
+        return Err(WasmDispatchError::UrlNotResolved);
     } else {
         return Err(WasmDispatchError::NoModuleSource);
     };
@@ -217,6 +219,102 @@ fn to_host_fact(fact: &corecrux_memory::fact_store::Fact) -> HostFact {
     }
 }
 
+// ── M6.4: install-time module download ───────────────────────────────────
+
+/// Cap on how big a downloaded `.wasm` can be. Real community modules
+/// are typically <1 MiB; 16 MiB gives plenty of headroom while
+/// stopping a malicious or accidentally-huge URL from filling the
+/// daemon's data dir.
+pub const WASM_MODULE_DOWNLOAD_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub enum WasmDownloadError {
+    #[error("module download failed: {0}")]
+    Transport(String),
+    #[error("module download upstream returned status {0}")]
+    UpstreamStatus(u16),
+    #[error("module download exceeded the {WASM_MODULE_DOWNLOAD_LIMIT_BYTES}-byte cap")]
+    TooLarge,
+    #[error("module sha256 mismatch: manifest says {expected}, downloaded bytes are {actual}")]
+    Sha256Mismatch { expected: String, actual: String },
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Sync (blocking) download of a `.wasm` module URL into the per-extension
+/// cache directory. Designed to be called from inside
+/// `tokio::task::spawn_blocking`.
+///
+/// On success, returns the absolute path to the cached file (always
+/// `<data_dir>/extensions/{id}/extension.wasm`) so the caller can
+/// mutate the in-memory manifest to use `wasm_module_path` instead of
+/// the URL form before persisting. The original URL is dropped from
+/// the persisted record — once cached, the daemon never re-fetches.
+///
+/// Sha256 is verified against `expected_sha256` BEFORE bytes are
+/// written to the destination; a mismatch leaves no partial file.
+pub fn download_module_to_cache(
+    url: &str,
+    expected_sha256: &str,
+    data_dir: &Path,
+    extension_id: &str,
+) -> Result<PathBuf, WasmDownloadError> {
+    use std::io::Read as _;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .build()
+        .into();
+    let mut response = agent
+        .get(url)
+        .call()
+        .map_err(|e| WasmDownloadError::Transport(e.to_string()))?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(WasmDownloadError::UpstreamStatus(status));
+    }
+    let mut reader = response.body_mut().as_reader();
+    let mut buf = Vec::with_capacity(64 * 1024);
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut chunk).map_err(WasmDownloadError::Io)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > WASM_MODULE_DOWNLOAD_LIMIT_BYTES {
+            return Err(WasmDownloadError::TooLarge);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let actual = sha256_hex(&buf);
+    if actual != expected_sha256 {
+        return Err(WasmDownloadError::Sha256Mismatch {
+            expected: expected_sha256.to_string(),
+            actual,
+        });
+    }
+    let dest_dir = data_dir.join("extensions").join(extension_id);
+    std::fs::create_dir_all(&dest_dir).map_err(WasmDownloadError::Io)?;
+    let dest = dest_dir.join("extension.wasm");
+    let tmp = dest.with_extension("wasm.tmp");
+    std::fs::write(&tmp, &buf).map_err(WasmDownloadError::Io)?;
+    std::fs::rename(&tmp, &dest).map_err(WasmDownloadError::Io)?;
+    Ok(dest)
+}
+
+/// Spawn-blocking wrapper for [`download_module_to_cache`] so the HTTP
+/// install handler can call it from an async context without holding
+/// the tokio runtime.
+pub async fn download_module_to_cache_async(
+    url: String,
+    expected_sha256: String,
+    data_dir: PathBuf,
+    extension_id: String,
+) -> Result<PathBuf, WasmDownloadError> {
+    tokio::task::spawn_blocking(move || download_module_to_cache(&url, &expected_sha256, &data_dir, &extension_id))
+        .await
+        .map_err(|e| WasmDownloadError::Transport(format!("join error: {e}")))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +350,97 @@ mod tests {
         manifest.wasm_module_path = Some("extension.wasm".to_string());
         let p = module_path_for(Path::new("/data"), "ext.test", &manifest).unwrap();
         assert_eq!(p, PathBuf::from("/data/extensions/ext.test/extension.wasm"));
+    }
+
+    /// Spin up a one-shot HTTP/1.1 listener on 127.0.0.1:0 that serves
+    /// the given bytes as `application/wasm`. Returns the bound port +
+    /// a join handle. Used by the M6.4 download tests.
+    fn serve_once(bytes: Vec<u8>) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut req_buf = [0u8; 4096];
+            // Read until we see end-of-headers (we don't actually care
+            // about the request beyond consuming it so the writer can
+            // proceed without blocking the client on read-after-write).
+            let _ = stream.read(&mut req_buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/wasm\r\nContent-Length: {}\r\n\r\n",
+                bytes.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(&bytes);
+            let _ = stream.flush();
+        });
+        (port, handle)
+    }
+
+    /// Same as [`serve_once`] but always returns 404. Used to test the
+    /// upstream-status branch.
+    fn serve_404() -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().expect("accept");
+            let _ = stream.read(&mut [0u8; 4096]);
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn download_happy_path_writes_to_cache_after_sha_check() {
+        let bytes = b"\0asm\x01\x00\x00\x00".to_vec(); // minimal wasm header (not a real module, but bytes are bytes for the sha)
+        let expected = sha256_hex(&bytes);
+        let (port, h) = serve_once(bytes.clone());
+        let dir = std::env::temp_dir().join(format!("wasm-dl-test-{}", uuid::Uuid::new_v4()));
+        let url = format!("http://127.0.0.1:{port}/module.wasm");
+        let dest = download_module_to_cache(&url, &expected, &dir, "ext.dl").expect("download");
+        h.join().ok();
+        assert_eq!(dest, dir.join("extensions").join("ext.dl").join("extension.wasm"));
+        let on_disk = std::fs::read(&dest).expect("read");
+        assert_eq!(on_disk, bytes);
+    }
+
+    #[test]
+    fn download_sha_mismatch_leaves_no_partial_file() {
+        let bytes = b"\0asm\x01\x00\x00\x00".to_vec();
+        let bogus_sha = sha256_hex(b"different bytes");
+        let (port, h) = serve_once(bytes);
+        let dir = std::env::temp_dir().join(format!("wasm-dl-bad-{}", uuid::Uuid::new_v4()));
+        let url = format!("http://127.0.0.1:{port}/module.wasm");
+        let err = download_module_to_cache(&url, &bogus_sha, &dir, "ext.dl-bad")
+            .err()
+            .expect("err");
+        h.join().ok();
+        assert!(matches!(err, WasmDownloadError::Sha256Mismatch { .. }), "got {err:?}");
+        // Final file must not exist; .tmp may or may not (rename is atomic).
+        assert!(!dir
+            .join("extensions")
+            .join("ext.dl-bad")
+            .join("extension.wasm")
+            .exists());
+    }
+
+    #[test]
+    fn download_upstream_404_classifies() {
+        let (port, h) = serve_404();
+        let dir = std::env::temp_dir().join(format!("wasm-dl-404-{}", uuid::Uuid::new_v4()));
+        let url = format!("http://127.0.0.1:{port}/missing.wasm");
+        let err = download_module_to_cache(&url, "0".repeat(64).as_str(), &dir, "ext.dl-404")
+            .err()
+            .expect("err");
+        h.join().ok();
+        // ureq surfaces 4xx as a Transport error containing the status,
+        // older versions surface it via UpstreamStatus — accept either.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("404") || matches!(err, WasmDownloadError::UpstreamStatus(404)),
+            "got {msg}"
+        );
     }
 
     fn sample_wasm_manifest() -> IntegrationManifest {
