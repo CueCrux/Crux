@@ -179,6 +179,12 @@ pub struct AppState {
     /// (M4 Phase A). Sliding 60-second window keyed by
     /// (extension_id, passport_fpr); cap is per-grant or daemon default.
     pub extension_rate_table: Arc<crate::extension_outbound::RateTable>,
+    /// Long-lived wasmtime engine + epoch-tick thread for `kind: wasm`
+    /// extensions (M6.3 of the community-extensions ExecPlan). Built
+    /// lazily at startup when the `wasm-extensions` feature is enabled;
+    /// `None` otherwise (the HTTP path returns 501 in that case).
+    #[cfg(feature = "wasm-extensions")]
+    pub wasm_engine: Option<Arc<crate::wasm_host::WasmEngine>>,
     /// Crux Daemon session store (scoped state per session).
     pub session_store: Arc<RwLock<corecrux_memory::SessionStore>>,
     /// Cached git-based update posture for humans and agents.

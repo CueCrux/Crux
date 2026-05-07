@@ -111,9 +111,30 @@ pub struct IntegrationManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_tool_endpoint: Option<String>,
     /// Tools the extension exposes. Required + non-empty for
-    /// `ExternalTool`; ignored for other kinds.
+    /// `ExternalTool` and `Wasm`; ignored for other kinds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ExternalToolDefinition>,
+
+    // ── Wasm-extension fields (kind == EntryKind::Wasm) ──────────────────
+    /// Local filesystem path to the `.wasm` module bytes, relative to
+    /// `<data_dir>/extensions/{id}/`. Required for `Wasm` when
+    /// [`Self::wasm_module_url`] is unset; mutually exclusive with the
+    /// URL form. Forbidden for any other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_module_path: Option<String>,
+    /// HTTPS URL the daemon downloads the `.wasm` module from at install
+    /// time, then caches under
+    /// `<data_dir>/extensions/{id}/extension.wasm`. Mutually exclusive
+    /// with [`Self::wasm_module_path`]. The download is verified against
+    /// [`Self::wasm_module_sha256`] before any bytes are persisted.
+    /// Forbidden for any kind other than `Wasm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_module_url: Option<String>,
+    /// SHA-256 of the canonical `.wasm` module bytes, hex-encoded
+    /// (lowercase, no `0x` prefix, 64 chars). Required for `Wasm`. The
+    /// daemon refuses to load a module whose on-disk bytes don't match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_module_sha256: Option<String>,
 }
 
 /// One MCP-callable tool an external-tool extension exposes.
@@ -157,6 +178,14 @@ pub enum EntryKind {
     /// Manifests of this kind MUST set `external_tool_endpoint` and
     /// declare at least one entry in `tools[]`.
     ExternalTool,
+    /// Community Phase-B WASM module — the daemon runs the extension
+    /// in-process inside a wasmtime sandbox with fuel + memory + epoch
+    /// limits. Manifests of this kind MUST declare at least one entry
+    /// in `tools[]` and set either `wasm_module_path` (locally bundled)
+    /// or `wasm_module_url` (HTTPS download at install time), and a
+    /// `wasm_module_sha256` to verify the on-disk bytes against. They
+    /// MUST NOT set `external_tool_endpoint`.
+    Wasm,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -421,10 +450,85 @@ impl IntegrationManifest {
                     return Err(IntegrationError::MissingField("tools[].description"));
                 }
             }
-        } else if self.external_tool_endpoint.is_some() || !self.tools.is_empty() {
-            // Inverse rule: only `ExternalTool` may set these fields.
+            if self.wasm_module_path.is_some() || self.wasm_module_url.is_some() || self.wasm_module_sha256.is_some() {
+                return Err(IntegrationError::InvalidIdentifier(
+                    "wasm_module_* fields only valid when entry.kind=wasm".to_string(),
+                ));
+            }
+        } else if self.entry.kind == EntryKind::Wasm {
+            // tools[] required + same shape as external-tool.
+            if self.tools.is_empty() {
+                return Err(IntegrationError::MissingField("tools"));
+            }
+            for tool in &self.tools {
+                if tool.name.trim().is_empty() {
+                    return Err(IntegrationError::MissingField("tools[].name"));
+                }
+                if tool.description.trim().is_empty() {
+                    return Err(IntegrationError::MissingField("tools[].description"));
+                }
+                if tool.auth_shared_secret_id.is_some() {
+                    // Wasm modules call `crux::get_secret_decrypted` directly;
+                    // the wire-Bearer-header path is HTTPS-only.
+                    return Err(IntegrationError::InvalidIdentifier(
+                        "wasm tools must not set tools[].auth_shared_secret_id; use crux::get_secret_decrypted in-module instead".to_string(),
+                    ));
+                }
+            }
+            if self.external_tool_endpoint.is_some() {
+                return Err(IntegrationError::InvalidIdentifier(
+                    "external_tool_endpoint must be unset for entry.kind=wasm".to_string(),
+                ));
+            }
+            // Module location: exactly one of path / url, plus sha256.
+            let sha256 = self
+                .wasm_module_sha256
+                .as_deref()
+                .ok_or(IntegrationError::MissingField("wasm_module_sha256"))?;
+            if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+                return Err(IntegrationError::InvalidIdentifier(format!(
+                    "wasm_module_sha256 must be 64 lowercase hex chars, got {} chars",
+                    sha256.len()
+                )));
+            }
+            match (self.wasm_module_path.as_deref(), self.wasm_module_url.as_deref()) {
+                (Some(p), None) => {
+                    if p.trim().is_empty() {
+                        return Err(IntegrationError::MissingField("wasm_module_path"));
+                    }
+                    // Reject any path component that escapes the
+                    // per-extension directory the daemon caches into.
+                    if p.starts_with('/') || p.contains("..") {
+                        return Err(IntegrationError::InvalidIdentifier(format!(
+                            "wasm_module_path must be relative to <data_dir>/extensions/{{id}}/, got '{p}'"
+                        )));
+                    }
+                }
+                (None, Some(u)) => {
+                    if !u.starts_with("https://") {
+                        return Err(IntegrationError::InvalidIdentifier(format!(
+                            "wasm_module_url must be an https:// URL, got '{u}'"
+                        )));
+                    }
+                }
+                (Some(_), Some(_)) => {
+                    return Err(IntegrationError::InvalidIdentifier(
+                        "wasm_module_path and wasm_module_url are mutually exclusive".to_string(),
+                    ));
+                }
+                (None, None) => {
+                    return Err(IntegrationError::MissingField("wasm_module_path or wasm_module_url"));
+                }
+            }
+        } else if self.external_tool_endpoint.is_some()
+            || !self.tools.is_empty()
+            || self.wasm_module_path.is_some()
+            || self.wasm_module_url.is_some()
+            || self.wasm_module_sha256.is_some()
+        {
+            // Inverse rule: only `ExternalTool` / `Wasm` may set these fields.
             return Err(IntegrationError::InvalidIdentifier(format!(
-                "external_tool_endpoint and tools[] only valid when entry.kind=external_tool, got {:?}",
+                "external_tool_endpoint, tools[], or wasm_module_* fields are only valid when entry.kind in {{external_tool, wasm}}, got {:?}",
                 self.entry.kind
             )));
         }
@@ -744,6 +848,9 @@ pub fn builtin_manifests() -> Vec<IntegrationManifest> {
             signature: None,
             external_tool_endpoint: None,
             tools: Vec::new(),
+            wasm_module_path: None,
+            wasm_module_url: None,
+            wasm_module_sha256: None,
         },
         IntegrationManifest {
             schema: INTEGRATION_SCHEMA_V1.to_string(),
@@ -764,6 +871,9 @@ pub fn builtin_manifests() -> Vec<IntegrationManifest> {
             signature: None,
             external_tool_endpoint: None,
             tools: Vec::new(),
+            wasm_module_path: None,
+            wasm_module_url: None,
+            wasm_module_sha256: None,
         },
         IntegrationManifest {
             schema: INTEGRATION_SCHEMA_V1.to_string(),
@@ -789,6 +899,9 @@ pub fn builtin_manifests() -> Vec<IntegrationManifest> {
             signature: None,
             external_tool_endpoint: None,
             tools: Vec::new(),
+            wasm_module_path: None,
+            wasm_module_url: None,
+            wasm_module_sha256: None,
         },
         // Note: a `github.pr-facts` declarative recipe used to live here.
         // Removed in favour of the live GitHub indexer integration which
@@ -1032,6 +1145,9 @@ mod tests {
             signature: None,
             external_tool_endpoint: None,
             tools: Vec::new(),
+            wasm_module_path: None,
+            wasm_module_url: None,
+            wasm_module_sha256: None,
         }
     }
 

@@ -114,6 +114,8 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
         retrieval_index: Arc::new(RwLock::new(corecrux_retrieval::IndexManager::new())),
         fact_store: Arc::new(RwLock::new(corecrux_memory::FactStore::new())),
         extension_rate_table: Arc::new(crate::extension_outbound::RateTable::new()),
+        #[cfg(feature = "wasm-extensions")]
+        wasm_engine: None,
         session_store: Arc::new(RwLock::new(corecrux_memory::SessionStore::new())),
         update_status: Arc::new(RwLock::new(corecrux_types::UpdateStatus::default())),
         event_bus: corecrux_memory::events::EventBus::new(16),
@@ -6933,6 +6935,9 @@ fn build_signed_manifest(
         signature: None,
         external_tool_endpoint: None,
         tools: Vec::new(),
+        wasm_module_path: None,
+        wasm_module_url: None,
+        wasm_module_sha256: None,
     };
     sign_manifest(&mut manifest, signing_key, publisher_fpr).expect("sign");
     manifest
@@ -7049,6 +7054,9 @@ async fn extensions_register_unsigned_returns_400_with_dev_hint() {
         signature: None,
         external_tool_endpoint: None,
         tools: Vec::new(),
+        wasm_module_path: None,
+        wasm_module_url: None,
+        wasm_module_sha256: None,
     };
     let resp = super::extensions::register_extension(
         State(state),
@@ -7395,4 +7403,247 @@ async fn invoke_tool_without_grant_returns_403() {
     .await
     .into_response();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+// ── M6.3: wasm dispatch via HTTP ────────────────────────────────────────
+
+#[cfg(feature = "wasm-extensions")]
+fn build_wasm_test_module() -> Vec<u8> {
+    // Tiny wat module that responds with `{"result":"ok","fact_writes":[]}`
+    // — same shape as a real wasm extension would, just hard-coded so the
+    // test asserts on dispatch wiring rather than module behaviour.
+    let body = r#"{"result":"ok","fact_writes":[]}"#;
+    let body_lit = body.replace('\\', "\\\\").replace('"', "\\\"");
+    let wat = format!(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (data (i32.const 5000) "{body_lit}")
+          (func (export "extension_call")
+            (param $req_ptr i32) (param $req_len i32)
+            (param $resp_ptr i32) (param $resp_cap i32)
+            (result i32)
+            (memory.copy (local.get $resp_ptr) (i32.const 5000) (i32.const {len}))
+            (i32.const {len})
+          )
+        )
+        "#,
+        body_lit = body_lit,
+        len = body.len(),
+    );
+    wat::parse_str(&wat).expect("wat parse")
+}
+
+#[cfg(feature = "wasm-extensions")]
+#[tokio::test]
+async fn wasm_install_then_invoke_returns_module_result() {
+    use crate::wasm_dispatcher::sha256_hex;
+    use crux_integrations::{
+        sign_manifest, DataAccess, EntryKind, ExternalToolDefinition, IntegrationEntry, IntegrationManifest,
+        ManifestHashes, NetworkAccess, SafetyPolicy, INTEGRATION_SCHEMA_V1,
+    };
+
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // Wire a real wasm engine for this test.
+    state.wasm_engine = Some(std::sync::Arc::new(
+        crate::wasm_host::WasmEngine::new(std::time::Duration::from_millis(5)).expect("engine"),
+    ));
+
+    // 1. Author a kind=wasm manifest, signed by a freshly-trusted key.
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xcd; 32]);
+    let publisher_fpr = "p_wasm_test".to_string();
+    add_test_key(
+        &state,
+        &publisher_fpr,
+        hex::encode(signing_key.verifying_key().to_bytes()),
+    )
+    .await;
+
+    let module_bytes = build_wasm_test_module();
+    let module_sha = sha256_hex(&module_bytes);
+
+    let mut manifest = IntegrationManifest {
+        schema: INTEGRATION_SCHEMA_V1.to_string(),
+        id: "ext.wasm.test".to_string(),
+        name: "Wasm Test".to_string(),
+        version: "0.1.0".to_string(),
+        publisher_passport_fpr: publisher_fpr.clone(),
+        summary: "Test wasm extension.".to_string(),
+        entry: IntegrationEntry {
+            kind: EntryKind::Wasm,
+            path: "wasm".to_string(),
+        },
+        capabilities: vec![],
+        network: NetworkAccess::default(),
+        data_access: DataAccess::default(),
+        safety: SafetyPolicy::default(),
+        hashes: ManifestHashes::default(),
+        signature: None,
+        external_tool_endpoint: None,
+        tools: vec![ExternalToolDefinition {
+            name: "ext.wasm.test.tool".to_string(),
+            description: "Test tool.".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+            auth_shared_secret_id: None,
+        }],
+        wasm_module_path: Some("extension.wasm".to_string()),
+        wasm_module_url: None,
+        wasm_module_sha256: Some(module_sha),
+    };
+    sign_manifest(&mut manifest, &signing_key, &publisher_fpr).expect("sign");
+
+    // 2. Place the bytes where the dispatcher will find them.
+    let module_dir = state.data_dir.join("extensions").join("ext.wasm.test");
+    std::fs::create_dir_all(&module_dir).expect("mkdir");
+    std::fs::write(module_dir.join("extension.wasm"), &module_bytes).expect("write module");
+
+    // 3. Install the manifest.
+    let install = super::extensions::register_extension(
+        State(state.clone()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::RegisterExtensionBody {
+            manifest: manifest.clone(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(install.status(), StatusCode::CREATED, "install failed");
+
+    // 4. Issue a grant for a calling passport.
+    let grantee = "p_wasm_caller".to_string();
+    let grant_resp = super::extensions::issue_grant(
+        State(state.clone()),
+        Path("ext.wasm.test".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::IssueGrantBody {
+            passport_fpr: grantee.clone(),
+            allowed_tool_names: vec!["ext.wasm.test.tool".to_string()],
+            allowed_prefixes_read: vec!["__test__::".to_string()],
+            allowed_prefixes_write: vec!["__test__::".to_string()],
+            rate_limit_per_min: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(grant_resp.status(), StatusCode::CREATED, "grant failed");
+
+    // 5. Invoke the tool — should hit the wasm dispatcher and return
+    //    {"result":"ok","fact_writes":[]} translated into a
+    //    WasmDispatchOutcome.
+    let invoke = super::extensions::invoke_extension_tool(
+        State(state.clone()),
+        Path(("ext.wasm.test".to_string(), "ext.wasm.test.tool".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::InvokeToolBody {
+            passport_fpr: Some(grantee),
+            args: serde_json::json!({"hello": "world"}),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(invoke.status(), StatusCode::OK, "invoke failed");
+    let body = json_body(invoke).await;
+    assert_eq!(body["result"], serde_json::Value::String("ok".into()));
+}
+
+#[cfg(feature = "wasm-extensions")]
+#[tokio::test]
+async fn wasm_invoke_with_sha_mismatch_returns_409() {
+    use crate::wasm_dispatcher::sha256_hex;
+    use crux_integrations::{
+        sign_manifest, DataAccess, EntryKind, ExternalToolDefinition, IntegrationEntry, IntegrationManifest,
+        ManifestHashes, NetworkAccess, SafetyPolicy, INTEGRATION_SCHEMA_V1,
+    };
+
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.wasm_engine = Some(std::sync::Arc::new(
+        crate::wasm_host::WasmEngine::new(std::time::Duration::from_millis(5)).expect("engine"),
+    ));
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xcd; 32]);
+    let publisher_fpr = "p_wasm_test_sha".to_string();
+    add_test_key(
+        &state,
+        &publisher_fpr,
+        hex::encode(signing_key.verifying_key().to_bytes()),
+    )
+    .await;
+
+    let module_bytes = build_wasm_test_module();
+    // Lie about the sha256 — should land as a 409 on invoke.
+    let bogus_sha = sha256_hex(b"not the real bytes");
+
+    let mut manifest = IntegrationManifest {
+        schema: INTEGRATION_SCHEMA_V1.to_string(),
+        id: "ext.wasm.bad".to_string(),
+        name: "Wasm Bad".to_string(),
+        version: "0.1.0".to_string(),
+        publisher_passport_fpr: publisher_fpr.clone(),
+        summary: "Mismatched-sha extension.".to_string(),
+        entry: IntegrationEntry {
+            kind: EntryKind::Wasm,
+            path: "wasm".to_string(),
+        },
+        capabilities: vec![],
+        network: NetworkAccess::default(),
+        data_access: DataAccess::default(),
+        safety: SafetyPolicy::default(),
+        hashes: ManifestHashes::default(),
+        signature: None,
+        external_tool_endpoint: None,
+        tools: vec![ExternalToolDefinition {
+            name: "ext.wasm.bad.tool".to_string(),
+            description: "Mismatch.".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+            auth_shared_secret_id: None,
+        }],
+        wasm_module_path: Some("extension.wasm".to_string()),
+        wasm_module_url: None,
+        wasm_module_sha256: Some(bogus_sha),
+    };
+    sign_manifest(&mut manifest, &signing_key, &publisher_fpr).expect("sign");
+
+    let module_dir = state.data_dir.join("extensions").join("ext.wasm.bad");
+    std::fs::create_dir_all(&module_dir).expect("mkdir");
+    std::fs::write(module_dir.join("extension.wasm"), &module_bytes).expect("write");
+
+    let install = super::extensions::register_extension(
+        State(state.clone()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::RegisterExtensionBody {
+            manifest: manifest.clone(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(install.status(), StatusCode::CREATED);
+
+    let grantee = "p_wasm_caller_sha".to_string();
+    let _ = super::extensions::issue_grant(
+        State(state.clone()),
+        Path("ext.wasm.bad".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::IssueGrantBody {
+            passport_fpr: grantee.clone(),
+            allowed_tool_names: vec!["ext.wasm.bad.tool".to_string()],
+            allowed_prefixes_read: vec![],
+            allowed_prefixes_write: vec![],
+            rate_limit_per_min: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    let invoke = super::extensions::invoke_extension_tool(
+        State(state.clone()),
+        Path(("ext.wasm.bad".to_string(), "ext.wasm.bad.tool".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::InvokeToolBody {
+            passport_fpr: Some(grantee),
+            args: serde_json::json!({}),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(invoke.status(), StatusCode::CONFLICT, "expected 409 on sha mismatch");
 }
