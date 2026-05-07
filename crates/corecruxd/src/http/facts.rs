@@ -32,17 +32,23 @@ pub(super) struct ExportFactsParams {
     pub limit: Option<u32>,
 }
 
+// `axum::response::Response` is large by clippy's reckoning, but
+// returning it as the Err arm is the idiomatic axum pattern; suppress
+// the lint at the helper boundary.
+#[allow(clippy::result_large_err)]
 fn require_fact_read_ctx(state: &AppState, headers: &HeaderMap) -> Result<crate::auth::HttpScopeContext, Response> {
     require_http_any_scope(&state.auth, headers, &["query:read", "admin:read"]).map_err(IntoResponse::into_response)?;
     http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)
 }
 
+#[allow(clippy::result_large_err)]
 fn require_fact_write_ctx(state: &AppState, headers: &HeaderMap) -> Result<crate::auth::HttpScopeContext, Response> {
     require_http_any_scope(&state.auth, headers, &["facts:write", "admin:write"])
         .map_err(IntoResponse::into_response)?;
     http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)
 }
 
+#[allow(clippy::result_large_err)]
 fn require_session_write_ctx(state: &AppState, headers: &HeaderMap) -> Result<crate::auth::HttpScopeContext, Response> {
     require_http_any_scope(&state.auth, headers, &["sessions:write", "admin:write"])
         .map_err(IntoResponse::into_response)?;

@@ -48,6 +48,10 @@ fn tenant_hash(tenant_id: &str) -> u64 {
     xxhash_rust::xxh64::xxh64(tenant_id.as_bytes(), 0)
 }
 
+// Same axum-Response-is-large-by-clippy issue as the helpers in
+// http::facts. The Err arm is the idiomatic carry-the-built-response
+// shape; suppress at the helper boundary so call sites stay clean.
+#[allow(clippy::result_large_err)]
 fn authorize_query_tenant(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<Option<u64>, Response> {
     let ctx = http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
     let tenant_id = tenant_id.trim();
@@ -82,6 +86,7 @@ fn authorize_query_tenant(state: &AppState, headers: &HeaderMap, tenant_id: &str
     Ok(Some(tenant_hash(tenant_id)))
 }
 
+#[allow(clippy::result_large_err)]
 fn authorize_concrete_query_tenant(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<u64, Response> {
     match authorize_query_tenant(state, headers, tenant_id)? {
         Some(hash) => Ok(hash),

@@ -651,8 +651,12 @@ async fn dispatch_wasm_kind_or_unsupported(
 }
 
 /// Without the `wasm-extensions` feature, the route returns 501 so the
-/// operator immediately understands what to flip to enable it.
+/// operator immediately understands what to flip to enable it. Marked
+/// `async` to share the call-site signature with the wasm-feature
+/// variant (which IS async); suppress the unused_async lint here since
+/// the body is a synchronous early-return.
 #[cfg(not(feature = "wasm-extensions"))]
+#[allow(clippy::unused_async)]
 async fn dispatch_wasm_kind_or_unsupported(
     _state: AppState,
     _extension_id: String,

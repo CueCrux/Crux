@@ -274,7 +274,7 @@ pub fn download_module_to_cache(
     }
     let mut reader = response.body_mut().as_reader();
     let mut buf = Vec::with_capacity(64 * 1024);
-    let mut chunk = [0u8; 64 * 1024];
+    let mut chunk = vec![0u8; 64 * 1024];
     loop {
         let n = reader.read(&mut chunk).map_err(WasmDownloadError::Io)?;
         if n == 0 {
