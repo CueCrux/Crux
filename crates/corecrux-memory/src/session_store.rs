@@ -145,6 +145,7 @@ impl SessionStore {
         Ok(session)
     }
 
+    #[allow(clippy::unused_self)]
     fn build_session(&self, session_id: &str, state: serde_json::Value, ttl_seconds: Option<u64>) -> SessionState {
         let tokens = estimate_tokens(&state);
         let expires_at = ttl_seconds.map(|secs| Utc::now() + chrono::Duration::seconds(secs as i64));
