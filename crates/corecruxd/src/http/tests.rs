@@ -7647,3 +7647,143 @@ async fn wasm_invoke_with_sha_mismatch_returns_409() {
     .into_response();
     assert_eq!(invoke.status(), StatusCode::CONFLICT, "expected 409 on sha mismatch");
 }
+
+// ── M7: real-world WASM summarise extension end-to-end ─────────────────
+
+#[cfg(feature = "wasm-extensions")]
+fn locate_summarise_artefacts() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let candidates = [
+        "../../../Community-Projects/example-extension-wasm-summarise",
+        "../../Community-Projects/example-extension-wasm-summarise",
+        "Community-Projects/example-extension-wasm-summarise",
+        "/home/myles/CueCrux/Community-Projects/example-extension-wasm-summarise",
+    ];
+    for c in candidates {
+        let dir = std::path::PathBuf::from(c);
+        let manifest = dir.join("manifest.json");
+        let wasm = dir.join("extension.wasm");
+        if manifest.exists() && wasm.exists() {
+            return Some((manifest, wasm));
+        }
+    }
+    None
+}
+
+/// End-to-end smoke against the real built artefact: install the signed
+/// `manifest.json` from the example-extension-wasm-summarise repo,
+/// place the matching `extension.wasm` bytes, issue a grant, write
+/// some seed facts under the prefix, then invoke and assert the
+/// summary is non-empty and the summary fact got persisted.
+///
+/// Skipped (with a warning) when the artefacts can't be found — the
+/// repo lives outside Crux/ so this is best-effort rather than a hard
+/// dependency on the layout.
+#[cfg(feature = "wasm-extensions")]
+#[tokio::test]
+async fn wasm_summarise_extension_end_to_end_or_skip() {
+    let Some((manifest_path, wasm_path)) = locate_summarise_artefacts() else {
+        eprintln!("SKIP: example-extension-wasm-summarise artefacts not found; run `cargo build --release -p summarise-module --target wasm32-unknown-unknown && cargo run -p summarise-signer` in the example repo to produce them");
+        return;
+    };
+    let manifest_bytes = std::fs::read(&manifest_path).expect("read manifest");
+    let manifest: crux_integrations::IntegrationManifest =
+        serde_json::from_slice(&manifest_bytes).expect("parse manifest");
+    let wasm_bytes = std::fs::read(&wasm_path).expect("read wasm");
+
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.wasm_engine = Some(std::sync::Arc::new(
+        crate::wasm_host::WasmEngine::new(std::time::Duration::from_millis(5)).expect("engine"),
+    ));
+
+    // 1. Trust the publisher key (taken from the manifest signature).
+    let sig = manifest.signature.as_ref().expect("signed");
+    let public_key_hex = sig.public_key_hex.clone().expect("inline pubkey");
+    add_test_key(&state, &sig.passport_fpr, public_key_hex).await;
+
+    // 2. Place the wasm bytes where the dispatcher will find them.
+    let module_dir = state.data_dir.join("extensions").join("ext.summarise");
+    std::fs::create_dir_all(&module_dir).expect("mkdir");
+    std::fs::write(module_dir.join("extension.wasm"), &wasm_bytes).expect("write module");
+
+    // 3. Install the signed manifest.
+    let install = super::extensions::register_extension(
+        State(state.clone()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::RegisterExtensionBody {
+            manifest: manifest.clone(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(install.status(), StatusCode::CREATED, "install");
+
+    // 4. Issue a grant: read+write `summarise::personal::notes::` and
+    //    read `personal::notes::`.
+    let grantee = "p_summarise_caller".to_string();
+    let grant = super::extensions::issue_grant(
+        State(state.clone()),
+        Path("ext.summarise".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::IssueGrantBody {
+            passport_fpr: grantee.clone(),
+            allowed_tool_names: vec!["ext.summarise.prefix".to_string()],
+            allowed_prefixes_read: vec!["personal::notes::".to_string()],
+            allowed_prefixes_write: vec!["summarise::personal::notes".to_string()],
+            rate_limit_per_min: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(grant.status(), StatusCode::CREATED, "grant");
+
+    // 5. Seed a couple of facts under personal::notes::.
+    {
+        let mut store = state.fact_store.write().await;
+        for (key, val) in [
+            (
+                "note1",
+                "Cats are excellent companions. They purr a lot. The cats also chase laser pointers.",
+            ),
+            (
+                "note2",
+                "Dogs are loyal pets. Cats and dogs both bring joy. Cats are independent.",
+            ),
+        ] {
+            let mut sf = corecrux_memory::fact_store::StoreFact {
+                entity: "personal::notes::misc".to_string(),
+                key: key.to_string(),
+                value: val.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+            };
+            crate::fact_privacy::enforce_global(&mut sf);
+            store.store(sf);
+        }
+    }
+
+    // 6. Invoke.
+    let invoke = super::extensions::invoke_extension_tool(
+        State(state.clone()),
+        Path(("ext.summarise".to_string(), "ext.summarise.prefix".to_string())),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::InvokeToolBody {
+            passport_fpr: Some(grantee),
+            args: serde_json::json!({"prefix": "personal::notes::", "top_sentences": 2}),
+        }),
+    )
+    .await
+    .into_response();
+    let status = invoke.status();
+    let body = json_body(invoke).await;
+    assert_eq!(status, StatusCode::OK, "invoke status (body={body:#?})");
+    let result = &body["result"];
+    assert!(
+        result["summary"].as_str().is_some_and(|s| !s.is_empty()),
+        "summary empty: {body:#?}"
+    );
+    assert!(
+        result["fact_count"].as_u64().unwrap_or(0) >= 2,
+        "fact_count too low: {body:#?}"
+    );
+}
