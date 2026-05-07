@@ -13,7 +13,7 @@ use corecrux_retrieval::bm25::{self, Bm25Params};
 
 /// `query` — BM25 + graph fusion search with optional token budget and min_score.
 pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let _tenant_id = require_str(params, "tenant_id")?;
+    let tenant_hash = require_tenant_hash(params)?;
     let query = require_str(params, "query")?;
     let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let min_score = params.get("min_score").and_then(|v| v.as_f64()).map(|f| f as f32);
@@ -34,7 +34,7 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
         &readers,
         query,
         limit,
-        None, // tenant hash filter deferred
+        Some(tenant_hash),
         &Bm25Params::default(),
         min_score,
     );
@@ -85,7 +85,7 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
 
 /// `query_scan` — metadata-only scan (no full content).
 pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let _tenant_id = require_str(params, "tenant_id")?;
+    let tenant_hash = require_tenant_hash(params)?;
     let query = require_str(params, "query")?;
     let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
@@ -97,7 +97,7 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
     }
 
     let readers = index.readers();
-    let result = bm25::bm25_search(&readers, query, limit, None, &Bm25Params::default(), None);
+    let result = bm25::bm25_search(&readers, query, limit, Some(tenant_hash), &Bm25Params::default(), None);
 
     let scan: Vec<Value> = result
         .hits
@@ -130,7 +130,7 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
 /// each expanded result is returned as a chunk with `segment_index`, `doc_id`,
 /// `frame_offset`, and `token_count`, plus a `tokens_loaded` total.
 pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let _tenant_id = require_str(params, "tenant_id")?;
+    let tenant_hash = require_tenant_hash(params)?;
     let result_ids = params
         .get("result_ids")
         .and_then(|v| v.as_array())
@@ -170,6 +170,10 @@ pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Val
         }
 
         let doc = &reader.docs[doc_id];
+        if doc.tenant_hash_full != tenant_hash {
+            errors.push(json!({ "result_id": id_str, "error": "tenant mismatch" }));
+            continue;
+        }
         tokens_loaded += doc.doc_length_tokens as usize;
 
         chunks.push(json!({
@@ -208,6 +212,18 @@ fn require_str<'a>(params: &'a Value, field: &str) -> Result<&'a str, JsonRpcErr
     })
 }
 
+fn require_tenant_hash(params: &Value) -> Result<u64, JsonRpcError> {
+    let tenant_id = require_str(params, "tenant_id")?.trim();
+    if tenant_id.is_empty() || tenant_id == "*" {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "tenant_id must name one concrete tenant".to_string(),
+            data: Some(json!({"param": "tenant_id", "required": true, "allow_wildcard": false})),
+        });
+    }
+    Ok(xxhash_rust::xxh64::xxh64(tenant_id.as_bytes(), 0))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -235,6 +251,20 @@ mod tests {
         let ctx = test_ctx();
         let err = handle_query(&json!({"query": "hello"}), &ctx).await.unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn query_rejects_empty_or_wildcard_tenant() {
+        let ctx = test_ctx();
+        let empty = handle_query(&json!({"tenant_id": "", "query": "hello"}), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(empty.code, INVALID_PARAMS);
+
+        let wildcard = handle_query(&json!({"tenant_id": "*", "query": "hello"}), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(wildcard.code, INVALID_PARAMS);
     }
 
     #[tokio::test]

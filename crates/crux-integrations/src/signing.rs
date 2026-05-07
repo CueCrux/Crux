@@ -226,6 +226,9 @@ mod tests {
             signature: None,
             external_tool_endpoint: None,
             tools: Vec::new(),
+            wasm_module_path: None,
+            wasm_module_url: None,
+            wasm_module_sha256: None,
         }
     }
 

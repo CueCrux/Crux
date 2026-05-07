@@ -44,6 +44,59 @@ pub(super) fn default_time_range_limit() -> usize {
     100
 }
 
+fn tenant_hash(tenant_id: &str) -> u64 {
+    xxhash_rust::xxh64::xxh64(tenant_id.as_bytes(), 0)
+}
+
+// Same axum-Response-is-large-by-clippy issue as the helpers in
+// http::facts. The Err arm is the idiomatic carry-the-built-response
+// shape; suppress at the helper boundary so call sites stay clean.
+#[allow(clippy::result_large_err)]
+fn authorize_query_tenant(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<Option<u64>, Response> {
+    let ctx = http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)?;
+    let tenant_id = tenant_id.trim();
+
+    if tenant_id.is_empty() {
+        if ctx.has_scope("admin:read") {
+            return Ok(None);
+        }
+        require_http_any_scope(&state.auth, headers, &["query:read"]).map_err(IntoResponse::into_response)?;
+        return Err(problem_response(
+            StatusCode::BAD_REQUEST,
+            "tenant_id must not be empty for query:read",
+        ));
+    }
+
+    if tenant_id == "*" {
+        if ctx.has_scope("admin:read") {
+            return Ok(None);
+        }
+        return Err(problem_response(
+            StatusCode::FORBIDDEN,
+            "tenant_id=* requires admin:read",
+        ));
+    }
+
+    if ctx.has_scope("admin:read") {
+        return Ok(Some(tenant_hash(tenant_id)));
+    }
+
+    require_http_scopes_for_tenant(&state.auth, headers, &["query:read"], tenant_id)
+        .map_err(IntoResponse::into_response)?;
+    Ok(Some(tenant_hash(tenant_id)))
+}
+
+#[allow(clippy::result_large_err)]
+fn authorize_concrete_query_tenant(state: &AppState, headers: &HeaderMap, tenant_id: &str) -> Result<u64, Response> {
+    match authorize_query_tenant(state, headers, tenant_id)? {
+        Some(hash) => Ok(hash),
+        None => Err(problem_response(
+            StatusCode::BAD_REQUEST,
+            "tenant_id must name one concrete tenant for this query route",
+        )),
+    }
+}
+
 // ── v4.2 query handlers ──────────────────────────────────────────────────
 
 #[utoipa::path(
@@ -65,11 +118,8 @@ pub(super) async fn post_query_graph_expand(
     headers: HeaderMap,
     Json(body): Json<GraphExpandBody>,
 ) -> impl IntoResponse {
-    if let Err(_problem) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
-        // Fall back to admin:read for backwards compat
-        if let Err(problem2) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-            return problem2.into_response();
-        }
+    if let Err(response) = authorize_concrete_query_tenant(&state, &headers, &body.tenant_id) {
+        return response;
     }
 
     if !is_query_feature_enabled("CORECRUXD_QUERY_GRAPH_EXPAND") {
@@ -194,10 +244,8 @@ pub(super) async fn post_query_time_range(
     headers: HeaderMap,
     Json(body): Json<TimeRangeBody>,
 ) -> impl IntoResponse {
-    if let Err(_problem) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
-        if let Err(problem2) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-            return problem2.into_response();
-        }
+    if let Err(response) = authorize_concrete_query_tenant(&state, &headers, &body.tenant_id) {
+        return response;
     }
 
     if !is_query_feature_enabled("CORECRUXD_QUERY_TIME_RANGE") {
@@ -353,18 +401,17 @@ pub(super) async fn post_query_text_search(
     headers: HeaderMap,
     Json(body): Json<TextSearchBody>,
 ) -> impl IntoResponse {
-    if let Err(_problem) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
-        if let Err(problem2) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-            return problem2.into_response();
-        }
+    let tenant_filter = match authorize_query_tenant(&state, &headers, &body.tenant_id) {
+        Ok(filter) => filter,
+        Err(response) => return response,
+    };
+
+    if body.query.trim().is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "query must not be empty");
     }
 
     if !is_query_feature_enabled("CORECRUXD_QUERY_TEXT_SEARCH") {
         return problem_response(StatusCode::NOT_FOUND, "text-search query not enabled");
-    }
-
-    if body.query.trim().is_empty() {
-        return problem_response(StatusCode::BAD_REQUEST, "query must not be empty");
     }
 
     let rcx_decision = enforce_rcx_local_query(&state);
@@ -376,13 +423,6 @@ pub(super) async fn post_query_text_search(
     let is_scan_mode = body.mode.as_deref() == Some("scan");
 
     let t0 = std::time::Instant::now();
-
-    let tenant_filter: Option<u16> = if body.tenant_id.is_empty() {
-        None
-    } else {
-        let hash = xxhash_rust::xxh64::xxh64(body.tenant_id.as_bytes(), 0);
-        Some((hash & 0xFFFF) as u16)
-    };
 
     let index = state.retrieval_index.read().await;
     let readers = index.readers();
@@ -640,10 +680,13 @@ pub(super) async fn post_query_text_search_expand(
     headers: HeaderMap,
     Json(body): Json<TextSearchExpandBody>,
 ) -> impl IntoResponse {
-    if let Err(_problem) = require_http_scopes(&state.auth, &headers, &["query:read"]) {
-        if let Err(problem2) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-            return problem2.into_response();
-        }
+    let tenant_hash = match authorize_concrete_query_tenant(&state, &headers, &body.tenant_id) {
+        Ok(hash) => hash,
+        Err(response) => return response,
+    };
+
+    if body.result_ids.is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "result_ids must not be empty");
     }
 
     if !is_query_feature_enabled("CORECRUXD_QUERY_TEXT_SEARCH") {
@@ -666,6 +709,9 @@ pub(super) async fn post_query_text_search_expand(
             continue;
         }
         let doc = &reader.docs[doc_id];
+        if doc.tenant_hash_full != tenant_hash {
+            continue;
+        }
         tokens_loaded += doc.doc_length_tokens as usize;
 
         chunks.push(serde_json::json!({

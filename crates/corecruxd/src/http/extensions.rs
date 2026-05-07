@@ -89,6 +89,14 @@ pub(super) async fn get_extension(
 }
 
 /// `POST /v1/extensions/register` — install a (signed) manifest.
+///
+/// For `kind: wasm` manifests with `wasm_module_url` set, the daemon
+/// downloads the module bytes via HTTPS at install time, verifies them
+/// against `wasm_module_sha256`, caches the result under
+/// `<data_dir>/extensions/{id}/extension.wasm`, and rewrites the
+/// persisted manifest to use the cached path form. Once cached, the
+/// daemon never re-fetches; an extension that wants a new module
+/// version is uninstalled + re-installed.
 pub(super) async fn register_extension(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -98,12 +106,70 @@ pub(super) async fn register_extension(
         return problem.into_response();
     }
     let installed_by = extract_passport_id(&headers);
-    let mut store = state.fact_store.write().await;
     let bypass = allow_unsigned_dev();
+
+    // Phase B (M6.4): if the manifest declares `kind: wasm` with a URL,
+    // download + verify the module bytes BEFORE we touch the fact store,
+    // then rewrite the manifest to the cached path form. The validator
+    // already constrained the URL to https:// at this point.
+    // `mut` only used under the `wasm-extensions` feature; default
+    // builds bind it as immutable.
+    #[cfg(feature = "wasm-extensions")]
+    let mut manifest = body.manifest;
+    #[cfg(not(feature = "wasm-extensions"))]
+    let manifest = body.manifest;
+    #[cfg(feature = "wasm-extensions")]
+    {
+        if manifest.entry.kind == crux_integrations::EntryKind::Wasm
+            && manifest.wasm_module_url.is_some()
+            && manifest.wasm_module_path.is_none()
+        {
+            let url = manifest.wasm_module_url.clone().unwrap_or_default();
+            let sha = match manifest.wasm_module_sha256.clone() {
+                Some(s) => s,
+                None => {
+                    return problem_response(
+                        StatusCode::BAD_REQUEST,
+                        "kind=wasm manifest with wasm_module_url MUST also set wasm_module_sha256",
+                    );
+                }
+            };
+            let id = manifest.id.clone();
+            match crate::wasm_dispatcher::download_module_to_cache_async(url, sha, state.data_dir.clone(), id).await {
+                Ok(_path) => {
+                    // Rewrite to the path form so the persisted record
+                    // never carries a stale URL.
+                    manifest.wasm_module_path = Some("extension.wasm".to_string());
+                    manifest.wasm_module_url = None;
+                }
+                Err(crate::wasm_dispatcher::WasmDownloadError::Sha256Mismatch { expected, actual }) => {
+                    return problem_response(
+                        StatusCode::CONFLICT,
+                        format!("downloaded module sha256 mismatch: manifest={expected}, downloaded={actual}"),
+                    );
+                }
+                Err(crate::wasm_dispatcher::WasmDownloadError::TooLarge) => {
+                    return problem_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        format!(
+                            "wasm module exceeds the {}-byte cap",
+                            crate::wasm_dispatcher::WASM_MODULE_DOWNLOAD_LIMIT_BYTES
+                        ),
+                    );
+                }
+                Err(crate::wasm_dispatcher::WasmDownloadError::UpstreamStatus(s)) => {
+                    return problem_response(StatusCode::BAD_GATEWAY, format!("module URL returned status {s}"));
+                }
+                Err(err) => return problem_response(StatusCode::BAD_GATEWAY, err.to_string()),
+            }
+        }
+    }
+
+    let mut store = state.fact_store.write().await;
     let result = crate::extension_registry::install_extension(
         &mut store,
         &state.data_dir,
-        body.manifest,
+        manifest,
         installed_by,
         now_unix_ms(),
         bypass,
@@ -326,9 +392,9 @@ fn make_request_id() -> String {
 }
 
 /// `POST /v1/extensions/{id}/tools/{tool_name}/invoke` — direct dispatch
-/// surface for an external-tool extension. Lets the operator (and the
-/// console "Test call" UI from M5) exercise the Phase A path without
-/// going through the MCP dispatcher (which lands in M5).
+/// surface for an installed extension. Branches on `manifest.entry.kind`:
+/// `ExternalTool` → Phase A HTTPS path; `Wasm` → Phase B in-process
+/// wasmtime path (M6.3, requires `--features wasm-extensions`).
 pub(super) async fn invoke_extension_tool(
     State(state): State<AppState>,
     Path((extension_id, tool_name)): Path<(String, String)>,
@@ -348,7 +414,7 @@ pub(super) async fn invoke_extension_tool(
 
     // Snapshot installed extension + grant out of the store before the
     // outbound call so we can drop the read lock during the (potentially
-    // slow) network round-trip.
+    // slow) network round-trip / wasm execution.
     let (manifest, grant) = {
         let store = state.fact_store.read().await;
         let installed = match crate::extension_registry::get_extension(&store, &extension_id) {
@@ -371,6 +437,38 @@ pub(super) async fn invoke_extension_tool(
         };
         (installed.manifest, grant)
     };
+
+    // Tool name must be in the grant's allow-list (or the allow-list
+    // must be empty, meaning "all tools the manifest declares").
+    if !grant.allowed_tool_names.is_empty() && !grant.allowed_tool_names.contains(&tool_name) {
+        return problem_response(
+            StatusCode::FORBIDDEN,
+            format!("tool '{tool_name}' is not in the grant's allowed_tool_names"),
+        );
+    }
+
+    // Branch on entry.kind: Wasm → Phase B host, ExternalTool → Phase A.
+    if manifest.entry.kind == crux_integrations::EntryKind::Wasm {
+        return dispatch_wasm_kind_or_unsupported(
+            state,
+            extension_id,
+            manifest,
+            grant,
+            tool_name,
+            body.args,
+            calling_passport,
+        )
+        .await;
+    }
+    if manifest.entry.kind != crux_integrations::EntryKind::ExternalTool {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "extension '{}' has unsupported entry.kind {:?} for tool dispatch",
+                extension_id, manifest.entry.kind
+            ),
+        );
+    }
 
     // Run the outbound HTTP call off the async runtime — ureq is blocking.
     let cfg = crate::extension_outbound::OutboundConfig::from_env();
@@ -490,4 +588,86 @@ pub(super) async fn delete_trusted_key(
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
     }
     (StatusCode::NO_CONTENT, ()).into_response()
+}
+
+// ── Phase B (M6.3) wasm-dispatch entry point ─────────────────────────────
+
+/// Wasm dispatch path for `kind: wasm` extensions. Without
+/// `--features wasm-extensions` the daemon returns 501; with the
+/// feature, calls into [`crate::wasm_dispatcher`].
+#[cfg(feature = "wasm-extensions")]
+async fn dispatch_wasm_kind_or_unsupported(
+    state: AppState,
+    extension_id: String,
+    manifest: IntegrationManifest,
+    grant: crate::extension_grants::ExtensionGrant,
+    tool_name: String,
+    args: serde_json::Value,
+    calling_passport: String,
+) -> axum::response::Response {
+    let Some(engine) = state.wasm_engine.clone() else {
+        return problem_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "wasm engine init failed at startup; restart the daemon and check logs",
+        );
+    };
+    let cfg = crate::wasm_host::WasmConfig::from_env();
+    let request_id = make_request_id();
+    let result = crate::wasm_dispatcher::dispatch_wasm_via_http(
+        engine,
+        cfg,
+        state.data_dir.clone(),
+        state.fact_store.clone(),
+        extension_id,
+        manifest,
+        grant,
+        tool_name,
+        args,
+        calling_passport,
+        request_id,
+    )
+    .await;
+    match result {
+        Ok(outcome) => (StatusCode::OK, Json(outcome)).into_response(),
+        Err(crate::wasm_dispatcher::WasmDispatchError::ModuleFileMissing(p)) => problem_response(
+            StatusCode::NOT_FOUND,
+            format!("wasm module file missing at '{}'", p.display()),
+        ),
+        Err(crate::wasm_dispatcher::WasmDispatchError::Sha256Mismatch { expected, actual }) => problem_response(
+            StatusCode::CONFLICT,
+            format!("module sha256 mismatch: manifest={expected}, on-disk={actual}"),
+        ),
+        Err(err @ crate::wasm_dispatcher::WasmDispatchError::Dispatch(crate::wasm_host::WasmError::FuelExhausted)) => {
+            problem_response(StatusCode::REQUEST_TIMEOUT, err.to_string())
+        }
+        Err(
+            err @ crate::wasm_dispatcher::WasmDispatchError::Dispatch(crate::wasm_host::WasmError::DeadlineExceeded),
+        ) => problem_response(StatusCode::REQUEST_TIMEOUT, err.to_string()),
+        Err(err @ crate::wasm_dispatcher::WasmDispatchError::Dispatch(crate::wasm_host::WasmError::OutOfMemory)) => {
+            problem_response(StatusCode::INSUFFICIENT_STORAGE, err.to_string())
+        }
+        Err(err) => problem_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    }
+}
+
+/// Without the `wasm-extensions` feature, the route returns 501 so the
+/// operator immediately understands what to flip to enable it. Marked
+/// `async` to share the call-site signature with the wasm-feature
+/// variant (which IS async); suppress the unused_async lint here since
+/// the body is a synchronous early-return.
+#[cfg(not(feature = "wasm-extensions"))]
+#[allow(clippy::unused_async)]
+async fn dispatch_wasm_kind_or_unsupported(
+    _state: AppState,
+    _extension_id: String,
+    _manifest: IntegrationManifest,
+    _grant: crate::extension_grants::ExtensionGrant,
+    _tool_name: String,
+    _args: serde_json::Value,
+    _calling_passport: String,
+) -> axum::response::Response {
+    problem_response(
+        StatusCode::NOT_IMPLEMENTED,
+        "wasm extensions require building corecruxd with --features wasm-extensions",
+    )
 }

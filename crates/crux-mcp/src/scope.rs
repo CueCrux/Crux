@@ -28,7 +28,7 @@ pub fn visible_entity_for_agent(fact: &Fact, agent_name: Option<&str>) -> Option
     if let Some((owner, logical)) = split_private_entity(&fact.entity) {
         return (agent_name == Some(owner)).then(|| logical.to_string());
     }
-    if fact.private && agent_name.is_some() {
+    if fact.private {
         return None;
     }
     Some(fact.entity.clone())
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn anonymous_private_fact_hidden_from_authenticated_agents() {
         let fact = sample_fact("legacy-private", true);
-        assert_eq!(visible_entity_for_agent(&fact, None).as_deref(), Some("legacy-private"));
+        assert!(visible_entity_for_agent(&fact, None).is_none());
         assert!(visible_entity_for_agent(&fact, Some("alice")).is_none());
     }
 

@@ -4,6 +4,8 @@
 
 use super::*;
 
+const MAX_FACT_QUERY_TOP_K: usize = 100;
+
 /// Query parameters for the GET /v1/facts endpoint.
 #[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
 pub(super) struct QueryFactsParams {
@@ -30,6 +32,149 @@ pub(super) struct ExportFactsParams {
     pub limit: Option<u32>,
 }
 
+// `axum::response::Response` is large by clippy's reckoning, but
+// returning it as the Err arm is the idiomatic axum pattern; suppress
+// the lint at the helper boundary.
+#[allow(clippy::result_large_err)]
+fn require_fact_read_ctx(state: &AppState, headers: &HeaderMap) -> Result<crate::auth::HttpScopeContext, Response> {
+    require_http_any_scope(&state.auth, headers, &["query:read", "admin:read"]).map_err(IntoResponse::into_response)?;
+    http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)
+}
+
+#[allow(clippy::result_large_err)]
+fn require_fact_write_ctx(state: &AppState, headers: &HeaderMap) -> Result<crate::auth::HttpScopeContext, Response> {
+    require_http_any_scope(&state.auth, headers, &["facts:write", "admin:write"])
+        .map_err(IntoResponse::into_response)?;
+    http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)
+}
+
+#[allow(clippy::result_large_err)]
+fn require_session_write_ctx(state: &AppState, headers: &HeaderMap) -> Result<crate::auth::HttpScopeContext, Response> {
+    require_http_any_scope(&state.auth, headers, &["sessions:write", "admin:write"])
+        .map_err(IntoResponse::into_response)?;
+    http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)
+}
+
+fn raw_admin_read(ctx: &crate::auth::HttpScopeContext) -> bool {
+    ctx.passport_id.is_none() && ctx.has_scope("admin:read")
+}
+
+fn raw_admin_write(ctx: &crate::auth::HttpScopeContext) -> bool {
+    ctx.passport_id.is_none() && ctx.has_scope("admin:write")
+}
+
+fn render_fact_for_http(
+    fact: &corecrux_memory::fact_store::Fact,
+    ctx: &crate::auth::HttpScopeContext,
+) -> Option<corecrux_memory::fact_store::Fact> {
+    if raw_admin_read(ctx) || raw_admin_write(ctx) {
+        return Some(fact.clone());
+    }
+    let entity = crux_mcp::scope::visible_entity_for_agent(fact, ctx.passport_id.as_deref())?;
+    let mut out = fact.clone();
+    out.entity = entity;
+    Some(out)
+}
+
+fn fact_visible_for_http_write(fact: &corecrux_memory::fact_store::Fact, ctx: &crate::auth::HttpScopeContext) -> bool {
+    raw_admin_write(ctx) || crux_mcp::scope::fact_visible_to_agent(fact, ctx.passport_id.as_deref())
+}
+
+fn fact_matches_query(fact: &corecrux_memory::fact_store::Fact, query: &str, agent_name: Option<&str>) -> bool {
+    let query_lower = query.to_lowercase();
+    let terms: Vec<&str> = query_lower.split_whitespace().collect();
+    let value_lower = fact.value.to_lowercase();
+    let key_lower = fact.key.to_lowercase();
+    let entity_lower = crux_mcp::scope::visible_entity_for_agent(fact, agent_name)
+        .unwrap_or_else(|| fact.entity.clone())
+        .to_lowercase();
+
+    terms
+        .iter()
+        .any(|term| value_lower.contains(term) || key_lower.contains(term) || entity_lower.contains(term))
+}
+
+fn query_visible_http_facts(
+    store: &corecrux_memory::FactStore,
+    q: &corecrux_memory::fact_store::FactQuery,
+    ctx: &crate::auth::HttpScopeContext,
+) -> Vec<corecrux_memory::fact_store::Fact> {
+    if raw_admin_read(ctx) {
+        return store.query(q).facts;
+    }
+
+    let agent_name = ctx.passport_id.as_deref();
+    let mut results: Vec<&corecrux_memory::fact_store::Fact> = store
+        .all_facts()
+        .filter(|fact| !fact.deleted)
+        .filter(|fact| crux_mcp::scope::fact_visible_to_agent(fact, agent_name))
+        .filter(|fact| {
+            q.entity_prefix
+                .as_ref()
+                .is_none_or(|prefix| crux_mcp::scope::entity_prefix_matches_for_agent(fact, prefix, agent_name))
+        })
+        .filter(|fact| {
+            q.entity
+                .as_ref()
+                .is_none_or(|entity| crux_mcp::scope::entity_matches_for_agent(fact, entity, agent_name))
+        })
+        .filter(|fact| {
+            q.query
+                .as_ref()
+                .is_none_or(|query| fact_matches_query(fact, query, agent_name))
+        })
+        .collect();
+
+    results.sort_by(|left, right| {
+        right
+            .confidence
+            .partial_cmp(&left.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.stored_at.cmp(&left.stored_at))
+    });
+
+    let selected = if let Some(budget) = q.token_budget {
+        let mut used = 0usize;
+        let mut selected = Vec::new();
+        for fact in results {
+            if used + fact.tokens > budget && !selected.is_empty() {
+                break;
+            }
+            used += fact.tokens;
+            selected.push(fact);
+            if used >= budget {
+                break;
+            }
+        }
+        selected
+    } else {
+        results.truncate(q.top_k);
+        results
+    };
+
+    selected
+        .into_iter()
+        .filter_map(|fact| render_fact_for_http(fact, ctx))
+        .collect()
+}
+
+fn scoped_session_id_for_http(ctx: &crate::auth::HttpScopeContext, session_id: &str) -> String {
+    crux_mcp::scope::scoped_session_id(ctx.passport_id.as_deref(), session_id)
+}
+
+fn render_session_for_http(
+    session: &corecrux_memory::session_store::SessionState,
+    ctx: &crate::auth::HttpScopeContext,
+) -> Option<corecrux_memory::session_store::SessionState> {
+    if raw_admin_read(ctx) || raw_admin_write(ctx) {
+        return Some(session.clone());
+    }
+    let visible_id = crux_mcp::scope::visible_session_for_agent(&session.session_id, ctx.passport_id.as_deref())?;
+    let mut out = session.clone();
+    out.session_id = visible_id;
+    Some(out)
+}
+
 #[utoipa::path(
     put,
     path = "/v1/facts",
@@ -46,10 +191,8 @@ pub(super) async fn put_fact(
     headers: HeaderMap,
     Json(body): Json<corecrux_memory::fact_store::StoreFact>,
 ) -> impl IntoResponse {
-    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
-        if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-            return problem.into_response();
-        }
+    if let Err(response) = require_fact_write_ctx(&state, &headers) {
+        return response;
     }
     if body.private {
         return problem_response(
@@ -57,7 +200,10 @@ pub(super) async fn put_fact(
             "private facts require MCP agent identity; HTTP /v1/facts does not support private=true",
         );
     }
-    let fact = state.fact_store.write().await.store(body);
+    let fact = match state.fact_store.write().await.try_store(body) {
+        Ok(fact) => fact,
+        Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
     (StatusCode::CREATED, axum::Json(serde_json::json!(fact))).into_response()
 }
 
@@ -77,10 +223,8 @@ pub(super) async fn put_facts_bulk(
     headers: HeaderMap,
     Json(body): Json<Vec<corecrux_memory::fact_store::StoreFact>>,
 ) -> impl IntoResponse {
-    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
-        if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-            return problem.into_response();
-        }
+    if let Err(response) = require_fact_write_ctx(&state, &headers) {
+        return response;
     }
     if body.iter().any(|fact| fact.private) {
         return problem_response(
@@ -88,7 +232,10 @@ pub(super) async fn put_facts_bulk(
             "private facts require MCP agent identity; HTTP /v1/facts/bulk does not support private=true",
         );
     }
-    let facts = state.fact_store.write().await.store_bulk(body);
+    let facts = match state.fact_store.write().await.try_store_bulk(body) {
+        Ok(facts) => facts,
+        Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
     (StatusCode::CREATED, axum::Json(serde_json::json!({"facts": facts}))).into_response()
 }
 
@@ -109,13 +256,12 @@ pub(super) async fn get_fact(
     headers: HeaderMap,
     Path(fact_id): Path<String>,
 ) -> impl IntoResponse {
-    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
-        if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-            return problem.into_response();
-        }
-    }
+    let ctx = match require_fact_read_ctx(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
     let store = state.fact_store.read().await;
-    match store.get(&fact_id) {
+    match store.get(&fact_id).and_then(|fact| render_fact_for_http(fact, &ctx)) {
         Some(fact) => (StatusCode::OK, axum::Json(serde_json::json!(fact))).into_response(),
         None => problem_response(StatusCode::NOT_FOUND, format!("fact '{}' not found", fact_id)),
     }
@@ -138,12 +284,22 @@ pub(super) async fn delete_fact(
     headers: HeaderMap,
     Path(fact_id): Path<String>,
 ) -> impl IntoResponse {
-    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
-        if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-            return problem.into_response();
+    let ctx = match require_fact_write_ctx(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let mut store = state.fact_store.write().await;
+    let visible = store
+        .get(&fact_id)
+        .is_some_and(|fact| fact_visible_for_http_write(fact, &ctx));
+    let deleted = if visible {
+        match store.try_delete(&fact_id) {
+            Ok(deleted) => deleted,
+            Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         }
-    }
-    let deleted = state.fact_store.write().await.delete(&fact_id);
+    } else {
+        false
+    };
     if deleted {
         (StatusCode::OK, axum::Json(serde_json::json!({"deleted": true}))).into_response()
     } else {
@@ -167,13 +323,21 @@ pub(super) async fn get_facts_by_entity(
     headers: HeaderMap,
     Path(entity): Path<String>,
 ) -> impl IntoResponse {
-    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
-        if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-            return problem.into_response();
-        }
-    }
+    let ctx = match require_fact_read_ctx(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
     let store = state.fact_store.read().await;
-    let facts: Vec<_> = store.get_by_entity(&entity);
+    let facts: Vec<_> = if raw_admin_read(&ctx) {
+        store.get_by_entity(&entity).into_iter().cloned().collect()
+    } else {
+        store
+            .all_facts()
+            .filter(|fact| !fact.deleted)
+            .filter(|fact| crux_mcp::scope::entity_matches_for_agent(fact, &entity, ctx.passport_id.as_deref()))
+            .filter_map(|fact| render_fact_for_http(fact, &ctx))
+            .collect()
+    };
     (StatusCode::OK, axum::Json(serde_json::json!({"facts": facts}))).into_response()
 }
 
@@ -193,25 +357,25 @@ pub(super) async fn query_facts(
     headers: HeaderMap,
     Query(params): Query<QueryFactsParams>,
 ) -> impl IntoResponse {
-    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
-        if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-            return problem.into_response();
-        }
-    }
+    let ctx = match require_fact_read_ctx(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
     let q = corecrux_memory::fact_store::FactQuery {
         query: params.query,
         entity: params.entity,
         entity_prefix: params.entity_prefix,
-        top_k: params.top_k.unwrap_or(10),
+        top_k: params.top_k.unwrap_or(10).clamp(1, MAX_FACT_QUERY_TOP_K),
         token_budget: params.token_budget,
     };
     let store = state.fact_store.read().await;
-    let result = store.query(&q);
+    let facts = query_visible_http_facts(&store, &q, &ctx);
+    let total_tokens = facts.iter().map(|fact| fact.tokens).sum::<usize>();
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({
-            "facts": result.facts,
-            "total_tokens": result.total_tokens,
+            "facts": facts,
+            "total_tokens": total_tokens,
         })),
     )
         .into_response()
@@ -233,11 +397,10 @@ pub(super) async fn export_facts(
     headers: HeaderMap,
     Query(params): Query<ExportFactsParams>,
 ) -> impl IntoResponse {
-    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
-        if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-            return problem.into_response();
-        }
-    }
+    let ctx = match require_fact_read_ctx(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
 
     let since = params
         .since
@@ -250,7 +413,14 @@ pub(super) async fn export_facts(
     let limit = params.limit.map_or(1000, |v| v.min(10000) as usize);
 
     let store = state.fact_store.read().await;
-    let result = store.export(since, cursor, limit);
+    let mut result = store.export(since, cursor, limit);
+    if !raw_admin_read(&ctx) {
+        result.facts = result
+            .facts
+            .iter()
+            .filter_map(|fact| render_fact_for_http(fact, &ctx))
+            .collect();
+    }
 
     (
         StatusCode::OK,
@@ -284,13 +454,24 @@ pub(super) async fn put_session_state(
     Path(session_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
-        if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-            return problem.into_response();
-        }
+    let ctx = match require_session_write_ctx(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let stored_session_id = scoped_session_id_for_http(&ctx, &session_id);
+    let session = match state
+        .session_store
+        .write()
+        .await
+        .try_put(&stored_session_id, body, None)
+    {
+        Ok(session) => session,
+        Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    match render_session_for_http(&session, &ctx) {
+        Some(session) => (StatusCode::OK, axum::Json(serde_json::json!(session))).into_response(),
+        None => problem_response(StatusCode::NOT_FOUND, format!("session '{}' not found", session_id)),
     }
-    let session = state.session_store.write().await.put(&session_id, body, None);
-    (StatusCode::OK, axum::Json(serde_json::json!(session))).into_response()
 }
 
 #[utoipa::path(
@@ -310,13 +491,22 @@ pub(super) async fn get_session_state(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
-    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
-        if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
-            return problem.into_response();
-        }
-    }
+    let ctx = match require_fact_read_ctx(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let stored_session_id = if ctx.passport_id.is_some() {
+        scoped_session_id_for_http(&ctx, &session_id)
+    } else if raw_admin_read(&ctx) || crux_mcp::scope::split_scoped_session_id(&session_id).is_none() {
+        session_id.clone()
+    } else {
+        return problem_response(StatusCode::NOT_FOUND, format!("session '{}' not found", session_id));
+    };
     let store = state.session_store.read().await;
-    match store.get(&session_id) {
+    match store
+        .get(&stored_session_id)
+        .and_then(|session| render_session_for_http(session, &ctx))
+    {
         Some(session) => (StatusCode::OK, axum::Json(serde_json::json!(session))).into_response(),
         None => problem_response(StatusCode::NOT_FOUND, format!("session '{}' not found", session_id)),
     }

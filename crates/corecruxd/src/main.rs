@@ -54,6 +54,8 @@ mod storybook;
 mod structured_log;
 mod update;
 #[cfg(feature = "wasm-extensions")]
+mod wasm_dispatcher;
+#[cfg(feature = "wasm-extensions")]
 mod wasm_host;
 mod work;
 mod workspace_scan;
@@ -87,6 +89,23 @@ use crate::ops_events::{append_ops_event, build_node_context, now_unix_ms};
 use crate::shard_map::{RoutingTable, ShardMapStore};
 
 const PASSPORT_CLAIM_MARKER_FILENAME: &str = "passport.claimed";
+
+/// Build the long-lived wasm engine used for `kind: wasm` extensions.
+/// Returns `None` (but logs) on failure so a wasm-engine init issue
+/// doesn't take the daemon offline — `kind: external_tool` extensions
+/// continue to work; the HTTP dispatcher returns 503 for `kind: wasm`
+/// requests until the operator fixes the underlying error.
+#[cfg(feature = "wasm-extensions")]
+fn build_wasm_engine_for_appstate() -> Option<std::sync::Arc<crate::wasm_host::WasmEngine>> {
+    let cfg = crate::wasm_host::WasmConfig::from_env();
+    match crate::wasm_host::WasmEngine::new(cfg.epoch_tick) {
+        Ok(eng) => Some(std::sync::Arc::new(eng)),
+        Err(err) => {
+            tracing::error!("wasm engine init failed: {err}; kind=wasm extensions will return 503");
+            None
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -447,6 +466,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             corecrux_memory::FactStore::new()
         })),
         extension_rate_table: Arc::new(crate::extension_outbound::RateTable::new()),
+        #[cfg(feature = "wasm-extensions")]
+        wasm_engine: build_wasm_engine_for_appstate(),
         session_store: Arc::new(RwLock::new(if config.fact_persistence_enabled {
             corecrux_memory::SessionStore::with_persistence(&config.data_dir)?
         } else {
@@ -605,9 +626,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let reaped = session_store.write().await.reap_expired();
-                        if reaped > 0 {
-                            tracing::info!(reaped, "session-ttl-reaper");
+                        match session_store.write().await.try_reap_expired() {
+                            Ok(reaped) if reaped > 0 => tracing::info!(reaped, "session-ttl-reaper"),
+                            Ok(_) => {}
+                            Err(err) => tracing::warn!(?err, "session-ttl-reaper-journal-failed"),
                         }
                     }
                     _ = rx.recv() => break,
@@ -652,8 +674,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             Err(e) => tracing::warn!(error = %e, "sync: pull failed"),
                         }
 
-                        // Then push.
-                        match client.push(&*sync_fact_store.read().await) {
+                        // Then push from a short-lived snapshot so network I/O does not hold the store read lock.
+                        let pushable = {
+                            let store = sync_fact_store.read().await;
+                            client.pushable_facts(&store)
+                        };
+                        match client.push_facts(&pushable) {
                             Ok(result) => {
                                 if result.facts_pushed > 0 {
                                     tracing::info!(pushed = result.facts_pushed, "sync: pushed facts to remote");
@@ -3532,6 +3558,8 @@ mod tests {
             retrieval_index: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_retrieval::IndexManager::new())),
             fact_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::FactStore::new())),
             extension_rate_table: std::sync::Arc::new(crate::extension_outbound::RateTable::new()),
+            #[cfg(feature = "wasm-extensions")]
+            wasm_engine: None,
             session_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::SessionStore::new())),
             update_status: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_types::UpdateStatus::default())),
             event_bus: corecrux_memory::events::EventBus::new(16),

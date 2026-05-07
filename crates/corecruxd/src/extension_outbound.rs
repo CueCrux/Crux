@@ -467,6 +467,9 @@ mod tests {
                 input_schema: serde_json::json!({"type":"object"}),
                 auth_shared_secret_id: None,
             }],
+            wasm_module_path: None,
+            wasm_module_url: None,
+            wasm_module_sha256: None,
         }
     }
 

@@ -17,6 +17,7 @@ tokio = { version = "1.51.1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1.41"
 ureq = { version = "3.3.0", features = ["json"] }
 uuid = { version = "1.23.1", features = ["v4"] }
+xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
 corecrux-memory = { path = "../corecrux-memory" }
 corecrux-retrieval = { path = "../corecrux-retrieval" }
 corecrux-types = { path = "../corecrux-types" }

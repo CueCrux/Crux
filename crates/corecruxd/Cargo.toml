@@ -17,7 +17,7 @@ otel = [
 # host for `kind: wasm` extensions. Off by default so that operators who
 # only use Phase A external-tool extensions don't pay the wasmtime build
 # cost (~30s cold + ~60MB binary growth).
-wasm-extensions = ["dep:wasmtime"]
+wasm-extensions = ["dep:wasmtime", "dep:sha2"]
 
 [dependencies]
 axum = "0.8.9"
@@ -73,6 +73,7 @@ crux-enterprise-shim = { path = "../crux-enterprise-shim" }
 vaultcrux-local = { path = "../vaultcrux-local" }
 
 wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime"], optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 corecrux-index = { path = "../corecrux-index" }

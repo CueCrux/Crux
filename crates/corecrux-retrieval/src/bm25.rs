@@ -21,6 +21,14 @@ impl Default for Bm25Params {
     }
 }
 
+fn doc_matches_tenant(reader: &CcxiReader, did: usize, tenant_filter: Option<u64>) -> bool {
+    let Some(tf64) = tenant_filter else {
+        return true;
+    };
+    let doc = &reader.docs[did];
+    doc.tenant_hash_lo16 == (tf64 & 0xFFFF) as u16 && doc.tenant_hash_full == tf64
+}
+
 /// A scored document from BM25 retrieval.
 #[derive(Debug, Clone)]
 pub struct Bm25Hit {
@@ -33,12 +41,12 @@ pub struct Bm25Hit {
 /// Score all documents in a CcxiReader against a query using BM25.
 ///
 /// Returns hits sorted by score descending, limited to `top_k`.
-/// If `tenant_filter` is Some, only documents matching the tenant are scored.
+/// If `tenant_filter` is Some, only documents matching the full 64-bit tenant hash are scored.
 pub fn bm25_score(
     reader: &CcxiReader,
     query: &str,
     top_k: usize,
-    tenant_filter: Option<u16>,
+    tenant_filter: Option<u64>,
     params: &Bm25Params,
 ) -> Vec<Bm25Hit> {
     let query_tokens = tokenize(query);
@@ -69,11 +77,8 @@ pub fn bm25_score(
                 continue;
             }
 
-            // Tenant filter
-            if let Some(tf16) = tenant_filter {
-                if reader.docs[did].tenant_hash_lo16 != tf16 {
-                    continue;
-                }
+            if !doc_matches_tenant(reader, did, tenant_filter) {
+                continue;
             }
 
             let tf = tfs.get(i).copied().unwrap_or(1) as f32;
@@ -110,7 +115,7 @@ pub fn bm25_score_multi(
     readers: &[&CcxiReader],
     query: &str,
     top_k: usize,
-    tenant_filter: Option<u16>,
+    tenant_filter: Option<u64>,
     params: &Bm25Params,
 ) -> Vec<MergedBm25Hit> {
     let query_tokens = tokenize(query);
@@ -160,10 +165,8 @@ pub fn bm25_score_multi(
                 if did >= reader.docs.len() {
                     continue;
                 }
-                if let Some(tf16) = tenant_filter {
-                    if reader.docs[did].tenant_hash_lo16 != tf16 {
-                        continue;
-                    }
+                if !doc_matches_tenant(reader, did, tenant_filter) {
+                    continue;
                 }
 
                 let tf = tfs.get(i).copied().unwrap_or(1) as f32;
@@ -230,7 +233,7 @@ pub fn bm25_search(
     readers: &[&CcxiReader],
     query: &str,
     top_k: usize,
-    tenant_filter: Option<u16>,
+    tenant_filter: Option<u64>,
     params: &Bm25Params,
     min_score: Option<f32>,
 ) -> Bm25SearchResult {
@@ -293,10 +296,8 @@ pub fn bm25_search(
                 if did >= reader.docs.len() {
                     continue;
                 }
-                if let Some(tf16) = tenant_filter {
-                    if reader.docs[did].tenant_hash_lo16 != tf16 {
-                        continue;
-                    }
+                if !doc_matches_tenant(reader, did, tenant_filter) {
+                    continue;
                 }
 
                 let tf = tfs.get(i).copied().unwrap_or(1) as f32;
@@ -406,6 +407,25 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, 0);
+    }
+
+    #[test]
+    fn tenant_filter_rejects_lo16_collision() {
+        let tenant_a = 0x0001_0000_0000_AAAAu64;
+        let tenant_b = 0x0002_0000_0000_AAAAu64;
+        assert_eq!((tenant_a & 0xFFFF) as u16, (tenant_b & 0xFFFF) as u16);
+
+        let mut builder = CcxiBuilder::new(0, 1, 100);
+        builder.add_document(0, "terraform module", 0, tenant_a);
+        builder.add_document(1, "terraform workspace", 100, tenant_b);
+        let bytes = builder.build();
+        let reader = CcxiReader::from_bytes(&bytes).unwrap();
+
+        let hits = bm25_score(&reader, "terraform", 5, Some(tenant_a), &Bm25Params::default());
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, 0);
+        assert_eq!(hits[0].tenant_hash_full, tenant_a);
     }
 
     #[test]

@@ -263,8 +263,15 @@ fn text_search_scan_mode() {
 
 #[test]
 fn text_search_expand() {
+    // Audit-triage tightening (2026-05-07): empty result_ids now 400s.
+    // Pass one synthetic rid so the route runs end-to-end against the
+    // (empty) test index; out-of-bounds segment_index is skipped, so
+    // tokens_loaded stays 0.
     let b: serde_json::Value = daemon()
-        .post_json("/v1/query/text-search/expand", json!({"tenant_id":"t","result_ids":[]}))
+        .post_json(
+            "/v1/query/text-search/expand",
+            json!({"tenant_id":"t","result_ids":[{"segment_index":0,"doc_id":0}]}),
+        )
         .unwrap()
         .into_body()
         .read_json()
