@@ -62,6 +62,8 @@ use wasmtime::{
     TypedFunc,
 };
 
+use super::extension_grants::ExtensionGrant;
+
 /// Per-call resource limits. Defaults are safe for trivial tools; a
 /// future "Pro" extension type may want to widen them, but defaulting
 /// tight means a misbehaving community module can't take the daemon down.
@@ -138,6 +140,17 @@ pub struct HostState {
     /// Bound passport for this call. Surfaced to the module via
     /// `current_passport_json`.
     pub calling_passport_id: String,
+    /// The grant that authorises this call. `None` only in M6.1-style
+    /// foundation tests; M6.3+ always sets this. With `None`, every
+    /// fact-store host fn returns the "no grant" code (-2).
+    pub grant: Option<Arc<ExtensionGrant>>,
+    /// Adapter over the daemon's fact store. `None` means "this build
+    /// doesn't wire fact ops"; the host fns return -5 (unavailable).
+    pub fact_store: Option<Arc<dyn HostFactStore>>,
+    /// Extension id, kept on the state so receipts the host emits can
+    /// attribute them. Unused in M6.2 itself; consumed by M6.3 when the
+    /// dispatcher records receipt lineage.
+    pub extension_id: String,
     /// Buffered log lines emitted via the host `log` ABI. Rendered into
     /// CROWN receipts and the audit tail upstream.
     pub log: Vec<HostLogEntry>,
@@ -153,9 +166,26 @@ pub struct HostLogEntry {
 }
 
 impl HostState {
+    /// Foundation-mode: no grant, no fact store. Used by M6.1 tests that
+    /// only exercise traps + minimal ABI (`log`, `now_unix_ms`,
+    /// `current_passport_json`).
     pub fn new(calling_passport_id: String, max_memory_bytes: usize) -> Self {
+        Self::with_context(calling_passport_id, String::new(), None, None, max_memory_bytes)
+    }
+
+    /// Production form (M6.3): all four context items wired.
+    pub fn with_context(
+        calling_passport_id: String,
+        extension_id: String,
+        grant: Option<Arc<ExtensionGrant>>,
+        fact_store: Option<Arc<dyn HostFactStore>>,
+        max_memory_bytes: usize,
+    ) -> Self {
         Self {
             calling_passport_id,
+            grant,
+            fact_store,
+            extension_id,
             log: Vec::new(),
             limits: StoreLimitsBuilder::new()
                 .memory_size(max_memory_bytes)
@@ -164,6 +194,104 @@ impl HostState {
                 .build(),
         }
     }
+}
+
+/// Trait the M6.3 dispatcher implements to expose the daemon's fact store
+/// to a wasm module without coupling `wasm_host.rs` to the concrete
+/// `corecrux_memory::FactStore` type. Tests pass a mock; production uses
+/// an adapter that calls into the real store via
+/// `tokio::sync::RwLock::blocking_{read,write}` from inside
+/// `tokio::task::spawn_blocking`.
+///
+/// Methods take `&self` (not `&mut self`) so a single
+/// `Arc<dyn HostFactStore>` can be cloned across host-fn calls; impls
+/// use interior mutability.
+pub trait HostFactStore: Send + Sync {
+    fn read_fact(&self, entity: &str, key: &str) -> Option<HostFact>;
+    fn store_fact(&self, req: HostStoreFact) -> Result<HostFact, String>;
+    fn query_facts(&self, q: HostFactQuery) -> Vec<HostFact>;
+}
+
+/// Projection of `corecrux_memory::Fact` for the wasm wire. Only the
+/// fields a community module needs to act; supersession + version
+/// bookkeeping is the host's concern.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HostFact {
+    pub fact_id: String,
+    pub entity: String,
+    pub key: String,
+    pub value: String,
+    pub confidence: f32,
+    pub stored_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct HostStoreFact {
+    pub entity: String,
+    pub key: String,
+    pub value: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HostFactQuery {
+    pub entity_prefix: Option<String>,
+    pub query: Option<String>,
+    pub top_k: usize,
+}
+
+// ── Host ABI return-code legend ────────────────────────────────────────
+//
+// Negative i32 codes returned by `read_fact` / `store_fact` /
+// `query_facts` / `get_secret_decrypted` / `emit_receipt`. Modules see
+// these as plain i32 < 0; idiomatic guest-side wrappers translate them
+// into Result<...>.
+//
+// Stable contract — DO NOT renumber across daemon versions; modules
+// may have hard-coded match arms.
+const HOST_RC_NOT_FOUND: i32 = -1;
+const HOST_RC_NO_GRANT: i32 = -2;
+const HOST_RC_SCOPE_VIOLATION: i32 = -3;
+const HOST_RC_BUFFER_TOO_SMALL: i32 = -4;
+const HOST_RC_FACT_STORE_UNAVAILABLE: i32 = -5;
+const HOST_RC_NOT_IMPLEMENTED: i32 = -6;
+/// 7-9 reserved for future scoped errors (e.g. rate-limit, secret-decrypt).
+const HOST_RC_HOST_INTERNAL: i32 = -10;
+const HOST_RC_BAD_INPUT: i32 = -11;
+const HOST_RC_SERIALISE_ERR: i32 = -12;
+
+/// Public re-exports of the negative-return-code constants so the M6.3
+/// dispatcher can map them to `WasmError` variants without re-defining
+/// the magic numbers.
+pub mod rc {
+    pub const NOT_FOUND: i32 = super::HOST_RC_NOT_FOUND;
+    pub const NO_GRANT: i32 = super::HOST_RC_NO_GRANT;
+    pub const SCOPE_VIOLATION: i32 = super::HOST_RC_SCOPE_VIOLATION;
+    pub const BUFFER_TOO_SMALL: i32 = super::HOST_RC_BUFFER_TOO_SMALL;
+    pub const FACT_STORE_UNAVAILABLE: i32 = super::HOST_RC_FACT_STORE_UNAVAILABLE;
+    pub const NOT_IMPLEMENTED: i32 = super::HOST_RC_NOT_IMPLEMENTED;
+    pub const HOST_INTERNAL: i32 = super::HOST_RC_HOST_INTERNAL;
+    pub const BAD_INPUT: i32 = super::HOST_RC_BAD_INPUT;
+    pub const SERIALISE_ERR: i32 = super::HOST_RC_SERIALISE_ERR;
+}
+
+/// Whether `entity` falls under any of the granted prefixes. Used by
+/// `read_fact` and to filter `query_facts` results post-fetch.
+pub(crate) fn entity_matches_any_prefix(entity: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|p| !p.is_empty() && entity.starts_with(p.as_str()))
+}
+
+/// Whether a `query_facts` prefix is acceptable for the given grant. The
+/// rule: the query prefix must be at least as specific as one granted
+/// prefix (i.e. `query_prefix.starts_with(granted)`). The empty string
+/// never satisfies this — modules can't enumerate everything.
+pub(crate) fn query_prefix_within_grant(query_prefix: &str, granted: &[String]) -> bool {
+    if query_prefix.is_empty() {
+        return false;
+    }
+    granted
+        .iter()
+        .any(|p| !p.is_empty() && query_prefix.starts_with(p.as_str()))
 }
 
 /// Process-wide wasmtime [`Engine`] + a background thread that ticks the
@@ -245,10 +373,26 @@ pub struct WasmCallResponse {
     pub fact_writes: Vec<super::extension_outbound::ProposedFactWrite>,
 }
 
+/// Bundled per-call context for [`dispatch_wasm_tool_with_context`].
+/// Lifetimes parameterised on `'a` mirror the original
+/// [`dispatch_wasm_tool`] borrow shape.
+pub struct WasmCallContext<'a> {
+    pub tool_name: &'a str,
+    pub args: &'a serde_json::Value,
+    pub calling_passport_id: &'a str,
+    pub request_id: &'a str,
+    pub extension_id: &'a str,
+    pub grant: Option<Arc<ExtensionGrant>>,
+    pub fact_store: Option<Arc<dyn HostFactStore>>,
+}
+
 /// Compile + instantiate + call. Single-shot; instance is dropped at the
 /// end of the call. Re-instantiation amortises instance setup but leaks
 /// state between calls — for a community-extension MVP, single-shot is
 /// the safer default.
+///
+/// Foundation form (M6.1 compatibility) — no grant, no fact-store. Use
+/// [`dispatch_wasm_tool_with_context`] for M6.2+ paths that need either.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_wasm_tool(
     engine: &WasmEngine,
@@ -259,12 +403,44 @@ pub fn dispatch_wasm_tool(
     calling_passport_id: &str,
     request_id: &str,
 ) -> Result<(WasmDispatchOutcome, WasmCallResponse), WasmError> {
+    dispatch_wasm_tool_with_context(
+        engine,
+        config,
+        module_bytes,
+        WasmCallContext {
+            tool_name,
+            args,
+            calling_passport_id,
+            request_id,
+            extension_id: "",
+            grant: None,
+            fact_store: None,
+        },
+    )
+}
+
+/// M6.2+ entry point: compiles, instantiates, calls, classifies trap.
+/// Same return shape as [`dispatch_wasm_tool`] but threads grant +
+/// fact-store handles into [`HostState`] so the host ABI can read/write
+/// facts on the module's behalf.
+pub fn dispatch_wasm_tool_with_context(
+    engine: &WasmEngine,
+    config: &WasmConfig,
+    module_bytes: &[u8],
+    ctx: WasmCallContext<'_>,
+) -> Result<(WasmDispatchOutcome, WasmCallResponse), WasmError> {
     let started = Instant::now();
     let module = Module::from_binary(engine.engine(), module_bytes).map_err(|e| WasmError::Compile(e.to_string()))?;
 
     let mut store = Store::new(
         engine.engine(),
-        HostState::new(calling_passport_id.to_string(), config.memory_bytes),
+        HostState::with_context(
+            ctx.calling_passport_id.to_string(),
+            ctx.extension_id.to_string(),
+            ctx.grant,
+            ctx.fact_store,
+            config.memory_bytes,
+        ),
     );
     store
         .set_fuel(config.fuel)
@@ -297,10 +473,10 @@ pub fn dispatch_wasm_tool(
         .map_err(|_| WasmError::MissingExport("extension_call"))?;
 
     let request = WasmCallRequest {
-        tool: tool_name,
-        args,
-        calling_passport_id,
-        request_id,
+        tool: ctx.tool_name,
+        args: ctx.args,
+        calling_passport_id: ctx.calling_passport_id,
+        request_id: ctx.request_id,
     };
     let request_bytes = serde_json::to_vec(&request)?;
 
@@ -353,7 +529,7 @@ pub fn dispatch_wasm_tool(
             elapsed_ms: elapsed.as_millis() as u64,
             fuel_consumed,
             log,
-            request_id: request_id.to_string(),
+            request_id: ctx.request_id.to_string(),
         },
         response,
     ))
@@ -410,9 +586,16 @@ fn write_str_capped(memory: &Memory, store: impl AsContextMut, ptr: i32, cap: i3
     bytes.len() as i32
 }
 
-/// Register the foundation host ABI. Richer fact + receipt ABI lands in
-/// M6.2 alongside grant enforcement.
+/// Register the full host ABI. Foundation surface (M6.1) + fact-store
+/// surface (M6.2) + secret + receipt placeholders.
 fn register_host_abi(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
+    register_foundation_abi(linker)?;
+    register_fact_abi(linker)?;
+    register_secret_and_receipt_abi(linker)?;
+    Ok(())
+}
+
+fn register_foundation_abi(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
     linker
         .func_wrap("crux", "now_unix_ms", |_caller: Caller<'_, HostState>| -> u64 {
             now_unix_ms()
@@ -447,7 +630,7 @@ fn register_host_abi(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
             |mut caller: Caller<'_, HostState>, ptr: i32, cap: i32| -> i32 {
                 let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                     Some(m) => m,
-                    None => return -1,
+                    None => return HOST_RC_HOST_INTERNAL,
                 };
                 let json = format!(
                     "{{\"calling_passport_id\":\"{}\"}}",
@@ -459,6 +642,252 @@ fn register_host_abi(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
         .map_err(|e| WasmError::Instantiate(e.to_string()))?;
 
     Ok(())
+}
+
+/// Wire signatures for the M6.2 fact ABI:
+///
+/// ```text
+/// crux::read_fact(entity_ptr, entity_len, key_ptr, key_len,
+///                 resp_ptr, resp_cap) -> i32
+/// crux::store_fact(entity_ptr, entity_len, key_ptr, key_len,
+///                  value_ptr, value_len, confidence_thousandths,
+///                  resp_ptr, resp_cap) -> i32
+/// crux::query_facts(prefix_ptr, prefix_len, query_ptr, query_len,
+///                   top_k, resp_ptr, resp_cap) -> i32
+/// ```
+///
+/// Confidence is passed as `i32` in thousandths (`0..=1000`) so the
+/// host ABI stays float-free; `confidence_thousandths` of 1000 = 1.0.
+fn register_fact_abi(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
+    linker
+        .func_wrap(
+            "crux",
+            "read_fact",
+            |mut caller: Caller<'_, HostState>,
+             entity_ptr: i32,
+             entity_len: i32,
+             key_ptr: i32,
+             key_len: i32,
+             resp_ptr: i32,
+             resp_cap: i32|
+             -> i32 {
+                let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    Some(m) => m,
+                    None => return HOST_RC_HOST_INTERNAL,
+                };
+                let entity = match read_string(&mem, &mut caller, entity_ptr, entity_len) {
+                    Some(s) => s,
+                    None => return HOST_RC_BAD_INPUT,
+                };
+                let key = match read_string(&mem, &mut caller, key_ptr, key_len) {
+                    Some(s) => s,
+                    None => return HOST_RC_BAD_INPUT,
+                };
+                let (grant, store) = match grant_and_store(&caller) {
+                    Ok(pair) => pair,
+                    Err(rc) => return rc,
+                };
+                if !entity_matches_any_prefix(&entity, &grant.allowed_prefixes_read) {
+                    return HOST_RC_SCOPE_VIOLATION;
+                }
+                let fact = match store.read_fact(&entity, &key) {
+                    Some(f) => f,
+                    None => return HOST_RC_NOT_FOUND,
+                };
+                let json = match serde_json::to_string(&fact) {
+                    Ok(s) => s,
+                    Err(_) => return HOST_RC_SERIALISE_ERR,
+                };
+                let written = write_str_capped(&mem, &mut caller, resp_ptr, resp_cap, &json);
+                if written < 0 {
+                    HOST_RC_BUFFER_TOO_SMALL
+                } else {
+                    written
+                }
+            },
+        )
+        .map_err(|e| WasmError::Instantiate(e.to_string()))?;
+
+    linker
+        .func_wrap(
+            "crux",
+            "store_fact",
+            |mut caller: Caller<'_, HostState>,
+             entity_ptr: i32,
+             entity_len: i32,
+             key_ptr: i32,
+             key_len: i32,
+             value_ptr: i32,
+             value_len: i32,
+             confidence_thousandths: i32,
+             resp_ptr: i32,
+             resp_cap: i32|
+             -> i32 {
+                let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    Some(m) => m,
+                    None => return HOST_RC_HOST_INTERNAL,
+                };
+                let entity = match read_string(&mem, &mut caller, entity_ptr, entity_len) {
+                    Some(s) => s,
+                    None => return HOST_RC_BAD_INPUT,
+                };
+                let key = match read_string(&mem, &mut caller, key_ptr, key_len) {
+                    Some(s) => s,
+                    None => return HOST_RC_BAD_INPUT,
+                };
+                let value = match read_string(&mem, &mut caller, value_ptr, value_len) {
+                    Some(s) => s,
+                    None => return HOST_RC_BAD_INPUT,
+                };
+                let confidence = (confidence_thousandths.clamp(0, 1000) as f32) / 1000.0;
+                let (grant, store) = match grant_and_store(&caller) {
+                    Ok(pair) => pair,
+                    Err(rc) => return rc,
+                };
+                if !entity_matches_any_prefix(&entity, &grant.allowed_prefixes_write) {
+                    return HOST_RC_SCOPE_VIOLATION;
+                }
+                let fact = match store.store_fact(HostStoreFact {
+                    entity,
+                    key,
+                    value,
+                    confidence,
+                }) {
+                    Ok(f) => f,
+                    Err(_) => return HOST_RC_HOST_INTERNAL,
+                };
+                let json = match serde_json::to_string(&fact) {
+                    Ok(s) => s,
+                    Err(_) => return HOST_RC_SERIALISE_ERR,
+                };
+                let written = write_str_capped(&mem, &mut caller, resp_ptr, resp_cap, &json);
+                if written < 0 {
+                    HOST_RC_BUFFER_TOO_SMALL
+                } else {
+                    written
+                }
+            },
+        )
+        .map_err(|e| WasmError::Instantiate(e.to_string()))?;
+
+    linker
+        .func_wrap(
+            "crux",
+            "query_facts",
+            |mut caller: Caller<'_, HostState>,
+             prefix_ptr: i32,
+             prefix_len: i32,
+             query_ptr: i32,
+             query_len: i32,
+             top_k: i32,
+             resp_ptr: i32,
+             resp_cap: i32|
+             -> i32 {
+                let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                    Some(m) => m,
+                    None => return HOST_RC_HOST_INTERNAL,
+                };
+                let entity_prefix = if prefix_len <= 0 {
+                    None
+                } else {
+                    match read_string(&mem, &mut caller, prefix_ptr, prefix_len) {
+                        Some(s) => Some(s),
+                        None => return HOST_RC_BAD_INPUT,
+                    }
+                };
+                let query = if query_len <= 0 {
+                    None
+                } else {
+                    match read_string(&mem, &mut caller, query_ptr, query_len) {
+                        Some(s) => Some(s),
+                        None => return HOST_RC_BAD_INPUT,
+                    }
+                };
+                let (grant, store) = match grant_and_store(&caller) {
+                    Ok(pair) => pair,
+                    Err(rc) => return rc,
+                };
+                // Require the prefix arg AND require it to be inside the
+                // grant's read-prefix list. Empty prefix would let the
+                // module enumerate the store; reject it.
+                let prefix = match entity_prefix.as_deref() {
+                    Some(p) => p,
+                    None => return HOST_RC_SCOPE_VIOLATION,
+                };
+                if !query_prefix_within_grant(prefix, &grant.allowed_prefixes_read) {
+                    return HOST_RC_SCOPE_VIOLATION;
+                }
+                let top_k = top_k.clamp(1, 256) as usize;
+                let mut facts = store.query_facts(HostFactQuery {
+                    entity_prefix: entity_prefix.clone(),
+                    query,
+                    top_k,
+                });
+                // Defence in depth: drop any result outside the granted
+                // read prefixes (the underlying store could return more
+                // than the prefix arg if its impl is loose).
+                facts.retain(|f| entity_matches_any_prefix(&f.entity, &grant.allowed_prefixes_read));
+                let json = match serde_json::to_string(&facts) {
+                    Ok(s) => s,
+                    Err(_) => return HOST_RC_SERIALISE_ERR,
+                };
+                let written = write_str_capped(&mem, &mut caller, resp_ptr, resp_cap, &json);
+                if written < 0 {
+                    HOST_RC_BUFFER_TOO_SMALL
+                } else {
+                    written
+                }
+            },
+        )
+        .map_err(|e| WasmError::Instantiate(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Wire `crux::get_secret_decrypted` and `crux::emit_receipt` as
+/// "not yet implemented" stubs so contributor modules that import them
+/// link cleanly even on a daemon that hasn't wired the decryption /
+/// receipt-signing paths yet. Both return [`HOST_RC_NOT_IMPLEMENTED`]
+/// (-6) until M6.3 wires them to `encrypted_secrets` and the receipts
+/// crate.
+fn register_secret_and_receipt_abi(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
+    linker
+        .func_wrap(
+            "crux",
+            "get_secret_decrypted",
+            |_caller: Caller<'_, HostState>, _id_ptr: i32, _id_len: i32, _resp_ptr: i32, _resp_cap: i32| -> i32 {
+                HOST_RC_NOT_IMPLEMENTED
+            },
+        )
+        .map_err(|e| WasmError::Instantiate(e.to_string()))?;
+
+    linker
+        .func_wrap(
+            "crux",
+            "emit_receipt",
+            |_caller: Caller<'_, HostState>,
+             _action_ptr: i32,
+             _action_len: i32,
+             _payload_ptr: i32,
+             _payload_len: i32,
+             _resp_ptr: i32,
+             _resp_cap: i32|
+             -> i32 { HOST_RC_NOT_IMPLEMENTED },
+        )
+        .map_err(|e| WasmError::Instantiate(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Pull the grant + fact-store handles off the caller's host state, or
+/// classify the absence as one of the host-rc codes. Returns clones so
+/// the host fn can drop the borrow on `caller.data()` before doing
+/// anything mutating.
+fn grant_and_store(caller: &Caller<'_, HostState>) -> Result<(Arc<ExtensionGrant>, Arc<dyn HostFactStore>), i32> {
+    let state = caller.data();
+    let grant = state.grant.as_ref().ok_or(HOST_RC_NO_GRANT)?;
+    let store = state.fact_store.as_ref().ok_or(HOST_RC_FACT_STORE_UNAVAILABLE)?;
+    Ok((Arc::clone(grant), Arc::clone(store)))
 }
 
 /// Convenience: build a [`WasmEngine`] from env-driven config. Test
@@ -646,5 +1075,317 @@ mod tests {
         assert_eq!(cfg.memory_bytes, 16_000_000);
         assert_eq!(cfg.wall_clock, Duration::from_millis(1_000));
         assert_eq!(cfg.epoch_tick, Duration::from_millis(10));
+    }
+
+    // ── M6.2: scope-helper unit tests ───────────────────────────────────
+
+    #[test]
+    fn entity_matches_any_prefix_basic() {
+        let granted = vec!["__test__::".to_string(), "ext::quote::".to_string()];
+        assert!(entity_matches_any_prefix("__test__::foo", &granted));
+        assert!(entity_matches_any_prefix("ext::quote::today", &granted));
+        assert!(!entity_matches_any_prefix("__other__::baz", &granted));
+        assert!(!entity_matches_any_prefix("ext::other::x", &granted));
+        // Empty grant denies everything.
+        assert!(!entity_matches_any_prefix("anything", &[]));
+        // Empty prefix in the grant is ignored (defence — we never want
+        // an empty string to match-all by accident).
+        assert!(!entity_matches_any_prefix("anything", &["".to_string()]));
+    }
+
+    #[test]
+    fn query_prefix_within_grant_basic() {
+        let granted = vec!["__test__::".to_string()];
+        assert!(query_prefix_within_grant("__test__::", &granted));
+        assert!(query_prefix_within_grant("__test__::sub::", &granted));
+        // Module can't query above the grant boundary.
+        assert!(!query_prefix_within_grant("__", &granted));
+        // Empty prefix is always rejected.
+        assert!(!query_prefix_within_grant("", &granted));
+        // Out-of-grant prefix.
+        assert!(!query_prefix_within_grant("__other__::", &granted));
+    }
+
+    // ── M6.2: HostFactStore mock + integration tests ────────────────────
+
+    use std::sync::Mutex;
+
+    /// Tiny in-memory mock used to assert host-fn behaviour without
+    /// pulling the real `corecrux_memory::FactStore` into wasm_host
+    /// tests. Records call sites so tests can assert on them.
+    struct MockFactStore {
+        facts: Mutex<Vec<HostFact>>,
+        store_calls: Mutex<Vec<HostStoreFact>>,
+    }
+
+    impl MockFactStore {
+        fn new() -> Self {
+            Self {
+                facts: Mutex::new(Vec::new()),
+                store_calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn seed(&self, fact: HostFact) {
+            self.facts.lock().unwrap().push(fact);
+        }
+    }
+
+    impl HostFactStore for MockFactStore {
+        fn read_fact(&self, entity: &str, key: &str) -> Option<HostFact> {
+            self.facts
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|f| f.entity == entity && f.key == key)
+                .cloned()
+        }
+        fn store_fact(&self, req: HostStoreFact) -> Result<HostFact, String> {
+            self.store_calls.lock().unwrap().push(req.clone());
+            let f = HostFact {
+                fact_id: format!("fact-{}", self.store_calls.lock().unwrap().len()),
+                entity: req.entity,
+                key: req.key,
+                value: req.value,
+                confidence: req.confidence,
+                stored_at_unix_ms: 1_700_000_000_000,
+            };
+            self.facts.lock().unwrap().push(f.clone());
+            Ok(f)
+        }
+        fn query_facts(&self, q: HostFactQuery) -> Vec<HostFact> {
+            let prefix = q.entity_prefix.unwrap_or_default();
+            self.facts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|f| prefix.is_empty() || f.entity.starts_with(&prefix))
+                .take(q.top_k)
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// Escape a Rust `&str` for embedding in a WAT data-section literal.
+    /// WAT supports `\"` and `\\` escapes; nothing else in our test strings
+    /// needs special handling (no NUL, no non-ASCII).
+    fn wat_str_lit(s: &str) -> String {
+        let mut out = String::from("\"");
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                _ => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// WAT module that calls `crux::read_fact("__test__::foo", "bar", buf, cap)`,
+    /// then writes a JSON response whose `result` field labels which rc
+    /// branch ran. Lengths are computed from the actual Rust strings to
+    /// avoid hand-counted off-by-ones.
+    ///
+    /// Memory layout (entity/key kept past the request window so dispatch's
+    /// request-bytes write at offset 0 doesn't trash them):
+    /// - 4096..  `__test__::foo` (entity)
+    /// - 4128..  `bar`           (key)
+    /// - 5000..  candidate response strings, 100-byte stride
+    /// - 6000..  `read_fact` host-write target (1 KiB cap)
+    fn read_fact_module() -> Vec<u8> {
+        let entity = "__test__::foo";
+        let key = "bar";
+        let ok = r#"{"result":"ok","fact_writes":[]}"#;
+        let err1 = r#"{"result":"err:-1","fact_writes":[]}"#;
+        let err2 = r#"{"result":"err:-2","fact_writes":[]}"#;
+        let err3 = r#"{"result":"err:-3","fact_writes":[]}"#;
+        let other = r#"{"result":"err:other","fact_writes":[]}"#;
+
+        let wat = format!(
+            r#"
+            (module
+              (import "crux" "read_fact"
+                (func $read_fact (param i32 i32 i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 4096) {entity_lit})
+              (data (i32.const 4128) {key_lit})
+              (data (i32.const 5000) {ok_lit})
+              (data (i32.const 5100) {err1_lit})
+              (data (i32.const 5200) {err2_lit})
+              (data (i32.const 5300) {err3_lit})
+              (data (i32.const 5400) {other_lit})
+
+              (func (export "extension_call")
+                (param $req_ptr i32) (param $req_len i32)
+                (param $resp_ptr i32) (param $resp_cap i32)
+                (result i32)
+                (local $rc i32)
+                (local.set $rc
+                  (call $read_fact
+                    (i32.const 4096) (i32.const {entity_len})
+                    (i32.const 4128) (i32.const {key_len})
+                    (i32.const 6000) (i32.const 1024)
+                  )
+                )
+
+                (if (i32.ge_s (local.get $rc) (i32.const 0))
+                  (then
+                    (memory.copy (local.get $resp_ptr) (i32.const 5000) (i32.const {ok_len}))
+                    (return (i32.const {ok_len}))
+                  )
+                )
+                (if (i32.eq (local.get $rc) (i32.const -1))
+                  (then
+                    (memory.copy (local.get $resp_ptr) (i32.const 5100) (i32.const {err1_len}))
+                    (return (i32.const {err1_len}))
+                  )
+                )
+                (if (i32.eq (local.get $rc) (i32.const -2))
+                  (then
+                    (memory.copy (local.get $resp_ptr) (i32.const 5200) (i32.const {err2_len}))
+                    (return (i32.const {err2_len}))
+                  )
+                )
+                (if (i32.eq (local.get $rc) (i32.const -3))
+                  (then
+                    (memory.copy (local.get $resp_ptr) (i32.const 5300) (i32.const {err3_len}))
+                    (return (i32.const {err3_len}))
+                  )
+                )
+                (memory.copy (local.get $resp_ptr) (i32.const 5400) (i32.const {other_len}))
+                (i32.const {other_len})
+              )
+            )
+            "#,
+            entity_lit = wat_str_lit(entity),
+            key_lit = wat_str_lit(key),
+            ok_lit = wat_str_lit(ok),
+            err1_lit = wat_str_lit(err1),
+            err2_lit = wat_str_lit(err2),
+            err3_lit = wat_str_lit(err3),
+            other_lit = wat_str_lit(other),
+            entity_len = entity.len(),
+            key_len = key.len(),
+            ok_len = ok.len(),
+            err1_len = err1.len(),
+            err2_len = err2.len(),
+            err3_len = err3.len(),
+            other_len = other.len(),
+        );
+        wat::parse_str(&wat).unwrap()
+    }
+
+    fn grant_with(read: &[&str], write: &[&str]) -> Arc<ExtensionGrant> {
+        Arc::new(ExtensionGrant {
+            extension_id: "ext.test".to_string(),
+            passport_fpr: "p_test".to_string(),
+            allowed_tool_names: vec!["ext.test.tool".to_string()],
+            allowed_prefixes_read: read.iter().map(|s| s.to_string()).collect(),
+            allowed_prefixes_write: write.iter().map(|s| s.to_string()).collect(),
+            rate_limit_per_min: None,
+            granted_at_unix_ms: 1_700_000_000_000,
+            granted_by_passport: None,
+        })
+    }
+
+    fn dispatch_with(
+        engine: &WasmEngine,
+        module_bytes: &[u8],
+        grant: Option<Arc<ExtensionGrant>>,
+        store: Option<Arc<dyn HostFactStore>>,
+    ) -> Result<(WasmDispatchOutcome, WasmCallResponse), WasmError> {
+        let cfg = WasmConfig::default();
+        dispatch_wasm_tool_with_context(
+            engine,
+            &cfg,
+            module_bytes,
+            WasmCallContext {
+                tool_name: "ext.test.tool",
+                args: &serde_json::json!({}),
+                calling_passport_id: "p_test",
+                request_id: "req-1",
+                extension_id: "ext.test",
+                grant,
+                fact_store: store,
+            },
+        )
+    }
+
+    #[test]
+    fn read_fact_returns_ok_when_in_scope_and_present() {
+        let mock = Arc::new(MockFactStore::new());
+        mock.seed(HostFact {
+            fact_id: "f1".into(),
+            entity: "__test__::foo".into(),
+            key: "bar".into(),
+            value: "baz".into(),
+            confidence: 1.0,
+            stored_at_unix_ms: 1_700_000_000_000,
+        });
+        let engine = engine_for_test();
+        let (_, resp) = dispatch_with(
+            &engine,
+            &read_fact_module(),
+            Some(grant_with(&["__test__::"], &[])),
+            Some(mock as Arc<dyn HostFactStore>),
+        )
+        .expect("happy path");
+        assert_eq!(resp.result, serde_json::Value::String("ok".into()));
+    }
+
+    #[test]
+    fn read_fact_returns_not_found_for_missing_entity_in_scope() {
+        let mock = Arc::new(MockFactStore::new()) as Arc<dyn HostFactStore>;
+        let engine = engine_for_test();
+        let (_, resp) = dispatch_with(
+            &engine,
+            &read_fact_module(),
+            Some(grant_with(&["__test__::"], &[])),
+            Some(mock),
+        )
+        .expect("dispatch ok even on not-found");
+        assert_eq!(resp.result, serde_json::Value::String("err:-1".into()));
+    }
+
+    #[test]
+    fn read_fact_returns_no_grant_when_grant_absent() {
+        let mock = Arc::new(MockFactStore::new()) as Arc<dyn HostFactStore>;
+        let engine = engine_for_test();
+        let (_, resp) = dispatch_with(&engine, &read_fact_module(), None, Some(mock)).unwrap();
+        assert_eq!(resp.result, serde_json::Value::String("err:-2".into()));
+    }
+
+    #[test]
+    fn read_fact_returns_scope_violation_when_outside_granted_prefix() {
+        let mock = Arc::new(MockFactStore::new());
+        // Seed the fact under __test__::, but grant only __other__::.
+        mock.seed(HostFact {
+            fact_id: "f1".into(),
+            entity: "__test__::foo".into(),
+            key: "bar".into(),
+            value: "baz".into(),
+            confidence: 1.0,
+            stored_at_unix_ms: 1_700_000_000_000,
+        });
+        let engine = engine_for_test();
+        let (_, resp) = dispatch_with(
+            &engine,
+            &read_fact_module(),
+            Some(grant_with(&["__other__::"], &[])),
+            Some(mock as Arc<dyn HostFactStore>),
+        )
+        .unwrap();
+        assert_eq!(resp.result, serde_json::Value::String("err:-3".into()));
+    }
+
+    #[test]
+    fn host_rc_constants_are_stable_negative_codes() {
+        // Wire contract — these MUST NOT change across versions.
+        assert_eq!(rc::NOT_FOUND, -1);
+        assert_eq!(rc::NO_GRANT, -2);
+        assert_eq!(rc::SCOPE_VIOLATION, -3);
+        assert_eq!(rc::BUFFER_TOO_SMALL, -4);
+        assert_eq!(rc::FACT_STORE_UNAVAILABLE, -5);
+        assert_eq!(rc::NOT_IMPLEMENTED, -6);
     }
 }
