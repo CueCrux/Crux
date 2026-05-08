@@ -352,16 +352,53 @@ pub(super) fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Resp
 pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoResponse {
     let sync_status = sync_runtime_status();
     let update_status = state.update_status.read().await.public_view();
+    let product = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services);
+    let cloud = crate::product::CloudPosture::from_sync(&sync_status);
+    let cloud_access =
+        crate::product::CloudAccessContract::new(state.operating_mode, &state.enabled_pro_services, &cloud);
+    let action_enrichment = super::actions::action_enrichment_posture(&state);
+    let agent_workbench = super::workbench::workbench_posture(&state);
+    let gpu1_compute = super::gpu1::compute_posture(&state);
+    let (embeddings_enabled, semantic_profile) = {
+        let store = state.fact_store.read().await;
+        (store.embeddings_enabled(), store.semantic_profile())
+    };
+    let retrieval_segment_count = state.retrieval_index.read().await.segment_count();
+    let protocol_contracts =
+        crate::protocol_posture::ProtocolPosture::from_runtime(retrieval_segment_count, semantic_profile.as_ref());
     Json(serde_json::json!({
         "version": state.build.version,
         "commit": state.build.commit,
         "msrv": "1.88.0",
+        "product": product,
+        "cloud": cloud,
+        "cloud_access": {
+            "schema": cloud_access.schema,
+            "contract_path": "/v1/cloud/access-contract",
+            "cloud_only_entitled": cloud_access.cloud_only_entitled,
+            "cloud_only_active": cloud_access.cloud_only_active,
+            "local_daemon_required_for_current_mode": cloud_access.local_daemon_required_for_current_mode,
+            "mode_switching_supported": cloud_access.mode_switching_supported,
+        },
+        "action_enrichment": action_enrichment,
+        "agent_workbench": agent_workbench,
+        "gpu1_compute": {
+            "schema": gpu1_compute.schema,
+            "contract_path": "/v1/gpu1/contract",
+            "endpoint_configured": gpu1_compute.endpoint_configured,
+            "api_key_configured": gpu1_compute.api_key_configured,
+            "enabled_services": gpu1_compute.enabled_services,
+            "remote_memory_sync_required": gpu1_compute.remote_memory_sync_required,
+            "payload_policy": gpu1_compute.payload_policy,
+        },
+        "semantic_profile": semantic_profile,
+        "protocol_contracts": protocol_contracts,
         "features": {
             "text_search": is_query_feature_enabled("CORECRUXD_QUERY_TEXT_SEARCH"),
             "graph_expand": is_query_feature_enabled("CORECRUXD_QUERY_GRAPH_EXPAND"),
             "self_observe": crux_observe::config::self_observe_enabled(),
             "mcp": state.mcp_enabled,
-            "embeddings": state.fact_store.read().await.embeddings_enabled(),
+            "embeddings": embeddings_enabled,
         },
         "sync": {
             "mode": sync_status.mode,
@@ -376,7 +413,7 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
     }))
 }
 
-fn sync_runtime_status() -> corecrux_memory::sync::SyncRuntimeStatus {
+pub(super) fn sync_runtime_status() -> corecrux_memory::sync::SyncRuntimeStatus {
     let background_sync_enabled = std::env::var("CORECRUXD_SYNC_ENABLED")
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));

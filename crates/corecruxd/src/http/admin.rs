@@ -2067,6 +2067,71 @@ pub(super) async fn get_replication_status(State(state): State<AppState>, header
         .into_response()
 }
 
+/// `GET /v1/admin/segments/fingerprints` — CoreCrux v6 compatibility
+/// posture for the local CPU-only retrieval index. The community daemon does
+/// not currently enforce v6 fingerprint guard or calibration metadata, so this
+/// route reports the local BM25/.ccxi state and names the missing pieces
+/// explicitly instead of pretending parity.
+pub(super) async fn get_segment_fingerprints(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+
+    let (segment_count, total_docs, tier_stats) = {
+        let index = state.retrieval_index.read().await;
+        (index.segment_count(), index.total_docs(), index.tier_stats())
+    };
+    let semantic_profile = state.fact_store.read().await.semantic_profile();
+    let semantic_profile_id = semantic_profile.as_ref().map(|profile| profile.profile_id.clone());
+    let embedding_fingerprint = semantic_profile
+        .as_ref()
+        .map(|profile| profile.embedding_fingerprint.clone());
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "schema": "crux.admin.segment_fingerprints.v1",
+            "contract": "corecrux.retrieval.v6.fingerprinted_segments",
+            "status": "partial",
+            "cpu_only": true,
+            "segments": {
+                "count": segment_count,
+                "total_docs": total_docs,
+                "tier_stats": {
+                    "hot_segments": tier_stats.hot_segments,
+                    "hot_docs": tier_stats.hot_docs,
+                    "hot_bytes": tier_stats.hot_bytes,
+                    "warm_segments": tier_stats.warm_segments,
+                    "warm_docs": tier_stats.warm_docs,
+                    "warm_bytes": tier_stats.warm_bytes,
+                    "cold_segments": tier_stats.cold_segments,
+                    "hot_budget_bytes": tier_stats.hot_budget_bytes,
+                }
+            },
+            "semantic_profile_id": semantic_profile_id,
+            "semantic_profile": semantic_profile,
+            "embedding_fingerprint": embedding_fingerprint,
+            "fingerprint_guard": {
+                "mode": "not_enforced",
+                "warnings": [
+                    "local daemon has no v6 segment fingerprint records yet",
+                    "mixed semantic-profile retrieval must use rank fusion or rerank, not raw cosine comparison"
+                ]
+            },
+            "calibration": {
+                "available": false,
+                "hash": null,
+                "vector_metadata": null
+            },
+            "warnings": [
+                "BM25 .ccxi segment stats are available, but v6 fingerprint parity is not complete",
+                "semantic profile IDs are exposed only when an embedding endpoint is configured"
+            ]
+        })),
+    )
+        .into_response()
+}
+
 /// `GET /v1/admin/sharing/posture` — surface the current privacy gating
 /// state: which prefixes are forced-private, share-overrides, fact counts
 /// (private vs pushable), and whether remote sync is configured. Used by

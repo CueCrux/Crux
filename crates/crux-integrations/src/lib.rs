@@ -155,6 +155,12 @@ pub struct ExternalToolDefinition {
     /// `tools/list`; the daemon doesn't validate against it (the
     /// extension endpoint is responsible for arg validation).
     pub input_schema: serde_json::Value,
+    /// Optional semantic consequence metadata for the tool. When present, the
+    /// daemon passes it through to MCP discovery so agents can reason about
+    /// reversibility, materiality, idempotency, blast radius, and compensating
+    /// actions before calling the tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consequence_metadata: Option<serde_json::Value>,
     /// Optional shared-secret reference: id of an entry in the daemon's
     /// `encrypted_secrets` store. The daemon decrypts this at dispatch
     /// time and forwards as `Authorization: Bearer <decrypted>` to the

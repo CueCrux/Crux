@@ -2,14 +2,18 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+mod actions;
 mod admin;
 mod append;
+mod cloud;
 mod console;
 mod dataplane;
 mod dossier;
+mod engrams;
 mod events;
 mod extensions;
 mod facts;
+mod gpu1;
 mod health;
 mod integrations_github;
 mod integrations_openai;
@@ -21,12 +25,16 @@ mod planes;
 mod projections;
 mod projects;
 mod query;
+mod rcx_publish;
 mod receipts;
 mod relations;
+mod replay;
 mod routing;
 pub mod session;
 mod storybook;
+mod sync;
 mod work;
+mod workbench;
 mod workspace;
 // session_metrics: Prometheus register!() at init — safe, panics only on
 // duplicate registration (programmer error caught in tests). Mirrors the
@@ -148,10 +156,13 @@ pub struct AppState {
     pub integrations_enabled: bool,
     pub integrations_safe_mode: bool,
     pub integrations_allow_executable_helpers: bool,
+    pub operating_mode: crate::product::OperatingMode,
+    pub enabled_pro_services: Vec<String>,
     pub read_retry_failed_readyz_threshold: u64,
     pub commit_level: CommitLevel,
     pub metrics: Metrics,
     pub node_id: String,
+    pub passport_key_path: PathBuf,
     pub passport_fpr: String,
     pub passport_public_key_hex: String,
     pub mcp_agent_count: usize,
@@ -271,10 +282,16 @@ pub fn router(state: AppState) -> Router {
             "/v1/replay/exports/streams/{streamType}/{streamId}",
             get(self::receipts::get_stream_export_v1),
         )
+        .route("/v1/replay/answers/{answerId}", get(self::replay::get_answer_replay))
+        .route(
+            "/v1/replay/answers/{answerId}/validity",
+            get(self::replay::get_answer_replay_validity),
+        )
         .route("/v1/shard-map", get(self::admin::get_shard_map))
         .route("/v1/admin/shard-map", axum::routing::post(self::admin::post_shard_map))
         .route("/v1/admin/control", get(self::admin::get_control))
         .route("/v1/admin/restart", axum::routing::post(self::admin::post_restart_daemon))
+        .route("/v1/admin/segments/fingerprints", get(self::admin::get_segment_fingerprints))
         .route("/v1/admin/sharing/posture", get(self::admin::get_sharing_posture))
         .route("/v1/admin/sharing/backfill", axum::routing::post(self::admin::post_sharing_backfill))
         .route("/v1/admin/ops-log", get(self::admin::get_ops_log))
@@ -307,6 +324,10 @@ pub fn router(state: AppState) -> Router {
             get(self::projections::get_proj_artifact_pressure_events),
         )
         .route("/v1/admin/projections/meta", get(self::projections::get_proj_meta))
+        .route(
+            "/v1/admin/projections/modules",
+            get(self::projections::get_projection_modules),
+        )
         // Phase 7: Entity projection query endpoints
         .route("/v1/projections/entity/count", get(self::projections::get_entity_count))
         .route("/v1/projections/entity/timeline", get(self::projections::get_entity_timeline))
@@ -362,6 +383,26 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/facts/{factId}", axum::routing::delete(self::facts::delete_fact))
         .route("/v1/facts/entity/{entity}", get(self::facts::get_facts_by_entity))
         .route("/v1/facts/export", get(self::facts::export_facts))
+        .route(
+            "/v1/sync/tenants/{tenantId}/manifest",
+            get(self::sync::get_tenant_manifest),
+        )
+        .route(
+            "/v1/sync/tenants/{tenantId}/collections/{collection}",
+            get(self::sync::get_tenant_collection),
+        )
+        .route(
+            "/v1/sync/tenants/{tenantId}/promotions/preview",
+            axum::routing::post(self::sync::post_promotion_preview),
+        )
+        .route(
+            "/v1/sync/tenants/{tenantId}/promotions/confirm",
+            axum::routing::post(self::sync::post_promotion_confirm),
+        )
+        .route(
+            "/v1/sync/tenants/{tenantId}/offboard",
+            axum::routing::post(self::sync::post_tenant_offboard),
+        )
         .route("/v1/sessions/{sessionId}/state", axum::routing::put(self::facts::put_session_state))
         .route("/v1/sessions/{sessionId}/state", get(self::facts::get_session_state))
         // Real-time event stream (SSE)
@@ -375,6 +416,7 @@ pub fn router(state: AppState) -> Router {
         // Session handshake (master-plan §5.1): Crux Daemon uses /session, not /v1/session.
         .route("/session", axum::routing::post(self::session::post_session))
         .route("/v1/sessions/active", get(self::session::get_active_sessions))
+        .route("/v1/sessions/{sessionId}/plan", get(self::session::get_session_plan))
         // Invocation verification (master-plan §8).
         .route(
             "/invocation/verify",
@@ -382,6 +424,50 @@ pub fn router(state: AppState) -> Router {
         )
         // Production hardening: version endpoint
         .route("/v1/version", get(self::health::get_version))
+        .route("/v1/cloud/access-contract", get(self::cloud::get_cloud_access_contract))
+        .route("/v1/actions/enrich", axum::routing::post(self::actions::post_action_enrich))
+        .route("/v1/workbench/contract", get(self::workbench::get_workbench_contract))
+        .route("/v1/workbench/brief", get(self::workbench::get_agent_brief))
+        .route(
+            "/v1/workbench/context-pack",
+            axum::routing::post(self::workbench::post_context_pack),
+        )
+        .route(
+            "/v1/workbench/impact-preflight",
+            axum::routing::post(self::workbench::post_impact_preflight),
+        )
+        .route("/v1/workbench/command-ledger", get(self::workbench::get_command_ledger))
+        .route(
+            "/v1/workbench/command-ledger",
+            axum::routing::post(self::workbench::post_command_ledger),
+        )
+        .route("/v1/workbench/audit-triage", get(self::workbench::get_audit_triage))
+        .route(
+            "/v1/workbench/reasoning-timeline",
+            get(self::workbench::get_reasoning_timeline),
+        )
+        .route(
+            "/v1/workbench/handoff-v2",
+            axum::routing::post(self::workbench::post_handoff_v2),
+        )
+        .route(
+            "/v1/workbench/route-probe",
+            axum::routing::post(self::workbench::post_route_probe),
+        )
+        .route("/v1/workbench/api-drift", get(self::workbench::get_api_drift))
+        .route(
+            "/v1/workbench/policy-simulation",
+            axum::routing::post(self::workbench::post_policy_simulation),
+        )
+        .route("/v1/gpu1/contract", get(self::gpu1::get_gpu1_contract))
+        .route("/v1/gpu1/answer", axum::routing::post(self::gpu1::post_gpu1_answer))
+        .route("/v1/gpu1/rerank", axum::routing::post(self::gpu1::post_gpu1_rerank))
+        .route("/v1/gpu1/enrich", axum::routing::post(self::gpu1::post_gpu1_enrich))
+        .route("/v1/gpu1/coverage", axum::routing::post(self::gpu1::post_gpu1_coverage))
+        .route(
+            "/v1/gpu1/developer",
+            axum::routing::post(self::gpu1::post_gpu1_developer),
+        )
         // OpenAPI spec
         .route("/v1/openapi.json", get(self::openapi::openapi_json))
         // Work coordination — kanban over `__work__::*` facts.
@@ -473,6 +559,15 @@ pub fn router(state: AppState) -> Router {
             "/v1/projects/{id}/context-graph",
             get(self::projects::get_context_graph),
         )
+        // RCX Registry publish preview/emit for local projects.
+        .route(
+            "/v1/rcx/publish/projects/{projectId}/preview",
+            axum::routing::post(self::rcx_publish::preview_project),
+        )
+        .route(
+            "/v1/rcx/publish/projects/{projectId}/emit",
+            axum::routing::post(self::rcx_publish::emit_project),
+        )
         // Workspace scan — Phase 2 of the context graph (modules, deps,
         // stubs, dead code).
         .route(
@@ -497,6 +592,16 @@ pub fn router(state: AppState) -> Router {
             "/v1/mcp/tools",
             get(self::workspace::get_mcp_tools),
         )
+        // Local MemoryCrux-compatible engram/session-procedure surfaces.
+        .route("/v1/engrams", get(self::engrams::list_engrams))
+        .route(
+            "/v1/memory/session-init",
+            axum::routing::post(self::engrams::memory_session_init),
+        )
+        .route(
+            "/v1/memory/engrams/resolve",
+            axum::routing::post(self::engrams::resolve_engrams),
+        )
         // Community extensions registry (M2 of community-extensions plan).
         // List/install/show/delete + trusted-key management. M3+M4 will add
         // /grants/* (capability-token issuance) + tool dispatch on top.
@@ -507,6 +612,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/extensions/register",
             axum::routing::post(self::extensions::register_extension),
+        )
+        .route(
+            "/v1/extensions/install-from-registry",
+            axum::routing::post(self::extensions::install_from_registry),
         )
         .route(
             "/v1/extensions/keys",
@@ -660,6 +769,15 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/passports/{passportId}",
             axum::routing::delete(self::passports::delete_passport),
+        )
+        // RCX Registry publish preview/emit for local passports.
+        .route(
+            "/v1/rcx/publish/passports/{passportId}/preview",
+            axum::routing::post(self::rcx_publish::preview_passport),
+        )
+        .route(
+            "/v1/rcx/publish/passports/{passportId}/emit",
+            axum::routing::post(self::rcx_publish::emit_passport),
         )
         // GitHub integration — encrypted PAT + connect/disconnect/status (Plan B G1).
         .route(

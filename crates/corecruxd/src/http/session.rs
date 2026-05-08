@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{body::Bytes, Json};
@@ -189,6 +189,28 @@ fn bad_request(message: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, Json(body)).into_response()
 }
 
+fn parse_session_id_hex(value: &str) -> Result<[u8; 16], Response> {
+    let trimmed = value.trim();
+    let bytes = match hex::decode(trimmed) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return Err(problem(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                format!("invalid session id hex: {err}"),
+            ));
+        }
+    };
+    match <[u8; 16]>::try_from(bytes.as_slice()) {
+        Ok(session_id) => Ok(session_id),
+        Err(_) => Err(problem(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "session id must be 16 bytes / 32 hex characters",
+        )),
+    }
+}
+
 /// `GET /v1/sessions/active` — list session bindings the daemon has minted
 /// (most recent first). Returns the resolved `(project_id, tenant_id,
 /// passport_id)` triple per session — does NOT include the cryptographically-
@@ -208,6 +230,96 @@ pub async fn get_active_sessions(State(state): State<AppState>, headers: HeaderM
         })),
     )
         .into_response()
+}
+
+/// `GET /v1/sessions/{session_id}/plan` — read through to the sealed
+/// session-plan registry. This emits the shared SessionPlan v2 JSON shape
+/// while continuing to decode older flat-graph plans from the sealed registry.
+pub async fn get_session_plan(
+    State(state): State<AppState>,
+    Path(session_id_hex): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(problem) = crate::auth::require_http_any_scope(&state.auth, &headers, &["sessions:read", "admin:read"]) {
+        return problem.into_response();
+    }
+    let services = match state.session.as_ref() {
+        Some(services) => services.clone(),
+        None => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "feature_disabled",
+                "session handshake feature is not enabled",
+            );
+        }
+    };
+    let session_id = match parse_session_id_hex(&session_id_hex) {
+        Ok(session_id) => session_id,
+        Err(response) => return response,
+    };
+    let entry = match services.registry.get(&session_id) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return problem(StatusCode::NOT_FOUND, "not_found", "session plan not found"),
+        Err(err) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                format!("registry read failed: {err}"),
+            );
+        }
+    };
+    let plan = match crux_session::SessionPlan::from_canonical_cbor(&entry.plan_cbor) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                format!("stored session plan decode failed: {err}"),
+            );
+        }
+    };
+    let plan_json = match serde_json::from_str::<serde_json::Value>(&plan.to_canonical_json()) {
+        Ok(value) => value,
+        Err(err) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                format!("stored session plan JSON mirror failed: {err}"),
+            );
+        }
+    };
+    let plan_hash_hex = hex::encode(entry.plan_receipt_hash);
+    let capability_graph_hash_hex = hex::encode(entry.capability_graph_hash);
+    let body = serde_json::json!({
+        "schema": "crux.session_plan.read.v2",
+        "session_id": session_id_hex.to_ascii_lowercase(),
+        "plan_hash": plan_hash_hex,
+        "capability_graph_hash": capability_graph_hash_hex,
+        "contract": "cuecrux.shared.session_plan.v2",
+        "legacy_contract": format!("crux.session_plan.v{}", plan.plan_version),
+        "target_contract": "cuecrux.shared.session_plan.v2",
+        "status": "current",
+        "minted_at": entry.minted_at,
+        "expires_at": entry.expires_at,
+        "closed": entry.closed,
+        "close_reason": entry.close_reason,
+        "origin": entry.origin,
+        "principal_id": entry.principal_id,
+        "plan": plan_json,
+    });
+    let mut response = (StatusCode::OK, Json(body)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Ok(value) = HeaderValue::from_str(&session_id_hex.to_ascii_lowercase()) {
+        response.headers_mut().insert("x-crux-session-id", value.clone());
+        response.headers_mut().insert("x-cuecrux-session-id", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&plan_hash_hex) {
+        response.headers_mut().insert("x-crux-plan-hash", value.clone());
+        response.headers_mut().insert("x-cuecrux-plan-hash", value);
+    }
+    response
 }
 
 /// `POST /session` — mint a session plan.

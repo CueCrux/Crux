@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
-use corecrux_memory::sync::{probe_remote_health, SyncClient, SyncRuntimeStatus};
+use corecrux_memory::sync::{probe_remote_health, promotion_preview, SyncClient, SyncRuntimeStatus};
 
 use crate::dispatch::McpContext;
 use crate::protocol::JsonRpcError;
@@ -94,14 +94,28 @@ pub async fn handle_sync_pull(_args: &Value, ctx: &McpContext) -> Result<Value, 
         Err(msg) => return Ok(sync_error_content(&msg)),
     };
 
+    let tenant_id = _args
+        .get("tenant_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
     let mut store = ctx.fact_store.write().await;
-    match client.pull(&mut store) {
+    let result = if let Some(tenant_id) = tenant_id {
+        client.pull_tenant_mirror(&mut store, tenant_id)
+    } else {
+        client.pull(&mut store)
+    };
+
+    match result {
         Ok(result) => {
             let cursor = client.load_cursor();
             let text = serde_json::to_string_pretty(&json!({
+                "tenant_id": tenant_id,
                 "facts_pulled": result.facts_pulled,
                 "cursor": result.new_cursor,
                 "total_pull_count": cursor.pull_count,
+                "collection_cursor_count": cursor.collection_pull_cursors.len(),
             }))
             .unwrap_or_default();
             Ok(json!({
@@ -132,6 +146,70 @@ pub async fn handle_sync_push(args: &Value, ctx: &McpContext) -> Result<Value, J
     };
 
     let confirm = args.get("confirm").and_then(|v| v.as_bool()).unwrap_or(false);
+    let tenant_id = args
+        .get("tenant_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let allowlist = args
+        .get("allowlist")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if let Some(tenant_id) = tenant_id {
+        if !confirm {
+            let store = ctx.fact_store.read().await;
+            let preview = promotion_preview(&store, tenant_id, &allowlist, false);
+            let text = serde_json::to_string_pretty(&json!({
+                "mode": "tenant_promotion_preview",
+                "tenant_id": tenant_id,
+                "allowlist": preview.allowlist,
+                "would_promote": preview.promote_count,
+                "skipped_private": preview.skipped_private,
+                "skipped_synced": preview.skipped_synced,
+                "skipped_not_allowlisted": preview.skipped_not_allowlisted,
+                "preview_hash": preview.preview_hash,
+                "note": "Call sync_push with tenant_id, allowlist, confirm=true to promote these records."
+            }))
+            .unwrap_or_default();
+            return Ok(json!({
+                "content": [{ "type": "text", "text": text }]
+            }));
+        }
+
+        let preview = {
+            let store = ctx.fact_store.read().await;
+            promotion_preview(&store, tenant_id, &allowlist, true)
+        };
+        match client.push_tenant_promotion(tenant_id, &preview.records) {
+            Ok(result) => {
+                let cursor = client.load_cursor();
+                let text = serde_json::to_string_pretty(&json!({
+                    "tenant_id": tenant_id,
+                    "facts_pushed": result.facts_pushed,
+                    "preview_hash": preview.preview_hash,
+                    "total_push_count": cursor.push_count,
+                    "collection_cursor_count": cursor.collection_push_cursors.len(),
+                }))
+                .unwrap_or_default();
+                return Ok(json!({
+                    "content": [{ "type": "text", "text": text }]
+                }));
+            }
+            Err(e) => {
+                return Ok(sync_error_content(&format!(
+                    "{e}. Local fact and session storage on this node remain available."
+                )))
+            }
+        }
+    }
 
     if !confirm {
         // Preview mode — show what would be pushed without actually pushing.
@@ -198,6 +276,9 @@ pub async fn handle_sync_status(_args: &Value, ctx: &McpContext) -> Result<Value
         "last_push_at": cursor.last_push_at,
         "pull_count": cursor.pull_count,
         "push_count": cursor.push_count,
+        "collection_pull_cursor_count": cursor.collection_pull_cursors.len(),
+        "collection_push_cursor_count": cursor.collection_push_cursors.len(),
+        "tenant_manifest_supported": true,
         "local_fact_count": local_fact_count,
     }))
     .unwrap_or_default();
@@ -576,6 +657,8 @@ mod tests {
             last_push_at: Some("2026-04-08T12:13:14Z".to_string()),
             pull_count: 7,
             push_count: 3,
+            collection_pull_cursors: std::collections::BTreeMap::new(),
+            collection_push_cursors: std::collections::BTreeMap::new(),
         });
         std::env::set_var("CORECRUXD_SYNC_REMOTE_URL", &remote_url);
         std::env::set_var("CORECRUXD_SYNC_API_KEY", "test-key");
@@ -658,6 +741,55 @@ mod tests {
         assert!(text.contains("\"would_push\""));
         assert!(text.contains("\"skipped_private\""));
         assert!(text.contains("\"skipped_synced\""));
+        clear_sync_env();
+    }
+
+    #[tokio::test]
+    async fn sync_push_tenant_preview_reports_collection_counts() {
+        let _guard = sync_env_lock().lock().await;
+        clear_sync_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CORECRUXD_SYNC_REMOTE_URL", "http://example.test:14800");
+        std::env::set_var("CORECRUXD_SYNC_API_KEY", "test-key");
+        std::env::set_var("CORECRUXD_DATA_DIR", dir.path());
+
+        let ctx = test_ctx();
+        let agent_ctx = agent_with_tier(&ctx, "tenantpreview", "established").await;
+        {
+            let mut store = ctx.fact_store.write().await;
+            store.store(StoreFact {
+                entity: "business::acme::note".to_string(),
+                key: "summary".to_string(),
+                value: "promote".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+            });
+            store.store(StoreFact {
+                entity: "business::acme::constraint::deploy".to_string(),
+                key: "constraint".to_string(),
+                value: "skip by allowlist".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+            });
+        }
+
+        let result = handle_sync_push(
+            &json!({
+                "tenant_id": "business::acme",
+                "allowlist": ["facts"]
+            }),
+            &agent_ctx,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"mode\": \"tenant_promotion_preview\""));
+        assert!(text.contains("\"tenant_id\": \"business::acme\""));
+        assert!(text.contains("\"would_promote\": 1"));
+        assert!(text.contains("\"skipped_not_allowlisted\": 1"));
+        assert!(text.contains("\"preview_hash\""));
         clear_sync_env();
     }
 

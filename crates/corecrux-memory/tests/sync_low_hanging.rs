@@ -159,6 +159,152 @@ fn wait_for_requests(rx: mpsc::Receiver<Vec<RecordedRequest>>, handle: thread::J
 }
 
 #[test]
+fn pull_tenant_mirror_uses_collection_manifest_and_cursors() {
+    let fact = json!({
+        "fact_id": "f_tenant_remote",
+        "entity": "business::acme::note",
+        "key": "summary",
+        "value": "cloud mirror",
+        "source_receipt": null,
+        "confidence": 1.0,
+        "stored_at": "2026-05-07T10:11:12Z",
+        "tokens": 2,
+        "deleted": false,
+        "version": 1,
+        "private": false
+    });
+    let (base_url, rx, handle) = start_mock_server(vec![
+        MockResponse::json(json!({
+            "schema": "crux.sync.tenant_manifest.v1",
+            "tenant_id": "business::acme",
+            "tenant_category": "business",
+            "owner_hash": "blake3:owner",
+            "membership_epoch": 3,
+            "membership_hash": "blake3:membership",
+            "role_grant_hash": "blake3:roles",
+            "generated_at": "2026-05-07T10:11:12Z",
+            "collections": [{
+                "collection": "facts",
+                "cursor": null,
+                "updated_since": null,
+                "record_count": 1,
+                "tombstone_count": 0,
+                "content_hash": "blake3:facts"
+            }],
+            "manifest_hash": "blake3:manifest"
+        })),
+        MockResponse::json(json!({
+            "schema": "crux.sync.collection_page.v1",
+            "tenant_id": "business::acme",
+            "collection": "facts",
+            "records": [{
+                "collection": "facts",
+                "record_id": "f_tenant_remote",
+                "entity": "business::acme::note",
+                "key": "summary",
+                "value_hash": "blake3:value",
+                "updated_at": "2026-05-07T10:11:12Z",
+                "deleted": false,
+                "source_receipt": null,
+                "fact": fact
+            }],
+            "next_cursor": "f_tenant_remote",
+            "has_more": false,
+            "collection_hash": "blake3:page"
+        })),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let client = SyncClient::new(&base_url, "test-key", dir.path());
+    let mut store = FactStore::new();
+
+    let result = client.pull_tenant_mirror(&mut store, "business::acme").unwrap();
+
+    assert_eq!(result.facts_pulled, 1);
+    let stored = store.get("f_tenant_remote").expect("tenant mirror fact");
+    assert_eq!(
+        stored.source_receipt.as_deref(),
+        Some(format!("sync:{base_url}:f_tenant_remote").as_str())
+    );
+    let cursor = client.load_cursor();
+    assert_eq!(
+        cursor.collection_pull_cursors.get("business::acme/facts"),
+        Some(&"f_tenant_remote".to_string())
+    );
+
+    let requests = wait_for_requests(rx, handle);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[0].path, "/v1/sync/tenants/business::acme/manifest");
+    assert_eq!(requests[1].method, "GET");
+    assert_eq!(
+        requests[1].path,
+        "/v1/sync/tenants/business::acme/collections/facts?limit=1000&include_content=true"
+    );
+}
+
+#[test]
+fn push_tenant_promotion_posts_collection_records() {
+    let (base_url, rx, handle) = start_mock_server(vec![MockResponse::json(json!({
+        "schema": "crux.sync.promotion_confirm.v1",
+        "tenant_id": "business::acme",
+        "applied_count": 1,
+        "record_hash": "blake3:server"
+    }))]);
+    let dir = tempfile::tempdir().unwrap();
+    let client = SyncClient::new(&base_url, "test-key", dir.path());
+    let fact = Fact {
+        fact_id: "f_local_promotion".to_string(),
+        entity: "business::acme::note".to_string(),
+        key: "summary".to_string(),
+        value: "promote".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        stored_at: Utc::now(),
+        tokens: 1,
+        deleted: false,
+        version: 1,
+        supersedes: None,
+        private: false,
+    };
+    let record = corecrux_memory::sync::SyncCollectionRecord {
+        collection: "facts".to_string(),
+        record_id: fact.fact_id.clone(),
+        entity: fact.entity.clone(),
+        key: fact.key.clone(),
+        identity_hash: "blake3:identity".to_string(),
+        content_hash: "blake3:content".to_string(),
+        value_hash: "blake3:value".to_string(),
+        updated_at: fact.stored_at.to_rfc3339(),
+        deleted: false,
+        source_receipt: None,
+        semantic_profile_id: None,
+        local_semantic_profile_id: None,
+        fact: Some(fact),
+    };
+
+    let result = client
+        .push_tenant_promotion("business::acme", std::slice::from_ref(&record))
+        .unwrap();
+
+    assert_eq!(result.facts_pushed, 1);
+    let cursor = client.load_cursor();
+    assert_eq!(cursor.push_count, 1);
+    assert!(cursor.collection_push_cursors.contains_key("business::acme/facts"));
+
+    let requests = wait_for_requests(rx, handle);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].path, "/v1/sync/tenants/business::acme/promotions/confirm");
+    assert_eq!(
+        requests[0].headers.get("authorization"),
+        Some(&"Bearer test-key".to_string())
+    );
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["records"][0]["record_id"], "f_local_promotion");
+    assert!(body["confirm_hash"].as_str().unwrap().starts_with("blake3:"));
+}
+
+#[test]
 fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
     let dir = tempfile::tempdir().unwrap();
     let client = SyncClient::new("http://localhost:14800", "test-key", dir.path());
@@ -338,6 +484,8 @@ fn pull_paginates_tags_synced_facts_and_persists_cursor() {
         last_push_at: None,
         pull_count: 5,
         push_count: 0,
+        collection_pull_cursors: std::collections::BTreeMap::new(),
+        collection_push_cursors: std::collections::BTreeMap::new(),
     });
 
     let mut store = FactStore::new();

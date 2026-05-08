@@ -25,6 +25,8 @@
 //! - `__project_layer__::`   — Vision / Goals / planes / etc.
 //! - `__work__::`            — work items
 //! - `__work_transition__::` — work state transitions
+//! - `__workbench__::`       — Pro workbench context packs, ledgers, handoffs
+//! - `__answer_replay_capsule__::` — deterministic answer replay capsules
 //! - `__passport__::`        — passport metadata (already shouldn't sync)
 //! - `__bootstrap__::`       — first-run setup state
 //! - `__project__::`         — project metadata
@@ -86,6 +88,8 @@ const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "__extension_grant__::",
     "__work__::",
     "__work_transition__::",
+    "__workbench__::",
+    "__answer_replay_capsule__::",
     "__passport__::",
     "__bootstrap__::",
     "__project__::",

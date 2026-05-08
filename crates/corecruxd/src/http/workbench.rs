@@ -1,0 +1,1553 @@
+// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+// Licensed under the CueCrux Community Licence (CCL v1.0).
+// See LICENCE.md in the repository root.
+
+//! Pro Agent Workbench surfaces.
+//!
+//! These handlers compose existing local-first primitives rather than executing
+//! commands or calling a model: fact memory, sessions, workspace storyline,
+//! local receipts, command metadata, and constraints. Free keeps the safety
+//! primitives; this module gates the acceleration/provenance workbench layer.
+
+use super::*;
+use corecrux_memory::action_enrichment::{enrich_action, hash_json, ActionEnrichmentInput, Materiality};
+use corecrux_memory::fact_store::{Fact, FactQuery, FactStore, StoreFact};
+use corecrux_memory::replay::{hash_text, AnswerReplayCapsule, ANSWER_REPLAY_CAPSULE_ENTITY_PREFIX};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+
+pub(super) const WORKBENCH_CONTRACT_SCHEMA: &str = "crux.agent_workbench.contract.v1";
+const WORKBENCH_RECEIPT_SCHEMA: &str = "crux.agent_workbench.receipt.v1";
+const WORKBENCH_FACT_PREFIX: &str = "__workbench__";
+const CONTEXT_PACK_KEY: &str = "context_pack";
+const COMMAND_LEDGER_KEY: &str = "command_ledger";
+const HANDOFF_KEY: &str = "handoff_v2";
+const PREFLIGHT_KEY: &str = "impact_preflight";
+const POLICY_SIM_KEY: &str = "policy_simulation";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkbenchSurface {
+    AgentBrief,
+    ContextPack,
+    ImpactPreflight,
+    CommandLedger,
+    AuditTriage,
+    ReasoningTimeline,
+    HandoffV2,
+    RouteProbe,
+    ApiDrift,
+    PolicySimulation,
+}
+
+impl WorkbenchSurface {
+    fn capability(self) -> &'static str {
+        match self {
+            Self::AgentBrief => "agent_brief:pro",
+            Self::ContextPack => "context_pack:budgeted",
+            Self::ImpactPreflight => "impact:preflight",
+            Self::CommandLedger => "ledger:history",
+            Self::AuditTriage => "audit:triage",
+            Self::ReasoningTimeline => "reasoning:timeline",
+            Self::HandoffV2 => "handoff:v2",
+            Self::RouteProbe => "route_probe:lab",
+            Self::ApiDrift => "api_drift:check",
+            Self::PolicySimulation => "policy:simulate",
+        }
+    }
+
+    fn path(self) -> &'static str {
+        match self {
+            Self::AgentBrief => "/v1/workbench/brief",
+            Self::ContextPack => "/v1/workbench/context-pack",
+            Self::ImpactPreflight => "/v1/workbench/impact-preflight",
+            Self::CommandLedger => "/v1/workbench/command-ledger",
+            Self::AuditTriage => "/v1/workbench/audit-triage",
+            Self::ReasoningTimeline => "/v1/workbench/reasoning-timeline",
+            Self::HandoffV2 => "/v1/workbench/handoff-v2",
+            Self::RouteProbe => "/v1/workbench/route-probe",
+            Self::ApiDrift => "/v1/workbench/api-drift",
+            Self::PolicySimulation => "/v1/workbench/policy-simulation",
+        }
+    }
+
+    fn method(self) -> &'static str {
+        match self {
+            Self::AgentBrief | Self::AuditTriage | Self::ReasoningTimeline | Self::ApiDrift => "GET",
+            Self::CommandLedger => "GET/POST",
+            _ => "POST",
+        }
+    }
+
+    fn all() -> Vec<Self> {
+        vec![
+            Self::AgentBrief,
+            Self::ContextPack,
+            Self::ImpactPreflight,
+            Self::CommandLedger,
+            Self::AuditTriage,
+            Self::ReasoningTimeline,
+            Self::HandoffV2,
+            Self::RouteProbe,
+            Self::ApiDrift,
+            Self::PolicySimulation,
+        ]
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct TenantWorkbenchQuery {
+    pub tenant_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ContextPackBody {
+    pub tenant_id: String,
+    pub query: String,
+    #[serde(default = "default_context_pack_budget")]
+    pub token_budget: usize,
+    #[serde(default)]
+    pub include_private: bool,
+    #[serde(default)]
+    pub source_labels: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ImpactPreflightBody {
+    pub tenant_id: String,
+    #[serde(default)]
+    pub changed_paths: Vec<String>,
+    #[serde(default)]
+    pub routes: Vec<String>,
+    #[serde(default)]
+    pub selected_tests: Vec<String>,
+    #[serde(default)]
+    pub include_storyline: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct CommandLedgerBody {
+    pub tenant_id: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_hash: Option<String>,
+    #[serde(default)]
+    pub linked_receipts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct RouteProbeBody {
+    pub route: String,
+    #[serde(default)]
+    pub include_storyline: bool,
+    #[serde(default)]
+    pub include_tests: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct HandoffV2Body {
+    pub tenant_id: String,
+    pub goal: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub next_actions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct PolicySimulationBody {
+    #[serde(flatten)]
+    pub action: ActionEnrichmentInput,
+}
+
+fn default_context_pack_budget() -> usize {
+    4000
+}
+
+pub(super) fn workbench_posture(state: &AppState) -> Value {
+    let product = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services);
+    json!({
+        "schema": WORKBENCH_CONTRACT_SCHEMA,
+        "contract_path": "/v1/workbench/contract",
+        "tier": product.tier,
+        "mode": product.mode,
+        "surfaces": WorkbenchSurface::all()
+            .into_iter()
+            .map(|surface| service_contract(&product, surface))
+            .collect::<Vec<_>>(),
+    })
+}
+
+pub(super) async fn get_workbench_contract(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["query:read", "admin:read"]) {
+        return problem.into_response();
+    }
+    Json(workbench_posture(&state)).into_response()
+}
+
+pub(super) async fn get_agent_brief(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TenantWorkbenchQuery>,
+) -> Response {
+    let tenant_id = match tenant_id(&q.tenant_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        require_surface_for_tenant(&state, &headers, WorkbenchSurface::AgentBrief, false, &tenant_id)
+    {
+        return response;
+    }
+    let sync_status = super::health::sync_runtime_status();
+    let workspace = crate::workspace_scan::load_latest(&state.fact_store).await;
+    let sessions = {
+        let sessions = state.session_store.read().await;
+        let mut ids: Vec<String> = sessions.list().into_iter().map(str::to_string).collect();
+        ids.sort();
+        ids.truncate(20);
+        json!({
+            "count": sessions.count(),
+            "sample": ids,
+        })
+    };
+    let (constraints, decisions, recent_receipts, tenant_fact_count, open_work) = {
+        let store = state.fact_store.read().await;
+        (
+            tenant_facts_by_prefix(&store, "__constraints__::", &tenant_id, 12),
+            tenant_facts_by_prefix(&store, "__decisions__::", &tenant_id, 12),
+            recent_receipt_refs(&store, &tenant_id, 16),
+            tenant_facts(&store, &tenant_id, 200).len(),
+            crate::work::list_work(&store, q.project_id.as_deref(), None, Some(&tenant_id), None)
+                .into_iter()
+                .filter(|item| !matches!(item.state.as_str(), "complete" | "deployed" | "archive"))
+                .take(20)
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    Json(json!({
+        "schema": "crux.agent_workbench.brief.v1",
+        "tenant_id": tenant_id,
+        "project_id": q.project_id,
+        "tenant_memory": {
+            "matched_fact_count": tenant_fact_count,
+            "local_mirror_state": sync_status.mode,
+            "sync_configured": sync_status.configured,
+            "sync_degraded": sync_status.degraded,
+            "sync_degraded_reason": sync_status.degraded_reason,
+        },
+        "workspace": workspace.as_ref().map(|scan| json!({
+            "scan_id": scan.scan_id,
+            "root_path": scan.root_path,
+            "stats": scan.stats,
+            "unresolved_routes": scan.diagnostics.unresolved_routes.len(),
+        })),
+        "sessions": sessions,
+        "active_constraints": constraints,
+        "open_decisions": decisions,
+        "open_work": open_work,
+        "recent_receipts": recent_receipts,
+    }))
+    .into_response()
+}
+
+pub(super) async fn post_context_pack(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ContextPackBody>,
+) -> Response {
+    let tenant_id = match tenant_id(&body.tenant_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        require_surface_for_tenant(&state, &headers, WorkbenchSurface::ContextPack, true, &tenant_id)
+    {
+        return response;
+    }
+    if body.query.trim().is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "query must not be empty");
+    }
+    let token_budget = body.token_budget.clamp(128, 128_000);
+    let semantic_profile = state.fact_store.read().await.semantic_profile();
+    let local_semantic_profile_id = semantic_profile.as_ref().map(|profile| profile.profile_id.clone());
+    let mut used = 0usize;
+    let selected = {
+        let store = state.fact_store.read().await;
+        let mut facts = query_facts(&store, Some(&body.query), None, 200);
+        facts.retain(|fact| {
+            fact.entity.contains(&tenant_id) || fact.value.contains(&tenant_id) || fact.key.contains(&tenant_id)
+        });
+        if !body.include_private {
+            facts.retain(|fact| !fact.private);
+        }
+        facts
+            .into_iter()
+            .filter_map(|fact| {
+                let tokens = fact.tokens.max(estimate_tokens(&fact.value));
+                if used + tokens > token_budget && used > 0 {
+                    return None;
+                }
+                used += tokens;
+                Some(json!({
+                    "fact_id": fact.fact_id,
+                    "entity": fact.entity,
+                    "key": fact.key,
+                    "text": fact.value,
+                    "tokens": tokens,
+                    "source_label": source_label_for_entity(&fact.entity),
+                    "content_hash": format!("blake3:{}", blake3::hash(fact.value.as_bytes()).to_hex()),
+                    "source_receipt": fact.source_receipt,
+                    "semantic_profile_id": local_semantic_profile_id,
+                    "score_space": "fact_store_keyword_confidence",
+                }))
+            })
+            .collect::<Vec<_>>()
+    };
+    let pack = json!({
+        "schema": "crux.agent_workbench.context_pack.v1",
+        "tenant_id": tenant_id,
+        "query": body.query,
+        "token_budget": token_budget,
+        "tokens_used": used,
+        "source_labels": body.source_labels,
+        "local_semantic_profile": semantic_profile,
+        "items": selected,
+    });
+    let receipt = workbench_receipt("context_pack", &tenant_id, &pack);
+    let response = json!({
+        "status": "ok",
+        "pack": pack,
+        "receipt": receipt,
+    });
+    if let Err(err) = store_workbench_fact(&state, &tenant_id, CONTEXT_PACK_KEY, &receipt, &response).await {
+        return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+    Json(response).into_response()
+}
+
+pub(super) async fn post_impact_preflight(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ImpactPreflightBody>,
+) -> Response {
+    let tenant_id = match tenant_id(&body.tenant_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        require_surface_for_tenant(&state, &headers, WorkbenchSurface::ImpactPreflight, true, &tenant_id)
+    {
+        return response;
+    }
+    let scan = crate::workspace_scan::load_latest(&state.fact_store).await;
+    let impacted_routes = scan
+        .as_ref()
+        .map(|scan| impacted_routes(scan, &body.changed_paths, &body.routes, body.include_storyline))
+        .unwrap_or_default();
+    let superseded_facts = {
+        let store = state.fact_store.read().await;
+        tenant_facts(&store, &tenant_id, 500)
+            .into_iter()
+            .filter(|fact| fact.supersedes.is_some() || fact.version > 1)
+            .take(50)
+            .map(|fact| {
+                json!({
+                    "fact_id": fact.fact_id,
+                    "entity": fact.entity,
+                    "key": fact.key,
+                    "version": fact.version,
+                    "supersedes": fact.supersedes,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let living_objects = living_object_preflight(&state, &tenant_id, &body.changed_paths).await;
+    let preflight = json!({
+        "schema": "crux.agent_workbench.impact_preflight.v1",
+        "tenant_id": tenant_id,
+        "changed_paths": body.changed_paths,
+        "requested_routes": body.routes,
+        "impacted_routes": impacted_routes,
+        "selected_tests": body.selected_tests,
+        "fact_supersession_refs": superseded_facts,
+        "living_objects": living_objects,
+    });
+    let receipt = workbench_receipt("impact_preflight", &tenant_id, &preflight);
+    let response = json!({ "status": "ok", "preflight": preflight, "receipt": receipt });
+    if let Err(err) = store_workbench_fact(&state, &tenant_id, PREFLIGHT_KEY, &receipt, &response).await {
+        return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+    Json(response).into_response()
+}
+
+pub(super) async fn post_command_ledger(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CommandLedgerBody>,
+) -> Response {
+    let tenant_id = match tenant_id(&body.tenant_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        require_surface_for_tenant(&state, &headers, WorkbenchSurface::CommandLedger, true, &tenant_id)
+    {
+        return response;
+    }
+    if body.command.trim().is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "command must not be empty");
+    }
+    let started = body.started_at_unix_ms.unwrap_or_else(crate::ops_events::now_unix_ms);
+    let completed = body.completed_at_unix_ms;
+    let record = json!({
+        "schema": "crux.agent_workbench.command_ledger.v1",
+        "tenant_id": tenant_id,
+        "recorded_at_unix_ms": crate::ops_events::now_unix_ms(),
+        "started_at_unix_ms": started,
+        "completed_at_unix_ms": completed,
+        "command": body.command,
+        "args": body.args,
+        "cwd": body.cwd,
+        "exit_status": body.exit_status,
+        "duration_ms": body.duration_ms,
+        "stdout_hash": body.stdout_hash,
+        "stderr_hash": body.stderr_hash,
+        "linked_receipts": body.linked_receipts,
+        "project_id": body.project_id,
+        "work_id": body.work_id,
+        "replay_note": "metadata only; command output bytes are not stored by this route",
+    });
+    let receipt = workbench_receipt("command_ledger", &tenant_id, &record);
+    let response = json!({ "status": "ok", "record": record, "receipt": receipt });
+    if let Err(err) = store_workbench_fact(&state, &tenant_id, COMMAND_LEDGER_KEY, &receipt, &response).await {
+        return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+    Json(response).into_response()
+}
+
+pub(super) async fn get_command_ledger(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TenantWorkbenchQuery>,
+) -> Response {
+    let tenant_id = match tenant_id(&q.tenant_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        require_surface_for_tenant(&state, &headers, WorkbenchSurface::CommandLedger, false, &tenant_id)
+    {
+        return response;
+    }
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let entries = {
+        let store = state.fact_store.read().await;
+        workbench_facts(&store, &tenant_id, COMMAND_LEDGER_KEY, limit)
+    };
+    Json(json!({
+        "schema": "crux.agent_workbench.command_ledger_page.v1",
+        "tenant_id": tenant_id,
+        "count": entries.len(),
+        "entries": entries,
+    }))
+    .into_response()
+}
+
+pub(super) async fn get_audit_triage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TenantWorkbenchQuery>,
+) -> Response {
+    let tenant_id = match tenant_id(&q.tenant_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        require_surface_for_tenant(&state, &headers, WorkbenchSurface::AuditTriage, false, &tenant_id)
+    {
+        return response;
+    }
+    let sync_status = super::health::sync_runtime_status();
+    let scan = crate::workspace_scan::load_latest(&state.fact_store).await;
+    let queues = {
+        let store = state.fact_store.read().await;
+        audit_queues(&store, &tenant_id, &sync_status, scan.as_ref())
+    };
+    Json(json!({
+        "schema": "crux.agent_workbench.audit_triage.v1",
+        "tenant_id": tenant_id,
+        "queues": queues,
+    }))
+    .into_response()
+}
+
+pub(super) async fn get_reasoning_timeline(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TenantWorkbenchQuery>,
+) -> Response {
+    let tenant_id = match tenant_id(&q.tenant_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        require_surface_for_tenant(&state, &headers, WorkbenchSurface::ReasoningTimeline, false, &tenant_id)
+    {
+        return response;
+    }
+    let limit = q.limit.unwrap_or(80).clamp(1, 250);
+    let events = {
+        let store = state.fact_store.read().await;
+        timeline_events(&store, &tenant_id, limit)
+    };
+    Json(json!({
+        "schema": "crux.agent_workbench.reasoning_timeline.v1",
+        "tenant_id": tenant_id,
+        "count": events.len(),
+        "events": events,
+    }))
+    .into_response()
+}
+
+pub(super) async fn post_handoff_v2(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<HandoffV2Body>,
+) -> Response {
+    let tenant_id = match tenant_id(&body.tenant_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if let Some(response) = require_surface_for_tenant(&state, &headers, WorkbenchSurface::HandoffV2, true, &tenant_id)
+    {
+        return response;
+    }
+    if body.goal.trim().is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "goal must not be empty");
+    }
+    let session_state = {
+        let sessions = state.session_store.read().await;
+        body.session_id
+            .as_deref()
+            .and_then(|id| sessions.get(id).cloned())
+            .map(|session| json!(session))
+    };
+    let (constraints, decisions, command_summary) = {
+        let store = state.fact_store.read().await;
+        (
+            tenant_facts_by_prefix(&store, "__constraints__::", &tenant_id, 25),
+            tenant_facts_by_prefix(&store, "__decisions__::", &tenant_id, 25),
+            workbench_facts(&store, &tenant_id, COMMAND_LEDGER_KEY, 10),
+        )
+    };
+    let package = json!({
+        "schema": "crux.agent_workbench.handoff_v2.v1",
+        "tenant_id": tenant_id,
+        "goal": body.goal,
+        "session_id": body.session_id,
+        "session_state": session_state,
+        "project_id": body.project_id,
+        "constraints": constraints,
+        "open_decisions": decisions,
+        "evidence_refs": body.evidence_refs,
+        "command_ledger_summary": command_summary,
+        "next_actions": body.next_actions,
+        "created_at_unix_ms": crate::ops_events::now_unix_ms(),
+    });
+    let receipt = workbench_receipt("handoff_v2", &tenant_id, &package);
+    let response = json!({ "status": "ok", "package": package, "receipt": receipt });
+    if let Err(err) = store_workbench_fact(&state, &tenant_id, HANDOFF_KEY, &receipt, &response).await {
+        return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+    Json(response).into_response()
+}
+
+pub(super) async fn post_route_probe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RouteProbeBody>,
+) -> Response {
+    if let Some(response) = require_surface(&state, &headers, WorkbenchSurface::RouteProbe, true) {
+        return response;
+    }
+    let scan = match crate::workspace_scan::load_latest(&state.fact_store).await {
+        Some(scan) => scan,
+        None => {
+            return problem_response(
+                StatusCode::NOT_FOUND,
+                "no scan found. POST /v1/workspace/scan to run one.",
+            )
+        }
+    };
+    let route = body.route.trim();
+    let matched = route.split_once(' ').and_then(|(method, path)| {
+        let method = method.to_ascii_uppercase();
+        let path = path.trim();
+        scan.routes
+            .iter()
+            .find(|r| r.method == method && r.path == path)
+            .cloned()
+    });
+    let Some(route) = matched else {
+        return problem_response(
+            StatusCode::NOT_FOUND,
+            format!("route '{}' not found in latest scan", body.route),
+        );
+    };
+    let storyline = if body.include_storyline {
+        crate::workspace_scan::compose_storyline_for_route(&scan, &route, body.include_tests)
+            .map(|story| crate::workspace_scan::format_storyline_tree(&story))
+    } else {
+        None
+    };
+    Json(json!({
+        "schema": "crux.agent_workbench.route_probe.v1",
+        "route": {
+            "method": route.method,
+            "path": route.path,
+            "handler_fn": route.handler_fn,
+            "handler_file": route.handler_file,
+            "handler_line": route.handler_line,
+            "source_file": route.source_file,
+            "source_line": route.source_line,
+        },
+        "scope_hints": scope_hints_for_route(&route.method, &route.path),
+        "storyline": storyline,
+        "warnings": route.handler_file.is_none().then(|| vec!["handler_file_unresolved"]).unwrap_or_default(),
+    }))
+    .into_response()
+}
+
+pub(super) async fn get_api_drift(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TenantWorkbenchQuery>,
+) -> Response {
+    let tenant_id = match tenant_id(&q.tenant_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if let Some(response) = require_surface_for_tenant(&state, &headers, WorkbenchSurface::ApiDrift, false, &tenant_id)
+    {
+        return response;
+    }
+    let scan = crate::workspace_scan::load_latest(&state.fact_store).await;
+    let drift = api_drift_report(scan.as_ref());
+    Json(drift).into_response()
+}
+
+pub(super) async fn post_policy_simulation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PolicySimulationBody>,
+) -> Response {
+    let tenant_id = match body
+        .action
+        .tenant_id
+        .as_deref()
+        .map(tenant_id)
+        .unwrap_or_else(|| Err(problem_response(StatusCode::BAD_REQUEST, "tenant_id must not be empty")))
+    {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        require_surface_for_tenant(&state, &headers, WorkbenchSurface::PolicySimulation, true, &tenant_id)
+    {
+        return response;
+    }
+    let proposal = {
+        let store = state.fact_store.read().await;
+        enrich_action(Some(&store), body.action)
+    };
+    let constraints = {
+        let store = state.fact_store.read().await;
+        active_constraints(&store, &tenant_id)
+    };
+    let matches = match_constraints(&proposal.narrative, &constraints);
+    let verdict = if matches.iter().any(|m| m["severity"] == "critical") {
+        "block"
+    } else if matches.iter().any(|m| m["severity"] == "high") {
+        "warn"
+    } else if proposal
+        .consequence_metadata
+        .materiality
+        .contains(&Materiality::TouchesProduction)
+    {
+        "warn"
+    } else {
+        "pass"
+    };
+    let simulation = json!({
+        "schema": "crux.agent_workbench.policy_simulation.v1",
+        "tenant_id": tenant_id,
+        "verdict": verdict,
+        "proposal": proposal,
+        "matched_constraints": matches,
+    });
+    let receipt = workbench_receipt("policy_simulation", &tenant_id, &simulation);
+    let response = json!({ "status": "ok", "simulation": simulation, "receipt": receipt });
+    if let Err(err) = store_workbench_fact(&state, &tenant_id, POLICY_SIM_KEY, &receipt, &response).await {
+        return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+    Json(response).into_response()
+}
+
+fn service_contract(product: &crate::product::ProductPosture, surface: WorkbenchSurface) -> Value {
+    let enabled = product
+        .enabled_pro_services
+        .iter()
+        .any(|service| service == surface.capability());
+    let status = if enabled {
+        "enabled"
+    } else if product.tier == "free" {
+        "pro_required"
+    } else {
+        "entitled_not_enabled"
+    };
+    json!({
+        "capability": surface.capability(),
+        "method": surface.method(),
+        "path": surface.path(),
+        "status": status,
+    })
+}
+
+fn require_surface(state: &AppState, headers: &HeaderMap, surface: WorkbenchSurface, write: bool) -> Option<Response> {
+    let fallback_scope = if write { "admin:write" } else { "admin:read" };
+    if let Err(problem) = require_http_any_scope(&state.auth, headers, &[surface.capability(), fallback_scope]) {
+        return Some(problem.into_response());
+    }
+    require_surface_enabled(state, surface)
+}
+
+fn require_surface_for_tenant(
+    state: &AppState,
+    headers: &HeaderMap,
+    surface: WorkbenchSurface,
+    write: bool,
+    tenant_id: &str,
+) -> Option<Response> {
+    let fallback_scope = if write { "admin:write" } else { "admin:read" };
+    if require_http_any_scope(&state.auth, headers, &[fallback_scope]).is_err() {
+        if let Err(problem) = require_http_scopes_for_tenant(&state.auth, headers, &[surface.capability()], tenant_id) {
+            return Some(problem.into_response());
+        }
+    }
+    require_surface_enabled(state, surface)
+}
+
+fn require_surface_enabled(state: &AppState, surface: WorkbenchSurface) -> Option<Response> {
+    let product = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services);
+    if !product
+        .enabled_pro_services
+        .iter()
+        .any(|service| service == surface.capability())
+    {
+        return Some(
+            (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(json!({
+                    "schema": WORKBENCH_CONTRACT_SCHEMA,
+                    "status": "pro_service_not_enabled",
+                    "capability": surface.capability(),
+                    "path": surface.path(),
+                    "fallback": {
+                        "reason_code": "pro_service_not_enabled",
+                        "detail": "enable this Agent Workbench Pro capability before using the surface"
+                    }
+                })),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
+fn tenant_id(value: &str) -> Result<String, Response> {
+    let id = value.trim();
+    if id.is_empty() {
+        return Err(problem_response(StatusCode::BAD_REQUEST, "tenant_id must not be empty"));
+    }
+    Ok(id.to_string())
+}
+
+async fn store_workbench_fact(
+    state: &AppState,
+    tenant_id: &str,
+    key: &str,
+    receipt: &Value,
+    value: &Value,
+) -> std::io::Result<()> {
+    let receipt_id = receipt
+        .get("receipt_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unsealed")
+        .to_string();
+    let mut fact = StoreFact {
+        entity: format!("{WORKBENCH_FACT_PREFIX}::{tenant_id}::{key}::{receipt_id}"),
+        key: key.to_string(),
+        value: serde_json::to_string(value).map_err(std::io::Error::other)?,
+        source_receipt: Some(receipt_id),
+        confidence: 1.0,
+        private: true,
+    };
+    crate::fact_privacy::enforce(&state.privacy_policy, &mut fact);
+    state.fact_store.write().await.try_store(fact)?;
+    Ok(())
+}
+
+fn workbench_receipt(kind: &str, tenant_id: &str, payload: &Value) -> Value {
+    let payload_hash = hash_json(payload);
+    let suffix = payload_hash
+        .trim_start_matches("blake3:")
+        .chars()
+        .take(16)
+        .collect::<String>();
+    json!({
+        "schema": WORKBENCH_RECEIPT_SCHEMA,
+        "receipt_id": format!("workbench:{kind}:{suffix}"),
+        "event_type": format!("agent_workbench_{kind}"),
+        "tenant_id": tenant_id,
+        "payload_hash": payload_hash,
+        "created_at_unix_ms": crate::ops_events::now_unix_ms(),
+    })
+}
+
+fn query_facts(store: &FactStore, query: Option<&str>, entity_prefix: Option<&str>, top_k: usize) -> Vec<Fact> {
+    crate::fact_helpers::dedup_latest(
+        store
+            .query(&FactQuery {
+                query: query.map(str::to_string),
+                entity: None,
+                entity_prefix: entity_prefix.map(str::to_string),
+                top_k,
+                token_budget: None,
+            })
+            .facts,
+    )
+}
+
+fn tenant_facts_by_prefix(store: &FactStore, prefix: &str, tenant_id: &str, limit: usize) -> Vec<Value> {
+    query_facts(store, None, Some(prefix), limit.saturating_mul(4).max(limit))
+        .into_iter()
+        .filter(|fact| {
+            fact.entity.contains(tenant_id) || fact.value.contains(tenant_id) || fact.key.contains(tenant_id)
+        })
+        .take(limit)
+        .map(fact_summary)
+        .collect()
+}
+
+fn tenant_facts(store: &FactStore, tenant_id: &str, limit: usize) -> Vec<Fact> {
+    query_facts(store, Some(tenant_id), None, limit)
+        .into_iter()
+        .filter(|fact| fact.entity.contains(tenant_id) || fact.value.contains(tenant_id))
+        .take(limit)
+        .collect()
+}
+
+fn workbench_facts(store: &FactStore, tenant_id: &str, key: &str, limit: usize) -> Vec<Value> {
+    let prefix = format!("{WORKBENCH_FACT_PREFIX}::{tenant_id}::{key}::");
+    query_facts(store, None, Some(&prefix), limit)
+        .into_iter()
+        .take(limit)
+        .filter_map(|fact| serde_json::from_str::<Value>(&fact.value).ok())
+        .collect()
+}
+
+fn recent_receipt_refs(store: &FactStore, tenant_id: &str, limit: usize) -> Vec<Value> {
+    let mut out = Vec::new();
+    for prefix in [
+        format!("__gpu1_receipt__::{tenant_id}::"),
+        format!(
+            "{}::{tenant_id}::",
+            corecrux_memory::action_enrichment::ACTION_ENRICHMENT_RECEIPT_ENTITY_PREFIX
+        ),
+        format!("{WORKBENCH_FACT_PREFIX}::{tenant_id}::"),
+    ] {
+        out.extend(
+            query_facts(store, None, Some(&prefix), limit)
+                .into_iter()
+                .map(|fact| {
+                    json!({
+                        "fact_id": fact.fact_id,
+                        "entity": fact.entity,
+                        "key": fact.key,
+                        "source_receipt": fact.source_receipt,
+                        "stored_at": fact.stored_at,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    out.sort_by(|a, b| {
+        b["stored_at"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(a["stored_at"].as_str().unwrap_or_default())
+    });
+    out.truncate(limit);
+    out
+}
+
+fn fact_summary(fact: Fact) -> Value {
+    json!({
+        "fact_id": fact.fact_id,
+        "entity": fact.entity,
+        "key": fact.key,
+        "value_preview": truncate(&fact.value, 240),
+        "source_receipt": fact.source_receipt,
+        "confidence": fact.confidence,
+        "stored_at": fact.stored_at,
+        "version": fact.version,
+    })
+}
+
+fn estimate_tokens(text: &str) -> usize {
+    text.len().div_ceil(4)
+}
+
+fn source_label_for_entity(entity: &str) -> &'static str {
+    if entity.starts_with("__constraints__::") {
+        "constraint"
+    } else if entity.starts_with("__decisions__::") {
+        "decision"
+    } else if entity.starts_with("__work__::") {
+        "work"
+    } else if entity.starts_with("__workspace_scan__::") {
+        "workspace_scan"
+    } else if entity.starts_with("github::") {
+        "github"
+    } else {
+        "fact_store"
+    }
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        value.to_string()
+    } else {
+        format!("{}...", value.chars().take(max).collect::<String>())
+    }
+}
+
+fn impacted_routes(
+    scan: &crate::workspace_scan::WorkspaceScan,
+    changed_paths: &[String],
+    requested_routes: &[String],
+    include_storyline: bool,
+) -> Vec<Value> {
+    let mut routes = scan
+        .routes
+        .iter()
+        .filter(|route| {
+            requested_routes
+                .iter()
+                .any(|needle| route_matches(needle, &route.method, &route.path))
+                || route.handler_file.as_deref().is_some_and(|file| {
+                    changed_paths
+                        .iter()
+                        .any(|path| file.contains(path) || path.contains(file))
+                })
+                || changed_paths
+                    .iter()
+                    .any(|path| route.source_file.contains(path) || path.contains(&route.source_file))
+        })
+        .map(|route| {
+            let storyline = include_storyline
+                .then(|| crate::workspace_scan::compose_storyline_for_route(scan, route, false))
+                .flatten()
+                .map(|story| crate::workspace_scan::format_storyline_tree(&story));
+            json!({
+                "method": route.method,
+                "path": route.path,
+                "handler_fn": route.handler_fn,
+                "handler_file": route.handler_file,
+                "source_file": route.source_file,
+                "scope_hints": scope_hints_for_route(&route.method, &route.path),
+                "storyline": storyline,
+            })
+        })
+        .collect::<Vec<_>>();
+    routes.sort_by(|a, b| route_key(a).cmp(&route_key(b)));
+    routes.dedup_by(|a, b| route_key(a) == route_key(b));
+    routes
+}
+
+fn route_key(value: &Value) -> String {
+    format!(
+        "{} {}",
+        value["method"].as_str().unwrap_or_default(),
+        value["path"].as_str().unwrap_or_default()
+    )
+}
+
+fn route_matches(needle: &str, method: &str, path: &str) -> bool {
+    needle.trim() == format!("{method} {path}") || needle.trim() == path
+}
+
+fn scope_hints_for_route(method: &str, path: &str) -> Vec<&'static str> {
+    if let Some(surface) = surface_for_path(path) {
+        let mut scopes = vec![surface.capability()];
+        if matches!(
+            method.to_ascii_uppercase().as_str(),
+            "POST" | "PUT" | "PATCH" | "DELETE"
+        ) {
+            scopes.push("admin:write");
+        } else {
+            scopes.push("admin:read");
+        }
+        scopes.sort();
+        scopes.dedup();
+        return scopes;
+    }
+
+    let mut scopes = Vec::new();
+    let method = method.to_ascii_uppercase();
+    if path.contains("/admin") || path.contains("/workspace") || path.contains("/workbench") {
+        scopes.push("admin:read");
+    }
+    if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+        if path.contains("/facts")
+            || path.contains("/sync")
+            || path.contains("/projects")
+            || path.contains("/work")
+            || path.contains("/actions")
+        {
+            scopes.push("facts:write");
+        }
+        if path.contains("/sessions") {
+            scopes.push("sessions:write");
+        }
+    } else if path.contains("/facts") || path.contains("/query") {
+        scopes.push("query:read");
+    }
+    if path.contains("/receipts") || path.contains("/replay") {
+        scopes.push("receipts:read");
+    }
+    if scopes.is_empty() {
+        scopes.push("query:read");
+    }
+    scopes.sort();
+    scopes.dedup();
+    scopes
+}
+
+fn surface_for_path(path: &str) -> Option<WorkbenchSurface> {
+    WorkbenchSurface::all()
+        .into_iter()
+        .find(|surface| surface.path() == path)
+}
+
+fn api_drift_report(scan: Option<&crate::workspace_scan::WorkspaceScan>) -> Value {
+    let tools = crux_mcp::tools::list_tools_json();
+    let tool_count = tools["tools"].as_array().map_or(0, Vec::len);
+    let Some(scan) = scan else {
+        return json!({
+            "schema": "crux.agent_workbench.api_drift.v1",
+            "status": "no_workspace_scan",
+            "tool_count": tool_count,
+            "route_count": 0,
+            "queues": [{
+                "category": "workspace_scan_missing",
+                "severity": "medium",
+                "items": ["POST /v1/workspace/scan before route/API drift checks"]
+            }]
+        });
+    };
+    let unresolved = scan
+        .diagnostics
+        .unresolved_routes
+        .iter()
+        .map(|route| {
+            json!({
+                "method": route.method,
+                "path": route.path,
+                "handler_fn": route.handler_fn,
+                "reason": route.reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    let workbench_routes = WorkbenchSurface::all()
+        .into_iter()
+        .filter(|surface| !route_exists(scan, surface.method(), surface.path()))
+        .map(|surface| {
+            json!({
+                "method": surface.method(),
+                "path": surface.path(),
+                "capability": surface.capability(),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema": "crux.agent_workbench.api_drift.v1",
+        "status": if unresolved.is_empty() && workbench_routes.is_empty() { "ok" } else { "drift_detected" },
+        "route_count": scan.routes.len(),
+        "tool_count": tool_count,
+        "routes_by_crate": scan.stats.routes_by_crate,
+        "queues": [
+            {
+                "category": "unresolved_routes",
+                "severity": if unresolved.is_empty() { "ok" } else { "medium" },
+                "count": unresolved.len(),
+                "items": unresolved,
+            },
+            {
+                "category": "workbench_contract_missing_from_scan",
+                "severity": if workbench_routes.is_empty() { "ok" } else { "low" },
+                "count": workbench_routes.len(),
+                "items": workbench_routes,
+            }
+        ],
+    })
+}
+
+fn route_exists(scan: &crate::workspace_scan::WorkspaceScan, method: &str, path: &str) -> bool {
+    scan.routes
+        .iter()
+        .any(|route| method.contains(&route.method) && normalize_path(&route.path) == normalize_path(path))
+}
+
+fn normalize_path(path: &str) -> String {
+    let mut out = String::new();
+    let mut in_brace = false;
+    for c in path.chars() {
+        match c {
+            '{' => {
+                in_brace = true;
+                out.push_str("{}");
+            }
+            '}' => in_brace = false,
+            _ if !in_brace => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn audit_queues(
+    store: &FactStore,
+    tenant_id: &str,
+    sync_status: &corecrux_memory::sync::SyncRuntimeStatus,
+    scan: Option<&crate::workspace_scan::WorkspaceScan>,
+) -> Vec<Value> {
+    let degraded_receipts = recent_receipt_refs(store, tenant_id, 100)
+        .into_iter()
+        .filter(|receipt| serde_json::to_string(receipt).unwrap_or_default().contains("degraded"))
+        .collect::<Vec<_>>();
+    let sync_conflicts = sync_status
+        .degraded
+        .then(|| {
+            vec![json!({
+                "mode": sync_status.mode,
+                "reason": sync_status.degraded_reason,
+            })]
+        })
+        .unwrap_or_default();
+    let unresolved_routes = scan
+        .map(|scan| scan.diagnostics.unresolved_routes.len())
+        .unwrap_or_default();
+    let replay_failures = replay_failure_items(store, tenant_id, 50);
+    let replay_failure_severity = replay_failure_severity(&replay_failures);
+    vec![
+        json!({
+            "category": "receipt_anomalies",
+            "severity": if degraded_receipts.is_empty() { "ok" } else { "medium" },
+            "count": degraded_receipts.len(),
+            "items": degraded_receipts,
+        }),
+        json!({
+            "category": "sync_conflicts",
+            "severity": if sync_conflicts.is_empty() { "ok" } else { "high" },
+            "count": sync_conflicts.len(),
+            "items": sync_conflicts,
+        }),
+        json!({
+            "category": "route_resolution_drift",
+            "severity": if unresolved_routes == 0 { "ok" } else { "medium" },
+            "count": unresolved_routes,
+            "items": scan.map(|scan| scan.diagnostics.unresolved_routes.clone()).unwrap_or_default(),
+        }),
+        json!({
+            "category": "replay_failures",
+            "severity": replay_failure_severity,
+            "count": replay_failures.len(),
+            "items": replay_failures,
+        }),
+    ]
+}
+
+async fn living_object_preflight(state: &AppState, tenant_id: &str, changed_paths: &[String]) -> Value {
+    let tenant_hash = corecrux_projections::tenant_hash_xxhash64(tenant_id);
+    let projection = state.projection_state.read().await;
+    let mut status_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut drift_categories: BTreeSet<String> = BTreeSet::new();
+    let mut drifted_artifacts = Vec::new();
+    let mut tracked_count = 0usize;
+    let mut dependent_count = 0i64;
+
+    for ((row_tenant_hash, artifact_id), row) in &projection.living {
+        if *row_tenant_hash != tenant_hash {
+            continue;
+        }
+        tracked_count += 1;
+        dependent_count += i64::from(row.dependents_count);
+        let status = row.living_status.as_engine_str();
+        *status_counts.entry(status.to_string()).or_default() += 1;
+        if let Some(category) = living_status_drift_category(row.living_status) {
+            drift_categories.insert(category.to_string());
+            if drifted_artifacts.len() < 50 {
+                drifted_artifacts.push(json!({
+                    "artifact_id": artifact_id,
+                    "living_status": status,
+                    "confidence": corecrux_projections::dequantize_confidence_f32(row.confidence_q16),
+                    "dependents_count": row.dependents_count,
+                    "pressure_level": row.pressure_level,
+                    "updated_at_micros": row.updated_at_micros,
+                }));
+            }
+        }
+    }
+
+    let open_pressure_event_count = projection
+        .pressure
+        .keys()
+        .filter(|(row_tenant_hash, _, _)| *row_tenant_hash == tenant_hash)
+        .count();
+    let status = if tracked_count == 0 {
+        "not_recorded"
+    } else if drifted_artifacts.is_empty() {
+        "current"
+    } else {
+        "stale"
+    };
+
+    json!({
+        "status": status,
+        "source": "local_projection_state",
+        "tenant_hash": format!("{tenant_hash:016x}"),
+        "changed_path_count": changed_paths.len(),
+        "tracked_artifact_count": tracked_count,
+        "status_counts": status_counts,
+        "drift_categories": drift_categories.into_iter().collect::<Vec<_>>(),
+        "drifted_artifacts": drifted_artifacts,
+        "affected_downstream_projections": {
+            "dependent_count": dependent_count,
+        },
+        "open_pressure_event_count": open_pressure_event_count,
+    })
+}
+
+fn living_status_drift_category(status: corecrux_projections::LivingStatusV1) -> Option<&'static str> {
+    match status {
+        corecrux_projections::LivingStatusV1::Stale => Some("living_state_stale"),
+        corecrux_projections::LivingStatusV1::Contested => Some("living_state_contested"),
+        corecrux_projections::LivingStatusV1::Superseded => Some("living_state_superseded"),
+        corecrux_projections::LivingStatusV1::Deprecated => Some("living_state_deprecated"),
+        corecrux_projections::LivingStatusV1::Dormant | corecrux_projections::LivingStatusV1::Active => None,
+    }
+}
+
+fn replay_failure_items(store: &FactStore, tenant_id: &str, limit: usize) -> Vec<Value> {
+    let prefix = format!("{ANSWER_REPLAY_CAPSULE_ENTITY_PREFIX}::{tenant_id}::");
+    query_facts(store, None, Some(&prefix), limit)
+        .into_iter()
+        .filter_map(|fact| serde_json::from_str::<AnswerReplayCapsule>(&fact.value).ok())
+        .filter_map(|capsule| replay_failure_item(store, capsule))
+        .take(limit)
+        .collect()
+}
+
+fn replay_failure_item(store: &FactStore, capsule: AnswerReplayCapsule) -> Option<Value> {
+    let mut categories = BTreeSet::new();
+    for evidence in &capsule.evidence {
+        if let Some(category) = replay_evidence_drift_category(store, evidence) {
+            categories.insert(category);
+        }
+    }
+    if let Some(category) = replay_semantic_profile_category(store, &capsule) {
+        categories.insert(category);
+    }
+    for category in replay_projection_categories(&capsule) {
+        categories.insert(category);
+    }
+    if categories.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "answer_id": capsule.answer_id,
+        "capsule_hash": capsule.capsule_hash,
+        "question_preview": truncate(&capsule.question, 180),
+        "categories": categories.into_iter().collect::<Vec<_>>(),
+        "evidence_count": capsule.evidence.len(),
+        "projection_ref_count": capsule.projection_refs.len(),
+        "created_at": capsule.created_at,
+    }))
+}
+
+fn replay_evidence_drift_category(
+    store: &FactStore,
+    evidence: &corecrux_memory::replay::ReplayEvidenceRef,
+) -> Option<String> {
+    let Some(fact) = store.get(&evidence.record_id) else {
+        return Some("fact_missing".to_string());
+    };
+    let latest_id = latest_fact_for_entity_key(store, fact).map(|latest| latest.fact_id.as_str());
+    if latest_id.is_some_and(|id| id != evidence.record_id) {
+        return Some("fact_superseded".to_string());
+    }
+    let current_hash = hash_text(&fact.value);
+    let captured_hash = evidence.text_hash.as_ref().or(evidence.content_hash.as_ref());
+    if captured_hash.is_some_and(|hash| hash == &current_hash)
+        || evidence.content_hash.as_ref().is_some_and(|hash| hash == &current_hash)
+    {
+        None
+    } else {
+        Some("fact_changed".to_string())
+    }
+}
+
+fn latest_fact_for_entity_key<'a>(store: &'a FactStore, fact: &Fact) -> Option<&'a Fact> {
+    store
+        .get_by_entity(&fact.entity)
+        .into_iter()
+        .filter(|candidate| candidate.key == fact.key)
+        .max_by_key(|candidate| candidate.version)
+}
+
+fn replay_semantic_profile_category(store: &FactStore, capsule: &AnswerReplayCapsule) -> Option<String> {
+    let captured = capsule
+        .local_semantic_profile_id
+        .as_deref()
+        .or(capsule.semantic_profile_id.as_deref())?;
+    let current = store.semantic_profile();
+    let current_id = current.as_ref().map(|profile| profile.profile_id.as_str());
+    match current_id {
+        Some(id) if id == captured => None,
+        Some(_) => Some("semantic_profile_changed".to_string()),
+        None => Some("semantic_profile_unavailable".to_string()),
+    }
+}
+
+fn replay_projection_categories(capsule: &AnswerReplayCapsule) -> Vec<String> {
+    let current = corecrux_projections::current_projection_module_versions_v1();
+    capsule
+        .projection_refs
+        .iter()
+        .filter_map(|reference| {
+            let matched = current.iter().find(|module| {
+                module.matches_ref(
+                    &reference.module_id,
+                    &reference.module_version,
+                    reference.code_hash.as_deref(),
+                    reference.config_hash.as_deref(),
+                ) && reference
+                    .schema_version
+                    .is_none_or(|schema_version| schema_version == module.schema_version)
+            })?;
+            match &matched.status {
+                corecrux_projections::ProjectionModuleStatusV1::Active
+                | corecrux_projections::ProjectionModuleStatusV1::RetainedForReplay => None,
+                corecrux_projections::ProjectionModuleStatusV1::Deprecated => {
+                    Some("projection_module_deprecated".to_string())
+                }
+                corecrux_projections::ProjectionModuleStatusV1::Unavailable => {
+                    Some("projection_module_unavailable".to_string())
+                }
+            }
+        })
+        .chain(
+            capsule
+                .projection_refs
+                .iter()
+                .filter(|reference| {
+                    !current.iter().any(|module| {
+                        module.matches_ref(
+                            &reference.module_id,
+                            &reference.module_version,
+                            reference.code_hash.as_deref(),
+                            reference.config_hash.as_deref(),
+                        ) && reference
+                            .schema_version
+                            .is_none_or(|schema_version| schema_version == module.schema_version)
+                    })
+                })
+                .map(|_| "projection_module_unavailable".to_string()),
+        )
+        .collect()
+}
+
+fn replay_failure_severity(items: &[Value]) -> &'static str {
+    if items.is_empty() {
+        return "ok";
+    }
+    let has_high = items.iter().any(|item| {
+        item["categories"].as_array().is_some_and(|categories| {
+            categories.iter().any(|category| {
+                category
+                    .as_str()
+                    .is_some_and(|value| matches!(value, "fact_missing" | "projection_module_unavailable"))
+            })
+        })
+    });
+    if has_high {
+        "high"
+    } else {
+        "medium"
+    }
+}
+
+fn timeline_events(store: &FactStore, tenant_id: &str, limit: usize) -> Vec<Value> {
+    let mut events = Vec::new();
+    for (prefix, kind) in [
+        (
+            format!(
+                "{}::{tenant_id}::",
+                corecrux_memory::action_enrichment::ACTION_ENRICHMENT_RECEIPT_ENTITY_PREFIX
+            ),
+            "action_enrichment",
+        ),
+        (format!("__gpu1_receipt__::{tenant_id}::"), "gpu1_compute"),
+        (format!("{WORKBENCH_FACT_PREFIX}::{tenant_id}::"), "workbench"),
+        (format!("__work__::{tenant_id}::"), "work"),
+    ] {
+        events.extend(
+            query_facts(store, None, Some(&prefix), limit)
+                .into_iter()
+                .map(|fact| {
+                    json!({
+                        "kind": kind,
+                        "fact_id": fact.fact_id,
+                        "entity": fact.entity,
+                        "key": fact.key,
+                        "source_receipt": fact.source_receipt,
+                        "stored_at": fact.stored_at,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    events.sort_by(|a, b| {
+        b["stored_at"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(a["stored_at"].as_str().unwrap_or_default())
+    });
+    events.truncate(limit);
+    events
+}
+
+fn active_constraints(store: &FactStore, tenant_id: &str) -> Vec<Value> {
+    query_facts(store, None, Some("__constraints__::"), 200)
+        .into_iter()
+        .filter(|fact| {
+            fact.entity.contains(tenant_id) || fact.value.contains(tenant_id) || fact.key.contains(tenant_id)
+        })
+        .map(|fact| {
+            let parsed = serde_json::from_str::<Value>(&fact.value).ok();
+            if let Some(mut value) = parsed {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.entry("fact_id").or_insert_with(|| json!(fact.fact_id));
+                    obj.entry("entity").or_insert_with(|| json!(fact.entity));
+                    obj.entry("key").or_insert_with(|| json!(fact.key));
+                }
+                value
+            } else {
+                fact_summary(fact)
+            }
+        })
+        .collect()
+}
+
+fn match_constraints(narrative: &str, constraints: &[Value]) -> Vec<Value> {
+    let action_terms = terms(narrative);
+    let mut matches = Vec::new();
+    for constraint in constraints {
+        let assertion = constraint
+            .get("assertion")
+            .and_then(Value::as_str)
+            .or_else(|| constraint.get("value_preview").and_then(Value::as_str))
+            .unwrap_or_default();
+        let assertion_terms = terms(assertion);
+        if assertion_terms.is_empty() {
+            continue;
+        }
+        let overlap = assertion_terms
+            .iter()
+            .filter(|term| action_terms.contains(term))
+            .count();
+        if overlap > 0 {
+            matches.push(json!({
+                "constraint_id": constraint.get("constraint_id").cloned().unwrap_or_else(|| constraint.get("fact_id").cloned().unwrap_or(Value::Null)),
+                "assertion": assertion,
+                "severity": constraint.get("severity").and_then(Value::as_str).unwrap_or("medium"),
+                "match_score": overlap as f32 / assertion_terms.len() as f32,
+            }));
+        }
+    }
+    matches.sort_by(|a, b| {
+        b["match_score"]
+            .as_f64()
+            .unwrap_or_default()
+            .partial_cmp(&a["match_score"].as_f64().unwrap_or_default())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    matches
+}
+
+fn terms(input: &str) -> Vec<String> {
+    let mut out = input
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|term| term.len() >= 3)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    out.sort();
+    out.dedup();
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_path_replaces_path_params() {
+        assert_eq!(normalize_path("/v1/work/{id}/comments"), "/v1/work/{}/comments");
+    }
+
+    #[test]
+    fn scope_hints_distinguish_write_routes() {
+        let scopes = scope_hints_for_route("POST", "/v1/facts");
+        assert!(scopes.contains(&"facts:write"));
+    }
+}

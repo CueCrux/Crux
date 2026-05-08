@@ -8,10 +8,12 @@
 //! specification. [`list_tools`] returns the full catalogue advertised to
 //! MCP clients via the `tools/list` response.
 
+pub mod action;
 pub mod constraint;
 pub mod coordination;
 pub mod cuecrux_session;
 pub mod decision;
+pub mod extensions;
 pub mod facts;
 pub mod github;
 pub mod handoff;
@@ -458,7 +460,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             description: "Check a proposed action against all active constraints. Returns \
                           a verdict (pass, warn, or block) based on keyword matching \
                           against constraint assertions. Critical matches block, high \
-                          matches warn."
+                          matches warn. If tool_name/tool_parameters are supplied, the \
+                          action is deterministically enriched before matching."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -466,12 +469,60 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "action_description": {
                         "type": "string",
                         "description": "Description of the action to check against constraints"
+                    },
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Optional tool name to enrich into a structured action proposal before constraint matching"
+                    },
+                    "tool_parameters": {
+                        "type": "object",
+                        "description": "Optional tool parameters used by deterministic basic action enrichment"
+                    },
+                    "tenant_id": {
+                        "type": "string",
+                        "description": "Optional tenant identifier to include in the enrichment receipt"
                     }
                 },
-                "required": ["action_description"],
                 "examples": [
                     { "action_description": "Delete all user records from the production database" },
-                    { "action_description": "Deploy updated API to staging environment" }
+                    { "action_description": "Deploy updated API to staging environment" },
+                    { "tenant_id": "business::acme", "tool_name": "calendar.move_event", "tool_parameters": { "event_id": "evt_1", "attendees": ["customer@example.com"], "new_time": "2026-05-08T16:00:00Z" } }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "enrich_action".to_string(),
+            description: "Build a deterministic EnrichedActionProposal from a raw tool call. \
+                          This is the Free/basic local path: it records consequence metadata, \
+                          affected principals/resources, a narrative for constraint matching, \
+                          and a local enrichment receipt. Pro first-party enrichers are exposed \
+                          on the daemon HTTP route POST /v1/actions/enrich."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "tenant_id": {
+                        "type": "string",
+                        "description": "Optional tenant identifier for the enrichment receipt"
+                    },
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Tool being considered"
+                    },
+                    "tool_parameters": {
+                        "type": "object",
+                        "description": "Structured parameters for the proposed tool call",
+                        "default": {}
+                    },
+                    "action_description": {
+                        "type": "string",
+                        "description": "Optional natural-language action description"
+                    }
+                },
+                "required": ["tool_name"],
+                "examples": [
+                    { "tenant_id": "business::acme", "tool_name": "calendar.move_event", "tool_parameters": { "event_id": "evt_1", "attendees": ["customer@example.com"], "new_time": "2026-05-08T16:00:00Z" }, "action_description": "Move customer meeting to Friday at 4pm" },
+                    { "tool_name": "github.deploy", "tool_parameters": { "repo": "CueCrux/Crux", "environment": "production" } }
                 ]
             }),
         },
@@ -513,9 +564,10 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         // ── Sync ──────────────────────────────────────────────────
         ToolDefinition {
             name: "sync_pull".to_string(),
-            description: "Pull latest facts from a remote CoreCrux instance. Resumes \
-                          from the last pull cursor. Requires CORECRUXD_SYNC_REMOTE_URL \
-                          and CORECRUXD_SYNC_API_KEY to be configured."
+            description: "Pull shared cloud tenant facts into this local-first daemon's \
+                          mirror. Resumes from the last pull cursor; local private memory \
+                          stays local. Requires CORECRUXD_SYNC_REMOTE_URL and \
+                          CORECRUXD_SYNC_API_KEY to be configured."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -523,32 +575,43 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "entity_prefix": {
                         "type": "string",
                         "description": "Optional entity prefix filter (reserved for future use)"
+                    },
+                    "tenant_id": {
+                        "type": "string",
+                        "description": "When set, pull the collection-aware mirror for this personal/business tenant instead of using the legacy all-facts export."
                     }
                 },
-                "examples": [{}]
+                "examples": [{}, { "tenant_id": "personal::myles" }, { "tenant_id": "business::acme" }]
             }),
         },
         ToolDefinition {
             name: "sync_push".to_string(),
-            description: "Push local facts to a remote CoreCrux instance. Only pushes \
-                          facts that were created locally (not previously synced). \
+            description: "Promote selected local facts to the shared cloud tenant. Only \
+                          pushes facts that were created locally (not previously synced). \
                           Private facts and sensitive entity prefixes are never pushed. \
-                          Call without confirm=true to preview what would be pushed. \
+                          Call without confirm=true to preview what would be promoted. \
                           Requires CORECRUXD_SYNC_REMOTE_URL and CORECRUXD_SYNC_API_KEY."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "confirm": { "type": "boolean", "description": "Set to true to actually push. Without this, returns a preview of facts that would be pushed.", "default": false }
+                    "confirm": { "type": "boolean", "description": "Set to true to actually push. Without this, returns a preview of facts that would be pushed.", "default": false },
+                    "tenant_id": { "type": "string", "description": "When set, use collection-aware tenant promotion instead of the legacy all-facts push." },
+                    "allowlist": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Tenant promotion allowlist entries such as facts, constraints, plans, collection:facts, entity:business::acme::public, or *."
+                    }
                 },
-                "examples": [{}, { "confirm": true }]
+                "examples": [{}, { "confirm": true }, { "tenant_id": "business::acme", "allowlist": ["facts", "constraints"] }, { "tenant_id": "business::acme", "allowlist": ["facts", "constraints"], "confirm": true }]
             }),
         },
         ToolDefinition {
             name: "sync_status".to_string(),
-            description: "Show whether this node is running local-only, manual sync, \
-                          full background sync, or degraded sync. Includes remote reachability, \
-                          pull/push timestamps, and local fact count."
+            description: "Show whether this node is local-only, cloud-mirror configured, \
+                          full background sync, or degraded. Includes remote reachability, \
+                          pull/push timestamps, local fact count, and onboarding guidance \
+                          for local-first or hosted Pro setups."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -759,6 +822,31 @@ pub fn list_tools_json_for_rcx_router(router: &RcxRouter, now_unix_seconds: u64)
     )
 }
 
+pub async fn list_tools_json_for_context(ctx: &McpContext, now_unix_seconds: u64) -> Value {
+    let auth = ctx
+        .rcx_router
+        .as_ref()
+        .map(|router| ToolAuthMetadata::from_token(router.token()));
+    let mut tools = ctx
+        .rcx_router
+        .as_ref()
+        .map_or_else(list_tools, |router| list_tools_for_rcx_router(router, now_unix_seconds));
+    let mut extension_tools = extensions::list_extension_tools(ctx).await;
+    if let Some(router) = ctx.rcx_router.as_ref() {
+        let capabilities: Vec<McpToolCapability> = extension_tools
+            .iter()
+            .map(|tool| rcx_mcp_tool_capability(&tool.name))
+            .collect();
+        let allowed: HashSet<String> = router
+            .filter_mcp_tools(&capabilities, now_unix_seconds)
+            .into_iter()
+            .collect();
+        extension_tools.retain(|tool| allowed.contains(&tool.name));
+    }
+    tools.extend(extension_tools);
+    tools_to_json(tools, auth)
+}
+
 #[derive(Debug, Clone)]
 struct ToolAuthMetadata {
     token_id: String,
@@ -783,6 +871,7 @@ fn tools_to_json(tools: Vec<ToolDefinition>, auth: Option<ToolAuthMetadata>) -> 
         .into_iter()
         .map(|t| {
             let mut input_schema = t.input_schema;
+            let consequence_metadata = corecrux_memory::action_enrichment::metadata_for_tool_value(&t.name);
             if let Some(auth) = &auth {
                 if let Some(schema) = input_schema.as_object_mut() {
                     schema.insert(
@@ -796,27 +885,24 @@ fn tools_to_json(tools: Vec<ToolDefinition>, auth: Option<ToolAuthMetadata>) -> 
                     schema.insert("x-crux-tier".to_string(), json!(&auth.tier));
                 }
             }
-            let meta = auth.as_ref().map(|auth| {
-                json!({
-                    "crux": {
-                        "filtered_by": "rcx-capability-token",
-                        "token_ref": {
-                            "token_id": &auth.token_id,
-                            "token_hash": &auth.token_hash,
-                        },
-                        "receipt_class": &auth.receipt_class,
-                        "tier": &auth.tier,
-                    }
-                })
+            let mut crux_meta = json!({
+                "consequence_metadata": consequence_metadata,
             });
-            let mut tool = json!({
+            if let Some(auth) = &auth {
+                crux_meta["filtered_by"] = json!("rcx-capability-token");
+                crux_meta["token_ref"] = json!({
+                    "token_id": &auth.token_id,
+                    "token_hash": &auth.token_hash,
+                });
+                crux_meta["receipt_class"] = json!(&auth.receipt_class);
+                crux_meta["tier"] = json!(&auth.tier);
+            }
+            let tool = json!({
                 "name": t.name,
                 "description": t.description,
                 "inputSchema": input_schema,
+                "_meta": { "crux": crux_meta },
             });
-            if let Some(meta) = meta {
-                tool["_meta"] = meta;
-            }
             tool
         })
         .collect();
@@ -881,6 +967,9 @@ pub fn rcx_local_capabilities() -> Vec<String> {
 }
 
 fn rcx_capability_for_tool(tool_name: &str) -> String {
+    if extensions::is_extension_tool_name(tool_name) {
+        return extensions::rcx_capability_name(tool_name);
+    }
     match tool_name {
         "query" | "query_scan" | "query_expand" => "corecrux.query.local".to_string(),
         other => format!("crux-mcp.{other}"),
@@ -916,11 +1005,12 @@ pub fn tool_output_docs() -> Value {
         { "tool": "declare_constraint", "output": "{ constraint_id, constraint_hash, constraint_type, assertion }" },
         { "tool": "get_constraints",    "output": "{ constraints: [{constraint_id, constraint_type, assertion, severity, status, created_at}], count }" },
         { "tool": "check_constraints",  "output": "{ verdict: pass|warn|block, matched_constraints: [{constraint_id, assertion, severity, match_score}] }" },
+        { "tool": "enrich_action",      "output": "EnrichedActionProposal { schema, tenant_id, enrichment_mode, tool_call, narrative, affected_principals, affected_resources, state_diff, consequences, relationship_hits, consequence_metadata, enrichment_receipt }" },
         { "tool": "issue_passport",     "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id }" },
         { "tool": "get_passport",       "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id, issued_at, passport_hash }" },
-        { "tool": "sync_pull",          "output": "{ facts_pulled, cursor, total_pull_count }" },
-        { "tool": "sync_push",          "output": "{ facts_pushed, total_push_count }" },
-        { "tool": "sync_status",        "output": "{ mode, configured, background_sync_enabled, remote_url, api_key_configured, platform_online, degraded, degraded_reason, onboarding_hint, last_pull_at, last_push_at, pull_count, push_count, local_fact_count }" },
+        { "tool": "sync_pull",          "output": "{ tenant_id?, facts_pulled, cursor, total_pull_count, collection_cursor_count }" },
+        { "tool": "sync_push",          "output": "{ mode?='tenant_promotion_preview', tenant_id?, facts_pushed?|would_promote?, preview_hash?, skipped_private?, skipped_synced?, skipped_not_allowlisted?, total_push_count?, collection_cursor_count? }" },
+        { "tool": "sync_status",        "output": "{ mode, configured, background_sync_enabled, remote_url, api_key_configured, platform_online, degraded, degraded_reason, onboarding_hint, last_pull_at, last_push_at, pull_count, push_count, collection_pull_cursor_count, collection_push_cursor_count, tenant_manifest_supported, local_fact_count }" },
         { "tool": "update_status",      "output": "{ enabled, state, tracking_ref, current_commit, latest_commit, ahead_by, behind_by, checked_at, error, upgrade_hint, upgrade_playbook_query, backup_playbook_query }" },
         { "tool": "list_projects",      "output": "{ projects: [{ id, name, planning_target?, default_passport_id, created_at_unix_ms }] }" },
         { "tool": "get_project_context","output": "{ id, name, planning_target?, default_passport_id, members: [{ passport_id, role }], tenants: [{ tenant_id, default_passport_id? }] }" },
@@ -978,6 +1068,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "declare_constraint" => constraint::handle_declare_constraint(args, ctx).await,
         "get_constraints" => constraint::handle_get_constraints(args, ctx).await,
         "check_constraints" => constraint::handle_check_constraints(args, ctx).await,
+        "enrich_action" => action::handle_enrich_action(args, ctx).await,
         "issue_passport" => passport::handle_issue_passport(args, ctx).await,
         "get_passport" => passport::handle_get_passport(args, ctx).await,
         "sync_pull" => sync::handle_sync_pull(args, ctx).await,
@@ -999,6 +1090,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "github_comments_since" => github::handle_github_comments_since(args, ctx).await,
         // Workspace storyline (HTTP loopback to corecruxd).
         "get_workspace_storyline" => storyline::handle_get_workspace_storyline(args, ctx).await,
+        name if extensions::is_extension_tool_name(name) => extensions::call_extension_tool(name, args, ctx).await,
         _ => Err(JsonRpcError {
             code: crate::protocol::METHOD_NOT_FOUND,
             message: format!("unknown tool: {name}"),
@@ -1034,7 +1126,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 40; // 34 + 5 GitHub tools (Plan B G5) + get_workspace_storyline (workspace-scan storyline ExecPlan)
+    const TOOL_COUNT: usize = 41; // 34 + enrich_action + 5 GitHub tools + get_workspace_storyline.
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
@@ -1123,6 +1215,7 @@ mod tests {
         assert!(names.contains(&"declare_constraint".to_string()));
         assert!(names.contains(&"get_constraints".to_string()));
         assert!(names.contains(&"check_constraints".to_string()));
+        assert!(names.contains(&"enrich_action".to_string()));
         // Passport tools (2)
         assert!(names.contains(&"issue_passport".to_string()));
         assert!(names.contains(&"get_passport".to_string()));
@@ -1219,10 +1312,30 @@ mod tests {
         let by_name = |n: &str| tools.iter().find(|t| t.name == n).unwrap();
 
         assert!(by_name("query").description.starts_with("[local]"));
+        assert!(by_name("enrich_action").description.starts_with("[local]"));
         assert!(by_name("sync_status").description.starts_with("[local]"));
         assert!(by_name("issue_passport").description.starts_with("[hosted]"));
         assert!(by_name("sync_pull").description.starts_with("[hosted]"));
         assert!(by_name("sync_push").description.starts_with("[hosted]"));
+    }
+
+    #[test]
+    fn list_tools_json_includes_consequence_metadata() {
+        let listed = list_tools_json();
+        let tools = listed["tools"].as_array().unwrap();
+        let enrich = tools
+            .iter()
+            .find(|tool| tool["name"] == "enrich_action")
+            .expect("enrich_action listed");
+
+        assert_eq!(
+            enrich["_meta"]["crux"]["consequence_metadata"]["schema"],
+            "crux.tool_consequence_metadata.v1"
+        );
+        assert_eq!(
+            enrich["_meta"]["crux"]["consequence_metadata"]["reversibility"],
+            "unknown"
+        );
     }
 
     #[test]
@@ -1479,6 +1592,30 @@ mod tests {
         .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("verdict: pass"));
+    }
+
+    #[tokio::test]
+    async fn call_tool_enrich_action() {
+        let ctx = test_ctx();
+        let result = call_tool(
+            "enrich_action",
+            &json!({
+                "tenant_id": "business::acme",
+                "tool_name": "calendar.move_event",
+                "tool_parameters": {
+                    "event_id": "evt_1",
+                    "attendees": ["customer@example.com"],
+                    "new_time": "2026-05-08T16:00:00Z"
+                }
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result["structuredContent"]["schema"],
+            corecrux_memory::action_enrichment::ACTION_ENRICHMENT_SCHEMA
+        );
     }
 
     // ── sync dispatch integration tests ────────────────────────────

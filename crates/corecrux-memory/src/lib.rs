@@ -20,9 +20,12 @@
 //! constraints) keyed by session ID. Sessions cost ~87 tokens vs ~15K tokens
 //! for replaying a full conversation.
 
+pub mod action_enrichment;
 pub mod embeddings;
 pub mod events;
 pub mod fact_store;
+pub mod replay;
+pub mod semantic;
 pub mod session_store;
 pub mod sync;
 

@@ -31,7 +31,7 @@ use crate::catalog::{tier_meets, CatalogEntry, DEFAULT_CATALOG};
 use crate::intent::{
     apply_intent_shaping_with_affinity, default_intent_table, hash_capability_graph_with_intent, IntentTable,
 };
-use crate::plan::{Capability, Passport, HASH_LEN};
+use crate::plan::{Capability, Edge, Exclusion, Passport, HASH_LEN};
 
 /// Threshold below which `heavy` capabilities are dropped. Callers with
 /// `budget.crux_cap = None` (local daemon) always keep heavy capabilities.
@@ -96,6 +96,8 @@ pub struct GenerateInput<'a> {
 #[derive(Debug, Clone)]
 pub struct GeneratedGraph {
     pub capabilities: Vec<Capability>,
+    pub edges: Vec<Edge>,
+    pub excluded: Vec<Exclusion>,
     pub hash: [u8; HASH_LEN],
 }
 
@@ -147,6 +149,8 @@ pub fn generate_graph(input: GenerateInput<'_>) -> GeneratedGraph {
     let hash = hash_capability_graph_with_intent(&caps, input.hints.intent.as_deref());
     GeneratedGraph {
         capabilities: caps,
+        edges: Vec::new(),
+        excluded: Vec::new(),
         hash,
     }
 }
@@ -228,6 +232,8 @@ mod tests {
             principal_id: "test".into(),
             tier: tier.into(),
             affinities: affinities.iter().map(|s| (*s).into()).collect(),
+            denied_capabilities: None,
+            grant_expansions: None,
             passport_receipt: None,
         }
     }

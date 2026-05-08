@@ -27,7 +27,9 @@ use crate::cold_segment_v1::{
     ColdSegmentIndexEntryV1,
 };
 use crate::events::{parse_projection_event, ProjectionEventV1};
-use crate::meta::{load_projections_meta_v1, store_projections_meta_v1, ProjectionCursorV1};
+use crate::meta::{
+    load_projections_meta_v1, record_current_projection_modules_v1, store_projections_meta_v1, ProjectionCursorV1,
+};
 use crate::state::ProjectionState;
 use crate::{ProjectionError, Result};
 
@@ -707,6 +709,8 @@ impl ProjectionStoreV1 {
         self.meta.artifact_relations.row_count = self.state.relations.len() as u64;
         self.meta.pressure_events.row_count = self.state.pressure.len() as u64;
         self.meta.artifact_dependents.row_count = self.state.dependents.len() as u64;
+
+        record_current_projection_modules_v1(&mut self.meta);
 
         store_projections_meta_v1(&self.files.meta_path, &self.meta)?;
         Ok(())

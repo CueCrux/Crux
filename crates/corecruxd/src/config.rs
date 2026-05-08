@@ -6,6 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use crate::auth::AuthMode;
+use crate::product::OperatingMode;
 use crux_enterprise_shim::EnterpriseTrustRoot;
 use serde::Deserialize;
 
@@ -209,6 +210,11 @@ pub struct Config {
     pub integrations_enabled: bool,
     pub integrations_safe_mode: bool,
     pub integrations_allow_executable_helpers: bool,
+
+    // Product posture / entitlement reporting. These values report the local
+    // daemon's operating contract; paid-gate enforcement is layered separately.
+    pub operating_mode: OperatingMode,
+    pub enabled_pro_services: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -490,6 +496,14 @@ pub fn load_config() -> Config {
             .or(file_config.enterprise.allow_vaultcrux_cross_sign)
             .unwrap_or(false),
     });
+    let operating_mode = env_string("CORECRUXD_OPERATING_MODE")
+        .or_else(|| env_string("CRUX_OPERATING_MODE"))
+        .as_deref()
+        .and_then(OperatingMode::parse)
+        .unwrap_or_default();
+    let enabled_pro_services = env_csv("CORECRUXD_ENABLED_PRO_SERVICES")
+        .or_else(|| env_csv("CRUX_ENABLED_PRO_SERVICES"))
+        .unwrap_or_default();
     let llm_endpoint = env_string("CORECRUXD_LLM_ENDPOINT").or(file_config.llm.endpoint.clone());
     let llm_model = env_string("CORECRUXD_LLM_MODEL").or(file_config.llm.model.clone());
 
@@ -805,6 +819,8 @@ pub fn load_config() -> Config {
         integrations_allow_executable_helpers: std::env::var("CORECRUXD_INTEGRATIONS_ALLOW_EXECUTABLE_HELPERS")
             .ok()
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
+        operating_mode,
+        enabled_pro_services,
     }
 }
 

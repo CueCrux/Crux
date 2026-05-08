@@ -11,6 +11,9 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
+pub const SEMANTIC_PROFILE_SCHEMA_V1: &str = "cuecrux.semantic_profile.v1";
+pub const EMBEDDING_FINGERPRINT_SCHEMA_V1: &str = "cuecrux.embedding_fingerprint.v1";
+
 /// Configuration for the embedding endpoint.
 #[derive(Debug, Clone)]
 pub struct EmbeddingConfig {
@@ -20,6 +23,70 @@ pub struct EmbeddingConfig {
     pub model: String,
     /// Dimensionality of the embedding vectors. Auto-detected on first call if 0.
     pub dimensions: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddingFingerprint {
+    pub schema: String,
+    pub fingerprint_id: String,
+    pub model: String,
+    pub dimensions: usize,
+    pub tokenizer: String,
+    pub prompt_template_version: String,
+    pub normalisation: String,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SemanticProfile {
+    pub schema: String,
+    pub profile_id: String,
+    pub model: String,
+    pub dimensions: usize,
+    pub tokenizer: String,
+    pub prompt_template_version: String,
+    pub normalisation: String,
+    pub embedding_fingerprint: EmbeddingFingerprint,
+}
+
+impl SemanticProfile {
+    pub fn from_embedding_config(config: &EmbeddingConfig, detected_dimensions: usize) -> Self {
+        let dimensions = if detected_dimensions == 0 {
+            config.dimensions
+        } else {
+            detected_dimensions
+        };
+        let tokenizer = "model_default".to_string();
+        let prompt_template_version = "none".to_string();
+        let normalisation = "none".to_string();
+        let hash_material = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            config.model, dimensions, tokenizer, prompt_template_version, normalisation
+        );
+        let hash = blake3::hash(hash_material.as_bytes()).to_hex().to_string();
+        let fingerprint_id = format!("efp_{}", &hash[..24]);
+        let profile_id = format!("sp_{}", &hash[..24]);
+
+        Self {
+            schema: SEMANTIC_PROFILE_SCHEMA_V1.to_string(),
+            profile_id,
+            model: config.model.clone(),
+            dimensions,
+            tokenizer: tokenizer.clone(),
+            prompt_template_version: prompt_template_version.clone(),
+            normalisation: normalisation.clone(),
+            embedding_fingerprint: EmbeddingFingerprint {
+                schema: EMBEDDING_FINGERPRINT_SCHEMA_V1.to_string(),
+                fingerprint_id,
+                model: config.model.clone(),
+                dimensions,
+                tokenizer,
+                prompt_template_version,
+                normalisation,
+                hash,
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -123,6 +190,10 @@ impl EmbeddingClient {
     pub fn base_url(&self) -> &str {
         &self.config.base_url
     }
+
+    pub fn semantic_profile(&self) -> SemanticProfile {
+        SemanticProfile::from_embedding_config(&self.config, self.dimensions())
+    }
 }
 
 /// Compute cosine similarity between two vectors.
@@ -183,5 +254,46 @@ mod tests {
     fn cosine_empty_vectors() {
         let sim = cosine_similarity(&[], &[]);
         assert_eq!(sim, 0.0);
+    }
+
+    #[test]
+    fn semantic_profile_is_stable_for_same_embedding_config() {
+        let config = EmbeddingConfig {
+            base_url: "http://localhost:11434".to_string(),
+            model: "nomic-embed-text".to_string(),
+            dimensions: 768,
+        };
+
+        let a = SemanticProfile::from_embedding_config(&config, 0);
+        let b = SemanticProfile::from_embedding_config(&config, 768);
+
+        assert_eq!(a, b);
+        assert_eq!(a.schema, SEMANTIC_PROFILE_SCHEMA_V1);
+        assert_eq!(a.embedding_fingerprint.schema, EMBEDDING_FINGERPRINT_SCHEMA_V1);
+        assert!(a.profile_id.starts_with("sp_"));
+        assert!(a.embedding_fingerprint.fingerprint_id.starts_with("efp_"));
+    }
+
+    #[test]
+    fn semantic_profile_changes_when_model_changes() {
+        let a = SemanticProfile::from_embedding_config(
+            &EmbeddingConfig {
+                base_url: "http://localhost:11434".to_string(),
+                model: "model-a".to_string(),
+                dimensions: 384,
+            },
+            0,
+        );
+        let b = SemanticProfile::from_embedding_config(
+            &EmbeddingConfig {
+                base_url: "http://localhost:11434".to_string(),
+                model: "model-b".to_string(),
+                dimensions: 384,
+            },
+            0,
+        );
+
+        assert_ne!(a.profile_id, b.profile_id);
+        assert_ne!(a.embedding_fingerprint.hash, b.embedding_fingerprint.hash);
     }
 }

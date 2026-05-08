@@ -170,14 +170,7 @@ mod tests {
     use crate::plan::ImplPath;
 
     fn cap(name: &str, _affinity: &str) -> Capability {
-        Capability {
-            cap: name.to_string(),
-            prefer: "mcp".to_string(),
-            shape: "Receipt".to_string(),
-            min_tier: None,
-            cost_class: "free".to_string(),
-            impl_path: ImplPath { ce: None, core: None },
-        }
+        Capability::legacy(name, "mcp", "Receipt", None, "free", ImplPath { ce: None, core: None })
     }
 
     fn caps_with_affinity() -> Vec<(Capability, &'static str)> {

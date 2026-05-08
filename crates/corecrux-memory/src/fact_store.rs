@@ -133,6 +133,11 @@ impl FactStore {
         self.embedding_client.is_some()
     }
 
+    /// Return the semantic profile for the configured embedding client.
+    pub fn semantic_profile(&self) -> Option<crate::embeddings::SemanticProfile> {
+        self.embedding_client.as_ref().map(|client| client.semantic_profile())
+    }
+
     /// Create a fact store backed by a JSONL journal in `data_dir`.
     ///
     /// If `data_dir/facts.jsonl` exists, it is replayed to rebuild in-memory

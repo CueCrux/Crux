@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INVALID_PARAMS};
 
+use corecrux_memory::semantic::{MIXED_PROFILE_MERGE_RULE, SCORE_MERGE_RULE_SINGLE_SPACE, SCORE_SPACE_BM25_LEXICAL};
 use corecrux_retrieval::bm25::{self, Bm25Params};
 
 /// `query` — BM25 + graph fusion search with optional token budget and min_score.
@@ -18,6 +19,11 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
     let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let min_score = params.get("min_score").and_then(|v| v.as_f64()).map(|f| f as f32);
     let token_budget = params.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize);
+    let semantic_profile = ctx.fact_store.read().await.semantic_profile();
+    let local_semantic_profile_id = semantic_profile.as_ref().map(|profile| profile.profile_id.clone());
+    let embedding_fingerprint = semantic_profile
+        .as_ref()
+        .map(|profile| profile.embedding_fingerprint.clone());
 
     let index = ctx.retrieval_index.read().await;
     if index.total_docs() == 0 {
@@ -56,10 +62,16 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
 
     let results_json: Vec<Value> = hits
         .iter()
-        .map(|h| {
+        .enumerate()
+        .map(|(idx, h)| {
             json!({
                 "result_id": format!("{}:{}", h.segment_index, h.doc_id),
+                "rank": idx + 1,
                 "score": h.score,
+                "source_label": "local_tenant_index",
+                "score_space": SCORE_SPACE_BM25_LEXICAL,
+                "semantic_profile_id": null,
+                "local_semantic_profile_id": local_semantic_profile_id.clone(),
                 "segment_index": h.segment_index,
                 "doc_id": h.doc_id,
                 "doc_length_tokens": h.doc_length_tokens,
@@ -77,6 +89,16 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
                     "score": result.coverage.score,
                     "missing_tokens": result.coverage.missing_tokens,
                     "below_floor": result.coverage.below_floor,
+                },
+                "meta": {
+                    "source_label": "local_tenant_index",
+                    "score_space": SCORE_SPACE_BM25_LEXICAL,
+                    "score_merge_rule": SCORE_MERGE_RULE_SINGLE_SPACE,
+                    "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,
+                    "semantic_profile_id": null,
+                    "local_semantic_profile_id": local_semantic_profile_id.clone(),
+                    "local_semantic_profile": semantic_profile.clone(),
+                    "embedding_fingerprint": embedding_fingerprint.clone(),
                 }
             })).unwrap_or_default()
         }]
@@ -88,6 +110,11 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
     let tenant_hash = require_tenant_hash(params)?;
     let query = require_str(params, "query")?;
     let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    let semantic_profile = ctx.fact_store.read().await.semantic_profile();
+    let local_semantic_profile_id = semantic_profile.as_ref().map(|profile| profile.profile_id.clone());
+    let embedding_fingerprint = semantic_profile
+        .as_ref()
+        .map(|profile| profile.embedding_fingerprint.clone());
 
     let index = ctx.retrieval_index.read().await;
     if index.total_docs() == 0 {
@@ -102,10 +129,16 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
     let scan: Vec<Value> = result
         .hits
         .iter()
-        .map(|h| {
+        .enumerate()
+        .map(|(idx, h)| {
             json!({
                 "result_id": format!("{}:{}", h.segment_index, h.doc_id),
+                "rank": idx + 1,
                 "score": h.score,
+                "source_label": "local_tenant_index",
+                "score_space": SCORE_SPACE_BM25_LEXICAL,
+                "semantic_profile_id": null,
+                "local_semantic_profile_id": local_semantic_profile_id.clone(),
                 "segment_index": h.segment_index,
                 "doc_id": h.doc_id,
                 "doc_length_tokens": h.doc_length_tokens,
@@ -119,6 +152,16 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
             "text": serde_json::to_string_pretty(&json!({
                 "scan": scan,
                 "total_candidates": result.total_candidates,
+                "meta": {
+                    "source_label": "local_tenant_index",
+                    "score_space": SCORE_SPACE_BM25_LEXICAL,
+                    "score_merge_rule": SCORE_MERGE_RULE_SINGLE_SPACE,
+                    "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,
+                    "semantic_profile_id": null,
+                    "local_semantic_profile_id": local_semantic_profile_id.clone(),
+                    "local_semantic_profile": semantic_profile.clone(),
+                    "embedding_fingerprint": embedding_fingerprint.clone(),
+                }
             })).unwrap_or_default()
         }]
     }))
@@ -139,6 +182,11 @@ pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Val
             message: "missing required param: result_ids".to_string(),
             data: Some(json!({"param": "result_ids", "required": true})),
         })?;
+    let semantic_profile = ctx.fact_store.read().await.semantic_profile();
+    let local_semantic_profile_id = semantic_profile.as_ref().map(|profile| profile.profile_id.clone());
+    let embedding_fingerprint = semantic_profile
+        .as_ref()
+        .map(|profile| profile.embedding_fingerprint.clone());
 
     let index = ctx.retrieval_index.read().await;
     let readers = index.readers();
@@ -179,6 +227,10 @@ pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Val
         chunks.push(json!({
             "segment_index": seg_idx,
             "doc_id": doc_id,
+            "source_label": "local_tenant_index",
+            "score_space": SCORE_SPACE_BM25_LEXICAL,
+            "semantic_profile_id": null,
+            "local_semantic_profile_id": local_semantic_profile_id.clone(),
             "frame_offset": doc.frame_offset,
             "token_count": doc.doc_length_tokens,
         }));
@@ -187,6 +239,14 @@ pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Val
     let mut response = json!({
         "chunks": chunks,
         "tokens_loaded": tokens_loaded,
+        "meta": {
+            "source_label": "local_tenant_index",
+            "score_space": SCORE_SPACE_BM25_LEXICAL,
+            "semantic_profile_id": null,
+            "local_semantic_profile_id": local_semantic_profile_id.clone(),
+            "local_semantic_profile": semantic_profile.clone(),
+            "embedding_fingerprint": embedding_fingerprint.clone(),
+        }
     });
 
     if !errors.is_empty() {
@@ -319,6 +379,8 @@ mod tests {
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert!(parsed.get("chunks").is_some());
         assert!(parsed.get("tokens_loaded").is_some());
+        assert_eq!(parsed["meta"]["score_space"], SCORE_SPACE_BM25_LEXICAL);
+        assert!(parsed["meta"]["semantic_profile_id"].is_null());
     }
 
     #[tokio::test]

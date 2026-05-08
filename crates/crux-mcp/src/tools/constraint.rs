@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INVALID_PARAMS};
+use corecrux_memory::action_enrichment::{enrich_action, ActionEnrichmentInput};
 use corecrux_memory::fact_store::{FactQuery, StoreFact};
 
 /// Entity prefix for all constraints.
@@ -159,7 +160,7 @@ pub async fn handle_get_constraints(args: &Value, ctx: &McpContext) -> Result<Va
 
 /// `check_constraints` — check a proposed action against active constraints.
 pub async fn handle_check_constraints(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let action = require_str(args, "action_description")?;
+    let (action, enrichment_receipt_id) = action_text_for_constraint_check(args)?;
 
     // Load all active constraints.
     let q = FactQuery {
@@ -185,13 +186,16 @@ pub async fn handle_check_constraints(args: &Value, ctx: &McpContext) -> Result<
         return Ok(json!({
             "content": [{
                 "type": "text",
-                "text": "verdict: pass (no constraints defined)"
+                "text": format!(
+                    "{}verdict: pass (no constraints defined)",
+                    enrichment_prefix(enrichment_receipt_id.as_deref())
+                )
             }]
         }));
     }
 
     // Keyword match: tokenise action and each constraint assertion.
-    let action_terms = tokenise(action);
+    let action_terms = tokenise(&action);
     let mut matches: Vec<(ConstraintRecord, f64)> = Vec::new();
 
     for constraint in &constraints {
@@ -222,7 +226,11 @@ pub async fn handle_check_constraints(args: &Value, ctx: &McpContext) -> Result<
         return Ok(json!({
             "content": [{
                 "type": "text",
-                "text": format!("verdict: pass (0/{} constraints matched)", constraints.len())
+                "text": format!(
+                    "{}verdict: pass (0/{} constraints matched)",
+                    enrichment_prefix(enrichment_receipt_id.as_deref()),
+                    constraints.len()
+                )
             }]
         }));
     }
@@ -244,7 +252,8 @@ pub async fn handle_check_constraints(args: &Value, ctx: &McpContext) -> Result<
         .collect();
 
     let text = format!(
-        "verdict: {} ({}/{} constraints matched)\n{}",
+        "{}verdict: {} ({}/{} constraints matched)\n{}",
+        enrichment_prefix(enrichment_receipt_id.as_deref()),
         verdict,
         matches.len(),
         constraints.len(),
@@ -257,6 +266,37 @@ pub async fn handle_check_constraints(args: &Value, ctx: &McpContext) -> Result<
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
+
+fn action_text_for_constraint_check(args: &Value) -> Result<(String, Option<String>), JsonRpcError> {
+    if let Some(tool_name) = args.get("tool_name").and_then(|v| v.as_str()) {
+        let proposal = enrich_action(
+            None,
+            ActionEnrichmentInput {
+                tenant_id: args.get("tenant_id").and_then(|v| v.as_str()).map(str::to_string),
+                tool_name: tool_name.to_string(),
+                tool_parameters: args.get("tool_parameters").cloned().unwrap_or_else(|| json!({})),
+                action_description: args
+                    .get("action_description")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                include_first_party_enrichers: false,
+            },
+        );
+        let receipt_id = proposal
+            .enrichment_receipt
+            .as_ref()
+            .map(|receipt| receipt.receipt_id.clone());
+        return Ok((proposal.narrative, receipt_id));
+    }
+
+    Ok((require_str(args, "action_description")?.to_string(), None))
+}
+
+fn enrichment_prefix(receipt_id: Option<&str>) -> String {
+    receipt_id.map_or_else(String::new, |receipt_id| {
+        format!("action_enrichment: basic receipt={receipt_id}\n")
+    })
+}
 
 /// Map severity to a sort rank (lower = higher priority).
 fn severity_rank(severity: &str) -> u8 {

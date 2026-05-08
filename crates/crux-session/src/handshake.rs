@@ -28,7 +28,9 @@ use rand::RngCore;
 use crate::catalog::CatalogEntry;
 use crate::error::SessionError;
 use crate::generator::{generate_graph, GenerateInput, GraphHints};
-use crate::plan::{Budget, Channels, Passport, ReceiptEnvelope, SessionPlan, SESSION_PLAN_VERSION, ULID_LEN};
+use crate::plan::{
+    Budget, Channels, Passport, ReceiptEnvelope, SessionPlan, CAPABILITY_GRAPH_VERSION, SESSION_PLAN_VERSION, ULID_LEN,
+};
 use crate::receipt::plan_receipt_hash;
 use crate::signer::PlanSigner;
 
@@ -83,8 +85,20 @@ pub fn mint(request: HandshakeRequest, inputs: HandshakeInputs<'_>) -> Result<Se
         session_id,
         session_ttl_s: request.session_ttl_s,
         passport: request.passport,
+        model: None,
         channels: request.channels,
         capability_graph: graph.capabilities,
+        capability_graph_edges: graph.edges,
+        capability_graph_excluded: if graph.excluded.is_empty() {
+            None
+        } else {
+            Some(graph.excluded)
+        },
+        capability_graph_version: CAPABILITY_GRAPH_VERSION,
+        capability_graph_valid_until: request
+            .now_ms
+            .saturating_add(request.session_ttl_s.saturating_mul(1000)),
+        capability_graph_refresh_hint: None,
         capability_graph_hash: graph.hash,
         budget: request.budget,
         receipt: ReceiptEnvelope {
@@ -156,6 +170,8 @@ mod tests {
             principal_id: "ce:abc:user".into(),
             tier: "local".into(),
             affinities: vec!["*".into()],
+            denied_capabilities: None,
+            grant_expansions: None,
             passport_receipt: None,
         };
         let flags = HashSet::new();
@@ -182,6 +198,8 @@ mod tests {
             principal_id: "tenant:co:user".into(),
             tier: "team".into(),
             affinities: vec!["retrieval".into(), "proof".into(), "memory".into()],
+            denied_capabilities: None,
+            grant_expansions: None,
             passport_receipt: None,
         };
         let flags = HashSet::new();

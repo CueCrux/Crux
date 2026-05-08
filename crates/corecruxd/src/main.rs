@@ -45,8 +45,10 @@ mod playground;
 mod pool;
 mod presence;
 mod problem;
+mod product;
 mod project_repo_links;
 mod projects;
+mod protocol_posture;
 mod relations;
 mod session_bindings;
 mod shard_map;
@@ -418,10 +420,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         integrations_enabled: config.integrations_enabled,
         integrations_safe_mode: config.integrations_safe_mode,
         integrations_allow_executable_helpers: config.integrations_allow_executable_helpers,
+        operating_mode: config.operating_mode,
+        enabled_pro_services: config.enabled_pro_services.clone(),
         read_retry_failed_readyz_threshold: config.read_retry_failed_readyz_threshold,
         commit_level: config.commit_level,
         metrics: metrics.clone(),
         node_id: node_id.clone(),
+        passport_key_path: config.passport_key_path.clone(),
         passport_fpr: rcx_passport_key.passport_fpr().to_string(),
         passport_public_key_hex: rcx_passport_key.public_key_hex().to_string(),
         mcp_agent_count: mcp_agent_registry.len(),
@@ -3532,10 +3537,13 @@ mod tests {
             integrations_enabled: true,
             integrations_safe_mode: false,
             integrations_allow_executable_helpers: false,
+            operating_mode: crate::product::OperatingMode::FreeLocal,
+            enabled_pro_services: Vec::new(),
             read_retry_failed_readyz_threshold: 0,
             commit_level: crate::config::CommitLevel::LocalCommit,
             metrics: metrics.clone(),
             node_id: "node-test".to_string(),
+            passport_key_path: tmp.path().join("passport.key"),
             passport_fpr: "p_test".to_string(),
             passport_public_key_hex: "00".repeat(32),
             mcp_agent_count: 0,
