@@ -227,8 +227,7 @@ fn dedup_latest(facts: Vec<corecrux_memory::fact_store::Fact>) -> Vec<corecrux_m
         let key = (fact.entity.clone(), fact.key.clone());
         let replace = by_key
             .get(&key)
-            .map(|existing| fact.stored_at >= existing.stored_at)
-            .unwrap_or(true);
+            .is_none_or(|existing| fact.stored_at >= existing.stored_at);
         if replace {
             by_key.insert(key, fact);
         }

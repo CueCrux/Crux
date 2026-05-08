@@ -35,6 +35,16 @@ pub struct LocalEngram {
     pub capability_class_min: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_class_max: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_chunk_hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_chunk_set_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_hash: Option<String>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     pub created_at_unix_ms: u64,
@@ -114,6 +124,11 @@ pub(super) async fn list_engrams(
                 "prompt_hash": prompt_hash(&e.content),
                 "capability_class_min": e.capability_class_min,
                 "capability_class_max": e.capability_class_max,
+                "generated_class": &e.generated_class,
+                "source_chunk_hashes": &e.source_chunk_hashes,
+                "source_chunk_set_hash": &e.source_chunk_set_hash,
+                "inherited_reason": &e.inherited_reason,
+                "policy_hash": &e.policy_hash,
                 "enabled": e.enabled,
                 "created_at_unix_ms": e.created_at_unix_ms,
             })
@@ -249,6 +264,11 @@ pub(super) async fn resolve_engrams(
                 "content": e.content,
                 "prompt_hash": prompt_hash(&e.content),
                 "applicable_why": e.applicable_why,
+                "generated_class": &e.generated_class,
+                "source_chunk_hashes": &e.source_chunk_hashes,
+                "source_chunk_set_hash": &e.source_chunk_set_hash,
+                "inherited_reason": &e.inherited_reason,
+                "policy_hash": &e.policy_hash,
             })).collect::<Vec<_>>(),
             "manifest_status": manifest_status,
             "manifest_hash": manifest["manifest_hash"],
@@ -293,6 +313,11 @@ fn builtin_engrams() -> Vec<LocalEngram> {
             applicable_why: Some("Local daemon baseline for agent investigation sessions.".to_string()),
             capability_class_min: None,
             capability_class_max: None,
+            generated_class: None,
+            source_chunk_hashes: Vec::new(),
+            source_chunk_set_hash: None,
+            inherited_reason: None,
+            policy_hash: None,
             enabled: true,
             created_at_unix_ms: 1_776_710_400_000,
         },
@@ -306,6 +331,11 @@ fn builtin_engrams() -> Vec<LocalEngram> {
             applicable_why: Some("Useful when daemon API work touches handlers or MCP surfaces.".to_string()),
             capability_class_min: None,
             capability_class_max: None,
+            generated_class: None,
+            source_chunk_hashes: Vec::new(),
+            source_chunk_set_hash: None,
+            inherited_reason: None,
+            policy_hash: None,
             enabled: true,
             created_at_unix_ms: 1_776_710_400_000,
         },
@@ -319,6 +349,11 @@ fn builtin_engrams() -> Vec<LocalEngram> {
             applicable_why: Some("Matches hosted MemoryCrux aggregation-session-expansion behavior.".to_string()),
             capability_class_min: None,
             capability_class_max: None,
+            generated_class: None,
+            source_chunk_hashes: Vec::new(),
+            source_chunk_set_hash: None,
+            inherited_reason: None,
+            policy_hash: None,
             enabled: true,
             created_at_unix_ms: 1_776_710_400_000,
         },
@@ -347,6 +382,11 @@ fn build_engram_manifest(engrams: &[LocalEngram], tenant_id: &str, capability_cl
                 "version": e.version,
                 "intent_bucket": e.intent_bucket,
                 "prompt_hash": prompt_hash(&e.content),
+                "generated_class": &e.generated_class,
+                "source_chunk_hashes": &e.source_chunk_hashes,
+                "source_chunk_set_hash": &e.source_chunk_set_hash,
+                "inherited_reason": &e.inherited_reason,
+                "policy_hash": &e.policy_hash,
             })
         })
         .collect();
@@ -445,5 +485,33 @@ mod tests {
         let a = build_engram_manifest(&one, "t", "capable");
         let b = build_engram_manifest(&two, "t", "capable");
         assert_ne!(a["manifest_hash"], b["manifest_hash"]);
+    }
+
+    #[test]
+    fn manifest_round_trips_generated_metadata() {
+        let engrams = vec![LocalEngram {
+            id: "generated-1".to_string(),
+            name: "shared-date-header".to_string(),
+            version: "v1".to_string(),
+            intent_bucket: "temporal_duration".to_string(),
+            query_pattern: None,
+            content: "The docs store effective dates in the nearest Date header.".to_string(),
+            applicable_why: Some("generated_inheritance=exact_chunk_hash".to_string()),
+            capability_class_min: None,
+            capability_class_max: None,
+            generated_class: Some("chunk_bound".to_string()),
+            source_chunk_hashes: vec!["a".repeat(64)],
+            source_chunk_set_hash: Some("b".repeat(64)),
+            inherited_reason: Some("exact_chunk_hash".to_string()),
+            policy_hash: Some("policy-hash-1".to_string()),
+            enabled: true,
+            created_at_unix_ms: 1,
+        }];
+
+        let manifest = build_engram_manifest(&engrams, "tenant-a", "capable");
+
+        assert_eq!(manifest["engrams"][0]["generated_class"], "chunk_bound");
+        assert_eq!(manifest["engrams"][0]["source_chunk_hashes"][0], "a".repeat(64));
+        assert_eq!(manifest["engrams"][0]["inherited_reason"], "exact_chunk_hash");
     }
 }

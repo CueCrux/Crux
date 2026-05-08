@@ -4,7 +4,13 @@
 
 //! Product/cloud access posture for Pro cloud-only and hybrid deployments.
 
-use super::*;
+use super::{require_http_any_scope, AppState};
+use axum::{
+    extract::State,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
+    Json,
+};
 
 pub(super) async fn get_cloud_access_contract(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["admin:read", "query:read"]) {

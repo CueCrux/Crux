@@ -56,6 +56,7 @@ fn parse_role_grants(raw: Option<String>) -> Vec<String> {
         .collect()
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_tenant_id(tenant_id: &str) -> Result<(), Response> {
     if tenant_id.trim().is_empty() {
         return Err(problem_response(StatusCode::BAD_REQUEST, "tenant_id must not be empty"));

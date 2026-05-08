@@ -381,6 +381,7 @@ pub(super) async fn post_gpu1_developer(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_compute(
     state: AppState,
     headers: HeaderMap,
@@ -635,6 +636,7 @@ fn terms(input: &str) -> Vec<String> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_receipts(
     tenant_id: &str,
     service: Gpu1Service,
@@ -733,6 +735,7 @@ async fn store_receipts(state: &AppState, tenant_id: &str, service: Gpu1Service,
     state.fact_store.write().await.store(fact);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_and_store_answer_capsule(
     state: &AppState,
     tenant_id: &str,

@@ -162,9 +162,7 @@ impl AnswerReplayCapsule {
     pub fn compute_hash(&self) -> String {
         let mut clone = self.clone();
         clone.capsule_hash.clear();
-        serde_json::to_value(clone)
-            .map(|value| hash_json(&value))
-            .unwrap_or_else(|_| "blake3:".to_string())
+        serde_json::to_value(clone).map_or_else(|_| "blake3:".to_string(), |value| hash_json(&value))
     }
 
     pub fn metadata_only(&self) -> Self {

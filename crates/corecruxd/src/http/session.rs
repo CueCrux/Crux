@@ -189,6 +189,7 @@ fn bad_request(message: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, Json(body)).into_response()
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_session_id_hex(value: &str) -> Result<[u8; 16], Response> {
     let trimmed = value.trim();
     let bytes = match hex::decode(trimmed) {

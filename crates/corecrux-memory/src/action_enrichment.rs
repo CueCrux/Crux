@@ -334,7 +334,6 @@ fn classify_domain(haystack: &str) -> ActionDomain {
             "branch",
             "pull_request",
             "pull request",
-            "pr",
             "deploy",
             "test",
             "route",
@@ -1243,5 +1242,293 @@ mod tests {
         assert_eq!(metadata.reversibility, Reversibility::Irreversible);
         assert_eq!(metadata.idempotency_class, IdempotencyClass::MustNotRetry);
         assert!(metadata.materiality.contains(&Materiality::TouchesMoney));
+    }
+
+    #[test]
+    fn classifier_covers_domain_materiality_and_compensation_edges() {
+        let code = consequence_metadata_for_tool(
+            "github.deploy_release",
+            Some(&json!({"repo": "cuecrux/crux", "branch": "main", "environment": "production", "project": "crux"})),
+            Some("Deploy production route and API changes"),
+        );
+        assert_eq!(code.domain, ActionDomain::Code);
+        assert_eq!(code.blast_radius, BlastRadius::Tenant);
+        assert_eq!(code.reversibility, Reversibility::ReversibleWithCompensation);
+        assert_eq!(code.idempotency_class, IdempotencyClass::MustNotRetry);
+        assert_eq!(
+            code.compensating_tool.as_deref(),
+            Some("github.deploy_release.rollback")
+        );
+        assert!(code.materiality.contains(&Materiality::TouchesProduction));
+
+        let file = consequence_metadata_for_tool(
+            "drive.rename_document",
+            Some(&json!({"document_id": "doc_1", "path": "/Team/Plan.md", "new_name": "Plan v2.md"})),
+            None,
+        );
+        assert_eq!(file.domain, ActionDomain::File);
+        assert_eq!(file.reversibility, Reversibility::ReversibleWithCompensation);
+        assert_eq!(file.idempotency_class, IdempotencyClass::RequiresKey);
+        assert_eq!(
+            file.compensating_tool.as_deref(),
+            Some("drive.rename_document.restore_previous_state")
+        );
+
+        let sync = consequence_metadata_for_tool(
+            "tenant.promote_collection",
+            Some(&json!({"tenant_id": "business::acme", "collection": "facts"})),
+            None,
+        );
+        assert_eq!(sync.domain, ActionDomain::Sync);
+        assert_eq!(sync.blast_radius, BlastRadius::Tenant);
+        assert_eq!(sync.reversibility, Reversibility::ReversibleWithCompensation);
+
+        let memory = consequence_metadata_for_tool(
+            "facts.store_private_session",
+            Some(&json!({"passport_id": "pass_1", "session_id": "sess_1", "private": true})),
+            None,
+        );
+        assert_eq!(memory.domain, ActionDomain::Memory);
+        assert!(memory.materiality.contains(&Materiality::LocalPrivateMemory));
+
+        let extension = consequence_metadata_for_tool(
+            "extension.invoke_wasm",
+            Some(&json!({"manifest": "tool.json", "tool": "summarise"})),
+            None,
+        );
+        assert_eq!(extension.domain, ActionDomain::Extension);
+        assert_eq!(extension.blast_radius, BlastRadius::SelfOnly);
+
+        let read = consequence_metadata_for_tool("status.list", Some(&json!({"preview": true})), None);
+        assert_eq!(read.reversibility, Reversibility::Reversible);
+        assert_eq!(read.idempotency_class, IdempotencyClass::Safe);
+
+        let unknown = consequence_metadata_for_tool("opaque_tool", Some(&json!({"value": 7})), None);
+        assert_eq!(unknown.domain, ActionDomain::General);
+        assert_eq!(unknown.reversibility, Reversibility::Unknown);
+        assert_eq!(unknown.idempotency_class, IdempotencyClass::Unknown);
+    }
+
+    #[test]
+    fn first_party_enrichers_cover_code_file_crm_and_memory_domains() {
+        let mut store = FactStore::new();
+        store.store(StoreFact {
+            entity: "business::acme::repo::crux".to_string(),
+            key: "route".to_string(),
+            value: "API route deploy requires command ledger evidence".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+        store.store(StoreFact {
+            entity: "business::acme::file::plan".to_string(),
+            key: "document".to_string(),
+            value: "Drive document contains launch checklist".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+        store.store(StoreFact {
+            entity: "business::acme::customer::acme".to_string(),
+            key: "contract".to_string(),
+            value: "Customer contract invoice and opportunity context".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+        store.store(StoreFact {
+            entity: "__constraints__::business::acme::policy".to_string(),
+            key: "policy".to_string(),
+            value: "Never promote tenant memory without approval".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+        });
+        store.store(StoreFact {
+            entity: "business::acme::private::session".to_string(),
+            key: "memory".to_string(),
+            value: "private session memory should be skipped by enrichers".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+        });
+
+        let cases = [
+            (
+                "github.update_route",
+                json!({"repo": "crux", "route": "/v1/query/answer", "deploy": true}),
+                "Update API route before deploy",
+                "code-domain-enricher-v1.local",
+                "route_or_api_surface_touch",
+            ),
+            (
+                "drive.update_file",
+                json!({"path": "/Team/launch.md", "document_id": "doc_launch"}),
+                "Update launch document",
+                "file-domain-enricher-v1.local",
+                "file_or_document_touch",
+            ),
+            (
+                "crm.update_opportunity",
+                json!({"customer_id": "acme", "invoice_id": "inv_1"}),
+                "Update Acme customer opportunity",
+                "crm-customer-domain-enricher-v1.local",
+                "customer_commercial_record_touch",
+            ),
+            (
+                "memory.promote_constraint",
+                json!({"tenant_id": "business::acme", "constraint_id": "policy"}),
+                "Promote tenant policy memory",
+                "tenant-memory-domain-enricher-v1.local",
+                "policy_context",
+            ),
+        ];
+
+        for (tool_name, tool_parameters, description, version, expected_consequence) in cases {
+            let proposal = enrich_action(
+                Some(&store),
+                ActionEnrichmentInput {
+                    tenant_id: Some("business::acme".to_string()),
+                    tool_name: tool_name.to_string(),
+                    tool_parameters,
+                    action_description: Some(description.to_string()),
+                    include_first_party_enrichers: true,
+                },
+            );
+            assert!(
+                proposal.enricher_versions.iter().any(|item| item.ends_with(".local")),
+                "expected a local domain enricher in {:?}, wanted {version}",
+                proposal.enricher_versions
+            );
+            assert!(proposal
+                .consequences
+                .iter()
+                .any(|consequence| consequence.consequence_type == expected_consequence));
+            assert!(proposal
+                .relationship_hits
+                .iter()
+                .all(|hit| !hit.entity.contains("private::session")));
+            assert!(proposal
+                .enrichment_receipt
+                .as_ref()
+                .unwrap()
+                .proposal_hash
+                .starts_with("blake3:"));
+        }
+    }
+
+    #[test]
+    fn first_party_requested_without_store_reports_degraded_domain_versions() {
+        let cases = [
+            (
+                "github.deploy",
+                json!({"repo": "crux"}),
+                "code-domain-enricher-v1.local",
+            ),
+            (
+                "drive.update_file",
+                json!({"path": "/docs/a.md"}),
+                "file-domain-enricher-v1.local",
+            ),
+            (
+                "calendar.send_invite",
+                json!({"attendees": ["customer@example.com"]}),
+                "email-calendar-domain-enricher-v1.local",
+            ),
+            (
+                "crm.refund_invoice",
+                json!({"invoice_id": "inv_1", "customer_id": "acme"}),
+                "crm-customer-domain-enricher-v1.local",
+            ),
+            (
+                "facts.update_memory",
+                json!({"entity": "memory", "private": true}),
+                "tenant-memory-domain-enricher-v1.local",
+            ),
+        ];
+
+        for (tool_name, tool_parameters, version) in cases {
+            let proposal = enrich_action(
+                None,
+                ActionEnrichmentInput {
+                    tenant_id: Some("business::acme".to_string()),
+                    tool_name: tool_name.to_string(),
+                    tool_parameters,
+                    action_description: None,
+                    include_first_party_enrichers: true,
+                },
+            );
+            assert!(
+                proposal.enricher_versions.len() >= 2,
+                "expected degraded first-party version marker {version}, got {:?}",
+                proposal.enricher_versions
+            );
+            assert!(proposal
+                .consequences
+                .iter()
+                .any(|consequence| consequence.consequence_type == "first_party_context_unavailable"));
+            assert!(proposal.narrative.contains("first_party_context_unavailable"));
+        }
+    }
+
+    #[test]
+    fn enrichment_deduplicates_principals_resources_and_tracks_state_diff() {
+        let proposal = enrich_action(
+            None,
+            ActionEnrichmentInput {
+                tenant_id: None,
+                tool_name: "calendar.update_event".to_string(),
+                tool_parameters: json!({
+                    "attendees": ["sarah@example.com", "sarah@example.com"],
+                    "event_id": "evt_1",
+                    "meeting": "evt_1",
+                    "before": { "start": "2026-05-08T10:00:00Z" },
+                    "after": { "start": "2026-05-08T11:00:00Z" },
+                    "target_time": "2026-05-08T11:00:00Z",
+                    "status": "confirmed"
+                }),
+                action_description: None,
+                include_first_party_enrichers: false,
+            },
+        );
+
+        assert_eq!(proposal.tenant_id, "local");
+        assert_eq!(proposal.affected_principals.len(), 1);
+        assert_eq!(proposal.affected_resources.len(), 2);
+        assert!(proposal.state_diff.before.is_some());
+        assert!(proposal.state_diff.after.is_some());
+        assert!(proposal.state_diff.fields_changed.contains(&"target_time".to_string()));
+        assert!(proposal.state_diff.fields_changed.contains(&"status".to_string()));
+        assert!(proposal
+            .narrative
+            .contains("affected_principals=recipient:sarah@example.com"));
+    }
+
+    #[test]
+    fn hash_and_receipt_outputs_are_stable_shape_for_nested_values() {
+        let value = json!({
+            "z": [3, 2, 1],
+            "nested": { "flag": true, "count": 4, "none": null }
+        });
+        let hash = hash_json(&value);
+        assert!(hash.starts_with("blake3:"));
+
+        let proposal = enrich_action(
+            None,
+            ActionEnrichmentInput {
+                tenant_id: Some("business::acme".to_string()),
+                tool_name: "opaque_tool".to_string(),
+                tool_parameters: value,
+                action_description: Some("Inspect opaque payload".to_string()),
+                include_first_party_enrichers: false,
+            },
+        );
+        let receipt = proposal.enrichment_receipt.as_ref().unwrap();
+        assert_eq!(receipt.schema, ACTION_ENRICHMENT_RECEIPT_SCHEMA);
+        assert_eq!(receipt.event_type, "action_enrichment_capsule");
+        assert_eq!(receipt.tenant_id, "business::acme");
+        assert!(receipt.receipt_id.starts_with("action_enrichment:"));
+        assert!(receipt.tool_call_hash.starts_with("blake3:"));
+        assert!(receipt.proposal_hash.starts_with("blake3:"));
     }
 }

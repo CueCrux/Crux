@@ -14,6 +14,7 @@ pub struct ContractPosture {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[allow(clippy::struct_field_names)]
 pub struct ProtocolPosture {
     pub session_plan_contract: ContractPosture,
     pub corecrux_retrieval_contract: ContractPosture,

@@ -714,8 +714,8 @@ fn pro_claim_placements() -> Vec<ProClaimPlacement> {
     PRO_CAPABILITY_CLAIMS
         .iter()
         .map(|claim| {
-            let daemon = contains_claim(DAEMON_IMPLEMENTED_PRO_CLAIMS, *claim);
-            let hosted = contains_claim(HOSTED_CONTROL_PLANE_PRO_CLAIMS, *claim);
+            let daemon = contains_claim(DAEMON_IMPLEMENTED_PRO_CLAIMS, claim);
+            let hosted = contains_claim(HOSTED_CONTROL_PLANE_PRO_CLAIMS, claim);
             let implementation = match (daemon, hosted) {
                 (true, true) => "daemon_and_hosted_control_plane",
                 (true, false) => "daemon",
@@ -723,7 +723,7 @@ fn pro_claim_placements() -> Vec<ProClaimPlacement> {
                 (false, false) => "contracted_external",
             };
             ProClaimPlacement {
-                claim: *claim,
+                claim,
                 implementation,
                 daemon_implemented: daemon,
                 hosted_control_plane: hosted,

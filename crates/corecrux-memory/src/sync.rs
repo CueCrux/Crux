@@ -355,7 +355,7 @@ pub fn promotion_preview(
             skipped_not_allowlisted += 1;
             continue;
         }
-        records.push(record_from_fact(&tenant_id, fact, collection, include_content));
+        records.push(record_from_fact(tenant_id, fact, collection, include_content));
     }
     records.sort_by(|a, b| {
         a.collection
@@ -1033,7 +1033,7 @@ impl SyncClient {
                     total_pulled += 1;
                 }
 
-                current_cursor = page.next_cursor.clone();
+                current_cursor.clone_from(&page.next_cursor);
                 if let Some(next) = current_cursor.as_deref() {
                     cursor.collection_pull_cursors.insert(key.clone(), next.to_string());
                 }
@@ -1191,8 +1191,7 @@ impl SyncClient {
             .map_err(|e| format!("tenant promotion response parse error: {e}"))?;
         let applied = body["applied_count"]
             .as_u64()
-            .map(|value| value as usize)
-            .unwrap_or(records.len());
+            .map_or(records.len(), |value| value as usize);
 
         let mut cursor = self.load_cursor();
         cursor.last_push_at = Some(Utc::now().to_rfc3339());

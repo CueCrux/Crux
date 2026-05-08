@@ -641,7 +641,11 @@ pub(super) async fn post_route_probe(
         },
         "scope_hints": scope_hints_for_route(&route.method, &route.path),
         "storyline": storyline,
-        "warnings": route.handler_file.is_none().then(|| vec!["handler_file_unresolved"]).unwrap_or_default(),
+        "warnings": if route.handler_file.is_none() {
+            vec!["handler_file_unresolved"]
+        } else {
+            Vec::<&str>::new()
+        },
     }))
     .into_response()
 }
@@ -669,13 +673,10 @@ pub(super) async fn post_policy_simulation(
     headers: HeaderMap,
     Json(body): Json<PolicySimulationBody>,
 ) -> Response {
-    let tenant_id = match body
-        .action
-        .tenant_id
-        .as_deref()
-        .map(tenant_id)
-        .unwrap_or_else(|| Err(problem_response(StatusCode::BAD_REQUEST, "tenant_id must not be empty")))
-    {
+    let tenant_id = match body.action.tenant_id.as_deref().map_or_else(
+        || Err(problem_response(StatusCode::BAD_REQUEST, "tenant_id must not be empty")),
+        tenant_id,
+    ) {
         Ok(id) => id,
         Err(response) => return response,
     };
@@ -695,12 +696,11 @@ pub(super) async fn post_policy_simulation(
     let matches = match_constraints(&proposal.narrative, &constraints);
     let verdict = if matches.iter().any(|m| m["severity"] == "critical") {
         "block"
-    } else if matches.iter().any(|m| m["severity"] == "high") {
-        "warn"
-    } else if proposal
-        .consequence_metadata
-        .materiality
-        .contains(&Materiality::TouchesProduction)
+    } else if matches.iter().any(|m| m["severity"] == "high")
+        || proposal
+            .consequence_metadata
+            .materiality
+            .contains(&Materiality::TouchesProduction)
     {
         "warn"
     } else {
@@ -792,6 +792,7 @@ fn require_surface_enabled(state: &AppState, surface: WorkbenchSurface) -> Optio
     None
 }
 
+#[allow(clippy::result_large_err)]
 fn tenant_id(value: &str) -> Result<String, Response> {
     let id = value.trim();
     if id.is_empty() {
@@ -998,7 +999,7 @@ fn impacted_routes(
             })
         })
         .collect::<Vec<_>>();
-    routes.sort_by(|a, b| route_key(a).cmp(&route_key(b)));
+    routes.sort_by_key(route_key);
     routes.dedup_by(|a, b| route_key(a) == route_key(b));
     routes
 }
@@ -1026,7 +1027,7 @@ fn scope_hints_for_route(method: &str, path: &str) -> Vec<&'static str> {
         } else {
             scopes.push("admin:read");
         }
-        scopes.sort();
+        scopes.sort_unstable();
         scopes.dedup();
         return scopes;
     }
@@ -1057,7 +1058,7 @@ fn scope_hints_for_route(method: &str, path: &str) -> Vec<&'static str> {
     if scopes.is_empty() {
         scopes.push("query:read");
     }
-    scopes.sort();
+    scopes.sort_unstable();
     scopes.dedup();
     scopes
 }
@@ -1164,15 +1165,14 @@ fn audit_queues(
         .into_iter()
         .filter(|receipt| serde_json::to_string(receipt).unwrap_or_default().contains("degraded"))
         .collect::<Vec<_>>();
-    let sync_conflicts = sync_status
-        .degraded
-        .then(|| {
-            vec![json!({
+    let sync_conflicts = if sync_status.degraded {
+        vec![json!({
                 "mode": sync_status.mode,
                 "reason": sync_status.degraded_reason,
-            })]
-        })
-        .unwrap_or_default();
+        })]
+    } else {
+        Vec::new()
+    };
     let unresolved_routes = scan
         .map(|scan| scan.diagnostics.unresolved_routes.len())
         .unwrap_or_default();
