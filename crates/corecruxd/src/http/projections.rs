@@ -78,6 +78,81 @@ pub(super) async fn post_projection_rebuild(State(state): State<AppState>, heade
     (status, Json(serde_json::json!({ "shards": shards }))).into_response()
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ProjectionModulesQuery {
+    #[serde(default)]
+    pub shard_id: Option<String>,
+}
+
+pub(super) async fn get_projection_modules(
+    State(state): State<AppState>,
+    Query(q): Query<ProjectionModulesQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+
+    let current_modules = corecrux_projections::current_projection_module_versions_v1();
+    let mut source = "runtime_current";
+    let mut commit_id = serde_json::Value::Null;
+    let mut module_refs = serde_json::Value::Null;
+    let modules = if let Some(shard_id) = q.shard_id.as_deref().filter(|value| !value.trim().is_empty()) {
+        if state.http_dataplane.enabled() {
+            match state.http_dataplane.projection_meta(shard_id).await {
+                Ok(Some(meta)) => {
+                    source = "projection_meta";
+                    commit_id = serde_json::json!(meta.commit_id);
+                    module_refs = serde_json::json!({
+                        "artifact_living_state": meta.artifact_living_state.module,
+                        "artifact_relations": meta.artifact_relations.module,
+                        "pressure_events": meta.pressure_events.module,
+                        "artifact_dependents": meta.artifact_dependents.module,
+                    });
+                    if meta.projection_module_registry.is_empty() {
+                        current_modules.clone()
+                    } else {
+                        meta.projection_module_registry
+                    }
+                }
+                Ok(None) => return problem_response(StatusCode::NOT_FOUND, "projection meta not found"),
+                Err(err) => return map_http_dataplane_error(err),
+            }
+        } else {
+            current_modules.clone()
+        }
+    } else {
+        current_modules.clone()
+    };
+
+    let replay_availability = modules
+        .iter()
+        .map(|module| {
+            serde_json::json!({
+                "module_id": &module.module_id,
+                "module_version": &module.module_version,
+                "code_hash": &module.code_hash,
+                "config_hash": &module.config_hash,
+                "status": module.status.as_str(),
+                "historical_replay_available": module.status.replay_available(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Json(serde_json::json!({
+        "schema": corecrux_projections::PROJECTION_MODULES_LIST_SCHEMA_V1,
+        "dataplane_enabled": state.http_dataplane.enabled(),
+        "source": source,
+        "shard_id": q.shard_id,
+        "commit_id": commit_id,
+        "module_refs": module_refs,
+        "modules": modules,
+        "current_modules": current_modules,
+        "replay_availability": replay_availability,
+    }))
+    .into_response()
+}
+
 #[tracing::instrument(level = "info", skip(state, headers), fields(artifact_id, tenant_id = %q.tenant_id))]
 pub(super) async fn get_proj_artifact_state(
     State(state): State<AppState>,

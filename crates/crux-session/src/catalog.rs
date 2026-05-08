@@ -39,17 +39,19 @@ impl CatalogEntry {
         } else {
             "mcp"
         };
-        Capability {
-            cap: self.cap.to_string(),
-            prefer: prefer.to_string(),
-            shape: self.shape.to_string(),
-            min_tier: self.min_tier.map(String::from),
-            cost_class: self.cost_class.to_string(),
-            impl_path: ImplPath {
+        let required_affinity = (self.cap != "session_context").then(|| self.affinity.to_string());
+        Capability::v2(
+            self.cap,
+            prefer,
+            self.shape,
+            self.min_tier.map(String::from),
+            required_affinity,
+            self.cost_class,
+            ImplPath {
                 ce: self.ce_path.map(String::from),
                 core: self.core_path.map(String::from),
             },
-        }
+        )
     }
 }
 

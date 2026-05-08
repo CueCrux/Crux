@@ -30,6 +30,206 @@ fn test_node(node_id: &str, http_addr: &str, grpc_addr: &str) -> NodeAddr {
     }
 }
 
+#[tokio::test]
+async fn sync_manifest_and_collection_page_are_tenant_scoped() {
+    let state = test_app_state(1);
+    {
+        let mut store = state.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "business::acme::note".to_string(),
+            key: "summary".to_string(),
+            value: "shared tenant fact".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "business::other::note".to_string(),
+            key: "summary".to_string(),
+            value: "other tenant fact".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+    }
+
+    let manifest = super::sync::get_tenant_manifest(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path("business::acme".to_string()),
+        Query(super::sync::ManifestQuery {
+            tenant_category: None,
+            owner_id: Some("owner-a".to_string()),
+            membership_epoch: Some(2),
+            role_grants: Some("reader,writer".to_string()),
+        }),
+    )
+    .await;
+    assert_eq!(manifest.status(), StatusCode::OK);
+    let body = json_body(manifest).await;
+    assert_eq!(body["tenant_category"], "business");
+    assert_eq!(body["membership_epoch"], 2);
+
+    let page = super::sync::get_tenant_collection(
+        State(state),
+        HeaderMap::new(),
+        Path(("business::acme".to_string(), "facts".to_string())),
+        Query(super::sync::CollectionQuery {
+            cursor: None,
+            limit: Some(10),
+            include_content: true,
+        }),
+    )
+    .await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let body = json_body(page).await;
+    assert_eq!(body["records"].as_array().unwrap().len(), 1);
+    assert_eq!(body["records"][0]["entity"], "business::acme::note");
+    assert!(body["records"][0]["fact"].is_object());
+}
+
+#[tokio::test]
+async fn sync_promotion_preview_respects_allowlist() {
+    let state = test_app_state(1);
+    {
+        let mut store = state.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "business::acme::note".to_string(),
+            key: "summary".to_string(),
+            value: "promote".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "business::acme::constraint::deploy".to_string(),
+            key: "constraint".to_string(),
+            value: "skip by allowlist".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+    }
+
+    let resp = super::sync::post_promotion_preview(
+        State(state),
+        HeaderMap::new(),
+        Path("business::acme".to_string()),
+        Json(super::sync::PromotionRequest {
+            allowlist: vec!["facts".to_string()],
+            include_content: false,
+            confirm_hash: None,
+            records: Vec::new(),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["promote_count"], 1);
+    assert_eq!(body["skipped_not_allowlisted"], 1);
+    assert!(body["preview_hash"].as_str().unwrap().starts_with("blake3:"));
+}
+
+#[tokio::test]
+async fn sync_promotion_confirm_applies_remote_records() {
+    let state = test_app_state(1);
+    let fact = corecrux_memory::fact_store::Fact {
+        fact_id: "f_promoted_remote".to_string(),
+        entity: "business::acme::note".to_string(),
+        key: "summary".to_string(),
+        value: "cloud promoted".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        stored_at: chrono::Utc::now(),
+        tokens: 2,
+        deleted: false,
+        version: 1,
+        supersedes: None,
+        private: false,
+    };
+    let record = corecrux_memory::sync::SyncCollectionRecord {
+        collection: "facts".to_string(),
+        record_id: fact.fact_id.clone(),
+        entity: fact.entity.clone(),
+        key: fact.key.clone(),
+        identity_hash: "blake3:identity".to_string(),
+        content_hash: "blake3:content".to_string(),
+        value_hash: "blake3:test".to_string(),
+        updated_at: fact.stored_at.to_rfc3339(),
+        deleted: false,
+        source_receipt: None,
+        semantic_profile_id: None,
+        local_semantic_profile_id: None,
+        fact: Some(fact),
+    };
+
+    let resp = super::sync::post_promotion_confirm(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path("business::acme".to_string()),
+        Json(super::sync::PromotionRequest {
+            allowlist: Vec::new(),
+            include_content: false,
+            confirm_hash: None,
+            records: vec![record],
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["applied_count"], 1);
+    let store = state.fact_store.read().await;
+    let stored = store.get("f_promoted_remote").expect("promoted fact");
+    assert!(stored
+        .source_receipt
+        .as_deref()
+        .unwrap()
+        .starts_with("sync-promotion:http:node-a:"));
+}
+
+#[tokio::test]
+async fn sync_offboard_signs_wipe_receipt_and_stores_proof() {
+    let mut state = test_app_state(1);
+    bind_test_state_to_root_passport_key(&mut state);
+    {
+        let mut store = state.fact_store.write().await;
+        store.store_synced(corecrux_memory::fact_store::Fact {
+            fact_id: "f_acme_mirror".to_string(),
+            entity: "business::acme::remote".to_string(),
+            key: "summary".to_string(),
+            value: "mirrored".to_string(),
+            source_receipt: Some("sync:http://cloud:f_acme_mirror".to_string()),
+            confidence: 1.0,
+            stored_at: chrono::Utc::now(),
+            tokens: 1,
+            deleted: false,
+            version: 1,
+            supersedes: None,
+            private: false,
+        });
+    }
+
+    let resp = super::sync::post_tenant_offboard(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path("business::acme".to_string()),
+        Json(super::sync::OffboardRequest { membership_epoch: 5 }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["membership_epoch"], 5);
+    assert_eq!(body["signed_by"], state.passport_fpr);
+    assert_eq!(body["signature"].as_str().unwrap().len(), 128);
+    assert_eq!(body["deleted_fact_ids"][0], "f_acme_mirror");
+
+    let receipt_entity = "__sync_wipe_receipt__::business::acme";
+    let store = state.fact_store.read().await;
+    assert!(store.get("f_acme_mirror").is_none());
+    assert_eq!(store.get_by_entity(receipt_entity).len(), 1);
+    assert!(store.get_by_entity(receipt_entity)[0].private);
+}
+
 fn test_routing() -> RoutingTable {
     let mut map = ShardMapV1 {
         v: SHARDMAP_V1,
@@ -89,10 +289,13 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
         integrations_enabled: true,
         integrations_safe_mode: false,
         integrations_allow_executable_helpers: false,
+        operating_mode: crate::product::OperatingMode::FreeLocal,
+        enabled_pro_services: Vec::new(),
         read_retry_failed_readyz_threshold: 0,
         commit_level: CommitLevel::LocalCommit,
         metrics,
         node_id: "node-a".to_string(),
+        passport_key_path: root.join("passport.key"),
         passport_fpr: "p_test".to_string(),
         passport_public_key_hex: "00".repeat(32),
         mcp_agent_count: 0,
@@ -145,6 +348,19 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
 
 fn test_app_state(action_max_pending: usize) -> AppState {
     test_app_state_with_auth(action_max_pending, AuthMode::Off)
+}
+
+fn pro_workbench_state(services: &[&str]) -> AppState {
+    let mut state = test_app_state(16);
+    state.operating_mode = crate::product::OperatingMode::ProHybrid;
+    state.enabled_pro_services = services.iter().map(|service| (*service).to_string()).collect();
+    state
+}
+
+fn bind_test_state_to_root_passport_key(state: &mut AppState) {
+    let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).expect("root passport key");
+    state.passport_fpr = key.passport_fpr().to_string();
+    state.passport_public_key_hex = key.public_key_hex().to_string();
 }
 
 fn test_rcx_router(capabilities: Vec<&str>) -> std::sync::Arc<crux_router::RcxRouter> {
@@ -1837,6 +2053,56 @@ async fn text_search_empty_index_returns_empty_results() {
     assert_eq!(body["coverage"]["score"], 0.0);
     assert_eq!(body["meta"]["segments_searched"], 0);
     assert_eq!(body["meta"]["total_docs"], 0);
+    assert_eq!(body["meta"]["score_space"], "bm25_lexical");
+    assert_eq!(body["meta"]["score_merge_rule"], "single_score_space");
+    assert_eq!(
+        body["meta"]["mixed_profile_merge_rule"],
+        "rank_fusion_or_single_profile_rerank_required"
+    );
+    assert!(body["meta"]["semantic_profile_id"].is_null());
+    assert!(body["meta"]["local_semantic_profile_id"].is_null());
+}
+
+#[tokio::test]
+async fn text_search_reports_local_semantic_profile_when_embeddings_configured() {
+    enable_text_search();
+
+    let state = test_app_state(16);
+    state
+        .fact_store
+        .write()
+        .await
+        .set_embedding_client(corecrux_memory::embeddings::EmbeddingClient::new(
+            corecrux_memory::embeddings::EmbeddingConfig {
+                base_url: "http://localhost:11434".to_string(),
+                model: "nomic-embed-text".to_string(),
+                dimensions: 768,
+            },
+        ));
+    let body = query::TextSearchBody {
+        tenant_id: "tenant-a".to_string(),
+        query: "hello world".to_string(),
+        limit: 10,
+        token_budget: None,
+        min_score: None,
+        mode: None,
+        include_receipt: None,
+    };
+
+    let resp = query::post_query_text_search(State(state), HeaderMap::new(), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert!(body["meta"]["semantic_profile_id"].is_null());
+    assert!(body["meta"]["local_semantic_profile_id"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("sp_"));
+    assert_eq!(
+        body["meta"]["local_semantic_profile"]["schema"],
+        "cuecrux.semantic_profile.v1"
+    );
 }
 
 #[tokio::test]
@@ -1997,6 +2263,12 @@ async fn text_search_with_index_returns_hits() {
     assert!(body["meta"]["segments_searched"].as_u64().unwrap() > 0);
     assert!(body["meta"]["total_docs"].as_u64().unwrap() == 3);
     assert!(body["coverage"]["score"].as_f64().is_some());
+    assert_eq!(body["meta"]["source_label"], "local_tenant_index");
+    assert_eq!(body["meta"]["score_space"], "bm25_lexical");
+    assert_eq!(results[0]["source_label"], "local_tenant_index");
+    assert_eq!(results[0]["score_space"], "bm25_lexical");
+    assert_eq!(results[0]["rank"], 1);
+    assert!(results[0]["semantic_profile_id"].is_null());
 }
 
 #[tokio::test]
@@ -2088,8 +2360,11 @@ async fn text_search_expand_returns_chunks() {
     let chunks = body["chunks"].as_array().expect("chunks array");
     assert_eq!(chunks.len(), 2);
     assert!(body["tokens_loaded"].as_u64().unwrap() > 0);
+    assert_eq!(body["meta"]["score_space"], "bm25_lexical");
     assert_eq!(chunks[0]["segment_index"], 0);
     assert_eq!(chunks[0]["doc_id"], 0);
+    assert_eq!(chunks[0]["source_label"], "local_tenant_index");
+    assert_eq!(chunks[0]["score_space"], "bm25_lexical");
     assert_eq!(chunks[1]["doc_id"], 1);
 }
 
@@ -3051,6 +3326,60 @@ async fn get_proj_meta_uses_http_dataplane_fake() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
     assert_eq!(body["commitId"], 7);
+}
+
+#[tokio::test]
+async fn get_projection_modules_returns_runtime_registry_without_dataplane() {
+    let state = test_app_state(16);
+    let resp = get_projection_modules(
+        State(state),
+        Query(ProjectionModulesQuery { shard_id: None }),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], corecrux_projections::PROJECTION_MODULES_LIST_SCHEMA_V1);
+    assert_eq!(body["dataplane_enabled"], false);
+    assert_eq!(body["source"], "runtime_current");
+    assert_eq!(body["modules"].as_array().unwrap().len(), 4);
+    assert!(body["replay_availability"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["historical_replay_available"] == true));
+}
+
+#[tokio::test]
+async fn get_projection_modules_uses_persisted_meta_registry_when_available() {
+    let mut meta = corecrux_projections::ProjectionsMetaV1::empty_now();
+    meta.commit_id = 42;
+    corecrux_projections::record_current_projection_modules_v1(&mut meta);
+    let fake = Arc::new(FakeHttpDataplane {
+        enabled: true,
+        projection_meta: Some(meta),
+        ..Default::default()
+    });
+    let mut state = test_app_state(16);
+    state.http_dataplane = fake;
+
+    let resp = get_projection_modules(
+        State(state),
+        Query(ProjectionModulesQuery {
+            shard_id: Some("shard-0001".to_string()),
+        }),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["source"], "projection_meta");
+    assert_eq!(body["commit_id"], 42);
+    assert!(body["module_refs"]["artifact_relations"].is_object());
 }
 
 // ── post_projection_rebuild (no dataplane) ──────────────────────
@@ -5252,6 +5581,81 @@ async fn version_endpoint_returns_build_info_and_features() {
     assert_eq!(body["version"], "test");
     assert_eq!(body["commit"], "test");
     assert_eq!(body["msrv"], "1.88.0");
+    assert_eq!(body["product"]["mode"], "free_local");
+    assert_eq!(body["product"]["tier"], "free");
+    assert_eq!(body["product"]["free_safety_baseline_active"], true);
+    assert!(body["product"]["enabled_capability_claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|claim| claim == "daemon:local"));
+    assert!(body["product"]["enabled_capability_claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|claim| claim == "tenant:isolation"));
+    assert!(!body["product"]["enabled_capability_claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|claim| claim == "gpu1:answer"));
+    assert_eq!(body["cloud"]["tenant_connectivity"], "not_configured");
+    assert_eq!(body["cloud"]["local_mirror_state"], "disabled");
+    assert_eq!(
+        body["cloud_access"]["schema"],
+        crate::product::CLOUD_ACCESS_CONTRACT_SCHEMA
+    );
+    assert_eq!(body["cloud_access"]["contract_path"], "/v1/cloud/access-contract");
+    assert_eq!(body["cloud_access"]["cloud_only_entitled"], false);
+    assert_eq!(
+        body["action_enrichment"]["schema"],
+        corecrux_memory::action_enrichment::ACTION_ENRICHMENT_SCHEMA
+    );
+    assert_eq!(body["action_enrichment"]["contract_path"], "/v1/actions/enrich");
+    assert_eq!(body["action_enrichment"]["basic_available"], true);
+    assert_eq!(body["action_enrichment"]["first_party_enabled"], false);
+    assert_eq!(
+        body["agent_workbench"]["schema"],
+        super::workbench::WORKBENCH_CONTRACT_SCHEMA
+    );
+    assert_eq!(body["agent_workbench"]["contract_path"], "/v1/workbench/contract");
+    assert!(body["agent_workbench"]["surfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|surface| surface["capability"] == "agent_brief:pro" && surface["status"] == "pro_required"));
+    assert_eq!(
+        body["gpu1_compute"]["schema"],
+        super::gpu1::GPU1_COMPUTE_CONTRACT_SCHEMA
+    );
+    assert_eq!(body["gpu1_compute"]["contract_path"], "/v1/gpu1/contract");
+    assert_eq!(body["gpu1_compute"]["remote_memory_sync_required"], false);
+    assert!(body["semantic_profile"].is_null());
+    assert_eq!(body["protocol_contracts"]["session_plan_contract"]["status"], "current");
+    assert_eq!(
+        body["protocol_contracts"]["session_plan_contract"]["target"],
+        "cuecrux.shared.session_plan.v2"
+    );
+    assert_eq!(
+        body["protocol_contracts"]["corecrux_retrieval_contract"]["status"],
+        "partial"
+    );
+    assert_eq!(
+        body["protocol_contracts"]["semantic_profile_contract"]["status"],
+        "missing"
+    );
+    assert_eq!(
+        body["protocol_contracts"]["projection_module_contract"]["status"],
+        "current"
+    );
+    assert_eq!(
+        body["protocol_contracts"]["extension_registry_contract"]["status"],
+        "current"
+    );
+    assert_eq!(
+        body["protocol_contracts"]["rcx_registry_publish_contract"]["status"],
+        "current"
+    );
     assert!(body["features"].is_object());
     // Features should be booleans
     assert!(body["features"]["text_search"].is_boolean());
@@ -5291,6 +5695,1316 @@ async fn version_endpoint_reports_degraded_sync_when_remote_is_incomplete() {
     std::env::remove_var("CORECRUXD_SYNC_ENABLED");
     std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
     std::env::remove_var("CORECRUXD_SYNC_API_KEY");
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn version_endpoint_reports_pro_agent_workbench_posture() {
+    std::env::remove_var("CORECRUXD_SYNC_ENABLED");
+    std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
+    std::env::remove_var("CORECRUXD_SYNC_API_KEY");
+    let mut state = test_app_state(16);
+    state.operating_mode = crate::product::OperatingMode::ProHybrid;
+    state.enabled_pro_services = vec![
+        "gpu1:answer".to_string(),
+        "context_pack:budgeted".to_string(),
+        "gpu:onsite".to_string(),
+    ];
+
+    let resp = get_version(State(state)).await.into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["product"]["mode"], "pro_hybrid");
+    assert_eq!(body["product"]["tier"], "pro");
+    assert!(body["product"]["enabled_capability_claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|claim| claim == "receipts:local"));
+    assert!(body["product"]["enabled_capability_claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|claim| claim == "gpu1:answer"));
+    assert!(!body["product"]["enabled_capability_claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|claim| claim == "gpu:onsite"));
+    assert_eq!(
+        body["product"]["enabled_pro_services"],
+        serde_json::json!(["gpu1:answer", "context_pack:budgeted"])
+    );
+    assert!(body["product"]["capability_catalog"]["pro_claim_placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|placement| placement["claim"] == "impact:preflight" && placement["implementation"] == "daemon"));
+    assert!(body["product"]["capability_catalog"]["pro_claim_placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|placement| placement["claim"] == "sso:rbac" && placement["implementation"] == "hosted_control_plane"));
+    assert!(body["agent_workbench"]["surfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|surface| surface["capability"] == "context_pack:budgeted" && surface["status"] == "enabled"));
+    assert_eq!(body["cloud_access"]["cloud_only_entitled"], true);
+    assert_eq!(body["cloud_access"]["mode_switching_supported"], true);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn cloud_access_contract_reports_cloud_only_no_daemon_path() {
+    std::env::remove_var("CORECRUXD_SYNC_ENABLED");
+    std::env::set_var("CORECRUXD_SYNC_REMOTE_URL", "https://memory.example");
+    std::env::set_var("CORECRUXD_SYNC_API_KEY", "test-key");
+    let mut state = test_app_state(16);
+    state.operating_mode = crate::product::OperatingMode::ProCloudOnly;
+    state.enabled_pro_services = vec!["gpu1:answer".to_string(), "gpu1:rerank".to_string()];
+
+    let resp = super::cloud::get_cloud_access_contract(State(state), HeaderMap::new()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["schema"], crate::product::CLOUD_ACCESS_CONTRACT_SCHEMA);
+    assert_eq!(body["mode"], "pro_cloud_only");
+    assert_eq!(body["cloud_only_entitled"], true);
+    assert_eq!(body["cloud_only_active"], true);
+    assert_eq!(body["local_daemon_required_for_current_mode"], false);
+    assert_eq!(body["configured_rest_base_url"], "https://memory.example");
+    assert_eq!(body["hosted_mcp"]["local_daemon_required"], false);
+    assert!(body["hosted_mcp"]["tool_catalog"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool == "cuecrux_session"));
+    assert!(body["tenant_memory_model"]["collections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|collection| collection == "semantic_profiles"));
+    assert!(body["hosted_rest"]["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|endpoint| endpoint["hosted_path"] == "/v1/session" && endpoint["local_path"] == "/session"));
+    assert!(body["hosted_rest"]["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|endpoint| endpoint["hosted_path"] == "/v1/workbench/context-pack"
+            && endpoint["scopes"] == serde_json::json!(["context_pack:budgeted"])));
+    assert!(body["pro_gpu_services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|service| service["capability"] == "gpu1:answer" && service["status"] == "enabled"));
+    assert!(body["pro_claim_placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|placement| placement["claim"] == "sso:rbac"
+            && placement["hosted_control_plane"] == true
+            && placement["daemon_implemented"] == false));
+
+    std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
+    std::env::remove_var("CORECRUXD_SYNC_API_KEY");
+}
+
+#[tokio::test]
+async fn cloud_access_contract_is_visible_in_free_but_not_entitled() {
+    let state = test_app_state(16);
+
+    let resp = super::cloud::get_cloud_access_contract(State(state), HeaderMap::new()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["mode"], "free_local");
+    assert_eq!(body["cloud_only_entitled"], false);
+    assert_eq!(body["cloud_only_active"], false);
+    assert_eq!(body["local_daemon_required_for_current_mode"], true);
+    assert!(body["pro_gpu_services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|service| service["status"] == "pro_required"));
+}
+
+#[tokio::test]
+async fn action_enrich_basic_is_free_and_stores_private_receipt() {
+    let state = test_app_state(16);
+    let shared = state.clone();
+
+    let resp = super::actions::post_action_enrich(
+        State(state),
+        HeaderMap::new(),
+        Json(corecrux_memory::action_enrichment::ActionEnrichmentInput {
+            tenant_id: Some("business::acme".to_string()),
+            tool_name: "calendar.move_event".to_string(),
+            tool_parameters: serde_json::json!({
+                "event_id": "evt_1",
+                "attendees": ["customer@example.com"],
+                "new_time": "2026-05-08T16:00:00Z"
+            }),
+            action_description: Some("Move customer meeting".to_string()),
+            include_first_party_enrichers: false,
+        }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["schema"],
+        corecrux_memory::action_enrichment::ACTION_ENRICHMENT_SCHEMA
+    );
+    assert_eq!(body["first_party_enrichers_used"], false);
+    assert_eq!(body["proposal"]["consequence_metadata"]["domain"], "email_calendar");
+
+    let store = shared.fact_store.read().await;
+    let facts = store.query(&corecrux_memory::fact_store::FactQuery {
+        query: None,
+        entity: None,
+        entity_prefix: Some("__action_enrichment_receipt__::business::acme".to_string()),
+        top_k: 10,
+        token_budget: None,
+    });
+    assert_eq!(facts.facts.len(), 1);
+    assert!(facts.facts[0].private);
+    assert_eq!(facts.facts[0].key, "proposal");
+}
+
+#[tokio::test]
+async fn action_enrich_first_party_requires_enabled_pro_service() {
+    let state = test_app_state(16);
+
+    let resp = super::actions::post_action_enrich(
+        State(state),
+        HeaderMap::new(),
+        Json(corecrux_memory::action_enrichment::ActionEnrichmentInput {
+            tenant_id: Some("business::acme".to_string()),
+            tool_name: "calendar.move_event".to_string(),
+            tool_parameters: serde_json::json!({ "event_id": "evt_1" }),
+            action_description: None,
+            include_first_party_enrichers: true,
+        }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let body = json_body(resp).await;
+    assert_eq!(body["status"], "pro_service_not_enabled");
+    assert_eq!(body["capability"], "enrichers:first_party");
+}
+
+#[tokio::test]
+async fn action_enrich_first_party_uses_local_tenant_context_when_enabled() {
+    let mut state = test_app_state(16);
+    state.operating_mode = crate::product::OperatingMode::ProHybrid;
+    state.enabled_pro_services = vec!["enrichers:first_party".to_string()];
+    state
+        .fact_store
+        .write()
+        .await
+        .store(corecrux_memory::fact_store::StoreFact {
+            entity: "business::acme::customer::cfo".to_string(),
+            key: "constraint".to_string(),
+            value: "Customer meeting conflicts with Sarah's preparation block".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+
+    let resp = super::actions::post_action_enrich(
+        State(state),
+        HeaderMap::new(),
+        Json(corecrux_memory::action_enrichment::ActionEnrichmentInput {
+            tenant_id: Some("business::acme".to_string()),
+            tool_name: "calendar.move_event".to_string(),
+            tool_parameters: serde_json::json!({
+                "customer": "acme",
+                "attendees": ["sarah@example.com"],
+                "new_time": "2026-05-08T16:00:00Z"
+            }),
+            action_description: Some("Move Acme customer meeting".to_string()),
+            include_first_party_enrichers: true,
+        }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["first_party_enrichers_used"], true);
+    assert_eq!(body["proposal"]["enrichment_mode"], "first_party");
+    assert_eq!(body["proposal"]["relationship_hits"].as_array().unwrap().len(), 1);
+    assert!(body["proposal"]["narrative"]
+        .as_str()
+        .unwrap()
+        .contains("first_party_hits=1"));
+}
+
+#[tokio::test]
+async fn workbench_contract_visible_in_free_lists_pro_surfaces() {
+    let state = test_app_state(16);
+
+    let resp = super::workbench::get_workbench_contract(State(state), HeaderMap::new()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["schema"], super::workbench::WORKBENCH_CONTRACT_SCHEMA);
+    assert_eq!(body["tier"], "free");
+    assert!(body["surfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|surface| surface["capability"] == "context_pack:budgeted"
+            && surface["path"] == "/v1/workbench/context-pack"
+            && surface["status"] == "pro_required"));
+}
+
+#[tokio::test]
+async fn workbench_brief_requires_enabled_pro_service() {
+    let state = test_app_state(16);
+
+    let resp = super::workbench::get_agent_brief(
+        State(state),
+        HeaderMap::new(),
+        Query(super::workbench::TenantWorkbenchQuery {
+            tenant_id: "business::acme".to_string(),
+            project_id: None,
+            limit: None,
+        }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let body = json_body(resp).await;
+    assert_eq!(body["status"], "pro_service_not_enabled");
+    assert_eq!(body["capability"], "agent_brief:pro");
+}
+
+#[tokio::test]
+async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
+    let state = pro_workbench_state(&["context_pack:budgeted", "ledger:history"]);
+    let shared = state.clone();
+    {
+        let mut store = shared.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "business::acme::memory::route-scope".to_string(),
+            key: "summary".to_string(),
+            value: "business::acme route scope drift context for command ledger".to_string(),
+            source_receipt: Some("rcpt_seed".to_string()),
+            confidence: 1.0,
+            private: false,
+        });
+    }
+
+    let pack_resp = super::workbench::post_context_pack(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::workbench::ContextPackBody {
+            tenant_id: "business::acme".to_string(),
+            query: "route scope drift".to_string(),
+            token_budget: 128,
+            include_private: false,
+            source_labels: vec!["fact_store".to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(pack_resp.status(), StatusCode::OK);
+    let pack = json_body(pack_resp).await;
+    assert_eq!(pack["pack"]["schema"], "crux.agent_workbench.context_pack.v1");
+    assert_eq!(pack["pack"]["tenant_id"], "business::acme");
+    assert_eq!(pack["pack"]["items"].as_array().unwrap().len(), 1);
+    assert!(pack["receipt"]["receipt_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("workbench:context_pack:"));
+
+    let ledger_resp = super::workbench::post_command_ledger(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::workbench::CommandLedgerBody {
+            tenant_id: "business::acme".to_string(),
+            command: "cargo".to_string(),
+            args: vec!["test".to_string(), "-p".to_string(), "corecruxd".to_string()],
+            cwd: Some("/home/myles/CueCrux/Crux".to_string()),
+            exit_status: Some(0),
+            duration_ms: Some(42),
+            started_at_unix_ms: Some(100),
+            completed_at_unix_ms: Some(142),
+            stdout_hash: Some("blake3:stdout".to_string()),
+            stderr_hash: None,
+            linked_receipts: vec![pack["receipt"]["receipt_id"].as_str().unwrap().to_string()],
+            project_id: Some("alpha".to_string()),
+            work_id: Some("work-1".to_string()),
+        }),
+    )
+    .await;
+    assert_eq!(ledger_resp.status(), StatusCode::OK);
+
+    let list_resp = super::workbench::get_command_ledger(
+        State(state),
+        HeaderMap::new(),
+        Query(super::workbench::TenantWorkbenchQuery {
+            tenant_id: "business::acme".to_string(),
+            project_id: None,
+            limit: Some(10),
+        }),
+    )
+    .await;
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list = json_body(list_resp).await;
+    assert_eq!(list["count"], 1);
+    assert_eq!(list["entries"][0]["record"]["command"], "cargo");
+
+    let store = shared.fact_store.read().await;
+    let facts = store.query(&corecrux_memory::fact_store::FactQuery {
+        query: None,
+        entity: None,
+        entity_prefix: Some("__workbench__::business::acme::".to_string()),
+        top_k: 10,
+        token_budget: None,
+    });
+    assert_eq!(facts.facts.len(), 2);
+    assert!(facts.facts.iter().all(|fact| fact.private));
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn workbench_context_pack_honors_jwt_tenant_binding() {
+    std::env::set_var("CORECRUXD_JWT_HS256_SECRET", "secret");
+    std::env::remove_var("CORECRUXD_JWT_ISS");
+    std::env::remove_var("CORECRUXD_JWT_AUD");
+    let mut state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    state.operating_mode = crate::product::OperatingMode::ProHybrid;
+    state.enabled_pro_services = vec!["context_pack:budgeted".to_string()];
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &serde_json::json!({
+            "sub": "agent-a",
+            "scope": "context_pack:budgeted",
+            "tenant_id": "business::other",
+            "exp": exp,
+        }),
+        &jsonwebtoken::EncodingKey::from_secret(b"secret"),
+    )
+    .expect("jwt");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer"),
+    );
+
+    let resp = super::workbench::post_context_pack(
+        State(state),
+        headers,
+        Json(super::workbench::ContextPackBody {
+            tenant_id: "business::acme".to_string(),
+            query: "route scope drift".to_string(),
+            token_budget: 128,
+            include_private: false,
+            source_labels: Vec::new(),
+        }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = json_body(resp).await;
+    assert_eq!(body["code"], "TENANT_FORBIDDEN");
+    assert_eq!(body["tenantId"], "business::acme");
+    std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+}
+
+#[tokio::test]
+async fn workbench_route_probe_and_api_drift_use_workspace_scan() {
+    let state = pro_workbench_state(&["route_probe:lab", "api_drift:check"]);
+    let mut scan = crate::workspace_scan::WorkspaceScan::default();
+    scan.scan_id = "scan-test".to_string();
+    scan.root_path = "/home/myles/CueCrux/Crux".to_string();
+    scan.routes.push(crate::workspace_scan::RouteHit {
+        method: "POST".to_string(),
+        path: "/v1/work".to_string(),
+        handler_fn: "post_work".to_string(),
+        handler_file: Some("crates/corecruxd/src/http/work.rs".to_string()),
+        handler_line: Some(120),
+        source_file: "crates/corecruxd/src/http/mod.rs".to_string(),
+        source_line: 430,
+    });
+    scan.diagnostics
+        .unresolved_routes
+        .push(crate::workspace_scan::UnresolvedRoute {
+            method: "GET".to_string(),
+            path: "/v1/generated".to_string(),
+            handler_fn: "generated_handler".to_string(),
+            source_file: "crates/corecruxd/src/http/mod.rs".to_string(),
+            source_line: 999,
+            reason: "not_found".to_string(),
+        });
+    scan.stats.route_count = scan.routes.len();
+    scan.stats.routes_by_crate.insert("corecruxd".to_string(), 1);
+    state
+        .fact_store
+        .write()
+        .await
+        .store(corecrux_memory::fact_store::StoreFact {
+            entity: "__workspace_scan__::latest".to_string(),
+            key: "content".to_string(),
+            value: serde_json::to_string(&scan).expect("serialize scan"),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+        });
+
+    let probe_resp = super::workbench::post_route_probe(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::workbench::RouteProbeBody {
+            route: "POST /v1/work".to_string(),
+            include_storyline: false,
+            include_tests: false,
+        }),
+    )
+    .await;
+    assert_eq!(probe_resp.status(), StatusCode::OK);
+    let probe = json_body(probe_resp).await;
+    assert_eq!(probe["route"]["handler_fn"], "post_work");
+    assert!(probe["scope_hints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|scope| scope == "facts:write"));
+
+    let drift_resp = super::workbench::get_api_drift(
+        State(state),
+        HeaderMap::new(),
+        Query(super::workbench::TenantWorkbenchQuery {
+            tenant_id: "business::acme".to_string(),
+            project_id: None,
+            limit: None,
+        }),
+    )
+    .await;
+    assert_eq!(drift_resp.status(), StatusCode::OK);
+    let drift = json_body(drift_resp).await;
+    assert_eq!(drift["status"], "drift_detected");
+    assert_eq!(drift["queues"][0]["category"], "unresolved_routes");
+    assert_eq!(drift["queues"][0]["count"], 1);
+}
+
+#[tokio::test]
+async fn workbench_impact_preflight_reports_living_object_drift() {
+    let state = pro_workbench_state(&["impact:preflight"]);
+    {
+        let tenant_hash = corecrux_projections::tenant_hash_xxhash64("business::acme");
+        let mut row = corecrux_projections::LivingStateRowV1::default();
+        row.living_status = corecrux_projections::LivingStatusV1::Stale;
+        row.confidence_q16 = u16::MAX;
+        row.dependents_count = 2;
+        row.pressure_level = 1;
+        state
+            .projection_state
+            .write()
+            .await
+            .living
+            .insert((tenant_hash, 42), row);
+    }
+
+    let resp = super::workbench::post_impact_preflight(
+        State(state),
+        HeaderMap::new(),
+        Json(super::workbench::ImpactPreflightBody {
+            tenant_id: "business::acme".to_string(),
+            changed_paths: vec!["crates/corecruxd/src/http/replay.rs".to_string()],
+            routes: Vec::new(),
+            selected_tests: Vec::new(),
+            include_storyline: false,
+        }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["preflight"]["living_objects"]["status"], "stale");
+    assert_eq!(body["preflight"]["living_objects"]["status_counts"]["stale"], 1);
+    assert!(body["preflight"]["living_objects"]["drift_categories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|category| category == "living_state_stale"));
+}
+
+#[tokio::test]
+async fn workbench_audit_triage_groups_replay_failures() {
+    let state = pro_workbench_state(&["audit:triage"]);
+    let evidence = {
+        let mut store = state.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "business::acme::doc::answer-source".to_string(),
+            key: "summary".to_string(),
+            value: "original answer source".to_string(),
+            source_receipt: Some("source:receipt".to_string()),
+            confidence: 1.0,
+            private: false,
+        })
+    };
+    let capsule =
+        corecrux_memory::replay::AnswerReplayCapsule::build(corecrux_memory::replay::BuildAnswerReplayCapsule {
+            answer_id: "answer-a".to_string(),
+            tenant_id: "business::acme".to_string(),
+            source: "test".to_string(),
+            question: "What changed?".to_string(),
+            stored_answer: serde_json::json!({"answer": "original answer"}),
+            evidence: vec![corecrux_memory::replay::ReplayEvidenceRef {
+                record_id: evidence.fact_id.clone(),
+                artifact_id: None,
+                source_label: Some("fact_store".to_string()),
+                text: None,
+                text_hash: Some(corecrux_memory::replay::hash_text(&evidence.value)),
+                content_hash: None,
+                semantic_profile_id: None,
+                local_semantic_profile_id: None,
+                score_space: None,
+                receipt_id: evidence.source_receipt.clone(),
+            }],
+            projection_refs: Vec::new(),
+            source_receipts: vec!["source:receipt".to_string()],
+            context_pack_receipt_id: None,
+            semantic_profile_id: None,
+            local_semantic_profile_id: None,
+            created_at: "2026-05-07T00:00:00Z".to_string(),
+        });
+    super::replay::store_answer_capsule(&state, &capsule)
+        .await
+        .expect("store replay capsule");
+    {
+        state
+            .fact_store
+            .write()
+            .await
+            .store(corecrux_memory::fact_store::StoreFact {
+                entity: "business::acme::doc::answer-source".to_string(),
+                key: "summary".to_string(),
+                value: "updated answer source".to_string(),
+                source_receipt: Some("source:receipt:2".to_string()),
+                confidence: 1.0,
+                private: false,
+            });
+    }
+
+    let resp = super::workbench::get_audit_triage(
+        State(state),
+        HeaderMap::new(),
+        Query(super::workbench::TenantWorkbenchQuery {
+            tenant_id: "business::acme".to_string(),
+            project_id: None,
+            limit: None,
+        }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let replay_queue = body["queues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|queue| queue["category"] == "replay_failures")
+        .expect("replay failure queue");
+    assert_eq!(replay_queue["severity"], "medium");
+    assert_eq!(replay_queue["count"], 1);
+    assert_eq!(replay_queue["items"][0]["answer_id"], "answer-a");
+    assert!(replay_queue["items"][0]["categories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|category| category == "fact_superseded"));
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn m11_closure_suite_exercises_hybrid_workbench_replay_and_offboarding() {
+    std::env::remove_var("CORECRUXD_GPU1_BASE_URL");
+    std::env::remove_var("CRUX_GPU1_BASE_URL");
+    let mut state = pro_workbench_state(&[
+        "context_pack:budgeted",
+        "impact:preflight",
+        "audit:triage",
+        "gpu1:answer",
+        "replay:answer",
+    ]);
+    bind_test_state_to_root_passport_key(&mut state);
+    let evidence = {
+        let mut store = state.fact_store.write().await;
+        let evidence = store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "business::acme::doc::m11-source".to_string(),
+            key: "summary".to_string(),
+            value: "business::acme closure context for deterministic replay".to_string(),
+            source_receipt: Some("m11:source:1".to_string()),
+            confidence: 1.0,
+            private: false,
+        });
+        store.store_synced(corecrux_memory::fact_store::Fact {
+            fact_id: "f_m11_business_mirror".to_string(),
+            entity: "business::acme::mirror::cloud".to_string(),
+            key: "summary".to_string(),
+            value: "mirrored business tenant state".to_string(),
+            source_receipt: Some("sync:http://cloud:f_m11_business_mirror".to_string()),
+            confidence: 1.0,
+            stored_at: chrono::Utc::now(),
+            tokens: 4,
+            deleted: false,
+            version: 1,
+            supersedes: None,
+            private: false,
+        });
+        evidence
+    };
+
+    let cloud = super::cloud::get_cloud_access_contract(State(state.clone()), HeaderMap::new()).await;
+    assert_eq!(cloud.status(), StatusCode::OK);
+    let cloud_body = json_body(cloud).await;
+    assert_eq!(cloud_body["cloud_only_entitled"], true);
+    assert!(cloud_body["pro_claim_placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|placement| placement["claim"] == "sso:rbac" && placement["implementation"] == "hosted_control_plane"));
+
+    let pack = super::workbench::post_context_pack(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::workbench::ContextPackBody {
+            tenant_id: "business::acme".to_string(),
+            query: "closure deterministic replay".to_string(),
+            token_budget: 256,
+            include_private: false,
+            source_labels: Vec::new(),
+        }),
+    )
+    .await;
+    assert_eq!(pack.status(), StatusCode::OK);
+    let pack_body = json_body(pack).await;
+    assert_eq!(pack_body["pack"]["items"].as_array().unwrap().len(), 1);
+
+    let answer = super::gpu1::post_gpu1_answer(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::gpu1::Gpu1AnswerRequest {
+            tenant_id: "business::acme".to_string(),
+            question: "What changed in M11?".to_string(),
+            evidence: vec![super::gpu1::Gpu1Evidence {
+                record_id: evidence.fact_id.clone(),
+                artifact_id: None,
+                source_label: Some("local_tenant_index".to_string()),
+                text: Some(evidence.value.clone()),
+                content_hash: Some(corecrux_memory::replay::hash_text(&evidence.value)),
+                semantic_profile_id: None,
+                local_semantic_profile_id: None,
+                score: Some(1.0),
+                score_space: Some("bm25_lexical".to_string()),
+                receipt_id: evidence.source_receipt.clone(),
+            }],
+            token_budget: Some(256),
+            semantic_profile_id: None,
+            local_semantic_profile_id: None,
+            context_pack_receipt_id: pack_body["receipt"]["receipt_id"].as_str().map(str::to_string),
+            options: serde_json::Value::Null,
+        }),
+    )
+    .await;
+    assert_eq!(answer.status(), StatusCode::OK);
+    let answer_body = json_body(answer).await;
+    let answer_id = answer_body["answer_replay"]["answer_id"]
+        .as_str()
+        .expect("answer id")
+        .to_string();
+    assert!(answer_body["answer_replay"]["validity_path"]
+        .as_str()
+        .unwrap()
+        .contains(&answer_id));
+
+    state
+        .fact_store
+        .write()
+        .await
+        .store(corecrux_memory::fact_store::StoreFact {
+            entity: evidence.entity.clone(),
+            key: evidence.key.clone(),
+            value: "business::acme closure context changed after answer".to_string(),
+            source_receipt: Some("m11:source:2".to_string()),
+            confidence: 1.0,
+            private: false,
+        });
+    let triage = super::workbench::get_audit_triage(
+        State(state.clone()),
+        HeaderMap::new(),
+        Query(super::workbench::TenantWorkbenchQuery {
+            tenant_id: "business::acme".to_string(),
+            project_id: None,
+            limit: None,
+        }),
+    )
+    .await;
+    assert_eq!(triage.status(), StatusCode::OK);
+    let triage_body = json_body(triage).await;
+    let replay_queue = triage_body["queues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|queue| queue["category"] == "replay_failures")
+        .expect("replay failure queue");
+    assert_eq!(replay_queue["count"], 1);
+
+    let offboard = super::sync::post_tenant_offboard(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path("business::acme".to_string()),
+        Json(super::sync::OffboardRequest { membership_epoch: 11 }),
+    )
+    .await;
+    assert_eq!(offboard.status(), StatusCode::OK);
+    let offboard_body = json_body(offboard).await;
+    assert_eq!(offboard_body["deleted_fact_ids"][0], "f_m11_business_mirror");
+    assert_eq!(offboard_body["signed_by"], state.passport_fpr);
+}
+
+#[tokio::test]
+async fn workbench_policy_simulation_blocks_matching_critical_constraint() {
+    let state = pro_workbench_state(&["policy:simulate"]);
+    state
+        .fact_store
+        .write()
+        .await
+        .store(corecrux_memory::fact_store::StoreFact {
+            entity: "__constraints__::business::acme::no-prod-deploy".to_string(),
+            key: "constraint".to_string(),
+            value: serde_json::json!({
+                "constraint_id": "no-prod-deploy",
+                "assertion": "No production deploy for business::acme without approval",
+                "severity": "critical",
+                "status": "active"
+            })
+            .to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+        });
+
+    let resp = super::workbench::post_policy_simulation(
+        State(state),
+        HeaderMap::new(),
+        Json(super::workbench::PolicySimulationBody {
+            action: corecrux_memory::action_enrichment::ActionEnrichmentInput {
+                tenant_id: Some("business::acme".to_string()),
+                tool_name: "github.deploy_production".to_string(),
+                tool_parameters: serde_json::json!({
+                    "environment": "production",
+                    "service": "api"
+                }),
+                action_description: Some("Deploy production API for business::acme".to_string()),
+                include_first_party_enrichers: false,
+            },
+        }),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["simulation"]["verdict"], "block");
+    assert_eq!(
+        body["simulation"]["matched_constraints"][0]["constraint_id"],
+        "no-prod-deploy"
+    );
+    assert!(body["receipt"]["receipt_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("workbench:policy_simulation:"));
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn gpu1_contract_reports_enabled_degraded_without_endpoint() {
+    std::env::remove_var("CORECRUXD_GPU1_BASE_URL");
+    std::env::remove_var("CRUX_GPU1_BASE_URL");
+    std::env::remove_var("CORECRUXD_GPU1_API_KEY");
+    std::env::remove_var("CRUX_GPU1_API_KEY");
+    let mut state = test_app_state(16);
+    state.operating_mode = crate::product::OperatingMode::ProHybrid;
+    state.enabled_pro_services = vec!["gpu1:coverage".to_string(), "gpu1:developer".to_string()];
+
+    let resp = super::gpu1::get_gpu1_contract(State(state), HeaderMap::new()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["schema"], super::gpu1::GPU1_COMPUTE_CONTRACT_SCHEMA);
+    assert_eq!(body["endpoint_configured"], false);
+    assert_eq!(body["remote_memory_sync_required"], false);
+    assert!(body["enabled_services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|service| service == "gpu1:developer"));
+    assert!(body["services"].as_array().unwrap().iter().any(|service| {
+        service["operation"] == "coverage"
+            && service["status"] == "enabled_degraded_not_configured"
+            && service["local_path"] == "/v1/gpu1/coverage"
+            && service["remote_path"] == "/v1/query/coverage"
+    }));
+}
+
+#[tokio::test]
+async fn gpu1_answer_requires_enabled_pro_service() {
+    let state = test_app_state(16);
+    let resp = super::gpu1::post_gpu1_answer(
+        State(state),
+        HeaderMap::new(),
+        Json(super::gpu1::Gpu1AnswerRequest {
+            tenant_id: "tenant-a".to_string(),
+            question: "What changed?".to_string(),
+            evidence: Vec::new(),
+            token_budget: None,
+            semantic_profile_id: None,
+            local_semantic_profile_id: None,
+            context_pack_receipt_id: None,
+            options: serde_json::Value::Null,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let body = json_body(resp).await;
+    assert_eq!(body["status"], "pro_service_not_enabled");
+    assert_eq!(body["remote_memory_sync_required"], false);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn gpu1_answer_falls_back_without_endpoint_and_stores_private_receipt() {
+    std::env::remove_var("CORECRUXD_GPU1_BASE_URL");
+    std::env::remove_var("CRUX_GPU1_BASE_URL");
+    let mut state = test_app_state(16);
+    state.operating_mode = crate::product::OperatingMode::ProHybrid;
+    state.enabled_pro_services = vec!["gpu1:answer".to_string()];
+    let shared = state.clone();
+
+    let resp = super::gpu1::post_gpu1_answer(
+        State(state),
+        HeaderMap::new(),
+        Json(super::gpu1::Gpu1AnswerRequest {
+            tenant_id: "tenant-a".to_string(),
+            question: "What changed?".to_string(),
+            evidence: vec![super::gpu1::Gpu1Evidence {
+                record_id: "r1".to_string(),
+                artifact_id: None,
+                source_label: Some("local_tenant_index".to_string()),
+                text: Some("The route changed auth scopes.".to_string()),
+                content_hash: Some("blake3:test".to_string()),
+                semantic_profile_id: None,
+                local_semantic_profile_id: Some("sp_local".to_string()),
+                score: Some(1.0),
+                score_space: Some("bm25_lexical".to_string()),
+                receipt_id: Some("rcpt_1".to_string()),
+            }],
+            token_budget: Some(512),
+            semantic_profile_id: None,
+            local_semantic_profile_id: Some("sp_local".to_string()),
+            context_pack_receipt_id: Some("ctx_1".to_string()),
+            options: serde_json::Value::Null,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["mode"], "local_fallback");
+    assert_eq!(body["fallback"]["reason_code"], "gpu1_not_configured");
+    assert_eq!(body["remote_memory_sync_required"], false);
+    assert_eq!(body["receipts"]["request"]["remote_memory_sync_required"], false);
+    assert_eq!(
+        body["receipts"]["context_pack"]["event_type"],
+        "gpu1_local_context_pack"
+    );
+    let answer_id = body["answer_replay"]["answer_id"].as_str().expect("answer id");
+    assert!(answer_id.starts_with("ans_"));
+    assert_eq!(body["answer_replay"]["agent_required"], false);
+    assert_eq!(body["answer_replay"]["llm_required"], false);
+
+    let store = shared.fact_store.read().await;
+    let receipts = store.get_by_entity("__gpu1_receipt__::tenant-a::answer");
+    assert_eq!(receipts.len(), 1);
+    assert!(receipts[0].private);
+    assert_eq!(receipts[0].key, "receipt_bundle");
+    let capsules = store.get_by_entity(&format!("__answer_replay_capsule__::tenant-a::{answer_id}"));
+    assert_eq!(capsules.len(), 1);
+    assert!(capsules[0].private);
+    assert_eq!(capsules[0].key, "capsule");
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn answer_replay_renders_stored_answer_and_validity_detects_superseded_evidence() {
+    std::env::remove_var("CORECRUXD_GPU1_BASE_URL");
+    std::env::remove_var("CRUX_GPU1_BASE_URL");
+    let mut state = test_app_state(16);
+    state.operating_mode = crate::product::OperatingMode::ProHybrid;
+    state.enabled_pro_services = vec!["gpu1:answer".to_string(), "replay:answer".to_string()];
+    let evidence_fact = state
+        .fact_store
+        .write()
+        .await
+        .store(corecrux_memory::fact_store::StoreFact {
+            entity: "tenant-a::doc::route-scope".to_string(),
+            key: "content".to_string(),
+            value: "The route changed auth scopes.".to_string(),
+            source_receipt: Some("rcpt_1".to_string()),
+            confidence: 1.0,
+            private: false,
+        });
+
+    let resp = super::gpu1::post_gpu1_answer(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::gpu1::Gpu1AnswerRequest {
+            tenant_id: "tenant-a".to_string(),
+            question: "What changed?".to_string(),
+            evidence: vec![super::gpu1::Gpu1Evidence {
+                record_id: evidence_fact.fact_id.clone(),
+                artifact_id: Some(42),
+                source_label: Some("local_tenant_index".to_string()),
+                text: Some(evidence_fact.value.clone()),
+                content_hash: Some(corecrux_memory::replay::hash_text(&evidence_fact.value)),
+                semantic_profile_id: None,
+                local_semantic_profile_id: Some("sp_local".to_string()),
+                score: Some(1.0),
+                score_space: Some("bm25_lexical".to_string()),
+                receipt_id: evidence_fact.source_receipt.clone(),
+            }],
+            token_budget: Some(512),
+            semantic_profile_id: None,
+            local_semantic_profile_id: Some("sp_local".to_string()),
+            context_pack_receipt_id: Some("ctx_1".to_string()),
+            options: serde_json::Value::Null,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let answer_id = body["answer_replay"]["answer_id"]
+        .as_str()
+        .expect("answer id")
+        .to_string();
+
+    let replay = super::replay::get_answer_replay(
+        State(state.clone()),
+        Path(answer_id.clone()),
+        Query(super::replay::ReplayQuery {
+            tenant_id: "tenant-a".to_string(),
+            shard_id: None,
+        }),
+        HeaderMap::new(),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay_body = json_body(replay).await;
+    assert_eq!(replay_body["agent_required"], false);
+    assert_eq!(replay_body["llm_required"], false);
+    assert!(replay_body["rendered_answer"]
+        .as_str()
+        .unwrap()
+        .contains("GPU-1 answer unavailable"));
+    assert_eq!(replay_body["evidence"][0]["text"], "The route changed auth scopes.");
+
+    state
+        .fact_store
+        .write()
+        .await
+        .store(corecrux_memory::fact_store::StoreFact {
+            entity: evidence_fact.entity.clone(),
+            key: evidence_fact.key.clone(),
+            value: "The route changed auth scopes and tenant checks.".to_string(),
+            source_receipt: Some("rcpt_2".to_string()),
+            confidence: 1.0,
+            private: false,
+        });
+    let tenant_hash = corecrux_projections::tenant_hash_xxhash64("tenant-a");
+    let dependent_id = uuid::Uuid::new_v4();
+    let pressure_id = uuid::Uuid::new_v4();
+    {
+        let mut projection = state.projection_state.write().await;
+        projection.living.insert(
+            (tenant_hash, 42),
+            corecrux_projections::LivingStateRowV1 {
+                living_status: corecrux_projections::LivingStatusV1::Stale,
+                confidence_q16: corecrux_projections::quantize_confidence_q16(0.72),
+                updated_at_micros: 1_000_000,
+                dependents_count: 1,
+                ..Default::default()
+            },
+        );
+        projection.relations.insert(
+            (
+                tenant_hash,
+                42,
+                43,
+                corecrux_projections::RelationTypeV1::Contradicts.to_u8(),
+            ),
+            corecrux_projections::RelationEdgeV1 {
+                confidence_q16: corecrux_projections::quantize_confidence_q16(0.9),
+                evidence_ref_hash16: [7u8; 16],
+                created_at_micros: 1_000_000,
+                updated_at_micros: 2_000_000,
+            },
+        );
+        projection.dependents.insert(
+            (
+                tenant_hash,
+                42,
+                corecrux_projections::DependentTypeV1::Answer.to_u8(),
+                dependent_id,
+            ),
+            corecrux_projections::DependentEdgeV1 {
+                last_seen_at_micros: 2_000_000,
+                usage_weight_q16: corecrux_projections::quantize_confidence_q16(0.8),
+            },
+        );
+        projection.pressure.insert(
+            (tenant_hash, 42, pressure_id),
+            corecrux_projections::PressureEventRowV1 {
+                pressure_code_id: corecrux_projections::pressure_code_id_xxhash16("stale_answer"),
+                severity: 2,
+                observed_at_micros: 2_000_000,
+                acknowledged_at_micros: 0,
+                resolved_at_micros: 0,
+                receipt_id: None,
+            },
+        );
+    }
+
+    let validity = super::replay::get_answer_replay_validity(
+        State(state),
+        Path(answer_id),
+        Query(super::replay::ReplayQuery {
+            tenant_id: "tenant-a".to_string(),
+            shard_id: None,
+        }),
+        HeaderMap::new(),
+    )
+    .await;
+    assert_eq!(validity.status(), StatusCode::OK);
+    let validity_body = json_body(validity).await;
+    assert_eq!(validity_body["overall"], "drift_detected");
+    assert_eq!(validity_body["historical_answer"]["status"], "verified");
+    assert_eq!(validity_body["current_answer"]["status"], "stale");
+    assert_eq!(validity_body["evidence"][0]["status"], "superseded");
+    let categories = validity_body["current_answer"]["drift_categories"].as_array().unwrap();
+    assert!(categories.iter().any(|category| category == "fact_superseded"));
+    assert!(categories.iter().any(|category| category == "living_state_stale"));
+    assert!(categories.iter().any(|category| category == "relation_contradicts"));
+    assert!(categories.iter().any(|category| category == "pressure_open"));
+    assert_eq!(validity_body["living_objects"]["status"], "stale");
+    assert_eq!(
+        validity_body["living_objects"]["affected_downstream_projections"]["dependent_count"],
+        1
+    );
+    assert_eq!(
+        validity_body["living_objects"]["artifacts"][0]["downstream_dependents"][0]["dependent_type"],
+        "answer"
+    );
+    assert_eq!(validity_body["projection_modules"]["status"], "current");
+    assert_eq!(validity_body["projection_modules"]["refs"].as_array().unwrap().len(), 4);
+    assert!(validity_body["projection_modules"]["refs"][0]["schema_version"]
+        .as_u64()
+        .is_some());
+    assert!(
+        validity_body["projection_modules"]["refs"][0]["projection_registry_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("blake3:")
+    );
+    assert_eq!(validity_body["historical_replay_available"], true);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn answer_replay_export_uses_local_capsule_without_dataplane() {
+    std::env::remove_var("CORECRUXD_GPU1_BASE_URL");
+    std::env::remove_var("CRUX_GPU1_BASE_URL");
+    let mut state = test_app_state(16);
+    state.operating_mode = crate::product::OperatingMode::ProHybrid;
+    state.enabled_pro_services = vec!["gpu1:answer".to_string(), "replay:answer".to_string()];
+
+    let resp = super::gpu1::post_gpu1_answer(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(super::gpu1::Gpu1AnswerRequest {
+            tenant_id: "tenant-a".to_string(),
+            question: "What changed?".to_string(),
+            evidence: Vec::new(),
+            token_budget: Some(512),
+            semantic_profile_id: None,
+            local_semantic_profile_id: None,
+            context_pack_receipt_id: None,
+            options: serde_json::Value::Null,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let answer_id = body["answer_replay"]["answer_id"]
+        .as_str()
+        .expect("answer id")
+        .to_string();
+
+    let export = super::receipts::get_answer_export_v1(
+        State(state),
+        Path(answer_id),
+        Query(super::receipts::SubjectExportQueryV1 {
+            tenant_id: "tenant-a".to_string(),
+            mode: None,
+            include: None,
+            redaction: Some("metadata_only".to_string()),
+            format: Some("zip".to_string()),
+        }),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(export.status(), StatusCode::OK);
+    assert_eq!(export.headers().get(header::CONTENT_TYPE).unwrap(), "application/zip");
+    let bytes = to_bytes(export.into_body(), 1_048_576).await.expect("zip body");
+    assert!(bytes.starts_with(b"PK"));
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn gpu1_coverage_local_fallback_is_deterministic() {
+    std::env::remove_var("CORECRUXD_GPU1_BASE_URL");
+    std::env::remove_var("CRUX_GPU1_BASE_URL");
+    let mut state = test_app_state(16);
+    state.operating_mode = crate::product::OperatingMode::ProHybrid;
+    state.enabled_pro_services = vec!["gpu1:coverage".to_string()];
+
+    let resp = super::gpu1::post_gpu1_coverage(
+        State(state),
+        HeaderMap::new(),
+        Json(super::gpu1::Gpu1CoverageRequest {
+            tenant_id: "tenant-a".to_string(),
+            query: "route scopes receipts".to_string(),
+            evidence: vec![super::gpu1::Gpu1Evidence {
+                record_id: "r1".to_string(),
+                artifact_id: None,
+                source_label: None,
+                text: Some("route receipts".to_string()),
+                content_hash: None,
+                semantic_profile_id: None,
+                local_semantic_profile_id: None,
+                score: None,
+                score_space: None,
+                receipt_id: None,
+            }],
+            coverage_floor: Some(0.8),
+            semantic_profile_id: None,
+            local_semantic_profile_id: None,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["mode"], "local_fallback");
+    assert_eq!(body["result"]["coverage_model"], "local_lexical_fallback");
+    assert_eq!(body["result"]["missing_terms"], serde_json::json!(["scopes"]));
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn version_endpoint_reports_semantic_profile_when_embeddings_configured() {
+    std::env::remove_var("CORECRUXD_SYNC_ENABLED");
+    std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
+    std::env::remove_var("CORECRUXD_SYNC_API_KEY");
+    let state = test_app_state(16);
+    state
+        .fact_store
+        .write()
+        .await
+        .set_embedding_client(corecrux_memory::embeddings::EmbeddingClient::new(
+            corecrux_memory::embeddings::EmbeddingConfig {
+                base_url: "http://localhost:11434".to_string(),
+                model: "nomic-embed-text".to_string(),
+                dimensions: 768,
+            },
+        ));
+
+    let resp = get_version(State(state)).await.into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["semantic_profile"]["schema"], "cuecrux.semantic_profile.v1");
+    assert_eq!(body["semantic_profile"]["model"], "nomic-embed-text");
+    assert_eq!(body["semantic_profile"]["dimensions"], 768);
+    assert!(body["semantic_profile"]["profile_id"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("sp_"));
+    assert_eq!(
+        body["protocol_contracts"]["semantic_profile_contract"]["status"],
+        "partial"
+    );
+}
+
+#[tokio::test]
+async fn segment_fingerprints_reports_cpu_only_retrieval_posture() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let headers = dev_scope_headers("admin:read");
+
+    let resp = get_segment_fingerprints(State(state), headers).await.into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["schema"], "crux.admin.segment_fingerprints.v1");
+    assert_eq!(body["contract"], "corecrux.retrieval.v6.fingerprinted_segments");
+    assert_eq!(body["status"], "partial");
+    assert_eq!(body["cpu_only"], true);
+    assert_eq!(body["segments"]["count"], 0);
+    assert_eq!(body["segments"]["total_docs"], 0);
+    assert_eq!(body["fingerprint_guard"]["mode"], "not_enforced");
+    assert!(body["semantic_profile"].is_null());
+    assert!(body["embedding_fingerprint"].is_null());
+}
+
+#[tokio::test]
+async fn segment_fingerprints_includes_semantic_profile_when_configured() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state
+        .fact_store
+        .write()
+        .await
+        .set_embedding_client(corecrux_memory::embeddings::EmbeddingClient::new(
+            corecrux_memory::embeddings::EmbeddingConfig {
+                base_url: "http://localhost:11434".to_string(),
+                model: "nomic-embed-text".to_string(),
+                dimensions: 768,
+            },
+        ));
+    let headers = dev_scope_headers("admin:read");
+
+    let resp = get_segment_fingerprints(State(state), headers).await.into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+
+    assert_eq!(body["semantic_profile"]["schema"], "cuecrux.semantic_profile.v1");
+    assert_eq!(
+        body["embedding_fingerprint"]["schema"],
+        "cuecrux.embedding_fingerprint.v1"
+    );
+    assert_eq!(body["semantic_profile_id"], body["semantic_profile"]["profile_id"]);
 }
 
 #[tokio::test]
@@ -6048,6 +7762,288 @@ async fn active_sessions_requires_admin_read() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = super::session::get_active_sessions(State(state), HeaderMap::new()).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_plan_read_through_returns_sealed_v1_plan() {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    state.session = Some(Arc::new(super::session::SessionServices::local_default("node-a")));
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let create_resp = super::session::post_session(
+        State(state.clone()),
+        headers,
+        axum::body::Bytes::from_static(
+            br#"{"client_id":"test-agent","client_version":"0.1.0","accepts":["application/json"],"intent":"audit"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(create_resp.status(), StatusCode::OK);
+    let session_id = create_resp
+        .headers()
+        .get("x-cuecrux-session-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(session_id.len(), 32);
+
+    let read_resp = super::session::get_session_plan(
+        State(state),
+        Path(session_id.clone()),
+        dev_scope_headers("sessions:read"),
+    )
+    .await;
+    assert_eq!(read_resp.status(), StatusCode::OK);
+    assert_eq!(
+        read_resp
+            .headers()
+            .get("x-cuecrux-session-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(session_id.as_str())
+    );
+    assert!(read_resp.headers().get("x-cuecrux-plan-hash").is_some());
+    let body = json_body(read_resp).await;
+    assert_eq!(body["schema"], "crux.session_plan.read.v2");
+    assert_eq!(body["session_id"], session_id);
+    assert_eq!(body["contract"], "cuecrux.shared.session_plan.v2");
+    assert_eq!(body["legacy_contract"], "crux.session_plan.v1");
+    assert_eq!(body["target_contract"], "cuecrux.shared.session_plan.v2");
+    assert_eq!(body["status"], "current");
+    assert_eq!(body["plan"]["plan_version"], 1);
+    assert!(body["plan"]["capability_graph"].is_object());
+    assert!(body["plan"]["capability_graph"]["nodes"].is_array());
+    assert!(body["plan"]["capability_graph"]["edges"].is_array());
+}
+
+#[tokio::test]
+async fn session_plan_read_through_requires_session_scope() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::session::get_session_plan(
+        State(state),
+        Path("00000000000000000000000000000000".to_string()),
+        HeaderMap::new(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn engram_list_session_init_and_resolve_match_hosted_shape() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let list_resp = super::engrams::list_engrams(
+        State(state.clone()),
+        dev_scope_headers("query:read"),
+        Query(super::engrams::ListEngramsQuery {
+            intent_bucket: Some("developer_surface".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_body = json_body(list_resp).await;
+    assert_eq!(list_body["schema"], "crux.local.engrams.list.v1");
+    assert!(list_body["engrams"].as_array().expect("engrams").iter().any(|engram| {
+        engram["name"] == "route-impact-preflight"
+            && engram["version"] == "v1"
+            && engram["content"].is_null()
+            && engram["prompt_hash"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("blake3:")
+    }));
+
+    let init_resp = super::engrams::memory_session_init(
+        State(state.clone()),
+        dev_scope_headers("sessions:read"),
+        Json(super::engrams::SessionInitBody {
+            tenant_id: Some("tenant-a".to_string()),
+            tenant_id_camel: None,
+            agent_id: Some("codex".to_string()),
+            agent_id_camel: None,
+            model_id: Some("local-cpu".to_string()),
+            model_id_camel: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(init_resp.status(), StatusCode::OK);
+    let init_body = json_body(init_resp).await;
+    assert_eq!(init_body["schema"], "crux.memory.session_init.v1");
+    assert_eq!(
+        init_body["session_procedure"]["schema"],
+        "cuecrux.memory.session_procedure.v1"
+    );
+    assert!(init_body["session_procedure_hash"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("blake3:"));
+    let manifest_hash = init_body["engram_manifest"]["manifest_hash"]
+        .as_str()
+        .expect("manifest hash")
+        .to_string();
+
+    let resolve_resp = super::engrams::resolve_engrams(
+        State(state),
+        dev_scope_headers("query:read"),
+        Json(super::engrams::ResolveEngramsBody {
+            tenant_id: Some("tenant-a".to_string()),
+            tenant_id_camel: None,
+            agent_id: Some("codex".to_string()),
+            agent_id_camel: None,
+            names: vec!["route-impact-preflight@v1".to_string()],
+            manifest_hash: Some(manifest_hash),
+            model_id: Some("local-cpu".to_string()),
+            model_id_camel: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resolve_resp.status(), StatusCode::OK);
+    let resolve_body = json_body(resolve_resp).await;
+    assert_eq!(resolve_body["schema"], "crux.memory.engrams.resolve.v1");
+    assert_eq!(resolve_body["manifest_status"], "current");
+    assert_eq!(resolve_body["engrams"][0]["name"], "route-impact-preflight");
+    assert!(resolve_body["engrams"][0]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("HTTP/gRPC work"));
+    assert!(resolve_body["engram_set_hash"]["hash"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("blake3:"));
+    assert!(resolve_body["receipt_linkage"]["receipt_id"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("local-engram-dispatch:"));
+}
+
+#[tokio::test]
+async fn rcx_publish_passport_preview_builds_signed_schema_record() {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    bind_test_state_to_root_passport_key(&mut state);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::create_passport(
+            &state.data_dir,
+            &mut store,
+            crate::passports::CreatePassportInput {
+                id: "personal_default".to_string(),
+                category: "personal".to_string(),
+                sponsor_id: None,
+                agent_work_gate: true,
+                is_default_for_category: true,
+            },
+            1_700_000_000_000,
+        )
+        .expect("create passport");
+    }
+
+    let resp = super::rcx_publish::preview_passport(
+        State(state.clone()),
+        Path("personal_default".to_string()),
+        dev_scope_headers("admin:read"),
+        Json(super::rcx_publish::PublishBody {
+            registry_url: None,
+            operator_metadata: Some(serde_json::json!({"channel": "test"})),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.rcx_publish.preview.v1");
+    assert_eq!(
+        body["record"]["schema_uri"],
+        "https://static.rcxprotocol.org/schemas/2026-05-01/passport-publish.schema.json"
+    );
+    assert_eq!(body["record"]["publisher_passport"], state.passport_fpr);
+    assert_eq!(body["record"]["passport_id"], "personal_default");
+    assert_eq!(body["record"]["operator_metadata"]["channel"], "test");
+    assert_eq!(body["record"]["passport_hash"].as_str().unwrap_or_default().len(), 64);
+    assert_eq!(body["record"]["signature"].as_str().unwrap_or_default().len(), 128);
+}
+
+#[tokio::test]
+async fn rcx_publish_project_emit_stores_local_receipt() {
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    bind_test_state_to_root_passport_key(&mut state);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::create_passport(
+            &state.data_dir,
+            &mut store,
+            crate::passports::CreatePassportInput {
+                id: "work_default".to_string(),
+                category: "work".to_string(),
+                sponsor_id: None,
+                agent_work_gate: true,
+                is_default_for_category: true,
+            },
+            1_700_000_000_000,
+        )
+        .expect("create passport");
+        crate::projects::create_project(
+            &mut store,
+            crate::projects::CreateProjectInput {
+                id: "alpha".to_string(),
+                name: "Alpha".to_string(),
+                planning_target: Some("tenant://tenant-alpha".to_string()),
+                default_passport_id: "work_default".to_string(),
+                working_tenants: vec!["tenant-alpha".to_string()],
+            },
+            1_700_000_100_000,
+        )
+        .expect("create project");
+        crate::project_repo_links::link_repo(
+            &mut store,
+            "alpha",
+            "CueCrux/Crux",
+            None,
+            "work",
+            Some("work_default".to_string()),
+            1_700_000_200_000,
+        )
+        .expect("link repo");
+    }
+
+    let resp = super::rcx_publish::emit_project(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::rcx_publish::PublishBody {
+            registry_url: None,
+            operator_metadata: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.rcx_publish.emit.v1");
+    assert_eq!(body["submitted"], false);
+    assert_eq!(body["receipt"]["kind"], "project");
+    assert_eq!(body["receipt"]["record"]["project_id"], "alpha");
+    assert_eq!(body["receipt"]["record"]["linked_github_repos"][0], "CueCrux/Crux");
+    assert_eq!(
+        body["receipt"]["record"]["project_hash"]
+            .as_str()
+            .unwrap_or_default()
+            .len(),
+        64
+    );
+
+    let store = state.fact_store.read().await;
+    let result = store.query(&corecrux_memory::fact_store::FactQuery {
+        query: None,
+        entity: Some("__rcx_publish__::project::alpha".to_string()),
+        entity_prefix: None,
+        top_k: 10,
+        token_budget: None,
+    });
+    assert_eq!(result.facts.len(), 1);
+    assert!(result.facts[0].private);
+    assert!(result.facts[0].value.contains("crux.rcx_publish.receipt.v1"));
 }
 
 #[tokio::test]
@@ -7029,6 +9025,75 @@ async fn extensions_register_then_list_then_get_then_delete() {
 }
 
 #[tokio::test]
+async fn extensions_install_from_registry_verifies_index_and_manifest_sha() {
+    use crux_integrations::{CommunityExtensionEntry, CommunityExtensionsIndex, EntryKind, TrustTier};
+    use sha2::Digest as _;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xac; 32]);
+    let publisher_fpr = "p_test_registry";
+    let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+    add_test_key(&state, publisher_fpr, public_key_hex).await;
+
+    let manifest = build_signed_manifest("ext.example.registry", &signing_key, publisher_fpr);
+    let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest bytes");
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&manifest_bytes);
+    let manifest_sha256 = hex::encode(hasher.finalize());
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind manifest server");
+    let manifest_url = format!("http://{}", listener.local_addr().expect("addr"));
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept manifest request");
+        let mut request_buf = [0u8; 512];
+        let _ = stream.read(&mut request_buf);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            manifest_bytes.len()
+        )
+        .expect("write response head");
+        stream.write_all(&manifest_bytes).expect("write response body");
+    });
+
+    let mut index = CommunityExtensionsIndex::new(publisher_fpr, 1_700_000_000_000);
+    index.entries.push(CommunityExtensionEntry {
+        id: "ext.example.registry".to_string(),
+        name: "Registry Extension".to_string(),
+        version: "0.1.0".to_string(),
+        summary: "Installed from a signed registry index.".to_string(),
+        manifest_url,
+        manifest_sha256: manifest_sha256.clone(),
+        repo_url: "https://example.invalid/ext.example.registry".to_string(),
+        kind: EntryKind::HttpRecipe,
+        trust_tier: TrustTier::CommunityReviewed,
+    });
+    index.sign(&signing_key).expect("sign index");
+    let index_path = state.data_dir.join("extensions/registry/index.json");
+    std::fs::create_dir_all(index_path.parent().expect("index parent")).expect("index dir");
+    std::fs::write(&index_path, serde_json::to_vec(&index).expect("index bytes")).expect("write index");
+
+    let resp = super::extensions::install_from_registry(
+        State(state),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::extensions::InstallFromRegistryBody {
+            id: "ext.example.registry".to_string(),
+            index_path: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.extensions.registry_install.v1");
+    assert_eq!(body["manifest_sha256"], manifest_sha256);
+    assert_eq!(body["installed"]["manifest"]["id"], "ext.example.registry");
+    assert_eq!(body["installed"]["trust_tier"], "community_reviewed");
+}
+
+#[tokio::test]
 async fn extensions_register_unsigned_returns_400_with_dev_hint() {
     use crux_integrations::{
         DataAccess, EntryKind, IntegrationEntry, IntegrationManifest, ManifestHashes, NetworkAccess, SafetyPolicy,
@@ -7484,6 +9549,7 @@ async fn wasm_install_then_invoke_returns_module_result() {
             name: "ext.wasm.test.tool".to_string(),
             description: "Test tool.".to_string(),
             input_schema: serde_json::json!({"type":"object"}),
+            consequence_metadata: None,
             auth_shared_secret_id: None,
         }],
         wasm_module_path: Some("extension.wasm".to_string()),
@@ -7595,6 +9661,7 @@ async fn wasm_invoke_with_sha_mismatch_returns_409() {
             name: "ext.wasm.bad.tool".to_string(),
             description: "Mismatch.".to_string(),
             input_schema: serde_json::json!({"type":"object"}),
+            consequence_metadata: None,
             auth_shared_secret_id: None,
         }],
         wasm_module_path: Some("extension.wasm".to_string()),

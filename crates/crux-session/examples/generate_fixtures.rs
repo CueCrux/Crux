@@ -212,17 +212,17 @@ fn cap(
     ce_path: Option<&str>,
     core_path: Option<&str>,
 ) -> Capability {
-    Capability {
-        cap: name.to_string(),
-        prefer: prefer.to_string(),
-        shape: shape.to_string(),
-        min_tier: min_tier.map(String::from),
-        cost_class: cost_class.to_string(),
-        impl_path: ImplPath {
+    Capability::legacy(
+        name,
+        prefer,
+        shape,
+        min_tier.map(String::from),
+        cost_class,
+        ImplPath {
             ce: ce_path.map(String::from),
             core: core_path.map(String::from),
         },
-    }
+    )
 }
 
 fn empty_receipt(mode: ReceiptMode) -> ReceiptEnvelope {
@@ -248,8 +248,11 @@ fn ce_minimal(_: &mut Context) -> SessionPlan {
             principal_id: "ce:a4f3b1c2:user_001".to_string(),
             tier: "local".to_string(),
             affinities: vec!["*".to_string()],
+            denied_capabilities: None,
+            grant_expansions: None,
             passport_receipt: None,
         },
+        model: None,
         channels: Channels {
             bulk: Some("h2://localhost:14801/v2".to_string()),
             mcp: "http://localhost:14801/mcp".to_string(),
@@ -283,6 +286,11 @@ fn ce_minimal(_: &mut Context) -> SessionPlan {
                 Some("/mcp/vault#journal_append"),
             ),
         ],
+        capability_graph_edges: Vec::new(),
+        capability_graph_excluded: Some(Vec::new()),
+        capability_graph_version: crux_session::plan::CAPABILITY_GRAPH_VERSION,
+        capability_graph_valid_until: 1_745_000_000_000 + 3600 * 1000,
+        capability_graph_refresh_hint: None,
         capability_graph_hash: hash32(0xC1),
         budget: Budget {
             tokens_cap: None,
@@ -329,8 +337,11 @@ fn hosted_free(_: &mut Context) -> SessionPlan {
             principal_id: "tenant:indie_co:sam".to_string(),
             tier: "free".to_string(),
             affinities: vec!["retrieval".to_string()],
+            denied_capabilities: None,
+            grant_expansions: None,
             passport_receipt: Some(hash32(0xE0)),
         },
+        model: None,
         channels: Channels {
             bulk: Some("h2://vault.cuecrux.com/v2".to_string()),
             mcp: "https://vault.cuecrux.com/mcp/vault".to_string(),
@@ -355,6 +366,11 @@ fn hosted_free(_: &mut Context) -> SessionPlan {
                 Some("/mcp/vault#session_context"),
             ),
         ],
+        capability_graph_edges: Vec::new(),
+        capability_graph_excluded: Some(Vec::new()),
+        capability_graph_version: crux_session::plan::CAPABILITY_GRAPH_VERSION,
+        capability_graph_valid_until: 1_745_100_000_000 + 3600 * 1000,
+        capability_graph_refresh_hint: None,
         capability_graph_hash: hash32(0xC2),
         budget: Budget {
             tokens_cap: Some(10_000),

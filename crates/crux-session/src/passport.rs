@@ -240,6 +240,8 @@ impl LocalPassportConfig {
             principal_id,
             tier: "local".to_string(),
             affinities: vec!["*".to_string()],
+            denied_capabilities: None,
+            grant_expansions: None,
             passport_receipt: None,
         };
         (passport, install_hash)

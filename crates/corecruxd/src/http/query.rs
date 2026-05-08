@@ -3,6 +3,7 @@
 // See LICENCE.md in the repository root.
 
 use super::*;
+use corecrux_memory::semantic::{MIXED_PROFILE_MERGE_RULE, SCORE_MERGE_RULE_SINGLE_SPACE, SCORE_SPACE_BM25_LEXICAL};
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub(super) struct GraphExpandBody {
@@ -421,6 +422,11 @@ pub(super) async fn post_query_text_search(
 
     let limit = body.limit.clamp(1, 100);
     let is_scan_mode = body.mode.as_deref() == Some("scan");
+    let semantic_profile = state.fact_store.read().await.semantic_profile();
+    let local_semantic_profile_id = semantic_profile.as_ref().map(|profile| profile.profile_id.clone());
+    let embedding_fingerprint = semantic_profile
+        .as_ref()
+        .map(|profile| profile.embedding_fingerprint.clone());
 
     let t0 = std::time::Instant::now();
 
@@ -439,6 +445,14 @@ pub(super) async fn post_query_text_search(
                         "took_ms": t0.elapsed().as_millis(),
                         "segments_searched": 0,
                         "total_docs": 0,
+                        "source_label": "local_tenant_index",
+                        "score_space": SCORE_SPACE_BM25_LEXICAL,
+                        "score_merge_rule": SCORE_MERGE_RULE_SINGLE_SPACE,
+                        "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,
+                        "semantic_profile_id": null,
+                        "local_semantic_profile_id": local_semantic_profile_id,
+                        "local_semantic_profile": semantic_profile,
+                        "embedding_fingerprint": embedding_fingerprint,
                     }
                 })),
             )
@@ -500,19 +514,32 @@ pub(super) async fn post_query_text_search(
 
     #[derive(serde::Serialize)]
     struct HitResp {
+        result_id: String,
+        rank: usize,
         segment_index: usize,
         doc_id: u32,
         score: f32,
+        source_label: &'static str,
+        score_space: &'static str,
+        semantic_profile_id: Option<String>,
+        local_semantic_profile_id: Option<String>,
         frame_offset: u32,
         token_count: u16,
     }
 
     let result_items: Vec<HitResp> = results
         .iter()
-        .map(|h| HitResp {
+        .enumerate()
+        .map(|(idx, h)| HitResp {
+            result_id: format!("{}:{}", h.segment_index, h.doc_id),
+            rank: idx + 1,
             segment_index: h.segment_index,
             doc_id: h.doc_id,
             score: h.score,
+            source_label: "local_tenant_index",
+            score_space: SCORE_SPACE_BM25_LEXICAL,
+            semantic_profile_id: None,
+            local_semantic_profile_id: local_semantic_profile_id.clone(),
             frame_offset: h.frame_offset,
             token_count: h.doc_length_tokens,
         })
@@ -531,6 +558,14 @@ pub(super) async fn post_query_text_search(
             "segments_searched": readers.len(),
             "total_docs": index.total_docs(),
             "total_candidates": search_result.total_candidates,
+            "source_label": "local_tenant_index",
+            "score_space": SCORE_SPACE_BM25_LEXICAL,
+            "score_merge_rule": SCORE_MERGE_RULE_SINGLE_SPACE,
+            "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,
+            "semantic_profile_id": null,
+            "local_semantic_profile_id": local_semantic_profile_id,
+            "local_semantic_profile": semantic_profile,
+            "embedding_fingerprint": embedding_fingerprint,
         }
     });
 
@@ -693,6 +728,11 @@ pub(super) async fn post_query_text_search_expand(
         return problem_response(StatusCode::NOT_FOUND, "text-search query not enabled");
     }
 
+    let semantic_profile = state.fact_store.read().await.semantic_profile();
+    let local_semantic_profile_id = semantic_profile.as_ref().map(|profile| profile.profile_id.clone());
+    let embedding_fingerprint = semantic_profile
+        .as_ref()
+        .map(|profile| profile.embedding_fingerprint.clone());
     let index = state.retrieval_index.read().await;
     let readers = index.readers();
 
@@ -717,6 +757,10 @@ pub(super) async fn post_query_text_search_expand(
         chunks.push(serde_json::json!({
             "segment_index": rid.segment_index,
             "doc_id": rid.doc_id,
+            "source_label": "local_tenant_index",
+            "score_space": SCORE_SPACE_BM25_LEXICAL,
+            "semantic_profile_id": null,
+            "local_semantic_profile_id": local_semantic_profile_id.clone(),
             "frame_offset": doc.frame_offset,
             "token_count": doc.doc_length_tokens,
         }));
@@ -727,6 +771,14 @@ pub(super) async fn post_query_text_search_expand(
         axum::Json(serde_json::json!({
             "chunks": chunks,
             "tokens_loaded": tokens_loaded,
+            "meta": {
+                "source_label": "local_tenant_index",
+                "score_space": SCORE_SPACE_BM25_LEXICAL,
+                "semantic_profile_id": null,
+                "local_semantic_profile_id": local_semantic_profile_id,
+                "local_semantic_profile": semantic_profile,
+                "embedding_fingerprint": embedding_fingerprint,
+            }
         })),
     )
         .into_response()

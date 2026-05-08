@@ -27,6 +27,8 @@ fn build_plan() -> (SessionPlan, Vec<u8>) {
         principal_id: "tenant:cuecrux_ltd:myles".into(),
         tier: "team".into(),
         affinities: vec!["retrieval".into(), "journal".into(), "memory".into(), "proof".into()],
+        denied_capabilities: None,
+        grant_expansions: None,
         passport_receipt: None,
     };
     let request = HandshakeRequest {

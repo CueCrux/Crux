@@ -412,6 +412,11 @@ mod tests {
         assert!(tick_result.cursor_before.is_none());
         assert!(tick_result.cursor_after.is_some());
         assert_eq!(tick_result.commit_id, 1);
+        assert_eq!(proj.meta.projection_module_registry.len(), 4);
+        assert!(proj.meta.artifact_living_state.module.is_some());
+        assert!(proj.meta.artifact_relations.module.is_some());
+        assert!(proj.meta.pressure_events.module.is_some());
+        assert!(proj.meta.artifact_dependents.module.is_some());
     }
 
     #[test]

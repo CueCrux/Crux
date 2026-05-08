@@ -192,9 +192,7 @@ pub async fn dispatch(req: JsonRpcRequest, ctx: &McpContext, _agent: Option<&Age
 
         // ── Tool surface ───────────────────────────────────────────────
         "tools/list" => {
-            let result = ctx.rcx_router.as_ref().map_or_else(tools::list_tools_json, |router| {
-                tools::list_tools_json_for_rcx_router(router, current_unix_seconds())
-            });
+            let result = tools::list_tools_json_for_context(ctx, current_unix_seconds()).await;
             JsonRpcResponse::success(req.id, result)
         }
 

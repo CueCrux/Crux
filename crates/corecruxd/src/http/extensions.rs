@@ -20,10 +20,16 @@
 //! delete + the keyring sub-routes so the install path is end-to-end
 //! testable without RCX integration.
 
+use std::io::Read as _;
+use std::path::{Path as FsPath, PathBuf};
+
 use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, State, StatusCode};
-use crux_integrations::{IntegrationManifest, TrustTier, TrustedKeyEntry, TrustedKeyring};
+use crux_integrations::{CommunityExtensionsIndex, IntegrationManifest, TrustTier, TrustedKeyEntry, TrustedKeyring};
+use sha2::Digest as _;
 
 const ALLOW_UNSIGNED_ENV: &str = "CORECRUXD_EXTENSIONS_ALLOW_UNSIGNED";
+const REGISTRY_INDEX_REL_PATH: &str = "extensions/registry/index.json";
+const REGISTRY_MANIFEST_DOWNLOAD_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -49,6 +55,17 @@ fn extract_passport_id(headers: &HeaderMap) -> Option<String> {
 pub(super) struct RegisterExtensionBody {
     /// Signed (or unsigned, with bypass) integration manifest.
     pub manifest: IntegrationManifest,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct InstallFromRegistryBody {
+    /// Extension id to install from the cached community-extension index.
+    pub id: String,
+    /// Optional alternate cached index path. Relative paths resolve under
+    /// `data_dir`; absolute paths are accepted for operator-controlled tests
+    /// and private mirrors.
+    #[serde(default)]
+    pub index_path: Option<PathBuf>,
 }
 
 /// `GET /v1/extensions` — list every installed extension.
@@ -195,6 +212,190 @@ pub(super) async fn register_extension(
         }
         Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
+}
+
+/// `POST /v1/extensions/install-from-registry` — install by id from a
+/// verified cached community-extension index. The daemon re-verifies the
+/// signed index against the local trusted-keyring, fetches the manifest URL,
+/// enforces the curator-published `manifest_sha256`, then delegates to the
+/// same signed-manifest installer as `/v1/extensions/register`.
+pub(super) async fn install_from_registry(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<InstallFromRegistryBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read", "facts:write"]) {
+        return problem.into_response();
+    }
+    let installed_by = extract_passport_id(&headers);
+    let bypass = allow_unsigned_dev();
+
+    let index_path = registry_index_path(&state.data_dir, body.index_path.as_deref());
+    let index = match load_and_verify_registry_index(&state.data_dir, &index_path) {
+        Ok(index) => index,
+        Err((status, msg)) => return problem_response(status, msg),
+    };
+    let Some(entry) = index.entries.iter().find(|entry| entry.id == body.id).cloned() else {
+        return problem_response(
+            StatusCode::NOT_FOUND,
+            format!("extension '{}' not found in registry index", body.id),
+        );
+    };
+    let manifest_bytes = match fetch_registry_manifest(entry.manifest_url.clone()).await {
+        Ok(bytes) => bytes,
+        Err((status, msg)) => return problem_response(status, msg),
+    };
+    let actual_sha256 = sha256_hex(&manifest_bytes);
+    if !actual_sha256.eq_ignore_ascii_case(entry.manifest_sha256.trim()) {
+        return problem_response(
+            StatusCode::CONFLICT,
+            format!(
+                "manifest_sha256 mismatch for '{}': registry={}, downloaded={actual_sha256}",
+                entry.id, entry.manifest_sha256
+            ),
+        );
+    }
+    let manifest: IntegrationManifest = match serde_json::from_slice(&manifest_bytes) {
+        Ok(manifest) => manifest,
+        Err(err) => return problem_response(StatusCode::BAD_GATEWAY, format!("manifest JSON decode failed: {err}")),
+    };
+    if manifest.id != entry.id || manifest.version != entry.version {
+        return problem_response(
+            StatusCode::CONFLICT,
+            format!(
+                "registry entry mismatch: expected {}@{}, manifest is {}@{}",
+                entry.id, entry.version, manifest.id, manifest.version
+            ),
+        );
+    }
+
+    let mut store = state.fact_store.write().await;
+    let result = crate::extension_registry::install_extension(
+        &mut store,
+        &state.data_dir,
+        manifest,
+        installed_by,
+        now_unix_ms(),
+        bypass,
+    );
+    drop(store);
+    match result {
+        Ok(record) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "schema": "crux.extensions.registry_install.v1",
+                "registry_entry": entry,
+                "manifest_sha256": actual_sha256,
+                "installed": record,
+            })),
+        )
+            .into_response(),
+        Err(crate::extension_registry::ExtensionsError::AlreadyInstalled(_)) => {
+            problem_response(StatusCode::CONFLICT, "extension id already installed")
+        }
+        Err(err @ crate::extension_registry::ExtensionsError::ManifestInvalid(_)) => {
+            use std::fmt::Write as _;
+            let mut msg = err.to_string();
+            if !bypass {
+                let _ = write!(
+                    msg,
+                    " (set {ALLOW_UNSIGNED_ENV}=true to bypass signature requirement in dev)"
+                );
+            }
+            problem_response(StatusCode::BAD_REQUEST, msg)
+        }
+        Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+fn registry_index_path(data_dir: &FsPath, override_path: Option<&FsPath>) -> PathBuf {
+    match override_path {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => data_dir.join(path),
+        None => data_dir.join(REGISTRY_INDEX_REL_PATH),
+    }
+}
+
+fn load_and_verify_registry_index(
+    data_dir: &FsPath,
+    index_path: &FsPath,
+) -> Result<CommunityExtensionsIndex, (StatusCode, String)> {
+    let bytes = std::fs::read(index_path)
+        .map_err(|err| (StatusCode::NOT_FOUND, format!("registry index read failed: {err}")))?;
+    let index: CommunityExtensionsIndex = serde_json::from_slice(&bytes).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("registry index JSON decode failed: {err}"),
+        )
+    })?;
+    let policy = crate::extension_registry::build_policy(data_dir)
+        .map_err(|err| (StatusCode::BAD_REQUEST, format!("trusted keyring read failed: {err}")))?;
+    index.verify(&policy).map_err(|err| {
+        (
+            StatusCode::FORBIDDEN,
+            format!("registry index signature verification failed: {err}"),
+        )
+    })?;
+    Ok(index)
+}
+
+async fn fetch_registry_manifest(url: String) -> Result<Vec<u8>, (StatusCode, String)> {
+    if !registry_manifest_url_allowed(&url) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "manifest_url must be https://, or loopback http:// for local tests".to_string(),
+        ));
+    }
+    tokio::task::spawn_blocking(move || fetch_registry_manifest_blocking(&url))
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("manifest fetch join error: {err}")))?
+}
+
+fn registry_manifest_url_allowed(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://127.0.0.1") || url.starts_with("http://localhost")
+}
+
+fn fetch_registry_manifest_blocking(url: &str) -> Result<Vec<u8>, (StatusCode, String)> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .build()
+        .into();
+    let mut response = agent
+        .get(url)
+        .call()
+        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("manifest fetch failed: {err}")))?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("manifest URL returned status {status}"),
+        ));
+    }
+    let mut reader = response.body_mut().as_reader();
+    let mut out = Vec::with_capacity(64 * 1024);
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|err| (StatusCode::BAD_GATEWAY, format!("manifest read failed: {err}")))?;
+        if n == 0 {
+            break;
+        }
+        if out.len() + n > REGISTRY_MANIFEST_DOWNLOAD_LIMIT_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("manifest exceeds the {REGISTRY_MANIFEST_DOWNLOAD_LIMIT_BYTES}-byte cap"),
+            ));
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+    Ok(out)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 /// `DELETE /v1/extensions/{id}` — uninstall.

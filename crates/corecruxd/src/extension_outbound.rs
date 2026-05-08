@@ -465,6 +465,7 @@ mod tests {
                 name: "quote.daily".to_string(),
                 description: "Today's quote.".to_string(),
                 input_schema: serde_json::json!({"type":"object"}),
+                consequence_metadata: None,
                 auth_shared_secret_id: None,
             }],
             wasm_module_path: None,

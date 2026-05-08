@@ -13,6 +13,7 @@ use crate::error::SessionError;
 
 pub const SESSION_PLAN_VERSION: u64 = 1;
 pub const INVOCATION_RECEIPT_VERSION: u64 = 1;
+pub const CAPABILITY_GRAPH_VERSION: u64 = 1;
 
 pub const HASH_LEN: usize = 32;
 pub const SIGNATURE_LEN: usize = 64;
@@ -43,8 +44,18 @@ pub struct Passport {
     pub principal_id: String,
     pub tier: String,
     pub affinities: Vec<String>,
+    pub denied_capabilities: Option<Vec<String>>,
+    pub grant_expansions: Option<Vec<String>>,
     /// BLAKE3 of the source passport record; hosted only. None on Crux Daemon.
     pub passport_receipt: Option<[u8; HASH_LEN]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDeclaration {
+    pub declared: Option<String>,
+    pub declared_family: Option<String>,
+    pub declared_size: Option<String>,
+    pub auth_bound: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,16 +80,148 @@ pub struct ImplPath {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaRef {
+    pub kind: String,
+    pub uri: String,
+    pub hash: [u8; HASH_LEN],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CostEstimate {
+    pub p50_crux: Option<u64>,
+    pub p95_crux: Option<u64>,
+    pub estimation_method: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestationRef {
+    pub issuer: String,
+    pub typ: String,
+    pub hash: [u8; HASH_LEN],
+    pub uri: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitHints {
+    pub calls_per_minute: Option<u64>,
+    pub tokens_per_minute: Option<u64>,
+    pub bursts_allowed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcurrencyHints {
+    pub max_parallel: Option<u64>,
+    pub rate_limit: Option<RateLimitHints>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPolicy {
+    pub min_family: Option<Vec<String>>,
+    pub min_size: Option<String>,
+    pub deny_models: Option<Vec<String>>,
+    pub auth_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityTokenRef {
+    pub token_id: String,
+    pub issued_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capability {
     pub cap: String,
+    pub category: String,
     /// "bulk" | "mcp"
     pub prefer: String,
     /// Payload shape, e.g. `stream<Chunk>`, `Receipt`, `Snapshot`.
     pub shape: String,
+    pub input_schema: Option<SchemaRef>,
+    pub output_schema: Option<SchemaRef>,
     pub min_tier: Option<String>,
+    pub required_affinity: Option<String>,
     /// "free" | "metered" | "heavy"
     pub cost_class: String,
+    pub cost_estimate: Option<CostEstimate>,
+    pub stability: String,
+    pub since: Option<String>,
+    pub sunset_at: Option<u64>,
+    pub model_policy: Option<ModelPolicy>,
+    pub attestations: Vec<AttestationRef>,
+    pub concurrency: Option<ConcurrencyHints>,
     pub impl_path: ImplPath,
+    pub token_ref: Option<CapabilityTokenRef>,
+}
+
+impl Capability {
+    pub fn category_for(min_tier: Option<&str>, required_affinity: Option<&str>) -> String {
+        if required_affinity.is_some() {
+            "affinity_required".to_string()
+        } else if min_tier.is_some() {
+            "tier_gated".to_string()
+        } else {
+            "public".to_string()
+        }
+    }
+
+    pub fn legacy(
+        cap: impl Into<String>,
+        prefer: impl Into<String>,
+        shape: impl Into<String>,
+        min_tier: Option<String>,
+        cost_class: impl Into<String>,
+        impl_path: ImplPath,
+    ) -> Self {
+        Self::v2(cap, prefer, shape, min_tier, None, cost_class, impl_path)
+    }
+
+    pub fn v2(
+        cap: impl Into<String>,
+        prefer: impl Into<String>,
+        shape: impl Into<String>,
+        min_tier: Option<String>,
+        required_affinity: Option<String>,
+        cost_class: impl Into<String>,
+        impl_path: ImplPath,
+    ) -> Self {
+        let category = Self::category_for(min_tier.as_deref(), required_affinity.as_deref());
+        Self {
+            cap: cap.into(),
+            category,
+            prefer: prefer.into(),
+            shape: shape.into(),
+            input_schema: None,
+            output_schema: None,
+            min_tier,
+            required_affinity,
+            cost_class: cost_class.into(),
+            cost_estimate: None,
+            stability: "stable".to_string(),
+            since: Some("1.0.0".to_string()),
+            sunset_at: None,
+            model_policy: None,
+            attestations: Vec::new(),
+            concurrency: None,
+            impl_path,
+            token_ref: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edge {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+    pub weight: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exclusion {
+    pub cap: String,
+    pub reason: String,
+    pub layer: String,
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,9 +250,15 @@ pub struct SessionPlan {
     pub session_ttl_s: u64,
 
     pub passport: Passport,
+    pub model: Option<ModelDeclaration>,
     pub channels: Channels,
 
     pub capability_graph: Vec<Capability>,
+    pub capability_graph_edges: Vec<Edge>,
+    pub capability_graph_excluded: Option<Vec<Exclusion>>,
+    pub capability_graph_version: u64,
+    pub capability_graph_valid_until: u64,
+    pub capability_graph_refresh_hint: Option<String>,
     pub capability_graph_hash: [u8; HASH_LEN],
 
     pub budget: Budget,
@@ -140,11 +289,15 @@ impl SessionPlan {
         pairs.push(("session_id".into(), CborValue::Bytes(self.session_id.to_vec())));
         pairs.push(("session_ttl_s".into(), CborValue::Uint(self.session_ttl_s)));
         pairs.push(("passport".into(), passport_to_cbor(&self.passport)));
-        pairs.push(("channels".into(), channels_to_cbor(&self.channels)));
         pairs.push((
-            "capability_graph".into(),
-            CborValue::Array(self.capability_graph.iter().map(capability_to_cbor).collect()),
+            "model".into(),
+            match &self.model {
+                Some(model) => model_to_cbor(model),
+                None => CborValue::Null,
+            },
         ));
+        pairs.push(("channels".into(), channels_to_cbor(&self.channels)));
+        pairs.push(("capability_graph".into(), capability_graph_to_cbor(self)));
         pairs.push((
             "capability_graph_hash".into(),
             CborValue::Bytes(self.capability_graph_hash.to_vec()),
@@ -192,8 +345,18 @@ impl SessionPlan {
             session_id: take_bytes_fixed(map, "session_id")?,
             session_ttl_s: take_uint(map, "session_ttl_s")?,
             passport: passport_from_cbor(get(map, "passport")?)?,
+            model: model_from_cbor(find(map, "model").unwrap_or(&CborValue::Null))?,
             channels: channels_from_cbor(get(map, "channels")?)?,
-            capability_graph: capability_graph_from_cbor(get(map, "capability_graph")?)?,
+            capability_graph: capability_nodes_from_cbor(get(map, "capability_graph")?)?,
+            capability_graph_edges: capability_edges_from_cbor(get(map, "capability_graph")?)?,
+            capability_graph_excluded: capability_excluded_from_cbor(get(map, "capability_graph")?)?,
+            capability_graph_version: capability_graph_version_from_cbor(get(map, "capability_graph")?)?,
+            capability_graph_valid_until: capability_graph_valid_until_from_cbor(
+                get(map, "capability_graph")?,
+                take_uint(map, "minted_at")?,
+                take_uint(map, "session_ttl_s")?,
+            )?,
+            capability_graph_refresh_hint: capability_graph_refresh_hint_from_cbor(get(map, "capability_graph")?)?,
             capability_graph_hash: take_bytes_fixed(map, "capability_graph_hash")?,
             budget: budget_from_cbor(get(map, "budget")?)?,
             receipt: receipt_from_cbor(get(map, "receipt")?)?,
@@ -213,12 +376,32 @@ fn passport_to_cbor(p: &Passport) -> CborValue {
             CborValue::Array(p.affinities.iter().map(|s| CborValue::Text(s.clone())).collect()),
         ),
         (
+            "denied_capabilities".into(),
+            text_array_opt_to_cbor(p.denied_capabilities.as_ref()),
+        ),
+        (
+            "grant_expansions".into(),
+            text_array_opt_to_cbor(p.grant_expansions.as_ref()),
+        ),
+        (
             "passport_receipt".into(),
             match &p.passport_receipt {
                 Some(b) => CborValue::Bytes(b.to_vec()),
                 None => CborValue::Null,
             },
         ),
+    ])
+}
+
+fn model_to_cbor(model: &ModelDeclaration) -> CborValue {
+    CborValue::Map(vec![
+        ("declared".into(), text_opt_to_cbor(model.declared.as_deref())),
+        (
+            "declared_family".into(),
+            text_opt_to_cbor(model.declared_family.as_deref()),
+        ),
+        ("declared_size".into(), text_opt_to_cbor(model.declared_size.as_deref())),
+        ("auth_bound".into(), CborValue::Bool(model.auth_bound)),
     ])
 }
 
@@ -256,10 +439,13 @@ fn budget_to_cbor(b: &Budget) -> CborValue {
 }
 
 fn capability_to_cbor(c: &Capability) -> CborValue {
-    CborValue::Map(vec![
+    let mut pairs = vec![
         ("cap".into(), CborValue::Text(c.cap.clone())),
+        ("category".into(), CborValue::Text(c.category.clone())),
         ("prefer".into(), CborValue::Text(c.prefer.clone())),
         ("shape".into(), CborValue::Text(c.shape.clone())),
+        ("input_schema".into(), schema_ref_opt_to_cbor(c.input_schema.as_ref())),
+        ("output_schema".into(), schema_ref_opt_to_cbor(c.output_schema.as_ref())),
         (
             "min_tier".into(),
             match &c.min_tier {
@@ -267,7 +453,24 @@ fn capability_to_cbor(c: &Capability) -> CborValue {
                 None => CborValue::Null,
             },
         ),
+        (
+            "required_affinity".into(),
+            text_opt_to_cbor(c.required_affinity.as_deref()),
+        ),
         ("cost_class".into(), CborValue::Text(c.cost_class.clone())),
+        (
+            "cost_estimate".into(),
+            cost_estimate_opt_to_cbor(c.cost_estimate.as_ref()),
+        ),
+        ("stability".into(), CborValue::Text(c.stability.clone())),
+        ("since".into(), text_opt_to_cbor(c.since.as_deref())),
+        ("sunset_at".into(), uint_opt_to_cbor(c.sunset_at)),
+        ("model_policy".into(), model_policy_opt_to_cbor(c.model_policy.as_ref())),
+        (
+            "attestations".into(),
+            CborValue::Array(c.attestations.iter().map(attestation_to_cbor).collect()),
+        ),
+        ("concurrency".into(), concurrency_opt_to_cbor(c.concurrency.as_ref())),
         (
             "impl_path".into(),
             CborValue::Map(vec![
@@ -287,7 +490,160 @@ fn capability_to_cbor(c: &Capability) -> CborValue {
                 ),
             ]),
         ),
+    ];
+    if let Some(token_ref) = &c.token_ref {
+        pairs.push(("token_ref".into(), token_ref_to_cbor(token_ref)));
+    }
+    CborValue::Map(pairs)
+}
+
+fn capability_graph_to_cbor(plan: &SessionPlan) -> CborValue {
+    CborValue::Map(vec![
+        (
+            "nodes".into(),
+            CborValue::Array(plan.capability_graph.iter().map(capability_to_cbor).collect()),
+        ),
+        (
+            "edges".into(),
+            CborValue::Array(plan.capability_graph_edges.iter().map(edge_to_cbor).collect()),
+        ),
+        (
+            "excluded".into(),
+            match &plan.capability_graph_excluded {
+                Some(items) => CborValue::Array(items.iter().map(exclusion_to_cbor).collect()),
+                None => CborValue::Null,
+            },
+        ),
+        ("intent_hint".into(), text_opt_to_cbor(plan.intent_hint.as_deref())),
+        ("version".into(), CborValue::Uint(plan.capability_graph_version)),
+        ("valid_until".into(), CborValue::Uint(plan.capability_graph_valid_until)),
+        (
+            "refresh_hint".into(),
+            text_opt_to_cbor(plan.capability_graph_refresh_hint.as_deref()),
+        ),
     ])
+}
+
+fn edge_to_cbor(edge: &Edge) -> CborValue {
+    CborValue::Map(vec![
+        ("from".into(), CborValue::Text(edge.from.clone())),
+        ("to".into(), CborValue::Text(edge.to.clone())),
+        ("kind".into(), CborValue::Text(edge.kind.clone())),
+        ("weight".into(), uint_opt_to_cbor(edge.weight)),
+    ])
+}
+
+fn exclusion_to_cbor(exclusion: &Exclusion) -> CborValue {
+    CborValue::Map(vec![
+        ("cap".into(), CborValue::Text(exclusion.cap.clone())),
+        ("reason".into(), CborValue::Text(exclusion.reason.clone())),
+        ("layer".into(), CborValue::Text(exclusion.layer.clone())),
+        ("hint".into(), text_opt_to_cbor(exclusion.hint.as_deref())),
+    ])
+}
+
+fn schema_ref_opt_to_cbor(schema: Option<&SchemaRef>) -> CborValue {
+    match schema {
+        Some(schema) => CborValue::Map(vec![
+            ("kind".into(), CborValue::Text(schema.kind.clone())),
+            ("uri".into(), CborValue::Text(schema.uri.clone())),
+            ("hash".into(), CborValue::Bytes(schema.hash.to_vec())),
+        ]),
+        None => CborValue::Null,
+    }
+}
+
+fn cost_estimate_opt_to_cbor(cost: Option<&CostEstimate>) -> CborValue {
+    match cost {
+        Some(cost) => CborValue::Map(vec![
+            ("p50_crux".into(), uint_opt_to_cbor(cost.p50_crux)),
+            ("p95_crux".into(), uint_opt_to_cbor(cost.p95_crux)),
+            (
+                "estimation_method".into(),
+                CborValue::Text(cost.estimation_method.clone()),
+            ),
+        ]),
+        None => CborValue::Null,
+    }
+}
+
+fn model_policy_opt_to_cbor(policy: Option<&ModelPolicy>) -> CborValue {
+    match policy {
+        Some(policy) => CborValue::Map(vec![
+            ("min_family".into(), text_array_opt_to_cbor(policy.min_family.as_ref())),
+            ("min_size".into(), text_opt_to_cbor(policy.min_size.as_deref())),
+            (
+                "deny_models".into(),
+                text_array_opt_to_cbor(policy.deny_models.as_ref()),
+            ),
+            ("auth_required".into(), CborValue::Bool(policy.auth_required)),
+        ]),
+        None => CborValue::Null,
+    }
+}
+
+fn attestation_to_cbor(attestation: &AttestationRef) -> CborValue {
+    CborValue::Map(vec![
+        ("issuer".into(), CborValue::Text(attestation.issuer.clone())),
+        ("type".into(), CborValue::Text(attestation.typ.clone())),
+        ("hash".into(), CborValue::Bytes(attestation.hash.to_vec())),
+        ("uri".into(), text_opt_to_cbor(attestation.uri.as_deref())),
+    ])
+}
+
+fn concurrency_opt_to_cbor(concurrency: Option<&ConcurrencyHints>) -> CborValue {
+    match concurrency {
+        Some(concurrency) => CborValue::Map(vec![
+            ("max_parallel".into(), uint_opt_to_cbor(concurrency.max_parallel)),
+            (
+                "rate_limit".into(),
+                rate_limit_opt_to_cbor(concurrency.rate_limit.as_ref()),
+            ),
+        ]),
+        None => CborValue::Null,
+    }
+}
+
+fn rate_limit_opt_to_cbor(rate_limit: Option<&RateLimitHints>) -> CborValue {
+    match rate_limit {
+        Some(rate_limit) => CborValue::Map(vec![
+            ("calls_per_minute".into(), uint_opt_to_cbor(rate_limit.calls_per_minute)),
+            (
+                "tokens_per_minute".into(),
+                uint_opt_to_cbor(rate_limit.tokens_per_minute),
+            ),
+            ("bursts_allowed".into(), CborValue::Bool(rate_limit.bursts_allowed)),
+        ]),
+        None => CborValue::Null,
+    }
+}
+
+fn token_ref_to_cbor(token_ref: &CapabilityTokenRef) -> CborValue {
+    CborValue::Map(vec![
+        ("token_id".into(), CborValue::Text(token_ref.token_id.clone())),
+        ("issued_at".into(), CborValue::Uint(token_ref.issued_at)),
+    ])
+}
+
+fn text_opt_to_cbor(value: Option<&str>) -> CborValue {
+    match value {
+        Some(value) => CborValue::Text(value.to_string()),
+        None => CborValue::Null,
+    }
+}
+
+fn uint_opt_to_cbor(value: Option<u64>) -> CborValue {
+    match value {
+        Some(value) => CborValue::Uint(value),
+        None => CborValue::Null,
+    }
+}
+
+fn text_array_opt_to_cbor(values: Option<&Vec<String>>) -> CborValue {
+    match values {
+        Some(values) => CborValue::Array(values.iter().map(|s| CborValue::Text(s.clone())).collect()),
+        None => CborValue::Null,
+    }
 }
 
 fn receipt_to_cbor(r: &ReceiptEnvelope, zero: bool) -> CborValue {
@@ -328,18 +684,24 @@ fn passport_from_cbor(v: &CborValue) -> Result<Passport, SessionError> {
     Ok(Passport {
         principal_id: take_text(map, "principal_id")?,
         tier: take_text(map, "tier")?,
-        affinities: match get(map, "affinities")? {
-            CborValue::Array(items) => items
-                .iter()
-                .map(|it| match it {
-                    CborValue::Text(s) => Ok(s.clone()),
-                    _ => Err(SessionError::Decode("affinities item not text".to_string())),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            _ => return Err(SessionError::Decode("affinities not array".to_string())),
-        },
+        affinities: take_text_array(map, "affinities")?,
+        denied_capabilities: take_text_array_opt(map, "denied_capabilities")?,
+        grant_expansions: take_text_array_opt(map, "grant_expansions")?,
         passport_receipt: take_bytes_fixed_opt(map, "passport_receipt")?,
     })
+}
+
+fn model_from_cbor(v: &CborValue) -> Result<Option<ModelDeclaration>, SessionError> {
+    if matches!(v, CborValue::Null) {
+        return Ok(None);
+    }
+    let map = as_map(v, "model")?;
+    Ok(Some(ModelDeclaration {
+        declared: take_text_opt(map, "declared")?,
+        declared_family: take_text_opt(map, "declared_family")?,
+        declared_size: take_text_opt(map, "declared_size")?,
+        auth_bound: take_bool(map, "auth_bound")?,
+    }))
 }
 
 fn channels_from_cbor(v: &CborValue) -> Result<Channels, SessionError> {
@@ -359,11 +721,65 @@ fn budget_from_cbor(v: &CborValue) -> Result<Budget, SessionError> {
     })
 }
 
-fn capability_graph_from_cbor(v: &CborValue) -> Result<Vec<Capability>, SessionError> {
-    let CborValue::Array(items) = v else {
-        return Err(SessionError::Decode("capability_graph not array".to_string()));
+fn capability_nodes_from_cbor(v: &CborValue) -> Result<Vec<Capability>, SessionError> {
+    match v {
+        CborValue::Array(items) => items.iter().map(capability_from_legacy_cbor).collect(),
+        CborValue::Map(pairs) => {
+            let CborValue::Array(items) = get(pairs, "nodes")? else {
+                return Err(SessionError::Decode("capability_graph.nodes not array".to_string()));
+            };
+            items.iter().map(capability_from_cbor).collect()
+        }
+        _ => Err(SessionError::Decode("capability_graph not array or map".to_string())),
+    }
+}
+
+fn capability_edges_from_cbor(v: &CborValue) -> Result<Vec<Edge>, SessionError> {
+    let CborValue::Map(pairs) = v else {
+        return Ok(Vec::new());
     };
-    items.iter().map(capability_from_cbor).collect()
+    let CborValue::Array(items) = get(pairs, "edges")? else {
+        return Err(SessionError::Decode("capability_graph.edges not array".to_string()));
+    };
+    items.iter().map(edge_from_cbor).collect()
+}
+
+fn capability_excluded_from_cbor(v: &CborValue) -> Result<Option<Vec<Exclusion>>, SessionError> {
+    let CborValue::Map(pairs) = v else {
+        return Ok(None);
+    };
+    match get(pairs, "excluded")? {
+        CborValue::Null => Ok(None),
+        CborValue::Array(items) => items
+            .iter()
+            .map(exclusion_from_cbor)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        _ => Err(SessionError::Decode(
+            "capability_graph.excluded not array or null".to_string(),
+        )),
+    }
+}
+
+fn capability_graph_version_from_cbor(v: &CborValue) -> Result<u64, SessionError> {
+    let CborValue::Map(pairs) = v else {
+        return Ok(CAPABILITY_GRAPH_VERSION);
+    };
+    take_uint(pairs, "version")
+}
+
+fn capability_graph_valid_until_from_cbor(v: &CborValue, minted_at: u64, ttl_s: u64) -> Result<u64, SessionError> {
+    let CborValue::Map(pairs) = v else {
+        return Ok(minted_at.saturating_add(ttl_s.saturating_mul(1000)));
+    };
+    take_uint(pairs, "valid_until")
+}
+
+fn capability_graph_refresh_hint_from_cbor(v: &CborValue) -> Result<Option<String>, SessionError> {
+    let CborValue::Map(pairs) = v else {
+        return Ok(None);
+    };
+    take_text_opt(pairs, "refresh_hint")
 }
 
 fn capability_from_cbor(v: &CborValue) -> Result<Capability, SessionError> {
@@ -371,15 +787,156 @@ fn capability_from_cbor(v: &CborValue) -> Result<Capability, SessionError> {
     let impl_path_map = as_map(get(map, "impl_path")?, "impl_path")?;
     Ok(Capability {
         cap: take_text(map, "cap")?,
+        category: take_text(map, "category")?,
         prefer: take_text(map, "prefer")?,
         shape: take_text(map, "shape")?,
+        input_schema: schema_ref_from_cbor(get(map, "input_schema")?)?,
+        output_schema: schema_ref_from_cbor(get(map, "output_schema")?)?,
         min_tier: take_text_opt(map, "min_tier")?,
+        required_affinity: take_text_opt(map, "required_affinity")?,
         cost_class: take_text(map, "cost_class")?,
+        cost_estimate: cost_estimate_from_cbor(get(map, "cost_estimate")?)?,
+        stability: take_text(map, "stability")?,
+        since: take_text_opt(map, "since")?,
+        sunset_at: take_uint_opt(map, "sunset_at")?,
+        model_policy: model_policy_from_cbor(get(map, "model_policy")?)?,
+        attestations: attestations_from_cbor(get(map, "attestations")?)?,
+        concurrency: concurrency_from_cbor(get(map, "concurrency")?)?,
         impl_path: ImplPath {
             ce: take_text_opt(impl_path_map, "ce")?,
             core: take_text_opt(impl_path_map, "core")?,
         },
+        token_ref: match find(map, "token_ref") {
+            Some(v) => token_ref_from_cbor(v)?,
+            None => None,
+        },
     })
+}
+
+fn capability_from_legacy_cbor(v: &CborValue) -> Result<Capability, SessionError> {
+    let map = as_map(v, "Capability")?;
+    let impl_path_map = as_map(get(map, "impl_path")?, "impl_path")?;
+    let min_tier = take_text_opt(map, "min_tier")?;
+    Ok(Capability::legacy(
+        take_text(map, "cap")?,
+        take_text(map, "prefer")?,
+        take_text(map, "shape")?,
+        min_tier,
+        take_text(map, "cost_class")?,
+        ImplPath {
+            ce: take_text_opt(impl_path_map, "ce")?,
+            core: take_text_opt(impl_path_map, "core")?,
+        },
+    ))
+}
+
+fn edge_from_cbor(v: &CborValue) -> Result<Edge, SessionError> {
+    let map = as_map(v, "Edge")?;
+    Ok(Edge {
+        from: take_text(map, "from")?,
+        to: take_text(map, "to")?,
+        kind: take_text(map, "kind")?,
+        weight: take_uint_opt(map, "weight")?,
+    })
+}
+
+fn exclusion_from_cbor(v: &CborValue) -> Result<Exclusion, SessionError> {
+    let map = as_map(v, "Exclusion")?;
+    Ok(Exclusion {
+        cap: take_text(map, "cap")?,
+        reason: take_text(map, "reason")?,
+        layer: take_text(map, "layer")?,
+        hint: take_text_opt(map, "hint")?,
+    })
+}
+
+fn schema_ref_from_cbor(v: &CborValue) -> Result<Option<SchemaRef>, SessionError> {
+    if matches!(v, CborValue::Null) {
+        return Ok(None);
+    }
+    let map = as_map(v, "SchemaRef")?;
+    Ok(Some(SchemaRef {
+        kind: take_text(map, "kind")?,
+        uri: take_text(map, "uri")?,
+        hash: take_bytes_fixed(map, "hash")?,
+    }))
+}
+
+fn cost_estimate_from_cbor(v: &CborValue) -> Result<Option<CostEstimate>, SessionError> {
+    if matches!(v, CborValue::Null) {
+        return Ok(None);
+    }
+    let map = as_map(v, "CostEstimate")?;
+    Ok(Some(CostEstimate {
+        p50_crux: take_uint_opt(map, "p50_crux")?,
+        p95_crux: take_uint_opt(map, "p95_crux")?,
+        estimation_method: take_text(map, "estimation_method")?,
+    }))
+}
+
+fn model_policy_from_cbor(v: &CborValue) -> Result<Option<ModelPolicy>, SessionError> {
+    if matches!(v, CborValue::Null) {
+        return Ok(None);
+    }
+    let map = as_map(v, "ModelPolicy")?;
+    Ok(Some(ModelPolicy {
+        min_family: take_text_array_opt(map, "min_family")?,
+        min_size: take_text_opt(map, "min_size")?,
+        deny_models: take_text_array_opt(map, "deny_models")?,
+        auth_required: take_bool(map, "auth_required")?,
+    }))
+}
+
+fn attestations_from_cbor(v: &CborValue) -> Result<Vec<AttestationRef>, SessionError> {
+    match v {
+        CborValue::Null => Ok(Vec::new()),
+        CborValue::Array(items) => items.iter().map(attestation_from_cbor).collect(),
+        _ => Err(SessionError::Decode("attestations not array or null".to_string())),
+    }
+}
+
+fn attestation_from_cbor(v: &CborValue) -> Result<AttestationRef, SessionError> {
+    let map = as_map(v, "AttestationRef")?;
+    Ok(AttestationRef {
+        issuer: take_text(map, "issuer")?,
+        typ: take_text(map, "type")?,
+        hash: take_bytes_fixed(map, "hash")?,
+        uri: take_text_opt(map, "uri")?,
+    })
+}
+
+fn concurrency_from_cbor(v: &CborValue) -> Result<Option<ConcurrencyHints>, SessionError> {
+    if matches!(v, CborValue::Null) {
+        return Ok(None);
+    }
+    let map = as_map(v, "ConcurrencyHints")?;
+    Ok(Some(ConcurrencyHints {
+        max_parallel: take_uint_opt(map, "max_parallel")?,
+        rate_limit: rate_limit_from_cbor(get(map, "rate_limit")?)?,
+    }))
+}
+
+fn rate_limit_from_cbor(v: &CborValue) -> Result<Option<RateLimitHints>, SessionError> {
+    if matches!(v, CborValue::Null) {
+        return Ok(None);
+    }
+    let map = as_map(v, "RateLimitHints")?;
+    Ok(Some(RateLimitHints {
+        calls_per_minute: take_uint_opt(map, "calls_per_minute")?,
+        tokens_per_minute: take_uint_opt(map, "tokens_per_minute")?,
+        bursts_allowed: take_bool(map, "bursts_allowed")?,
+    }))
+}
+
+fn token_ref_from_cbor(v: &CborValue) -> Result<Option<CapabilityTokenRef>, SessionError> {
+    if matches!(v, CborValue::Null) {
+        return Ok(None);
+    }
+    let map = as_map(v, "CapabilityTokenRef")?;
+    Ok(Some(CapabilityTokenRef {
+        token_id: take_text(map, "token_id")?,
+        issued_at: take_uint(map, "issued_at")?,
+    }))
 }
 
 fn receipt_from_cbor(v: &CborValue) -> Result<ReceiptEnvelope, SessionError> {
@@ -451,6 +1008,10 @@ fn get<'a>(map: &'a [Pair], key: &'static str) -> Result<&'a CborValue, SessionE
     Err(SessionError::Decode(format!("missing field `{key}`")))
 }
 
+fn find<'a>(map: &'a [Pair], key: &'static str) -> Option<&'a CborValue> {
+    map.iter().find_map(|(k, v)| (k == key).then_some(v))
+}
+
 fn take_uint(map: &[Pair], key: &'static str) -> Result<u64, SessionError> {
     match get(map, key)? {
         CborValue::Uint(n) => Ok(*n),
@@ -459,10 +1020,17 @@ fn take_uint(map: &[Pair], key: &'static str) -> Result<u64, SessionError> {
 }
 
 fn take_uint_opt(map: &[Pair], key: &'static str) -> Result<Option<u64>, SessionError> {
-    match get(map, key)? {
+    match find(map, key).unwrap_or(&CborValue::Null) {
         CborValue::Null => Ok(None),
         CborValue::Uint(n) => Ok(Some(*n)),
         _ => Err(SessionError::Decode(format!("{key} not uint or null"))),
+    }
+}
+
+fn take_bool(map: &[Pair], key: &'static str) -> Result<bool, SessionError> {
+    match get(map, key)? {
+        CborValue::Bool(value) => Ok(*value),
+        _ => Err(SessionError::Decode(format!("{key} not bool"))),
     }
 }
 
@@ -474,10 +1042,38 @@ fn take_text(map: &[Pair], key: &'static str) -> Result<String, SessionError> {
 }
 
 fn take_text_opt(map: &[Pair], key: &'static str) -> Result<Option<String>, SessionError> {
-    match get(map, key)? {
+    match find(map, key).unwrap_or(&CborValue::Null) {
         CborValue::Null => Ok(None),
         CborValue::Text(s) => Ok(Some(s.clone())),
         _ => Err(SessionError::Decode(format!("{key} not text or null"))),
+    }
+}
+
+fn take_text_array(map: &[Pair], key: &'static str) -> Result<Vec<String>, SessionError> {
+    match get(map, key)? {
+        CborValue::Array(items) => items
+            .iter()
+            .map(|it| match it {
+                CborValue::Text(s) => Ok(s.clone()),
+                _ => Err(SessionError::Decode(format!("{key} item not text"))),
+            })
+            .collect(),
+        _ => Err(SessionError::Decode(format!("{key} not array"))),
+    }
+}
+
+fn take_text_array_opt(map: &[Pair], key: &'static str) -> Result<Option<Vec<String>>, SessionError> {
+    match find(map, key).unwrap_or(&CborValue::Null) {
+        CborValue::Null => Ok(None),
+        CborValue::Array(items) => items
+            .iter()
+            .map(|it| match it {
+                CborValue::Text(s) => Ok(s.clone()),
+                _ => Err(SessionError::Decode(format!("{key} item not text"))),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        _ => Err(SessionError::Decode(format!("{key} not array or null"))),
     }
 }
 
@@ -500,7 +1096,7 @@ fn take_bytes_fixed<const N: usize>(map: &[Pair], key: &'static str) -> Result<[
 }
 
 fn take_bytes_fixed_opt<const N: usize>(map: &[Pair], key: &'static str) -> Result<Option<[u8; N]>, SessionError> {
-    match get(map, key)? {
+    match find(map, key).unwrap_or(&CborValue::Null) {
         CborValue::Null => Ok(None),
         CborValue::Bytes(b) => {
             if b.len() != N {

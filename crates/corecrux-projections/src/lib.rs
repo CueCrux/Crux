@@ -57,7 +57,10 @@ pub mod events_api {
     pub use crate::events::*;
 }
 pub use meta::{
-    load_projections_meta_v1, store_projections_meta_v1, ProjectionCursorV1, ProjectionMetaV1, ProjectionsMetaV1,
+    current_projection_module_versions_v1, load_projections_meta_v1, record_current_projection_modules_v1,
+    store_projections_meta_v1, ProjectionCursorV1, ProjectionMetaV1, ProjectionModuleRefV1, ProjectionModuleStatusV1,
+    ProjectionModuleVersionV1, ProjectionsMetaV1, PROJECTION_MODULES_LIST_SCHEMA_V1,
+    PROJECTION_MODULE_VERSION_SCHEMA_V1,
 };
 pub use runner::{
     ColdSegmentGcOptionsV1, ColdSegmentGcProjectionReportV1, ColdSegmentGcReportV1, ProjectionFilesV1,

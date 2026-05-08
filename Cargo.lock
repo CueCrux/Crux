@@ -1135,6 +1135,7 @@ dependencies = [
  "corecrux-memory",
  "corecrux-retrieval",
  "corecrux-types",
+ "crux-integrations",
  "crux-observe",
  "crux-router",
  "http-body-util",

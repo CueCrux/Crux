@@ -264,6 +264,11 @@ pub(super) async fn get_answer_export_v1(
         Ok(v) => v,
         Err(msg) => return problem_response(StatusCode::BAD_REQUEST, msg),
     };
+    if let Some(response) =
+        super::replay::export_answer_capsule_if_present(&state, &q.tenant_id, &answer_id, opts.clone()).await
+    {
+        return response;
+    }
 
     let mode = q.mode.as_deref().unwrap_or("latest");
     let resolve_mode = match SubjectResolveModeV1::parse(mode) {
