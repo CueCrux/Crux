@@ -1680,6 +1680,302 @@ mod tests {
         }
     }
 
+    /// Read a `Response`'s JSON body fully — mirror of `super::tests::json_body`.
+    async fn response_to_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn post_observation_handler_happy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let resp = post_observation(
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumPath("handler-test".to_string()),
+            Json(PostObservationBody {
+                kind: "tool_use".to_string(),
+                provider: "claude-code".to_string(),
+                client_ts: None,
+                payload: serde_json::json!({"tool": "Read"}),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = response_to_json(resp).await;
+        assert!(body["observation_id"].is_string());
+        assert_eq!(body["receipt"]["alg"], "ed25519");
+        assert!(body["receipt"]["body_hash"].as_str().unwrap().starts_with("blake3:"));
+        assert_eq!(body["receipt"]["signed_by"], key.passport_fpr());
+    }
+
+    #[tokio::test]
+    async fn post_observation_handler_rejects_oversize_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+        // Build a payload > MAX_PAYLOAD_BYTES by stuffing a long string.
+        let oversize = "x".repeat(MAX_PAYLOAD_BYTES + 100);
+        let resp = post_observation(
+            State(state),
+            HeaderMap::new(),
+            AxumPath("oversize-session".to_string()),
+            Json(PostObservationBody {
+                kind: "tool_use".to_string(),
+                provider: "claude-code".to_string(),
+                client_ts: None,
+                payload: serde_json::json!({"big": oversize}),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn post_observations_batch_handler_threads_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        let resp = post_observations_batch(
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumPath("batch-session".to_string()),
+            Json(PostObservationsBatchBody {
+                items: (0..3)
+                    .map(|i| PostObservationBody {
+                        kind: format!("kind_{i}"),
+                        provider: "openai".to_string(),
+                        client_ts: None,
+                        payload: serde_json::json!({"i": i}),
+                    })
+                    .collect(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = response_to_json(resp).await;
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        // Chain was threaded: seq=0,1,2 on the JSONL records.
+        let path = observation_file_path(tmp.path(), "batch-session");
+        let records = read_observations(&path).unwrap();
+        assert_eq!(records.len(), 3);
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(r.seq, Some(i as u64));
+        }
+        assert_eq!(records[0].prev_hash, None);
+        assert!(records[1].prev_hash.is_some());
+        assert!(records[2].prev_hash.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_observations_handler_returns_chain_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        for provider in ["claude-code", "openai"] {
+            append_one(
+                &state,
+                "get-session",
+                key.passport_fpr(),
+                PostObservationBody {
+                    kind: "tool_use".to_string(),
+                    provider: provider.to_string(),
+                    client_ts: None,
+                    payload: serde_json::json!({"p": provider}),
+                },
+                None,
+            )
+            .unwrap();
+        }
+
+        // No filter → 2 records, chain ok.
+        let resp = get_observations(
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumPath("get-session".to_string()),
+            Query(ListObservationsQuery {
+                since: None,
+                limit: None,
+                provider: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = response_to_json(resp).await;
+        assert_eq!(body["observations"].as_array().unwrap().len(), 2);
+        assert_eq!(body["chain"]["status"], "ok");
+        assert_eq!(body["chain"]["chained_len"], 2);
+        assert_eq!(body["chain"]["legacy_prefix_len"], 0);
+
+        // provider=openai → 1 record.
+        let resp = get_observations(
+            State(state.clone()),
+            HeaderMap::new(),
+            AxumPath("get-session".to_string()),
+            Query(ListObservationsQuery {
+                since: None,
+                limit: None,
+                provider: Some("openai".to_string()),
+            }),
+        )
+        .await;
+        let body = response_to_json(resp).await;
+        let obs = body["observations"].as_array().unwrap();
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0]["provider"], "openai");
+
+        // since=<far future> → 0 records but chain still reports the full file ok.
+        let resp = get_observations(
+            State(state),
+            HeaderMap::new(),
+            AxumPath("get-session".to_string()),
+            Query(ListObservationsQuery {
+                since: Some(chrono::Utc::now() + chrono::Duration::days(365)),
+                limit: None,
+                provider: None,
+            }),
+        )
+        .await;
+        let body = response_to_json(resp).await;
+        assert_eq!(body["observations"].as_array().unwrap().len(), 0);
+        assert_eq!(body["chain"]["status"], "ok");
+        assert_eq!(body["chain"]["chained_len"], 2);
+    }
+
+    #[tokio::test]
+    async fn get_observations_aggregate_handler_merges_and_filters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+
+        for sess in ["agg-a", "agg-b"] {
+            for (provider, kind) in [("claude-code", "tool_use"), ("openai", "model_response")] {
+                append_one(
+                    &state,
+                    sess,
+                    key.passport_fpr(),
+                    PostObservationBody {
+                        kind: kind.to_string(),
+                        provider: provider.to_string(),
+                        client_ts: None,
+                        payload: serde_json::Value::Null,
+                    },
+                    None,
+                )
+                .unwrap();
+            }
+        }
+
+        // No filter → 4 records, 2 chains.
+        let resp = get_observations_aggregate(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(AggregateObservationsQuery {
+                since: None,
+                provider: None,
+                kind: None,
+                session_id: None,
+                limit: None,
+            }),
+        )
+        .await;
+        let body = response_to_json(resp).await;
+        assert_eq!(body["matched"], 4);
+        assert_eq!(body["returned"], 4);
+        assert_eq!(body["chains"].as_object().unwrap().len(), 2);
+
+        // provider=openai filter
+        let resp = get_observations_aggregate(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(AggregateObservationsQuery {
+                since: None,
+                provider: Some("openai".to_string()),
+                kind: None,
+                session_id: None,
+                limit: None,
+            }),
+        )
+        .await;
+        let body = response_to_json(resp).await;
+        assert_eq!(body["matched"], 2);
+        for o in body["observations"].as_array().unwrap() {
+            assert_eq!(o["provider"], "openai");
+        }
+
+        // kind=model_response filter
+        let resp = get_observations_aggregate(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(AggregateObservationsQuery {
+                since: None,
+                provider: None,
+                kind: Some("model_response".to_string()),
+                session_id: None,
+                limit: None,
+            }),
+        )
+        .await;
+        let body = response_to_json(resp).await;
+        assert_eq!(body["matched"], 2);
+        for o in body["observations"].as_array().unwrap() {
+            assert_eq!(o["kind"], "model_response");
+        }
+
+        // session_id=agg-a filter
+        let resp = get_observations_aggregate(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(AggregateObservationsQuery {
+                since: None,
+                provider: None,
+                kind: None,
+                session_id: Some("agg-a".to_string()),
+                limit: None,
+            }),
+        )
+        .await;
+        let body = response_to_json(resp).await;
+        assert_eq!(body["matched"], 2);
+        let sids: std::collections::HashSet<String> = body["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["session_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(sids.len(), 1);
+        assert!(sids.iter().next().unwrap().contains("agg-a"));
+
+        // limit=1 with sorted-desc ordering.
+        let resp = get_observations_aggregate(
+            State(state),
+            HeaderMap::new(),
+            Query(AggregateObservationsQuery {
+                since: None,
+                provider: None,
+                kind: None,
+                session_id: None,
+                limit: Some(1),
+            }),
+        )
+        .await;
+        let body = response_to_json(resp).await;
+        assert_eq!(body["matched"], 4);
+        assert_eq!(body["returned"], 1);
+        assert_eq!(body["observations"].as_array().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn end_to_end_chain_is_built_by_repeated_appends() {
         // Set up an AppState with a real passport key + scoped data_dir.
