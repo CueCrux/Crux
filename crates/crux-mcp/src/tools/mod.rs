@@ -17,6 +17,7 @@ pub mod extensions;
 pub mod facts;
 pub mod github;
 pub mod handoff;
+pub mod observations;
 pub mod observe;
 pub mod passport;
 pub mod query;
@@ -316,6 +317,62 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "examples": [
                     { "query": "quantum physics" },
                     {}
+                ]
+            }),
+        },
+        // ── Session observations (multi-provider capture) ──────────
+        ToolDefinition {
+            name: "list_observations".to_string(),
+            description: "List signed observations captured for a session. Each record \
+                          carries an Ed25519 receipt verifiable against the daemon's \
+                          published passport public key. Optional `since` (RFC3339), \
+                          `provider`, and `limit` filters."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session whose observations to list" },
+                    "since":      { "type": "string", "description": "RFC3339 lower bound on observation ts" },
+                    "provider":   { "type": "string", "description": "Filter by capture provider (claude-code, openai, anthropic, codex-cli, openclaw)" },
+                    "limit":      { "type": "integer", "description": "Max records to return (default 50, max 500)" }
+                },
+                "required": ["session_id"],
+                "examples": [
+                    { "session_id": "my-session" },
+                    { "session_id": "my-session", "provider": "claude-code", "limit": 20 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "get_observation".to_string(),
+            description: "Fetch a single observation by id from a given session.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id":     { "type": "string", "description": "Session id" },
+                    "observation_id": { "type": "string", "description": "Observation UUID" }
+                },
+                "required": ["session_id", "observation_id"],
+                "examples": [
+                    { "session_id": "my-session", "observation_id": "01HXXXXXXXXX" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "verify_observation".to_string(),
+            description: "Re-canonicalise an observation, recompute its BLAKE3 body hash, \
+                          and verify the Ed25519 signature against the daemon's published \
+                          passport public key. Returns `{ok, hash_match, signature_valid}`."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id":     { "type": "string", "description": "Session id" },
+                    "observation_id": { "type": "string", "description": "Observation UUID to verify" }
+                },
+                "required": ["session_id", "observation_id"],
+                "examples": [
+                    { "session_id": "my-session", "observation_id": "01HXXXXXXXXX" }
                 ]
             }),
         },
@@ -998,6 +1055,9 @@ pub fn tool_output_docs() -> Value {
         { "tool": "list_sessions",      "output": "{ sessions: [string] }" },
         { "tool": "delete_session",     "output": "{ deleted: bool, session_id }" },
         { "tool": "get_gaps",           "output": "{ gaps: [{entity, key, value, stored_at}], total_tokens }" },
+        { "tool": "list_observations",  "output": "{ session_id, count, observations: [{ observation_id, session_id, ts, provider, principal, kind, payload, receipt: {alg, signed_by, body_hash, signature} }] }" },
+        { "tool": "get_observation",    "output": "Single observation record (same shape as list_observations entries), or a not-found text response." },
+        { "tool": "verify_observation", "output": "{ observation_id, ok: bool, hash_match: bool, signature_valid: bool, recomputed_hash, receipt_hash, reason?: string }" },
         { "tool": "get_agent_identity", "output": "{ agent_name: string }" },
         { "tool": "create_handoff",     "output": "{ package_json, content_hash, signature, relevant_fact_count }" },
         { "tool": "accept_handoff",     "output": "{ session_loaded, facts_loaded, verified: bool }" },
@@ -1061,6 +1121,9 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "list_sessions" => sessions::handle_list_sessions(args, ctx).await,
         "delete_session" => sessions::handle_delete_session(args, ctx).await,
         "get_gaps" => observe::handle_get_gaps(args, ctx).await,
+        "list_observations" => observations::handle_list_observations(args, ctx).await,
+        "get_observation" => observations::handle_get_observation(args, ctx).await,
+        "verify_observation" => observations::handle_verify_observation(args, ctx).await,
         "get_agent_identity" => handle_get_agent_identity(args, ctx).await,
         "create_handoff" => handoff::handle_create_handoff(args, ctx).await,
         "accept_handoff" => handoff::handle_accept_handoff(args, ctx).await,
@@ -1126,7 +1189,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 41; // 34 + enrich_action + 5 GitHub tools + get_workspace_storyline.
+    const TOOL_COUNT: usize = 44; // 41 prior + list_observations + get_observation + verify_observation.
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

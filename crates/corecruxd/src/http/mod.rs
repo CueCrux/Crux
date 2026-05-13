@@ -18,6 +18,7 @@ mod health;
 mod integrations_github;
 mod integrations_openai;
 pub mod invocation;
+pub(crate) mod observations;
 mod observe;
 mod openapi;
 mod passports;
@@ -405,6 +406,23 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/sessions/{sessionId}/state", axum::routing::put(self::facts::put_session_state))
         .route("/v1/sessions/{sessionId}/state", get(self::facts::get_session_state))
+        // Session observations (multi-provider capture, ExecPlan 2026-05-13).
+        .route(
+            "/v1/sessions/{sessionId}/observations",
+            axum::routing::post(self::observations::post_observation),
+        )
+        .route(
+            "/v1/sessions/{sessionId}/observations",
+            get(self::observations::get_observations),
+        )
+        .route(
+            "/v1/sessions/{sessionId}/observations/batch",
+            axum::routing::post(self::observations::post_observations_batch),
+        )
+        .route(
+            "/v1/observations/aggregate",
+            get(self::observations::get_observations_aggregate),
+        )
         // Real-time event stream (SSE)
         .route("/v1/events/stream", get(self::events::event_stream))
         // Self-observation (crux-observe)

@@ -370,6 +370,15 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
         "version": state.build.version,
         "commit": state.build.commit,
         "msrv": "1.88.0",
+        "passport": {
+            // Daemon's local RCX passport identity. The public key is the
+            // verification key for receipts minted by this daemon (e.g.
+            // observation signatures); auditors with the JSONL + this hex
+            // can verify offline.
+            "fingerprint": state.passport_fpr,
+            "public_key_hex": state.passport_public_key_hex,
+            "alg": "ed25519",
+        },
         "product": product,
         "cloud": cloud,
         "cloud_access": {

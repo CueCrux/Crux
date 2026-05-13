@@ -36,6 +36,9 @@ services:
       # Embedding endpoint — set via env or uncomment for Ollama sidecar.
       - CORECRUXD_EMBEDDING_URL=${CORECRUXD_EMBEDDING_URL:-}
       - CORECRUXD_EMBEDDING_MODEL=${CORECRUXD_EMBEDDING_MODEL:-nomic-embed-text}
+      # Phase 2 M5f.2 — archive observation sessions whose newest record is
+      # older than this many days. Default unset = retain forever.
+      - CORECRUXD_OBS_RETENTION_DAYS=${CORECRUXD_OBS_RETENTION_DAYS:-}
 
   # ── Optional: local Ollama for embeddings ──────────────────────
   # Start with:  docker compose --profile embeddings up -d

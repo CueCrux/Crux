@@ -614,7 +614,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 mcp_agent_registry.clone(),
             )
             .with_daemon_base_url(daemon_base)
-            .with_shared_rcx_router(rcx_router),
+            .with_shared_rcx_router(rcx_router)
+            .with_data_dir(state.data_dir.clone())
+            .with_passport_public_key(state.passport_public_key_hex.clone()),
         ))
     } else {
         None
@@ -635,6 +637,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             Ok(reaped) if reaped > 0 => tracing::info!(reaped, "session-ttl-reaper"),
                             Ok(_) => {}
                             Err(err) => tracing::warn!(?err, "session-ttl-reaper-journal-failed"),
+                        }
+                    }
+                    _ = rx.recv() => break,
+                }
+            }
+        });
+    }
+
+    // Observation retention — runs hourly, archives sessions whose newest
+    // record is older than CORECRUXD_OBS_RETENTION_DAYS. Skipped entirely
+    // when the env var is unset or zero so the default is "keep forever".
+    if let Some(max_age_days) = std::env::var("CORECRUXD_OBS_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&n| n > 0)
+    {
+        let data_dir = config.data_dir.clone();
+        let max_age = chrono::Duration::days(max_age_days);
+        let mut rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            tracing::info!(
+                max_age_days,
+                data_dir = %data_dir.display(),
+                "starting observation-retention task (interval=1h)"
+            );
+            // Initial delay so we don't archive in the boot path.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
+            interval.tick().await; // consume the immediate first tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        match crate::http::observations::run_retention_pass(&data_dir, max_age) {
+                            Ok((archived, scanned)) if archived > 0 => {
+                                tracing::info!(archived, scanned, "observation-retention pass");
+                            }
+                            Ok((_, _scanned)) => {}
+                            Err(err) => tracing::warn!(?err, "observation-retention pass failed"),
                         }
                     }
                     _ = rx.recv() => break,
