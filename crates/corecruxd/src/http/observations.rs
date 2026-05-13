@@ -843,6 +843,73 @@ const OBS_DATAPLANE_TENANT: &str = "local";
 /// common case. Failures are logged at WARN — the JSONL write that just
 /// succeeded is the source of truth and the caller has already returned
 /// 201 to the client.
+/// Reason a stream-write build attempt was rejected before the spawn even
+/// happened. Surfaced as an `Err` from `build_observation_stream_events`
+/// so the caller can `tracing::warn!` once and bail without the noise of
+/// nested `match` arms.
+#[derive(Debug, PartialEq, Eq)]
+enum BuildStreamEventsError {
+    InvalidSignatureHex(String),
+    /// Signature decoded to a byte length other than 64.
+    WrongSignatureLength(usize),
+}
+
+impl std::fmt::Display for BuildStreamEventsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSignatureHex(err) => write!(f, "signature hex invalid: {err}"),
+            Self::WrongSignatureLength(len) => write!(f, "signature is not 64 bytes (got {len})"),
+        }
+    }
+}
+
+/// Pure construction of the `(body, sig)` `AppendEvent` pair that a Tier 2+
+/// `PoolBackedHttpDataplane` will write to `STREAM_TYPE_AGENT_OBSERVATION`.
+/// Extracted from `spawn_stream_observation_write` so the event shape (event
+/// ids, content types, occurred_at, payload layout) is unit-testable without
+/// needing a real `DataPlanePool` or a tokio runtime. The async wrapper just
+/// routes the events through the pool.
+fn build_observation_stream_events(
+    observation_id: &str,
+    body_bytes: Vec<u8>,
+    signature_hex: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<
+    (
+        corecrux_proto::dataplane_v1::AppendEvent,
+        corecrux_proto::dataplane_v1::AppendEvent,
+    ),
+    BuildStreamEventsError,
+> {
+    use corecrux_proto::dataplane_v1::AppendEvent;
+    use corecrux_receipts::{
+        CONTENT_TYPE_AGENT_OBSERVATION_BODY_V1, CONTENT_TYPE_AGENT_OBSERVATION_SIG_V1, EVT_AGENT_OBSERVATION_BODY_V1,
+        EVT_AGENT_OBSERVATION_SIG_V1,
+    };
+
+    let signature_bytes =
+        hex::decode(signature_hex).map_err(|err| BuildStreamEventsError::InvalidSignatureHex(err.to_string()))?;
+    if signature_bytes.len() != 64 {
+        return Err(BuildStreamEventsError::WrongSignatureLength(signature_bytes.len()));
+    }
+    let occurred_at_rfc3339 = occurred_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let body_event = AppendEvent {
+        event_id: format!("{observation_id}.body"),
+        occurred_at: occurred_at_rfc3339.clone(),
+        event_type: EVT_AGENT_OBSERVATION_BODY_V1.to_string(),
+        content_type: CONTENT_TYPE_AGENT_OBSERVATION_BODY_V1.to_string(),
+        payload: body_bytes,
+    };
+    let sig_event = AppendEvent {
+        event_id: format!("{observation_id}.sig"),
+        occurred_at: occurred_at_rfc3339,
+        event_type: EVT_AGENT_OBSERVATION_SIG_V1.to_string(),
+        content_type: CONTENT_TYPE_AGENT_OBSERVATION_SIG_V1.to_string(),
+        payload: signature_bytes,
+    };
+    Ok((body_event, sig_event))
+}
+
 fn spawn_stream_observation_write(
     state: &AppState,
     observation_id: &str,
@@ -854,50 +921,17 @@ fn spawn_stream_observation_write(
         return;
     };
     let observation_id = observation_id.to_string();
-    // Sig bytes off the hex receipt — failure here means the signature
-    // we just stored on disk is malformed, which is its own bug.
-    let signature_bytes = match hex::decode(signature_hex) {
-        Ok(bytes) if bytes.len() == 64 => bytes,
-        Ok(bytes) => {
-            tracing::warn!(
-                observation_id,
-                len = bytes.len(),
-                "skipping observation stream write: signature is not 64 bytes"
-            );
-            return;
-        }
-        Err(err) => {
-            tracing::warn!(
-                observation_id,
-                ?err,
-                "skipping observation stream write: signature hex invalid"
-            );
-            return;
-        }
-    };
-    let occurred_at_rfc3339 = occurred_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (body_event, sig_event) =
+        match build_observation_stream_events(&observation_id, body_bytes, signature_hex, occurred_at) {
+            Ok(events) => events,
+            Err(err) => {
+                tracing::warn!(observation_id, reason = %err, "skipping observation stream write");
+                return;
+            }
+        };
 
     tokio::spawn(async move {
-        use corecrux_proto::dataplane_v1::AppendEvent;
-        use corecrux_receipts::{
-            CONTENT_TYPE_AGENT_OBSERVATION_BODY_V1, CONTENT_TYPE_AGENT_OBSERVATION_SIG_V1,
-            EVT_AGENT_OBSERVATION_BODY_V1, EVT_AGENT_OBSERVATION_SIG_V1, STREAM_TYPE_AGENT_OBSERVATION,
-        };
-
-        let body_event = AppendEvent {
-            event_id: format!("{observation_id}.body"),
-            occurred_at: occurred_at_rfc3339.clone(),
-            event_type: EVT_AGENT_OBSERVATION_BODY_V1.to_string(),
-            content_type: CONTENT_TYPE_AGENT_OBSERVATION_BODY_V1.to_string(),
-            payload: body_bytes,
-        };
-        let sig_event = AppendEvent {
-            event_id: format!("{observation_id}.sig"),
-            occurred_at: occurred_at_rfc3339,
-            event_type: EVT_AGENT_OBSERVATION_SIG_V1.to_string(),
-            content_type: CONTENT_TYPE_AGENT_OBSERVATION_SIG_V1.to_string(),
-            payload: signature_bytes,
-        };
+        use corecrux_receipts::STREAM_TYPE_AGENT_OBSERVATION;
 
         let route = match pool
             .store_for_stream(
@@ -1406,6 +1440,78 @@ mod tests {
             ChainStatus::Broken { at_index, .. } => assert_eq!(at_index, 1),
             other => panic!("expected Broken, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_observation_stream_events_success_shape() {
+        // 64-byte signature (128 hex chars). Use zeros — the test cares
+        // about event shape, not signature contents.
+        let sig_hex = "00".repeat(64);
+        let occurred_at = chrono::DateTime::parse_from_rfc3339("2026-05-13T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let body_bytes = b"canonical-body-bytes".to_vec();
+
+        let (body, sig) =
+            build_observation_stream_events("obs-abc-123", body_bytes.clone(), &sig_hex, occurred_at).unwrap();
+
+        use corecrux_receipts::{
+            CONTENT_TYPE_AGENT_OBSERVATION_BODY_V1, CONTENT_TYPE_AGENT_OBSERVATION_SIG_V1,
+            EVT_AGENT_OBSERVATION_BODY_V1, EVT_AGENT_OBSERVATION_SIG_V1,
+        };
+
+        // Body event
+        assert_eq!(body.event_id, "obs-abc-123.body");
+        assert_eq!(body.event_type, EVT_AGENT_OBSERVATION_BODY_V1);
+        assert_eq!(body.content_type, CONTENT_TYPE_AGENT_OBSERVATION_BODY_V1);
+        assert_eq!(body.payload, body_bytes);
+        assert_eq!(body.occurred_at, "2026-05-13T10:00:00Z");
+
+        // Sig event
+        assert_eq!(sig.event_id, "obs-abc-123.sig");
+        assert_eq!(sig.event_type, EVT_AGENT_OBSERVATION_SIG_V1);
+        assert_eq!(sig.content_type, CONTENT_TYPE_AGENT_OBSERVATION_SIG_V1);
+        assert_eq!(sig.payload.len(), 64);
+        assert_eq!(sig.payload, vec![0u8; 64]);
+        // Both events share the same occurred_at (clamped to Seconds RFC3339).
+        assert_eq!(body.occurred_at, sig.occurred_at);
+    }
+
+    #[test]
+    fn build_observation_stream_events_rejects_invalid_signature_hex() {
+        let occurred_at = chrono::Utc::now();
+        // "zz" is not valid hex.
+        let err = build_observation_stream_events("obs-bad-hex", vec![], "zz", occurred_at).unwrap_err();
+        assert!(
+            matches!(err, BuildStreamEventsError::InvalidSignatureHex(_)),
+            "expected InvalidSignatureHex, got {err:?}"
+        );
+        // Display impl should mention the cause.
+        assert!(err.to_string().contains("signature hex"), "got: {err}");
+    }
+
+    #[test]
+    fn build_observation_stream_events_rejects_wrong_signature_length() {
+        let occurred_at = chrono::Utc::now();
+        // 32 bytes (64 hex chars) — half the required length.
+        let sig_hex = "ab".repeat(32);
+        let err = build_observation_stream_events("obs-short-sig", vec![], &sig_hex, occurred_at).unwrap_err();
+        assert_eq!(err, BuildStreamEventsError::WrongSignatureLength(32));
+        // Display impl should mention the actual length.
+        assert!(err.to_string().contains("32"), "got: {err}");
+    }
+
+    #[test]
+    fn build_observation_stream_events_body_bytes_passed_through_verbatim() {
+        // The pure builder MUST NOT touch the body payload — it's the
+        // exact bytes the daemon already hashed and signed. Any rewrite
+        // would break verification.
+        let sig_hex = "11".repeat(64);
+        let bytes_with_nulls = vec![0u8, 1, 2, 0, 3, 4, 0, 5];
+        let (body, _) =
+            build_observation_stream_events("obs-null-bytes", bytes_with_nulls.clone(), &sig_hex, chrono::Utc::now())
+                .unwrap();
+        assert_eq!(body.payload, bytes_with_nulls);
     }
 
     #[tokio::test]
