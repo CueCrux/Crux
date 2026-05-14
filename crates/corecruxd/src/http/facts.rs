@@ -36,7 +36,10 @@ pub(super) struct ExportFactsParams {
 // returning it as the Err arm is the idiomatic axum pattern; suppress
 // the lint at the helper boundary.
 #[allow(clippy::result_large_err)]
-fn require_fact_read_ctx(state: &AppState, headers: &HeaderMap) -> Result<crate::auth::HttpScopeContext, Response> {
+pub(super) fn require_fact_read_ctx(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<crate::auth::HttpScopeContext, Response> {
     require_http_any_scope(&state.auth, headers, &["query:read", "admin:read"]).map_err(IntoResponse::into_response)?;
     http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)
 }
@@ -49,7 +52,10 @@ fn require_fact_write_ctx(state: &AppState, headers: &HeaderMap) -> Result<crate
 }
 
 #[allow(clippy::result_large_err)]
-fn require_session_write_ctx(state: &AppState, headers: &HeaderMap) -> Result<crate::auth::HttpScopeContext, Response> {
+pub(super) fn require_session_write_ctx(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<crate::auth::HttpScopeContext, Response> {
     require_http_any_scope(&state.auth, headers, &["sessions:write", "admin:write"])
         .map_err(IntoResponse::into_response)?;
     http_scope_context(&state.auth, headers).map_err(IntoResponse::into_response)
@@ -158,7 +164,7 @@ fn query_visible_http_facts(
         .collect()
 }
 
-fn scoped_session_id_for_http(ctx: &crate::auth::HttpScopeContext, session_id: &str) -> String {
+pub(super) fn scoped_session_id_for_http(ctx: &crate::auth::HttpScopeContext, session_id: &str) -> String {
     crux_mcp::scope::scoped_session_id(ctx.passport_id.as_deref(), session_id)
 }
 

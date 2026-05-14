@@ -209,7 +209,21 @@ impl TestDaemon {
                 Ok(None) => {}
                 Err(err) => return Err(format!("failed to poll corecruxd process status: {err}")),
             }
-            if self.get("/healthz").is_ok() && self.mcp_get().is_ok() && self.grpc_listening() {
+            // Bind + transport health (/healthz 200, MCP 200, gRPC listening)
+            // is necessary but not sufficient — `/readyz` adds the readiness
+            // gates (lock_held, routing_loaded, capacity, control_evidence,
+            // …) that integration tests like the `readyz` test in
+            // `tests/daemon.rs` assert against. Under `cargo llvm-cov`
+            // instrumentation the daemon's boot path is slower, so tests
+            // racing `/readyz` against `start()` flake. Wait here until the
+            // daemon is *actually* serve-ready, not just port-bound.
+            let healthy = self.get("/healthz").is_ok() && self.mcp_get().is_ok() && self.grpc_listening();
+            let ready = healthy
+                && self
+                    .get("/readyz")
+                    .map(|resp| resp.status().as_u16() == 200)
+                    .unwrap_or(false);
+            if ready {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(100));

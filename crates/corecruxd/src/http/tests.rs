@@ -346,7 +346,7 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
     }
 }
 
-fn test_app_state(action_max_pending: usize) -> AppState {
+pub(super) fn test_app_state(action_max_pending: usize) -> AppState {
     test_app_state_with_auth(action_max_pending, AuthMode::Off)
 }
 

@@ -4,6 +4,7 @@
 
 //! MCP method dispatcher — routes JSON-RPC requests to handlers.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -48,6 +49,14 @@ pub struct McpContext {
     pub daemon_base_url: Option<String>,
     /// Optional RCX router for token-gated MCP catalogue and tool dispatch.
     pub rcx_router: Option<Arc<RcxRouter>>,
+    /// Daemon data directory — needed by tools that read on-disk artifacts
+    /// the HTTP routes produced (e.g. observation JSONL files). `None` in
+    /// test contexts; populated by `corecruxd::main` from `AppState.data_dir`.
+    pub data_dir: Option<PathBuf>,
+    /// Daemon's Ed25519 passport public key (hex). Needed by tools that
+    /// verify signatures (e.g. `verify_observation`). `None` in test
+    /// contexts; populated by `corecruxd::main` from `AppState.passport_public_key_hex`.
+    pub passport_public_key_hex: Option<String>,
 }
 
 impl McpContext {
@@ -65,6 +74,8 @@ impl McpContext {
             node_id,
             daemon_base_url: None,
             rcx_router: None,
+            data_dir: None,
+            passport_public_key_hex: None,
         }
     }
 
@@ -89,6 +100,8 @@ impl McpContext {
             node_id,
             daemon_base_url: None,
             rcx_router: None,
+            data_dir: None,
+            passport_public_key_hex: None,
         }
     }
 
@@ -105,6 +118,8 @@ impl McpContext {
             handoff_key: self.handoff_key,
             daemon_base_url: self.daemon_base_url.clone(),
             rcx_router: self.rcx_router.clone(),
+            data_dir: self.data_dir.clone(),
+            passport_public_key_hex: self.passport_public_key_hex.clone(),
         }
     }
 
@@ -112,6 +127,20 @@ impl McpContext {
     /// corecruxd HTTP server (e.g., `cuecrux_session`).
     pub fn with_daemon_base_url(mut self, url: impl Into<String>) -> Self {
         self.daemon_base_url = Some(url.into());
+        self
+    }
+
+    /// Configure the daemon data directory (used by observation-reading
+    /// tools to locate the on-disk JSONL files).
+    pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
+        self.data_dir = Some(data_dir.into());
+        self
+    }
+
+    /// Configure the daemon's Ed25519 passport public key (hex). Used by
+    /// signature-verifying tools.
+    pub fn with_passport_public_key(mut self, hex: impl Into<String>) -> Self {
+        self.passport_public_key_hex = Some(hex.into());
         self
     }
 

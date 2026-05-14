@@ -40,5 +40,21 @@ pub const EVT_RECEIPT_SIG_V1: &str = "receipt.sig.v1";
 pub const CONTENT_TYPE_RECEIPT_BODY_V1: &str = "application/cbor; profile=cuecrux-receipt-body-v1";
 pub const CONTENT_TYPE_RECEIPT_SIG_V1: &str = "application/cbor; profile=cuecrux-receipt-sig-v1";
 
+// Agent observation stream (Phase 2 M5e — multi-provider capture).
+//
+// The local daemon writes chained JSONL today (each record carries
+// `prev_hash` + `seq` so sequence-level tamper-evident audit works without
+// the dataplane pool). The constants below are the canonical stream-type
+// + event-type tags for a future Tier 2+ deployment that replays chained
+// JSONL into the same `PoolBackedHttpDataplane` infrastructure used by
+// receipts. Declaring them here keeps the schema in one place even though
+// only chained-JSONL writes are wired in the community edition.
+pub const STREAM_TYPE_AGENT_OBSERVATION: &str = "agent.observation";
+pub const EVT_AGENT_OBSERVATION_BODY_V1: &str = "agent.observation.body.v1";
+pub const EVT_AGENT_OBSERVATION_SIG_V1: &str = "agent.observation.sig.v1";
+
+pub const CONTENT_TYPE_AGENT_OBSERVATION_BODY_V1: &str = "application/json; profile=cuecrux-agent-observation-body-v1";
+pub const CONTENT_TYPE_AGENT_OBSERVATION_SIG_V1: &str = "application/json; profile=cuecrux-agent-observation-sig-v1";
+
 #[cfg(test)]
 mod tests;

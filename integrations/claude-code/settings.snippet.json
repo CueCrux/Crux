@@ -1,0 +1,45 @@
+{
+  "_comment": "Crux Daemon observation capture for Claude Code. Merge the 'hooks' block into your ~/.claude/settings.json. Adjust 'command' paths to wherever you installed Crux. The script is fire-and-forget; daemon-down does not block Claude Code.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "/usr/local/share/crux/integrations/claude-code/hooks/crux-observe.sh session_start" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "/usr/local/share/crux/integrations/claude-code/hooks/crux-observe.sh user_prompt" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "/usr/local/share/crux/integrations/claude-code/hooks/crux-observe.sh tool_use" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "/usr/local/share/crux/integrations/claude-code/hooks/crux-observe.sh stop" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "/usr/local/share/crux/integrations/claude-code/hooks/crux-observe.sh session_end" }
+        ]
+      }
+    ]
+  }
+}
