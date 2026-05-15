@@ -335,10 +335,193 @@ fn urlencoding(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
 
     #[test]
     fn urlencoding_handles_special_chars() {
         assert_eq!(urlencoding("work::team"), "work%3A%3Ateam");
         assert_eq!(urlencoding("alphanum-123"), "alphanum-123");
+    }
+
+    fn serve_coordination_loopback() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind coordination loopback");
+        listener.set_nonblocking(true).expect("nonblocking loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                let mut buf = [0u8; 8192];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..read]);
+                let mut parts = req.lines().next().unwrap_or_default().split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or_default();
+
+                let (status, body) = match (method, path) {
+                    ("GET", "/v1/projects") => (
+                        200,
+                        r#"{"projects":[{"id":"alpha","name":"Alpha","planning_target":"tenant://alpha","default_passport_id":"p1"}]}"#,
+                    ),
+                    ("GET", "/v1/projects/alpha") => (
+                        200,
+                        r#"{"id":"alpha","members":[{"passport_id":"p1","role":"owner"}],"tenants":[{"tenant_id":"tenant-a"}]}"#,
+                    ),
+                    ("GET", p) if p.starts_with("/v1/work") => (
+                        200,
+                        r#"{"count":1,"work":[{"id":"w1","project_id":"alpha","state":"planned","tenant_id":"tenant-a"}]}"#,
+                    ),
+                    ("POST", "/v1/work") => (
+                        201,
+                        r#"{"id":"w1","project_id":"alpha","state":"planned","created_by_passport":"p1"}"#,
+                    ),
+                    ("PATCH", "/v1/work/w1") => (200, r#"{"applied":true,"work":{"id":"w1","state":"in_progress"}}"#),
+                    ("POST", "/v1/work/w1/comments") => (
+                        201,
+                        r#"{"id":"c1","work_id":"w1","author_passport":"p1","body":"note"}"#,
+                    ),
+                    _ => (404, r#"{"error":"not found"}"#),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (base, stop, handle)
+    }
+
+    fn stop_loopback(base: &str, stop: Arc<AtomicBool>, handle: std::thread::JoinHandle<()>) {
+        stop.store(true, Ordering::Relaxed);
+        let _ = std::net::TcpStream::connect(base.trim_start_matches("http://"));
+        handle.join().expect("loopback thread");
+    }
+
+    fn text_json(value: Value) -> Value {
+        serde_json::from_str(value["content"][0]["text"].as_str().expect("text content")).expect("json text")
+    }
+
+    #[tokio::test]
+    async fn coordination_handlers_call_loopback_endpoints() {
+        let (base, stop, handle) = serve_coordination_loopback();
+        let ctx = McpContext::new_default("node-a").with_daemon_base_url(base.clone());
+
+        let projects = text_json(handle_list_projects(&json!({}), &ctx).await.expect("list projects"));
+        assert_eq!(projects["projects"][0]["id"], "alpha");
+
+        let project = text_json(
+            handle_get_project_context(&json!({"project_id": "alpha"}), &ctx)
+                .await
+                .expect("project"),
+        );
+        assert_eq!(project["id"], "alpha");
+
+        let work = text_json(
+            handle_list_work(
+                &json!({
+                    "project_id": "alpha",
+                    "state": "planned",
+                    "tenant_id": "tenant-a",
+                    "assignee_passport": "p1"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("list work"),
+        );
+        assert_eq!(work["count"], 1);
+
+        let created = text_json(
+            handle_create_work(
+                &json!({
+                    "project_id": "alpha",
+                    "title": "Ship coverage",
+                    "body": "exercise loopback",
+                    "state": "planned",
+                    "created_by_passport": "p1"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("create work"),
+        );
+        assert_eq!(created["id"], "w1");
+
+        let updated = text_json(
+            handle_update_work_state(
+                &json!({
+                    "work_id": "w1",
+                    "state": "in_progress",
+                    "by_passport": "p1",
+                    "blocker_reason": "none"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("update work"),
+        );
+        assert_eq!(updated["applied"], true);
+
+        let comment = text_json(
+            handle_comment_on_work(
+                &json!({
+                    "work_id": "w1",
+                    "author_passport": "p1",
+                    "body": "covered"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("comment"),
+        );
+        assert_eq!(comment["work_id"], "w1");
+
+        stop_loopback(&base, stop, handle);
+    }
+
+    #[tokio::test]
+    async fn coordination_handlers_validate_required_arguments() {
+        let ctx = McpContext::new_default("node-a").with_daemon_base_url("http://127.0.0.1:9");
+        assert_eq!(
+            handle_get_project_context(&json!({}), &ctx)
+                .await
+                .expect_err("missing project")
+                .code,
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            handle_create_work(&json!({"project_id": "alpha"}), &ctx)
+                .await
+                .expect_err("missing title")
+                .code,
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            handle_update_work_state(&json!({"work_id": "w1"}), &ctx)
+                .await
+                .expect_err("missing state")
+                .code,
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            handle_comment_on_work(&json!({"work_id": "w1", "author_passport": "p1"}), &ctx)
+                .await
+                .expect_err("missing body")
+                .code,
+            INVALID_PARAMS
+        );
     }
 }

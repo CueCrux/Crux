@@ -441,6 +441,13 @@ pub fn compare(file1: &str, file2: &str) -> Result<(), Box<dyn std::error::Error
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
 
     #[test]
     fn percentile_basic() {
@@ -484,5 +491,121 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn serve_mock_daemon() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock daemon");
+        listener.set_nonblocking(true).expect("set mock daemon nonblocking");
+        let base = format!("http://{}", listener.local_addr().expect("mock addr"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let fact_counter = Arc::new(AtomicUsize::new(0));
+        let counter_thread = Arc::clone(&fact_counter);
+
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+
+                let mut buf = [0u8; 8192];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..read]);
+                let mut parts = req.lines().next().unwrap_or_default().split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or_default();
+
+                let body = match (method, path) {
+                    ("GET", "/readyz") => "{}".to_string(),
+                    ("PUT", "/v1/facts") => {
+                        let n = counter_thread.fetch_add(1, Ordering::Relaxed);
+                        format!(r#"{{"fact_id":"f_mock_{n}"}}"#)
+                    }
+                    ("GET", p) if p.starts_with("/v1/facts/entity/") && p.ends_with("/history") => {
+                        r#"{"versions":[{"fact_id":"f_mock_0"},{"fact_id":"f_mock_1"}]}"#.to_string()
+                    }
+                    ("GET", p) if p.starts_with("/v1/facts?query=") => {
+                        r#"{"facts":[{"fact_id":"f_doc_1","entity":"__benchmark__::doc_001","value":"rust benchmark latency policy test value"},{"fact_id":"f_doc_2","entity":"__benchmark__::doc_002","value":"storage graph session coverage"}]}"#
+                            .to_string()
+                    }
+                    ("GET", p) if p.starts_with("/v1/facts?entity=") => r#"{"facts":[]}"#.to_string(),
+                    ("DELETE", _) => "{}".to_string(),
+                    _ => r#"{"facts":[]}"#.to_string(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (base, stop, handle)
+    }
+
+    #[test]
+    fn quick_benchmark_runs_against_mock_daemon_and_writes_report() {
+        let (base, stop, handle) = serve_mock_daemon();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = dir.path().join("cruxscore-report.json");
+
+        run(&base, "quick", false, output.to_str()).expect("quick benchmark");
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = std::net::TcpStream::connect(base.trim_start_matches("http://"));
+        handle.join().expect("mock daemon thread");
+
+        let report: BenchmarkReport =
+            serde_json::from_slice(&std::fs::read(&output).expect("read benchmark report")).expect("parse report");
+        assert_eq!(report.suite, "quick");
+        assert_eq!(report.scores.corpus_size, 50);
+        assert_eq!(report.scores.query_count, 20);
+        assert!(report.scores.query_latency_p50_ms >= 0.0);
+        assert_eq!(report.scores.config_hash, "default");
+    }
+
+    #[test]
+    fn compare_accepts_two_report_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mk_report = |name: &str, coverage_score: f32, latency: f64| {
+            let report = BenchmarkReport {
+                suite: "quick".to_string(),
+                scores: CruxScoreLite {
+                    version: "lite-1.0".to_string(),
+                    coverage_score,
+                    recall_at_5: 0.5,
+                    mrr: 0.25,
+                    fact_recall: 1.0,
+                    version_chain_depth: 2.0,
+                    query_latency_p50_ms: latency,
+                    query_latency_p95_ms: latency + 1.0,
+                    corpus_size: 2,
+                    query_count: 1,
+                    config_hash: "default".to_string(),
+                    crux_version: "test".to_string(),
+                    timestamp: "2026-05-15T00:00:00Z".to_string(),
+                },
+                config: BenchmarkConfig {
+                    bm25_k1: 1.2,
+                    bm25_b: 0.75,
+                    graph_weight: 0.3,
+                    build_ccxi: true,
+                },
+                system: SystemInfo {
+                    crux_version: "test".to_string(),
+                    os: "test".to_string(),
+                    arch: "test".to_string(),
+                },
+            };
+            let path = dir.path().join(name);
+            std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+            path
+        };
+
+        let one = mk_report("one.json", 0.4, 10.0);
+        let two = mk_report("two.json", 0.7, 7.5);
+        compare(one.to_str().unwrap(), two.to_str().unwrap()).expect("compare");
     }
 }

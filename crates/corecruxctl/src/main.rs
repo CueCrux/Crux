@@ -1029,7 +1029,10 @@ enum EvidenceCommand {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cli = Cli::parse();
+    run_cli(Cli::parse())
+}
+
+fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match cli.command {
         Command::Replay {
             pack,
@@ -2244,6 +2247,10 @@ mod tests {
     use clap::Parser;
     use std::fs;
     use tempfile::TempDir;
+
+    fn run_args(args: &[&str]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        run_cli(Cli::try_parse_from(args.iter().copied()).unwrap())
+    }
 
     // ── CLI parsing: top-level subcommands ──────────────────────────────
 
@@ -4036,8 +4043,201 @@ mod tests {
     // Dispatch-level tests: exercise match-arm bodies with real tempdirs
     // ════════════════════════════════════════════════════════════════════
 
-    /// Helper: run the full main() dispatch for a given command via Cli::try_parse_from.
-    /// We replicate the match logic but call the underlying functions directly.
+    #[test]
+    fn run_cli_dispatches_replay_validation_paths() {
+        let err = run_args(&["corecruxctl", "replay", "--pack", "/tmp/nope", "--mode", "debug"]).unwrap_err();
+        assert!(err.to_string().contains("unsupported mode"));
+
+        let err = run_args(&["corecruxctl", "replay"]).unwrap_err();
+        assert!(err.to_string().contains("--pack"));
+    }
+
+    #[test]
+    fn run_cli_dispatches_store_index_and_snapshot_commands() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("shards")).unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+
+        run_args(&["corecruxctl", "verify-store", "--data-dir", data_dir]).unwrap();
+        run_args(&["corecruxctl", "ccxi", "verify", "--data-dir", data_dir]).unwrap();
+        run_args(&["corecruxctl", "snapshot", "list", "--data-dir", data_dir]).unwrap();
+        run_args(&["corecruxctl", "snapshot", "verify", "--data-dir", data_dir]).unwrap();
+    }
+
+    #[test]
+    fn run_cli_dispatches_shardmap_file_commands() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        let map = dir.path().join("map.json");
+        let gpu_map = dir.path().join("map-gpu.json");
+        let split_map = dir.path().join("map-split.json");
+        let map_s = map.to_str().unwrap();
+        let gpu_map_s = gpu_map.to_str().unwrap();
+        let split_map_s = split_map.to_str().unwrap();
+        let data_dir_s = data_dir.to_str().unwrap();
+
+        run_args(&["corecruxctl", "shardmap", "init", "--shards", "2", "--out", map_s]).unwrap();
+        run_args(&["corecruxctl", "shardmap", "validate", "--file", map_s]).unwrap();
+        run_args(&[
+            "corecruxctl",
+            "shardmap",
+            "publish",
+            "--file",
+            map_s,
+            "--data-dir",
+            data_dir_s,
+        ])
+        .unwrap();
+        run_args(&[
+            "corecruxctl",
+            "shardmap",
+            "set-gpu",
+            "--file",
+            map_s,
+            "--shard",
+            "shard-0001",
+            "--gpu-id",
+            "3",
+            "--out",
+            gpu_map_s,
+        ])
+        .unwrap();
+        run_args(&[
+            "corecruxctl",
+            "shardmap",
+            "split",
+            "--file",
+            gpu_map_s,
+            "--shard",
+            "shard-0001",
+            "--at",
+            "0x4000000000000000",
+            "--out",
+            split_map_s,
+        ])
+        .unwrap();
+        assert!(data_dir.join("meta/routing/current").exists());
+    }
+
+    #[test]
+    fn run_cli_dispatches_local_report_commands() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+
+        run_args(&["corecruxctl", "gaps", "--data-dir", data_dir, "--since", "2026-01-01"]).unwrap();
+        run_args(&["corecruxctl", "inspect-receipt", "receipt-abc", "--data-dir", data_dir]).unwrap();
+        run_args(&["corecruxctl", "explain", "receipt-abc", "--data-dir", data_dir]).unwrap();
+    }
+
+    #[test]
+    fn run_cli_dispatches_fast_error_paths() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let target = dir.path().join("warm");
+        let target_s = target.to_str().unwrap();
+
+        let err = run_args(&[
+            "corecruxctl",
+            "storage",
+            "offload",
+            "--tier",
+            "warm",
+            "--older-than",
+            "30",
+            "--target",
+            target_s,
+            "--data-dir",
+            data_dir,
+            "--delete-source",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("delete-source"));
+
+        let err = run_args(&[
+            "corecruxctl",
+            "reconcile",
+            "--connection-string",
+            "postgres://example",
+            "--tenant",
+            "tenant-a",
+            "--data-dir",
+            data_dir,
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("--postgres"));
+
+        let err = run_args(&[
+            "corecruxctl",
+            "admin",
+            "stream-meta",
+            "--tenant-id",
+            "tenant-a",
+            "--stream-type",
+            "orders",
+            "--stream-id",
+            "order-1",
+            "--actor",
+            "ops",
+            "--reason",
+            "test",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("min-live-seq"));
+
+        let err = run_args(&["corecruxctl", "extensions", "list-registry", "--data-dir", data_dir]).unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn run_cli_dispatches_benchmark_compare_and_standard_suite() {
+        let dir = TempDir::new().unwrap();
+        let report_a = dir.path().join("a.json");
+        let report_b = dir.path().join("b.json");
+        let report = |coverage_score: f32, latency: f64| {
+            serde_json::json!({
+                "suite": "quick",
+                "scores": {
+                    "version": "lite-1.0",
+                    "coverage_score": coverage_score,
+                    "recall_at_5": 0.5,
+                    "mrr": 0.25,
+                    "fact_recall": 1.0,
+                    "version_chain_depth": 2.0,
+                    "query_latency_p50_ms": latency,
+                    "query_latency_p95_ms": latency + 1.0,
+                    "corpus_size": 2,
+                    "query_count": 1,
+                    "config_hash": "default",
+                    "crux_version": "test",
+                    "timestamp": "2026-05-15T00:00:00Z"
+                },
+                "config": {
+                    "bm25_k1": 1.2,
+                    "bm25_b": 0.75,
+                    "graph_weight": 0.3,
+                    "build_ccxi": true
+                },
+                "system": {
+                    "crux_version": "test",
+                    "os": "test",
+                    "arch": "test"
+                }
+            })
+        };
+        fs::write(&report_a, serde_json::to_vec(&report(0.4, 10.0)).unwrap()).unwrap();
+        fs::write(&report_b, serde_json::to_vec(&report(0.7, 7.5)).unwrap()).unwrap();
+
+        run_args(&[
+            "corecruxctl",
+            "benchmark",
+            "--compare",
+            report_a.to_str().unwrap(),
+            "--compare",
+            report_b.to_str().unwrap(),
+        ])
+        .unwrap();
+        run_args(&["corecruxctl", "benchmark", "--suite", "standard"]).unwrap();
+    }
 
     // ── Dispatch: verify-store with tempdir ────────────────────────────
 

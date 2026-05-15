@@ -278,6 +278,14 @@ impl TestDaemon {
         Self::agent().put(&format!("{}{path}", self.base_url)).send_json(body)
     }
 
+    pub fn patch_json(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        Self::agent().patch(&format!("{}{path}", self.base_url)).send_json(body)
+    }
+
     pub fn delete(&self, path: &str) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         Self::agent().delete(&format!("{}{path}", self.base_url)).call()
     }

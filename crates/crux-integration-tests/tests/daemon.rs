@@ -14,6 +14,36 @@ fn daemon() -> &'static TestDaemon {
     D.get_or_init(TestDaemon::start)
 }
 
+fn unique_id(prefix: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{prefix}-{nanos}")
+}
+
+fn mcp_tool_call(tool: &str, arguments: serde_json::Value) -> serde_json::Value {
+    daemon()
+        .mcp_post_json(json!({
+            "jsonrpc": "2.0",
+            "id": unique_id("mcp"),
+            "method": "tools/call",
+            "params": {
+                "name": tool,
+                "arguments": arguments
+            }
+        }))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap()
+}
+
+fn mcp_text_json(body: &serde_json::Value) -> serde_json::Value {
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    serde_json::from_str(text).unwrap()
+}
+
 #[test]
 fn healthz() {
     let b: serde_json::Value = daemon().get("/healthz").unwrap().into_body().read_json().unwrap();
@@ -97,6 +127,465 @@ fn console_integrations_api() {
         .unwrap()
         .iter()
         .any(|pack| { pack["manifest"]["id"] == "mcp.cursor" }));
+}
+
+#[test]
+fn projects_work_and_coordination_tools_flow() {
+    let d = daemon();
+    let project_id = unique_id("coverage-project");
+    let actor_passport = unique_id("coverage-actor");
+    let gated_passport = unique_id("coverage-gate");
+
+    let actor: serde_json::Value = d
+        .post_json(
+            "/v1/passports",
+            json!({
+                "id": actor_passport,
+                "category": "work"
+            }),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(actor["id"], actor_passport);
+
+    let passport: serde_json::Value = d
+        .post_json(
+            "/v1/passports",
+            json!({
+                "id": gated_passport,
+                "category": "work",
+                "agent_work_gate": true
+            }),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(passport["id"], gated_passport);
+
+    let created: serde_json::Value = d
+        .post_json(
+            "/v1/projects",
+            json!({
+                "id": project_id,
+                "name": "Coverage Project",
+                "planning_target": "github://cuecrux/crux",
+                "default_passport_id": actor_passport,
+                "working_tenants": ["tenant-a"]
+            }),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(created["id"], project_id);
+
+    let project: serde_json::Value = d
+        .get(&format!("/v1/projects/{project_id}"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(project["id"], project_id);
+
+    let patched: serde_json::Value = d
+        .patch_json(
+            &format!("/v1/projects/{project_id}"),
+            json!({
+                "name": "Coverage Project Updated",
+                "planning_target": null,
+                "archived": false
+            }),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(patched["planning_target"], serde_json::Value::Null);
+
+    let member: serde_json::Value = d
+        .post_json(
+            &format!("/v1/projects/{project_id}/passports"),
+            json!({"passport_id": gated_passport, "role": "reviewer"}),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(member["role"], "reviewer");
+
+    let tenant: serde_json::Value = d
+        .post_json(
+            &format!("/v1/projects/{project_id}/tenants"),
+            json!({"tenant_id": "tenant-b", "default_passport_id": actor_passport}),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(tenant["tenant_id"], "tenant-b");
+
+    let layer: serde_json::Value = d
+        .put_json(
+            &format!("/v1/projects/{project_id}/layers/vision"),
+            json!({"content": "Coverage-driven project context"}),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(layer["layer"], "vision");
+
+    let layers: serde_json::Value = d
+        .get(&format!("/v1/projects/{project_id}/layers"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(layers["count"], 1);
+
+    let repo_link: serde_json::Value = d
+        .post_json(
+            &format!("/v1/projects/{project_id}/repos"),
+            json!({"repo": "cuecrux/crux", "plane_id": "backend", "role": "work"}),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(repo_link["owner"], "cuecrux");
+    assert_eq!(repo_link["repo"], "crux");
+
+    let repos: serde_json::Value = d
+        .get(&format!("/v1/projects/{project_id}/repos"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(repos["count"], 1);
+
+    let plane_repos: serde_json::Value = d
+        .get(&format!("/v1/projects/{project_id}/planes/backend/repos"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(plane_repos["count"], 1);
+
+    let graph: serde_json::Value = d
+        .get(&format!("/v1/projects/{project_id}/context-graph"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert!(graph["nodes"].as_array().unwrap().len() >= 2);
+
+    let work: serde_json::Value = d
+        .post_json(
+            "/v1/work",
+            json!({
+                "project_id": project_id,
+                "title": "Raise coverage",
+                "body": "Add deterministic coverage tests",
+                "state": "planned",
+                "assignee_passport": actor_passport,
+                "tenant_id": "tenant-a",
+                "linked_pr": "https://github.com/cuecrux/crux/pull/1",
+                "linked_issue": "https://github.com/cuecrux/crux/issues/1",
+                "created_by_passport": actor_passport
+            }),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let work_id = work["id"].as_str().unwrap().to_string();
+
+    let work_list: serde_json::Value = d
+        .get(&format!(
+            "/v1/work?project_id={project_id}&state=planned&tenant_id=tenant-a"
+        ))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert!(work_list["count"].as_u64().unwrap() >= 1);
+
+    let applied: serde_json::Value = d
+        .patch_json(
+            &format!("/v1/work/{work_id}"),
+            json!({
+                "state": "in_progress",
+                "body": "Now underway",
+                "by_passport": actor_passport
+            }),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(applied["applied"], true);
+
+    let comment: serde_json::Value = d
+        .post_json(
+            &format!("/v1/work/{work_id}/comments"),
+            json!({"author_passport": actor_passport, "body": "Coverage flow exercised."}),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(comment["work_id"], work_id);
+
+    let comments: serde_json::Value = d
+        .get(&format!("/v1/work/{work_id}/comments"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(comments["comments"].as_array().unwrap().len(), 1);
+
+    let transitions: serde_json::Value = d
+        .get(&format!("/v1/work/{work_id}/transitions"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert!(!transitions["transitions"].as_array().unwrap().is_empty());
+
+    let queued: serde_json::Value = d
+        .patch_json(
+            &format!("/v1/work/{work_id}"),
+            json!({
+                "state": "complete",
+                "by_passport": gated_passport
+            }),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(queued["applied"], false);
+    let action_id = queued["queued"]["action_id"].as_str().unwrap();
+
+    let pending: serde_json::Value = d
+        .get(&format!("/v1/work/gate/pending?by_passport={gated_passport}"))
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(pending["count"], 1);
+
+    let approved: serde_json::Value = d
+        .post_json(
+            &format!("/v1/work/gate/{action_id}/approve"),
+            json!({"approver_passport": actor_passport}),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(approved["state"], "complete");
+
+    let mcp_projects = mcp_text_json(&mcp_tool_call("list_projects", json!({})));
+    assert!(mcp_projects["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"] == project_id));
+
+    let mcp_project = mcp_text_json(&mcp_tool_call("get_project_context", json!({"project_id": project_id})));
+    assert_eq!(mcp_project["id"], project_id);
+
+    let mcp_work = mcp_text_json(&mcp_tool_call(
+        "create_work",
+        json!({
+            "project_id": project_id,
+            "title": "MCP-created coverage work",
+            "body": "Created through coordination tool",
+            "state": "planned",
+            "tenant_id": "tenant-b",
+            "created_by_passport": actor_passport
+        }),
+    ));
+    let mcp_work_id = mcp_work["id"].as_str().unwrap();
+
+    let mcp_list_work = mcp_text_json(&mcp_tool_call(
+        "list_work",
+        json!({"project_id": project_id, "tenant_id": "tenant-b"}),
+    ));
+    assert!(mcp_list_work["count"].as_u64().unwrap() >= 1);
+
+    let mcp_updated = mcp_text_json(&mcp_tool_call(
+        "update_work_state",
+        json!({
+            "work_id": mcp_work_id,
+            "state": "blocked",
+            "by_passport": actor_passport,
+            "blocker_reason": "waiting for CI"
+        }),
+    ));
+    assert_eq!(mcp_updated["applied"], true);
+
+    let mcp_comment = mcp_text_json(&mcp_tool_call(
+        "comment_on_work",
+        json!({
+            "work_id": mcp_work_id,
+            "author_passport": actor_passport,
+            "body": "MCP comment coverage"
+        }),
+    ));
+    assert_eq!(mcp_comment["work_id"], mcp_work_id);
+
+    assert_eq!(
+        d.delete(&format!("/v1/projects/{project_id}/repos/cuecrux/crux"))
+            .unwrap()
+            .status()
+            .as_u16(),
+        204
+    );
+    assert_eq!(
+        d.delete(&format!("/v1/projects/{project_id}/layers/vision"))
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    assert_eq!(
+        d.delete(&format!("/v1/projects/{project_id}/tenants/tenant-b"))
+            .unwrap()
+            .status()
+            .as_u16(),
+        204
+    );
+    assert_eq!(
+        d.delete(&format!("/v1/projects/{project_id}/passports/{gated_passport}"))
+            .unwrap()
+            .status()
+            .as_u16(),
+        204
+    );
+}
+
+#[test]
+fn integration_setup_and_workspace_status_endpoints() {
+    let d = daemon();
+
+    let tools: serde_json::Value = d.get("/v1/mcp/tools").unwrap().into_body().read_json().unwrap();
+    assert!(tools["count"].as_u64().unwrap() >= 35);
+
+    match d.get("/v1/workspace/scan") {
+        Err(ureq::Error::StatusCode(404)) => {}
+        other => panic!("expected no persisted workspace scan yet, got {other:?}"),
+    }
+    match d.get("/v1/workspace/storyline?format=json") {
+        Err(ureq::Error::StatusCode(404)) => {}
+        other => panic!("expected storyline without scan to 404, got {other:?}"),
+    }
+    match d.post_json("/v1/workspace/scan", json!({})) {
+        Err(ureq::Error::StatusCode(412)) => {}
+        other => panic!("expected unconfigured workspace scan to 412, got {other:?}"),
+    }
+
+    let github_initial: serde_json::Value = d
+        .get("/v1/integrations/github/status")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(github_initial["connected"], false);
+
+    match d.get("/v1/integrations/github/repos/accessible") {
+        Err(ureq::Error::StatusCode(412)) => {}
+        other => panic!("expected GitHub accessible repos to require connect, got {other:?}"),
+    }
+
+    let github_connected: serde_json::Value = d
+        .post_json(
+            "/v1/integrations/github/connect",
+            json!({
+                "pat": "ghp_test_token",
+                "skip_verify": true,
+                "username_override": "coverage-bot"
+            }),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(github_connected["connected"], true);
+    assert_eq!(github_connected["username"], "coverage-bot");
+
+    let selected: serde_json::Value = d
+        .get("/v1/integrations/github/repos")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(selected["count"], 0);
+
+    assert_eq!(
+        d.post_json("/v1/integrations/github/disconnect", json!({}))
+            .unwrap()
+            .status()
+            .as_u16(),
+        204
+    );
+
+    let openai_initial: serde_json::Value = d
+        .get("/v1/integrations/openai/status")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(openai_initial["connected"], false);
+
+    match d.post_json("/v1/integrations/openai/chat", json!({"messages": []})) {
+        Err(ureq::Error::StatusCode(412)) => {}
+        other => panic!("expected OpenAI chat to require connect, got {other:?}"),
+    }
+
+    let openai_connected: serde_json::Value = d
+        .post_json(
+            "/v1/integrations/openai/connect",
+            json!({
+                "api_key": "sk-test-token",
+                "organization_id": "org-coverage",
+                "default_model": "gpt-4o-mini",
+                "skip_verify": true
+            }),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(openai_connected["connected"], true);
+    assert_eq!(openai_connected["organization_id"], "org-coverage");
+
+    let openai_updated: serde_json::Value = d
+        .patch_json(
+            "/v1/integrations/openai/settings",
+            json!({
+                "default_model": "gpt-4.1-mini",
+                "organization_id": ""
+            }),
+        )
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(openai_updated["default_model"], "gpt-4.1-mini");
+    assert!(openai_updated.get("organization_id").is_none());
+
+    assert_eq!(
+        d.post_json("/v1/integrations/openai/disconnect", json!({}))
+            .unwrap()
+            .status()
+            .as_u16(),
+        204
+    );
 }
 #[test]
 fn shards() {

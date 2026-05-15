@@ -7831,6 +7831,133 @@ async fn session_plan_read_through_requires_session_scope() {
 }
 
 #[tokio::test]
+async fn invocation_verify_disabled_and_bad_request_paths() {
+    let state = test_app_state(16);
+    let disabled = super::invocation::post_invocation_verify(State(state), axum::body::Bytes::from_static(b"{}")).await;
+    assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let mut state = test_app_state(16);
+    state.session = Some(Arc::new(super::session::SessionServices::local_default("node-a")));
+    let bad_json =
+        super::invocation::post_invocation_verify(State(state.clone()), axum::body::Bytes::from_static(b"{")).await;
+    assert_eq!(bad_json.status(), StatusCode::BAD_REQUEST);
+
+    let invalid_wire = serde_json::json!({
+        "invocation_id": "not-hex",
+        "session_id": "00".repeat(16),
+        "parent_plan_receipt_hash": "00".repeat(32),
+        "capability": "retrieve",
+        "channel": "mcp",
+        "invoked_at": 1,
+        "completed_at": 2,
+        "input_hash": "00".repeat(32),
+        "output_hash": "00".repeat(32),
+        "outcome": "ok",
+        "receipt_hash": "00".repeat(32)
+    });
+    let invalid = super::invocation::post_invocation_verify(
+        State(state),
+        axum::body::Bytes::from(serde_json::to_vec(&invalid_wire).unwrap()),
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn invocation_verify_parent_not_found_and_success_paths() {
+    let mut state = test_app_state(16);
+    let services = Arc::new(super::session::SessionServices::local_default("node-a"));
+    state.session = Some(services.clone());
+
+    let not_found_wire = serde_json::json!({
+        "invocation_id": "11".repeat(16),
+        "session_id": "22".repeat(16),
+        "parent_plan_receipt_hash": "33".repeat(32),
+        "capability": "retrieve",
+        "channel": "mcp",
+        "invoked_at": 1,
+        "completed_at": 2,
+        "input_hash": "44".repeat(32),
+        "output_hash": "55".repeat(32),
+        "outcome": "ok",
+        "cost_crux": 7,
+        "receipt_hash": "66".repeat(32),
+        "receipt_signature": "77".repeat(64),
+        "signer_kid": "kid-test"
+    });
+    let not_found = super::invocation::post_invocation_verify(
+        State(state.clone()),
+        axum::body::Bytes::from(serde_json::to_vec(&not_found_wire).unwrap()),
+    )
+    .await;
+    assert_eq!(not_found.status(), StatusCode::OK);
+    let not_found_body = json_body(not_found).await;
+    assert_eq!(not_found_body["verified"], false);
+    assert_eq!(not_found_body["parent_plan_found"], false);
+    assert_eq!(not_found_body["governance_faults"][0], "parent_plan_not_found");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let create = super::session::post_session(
+        State(state.clone()),
+        headers,
+        axum::body::Bytes::from_static(
+            br#"{"client_id":"test-agent","client_version":"0.1.0","accepts":["application/json"],"intent":"audit"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::OK);
+    let session_id_hex = create
+        .headers()
+        .get("x-cuecrux-session-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    let session_bytes: [u8; 16] = hex::decode(&session_id_hex).unwrap().try_into().unwrap();
+    let entry = services.registry.get(&session_bytes).unwrap().unwrap();
+    let plan = crux_session::SessionPlan::from_canonical_cbor(&entry.plan_cbor).unwrap();
+    let cap = plan.capability_graph.first().unwrap();
+    let receipt = crux_session::mint_invocation_receipt(crux_session::MintInvocation {
+        invocation_id: [0x99; 16],
+        parent_plan: &plan,
+        capability: cap.cap.clone(),
+        channel: cap.prefer.clone(),
+        invoked_at_ms: 10,
+        completed_at_ms: 11,
+        input_hash: [0x44; 32],
+        output_hash: [0x55; 32],
+        outcome: "ok".to_string(),
+        cost_crux: Some(7),
+        signer_kid: Some("kid-test".to_string()),
+    });
+    let ok_wire = serde_json::json!({
+        "invocation_id": hex::encode(receipt.invocation_id),
+        "session_id": hex::encode(receipt.session_id),
+        "parent_plan_receipt_hash": hex::encode(receipt.parent_plan_receipt_hash),
+        "capability": receipt.capability,
+        "channel": receipt.channel,
+        "invoked_at": receipt.invoked_at,
+        "completed_at": receipt.completed_at,
+        "input_hash": hex::encode(receipt.input_hash),
+        "output_hash": hex::encode(receipt.output_hash),
+        "outcome": receipt.outcome,
+        "cost_crux": receipt.cost_crux,
+        "receipt_hash": hex::encode(receipt.receipt_hash),
+        "signer_kid": receipt.signer_kid
+    });
+    let ok = super::invocation::post_invocation_verify(
+        State(state),
+        axum::body::Bytes::from(serde_json::to_vec(&ok_wire).unwrap()),
+    )
+    .await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let ok_body = json_body(ok).await;
+    assert_eq!(ok_body["verified"], true);
+    assert_eq!(ok_body["parent_plan_found"], true);
+    assert!(ok_body["parent_plan_principal_id"].as_str().unwrap().starts_with("ce:"));
+}
+
+#[tokio::test]
 async fn engram_list_session_init_and_resolve_match_hosted_shape() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
 
@@ -8185,6 +8312,180 @@ async fn projects_delete_removes_subentities() {
 }
 
 #[tokio::test]
+async fn projects_members_tenants_layers_repos_and_graph_round_trip() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+
+    let create_resp = super::projects::post_project(
+        State(state.clone()),
+        dev_scope_headers("admin:read facts:write"),
+        Json(super::projects::CreateProjectBody {
+            id: "alpha".to_string(),
+            name: "Alpha".to_string(),
+            planning_target: Some("github://cuecrux/crux".to_string()),
+            default_passport_id: "personal-default".to_string(),
+            working_tenants: vec!["tenant-a".to_string()],
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    let patch_resp = super::projects::patch_project(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+        Json(super::projects::UpdateProjectBody {
+            name: Some("Alpha Updated".to_string()),
+            planning_target: Some(None),
+            default_passport_id: None,
+            archived: Some(false),
+            is_default: Some(true),
+        }),
+    )
+    .await
+    .into_response();
+    let patched = json_body(patch_resp).await;
+    assert_eq!(patched["name"], "Alpha Updated");
+    assert!(patched["planning_target"].is_null());
+
+    let member_resp = super::projects::post_project_member(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+        Json(super::projects::AddMemberBody {
+            passport_id: "work-default".to_string(),
+            role: "reviewer".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(member_resp.status(), StatusCode::CREATED);
+
+    let tenant_resp = super::projects::post_project_tenant(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+        Json(super::projects::AddTenantBody {
+            tenant_id: "tenant-b".to_string(),
+            default_passport_id: Some("public-default".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(tenant_resp.status(), StatusCode::CREATED);
+
+    let layer_resp = super::projects::put_project_layer(
+        State(state.clone()),
+        Path(("alpha".to_string(), "vision".to_string())),
+        dev_scope_headers("facts:write"),
+        Json(super::projects::PutLayerBody {
+            content: "project context".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(layer_resp.status(), StatusCode::OK);
+
+    let layers = super::projects::get_project_layers(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let layers_body = json_body(layers).await;
+    assert_eq!(layers_body["count"], 1);
+
+    let repo_resp = super::projects::post_project_repo(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_passport_headers("facts:write", "work-default"),
+        Json(super::projects::LinkRepoBody {
+            repo: "cuecrux/crux".to_string(),
+            plane_id: Some("daemon".to_string()),
+            role: "work".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    let repo_body = json_body(repo_resp).await;
+    assert_eq!(repo_body["owner"], "cuecrux");
+
+    let repos = super::projects::get_project_repos(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(json_body(repos).await["count"], 1);
+
+    let plane_repos = super::projects::get_plane_repos(
+        State(state.clone()),
+        Path(("alpha".to_string(), "daemon".to_string())),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(json_body(plane_repos).await["count"], 1);
+
+    let graph = super::projects::get_context_graph(
+        State(state.clone()),
+        Path("alpha".to_string()),
+        Query(super::projects::GraphQuery {
+            include_workspace: false,
+            include_symbols: false,
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(graph.status(), StatusCode::OK);
+    let graph_body = json_body(graph).await;
+    assert!(graph_body["nodes"].as_array().expect("nodes").len() >= 2);
+
+    let delete_repo = super::projects::delete_project_repo(
+        State(state.clone()),
+        Path(("alpha".to_string(), "cuecrux".to_string(), "crux".to_string())),
+        dev_scope_headers("facts:write"),
+    )
+    .await
+    .into_response();
+    assert_eq!(delete_repo.status(), StatusCode::NO_CONTENT);
+
+    let delete_layer = super::projects::delete_project_layer(
+        State(state.clone()),
+        Path(("alpha".to_string(), "vision".to_string())),
+        dev_scope_headers("facts:write"),
+    )
+    .await
+    .into_response();
+    assert_eq!(delete_layer.status(), StatusCode::OK);
+
+    let delete_tenant = super::projects::delete_project_tenant(
+        State(state.clone()),
+        Path(("alpha".to_string(), "tenant-b".to_string())),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(delete_tenant.status(), StatusCode::NO_CONTENT);
+
+    let delete_member = super::projects::delete_project_member(
+        State(state),
+        Path(("alpha".to_string(), "work-default".to_string())),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(delete_member.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn work_post_then_list_then_patch_state_round_trip() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     {
@@ -8333,6 +8634,146 @@ async fn work_patch_with_gated_passport_returns_202_queued() {
     .into_response();
     let pending_body = json_body(pending_resp).await;
     assert_eq!(pending_body["count"], 1);
+}
+
+#[tokio::test]
+async fn work_comments_get_item_and_gate_resolution_paths() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let work_id = {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+        crate::projects::seed_default_if_missing(&mut store, 1).expect("project seed");
+        crate::work::create_work(
+            &mut store,
+            crate::work::CreateWorkInput {
+                project_id: "default".to_string(),
+                title: "gate me".to_string(),
+                body: None,
+                state: None,
+                assignee_passport: None,
+                tenant_id: None,
+                linked_pr: None,
+                linked_issue: None,
+                created_by_passport: "personal-default".to_string(),
+            },
+            1_000,
+        )
+        .expect("create")
+        .id
+    };
+
+    let item_resp = super::work::get_work_item(
+        State(state.clone()),
+        Path(work_id.clone()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(json_body(item_resp).await["id"], work_id);
+
+    let comment_resp = super::work::post_comment(
+        State(state.clone()),
+        Path(work_id.clone()),
+        dev_scope_headers("facts:write"),
+        Json(super::work::CommentBody {
+            author_passport: "personal-default".to_string(),
+            body: "ready for review".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(comment_resp.status(), StatusCode::CREATED);
+
+    let comments_resp = super::work::get_comments(
+        State(state.clone()),
+        Path(work_id.clone()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(json_body(comments_resp).await["comments"].as_array().unwrap().len(), 1);
+
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::update_passport(
+            &mut store,
+            "personal-default",
+            crate::passports::UpdatePassportInput {
+                agent_work_gate: Some(true),
+                is_default_for_category: None,
+                sponsor_id: None,
+                reputation_tier: None,
+                receipt_count: None,
+            },
+        )
+        .expect("flip gate");
+    }
+
+    let queue_for_reject = super::work::patch_work(
+        State(state.clone()),
+        Path(work_id.clone()),
+        dev_scope_headers("facts:write"),
+        Json(super::work::UpdateWorkBody {
+            title: Some("queued reject".to_string()),
+            body: None,
+            state: Some("blocked".to_string()),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: Some(Some("needs approval".to_string())),
+            by_passport: "personal-default".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    let reject_body = json_body(queue_for_reject).await;
+    let reject_action = reject_body["queued"]["action_id"].as_str().unwrap().to_string();
+
+    let rejected = super::work::post_gate_reject(
+        State(state.clone()),
+        Path(reject_action),
+        dev_scope_headers("admin:read"),
+        Json(super::work::GateResolutionBody {
+            approver_passport: "work-default".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(rejected.status(), StatusCode::OK);
+
+    let queue_for_approve = super::work::patch_work(
+        State(state.clone()),
+        Path(work_id),
+        dev_scope_headers("facts:write"),
+        Json(super::work::UpdateWorkBody {
+            title: None,
+            body: None,
+            state: Some("complete".to_string()),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            by_passport: "personal-default".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    let approve_body = json_body(queue_for_approve).await;
+    let approve_action = approve_body["queued"]["action_id"].as_str().unwrap().to_string();
+
+    let approved = super::work::post_gate_approve(
+        State(state),
+        Path(approve_action),
+        dev_scope_headers("admin:read"),
+        Json(super::work::GateResolutionBody {
+            approver_passport: "work-default".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(json_body(approved).await["state"], "complete");
 }
 
 #[tokio::test]
@@ -8554,6 +8995,134 @@ async fn github_sync_returns_412_when_not_connected() {
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+}
+
+#[tokio::test]
+async fn openai_connect_settings_chat_precondition_and_disconnect() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let status = super::integrations_openai::get_status(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(json_body(status).await["connected"], false);
+
+    let chat_precondition = super::integrations_openai::post_chat(
+        State(state.clone()),
+        dev_scope_headers("integrations:install"),
+        Json(super::integrations_openai::ChatBody {
+            messages: serde_json::json!([]),
+            model: None,
+            max_tokens: None,
+            temperature: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(chat_precondition.status(), StatusCode::PRECONDITION_FAILED);
+
+    let bad_connect = super::integrations_openai::post_connect(
+        State(state.clone()),
+        dev_scope_headers("integrations:install"),
+        Json(super::integrations_openai::ConnectOpenAiBody {
+            api_key: " ".to_string(),
+            organization_id: None,
+            default_model: None,
+            skip_verify: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(bad_connect.status(), StatusCode::BAD_REQUEST);
+
+    let forbidden = super::integrations_openai::post_connect(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Json(super::integrations_openai::ConnectOpenAiBody {
+            api_key: "sk-test".to_string(),
+            organization_id: None,
+            default_model: None,
+            skip_verify: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let connected = super::integrations_openai::post_connect(
+        State(state.clone()),
+        dev_scope_headers("integrations:install"),
+        Json(super::integrations_openai::ConnectOpenAiBody {
+            api_key: "sk-test".to_string(),
+            organization_id: Some("org-test".to_string()),
+            default_model: Some("gpt-4o-mini".to_string()),
+            skip_verify: true,
+        }),
+    )
+    .await
+    .into_response();
+    let connected_body = json_body(connected).await;
+    assert_eq!(connected_body["connected"], true);
+    assert_eq!(connected_body["organization_id"], "org-test");
+
+    let settings = super::integrations_openai::patch_settings(
+        State(state.clone()),
+        dev_scope_headers("integrations:install"),
+        Json(super::integrations_openai::UpdateOpenAiBody {
+            default_model: Some("gpt-4.1-mini".to_string()),
+            organization_id: Some(" ".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let settings_body = json_body(settings).await;
+    assert_eq!(settings_body["default_model"], "gpt-4.1-mini");
+    assert!(settings_body.get("organization_id").is_none());
+
+    let disconnected =
+        super::integrations_openai::post_disconnect(State(state.clone()), dev_scope_headers("integrations:disable"))
+            .await
+            .into_response();
+    assert_eq!(disconnected.status(), StatusCode::NO_CONTENT);
+
+    let status = super::integrations_openai::get_status(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(json_body(status).await["connected"], false);
+}
+
+#[tokio::test]
+async fn workspace_routes_report_catalog_and_missing_scan_states() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let tools = super::workspace::get_mcp_tools(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    let tools_body = json_body(tools).await;
+    assert!(tools_body["count"].as_u64().unwrap() >= 35);
+
+    let missing_scan = super::workspace::get_scan(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(missing_scan.status(), StatusCode::NOT_FOUND);
+
+    let missing_storyline = super::workspace::get_storyline(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(super::workspace::StorylineQuery {
+            root: None,
+            format: Some("json".to_string()),
+            include_tests: Some("yes".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(missing_storyline.status(), StatusCode::NOT_FOUND);
+
+    std::env::remove_var("CORECRUXD_WORKSPACE_PATH");
+    let unconfigured = super::workspace::post_scan(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(unconfigured.status(), StatusCode::PRECONDITION_FAILED);
 }
 
 #[tokio::test]

@@ -148,7 +148,7 @@ jobs:
     runs-on: [self-hosted, ci]
     env:
       CARGO_HOME: /home/gha-runner/.cargo
-      COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/http/append\.rs|.*/corecruxd/src/http/query\.rs|.*/corecruxd/src/http/projections\.rs|.*/corecruxd/src/http/receipts\.rs)$'
+      COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/main\.rs|.*/corecruxd/src/http/admin\.rs|.*/corecruxd/src/http/append\.rs|.*/corecruxd/src/http/query\.rs|.*/corecruxd/src/http/projections\.rs|.*/corecruxd/src/http/receipts\.rs|.*/corecruxctl/src/main\.rs|.*/corecruxctl/src/audit_pack\.rs)$'
     steps:
       - uses: actions/checkout@v6
       - name: Preflight (self-hosted runner toolchain)
@@ -183,8 +183,8 @@ jobs:
 
           FAILED=0
 
-          if (( $(echo "$TOTAL < 81" | bc -l) )); then
-            echo "::error::Workspace coverage ${TOTAL}% is below 81% floor"
+          if (( $(echo "$TOTAL < 85" | bc -l) )); then
+            echo "::error::Workspace coverage ${TOTAL}% is below 85% floor"
             FAILED=1
           fi
 
