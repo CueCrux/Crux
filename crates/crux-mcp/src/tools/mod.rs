@@ -13,10 +13,14 @@ pub mod constraint;
 pub mod coordination;
 pub mod cuecrux_session;
 pub mod decision;
+pub mod edges;
+pub mod entities;
 pub mod extensions;
 pub mod facts;
+pub mod features;
 pub mod github;
 pub mod handoff;
+pub mod kinds;
 pub mod observations;
 pub mod observe;
 pub mod passport;
@@ -852,6 +856,198 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             description: storyline::description().to_string(),
             input_schema: storyline::input_schema(),
         },
+        // ── Substrate: entities / edges / kinds (M1) ──────────────
+        ToolDefinition {
+            name: "entity_upsert".to_string(),
+            description: "Substrate: upsert an entity in the domain substrate. `kind` must \
+                          be a registered KindRegistry kind (lens crates register at \
+                          startup). `payload` is validated against the kind's JSON-Schema."
+                .to_string(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "kind":{"type":"string","description":"Entity kind (e.g. 'capability', 'repo')"},
+                    "id":{"type":"string","description":"Entity ID within its kind"},
+                    "payload":{"type":"object","description":"Domain payload (kind-specific schema)"}
+                },
+                "required":["kind","id","payload"],
+                "examples":[{"kind":"capability","id":"CORECRUX-RECEIPTS","payload":{"name":"Receipts","system":"CoreCrux","maturity":"shipped"}}]
+            }),
+        },
+        ToolDefinition {
+            name: "entity_get".to_string(),
+            description: "Substrate: fetch one entity by (kind, id). Returns null payload if missing.".to_string(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "kind":{"type":"string"},
+                    "id":{"type":"string"},
+                    "include_deleted":{"type":"boolean","default":false}
+                },
+                "required":["kind","id"],
+                "examples":[{"kind":"capability","id":"CORECRUX-RECEIPTS"}]
+            }),
+        },
+        ToolDefinition {
+            name: "entity_list".to_string(),
+            description: "Substrate: list entities, optionally filtered by kind. Sorted by (kind, id).".to_string(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "kind":{"type":"string"},
+                    "limit":{"type":"integer"},
+                    "include_deleted":{"type":"boolean","default":false}
+                },
+                "examples":[{"kind":"capability","limit":100},{}]
+            }),
+        },
+        ToolDefinition {
+            name: "entity_delete".to_string(),
+            description: "Substrate: soft-delete an entity. The version chain is preserved.".to_string(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "kind":{"type":"string"},
+                    "id":{"type":"string"}
+                },
+                "required":["kind","id"],
+                "examples":[{"kind":"capability","id":"OBSOLETE-FOO"}]
+            }),
+        },
+        ToolDefinition {
+            name: "entity_history".to_string(),
+            description: "Substrate: return the full version chain (oldest → newest) for an entity. M2: receipt-grade audit trail.".to_string(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "kind":{"type":"string"},
+                    "id":{"type":"string"}
+                },
+                "required":["kind","id"],
+                "examples":[{"kind":"capability","id":"CORECRUX-RECEIPTS"}]
+            }),
+        },
+        ToolDefinition {
+            name: "edge_upsert".to_string(),
+            description: "Substrate: upsert a labelled directed edge between two entities.".to_string(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "from_kind":{"type":"string"},
+                    "from_id":{"type":"string"},
+                    "edge_kind":{"type":"string"},
+                    "to_kind":{"type":"string"},
+                    "to_id":{"type":"string"},
+                    "payload":{"type":"object"}
+                },
+                "required":["from_kind","from_id","edge_kind","to_kind","to_id"],
+                "examples":[{"from_kind":"capability","from_id":"A","edge_kind":"depends_on","to_kind":"capability","to_id":"B"}]
+            }),
+        },
+        ToolDefinition {
+            name: "edge_get".to_string(),
+            description: "Substrate: fetch one edge by its full five-tuple.".to_string(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "from_kind":{"type":"string"},
+                    "from_id":{"type":"string"},
+                    "edge_kind":{"type":"string"},
+                    "to_kind":{"type":"string"},
+                    "to_id":{"type":"string"}
+                },
+                "required":["from_kind","from_id","edge_kind","to_kind","to_id"],
+                "examples":[{"from_kind":"capability","from_id":"A","edge_kind":"depends_on","to_kind":"capability","to_id":"B"}]
+            }),
+        },
+        ToolDefinition {
+            name: "edge_list".to_string(),
+            description: "Substrate: list edges by any prefix of (from_kind, from_id), (to_kind, to_id), or edge_kind.".to_string(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "from_kind":{"type":"string"},
+                    "from_id":{"type":"string"},
+                    "to_kind":{"type":"string"},
+                    "to_id":{"type":"string"},
+                    "edge_kind":{"type":"string"},
+                    "limit":{"type":"integer"},
+                    "include_deleted":{"type":"boolean","default":false}
+                },
+                "examples":[{"from_kind":"capability","from_id":"A"},{"edge_kind":"depends_on","limit":50}]
+            }),
+        },
+        ToolDefinition {
+            name: "edge_delete".to_string(),
+            description: "Substrate: soft-delete an edge by its full five-tuple.".to_string(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "from_kind":{"type":"string"},
+                    "from_id":{"type":"string"},
+                    "edge_kind":{"type":"string"},
+                    "to_kind":{"type":"string"},
+                    "to_id":{"type":"string"}
+                },
+                "required":["from_kind","from_id","edge_kind","to_kind","to_id"],
+                "examples":[{"from_kind":"capability","from_id":"A","edge_kind":"depends_on","to_kind":"capability","to_id":"B"}]
+            }),
+        },
+        // ── Features lens (M3) ─────────────────────────────────────
+        ToolDefinition {
+            name: "feature_file_search".to_string(),
+            description: "Features lens: find capabilities whose `files` list contains the given substring.".to_string(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{"path":{"type":"string"}},
+                "required":["path"],
+                "examples":[{"path":"src/foo.rs"}]
+            }),
+        },
+        ToolDefinition {
+            name: "feature_coverage_report".to_string(),
+            description: "Features lens: per-system coverage report (totals, tested, audited, shipped, maturity breakdown).".to_string(),
+            input_schema: json!({"type":"object","properties":{},"examples":[{}]}),
+        },
+        ToolDefinition {
+            name: "feature_trigger_audit".to_string(),
+            description: "Features lens: record an audit on a capability. Status must be one of audited|gap|waived|blocked.".to_string(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{
+                    "id":{"type":"string"},
+                    "status":{"type":"string","enum":["audited","gap","waived","blocked"]},
+                    "auditor":{"type":"string"},
+                    "notes":{"type":"string"}
+                },
+                "required":["id","status"],
+                "examples":[{"id":"CORECRUX-RECEIPTS","status":"audited","auditor":"qa"}]
+            }),
+        },
+        ToolDefinition {
+            name: "feature_suggest_next".to_string(),
+            description: "Features lens: suggest next-best capabilities to work on, derived from gap analysis + weakest promise.".to_string(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{"limit":{"type":"integer","default":5}},
+                "examples":[{},{"limit":10}]
+            }),
+        },
+        ToolDefinition {
+            name: "kind_list".to_string(),
+            description: "Substrate: list all registered kinds (entity types) with their description and allowed edges.".to_string(),
+            input_schema: json!({"type":"object","properties":{},"examples":[{}]}),
+        },
+        ToolDefinition {
+            name: "kind_get".to_string(),
+            description: "Substrate: fetch the registration for one kind, including its JSON-Schema.".to_string(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{"kind":{"type":"string"}},
+                "required":["kind"],
+                "examples":[{"kind":"capability"}]
+            }),
+        },
     ]
     .into_iter()
     .map(|mut t: ToolDefinition| {
@@ -1083,7 +1279,22 @@ pub fn tool_output_docs() -> Value {
         { "tool": "github_open_prs",       "output": "{ count, facts: [Fact] } — entities are `github::owner/repo::pr/{number}`; value JSON contains title, state, author_login?, head_sha, base_branch, body, merged_at?, closed_at?, html_url." },
         { "tool": "github_open_issues",    "output": "{ count, facts: [Fact] } — entities are `github::owner/repo::issue/{number}`; value JSON contains title, state, labels[], body, closed_at?, html_url." },
         { "tool": "github_comments_since", "output": "{ count, facts: [Fact] } — entities are `github::owner/repo::comment/{id}`; value JSON contains author_login?, body, posted_at, parent_number, html_url." },
-        { "tool": "get_workspace_storyline", "output": "When format='tree': plaintext ASCII tree-art (one tree per route, or one if endpoint set), `text/plain`. When format='json': { files: [{p, c, m, d, f, t}], edges: [[from_id, to_id, count, to_symbol]], routes: [{m, p, h, f, chain: [file_ids]}] }." }
+        { "tool": "get_workspace_storyline", "output": "When format='tree': plaintext ASCII tree-art (one tree per route, or one if endpoint set), `text/plain`. When format='json': { files: [{p, c, m, d, f, t}], edges: [[from_id, to_id, count, to_symbol]], routes: [{m, p, h, f, chain: [file_ids]}] }." },
+        { "tool": "entity_upsert", "output": "{ content: [...], entity: EntityRecord { kind, id, payload, created_at, updated_at, version, deleted, actor } }" },
+        { "tool": "entity_get",    "output": "{ content: [...], entity: EntityRecord | null }" },
+        { "tool": "entity_list",   "output": "{ content: [...], entities: [EntityRecord], count }" },
+        { "tool": "entity_delete", "output": "{ content: [...], entity: EntityRecord (deleted=true) }" },
+        { "tool": "entity_history", "output": "{ content: [...], versions: [EntityRecord], count } — oldest first; last entry has deleted=true if the entity has been deleted." },
+        { "tool": "edge_upsert",   "output": "{ content: [...], edge: EdgeRecord { edge_id, from_kind, from_id, edge_kind, to_kind, to_id, payload, created_at, updated_at, version, deleted, actor } }" },
+        { "tool": "edge_get",      "output": "{ content: [...], edge: EdgeRecord | null }" },
+        { "tool": "edge_list",     "output": "{ content: [...], edges: [EdgeRecord], count }" },
+        { "tool": "edge_delete",   "output": "{ content: [...], edge: EdgeRecord (deleted=true) }" },
+        { "tool": "kind_list",     "output": "{ content: [...], kinds: [{ kind, description, allowed_outgoing_edges, allowed_incoming_edges }], count }" },
+        { "tool": "kind_get",      "output": "{ content: [...], registration: KindRegistration | null }" },
+        { "tool": "feature_file_search",     "output": "{ content: [...], capabilities: [{id, name, system, files}], count }" },
+        { "tool": "feature_coverage_report", "output": "{ content: [...], report: CoverageReport { total_capabilities, total_tested, total_audited, maturity, systems } }" },
+        { "tool": "feature_trigger_audit",   "output": "{ content: [...], capability: <updated payload>, version }" },
+        { "tool": "feature_suggest_next",    "output": "{ content: [...], suggestions: [{kind, capability_id?, gap_type?, severity?, promise?, rationale}], count }" }
     ])
 }
 
@@ -1153,6 +1364,23 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "github_comments_since" => github::handle_github_comments_since(args, ctx).await,
         // Workspace storyline (HTTP loopback to corecruxd).
         "get_workspace_storyline" => storyline::handle_get_workspace_storyline(args, ctx).await,
+        // Substrate (M1).
+        "entity_upsert" => entities::handle_entity_upsert(args, ctx).await,
+        "entity_get" => entities::handle_entity_get(args, ctx).await,
+        "entity_list" => entities::handle_entity_list(args, ctx).await,
+        "entity_delete" => entities::handle_entity_delete(args, ctx).await,
+        "entity_history" => entities::handle_entity_history(args, ctx).await,
+        "edge_upsert" => edges::handle_edge_upsert(args, ctx).await,
+        "edge_get" => edges::handle_edge_get(args, ctx).await,
+        "edge_list" => edges::handle_edge_list(args, ctx).await,
+        "edge_delete" => edges::handle_edge_delete(args, ctx).await,
+        "kind_list" => kinds::handle_kind_list(args, ctx).await,
+        "kind_get" => kinds::handle_kind_get(args, ctx).await,
+        // Features lens (M3).
+        "feature_file_search" => features::handle_feature_file_search(args, ctx).await,
+        "feature_coverage_report" => features::handle_feature_coverage_report(args, ctx).await,
+        "feature_trigger_audit" => features::handle_feature_trigger_audit(args, ctx).await,
+        "feature_suggest_next" => features::handle_feature_suggest_next(args, ctx).await,
         name if extensions::is_extension_tool_name(name) => extensions::call_extension_tool(name, args, ctx).await,
         _ => Err(JsonRpcError {
             code: crate::protocol::METHOD_NOT_FOUND,
@@ -1189,7 +1417,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 44; // 41 prior + list_observations + get_observation + verify_observation.
+    const TOOL_COUNT: usize = 59; // 55 prior + 4 Features lens tools (M3: feature_*).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

@@ -63,6 +63,9 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
             rcx_router: ctx.rcx_router.clone(),
             data_dir: ctx.data_dir.clone(),
             passport_public_key_hex: ctx.passport_public_key_hex.clone(),
+            entity_store: Arc::clone(&ctx.entity_store),
+            edge_store: Arc::clone(&ctx.edge_store),
+            kind_registry: Arc::clone(&ctx.kind_registry),
         }
     };
 

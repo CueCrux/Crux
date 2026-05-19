@@ -53,6 +53,21 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
         }
     }
 
+    // Drift check against bundled profile fragments. Cheap, filesystem-only;
+    // surfaces "your CLAUDE.md is out of date" without touching the daemon.
+    if std::env::var("CRUX_HOOK_WIZARD_CHECK").as_deref() != Ok("off") {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        match crux_config_wizard::drift::check_workspace(&cwd) {
+            Ok(report) if report.drifted() => {
+                sections.push(format!("**Crux config drift**\n{}", report.message_for_claude()));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("crux-hook session-start: wizard drift check failed: {err}");
+            }
+        }
+    }
+
     if !sections.is_empty() {
         let body = sections.join("\n\n");
         HookOutput::new("SessionStart", body).emit()?;

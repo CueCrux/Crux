@@ -1,0 +1,29 @@
+[package]
+name = "crux-config-wizard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Composes CLAUDE.md and AGENTS.md from versioned profile fragments for Crux-aligned workspaces."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "crux-config-wizard"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = "1.8.5"
+chrono = { version = "0.4.40", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.6.1", features = ["derive"] }
+dialoguer = "0.11.0"
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.139"
+thiserror = "2.0.12"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3.16.0"
+
+[lints]
+workspace = true

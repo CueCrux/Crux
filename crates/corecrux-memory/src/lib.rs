@@ -19,15 +19,28 @@
 //! [`SessionStore`] persists structured session state (decisions, open questions,
 //! constraints) keyed by session ID. Sessions cost ~87 tokens vs ~15K tokens
 //! for replaying a full conversation.
+//!
+//! ## Entity / Edge Substrate
+//!
+//! [`EntityStore`] and [`EdgeStore`], paired with a [`KindRegistry`], form the
+//! domain substrate exposed under `/v1/entities/*` and `/v1/edges/*`. Lens
+//! crates register a `KindRegistration` at startup and store their domain data
+//! as `(kind, id, payload)` tuples plus directed labelled edges between them.
 
 pub mod action_enrichment;
+pub mod edge_store;
 pub mod embeddings;
+pub mod entity_store;
 pub mod events;
 pub mod fact_store;
+pub mod kind_registry;
 pub mod replay;
 pub mod semantic;
 pub mod session_store;
 pub mod sync;
 
+pub use edge_store::{EdgeError, EdgeQuery, EdgeRecord, EdgeStore};
+pub use entity_store::{EntityError, EntityQuery, EntityRecord, EntityStore};
 pub use fact_store::{Fact, FactStore};
+pub use kind_registry::{KindError, KindRegistration, KindRegistry};
 pub use session_store::{SessionState, SessionStore};
