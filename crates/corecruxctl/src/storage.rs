@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Storage inspector — opens shard storage, enumerates segments + dir runs, reports counts + sizes.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;

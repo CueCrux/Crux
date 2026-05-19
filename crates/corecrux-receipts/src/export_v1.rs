@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Replay-export bundle writer — packages receipts + verification reports into a portable ZIP.
+
 use std::io::Write as _;
 
 use thiserror::Error;

@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Integration tests for the HTTP surface — spins up `AppState` and exercises every route family.
+
 use super::admin::*;
 use super::append::*;
 use super::facts::*;

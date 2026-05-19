@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Structured request-log middleware — emits one JSON line per HTTP request with op + outcome + took_ms.
+
 use axum::http::HeaderMap;
 use chrono::Utc;
 use serde::Serialize;

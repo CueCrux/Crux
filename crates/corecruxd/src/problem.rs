@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! RFC-7807 `application/problem+json` helpers — `problem_response(StatusCode, detail)` used across HTTP handlers.
+
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use corecrux_types::ProblemDetails;

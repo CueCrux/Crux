@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Structured-log helpers for `corecruxctl` — single-event JSON lines matching the daemon's log shape.
+
 use chrono::Utc;
 use serde::Serialize;
 

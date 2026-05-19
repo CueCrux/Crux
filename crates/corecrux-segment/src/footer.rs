@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! v1 segment footer codec — magic `CCF3`, file length, content offsets; the canonical "sealed" marker.
+
 use crate::util::{read_u16, read_u32, read_u64};
 use crate::{
     Result, SegmentError, SegmentFooterV1, SegmentId, SEGMENT_FOOTER_LEN, SEGMENT_MAGIC_CCF3, SEGMENT_MAJOR,

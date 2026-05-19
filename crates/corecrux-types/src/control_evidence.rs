@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Control-plane evidence schemas: admin-action lifecycle events, state mutations, checkpoints. Content-type `corecrux-control-evidence-v1`.
+
 use serde::{Deserialize, Serialize};
 
 use crate::{BuildInfo, EvidenceStatusV1, EvidenceSubjectScopeV1, KnowledgeAuthorityV1};

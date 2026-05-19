@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Replay driver — streams sealed segments through projection runners + verifies the resulting state.
+
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};

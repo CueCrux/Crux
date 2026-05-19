@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Manifest codec (`CCMF`) — encodes/decodes add-segment / add-dir-run / stream-meta-update records.
+
 use super::{
     io_err, read_bytes, read_u16, read_u32, read_u64, DirRunKey, DirRunMeta, ManifestSegmentCatalogV1, Result,
     SegmentMeta, StorageError, StreamMeta, MANIFEST_HEADER_LEN, MANIFEST_MAGIC_CCMF, MANIFEST_VERSION_V1,

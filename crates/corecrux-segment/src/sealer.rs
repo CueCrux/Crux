@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Sealer entry-point — consumes record-block bytes + trailer index parts, produces a fully sealed segment.
+
 use blake3::Hasher as Blake3;
 
 use crate::footer::encode_segment_footer_v1;

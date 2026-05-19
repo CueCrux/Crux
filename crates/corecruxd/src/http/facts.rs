@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! HTTP fact-store routes — `/v1/facts` CRUD + bulk-write + export + per-entity listing.
+
 use super::*;
 
 const MAX_FACT_QUERY_TOP_K: usize = 100;

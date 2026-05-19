@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! In-memory projection state + tenant/pressure-code hash helpers used by the runner and `/v1/relations`.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use uuid::Uuid;

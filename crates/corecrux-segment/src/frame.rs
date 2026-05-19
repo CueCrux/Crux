@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! v1 frame codec (`FRAME_MAGIC_CRX1`) — header-bytes + payload-bytes wrapped with magic, version, and lengths.
+
 use crate::util::{read_u16, read_u32};
 use crate::{FrameV1Decoded, Result, SegmentError, FRAME_MAGIC_CRX1, FRAME_VERSION_V1};
 

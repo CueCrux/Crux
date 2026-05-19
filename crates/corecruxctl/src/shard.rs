@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Coordinator client (`CoordinatorClient`) — wraps shard-coordinator HTTP for `corecruxctl shard` subcommands.
+
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[derive(Debug)]

@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Unit + integration tests for `corecrux-storage` — manifest round-trips, append/seal/replay cycles, companions.
+
 use super::*;
 
 #[cfg(test)]

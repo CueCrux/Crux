@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Embedded `/playground` HTML asset server — small static-file router for the in-process console.
+
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 

@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Verify-store driver — replays all segments under a data dir, reports `ReplayScanStats` + integrity errors.
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

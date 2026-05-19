@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Integration tests for the projection runner — builds synthetic segments and asserts replay/snapshot round-trips.
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

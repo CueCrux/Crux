@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! v1 CROWN receipt body index — CBOR layout + accessor helpers shared by signing, verification, and export.
+
 use std::io::Cursor;
 
 use ciborium::value::Value;

@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Unit + round-trip tests for `corecrux-receipts` — signing, verification, keyring rotation, export bundles.
+
 use base64::Engine as _;
 use ed25519_dalek::Signer as _;
 use ed25519_dalek::SigningKey;

@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! v1 candidate-digest parser + recomputer — extracts `candidate_digest` from a stored retrieval trace for verification.
+
 use ciborium::value::Value;
 
 const SCALE: f64 = 1_000_000.0;

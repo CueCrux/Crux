@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Phase 7 Living-Objects projection event types (RelationUpsert/Delete, LivingStateUpdate, PressureEventUpsert, DependentEvidenceUpsert).
+
 use uuid::Uuid;
 
 use crate::{ProjectionError, Result};

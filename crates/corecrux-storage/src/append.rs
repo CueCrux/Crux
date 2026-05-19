@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Append-lane implementation — writes events to head blocks, builds tail locators, fences durability via fsync.
+
 use super::companions::build_ccxi_companion;
 use super::manifest::{
     encode_manifest_add_dir_run_v1, encode_manifest_add_segment_v1, encode_manifest_remove_dir_run_v1,

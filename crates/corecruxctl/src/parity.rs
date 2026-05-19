@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Parity-smoke driver — compares two daemons (or two segments) for byte-equivalent reads under a query set.
+
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write as _;

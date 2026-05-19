@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Read path — tail locators, range scans, frame batch reads, replay cursors, stream-range index lookups.
+
 use super::{
     add_selected_entries_stats, block_logical_starts, decode_stored_event_from_frame_bytes, frame_len_at, io_err,
     logical_offset_to_block, read_blocks_cpu, read_frame_bytes_physical, read_selected_frames_codec_none_from_entries,

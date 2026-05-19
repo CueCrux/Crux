@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Self-observation routes — `/v1/ops/{facts,errors,health}` + `/v1/bootstrap/{pull,status}`.
+
 use super::{
     problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Query, Response, State, StatusCode,
 };

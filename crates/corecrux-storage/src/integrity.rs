@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Phase 5 integrity helpers — physical-order block reads + optional CUDA "touch" to ensure device-visible bytes.
+
 use super::{io_err, read_blocks_cpu, scan_frames_v1_block_bytes, ReplayScanStats, Result, ShardStorage, StorageError};
 use std::fs::File;
 

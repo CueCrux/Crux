@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! HTTP handlers for `/v1/admin/*` routes — shard map, restart, valves, force-seal, ops-log, admin-actions.
+
 use super::*;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

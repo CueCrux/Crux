@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Smoke-test report types + summariser — used by `corecruxctl smoke run` and CI parity gates.
+
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]

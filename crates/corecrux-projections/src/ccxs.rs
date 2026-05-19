@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! `.ccxs` companion file types + error variants (CcxsError, CcxsSnapshot, CCXS_BLOCK_* tags).
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

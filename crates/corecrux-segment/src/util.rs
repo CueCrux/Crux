@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Byte-decode helpers (`read_u16`, `read_u32`, `read_u64`) + TOC sorted-order check + `align_up`.
+
 use crate::{Result, SegmentError, TocEntryV1};
 
 pub(crate) fn read_u16(bytes: &[u8], off: usize) -> Result<u16> {

@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Stage-1 import — bulk-loads legacy event streams into the v3 store using deterministic segment IDs.
+
 use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Read, Write};
 use std::path::Path;

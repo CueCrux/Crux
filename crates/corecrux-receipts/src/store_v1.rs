@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Receipt-store v1 — append-only on-disk record + subject-indexed lookup; produces `VerificationReportV1`.
+
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;

@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Directory LSM compaction — merges DirExtent runs, emits `DirCompactionEventV1`, maintains directory-level stats.
+
 use super::{
     decode_dir_run_v1, fsync_dir, io_err, merge_dir_extents_partition_sorted_unique_cpu, BTreeMap,
     DirCompactionEventV1, DirExtentV1, DirRunKey, DirRunMeta, DirectoryLevelStatsV1, DirectoryLsmStatsV1, Result,

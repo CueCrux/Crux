@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Companion-file builders (`.ccxi` inverted index, etc.) invoked at seal time alongside `.ccxseg`.
+
 use super::{fsync_dir, hex16, io_err, Result};
 use std::path::Path;
 

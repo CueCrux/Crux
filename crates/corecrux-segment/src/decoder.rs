@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Segment decoder — parses a sealed `.ccxseg` back into its header, TOC, footer, and frame iterators.
+
 use blake3::Hasher as Blake3;
 
 use crate::footer::decode_segment_footer_v1;

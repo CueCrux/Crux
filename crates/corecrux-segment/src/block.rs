@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Record-block metadata + TOC-by-offset entry codecs (`BlockMetaV1`, `TocByOffsetEntryV1`).
+
 use crate::{
     BlockMetaV1, Result, SegmentError, TocByOffsetEntryV1, BLOCK_META_V1_LEN, BLOOM_BYTES_PER_BLOCK_V1,
     TOC_BY_OFFSET_ENTRY_V1_LEN,

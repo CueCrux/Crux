@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! `/v1/admin/control` state — valves (pause-ingest, throttle, read-only, etc.) persisted to `CONTROL.json`.
+
 use std::path::{Path, PathBuf};
 
 use corecrux_types::{
