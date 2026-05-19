@@ -5,6 +5,14 @@
 // Hook binary — writes JSON to stdout per Claude Code hook protocol.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+//! `crux-hook` binary entry point — Claude Code lifecycle hooks.
+//!
+//! Clap-based dispatcher routing `context-monitor`, `pre-compact`, and
+//! `session-start` subcommands to handlers in the `crux-claude-hooks`
+//! library crate. Reads JSON hook input on stdin, emits hook output JSON
+//! on stdout per the Claude Code hook protocol. See library docs for
+//! per-subcommand semantics.
+
 use clap::{Parser, Subcommand};
 use crux_claude_hooks::cmds;
 

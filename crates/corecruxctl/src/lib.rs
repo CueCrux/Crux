@@ -6,6 +6,17 @@
 // CLI tool — printing to stdout/stderr is correct behaviour.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+//! `corecruxctl` — CLI tool for Crux Daemon operations.
+//!
+//! Subcommands cover admin tasks (segment fingerprints, projection meta,
+//! shard map, force-seal), receipt verification + export, audit packs,
+//! benchmark drivers, parity smoke tests, and replay tooling. Reads and
+//! writes through the same on-disk substrate as `corecruxd`, but never
+//! over the network — operators run it locally against a stopped or
+//! quiesced daemon.
+//!
+//! See `corecruxctl --help` for the live subcommand listing.
+
 pub mod admin;
 pub mod audit_pack;
 pub mod benchmark;

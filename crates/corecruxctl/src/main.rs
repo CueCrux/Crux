@@ -5,6 +5,12 @@
 // CLI binary — printing to stdout/stderr is correct behaviour.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+//! `corecruxctl` binary entry point.
+//!
+//! Clap-based dispatcher that routes subcommands to handlers in the
+//! `corecruxctl` library crate. See library docs for the operational
+//! surface; see `corecruxctl --help` for the live subcommand listing.
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
