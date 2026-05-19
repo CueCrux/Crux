@@ -8,7 +8,7 @@ license.workspace = true
 blake3 = "1.8.5"
 crc32c = "0.6.8"
 crc32fast = "1.4.2"
-lz4_flex = "0.13.0"
+lz4_flex = "0.13.1"
 thiserror = "2.0.12"
 tracing = "0.1.41"
 xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
