@@ -13,6 +13,7 @@
 //!
 //! See `ExecPlan agent-config-wizard-2026-05-19` for the design rationale.
 
+pub mod commands;
 pub mod compose;
 pub mod config;
 pub mod drift;
