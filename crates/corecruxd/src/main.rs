@@ -9,6 +9,20 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 
+//! `corecruxd` — the Crux Daemon binary.
+//!
+//! Runs the HTTP API on port 14800 (axum), the gRPC API on port 4007
+//! (tonic), and an embedded MCP server on port 14801. Composes
+//! `corecrux-{frame, segment, storage, projections, retrieval, receipts,
+//! memory}` plus `crux-{mcp, session, sync, observe, router,
+//! integrations, lens-features}` and the new `crux-config-wizard` drift
+//! check into a single long-running process.
+//!
+//! Startup wiring: bootstrap data → seeded passports → lens kind
+//! registrations → HTTP router → gRPC router → MCP server → optional
+//! workspace-scan + storyline materialiser. Configuration is
+//! environment-variable driven; see `config.example.env`.
+
 mod auth;
 mod config;
 mod console_index;

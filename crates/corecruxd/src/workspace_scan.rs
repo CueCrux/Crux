@@ -1408,8 +1408,11 @@ fn parse_file_doc_header(src: &str) -> (Option<String>, Option<String>) {
     for line in src.lines() {
         let t = line.trim_start();
         if !started {
-            // Skip leading blank lines and copyright `//` (but not `//!`).
-            if t.is_empty() || (t.starts_with("//") && !t.starts_with("//!")) {
+            // Skip leading blank lines, copyright `//` (but not `//!`), and
+            // inner attributes like `#![recursion_limit = ...]` or
+            // `#![allow(...)]` that often live between the copyright header
+            // and the module doc block.
+            if t.is_empty() || (t.starts_with("//") && !t.starts_with("//!")) || t.starts_with("#![") {
                 continue;
             }
         }
@@ -1904,6 +1907,18 @@ version = "0.1.0"
 
         let no_header = "use foo::bar;\nfn x() {}\n";
         assert_eq!(parse_file_doc_header(no_header), (None, None));
+
+        // Regression: inner attributes (`#![...]`) between the copyright
+        // header and the doc block must not break detection.
+        let with_attr =
+            "// Copyright\n\n#![recursion_limit = \"256\"]\n\n//! Module docs after attribute.\n\nuse foo;\n";
+        let (full2, summary2) = parse_file_doc_header(with_attr);
+        assert_eq!(summary2.as_deref(), Some("Module docs after attribute."));
+        assert!(full2.is_some());
+
+        let with_allow = "// Copyright\n#![allow(clippy::print_stdout)]\n//! Allowed-attr docs.\n";
+        let (_, summary3) = parse_file_doc_header(with_allow);
+        assert_eq!(summary3.as_deref(), Some("Allowed-attr docs."));
     }
 
     #[test]
