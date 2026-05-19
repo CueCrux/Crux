@@ -161,16 +161,19 @@ pub fn compose_file(
 }
 
 fn render_full_section(f: &ProfileFragment) -> String {
+    use std::fmt::Write as _;
     let mut s = String::new();
-    s.push_str(&format!(
-        "<!-- BEGIN-CRUX-MANAGED:{} v{} -->\n",
+    writeln!(
+        s,
+        "<!-- BEGIN-CRUX-MANAGED:{} v{} -->",
         f.frontmatter.name, f.frontmatter.version
-    ));
+    )
+    .expect("write to String cannot fail");
     s.push_str(&render_managed_body(f));
     if !s.ends_with('\n') {
         s.push('\n');
     }
-    s.push_str(&format!("<!-- END-CRUX-MANAGED:{} -->\n", f.frontmatter.name));
+    writeln!(s, "<!-- END-CRUX-MANAGED:{} -->", f.frontmatter.name).expect("write to String cannot fail");
     s
 }
 

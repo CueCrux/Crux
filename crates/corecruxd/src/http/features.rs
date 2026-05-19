@@ -17,16 +17,14 @@ use crux_lens_features::{compute_coverage_report, compute_gaps, compute_promise_
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-fn load_capabilities(state: &AppState) -> impl std::future::Future<Output = Vec<Value>> + '_ {
-    async move {
-        let store = state.entity_store.read().await;
-        let q = EntityQuery {
-            kind: Some(CAPABILITY_KIND.into()),
-            limit: None,
-            include_deleted: false,
-        };
-        store.list(&q).into_iter().map(|e| e.payload.clone()).collect()
-    }
+async fn load_capabilities(state: &AppState) -> Vec<Value> {
+    let store = state.entity_store.read().await;
+    let q = EntityQuery {
+        kind: Some(CAPABILITY_KIND.into()),
+        limit: None,
+        include_deleted: false,
+    };
+    store.list(&q).into_iter().map(|e| e.payload.clone()).collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,8 +61,7 @@ fn payload_matches(p: &Value, q: &ListCapabilitiesQuery) -> bool {
         let aligned = p
             .get("promise_alignment")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_u64()).any(|x| x == p_promise))
-            .unwrap_or(false);
+            .is_some_and(|a| a.iter().filter_map(serde_json::Value::as_u64).any(|x| x == p_promise));
         if !aligned {
             return false;
         }

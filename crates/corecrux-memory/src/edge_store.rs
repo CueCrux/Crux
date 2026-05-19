@@ -56,7 +56,7 @@ fn edge_id(from_kind: &str, from_id: &str, edge_kind: &str, to_kind: &str, to_id
 #[serde(tag = "op")]
 enum JournalEvent {
     #[serde(rename = "upsert")]
-    Upsert { record: EdgeRecord },
+    Upsert { record: Box<EdgeRecord> },
     #[serde(rename = "delete")]
     Delete {
         edge_id: String,
@@ -166,7 +166,7 @@ impl EdgeStore {
                         .or_default()
                         .push(id.clone());
                 }
-                self.by_id.insert(id, record);
+                self.by_id.insert(id, *record);
             }
             JournalEvent::Delete {
                 edge_id,
@@ -184,6 +184,7 @@ impl EdgeStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // five-tuple is the edge identity; collapsing into a struct would be a worse API.
     pub fn upsert(
         &mut self,
         from_kind: &str,
@@ -214,7 +215,9 @@ impl EdgeStore {
             deleted: false,
             actor: actor.into(),
         };
-        let evt = JournalEvent::Upsert { record: record.clone() };
+        let evt = JournalEvent::Upsert {
+            record: Box::new(record.clone()),
+        };
         self.write_journal(&evt)?;
         self.apply(evt);
         Ok(record)
@@ -256,7 +259,11 @@ impl EdgeStore {
         };
         self.write_journal(&evt)?;
         self.apply(evt);
-        Ok(self.by_id.get(&id).cloned().expect("just-applied delete keeps record"))
+        // Just-applied delete; record is guaranteed present.
+        self.by_id
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| EdgeError::Io("delete apply did not persist record".into()))
     }
 
     pub fn list(&self, q: &EdgeQuery) -> Vec<&EdgeRecord> {
@@ -283,11 +290,11 @@ impl EdgeStore {
         let mut out: Vec<&EdgeRecord> = candidates
             .into_iter()
             .filter(|r| q.include_deleted || !r.deleted)
-            .filter(|r| q.from_kind.as_deref().map_or(true, |k| r.from_kind == k))
-            .filter(|r| q.from_id.as_deref().map_or(true, |i| r.from_id == i))
-            .filter(|r| q.to_kind.as_deref().map_or(true, |k| r.to_kind == k))
-            .filter(|r| q.to_id.as_deref().map_or(true, |i| r.to_id == i))
-            .filter(|r| q.edge_kind.as_deref().map_or(true, |k| r.edge_kind == k))
+            .filter(|r| q.from_kind.as_deref().is_none_or(|k| r.from_kind == k))
+            .filter(|r| q.from_id.as_deref().is_none_or(|i| r.from_id == i))
+            .filter(|r| q.to_kind.as_deref().is_none_or(|k| r.to_kind == k))
+            .filter(|r| q.to_id.as_deref().is_none_or(|i| r.to_id == i))
+            .filter(|r| q.edge_kind.as_deref().is_none_or(|k| r.edge_kind == k))
             .collect();
         out.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
         if let Some(limit) = q.limit {

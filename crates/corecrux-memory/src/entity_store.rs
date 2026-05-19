@@ -152,7 +152,7 @@ impl EntityStore {
                 let snapshot = if let Some(rec) = self.by_id.get_mut(&key) {
                     rec.deleted = true;
                     rec.updated_at = deleted_at;
-                    rec.actor = actor.clone();
+                    actor.clone_into(&mut rec.actor);
                     rec.version = version;
                     Some(rec.clone())
                 } else {
@@ -243,11 +243,11 @@ impl EntityStore {
         };
         self.write_journal(&evt)?;
         self.apply(evt);
-        Ok(self
-            .by_id
+        // Just-applied delete; the record is guaranteed present.
+        self.by_id
             .get(&key)
             .cloned()
-            .expect("just-applied delete must keep record"))
+            .ok_or_else(|| EntityError::Io("delete apply did not persist record".into()))
     }
 
     pub fn list(&self, q: &EntityQuery) -> Vec<&EntityRecord> {

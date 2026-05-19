@@ -37,12 +37,7 @@ pub async fn handle_feature_file_search(args: &Value, ctx: &McpContext) -> Resul
         .filter(|c| {
             c.get("files")
                 .and_then(|v| v.as_array())
-                .map(|files| {
-                    files
-                        .iter()
-                        .any(|f| f.as_str().map(|s| s.contains(needle)).unwrap_or(false))
-                })
-                .unwrap_or(false)
+                .is_some_and(|files| files.iter().any(|f| f.as_str().is_some_and(|s| s.contains(needle))))
         })
         .collect();
     let items: Vec<_> = matches
@@ -101,8 +96,7 @@ pub async fn handle_feature_trigger_audit(args: &Value, ctx: &McpContext) -> Res
     let actor = ctx
         .agent
         .as_ref()
-        .map(|a| a.name.clone())
-        .unwrap_or_else(|| "anonymous".into());
+        .map_or_else(|| "anonymous".into(), |a| a.name.clone());
 
     let mut store = ctx.entity_store.write().await;
     let current = match store.get(CAPABILITY_KIND, id) {

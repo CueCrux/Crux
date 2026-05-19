@@ -105,3 +105,48 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<DriftReport> {
     let drifted = !details.is_empty();
     Ok(DriftReport { drifted, details })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn empty_workspace_is_not_drifted() {
+        let dir = TempDir::new().unwrap();
+        let r = check_workspace(dir.path()).unwrap();
+        assert!(!r.drifted());
+        assert!(r.message_for_claude().is_empty());
+    }
+
+    #[test]
+    fn drift_report_message_when_clean() {
+        let r = DriftReport {
+            drifted: false,
+            details: Vec::new(),
+        };
+        assert!(r.message_for_claude().is_empty());
+    }
+
+    #[test]
+    fn drift_report_message_with_details() {
+        let r = DriftReport {
+            drifted: true,
+            details: vec!["profile 'x' is at v1 in config but v2 in the crate".into()],
+        };
+        let msg = r.message_for_claude();
+        assert!(msg.contains("out of date"));
+        assert!(msg.contains("profile 'x'"));
+        assert!(msg.contains("regenerate"));
+    }
+
+    #[test]
+    fn drift_report_message_no_details_falls_back_to_generic() {
+        let r = DriftReport {
+            drifted: true,
+            details: Vec::new(),
+        };
+        let msg = r.message_for_claude();
+        assert!(msg.contains("regenerate"));
+    }
+}

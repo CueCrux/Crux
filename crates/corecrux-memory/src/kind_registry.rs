@@ -125,7 +125,7 @@ fn validate_against_schema(kind: &str, payload: &Value, schema: &Value) -> Resul
                 Some(s) => s,
                 None => continue,
             };
-            let present = obj.map(|m| m.contains_key(key)).unwrap_or(false);
+            let present = obj.is_some_and(|m| m.contains_key(key));
             if !present {
                 return Err(KindError::Validation {
                     kind: kind.to_string(),

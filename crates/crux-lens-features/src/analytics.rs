@@ -95,8 +95,7 @@ fn tests_count(p: &Value, kind: &str) -> usize {
     p.get("tests")
         .and_then(|t| t.get(kind))
         .and_then(|v| v.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0)
+        .map_or(0, std::vec::Vec::len)
 }
 
 fn has_any_tests(p: &Value) -> bool {
@@ -104,7 +103,7 @@ fn has_any_tests(p: &Value) -> bool {
 }
 
 fn dod_len(p: &Value) -> usize {
-    p.get("dod").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
+    p.get("dod").and_then(|v| v.as_array()).map_or(0, std::vec::Vec::len)
 }
 
 fn audit_status(p: &Value) -> &str {

@@ -4,6 +4,8 @@
 
 //! `crux-config-wizard` — composes `CLAUDE.md` and `AGENTS.md` from
 //! versioned profile fragments for Crux-aligned workspaces.
+#![allow(clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::inefficient_to_string))]
 //!
 //! Loaded by the `crux-claude-hooks session-start` hook for drift detection,
 //! and called directly via the `crux-config-wizard` binary for `init`,
@@ -48,6 +50,37 @@ impl Target {
         match self {
             Self::ClaudeMd => "CLAUDE.md",
             Self::AgentsMd => "AGENTS.md",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_filenames() {
+        assert_eq!(Target::ClaudeMd.filename(), "CLAUDE.md");
+        assert_eq!(Target::AgentsMd.filename(), "AGENTS.md");
+    }
+
+    #[test]
+    fn default_profiles_present_and_unique() {
+        assert_eq!(DEFAULT_PROFILES.len(), 8);
+        let mut seen = std::collections::HashSet::new();
+        for p in DEFAULT_PROFILES {
+            assert!(seen.insert(*p), "duplicate default profile '{p}'");
+        }
+    }
+
+    #[test]
+    fn default_profiles_match_bundled() {
+        let bundled = load_bundled_profiles().unwrap();
+        for p in DEFAULT_PROFILES {
+            assert!(
+                bundled.iter().any(|f| f.frontmatter.name == *p),
+                "DEFAULT_PROFILES entry '{p}' missing from bundled set"
+            );
         }
     }
 }

@@ -26,8 +26,7 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, JsonRpcError> 
 fn actor_from_ctx(ctx: &McpContext) -> String {
     ctx.agent
         .as_ref()
-        .map(|a| a.name.clone())
-        .unwrap_or_else(|| "anonymous".into())
+        .map_or_else(|| "anonymous".into(), |a| a.name.clone())
 }
 
 pub async fn handle_edge_upsert(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
@@ -61,8 +60,8 @@ pub async fn handle_edge_get(args: &Value, ctx: &McpContext) -> Result<Value, Js
     let store = ctx.edge_store.read().await;
     let rec = store.get(from_kind, from_id, edge_kind, to_kind, to_id).cloned();
     Ok(json!({
-        "content": [{"type":"text","text": rec.as_ref().map(|r| format!("found {}", r.edge_id)).unwrap_or_else(|| "edge not found".into()) }],
-        "edge": rec.map(serde_json::to_value).transpose().unwrap_or(None).unwrap_or(Value::Null)
+        "content": [{"type":"text","text": rec.as_ref().map_or_else(|| "edge not found".into(), |r| format!("found {}", r.edge_id)) }],
+        "edge": rec.map(serde_json::to_value).transpose().ok().flatten().unwrap_or(Value::Null)
     }))
 }
 

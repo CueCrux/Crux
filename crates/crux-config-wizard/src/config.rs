@@ -196,4 +196,32 @@ mod tests {
         assert_eq!(f1, f2);
         assert!(f1.starts_with("blake3:"));
     }
+
+    #[test]
+    fn fingerprint_differs_per_workspace() {
+        let a = TempDir::new().unwrap();
+        let b = TempDir::new().unwrap();
+        assert_ne!(workspace_fingerprint(a.path()), workspace_fingerprint(b.path()));
+    }
+
+    #[test]
+    fn workspace_path_uses_dot_crux_dir() {
+        let p = AgentProfileConfig::workspace_path(std::path::Path::new("/tmp/ws"));
+        assert!(p.ends_with(".crux/agent-profile.toml"));
+    }
+
+    #[test]
+    fn relative_path_under_dot_crux() {
+        assert_eq!(
+            AgentProfileConfig::relative_path(),
+            std::path::Path::new(".crux/agent-profile.toml")
+        );
+    }
+
+    #[test]
+    fn targets_config_defaults() {
+        let t = TargetsConfig::default();
+        assert_eq!(t.claude_md, "CLAUDE.md");
+        assert_eq!(t.agents_md, "AGENTS.md");
+    }
 }

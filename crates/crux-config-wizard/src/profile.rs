@@ -165,4 +165,35 @@ This is the body.
         let f = ProfileFragment::parse("x", raw).unwrap();
         assert_eq!(f.frontmatter.targets, vec![Target::ClaudeMd, Target::AgentsMd]);
     }
+
+    #[test]
+    fn bundled_load_returns_eight_in_order() {
+        let bundled = load_bundled_profiles().unwrap();
+        assert_eq!(bundled.len(), 8);
+        for win in bundled.windows(2) {
+            assert!(
+                win[0].frontmatter.order <= win[1].frontmatter.order,
+                "bundled profiles must be sorted by order"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_profiles_have_non_empty_bodies() {
+        let bundled = load_bundled_profiles().unwrap();
+        for f in &bundled {
+            assert!(
+                !f.body.trim().is_empty(),
+                "profile '{}' has an empty body",
+                f.frontmatter.name
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_toml_in_frontmatter_errors() {
+        let raw = "+++\nname = \"x\"\nversion = not_a_number\n+++\nbody\n";
+        let err = ProfileFragment::parse("x", raw).unwrap_err();
+        assert!(matches!(err, ProfileError::TomlParse(_, _)));
+    }
 }

@@ -24,8 +24,7 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, JsonRpcError> 
 fn actor_from_ctx(ctx: &McpContext) -> String {
     ctx.agent
         .as_ref()
-        .map(|a| a.name.clone())
-        .unwrap_or_else(|| "anonymous".into())
+        .map_or_else(|| "anonymous".into(), |a| a.name.clone())
 }
 
 pub async fn handle_entity_upsert(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {

@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::inefficient_to_string)]
+
 //! End-to-end test: drive the library API the same way `main.rs` does, in a
 //! tempdir. Covers init → regenerate idempotency → add → remove → check.
 

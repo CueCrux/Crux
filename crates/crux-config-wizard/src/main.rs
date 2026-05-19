@@ -3,6 +3,10 @@
 // See LICENCE.md in the repository root.
 
 //! `crux-config-wizard` binary entry point.
+//!
+//! CLI tool — `println!`/`eprintln!` are correct behaviour; `unwrap`/`expect`
+//! at startup are acceptable when the alternative is a more confusing error.
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -65,7 +69,7 @@ fn cmd_init(workspace: &Path, non_interactive: bool, profiles_arg: Option<String
         if raw == "all" {
             crux_config_wizard::DEFAULT_PROFILES
                 .iter()
-                .map(|s| s.to_string())
+                .map(|s| (*s).to_string())
                 .collect()
         } else {
             raw.split(',').map(|s| s.trim().to_string()).collect()
@@ -163,8 +167,7 @@ fn cmd_list(workspace: &Path) -> std::io::Result<ExitCode> {
     for f in &bundled {
         let enabled = cfg_opt
             .as_ref()
-            .map(|c| c.profiles.contains_key(&f.frontmatter.name))
-            .unwrap_or(false);
+            .is_some_and(|c| c.profiles.contains_key(&f.frontmatter.name));
         let marker = if enabled { "[x]" } else { "[ ]" };
         println!(
             "  {marker} {} (v{}, risk={}) — {}",
