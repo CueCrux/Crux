@@ -92,7 +92,10 @@ jobs:
           done
           curl -sf http://localhost:14800/healthz | jq .
           curl -sf http://localhost:14800/readyz
-          curl -sf http://localhost:14800/metrics | head -5
+          # Same SIGPIPE-race pattern as /console below: head -5 closes the pipe,
+          # curl exits 23, set -o pipefail propagates. Stage to a variable.
+          METRICS=$(curl -sf http://localhost:14800/metrics)
+          printf '%s\n' "$METRICS" | head -5
           curl -sf http://localhost:14800/v1/version | jq -e '.features.mcp == true' >/dev/null
           curl -sf http://localhost:14800/v1/version | jq -e '.update.state | type == "string"' >/dev/null
           # The console HTML is now ~430 KB. Any `... | grep -q 'X'` pipeline
