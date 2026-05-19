@@ -41,7 +41,7 @@ xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
 tar = "0.4.44"
 tokio = { version = "1.51.1", features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
 tokio-stream = { version = "0.1.15", features = ["sync"] }
-tonic = "0.14.5"
+tonic = "0.14.6"
 tower-http = { version = "0.6.2", features = ["catch-panic", "cors", "timeout", "trace"] }
 thiserror = "2.0.12"
 tracing = "0.1.41"
