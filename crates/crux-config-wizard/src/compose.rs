@@ -383,4 +383,64 @@ mod tests {
         let err = compose_file(dir.path(), Target::ClaudeMd, &fragments, false, false).unwrap_err();
         assert!(matches!(err, ComposeError::UnbalancedMarkers { .. }));
     }
+
+    #[test]
+    fn nested_markers_rejected() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("CLAUDE.md"),
+            "<!-- BEGIN-CRUX-MANAGED:a v1 -->\n<!-- BEGIN-CRUX-MANAGED:b v1 -->\nbody\n<!-- END-CRUX-MANAGED:b -->\n<!-- END-CRUX-MANAGED:a -->\n",
+        )
+        .unwrap();
+        let fragments = vec![frag("a", 1, 10, "## A body")];
+        let err = compose_file(dir.path(), Target::ClaudeMd, &fragments, false, false).unwrap_err();
+        assert!(matches!(err, ComposeError::UnbalancedMarkers { .. }));
+    }
+
+    #[test]
+    fn mismatched_end_marker_rejected() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("CLAUDE.md"),
+            "<!-- BEGIN-CRUX-MANAGED:a v1 -->\nbody\n<!-- END-CRUX-MANAGED:b -->\n",
+        )
+        .unwrap();
+        let fragments = vec![frag("a", 1, 10, "## A body")];
+        let err = compose_file(dir.path(), Target::ClaudeMd, &fragments, false, false).unwrap_err();
+        assert!(matches!(err, ComposeError::UnbalancedMarkers { .. }));
+    }
+
+    #[test]
+    fn end_without_begin_rejected() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "<!-- END-CRUX-MANAGED:a -->\n").unwrap();
+        let fragments = vec![frag("a", 1, 10, "## A body")];
+        let err = compose_file(dir.path(), Target::ClaudeMd, &fragments, false, false).unwrap_err();
+        assert!(matches!(err, ComposeError::UnbalancedMarkers { .. }));
+    }
+
+    #[test]
+    fn dry_run_does_not_write() {
+        let dir = TempDir::new().unwrap();
+        let fragments = vec![frag("a", 1, 10, "## A body")];
+        let r = compose_file(dir.path(), Target::ClaudeMd, &fragments, false, true).unwrap();
+        assert!(!r.wrote);
+        assert!(!dir.path().join("CLAUDE.md").exists());
+    }
+
+    #[test]
+    fn parse_begin_marker_round_trip() {
+        assert!(parse_begin_marker("not a marker\n").is_none());
+        assert!(parse_begin_marker("<!-- BEGIN-CRUX-MANAGED:a -->\n").is_none());
+        assert!(parse_begin_marker("<!-- BEGIN-CRUX-MANAGED:a vNOT -->\n").is_none());
+        let (n, v) = parse_begin_marker("<!-- BEGIN-CRUX-MANAGED:my-name v42 -->\n").unwrap();
+        assert_eq!(n, "my-name");
+        assert_eq!(v, 42);
+    }
+
+    #[test]
+    fn parse_end_marker_round_trip() {
+        assert!(parse_end_marker("not a marker\n").is_none());
+        assert_eq!(parse_end_marker("<!-- END-CRUX-MANAGED:abc -->\n").unwrap(), "abc");
+    }
 }
