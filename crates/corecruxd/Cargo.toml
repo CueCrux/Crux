@@ -74,7 +74,7 @@ crux-enterprise-shim = { path = "../crux-enterprise-shim" }
 vaultcrux-local = { path = "../vaultcrux-local" }
 
 wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime"], optional = true }
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
 corecrux-index = { path = "../corecrux-index" }
