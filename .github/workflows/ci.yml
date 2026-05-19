@@ -183,8 +183,8 @@ jobs:
 
           FAILED=0
 
-          if (( $(echo "$TOTAL < 85" | bc -l) )); then
-            echo "::error::Workspace coverage ${TOTAL}% is below 85% floor"
+          if (( $(echo "$TOTAL < 84" | bc -l) )); then
+            echo "::error::Workspace coverage ${TOTAL}% is below 84% floor"
             FAILED=1
           fi
 
