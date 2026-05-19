@@ -478,6 +478,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             corecrux_memory::SessionStore::new()
         })),
+        entity_store: Arc::new(RwLock::new(if config.fact_persistence_enabled {
+            corecrux_memory::EntityStore::with_persistence(&config.data_dir)
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+        } else {
+            corecrux_memory::EntityStore::new()
+        })),
+        edge_store: Arc::new(RwLock::new(if config.fact_persistence_enabled {
+            corecrux_memory::EdgeStore::with_persistence(&config.data_dir)
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+        } else {
+            corecrux_memory::EdgeStore::new()
+        })),
+        kind_registry: Arc::new(RwLock::new(corecrux_memory::KindRegistry::new())),
         update_status: update_status.clone(),
         event_bus: corecrux_memory::events::EventBus::new(1024),
         session: {
@@ -594,6 +607,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    // Bootstrap the Features lens kind registrations (M3). Performed after
+    // AppState is constructed so the substrate sees the registered kinds
+    // before any HTTP request lands.
+    {
+        let mut reg = state.kind_registry.write().await;
+        if let Err(e) = crux_lens_features::bootstrap_kinds(&mut reg) {
+            tracing::warn!(error=%e, "features lens bootstrap_kinds returned an error; continuing");
+        }
+    }
+
     // Clone handles before state is moved into the router.
     let session_store_handle = state.session_store.clone();
     let sync_fact_store_handle = state.fact_store.clone();
@@ -616,7 +639,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .with_daemon_base_url(daemon_base)
             .with_shared_rcx_router(rcx_router)
             .with_data_dir(state.data_dir.clone())
-            .with_passport_public_key(state.passport_public_key_hex.clone()),
+            .with_passport_public_key(state.passport_public_key_hex.clone())
+            .with_substrate(
+                state.entity_store.clone(),
+                state.edge_store.clone(),
+                state.kind_registry.clone(),
+            ),
         ))
     } else {
         None
@@ -3624,6 +3652,9 @@ mod tests {
             integration_encryption_key: std::sync::Arc::new([0u8; 32]),
             presence: crate::presence::PresenceTracker::new(),
             privacy_policy: crate::fact_privacy::PrivacyPolicy::from_env(),
+            entity_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::EntityStore::new())),
+            edge_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::EdgeStore::new())),
+            kind_registry: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::KindRegistry::new())),
         };
 
         let router: axum::Router = crate::http::router(state);

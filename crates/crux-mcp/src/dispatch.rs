@@ -15,7 +15,7 @@ use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use corecrux_memory::{FactStore, SessionStore};
+use corecrux_memory::{EdgeStore, EntityStore, FactStore, KindRegistry, SessionStore};
 use corecrux_retrieval::IndexManager;
 use corecrux_types::UpdateStatus;
 
@@ -57,6 +57,12 @@ pub struct McpContext {
     /// verify signatures (e.g. `verify_observation`). `None` in test
     /// contexts; populated by `corecruxd::main` from `AppState.passport_public_key_hex`.
     pub passport_public_key_hex: Option<String>,
+    /// Substrate entity store (Crux domain substrate, M1).
+    pub entity_store: Arc<RwLock<EntityStore>>,
+    /// Substrate edge store (Crux domain substrate, M1).
+    pub edge_store: Arc<RwLock<EdgeStore>>,
+    /// Substrate kind registry — populated at startup by lens crates.
+    pub kind_registry: Arc<RwLock<KindRegistry>>,
 }
 
 impl McpContext {
@@ -76,6 +82,9 @@ impl McpContext {
             rcx_router: None,
             data_dir: None,
             passport_public_key_hex: None,
+            entity_store: Arc::new(RwLock::new(EntityStore::new())),
+            edge_store: Arc::new(RwLock::new(EdgeStore::new())),
+            kind_registry: Arc::new(RwLock::new(KindRegistry::new())),
         }
     }
 
@@ -102,7 +111,23 @@ impl McpContext {
             rcx_router: None,
             data_dir: None,
             passport_public_key_hex: None,
+            entity_store: Arc::new(RwLock::new(EntityStore::new())),
+            edge_store: Arc::new(RwLock::new(EdgeStore::new())),
+            kind_registry: Arc::new(RwLock::new(KindRegistry::new())),
         }
+    }
+
+    /// Attach shared substrate stores (entity / edge / kind registry).
+    pub fn with_substrate(
+        mut self,
+        entity_store: Arc<RwLock<EntityStore>>,
+        edge_store: Arc<RwLock<EdgeStore>>,
+        kind_registry: Arc<RwLock<KindRegistry>>,
+    ) -> Self {
+        self.entity_store = entity_store;
+        self.edge_store = edge_store;
+        self.kind_registry = kind_registry;
+        self
     }
 
     /// Return a copy of this context with the given agent identity attached.
@@ -120,6 +145,9 @@ impl McpContext {
             rcx_router: self.rcx_router.clone(),
             data_dir: self.data_dir.clone(),
             passport_public_key_hex: self.passport_public_key_hex.clone(),
+            entity_store: Arc::clone(&self.entity_store),
+            edge_store: Arc::clone(&self.edge_store),
+            kind_registry: Arc::clone(&self.kind_registry),
         }
     }
 

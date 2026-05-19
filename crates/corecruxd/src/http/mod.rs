@@ -10,9 +10,11 @@ mod console;
 mod dataplane;
 mod dossier;
 mod engrams;
+mod entities;
 mod events;
 mod extensions;
 mod facts;
+mod features;
 mod gpu1;
 mod health;
 mod integrations_github;
@@ -247,6 +249,12 @@ pub struct AppState {
     /// before `store.store(fact)`, ensuring entities under reserved
     /// prefixes are born `private=true` and never leak via `sync_push`.
     pub privacy_policy: crate::fact_privacy::PrivacyPolicy,
+    /// Substrate entity store (M1: Crux as domain substrate).
+    pub entity_store: Arc<RwLock<corecrux_memory::EntityStore>>,
+    /// Substrate edge store (M1).
+    pub edge_store: Arc<RwLock<corecrux_memory::EdgeStore>>,
+    /// Substrate kind registry. Lens crates register at startup.
+    pub kind_registry: Arc<RwLock<corecrux_memory::KindRegistry>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -384,6 +392,40 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/facts/{factId}", axum::routing::delete(self::facts::delete_fact))
         .route("/v1/facts/entity/{entity}", get(self::facts::get_facts_by_entity))
         .route("/v1/facts/export", get(self::facts::export_facts))
+        // Substrate (M1: Crux as domain substrate).
+        .route("/v1/entities", get(self::entities::list_entities))
+        .route("/v1/entities/{kind}/{id}", get(self::entities::get_entity))
+        .route("/v1/entities/{kind}/{id}", axum::routing::put(self::entities::put_entity))
+        .route(
+            "/v1/entities/{kind}/{id}",
+            axum::routing::delete(self::entities::delete_entity),
+        )
+        .route(
+            "/v1/entities/{kind}/{id}/history",
+            get(self::entities::get_entity_history),
+        )
+        .route("/v1/edges", get(self::entities::list_edges))
+        .route("/v1/edges", axum::routing::put(self::entities::put_edge))
+        .route("/v1/edges", axum::routing::delete(self::entities::delete_edge))
+        .route("/v1/kinds", get(self::entities::list_kinds))
+        .route("/v1/kinds/{kind}", get(self::entities::get_kind))
+        // Features lens (M3).
+        .route("/v1/features/capabilities", get(self::features::list_capabilities))
+        .route("/v1/features/capabilities/{id}", get(self::features::get_capability))
+        .route("/v1/features/capabilities/{id}/tree", get(self::features::get_dependency_tree))
+        .route("/v1/features/capabilities/analysis/gaps", get(self::features::analysis_gaps))
+        .route(
+            "/v1/features/capabilities/analysis/promises",
+            get(self::features::analysis_promises),
+        )
+        .route(
+            "/v1/features/capabilities/analysis/coverage",
+            get(self::features::analysis_coverage),
+        )
+        .route(
+            "/v1/features/capabilities/{id}/audit",
+            axum::routing::post(self::features::post_audit),
+        )
         .route(
             "/v1/sync/tenants/{tenantId}/manifest",
             get(self::sync::get_tenant_manifest),

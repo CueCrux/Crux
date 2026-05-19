@@ -177,6 +177,216 @@ fn mcp_update_status_tool() {
 }
 
 #[test]
+fn substrate_entity_round_trip() {
+    let d = daemon();
+    // Upsert a capability entity.
+    let res = d
+        .put_json(
+            "/v1/entities/capability/CAPTEST-RT",
+            json!({"payload":{"id":"CAPTEST-RT","name":"Round Trip","system":"Crux","maturity":"shipped"}}),
+        )
+        .expect("PUT entity");
+    assert_eq!(res.status().as_u16(), 200, "PUT entity should 200");
+    // GET it back.
+    let got: serde_json::Value = d
+        .get("/v1/entities/capability/CAPTEST-RT")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(got["entity"]["kind"], "capability");
+    assert_eq!(got["entity"]["id"], "CAPTEST-RT");
+    assert_eq!(got["entity"]["payload"]["name"], "Round Trip");
+    // LIST by kind.
+    let listed: serde_json::Value = d
+        .get("/v1/entities?kind=capability")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let arr = listed["entities"].as_array().unwrap();
+    assert!(
+        arr.iter().any(|e| e["id"] == "CAPTEST-RT"),
+        "list must contain the upserted entity"
+    );
+    // DELETE.
+    assert_eq!(
+        d.delete("/v1/entities/capability/CAPTEST-RT")
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    // GET after delete = 404 (ureq returns 4xx as Err).
+    match d.get("/v1/entities/capability/CAPTEST-RT") {
+        Err(ureq::Error::StatusCode(404)) => {}
+        other => panic!("expected 404 after delete, got {other:?}"),
+    }
+}
+
+#[test]
+fn substrate_entity_history() {
+    let d = daemon();
+    // Three upserts on the same id; final delete.
+    for v in 1..=3u64 {
+        d.put_json(
+            "/v1/entities/capability/CAPTEST-HIST",
+            json!({"payload":{"id":"CAPTEST-HIST","name":"H","system":"X","maturity":"built","v":v}}),
+        )
+        .unwrap();
+    }
+    d.delete("/v1/entities/capability/CAPTEST-HIST").unwrap();
+    let body: serde_json::Value = d
+        .get("/v1/entities/capability/CAPTEST-HIST/history")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let versions = body["versions"].as_array().unwrap();
+    assert_eq!(versions.len(), 4, "3 upserts + 1 delete = 4 versions");
+    assert_eq!(versions[0]["version"], 1);
+    assert_eq!(versions.last().unwrap()["deleted"], true);
+}
+
+#[test]
+fn substrate_edge_round_trip() {
+    let d = daemon();
+    // Need source + target entities first.
+    d.put_json(
+        "/v1/entities/capability/CAPTEST-EDGE-A",
+        json!({"payload":{"id":"CAPTEST-EDGE-A","name":"A","system":"X","maturity":"built"}}),
+    )
+    .unwrap();
+    d.put_json(
+        "/v1/entities/capability/CAPTEST-EDGE-B",
+        json!({"payload":{"id":"CAPTEST-EDGE-B","name":"B","system":"X","maturity":"built"}}),
+    )
+    .unwrap();
+    // PUT edge.
+    let res = d
+        .put_json(
+            "/v1/edges",
+            json!({
+                "from_kind":"capability","from_id":"CAPTEST-EDGE-A",
+                "edge_kind":"depends_on",
+                "to_kind":"capability","to_id":"CAPTEST-EDGE-B"
+            }),
+        )
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    // LIST from-side.
+    let listed: serde_json::Value = d
+        .get("/v1/edges?from_kind=capability&from_id=CAPTEST-EDGE-A")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert!(listed["count"].as_u64().unwrap() >= 1);
+    // Cleanup (delete uses body via DELETE; not all clients support it, so we
+    // assert basic round-trip and leave full cleanup to journal scoping).
+}
+
+#[test]
+fn features_lens_end_to_end() {
+    let d = daemon();
+    // Seed two capability entities via the substrate.
+    d.put_json(
+        "/v1/entities/capability/FLENS-A",
+        json!({"payload":{
+            "id":"FLENS-A","name":"Feature A","system":"Crux","maturity":"shipped",
+            "tests":{"unit":["a.rs"]}, "dod":["compiles"],
+            "audit":{"status":"audited"},
+            "promise_alignment":[1]
+        }}),
+    )
+    .unwrap();
+    d.put_json(
+        "/v1/entities/capability/FLENS-B",
+        json!({"payload":{
+            "id":"FLENS-B","name":"Feature B","system":"Crux","maturity":"shipped",
+            "tests":{}, "dod":[],
+            "audit":{"status":"gap"},
+            "promise_alignment":[1,7]
+        }}),
+    )
+    .unwrap();
+
+    // List via lens.
+    let list: serde_json::Value = d
+        .get("/v1/features/capabilities?system=Crux")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert!(list["count"].as_u64().unwrap() >= 2);
+
+    // Gap analysis.
+    let gaps: serde_json::Value = d
+        .get("/v1/features/capabilities/analysis/gaps")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert!(gaps["gaps"].is_array());
+    let gap_for_b = gaps["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|g| g["id"] == "FLENS-B" && g["type"] == "no_tests");
+    assert!(gap_for_b, "B is shipped without tests → critical no_tests");
+
+    // Promise coverage.
+    let promises: serde_json::Value = d
+        .get("/v1/features/capabilities/analysis/promises")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    let p1 = promises["coverage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["promise"] == 1)
+        .unwrap()
+        .clone();
+    assert!(p1["total"].as_u64().unwrap() >= 2);
+
+    // Coverage report.
+    let coverage: serde_json::Value = d
+        .get("/v1/features/capabilities/analysis/coverage")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert!(coverage["total_capabilities"].as_u64().unwrap() >= 2);
+
+    // Audit POST.
+    let audit_res = d
+        .post_json(
+            "/v1/features/capabilities/FLENS-B/audit",
+            json!({"status":"audited","auditor":"qa","notes":"covered"}),
+        )
+        .unwrap();
+    assert_eq!(audit_res.status().as_u16(), 200);
+    // GET capability shows new audit status.
+    let after: serde_json::Value = d
+        .get("/v1/features/capabilities/FLENS-B")
+        .unwrap()
+        .into_body()
+        .read_json()
+        .unwrap();
+    assert_eq!(after["audit"]["status"], "audited");
+}
+
+#[test]
+fn substrate_kinds_list() {
+    // The substrate is generic; kinds start empty until a lens registers one.
+    let body: serde_json::Value = daemon().get("/v1/kinds").unwrap().into_body().read_json().unwrap();
+    assert!(body["kinds"].is_array(), "kinds response must include array");
+    assert!(body["count"].is_number(), "kinds response must include count");
+}
+
+#[test]
 fn mcp_requires_auth_when_agent_token_configured() {
     let daemon = TestDaemon::start_with_agent_token("secret-token");
 

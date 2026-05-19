@@ -26,6 +26,24 @@ You have access to Crux, a receipted memory and retrieval backend. Use these too
 - `get_gaps(query)` — Check what the corpus doesn't know.
 - `get_bootstrap(topic, query?)` — Learn best practices and pull onboarding playbooks (topics: "patterns", "docs", "errors").
 
+## Substrate (M1–M2)
+The substrate hosts arbitrary domain data as `(kind, id, payload)` entities + labelled edges between them. Lens crates register kinds at daemon startup; agents can read and write via these generic tools.
+- `entity_upsert(kind, id, payload)` — Upsert. Payload is validated against the registered kind's JSON-Schema.
+- `entity_get(kind, id, include_deleted?)` — Fetch one entity.
+- `entity_list(kind?, limit?, include_deleted?)` — List entities, optionally filtered by kind.
+- `entity_delete(kind, id)` — Soft-delete. The version chain is preserved.
+- `entity_history(kind, id)` — Full version chain (oldest → newest); receipt-grade audit trail.
+- `edge_upsert(from_kind, from_id, edge_kind, to_kind, to_id, payload?)` — Upsert a labelled directed edge.
+- `edge_get`, `edge_list`, `edge_delete` — Edge CRUD.
+- `kind_list()`, `kind_get(kind)` — Discover registered kinds and their schemas.
+
+## Features lens (M3)
+Domain lens for the PlanCrux Feature Registry on top of the substrate. Capabilities live as `entity:capability:<id>`; `depends_on` edges form the dependency graph.
+- `feature_file_search(path)` — Find capabilities whose `files` list contains the given substring.
+- `feature_coverage_report()` — Per-system totals (capabilities, tested, audited, shipped) and maturity breakdown.
+- `feature_trigger_audit(id, status, auditor?, notes?)` — Record an audit on a capability. Status ∈ {audited, gap, waived, blocked}.
+- `feature_suggest_next(limit?)` — Suggest next-best capabilities to work on, derived from gap analysis + weakest-promise heuristic.
+
 ## Rules
 1. Always use `token_budget` to control context size.
 2. Store important findings as facts — don't rely on conversation memory.

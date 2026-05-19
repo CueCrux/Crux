@@ -343,6 +343,9 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
         integration_encryption_key: Arc::new([0u8; 32]),
         presence: crate::presence::PresenceTracker::new(),
         privacy_policy: crate::fact_privacy::PrivacyPolicy::from_env(),
+        entity_store: Arc::new(RwLock::new(corecrux_memory::EntityStore::new())),
+        edge_store: Arc::new(RwLock::new(corecrux_memory::EdgeStore::new())),
+        kind_registry: Arc::new(RwLock::new(corecrux_memory::KindRegistry::new())),
     }
 }
 
