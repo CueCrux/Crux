@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Receipt-tooling — sign receipts with an Ed25519 key, encode + decode CROWN bodies, base64 IO.
+
 use std::path::Path;
 
 use base64::Engine as _;

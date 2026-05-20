@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Projection-query routes — `/v1/projections/entity/{count,timeline,current-state}` + admin rebuild.
+
 use super::{
     hex16, map_http_dataplane_error, problem_response, require_http_scopes, AppState, DependentsQuery, HeaderMap,
     IntoResponse, Json, Path, PressureQuery, ProjMetaQuery, Query, RelationsQuery, State, StatusCode, TenantQuery,

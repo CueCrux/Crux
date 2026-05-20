@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Product-tier metadata + sync-runtime status types — feeds `/v1/version` and onboarding probes.
+
 use corecrux_memory::sync::{SyncRuntimeStatus, SYNC_COLLECTIONS};
 use serde::Serialize;
 

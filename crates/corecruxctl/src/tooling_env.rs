@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Tooling environment detection (`corecruxctl tooling-env`) — reports daemon URL, data dir, auth posture.
+
 use clap::ValueEnum;
 use serde::Serialize;
 

@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Error type for the `crux-session` crate (CBOR/JSON encode/decode failures, signature errors).
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

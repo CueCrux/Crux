@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Liveness + readiness probes — `/healthz`, `/readyz`, `/metrics` (Prometheus text format).
+
 use corecrux_types::{HealthzResponse, ProblemDetails};
 
 use super::{

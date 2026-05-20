@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Ed25519 keyring v1 — multi-key signer/verifier with key-id rotation for CROWN receipts.
+
 use std::collections::BTreeMap;
 
 use base64::Engine as _;

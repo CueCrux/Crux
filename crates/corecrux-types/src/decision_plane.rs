@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Agent decision-plane event schemas (action recorded/executed/superseded, character drift, knowledge state) + enrichment receipt types.
+
 use serde::{Deserialize, Serialize};
 
 pub const DECISION_EVENT_CONTENT_TYPE_V1: &str = "application/json; profile=corecrux-decision-plane-v1";

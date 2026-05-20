@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! v1 codec for the cold-segment directory inside a `.ccxs` snapshot (offset + length entries for sealed-segment lookups).
+
 // SAFETY: All .try_into().unwrap() in decode/parse functions below operate on fixed-size
 // sub-slices from validated header/index regions. The slice lengths match the target
 // array size, so the conversion is infallible.

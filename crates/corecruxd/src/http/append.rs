@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! HTTP append surface — `POST /v1/events` writes events through the append lane.
+
 use super::*;
 
 #[derive(serde::Deserialize)]

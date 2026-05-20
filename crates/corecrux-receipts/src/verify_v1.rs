@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! v1 receipt verifier — checks Ed25519 signatures, recomputes candidate digests, returns `VerificationReportV1`.
+
 use ed25519_dalek::{Signature, VerifyingKey};
 use thiserror::Error;
 

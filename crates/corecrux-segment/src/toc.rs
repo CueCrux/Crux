@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! v1 TOC codec (`TOC_MAGIC_TOC1`) — table of contents header + per-entry stride for record-block + frame lookups.
+
 use crate::util::{read_u16, read_u32, read_u64};
 use crate::{
     Result, SegmentError, TocEntryV1, TocHeaderV1, DEFAULT_RECORD_BLOCK_SIZE, DEFAULT_TOC_BLOCK_SIZE, TOC_ENTRY_LEN,

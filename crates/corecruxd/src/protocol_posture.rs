@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Protocol-posture surfacer — emits which routes/MCP tools are gated by tier or capability token at runtime.
+
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]

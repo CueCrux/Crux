@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Fixture digest helper — computes deterministic segment IDs + header/payload hashes for golden test fixtures.
+
 use corecrux_frame::{compute_header_hash, compute_payload_hash};
 use corecrux_segment::decode_frame_v1;
 use corecrux_storage::{

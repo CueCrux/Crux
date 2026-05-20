@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Projection inspector — opens shard storage, loads projections meta, prints per-shard snapshot state.
+
 use std::path::{Path, PathBuf};
 
 use corecrux_storage::{ShardStorage, ShardStorageOptions, MANIFEST_HEADER_LEN};

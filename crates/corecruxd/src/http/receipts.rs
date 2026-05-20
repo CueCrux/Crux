@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Receipt-access routes — `/v1/receipts/{id}/{body,signature,verification}` + replay export bundles.
+
 use super::*;
 
 #[tracing::instrument(level = "info", skip(state, headers), fields(%receipt_id, tenant_id = %q.tenant_id))]

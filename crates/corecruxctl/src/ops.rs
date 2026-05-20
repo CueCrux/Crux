@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Append-lane gRPC client — `corecruxctl ops append` for operator-side smoke writes against `CoreCruxDataPlaneV1`.
+
 use std::str::FromStr;
 
 use corecrux_proto::dataplane_v1::{

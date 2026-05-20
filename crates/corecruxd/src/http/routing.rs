@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! RCX routing + status routes — `/v1/route`, `/v1/routing/status`, `/v1/gpus`, `/v1/shards`.
+
 use super::{
     format_u64_hex, problem_response, require_http_scopes, stream_hash_xxhash64, AppState, HeaderMap, IntoResponse,
     Json, State, StatusCode,

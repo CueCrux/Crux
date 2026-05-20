@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Public segment types: `SegmentId`, `SegmentHeaderV1`, `SegmentFooterV1`, `TocEntryV1`, `BlockMetaV1`.
+
 use crate::BLOOM_BYTES_PER_BLOCK_V1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

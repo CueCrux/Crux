@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Segment builder — assembles header + frames + TOC + trailer + footer into a sealed `.ccxseg` byte stream.
+
 use blake3::Hasher as Blake3;
 
 use crate::footer::encode_segment_footer_v1;

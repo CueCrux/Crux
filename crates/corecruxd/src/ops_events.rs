@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Self-observation event helpers — builds `corecrux.ops.*.v1` events for the daemon's own state changes.
+
 use corecrux_proto::dataplane_v1::AppendEvent;
 use corecrux_types::{BuildInfo, EvidenceNodeContextV1, OPS_EVIDENCE_CONTENT_TYPE_V1};
 

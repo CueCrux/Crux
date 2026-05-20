@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Per-block bloom-filter helpers — inserts/queries stream-hashes for fast segment-skip during retrieval.
+
 use xxhash_rust::xxh64::xxh64;
 
 use crate::BLOOM_BYTES_PER_BLOCK_V1;

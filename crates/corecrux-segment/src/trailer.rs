@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! v1 trailer-index codec — per-block bloom + sorted stream-range tables for tail-locator + range-scan queries.
+
 use crate::block::{
     decode_block_meta_v1, decode_toc_by_offset_entry_v1, encode_block_meta_v1, encode_toc_by_offset_entry_v1,
 };

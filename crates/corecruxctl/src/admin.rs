@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Admin client — wraps `/v1/admin/*` HTTP routes for `corecruxctl admin` subcommands.
+
 use serde::Serialize;
 
 #[derive(Debug)]

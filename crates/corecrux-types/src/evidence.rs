@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Evidence-manifest + audit-pack-index schemas exchanged between `corecruxd` and `corecruxctl`.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

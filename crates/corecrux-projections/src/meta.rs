@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! `projections-meta.json` reader + writer; tracks per-shard projection state versions and snapshot fingerprints.
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;

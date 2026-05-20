@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! OpenAPI document — `GET /v1/openapi.json` returns the utoipa-generated schema for the daemon's HTTP surface.
+
 use axum::Json;
 use utoipa::OpenApi;
 

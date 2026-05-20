@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! gRPC server — implements `CoreCruxDataPlaneV1` (append/replay/route) on port 4007.
+
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;

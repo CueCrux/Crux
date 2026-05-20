@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Replication apply path — accepts a serialised sealed segment + manifest, materialises it on the receiver.
+
 use super::{
     build_trailer_stream_ranges, fsync_dir, hex16, io_err, normalize_hash16_prefix, write_new_file_host, DirExtentV1,
     DirRunKey, FrameLocation, IdemEntry, IdemKey, ReplicatedSegmentApplyResultV1, Result, SegmentMeta, ShardStorage,

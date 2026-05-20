@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Per-subject receipt index — maps subject IDs to receipt offsets for O(1) `query_facts`-time verification fetches.
+
 use std::path::{Path, PathBuf};
 
 use crate::store_v1::ReceiptStoreError;

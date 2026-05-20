@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! HTTP dataplane shim — proxies to the gRPC dataplane when a CPU-only build needs an HTTP fallback path.
+
 use std::sync::Arc;
 
 use corecrux_frame::stream_hash_xxhash64;

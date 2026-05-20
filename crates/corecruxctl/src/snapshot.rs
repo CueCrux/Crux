@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Snapshot loader — opens a `.ccxs` snapshot via `corecrux-projections` and prints its contents.
+
 use std::path::{Path, PathBuf};
 
 use corecrux_projections::{load_projections_meta_v1, CcxsSnapshot};

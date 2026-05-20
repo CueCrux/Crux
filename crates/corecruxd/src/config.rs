@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Daemon configuration: parses `CORECRUXD_*` environment variables into a typed `Config` at startup.
+
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 

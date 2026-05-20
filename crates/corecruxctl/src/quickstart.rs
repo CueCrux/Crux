@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! `corecruxctl quickstart` subcommand — prints an onboarding script + sample workflow for new operators.
+
 use std::fmt::Write as _;
 
 /// Interactive quickstart wizard for new CoreCrux users.

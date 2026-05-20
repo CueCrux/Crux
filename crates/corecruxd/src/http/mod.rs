@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Top-level HTTP module: composes the axum `Router`, defines `AppState`, declares all `/v1/*` route handlers.
+
 mod actions;
 mod admin;
 mod append;

@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! v1 segment header codec — magic `CCS3`, segment id, version (`SEGMENT_MAJOR/MINOR`), flags.
+
 use crate::util::{read_u16, read_u32, read_u64};
 use crate::{
     Result, SegmentError, SegmentHeaderV1, SegmentId, SEGMENT_HEADER_LEN, SEGMENT_MAGIC_CCS3, SEGMENT_MAJOR,

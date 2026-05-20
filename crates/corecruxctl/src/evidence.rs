@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Evidence verifier — verifies receipts against a keyring, loads projection meta, prints a verification report.
+
 use corecrux_frame::{compute_header_hash, decode_canonical_header_bytes_v1};
 use corecrux_projections::{load_projections_meta_v1, CcxsSnapshot};
 use corecrux_receipts::{

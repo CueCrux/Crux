@@ -2,6 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
+//! Prometheus metrics registry + helpers — emits `corecruxd_*` counters and histograms.
+
 use std::sync::Arc;
 
 use prometheus::{Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramVec, Registry, TextEncoder};
