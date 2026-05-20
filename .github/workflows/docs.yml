@@ -11,8 +11,13 @@ permissions:
   pages: write
   id-token: write
 
+# Scope the concurrency group per-ref so PRs don't cancel each other's
+# rustdoc builds. The deploy job is push-to-main only, so the actual Pages
+# slot is only ever contended by one ref at a time (main). On PRs we still
+# want cancel-in-progress (a force-push supersedes the earlier run) but it
+# must be scoped to that PR's ref.
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
