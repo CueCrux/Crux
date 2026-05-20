@@ -257,6 +257,13 @@ pub async fn handle_github_comments_since(args: &Value, ctx: &McpContext) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
 
     #[test]
     fn require_repo_rejects_missing_slash() {
@@ -291,5 +298,179 @@ mod tests {
     #[test]
     fn urlencoding_encodes_special_chars() {
         assert_eq!(urlencoding("a/b::commit"), "a%2Fb%3A%3Acommit");
+    }
+
+    fn serve_github_loopback() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind github loopback");
+        listener.set_nonblocking(true).expect("nonblocking loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                let mut buf = [0u8; 4096];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..read]);
+                let path = req
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default();
+                let body = if path.contains("invalid-json") {
+                    "not json".to_string()
+                } else {
+                    json!({
+                        "facts": [
+                            {
+                                "entity": "github::cuecrux/crux::commit/abc",
+                                "value": "{\"sha\":\"abc\",\"message\":\"ship\"}"
+                            },
+                            {
+                                "entity": "github::cuecrux/crux::pr/7",
+                                "value": "{\"state\":\"open\",\"title\":\"coverage\"}"
+                            },
+                            {
+                                "entity": "github::cuecrux/crux::pr/8",
+                                "value": "{\"state\":\"closed\",\"title\":\"old\"}"
+                            },
+                            {
+                                "entity": "github::cuecrux/crux::issue/3",
+                                "value": "{\"state\":\"open\",\"labels\":[\"ci\",\"coverage\"]}"
+                            },
+                            {
+                                "entity": "github::cuecrux/crux::issue/4",
+                                "value": "{\"state\":\"open\",\"labels\":[\"docs\"]}"
+                            },
+                            {
+                                "entity": "github::cuecrux/crux::comment/9",
+                                "value": "{\"body\":\"review note\"}"
+                            },
+                            {
+                                "entity": "github::other/repo::commit/def",
+                                "value": "{\"sha\":\"def\"}"
+                            }
+                        ]
+                    })
+                    .to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (base, stop, handle)
+    }
+
+    fn stop_loopback(base: &str, stop: Arc<AtomicBool>, handle: std::thread::JoinHandle<()>) {
+        stop.store(true, Ordering::Relaxed);
+        let _ = std::net::TcpStream::connect(base.trim_start_matches("http://"));
+        handle.join().expect("loopback thread");
+    }
+
+    fn text_json(value: Value) -> Value {
+        serde_json::from_str(value["content"][0]["text"].as_str().expect("text content")).expect("json text")
+    }
+
+    #[tokio::test]
+    async fn github_handlers_filter_loopback_facts() {
+        let (base, stop, handle) = serve_github_loopback();
+        let ctx = McpContext::new_default("node-a").with_daemon_base_url(base.clone());
+
+        let search = text_json(
+            handle_github_search(&json!({"query": "coverage", "repo": "cuecrux/crux", "top_k": 10}), &ctx)
+                .await
+                .expect("search"),
+        );
+        assert_eq!(search["count"], 6);
+
+        let commits = text_json(
+            handle_github_recent_commits(&json!({"repo": "cuecrux/crux", "limit": 5}), &ctx)
+                .await
+                .expect("commits"),
+        );
+        assert_eq!(commits["count"], 1);
+        assert_eq!(commits["facts"][0]["entity"], "github::cuecrux/crux::commit/abc");
+
+        let prs = text_json(
+            handle_github_open_prs(&json!({"repo": "cuecrux/crux", "limit": 5}), &ctx)
+                .await
+                .expect("prs"),
+        );
+        assert_eq!(prs["count"], 1);
+        assert_eq!(prs["facts"][0]["entity"], "github::cuecrux/crux::pr/7");
+
+        let issues = text_json(
+            handle_github_open_issues(&json!({"repo": "cuecrux/crux", "label": "ci", "limit": 5}), &ctx)
+                .await
+                .expect("issues"),
+        );
+        assert_eq!(issues["count"], 1);
+        assert_eq!(issues["facts"][0]["entity"], "github::cuecrux/crux::issue/3");
+
+        let comments = text_json(
+            handle_github_comments_since(&json!({"limit": 5}), &ctx)
+                .await
+                .expect("comments"),
+        );
+        assert_eq!(comments["count"], 1);
+        assert_eq!(comments["facts"][0]["entity"], "github::cuecrux/crux::comment/9");
+
+        stop_loopback(&base, stop, handle);
+    }
+
+    #[tokio::test]
+    async fn github_handlers_validate_required_arguments() {
+        let ctx = McpContext::new_default("node-a").with_daemon_base_url("http://127.0.0.1:9");
+        assert_eq!(
+            handle_github_search(&json!({}), &ctx)
+                .await
+                .expect_err("missing query")
+                .code,
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            handle_github_recent_commits(&json!({"repo": "missing-slash"}), &ctx)
+                .await
+                .expect_err("bad repo")
+                .code,
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            handle_github_open_prs(&json!({}), &ctx)
+                .await
+                .expect_err("missing repo")
+                .code,
+            INVALID_PARAMS
+        );
+        assert_eq!(
+            handle_github_open_issues(&json!({}), &ctx)
+                .await
+                .expect_err("missing repo")
+                .code,
+            INVALID_PARAMS
+        );
+    }
+
+    #[tokio::test]
+    async fn github_search_wraps_unparsable_loopback_response() {
+        let (base, stop, handle) = serve_github_loopback();
+        let ctx = McpContext::new_default("node-a").with_daemon_base_url(base.clone());
+        let result = text_json(
+            handle_github_search(&json!({"query": "invalid-json", "top_k": 5}), &ctx)
+                .await
+                .expect("search"),
+        );
+        assert_eq!(result["raw"], "not json");
+        stop_loopback(&base, stop, handle);
     }
 }

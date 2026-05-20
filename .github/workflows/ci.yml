@@ -92,7 +92,10 @@ jobs:
           done
           curl -sf http://localhost:14800/healthz | jq .
           curl -sf http://localhost:14800/readyz
-          curl -sf http://localhost:14800/metrics | head -5
+          # Same SIGPIPE-race pattern as /console below: head -5 closes the pipe,
+          # curl exits 23, set -o pipefail propagates. Stage to a variable.
+          METRICS=$(curl -sf http://localhost:14800/metrics)
+          printf '%s\n' "$METRICS" | head -5
           curl -sf http://localhost:14800/v1/version | jq -e '.features.mcp == true' >/dev/null
           curl -sf http://localhost:14800/v1/version | jq -e '.update.state | type == "string"' >/dev/null
           # The console HTML is now ~430 KB. Any `... | grep -q 'X'` pipeline
@@ -148,7 +151,7 @@ jobs:
     runs-on: [self-hosted, ci]
     env:
       CARGO_HOME: /home/gha-runner/.cargo
-      COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/http/append\.rs|.*/corecruxd/src/http/query\.rs|.*/corecruxd/src/http/projections\.rs|.*/corecruxd/src/http/receipts\.rs)$'
+      COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/main\.rs|.*/corecruxd/src/http/admin\.rs|.*/corecruxd/src/http/append\.rs|.*/corecruxd/src/http/query\.rs|.*/corecruxd/src/http/projections\.rs|.*/corecruxd/src/http/receipts\.rs|.*/corecruxctl/src/main\.rs|.*/corecruxctl/src/audit_pack\.rs)$'
     steps:
       - uses: actions/checkout@v6
       - name: Preflight (self-hosted runner toolchain)
@@ -183,8 +186,8 @@ jobs:
 
           FAILED=0
 
-          if (( $(echo "$TOTAL < 81" | bc -l) )); then
-            echo "::error::Workspace coverage ${TOTAL}% is below 81% floor"
+          if (( $(echo "$TOTAL < 84" | bc -l) )); then
+            echo "::error::Workspace coverage ${TOTAL}% is below 84% floor"
             FAILED=1
           fi
 

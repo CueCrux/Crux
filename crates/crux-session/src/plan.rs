@@ -1113,3 +1113,231 @@ fn take_bytes_fixed_opt<const N: usize>(map: &[Pair], key: &'static str) -> Resu
         _ => Err(SessionError::Decode(format!("{key} not bytes or null"))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bytes<const N: usize>(value: u8) -> [u8; N] {
+        [value; N]
+    }
+
+    fn full_capability() -> Capability {
+        Capability {
+            cap: "corecrux.query.local".to_string(),
+            category: "tier_gated".to_string(),
+            prefer: "mcp".to_string(),
+            shape: "QueryRequest".to_string(),
+            input_schema: Some(SchemaRef {
+                kind: "json-schema".to_string(),
+                uri: "schema://input".to_string(),
+                hash: bytes(11),
+            }),
+            output_schema: Some(SchemaRef {
+                kind: "json-schema".to_string(),
+                uri: "schema://output".to_string(),
+                hash: bytes(12),
+            }),
+            min_tier: Some("basic".to_string()),
+            required_affinity: Some("search".to_string()),
+            cost_class: "metered".to_string(),
+            cost_estimate: Some(CostEstimate {
+                p50_crux: Some(7),
+                p95_crux: Some(13),
+                estimation_method: "fixture".to_string(),
+            }),
+            stability: "stable".to_string(),
+            since: Some("1.2.3".to_string()),
+            sunset_at: Some(9_999),
+            model_policy: Some(ModelPolicy {
+                min_family: Some(vec!["gpt".to_string(), "o".to_string()]),
+                min_size: Some("mini".to_string()),
+                deny_models: Some(vec!["legacy".to_string()]),
+                auth_required: true,
+            }),
+            attestations: vec![AttestationRef {
+                issuer: "issuer".to_string(),
+                typ: "soc2".to_string(),
+                hash: bytes(13),
+                uri: Some("attest://soc2".to_string()),
+            }],
+            concurrency: Some(ConcurrencyHints {
+                max_parallel: Some(4),
+                rate_limit: Some(RateLimitHints {
+                    calls_per_minute: Some(60),
+                    tokens_per_minute: Some(1_000),
+                    bursts_allowed: true,
+                }),
+            }),
+            impl_path: ImplPath {
+                ce: Some("ce.tool".to_string()),
+                core: Some("core.tool".to_string()),
+            },
+            token_ref: Some(CapabilityTokenRef {
+                token_id: "tok_123".to_string(),
+                issued_at: 1_700_000_000,
+            }),
+        }
+    }
+
+    fn full_plan() -> SessionPlan {
+        SessionPlan {
+            plan_id: bytes(1),
+            plan_version: SESSION_PLAN_VERSION,
+            minted_at: 1_700_000_000_000,
+            origin: "ce".to_string(),
+            origin_install: Some(bytes(2)),
+            session_id: bytes(3),
+            session_ttl_s: 600,
+            passport: Passport {
+                principal_id: "p_test".to_string(),
+                tier: "basic".to_string(),
+                affinities: vec!["search".to_string()],
+                denied_capabilities: Some(vec!["dangerous.cap".to_string()]),
+                grant_expansions: Some(vec!["bonus.cap".to_string()]),
+                passport_receipt: Some(bytes(4)),
+            },
+            model: Some(ModelDeclaration {
+                declared: Some("gpt-test".to_string()),
+                declared_family: Some("gpt".to_string()),
+                declared_size: Some("mini".to_string()),
+                auth_bound: true,
+            }),
+            channels: Channels {
+                bulk: Some("h2://bulk".to_string()),
+                mcp: "mcp://local".to_string(),
+            },
+            capability_graph: vec![full_capability()],
+            capability_graph_edges: vec![Edge {
+                from: "corecrux.query.local".to_string(),
+                to: "corecrux.receipt.export".to_string(),
+                kind: "requires".to_string(),
+                weight: Some(10),
+            }],
+            capability_graph_excluded: Some(vec![Exclusion {
+                cap: "hosted.only".to_string(),
+                reason: "tier".to_string(),
+                layer: "policy".to_string(),
+                hint: Some("upgrade".to_string()),
+            }]),
+            capability_graph_version: CAPABILITY_GRAPH_VERSION,
+            capability_graph_valid_until: 1_700_000_600_000,
+            capability_graph_refresh_hint: Some("refresh soon".to_string()),
+            capability_graph_hash: bytes(5),
+            budget: Budget {
+                tokens_cap: Some(10_000),
+                crux_cap: Some(250),
+                ttl_s: 600,
+            },
+            receipt: ReceiptEnvelope {
+                mode: ReceiptMode::Verified,
+                hash: bytes(6),
+                signature: Some(bytes(7)),
+                signer_kid: Some("kid-1".to_string()),
+                parent_chain: Some(vec![bytes(8), bytes(9)]),
+            },
+            intent_hint: Some("audit-review".to_string()),
+        }
+    }
+
+    #[test]
+    fn full_plan_round_trips_all_optional_fields() {
+        let plan = full_plan();
+        let encoded = plan.to_canonical_cbor();
+        let decoded = SessionPlan::from_canonical_cbor(&encoded).expect("decode full plan");
+
+        assert_eq!(decoded, plan);
+        assert!(plan.to_zeroed_canonical_cbor().len() < encoded.len());
+        let json = plan.to_canonical_json();
+        assert!(json.contains("audit-review"));
+        assert_eq!(ReceiptMode::Audit.as_str(), "audit");
+    }
+
+    #[test]
+    fn legacy_capability_graph_array_decodes_with_defaults() {
+        let mut plan = full_plan();
+        plan.capability_graph_edges.clear();
+        plan.capability_graph_excluded = None;
+        plan.capability_graph_refresh_hint = None;
+        let mut pairs = match plan.to_cbor_value(false) {
+            CborValue::Map(pairs) => pairs,
+            _ => unreachable!("plan encodes to map"),
+        };
+        let legacy_cap = Capability::legacy(
+            "legacy.cap",
+            "bulk",
+            "stream<Chunk>",
+            Some("trusted".to_string()),
+            "heavy",
+            ImplPath {
+                ce: None,
+                core: Some("legacy.core".to_string()),
+            },
+        );
+        for (key, value) in &mut pairs {
+            if key == "capability_graph" {
+                *value = CborValue::Array(vec![capability_to_cbor(&legacy_cap)]);
+            }
+        }
+
+        let decoded = SessionPlan::from_cbor_value(&CborValue::Map(pairs)).expect("decode legacy graph");
+        assert_eq!(decoded.capability_graph.len(), 1);
+        assert_eq!(decoded.capability_graph[0].cap, "legacy.cap");
+        assert!(decoded.capability_graph_edges.is_empty());
+        assert!(decoded.capability_graph_excluded.is_none());
+        assert_eq!(
+            decoded.capability_graph_valid_until,
+            decoded.minted_at + decoded.session_ttl_s * 1000
+        );
+    }
+
+    #[test]
+    fn decode_rejects_bad_shapes_and_lengths() {
+        let err = SessionPlan::from_cbor_value(&CborValue::Text("bad".to_string())).expect_err("not map");
+        assert!(err.to_string().contains("SessionPlan"));
+
+        let mut pairs = match full_plan().to_cbor_value(false) {
+            CborValue::Map(pairs) => pairs,
+            _ => unreachable!("plan encodes to map"),
+        };
+        for (key, value) in &mut pairs {
+            if key == "receipt" {
+                *value = CborValue::Map(vec![
+                    ("mode".to_string(), CborValue::Text("mystery".to_string())),
+                    ("hash".to_string(), CborValue::Bytes(bytes::<HASH_LEN>(1).to_vec())),
+                    ("signature".to_string(), CborValue::Null),
+                    ("signer_kid".to_string(), CborValue::Null),
+                    ("parent_chain".to_string(), CborValue::Null),
+                ]);
+            }
+        }
+        let err = SessionPlan::from_cbor_value(&CborValue::Map(pairs)).expect_err("unsupported receipt mode");
+        assert!(err.to_string().contains("mystery"));
+
+        let err = schema_ref_from_cbor(&CborValue::Map(vec![
+            ("kind".to_string(), CborValue::Text("json-schema".to_string())),
+            ("uri".to_string(), CborValue::Text("schema://short".to_string())),
+            ("hash".to_string(), CborValue::Bytes(vec![1, 2, 3])),
+        ]))
+        .expect_err("short hash rejected");
+        assert!(err.to_string().contains("hash"));
+    }
+
+    #[test]
+    fn constructors_set_categories_from_tier_and_affinity() {
+        assert_eq!(Capability::category_for(None, None), "public");
+        assert_eq!(Capability::category_for(Some("basic"), None), "tier_gated");
+        assert_eq!(Capability::category_for(None, Some("ops")), "affinity_required");
+
+        let cap = Capability::v2(
+            "cap",
+            "mcp",
+            "shape",
+            None,
+            Some("ops".to_string()),
+            "free",
+            ImplPath { ce: None, core: None },
+        );
+        assert_eq!(cap.category, "affinity_required");
+    }
+}
