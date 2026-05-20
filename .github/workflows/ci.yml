@@ -22,6 +22,18 @@ jobs:
       CARGO_HOME: /home/gha-runner/.cargo
     steps:
       - uses: actions/checkout@v6
+      - name: Preflight (self-hosted runner toolchain)
+        run: |
+          set +e
+          MISSING=""
+          if ! command -v cc >/dev/null 2>&1; then MISSING="$MISSING cc"; fi
+          if ! sudo -n true 2>/dev/null; then MISSING="$MISSING passwordless-sudo"; fi
+          if [ -n "$MISSING" ]; then
+            echo "::error::Self-hosted runner is missing required tooling:$MISSING"
+            echo "::error::Run scripts/provision-self-hosted-runner.sh on the runner host."
+            echo "::error::Or add the ci:fallback label on this PR to use ubuntu-latest runners (see docs/self-hosted-runner.md)."
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -42,6 +54,18 @@ jobs:
       CARGO_HOME: /home/gha-runner/.cargo
     steps:
       - uses: actions/checkout@v6
+      - name: Preflight (self-hosted runner toolchain)
+        run: |
+          set +e
+          MISSING=""
+          if ! command -v cc >/dev/null 2>&1; then MISSING="$MISSING cc"; fi
+          if ! sudo -n true 2>/dev/null; then MISSING="$MISSING passwordless-sudo"; fi
+          if [ -n "$MISSING" ]; then
+            echo "::error::Self-hosted runner is missing required tooling:$MISSING"
+            echo "::error::Run scripts/provision-self-hosted-runner.sh on the runner host."
+            echo "::error::Or add the ci:fallback label on this PR to use ubuntu-latest runners (see docs/self-hosted-runner.md)."
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: cargo build --workspace
@@ -104,6 +128,17 @@ jobs:
       CARGO_HOME: /home/gha-runner/.cargo
     steps:
       - uses: actions/checkout@v6
+      - name: Preflight (self-hosted runner toolchain)
+        run: |
+          set +e
+          MISSING=""
+          if ! command -v cc >/dev/null 2>&1; then MISSING="$MISSING cc"; fi
+          if ! sudo -n true 2>/dev/null; then MISSING="$MISSING passwordless-sudo"; fi
+          if [ -n "$MISSING" ]; then
+            echo "::error::Self-hosted runner is missing required tooling:$MISSING"
+            echo "::error::Run scripts/provision-self-hosted-runner.sh on the runner host (or add ci:fallback label)."
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@1.88.0
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: cargo build --workspace
@@ -116,6 +151,17 @@ jobs:
       COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/http/append\.rs|.*/corecruxd/src/http/query\.rs|.*/corecruxd/src/http/projections\.rs|.*/corecruxd/src/http/receipts\.rs)$'
     steps:
       - uses: actions/checkout@v6
+      - name: Preflight (self-hosted runner toolchain)
+        run: |
+          set +e
+          MISSING=""
+          if ! command -v cc >/dev/null 2>&1; then MISSING="$MISSING cc"; fi
+          if ! sudo -n true 2>/dev/null; then MISSING="$MISSING passwordless-sudo"; fi
+          if [ -n "$MISSING" ]; then
+            echo "::error::Self-hosted runner is missing required tooling:$MISSING"
+            echo "::error::Run scripts/provision-self-hosted-runner.sh on the runner host (or add ci:fallback label)."
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview

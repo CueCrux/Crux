@@ -11,8 +11,13 @@ permissions:
   pages: write
   id-token: write
 
+# Scope the concurrency group per-ref so PRs don't cancel each other's
+# rustdoc builds. The deploy job is push-to-main only, so the actual Pages
+# slot is only ever contended by one ref at a time (main). On PRs we still
+# want cancel-in-progress (a force-push supersedes the earlier run) but it
+# must be scoped to that PR's ref.
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -49,7 +54,14 @@ jobs:
             echo '</ul></body></html>'
           } > target/doc/index.html
 
+      # Upload the Pages artifact only on push-to-main. On PRs we just want
+      # to verify `cargo doc` builds with `-D warnings`; uploading reserves
+      # the org-wide GitHub Pages deployment slot and causes the build to be
+      # cancelled when another PR is open ("higher priority waiting request
+      # for pages exists"), which is the failure mode that blocked PRs #85
+      # and #86 in the 2026-05-20 batch.
       - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: actions/upload-pages-artifact@v5
         with:
           path: target/doc
