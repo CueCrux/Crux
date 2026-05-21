@@ -469,8 +469,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "constraint_type": {
                         "type": "string",
-                        "enum": ["boundary", "relationship", "policy", "context_flag"],
-                        "description": "The kind of constraint"
+                        "enum": ["boundary", "relationship", "policy", "context_flag", "shell_pattern"],
+                        "description": "The kind of constraint. `shell_pattern` treats the assertion as a regex matched against `tool_parameters.command` for Bash/shell calls."
                     },
                     "assertion": {
                         "type": "string",
