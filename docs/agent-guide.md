@@ -180,6 +180,38 @@ Returns facts matching the query, fitted within your token budget.
 
 HTTP `/v1/facts` is a shared surface. It does not support `private=true`.
 
+### Citing Quality + Threat refs in design facts
+
+CueCrux uses a small, stable taxonomy so design decisions cite a fixed set of IDs instead of free-text rationale. The taxonomy is defined in [PlanCrux/.agent/PLANS.md](../../PlanCrux/.agent/PLANS.md) under "Quality refs" and "Threat refs". Refs themselves never change — `QC.1` means the same thing across every ExecPlan and every commit body — so they survive renaming, refactors, and time.
+
+When storing a design fact, embed the refs in the value JSON **and** write sibling tag facts so `query_facts` can retrieve "every design citing QC.3" cheaply:
+
+```bash
+# Main decision fact.
+store_fact(
+  entity="design:passport-routing",
+  key="decision:tenant-isolation",
+  value={
+    "rationale": "...",
+    "qc_ref": ["QC.3"],
+    "threat_ref": ["T.1"],
+    "commit_sha": "abc123"
+  }
+)
+
+# Sibling tags — one per cited ref. Cheap (~12 tokens each) and queryable.
+store_fact(entity="design:passport-routing", key="qc_ref:QC.3", value={"cited_in": "decision:tenant-isolation"})
+store_fact(entity="design:passport-routing", key="threat_ref:T.1", value={"cited_in": "decision:tenant-isolation"})
+```
+
+Retrieval:
+```bash
+# Every design fact citing QC.3, across all design entities.
+query_facts(entity_prefix="design:", key="qc_ref:QC.3", token_budget=2000)
+```
+
+This pattern uses the existing `query_facts` (no retrieval-layer change required) and stays compatible with `query_expand`'s `segment_index:doc_id` shape. The drift-check script `Crux/scripts/check-execplan-drift.sh` flags ExecPlans that cite a `decision:<topic>` whose sibling tags are absent — that's the integrity gate.
+
 ### Private facts over MCP
 
 Set `private: true` with the `store_fact` MCP tool to scope a fact to your
