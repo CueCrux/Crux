@@ -6,8 +6,24 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".agent/**"
+      - "LICENSE*"
+      - "LICENCE*"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".agent/**"
+      - "LICENSE*"
+      - "LICENCE*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -69,14 +85,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: cargo build --workspace
-      - run: cargo test -p crux-integrations --test community_packs
+      # `cargo test --workspace` (next step) already covers
+      # `crux-integrations::community_packs`; the explicit invocation here
+      # was duplicating that target's execution. Drop it.
       - run: cargo test --workspace
-      - run: cargo build --release
+      # Smoke now runs against the debug binary built by `cargo build
+      # --workspace` above. The release build (previously a `cargo build
+      # --release` step here) added ~2m45s to the critical path purely to
+      # produce an optimised binary for the smoke probe — but the probe
+      # only hits /readyz, /healthz, /metrics, /console, /v1/version, and
+      # /mcp, none of which care about codegen. If a perf-sensitive smoke
+      # gate becomes useful later, move it to its own parallel job.
       - name: Smoke test
         run: |
           set -euo pipefail
           DATA_DIR=/tmp/crux-smoke-${{ github.run_id }}
-          CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR="$DATA_DIR" ./target/release/corecruxd &
+          CORECRUXD_AUTH_MODE=dev_scopes CORECRUXD_DATA_DIR="$DATA_DIR" ./target/debug/corecruxd &
           PID=$!
           cleanup() {
             kill "$PID" 2>/dev/null || true
