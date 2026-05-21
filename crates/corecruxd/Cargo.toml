@@ -73,7 +73,7 @@ crux-session = { path = "../crux-session" }
 crux-enterprise-shim = { path = "../crux-enterprise-shim" }
 vaultcrux-local = { path = "../vaultcrux-local" }
 
-wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime"], optional = true }
+wasmtime = { version = "44", default-features = false, features = ["cranelift", "runtime"], optional = true }
 sha2 = "0.11"
 
 [dev-dependencies]
