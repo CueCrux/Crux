@@ -22,6 +22,7 @@
 //! `PlanCrux/.agent/execplans/crux-claude-hooks-2026-05-17.md`.
 
 pub mod cmds;
+pub mod config_audit;
 pub mod hook_input;
 pub mod hook_output;
 pub mod mcp_client;

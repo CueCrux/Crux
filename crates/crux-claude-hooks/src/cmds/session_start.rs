@@ -11,7 +11,7 @@
 
 use serde_json::{json, Value};
 
-use crate::{hook_input::HookInput, hook_output::HookOutput, mcp_client};
+use crate::{config_audit, hook_input::HookInput, hook_output::HookOutput, mcp_client};
 
 const BOOTSTRAP_TOKEN_BUDGET: u64 = 500;
 
@@ -51,6 +51,13 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
             eprintln!("crux-hook session-start: sync_status failed: {err}");
             return Ok(());
         }
+    }
+
+    // Warn-only config-audit: hash known agent-config files, ask the daemon
+    // which content hashes are unreviewed, surface inline. Operators clear
+    // by calling `audit_config(...)` after review.
+    if let Some(warning) = config_audit::session_start_warning() {
+        sections.push(warning);
     }
 
     // Drift check against bundled profile fragments. Cheap, filesystem-only;

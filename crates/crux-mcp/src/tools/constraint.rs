@@ -19,7 +19,13 @@ use corecrux_memory::fact_store::{FactQuery, StoreFact};
 const CONSTRAINT_PREFIX: &str = "__constraints__::";
 
 /// Allowed constraint types.
-const VALID_TYPES: &[&str] = &["boundary", "relationship", "policy", "context_flag"];
+///
+/// `shell_pattern` is the supply-chain gate type: the `assertion` field
+/// holds a regex matched against `tool_parameters.command` whenever the
+/// proposed action is a `Bash` (or `shell`) tool call. Regex is validated
+/// at declare-time; non-compiling assertions are rejected with
+/// `INVALID_PARAMS`.
+const VALID_TYPES: &[&str] = &["boundary", "relationship", "policy", "context_flag", "shell_pattern"];
 
 /// Allowed severity levels (ordered critical → low).
 const VALID_SEVERITIES: &[&str] = &["critical", "high", "medium", "low"];
@@ -63,6 +69,18 @@ pub async fn handle_declare_constraint(args: &Value, ctx: &McpContext) -> Result
             ),
             data: Some(json!({"param": "severity", "allowed": VALID_SEVERITIES})),
         });
+    }
+
+    // shell_pattern assertions are regexes; compile-and-discard now so a
+    // broken pattern never reaches the matcher path.
+    if constraint_type == "shell_pattern" {
+        if let Err(err) = regex::Regex::new(assertion) {
+            return Err(JsonRpcError {
+                code: INVALID_PARAMS,
+                message: format!("invalid shell_pattern regex: {err}"),
+                data: Some(json!({"param": "assertion", "regex_error": err.to_string()})),
+            });
+        }
     }
 
     let constraint_id = format!("c_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
@@ -162,6 +180,10 @@ pub async fn handle_get_constraints(args: &Value, ctx: &McpContext) -> Result<Va
 pub async fn handle_check_constraints(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let (action, enrichment_receipt_id) = action_text_for_constraint_check(args)?;
 
+    // Raw bash command — extracted separately for shell_pattern regex
+    // matching, which needs the verbatim command, not the enriched narrative.
+    let bash_command = bash_command_from_args(args);
+
     // Load all active constraints.
     let q = FactQuery {
         query: None,
@@ -194,11 +216,34 @@ pub async fn handle_check_constraints(args: &Value, ctx: &McpContext) -> Result<
         }));
     }
 
-    // Keyword match: tokenise action and each constraint assertion.
     let action_terms = tokenise(&action);
     let mut matches: Vec<(ConstraintRecord, f64)> = Vec::new();
 
     for constraint in &constraints {
+        if constraint.constraint_type == "shell_pattern" {
+            // Regex against the raw bash command. Skip if the proposed
+            // action isn't a Bash/shell tool call — shell_pattern only
+            // applies when there's actually a command to match.
+            let Some(cmd) = bash_command.as_deref() else {
+                continue;
+            };
+            match regex::Regex::new(&constraint.assertion) {
+                Ok(re) => {
+                    if re.is_match(cmd) {
+                        // Score 1.0 — regex match is binary.
+                        matches.push((constraint.clone(), 1.0));
+                    }
+                }
+                Err(_) => {
+                    // Stored regex is invalid (shouldn't happen — declare-time
+                    // validation rejects this — but guard anyway). Skip.
+                    continue;
+                }
+            }
+            continue;
+        }
+
+        // Keyword match for other constraint types.
         let assertion_terms = tokenise(&constraint.assertion);
         if assertion_terms.is_empty() {
             continue;
@@ -266,6 +311,20 @@ pub async fn handle_check_constraints(args: &Value, ctx: &McpContext) -> Result<
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
+
+/// Extract the raw shell command from `args.tool_parameters.command`
+/// when the proposed action is a Bash/shell tool call. Returns `None`
+/// for non-shell tools so shell_pattern constraints are skipped cleanly.
+fn bash_command_from_args(args: &Value) -> Option<String> {
+    let tool_name = args.get("tool_name")?.as_str()?;
+    if tool_name != "Bash" && tool_name != "shell" && tool_name != "bash" {
+        return None;
+    }
+    args.get("tool_parameters")?
+        .get("command")?
+        .as_str()
+        .map(str::to_string)
+}
 
 fn action_text_for_constraint_check(args: &Value) -> Result<(String, Option<String>), JsonRpcError> {
     if let Some(tool_name) = args.get("tool_name").and_then(|v| v.as_str()) {
@@ -549,6 +608,171 @@ mod tests {
             .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("verdict: pass"));
+    }
+
+    // ── shell_pattern constraints ──────────────────────────────────
+
+    #[tokio::test]
+    async fn declare_shell_pattern_validates_regex() {
+        let ctx = test_ctx();
+        // Valid regex — accepted.
+        handle_declare_constraint(
+            &json!({"constraint_type": "shell_pattern", "assertion": r"^curl\b.*\|\s*sh"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        // Invalid regex — rejected with INVALID_PARAMS.
+        let err = handle_declare_constraint(
+            &json!({"constraint_type": "shell_pattern", "assertion": "[unterminated"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("invalid shell_pattern regex"));
+    }
+
+    #[tokio::test]
+    async fn shell_pattern_warns_on_match() {
+        let ctx = test_ctx();
+        handle_declare_constraint(
+            &json!({
+                "constraint_type": "shell_pattern",
+                "assertion": r"\bcurl\b[^|]*\|\s*(sh|bash)",
+                "severity": "high",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_check_constraints(
+            &json!({
+                "tool_name": "Bash",
+                "tool_parameters": {"command": "curl https://example.com/install | sh"},
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("verdict: warn"), "expected warn, got: {text}");
+        assert!(text.contains("curl"));
+    }
+
+    #[tokio::test]
+    async fn shell_pattern_blocks_on_critical() {
+        let ctx = test_ctx();
+        handle_declare_constraint(
+            &json!({
+                "constraint_type": "shell_pattern",
+                "assertion": r"^rm\s+-rf\s+/",
+                "severity": "critical",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_check_constraints(
+            &json!({
+                "tool_name": "Bash",
+                "tool_parameters": {"command": "rm -rf / --no-preserve-root"},
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("verdict: block"), "expected block, got: {text}");
+    }
+
+    #[tokio::test]
+    async fn shell_pattern_passes_on_safe_command() {
+        let ctx = test_ctx();
+        handle_declare_constraint(
+            &json!({
+                "constraint_type": "shell_pattern",
+                "assertion": r"\bcurl\b[^|]*\|\s*(sh|bash)",
+                "severity": "high",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let result = handle_check_constraints(
+            &json!({
+                "tool_name": "Bash",
+                "tool_parameters": {"command": "curl -o foo.tar https://example.com/foo.tar"},
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("verdict: pass"), "expected pass, got: {text}");
+    }
+
+    #[tokio::test]
+    async fn shell_pattern_skipped_for_non_bash_tool() {
+        let ctx = test_ctx();
+        handle_declare_constraint(
+            &json!({
+                "constraint_type": "shell_pattern",
+                "assertion": r"DROP TABLE",
+                "severity": "critical",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // tool_name is not Bash/shell — the shell_pattern matcher is skipped
+        // entirely, even though the narrative contains the regex literal.
+        let result = handle_check_constraints(
+            &json!({
+                "tool_name": "sql_query",
+                "tool_parameters": {"query": "DROP TABLE users"},
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("verdict: pass"), "expected pass, got: {text}");
+    }
+
+    #[tokio::test]
+    async fn shell_pattern_baseline_regex_set_compiles() {
+        // The recommended baseline (see Crux/scripts/seed-shell-pattern-constraints.sh)
+        // must compile; this test guards against regressions in the regex
+        // syntax we promise to operators.
+        let ctx = test_ctx();
+        // The Rust `regex` crate does not support lookahead/lookbehind, so
+        // patterns that need "absent X" (e.g. unpinned pip install) are
+        // reformulated as coarse positive matches that the operator
+        // confirms on the merit of the call (warn-only at medium severity).
+        let baselines = [
+            r"^npx\s+(-y|--yes)\b",
+            r"^uvx\s+--from\s+git\+",
+            r"@latest\b",
+            r"\bcurl\b[^|]*\|\s*(sh|bash)",
+            r"--no-verify\b",
+        ];
+        for pattern in baselines {
+            handle_declare_constraint(
+                &json!({
+                    "constraint_type": "shell_pattern",
+                    "assertion": pattern,
+                    "severity": "medium",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("baseline pattern {pattern:?} rejected: {}", err.message));
+        }
     }
 
     // ── tokenise helper ────────────────────────────────────────────
