@@ -16,6 +16,26 @@ You have access to Crux, a receipted memory and retrieval backend. Use these too
 - `get_session(session_id)` — Resume from where you left off in your agent namespace.
 - `list_sessions()` — See the active sessions visible to you.
 
+### PreCompact crash recovery
+When the `crux-claude-hooks` PreCompact subcommand is installed (see [crates/crux-claude-hooks/README.md](../crates/crux-claude-hooks/README.md)), the harness calls `save_session` automatically before context compaction with `session_id = "hook:session:<claude-session-id>"`. The persisted `state.recovery` object captures the anchors needed to resume mid-ExecPlan:
+```json
+{
+  "hook_event": "PreCompact",
+  "trigger": "auto|manual",
+  "cwd": "/path/to/repo",
+  "transcript_path": "/path/to/jsonl",
+  "snapshot_ts": 1747776000,
+  "recovery": {
+    "last_commit_sha": "<sha>",
+    "branch": "<name>",        // present unless on a detached HEAD
+    "active_milestone": "M3"    // present if .agent/current-milestone exists
+  }
+}
+```
+To recover after a session restart: `list_sessions()` with a prefix filter on `hook:session:`, sort by `snapshot_ts` descending, then `get_session(session_id="hook:session:<id>")` on the most recent. `recovery.last_commit_sha` lets you verify the working tree against the snapshot; `recovery.active_milestone` re-anchors the ExecPlan.
+
+To name the current milestone for the hook, operators write a short label to `.agent/current-milestone` at the start of each milestone (e.g. `echo "M3: shell_pattern constraints" > .agent/current-milestone`). The file is read up to 256 bytes; longer content is truncated. Absent file → field omitted.
+
 ## Coordination
 - `create_handoff(session_id, include_facts, target_agent?)` — Bundle session state plus relevant non-private facts for another agent.
 - `accept_handoff(package)` — Receive and verify a server-authenticated handoff package.
