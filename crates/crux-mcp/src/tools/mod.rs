@@ -9,6 +9,7 @@
 //! MCP clients via the `tools/list` response.
 
 pub mod action;
+pub mod audit;
 pub mod constraint;
 pub mod coordination;
 pub mod cuecrux_session;
@@ -548,6 +549,80 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     { "action_description": "Delete all user records from the production database" },
                     { "action_description": "Deploy updated API to staging environment" },
                     { "tenant_id": "business::acme", "tool_name": "calendar.move_event", "tool_parameters": { "event_id": "evt_1", "attendees": ["customer@example.com"], "new_time": "2026-05-08T16:00:00Z" } }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "audit_config".to_string(),
+            description: "Record an attestation that a config file's content hash has been \
+                          reviewed. Idempotent on sha256 — re-auditing the same hash updates \
+                          the record's path/auditor/timestamp. Records live under \
+                          `__ops::config-audit` keyed by `sha256:<hash>`, so the SessionStart \
+                          hook (or any caller) can ask `check_config_audit` which paths still \
+                          need review."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path observed at audit time (advisory; the hash is canonical identity)"
+                    },
+                    "sha256": {
+                        "type": "string",
+                        "description": "Lowercase 64-char hex SHA-256 digest of the file contents"
+                    },
+                    "auditor": {
+                        "type": "string",
+                        "description": "Passport id, email, or free-text identifier of the auditor"
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Optional context (PR link, ticket, rationale)"
+                    }
+                },
+                "required": ["path", "sha256", "auditor"],
+                "examples": [
+                    {
+                        "path": "/home/u/.claude/settings.json",
+                        "sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+                        "auditor": "passport:ops-2026",
+                        "note": "reviewed for PR #42"
+                    }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "check_config_audit".to_string(),
+            description: "Given a list of {path, sha256} pairs, return which entries are \
+                          unaudited. Typical caller: SessionStart hook that has just hashed \
+                          settings.json / .mcp.json / CLAUDE.md and wants a warn-only signal \
+                          surfaced via additionalContext."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "description": "Array of {path, sha256} objects to check",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "sha256": {"type": "string"}
+                            },
+                            "required": ["path", "sha256"]
+                        }
+                    }
+                },
+                "required": ["paths"],
+                "examples": [
+                    {
+                        "paths": [
+                            {"path": "/home/u/.claude/settings.json", "sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"},
+                            {"path": "/home/u/.mcp.json", "sha256": "deadbeef0000000000000000000000000000000000000000000000000000cafe"}
+                        ]
+                    }
                 ]
             }),
         },
@@ -1261,6 +1336,8 @@ pub fn tool_output_docs() -> Value {
         { "tool": "declare_constraint", "output": "{ constraint_id, constraint_hash, constraint_type, assertion }" },
         { "tool": "get_constraints",    "output": "{ constraints: [{constraint_id, constraint_type, assertion, severity, status, created_at}], count }" },
         { "tool": "check_constraints",  "output": "{ verdict: pass|warn|block, matched_constraints: [{constraint_id, assertion, severity, match_score}] }" },
+        { "tool": "audit_config",        "output": "{ content: [{type:'text', text:'config audited: path=… sha256=… auditor=…'}] } — fact written under __ops::config-audit key=sha256:<hash>." },
+        { "tool": "check_config_audit",  "output": "{ content: [...], unaudited: [{path, sha256}], audited: [{path, sha256, audited_at, auditor, audited_path}] }" },
         { "tool": "enrich_action",      "output": "EnrichedActionProposal { schema, tenant_id, enrichment_mode, tool_call, narrative, affected_principals, affected_resources, state_diff, consequences, relationship_hits, consequence_metadata, enrichment_receipt }" },
         { "tool": "issue_passport",     "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id }" },
         { "tool": "get_passport",       "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id, issued_at, passport_hash }" },
@@ -1342,6 +1419,8 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "declare_constraint" => constraint::handle_declare_constraint(args, ctx).await,
         "get_constraints" => constraint::handle_get_constraints(args, ctx).await,
         "check_constraints" => constraint::handle_check_constraints(args, ctx).await,
+        "audit_config" => audit::handle_audit_config(args, ctx).await,
+        "check_config_audit" => audit::handle_check_config_audit(args, ctx).await,
         "enrich_action" => action::handle_enrich_action(args, ctx).await,
         "issue_passport" => passport::handle_issue_passport(args, ctx).await,
         "get_passport" => passport::handle_get_passport(args, ctx).await,
@@ -1417,7 +1496,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 59; // 55 prior + 4 Features lens tools (M3: feature_*).
+    const TOOL_COUNT: usize = 61; // 55 prior + 4 Features lens tools + 2 audit tools (audit_config, check_config_audit).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
