@@ -99,7 +99,13 @@ pub fn unaudited_via_daemon(entries: &[(PathBuf, String)]) -> Vec<(PathBuf, Stri
     let result = match crate::mcp_client::call_tool("check_config_audit", json!({"paths": paths_arg})) {
         Ok(v) => v,
         Err(err) => {
-            eprintln!("crux-hook config-audit: check_config_audit failed: {err}");
+            // `capability_not_permitted` is expected for free/local-tier tokens that
+            // lack the `crux-mcp.check_config_audit` capability — fires every session
+            // start. Daemon-down / network / 4xx-not-perm-related errors still print.
+            let msg = err.to_string();
+            if !msg.contains("capability_not_permitted") {
+                eprintln!("crux-hook config-audit: check_config_audit failed: {err}");
+            }
             return Vec::new();
         }
     };
