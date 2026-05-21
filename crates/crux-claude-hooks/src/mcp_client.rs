@@ -6,6 +6,13 @@
 //! (`POST /mcp`). Uses `ureq` per the workspace convention. Daemon-unreachable
 //! errors are returned to the caller, which logs and exits 0 — hooks never
 //! block tool execution.
+//!
+//! Auth contract: when `CRUX_AGENT_TOKEN` is set and non-empty, every
+//! request carries `Authorization: Bearer <token>`. When unset/empty, no
+//! header is emitted — preserves the pre-auth local-daemon path. Regression
+//! test in `tests/hook_e2e.rs` pins this contract: a missing header against
+//! the auth'd remote daemon at `100.70.12.73:14801` produced silent 401s
+//! for ~12+ sessions before the bug was found (2026-05-21).
 
 use std::time::Duration;
 
@@ -19,15 +26,35 @@ pub fn mcp_url() -> String {
     std::env::var("CRUX_MCP_URL").unwrap_or_else(|_| DEFAULT_MCP_URL.to_string())
 }
 
+/// Resolve the agent token from env. `None` (or empty) preserves the
+/// pre-auth local-daemon path: no `Authorization` header is emitted.
+pub fn mcp_token() -> Option<String> {
+    std::env::var("CRUX_AGENT_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 /// Call an MCP tool by name with the given arguments. Returns the
 /// JSON-RPC `result` payload on success.
 pub fn call_tool<A: Serialize>(name: &str, arguments: A) -> anyhow::Result<Value> {
-    call_tool_at(&mcp_url(), name, arguments)
+    call_tool_at_with_token(&mcp_url(), name, arguments, mcp_token())
 }
 
 /// Variant that accepts an explicit endpoint URL — used by tests that
-/// spin up a mock server.
+/// spin up a mock server. Resolves the token from env.
 pub fn call_tool_at<A: Serialize>(url: &str, name: &str, arguments: A) -> anyhow::Result<Value> {
+    call_tool_at_with_token(url, name, arguments, mcp_token())
+}
+
+/// Lowest-level call: explicit URL and explicit token. Used by the
+/// integration test in `tests/hook_e2e.rs` to exercise the auth contract
+/// without env-var racing.
+pub fn call_tool_at_with_token<A: Serialize>(
+    url: &str,
+    name: &str,
+    arguments: A,
+    token: Option<String>,
+) -> anyhow::Result<Value> {
     let envelope = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -43,11 +70,14 @@ pub fn call_tool_at<A: Serialize>(url: &str, name: &str, arguments: A) -> anyhow
         .build()
         .into();
 
-    let mut response = agent
+    let mut request = agent
         .post(url)
         .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .send_json(&envelope)?;
+        .header("Accept", "application/json");
+    if let Some(t) = token {
+        request = request.header("Authorization", &format!("Bearer {t}"));
+    }
+    let mut response = request.send_json(&envelope)?;
 
     let body: Value = response.body_mut().read_json()?;
 
@@ -65,11 +95,7 @@ mod tests {
 
     #[test]
     fn mcp_url_defaults_when_env_absent() {
-        // Use a unique var-clearing pattern that won't fight a parallel test.
         let prev = std::env::var("CRUX_MCP_URL").ok();
-        // SAFETY: tests in a single-threaded `cargo test --test-threads=1` block
-        // would be ideal, but with default parallelism this is best-effort.
-        // We restore at the end.
         std::env::remove_var("CRUX_MCP_URL");
         assert_eq!(mcp_url(), DEFAULT_MCP_URL);
         if let Some(v) = prev {
@@ -78,9 +104,20 @@ mod tests {
     }
 
     #[test]
+    fn mcp_token_treats_empty_as_none() {
+        let prev = std::env::var("CRUX_AGENT_TOKEN").ok();
+        std::env::set_var("CRUX_AGENT_TOKEN", "");
+        assert!(mcp_token().is_none(), "empty CRUX_AGENT_TOKEN must yield None");
+        std::env::set_var("CRUX_AGENT_TOKEN", "nonempty");
+        assert_eq!(mcp_token(), Some("nonempty".to_string()));
+        match prev {
+            Some(v) => std::env::set_var("CRUX_AGENT_TOKEN", v),
+            None => std::env::remove_var("CRUX_AGENT_TOKEN"),
+        }
+    }
+
+    #[test]
     fn envelope_shape_is_jsonrpc_2_0() {
-        // We can't exercise the wire call without a mock server, but we can
-        // verify the envelope shape by constructing it locally and asserting.
         let envelope = json!({
             "jsonrpc": "2.0",
             "id": 1,
