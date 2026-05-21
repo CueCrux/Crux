@@ -29,9 +29,7 @@ pub fn mcp_url() -> String {
 /// Resolve the agent token from env. `None` (or empty) preserves the
 /// pre-auth local-daemon path: no `Authorization` header is emitted.
 pub fn mcp_token() -> Option<String> {
-    std::env::var("CRUX_AGENT_TOKEN")
-        .ok()
-        .filter(|s| !s.is_empty())
+    std::env::var("CRUX_AGENT_TOKEN").ok().filter(|s| !s.is_empty())
 }
 
 /// Call an MCP tool by name with the given arguments. Returns the

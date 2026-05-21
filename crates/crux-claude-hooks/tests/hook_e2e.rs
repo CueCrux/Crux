@@ -78,8 +78,7 @@ fn spawn_mock(response_body: &str, status_line: &str) -> (String, thread::JoinHa
 
 #[test]
 fn auth_header_present_when_token_provided() {
-    let body =
-        r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}]}}"#;
+    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}]}}"#;
     let (url, handle) = spawn_mock(body, "200 OK");
 
     let r = call_tool_at_with_token(
@@ -149,8 +148,7 @@ fn http_401_does_not_silently_succeed() {
     // The actual failure mode of the 2026-05-21 bug: daemon returned 401,
     // hook treated it as "no result", produced empty additionalContext.
     // The caller MUST observe an error — silent empty is the regression.
-    let body =
-        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unauthorized"}}"#;
+    let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unauthorized"}}"#;
     let (url, _handle) = spawn_mock(body, "401 Unauthorized");
 
     let result = call_tool_at_with_token(
