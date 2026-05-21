@@ -11,11 +11,11 @@ serde_json = "1.0.139"
 uuid = { version = "1.23.1", features = ["v4"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "registry"] }
-tokio = { version = "1.51.1", features = ["sync", "rt"] }
+tokio = { version = "1.52.3", features = ["sync", "rt"] }
 corecrux-memory = { path = "../corecrux-memory" }
 
 [dev-dependencies]
-tokio = { version = "1.51.1", features = ["sync", "rt", "macros", "rt-multi-thread"] }
+tokio = { version = "1.52.3", features = ["sync", "rt", "macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true
