@@ -24,6 +24,7 @@
 //! environment-variable driven; see `config.example.env`.
 
 mod auth;
+mod category_enforce;
 mod config;
 mod console_index;
 mod control;

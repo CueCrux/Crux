@@ -199,16 +199,23 @@ pub(super) async fn put_fact(
     headers: HeaderMap,
     Json(body): Json<corecrux_memory::fact_store::StoreFact>,
 ) -> impl IntoResponse {
-    if let Err(response) = require_fact_write_ctx(&state, &headers) {
-        return response;
-    }
+    let ctx = match require_fact_write_ctx(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
     if body.private {
         return problem_response(
             StatusCode::BAD_REQUEST,
             "private facts require MCP agent identity; HTTP /v1/facts does not support private=true",
         );
     }
-    let fact = match state.fact_store.write().await.try_store(body) {
+    let mut store = state.fact_store.write().await;
+    if let Err(e) =
+        crate::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), &body.entity)
+    {
+        return problem_response(StatusCode::FORBIDDEN, e.to_string());
+    }
+    let fact = match store.try_store(body) {
         Ok(fact) => fact,
         Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
@@ -231,16 +238,25 @@ pub(super) async fn put_facts_bulk(
     headers: HeaderMap,
     Json(body): Json<Vec<corecrux_memory::fact_store::StoreFact>>,
 ) -> impl IntoResponse {
-    if let Err(response) = require_fact_write_ctx(&state, &headers) {
-        return response;
-    }
+    let ctx = match require_fact_write_ctx(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
     if body.iter().any(|fact| fact.private) {
         return problem_response(
             StatusCode::BAD_REQUEST,
             "private facts require MCP agent identity; HTTP /v1/facts/bulk does not support private=true",
         );
     }
-    let facts = match state.fact_store.write().await.try_store_bulk(body) {
+    let mut store = state.fact_store.write().await;
+    for fact in &body {
+        if let Err(e) =
+            crate::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), &fact.entity)
+        {
+            return problem_response(StatusCode::FORBIDDEN, e.to_string());
+        }
+    }
+    let facts = match store.try_store_bulk(body) {
         Ok(facts) => facts,
         Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };

@@ -7435,6 +7435,284 @@ async fn console_tenant_category_patch_requires_admin_write_scope() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
+// ── ExecPlan crux-tenant-category-model-2026-05-22 M3 ────────────────────
+// Write-side passport-category enforcement on /v1/facts, /v1/facts/bulk,
+// /v1/console/facts/add. System category exempt; no-passport bypass for
+// console-bridge envelope; passport.category must match entity effective
+// category.
+
+#[tokio::test]
+async fn put_fact_personal_passport_blocked_on_work_entity() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "work::team::status".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let resp = facts::put_fact(
+        State(state),
+        dev_scope_passport_headers("facts:write", "personal-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn put_fact_work_passport_allowed_on_work_entity() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "work::team::status".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let resp = facts::put_fact(
+        State(state),
+        dev_scope_passport_headers("facts:write", "work-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn put_fact_personal_passport_blocked_on_untagged_entity_post_default_flip() {
+    // Untagged entity → default Work; personal passport blocked.
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "execplan::foo".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let resp = facts::put_fact(
+        State(state),
+        dev_scope_passport_headers("facts:write", "personal-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn put_fact_no_passport_id_header_bypasses_enforcement() {
+    // Console-bridge envelope: scope present but no passport-id header.
+    // The check has nothing per-passport to gate; route-level access already
+    // satisfied; write goes through.
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "work::team::status".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let resp = facts::put_fact(State(state), dev_scope_headers("admin:write"), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn put_fact_system_entity_exempt_from_passport_category() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "__bootstrap__::seed".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    // personal-default writing a __bootstrap__:: system entity must succeed.
+    let resp = facts::put_fact(
+        State(state),
+        dev_scope_passport_headers("facts:write", "personal-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn put_fact_unknown_passport_id_rejected_as_legacy() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "work::team::status".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let resp = facts::put_fact(
+        State(state),
+        dev_scope_passport_headers("facts:write", "not-a-real-passport"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn put_facts_bulk_rejects_when_any_entity_violates_category() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let bulk = vec![
+        corecrux_memory::fact_store::StoreFact {
+            entity: "personal::a".to_string(),
+            key: "x".to_string(),
+            value: "1".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        },
+        // This second entity is Work; personal-default cannot write it →
+        // the entire bulk is refused.
+        corecrux_memory::fact_store::StoreFact {
+            entity: "work::b".to_string(),
+            key: "x".to_string(),
+            value: "1".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        },
+    ];
+    let resp = facts::put_facts_bulk(
+        State(state),
+        dev_scope_passport_headers("facts:write", "personal-default"),
+        Json(bulk),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn console_fact_add_personal_passport_blocked_on_work_entity() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = console::ConsoleAddFactBody {
+        entity: "work::team".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        confidence: 1.0,
+    };
+    let resp = console::post_console_fact_add(
+        State(state),
+        dev_scope_passport_headers("facts:write", "personal-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn console_fact_add_override_to_personal_lets_personal_passport_write_again() {
+    // After the operator overrides a tenant to Personal via the M2 PATCH
+    // endpoint, a personal passport can write entities under it again, and
+    // a work passport is blocked.
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    // PATCH: myproject → personal
+    let _ = console::patch_console_tenant_category(
+        State(state.clone()),
+        axum::extract::Path("myproject".to_string()),
+        dev_scope_headers("admin:write"),
+        Json(crate::tenant_metadata::PatchTenantCategoryBody {
+            category: "personal".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    // personal-default writes myproject::foo → allowed (overridden to Personal)
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "myproject::foo".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let resp = facts::put_fact(
+        State(state.clone()),
+        dev_scope_passport_headers("facts:write", "personal-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED, "personal can write after override");
+    // work-default writes myproject::bar → blocked now
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "myproject::bar".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let resp = facts::put_fact(
+        State(state),
+        dev_scope_passport_headers("facts:write", "work-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "work blocked after override to personal"
+    );
+}
+
 #[tokio::test]
 async fn console_settings_get_returns_running_and_chosen_state() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);

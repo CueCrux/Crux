@@ -841,6 +841,10 @@ pub(super) async fn post_console_fact_add(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["facts:write"]) {
         return problem.into_response();
     }
+    let ctx = match crate::auth::http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
 
     let entity = body.entity.trim();
     let key = body.key.trim();
@@ -853,6 +857,10 @@ pub(super) async fn post_console_fact_add(
     }
 
     let mut store = state.fact_store.write().await;
+    if let Err(e) = crate::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), entity)
+    {
+        return problem_response(StatusCode::FORBIDDEN, e.to_string());
+    }
     let mut sf = corecrux_memory::fact_store::StoreFact {
         entity: entity.to_string(),
         key: key.to_string(),
