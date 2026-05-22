@@ -51,7 +51,7 @@ pub fn resolve(store: &FactStore, input: ResolveInput<'_>) -> Result<SessionBind
     if tenant_id.is_empty() {
         return Err(SessionBindingsError::InvalidTenant(tenant_id));
     }
-    let category = crate::tenant_category::classify_tenant(&tenant_id, None).as_str();
+    let category = crux_mcp::tenant_category::classify_tenant(&tenant_id, None).as_str();
 
     let passport = if let Some(id) = input.passport_id {
         crate::passports::get_passport(store, &id).ok_or(SessionBindingsError::PassportNotFound(id))?

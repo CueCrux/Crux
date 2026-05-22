@@ -857,7 +857,7 @@ pub(super) async fn post_console_fact_add(
     }
 
     let mut store = state.fact_store.write().await;
-    if let Err(e) = crate::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), entity)
+    if let Err(e) = crux_mcp::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), entity)
     {
         return problem_response(StatusCode::FORBIDDEN, e.to_string());
     }
@@ -924,7 +924,7 @@ pub(super) async fn get_console_tenants(
         .into_iter()
         .map(|tenant_id| {
             let override_ = crate::tenant_metadata::get_tenant_category_override(&store, &tenant_id);
-            let category = crate::tenant_category::classify_tenant(&tenant_id, override_).as_str();
+            let category = crux_mcp::tenant_category::classify_tenant(&tenant_id, override_).as_str();
             serde_json::json!({
                 "tenant_id": tenant_id,
                 "category": category,
@@ -1064,10 +1064,10 @@ fn require_console_write(state: &AppState, headers: &HeaderMap) -> Result<(), cr
 /// `effective` is what `classify_tenant` returns under the current override.
 fn tenant_category_response(
     tenant_id: &str,
-    override_: Option<crate::tenant_category::TenantCategory>,
+    override_: Option<crux_mcp::tenant_category::TenantCategory>,
 ) -> serde_json::Value {
-    let effective = crate::tenant_category::classify_tenant(tenant_id, override_);
-    let derived = crate::tenant_category::classify_tenant(tenant_id, None);
+    let effective = crux_mcp::tenant_category::classify_tenant(tenant_id, override_);
+    let derived = crux_mcp::tenant_category::classify_tenant(tenant_id, None);
     serde_json::json!({
         "tenant_id": tenant_id,
         "derived": derived.as_str(),
@@ -1106,7 +1106,7 @@ pub(super) async fn patch_console_tenant_category(
         return problem_response(StatusCode::BAD_REQUEST, "tenant_id must not be empty".to_string());
     }
     // `parse_user_input` rejects "system" with its own error; surface as 400.
-    let category = match crate::tenant_category::TenantCategory::parse_user_input(&body.category) {
+    let category = match crux_mcp::tenant_category::TenantCategory::parse_user_input(&body.category) {
         Ok(c) => c,
         Err(e) => {
             return problem_response(StatusCode::BAD_REQUEST, e.to_string());

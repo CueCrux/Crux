@@ -27,7 +27,7 @@
 use corecrux_memory::fact_store::{FactStore, StoreFact};
 use serde::Deserialize;
 
-use crate::tenant_category::TenantCategory;
+use crux_mcp::tenant_category::TenantCategory;
 
 const TENANT_METADATA_PREFIX: &str = "__tenant_metadata__";
 const CATEGORY_KEY: &str = "category";
@@ -85,7 +85,7 @@ pub fn set_tenant_category_override(
     if matches!(category, TenantCategory::System) {
         return Err(TenantMetadataError::SystemNotPersistable);
     }
-    if crate::tenant_category::is_system_prefix(tenant_id) {
+    if crux_mcp::tenant_category::is_system_prefix(tenant_id) {
         return Err(TenantMetadataError::SystemPrefixTarget(tenant_id.to_string()));
     }
     let mut sf = StoreFact {

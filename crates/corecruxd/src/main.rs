@@ -24,7 +24,6 @@
 //! environment-variable driven; see `config.example.env`.
 
 mod auth;
-mod category_enforce;
 mod config;
 mod console_index;
 mod control;
@@ -69,7 +68,6 @@ mod session_bindings;
 mod shard_map;
 mod storybook;
 mod structured_log;
-mod tenant_category;
 mod tenant_metadata;
 mod update;
 #[cfg(feature = "wasm-extensions")]

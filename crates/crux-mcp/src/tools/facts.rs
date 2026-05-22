@@ -53,6 +53,17 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     };
 
     let mut store = ctx.fact_store.write().await;
+    // M3.5 NOTE: We deliberately do NOT call
+    // `category_enforce::check_passport_can_write_entity` here yet. The check
+    // requires an identifiable passport_id, but on prod the MCP agent names
+    // (`windows-host`, `openai`, `anthropic`, `tailnet`) don't match any
+    // passport_id (`agent-claude`, `personal-default`). There is no agent→passport
+    // mapping at this layer — sessions resolve passports via category-default
+    // (`session_bindings::resolve`), but `handle_store_fact` carries no session
+    // context. Wiring the check naively would 403 every operator MCP write after
+    // deploy. Designing the agent→passport resolution is a separate ExecPlan.
+    // See `PlanCrux/.agent/execplans/crux-tenant-category-model-2026-05-22.md`
+    // Decision Log, M3.5 entry.
     let fact = store.try_store(req).map_err(|err| JsonRpcError {
         code: INTERNAL_ERROR,
         message: "fact journal append failed".to_string(),

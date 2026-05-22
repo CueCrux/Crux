@@ -211,7 +211,7 @@ pub(super) async fn put_fact(
     }
     let mut store = state.fact_store.write().await;
     if let Err(e) =
-        crate::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), &body.entity)
+        crux_mcp::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), &body.entity)
     {
         return problem_response(StatusCode::FORBIDDEN, e.to_string());
     }
@@ -251,7 +251,7 @@ pub(super) async fn put_facts_bulk(
     let mut store = state.fact_store.write().await;
     for fact in &body {
         if let Err(e) =
-            crate::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), &fact.entity)
+            crux_mcp::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), &fact.entity)
         {
             return problem_response(StatusCode::FORBIDDEN, e.to_string());
         }
