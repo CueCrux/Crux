@@ -69,6 +69,7 @@ mod shard_map;
 mod storybook;
 mod structured_log;
 mod tenant_category;
+mod tenant_metadata;
 mod update;
 #[cfg(feature = "wasm-extensions")]
 mod wasm_dispatcher;

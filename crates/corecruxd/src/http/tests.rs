@@ -7278,6 +7278,163 @@ async fn console_tenants_classify_by_prefix_and_filter() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+// ── ExecPlan crux-tenant-category-model-2026-05-22 M2 ────────────────────
+// GET/PATCH /v1/console/tenants/:tenant/category — override layer for the
+// derived classification. System category not user-settable; system-prefix
+// tenant ids not overridable.
+
+#[tokio::test]
+async fn console_tenant_category_get_returns_derived_when_no_override() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::get_console_tenant_category(
+        State(state),
+        axum::extract::Path("execplan".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["tenant_id"], "execplan");
+    // Default-flipped-to-work + no override = derived & effective both "work".
+    assert_eq!(body["derived"], "work");
+    assert_eq!(body["effective"], "work");
+    assert!(body["override"].is_null());
+}
+
+#[tokio::test]
+async fn console_tenant_category_patch_sets_override_then_get_reflects_it() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // Seed at least one entity under the "execplan" prefix so it gets
+    // enumerated by `get_console_tenants` (which builds the tenant list from
+    // stored entity prefixes). The override alone is stored at
+    // `__tenant_metadata__::execplan` and would otherwise not surface
+    // "execplan" in the list.
+    {
+        let mut facts = state.fact_store.write().await;
+        facts.store(corecrux_memory::fact_store::StoreFact {
+            entity: "execplan::foo".to_string(),
+            key: "x".to_string(),
+            value: "v".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+    }
+    // PATCH to "personal"
+    let resp = console::patch_console_tenant_category(
+        State(state.clone()),
+        axum::extract::Path("execplan".to_string()),
+        dev_scope_headers("admin:write"),
+        Json(crate::tenant_metadata::PatchTenantCategoryBody {
+            category: "personal".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["derived"], "work");
+    assert_eq!(body["override"], "personal");
+    assert_eq!(body["effective"], "personal");
+
+    // GET reflects it
+    let resp = console::get_console_tenant_category(
+        State(state.clone()),
+        axum::extract::Path("execplan".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["override"], "personal");
+    assert_eq!(body["effective"], "personal");
+
+    // The override also flows through /v1/console/tenants list
+    let resp = console::get_console_tenants(
+        State(state),
+        Query(console::ConsoleTenantsQuery { category: None }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    let row = body["tenants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["tenant_id"] == "execplan")
+        .expect("execplan present once it has an override");
+    assert_eq!(row["category"], "personal");
+    assert_eq!(row["override"], "personal");
+}
+
+#[tokio::test]
+async fn console_tenant_category_patch_rejects_system_category() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::patch_console_tenant_category(
+        State(state),
+        axum::extract::Path("execplan".to_string()),
+        dev_scope_headers("admin:write"),
+        Json(crate::tenant_metadata::PatchTenantCategoryBody {
+            category: "system".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn console_tenant_category_patch_rejects_system_prefix_target() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::patch_console_tenant_category(
+        State(state),
+        axum::extract::Path("__bootstrap__".to_string()),
+        dev_scope_headers("admin:write"),
+        Json(crate::tenant_metadata::PatchTenantCategoryBody {
+            category: "work".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn console_tenant_category_patch_rejects_invalid_category_string() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::patch_console_tenant_category(
+        State(state),
+        axum::extract::Path("execplan".to_string()),
+        dev_scope_headers("admin:write"),
+        Json(crate::tenant_metadata::PatchTenantCategoryBody {
+            category: "rubbish".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn console_tenant_category_patch_requires_admin_write_scope() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // dev_scope_headers("admin:read") is the read scope; PATCH should reject.
+    let resp = console::patch_console_tenant_category(
+        State(state),
+        axum::extract::Path("execplan".to_string()),
+        dev_scope_headers("admin:read"),
+        Json(crate::tenant_metadata::PatchTenantCategoryBody {
+            category: "personal".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    // Insufficient scope → 403 from require_http_scopes.
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn console_settings_get_returns_running_and_chosen_state() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
