@@ -43,10 +43,7 @@ pub enum CategoryEnforcementError {
     )]
     LegacyOrMissingPassport(String),
     #[error("passport category '{passport_cat}' cannot write to entity in category '{entity_cat}'")]
-    CategoryMismatch {
-        passport_cat: String,
-        entity_cat: String,
-    },
+    CategoryMismatch { passport_cat: String, entity_cat: String },
 }
 
 /// Read the override category for `tenant_id`, or `None` if none is set.
@@ -100,9 +97,7 @@ fn passport_category_for(store: &FactStore, passport_id: &str) -> Option<String>
         .filter(|f| f.key == PASSPORT_RECORD_KEY)
         .collect();
     // Newest first (supersession picks the live version).
-    let latest = facts
-        .into_iter()
-        .max_by_key(|f| f.version)?;
+    let latest = facts.into_iter().max_by_key(|f| f.version)?;
     let slice: PassportCategorySlice = serde_json::from_str(&latest.value).ok()?;
     Some(slice.category)
 }
@@ -210,10 +205,7 @@ mod tests {
         let mut store = FactStore::new();
         seed_passport(&mut store, "p-personal", "personal");
         let r = check_passport_can_write_entity(&store, Some("p-personal"), "work::a");
-        assert!(matches!(
-            r,
-            Err(CategoryEnforcementError::CategoryMismatch { .. })
-        ));
+        assert!(matches!(r, Err(CategoryEnforcementError::CategoryMismatch { .. })));
     }
 
     #[test]
@@ -222,10 +214,7 @@ mod tests {
         let mut store = FactStore::new();
         seed_passport(&mut store, "p-personal", "personal");
         let r = check_passport_can_write_entity(&store, Some("p-personal"), "execplan::foo");
-        assert!(matches!(
-            r,
-            Err(CategoryEnforcementError::CategoryMismatch { .. })
-        ));
+        assert!(matches!(r, Err(CategoryEnforcementError::CategoryMismatch { .. })));
     }
 
     #[test]
@@ -255,10 +244,7 @@ mod tests {
     fn check_unknown_passport_rejected_as_legacy() {
         let store = FactStore::new();
         let r = check_passport_can_write_entity(&store, Some("ghost"), "work::a");
-        assert!(matches!(
-            r,
-            Err(CategoryEnforcementError::LegacyOrMissingPassport(_))
-        ));
+        assert!(matches!(r, Err(CategoryEnforcementError::LegacyOrMissingPassport(_))));
     }
 
     #[test]
@@ -266,10 +252,7 @@ mod tests {
         let mut store = FactStore::new();
         seed_passport(&mut store, "p-empty", "");
         let r = check_passport_can_write_entity(&store, Some("p-empty"), "work::a");
-        assert!(matches!(
-            r,
-            Err(CategoryEnforcementError::LegacyOrMissingPassport(_))
-        ));
+        assert!(matches!(r, Err(CategoryEnforcementError::LegacyOrMissingPassport(_))));
     }
 
     #[test]
@@ -282,9 +265,6 @@ mod tests {
         let ok = check_passport_can_write_entity(&store, Some("p-personal"), "myproject::x");
         assert!(ok.is_ok());
         let bad = check_passport_can_write_entity(&store, Some("p-work"), "myproject::x");
-        assert!(matches!(
-            bad,
-            Err(CategoryEnforcementError::CategoryMismatch { .. })
-        ));
+        assert!(matches!(bad, Err(CategoryEnforcementError::CategoryMismatch { .. })));
     }
 }

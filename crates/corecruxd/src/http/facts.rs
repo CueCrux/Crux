@@ -250,9 +250,11 @@ pub(super) async fn put_facts_bulk(
     }
     let mut store = state.fact_store.write().await;
     for fact in &body {
-        if let Err(e) =
-            crux_mcp::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), &fact.entity)
-        {
+        if let Err(e) = crux_mcp::category_enforce::check_passport_can_write_entity(
+            &store,
+            ctx.passport_id.as_deref(),
+            &fact.entity,
+        ) {
             return problem_response(StatusCode::FORBIDDEN, e.to_string());
         }
     }

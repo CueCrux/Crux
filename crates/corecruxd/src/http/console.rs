@@ -857,7 +857,8 @@ pub(super) async fn post_console_fact_add(
     }
 
     let mut store = state.fact_store.write().await;
-    if let Err(e) = crux_mcp::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), entity)
+    if let Err(e) =
+        crux_mcp::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), entity)
     {
         return problem_response(StatusCode::FORBIDDEN, e.to_string());
     }
