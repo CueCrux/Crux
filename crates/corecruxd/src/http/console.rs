@@ -875,19 +875,6 @@ pub(super) struct ConsoleTenantsQuery {
     pub category: Option<String>,
 }
 
-/// Tenant categorisation by id prefix. Personal is the safe default for any
-/// tenant id that doesn't carry a recognised prefix.
-fn classify_tenant(tenant_id: &str) -> &'static str {
-    let lower = tenant_id.to_ascii_lowercase();
-    if lower.starts_with("work::") || lower.starts_with("work-") || lower == "work" {
-        "work"
-    } else if lower.starts_with("public::") || lower.starts_with("public-") || lower == "public" {
-        "public"
-    } else {
-        "personal"
-    }
-}
-
 pub(super) async fn get_console_tenants(
     State(state): State<AppState>,
     Query(query): Query<ConsoleTenantsQuery>,
@@ -928,7 +915,7 @@ pub(super) async fn get_console_tenants(
     let tenant_objects: Vec<_> = tenants
         .into_iter()
         .map(|tenant_id| {
-            let category = classify_tenant(&tenant_id);
+            let category = crate::tenant_category::classify_tenant(&tenant_id, None).as_str();
             serde_json::json!({
                 "tenant_id": tenant_id,
                 "category": category,

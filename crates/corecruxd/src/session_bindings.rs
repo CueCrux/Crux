@@ -46,25 +46,12 @@ pub struct ResolveInput<'a> {
     pub now_unix_ms: u64,
 }
 
-/// Default passport categorisation by tenant id prefix — mirrors the console's
-/// classify_tenant helper so the same convention holds end-to-end.
-pub fn classify_tenant(tenant_id: &str) -> &'static str {
-    let lower = tenant_id.to_ascii_lowercase();
-    if lower.starts_with("work::") || lower.starts_with("work-") || lower == "work" {
-        "work"
-    } else if lower.starts_with("public::") || lower.starts_with("public-") || lower == "public" {
-        "public"
-    } else {
-        "personal"
-    }
-}
-
 pub fn resolve(store: &FactStore, input: ResolveInput<'_>) -> Result<SessionBinding, SessionBindingsError> {
     let tenant_id = input.tenant_id.unwrap_or_else(|| "personal".to_string());
     if tenant_id.is_empty() {
         return Err(SessionBindingsError::InvalidTenant(tenant_id));
     }
-    let category = classify_tenant(&tenant_id);
+    let category = crate::tenant_category::classify_tenant(&tenant_id, None).as_str();
 
     let passport = if let Some(id) = input.passport_id {
         crate::passports::get_passport(store, &id).ok_or(SessionBindingsError::PassportNotFound(id))?
@@ -133,14 +120,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("corecruxd-bindings-{name}-{nanos}"));
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
-    }
-
-    #[test]
-    fn classify_by_prefix() {
-        assert_eq!(classify_tenant("work::team"), "work");
-        assert_eq!(classify_tenant("Public::release"), "public");
-        assert_eq!(classify_tenant("project-x"), "personal");
-        assert_eq!(classify_tenant("personal::notes"), "personal");
     }
 
     #[test]

@@ -7208,7 +7208,7 @@ async fn console_tenants_classify_by_prefix_and_filter() {
             "personal::notes::status",
             "work::team::status",
             "public::release::status",
-            "myproject::status", // unknown prefix → personal
+            "myproject::status", // unknown prefix → work (default flipped by ExecPlan crux-tenant-category-model-2026-05-22)
         ] {
             facts.store(corecrux_memory::fact_store::StoreFact {
                 entity: entity.to_string(),
@@ -7242,8 +7242,11 @@ async fn console_tenants_classify_by_prefix_and_filter() {
     assert_eq!(with_cat("personal"), "personal");
     assert_eq!(with_cat("work"), "work");
     assert_eq!(with_cat("public"), "public");
-    assert_eq!(with_cat("myproject"), "personal");
-    assert_eq!(with_cat("local"), "personal");
+    // Default flipped to "work" by ExecPlan crux-tenant-category-model-2026-05-22:
+    // any tenant id without an explicit personal::/work::/public:: prefix that
+    // also isn't a __system__:: prefix lands in Work.
+    assert_eq!(with_cat("myproject"), "work");
+    assert_eq!(with_cat("local"), "work");
 
     // ?category=work → only work tenants.
     let resp = console::get_console_tenants(
