@@ -2319,6 +2319,7 @@ pre {
             <button role="tab" aria-selected="false" data-cat-filter="personal">Personal</button>
             <button role="tab" aria-selected="false" data-cat-filter="work">Work</button>
             <button role="tab" aria-selected="false" data-cat-filter="public">Public</button>
+            <button role="tab" aria-selected="false" data-cat-filter="system">System</button>
           </div>
           <div id="passportListNew" class="list"></div>
           <details>
@@ -2522,6 +2523,7 @@ pre {
             <button role="tab" data-tab="personal" aria-selected="true">Personal</button>
             <button role="tab" data-tab="work" aria-selected="false">Work</button>
             <button role="tab" data-tab="public" aria-selected="false">Public</button>
+            <button role="tab" data-tab="system" aria-selected="false">System</button>
           </div>
           <div class="list" id="tenantList"></div>
         </article>
@@ -2999,6 +3001,26 @@ $('tenantList').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-tenant]');
   if (btn) loadTenantChunks(btn.dataset.tenant);
 });
+// Per-tenant "Change category" dropdown: PATCH the new endpoint
+// (ExecPlan crux-tenant-category-model-2026-05-22 M2 + M4) and re-fetch.
+$('tenantList').addEventListener('change', async (e) => {
+  const sel = e.target.closest('select.tenant-category-select');
+  if (!sel) return;
+  const tenant = sel.dataset.tenant;
+  const newCategory = sel.value;
+  sel.disabled = true;
+  try {
+    await patchApi('/v1/console/tenants/' + encodeURIComponent(tenant) + '/category', { category: newCategory });
+    // Re-fetch the tenant list so the badge and any new bucket assignment refresh.
+    setTenantTab(state.ui.tenantTab);
+  } catch (err) {
+    console.error('Failed to set tenant category', err);
+    const detail = (err && err.data && (err.data.detail || err.data.title)) || (err && err.message) || String(err);
+    alert('Failed to change category: ' + detail);
+  } finally {
+    sel.disabled = false;
+  }
+});
 $('tenantTabs').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-tab]');
   if (!btn) return;
@@ -3315,14 +3337,15 @@ function renderTenantsSummary() {
     $('tenantsSummary').innerHTML = row('No tenants yet', 'Add a fact with a prefixed entity (e.g. work::project) to seed one.', 'empty', 'warn');
     return;
   }
-  const counts = { personal: 0, work: 0, public: 0 };
+  const counts = { personal: 0, work: 0, public: 0, system: 0 };
   all.forEach((t) => { counts[t.category || 'personal']++; });
 
   const summary = '<div class="chip-group">' +
     chip('Total', String(all.length), 'neutral', 'Distinct tenants currently visible to the console.') +
-    chip('Personal', String(counts.personal), counts.personal > 0 ? 'good' : 'neutral', 'Tenants without an explicit work::/public:: prefix, plus the implicit "local" bucket.') +
-    chip('Work', String(counts.work), counts.work > 0 ? 'good' : 'neutral', 'Tenants whose ids start with "work::" or "work-".') +
-    chip('Public', String(counts.public), counts.public > 0 ? 'good' : 'neutral', 'Tenants whose ids start with "public::" or "public-".') +
+    chip('Personal', String(counts.personal), counts.personal > 0 ? 'good' : 'neutral', 'Tenants with an explicit personal:: prefix (or overridden to personal).') +
+    chip('Work', String(counts.work), counts.work > 0 ? 'good' : 'neutral', 'Tenants whose ids start with "work::" / "work-", or untagged tenants (the new default after the 2026-05-22 model change), or overridden to work.') +
+    chip('Public', String(counts.public), counts.public > 0 ? 'good' : 'neutral', 'Tenants whose ids start with "public::" or "public-", or overridden to public.') +
+    chip('System', String(counts.system), counts.system > 0 ? 'good' : 'neutral', 'Daemon-internal entities matching __\\w+__::, exempt from passport-category write enforcement.') +
     '</div>';
 
   const top = all.slice(0, 5).map((t) =>
@@ -3697,11 +3720,17 @@ const FACTS_INTERNAL_PREFIXES = [
   'github::',
 ];
 
+// Mirrors `crux_mcp::tenant_category::classify_tenant` (with override=None).
+// ExecPlan crux-tenant-category-model-2026-05-22 flipped the default for
+// untagged entities from "personal" to "work" and added a 4th "system"
+// category for daemon-internal entities matching __\w+__($|::).
 function classifyFactCategory(entity) {
   const lower = (entity || '').toLowerCase();
+  if (/^__\w+__($|::)/.test(lower)) return 'system';
   if (lower.startsWith('work::') || lower.startsWith('work-') || lower === 'work') return 'work';
   if (lower.startsWith('public::') || lower.startsWith('public-') || lower === 'public') return 'public';
-  return 'personal';
+  if (lower.startsWith('personal::') || lower.startsWith('personal-') || lower === 'personal') return 'personal';
+  return 'work';
 }
 
 function activePassportCategory() {
@@ -3788,7 +3817,7 @@ function renderFacts() {
   // Hide internal prefixes — they have dedicated panels.
   const visible = all.filter((f) => !FACTS_INTERNAL_PREFIXES.some((p) => (f.entity || '').startsWith(p)));
   const { primary, set } = visibleCategoriesSet();
-  const buckets = { personal: [], work: [], public: [] };
+  const buckets = { personal: [], work: [], public: [], system: [] };
   for (const f of visible) {
     const cat = classifyFactCategory(f.entity);
     if (set.has(cat)) buckets[cat].push(f);
@@ -3896,11 +3925,23 @@ function renderTenants() {
       'preview ' + (tenant.content_preview ? 'on' : 'off'),
     ];
     if (chunkCount !== null) facts.push(chunkCount + (chunkCount === 1 ? ' chunk loaded' : ' chunks loaded'));
+    const cat = tenant.category || 'personal';
+    const isSystem = cat === 'system';
+    // Build the per-row category selector. System tenants (`__\w+__::`) are
+    // not user-settable — render a static badge instead of a select.
+    const categorySelector = isSystem
+      ? '<span class="passport-cat" title="System entities are derived and not user-settable">system</span>'
+      : '<select class="action sm tenant-category-select" data-tenant="' + esc(tenant.tenant_id) + '" ' +
+          'title="Change tenant category (overrides the prefix-derived classification)">' +
+          ['personal', 'work', 'public'].map((opt) =>
+            '<option value="' + opt + '"' + (opt === cat ? ' selected' : '') + '>' + opt + '</option>'
+          ).join('') +
+        '</select>';
     return '<div class="passport-row tenant-row">' +
       '<div class="left">' +
         '<div class="passport-ids">' +
           '<strong>' + esc(tenant.tenant_id) + '</strong>' +
-          '<span class="passport-cat">' + esc(tenant.category || 'personal') + '</span>' +
+          categorySelector +
         '</div>' +
         '<div class="muted passport-facts">' + facts.map(esc).join(' · ') + '</div>' +
         chunkRows +
