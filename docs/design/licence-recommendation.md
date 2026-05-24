@@ -6,7 +6,7 @@
 
 ---
 
-> **This is engineering research, not a legal opinion.** The recommendation below is grounded in licence-text comparison and the published practice of comparable projects (MariaDB, CockroachDB, Sentry, HashiCorp). Any licence change must be reviewed by counsel; this document is structured to be the input to that conversation, not a substitute for it.
+> **This is engineering research, not a legal opinion.** The recommendation below is grounded in licence-text comparison and the published practice of comparable projects (MariaDB, CockroachDB, Sentry). Any licence change must be reviewed by counsel; this document is structured to be the input to that conversation, not a substitute for it.
 
 ## Recommendation
 
