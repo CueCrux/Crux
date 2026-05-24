@@ -23,7 +23,7 @@
 
 use std::collections::HashSet;
 
-use rand::RngCore;
+use rand::Rng;
 
 use crate::catalog::CatalogEntry;
 use crate::error::SessionError;
@@ -128,7 +128,7 @@ pub fn mint(request: HandshakeRequest, inputs: HandshakeInputs<'_>) -> Result<Se
 /// a nice-to-have but not a schema-visible change.
 pub fn random_ulid() -> [u8; ULID_LEN] {
     let mut out = [0u8; ULID_LEN];
-    rand::thread_rng().fill_bytes(&mut out);
+    rand::rng().fill_bytes(&mut out);
     out
 }
 
