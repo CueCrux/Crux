@@ -2,15 +2,11 @@
 
 Crux Daemon supports the VaultCrux Session Handshake v1 protocol — one endpoint
 and one MCP tool that together give an agent a receipted plan describing
-what it's allowed to do. This document covers the local-daemon specifics:
+what it's allowed to do. This document is the operator-facing summary —
 where state lives on disk, what the wire formats look like, and how to
-verify a session plan or invocation receipt outside the daemon.
-
-The full protocol specification lives in the master plan at
-[VaultCrux-Session-Handshake-Master-Plan-v1_0.md](../../PlanCrux/docs/master-plan/VaultCrux-Session-Handshake-Master-Plan-v1_0.md);
-the execution history lives in
-[vaultcrux-session-handshake-2026-04-17.md](../../PlanCrux/.agent/execplans/vaultcrux-session-handshake-2026-04-17.md).
-What follows is the operator-facing summary.
+verify a session plan or invocation receipt outside the daemon. The
+canonical protocol invariants are encoded in the `crux-session` crate
+([crates/crux-session/src/lib.rs](../crates/crux-session/src/lib.rs)).
 
 ## What Crux Daemon Gives You
 

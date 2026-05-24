@@ -1,0 +1,25 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+
+name: Private Paths Guard
+
+# Runs on every push and PR, including .md-only changes (the main ci.yml
+# skips those, but private-path leaks land most often in docs).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  private-paths:
+    name: No private-monorepo refs
+    runs-on: [self-hosted, ci]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run guard
+        run: bash scripts/check-no-private-paths.sh

@@ -6,8 +6,8 @@
 //!
 //! Implements the canonical CBOR encoder, JSON mirror (RFC 8785 JCS), BLAKE3
 //! zeroed-receipt hashing, and ed25519 verification for the `SessionPlan`
-//! type family defined in
-//! `PlanCrux/docs/master-plan/VaultCrux-Session-Handshake-Master-Plan-v1_0.md`.
+//! type family. See [Session Handshake](../../docs/session-handshake.md) for
+//! the operator-facing protocol summary and on-disk layout.
 //!
 //! ## Invariants
 //!
