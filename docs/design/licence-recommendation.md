@@ -20,7 +20,7 @@ Switch from the bespoke **CueCrux Community Licence (CCL v1.0)** to **Business S
 
 ## Why this conversation now
 
-The May 2026 [Crux code review](../../../PlanCrux/docs/audits/crux-code-review.md) identified the bespoke CCL as a real adoption speed bump:
+An external code review of this repository in May 2026 identified the bespoke CCL as a real adoption speed bump:
 
 - CCL v1.0 is **not SPDX-recognised**, so GitHub's repo header reads "Unknown and 2 other licenses found." The default-MIT/Apache developer audience reads "Unknown" and bounces.
 - The 3-year Apache 2.0 conversion is a genuinely fair touch that's buried in the licence file rather than surfaced.
