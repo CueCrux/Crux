@@ -1,7 +1,7 @@
 # Receipts Over Vibes
 ## The Crux Daemon Manifesto
 
-> Adapted from [`PlanCrux/docs/manifesto/Crux-Manifesto-v2.2.md`](https://github.com/CueCrux/PlanCrux/blob/main/docs/manifesto/Crux-Manifesto-v2.2.md), scoped to what the Crux Daemon itself ships. The canonical, portfolio-wide manifesto lives in PlanCrux.
+> This repository-local manifesto is scoped to what the Crux Daemon itself ships: a source-available, on-prem-deployable receipt engine for proof-carrying software work.
 
 ---
 
@@ -101,4 +101,4 @@ That is what this daemon is. The broader CueCrux portfolio (WatchCrux for confid
 
 ---
 
-*The Crux Daemon is source-available under the [CueCrux Community Licence](LICENCE.md) (CCL v1.0). The canonical portfolio-wide manifesto, vision, and roadmap live in [PlanCrux](https://github.com/CueCrux/PlanCrux).*
+*The Crux Daemon is source-available under the [CueCrux Community Licence](LICENCE.md) (CCL v1.0).*
