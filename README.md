@@ -46,9 +46,11 @@ bash scripts/demo-receipt-tamper.sh
 The script seeds a minimal CROWN receipt into a tmp data directory, runs
 `corecruxctl verify-store --mode full` (expects `ok: true`), flips one byte
 in the receipt body on disk, re-runs `verify-store`, and asserts the failure
-reports a `PAYLOAD_HASH_MISMATCH`. Read the script before you run it — it
-stays under 100 lines of bash and uses only documented `corecruxctl`
-subcommands. No daemon needed; verification is offline.
+is detected (a `*MISMATCH` / `*CORRUPT` reason, or a hash-mismatch error
+message — the exact classification depends on which integrity layer catches
+the flipped byte first). Read the script before you run it — it stays under
+~150 lines of bash and uses only documented `corecruxctl` subcommands. No
+daemon needed; verification is offline.
 
 The verifier itself is ~1,250 lines of Rust at
 [`crates/corecrux-receipts/src/verify_v1.rs`](crates/corecrux-receipts/src/verify_v1.rs).
