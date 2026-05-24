@@ -182,7 +182,7 @@ HTTP `/v1/facts` is a shared surface. It does not support `private=true`.
 
 ### Citing Quality + Threat refs in design facts
 
-CueCrux uses a small, stable taxonomy so design decisions cite a fixed set of IDs instead of free-text rationale. The taxonomy is defined in [PlanCrux/.agent/PLANS.md](../../PlanCrux/.agent/PLANS.md) under "Quality refs" and "Threat refs". Refs themselves never change — `QC.1` means the same thing across every ExecPlan and every commit body — so they survive renaming, refactors, and time.
+CueCrux uses a small, stable taxonomy so design decisions cite a fixed set of IDs instead of free-text rationale. The taxonomy is defined in [docs/quality-threat-refs.md](./quality-threat-refs.md) under "Quality refs" and "Threat refs". Refs themselves never change — `QC.1` means the same thing across every ExecPlan and every commit body — so they survive renaming, refactors, and time.
 
 When storing a design fact, embed the refs in the value JSON **and** write sibling tag facts so `query_facts` can retrieve "every design citing QC.3" cheaply:
 

@@ -106,7 +106,16 @@ To turn off in the current workspace, either:
 
 ## Design rationale
 
-See the ExecPlan: [`PlanCrux/.agent/execplans/crux-claude-hooks-2026-05-17.md`](../../../PlanCrux/.agent/execplans/crux-claude-hooks-2026-05-17.md).
+Three lifecycle slots map to three Crux concerns. `PostToolUse` is the only
+moment per turn when the operator has just executed something, so it's where
+read-only loop/file-scope warnings belong — and it's deliberately read-only
+because writing facts on every tool use would dilute recall. `PreCompact`
+fires immediately before Claude Code summarises and discards history, so it's
+the last chance to snapshot session state via MCP `save_session`. The hook is
+best-effort and non-blocking because a hook that crashes a session is worse
+than no hook. `SessionStart` runs once at the top of each session with a
+500-token budget — enough to load current playbook patterns without blowing
+the agent's output budget on a stale boot dump.
 
 ## Attribution
 

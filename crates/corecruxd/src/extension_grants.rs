@@ -25,9 +25,6 @@
 //! 3. The dispatcher (M4) queries the fact store at call time anyway to
 //!    look up which extension a tool name belongs to; checking the grant
 //!    in the same query is essentially free.
-//!
-//! See the Decision Log in
-//! `PlanCrux/.agent/execplans/community-extensions-token-and-wasm-2026-05-05.md`.
 
 use corecrux_memory::fact_store::{FactQuery, FactStore, StoreFact};
 use serde::{Deserialize, Serialize};

@@ -5,10 +5,8 @@
 //! MCP tool handlers for session observations: `list_observations`,
 //! `get_observation`, `verify_observation`.
 //!
-//! These are the read-and-verify side of the multi-provider capture system
-//! shipped in Phase 1
-//! (`PlanCrux/.agent/execplans/crux-daemon-session-observations-multi-provider-2026-05-13.md`).
-//! The daemon already writes signed observations as JSONL under
+//! These are the read-and-verify side of the multi-provider capture system.
+//! The daemon writes signed observations as JSONL under
 //! `<data_dir>/observations/<scoped_session_id>.jsonl`; these tools let
 //! agents and IDE plugins query and verify those records without going
 //! through HTTP.

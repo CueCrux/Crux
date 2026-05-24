@@ -399,7 +399,7 @@ pub(super) async fn get_plane_repos(
 // ── Project layers (Vision, Goals, Manifesto, etc.) ───────────────────────
 // Layers are free-text content cards attached to a project. The Console
 // surfaces them on the project detail page; agents populate them by syncing
-// from upstream docs (e.g. PlanCrux/docs/manifesto/ → vision layer).
+// from upstream docs (e.g. an operator's manifesto repo → vision layer).
 //
 // Storage: facts under `__project_layer__::{project_id}::{layer_name}` with
 // key=`content`. The Console used to reach into facts directly to set these;
