@@ -56,6 +56,27 @@ service.
 The `/v1/version` response reports which runtime features are active on the
 current process.
 
+## Repository scope
+
+**What this repo contains.** The local-first daemon (`corecruxd`), CLI
+(`corecruxctl`), MCP server, append-only storage, BM25 retrieval, CROWN
+receipt verification, capability-token signing/verification, and the
+outbox-push sync client. Every claim about *local* trust — receipts, signed
+projections, BM25, tenant isolation, JWT auth, local content signing — can
+be verified by reading the source in this tree. The same goes for the Claude
+Code lifecycle hooks (`crux-claude-hooks`) that ship with the daemon.
+
+**What this repo does not.** The hosted VaultCrux API that the outbox sync
+client pushes to is operated by CueCrux Ltd and is not part of this
+repository. If you self-host without the hosted backend, `crux-router`
+returns `DegradedLocal` for hosted-tier decisions and the daemon stays
+fully functional in local-only mode. GPU/CUDA acceleration is a separate
+distribution; this repo is CPU-only.
+
+This boundary is intentional, not a missing-source mistake. Audit the local
+half from this tree; audit the hosted half via the published Trust Contract
+and the receipts your daemon emits.
+
 ## Requirements
 
 | Path | Requirements |
