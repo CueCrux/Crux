@@ -4,7 +4,7 @@
 
 ## Why this exists
 
-The [Claude Code Insights report](../../PlanCrux/docs/insights/report.html) for 2026-04-12 → 2026-05-13 showed three recurring frictions: output-token-limit exhaustion (9 blocked sessions), late-surfacing bugs in agent code (22 buggy_code + 15 wrong_approach events), and prerequisite-state mismatches that wasted ~978 hours of compute. Each of those frictions has a "if only the rule were in CLAUDE.md" answer. The wizard ships those rules as version-pinned, source-controlled profile fragments so they actually load into every Claude session.
+A four-week internal Claude Code session review (2026-04-12 → 2026-05-13) identified three recurring frictions: output-token-limit exhaustion (9 blocked sessions), late-surfacing bugs in agent code (22 buggy-code + 15 wrong-approach events), and prerequisite-state mismatches that wasted ~978 hours of compute. Each of those frictions has a "if only the rule were in CLAUDE.md" answer. The wizard ships those rules as version-pinned, source-controlled profile fragments so they actually load into every Claude session.
 
 The same shape supports EU AI Act-aligned posture (Articles 9, 10, 12, 13, 14, 15) and SOC 2-style audit hygiene without manual upkeep.
 
@@ -191,6 +191,6 @@ Both ship as separate crates with version-pinned content; both leverage the same
 
 ## See also
 
-- ExecPlan: [PlanCrux/.agent/execplans/agent-config-wizard-2026-05-19.md](../../PlanCrux/.agent/execplans/agent-config-wizard-2026-05-19.md)
-- Source: [Crux/crates/crux-config-wizard/](../crates/crux-config-wizard/)
-- Hook wiring: [Crux/crates/crux-claude-hooks/src/cmds/session_start.rs](../crates/crux-claude-hooks/src/cmds/session_start.rs)
+- Source: [crates/crux-config-wizard/](../crates/crux-config-wizard/)
+- Hook wiring: [crates/crux-claude-hooks/src/cmds/session_start.rs](../crates/crux-claude-hooks/src/cmds/session_start.rs)
+- Quality + Threat refs taxonomy: [docs/quality-threat-refs.md](./quality-threat-refs.md)
