@@ -31,7 +31,7 @@ When calling `store_fact`, use these entity prefixes and required keys — this 
 - `entity="execplan:<slug>"` — keys: `decision:<topic>`, `milestone:M<n>`, `gate:M<n>`. Decision values must include `commit_sha`.
 - `entity="bench:<id>"` — value object requires `{metric, value, corpus, lane_flags, commit_sha, run_id}`. `corpus` is mandatory.
 - `entity="incident:<YYYY-MM-DD>"` — value requires `{symptom, cause, fix_sha, repro_steps}`.
-- `entity="design:<slug>"` — for architectural notes; links to file path under `PlanCrux/.agent/execplans/<slug>.design.md`.
+- `entity="design:<slug>"` — for architectural notes; value includes a `doc_path` field pointing at the design doc in your repo.
 
 ### Don'ts
 

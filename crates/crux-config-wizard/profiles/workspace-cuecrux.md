@@ -1,13 +1,15 @@
 +++
 name = "workspace-cuecrux"
-version = 1
-description = "CueCrux workspace specifics: ExecPlan paths, daemon ports, Chainguard rule, JobClaw/MirrorClaw, three-place wiring."
+version = 2
+description = "CueCrux workspace specifics: ExecPlan paths, daemon ports, Chainguard rule, JobClaw/MirrorClaw, three-place wiring. CueCrux-internal — only enable inside the CueCrux planning monorepo."
 targets = ["claude_md", "agents_md"]
 order = 90
 risk_class = "low"
 +++
 
 ## CueCrux Workspace
+
+> **Scope.** This profile encodes paths and tools (`PlanCrux/`, `AuditCrux/benchmarks/`) that exist inside the CueCrux planning monorepo. Operators outside the CueCrux workspace should not enable this profile — the cross-references will not resolve. Use the generic profiles (`memory-practices`, `execplan-discipline`, `eu-ai-act`, etc.) instead.
 
 ### ExecPlan location
 
