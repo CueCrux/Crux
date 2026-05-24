@@ -14,15 +14,51 @@
 [![Licence: CCL-1.0 (source-available)](https://img.shields.io/badge/licence-CCL--1.0_(source--available)-blue)](LICENCE.md)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88.0-orange)](rust-toolchain.toml)
 
-Crux Daemon is a local-first memory, retrieval, and receipt daemon for agents
-and applications. It gives you an HTTP API, a built-in MCP server, append-only
-storage, local facts and sessions, BM25 retrieval, CROWN receipts, Prometheus
-metrics, and optional bring-your-own embeddings.
+**Local-first memory and signed receipts for agents.** Every state change
+your daemon makes produces a CROWN receipt — a body hash plus an Ed25519
+signature — so you can verify what happened, replay it, and prove
+integrity. If a byte changes on disk, verification returns
+`BODY_HASH_MISMATCH`; if the signature is replaced, `SIG_INVALID`. The
+distinction lives in the error taxonomy because operators need to know
+*why* verification failed.
 
-The daemon is designed to run cleanly on a laptop, workstation, VM, or container.
-It is source-available under the CueCrux Community Licence, but it is not
-open-source. Read [Licence](#licence) before redistributing or offering a hosted
+Crux Daemon is a local-first memory, retrieval, and receipt daemon for
+agents and applications. It gives you an HTTP API, a built-in MCP server,
+append-only storage, local facts and sessions, BM25 retrieval, CROWN
+receipts, Prometheus metrics, and optional bring-your-own embeddings.
+
+The daemon is designed to run cleanly on a laptop, workstation, VM, or
+container. It is source-available under the CueCrux Community Licence
+and **converts to Apache 2.0 three years after each versioned release**.
+Read [Licence](#licence) before redistributing or offering a hosted
 service.
+
+## Verify it yourself
+
+A 60-second demo proves the central claim — verification catches tampering:
+
+```bash
+git clone https://github.com/CueCrux/Crux.git && cd Crux
+cargo build --release --bin corecruxctl
+bash scripts/demo-receipt-tamper.sh
+```
+
+The script seeds a minimal CROWN receipt into a tmp data directory, runs
+`corecruxctl verify-store --mode full` (expects `ok: true`), flips one byte
+in the receipt body on disk, re-runs `verify-store`, and asserts the failure
+reports a `PAYLOAD_HASH_MISMATCH`. Read the script before you run it — it
+stays under 100 lines of bash and uses only documented `corecruxctl`
+subcommands. No daemon needed; verification is offline.
+
+The verifier itself is ~1,250 lines of Rust at
+[`crates/corecrux-receipts/src/verify_v1.rs`](crates/corecrux-receipts/src/verify_v1.rs).
+It uses `ed25519-dalek::verify_strict` (rejects malleable signatures and
+small-order public keys), binds the signature to both the receipt ID and
+the payload hash (so a valid signature can't be transplanted onto a
+different receipt), and is exercised by tamper tests at
+[`crates/corecrux-receipts/src/tests.rs`](crates/corecrux-receipts/src/tests.rs)
+(`verify_body_corruption_surfaces_hash_mismatch`,
+`verify_invalid_signature_returns_sig_invalid_when_hash_matches`).
 
 ## Naming
 
