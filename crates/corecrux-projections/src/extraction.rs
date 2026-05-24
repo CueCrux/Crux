@@ -22,9 +22,6 @@
 //!   * [`ExtractionVerifierScoredV1`]  — M4 attaches cross-encoder support score
 //!   * [`ExtractionConfidenceDeltaV1`] — M7 adjusts confidence from downstream signal
 //!   * [`ExtractionCacheInvalidateV1`] — explicit invalidation (prompt change, etc.)
-//!
-//! See `PlanCrux/.agent/execplans/stateful-extraction-flywheel.md` §M1 for
-//! the full design rationale.
 
 use crate::{ProjectionError, Result};
 

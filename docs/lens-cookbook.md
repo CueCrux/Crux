@@ -1,6 +1,6 @@
 # Lens Cookbook — Adding a Domain to the Crux Substrate
 
-> Status: living document. Worked example uses the Features lens shipped in 2026-05-19 via [PlanCrux/.agent/execplans/crux-domain-substrate-and-features-lens-2026-05-18.md](../../PlanCrux/.agent/execplans/crux-domain-substrate-and-features-lens-2026-05-18.md).
+> Status: living document. Worked example uses the Features lens shipped in May 2026.
 
 ## What is a lens?
 
@@ -157,13 +157,13 @@ If `tool_output_docs()`'s `json!` macro hits the recursion limit, the file alrea
 
 ### 7. Migration / cutover
 
-If the data lives outside Crux (PlanCrux Postgres, a YAML file, an external API), write a one-shot migration script next to the existing ones in `PlanCrux/scripts/`. Pattern:
+If the data lives outside Crux (a legacy Postgres, a YAML file, an external API), write a one-shot migration script. Pattern:
 
 - Read source.
 - For each record, `PUT /v1/entities/<kind>/<id>` with the validated payload.
 - For each edge, `PUT /v1/edges`.
 
-Then a parity script that compares Crux state to source, dedupes upstream id-collisions (last-write-wins), and exits non-zero on divergence. The Features lens provides a reference implementation at `PlanCrux/scripts/{migrate-features-to-crux,verify-features-parity,dual-write-features-bridge,capabilities-crux-proxy}.ts`.
+Then a parity script that compares Crux state to source, dedupes upstream id-collisions (last-write-wins), and exits non-zero on divergence. Cutover pattern: keep a dual-write bridge running until parity holds for one full poll cycle, then proxy reads to Crux, then retire the legacy path.
 
 ### 8. Tests
 
