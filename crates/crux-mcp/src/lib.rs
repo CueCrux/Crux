@@ -25,9 +25,11 @@
 #![deny(clippy::unwrap_used)]
 
 pub mod agent;
+pub mod category_enforce;
 pub mod dispatch;
 pub mod handoff;
 pub mod protocol;
 pub mod scope;
 pub mod server;
+pub mod tenant_category;
 pub mod tools;

@@ -841,6 +841,10 @@ pub(super) async fn post_console_fact_add(
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["facts:write"]) {
         return problem.into_response();
     }
+    let ctx = match crate::auth::http_scope_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
 
     let entity = body.entity.trim();
     let key = body.key.trim();
@@ -853,6 +857,11 @@ pub(super) async fn post_console_fact_add(
     }
 
     let mut store = state.fact_store.write().await;
+    if let Err(e) =
+        crux_mcp::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), entity)
+    {
+        return problem_response(StatusCode::FORBIDDEN, e.to_string());
+    }
     let mut sf = corecrux_memory::fact_store::StoreFact {
         entity: entity.to_string(),
         key: key.to_string(),
@@ -873,19 +882,6 @@ pub(super) async fn post_console_fact_add(
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct ConsoleTenantsQuery {
     pub category: Option<String>,
-}
-
-/// Tenant categorisation by id prefix. Personal is the safe default for any
-/// tenant id that doesn't carry a recognised prefix.
-fn classify_tenant(tenant_id: &str) -> &'static str {
-    let lower = tenant_id.to_ascii_lowercase();
-    if lower.starts_with("work::") || lower.starts_with("work-") || lower == "work" {
-        "work"
-    } else if lower.starts_with("public::") || lower.starts_with("public-") || lower == "public" {
-        "public"
-    } else {
-        "personal"
-    }
 }
 
 pub(super) async fn get_console_tenants(
@@ -928,10 +924,12 @@ pub(super) async fn get_console_tenants(
     let tenant_objects: Vec<_> = tenants
         .into_iter()
         .map(|tenant_id| {
-            let category = classify_tenant(&tenant_id);
+            let override_ = crate::tenant_metadata::get_tenant_category_override(&store, &tenant_id);
+            let category = crux_mcp::tenant_category::classify_tenant(&tenant_id, override_).as_str();
             serde_json::json!({
                 "tenant_id": tenant_id,
                 "category": category,
+                "override": override_.map(|c| c.as_str()),
                 "source": "local_metadata",
                 "chunk_visibility": "metadata_only",
                 "content_preview": false
@@ -1056,6 +1054,73 @@ pub(super) async fn get_console_chunk_preview(
 #[allow(clippy::result_large_err)]
 fn require_console_read(state: &AppState, headers: &HeaderMap) -> Result<(), crate::problem::ProblemResponse> {
     require_http_scopes(&state.auth, headers, &["admin:read"])
+}
+
+#[allow(clippy::result_large_err)]
+fn require_console_write(state: &AppState, headers: &HeaderMap) -> Result<(), crate::problem::ProblemResponse> {
+    require_http_scopes(&state.auth, headers, &["admin:write"])
+}
+
+/// Build the response body for `GET/PATCH /v1/console/tenants/:tenant/category`.
+/// `effective` is what `classify_tenant` returns under the current override.
+fn tenant_category_response(
+    tenant_id: &str,
+    override_: Option<crux_mcp::tenant_category::TenantCategory>,
+) -> serde_json::Value {
+    let effective = crux_mcp::tenant_category::classify_tenant(tenant_id, override_);
+    let derived = crux_mcp::tenant_category::classify_tenant(tenant_id, None);
+    serde_json::json!({
+        "tenant_id": tenant_id,
+        "derived": derived.as_str(),
+        "override": override_.map(|c| c.as_str()),
+        "effective": effective.as_str(),
+    })
+}
+
+pub(super) async fn get_console_tenant_category(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    if tenant_id.is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "tenant_id must not be empty".to_string());
+    }
+    let store = state.fact_store.read().await;
+    let override_ = crate::tenant_metadata::get_tenant_category_override(&store, &tenant_id);
+    let body = tenant_category_response(&tenant_id, override_);
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+pub(super) async fn patch_console_tenant_category(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<crate::tenant_metadata::PatchTenantCategoryBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_write(&state, &headers) {
+        return problem.into_response();
+    }
+    if tenant_id.is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "tenant_id must not be empty".to_string());
+    }
+    // `parse_user_input` rejects "system" with its own error; surface as 400.
+    let category = match crux_mcp::tenant_category::TenantCategory::parse_user_input(&body.category) {
+        Ok(c) => c,
+        Err(e) => {
+            return problem_response(StatusCode::BAD_REQUEST, e.to_string());
+        }
+    };
+    let mut store = state.fact_store.write().await;
+    if let Err(e) = crate::tenant_metadata::set_tenant_category_override(&mut store, &tenant_id, category) {
+        return problem_response(StatusCode::BAD_REQUEST, e.to_string());
+    }
+    // Re-read so the response reflects what's actually in the store.
+    let override_ = crate::tenant_metadata::get_tenant_category_override(&store, &tenant_id);
+    let resp = tenant_category_response(&tenant_id, override_);
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 fn validation_policy(state: &AppState) -> crux_integrations::ValidationPolicy {

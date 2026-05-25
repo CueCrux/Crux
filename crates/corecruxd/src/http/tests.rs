@@ -7208,7 +7208,7 @@ async fn console_tenants_classify_by_prefix_and_filter() {
             "personal::notes::status",
             "work::team::status",
             "public::release::status",
-            "myproject::status", // unknown prefix → personal
+            "myproject::status", // unknown prefix → work (default flipped by ExecPlan crux-tenant-category-model-2026-05-22)
         ] {
             facts.store(corecrux_memory::fact_store::StoreFact {
                 entity: entity.to_string(),
@@ -7242,8 +7242,11 @@ async fn console_tenants_classify_by_prefix_and_filter() {
     assert_eq!(with_cat("personal"), "personal");
     assert_eq!(with_cat("work"), "work");
     assert_eq!(with_cat("public"), "public");
-    assert_eq!(with_cat("myproject"), "personal");
-    assert_eq!(with_cat("local"), "personal");
+    // Default flipped to "work" by ExecPlan crux-tenant-category-model-2026-05-22:
+    // any tenant id without an explicit personal::/work::/public:: prefix that
+    // also isn't a __system__:: prefix lands in Work.
+    assert_eq!(with_cat("myproject"), "work");
+    assert_eq!(with_cat("local"), "work");
 
     // ?category=work → only work tenants.
     let resp = console::get_console_tenants(
@@ -7273,6 +7276,441 @@ async fn console_tenants_classify_by_prefix_and_filter() {
     .await
     .into_response();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── ExecPlan crux-tenant-category-model-2026-05-22 M2 ────────────────────
+// GET/PATCH /v1/console/tenants/:tenant/category — override layer for the
+// derived classification. System category not user-settable; system-prefix
+// tenant ids not overridable.
+
+#[tokio::test]
+async fn console_tenant_category_get_returns_derived_when_no_override() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::get_console_tenant_category(
+        State(state),
+        axum::extract::Path("execplan".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["tenant_id"], "execplan");
+    // Default-flipped-to-work + no override = derived & effective both "work".
+    assert_eq!(body["derived"], "work");
+    assert_eq!(body["effective"], "work");
+    assert!(body["override"].is_null());
+}
+
+#[tokio::test]
+async fn console_tenant_category_patch_sets_override_then_get_reflects_it() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // Seed at least one entity under the "execplan" prefix so it gets
+    // enumerated by `get_console_tenants` (which builds the tenant list from
+    // stored entity prefixes). The override alone is stored at
+    // `__tenant_metadata__::execplan` and would otherwise not surface
+    // "execplan" in the list.
+    {
+        let mut facts = state.fact_store.write().await;
+        facts.store(corecrux_memory::fact_store::StoreFact {
+            entity: "execplan::foo".to_string(),
+            key: "x".to_string(),
+            value: "v".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        });
+    }
+    // PATCH to "personal"
+    let resp = console::patch_console_tenant_category(
+        State(state.clone()),
+        axum::extract::Path("execplan".to_string()),
+        dev_scope_headers("admin:write"),
+        Json(crate::tenant_metadata::PatchTenantCategoryBody {
+            category: "personal".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["derived"], "work");
+    assert_eq!(body["override"], "personal");
+    assert_eq!(body["effective"], "personal");
+
+    // GET reflects it
+    let resp = console::get_console_tenant_category(
+        State(state.clone()),
+        axum::extract::Path("execplan".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    assert_eq!(body["override"], "personal");
+    assert_eq!(body["effective"], "personal");
+
+    // The override also flows through /v1/console/tenants list
+    let resp = console::get_console_tenants(
+        State(state),
+        Query(console::ConsoleTenantsQuery { category: None }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    let body = json_body(resp).await;
+    let row = body["tenants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["tenant_id"] == "execplan")
+        .expect("execplan present once it has an override");
+    assert_eq!(row["category"], "personal");
+    assert_eq!(row["override"], "personal");
+}
+
+#[tokio::test]
+async fn console_tenant_category_patch_rejects_system_category() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::patch_console_tenant_category(
+        State(state),
+        axum::extract::Path("execplan".to_string()),
+        dev_scope_headers("admin:write"),
+        Json(crate::tenant_metadata::PatchTenantCategoryBody {
+            category: "system".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn console_tenant_category_patch_rejects_system_prefix_target() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::patch_console_tenant_category(
+        State(state),
+        axum::extract::Path("__bootstrap__".to_string()),
+        dev_scope_headers("admin:write"),
+        Json(crate::tenant_metadata::PatchTenantCategoryBody {
+            category: "work".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn console_tenant_category_patch_rejects_invalid_category_string() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::patch_console_tenant_category(
+        State(state),
+        axum::extract::Path("execplan".to_string()),
+        dev_scope_headers("admin:write"),
+        Json(crate::tenant_metadata::PatchTenantCategoryBody {
+            category: "rubbish".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn console_tenant_category_patch_requires_admin_write_scope() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // dev_scope_headers("admin:read") is the read scope; PATCH should reject.
+    let resp = console::patch_console_tenant_category(
+        State(state),
+        axum::extract::Path("execplan".to_string()),
+        dev_scope_headers("admin:read"),
+        Json(crate::tenant_metadata::PatchTenantCategoryBody {
+            category: "personal".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    // Insufficient scope → 403 from require_http_scopes.
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+// ── ExecPlan crux-tenant-category-model-2026-05-22 M3 ────────────────────
+// Write-side passport-category enforcement on /v1/facts, /v1/facts/bulk,
+// /v1/console/facts/add. System category exempt; no-passport bypass for
+// console-bridge envelope; passport.category must match entity effective
+// category.
+
+#[tokio::test]
+async fn put_fact_personal_passport_blocked_on_work_entity() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "work::team::status".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let resp = facts::put_fact(
+        State(state),
+        dev_scope_passport_headers("facts:write", "personal-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn put_fact_work_passport_allowed_on_work_entity() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "work::team::status".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let resp = facts::put_fact(
+        State(state),
+        dev_scope_passport_headers("facts:write", "work-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn put_fact_personal_passport_blocked_on_untagged_entity_post_default_flip() {
+    // Untagged entity → default Work; personal passport blocked.
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "execplan::foo".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let resp = facts::put_fact(
+        State(state),
+        dev_scope_passport_headers("facts:write", "personal-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn put_fact_no_passport_id_header_bypasses_enforcement() {
+    // Console-bridge envelope: scope present but no passport-id header.
+    // The check has nothing per-passport to gate; route-level access already
+    // satisfied; write goes through.
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "work::team::status".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let resp = facts::put_fact(State(state), dev_scope_headers("admin:write"), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn put_fact_system_entity_exempt_from_passport_category() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "__bootstrap__::seed".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    // personal-default writing a __bootstrap__:: system entity must succeed.
+    let resp = facts::put_fact(
+        State(state),
+        dev_scope_passport_headers("facts:write", "personal-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn put_fact_unknown_passport_id_rejected_as_legacy() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "work::team::status".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let resp = facts::put_fact(
+        State(state),
+        dev_scope_passport_headers("facts:write", "not-a-real-passport"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn put_facts_bulk_rejects_when_any_entity_violates_category() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let bulk = vec![
+        corecrux_memory::fact_store::StoreFact {
+            entity: "personal::a".to_string(),
+            key: "x".to_string(),
+            value: "1".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        },
+        // This second entity is Work; personal-default cannot write it →
+        // the entire bulk is refused.
+        corecrux_memory::fact_store::StoreFact {
+            entity: "work::b".to_string(),
+            key: "x".to_string(),
+            value: "1".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+        },
+    ];
+    let resp = facts::put_facts_bulk(
+        State(state),
+        dev_scope_passport_headers("facts:write", "personal-default"),
+        Json(bulk),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn console_fact_add_personal_passport_blocked_on_work_entity() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    let body = console::ConsoleAddFactBody {
+        entity: "work::team".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        confidence: 1.0,
+    };
+    let resp = console::post_console_fact_add(
+        State(state),
+        dev_scope_passport_headers("facts:write", "personal-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn console_fact_add_override_to_personal_lets_personal_passport_write_again() {
+    // After the operator overrides a tenant to Personal via the M2 PATCH
+    // endpoint, a personal passport can write entities under it again, and
+    // a work passport is blocked.
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+    // PATCH: myproject → personal
+    let _ = console::patch_console_tenant_category(
+        State(state.clone()),
+        axum::extract::Path("myproject".to_string()),
+        dev_scope_headers("admin:write"),
+        Json(crate::tenant_metadata::PatchTenantCategoryBody {
+            category: "personal".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    // personal-default writes myproject::foo → allowed (overridden to Personal)
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "myproject::foo".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let resp = facts::put_fact(
+        State(state.clone()),
+        dev_scope_passport_headers("facts:write", "personal-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED, "personal can write after override");
+    // work-default writes myproject::bar → blocked now
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "myproject::bar".to_string(),
+        key: "x".to_string(),
+        value: "v".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+    };
+    let resp = facts::put_fact(
+        State(state),
+        dev_scope_passport_headers("facts:write", "work-default"),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "work blocked after override to personal"
+    );
 }
 
 #[tokio::test]

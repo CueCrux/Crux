@@ -960,6 +960,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/console/tenants", get(self::console::get_console_tenants))
         .route(
+            "/v1/console/tenants/{tenantId}/category",
+            get(self::console::get_console_tenant_category)
+                .patch(self::console::patch_console_tenant_category),
+        )
+        .route(
             "/v1/console/tenants/{tenantId}/chunks",
             get(self::console::get_console_tenant_chunks),
         )
