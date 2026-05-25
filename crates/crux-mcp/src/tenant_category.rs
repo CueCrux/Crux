@@ -23,8 +23,6 @@
 //!   2. explicit override      — typically from `__tenant_metadata__::` store
 //!   3. prefix-derived         — work / public / personal
 //!   4. default                — Work
-//!
-//! See `PlanCrux/.agent/execplans/crux-tenant-category-model-2026-05-22.md`.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

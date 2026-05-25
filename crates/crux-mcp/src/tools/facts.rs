@@ -62,8 +62,8 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     // (`session_bindings::resolve`), but `handle_store_fact` carries no session
     // context. Wiring the check naively would 403 every operator MCP write after
     // deploy. Designing the agent→passport resolution is a separate ExecPlan.
-    // See `PlanCrux/.agent/execplans/crux-tenant-category-model-2026-05-22.md`
-    // Decision Log, M3.5 entry.
+    // The follow-up design must define a stable agent-to-passport mapping
+    // before this layer can enforce tenant-category writes safely.
     let fact = store.try_store(req).map_err(|err| JsonRpcError {
         code: INTERNAL_ERROR,
         message: "fact journal append failed".to_string(),
