@@ -93,6 +93,7 @@ const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "__passport__::",
     "__bootstrap__::",
     "__project__::",
+    "__tenant_metadata__::",
     "decisions::",
     "github::",
 ];
