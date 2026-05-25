@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use blake3::Hasher;
 use ed25519_dalek::{Signer as DalekSigner, SigningKey};
+use rand::Rng;
 
 use crate::error::SessionError;
 use crate::plan::{Passport, HASH_LEN, SIGNATURE_LEN};
@@ -103,7 +104,7 @@ fn read_or_init_install_uuid(path: &Path) -> Result<String, SessionError> {
             // `synthesise`), so the exact format doesn't matter as long as
             // it's globally unique.
             let mut bytes = [0u8; 16];
-            rand::Rng::fill(&mut rand::thread_rng(), &mut bytes[..]);
+            rand::rng().fill_bytes(&mut bytes);
             let uuid = hex::encode(bytes);
             fs::write(path, &uuid).map_err(|e| SessionError::Encode(format!("write install-uuid: {e}")))?;
             Ok(uuid)
@@ -204,7 +205,7 @@ fn write_new_passport_seed(path: &Path) -> Result<[u8; 32], SessionError> {
     }
 
     let mut seed = [0_u8; 32];
-    rand::Rng::fill(&mut rand::thread_rng(), &mut seed[..]);
+    rand::rng().fill_bytes(&mut seed);
 
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);

@@ -25,7 +25,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use corecrux_memory::fact_store::{FactQuery, FactStore, StoreFact};
 use crux_session::LocalPassportKey;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 pub const PASSPORT_ENTITY_PREFIX: &str = "__passport__";
@@ -306,7 +306,7 @@ fn generate_keypair_for_passport(data_dir: &Path, id: &str) -> Result<LocalPassp
     }
     if !path.exists() {
         let mut seed = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut seed);
+        rand::rng().fill_bytes(&mut seed);
         let hex_seed = hex::encode(seed);
         fs::write(&path, hex_seed)?;
         #[cfg(unix)]
