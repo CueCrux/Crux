@@ -33,9 +33,9 @@ jsonwebtoken = { version = "10.3.0", default-features = false, features = ["use_
 prometheus = { version = "0.13.4", default-features = false }
 chacha20poly1305 = "0.10.1"
 prost = "0.14.3"
-rand = "0.8.5"
+rand = "0.10.1"
 serde = { version = "1.0.218", features = ["derive"] }
-serde_json = "1.0.139"
+serde_json = "1.0.150"
 serde_yaml = "0.9.34"
 xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
 tar = "0.4.44"
@@ -45,12 +45,12 @@ tonic = "0.14.6"
 tower-http = { version = "0.6.2", features = ["catch-panic", "cors", "timeout", "trace"] }
 thiserror = "2.0.12"
 tracing = "0.1.41"
-tracing-opentelemetry = { version = "0.32", optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 ureq = { version = "3.3.0", features = ["json"] }
 opentelemetry = { version = "0.32", optional = true }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.32", features = ["tonic"], optional = true }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"], optional = true }
 uuid = { version = "1.23.1", features = ["v4"] }
 zstd = "0.13.3"
 zip = "8.6.0"
@@ -73,7 +73,7 @@ crux-session = { path = "../crux-session" }
 crux-enterprise-shim = { path = "../crux-enterprise-shim" }
 vaultcrux-local = { path = "../vaultcrux-local" }
 
-wasmtime = { version = "44", default-features = false, features = ["cranelift", "runtime"], optional = true }
+wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime"], optional = true }
 sha2 = "0.11"
 
 [dev-dependencies]

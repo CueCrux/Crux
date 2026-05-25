@@ -6,4 +6,4 @@ Covered content includes elicitation rubrics, constraint taxonomies, retrieval p
 
 Use inside a Crux daemon deployment is permitted. Standalone redistribution, sublicensing, model training to replicate Crux capabilities, or stripping CROWN signatures from covered content is not permitted.
 
-The canonical licence text lives in `PlanCrux/docs/handbook/CueCrux-Content-Licence-v1_0.md` in the CueCrux planning repository.
+This file is the canonical Content Licence text. Bundled releases ship this file alongside `LICENCE.md` (the code licence) so operators always have both at the same path layout they were built against.

@@ -17,9 +17,6 @@
 //! - `session-start` (SessionStart): calls `sync_status` and
 //!   `get_bootstrap("patterns")` with `token_budget=500`, returns the result
 //!   as `additionalContext`.
-//!
-//! Design rationale: see
-//! `PlanCrux/.agent/execplans/crux-claude-hooks-2026-05-17.md`.
 
 pub mod cmds;
 pub mod config_audit;

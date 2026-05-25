@@ -7,7 +7,7 @@
 use base64::Engine as _;
 use ed25519_dalek::Signer as _;
 use ed25519_dalek::SigningKey;
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 
 use crate::export_v1::{
     build_receipt_export_v1, BuildReceiptExportInput, ExportFormatV1, ExportRedactionV1, ReceiptEventHeaderRefV1,

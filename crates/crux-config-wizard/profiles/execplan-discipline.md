@@ -17,9 +17,9 @@ Trivial fixes and one-shot edits don't need a plan.
 
 ### Where plans live
 
-Default: `PlanCrux/.agent/execplans/<slug>.md`.
+Default: `./.agent/execplans/<slug>.md` at the workspace root. Create the directory on first use.
 
-Plans must follow `PlanCrux/.agent/PLANS.md` (required sections: Purpose, Non-goals, Context, Constraints, Proposed design, Milestones, Test plan, Rollout/rollback, Risks, Progress, Decision log).
+Required sections in each plan: Purpose, Non-goals, Context, Constraints, Proposed design, Milestones, Test plan, Rollout/rollback, Risks, Progress, Decision log.
 
 ### Execution rules
 

@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use crux_router::{CallContext, RcxRouter};
-use rand::RngCore;
+use rand::Rng;
 use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -197,7 +197,7 @@ fn default_handoff_key(node_id: &str) -> [u8; 32] {
     }
 
     let mut seed = [0_u8; 32];
-    rand::thread_rng().fill_bytes(&mut seed);
+    rand::rng().fill_bytes(&mut seed);
     let material = format!(
         "crux-mcp-handoff:{node_id}:{}",
         base64::engine::general_purpose::STANDARD.encode(seed)

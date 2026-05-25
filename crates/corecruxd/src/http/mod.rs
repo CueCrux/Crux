@@ -1030,7 +1030,7 @@ async fn traceparent_middleware(req: Request<axum::body::Body>, next: Next) -> i
 
         let parent_cx =
             global::get_text_map_propagator(|propagator| propagator.extract(&HeaderExtractor(req.headers())));
-        tracing::Span::current().set_parent(parent_cx);
+        let _ = tracing::Span::current().set_parent(parent_cx);
     }
     next.run(req).await
 }

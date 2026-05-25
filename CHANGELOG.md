@@ -10,8 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **GitHub shared memory** — selected GitHub repos become a searchable corpus
-  any agent attached to the daemon can read (Plan B in
-  `PlanCrux/.agent/execplans/crux-github-shared-memory.md`):
+  any agent attached to the daemon can read:
   - PAT-based connection; the token is encrypted at rest with XChaCha20-
     Poly1305 using a key derived from the daemon-root passport via BLAKE3
     KDF (`LocalPassportKey::derive_subkey`). Endpoints:
@@ -34,8 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     picker, sync button, and per-repo selection. Project drawer surfaces
     open issues inline when `planning_target = github://owner/repo`.
 - **Coordination** — multi-passport, projects, and a 6-state work kanban for
-  cross-agent coordination on the same daemon (see Plan A in
-  `PlanCrux/.agent/execplans/crux-coordination-multi-passport-projects.md`):
+  cross-agent coordination on the same daemon:
   - `GET/POST/PATCH/DELETE /v1/passports` + `GET /v1/passports/{id}` — multi-
     passport store; auto-seeds `personal-default` / `work-default` /
     `public-default` on first boot. Per-passport `agent_work_gate` toggle
