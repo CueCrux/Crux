@@ -12,7 +12,7 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 pub const SCHEME_V1: &str = "xchacha20poly1305-v1";
@@ -39,7 +39,7 @@ pub struct EncryptedEnvelope {
 pub fn seal(plaintext: &[u8], key: &[u8; 32]) -> EncryptedEnvelope {
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce_bytes = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
