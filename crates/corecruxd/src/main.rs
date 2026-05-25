@@ -1353,38 +1353,40 @@ fn init_tracing(level: &str) {
 
         let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
         if let Some(endpoint) = otel_endpoint {
-            let exporter = opentelemetry_otlp::SpanExporter::builder()
+            if let Ok(exporter) = opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()
                 .with_endpoint(&endpoint)
                 .build()
-                .expect("failed to build OTLP exporter");
+            {
+                let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                    .with_batch_exporter(exporter)
+                    .with_resource(
+                        opentelemetry_sdk::Resource::builder()
+                            .with_service_name("corecruxd")
+                            .build(),
+                    )
+                    .build();
 
-            let provider = opentelemetry_sdk::trace::TracerProvider::builder()
-                .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-                .with_resource(opentelemetry_sdk::Resource::new(vec![opentelemetry::KeyValue::new(
-                    "service.name",
-                    "corecruxd",
-                )]))
-                .build();
+                opentelemetry::global::set_tracer_provider(provider.clone());
+                let _ = OTEL_TRACER_PROVIDER.set(provider.clone());
+                opentelemetry::global::set_text_map_propagator(
+                    opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+                );
+                let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(provider.tracer("corecruxd"));
 
-            opentelemetry::global::set_tracer_provider(provider.clone());
-            opentelemetry::global::set_text_map_propagator(
-                opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-            );
-            let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(provider.tracer("corecruxd"));
+                let fmt_layer = if log_format.eq_ignore_ascii_case("json") {
+                    tracing_subscriber::fmt::layer().json().boxed()
+                } else {
+                    tracing_subscriber::fmt::layer().boxed()
+                };
 
-            let fmt_layer = if log_format.eq_ignore_ascii_case("json") {
-                tracing_subscriber::fmt::layer().json().boxed()
-            } else {
-                tracing_subscriber::fmt::layer().boxed()
-            };
-
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt_layer)
-                .with(otel_layer)
-                .init();
-            return;
+                tracing_subscriber::registry()
+                    .with(filter)
+                    .with(fmt_layer)
+                    .with(otel_layer)
+                    .init();
+                return;
+            }
         }
     }
 
@@ -1392,6 +1394,19 @@ fn init_tracing(level: &str) {
         tracing_subscriber::fmt().json().with_env_filter(filter).init();
     } else {
         tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
+}
+
+#[cfg(feature = "otel")]
+static OTEL_TRACER_PROVIDER: std::sync::OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "otel")]
+fn shutdown_otel_tracer_provider() {
+    if let Some(provider) = OTEL_TRACER_PROVIDER.get() {
+        if let Err(err) = provider.shutdown() {
+            tracing::warn!(error = %err, "failed to shut down OpenTelemetry tracer provider");
+        }
     }
 }
 
@@ -1426,7 +1441,7 @@ fn spawn_shutdown_signal(tx: broadcast::Sender<()>) {
             tracing::info!("SIGINT received, shutting down");
         }
         #[cfg(feature = "otel")]
-        opentelemetry::global::shutdown_tracer_provider();
+        shutdown_otel_tracer_provider();
 
         let _ = tx.send(());
     });
