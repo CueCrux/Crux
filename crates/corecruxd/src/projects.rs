@@ -380,7 +380,7 @@ pub fn add_member(
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -427,7 +427,7 @@ pub fn add_tenant(
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -480,7 +480,7 @@ fn write_record(store: &mut FactStore, record: &ProjectRecord) -> Result<(), Pro
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);

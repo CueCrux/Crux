@@ -319,7 +319,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     });
     store.store(StoreFact {
         entity: "alpha".to_string(),
@@ -328,7 +328,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     });
     store.store(StoreFact {
         entity: "beta".to_string(),
@@ -337,7 +337,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     });
     store.store(StoreFact {
         entity: "finance:ledger".to_string(),
@@ -346,7 +346,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     });
     store.store(StoreFact {
         entity: "flagged".to_string(),
@@ -355,7 +355,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         source_receipt: None,
         confidence: 1.0,
         private: true,
-    horizon_class: None,
+        horizon_class: None,
     });
 
     store.store_synced(Fact {
@@ -382,7 +382,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     });
     assert!(store.delete(&deleted.fact_id));
 
@@ -407,7 +407,7 @@ fn push_returns_zero_when_no_non_private_local_facts_exist() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     });
 
     store.store_synced(Fact {
@@ -434,7 +434,7 @@ fn push_returns_zero_when_no_non_private_local_facts_exist() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     });
     assert!(store.delete(&deleted.fact_id));
 
@@ -567,7 +567,7 @@ fn push_batches_local_facts_and_updates_cursor() {
             source_receipt: Some(format!("local-receipt-{index}")),
             confidence: 0.75,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
     }
     store.store(StoreFact {
@@ -577,7 +577,7 @@ fn push_batches_local_facts_and_updates_cursor() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     });
     store.store_synced(Fact {
         fact_id: "f_synced_skip".to_string(),

@@ -859,6 +859,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn envelope_on_memory_freshness_omits_reserved_prefix_entries() {
+        // Sibling test for agent-ux-03 M3: memory_freshness is the second
+        // tool opted into the envelope. Same reserved-prefix filter must
+        // apply or the envelope leaks ops/agent state. See
+        // dispatch::tests::envelope_on_query_facts_omits_reserved_prefix_entries
+        // for the original spike contract.
+        //
+        // Two env-var locks are acquired (envelope + freshness) because
+        // each is held by a different test module and either being
+        // toggled mid-call would race this test.
+        let _guard = envelope_env_lock().lock().await;
+        let _gf = crate::tools::freshness::tests_support_flag_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::freshness::FEATURE_FLAG_ENV, "1");
+        let ctx = test_ctx();
+        for (entity, key) in [
+            ("project-x", "status"),
+            ("__ops::config-audit", "sha256:abc"),
+            ("__bootstrap__::pattern:x", "Retry"),
+        ] {
+            dispatch(
+                rpc(
+                    "tools/call",
+                    json!({
+                        "name": "store_fact",
+                        "arguments": {"entity": entity, "key": key, "value": "shipped"}
+                    }),
+                ),
+                &ctx,
+                None,
+            )
+            .await;
+        }
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "memory_freshness", "arguments": {"top_k": 50, "token_budget": 1000}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        let env = &result["envelope"];
+        let memories = env["memories_used"].as_array().unwrap();
+        assert_eq!(
+            memories.len(),
+            1,
+            "memory_freshness envelope must filter reserved-prefix entries"
+        );
+        assert_eq!(memories[0]["topic"], "project-x");
+
+        // The tool payload (under "payload") must also not leak reserved
+        // entries.
+        let rows = result["payload"]["structuredContent"]["rows"].as_array().unwrap();
+        for r in rows {
+            let ent = r["entity"].as_str().unwrap();
+            assert!(
+                !ent.starts_with("__ops::") && !ent.starts_with("__bootstrap__::") && !ent.starts_with("__agent::"),
+                "payload leaked reserved entity {ent}"
+            );
+        }
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::freshness::FEATURE_FLAG_ENV);
+    }
+
+    #[tokio::test]
     async fn tools_call_store_and_query_facts() {
         // Share the envelope env-var lock so this test isn't racy with the
         // envelope_on_* tests that mutate CORECRUXD_FEATURE_AUDIT_ENVELOPE.

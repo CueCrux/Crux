@@ -363,7 +363,7 @@ pub fn add_comment(
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -525,7 +525,7 @@ fn write_record(store: &mut FactStore, item: &WorkItem) -> Result<(), WorkError>
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -544,7 +544,7 @@ fn write_transition(store: &mut FactStore, tx: &WorkTransition) -> Result<(), Wo
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -560,7 +560,7 @@ fn write_gate(store: &mut FactStore, gate: &PendingGateAction) -> Result<(), Wor
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);

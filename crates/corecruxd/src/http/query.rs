@@ -610,7 +610,7 @@ pub(super) async fn post_query_text_search(
                     source_receipt: None,
                     confidence: score,
                     private: false,
-                horizon_class: None,
+                    horizon_class: None,
                 };
                 crate::fact_privacy::enforce_global(&mut sf);
                 store.store(sf);

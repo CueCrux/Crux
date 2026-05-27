@@ -44,7 +44,7 @@ async fn sync_manifest_and_collection_page_are_tenant_scoped() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
         store.store(corecrux_memory::fact_store::StoreFact {
             entity: "business::other::note".to_string(),
@@ -53,7 +53,7 @@ async fn sync_manifest_and_collection_page_are_tenant_scoped() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
     }
 
@@ -104,7 +104,7 @@ async fn sync_promotion_preview_respects_allowlist() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
         store.store(corecrux_memory::fact_store::StoreFact {
             entity: "business::acme::constraint::deploy".to_string(),
@@ -113,7 +113,7 @@ async fn sync_promotion_preview_respects_allowlist() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
     }
 
@@ -976,7 +976,7 @@ async fn console_redacts_private_facts_and_session_state() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
         facts.store(corecrux_memory::fact_store::StoreFact {
             entity: "tenant-a::service".to_string(),
@@ -985,7 +985,7 @@ async fn console_redacts_private_facts_and_session_state() {
             source_receipt: None,
             confidence: 1.0,
             private: true,
-        horizon_class: None,
+            horizon_class: None,
         });
     }
     state.session_store.write().await.put(
@@ -1214,7 +1214,7 @@ async fn put_fact_returns_created() {
         source_receipt: Some("crx_abc".to_string()),
         confidence: 0.95,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
 
     let resp = facts::put_fact(State(state), HeaderMap::new(), Json(body))
@@ -1240,7 +1240,7 @@ async fn put_fact_rejects_private_true_over_http() {
         source_receipt: None,
         confidence: 1.0,
         private: true,
-    horizon_class: None,
+        horizon_class: None,
     };
 
     let resp = facts::put_fact(State(state), HeaderMap::new(), Json(body))
@@ -1265,7 +1265,7 @@ async fn put_facts_bulk_rejects_private_true_over_http() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         },
         corecrux_memory::fact_store::StoreFact {
             entity: "server".to_string(),
@@ -1274,7 +1274,7 @@ async fn put_facts_bulk_rejects_private_true_over_http() {
             source_receipt: None,
             confidence: 1.0,
             private: true,
-        horizon_class: None,
+            horizon_class: None,
         },
     ];
 
@@ -1301,7 +1301,7 @@ async fn get_fact_returns_stored_fact() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
 
     let create_resp = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
@@ -1342,7 +1342,7 @@ async fn delete_fact_soft_deletes() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
 
     let create_resp = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
@@ -1392,7 +1392,7 @@ async fn get_facts_by_entity_returns_matching() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         };
         let _ = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
             .await
@@ -1433,7 +1433,7 @@ async fn bulk_store_facts() {
             source_receipt: None,
             confidence: 0.8,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         },
         corecrux_memory::fact_store::StoreFact {
             entity: "b".to_string(),
@@ -1442,7 +1442,7 @@ async fn bulk_store_facts() {
             source_receipt: Some("rcpt".to_string()),
             confidence: 0.9,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         },
     ];
 
@@ -1477,7 +1477,7 @@ async fn query_facts_by_keyword() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         };
         let _ = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
             .await
@@ -1514,7 +1514,7 @@ async fn query_facts_no_params_returns_all() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         };
         let _ = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
             .await
@@ -1547,7 +1547,7 @@ async fn query_facts_accepts_admin_read_fallback_in_dev_scopes_mode() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     let _ = facts::put_fact(State(state.clone()), dev_scope_headers("facts:write"), Json(body))
         .await
@@ -1580,7 +1580,7 @@ async fn export_facts_handles_invalid_since_and_limit_and_skips_private() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
         store.store(corecrux_memory::fact_store::StoreFact {
             entity: "secret".to_string(),
@@ -1589,7 +1589,7 @@ async fn export_facts_handles_invalid_since_and_limit_and_skips_private() {
             source_receipt: None,
             confidence: 1.0,
             private: true,
-        horizon_class: None,
+            horizon_class: None,
         });
     }
 
@@ -1623,7 +1623,7 @@ async fn export_facts_honors_cursor_and_reports_next_cursor() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
         fact_ids.push(fact.fact_id);
     }
@@ -1775,7 +1775,7 @@ async fn fact_and_session_endpoints_use_read_and_write_scopes_in_dev_scopes_mode
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         }),
     )
     .await
@@ -1795,7 +1795,7 @@ async fn fact_and_session_endpoints_use_read_and_write_scopes_in_dev_scopes_mode
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
-            horizon_class: None,
+                horizon_class: None,
             },
             corecrux_memory::fact_store::StoreFact {
                 entity: "proj-admin:beta".to_string(),
@@ -1804,7 +1804,7 @@ async fn fact_and_session_endpoints_use_read_and_write_scopes_in_dev_scopes_mode
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
-            horizon_class: None,
+                horizon_class: None,
             },
         ]),
     )
@@ -1878,7 +1878,7 @@ async fn query_facts_supports_entity_prefix_top_k_and_token_budget() {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
-            horizon_class: None,
+                horizon_class: None,
             }),
         )
         .await
@@ -1916,7 +1916,7 @@ async fn query_facts_applies_passport_private_visibility() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
         store.store(corecrux_memory::fact_store::StoreFact {
             entity: crux_mcp::scope::private_entity_for_agent("alice", "notes"),
@@ -1925,7 +1925,7 @@ async fn query_facts_applies_passport_private_visibility() {
             source_receipt: None,
             confidence: 1.0,
             private: true,
-        horizon_class: None,
+            horizon_class: None,
         });
         store.store(corecrux_memory::fact_store::StoreFact {
             entity: crux_mcp::scope::private_entity_for_agent("bob", "notes"),
@@ -1934,7 +1934,7 @@ async fn query_facts_applies_passport_private_visibility() {
             source_receipt: None,
             confidence: 1.0,
             private: true,
-        horizon_class: None,
+            horizon_class: None,
         });
     }
 
@@ -2487,7 +2487,7 @@ async fn fact_endpoints_require_auth_in_dev_scopes_mode() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     let resp = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
         .await
@@ -2502,7 +2502,7 @@ async fn fact_endpoints_require_auth_in_dev_scopes_mode() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     let resp2 = put_fact(State(state.clone()), dev_scope_headers("query:read"), Json(body2))
         .await
@@ -5437,7 +5437,7 @@ async fn ops_errors_returns_facts_when_enabled() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
     }
     let headers = dev_scope_headers("admin:read");
@@ -5465,7 +5465,7 @@ async fn ops_health_returns_latest_per_component() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
         store.store(corecrux_memory::fact_store::StoreFact {
             entity: "__ops__::health:shard_store".to_string(),
@@ -5474,7 +5474,7 @@ async fn ops_health_returns_latest_per_component() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
     }
     let headers = dev_scope_headers("admin:read");
@@ -5958,7 +5958,7 @@ async fn action_enrich_first_party_uses_local_tenant_context_when_enabled() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
 
     let resp = super::actions::post_action_enrich(
@@ -6042,7 +6042,7 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
             source_receipt: Some("rcpt_seed".to_string()),
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
     }
 
@@ -6206,7 +6206,7 @@ async fn workbench_route_probe_and_api_drift_use_workspace_scan() {
             source_receipt: None,
             confidence: 1.0,
             private: true,
-        horizon_class: None,
+            horizon_class: None,
         });
 
     let probe_resp = super::workbench::post_route_probe(
@@ -6299,7 +6299,7 @@ async fn workbench_audit_triage_groups_replay_failures() {
             source_receipt: Some("source:receipt".to_string()),
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         })
     };
     let capsule =
@@ -6343,7 +6343,7 @@ async fn workbench_audit_triage_groups_replay_failures() {
                 source_receipt: Some("source:receipt:2".to_string()),
                 confidence: 1.0,
                 private: false,
-            horizon_class: None,
+                horizon_class: None,
             });
     }
 
@@ -6398,7 +6398,7 @@ async fn m11_closure_suite_exercises_hybrid_workbench_replay_and_offboarding() {
             source_receipt: Some("m11:source:1".to_string()),
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
         store.store_synced(corecrux_memory::fact_store::Fact {
             fact_id: "f_m11_business_mirror".to_string(),
@@ -6493,7 +6493,7 @@ async fn m11_closure_suite_exercises_hybrid_workbench_replay_and_offboarding() {
             source_receipt: Some("m11:source:2".to_string()),
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
     let triage = super::workbench::get_audit_triage(
         State(state.clone()),
@@ -6548,7 +6548,7 @@ async fn workbench_policy_simulation_blocks_matching_critical_constraint() {
             source_receipt: None,
             confidence: 1.0,
             private: true,
-        horizon_class: None,
+            horizon_class: None,
         });
 
     let resp = super::workbench::post_policy_simulation(
@@ -6719,7 +6719,7 @@ async fn answer_replay_renders_stored_answer_and_validity_detects_superseded_evi
             source_receipt: Some("rcpt_1".to_string()),
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
 
     let resp = super::gpu1::post_gpu1_answer(
@@ -6786,7 +6786,7 @@ async fn answer_replay_renders_stored_answer_and_validity_detects_superseded_evi
             source_receipt: Some("rcpt_2".to_string()),
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
     let tenant_hash = corecrux_projections::tenant_hash_xxhash64("tenant-a");
     let dependent_id = uuid::Uuid::new_v4();
@@ -7266,7 +7266,7 @@ async fn console_tenants_classify_by_prefix_and_filter() {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
-            horizon_class: None,
+                horizon_class: None,
             });
         }
     }
@@ -7369,7 +7369,7 @@ async fn console_tenant_category_patch_sets_override_then_get_reflects_it() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         });
     }
     // PATCH to "personal"
@@ -7506,7 +7506,7 @@ async fn put_fact_personal_passport_blocked_on_work_entity() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     let resp = facts::put_fact(
         State(state),
@@ -7532,7 +7532,7 @@ async fn put_fact_work_passport_allowed_on_work_entity() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     let resp = facts::put_fact(
         State(state),
@@ -7559,7 +7559,7 @@ async fn put_fact_personal_passport_blocked_on_untagged_entity_post_default_flip
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     let resp = facts::put_fact(
         State(state),
@@ -7588,7 +7588,7 @@ async fn put_fact_no_passport_id_header_bypasses_enforcement() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     let resp = facts::put_fact(State(state), dev_scope_headers("admin:write"), Json(body))
         .await
@@ -7610,7 +7610,7 @@ async fn put_fact_system_entity_exempt_from_passport_category() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     // personal-default writing a __bootstrap__:: system entity must succeed.
     let resp = facts::put_fact(
@@ -7637,7 +7637,7 @@ async fn put_fact_unknown_passport_id_rejected_as_legacy() {
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     let resp = facts::put_fact(
         State(state),
@@ -7664,7 +7664,7 @@ async fn put_facts_bulk_rejects_when_any_entity_violates_category() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         },
         // This second entity is Work; personal-default cannot write it →
         // the entire bulk is refused.
@@ -7675,7 +7675,7 @@ async fn put_facts_bulk_rejects_when_any_entity_violates_category() {
             source_receipt: None,
             confidence: 1.0,
             private: false,
-        horizon_class: None,
+            horizon_class: None,
         },
     ];
     let resp = facts::put_facts_bulk(
@@ -7740,7 +7740,7 @@ async fn console_fact_add_override_to_personal_lets_personal_passport_write_agai
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     let resp = facts::put_fact(
         State(state.clone()),
@@ -7758,7 +7758,7 @@ async fn console_fact_add_override_to_personal_lets_personal_passport_write_agai
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     let resp = facts::put_fact(
         State(state),
@@ -10897,7 +10897,7 @@ async fn wasm_summarise_extension_end_to_end_or_skip() {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
-            horizon_class: None,
+                horizon_class: None,
             };
             crate::fact_privacy::enforce_global(&mut sf);
             store.store(sf);

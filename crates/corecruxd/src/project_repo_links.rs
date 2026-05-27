@@ -101,7 +101,7 @@ pub fn link_repo(
         source_receipt: None,
         confidence: 1.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -117,7 +117,7 @@ pub fn unlink_repo(store: &mut FactStore, project_id: &str, repo_slug: &str) -> 
         source_receipt: None,
         confidence: 0.0,
         private: false,
-    horizon_class: None,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);

@@ -752,7 +752,7 @@ fn register_fact_abi(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
                     key,
                     value,
                     confidence,
-                horizon_class: None,
+                    horizon_class: None,
                 }) {
                     Ok(f) => f,
                     Err(_) => return HOST_RC_HOST_INTERNAL,

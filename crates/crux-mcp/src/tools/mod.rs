@@ -21,6 +21,7 @@ pub mod extensions;
 pub mod facts;
 pub mod features;
 pub mod forget;
+pub mod freshness;
 pub mod github;
 pub mod handoff;
 pub mod kinds;
@@ -72,7 +73,7 @@ pub struct ToolDefinition {
 /// `envelope` and never-listed tools always see the unchanged `payload`
 /// shape.
 pub fn tool_emits_envelope(name: &str) -> bool {
-    matches!(name, "query_facts" | "memory_acknowledge_use")
+    matches!(name, "query_facts" | "memory_acknowledge_use" | "memory_freshness")
 }
 
 /// Non-breaking pointer added to every legacy tool's description at
@@ -454,6 +455,67 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 },
                 "examples": [
                     { "entity": "person:carol", "key": "city" },
+                    { "fact_id": "f_01J_abc" }
+                ]
+            }),
+        },
+        // ── Freshness + decay (agent-ux-03 M3) ─────────────────────
+        ToolDefinition {
+            name: "memory_freshness".to_string(),
+            description: "Freshness: list facts with their per-fact decay state \
+                          ({fresh|stale|unknown}) under the deterministic decay policy. \
+                          Reserved-prefix facts (__agent::, __ops::, __bootstrap__::) are \
+                          filtered. Read-only; pass `token_budget` (default 500) per QC.2. \
+                          Gated by CORECRUXD_FEATURE_FRESHNESS=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity":       { "type": "string", "description": "Optional entity filter" },
+                    "key":          { "type": "string", "description": "Optional key filter" },
+                    "top_k":        { "type": "integer", "description": "Maximum rows", "default": 20 },
+                    "token_budget": { "type": "integer", "description": "Token budget cap", "default": 500 }
+                },
+                "examples": [
+                    { "token_budget": 500 },
+                    { "entity": "execplan:agent-ux-03-freshness-decay-2026-05-27", "top_k": 50, "token_budget": 1000 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_set_horizon".to_string(),
+            description: "Freshness: pin or override the horizon_class on a fact \
+                          (`volatile`, `medium`, `stable`, `none`). Requires an \
+                          authenticated passport. Reserved-prefix facts cannot be \
+                          re-classified through this surface. Gated by \
+                          CORECRUXD_FEATURE_FRESHNESS=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "fact_id":        { "type": "string", "description": "Target fact id (f_…)" },
+                    "horizon_class":  { "type": "string", "enum": ["volatile", "medium", "stable", "none"] }
+                },
+                "required": ["fact_id", "horizon_class"],
+                "examples": [
+                    { "fact_id": "f_01J_abc", "horizon_class": "stable" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_reverify".to_string(),
+            description: "Freshness: re-anchor a fact's decay clock without rewriting the \
+                          value, recording a CROWN-verifiable `Reverify` receipt under \
+                          `__reverify_receipts__::<fact_id>`. Requires an authenticated \
+                          passport. Gated by CORECRUXD_FEATURE_FRESHNESS=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "fact_id": { "type": "string", "description": "Target fact id (f_…)" }
+                },
+                "required": ["fact_id"],
+                "examples": [
                     { "fact_id": "f_01J_abc" }
                 ]
             }),
@@ -1573,6 +1635,9 @@ pub fn tool_output_docs() -> Value {
         { "tool": "memory_edit",        "output": "{ content: [...], structuredContent: { old_fact_id, new_fact: MemoryFact, reason } } — new fact supersedes old; reason embedded as `memory_edit:<reason>` source_receipt." },
         { "tool": "memory_pin",         "output": "{ content: [...], structuredContent: { fact_id, pinned: bool } } — pin state stored under reserved __memory_pin::<agent>::*." },
         { "tool": "memory_history",     "output": "{ content: [...], structuredContent: { versions: [{id, value, version, stored_at, supersedes, deleted, source_receipt}] } } — consumer-friendly version chain (excludes reserved prefixes)." },
+        { "tool": "memory_freshness",   "output": "{ rows: [{fact_id, entity, key, horizon_class, freshness, age_hours, stored_at, reverified_at?}], policy: {volatile_stale_hours, medium_stale_days, stable_stale_days}, now }" },
+        { "tool": "memory_set_horizon", "output": "{ fact_id, horizon_class, ok: bool }" },
+        { "tool": "memory_reverify",    "output": "{ fact_id, receipt_id, receipt_class: 'Reverify', reverified_at }" },
         { "tool": "get_session",        "output": "{ session_id, state, updated_at, total_tokens }" },
         { "tool": "save_session",       "output": "{ session_id, updated_at }" },
         { "tool": "list_sessions",      "output": "{ sessions: [string] }" },
@@ -1665,6 +1730,10 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "memory_edit" => memory::handle_memory_edit(args, ctx).await,
         "memory_pin" => memory::handle_memory_pin(args, ctx).await,
         "memory_history" => memory::handle_memory_history(args, ctx).await,
+        // Freshness + decay (agent-ux-03 M3).
+        "memory_freshness" => freshness::handle_memory_freshness(args, ctx).await,
+        "memory_set_horizon" => freshness::handle_memory_set_horizon(args, ctx).await,
+        "memory_reverify" => freshness::handle_memory_reverify(args, ctx).await,
         "get_session" => sessions::handle_get_session(args, ctx).await,
         "save_session" => sessions::handle_save_session(args, ctx).await,
         "list_sessions" => sessions::handle_list_sessions(args, ctx).await,
@@ -1758,7 +1827,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 69; // 68 prior + audit_export_bundle (agent-ux-11).
+    const TOOL_COUNT: usize = 73; // 70 on main (incl. audit_export_bundle agent-ux-11) + 3 freshness (memory_freshness, memory_set_horizon, memory_reverify agent-ux-03 M3).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

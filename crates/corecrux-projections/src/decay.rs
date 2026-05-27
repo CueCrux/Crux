@@ -75,7 +75,7 @@ impl HorizonClass {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "volatile" => Some(Self::Volatile),
             "medium" => Some(Self::Medium),
@@ -122,10 +122,7 @@ impl DecayPolicy {
                 .unwrap_or(default)
         }
         Self {
-            volatile_stale_hours: parse_i64(
-                "CORECRUXD_DECAY_VOLATILE_HOURS",
-                Self::DEFAULT_VOLATILE_HOURS,
-            ),
+            volatile_stale_hours: parse_i64("CORECRUXD_DECAY_VOLATILE_HOURS", Self::DEFAULT_VOLATILE_HOURS),
             medium_stale_days: parse_i64("CORECRUXD_DECAY_MEDIUM_DAYS", Self::DEFAULT_MEDIUM_DAYS),
             stable_stale_days: parse_i64("CORECRUXD_DECAY_STABLE_DAYS", Self::DEFAULT_STABLE_DAYS),
         }
@@ -188,12 +185,7 @@ pub fn apply_at_chrono(
     policy: DecayPolicy,
 ) -> Freshness {
     let anchor = reverified_at.unwrap_or(written_at);
-    apply_at(
-        class,
-        anchor.timestamp_millis(),
-        now.timestamp_millis(),
-        policy,
-    )
+    apply_at(class, anchor.timestamp_millis(), now.timestamp_millis(), policy)
 }
 
 /// Age in days between `written_ms` and `now_ms`. Returns `None` if
@@ -225,9 +217,9 @@ mod tests {
             HorizonClass::Stable,
             HorizonClass::None,
         ] {
-            assert_eq!(HorizonClass::from_str(c.as_str()), Some(c));
+            assert_eq!(HorizonClass::parse(c.as_str()), Some(c));
         }
-        assert!(HorizonClass::from_str("nope").is_none());
+        assert!(HorizonClass::parse("nope").is_none());
     }
 
     #[test]
@@ -276,14 +268,8 @@ mod tests {
         let day_34 = written + 34 * DAY_MS;
         let day_36 = written + 36 * DAY_MS;
 
-        assert_eq!(
-            apply_at(HorizonClass::Medium, written, day_34, p()),
-            Freshness::Fresh
-        );
-        assert_eq!(
-            apply_at(HorizonClass::Medium, written, day_36, p()),
-            Freshness::Stale
-        );
+        assert_eq!(apply_at(HorizonClass::Medium, written, day_34, p()), Freshness::Fresh);
+        assert_eq!(apply_at(HorizonClass::Medium, written, day_36, p()), Freshness::Stale);
     }
 
     #[test]
@@ -292,14 +278,8 @@ mod tests {
         let day_300 = written + 300 * DAY_MS;
         let day_400 = written + 400 * DAY_MS;
 
-        assert_eq!(
-            apply_at(HorizonClass::Stable, written, day_300, p()),
-            Freshness::Fresh
-        );
-        assert_eq!(
-            apply_at(HorizonClass::Stable, written, day_400, p()),
-            Freshness::Stale
-        );
+        assert_eq!(apply_at(HorizonClass::Stable, written, day_300, p()), Freshness::Fresh);
+        assert_eq!(apply_at(HorizonClass::Stable, written, day_400, p()), Freshness::Stale);
     }
 
     #[test]
