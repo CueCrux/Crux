@@ -51,16 +51,20 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 async fn loopback_get(url: String) -> Result<String, JsonRpcError> {
+    let bearer = crate::tools::loopback_auth::loopback_bearer_token();
     tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(10)))
             .build()
             .into();
-        agent
+        let mut req = agent
             .get(&url)
             .header("X-Corecrux-Scopes", SCOPES)
-            .header("Accept", "application/json")
-            .call()
+            .header("Accept", "application/json");
+        if let Some(token) = &bearer {
+            req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+        req.call()
             .map(|mut r| r.body_mut().read_to_string().unwrap_or_default())
             .map_err(|e| e.to_string())
     })

@@ -38,3 +38,15 @@ Each ExecPlan declares a risk class (`low | medium | high`) in its Purpose secti
 ### Pre-flight
 
 Before writing the plan, call `get_gaps(query="<area>")` on the Feature Registry endpoint and note any critical/high gaps in the plan's `Risk` or `Decision Log`.
+
+### Work table is true north
+
+On session boot, before picking up a new task or proposing one, call `mcp__crux__list_work(source="all")`. The response merges the kanban `work_items` table with the read-time projection over `*/.agent/execplans/*.md` (per ExecPlan `crux-work-panel-execplans-as-truenorth-2026-05-26`).
+
+- Treat unfinished entries (state in `{planned, in_progress, blocked}`) as the prioritized task set.
+- If the user's request matches an in_progress plan's next milestone, resume it — do not start a parallel plan.
+- A `blocked` entry with a `blocker_reason` is a question to surface to the operator, not a task to start.
+- ExecPlan items (id prefix `execplan:`) have a `plan_path` field — open it before guessing what the plan is about.
+- The `current_milestone` field on an ExecPlan item tells you where the previous session left off. Read the corresponding `gate:M<n-1>` fact for context.
+
+Do not invent work that already exists in the table; do not let the table go stale by completing work without storing a `gate:M<n>` fact.

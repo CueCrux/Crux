@@ -10,12 +10,34 @@ use super::{
     problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
 };
 
+/// Where `/v1/work` reads from.
+///
+/// - `Kanban` (default for backwards-compat with existing callers that omit
+///   the param) — the `__work__::*` fact table populated by `create_work`.
+/// - `Execplans` — the read-time aggregator over `PlanCrux/.agent/execplans/*.md`
+///   joined with facts under `entity = "execplan:<slug>"`. See
+///   [`crate::work_execplans`].
+/// - `All` — both, deduplicated by `id` (kanban wins on collision).
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum WorkSource {
+    Kanban,
+    Execplans,
+    /// Default. Includes both kanban-table items and the read-time ExecPlan
+    /// projection. ExecPlans are only included when `CRUX_EXECPLANS_ROOT` is
+    /// set; otherwise this behaves identically to `Kanban`.
+    #[default]
+    All,
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct ListWorkQuery {
     pub project_id: Option<String>,
     pub state: Option<String>,
     pub tenant_id: Option<String>,
     pub assignee_passport: Option<String>,
+    #[serde(default)]
+    pub source: WorkSource,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -120,22 +142,90 @@ pub(super) async fn get_work(
         }
     }
     let store = state.fact_store.read().await;
-    let items = crate::work::list_work(
-        &store,
-        q.project_id.as_deref(),
-        q.state.as_deref(),
-        q.tenant_id.as_deref(),
-        q.assignee_passport.as_deref(),
-    );
+
+    let kanban_items = if matches!(q.source, WorkSource::Kanban | WorkSource::All) {
+        crate::work::list_work(
+            &store,
+            q.project_id.as_deref(),
+            q.state.as_deref(),
+            q.tenant_id.as_deref(),
+            q.assignee_passport.as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
+
+    let execplan_items = if matches!(q.source, WorkSource::Execplans | WorkSource::All) {
+        execplan_items_for_query(&store, &q)
+    } else {
+        Vec::new()
+    };
     drop(store);
+
+    // Merge: kanban first (wins on id collision), then execplan items not
+    // already present. ExecPlan ids are namespaced (`execplan:<slug>`) so
+    // collisions are not expected in practice — the dedup is defence in depth.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(kanban_items.len());
+    let mut items = Vec::with_capacity(kanban_items.len() + execplan_items.len());
+    for w in kanban_items {
+        seen.insert(w.id.clone());
+        items.push(w);
+    }
+    for w in execplan_items {
+        if !seen.contains(&w.id) {
+            items.push(w);
+        }
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "count": items.len(),
+            "source": match q.source {
+                WorkSource::Kanban => "kanban",
+                WorkSource::Execplans => "execplans",
+                WorkSource::All => "all",
+            },
             "work": items,
         })),
     )
         .into_response()
+}
+
+/// Build the ExecPlan slice of the response. Applies the same state /
+/// tenant / assignee filters that kanban uses so `?source=all&state=planned`
+/// returns a coherent merged list.
+fn execplan_items_for_query(
+    store: &corecrux_memory::fact_store::FactStore,
+    q: &ListWorkQuery,
+) -> Vec<crate::work::WorkItem> {
+    // No root configured = aggregator off. Return empty rather than 500.
+    let Some(root) = crate::work_execplans::execplans_root_from_env() else {
+        return Vec::new();
+    };
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let items = match crate::work_execplans::list_execplans(store, &root, now_unix_ms) {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(error = %err, root = %root.display(), "execplan-aggregator-io-error");
+            return Vec::new();
+        }
+    };
+    items
+        .into_iter()
+        .filter(|w| {
+            q.project_id
+                .as_deref()
+                .is_none_or(|p| p == w.project_id || p == crate::work_execplans::VIRTUAL_PROJECT_ID)
+                && q.state.as_deref().is_none_or(|s| w.state == s)
+                && q.tenant_id.as_deref().is_none_or(|t| w.tenant_id.as_deref() == Some(t))
+                && q.assignee_passport
+                    .as_deref()
+                    .is_none_or(|a| w.assignee_passport.as_deref() == Some(a))
+        })
+        .collect()
 }
 
 pub(super) async fn get_work_item(

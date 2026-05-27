@@ -75,6 +75,7 @@ mod wasm_dispatcher;
 #[cfg(feature = "wasm-extensions")]
 mod wasm_host;
 mod work;
+mod work_execplans;
 mod workspace_scan;
 
 use std::fs::{create_dir_all, OpenOptions};
