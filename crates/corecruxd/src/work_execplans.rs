@@ -183,11 +183,54 @@ fn find_ci(haystack: &str, needle_lower: &str) -> Option<usize> {
     hl.find(needle_lower)
 }
 
+/// Strip leading markdown markup so we can ask "does this line *declare*
+/// X, or merely mention X mid-prose?". Removes leading whitespace, blockquote
+/// arrows, bulleted / numbered list markers, bold asterisks, and an optional
+/// `Status:` prefix (followed by more bold + spaces). Used by
+/// [`extract_superseded_slug`] to reject prose mentions like
+/// `"- See \`Status: Superseded by \[\[slug\]\]\` pattern"` while still matching
+/// declarations like `"Status: Superseded by \[\[next-plan\]\]"` or
+/// `"> **Status:** Superseded by \[\[next-plan\]\]"`.
+fn strip_leading_markup(line: &str) -> &str {
+    let mut s = line.trim_start();
+    // Blockquote arrows, possibly nested or separated by whitespace.
+    while let Some(rest) = s.strip_prefix('>') {
+        s = rest.trim_start();
+    }
+    // Unordered list marker.
+    if let Some(rest) = s.strip_prefix("- ").or_else(|| s.strip_prefix("* ")) {
+        s = rest;
+    }
+    // Ordered list marker (`6. ` etc.) — drop digits then a literal ". ".
+    let trimmed_digits = s.trim_start_matches(|c: char| c.is_ascii_digit());
+    if trimmed_digits.len() < s.len() {
+        if let Some(rest) = trimmed_digits.strip_prefix(". ") {
+            s = rest;
+        }
+    }
+    // Bold markers around the next token.
+    s = s.trim_start_matches('*');
+    // Optional `Status:` (case-insensitive). ASCII-only, so byte-indexing
+    // into `s` after measuring against `lower` is safe.
+    let lower = s.to_ascii_lowercase();
+    if lower.starts_with("status:") {
+        s = s[7..].trim_start_matches([' ', '*']);
+    }
+    s
+}
+
+/// Match a "Superseded by …" *declaration* at the start of a line, after
+/// stripping leading markdown markup. Returns the captured slug. Rejects
+/// prose mentions ("(superseded by today's work)") and backtick-quoted
+/// pattern examples ("`Status: Superseded by \[\[slug\]\]`") because in both
+/// cases the `Superseded by` token does not appear at the line's declarative
+/// prefix.
 fn extract_superseded_slug(line: &str) -> Option<String> {
-    let lower = line.to_ascii_lowercase();
-    let needle = "superseded by";
-    let idx = lower.find(needle)?;
-    let after = &line[idx + needle.len()..];
+    let trimmed = strip_leading_markup(line);
+    let lower = trimmed.to_ascii_lowercase();
+    let after = lower
+        .strip_prefix("superseded by")
+        .map(|_| &trimmed["superseded by".len()..])?;
     let after = after.trim_start_matches([':', ' ']);
     if let Some(rest) = after.strip_prefix("[[") {
         let end = rest.find("]]")?;
@@ -550,6 +593,53 @@ mod tests {
         let md = "# T\n\nSuperseded by foo-bar-baz-2026-05-19 (see decision log).\n";
         let p = parse_plan(md);
         assert_eq!(p.superseded_by.as_deref(), Some("foo-bar-baz-2026-05-19"));
+    }
+
+    #[test]
+    fn parse_accepts_status_superseded_in_blockquote() {
+        let md = "# T\n\n> **Status:** Superseded by [[next-plan]]\n";
+        let p = parse_plan(md);
+        assert_eq!(p.superseded_by.as_deref(), Some("next-plan"));
+    }
+
+    #[test]
+    fn parse_accepts_list_item_supersession() {
+        let md = "# T\n\n- Superseded by old-plan-2026-04-01\n";
+        let p = parse_plan(md);
+        assert_eq!(p.superseded_by.as_deref(), Some("old-plan-2026-04-01"));
+    }
+
+    // ── Regression tests for the 2026-05-27 false positives ──
+    // Pre-fix the parser matched `superseded by` anywhere on a line, so
+    // these three real-world plan bodies all triggered phantom supersessions.
+
+    #[test]
+    fn parse_ignores_backtick_quoted_pattern_in_list_item() {
+        // From crux-work-panel-execplans-as-truenorth-2026-05-26 line 91 —
+        // a numbered-list item that quotes the supersession *pattern* for
+        // documentation. The literal slug "slug" must not be captured.
+        let md = "# T\n\n6. `Status: Superseded by [[slug]]` line in plan front-matter → `archive`\n";
+        let p = parse_plan(md);
+        assert_eq!(p.superseded_by, None, "pattern example must not match");
+    }
+
+    #[test]
+    fn parse_ignores_prose_mention_inside_list_item() {
+        // From lme-s-q500-lift-handoff-2026-05-26 line 178 — a list item
+        // whose prose includes "superseded by today's …".
+        let md = "# T\n\n- Prior ccxev handoff (now superseded by today's LME-S work): foo.md\n";
+        let p = parse_plan(md);
+        assert_eq!(p.superseded_by, None, "prose mention must not match");
+    }
+
+    #[test]
+    fn parse_ignores_decision_log_reference_to_superseded_by() {
+        // From crux-work-panel-execplans-as-truenorth-2026-05-26 line 159 —
+        // a Decision Log entry that mentions the words "Superseded by" in
+        // a description of what fields the parser populates.
+        let md = "# T\n\n- 2026-05-26: M1 parser scans for `Status:` line, `Superseded by`. Rationale: …\n";
+        let p = parse_plan(md);
+        assert_eq!(p.superseded_by, None, "decision-log mention must not match");
     }
 
     #[test]
