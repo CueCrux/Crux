@@ -23,6 +23,7 @@ pub mod github;
 pub mod handoff;
 pub mod kinds;
 pub mod loopback_auth;
+pub mod memory_use;
 pub mod observations;
 pub mod observe;
 pub mod passport;
@@ -68,7 +69,7 @@ pub struct ToolDefinition {
 /// `envelope` and never-listed tools always see the unchanged `payload`
 /// shape.
 pub fn tool_emits_envelope(name: &str) -> bool {
-    matches!(name, "query_facts")
+    matches!(name, "query_facts" | "memory_acknowledge_use")
 }
 
 /// Non-breaking pointer added to every legacy tool's description at
@@ -269,6 +270,43 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["entity", "key"],
                 "examples": [
                     { "entity": "project-alpha", "key": "status" }
+                ]
+            }),
+        },
+        // ── Acknowledged memory use (agent-ux-02) ────────────────────
+        ToolDefinition {
+            name: "memory_acknowledge_use".to_string(),
+            description: "Declare which stored fact ids were consulted while producing the \
+                          current turn. Requires an authenticated passport. Reserved-prefix \
+                          entries (__agent::*, __ops::*, __bootstrap__::*) are stripped from \
+                          the acknowledgement. Per-turn audit envelope surfaces the filtered \
+                          list to the host so the consumer can render \"I used this\" \
+                          annotations. Gated by CORECRUXD_FEATURE_MEMORY_ACK=1 (default off)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "turn_id":  { "type": "string", "description": "Opaque per-host turn identifier" },
+                    "fact_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Stored fact ids the agent consulted in producing this turn"
+                    },
+                    "intent": {
+                        "type": "string",
+                        "description": "answer | decision | tool_call | implicit (default: answer)"
+                    },
+                    "retrieved_chunk_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Paid tier: chunks from memory-core retrieval. Free tier: ignored."
+                    },
+                    "confidence": { "type": "number", "description": "Optional 0..1 confidence" },
+                    "note":       { "type": "string", "description": "Optional free-form note" }
+                },
+                "required": ["turn_id"],
+                "examples": [
+                    { "turn_id": "turn-42", "fact_ids": ["f_01J_abc", "f_01J_def"], "intent": "answer" }
                 ]
             }),
         },
@@ -1345,6 +1383,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "list_entities",      "output": "{ entities: [string] }" },
         { "tool": "get_bootstrap",      "output": "{ facts: [{entity, key, value}], total_tokens }" },
         { "tool": "fact_history",       "output": "{ versions: [{fact_id, value, version, supersedes, confidence, stored_at, deleted}] }" },
+        { "tool": "memory_acknowledge_use", "output": "{ turn_id, intent, feature_enabled, receipt_ref, memories_used: [{fact_id, topic, age_days}], filtered_count, redacted_count, not_found_count, not_visible_count }" },
         { "tool": "get_session",        "output": "{ session_id, state, updated_at, total_tokens }" },
         { "tool": "save_session",       "output": "{ session_id, updated_at }" },
         { "tool": "list_sessions",      "output": "{ sessions: [string] }" },
@@ -1428,6 +1467,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "list_entities" => facts::handle_list_entities(args, ctx).await,
         "get_bootstrap" => facts::handle_get_bootstrap(args, ctx).await,
         "fact_history" => facts::handle_fact_history(args, ctx).await,
+        "memory_acknowledge_use" => memory_use::handle_memory_acknowledge_use(args, ctx).await,
         "get_session" => sessions::handle_get_session(args, ctx).await,
         "save_session" => sessions::handle_save_session(args, ctx).await,
         "list_sessions" => sessions::handle_list_sessions(args, ctx).await,
@@ -1520,7 +1560,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 61; // 55 prior + 4 Features lens tools + 2 audit tools (audit_config, check_config_audit).
+    const TOOL_COUNT: usize = 62; // 55 prior + 4 Features lens tools + 2 audit tools (audit_config, check_config_audit) + 1 memory_acknowledge_use (agent-ux-02).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

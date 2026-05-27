@@ -702,6 +702,98 @@ mod tests {
         std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
     }
 
+    /// Sibling envelope-filter contract for `memory_acknowledge_use`
+    /// (agent-ux-02). Mirrors the contract enforced by
+    /// `envelope_on_query_facts_omits_reserved_prefix_entries` so the
+    /// merge-result test the master plan asks every new envelope-emitting
+    /// tool to honour stays green for this surface too.
+    #[tokio::test]
+    async fn envelope_on_memory_acknowledge_use_omits_reserved_prefix_entries() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::memory_use::FEATURE_FLAG_ENV, "1");
+        crate::tools::memory_use::_reset_ack_buffer_for_tests().await;
+
+        // memory_acknowledge_use requires a passport — attach an agent.
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // Seed one public + two reserved-prefix facts. Capture each fact_id
+        // so we can pass them into the ack tool.
+        let mut ids: Vec<String> = Vec::new();
+        for (entity, key) in [
+            ("project-y", "status"),
+            ("__ops::config-audit", "sha256:ack"),
+            ("__bootstrap__::pattern:retry", "Retry"),
+        ] {
+            let resp = dispatch(
+                rpc(
+                    "tools/call",
+                    json!({
+                        "name": "store_fact",
+                        "arguments": {"entity": entity, "key": key, "value": "shipped-ack"}
+                    }),
+                ),
+                &ctx,
+                None,
+            )
+            .await;
+            let text = resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+            // "stored fact f_xxx (entity=..., key=..., ..."
+            let id = text
+                .trim_start_matches("stored fact ")
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            ids.push(id);
+        }
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "memory_acknowledge_use",
+                    "arguments": {
+                        "turn_id": "turn-envtest",
+                        "intent": "answer",
+                        "fact_ids": ids,
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        // The envelope wrapper engages because (a) feature flag on, (b) the
+        // tool is in `tool_emits_envelope`, (c) the per-tool builder is
+        // registered. Payload + envelope therefore both exist.
+        assert!(result["payload"].is_object());
+        let env = &result["envelope"];
+        let memories = env["memories_used"].as_array().unwrap();
+        assert_eq!(
+            memories.len(),
+            1,
+            "ack envelope must strip reserved-prefix entries (got {} entries)",
+            memories.len()
+        );
+        assert_eq!(memories[0]["topic"], "project-y");
+        for m in memories {
+            let topic = m["topic"].as_str().unwrap();
+            assert!(!topic.starts_with("__"), "ack envelope leaked reserved entity {topic}");
+        }
+        // autonomy_consumed identifies the capability as memory:acknowledge,
+        // not facts:read — proves the per-tool envelope builder ran (not the
+        // query_facts one).
+        assert_eq!(env["autonomy_consumed"]["capability"], "memory:acknowledge");
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::memory_use::FEATURE_FLAG_ENV);
+    }
+
     #[tokio::test]
     async fn tools_call_store_and_query_facts() {
         // Share the envelope env-var lock so this test isn't racy with the

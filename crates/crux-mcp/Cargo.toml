@@ -23,6 +23,7 @@ ureq = { version = "3.3.0", features = ["json"] }
 uuid = { version = "1.23.1", features = ["v4"] }
 xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
 corecrux-memory = { path = "../corecrux-memory" }
+corecrux-receipts = { path = "../corecrux-receipts" }
 corecrux-retrieval = { path = "../corecrux-retrieval" }
 crux-lens-features = { path = "../crux-lens-features" }
 corecrux-types = { path = "../corecrux-types" }
