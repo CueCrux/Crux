@@ -1999,11 +1999,7 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     print!("{}", memory::render_fact(&fact));
                     Ok(())
                 }
-                MemoryCommand::Edit {
-                    fact_id,
-                    value,
-                    reason,
-                } => {
+                MemoryCommand::Edit { fact_id, value, reason } => {
                     let new_fact = client.edit(&fact_id, &value, reason.as_deref())?;
                     println!("edited {} → {} (v{})", fact_id, new_fact.fact_id, new_fact.version);
                     Ok(())

@@ -17,7 +17,14 @@
 //! layer (callers without the flag still see the tools listed but every
 //! handler short-circuits with a "feature disabled" message).
 //!
-//! See `PlanCrux/.agent/execplans/agent-ux-01-readable-editable-memory-2026-05-27.md`.
+//! Rationale (agent-ux-01): host IDEs and the upcoming console memory panel
+//! need a "consumer-shaped" view of the fact store that is safe to render
+//! without exposing operator-only entities. The raw `store_fact` /
+//! `query_facts` surface stays unchanged for operators; the four tools here
+//! (`memory_view`, `memory_edit`, `memory_pin`, `memory_history`) layer
+//! pagination, reserved-prefix filtering, receipt attribution, and pin state
+//! on top, so a UI can show a coherent narrative without the agent having to
+//! reimplement that bookkeeping every session.
 
 // TODO(M2-envelope): once the sibling agent-ux M2 envelope spike lands,
 // `memory_view` should opt into the envelope wrapper so host IDEs can render
@@ -71,8 +78,7 @@ fn fact_visible_in_memory_panel(fact: &Fact, agent_name: Option<&str>) -> bool {
     if !scope::fact_visible_to_agent(fact, agent_name) {
         return false;
     }
-    let visible_entity = scope::visible_entity_for_agent(fact, agent_name)
-        .unwrap_or_else(|| fact.entity.clone());
+    let visible_entity = scope::visible_entity_for_agent(fact, agent_name).unwrap_or_else(|| fact.entity.clone());
     !entity_is_reserved(&visible_entity)
 }
 
@@ -105,8 +111,7 @@ fn feature_disabled_response(tool: &str) -> Value {
 
 /// Render a fact as a `MemoryFact` JSON object (the agent-ux-01 wire shape).
 fn fact_to_memory_json(fact: &Fact, agent_name: Option<&str>, pinned: bool) -> Value {
-    let entity = scope::visible_entity_for_agent(fact, agent_name)
-        .unwrap_or_else(|| fact.entity.clone());
+    let entity = scope::visible_entity_for_agent(fact, agent_name).unwrap_or_else(|| fact.entity.clone());
     json!({
         "id": fact.fact_id,
         "entity": entity,
@@ -168,9 +173,11 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
 
     // Newest first (descending stored_at), then confidence as tiebreaker.
     visible.sort_by(|a, b| {
-        b.stored_at
-            .cmp(&a.stored_at)
-            .then_with(|| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal))
+        b.stored_at.cmp(&a.stored_at).then_with(|| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     });
 
     // Apply token_budget cap and top_k.
@@ -233,10 +240,16 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
         selected
             .iter()
             .map(|f| {
-                let entity = scope::visible_entity_for_agent(f, agent_name)
-                    .unwrap_or_else(|| f.entity.clone());
-                let pinned = if pinned_ids.contains(&f.fact_id) { " [pinned]" } else { "" };
-                format!("[{}] {} = {} (id={}, v{}){}", entity, f.key, f.value, f.fact_id, f.version, pinned)
+                let entity = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
+                let pinned = if pinned_ids.contains(&f.fact_id) {
+                    " [pinned]"
+                } else {
+                    ""
+                };
+                format!(
+                    "[{}] {} = {} (id={}, v{}){}",
+                    entity, f.key, f.value, f.fact_id, f.version, pinned
+                )
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -415,8 +428,7 @@ pub async fn handle_memory_history(args: &Value, ctx: &McpContext) -> Result<Val
                 message: format!("fact not found: {fid}"),
                 data: Some(json!({"fact_id": fid})),
             })?;
-            let visible_entity = scope::visible_entity_for_agent(f, agent_name)
-                .unwrap_or_else(|| f.entity.clone());
+            let visible_entity = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
             (visible_entity, f.key.clone())
         }
         _ => {
@@ -544,9 +556,12 @@ mod tests {
         handle_store_fact(&json!({"entity": "person:bob", "key": "city", "value": "NYC"}), &ctx)
             .await
             .unwrap();
-        handle_store_fact(&json!({"entity": "person:bob", "key": "job", "value": "engineer"}), &ctx)
-            .await
-            .unwrap();
+        handle_store_fact(
+            &json!({"entity": "person:bob", "key": "job", "value": "engineer"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
         let res = handle_memory_view(&json!({"token_budget": 500, "top_k": 10}), &ctx)
             .await
             .unwrap();
@@ -571,9 +586,12 @@ mod tests {
         )
         .await
         .unwrap();
-        handle_store_fact(&json!({"entity": "__ops::heartbeat", "key": "last", "value": "now"}), &ctx)
-            .await
-            .unwrap();
+        handle_store_fact(
+            &json!({"entity": "__ops::heartbeat", "key": "last", "value": "now"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
 
         let res = handle_memory_view(&json!({"token_budget": 500}), &ctx).await.unwrap();
         let arr = res["structuredContent"]["facts"].as_array().unwrap();
@@ -603,9 +621,7 @@ mod tests {
             .unwrap();
 
         // Bob's view should NOT include alice's private fact.
-        let bob_view = handle_memory_view(&json!({"token_budget": 500}), &bob)
-            .await
-            .unwrap();
+        let bob_view = handle_memory_view(&json!({"token_budget": 500}), &bob).await.unwrap();
         let arr = bob_view["structuredContent"]["facts"].as_array().unwrap();
         let entities: Vec<&str> = arr.iter().map(|f| f["entity"].as_str().unwrap()).collect();
         assert!(entities.contains(&"public"));
@@ -616,12 +632,9 @@ mod tests {
     async fn memory_edit_requires_agent() {
         let _guard = FlagGuard::enabled().await;
         let ctx = test_ctx();
-        let err = handle_memory_edit(
-            &json!({"fact_id": "f_nope", "new_value": "x"}),
-            &ctx,
-        )
-        .await
-        .unwrap_err();
+        let err = handle_memory_edit(&json!({"fact_id": "f_nope", "new_value": "x"}), &ctx)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
         assert_eq!(err.data.unwrap()["requires_agent_identity"], true);
     }
@@ -630,9 +643,12 @@ mod tests {
     async fn memory_edit_produces_new_version_with_reason_receipt() {
         let _guard = FlagGuard::enabled().await;
         let alice = alice_ctx();
-        let stored = handle_store_fact(&json!({"entity": "person:carol", "key": "city", "value": "Berlin"}), &alice)
-            .await
-            .unwrap();
+        let stored = handle_store_fact(
+            &json!({"entity": "person:carol", "key": "city", "value": "Berlin"}),
+            &alice,
+        )
+        .await
+        .unwrap();
         let text = stored["content"][0]["text"].as_str().unwrap();
         let fact_id = text.split_whitespace().nth(2).unwrap();
 
@@ -662,10 +678,10 @@ mod tests {
         // Find its id.
         let snapshot = handle_memory_view(&json!({"token_budget": 500}), &alice).await.unwrap();
         let _ = snapshot; // memory_view filters it; we look it up directly.
-        // (We can't get the id through the panel — refusal already verified
-        // by the panel-filter test. Here we focus on the edit refusal when
-        // an id IS provided.)
-        // Find the fact id directly via the fact_history flow.
+                          // (We can't get the id through the panel — refusal already verified
+                          // by the panel-filter test. Here we focus on the edit refusal when
+                          // an id IS provided.)
+                          // Find the fact id directly via the fact_history flow.
         let history = handle_memory_history(
             &json!({"entity": "__bootstrap__::pattern:retry", "key": "Retry"}),
             &alice,
@@ -717,16 +733,16 @@ mod tests {
             .await
             .unwrap();
         // Update.
-        let stored = handle_store_fact(&json!({"entity": "person:eve", "key": "city", "value": "Bergen"}), &alice)
-            .await
-            .unwrap();
-        let _ = stored;
-        let res = handle_memory_history(
-            &json!({"entity": "person:eve", "key": "city"}),
+        let stored = handle_store_fact(
+            &json!({"entity": "person:eve", "key": "city", "value": "Bergen"}),
             &alice,
         )
         .await
         .unwrap();
+        let _ = stored;
+        let res = handle_memory_history(&json!({"entity": "person:eve", "key": "city"}), &alice)
+            .await
+            .unwrap();
         let versions = res["structuredContent"]["versions"].as_array().unwrap();
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0]["value"], "Oslo");

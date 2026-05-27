@@ -103,14 +103,20 @@ impl MemoryClient {
         format!("{}/{}", self.base, path)
     }
 
-    fn apply_auth(&self, mut req: ureq::RequestBuilder<ureq::typestate::WithoutBody>) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+    fn apply_auth(
+        &self,
+        mut req: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+    ) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
         if let Some(token) = &self.bearer {
             req = req.header("authorization", format!("Bearer {token}"));
         }
         req
     }
 
-    fn apply_auth_body(&self, mut req: ureq::RequestBuilder<ureq::typestate::WithBody>) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
+    fn apply_auth_body(
+        &self,
+        mut req: ureq::RequestBuilder<ureq::typestate::WithBody>,
+    ) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
         if let Some(token) = &self.bearer {
             req = req.header("authorization", format!("Bearer {token}"));
         }
@@ -128,10 +134,7 @@ impl MemoryClient {
         req = self.apply_auth(req);
         let resp = req.call().map_err(MemoryCliError::transport)?;
         let status = resp.status().as_u16();
-        let body = resp
-            .into_body()
-            .read_to_string()
-            .map_err(MemoryCliError::transport)?;
+        let body = resp.into_body().read_to_string().map_err(MemoryCliError::transport)?;
         if status >= 400 {
             return Err(MemoryCliError::UpstreamStatus { status, body });
         }
@@ -159,10 +162,7 @@ impl MemoryClient {
         let req = self.apply_auth(self.agent.get(&url));
         let resp = req.call().map_err(MemoryCliError::transport)?;
         let status = resp.status().as_u16();
-        let body = resp
-            .into_body()
-            .read_to_string()
-            .map_err(MemoryCliError::transport)?;
+        let body = resp.into_body().read_to_string().map_err(MemoryCliError::transport)?;
         if status >= 400 {
             return Err(MemoryCliError::UpstreamStatus { status, body });
         }
@@ -170,7 +170,10 @@ impl MemoryClient {
         if entity_is_reserved(&fact.entity) {
             return Err(MemoryCliError::UpstreamStatus {
                 status: 403,
-                body: format!("fact entity '{}' is reserved (not visible through memory panel)", fact.entity),
+                body: format!(
+                    "fact entity '{}' is reserved (not visible through memory panel)",
+                    fact.entity
+                ),
             });
         }
         Ok(fact)
@@ -191,12 +194,12 @@ impl MemoryClient {
         let req = self.apply_auth_body(self.agent.put(&url));
         let resp = req.send_json(body).map_err(MemoryCliError::transport)?;
         let status = resp.status().as_u16();
-        let resp_body = resp
-            .into_body()
-            .read_to_string()
-            .map_err(MemoryCliError::transport)?;
+        let resp_body = resp.into_body().read_to_string().map_err(MemoryCliError::transport)?;
         if status >= 400 {
-            return Err(MemoryCliError::UpstreamStatus { status, body: resp_body });
+            return Err(MemoryCliError::UpstreamStatus {
+                status,
+                body: resp_body,
+            });
         }
         let new_fact: MemoryFact = serde_json::from_str(&resp_body)?;
         Ok(new_fact)
@@ -220,12 +223,12 @@ impl MemoryClient {
         let req = self.apply_auth_body(self.agent.put(&url));
         let resp = req.send_json(body).map_err(MemoryCliError::transport)?;
         let status = resp.status().as_u16();
-        let resp_body = resp
-            .into_body()
-            .read_to_string()
-            .map_err(MemoryCliError::transport)?;
+        let resp_body = resp.into_body().read_to_string().map_err(MemoryCliError::transport)?;
         if status >= 400 {
-            return Err(MemoryCliError::UpstreamStatus { status, body: resp_body });
+            return Err(MemoryCliError::UpstreamStatus {
+                status,
+                body: resp_body,
+            });
         }
         Ok(())
     }
