@@ -2151,6 +2151,7 @@ pre {
       <button data-panel="integrations" aria-label="Integrations"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="2" width="9" height="9"></rect><rect x="13" y="2" width="9" height="9"></rect><rect x="2" y="13" width="9" height="9"></rect><rect x="13" y="13" width="9" height="9"></rect></svg>Integrations</button>
       <button data-panel="extensions" aria-label="Extensions"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6v3a3 3 0 0 0 6 0h0v6a3 3 0 0 0 0 6h0v3H9v-3a3 3 0 0 1-6 0v-6h3a3 3 0 0 0 0-6H3V3z"></path></svg>Extensions</button>
       <button data-panel="facts" aria-label="Facts"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="8" y1="13" x2="16" y2="13"></line><line x1="8" y1="17" x2="13" y2="17"></line></svg>Facts</button>
+      <button data-panel="memory" aria-label="Memory"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6v4l3 3v8a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-8l3-3z"></path><line x1="9" y1="13" x2="15" y2="13"></line></svg>Memory</button>
       <button data-panel="tenants" aria-label="Tenants"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 21h18"></path><path d="M5 21V7l7-4 7 4v14"></path><line x1="9" y1="9" x2="9" y2="9"></line><line x1="15" y1="9" x2="15" y2="9"></line><line x1="9" y1="13" x2="9" y2="13"></line><line x1="15" y1="13" x2="15" y2="13"></line></svg>Tenants</button>
       <button data-panel="raw" aria-label="Raw"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>Raw</button>
     </nav>
@@ -2509,6 +2510,27 @@ pre {
           </div>
 
           <div class="list" id="factList"></div>
+        </article>
+      </div>
+    </section>
+
+    <!-- agent-ux-01: Readable / Editable Memory panel. Guarded client-side
+         by `CORECRUXD_FEATURE_MEMORY_PANEL`. Reads `/v1/console/facts` and
+         filters reserved-prefix entities (__agent::*, __ops::*, etc.) before
+         rendering. Edits route through `PUT /v1/facts` with the standard
+         passport-attributed write path. -->
+    <section class="panel" id="panel-memory" aria-labelledby="memory-title">
+      <div class="grid">
+        <article class="card wide">
+          <span class="label">Memory</span>
+          <h2 id="memory-title">Readable, editable memory</h2>
+          <p class="helper">Consumer-shaped view of what the platform remembers about you. Reserved-prefix operator entries (<span class="mono">__agent::*</span>, <span class="mono">__ops::*</span>, <span class="mono">__bootstrap__::*</span>) are filtered out — use the Facts tab for the raw K/V surface. Narrative/topic grouping ships in a follow-up milestone.</p>
+          <div class="facts-controls">
+            <input id="memorySearch" class="search-input" type="search" placeholder="Search visible memory…" aria-label="Search visible memory">
+            <span id="memoryStatus" class="hint" aria-live="polite"></span>
+          </div>
+          <div class="list" id="memoryList"></div>
+          <noscript><p class="helper">Memory panel requires JavaScript.</p></noscript>
         </article>
       </div>
     </section>
@@ -2879,6 +2901,7 @@ function activatePanel(name, opts) {
   else { setScope('cx'); }
   if (name === 'onboarding') startHealthPoll();
   else stopHealthPoll();
+  if (name === 'memory') loadMemoryPanel();
   // Push to browser history so the back button navigates between panels
   // instead of leaving the site. `opts.fromPopstate` skips this when the
   // change was itself triggered by popstate.
@@ -3256,6 +3279,137 @@ async function loadFacts() {
   }
   renderFacts();
 }
+
+// ── agent-ux-01 readable / editable memory panel ──────────────────────
+// Reserved entity prefixes hidden from the memory panel. Kept in sync with
+// `crux_mcp::tools::memory::RESERVED_ENTITY_PREFIXES` and
+// `corecruxctl::memory::RESERVED_ENTITY_PREFIXES`. Filtered CLIENT-SIDE so
+// the panel degrades gracefully even if a future API forgets the filter.
+const MEMORY_RESERVED_PREFIXES = [
+  '__agent::',
+  '__ops::',
+  '__bootstrap__::',
+  '__memory_pin::',
+  '__work__::',
+  '__decisions__::',
+  '__project_layer__::',
+  '__tenant_metadata__::',
+];
+
+function memoryEntityIsReserved(entity) {
+  if (!entity) return true;
+  for (let i = 0; i < MEMORY_RESERVED_PREFIXES.length; i++) {
+    if (entity.indexOf(MEMORY_RESERVED_PREFIXES[i]) === 0) return true;
+  }
+  return false;
+}
+
+async function loadMemoryPanel() {
+  const list = document.getElementById('memoryList');
+  const status = document.getElementById('memoryStatus');
+  if (!list || !status) return;
+  status.textContent = 'Loading memory…';
+  let data;
+  try {
+    // /v1/console/facts already filters private facts; we layer the
+    // memory-panel reserved-prefix filter on top of that. token_budget is
+    // honoured via top_k here — the embedded surface caps at 200.
+    data = await api('/v1/console/facts?top_k=100');
+  } catch (err) {
+    // Free-degraded smoke: even if VaultCrux or some hosted service is
+    // unreachable, the local console panel must render something useful.
+    status.textContent = 'Daemon facts API unavailable — panel running in degraded mode.';
+    list.innerHTML = '<div class="row warn"><strong>Memory panel offline</strong><div>' +
+      'Check ' + '<span class="mono">CRUX_AGENT_TOKEN</span>' + ' and daemon health. ' +
+      'Status: ' + String((err && err.status) || 'fetch-failed') + '.</div></div>';
+    return;
+  }
+  const all = (data && data.facts) || [];
+  const visible = all.filter(function (f) {
+    return f && !f.deleted && !memoryEntityIsReserved(f.entity);
+  });
+  visible.sort(function (a, b) {
+    return String(b.stored_at || '').localeCompare(String(a.stored_at || ''));
+  });
+  const q = (document.getElementById('memorySearch').value || '').trim().toLowerCase();
+  const filtered = q
+    ? visible.filter(function (f) {
+        return (
+          String(f.entity || '').toLowerCase().indexOf(q) !== -1 ||
+          String(f.key || '').toLowerCase().indexOf(q) !== -1 ||
+          String(f.value || '').toLowerCase().indexOf(q) !== -1
+        );
+      })
+    : visible;
+  status.textContent =
+    filtered.length + ' visible / ' + all.length + ' total (reserved prefixes hidden)';
+  if (filtered.length === 0) {
+    list.innerHTML =
+      '<div class="row warn"><strong>No memory visible yet</strong>' +
+      '<div>Add facts via the Facts tab or any MCP client.</div></div>';
+    return;
+  }
+  // Group by entity for a narrative-shaped view (template renderer; the
+  // paid tier #4 will swap in a real summariser).
+  const byEntity = {};
+  filtered.forEach(function (f) {
+    byEntity[f.entity] = byEntity[f.entity] || [];
+    byEntity[f.entity].push(f);
+  });
+  const entityKeys = Object.keys(byEntity).sort();
+  const html = entityKeys
+    .map(function (entity) {
+      const rows = byEntity[entity]
+        .map(function (f) {
+          const stored = String(f.stored_at || '').slice(0, 19).replace('T', ' ');
+          const conf =
+            typeof f.confidence === 'number' ? ' · conf ' + f.confidence.toFixed(2) : '';
+          const id = (f.fact_id || '').replace(/"/g, '&quot;');
+          const ver = f.version || 1;
+          return (
+            '<div class="row" data-fact-id="' +
+            id +
+            '"><div><strong>' +
+            escapeHtml(f.key) +
+            '</strong> = ' +
+            escapeHtml(f.value) +
+            '</div><div class="hint"><span class="mono">' +
+            id +
+            '</span> · v' +
+            ver +
+            ' · ' +
+            stored +
+            conf +
+            '</div></div>'
+          );
+        })
+        .join('');
+      return (
+        '<article class="card narrow" style="margin:0.6rem 0"><span class="label">' +
+        escapeHtml(entity) +
+        '</span>' +
+        rows +
+        '</article>'
+      );
+    })
+    .join('');
+  list.innerHTML = html;
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// Re-render when the search input changes.
+document.addEventListener('input', function (e) {
+  if (e.target && e.target.id === 'memorySearch') {
+    loadMemoryPanel();
+  }
+});
 
 function render() {
   renderStatus();

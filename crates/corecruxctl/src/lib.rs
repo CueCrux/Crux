@@ -26,6 +26,7 @@ pub mod extensions;
 pub mod fixture_digest;
 pub mod gaps;
 pub mod inspect_receipt;
+pub mod memory;
 pub mod ops;
 pub mod parity;
 pub mod projections;

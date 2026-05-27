@@ -50,6 +50,27 @@ pub const TOOL_SURFACE: &[ToolSurfaceEntry] = &[
         tier: ToolTier::Local,
         marker: "[local]",
     },
+    // agent-ux-01 readable/editable memory panel — free-tier local surface.
+    ToolSurfaceEntry {
+        name: "memory_view",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_edit",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_pin",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_history",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
     ToolSurfaceEntry {
         name: "query_facts",
         tier: ToolTier::Local,

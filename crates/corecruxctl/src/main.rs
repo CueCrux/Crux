@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use corecruxctl::{
-    admin, audit_pack, evidence, explain, extensions, fixture_digest, gaps, inspect_receipt, parity, projections,
-    receipts, reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import, storage, structured_log, tooling_env,
-    verify_store,
+    admin, audit_pack, evidence, explain, extensions, fixture_digest, gaps, inspect_receipt, memory, parity,
+    projections, receipts, reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import, storage, structured_log,
+    tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -380,6 +380,51 @@ enum Command {
     Extensions {
         #[command(subcommand)]
         command: ExtensionsCommand,
+    },
+
+    /// Readable / editable memory panel (agent-ux-01). Operates against the
+    /// running daemon over HTTP; honours CRUX_AGENT_TOKEN.
+    #[command(name = "memory")]
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MemoryCommand {
+    /// List visible memory facts (newest first; reserved prefixes filtered).
+    Ls {
+        /// Maximum facts to return.
+        #[arg(long, default_value_t = 20)]
+        top_k: usize,
+        /// Optional entity to filter on.
+        #[arg(long)]
+        entity: Option<String>,
+    },
+    /// Print one fact with full metadata.
+    Show {
+        /// Fact id to look up.
+        fact_id: String,
+    },
+    /// Update the value of an existing fact (passport-attributed write).
+    Edit {
+        /// Fact id to update.
+        fact_id: String,
+        /// New value.
+        #[arg(long)]
+        value: String,
+        /// Optional human reason — stored as `memory_edit:<reason>` on the new fact.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Toggle pin state on a fact.
+    Pin {
+        /// Fact id to pin.
+        fact_id: String,
+        /// Set to remove the pin instead of adding it.
+        #[arg(long, default_value_t = false)]
+        off: bool,
     },
 }
 
@@ -1939,6 +1984,41 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(())
             }
         },
+
+        // ── memory panel (agent-ux-01) ──────────────────────────────
+        Command::Memory { command } => {
+            let client = memory::MemoryClient::from_env();
+            match command {
+                MemoryCommand::Ls { top_k, entity } => {
+                    let facts = client.list(top_k, entity.as_deref())?;
+                    print!("{}", memory::render_list(&facts));
+                    Ok(())
+                }
+                MemoryCommand::Show { fact_id } => {
+                    let fact = client.show(&fact_id)?;
+                    print!("{}", memory::render_fact(&fact));
+                    Ok(())
+                }
+                MemoryCommand::Edit {
+                    fact_id,
+                    value,
+                    reason,
+                } => {
+                    let new_fact = client.edit(&fact_id, &value, reason.as_deref())?;
+                    println!("edited {} → {} (v{})", fact_id, new_fact.fact_id, new_fact.version);
+                    Ok(())
+                }
+                MemoryCommand::Pin { fact_id, off } => {
+                    client.pin(&fact_id, !off)?;
+                    if off {
+                        println!("unpinned fact {fact_id}");
+                    } else {
+                        println!("pinned fact {fact_id}");
+                    }
+                    Ok(())
+                }
+            }
+        }
     }
 }
 
