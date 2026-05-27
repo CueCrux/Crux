@@ -213,13 +213,15 @@ fn execplan_items_for_query(
             return Vec::new();
         }
     };
+    // ExecPlan items are workspace-scoped, not project-scoped — they live
+    // in a virtual `execplans` project (`VIRTUAL_PROJECT_ID`) that callers
+    // don't filter against explicitly. Skip `project_id` here so the common
+    // SPA pattern `?source=all&project_id=default` still surfaces them; the
+    // user disambiguates kanban vs execplans via the `source` chip.
     items
         .into_iter()
         .filter(|w| {
-            q.project_id
-                .as_deref()
-                .is_none_or(|p| p == w.project_id || p == crate::work_execplans::VIRTUAL_PROJECT_ID)
-                && q.state.as_deref().is_none_or(|s| w.state == s)
+            q.state.as_deref().is_none_or(|s| w.state == s)
                 && q.tenant_id.as_deref().is_none_or(|t| w.tenant_id.as_deref() == Some(t))
                 && q.assignee_passport
                     .as_deref()
