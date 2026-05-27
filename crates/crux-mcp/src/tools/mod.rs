@@ -24,6 +24,7 @@ pub mod github;
 pub mod handoff;
 pub mod kinds;
 pub mod loopback_auth;
+pub mod memory;
 pub mod memory_use;
 pub mod observations;
 pub mod observe;
@@ -367,6 +368,92 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "examples": [
                     { "scope": {"type": "entity_prefix", "value": "test-fixture-"} },
                     { "scope": {"type": "key_glob", "value": "secret*"}, "token_budget": 500 }
+                ]
+            }),
+        },
+        // ── Memory panel (agent-ux-01) ──────────────────────────────
+        ToolDefinition {
+            name: "memory_view".to_string(),
+            description: "Read consumer memory in a paginated, narrative-friendly shape. \
+                          Returns facts grouped by entity with version + confidence + pin \
+                          state. Reserved-prefix entries (__agent::*, __ops::*, \
+                          __bootstrap__::*, __memory_pin::*) are filtered out. Honours \
+                          `token_budget` (default 2000). Feature-flagged behind \
+                          CORECRUXD_FEATURE_MEMORY_PANEL=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity":       { "type": "string",  "description": "Filter to a specific entity" },
+                    "key":          { "type": "string",  "description": "Filter to a specific key within the entity" },
+                    "top_k":        { "type": "integer", "description": "Maximum facts to return", "default": 20 },
+                    "token_budget": { "type": "integer", "description": "Total token budget across returned facts (default 2000)" }
+                },
+                "examples": [
+                    { "token_budget": 2000, "top_k": 20 },
+                    { "entity": "person:alice", "token_budget": 500 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_edit".to_string(),
+            description: "Update the value of an existing fact. Creates a new version that \
+                          supersedes the prior fact; the audit trail (`memory_history` / \
+                          `fact_history`) preserves the chain. Requires an authenticated \
+                          agent identity. The optional `reason` is embedded in the new \
+                          fact's source_receipt as `memory_edit:<reason>`. Reserved-prefix \
+                          entities are refused."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "fact_id":   { "type": "string", "description": "Existing fact id to update" },
+                    "new_value": { "type": "string", "description": "Replacement value" },
+                    "reason":    { "type": "string", "description": "Why the edit was made (becomes the receipt note)" }
+                },
+                "required": ["fact_id", "new_value"],
+                "examples": [
+                    { "fact_id": "f_01J_abc", "new_value": "Munich", "reason": "moved 2026-04" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_pin".to_string(),
+            description: "Mark a fact as user-pinned (or unpin it). Pinned facts survive \
+                          decay (#3) and scoped-forget (#9). Pin state is per-agent and is \
+                          stored under the reserved `__memory_pin::<agent>::*` entity, so \
+                          it never leaks across agents."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "fact_id": { "type": "string",  "description": "Fact id to (un)pin" },
+                    "pinned":  { "type": "boolean", "description": "True to pin, false to unpin", "default": true }
+                },
+                "required": ["fact_id"],
+                "examples": [
+                    { "fact_id": "f_01J_abc", "pinned": true },
+                    { "fact_id": "f_01J_abc", "pinned": false }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_history".to_string(),
+            description: "Walk the version chain for a memory entry, returned in \
+                          consumer-friendly shape. Accepts either {entity, key} or \
+                          {fact_id}. Reserved-prefix entries are refused; the operator-side \
+                          `fact_history` tool still covers those."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity":  { "type": "string", "description": "Entity to walk" },
+                    "key":     { "type": "string", "description": "Key within the entity" },
+                    "fact_id": { "type": "string", "description": "Resolve (entity, key) via this fact id" }
+                },
+                "examples": [
+                    { "entity": "person:carol", "key": "city" },
+                    { "fact_id": "f_01J_abc" }
                 ]
             }),
         },
@@ -1446,6 +1533,10 @@ pub fn tool_output_docs() -> Value {
         { "tool": "get_bootstrap",      "output": "{ facts: [{entity, key, value}], total_tokens }" },
         { "tool": "fact_history",       "output": "{ versions: [{fact_id, value, version, supersedes, confidence, stored_at, deleted}] }" },
         { "tool": "memory_acknowledge_use", "output": "{ turn_id, intent, feature_enabled, receipt_ref, memories_used: [{fact_id, topic, age_days}], filtered_count, redacted_count, not_found_count, not_visible_count }" },
+        { "tool": "memory_view",        "output": "{ content: [...], structuredContent: { facts: [{id, entity, key, value, version, stored_at, confidence, pinned, source_receipt}], total_tokens, returned } } — agent-ux-01 consumer surface; reserved prefixes filtered." },
+        { "tool": "memory_edit",        "output": "{ content: [...], structuredContent: { old_fact_id, new_fact: MemoryFact, reason } } — new fact supersedes old; reason embedded as `memory_edit:<reason>` source_receipt." },
+        { "tool": "memory_pin",         "output": "{ content: [...], structuredContent: { fact_id, pinned: bool } } — pin state stored under reserved __memory_pin::<agent>::*." },
+        { "tool": "memory_history",     "output": "{ content: [...], structuredContent: { versions: [{id, value, version, stored_at, supersedes, deleted, source_receipt}] } } — consumer-friendly version chain (excludes reserved prefixes)." },
         { "tool": "get_session",        "output": "{ session_id, state, updated_at, total_tokens }" },
         { "tool": "save_session",       "output": "{ session_id, updated_at }" },
         { "tool": "list_sessions",      "output": "{ sessions: [string] }" },
@@ -1532,6 +1623,11 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "get_bootstrap" => facts::handle_get_bootstrap(args, ctx).await,
         "fact_history" => facts::handle_fact_history(args, ctx).await,
         "memory_acknowledge_use" => memory_use::handle_memory_acknowledge_use(args, ctx).await,
+        // Memory panel (agent-ux-01).
+        "memory_view" => memory::handle_memory_view(args, ctx).await,
+        "memory_edit" => memory::handle_memory_edit(args, ctx).await,
+        "memory_pin" => memory::handle_memory_pin(args, ctx).await,
+        "memory_history" => memory::handle_memory_history(args, ctx).await,
         "get_session" => sessions::handle_get_session(args, ctx).await,
         "save_session" => sessions::handle_save_session(args, ctx).await,
         "list_sessions" => sessions::handle_list_sessions(args, ctx).await,
@@ -1624,7 +1720,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 64; // 62 prior (incl. memory_acknowledge_use agent-ux-02) + memory_forget + memory_forget_dry_run (agent-ux-09 scoped forget).
+    const TOOL_COUNT: usize = 68; // 64 prior (incl. memory_acknowledge_use agent-ux-02 + memory_forget/_dry_run agent-ux-09) + 4 memory panel (agent-ux-01).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
