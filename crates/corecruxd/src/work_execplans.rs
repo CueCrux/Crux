@@ -134,7 +134,7 @@ pub fn parse_plan(md: &str) -> ParsedPlan {
             if let Some(idx) = find_ci(trimmed, "risk class:") {
                 let after = &trimmed[idx + "risk class:".len()..];
                 let word = after
-                    .trim_start_matches(|c: char| c == ' ' || c == '*')
+                    .trim_start_matches([' ', '*'])
                     .split(|c: char| !c.is_ascii_alphabetic())
                     .next()
                     .unwrap_or("")
@@ -188,7 +188,7 @@ fn extract_superseded_slug(line: &str) -> Option<String> {
     let needle = "superseded by";
     let idx = lower.find(needle)?;
     let after = &line[idx + needle.len()..];
-    let after = after.trim_start_matches(|c: char| c == ':' || c == ' ');
+    let after = after.trim_start_matches([':', ' ']);
     if let Some(rest) = after.strip_prefix("[[") {
         let end = rest.find("]]")?;
         return Some(rest[..end].trim().to_string());
@@ -357,8 +357,7 @@ fn mk_item(
     let created = facts.first_fact_at_unix_ms.unwrap_or(file.mtime_unix_ms);
     let updated = facts
         .last_fact_at_unix_ms
-        .map(|f| f.max(file.mtime_unix_ms))
-        .unwrap_or(file.mtime_unix_ms);
+        .map_or(file.mtime_unix_ms, |f| f.max(file.mtime_unix_ms));
     let title = if parsed.title.is_empty() {
         file.slug.clone()
     } else {
@@ -415,8 +414,7 @@ pub fn walk_execplans_root(root: &Path) -> std::io::Result<Vec<ExecplanFile>> {
             .ok()
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis() as u64);
         out.push(ExecplanFile {
             slug: stem,
             path,
