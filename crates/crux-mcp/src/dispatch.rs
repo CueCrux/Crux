@@ -566,8 +566,14 @@ mod tests {
         let result = resp.result.unwrap();
         // Backwards-compat: no envelope, payload shape unchanged
         // (content/text directly at the top level).
-        assert!(result.get("envelope").is_none(), "envelope must be absent when flag is off");
-        assert!(result.get("payload").is_none(), "payload wrapper must be absent when flag is off");
+        assert!(
+            result.get("envelope").is_none(),
+            "envelope must be absent when flag is off"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "payload wrapper must be absent when flag is off"
+        );
         assert!(result["content"][0]["text"].as_str().unwrap().contains('v'));
     }
 
@@ -687,7 +693,11 @@ mod tests {
         let result = resp.result.unwrap();
         let env = &result["envelope"];
         let memories = env["memories_used"].as_array().unwrap();
-        assert_eq!(memories.len(), 1, "reserved-prefix entries must not be exposed in the envelope");
+        assert_eq!(
+            memories.len(),
+            1,
+            "reserved-prefix entries must not be exposed in the envelope"
+        );
         assert_eq!(memories[0]["topic"], "project-x");
         std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
     }

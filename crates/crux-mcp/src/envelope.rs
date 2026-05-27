@@ -28,14 +28,14 @@
 //! Older agents that ignore `envelope` keep working; the `payload` shape is
 //! unchanged from the pre-envelope era. This is enforced by
 //! [`crate::dispatch`]: when the feature flag is off, or the tool has not
-//! opted in via [`crate::tools::ToolDefinition::emit_envelope`], the
-//! dispatcher returns the unwrapped payload directly (no `envelope` key, no
+//! opted in via [`crate::tools::tool_emits_envelope`], the dispatcher
+//! returns the unwrapped payload directly (no `envelope` key, no
 //! `payload` indirection).
 //!
 //! ## Opting a tool in
 //!
-//! 1. In `tools::list_tools()`, set `emit_envelope: true` on the
-//!    [`crate::tools::ToolDefinition`] for the tool.
+//! 1. Add the tool name to [`crate::tools::tool_emits_envelope`] so the
+//!    dispatcher knows it participates in envelope wrapping.
 //! 2. Add a match arm in [`build_envelope_for_tool`] that constructs an
 //!    [`Envelope`] from the tool's args + [`crate::dispatch::McpContext`].
 //!    Keep the builder cheap (target < 2 ms for a 10-fact result; benched
@@ -294,7 +294,10 @@ mod tests {
     fn freshness_classifier_three_valued() {
         assert_eq!(Freshness::from_age_days(Some(0)), Freshness::Fresh);
         assert_eq!(Freshness::from_age_days(Some(7)), Freshness::Fresh);
-        assert_eq!(Freshness::from_age_days(Some(DEFAULT_STALE_AFTER_DAYS)), Freshness::Fresh);
+        assert_eq!(
+            Freshness::from_age_days(Some(DEFAULT_STALE_AFTER_DAYS)),
+            Freshness::Fresh
+        );
         assert_eq!(
             Freshness::from_age_days(Some(DEFAULT_STALE_AFTER_DAYS + 1)),
             Freshness::Stale
@@ -331,7 +334,11 @@ mod tests {
         assert_eq!(envelope.memories_used.len(), 1);
         assert_eq!(envelope.memories_used[0].topic, "project-alpha");
         for m in &envelope.memories_used {
-            assert!(!is_reserved_entity(&m.topic), "envelope leaked reserved entity {}", m.topic);
+            assert!(
+                !is_reserved_entity(&m.topic),
+                "envelope leaked reserved entity {}",
+                m.topic
+            );
         }
     }
 
@@ -406,12 +413,9 @@ mod tests {
         // for a 10-fact result.
         let ctx = test_ctx();
         for i in 0..10 {
-            handle_store_fact(
-                &json!({"entity": "p", "key": format!("k{i}"), "value": "needle"}),
-                &ctx,
-            )
-            .await
-            .unwrap();
+            handle_store_fact(&json!({"entity": "p", "key": format!("k{i}"), "value": "needle"}), &ctx)
+                .await
+                .unwrap();
         }
         // Warm one call to pay any per-process init cost (string interning,
         // tokio waker setup) before measuring.
