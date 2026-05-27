@@ -5,11 +5,11 @@
 //! Shared loopback-auth helpers for MCP tools that call the daemon over HTTP.
 //!
 //! Background. MCP tools used to send only `X-Corecrux-Scopes: admin:read,…`
-//! on loopback requests. That header is consumed by [`AuthMode::DevScopes`]
-//! and ignored by [`AuthMode::Off`], but `AuthMode::JwtHs256` /
-//! `AuthMode::JwtJwks` ignore it and demand `Authorization: Bearer <token>` —
-//! producing a 401 on every coordination, github, storyline, and extension
-//! tool when the daemon is in production JWT mode.
+//! on loopback requests. That header is consumed by the daemon's `DevScopes`
+//! auth mode and ignored by `Off`, but the `JwtHs256` / `JwtJwks` modes ignore
+//! it and demand `Authorization: Bearer <token>` — producing a 401 on every
+//! coordination, github, storyline, and extension tool when the daemon is in
+//! production JWT mode.
 //!
 //! Fix. Tools must additionally attach a bearer token when one is available
 //! in the process environment. `CRUX_AGENT_TOKEN` is the operator-canonical
@@ -23,7 +23,7 @@ pub const LOOPBACK_TOKEN_ENV_VARS: &[&str] = &["CORECRUX_LOOPBACK_TOKEN", "CRUX_
 /// Resolve the loopback bearer token from the environment.
 ///
 /// Returns `None` when no variable is set or all candidates are blank. Callers
-/// MUST treat `None` as "daemon is in `AuthMode::Off` or `DevScopes`" and rely
+/// MUST treat `None` as "daemon is in `Off` or `DevScopes` auth mode" and rely
 /// on the `X-Corecrux-Scopes` header alone.
 pub fn loopback_bearer_token() -> Option<String> {
     resolve_bearer_token(|name| std::env::var(name).ok())

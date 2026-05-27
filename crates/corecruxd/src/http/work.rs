@@ -14,9 +14,9 @@ use super::{
 ///
 /// - `Kanban` (default for backwards-compat with existing callers that omit
 ///   the param) — the `__work__::*` fact table populated by `create_work`.
-/// - `Execplans` — the read-time aggregator over `PlanCrux/.agent/execplans/*.md`
-///   joined with facts under `entity = "execplan:<slug>"`. See
-///   [`crate::work_execplans`].
+/// - `Execplans` — the read-time aggregator over plan files under
+///   `$CRUX_EXECPLANS_ROOT` joined with facts under `entity = "execplan:<slug>"`.
+///   See [`crate::work_execplans`].
 /// - `All` — both, deduplicated by `id` (kanban wins on collision).
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

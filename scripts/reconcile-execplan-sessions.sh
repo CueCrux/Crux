@@ -16,7 +16,7 @@
 #                              were never `save_session`'d (most plans).
 #                              Informational; aggregator surfaces them
 #                              automatically.
-#   3. Unparseable plans     — files where `parse_plan` finds neither a
+#   3. Unparsable plans     — files where `parse_plan` finds neither a
 #                              `# Title` heading nor a `Risk class:` line.
 #                              Likely scratch / WIP / non-conforming.
 #                              Candidates for the `_<slug>.md` rename.
@@ -35,7 +35,7 @@
 #   CRUX_EXECPLANS_ROOT   — fallback for the plan dir when arg omitted
 #
 # Exit codes:
-#   0 — report printed (orphans/unparseable may exist; this is informational)
+#   0 — report printed (orphans/unparsable may exist; this is informational)
 #   2 — usage error or daemon unreachable
 
 # Strict-but-not-paranoid: `set -u` interacts poorly with empty `declare -A`
@@ -48,14 +48,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRUX_HTTP_URL="${CRUX_HTTP_URL:-http://127.0.0.1:14800}"
 
 PLAN_DIR="${1:-${CRUX_EXECPLANS_ROOT:-}}"
-if [[ -z "${PLAN_DIR}" ]]; then
-  # Sensible default for the canonical CueCrux workspace layout.
-  PLAN_DIR="$(cd "${SCRIPT_DIR}/../../PlanCrux/.agent/execplans" 2>/dev/null && pwd || true)"
-fi
 
 if [[ -z "${PLAN_DIR}" || ! -d "${PLAN_DIR}" ]]; then
   echo "ERROR: plan dir not found. Pass as arg or set CRUX_EXECPLANS_ROOT." >&2
-  echo "  Tried: ${PLAN_DIR}" >&2
+  if [[ -n "${PLAN_DIR}" ]]; then
+    echo "  Tried: ${PLAN_DIR}" >&2
+  fi
   exit 2
 fi
 
@@ -108,7 +106,7 @@ registry_count="${#IN_REGISTRY[@]}"
 # ── Step 3: classify ───────────────────────────────────────────────────────
 declare -a ORPHANS=()        # registry only
 declare -a SESSIONLESS=()    # on-disk only
-declare -a UNPARSEABLE=()    # on-disk but missing both title and risk class
+declare -a UNPARSABLE=()    # on-disk but missing both title and risk class
 declare -a BOTH=()           # registry + on-disk
 
 for slug in "${!ON_DISK[@]}"; do
@@ -123,7 +121,7 @@ for slug in "${!ON_DISK[@]}"; do
   if grep -qE '^# .+' <<<"${content}"; then has_title=1; fi
   if grep -qiE '\*\*?Risk class:[[:space:]]*(low|medium|high)' <<<"${content}"; then has_risk=1; fi
   if [[ "${has_title}" == "0" && "${has_risk}" == "0" ]]; then
-    UNPARSEABLE+=("${slug}")
+    UNPARSABLE+=("${slug}")
   fi
 done
 
@@ -148,7 +146,7 @@ printf 'On-disk plans     : %d (after `_*.md` exclude)\n' "${on_disk_count}"
 printf 'Both              : %d\n' "${#BOTH[@]}"
 printf 'Sessionless plans : %d (info — aggregator picks these up via files alone)\n' "${#SESSIONLESS[@]}"
 printf 'Orphan sessions   : %d (registry entry, no .md file — candidates for delete_session)\n' "${#ORPHANS[@]}"
-printf 'Unparseable plans : %d (no title and no risk class — consider _<slug>.md scratch rename)\n' "${#UNPARSEABLE[@]}"
+printf 'Unparsable plans : %d (no title and no risk class — consider _<slug>.md scratch rename)\n' "${#UNPARSABLE[@]}"
 printf '\n'
 
 if (( ${#ORPHANS[@]} > 0 )); then
@@ -161,13 +159,13 @@ if (( ${#ORPHANS[@]} > 0 )); then
   printf '\n'
 fi
 
-if (( ${#UNPARSEABLE[@]} > 0 )); then
-  printf '── Unparseable plans ──\n'
-  for slug in "${UNPARSEABLE[@]}"; do
+if (( ${#UNPARSABLE[@]} > 0 )); then
+  printf '── Unparsable plans ──\n'
+  for slug in "${UNPARSABLE[@]}"; do
     printf '%s  (%s)\n' "${slug}" "${ON_DISK[${slug}]}"
   done | sort
   printf '\n  To rename to scratchpad (skips aggregator pickup):\n'
-  for slug in "${UNPARSEABLE[@]}"; do
+  for slug in "${UNPARSABLE[@]}"; do
     printf '    mv %q %q\n' "${ON_DISK[${slug}]}" "${PLAN_DIR}/_${slug}.md"
   done
   printf '\n'

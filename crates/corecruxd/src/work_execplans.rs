@@ -2,9 +2,9 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! ExecPlan aggregator — read-time projection of `PlanCrux/.agent/execplans/*.md`
-//! plus per-slug facts into the same [`WorkItem`] shape consumed by the kanban
-//! `/v1/work` path.
+//! ExecPlan aggregator — read-time projection of `*.md` plan files under
+//! `$CRUX_EXECPLANS_ROOT` plus per-slug facts into the same [`WorkItem`] shape
+//! consumed by the kanban `/v1/work` path.
 //!
 //! Data-flow split:
 //!
