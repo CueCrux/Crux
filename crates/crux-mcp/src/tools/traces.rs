@@ -4,7 +4,7 @@
 
 //! `tool_trace_recent` — agent-ux-06 free-tier inspector tool.
 //!
-//! Returns the most recent [`TraceEntry`] values for the calling
+//! Returns the most recent [`crate::traces::TraceEntry`] values for the calling
 //! passport, newest-first, capped by `top_k` and trimmed against the
 //! supplied `token_budget`. The traces are sourced from the per-passport
 //! ring buffer maintained by [`crate::traces`].
@@ -14,7 +14,7 @@
 //! - Per-passport partitioning: a passport never sees another
 //!   passport's traces (master plan T.3).
 //! - Reserved-prefix predicted effects are stripped at read time by
-//!   [`TraceStore::recent`] so the response can never leak
+//!   [`crate::traces::TraceStore::recent`] so the response can never leak
 //!   `__agent::*` / `__ops::*` / `__bootstrap__::*` entities (T.1).
 //!
 //! ## token_budget

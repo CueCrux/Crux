@@ -17,7 +17,7 @@
 //!
 //! This module records one structured `tracing` event per MCP tool
 //! dispatch with attributes matching the OTel GenAI semantic conventions
-//! (https://opentelemetry.io/docs/specs/semconv/gen-ai/):
+//! (<https://opentelemetry.io/docs/specs/semconv/gen-ai/>):
 //!
 //! - `gen_ai.system = "cuecrux"`
 //! - `gen_ai.operation.name = "<tool_name>"`
