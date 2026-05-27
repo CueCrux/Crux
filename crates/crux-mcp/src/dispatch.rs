@@ -281,13 +281,63 @@ async fn dispatch_tool_call(
     }
 
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let turn_id = args.get("turn_id").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    match tools::call_tool(name, &args, ctx).await {
+    // Emit an OTel-bridged tracing span around the dispatch when enabled
+    // (agent-ux-06 M4). The bridging via `tracing-opentelemetry` is wired
+    // in `corecruxd::main`; we keep this side lightweight (no direct
+    // `opentelemetry` dep in crux-mcp) so the MCP crate stays sync-able.
+    crate::otel::record_tool_span_start(name, ctx.agent.as_ref().map(|a| a.name.as_str()));
+
+    let outcome = tools::call_tool(name, &args, ctx).await;
+
+    // agent-ux-06 M2/M3: record into the per-passport trace ring.
+    let trace_outcome = if outcome.is_ok() {
+        crate::traces::TraceOutcome::Ok
+    } else {
+        crate::traces::TraceOutcome::Error
+    };
+    let passport = crate::scope::agent_name(ctx.agent.as_ref())
+        .unwrap_or(crate::traces::ANON_PASSPORT)
+        .to_string();
+    let predicted = build_predicted_effects(name, &args);
+    crate::traces::record_dispatch(&passport, name, turn_id.as_deref(), predicted, trace_outcome).await;
+
+    match outcome {
         Ok(result) => {
             let result = maybe_wrap_with_envelope(name, &args, ctx, result).await;
             JsonRpcResponse::success(id, result)
         }
         Err(e) => JsonRpcResponse::error(id, e.code, e.message),
+    }
+}
+
+/// Synthesise typed predicted effects for the trace ring based on
+/// well-known tool names + their args. Read-only tools emit a
+/// `fact_read`/`tool_dispatch` entry; mutating tools emit `fact_write`,
+/// `forget`, or `receipt_emit`. This stays a cheap lookup — the trace
+/// ring's purpose is observability, not full IR analysis.
+fn build_predicted_effects(name: &str, args: &serde_json::Value) -> Vec<crate::envelope::PredictedEffect> {
+    use crate::envelope::PredictedEffect;
+    let entity = args.get("entity").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    match name {
+        "store_fact" | "entity_upsert" | "edge_upsert" | "save_session" => {
+            vec![PredictedEffect::now("fact_write", entity, key)]
+        }
+        "delete_fact" | "entity_delete" | "edge_delete" | "delete_session" => {
+            vec![PredictedEffect::now("forget", entity, key)]
+        }
+        "memory_forget" | "memory_forget_dry_run" => {
+            vec![PredictedEffect::now("forget", entity, key)]
+        }
+        "memory_acknowledge_use" | "create_handoff" | "accept_handoff" | "record_decision" => {
+            vec![PredictedEffect::now("receipt_emit", entity, key)]
+        }
+        "query_facts" | "query" | "query_scan" | "query_expand" | "fact_history" => {
+            vec![PredictedEffect::now("fact_read", entity, key)]
+        }
+        _ => vec![PredictedEffect::now("tool_dispatch", entity, key)],
     }
 }
 
@@ -1094,5 +1144,146 @@ mod tests {
         assert!(resp.error.is_none());
         let text = resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
         assert!(text.contains("CueCrux"));
+    }
+
+    // ── agent-ux-06: typed action traces ─────────────────────────────────
+    //
+    // Sibling tests to `envelope_on_query_facts_omits_reserved_prefix_entries`
+    // (cross-PR envelope contract). Both assertions in the master plan's
+    // acceptance criteria — reserved-prefix filtering + per-passport
+    // isolation — exercised end-to-end through `dispatch_tool_call`.
+
+    #[tokio::test]
+    async fn envelope_traces_filter_reserved_prefixes() {
+        let _g = crate::traces::test_env_lock().lock().await;
+        std::env::set_var(crate::traces::FEATURE_FLAG_ENV, "1");
+
+        // Unique passport — tokio tests share the trace store; isolating
+        // by passport prevents cross-test pollution.
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "dispatch-envelope-traces-filter".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // Write to a reserved-prefix entity through the real dispatch path.
+        let _ = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "__ops::config-audit", "key": "sha256:abc", "value": "v"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        // And one public write so the trace ring has at least one survivor.
+        let _ = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "project-traces", "key": "status", "value": "v"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "tool_trace_recent", "arguments": {"top_k": 50, "token_budget": 2000}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        let traces = result["traces"].as_array().unwrap();
+        // Every recorded predicted_effect must NOT be a reserved-prefix entity.
+        for t in traces {
+            for eff in t["predicted_effects"].as_array().unwrap_or(&Vec::new()) {
+                let entity = eff["entity"].as_str().unwrap_or("");
+                assert!(
+                    !crate::envelope::is_reserved_entity(entity),
+                    "trace leaked reserved entity {entity}"
+                );
+            }
+        }
+        std::env::remove_var(crate::traces::FEATURE_FLAG_ENV);
+    }
+
+    #[tokio::test]
+    async fn envelope_traces_per_passport_isolated() {
+        let _g = crate::traces::test_env_lock().lock().await;
+        std::env::set_var(crate::traces::FEATURE_FLAG_ENV, "1");
+
+        let alice = test_ctx().with_agent(AgentIdentity {
+            name: "dispatch-envelope-traces-alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        let bob = test_ctx().with_agent(AgentIdentity {
+            name: "dispatch-envelope-traces-bob".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // Alice writes one fact; Bob writes another.
+        let _ = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "alice-only", "key": "k", "value": "v"}
+                }),
+            ),
+            &alice,
+            None,
+        )
+        .await;
+        let _ = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "bob-only", "key": "k", "value": "v"}
+                }),
+            ),
+            &bob,
+            None,
+        )
+        .await;
+
+        // Alice reads traces — should not see Bob's entries.
+        let resp = dispatch(
+            rpc("tools/call", json!({"name": "tool_trace_recent", "arguments": {}})),
+            &alice,
+            None,
+        )
+        .await;
+        let traces = resp.result.unwrap()["traces"].as_array().unwrap().clone();
+        for t in &traces {
+            for eff in t["predicted_effects"].as_array().unwrap_or(&Vec::new()) {
+                let entity = eff["entity"].as_str().unwrap_or("");
+                assert_ne!(entity, "bob-only", "alice leaked bob's trace");
+            }
+        }
+        // Bob symmetric check.
+        let resp = dispatch(
+            rpc("tools/call", json!({"name": "tool_trace_recent", "arguments": {}})),
+            &bob,
+            None,
+        )
+        .await;
+        let traces = resp.result.unwrap()["traces"].as_array().unwrap().clone();
+        for t in &traces {
+            for eff in t["predicted_effects"].as_array().unwrap_or(&Vec::new()) {
+                let entity = eff["entity"].as_str().unwrap_or("");
+                assert_ne!(entity, "alice-only", "bob leaked alice's trace");
+            }
+        }
+        std::env::remove_var(crate::traces::FEATURE_FLAG_ENV);
     }
 }
