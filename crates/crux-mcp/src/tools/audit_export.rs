@@ -38,9 +38,7 @@ use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 use crate::scope;
 use corecrux_memory::fact_store::Fact;
-use corecrux_receipts::{
-    build_bundle_v1, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1,
-};
+use corecrux_receipts::{build_bundle_v1, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1};
 
 /// Feature flag.
 pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_AUDIT_EXPORT";
@@ -179,10 +177,8 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
     let include_reserved = requested_include_reserved && agent_name.is_some();
 
     let now = Utc::now();
-    let since_rfc3339 = since_dt
-        .map(|dt| dt.to_rfc3339())
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-    let until_rfc3339 = until_dt.map(|dt| dt.to_rfc3339()).unwrap_or_else(|| now.to_rfc3339());
+    let since_rfc3339 = since_dt.map_or_else(|| "1970-01-01T00:00:00Z".to_string(), |dt| dt.to_rfc3339());
+    let until_rfc3339 = until_dt.map_or_else(|| now.to_rfc3339(), |dt| dt.to_rfc3339());
 
     // Walk the fact store under a read lock. We collect into Vec eagerly
     // so the lock is released before disk I/O.
@@ -466,7 +462,10 @@ mod tests {
                 use std::io::Read as _;
                 entry.read_to_string(&mut s).unwrap();
                 assert!(!s.contains("__ops::"), "leaked __ops:: into non-operator export");
-                assert!(!s.contains("__bootstrap__::"), "leaked __bootstrap__:: into non-operator export");
+                assert!(
+                    !s.contains("__bootstrap__::"),
+                    "leaked __bootstrap__:: into non-operator export"
+                );
                 assert!(s.contains("project-x"));
             }
         }
@@ -511,12 +510,9 @@ mod tests {
             .unwrap();
 
         // Far-future since: should select zero facts.
-        let resp = handle_audit_export_bundle(
-            &json!({"token_budget": 1000, "since_ts": "9999-01-01T00:00:00Z"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let resp = handle_audit_export_bundle(&json!({"token_budget": 1000, "since_ts": "9999-01-01T00:00:00Z"}), &ctx)
+            .await
+            .unwrap();
         assert_eq!(resp["fact_count"], 0);
     }
 

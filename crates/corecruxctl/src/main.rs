@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use corecruxctl::{
-    admin, audit_pack, evidence, explain, extensions, fixture_digest, gaps, inspect_receipt, memory, parity,
-    projections, receipts, reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import, storage, structured_log,
-    tooling_env, verify_store,
+    admin, audit_export, audit_pack, evidence, explain, extensions, fixture_digest, gaps, inspect_receipt, memory,
+    parity, projections, receipts, reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import, storage,
+    structured_log, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -388,6 +388,48 @@ enum Command {
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
+    },
+
+    /// BYO Audit Trail export (agent-ux-11). Builds a signed,
+    /// third-party-verifiable tar.zst from the on-disk fact journal.
+    /// Read-only against the data dir — safe to run while the daemon
+    /// is up.
+    #[command(name = "audit-export")]
+    AuditExport {
+        /// Data directory (defaults to CORECRUXD_DATA_DIR).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output bundle path (e.g. ./audit-bundle.tar.zst).
+        #[arg(long)]
+        out: PathBuf,
+        /// RFC3339 lower bound, inclusive (optional).
+        #[arg(long)]
+        since: Option<String>,
+        /// RFC3339 upper bound, exclusive (optional; defaults to wall-clock now).
+        #[arg(long)]
+        until: Option<String>,
+        /// Restrict to entities starting with this prefix.
+        #[arg(long)]
+        scope_entity_prefix: Option<String>,
+        /// Operator-only: include reserved-prefix entries
+        /// (__agent::*, __ops::*, __bootstrap__::*).
+        #[arg(long, default_value_t = false)]
+        include_reserved: bool,
+        /// Optional caller label embedded in the manifest scope.
+        #[arg(long)]
+        caller: Option<String>,
+    },
+
+    /// Verify a BYO audit bundle OFFLINE — no daemon, no network.
+    /// Checks: bundle_format_version, content hashes, Ed25519 signature.
+    /// Exits non-zero on any failure.
+    #[command(name = "audit-verify")]
+    AuditVerify {
+        /// Path to the bundle (e.g. ./audit-bundle.tar.zst).
+        bundle: PathBuf,
+        /// Print the structured report as JSON to stdout.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -2014,6 +2056,58 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Ok(())
                 }
             }
+        }
+        Command::AuditExport {
+            data_dir,
+            out,
+            since,
+            until,
+            scope_entity_prefix,
+            include_reserved,
+            caller,
+        } => {
+            let data_dir = data_dir
+                .or_else(|| std::env::var("CORECRUXD_DATA_DIR").ok().map(PathBuf::from))
+                .ok_or("audit-export requires --data-dir or CORECRUXD_DATA_DIR")?;
+            let (facts, receipts, bundle_id) = audit_export::run_audit_export(audit_export::AuditExportArgs {
+                data_dir,
+                out: out.clone(),
+                since,
+                until,
+                scope_entity_prefix,
+                include_reserved,
+                caller,
+            })?;
+            println!(
+                "audit-export OK: bundle_id={bundle_id} facts={facts} receipts={receipts} out={}",
+                out.display()
+            );
+            Ok(())
+        }
+        Command::AuditVerify { bundle, json } => {
+            let report = audit_export::run_audit_verify(&bundle)?;
+            if json {
+                let s = serde_json::to_string_pretty(&report)?;
+                println!("{s}");
+            } else {
+                println!(
+                    "audit-verify {}: bundle_id={} facts={} receipts={} sig={} events_hash={} receipts_hash={}",
+                    if report.ok { "OK" } else { "FAIL" },
+                    report.bundle_id,
+                    report.fact_count,
+                    report.receipt_count,
+                    report.signature_valid,
+                    report.events_jsonl_sha256_match,
+                    report.receipts_cbor_sha256_match,
+                );
+                if let Some(reason) = &report.failure_reason {
+                    eprintln!("failure: {reason}");
+                }
+            }
+            if !report.ok {
+                std::process::exit(2);
+            }
+            Ok(())
         }
     }
 }

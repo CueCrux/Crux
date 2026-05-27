@@ -527,7 +527,9 @@ mod tests {
 
         let mut tar_bytes: Vec<u8> = Vec::new();
         {
-            let zstd_enc = zstd::stream::write::Encoder::new(&mut tar_bytes, 3).unwrap().auto_finish();
+            let zstd_enc = zstd::stream::write::Encoder::new(&mut tar_bytes, 3)
+                .unwrap()
+                .auto_finish();
             let mut builder = tar::Builder::new(zstd_enc);
             write_tar_entry(&mut builder, MANIFEST_FILENAME, &built.manifest_json).unwrap();
             write_tar_entry(&mut builder, EVENTS_FILENAME, &tampered_events).unwrap();
@@ -558,7 +560,9 @@ mod tests {
 
         let mut tar_bytes: Vec<u8> = Vec::new();
         {
-            let zstd_enc = zstd::stream::write::Encoder::new(&mut tar_bytes, 3).unwrap().auto_finish();
+            let zstd_enc = zstd::stream::write::Encoder::new(&mut tar_bytes, 3)
+                .unwrap()
+                .auto_finish();
             let mut builder = tar::Builder::new(zstd_enc);
             write_tar_entry(&mut builder, MANIFEST_FILENAME, &tampered_manifest).unwrap();
             write_tar_entry(&mut builder, EVENTS_FILENAME, &built.events_jsonl).unwrap();
@@ -585,7 +589,9 @@ mod tests {
 
         let mut tar_bytes: Vec<u8> = Vec::new();
         {
-            let zstd_enc = zstd::stream::write::Encoder::new(&mut tar_bytes, 3).unwrap().auto_finish();
+            let zstd_enc = zstd::stream::write::Encoder::new(&mut tar_bytes, 3)
+                .unwrap()
+                .auto_finish();
             let mut builder = tar::Builder::new(zstd_enc);
             write_tar_entry(&mut builder, MANIFEST_FILENAME, &tampered_manifest).unwrap();
             write_tar_entry(&mut builder, EVENTS_FILENAME, &built.events_jsonl).unwrap();
@@ -603,7 +609,9 @@ mod tests {
 
         let mut tar_bytes: Vec<u8> = Vec::new();
         {
-            let zstd_enc = zstd::stream::write::Encoder::new(&mut tar_bytes, 3).unwrap().auto_finish();
+            let zstd_enc = zstd::stream::write::Encoder::new(&mut tar_bytes, 3)
+                .unwrap()
+                .auto_finish();
             let mut builder = tar::Builder::new(zstd_enc);
             write_tar_entry(&mut builder, MANIFEST_FILENAME, &built.manifest_json).unwrap();
             // EVENTS_FILENAME deliberately omitted.

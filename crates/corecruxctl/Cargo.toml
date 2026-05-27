@@ -28,9 +28,11 @@ urlencoding = "2.1"
 uuid = { version = "1.23.1", features = ["v4"] }
 xxhash-rust = { version = "0.8.10", features = ["xxh64"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
+rand = "0.10.1"
 
 corecrux-frame = { path = "../corecrux-frame" }
 corecrux-index = { path = "../corecrux-index" }
+corecrux-memory = { path = "../corecrux-memory" }
 corecrux-projections = { path = "../corecrux-projections" }
 corecrux-proto = { path = "../corecrux-proto" }
 corecrux-receipts = { path = "../corecrux-receipts" }
