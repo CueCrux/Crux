@@ -31,6 +31,10 @@ struct Cli {
 enum Command {
     /// PostToolUse hook: read-only operational anomaly warnings.
     ContextMonitor,
+    /// PostToolUse hook (agent-ux-02): emit "Memory used: …" annotation
+    /// from an envelope-emitting tool's response. Gated by
+    /// `CORECRUXD_FEATURE_MEMORY_ACK_INLINE=1`.
+    MemoryAckInline,
     /// PreCompact hook: snapshot session state to the Crux daemon.
     PreCompact,
     /// SessionStart hook: run §11.1 boot ritual, inject bootstrap context.
@@ -42,6 +46,7 @@ fn main() {
     let stdin = std::io::stdin();
     let result = match cli.command {
         Command::ContextMonitor => cmds::context_monitor::run(stdin.lock()),
+        Command::MemoryAckInline => cmds::memory_ack_inline::run(stdin.lock()),
         Command::PreCompact => cmds::pre_compact::run(stdin.lock()),
         Command::SessionStart => cmds::session_start::run(stdin.lock()),
     };
