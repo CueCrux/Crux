@@ -1237,6 +1237,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "http-body-util",
+ "jsonwebtoken",
  "rand 0.10.1",
  "rcx-capability-token",
  "regex",
