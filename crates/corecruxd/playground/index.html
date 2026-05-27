@@ -2727,6 +2727,11 @@ pre {
               <button role="tab" aria-selected="false" data-state-filter="complete">Complete</button>
               <button role="tab" aria-selected="false" data-state-filter="deployed">Deployed</button>
             </div>
+            <div class="filter-chips" id="workSourceChips" role="tablist" aria-label="Filter by source">
+              <button role="tab" aria-selected="true" data-source-filter="all" class="active" title="Kanban items + on-disk ExecPlans merged">All</button>
+              <button role="tab" aria-selected="false" data-source-filter="kanban" title="Kanban work_items table only">Kanban</button>
+              <button role="tab" aria-selected="false" data-source-filter="execplans" title="Read-only projection from PlanCrux/.agent/execplans/*.md">ExecPlans</button>
+            </div>
           </div>
           <div id="workCreateWrap" hidden>
             <form id="workCreateForm" class="work-create-form" novalidate>
@@ -2800,6 +2805,7 @@ const state = {
     activeProjectId: localStorage.getItem('crux-console-active-project') || 'default',
     workStateFilter: 'all',
     workViewMode: localStorage.getItem('crux-console-work-view-mode') || 'kanban',
+    workSourceFilter: localStorage.getItem('crux-console-work-source-filter') || 'all',
     passportCatFilter: 'all',
     integrationFilter: 'all'
   }
@@ -3180,7 +3186,7 @@ async function loadAll() {
       api('/v1/console/tenants?category=all'),
       api('/v1/projects'),
       api('/v1/passports'),
-      api('/v1/work?project_id=' + encodeURIComponent(activeProj)),
+      api('/v1/work?source=' + encodeURIComponent(state.ui.workSourceFilter || 'all') + '&project_id=' + encodeURIComponent(activeProj)),
       api('/v1/work/gate/pending'),
       api('/v1/extensions'),
       api('/v1/extensions/keys')
@@ -7389,7 +7395,7 @@ $('activeProject').addEventListener('change', async (e) => {
   state.ui.activeProjectId = e.target.value;
   localStorage.setItem('crux-console-active-project', state.ui.activeProjectId);
   try {
-    state.work = await api('/v1/work?project_id=' + encodeURIComponent(state.ui.activeProjectId));
+    state.work = await api('/v1/work?source=' + encodeURIComponent(state.ui.workSourceFilter || 'all') + '&project_id=' + encodeURIComponent(state.ui.activeProjectId));
   } catch (err) {
     state.work = { _error: err };
   }
@@ -8604,47 +8610,67 @@ function renderKanban() {
   }
 }
 
+function isExecplanItem(w) {
+  return typeof w.id === 'string' && w.id.indexOf('execplan:') === 0;
+}
+
 function workListRowHtml(w) {
   const meta = [];
+  if (isExecplanItem(w)) meta.push(badge('execplan', 'good'));
+  if (w.current_milestone) meta.push(badge(w.current_milestone, 'neutral'));
+  if (w.superseded_by) meta.push(badge('→ ' + w.superseded_by, 'neutral'));
   if (w.assignee_passport) meta.push(badge(w.assignee_passport, 'neutral'));
   if (w.tenant_id) meta.push(badge(w.tenant_id, 'neutral'));
   meta.push(badge(relativeTime(w.updated_at_unix_ms), 'neutral'));
   if (w.linked_pr) meta.push(badge('PR', 'good'));
   if (w.linked_issue) meta.push(badge('issue', 'good'));
+  if (w.plan_path) meta.push(badge('📄 ' + w.plan_path.split('/').pop(), 'neutral'));
   const blocker = w.state === 'blocked' && w.blocker_reason
     ? '<div class="blocker">⚠ ' + esc(w.blocker_reason) + '</div>'
     : '';
-  const stateOptions = WORK_STATES.map((s) =>
-    '<option value="' + s + '"' + (s === w.state ? ' selected' : '') + '>' + WORK_LABELS[s] + '</option>'
-  ).join('');
+  // ExecPlan items are derived from facts/files — there's no PATCH route for
+  // their state, so swap the editable select for a non-interactive badge.
+  const trailing = isExecplanItem(w)
+    ? '<span class="badge neutral" title="State derived from facts; edit by storing gate:M<n>">' + esc(WORK_LABELS[w.state] || w.state) + '</span>'
+    : '<select class="state-select" data-state-change="' + esc(w.id) + '" aria-label="Change state" onclick="event.stopPropagation()">' +
+        WORK_STATES.map((s) =>
+          '<option value="' + s + '"' + (s === w.state ? ' selected' : '') + '>' + WORK_LABELS[s] + '</option>'
+        ).join('') + '</select>';
   return '<button class="work-list-row" type="button" data-work="' + esc(w.id) + '">' +
     '<div class="work-list-row-main">' +
       '<div class="title">' + esc(w.title) + '</div>' +
       '<div class="meta">' + meta.join('') + '</div>' +
       blocker +
     '</div>' +
-    '<select class="state-select" data-state-change="' + esc(w.id) + '" aria-label="Change state" onclick="event.stopPropagation()">' + stateOptions + '</select>' +
+    trailing +
     '</button>';
 }
 
 function kanbanCardHtml(w) {
   const meta = [];
+  if (isExecplanItem(w)) meta.push(badge('execplan', 'good'));
+  if (w.current_milestone) meta.push(badge(w.current_milestone, 'neutral'));
+  if (w.superseded_by) meta.push(badge('→ ' + w.superseded_by, 'neutral'));
   if (w.assignee_passport) meta.push(badge(w.assignee_passport, 'neutral'));
   if (w.tenant_id) meta.push(badge(w.tenant_id, 'neutral'));
   meta.push(badge(relativeTime(w.updated_at_unix_ms), 'neutral'));
   if (w.linked_pr) meta.push(badge('PR', 'good'));
   if (w.linked_issue) meta.push(badge('issue', 'good'));
+  if (w.plan_path) meta.push(badge('📄 ' + w.plan_path.split('/').pop(), 'neutral'));
   const blocker = w.state === 'blocked' && w.blocker_reason
     ? '<div class="blocker">⚠ ' + esc(w.blocker_reason) + '</div>'
     : '';
-  const stateOptions = WORK_STATES.map(s =>
-    '<option value="' + s + '"' + (s === w.state ? ' selected' : '') + '>' + WORK_LABELS[s] + '</option>'
-  ).join('');
+  const trailing = isExecplanItem(w)
+    ? '<span class="badge neutral" title="State derived from facts; edit by storing gate:M<n>">' + esc(WORK_LABELS[w.state] || w.state) + '</span>'
+    : '<select class="state-select" data-state-change="' + esc(w.id) + '" aria-label="Change state">' +
+        WORK_STATES.map(s =>
+          '<option value="' + s + '"' + (s === w.state ? ' selected' : '') + '>' + WORK_LABELS[s] + '</option>'
+        ).join('') + '</select>';
   return '<button class="kanban-card" type="button" data-work="' + esc(w.id) + '">' +
     '<div class="title">' + esc(w.title) + '</div>' +
     '<div class="meta">' + meta.join('') + '</div>' +
     blocker +
-    '<select class="state-select" data-state-change="' + esc(w.id) + '" aria-label="Change state">' + stateOptions + '</select>' +
+    trailing +
     '</button>';
 }
 
@@ -8724,6 +8750,42 @@ document.querySelectorAll('#workStateChips button').forEach(b => {
     renderKanban();
   });
 });
+
+// Source-filter chips drive the `?source=` param on the next fetch. Changing
+// it triggers a refetch (not just a re-render) because kanban vs execplan
+// data lives in different stores. Persisted in localStorage so the operator's
+// "show me ExecPlans" preference survives a reload.
+document.querySelectorAll('#workSourceChips button').forEach(b => {
+  b.addEventListener('click', async () => {
+    state.ui.workSourceFilter = b.dataset.sourceFilter;
+    localStorage.setItem('crux-console-work-source-filter', state.ui.workSourceFilter);
+    document.querySelectorAll('#workSourceChips button').forEach(x =>
+      x.classList.toggle('active', x === b)
+    );
+    document.querySelectorAll('#workSourceChips button').forEach(x =>
+      x.setAttribute('aria-selected', String(x === b))
+    );
+    try {
+      state.work = await api(
+        '/v1/work?source=' + encodeURIComponent(state.ui.workSourceFilter || 'all') +
+        '&project_id=' + encodeURIComponent(state.ui.activeProjectId || 'default')
+      );
+    } catch (err) {
+      // Swallow: renderKanban handles empty state.
+    }
+    renderKanban();
+  });
+});
+
+// On boot, reflect the persisted source filter in the chip group.
+(function syncSourceChipsOnBoot() {
+  const sel = state.ui.workSourceFilter || 'all';
+  document.querySelectorAll('#workSourceChips button').forEach(x => {
+    const isActive = x.dataset.sourceFilter === sel;
+    x.classList.toggle('active', isActive);
+    x.setAttribute('aria-selected', String(isActive));
+  });
+})();
 
 function currentBoundPassportId() {
   // #10 — explicit override from the rail switcher wins; otherwise fall back

@@ -65,6 +65,15 @@ pub struct WorkItem {
     pub created_by_passport: String,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
+    /// ExecPlan-aggregator extension fields. Populated only for items produced
+    /// by `work_execplans::list_execplans`. Optional + `#[serde(default)]` so
+    /// the kanban path stays byte-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_milestone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,6 +157,9 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         created_by_passport: input.created_by_passport.clone(),
         created_at_unix_ms: now_unix_ms,
         updated_at_unix_ms: now_unix_ms,
+        plan_path: None,
+        current_milestone: None,
+        superseded_by: None,
     };
     write_record(store, &item)?;
     write_transition(

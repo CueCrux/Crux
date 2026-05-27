@@ -8962,6 +8962,7 @@ async fn work_post_then_list_then_patch_state_round_trip() {
             state: Some("planned".to_string()),
             tenant_id: None,
             assignee_passport: None,
+            source: super::work::WorkSource::default(),
         }),
         dev_scope_headers("admin:read"),
     )

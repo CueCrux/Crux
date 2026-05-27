@@ -22,6 +22,7 @@ pub mod features;
 pub mod github;
 pub mod handoff;
 pub mod kinds;
+pub mod loopback_auth;
 pub mod observations;
 pub mod observe;
 pub mod passport;

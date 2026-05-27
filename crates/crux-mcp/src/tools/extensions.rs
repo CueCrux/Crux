@@ -124,16 +124,22 @@ pub async fn call_extension_tool(name: &str, args: &Value, ctx: &McpContext) -> 
         "passport_fpr": passport_fpr,
         "args": args,
     });
+    let bearer = crate::tools::loopback_auth::loopback_bearer_token();
     let response = tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(30)))
             .build()
             .into();
-        agent
+        let mut req = agent
             .post(&url)
+            // `X-Corecrux-Scopes` covers `AuthMode::DevScopes`; bearer covers
+            // JWT modes (see `tools::loopback_auth`).
             .header("X-Corecrux-Scopes", "admin:read facts:write")
-            .header("Content-Type", "application/json")
-            .send_json(body)
+            .header("Content-Type", "application/json");
+        if let Some(token) = &bearer {
+            req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+        req.send_json(body)
             .map_err(|err| err.to_string())
             .and_then(|mut resp| resp.body_mut().read_json::<Value>().map_err(|err| err.to_string()))
     })
