@@ -11,6 +11,7 @@
 pub mod action;
 pub mod audit;
 pub mod audit_export;
+pub mod autonomy;
 pub mod constraint;
 pub mod coordination;
 pub mod cuecrux_session;
@@ -101,6 +102,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             name: "cuecrux_session".to_string(),
             description: cuecrux_session::CUECRUX_SESSION_DESCRIPTION.to_string(),
             input_schema: cuecrux_session::tool_input_schema(),
+        },
+        // ── Autonomy contract (agent-ux-10) ────────────────────────
+        ToolDefinition {
+            name: "autonomy_contract".to_string(),
+            description: autonomy::AUTONOMY_CONTRACT_DESCRIPTION.to_string(),
+            input_schema: autonomy::tool_input_schema(),
         },
         // ── Retrieval ──────────────────────────────────────────────
         ToolDefinition {
@@ -1619,6 +1626,7 @@ fn rcx_capability_for_tool(tool_name: &str) -> String {
 pub fn tool_output_docs() -> Value {
     json!([
         { "tool": "cuecrux_session",    "output": "SessionPlan (see agents.cuecrux.com/schemas/SessionPlan.v1). Contains plan_id, session_id, passport, channels {bulk?, mcp}, capability_graph[], receipt {hash, signature?, signer_kid?, mode}, budget, minted_at, session_ttl_s." },
+        { "tool": "autonomy_contract",  "output": "{ feature_enabled, passport_id, tier, token_id, token_hash, capabilities: [{name, allowed, scope, backend_id, mode, cost_credits, why_denied?}], summary: {total_tools, returned, allowed, denied, truncated_by_token_budget} }. Disabled when CORECRUXD_FEATURE_AUTONOMY_CONTRACT is off (feature_enabled=false, empty capabilities)." },
         { "tool": "query",              "output": "{ results: [{doc_id, score, segment_index, token_count}], coverage: {score, gaps, below_floor}, meta: {backend, took_ms, segments_searched} }" },
         { "tool": "query_scan",         "output": "{ results: [{doc_id, score, token_count}], meta: {took_ms, segments_searched} }" },
         { "tool": "query_expand",       "output": "{ results: [{doc_id, content, token_count}] }" },
@@ -1713,6 +1721,7 @@ pub async fn handle_get_agent_identity(_args: &Value, ctx: &McpContext) -> Resul
 pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     match name {
         "cuecrux_session" => cuecrux_session::handle_cuecrux_session(args, ctx).await,
+        "autonomy_contract" => autonomy::handle_autonomy_contract(args, ctx).await,
         "query" => query::handle_query(args, ctx).await,
         "query_scan" => query::handle_query_scan(args, ctx).await,
         "query_expand" => query::handle_query_expand(args, ctx).await,
@@ -1827,7 +1836,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 72; // 69 on main (incl. audit_export_bundle agent-ux-11) + 3 freshness (memory_freshness, memory_set_horizon, memory_reverify agent-ux-03 M3).
+    const TOOL_COUNT: usize = 73; // 72 on main (69 prior + audit_export_bundle agent-ux-11 + 3 freshness agent-ux-03) + autonomy_contract (agent-ux-10).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
