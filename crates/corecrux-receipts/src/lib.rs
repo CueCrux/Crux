@@ -13,6 +13,7 @@ mod body_v1;
 mod candidate_digest_v1;
 mod export_v1;
 mod keyring_v1;
+mod memory_use_v1;
 mod store_v1;
 mod subject_index_v1;
 mod verify_v1;
@@ -24,6 +25,11 @@ pub use export_v1::{
     ReplayExportManifestV1,
 };
 pub use keyring_v1::{Ed25519KeyEntryV1, Ed25519KeyRingV1, KeyRingError};
+pub use memory_use_v1::{
+    assert_memory_use_kind_v1, build_memory_use_body_v1, extract_memory_use_entries_v1, filter_reserved_entries,
+    is_reserved_entity_prefix, sign_memory_use_v1, MemoryUseBodyInputV1, MemoryUseEntryV1, MemoryUseIntentV1,
+    MEMORY_USE_BODY_SCHEMA_V1, MEMORY_USE_KIND_V1, RESERVED_ENTITY_PREFIXES_V1,
+};
 pub use store_v1::{
     load_verification_report_v1, store_verification_report_v1, verification_report_path_v1, ReceiptStoreError,
 };

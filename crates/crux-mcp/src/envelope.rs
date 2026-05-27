@@ -190,6 +190,13 @@ impl Envelope {
 pub async fn build_envelope_for_tool(name: &str, args: &Value, ctx: &McpContext) -> Option<Envelope> {
     match name {
         "query_facts" => Some(build_envelope_for_query_facts(args, ctx).await),
+        // agent-ux-02 (Acknowledged Memory Use): the ack tool emits an
+        // envelope whose memories_used[] mirrors the just-written
+        // pending-ack buffer entry. Built by the tool module so the
+        // envelope wrapper itself stays free of tool-specific state.
+        "memory_acknowledge_use" => {
+            Some(crate::tools::memory_use::build_envelope_for_memory_acknowledge_use(args, ctx).await)
+        }
         _ => None,
     }
 }

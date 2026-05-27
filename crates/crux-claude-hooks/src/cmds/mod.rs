@@ -7,5 +7,6 @@
 //! stderr but never block tool execution.
 
 pub mod context_monitor;
+pub mod memory_ack_inline;
 pub mod pre_compact;
 pub mod session_start;
