@@ -41,11 +41,34 @@ use crux_router::{McpToolCapability, RcxRouter};
 use rcx_capability_token::{DataEgressClass, RcxCapabilityToken};
 
 /// Describes a single MCP tool for the `tools/list` response.
+///
+/// The struct intentionally has only the three "wire-shape" fields. The
+/// per-tool **audit-envelope opt-in** is registered separately in
+/// [`tool_emits_envelope`] so adding new envelope-aware tools doesn't
+/// require touching every legacy `ToolDefinition { … }` literal in
+/// [`list_tools`]. See the docs on [`tool_emits_envelope`] for the opt-in
+/// pattern.
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+}
+
+/// Per-tool audit-envelope opt-in registry (master ExecPlan
+/// `agent-ux-best-in-class-master-2026-05-27`, M2).
+///
+/// Returns `true` iff the tool's responses should be wrapped with the
+/// per-turn audit envelope when the `CORECRUXD_FEATURE_AUDIT_ENVELOPE`
+/// feature flag is on. Wave-1 child plans #2 and #3 will add their new
+/// tools here; Wave-2 plans extend it further. Every entry MUST also have
+/// a matching arm in [`crate::envelope::build_envelope_for_tool`].
+///
+/// Default `false` for every tool not listed — older agents that ignore
+/// `envelope` and never-listed tools always see the unchanged `payload`
+/// shape.
+pub fn tool_emits_envelope(name: &str) -> bool {
+    matches!(name, "query_facts")
 }
 
 /// Non-breaking pointer added to every legacy tool's description at

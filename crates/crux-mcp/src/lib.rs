@@ -27,6 +27,7 @@
 pub mod agent;
 pub mod category_enforce;
 pub mod dispatch;
+pub mod envelope;
 pub mod handoff;
 pub mod protocol;
 pub mod scope;

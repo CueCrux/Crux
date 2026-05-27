@@ -283,8 +283,44 @@ async fn dispatch_tool_call(
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
 
     match tools::call_tool(name, &args, ctx).await {
-        Ok(result) => JsonRpcResponse::success(id, result),
+        Ok(result) => {
+            let result = maybe_wrap_with_envelope(name, &args, ctx, result).await;
+            JsonRpcResponse::success(id, result)
+        }
         Err(e) => JsonRpcResponse::error(id, e.code, e.message),
+    }
+}
+
+/// Conditionally wrap `payload` into the per-turn audit envelope.
+///
+/// Returns the raw `payload` unchanged unless ALL three conditions hold:
+///
+/// 1. [`crate::envelope::envelope_enabled`] (i.e. the
+///    `CORECRUXD_FEATURE_AUDIT_ENVELOPE` flag is on).
+/// 2. The tool is registered in
+///    [`crate::tools::tool_emits_envelope`].
+/// 3. A builder exists in
+///    [`crate::envelope::build_envelope_for_tool`] for this tool.
+///
+/// Older agents that don't read `envelope` see exactly the legacy payload
+/// shape any time any of these three conditions fails, preserving
+/// backwards-compat (master-plan §11 — "Backwards compat. Older agents
+/// that don't read the envelope field continue to work").
+async fn maybe_wrap_with_envelope(
+    name: &str,
+    args: &serde_json::Value,
+    ctx: &McpContext,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    if !crate::envelope::envelope_enabled() {
+        return payload;
+    }
+    if !tools::tool_emits_envelope(name) {
+        return payload;
+    }
+    match crate::envelope::build_envelope_for_tool(name, args, ctx).await {
+        Some(env) => env.wrap_payload(payload),
+        None => payload,
     }
 }
 
@@ -487,8 +523,181 @@ mod tests {
         assert!(err.message.contains("unknown tool"));
     }
 
+    // ── audit envelope (master ExecPlan agent-ux-best-in-class-master M2) ──
+
+    /// Serialize all envelope-related dispatch tests so the process-wide
+    /// `CORECRUXD_FEATURE_AUDIT_ENVELOPE` env var doesn't race between
+    /// concurrent tokio tests. `tokio::sync::Mutex` is used so the guard
+    /// can be safely held across `.await` boundaries.
+    fn envelope_env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    #[tokio::test]
+    async fn envelope_off_query_facts_response_has_no_envelope_field() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        let ctx = test_ctx();
+
+        // Seed one fact so query_facts has something to return.
+        dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "p", "key": "k", "value": "v"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "query_facts", "arguments": {"query": "v"}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        // Backwards-compat: no envelope, payload shape unchanged
+        // (content/text directly at the top level).
+        assert!(result.get("envelope").is_none(), "envelope must be absent when flag is off");
+        assert!(result.get("payload").is_none(), "payload wrapper must be absent when flag is off");
+        assert!(result["content"][0]["text"].as_str().unwrap().contains('v'));
+    }
+
+    #[tokio::test]
+    async fn envelope_on_query_facts_response_has_payload_and_envelope() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        let ctx = test_ctx();
+
+        dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "alpha", "key": "status", "value": "shipped",
+                                  "source_receipt": "r_test_001"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "query_facts", "arguments": {"query": "shipped"}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        // Both payload and envelope are present.
+        assert!(result["payload"].is_object());
+        assert!(result["envelope"].is_object());
+        // Payload preserves the original tool response shape.
+        assert!(result["payload"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("shipped"));
+        // Envelope is populated.
+        let env = &result["envelope"];
+        assert_eq!(env["memories_used"][0]["topic"], "alpha");
+        assert_eq!(env["memories_used"][0]["freshness"], "fresh");
+        assert_eq!(env["receipts_used"][0], "r_test_001");
+        assert_eq!(env["autonomy_consumed"]["capability"], "facts:read");
+        assert_eq!(env["autonomy_consumed"]["cost_credits"], 0);
+        assert!(env["predicted_effects"].as_array().unwrap().is_empty());
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+    }
+
+    #[tokio::test]
+    async fn envelope_on_other_tools_remain_unwrapped() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        let ctx = test_ctx();
+
+        // store_fact is NOT opted into envelope — must keep legacy shape.
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "p", "key": "k", "value": "v"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(result.get("envelope").is_none());
+        assert!(result.get("payload").is_none());
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("stored fact"));
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+    }
+
+    #[tokio::test]
+    async fn envelope_on_query_facts_omits_reserved_prefix_entries() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        let ctx = test_ctx();
+
+        // Public + reserved-prefix facts both matching the query.
+        for (entity, key) in [
+            ("project-x", "status"),
+            ("__ops::config-audit", "sha256:abc"),
+            ("__bootstrap__::pattern:x", "Retry"),
+        ] {
+            dispatch(
+                rpc(
+                    "tools/call",
+                    json!({
+                        "name": "store_fact",
+                        "arguments": {"entity": entity, "key": key, "value": "shipped"}
+                    }),
+                ),
+                &ctx,
+                None,
+            )
+            .await;
+        }
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "query_facts", "arguments": {"query": "shipped"}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        let env = &result["envelope"];
+        let memories = env["memories_used"].as_array().unwrap();
+        assert_eq!(memories.len(), 1, "reserved-prefix entries must not be exposed in the envelope");
+        assert_eq!(memories[0]["topic"], "project-x");
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+    }
+
     #[tokio::test]
     async fn tools_call_store_and_query_facts() {
+        // Share the envelope env-var lock so this test isn't racy with the
+        // envelope_on_* tests that mutate CORECRUXD_FEATURE_AUDIT_ENVELOPE.
+        let _guard = envelope_env_lock().lock().await;
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
         let ctx = test_ctx();
 
         // Store a fact
