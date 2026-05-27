@@ -10,6 +10,7 @@
 
 pub mod action;
 pub mod audit;
+pub mod audit_export;
 pub mod constraint;
 pub mod coordination;
 pub mod cuecrux_session;
@@ -871,6 +872,41 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 ]
             }),
         },
+        // ── BYO audit trail (agent-ux-11) ──────────────────────────
+        ToolDefinition {
+            name: "audit_export_bundle".to_string(),
+            description: "Bring-Your-Own audit-trail export (EU AI Act Art. 12). Builds a \
+                          self-contained, signed `tar.zst` bundle of every fact-event in \
+                          the time window plus the cross-references to source receipts. \
+                          The bundle re-verifies OFFLINE via `corecruxctl audit-verify` — \
+                          no daemon, no network. Reserved prefixes (__agent::*, __ops::*, \
+                          __bootstrap__::*) are filtered out unless the caller is \
+                          operator-tier (authenticated passport + scope.include_reserved). \
+                          REQUIRES `token_budget` (QC.2). Gated by \
+                          CORECRUXD_FEATURE_AUDIT_EXPORT=1 (default off)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "since_ts":     { "type": "string",  "description": "RFC3339 lower bound, inclusive (optional)" },
+                    "until_ts":     { "type": "string",  "description": "RFC3339 upper bound, exclusive (optional; defaults to now)" },
+                    "scope": {
+                        "type": "object",
+                        "description": "Optional scope filter.",
+                        "properties": {
+                            "entity_prefix":    { "type": "string",  "description": "Restrict to entities matching this prefix" },
+                            "include_reserved": { "type": "boolean", "description": "Operator-only: include reserved-prefix entries. Silently ignored for non-operator callers.", "default": false }
+                        }
+                    },
+                    "token_budget": { "type": "integer", "description": "REQUIRED — caps total tokens swept (QC.2)" }
+                },
+                "required": ["token_budget"],
+                "examples": [
+                    { "token_budget": 4000, "since_ts": "2026-05-01T00:00:00Z" },
+                    { "token_budget": 8000, "since_ts": "2026-01-01T00:00:00Z", "until_ts": "2026-06-01T00:00:00Z", "scope": {"entity_prefix": "project-"} }
+                ]
+            }),
+        },
         // ── Passport ───────────────────────────────────────────────
         ToolDefinition {
             name: "issue_passport".to_string(),
@@ -1555,6 +1591,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "audit_config",        "output": "{ content: [{type:'text', text:'config audited: path=… sha256=… auditor=…'}] } — fact written under __ops::config-audit key=sha256:<hash>." },
         { "tool": "check_config_audit",  "output": "{ content: [...], unaudited: [{path, sha256}], audited: [{path, sha256, audited_at, auditor, audited_path}] }" },
         { "tool": "enrich_action",      "output": "EnrichedActionProposal { schema, tenant_id, enrichment_mode, tool_call, narrative, affected_principals, affected_resources, state_diff, consequences, relationship_hits, consequence_metadata, enrichment_receipt }" },
+        { "tool": "audit_export_bundle", "output": "{ content: [...], bundle_id, bytes_path, manifest_signature_b64, fact_count, receipt_count, scope, since, until, events_jsonl_sha256, receipts_cbor_sha256 } — bundle persisted to CORECRUXD_AUDIT_EXPORT_DIR; verify offline via `corecruxctl audit-verify`. agent-ux-11 (EU AI Act Art. 12)." },
         { "tool": "issue_passport",     "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id }" },
         { "tool": "get_passport",       "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id, issued_at, passport_hash }" },
         { "tool": "sync_pull",          "output": "{ tenant_id?, facts_pulled, cursor, total_pull_count, collection_cursor_count }" },
@@ -1645,6 +1682,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "check_constraints" => constraint::handle_check_constraints(args, ctx).await,
         "audit_config" => audit::handle_audit_config(args, ctx).await,
         "check_config_audit" => audit::handle_check_config_audit(args, ctx).await,
+        "audit_export_bundle" => audit_export::handle_audit_export_bundle(args, ctx).await,
         "enrich_action" => action::handle_enrich_action(args, ctx).await,
         "issue_passport" => passport::handle_issue_passport(args, ctx).await,
         "get_passport" => passport::handle_get_passport(args, ctx).await,
@@ -1720,7 +1758,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 68; // 64 prior (incl. memory_acknowledge_use agent-ux-02 + memory_forget/_dry_run agent-ux-09) + 4 memory panel (agent-ux-01).
+    const TOOL_COUNT: usize = 69; // 68 prior + audit_export_bundle (agent-ux-11).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
