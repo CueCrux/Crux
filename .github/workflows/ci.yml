@@ -60,7 +60,7 @@ jobs:
       - run: cargo fmt --check
       - run: typos
       - run: bash scripts/assert-daemon-release-boundary.sh
-      - run: cargo clippy --workspace -- -D warnings
+      - run: bash scripts/ci-cargo-with-fallback.sh clippy --workspace -- -D warnings
 
   # ── Test, MSRV, Coverage: self-hosted ────────────────────────────────
   test:
@@ -84,11 +84,11 @@ jobs:
           fi
       - uses: dtolnay/rust-toolchain@stable
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - run: cargo build --workspace
+      - run: bash scripts/ci-cargo-with-fallback.sh build --workspace
       # `cargo test --workspace` (next step) already covers
       # `crux-integrations::community_packs`; the explicit invocation here
       # was duplicating that target's execution. Drop it.
-      - run: cargo test --workspace
+      - run: bash scripts/ci-cargo-with-fallback.sh test --workspace
       # Smoke now runs against the debug binary built by `cargo build
       # --workspace` above. The release build (previously a `cargo build
       # --release` step here) added ~2m45s to the critical path purely to
@@ -170,7 +170,7 @@ jobs:
           fi
       - uses: dtolnay/rust-toolchain@1.88.0
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - run: cargo build --workspace
+      - run: bash scripts/ci-cargo-with-fallback.sh build --workspace
 
   coverage:
     name: Coverage
@@ -198,11 +198,11 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - run: cargo build --bin corecruxd
+      - run: bash scripts/ci-cargo-with-fallback.sh build --bin corecruxd
       - name: Generate coverage reports
         run: |
           set -euo pipefail
-          cargo llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --lcov --output-path lcov.info
+          bash scripts/ci-cargo-with-fallback.sh llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --lcov --output-path lcov.info
           cargo llvm-cov report --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --summary-only | tee coverage-summary.txt
       - name: Enforce coverage thresholds
         run: |
