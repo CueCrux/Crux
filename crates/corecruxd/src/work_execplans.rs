@@ -227,10 +227,14 @@ fn strip_leading_markup(line: &str) -> &str {
 /// prefix.
 fn extract_superseded_slug(line: &str) -> Option<String> {
     let trimmed = strip_leading_markup(line);
-    let lower = trimmed.to_ascii_lowercase();
-    let after = lower
-        .strip_prefix("superseded by")
-        .map(|_| &trimmed["superseded by".len()..])?;
+    // Case-sensitive: real declarations idiomatically capitalise the `S`
+    // (`Status: Superseded by …`, `> **Status:** Superseded by …`,
+    // standalone `Superseded by …`). Lowercase continuation prose
+    // (`  superseded by today's work`, `   superseded by the older one`)
+    // is rejected here so it doesn't flag the parent plan as archived.
+    // Caught by the two new false positives observed against the live
+    // /v1/work?source=all response after the 2026-05-27 strip-markup fix.
+    let after = trimmed.strip_prefix("Superseded by")?;
     let after = after.trim_start_matches([':', ' ']);
     if let Some(rest) = after.strip_prefix("[[") {
         let end = rest.find("]]")?;
@@ -640,6 +644,28 @@ mod tests {
         let md = "# T\n\n- 2026-05-26: M1 parser scans for `Status:` line, `Superseded by`. Rationale: …\n";
         let p = parse_plan(md);
         assert_eq!(p.superseded_by, None, "decision-log mention must not match");
+    }
+
+    #[test]
+    fn parse_ignores_indented_lowercase_continuation_prose() {
+        // From vaultcrux-multi-predicate-enumerate-2026-04-29 line 419 —
+        // a continuation line of a bullet that starts with two-space indent
+        // and lowercase "superseded by per-request …". The post-strip-markup
+        // matcher (post-PR #108) caught this because it was case-insensitive;
+        // the case-sensitive `Superseded by` prefix rejects it now.
+        let md = "# T\n\n- some bullet\n  superseded by per-request `backend: \"legacy\"` field on chunks\n";
+        let p = parse_plan(md);
+        assert_eq!(p.superseded_by, None, "indented lowercase prose must not match");
+    }
+
+    #[test]
+    fn parse_ignores_lowercase_explicit_mention() {
+        // From vaultcrux-lme-hard50-retrieval-bugs-2026-04-27 line 125 — a
+        // deeply-indented bullet continuation that starts with lowercase
+        // "superseded by the explicit $350K mention …".
+        let md = "# T\n\n- bullet\n     superseded by the explicit $350K mention (false positive on …)\n";
+        let p = parse_plan(md);
+        assert_eq!(p.superseded_by, None, "lowercase prose must not match");
     }
 
     #[test]
