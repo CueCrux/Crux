@@ -110,8 +110,7 @@ pub const EVT_RECEIPT_FORGET_BODY_V1: &str = "receipt.forget.body.v1";
 pub const EVT_RECEIPT_PERMANENT_PURGE_BODY_V1: &str = "receipt.permanent_purge.body.v1";
 
 pub const CONTENT_TYPE_FORGET_BODY_V1: &str = "application/cbor; profile=cuecrux-receipt-forget-v1";
-pub const CONTENT_TYPE_PERMANENT_PURGE_BODY_V1: &str =
-    "application/cbor; profile=cuecrux-receipt-permanent-purge-v1";
+pub const CONTENT_TYPE_PERMANENT_PURGE_BODY_V1: &str = "application/cbor; profile=cuecrux-receipt-permanent-purge-v1";
 
 #[derive(Debug, Error)]
 pub enum ForgetReceiptError {
@@ -136,9 +135,7 @@ pub fn encode_forget_body_v1(body: &ForgetReceiptBodyV1) -> Result<Vec<u8>, Forg
 }
 
 /// Encode a `PermanentPurge` body into canonical CBOR bytes.
-pub fn encode_permanent_purge_body_v1(
-    body: &PermanentPurgeReceiptBodyV1,
-) -> Result<Vec<u8>, ForgetReceiptError> {
+pub fn encode_permanent_purge_body_v1(body: &PermanentPurgeReceiptBodyV1) -> Result<Vec<u8>, ForgetReceiptError> {
     let mut out = Vec::with_capacity(256);
     ciborium::ser::into_writer(body, &mut out).map_err(|e| ForgetReceiptError::CborEncode(e.to_string()))?;
     Ok(out)
@@ -150,9 +147,7 @@ pub fn decode_forget_body_v1(bytes: &[u8]) -> Result<ForgetReceiptBodyV1, Forget
 }
 
 /// Decode a `PermanentPurge` body from canonical CBOR bytes.
-pub fn decode_permanent_purge_body_v1(
-    bytes: &[u8],
-) -> Result<PermanentPurgeReceiptBodyV1, ForgetReceiptError> {
+pub fn decode_permanent_purge_body_v1(bytes: &[u8]) -> Result<PermanentPurgeReceiptBodyV1, ForgetReceiptError> {
     ciborium::de::from_reader(Cursor::new(bytes)).map_err(|e| ForgetReceiptError::CborDecode(e.to_string()))
 }
 
@@ -270,7 +265,10 @@ mod tests {
     fn forget_body_summary_rejects_other_schemas() {
         let bytes = {
             let val = Value::Map(vec![
-                (Value::Text("schema".into()), Value::Text("cuecrux.receipt.body.v1".into())),
+                (
+                    Value::Text("schema".into()),
+                    Value::Text("cuecrux.receipt.body.v1".into()),
+                ),
                 (Value::Text("receipt_id".into()), Value::Text("r1".into())),
             ]);
             let mut buf = Vec::new();

@@ -34,8 +34,7 @@ use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_F
 use crate::scope;
 use corecrux_memory::fact_store::Fact;
 use corecrux_receipts::{
-    blake3_hex, encode_forget_body_v1, ForgetFactRefV1, ForgetReceiptBodyV1, ForgetScopeV1,
-    SCHEMA_FORGET_BODY_V1,
+    blake3_hex, encode_forget_body_v1, ForgetFactRefV1, ForgetReceiptBodyV1, ForgetScopeV1, SCHEMA_FORGET_BODY_V1,
 };
 
 /// Feature flag for the mutating `memory_forget` tool.
@@ -43,19 +42,16 @@ pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_SCOPED_FORGET";
 
 /// Reserved entity prefixes that scoped-forget MUST NOT touch through
 /// the user-facing surface. Operator-only override is out of scope here.
-const RESERVED_PREFIXES: &[&str] = &[
-    "__agent::",
-    "__ops::",
-    "__bootstrap__::",
-    "__agent_session::",
-];
+const RESERVED_PREFIXES: &[&str] = &["__agent::", "__ops::", "__bootstrap__::", "__agent_session::"];
 
 /// Default recovery window (free tier) before `PermanentPurge`. Override
 /// per-tenant via `CORECRUXD_FORGET_RECOVERY_WINDOW_DAYS`.
 const DEFAULT_RECOVERY_WINDOW_DAYS: i64 = 7;
 
 fn feature_enabled() -> bool {
-    env::var(FEATURE_FLAG_ENV).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+    env::var(FEATURE_FLAG_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 fn recovery_window() -> Duration {
@@ -149,9 +145,7 @@ fn scope_matches(scope: &ForgetScopeV1, fact: &Fact, before_ts: Option<DateTime<
             // proper passport_id field on Fact.)
             fact.entity.starts_with(&format!("__agent::{value}::"))
         }
-        ForgetScopeV1::BeforeTimestamp { .. } => {
-            before_ts.is_some_and(|cutoff| fact.stored_at < cutoff)
-        }
+        ForgetScopeV1::BeforeTimestamp { .. } => before_ts.is_some_and(|cutoff| fact.stored_at < cutoff),
         ForgetScopeV1::TenantId { value } => {
             // Tenant scope today is encoded into the entity name via
             // `tenant:<id>::` or `personal::<id>::` / `business::<id>::`
@@ -246,15 +240,9 @@ fn build_receipt_body(
 
 /// `memory_forget_dry_run` — return the facts a forget call would affect,
 /// WITHOUT mutating the store.
-pub async fn handle_memory_forget_dry_run(
-    args: &Value,
-    ctx: &McpContext,
-) -> Result<Value, JsonRpcError> {
+pub async fn handle_memory_forget_dry_run(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let scope = parse_scope(args)?;
-    let token_budget = args
-        .get("token_budget")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
+    let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize);
     let agent_name = scope::agent_name(ctx.agent.as_ref());
 
     let store = ctx.fact_store.read().await;
@@ -312,11 +300,7 @@ pub async fn handle_memory_forget(args: &Value, ctx: &McpContext) -> Result<Valu
     let passport_id = agent_name.to_string();
 
     let scope = parse_scope(args)?;
-    let reason = args
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if reason.trim().is_empty() {
         return Err(JsonRpcError {
             code: INVALID_PARAMS,
@@ -329,10 +313,7 @@ pub async fn handle_memory_forget(args: &Value, ctx: &McpContext) -> Result<Valu
         .and_then(|v| v.as_str())
         .unwrap_or("default")
         .to_string();
-    let token_budget = args
-        .get("token_budget")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
+    let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize);
 
     // Resolve matches under a read lock first so we can compute the
     // pre-forget value hashes before we mutate (the value disappears on
@@ -481,8 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn parse_scope_typed_enum_only() {
-        let err = parse_scope(&json!({"scope": {"type": "raw_sql", "value": "DROP TABLE"}}))
-            .unwrap_err();
+        let err = parse_scope(&json!({"scope": {"type": "raw_sql", "value": "DROP TABLE"}})).unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
 
         let ok = parse_scope(&json!({"scope": {"type": "entity_prefix", "value": "x-"}})).unwrap();
@@ -493,18 +473,12 @@ mod tests {
     async fn dry_run_does_not_mutate() {
         let _guard = FeatureFlagGuard::disabled();
         let ctx = agent_ctx("alice");
-        handle_store_fact(
-            &json!({"entity": "test-fixture-a", "key": "k", "value": "v"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        handle_store_fact(
-            &json!({"entity": "test-fixture-b", "key": "k", "value": "v"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        handle_store_fact(&json!({"entity": "test-fixture-a", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        handle_store_fact(&json!({"entity": "test-fixture-b", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
         handle_store_fact(&json!({"entity": "production-x", "key": "k", "value": "v"}), &ctx)
             .await
             .unwrap();
@@ -576,12 +550,9 @@ mod tests {
     async fn memory_forget_requires_reason() {
         let _guard = FeatureFlagGuard::enabled();
         let ctx = agent_ctx("alice");
-        let err = handle_memory_forget(
-            &json!({"scope": {"type": "entity_prefix", "value": "x-"}}),
-            &ctx,
-        )
-        .await
-        .unwrap_err();
+        let err = handle_memory_forget(&json!({"scope": {"type": "entity_prefix", "value": "x-"}}), &ctx)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
         assert_eq!(err.data.unwrap()["param"], "reason");
     }
@@ -590,18 +561,12 @@ mod tests {
     async fn memory_forget_soft_deletes_matching_facts() {
         let _guard = FeatureFlagGuard::enabled();
         let ctx = agent_ctx("alice");
-        handle_store_fact(
-            &json!({"entity": "test-fixture-a", "key": "k1", "value": "v1"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        handle_store_fact(
-            &json!({"entity": "test-fixture-b", "key": "k2", "value": "v2"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        handle_store_fact(&json!({"entity": "test-fixture-a", "key": "k1", "value": "v1"}), &ctx)
+            .await
+            .unwrap();
+        handle_store_fact(&json!({"entity": "test-fixture-b", "key": "k2", "value": "v2"}), &ctx)
+            .await
+            .unwrap();
         handle_store_fact(&json!({"entity": "production-x", "key": "k", "value": "v"}), &ctx)
             .await
             .unwrap();
