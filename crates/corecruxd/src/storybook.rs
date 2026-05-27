@@ -869,6 +869,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+        horizon_class: None,
         });
 
         // Seed a plane.
@@ -887,6 +888,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+        horizon_class: None,
         });
 
         // Seed a vision layer for the project.
@@ -897,6 +899,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+        horizon_class: None,
         });
 
         let doc = generate(

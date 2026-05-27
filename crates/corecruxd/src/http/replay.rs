@@ -135,6 +135,7 @@ pub(super) async fn store_answer_capsule(state: &AppState, capsule: &AnswerRepla
         source_receipt: capsule.source_receipts.last().cloned(),
         confidence: 1.0,
         private: true,
+    horizon_class: None,
     };
     crate::fact_privacy::enforce(&state.privacy_policy, &mut fact);
     state.fact_store.write().await.try_store(fact)?;
@@ -1044,6 +1045,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+        horizon_class: None,
         });
         store.store(StoreFact {
             entity: "tenant-a::doc".to_string(),
@@ -1052,6 +1054,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+        horizon_class: None,
         });
         let capsule = AnswerReplayCapsule::build(BuildAnswerReplayCapsule {
             answer_id: "ans_1".to_string(),

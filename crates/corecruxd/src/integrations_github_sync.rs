@@ -117,6 +117,7 @@ fn sync_one_repo(
                     source_receipt: None,
                     confidence: 1.0,
                     private: repo.private,
+                horizon_class: None,
                 });
                 outcome.commits_added += 1;
             }
@@ -141,6 +142,7 @@ fn sync_one_repo(
                     source_receipt: None,
                     confidence: 1.0,
                     private: repo.private,
+                horizon_class: None,
                 });
                 outcome.prs_added += 1;
             }
@@ -165,6 +167,7 @@ fn sync_one_repo(
                     source_receipt: None,
                     confidence: 1.0,
                     private: repo.private,
+                horizon_class: None,
                 });
                 outcome.issues_added += 1;
             }
@@ -192,6 +195,7 @@ fn sync_one_repo(
                     source_receipt: None,
                     confidence: 1.0,
                     private: repo.private,
+                horizon_class: None,
                 });
                 outcome.comments_added += 1;
             }

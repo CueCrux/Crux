@@ -50,6 +50,7 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         source_receipt,
         confidence,
         private,
+    horizon_class: None,
     };
 
     let mut store = ctx.fact_store.write().await;

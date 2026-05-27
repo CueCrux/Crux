@@ -41,6 +41,6 @@ pub mod sync;
 
 pub use edge_store::{EdgeError, EdgeQuery, EdgeRecord, EdgeStore};
 pub use entity_store::{EntityError, EntityQuery, EntityRecord, EntityStore};
-pub use fact_store::{Fact, FactStore};
+pub use fact_store::{Fact, FactStore, HorizonClass};
 pub use kind_registry::{KindError, KindRegistration, KindRegistry};
 pub use session_store::{SessionState, SessionStore};

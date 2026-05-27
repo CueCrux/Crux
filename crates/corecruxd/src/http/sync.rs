@@ -239,6 +239,7 @@ pub(super) async fn post_tenant_offboard(
             source_receipt: Some(format!("sync-wipe:{}", receipt.receipt_hash)),
             confidence: 1.0,
             private: true,
+        horizon_class: None,
         });
     }
 

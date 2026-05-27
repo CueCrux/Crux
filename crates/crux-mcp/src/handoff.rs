@@ -197,6 +197,7 @@ pub fn accept_handoff(
             source_receipt: fact.source_receipt,
             confidence: fact.confidence,
             private,
+        horizon_class: None,
         });
     }
 
@@ -305,6 +306,7 @@ mod tests {
             source_receipt: Some("rcpt_001".to_string()),
             confidence: 0.95,
             private: false,
+        horizon_class: None,
         });
         facts.store(StoreFact {
             entity: "__decisions__::sess_handoff".to_string(),
@@ -313,6 +315,7 @@ mod tests {
             source_receipt: None,
             confidence: 0.9,
             private: false,
+        horizon_class: None,
         });
         let linked = facts.store(StoreFact {
             entity: "deploy".to_string(),
@@ -321,6 +324,7 @@ mod tests {
             source_receipt: None,
             confidence: 0.85,
             private: false,
+        horizon_class: None,
         });
         let mut session = sessions.get("sess_handoff").unwrap().state.clone();
         session["context_refs"] = json!([linked.fact_id.clone()]);
@@ -333,6 +337,7 @@ mod tests {
             source_receipt: None,
             confidence: 0.8,
             private: false,
+        horizon_class: None,
         });
         facts.store(StoreFact {
             entity: scope::private_entity_for_agent("agent-alpha", "notes"),
@@ -341,6 +346,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: true,
+        horizon_class: None,
         });
 
         (sessions, facts)

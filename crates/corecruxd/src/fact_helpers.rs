@@ -48,6 +48,8 @@ mod tests {
             version,
             supersedes: if version > 1 { Some("prev".to_string()) } else { None },
             private: false,
+            horizon_class: corecrux_memory::HorizonClass::None,
+            reverified_at: None,
         }
     }
 

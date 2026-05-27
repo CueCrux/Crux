@@ -133,6 +133,7 @@ impl MetricsSampler {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+            horizon_class: None,
             });
 
             fact_ids.push(fact.fact_id);

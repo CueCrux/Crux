@@ -164,6 +164,7 @@ pub fn install_extension(
         source_receipt: None,
         confidence: 1.0,
         private: false,
+    horizon_class: None,
     };
     // Force-private via the global gate (the `__extension__::` prefix is
     // in `fact_privacy::DEFAULT_PRIVATE_PREFIXES`).
@@ -207,6 +208,7 @@ pub fn delete_extension(store: &mut FactStore, id: &str) -> Result<(), Extension
         source_receipt: None,
         confidence: 0.0,
         private: false,
+    horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.try_store(sf)?;
