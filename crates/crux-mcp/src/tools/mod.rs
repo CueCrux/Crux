@@ -19,6 +19,7 @@ pub mod entities;
 pub mod extensions;
 pub mod facts;
 pub mod features;
+pub mod forget;
 pub mod github;
 pub mod handoff;
 pub mod kinds;
@@ -307,6 +308,65 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["turn_id"],
                 "examples": [
                     { "turn_id": "turn-42", "fact_ids": ["f_01J_abc", "f_01J_def"], "intent": "answer" }
+                ]
+            }),
+        },
+        // ── Scoped forget (agent-ux-09 — GDPR Art. 17) ─────────────
+        ToolDefinition {
+            name: "memory_forget".to_string(),
+            description: "GDPR Art. 17 scoped erasure. Soft-deletes every fact matching a \
+                          TYPED scope ({entity_prefix|key_glob|passport_id|before_timestamp|\
+                          tenant_id}), filters out reserved prefixes, emits a signed `Forget` \
+                          receipt that names the initiating passport. Requires authenticated \
+                          agent identity and feature flag CORECRUXD_FEATURE_SCOPED_FORGET=1. \
+                          Use `memory_forget_dry_run` first to preview affected facts."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "object",
+                        "description": "Typed scope selector. `type` must be one of entity_prefix, key_glob, passport_id, before_timestamp, tenant_id.",
+                        "oneOf": [
+                            {"properties": {"type": {"const": "entity_prefix"}, "value": {"type": "string"}}, "required": ["type", "value"]},
+                            {"properties": {"type": {"const": "key_glob"},      "value": {"type": "string"}}, "required": ["type", "value"]},
+                            {"properties": {"type": {"const": "passport_id"},   "value": {"type": "string"}}, "required": ["type", "value"]},
+                            {"properties": {"type": {"const": "before_timestamp"}, "value": {"type": "string", "format": "date-time"}}, "required": ["type", "value"]},
+                            {"properties": {"type": {"const": "tenant_id"},     "value": {"type": "string"}}, "required": ["type", "value"]}
+                        ]
+                    },
+                    "reason":       { "type": "string", "description": "Human-readable reason for the forget (audit-record requirement)." },
+                    "tenant_id":    { "type": "string", "description": "Tenant the receipt is attributed to. Defaults to 'default'." },
+                    "token_budget": { "type": "integer", "description": "Optional cap on the number of facts the resolver will touch (QC.2)." }
+                },
+                "required": ["scope", "reason"],
+                "examples": [
+                    { "scope": {"type": "entity_prefix", "value": "test-fixture-"}, "reason": "cleanup after benchmark" },
+                    { "scope": {"type": "before_timestamp", "value": "2026-01-01T00:00:00Z"}, "reason": "annual purge", "tenant_id": "personal::myles" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_forget_dry_run".to_string(),
+            description: "Preview a scoped-forget without mutating the store. Returns the \
+                          count + list of facts that WOULD be soft-deleted. Reserved \
+                          prefixes (`__agent::`, `__ops::`, `__bootstrap__::`, `__agent_session::`) \
+                          are excluded. Respects `token_budget` (QC.2). Always available — \
+                          does not require the feature flag."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "object",
+                        "description": "Same typed scope as memory_forget."
+                    },
+                    "token_budget": { "type": "integer" }
+                },
+                "required": ["scope"],
+                "examples": [
+                    { "scope": {"type": "entity_prefix", "value": "test-fixture-"} },
+                    { "scope": {"type": "key_glob", "value": "secret*"}, "token_budget": 500 }
                 ]
             }),
         },
@@ -1380,6 +1440,8 @@ pub fn tool_output_docs() -> Value {
         { "tool": "store_fact",         "output": "{ fact_id, entity, key, value, stored_at, tokens, confidence }" },
         { "tool": "query_facts",        "output": "{ facts: [{fact_id, entity, key, value, confidence, stored_at}], total_tokens }" },
         { "tool": "delete_fact",        "output": "{ deleted: bool, fact_id }" },
+        { "tool": "memory_forget",         "output": "{ content: [...], forget_receipt_id, facts_affected, recovery_window_seconds, recovery_window_ends_at, receipt_body_cbor_hex, receipt_body_hash_hex, scope, passport_id }" },
+        { "tool": "memory_forget_dry_run", "output": "{ content: [...], scope, count, facts_that_would_be_affected: [{fact_id, entity, key, stored_at, tokens}], dry_run: true }" },
         { "tool": "list_entities",      "output": "{ entities: [string] }" },
         { "tool": "get_bootstrap",      "output": "{ facts: [{entity, key, value}], total_tokens }" },
         { "tool": "fact_history",       "output": "{ versions: [{fact_id, value, version, supersedes, confidence, stored_at, deleted}] }" },
@@ -1464,6 +1526,8 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "store_fact" => facts::handle_store_fact(args, ctx).await,
         "query_facts" => facts::handle_query_facts(args, ctx).await,
         "delete_fact" => facts::handle_delete_fact(args, ctx).await,
+        "memory_forget" => forget::handle_memory_forget(args, ctx).await,
+        "memory_forget_dry_run" => forget::handle_memory_forget_dry_run(args, ctx).await,
         "list_entities" => facts::handle_list_entities(args, ctx).await,
         "get_bootstrap" => facts::handle_get_bootstrap(args, ctx).await,
         "fact_history" => facts::handle_fact_history(args, ctx).await,
@@ -1560,7 +1624,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 62; // 55 prior + 4 Features lens tools + 2 audit tools (audit_config, check_config_audit) + 1 memory_acknowledge_use (agent-ux-02).
+    const TOOL_COUNT: usize = 64; // 62 prior (incl. memory_acknowledge_use agent-ux-02) + memory_forget + memory_forget_dry_run (agent-ux-09 scoped forget).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
