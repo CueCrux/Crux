@@ -16,10 +16,9 @@
 //!
 //! 1. **Mint a short-lived HS256 JWT** using the same `CORECRUXD_JWT_HS256_SECRET`
 //!    the daemon's auth module reads on startup. Required for `JwtHs256` mode
-//!    (the daemon validates `iss` / `aud` / `exp` / `nbf` exactly as
-//!    [`crate::work_execplans`]-era operators set them in env). Tokens are
-//!    cached for 4 minutes (TTL is 5 minutes with a 60 s safety lead) so the
-//!    sign cost amortises across calls.
+//!    (the daemon validates `iss` / `aud` / `exp` / `nbf` exactly as operators
+//!    set them in env). Tokens are cached for 4 minutes (TTL is 5 minutes
+//!    with a 60 s safety lead) so the sign cost amortises across calls.
 //! 2. **Fall back to a raw env-supplied token** (`CRUX_AGENT_TOKEN` or
 //!    `CORECRUX_LOOPBACK_TOKEN`). Useful under `Off` / `DevScopes`, harmless
 //!    under JWT modes where it will be rejected.
