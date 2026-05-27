@@ -12,6 +12,7 @@
 mod body_v1;
 mod candidate_digest_v1;
 mod export_v1;
+mod forget_v1;
 mod keyring_v1;
 mod memory_use_v1;
 mod store_v1;
@@ -19,6 +20,13 @@ mod subject_index_v1;
 mod verify_v1;
 
 pub use body_v1::{extract_body_index_v1, extract_linked_receipts_v1, ReceiptBodyIndexV1};
+pub use forget_v1::{
+    blake3_hex, decode_forget_body_v1, decode_permanent_purge_body_v1, encode_forget_body_v1,
+    encode_permanent_purge_body_v1, extract_forget_summary_v1, ForgetFactRefV1, ForgetReceiptBodyV1,
+    ForgetReceiptError, ForgetReceiptSummaryV1, ForgetScopeV1, PermanentPurgeReceiptBodyV1,
+    CONTENT_TYPE_FORGET_BODY_V1, CONTENT_TYPE_PERMANENT_PURGE_BODY_V1, EVT_RECEIPT_FORGET_BODY_V1,
+    EVT_RECEIPT_PERMANENT_PURGE_BODY_V1, SCHEMA_FORGET_BODY_V1, SCHEMA_PERMANENT_PURGE_BODY_V1,
+};
 pub use export_v1::{
     build_receipt_export_v1, BuildReceiptExportInput, ExportError, ExportFileV1, ExportFormatV1, ExportRedactionV1,
     ReceiptEventHeaderRefV1, ReceiptExportBundleV1, ReceiptExportIncludeV1, ReceiptExportOptionsV1,
