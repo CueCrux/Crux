@@ -33,6 +33,7 @@ pub mod observations;
 pub mod observe;
 pub mod passport;
 pub mod query;
+pub mod receipt_verify;
 pub mod sessions;
 pub mod storyline;
 pub mod sync;
@@ -657,6 +658,30 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["session_id", "observation_id"],
                 "examples": [
                     { "session_id": "my-session", "observation_id": "01HXXXXXXXXX" }
+                ]
+            }),
+        },
+        // ── Receipt verification (agent-ux-04 source-linked traceability) ──
+        ToolDefinition {
+            name: "receipt_verify".to_string(),
+            description: "Re-verify a CROWN receipt by id via the daemon's existing \
+                          /v1/receipts/{id}/verification route. Returns \
+                          `{verified, signer_passport, errors[]}` so a host IDE can render \
+                          a one-click verify badge next to receipt ids in chat. Requires an \
+                          authenticated agent identity (audit pattern: only the signer or an \
+                          operator should re-verify). Gated by \
+                          CORECRUXD_FEATURE_RECEIPT_VERIFY=1 (default off)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "receipt_id": { "type": "string", "description": "Receipt id to verify (e.g. r_01JXXXXXX)" },
+                    "tenant_id":  { "type": "string", "description": "Tenant id the receipt belongs to (default: \"default\")" }
+                },
+                "required": ["receipt_id"],
+                "examples": [
+                    { "receipt_id": "r_01JABC" },
+                    { "receipt_id": "r_01JABC", "tenant_id": "personal::myles" }
                 ]
             }),
         },
@@ -1654,6 +1679,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "list_observations",  "output": "{ session_id, count, observations: [{ observation_id, session_id, ts, provider, principal, kind, payload, receipt: {alg, signed_by, body_hash, signature} }] }" },
         { "tool": "get_observation",    "output": "Single observation record (same shape as list_observations entries), or a not-found text response." },
         { "tool": "verify_observation", "output": "{ observation_id, ok: bool, hash_match: bool, signature_valid: bool, recomputed_hash, receipt_hash, reason?: string }" },
+        { "tool": "receipt_verify", "output": "{ content: [...], receipt_id, tenant_id, feature_enabled: bool, verified: bool, signer_passport: string|null, errors: [string], http_status: int, report: VerificationReportV1 } — when feature off, omits report and returns errors:[FEATURE_DISABLED]. agent-ux-04 source-linked traceability." },
         { "tool": "get_agent_identity", "output": "{ agent_name: string }" },
         { "tool": "create_handoff",     "output": "{ package_json, content_hash, signature, relevant_fact_count }" },
         { "tool": "accept_handoff",     "output": "{ session_loaded, facts_loaded, verified: bool }" },
@@ -1751,6 +1777,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "list_observations" => observations::handle_list_observations(args, ctx).await,
         "get_observation" => observations::handle_get_observation(args, ctx).await,
         "verify_observation" => observations::handle_verify_observation(args, ctx).await,
+        "receipt_verify" => receipt_verify::handle_receipt_verify(args, ctx).await,
         "get_agent_identity" => handle_get_agent_identity(args, ctx).await,
         "create_handoff" => handoff::handle_create_handoff(args, ctx).await,
         "accept_handoff" => handoff::handle_accept_handoff(args, ctx).await,
@@ -1836,7 +1863,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 73; // 72 on main (69 prior + audit_export_bundle agent-ux-11 + 3 freshness agent-ux-03) + autonomy_contract (agent-ux-10).
+    const TOOL_COUNT: usize = 74; // 73 on main (incl. audit_export_bundle agent-ux-11 + 3 freshness agent-ux-03 + autonomy_contract agent-ux-10) + receipt_verify (agent-ux-04).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

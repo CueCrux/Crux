@@ -279,6 +279,23 @@ pub async fn build_envelope_for_query_facts(args: &Value, ctx: &McpContext) -> E
     let scope = scope::agent_name(ctx.agent.as_ref())
         .map_or_else(|| format!("node:{}", ctx.node_id), |name| format!("agent:{name}"));
 
+    // agent-ux-04 (source-linked traceability): when at least one receipt id
+    // landed in `receipts_used` AND the daemon's loopback base is known, point
+    // `links.verify` at the FIRST receipt's verification endpoint. The host
+    // IDE can render a one-click "verify ↗" badge from this URL alone; the
+    // full list of receipts is still available in `receipts_used[]` so a
+    // multi-receipt drawer can fan out further verify links itself.
+    let links = if let (Some(first), Some(base)) = (receipts_used.first(), ctx.daemon_base_url.as_deref()) {
+        EnvelopeLinks {
+            verify: Some(crate::tools::receipt_verify::build_verification_url(
+                base, "default", first,
+            )),
+            open_in_console: None,
+        }
+    } else {
+        EnvelopeLinks::default()
+    };
+
     Envelope {
         receipts_used,
         memories_used,
@@ -289,7 +306,7 @@ pub async fn build_envelope_for_query_facts(args: &Value, ctx: &McpContext) -> E
         },
         // query_facts is read-only — no side effects to predict.
         predicted_effects: Vec::new(),
-        links: EnvelopeLinks::default(),
+        links,
     }
 }
 
@@ -477,6 +494,66 @@ mod tests {
         assert!(env.receipts_used.is_empty());
         assert!(env.predicted_effects.is_empty());
         assert_eq!(env.autonomy_consumed.capability, "facts:read");
+    }
+
+    /// agent-ux-04: when query_facts surfaces a fact with a `source_receipt`
+    /// AND the dispatcher has a `daemon_base_url`, the envelope's `links.verify`
+    /// must point at `/v1/receipts/<id>/verification` for the first receipt.
+    /// This is the load-bearing wiring for the host-IDE "verify ↗" badge.
+    #[tokio::test]
+    async fn envelope_links_verify_populated_when_receipt_present() {
+        let ctx = test_ctx().with_daemon_base_url("http://127.0.0.1:14800");
+        handle_store_fact(
+            &json!({"entity": "p", "key": "a", "value": "linkable", "source_receipt": "r_ux04_001"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let env = build_envelope_for_query_facts(&json!({"query": "linkable"}), &ctx).await;
+        assert_eq!(env.receipts_used, vec!["r_ux04_001"]);
+        let verify = env.links.verify.as_deref().expect("links.verify must be populated");
+        assert!(
+            verify.starts_with("http://127.0.0.1:14800/v1/receipts/r_ux04_001/verification"),
+            "verify link must hit the existing route; got {verify}"
+        );
+        assert!(
+            verify.contains("tenant_id=default"),
+            "verify link must carry tenant_id query param; got {verify}"
+        );
+    }
+
+    /// Without a `daemon_base_url`, the envelope still emits receipt ids in
+    /// `receipts_used[]` but `links.verify` is omitted (host falls back to
+    /// `corecruxctl receipts verify <id>` per the child plan's free-tier
+    /// offline-verify hint).
+    #[tokio::test]
+    async fn envelope_links_verify_absent_when_no_daemon_base_url() {
+        let ctx = test_ctx(); // no daemon_base_url
+        handle_store_fact(
+            &json!({"entity": "p", "key": "a", "value": "off", "source_receipt": "r_offline"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let env = build_envelope_for_query_facts(&json!({"query": "off"}), &ctx).await;
+        assert_eq!(env.receipts_used, vec!["r_offline"]);
+        assert!(
+            env.links.verify.is_none(),
+            "verify link must be absent without a loopback base"
+        );
+    }
+
+    /// If the result has no receipts, `links.verify` stays absent regardless
+    /// of `daemon_base_url`.
+    #[tokio::test]
+    async fn envelope_links_verify_absent_when_no_receipts() {
+        let ctx = test_ctx().with_daemon_base_url("http://127.0.0.1:14800");
+        handle_store_fact(&json!({"entity": "p", "key": "a", "value": "no-receipt"}), &ctx)
+            .await
+            .unwrap();
+        let env = build_envelope_for_query_facts(&json!({"query": "no-receipt"}), &ctx).await;
+        assert!(env.receipts_used.is_empty());
+        assert!(env.links.verify.is_none());
     }
 
     #[tokio::test]

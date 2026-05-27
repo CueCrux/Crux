@@ -899,6 +899,86 @@ mod tests {
         std::env::remove_var(crate::tools::memory_use::FEATURE_FLAG_ENV);
     }
 
+    /// Sibling envelope-filter contract for `receipt_verify` (agent-ux-04).
+    ///
+    /// `receipt_verify` is intentionally NOT in
+    /// [`crate::tools::tool_emits_envelope`] — it's a verifier, not a memory
+    /// retrieval, so it has no `memories_used[]` to filter. This test pins
+    /// that contract so a future change that flips the opt-in must also
+    /// rewire the envelope builder.
+    ///
+    /// Symmetric to `envelope_on_query_facts_omits_reserved_prefix_entries`
+    /// and `envelope_on_memory_acknowledge_use_omits_reserved_prefix_entries`:
+    /// every new envelope-eligible tool the master plan adds gets its own
+    /// reserved-prefix sibling, even if that tool's contract is "no
+    /// envelope at all".
+    #[tokio::test]
+    async fn envelope_on_receipt_verify_omits_reserved_prefix_entries() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        // Receipt-verify flag stays OFF — the handler must short-circuit to
+        // a "feature disabled" payload without hitting the loopback, AND the
+        // dispatcher must NOT wrap the response in an envelope (because the
+        // tool isn't opted in).
+        std::env::remove_var(crate::tools::receipt_verify::FEATURE_FLAG_ENV);
+        let ctx = test_ctx().with_agent(crate::agent::AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // Seed a reserved-prefix fact in the store. If the dispatcher ever
+        // wrongly opts receipt_verify into the envelope, the reserved-prefix
+        // filter contract would have to apply here too — but the envelope
+        // must not appear in the first place.
+        dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "__ops::config-audit", "key": "sha256:abc", "value": "x"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "receipt_verify", "arguments": {"receipt_id": "r_does_not_matter"}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        // Contract 1: no envelope wrapper (tool is not opted in).
+        assert!(
+            result.get("envelope").is_none(),
+            "receipt_verify must not be wrapped in an envelope (got {result:?})"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "receipt_verify response must keep the legacy unwrapped shape"
+        );
+        // Contract 2: with the flag off, payload is the disabled stub.
+        assert_eq!(result["feature_enabled"], false);
+        assert_eq!(result["verified"], false);
+        assert_eq!(result["errors"][0], "FEATURE_DISABLED");
+        // Contract 3: the response never carries an entity name from the
+        // reserved-prefix fact we seeded (defence in depth — the tool has
+        // nothing to do with the fact store, but proving it stays that way
+        // pins the invariant).
+        let payload_str = result.to_string();
+        assert!(
+            !payload_str.contains("__ops::"),
+            "receipt_verify response leaked reserved-prefix entity name: {payload_str}"
+        );
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+    }
+
     #[tokio::test]
     async fn envelope_on_memory_freshness_omits_reserved_prefix_entries() {
         // Sibling test for agent-ux-03 M3: memory_freshness is the second
