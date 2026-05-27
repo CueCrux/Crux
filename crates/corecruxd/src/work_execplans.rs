@@ -188,9 +188,9 @@ fn find_ci(haystack: &str, needle_lower: &str) -> Option<usize> {
 /// arrows, bulleted / numbered list markers, bold asterisks, and an optional
 /// `Status:` prefix (followed by more bold + spaces). Used by
 /// [`extract_superseded_slug`] to reject prose mentions like
-/// `"- See \`Status: Superseded by [[slug]]\` pattern"` while still matching
-/// declarations like `"Status: Superseded by [[next-plan]]"` or
-/// `"> **Status:** Superseded by [[next-plan]]"`.
+/// `"- See \`Status: Superseded by \[\[slug\]\]\` pattern"` while still matching
+/// declarations like `"Status: Superseded by \[\[next-plan\]\]"` or
+/// `"> **Status:** Superseded by \[\[next-plan\]\]"`.
 fn strip_leading_markup(line: &str) -> &str {
     let mut s = line.trim_start();
     // Blockquote arrows, possibly nested or separated by whitespace.
@@ -222,7 +222,7 @@ fn strip_leading_markup(line: &str) -> &str {
 /// Match a "Superseded by …" *declaration* at the start of a line, after
 /// stripping leading markdown markup. Returns the captured slug. Rejects
 /// prose mentions ("(superseded by today's work)") and backtick-quoted
-/// pattern examples ("`Status: Superseded by [[slug]]`") because in both
+/// pattern examples ("`Status: Superseded by \[\[slug\]\]`") because in both
 /// cases the `Superseded by` token does not appear at the line's declarative
 /// prefix.
 fn extract_superseded_slug(line: &str) -> Option<String> {
