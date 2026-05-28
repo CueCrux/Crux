@@ -26,7 +26,23 @@ pub const WORK_TRANSITION_ENTITY_PREFIX: &str = "__work_transition__";
 pub const WORK_GATE_ENTITY_PREFIX: &str = "__work_gate__";
 pub const RECORD_KEY: &str = "record";
 
-pub const WORK_STATES: &[&str] = &["planned", "in_progress", "blocked", "archive", "complete", "deployed"];
+/// Accepted work states.
+///
+/// `pending_approval` is the agent-ux-05 risk-tiered HITL state. It does not
+/// originate from the kanban write path (`create_work`); it surfaces from
+/// the in-memory approval queue managed by
+/// [`crux_mcp::tools::approvals`]. Validators accept it so the existing
+/// `/v1/work?state=pending_approval` path returns approval entries without
+/// rejecting the query.
+pub const WORK_STATES: &[&str] = &[
+    "planned",
+    "in_progress",
+    "blocked",
+    "archive",
+    "complete",
+    "deployed",
+    "pending_approval",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkError {

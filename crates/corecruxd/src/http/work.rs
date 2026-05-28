@@ -177,16 +177,38 @@ pub(super) async fn get_work(
         }
     }
 
+    // agent-ux-05 — risk-tiered HITL projection. When the caller asks for
+    // `state=pending_approval` (or no state filter at all), splice in the
+    // in-memory approval queue managed by `crux_mcp::tools::approvals`.
+    // Approval entries are emitted with `kind: "approval"` so the SPA can
+    // render them with a distinct row class. Tenant + state filters from
+    // `q` are honoured so cross-tenant approvers don't see other tenants'
+    // pending requests.
+    let want_approvals = match q.state.as_deref() {
+        Some("pending_approval") | None => true,
+        Some(_) => false,
+    };
+    let mut approval_entries: Vec<serde_json::Value> = if want_approvals {
+        crux_mcp::tools::approvals::pending_requests_for_work_panel().await
+    } else {
+        Vec::new()
+    };
+    if let Some(tenant) = q.tenant_id.as_deref() {
+        approval_entries.retain(|e| e.get("tenant_id").and_then(|v| v.as_str()) == Some(tenant));
+    }
+    let approval_count = approval_entries.len();
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "count": items.len(),
+            "count": items.len() + approval_count,
             "source": match q.source {
                 WorkSource::Kanban => "kanban",
                 WorkSource::Execplans => "execplans",
                 WorkSource::All => "all",
             },
             "work": items,
+            "approvals": approval_entries,
         })),
     )
         .into_response()
