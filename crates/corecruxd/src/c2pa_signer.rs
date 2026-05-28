@@ -223,6 +223,127 @@ pub fn build_manifest_signer(
     }
 }
 
-// Tests live in the M3 commit — see PR / git log for the
-// CORECRUX_C2PA_SIGNER unit-test suite (5+2 assertions covering kind
-// resolution + InProcess trait-dispatch round trip).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use corecrux_receipts::{build_c2pa_manifest_v1, sign_c2pa_manifest_via_signer, C2paManifestInputV1};
+    use serial_test::serial;
+
+    fn fixture_signing_key() -> SigningKey {
+        // Deterministic seed so the unit test snapshot is stable.
+        SigningKey::from_bytes(&[0x42u8; 32])
+    }
+
+    /// 1. Default (env unset) resolves to InProcess.
+    #[test]
+    #[serial(c2pa_signer_env)]
+    fn c2pa_signer_kind_from_env_default_in_process() {
+        std::env::remove_var(SIGNER_FLAG_ENV);
+        assert_eq!(C2paSignerKind::from_env(), C2paSignerKind::InProcess);
+    }
+
+    /// 2. `vault` resolves to Vault.
+    #[test]
+    #[serial(c2pa_signer_env)]
+    fn c2pa_signer_kind_from_env_explicit_vault() {
+        std::env::set_var(SIGNER_FLAG_ENV, "vault");
+        assert_eq!(C2paSignerKind::from_env(), C2paSignerKind::Vault);
+        std::env::remove_var(SIGNER_FLAG_ENV);
+    }
+
+    /// 3. `in_process` (and `IN_PROCESS` upper-case variant via the
+    ///    trim+to_ascii_lowercase pass) resolves to InProcess.
+    #[test]
+    #[serial(c2pa_signer_env)]
+    fn c2pa_signer_kind_from_env_in_process_explicit() {
+        std::env::set_var(SIGNER_FLAG_ENV, "in_process");
+        assert_eq!(C2paSignerKind::from_env(), C2paSignerKind::InProcess);
+        std::env::set_var(SIGNER_FLAG_ENV, "  IN_PROCESS  ");
+        assert_eq!(C2paSignerKind::from_env(), C2paSignerKind::InProcess);
+        std::env::set_var(SIGNER_FLAG_ENV, "");
+        assert_eq!(C2paSignerKind::from_env(), C2paSignerKind::InProcess);
+        std::env::remove_var(SIGNER_FLAG_ENV);
+    }
+
+    /// 4. Unknown values warn + fall back to InProcess (do NOT crash
+    ///    the daemon).
+    #[test]
+    #[serial(c2pa_signer_env)]
+    fn c2pa_signer_kind_from_env_unknown_falls_back() {
+        std::env::set_var(SIGNER_FLAG_ENV, "weird");
+        assert_eq!(C2paSignerKind::from_env(), C2paSignerKind::InProcess);
+        std::env::set_var(SIGNER_FLAG_ENV, "vault-pki-p256"); // wrong, not the accepted shape
+        assert_eq!(C2paSignerKind::from_env(), C2paSignerKind::InProcess);
+        std::env::remove_var(SIGNER_FLAG_ENV);
+    }
+
+    /// 5. `build_manifest_signer(InProcess, ..)` returns a trait
+    ///    object that can sign + the signature parses back via the
+    ///    backend-agnostic pipeline.
+    ///
+    ///    The Vault branch is NOT exercised here because it requires
+    ///    real `VAULT_ADDR` + `VAULT_TOKEN` env vars and a reachable
+    ///    Vault PKI mount — that's M4 (integration) per the parent
+    ///    ExecPlan, explicitly out of scope for unit tests.
+    #[test]
+    fn build_manifest_signer_returns_arc_trait_object() {
+        let signer = build_manifest_signer(
+            C2paSignerKind::InProcess,
+            fixture_signing_key(),
+            "test-key-runtime-c2pa",
+        )
+        .expect("InProcess build never reaches Vault");
+
+        let manifest = build_c2pa_manifest_v1(&C2paManifestInputV1 {
+            content_bytes: b"image-bytes",
+            content_type: Some("image/png"),
+            crown_receipt_id: "r_runtime_01",
+            signer_passport: "p_test",
+            claim_generator: "cuecrux/test",
+            manifest_id: "urn:cuecrux:c2pa:test",
+            when: "2026-05-29T12:00:00Z",
+            model: None,
+        });
+        let signed =
+            sign_c2pa_manifest_via_signer(manifest, &*signer, "2026-05-29T12:00:00Z").expect("sign via Arc<dyn>");
+        assert_eq!(signed.signature_alg, "ed25519");
+        assert_eq!(signed.key_id, "test-key-runtime-c2pa");
+        assert_eq!(signed.signature.len(), 64, "Ed25519 sig is 64 bytes");
+        assert!(signed.x5chain_pem.is_none(), "in-process path has no x5chain");
+    }
+
+    /// 6. Round-trip: the manifest produced via the Arc<dyn> path
+    ///    verifies under the same key — proves the trait dispatch
+    ///    doesn't mutate signer-relevant state.
+    #[test]
+    fn build_manifest_signer_round_trip_verifies() {
+        let key = fixture_signing_key();
+        let verifying = key.verifying_key();
+        let signer = build_manifest_signer(C2paSignerKind::InProcess, key, "k-roundtrip").expect("InProcess build");
+
+        let content = b"round-trip";
+        let manifest = build_c2pa_manifest_v1(&C2paManifestInputV1 {
+            content_bytes: content,
+            content_type: None,
+            crown_receipt_id: "r_roundtrip",
+            signer_passport: "p_test",
+            claim_generator: "cuecrux/test",
+            manifest_id: "urn:cuecrux:c2pa:roundtrip",
+            when: "2026-05-29T12:00:00Z",
+            model: None,
+        });
+        let signed = sign_c2pa_manifest_via_signer(manifest, &*signer, "2026-05-29T12:00:00Z").unwrap();
+        let envelope = signed.to_jumbf_base64();
+        let parsed = corecrux_receipts::parse_jumbf_base64(&envelope).unwrap();
+        let report = corecrux_receipts::verify_c2pa_manifest_v1(&parsed, content, &verifying).unwrap();
+        assert!(report.ok, "verify report: {report:?}");
+    }
+
+    /// 7. as_str() exposes the env-value string for breadcrumb logs.
+    #[test]
+    fn c2pa_signer_kind_as_str_matches_env_value() {
+        assert_eq!(C2paSignerKind::InProcess.as_str(), SIGNER_VALUE_IN_PROCESS);
+        assert_eq!(C2paSignerKind::Vault.as_str(), SIGNER_VALUE_VAULT);
+    }
+}
