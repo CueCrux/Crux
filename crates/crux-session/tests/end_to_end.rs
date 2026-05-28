@@ -130,3 +130,54 @@ fn ce_capability_graph_is_local_scoped() {
     assert!(!names.contains(&"audit_replay"));
     assert!(!names.contains(&"get_counterfactual_summary"));
 }
+
+/// Acceptance pin for ExecPlan `crux-session-capability-catalog-refresh-2026-05-29`:
+/// the local-tier Crux Daemon session plan must advertise >= 7 capabilities,
+/// including the 3 baseline strings AND the wave-A/B agent-UX dimensions shipped
+/// 2026-05-28. Dim 10 (`autonomy.contract`) is the explicit scorecard-floor fix.
+#[test]
+fn ce_capability_graph_advertises_wave_ab_agent_ux_dimensions() {
+    let (plan, _) = ce_handshake(&NullSigner);
+    let names: Vec<&str> = plan.capability_graph.iter().map(|c| c.cap.as_str()).collect();
+
+    assert!(
+        plan.capability_graph.len() >= 7,
+        "expected >= 7 capabilities on local-tier session plan, got {}: {:?}",
+        plan.capability_graph.len(),
+        names
+    );
+
+    // Baseline three remain present (regression guard).
+    for baseline in ["session_context", "journal_append", "proof_verify"] {
+        assert!(
+            names.contains(&baseline),
+            "baseline capability `{baseline}` missing from session plan: {names:?}"
+        );
+    }
+
+    // Wave-A/B agent-UX dimensions (01, 03-12; dim 02 deferred per source brief).
+    for wave_cap in [
+        "memory.readable_editable",   // dim 01
+        "memory.freshness",           // dim 03
+        "trace.source_linked",        // dim 04
+        "approval.risk_tiered",       // dim 05
+        "trace.typed_actions",        // dim 06
+        "output.verifiable_receipts", // dim 07
+        "identity.continuity",        // dim 08
+        "memory.scoped_forget",       // dim 09
+        "autonomy.contract",          // dim 10 (scorecard floor)
+        "audit.byo_trail",            // dim 11
+        "output.calm_deferred",       // dim 12
+    ] {
+        assert!(
+            names.contains(&wave_cap),
+            "wave-A/B agent-UX capability `{wave_cap}` missing from session plan: {names:?}"
+        );
+    }
+
+    // Dim 02 (`memory_acknowledge_use`) is deliberately NOT advertised.
+    assert!(
+        !names.contains(&"memory.acknowledge_use"),
+        "dim 02 should not be advertised (scoped out of wave-A/B per source brief)"
+    );
+}
