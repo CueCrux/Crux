@@ -27,6 +27,7 @@ pub mod forget;
 pub mod freshness;
 pub mod github;
 pub mod handoff;
+pub mod identity;
 pub mod kinds;
 pub mod loopback_auth;
 pub mod memory;
@@ -1143,6 +1144,135 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "examples": [{}]
             }),
         },
+        // ── Identity continuity (agent-ux-08) ──────────────────────
+        ToolDefinition {
+            name: "passport_split".to_string(),
+            description: "Fork a passport into a new identity that inherits the source's \
+                          facts via lineage read-through; future writes diverge to the new \
+                          id. Caller must own the source passport AND hold operator-tier \
+                          (trusted+). Cross-tenant splits are forbidden (T.1). Emits a \
+                          PassportSplit CROWN receipt. NOT REVERSIBLE at the fact level. \
+                          Gated behind CORECRUXD_FEATURE_IDENTITY_CONTINUITY=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target_passport": {
+                        "type": "string",
+                        "description": "Passport id to fork. Must equal the calling agent's passport."
+                    },
+                    "new_passport_name": {
+                        "type": "string",
+                        "description": "Name for the new passport. Must share the source's tenant prefix."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Human-readable rationale recorded in the receipt body."
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "Required positive cap on resolver work (QC.2).",
+                        "minimum": 1
+                    }
+                },
+                "required": ["target_passport", "new_passport_name", "token_budget"],
+                "examples": [
+                    {
+                        "target_passport": "personal::alice",
+                        "new_passport_name": "personal::alice-work",
+                        "reason": "separate work persona",
+                        "token_budget": 500
+                    }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "passport_merge".to_string(),
+            description: "Collapse two passports under one identity. Caller must own \
+                          the source OR target passport AND hold operator-tier (trusted+). \
+                          Cross-tenant merges are forbidden (T.1). `conflict_policy` is \
+                          MANDATORY and EXPLICIT: prefer_source | prefer_target | \
+                          error_on_conflict — never silently chosen. Emits a PassportMerge \
+                          CROWN receipt. The source passport is retired (sessions become \
+                          read-only references). NOT REVERSIBLE at the fact level. Gated \
+                          behind CORECRUXD_FEATURE_IDENTITY_CONTINUITY=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "source_passport": {
+                        "type": "string",
+                        "description": "Passport to retire into the target."
+                    },
+                    "target_passport": {
+                        "type": "string",
+                        "description": "Surviving passport id."
+                    },
+                    "conflict_policy": {
+                        "type": "string",
+                        "enum": ["prefer_source", "prefer_target", "error_on_conflict"],
+                        "description": "How to resolve (entity, key) conflicts. Required; never silent."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Human-readable rationale recorded in the receipt body."
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "Required positive cap on conflict-detection work (QC.2).",
+                        "minimum": 1
+                    }
+                },
+                "required": ["source_passport", "target_passport", "conflict_policy", "token_budget"],
+                "examples": [
+                    {
+                        "source_passport": "personal::alice-old",
+                        "target_passport": "personal::alice",
+                        "conflict_policy": "prefer_target",
+                        "reason": "consolidate after device retirement",
+                        "token_budget": 500
+                    }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "passport_link_device".to_string(),
+            description: "Bind an additional device fingerprint to the calling agent's \
+                          passport with a capability subset (defaults to facts:read). \
+                          Requires operator-tier (trusted+) on the calling passport. \
+                          Fingerprint MUST be a 64-char lowercase BLAKE3 hex digest \
+                          over the device's canonical attestation blob — raw attestations \
+                          are never stored. Emits a PassportLinkDevice CROWN receipt. \
+                          Gated behind CORECRUXD_FEATURE_IDENTITY_CONTINUITY=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "device_fingerprint": {
+                        "type": "string",
+                        "description": "64-char lowercase BLAKE3 hex digest of the device attestation."
+                    },
+                    "capabilities_subset": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Capability strings propagated to the linked device. Defaults to [facts:read]."
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "Required positive token budget (QC.2).",
+                        "minimum": 1
+                    }
+                },
+                "required": ["device_fingerprint", "token_budget"],
+                "examples": [
+                    {
+                        "device_fingerprint": "af2c4e3b6d8a9c1e0f7b5a3d2c1e8f4a9d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a",
+                        "capabilities_subset": ["facts:read"],
+                        "token_budget": 500
+                    }
+                ]
+            }),
+        },
         // ── Sync ──────────────────────────────────────────────────
         ToolDefinition {
             name: "sync_pull".to_string(),
@@ -1864,6 +1994,9 @@ pub fn tool_output_docs() -> Value {
         { "tool": "audit_export_bundle", "output": "{ content: [...], bundle_id, bytes_path, manifest_signature_b64, fact_count, receipt_count, scope, since, until, events_jsonl_sha256, receipts_cbor_sha256 } — bundle persisted to CORECRUXD_AUDIT_EXPORT_DIR; verify offline via `corecruxctl audit-verify`. agent-ux-11 (EU AI Act Art. 12)." },
         { "tool": "issue_passport",     "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id }" },
         { "tool": "get_passport",       "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id, issued_at, passport_hash }" },
+        { "tool": "passport_split",        "output": "{ content: [...], new_passport_id, split_receipt_id, receipt_body_cbor_hex, receipt_body_hash_hex, tenant_id }" },
+        { "tool": "passport_merge",        "output": "{ content: [...], merged_passport_id, merge_receipt_id, conflicts_resolved, conflict_policy, receipt_body_cbor_hex, receipt_body_hash_hex, tenant_id, retired_passport_id }" },
+        { "tool": "passport_link_device",  "output": "{ content: [...], link_receipt_id, passport_id, device_fingerprint, capabilities_subset, receipt_body_cbor_hex, receipt_body_hash_hex, tenant_id }" },
         { "tool": "sync_pull",          "output": "{ tenant_id?, facts_pulled, cursor, total_pull_count, collection_cursor_count }" },
         { "tool": "sync_push",          "output": "{ mode?='tenant_promotion_preview', tenant_id?, facts_pushed?|would_promote?, preview_hash?, skipped_private?, skipped_synced?, skipped_not_allowlisted?, total_push_count?, collection_cursor_count? }" },
         { "tool": "sync_status",        "output": "{ mode, configured, background_sync_enabled, remote_url, api_key_configured, platform_online, degraded, degraded_reason, onboarding_hint, last_pull_at, last_push_at, pull_count, push_count, collection_pull_cursor_count, collection_push_cursor_count, tenant_manifest_supported, local_fact_count }" },
@@ -1971,6 +2104,10 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "enrich_action" => action::handle_enrich_action(args, ctx).await,
         "issue_passport" => passport::handle_issue_passport(args, ctx).await,
         "get_passport" => passport::handle_get_passport(args, ctx).await,
+        // Identity continuity (agent-ux-08).
+        "passport_split" => identity::handle_passport_split(args, ctx).await,
+        "passport_merge" => identity::handle_passport_merge(args, ctx).await,
+        "passport_link_device" => identity::handle_passport_link_device(args, ctx).await,
         "sync_pull" => sync::handle_sync_pull(args, ctx).await,
         "sync_push" => sync::handle_sync_push(args, ctx).await,
         "sync_status" => sync::handle_sync_status(args, ctx).await,
@@ -2048,7 +2185,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 81; // 80 prior (incl. audit_export_bundle agent-ux-11 + freshness agent-ux-03 + autonomy_contract agent-ux-10 + receipt_verify agent-ux-04 + tool_trace_recent agent-ux-06 + 2 approvals agent-ux-05 + 3 artefacts agent-ux-12) + output_attest (agent-ux-07).
+    const TOOL_COUNT: usize = 84; // 81 prior (incl. audit_export_bundle agent-ux-11 + freshness agent-ux-03 + autonomy_contract agent-ux-10 + receipt_verify agent-ux-04 + tool_trace_recent agent-ux-06 + 2 approvals agent-ux-05 + 3 artefacts agent-ux-12 + output_attest agent-ux-07) + 3 identity-continuity (agent-ux-08).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

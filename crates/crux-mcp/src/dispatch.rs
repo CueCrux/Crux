@@ -1620,4 +1620,261 @@ mod tests {
         }
         std::env::remove_var(crate::traces::FEATURE_FLAG_ENV);
     }
+
+    // ── envelope opt-out for identity-continuity (agent-ux-08) ──
+    //
+    // The three identity-continuity tools (passport_split, passport_merge,
+    // passport_link_device) MUST NOT be opted into the audit-envelope
+    // wrapper — they are writes, not reads, so the envelope (which is
+    // shaped for memory-use accountability) would be inappropriate. The
+    // tests below assert the dispatcher leaves their responses unwrapped
+    // even when CORECRUXD_FEATURE_AUDIT_ENVELOPE=1.
+    //
+    // Each tool can short-circuit before the dispatcher runs the envelope
+    // logic (e.g. feature flag off, missing token_budget). What matters
+    // for the envelope contract is the JsonRpcResponse SHAPE: when the
+    // tool returns successfully, the response MUST NOT carry `envelope`
+    // or `payload` wrappers.
+
+    #[tokio::test]
+    async fn envelope_omits_for_passport_split() {
+        let _guard = envelope_env_lock().lock().await;
+        let _identity_guard = crate::tools::identity::tests::flag_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Use the explicit env var name to avoid taking another import.
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY", "1");
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "personal::alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        // Promote to operator-tier (trusted) by issuing a passport then
+        // seeding 500 receipt-backed facts.
+        dispatch(
+            rpc("tools/call", json!({"name": "issue_passport", "arguments": {}})),
+            &ctx,
+            None,
+        )
+        .await;
+        {
+            let mut store = ctx.fact_store.write().await;
+            for i in 0..500 {
+                store.store(corecrux_memory::fact_store::StoreFact {
+                    entity: format!("seed-{i}"),
+                    key: "k".to_string(),
+                    value: "v".to_string(),
+                    source_receipt: Some(format!("receipt-{i}")),
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                });
+            }
+        }
+        // Refresh tier.
+        dispatch(
+            rpc("tools/call", json!({"name": "get_passport", "arguments": {}})),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "passport_split",
+                    "arguments": {
+                        "target_passport": "personal::alice",
+                        "new_passport_name": "personal::alice-work",
+                        "reason": "envelope opt-out test",
+                        "token_budget": 500,
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "passport_split must not be wrapped in audit envelope"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "passport_split must keep legacy payload shape"
+        );
+        // Sanity: real handler ran.
+        assert_eq!(result["new_passport_id"], "personal::alice-work");
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY");
+    }
+
+    #[tokio::test]
+    async fn envelope_omits_for_passport_merge() {
+        let _guard = envelope_env_lock().lock().await;
+        let _identity_guard = crate::tools::identity::tests::flag_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY", "1");
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "personal::alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        dispatch(
+            rpc("tools/call", json!({"name": "issue_passport", "arguments": {}})),
+            &ctx,
+            None,
+        )
+        .await;
+        {
+            let mut store = ctx.fact_store.write().await;
+            for i in 0..500 {
+                store.store(corecrux_memory::fact_store::StoreFact {
+                    entity: format!("seed-{i}"),
+                    key: "k".to_string(),
+                    value: "v".to_string(),
+                    source_receipt: Some(format!("receipt-{i}")),
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                });
+            }
+            // Pre-seed the source passport under the same tenant so the
+            // merge call succeeds.
+            use crate::tools::passport::PassportRecord;
+            store.store(corecrux_memory::fact_store::StoreFact {
+                entity: "__passport__::personal::alice-old".to_string(),
+                key: "passport".to_string(),
+                value: serde_json::to_string(&PassportRecord {
+                    principal_id: "personal::alice-old".to_string(),
+                    sponsor_id: None,
+                    reputation_tier: "trusted".to_string(),
+                    receipt_count: 500,
+                    issued_at: "2026-05-28T00:00:00Z".to_string(),
+                    passport_hash: "deadbeef".to_string(),
+                })
+                .unwrap(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+            });
+        }
+        dispatch(
+            rpc("tools/call", json!({"name": "get_passport", "arguments": {}})),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "passport_merge",
+                    "arguments": {
+                        "source_passport": "personal::alice-old",
+                        "target_passport": "personal::alice",
+                        "conflict_policy": "prefer_target",
+                        "reason": "envelope opt-out test",
+                        "token_budget": 500,
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "passport_merge must not be wrapped in audit envelope"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "passport_merge must keep legacy payload shape"
+        );
+        assert_eq!(result["merged_passport_id"], "personal::alice");
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY");
+    }
+
+    #[tokio::test]
+    async fn envelope_omits_for_passport_link_device() {
+        let _guard = envelope_env_lock().lock().await;
+        let _identity_guard = crate::tools::identity::tests::flag_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY", "1");
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "personal::alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        dispatch(
+            rpc("tools/call", json!({"name": "issue_passport", "arguments": {}})),
+            &ctx,
+            None,
+        )
+        .await;
+        {
+            let mut store = ctx.fact_store.write().await;
+            for i in 0..500 {
+                store.store(corecrux_memory::fact_store::StoreFact {
+                    entity: format!("seed-{i}"),
+                    key: "k".to_string(),
+                    value: "v".to_string(),
+                    source_receipt: Some(format!("receipt-{i}")),
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                });
+            }
+        }
+        dispatch(
+            rpc("tools/call", json!({"name": "get_passport", "arguments": {}})),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let fp = blake3::hash(b"laptop-envelope-test").to_hex().to_string();
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "passport_link_device",
+                    "arguments": {
+                        "device_fingerprint": fp,
+                        "capabilities_subset": ["facts:read"],
+                        "token_budget": 500,
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "passport_link_device must not be wrapped in audit envelope"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "passport_link_device must keep legacy payload shape"
+        );
+        assert_eq!(result["passport_id"], "personal::alice");
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY");
+    }
 }

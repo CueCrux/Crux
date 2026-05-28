@@ -128,10 +128,8 @@ pub const EVT_RECEIPT_PASSPORT_SPLIT_BODY_V1: &str = "receipt.passport_split.bod
 pub const EVT_RECEIPT_PASSPORT_MERGE_BODY_V1: &str = "receipt.passport_merge.body.v1";
 pub const EVT_RECEIPT_PASSPORT_LINK_DEVICE_BODY_V1: &str = "receipt.passport_link_device.body.v1";
 
-pub const CONTENT_TYPE_PASSPORT_SPLIT_BODY_V1: &str =
-    "application/cbor; profile=cuecrux-receipt-passport-split-v1";
-pub const CONTENT_TYPE_PASSPORT_MERGE_BODY_V1: &str =
-    "application/cbor; profile=cuecrux-receipt-passport-merge-v1";
+pub const CONTENT_TYPE_PASSPORT_SPLIT_BODY_V1: &str = "application/cbor; profile=cuecrux-receipt-passport-split-v1";
+pub const CONTENT_TYPE_PASSPORT_MERGE_BODY_V1: &str = "application/cbor; profile=cuecrux-receipt-passport-merge-v1";
 pub const CONTENT_TYPE_PASSPORT_LINK_DEVICE_BODY_V1: &str =
     "application/cbor; profile=cuecrux-receipt-passport-link-device-v1";
 
@@ -144,9 +142,7 @@ pub enum IdentityReceiptError {
 }
 
 /// Encode a `PassportSplit` body into canonical CBOR.
-pub fn encode_passport_split_body_v1(
-    body: &PassportSplitReceiptBodyV1,
-) -> Result<Vec<u8>, IdentityReceiptError> {
+pub fn encode_passport_split_body_v1(body: &PassportSplitReceiptBodyV1) -> Result<Vec<u8>, IdentityReceiptError> {
     let mut out = Vec::with_capacity(256);
     ciborium::ser::into_writer(body, &mut out).map_err(|e| IdentityReceiptError::CborEncode(e.to_string()))?;
     Ok(out)
@@ -158,9 +154,7 @@ pub fn decode_passport_split_body_v1(bytes: &[u8]) -> Result<PassportSplitReceip
 }
 
 /// Encode a `PassportMerge` body into canonical CBOR.
-pub fn encode_passport_merge_body_v1(
-    body: &PassportMergeReceiptBodyV1,
-) -> Result<Vec<u8>, IdentityReceiptError> {
+pub fn encode_passport_merge_body_v1(body: &PassportMergeReceiptBodyV1) -> Result<Vec<u8>, IdentityReceiptError> {
     let mut out = Vec::with_capacity(384);
     ciborium::ser::into_writer(body, &mut out).map_err(|e| IdentityReceiptError::CborEncode(e.to_string()))?;
     Ok(out)
@@ -329,10 +323,7 @@ mod tests {
         assert_eq!(json, "\"error_on_conflict\"");
         assert_eq!(MergeConflictPolicyV1::PreferSource.as_str(), "prefer_source");
         assert_eq!(MergeConflictPolicyV1::PreferTarget.as_str(), "prefer_target");
-        assert_eq!(
-            MergeConflictPolicyV1::ErrorOnConflict.as_str(),
-            "error_on_conflict"
-        );
+        assert_eq!(MergeConflictPolicyV1::ErrorOnConflict.as_str(), "error_on_conflict");
     }
 
     #[test]
