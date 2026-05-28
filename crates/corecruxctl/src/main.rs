@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use corecruxctl::{
-    admin, audit_export, audit_pack, evidence, explain, extensions, fixture_digest, gaps, inspect_receipt, memory,
-    output_verify, parity, projections, receipts, reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import,
-    storage, structured_log, tooling_env, verify_store,
+    admin, audit_export, audit_pack, c2pa_x509, evidence, explain, extensions, fixture_digest, gaps, inspect_receipt,
+    memory, output_verify, parity, projections, receipts, reconcile, replay, shard, shardmap, smoke, snapshot,
+    stage1_import, storage, structured_log, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -428,6 +428,66 @@ enum Command {
         /// Path to the bundle (e.g. ./audit-bundle.tar.zst).
         bundle: PathBuf,
         /// Print the structured report as JSON to stdout.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Print the active C2PA leaf certificate's subject, issuer, validity
+    /// window, expiry urgency (green / yellow / red), and the local
+    /// trust anchor's SHA-256 fingerprint. Reads
+    /// `CORECRUXD_C2PA_LEAF_CERT_PATH` and `CORECRUXD_C2PA_ROOT_ANCHOR_PATH`
+    /// (or `--leaf-cert` / `--root-anchor`). Fully OFFLINE — no Vault
+    /// round-trip.
+    #[command(name = "c2pa-cert-status")]
+    C2paCertStatus {
+        /// Path to the leaf cert PEM (defaults to the env-derived path).
+        #[arg(long)]
+        leaf_cert: Option<PathBuf>,
+        /// Path to the root anchor PEM (defaults to the env-derived path).
+        #[arg(long)]
+        root_anchor: Option<PathBuf>,
+        /// Emit compact JSON instead of pretty.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Force-rotate the C2PA leaf certificate by minting a fresh CSR
+    /// and POSTing it to Vault PKI `pki-c2pa/sign/c2pa-leaf`. Requires
+    /// `VAULT_ADDR` + `VAULT_TOKEN` env vars. The new leaf key + chain
+    /// land at the configured paths atomically (write-temp + rename).
+    /// Use when the automatic <7d rotation hasn't fired yet or after
+    /// suspected key compromise.
+    #[command(name = "c2pa-rotate-leaf")]
+    C2paRotateLeaf {
+        /// Path to write the new leaf cert PEM (overrides env).
+        #[arg(long)]
+        leaf_cert: Option<PathBuf>,
+        /// Root anchor PEM (kept for reporting only).
+        #[arg(long)]
+        root_anchor: Option<PathBuf>,
+        /// Compact JSON output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Verify a C2PA manifest produced by the X.509 signer. Detects
+    /// whether the envelope carries an `x5chain` (vault-pki-p256) or
+    /// is a raw-Ed25519 legacy envelope, walks the X.509 chain to the
+    /// local anchor PEM, and verifies the leaf signature against the
+    /// canonical body bytes. Fully OFFLINE — no Vault round-trip.
+    #[command(name = "c2pa-verify")]
+    C2paVerify {
+        /// Path to the JUMBF envelope file (base64-encoded JSON).
+        #[arg(value_name = "FILE")]
+        manifest_path: PathBuf,
+        /// Optional content bytes to re-hash for the content-hash
+        /// assertion check.
+        #[arg(long, value_name = "PATH")]
+        content: Option<PathBuf>,
+        /// Local root anchor PEM. Defaults to the env-derived path.
+        #[arg(long)]
+        root_anchor: Option<PathBuf>,
+        /// Compact JSON output.
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -2159,6 +2219,62 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("{rendered}");
             if !report.ok {
                 return Err("C2PA manifest verification failed".into());
+            }
+            Ok(())
+        }
+        Command::C2paCertStatus {
+            leaf_cert,
+            root_anchor,
+            json,
+        } => {
+            let report = c2pa_x509::cert_status(&c2pa_x509::StatusOptions {
+                leaf_cert_path: leaf_cert,
+                root_anchor_path: root_anchor,
+            })?;
+            let rendered = if json {
+                serde_json::to_string(&report)?
+            } else {
+                serde_json::to_string_pretty(&report)?
+            };
+            println!("{rendered}");
+            Ok(())
+        }
+        Command::C2paRotateLeaf {
+            leaf_cert,
+            root_anchor,
+            json,
+        } => {
+            let report = c2pa_x509::rotate_leaf(&c2pa_x509::StatusOptions {
+                leaf_cert_path: leaf_cert,
+                root_anchor_path: root_anchor,
+            })?;
+            let rendered = if json {
+                serde_json::to_string(&report)?
+            } else {
+                serde_json::to_string_pretty(&report)?
+            };
+            println!("{rendered}");
+            Ok(())
+        }
+        Command::C2paVerify {
+            manifest_path,
+            content,
+            root_anchor,
+            json,
+        } => {
+            let report = c2pa_x509::c2pa_verify(&c2pa_x509::X509VerifyOptions {
+                manifest_path,
+                content,
+                root_anchor_path: root_anchor,
+            })?;
+            let rendered = if json {
+                serde_json::to_string(&report)?
+            } else {
+                serde_json::to_string_pretty(&report)?
+            };
+            println!("{rendered}");
+            if !report.ok {
+                return Err("C2PA X.509 manifest verification failed".into());
             }
             Ok(())
         }
