@@ -1372,6 +1372,64 @@ mod tests {
         std::env::remove_var(crate::tools::artefacts::FEATURE_FLAG_ENV);
     }
 
+    /// Sibling envelope-omission test for `output_attest` (agent-ux-07).
+    /// The attestation tool is a write of a NEW receipt class — it must
+    /// NOT opt into the per-turn audit envelope, mirroring the rule the
+    /// master ExecPlan documents in §"Cross-PR envelope-test interaction".
+    #[tokio::test]
+    async fn envelope_omits_for_output_attest() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::output_attest::FEATURE_FLAG_ENV, "1");
+        // Provide a signer key + key id for the round-trip path.
+        let secret = [0x22u8; 32];
+        std::env::set_var(
+            "CORECRUXD_WRITE_CONFIRMATION_SIGNING_KEY_B64",
+            base64::engine::general_purpose::STANDARD.encode(secret),
+        );
+        std::env::set_var("CORECRUXD_WRITE_CONFIRMATION_KEY_ID", "envtest-key");
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(b"some-attested-bytes");
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "output_attest",
+                    "arguments": {
+                        "content_bytes_base64": payload_b64,
+                        "receipt_id": "r_envtest",
+                        "content_type": "image/png"
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        // output_attest is NOT in tool_emits_envelope → response shape stays legacy.
+        assert!(
+            result.get("envelope").is_none(),
+            "output_attest must not emit an envelope: got {result}"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "output_attest must not be wrapped: got {result}"
+        );
+        // The manifest payload is still present at the top level.
+        assert!(result["manifest"]["manifest_id"].is_string());
+        assert_eq!(result["manifest"]["crown_receipt_id"], "r_envtest");
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::output_attest::FEATURE_FLAG_ENV);
+        std::env::remove_var("CORECRUXD_WRITE_CONFIRMATION_SIGNING_KEY_B64");
+        std::env::remove_var("CORECRUXD_WRITE_CONFIRMATION_KEY_ID");
+    }
+
     #[tokio::test]
     async fn tools_call_store_and_query_facts() {
         // Share the envelope env-var lock so this test isn't racy with the

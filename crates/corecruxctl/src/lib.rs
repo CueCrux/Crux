@@ -29,6 +29,7 @@ pub mod gaps;
 pub mod inspect_receipt;
 pub mod memory;
 pub mod ops;
+pub mod output_verify;
 pub mod parity;
 pub mod projections;
 pub mod quickstart;

@@ -17,8 +17,8 @@ use clap::{Parser, Subcommand};
 
 use corecruxctl::{
     admin, audit_export, audit_pack, evidence, explain, extensions, fixture_digest, gaps, inspect_receipt, memory,
-    parity, projections, receipts, reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import, storage,
-    structured_log, tooling_env, verify_store,
+    output_verify, parity, projections, receipts, reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import,
+    storage, structured_log, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -428,6 +428,35 @@ enum Command {
         /// Path to the bundle (e.g. ./audit-bundle.tar.zst).
         bundle: PathBuf,
         /// Print the structured report as JSON to stdout.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Verify a C2PA Content Credentials manifest produced by `output_attest`
+    /// (agent-ux-07). Reads the JUMBF envelope from FILE, optionally
+    /// re-hashes the bound CONTENT bytes, and reports the four-way check
+    /// (canonical-hash, signature, content-hash, receipt cross-reference).
+    /// Works OFFLINE — no network calls; the verifying key is supplied via
+    /// `--pub-key-hex` or `CRUX_C2PA_VERIFY_PUBLIC_KEY_HEX`.
+    #[command(name = "output-verify")]
+    OutputVerify {
+        /// Path to the JUMBF envelope file (base64-encoded JSON, as
+        /// returned by the MCP tool's `manifest_jumbf_base64`).
+        #[arg(value_name = "FILE")]
+        manifest_path: PathBuf,
+        /// Optional content bytes to re-hash. If omitted, the
+        /// content-hash check is skipped and reported as `n/a`.
+        #[arg(long, value_name = "PATH")]
+        content: Option<PathBuf>,
+        /// Hex-encoded Ed25519 verifying key (32 bytes / 64 hex chars).
+        /// Defaults to env var `CRUX_C2PA_VERIFY_PUBLIC_KEY_HEX`.
+        #[arg(long)]
+        pub_key_hex: Option<String>,
+        /// Optional expected CROWN receipt id — if set, the manifest's
+        /// `crown_receipt_id` must match or the verifier exits non-zero.
+        #[arg(long)]
+        expected_receipt: Option<String>,
+        /// Emit compact JSON instead of pretty JSON.
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -2106,6 +2135,30 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             if !report.ok {
                 std::process::exit(2);
+            }
+            Ok(())
+        }
+        Command::OutputVerify {
+            manifest_path,
+            content,
+            pub_key_hex,
+            expected_receipt,
+            json,
+        } => {
+            let report = output_verify::run(&output_verify::Options {
+                manifest_path,
+                content,
+                pub_key_hex,
+                expected_receipt,
+            })?;
+            let rendered = if json {
+                serde_json::to_string(&report)?
+            } else {
+                serde_json::to_string_pretty(&report)?
+            };
+            println!("{rendered}");
+            if !report.ok {
+                return Err("C2PA manifest verification failed".into());
             }
             Ok(())
         }

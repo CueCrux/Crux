@@ -33,6 +33,7 @@ pub mod memory;
 pub mod memory_use;
 pub mod observations;
 pub mod observe;
+pub mod output_attest;
 pub mod passport;
 pub mod query;
 pub mod receipt_verify;
@@ -332,6 +333,33 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["turn_id"],
                 "examples": [
                     { "turn_id": "turn-42", "fact_ids": ["f_01J_abc", "f_01J_def"], "intent": "answer" }
+                ]
+            }),
+        },
+        // ── Verifiable output receipts (agent-ux-07 — EU AI Act Art. 50) ─
+        ToolDefinition {
+            name: "output_attest".to_string(),
+            description: "Emit a C2PA-shaped Content Credentials manifest binding `content_bytes` to a \
+                          CROWN receipt id. The returned `manifest_jumbf_base64` is verifiable offline by \
+                          `corecruxctl output-verify` and online via the daemon `/v1/output/verify` route. \
+                          Reuses the daemon's existing Ed25519 CROWN signer (no new key class). \
+                          Requires an authenticated passport. Gated by CORECRUXD_FEATURE_C2PA_OUTPUT=1 \
+                          (default off). Engineering scaffolding aligned with EU AI Act Art. 50; legal \
+                          conformity assessment remains the operator's responsibility."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "content_bytes_base64": { "type": "string", "description": "Base64-encoded content bytes (one of content_bytes_base64 or content_path required)" },
+                    "content_path":         { "type": "string", "description": "Local file path the daemon reads (alternative to content_bytes_base64)" },
+                    "content_type":         { "type": "string", "description": "Optional MIME type (e.g. image/png)" },
+                    "receipt_id":           { "type": "string", "description": "CROWN receipt id this artefact is bound to" },
+                    "claim_generator":      { "type": "string", "description": "Optional claim_generator override (defaults to cuecrux/<version>)" },
+                    "token_budget":         { "type": "integer", "description": "Soft cap on content size in tokens (~bytes/4)" }
+                },
+                "required": ["receipt_id"],
+                "examples": [
+                    { "content_bytes_base64": "iVBORw0KGgo...", "receipt_id": "r_01J_abc", "content_type": "image/png", "token_budget": 4000 }
                 ]
             }),
         },
@@ -1803,6 +1831,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "get_bootstrap",      "output": "{ facts: [{entity, key, value}], total_tokens }" },
         { "tool": "fact_history",       "output": "{ versions: [{fact_id, value, version, supersedes, confidence, stored_at, deleted}] }" },
         { "tool": "memory_acknowledge_use", "output": "{ turn_id, intent, feature_enabled, receipt_ref, memories_used: [{fact_id, topic, age_days}], filtered_count, redacted_count, not_found_count, not_visible_count }" },
+        { "tool": "output_attest",          "output": "{ content: [...], manifest: { manifest_id, spec_version, manifest_jumbf_base64, content_hash_blake3_hex, crown_receipt_id, signer_key_id, signer_passport, verify_url, verify_command, ai_act_notice } } — agent-ux-07 C2PA Content Credentials emitter." },
         { "tool": "memory_view",        "output": "{ content: [...], structuredContent: { facts: [{id, entity, key, value, version, stored_at, confidence, pinned, source_receipt}], total_tokens, returned } } — agent-ux-01 consumer surface; reserved prefixes filtered." },
         { "tool": "memory_edit",        "output": "{ content: [...], structuredContent: { old_fact_id, new_fact: MemoryFact, reason } } — new fact supersedes old; reason embedded as `memory_edit:<reason>` source_receipt." },
         { "tool": "memory_pin",         "output": "{ content: [...], structuredContent: { fact_id, pinned: bool } } — pin state stored under reserved __memory_pin::<agent>::*." },
@@ -1905,6 +1934,8 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "get_bootstrap" => facts::handle_get_bootstrap(args, ctx).await,
         "fact_history" => facts::handle_fact_history(args, ctx).await,
         "memory_acknowledge_use" => memory_use::handle_memory_acknowledge_use(args, ctx).await,
+        // C2PA Content Credentials emitter (agent-ux-07).
+        "output_attest" => output_attest::handle_output_attest(args, ctx).await,
         // Memory panel (agent-ux-01).
         "memory_view" => memory::handle_memory_view(args, ctx).await,
         "memory_edit" => memory::handle_memory_edit(args, ctx).await,
@@ -2017,7 +2048,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 80; // 77 prior (incl. audit_export_bundle agent-ux-11 + freshness agent-ux-03 + autonomy_contract agent-ux-10 + receipt_verify agent-ux-04 + tool_trace_recent agent-ux-06 + 2 approvals agent-ux-05) + 3 artefacts (agent-ux-12).
+    const TOOL_COUNT: usize = 81; // 80 prior (incl. audit_export_bundle agent-ux-11 + freshness agent-ux-03 + autonomy_contract agent-ux-10 + receipt_verify agent-ux-04 + tool_trace_recent agent-ux-06 + 2 approvals agent-ux-05 + 3 artefacts agent-ux-12) + output_attest (agent-ux-07).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
