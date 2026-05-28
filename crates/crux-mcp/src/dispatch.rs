@@ -719,6 +719,47 @@ mod tests {
         std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
     }
 
+    /// `autonomy_contract` (agent-ux-10) is metadata-only — it MUST NOT
+    /// participate in the audit-envelope wrapper. Pinning this with a
+    /// dispatch-level test makes any accidental opt-in (e.g. someone adds
+    /// "autonomy_contract" to `tool_emits_envelope`) fail loud, matching
+    /// the child plan's "cross-PR envelope-test interaction" gate.
+    #[tokio::test]
+    async fn envelope_omits_for_autonomy_contract() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::autonomy::FEATURE_FLAG_ENV, "1");
+        let ctx = test_ctx();
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "autonomy_contract",
+                    "arguments": {"token_budget": 4000}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "autonomy_contract must NOT emit an envelope (metadata-only tool); got {result}"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "autonomy_contract must NOT use the payload/envelope wrapper shape"
+        );
+        // Tool still returns its own structuredContent under the legacy
+        // shape — assert the matrix made it through.
+        assert!(result["structuredContent"].is_object());
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::autonomy::FEATURE_FLAG_ENV);
+    }
+
     #[tokio::test]
     async fn envelope_on_query_facts_omits_reserved_prefix_entries() {
         let _guard = envelope_env_lock().lock().await;
