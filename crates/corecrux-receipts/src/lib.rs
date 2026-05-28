@@ -21,6 +21,7 @@ mod keyring_v1;
 mod memory_use_v1;
 mod store_v1;
 mod subject_index_v1;
+pub mod vault_pki_x509_signer;
 mod verify_v1;
 
 pub use approval_decision_v1::{
