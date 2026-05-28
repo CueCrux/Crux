@@ -28,6 +28,7 @@
 //! as `(kind, id, payload)` tuples plus directed labelled edges between them.
 
 pub mod action_enrichment;
+pub mod artefact_store;
 pub mod edge_store;
 pub mod embeddings;
 pub mod entity_store;
@@ -39,6 +40,7 @@ pub mod semantic;
 pub mod session_store;
 pub mod sync;
 
+pub use artefact_store::{ArtefactError, ArtefactMetadata, ArtefactRecord, ArtefactStore, PutArtefact};
 pub use edge_store::{EdgeError, EdgeQuery, EdgeRecord, EdgeStore};
 pub use entity_store::{EntityError, EntityQuery, EntityRecord, EntityStore};
 pub use fact_store::{Fact, FactStore, HorizonClass};

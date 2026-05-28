@@ -356,6 +356,7 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
         entity_store: Arc::new(RwLock::new(corecrux_memory::EntityStore::new())),
         edge_store: Arc::new(RwLock::new(corecrux_memory::EdgeStore::new())),
         kind_registry: Arc::new(RwLock::new(corecrux_memory::KindRegistry::new())),
+        artefact_store: Arc::new(RwLock::new(corecrux_memory::ArtefactStore::new())),
     }
 }
 

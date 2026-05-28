@@ -10,6 +10,7 @@
 
 pub mod action;
 pub mod approvals;
+pub mod artefacts;
 pub mod audit;
 pub mod audit_export;
 pub mod autonomy;
@@ -77,7 +78,17 @@ pub struct ToolDefinition {
 /// `envelope` and never-listed tools always see the unchanged `payload`
 /// shape.
 pub fn tool_emits_envelope(name: &str) -> bool {
-    matches!(name, "query_facts" | "memory_acknowledge_use" | "memory_freshness")
+    // `memory_freshness` (agent-ux-03 M3) opts in to expose freshness info
+    // alongside the envelope-style memories_used[] view.
+    // `artefact_list` (agent-ux-12) is memory-adjacent — it surfaces parked
+    // artefact ids as the `memories_used[]` envelope entries so the host can
+    // render "I parked this for you" affordances next to the chat turn.
+    // `artefact_put` + `artefact_get` are opaque-byte read/write and do NOT
+    // opt in (no envelope on either).
+    matches!(
+        name,
+        "query_facts" | "memory_acknowledge_use" | "memory_freshness" | "artefact_list"
+    )
 }
 
 /// Non-breaking pointer added to every legacy tool's description at
@@ -527,6 +538,72 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["fact_id"],
                 "examples": [
                     { "fact_id": "f_01J_abc" }
+                ]
+            }),
+        },
+        // ── Artefacts (agent-ux-12 — calm deferred output) ────────
+        ToolDefinition {
+            name: "artefact_put".to_string(),
+            description: "Park a large byte payload under a passport-owned, BLAKE3-keyed id. \
+                          Returns `{artefact_id, size_bytes, mime_type, created_at, expires_at}` — \
+                          the content itself is fetched separately via `artefact_get`. Identical \
+                          bytes always produce the same id (content-addressed). Default TTL 7 days, \
+                          max 90 days. Requires an authenticated passport. Gated by \
+                          CORECRUXD_FEATURE_ARTEFACTS=1 (default off)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "content_bytes_base64": { "type": "string",  "description": "Base64-encoded content bytes (required for inline put)." },
+                    "mime_type":             { "type": "string",  "description": "Free-form MIME label (e.g. application/json, application/x-c2pa-manifest)." },
+                    "tool_origin":           { "type": "string",  "description": "Optional 'which tool produced this' label, surfaced in artefact_list." },
+                    "ttl_seconds":           { "type": "integer", "description": "Optional TTL in seconds. Default 7d. Max 90d. 0 = no expiry." },
+                    "token_budget":          { "type": "integer", "description": "Mandatory output-token cap (QC.2). Honoured by the response shape." }
+                },
+                "required": ["content_bytes_base64", "mime_type"],
+                "examples": [
+                    { "content_bytes_base64": "eyJzaGEyNTYiOiJhYmMifQ==", "mime_type": "application/json", "tool_origin": "audit_export_bundle", "token_budget": 500 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "artefact_get".to_string(),
+            description: "Fetch a previously-put artefact by id. Returns `{content_base64, mime_type, \
+                          size_bytes, created_at, expires_at}`. Cross-passport reads return \
+                          CAPABILITY_DENIED so the operator can audit. Reserved-prefix mime entries \
+                          are still readable by their owner — filtering only applies to list output. \
+                          Gated by CORECRUXD_FEATURE_ARTEFACTS=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "artefact_id":  { "type": "string",  "description": "Content-addressed id returned by artefact_put." },
+                    "token_budget": { "type": "integer", "description": "Mandatory output-token cap (QC.2)." }
+                },
+                "required": ["artefact_id"],
+                "examples": [
+                    { "artefact_id": "art_0123abcd…", "token_budget": 4000 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "artefact_list".to_string(),
+            description: "List metadata for artefacts owned by the calling passport. Reserved-prefix \
+                          mime entries are filtered out (T.1). Cross-passport entries are never \
+                          included. Newest-first, capped at `top_k`. Optional `scope` substring \
+                          filters by mime_type or tool_origin. This is the read surface the console \
+                          /artefacts panel calls. Gated by CORECRUXD_FEATURE_ARTEFACTS=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "top_k":        { "type": "integer", "description": "Max artefacts to return (default 20).", "default": 20 },
+                    "scope":        { "type": "string",  "description": "Optional mime_type / tool_origin substring filter." },
+                    "token_budget": { "type": "integer", "description": "Mandatory output-token cap (QC.2)." }
+                },
+                "examples": [
+                    { "token_budget": 500 },
+                    { "top_k": 50, "scope": "audit_export_bundle", "token_budget": 2000 }
                 ]
             }),
         },
@@ -1733,6 +1810,9 @@ pub fn tool_output_docs() -> Value {
         { "tool": "memory_freshness",   "output": "{ rows: [{fact_id, entity, key, horizon_class, freshness, age_hours, stored_at, reverified_at?}], policy: {volatile_stale_hours, medium_stale_days, stable_stale_days}, now }" },
         { "tool": "memory_set_horizon", "output": "{ fact_id, horizon_class, ok: bool }" },
         { "tool": "memory_reverify",    "output": "{ fact_id, receipt_id, receipt_class: 'Reverify', reverified_at }" },
+        { "tool": "artefact_put",       "output": "{ content: [...], structuredContent: { artefact_id, mime_type, tool_origin, size_bytes, created_at, expires_at } } — id is `art_<blake3_hex>`; identical bytes coalesce." },
+        { "tool": "artefact_get",       "output": "{ content: [...], structuredContent: { artefact_id, mime_type, tool_origin, size_bytes, created_at, expires_at, content_base64 } } — cross-passport reads return CAPABILITY_DENIED." },
+        { "tool": "artefact_list",      "output": "{ content: [...], structuredContent: { artefacts: [{artefact_id, mime_type, tool_origin, size_bytes, created_at, expires_at}], count } } — passport-scoped, reserved-prefix mime entries filtered." },
         { "tool": "get_session",        "output": "{ session_id, state, updated_at, total_tokens }" },
         { "tool": "save_session",       "output": "{ session_id, updated_at }" },
         { "tool": "list_sessions",      "output": "{ sessions: [string] }" },
@@ -1834,6 +1914,10 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "memory_freshness" => freshness::handle_memory_freshness(args, ctx).await,
         "memory_set_horizon" => freshness::handle_memory_set_horizon(args, ctx).await,
         "memory_reverify" => freshness::handle_memory_reverify(args, ctx).await,
+        // Artefacts (agent-ux-12).
+        "artefact_put" => artefacts::handle_artefact_put(args, ctx).await,
+        "artefact_get" => artefacts::handle_artefact_get(args, ctx).await,
+        "artefact_list" => artefacts::handle_artefact_list(args, ctx).await,
         "get_session" => sessions::handle_get_session(args, ctx).await,
         "save_session" => sessions::handle_save_session(args, ctx).await,
         "list_sessions" => sessions::handle_list_sessions(args, ctx).await,
@@ -1933,7 +2017,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 77; // 75 prior (incl. audit_export_bundle agent-ux-11 + freshness agent-ux-03 + autonomy_contract agent-ux-10 + receipt_verify agent-ux-04 + tool_trace_recent agent-ux-06) + 2 risk-tiered HITL (agent-ux-05: approval_request + approval_decide).
+    const TOOL_COUNT: usize = 80; // 77 prior (incl. audit_export_bundle agent-ux-11 + freshness agent-ux-03 + autonomy_contract agent-ux-10 + receipt_verify agent-ux-04 + tool_trace_recent agent-ux-06 + 2 approvals agent-ux-05) + 3 artefacts (agent-ux-12).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

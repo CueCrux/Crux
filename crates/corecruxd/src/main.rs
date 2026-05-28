@@ -507,6 +507,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             corecrux_memory::EdgeStore::new()
         })),
         kind_registry: Arc::new(RwLock::new(corecrux_memory::KindRegistry::new())),
+        artefact_store: Arc::new(RwLock::new(corecrux_memory::ArtefactStore::new())),
         update_status: update_status.clone(),
         event_bus: corecrux_memory::events::EventBus::new(1024),
         session: {
@@ -660,7 +661,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 state.entity_store.clone(),
                 state.edge_store.clone(),
                 state.kind_registry.clone(),
-            ),
+            )
+            .with_artefact_store(state.artefact_store.clone()),
         ))
     } else {
         None
@@ -3686,6 +3688,7 @@ mod tests {
             entity_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::EntityStore::new())),
             edge_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::EdgeStore::new())),
             kind_registry: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::KindRegistry::new())),
+            artefact_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::ArtefactStore::new())),
         };
 
         let router: axum::Router = crate::http::router(state);
