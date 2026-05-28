@@ -18,6 +18,7 @@
 //! See `corecruxctl --help` for the live subcommand listing.
 
 pub mod admin;
+pub mod audit_export;
 pub mod audit_pack;
 pub mod benchmark;
 pub mod evidence;

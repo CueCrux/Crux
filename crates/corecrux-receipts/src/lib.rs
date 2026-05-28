@@ -9,6 +9,7 @@
 //! - Hashing/verification operates over the stored bytes exactly (no re-serialization).
 //! - Verification output is derived state (rebuildable).
 
+mod audit_bundle_v1;
 mod body_v1;
 mod candidate_digest_v1;
 mod export_v1;
@@ -19,6 +20,11 @@ mod store_v1;
 mod subject_index_v1;
 mod verify_v1;
 
+pub use audit_bundle_v1::{
+    build_bundle_v1, decode_receipts_cbor, verify_bundle_v1, AuditBundleError, AuditBundleManifestV1,
+    AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1, BuiltBundleV1, VerifyReportV1,
+    BUNDLE_FORMAT_VERSION, EVENTS_FILENAME, MANIFEST_FILENAME, RECEIPTS_FILENAME,
+};
 pub use body_v1::{extract_body_index_v1, extract_linked_receipts_v1, ReceiptBodyIndexV1};
 pub use export_v1::{
     build_receipt_export_v1, BuildReceiptExportInput, ExportError, ExportFileV1, ExportFormatV1, ExportRedactionV1,

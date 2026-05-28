@@ -626,6 +626,70 @@ mod tests {
         std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
     }
 
+    /// Cross-PR envelope-contract sibling for agent-ux-11. The
+    /// `audit_export_bundle` tool is an audit-export surface — the bundle
+    /// IS the receipts artefact. The per-turn envelope (which is a
+    /// memory-query rationale) doesn't naturally apply, so the master
+    /// plan asks us to explicitly assert the negative: even with the
+    /// feature flag ON, `audit_export_bundle` must NOT emit an
+    /// `envelope` field.
+    #[tokio::test]
+    async fn envelope_omits_for_audit_export() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::audit_export::FEATURE_FLAG_ENV, "1");
+        let td = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::tools::audit_export::EXPORT_DIR_ENV, td.path());
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "operator-1".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // Seed one fact so the export has something to write.
+        dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "project-x", "key": "k", "value": "v"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "audit_export_bundle",
+                    "arguments": {"token_budget": 1000}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.expect("audit_export_bundle returned no result");
+        assert!(
+            result.get("envelope").is_none(),
+            "audit_export_bundle MUST NOT emit envelope (the bundle IS the receipts) — got {result:#?}"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "audit_export_bundle MUST NOT be wrapped in payload (the bundle IS the receipts) — got {result:#?}"
+        );
+        // The raw response shape stays intact.
+        assert!(result["bundle_id"].is_string());
+        assert!(result["bytes_path"].is_string());
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::audit_export::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::audit_export::EXPORT_DIR_ENV);
+    }
+
     #[tokio::test]
     async fn envelope_on_other_tools_remain_unwrapped() {
         let _guard = envelope_env_lock().lock().await;

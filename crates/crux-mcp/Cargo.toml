@@ -39,6 +39,8 @@ http-body-util = "0.1"
 tempfile = "3"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
+zstd = "0.13.3"
+tar = "0.4.44"
 
 [lints]
 workspace = true
