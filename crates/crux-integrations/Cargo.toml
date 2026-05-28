@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 base64 = "0.22.1"
 blake3 = "1.8.5"
+# c2pa_signer_selector reuses the existing CROWN signer + Vault PKI
+# X.509 signer that already live in corecrux-receipts (PR #123).
+corecrux-receipts = { path = "../corecrux-receipts" }
 # `rand_core` lets the signing helper generate keypairs deterministically
 # from caller-supplied RNG (also enables pack-time signing in tools).
 ed25519-dalek = { version = "2.2.0", features = ["std", "rand_core"] }
@@ -14,9 +17,14 @@ hex = "0.4.3"
 serde = { version = "1.0.218", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.12"
+# tracing::warn! breadcrumb when an operator typoes CORECRUX_C2PA_SIGNER.
+tracing = "0.1.41"
 
 [dev-dependencies]
 ed25519-dalek = { version = "2.2.0", features = ["std", "rand_core"] }
+# Env-mutation tests in c2pa_signer_selector are serialised so they
+# don't race the dual-flag tests in crux-mcp::tools::output_attest.
+serial_test = "3"
 tempfile = "3.10"
 
 [lints]
