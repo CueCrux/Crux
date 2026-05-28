@@ -206,11 +206,11 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
     // ── Wave-A/B agent-UX dimensions (shipped 2026-05-28) ────────────────
     //
     // These entries advertise capabilities surfaced by the wave-A/B agent-UX
-    // programme. EVERY entry below corresponds to a real shipped MCP tool with
-    // a file:line citation; see
-    // `PlanCrux/.agent/execplans/crux-session-capability-catalog-refresh-2026-05-29.md`
-    // for the full mapping. These are ADVERTISEMENTS — never consult them for
-    // auth or rate-limiting; the underlying tool surface keeps its own gates.
+    // programme. EVERY entry below carries an inline `file:line` citation to
+    // a real shipped MCP tool — that is the load-bearing audit trail (per the
+    // workspace QC.5 "no unverified claims" rule). These are ADVERTISEMENTS —
+    // never consult them for auth or rate-limiting; the underlying tool
+    // surface keeps its own gates.
     // `min_tier = None` keeps them visible on the local-tier passport so the
     // Crux Daemon `POST /session` response is self-describing.
     // Dim 02 (`memory_acknowledge_use`) is deliberately NOT advertised here per
@@ -397,20 +397,20 @@ mod tests {
     const BASELINE_LOCAL_TIER_CAPS: &[&str] = &["session_context", "journal_append", "proof_verify"];
 
     /// Wave-A/B agent-UX capability strings (dims 01, 03-12 — dim 02 deliberately
-    /// excluded per the source brief on `memory_acknowledge_use`).
-    /// See PlanCrux/.agent/execplans/crux-session-capability-catalog-refresh-2026-05-29.md.
+    /// excluded; the `memory_acknowledge_use` tool exists but the dimension was
+    /// scoped out of wave-A/B shipping).
     const WAVE_AB_AGENT_UX_CAPS: &[&str] = &[
-        "memory.readable_editable", // dim 01
-        "memory.freshness",         // dim 03
-        "trace.source_linked",      // dim 04
-        "approval.risk_tiered",     // dim 05
-        "trace.typed_actions",      // dim 06
+        "memory.readable_editable",   // dim 01
+        "memory.freshness",           // dim 03
+        "trace.source_linked",        // dim 04
+        "approval.risk_tiered",       // dim 05
+        "trace.typed_actions",        // dim 06
         "output.verifiable_receipts", // dim 07
-        "identity.continuity",      // dim 08
-        "memory.scoped_forget",     // dim 09
-        "autonomy.contract",        // dim 10
-        "audit.byo_trail",          // dim 11
-        "output.calm_deferred",     // dim 12
+        "identity.continuity",        // dim 08
+        "memory.scoped_forget",       // dim 09
+        "autonomy.contract",          // dim 10
+        "audit.byo_trail",            // dim 11
+        "output.calm_deferred",       // dim 12
     ];
 
     #[test]
@@ -430,11 +430,7 @@ mod tests {
         for entry in DEFAULT_CATALOG {
             assert!(!entry.cap.is_empty(), "empty capability name in DEFAULT_CATALOG");
             assert!(!entry.affinity.is_empty(), "empty affinity for cap `{}`", entry.cap);
-            assert!(
-                !entry.cost_class.is_empty(),
-                "empty cost_class for cap `{}`",
-                entry.cap
-            );
+            assert!(!entry.cost_class.is_empty(), "empty cost_class for cap `{}`", entry.cap);
         }
     }
 
