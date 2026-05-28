@@ -15,7 +15,7 @@ use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use corecrux_memory::{EdgeStore, EntityStore, FactStore, KindRegistry, SessionStore};
+use corecrux_memory::{ArtefactStore, EdgeStore, EntityStore, FactStore, KindRegistry, SessionStore};
 use corecrux_retrieval::IndexManager;
 use corecrux_types::UpdateStatus;
 
@@ -63,6 +63,9 @@ pub struct McpContext {
     pub edge_store: Arc<RwLock<EdgeStore>>,
     /// Substrate kind registry — populated at startup by lens crates.
     pub kind_registry: Arc<RwLock<KindRegistry>>,
+    /// Content-addressed artefact store (agent-ux-12, calm deferred output).
+    /// In-memory; opt-in for tools that want to park large payloads off-chat.
+    pub artefact_store: Arc<RwLock<ArtefactStore>>,
 }
 
 impl McpContext {
@@ -85,6 +88,7 @@ impl McpContext {
             entity_store: Arc::new(RwLock::new(EntityStore::new())),
             edge_store: Arc::new(RwLock::new(EdgeStore::new())),
             kind_registry: Arc::new(RwLock::new(KindRegistry::new())),
+            artefact_store: Arc::new(RwLock::new(ArtefactStore::new())),
         }
     }
 
@@ -114,6 +118,7 @@ impl McpContext {
             entity_store: Arc::new(RwLock::new(EntityStore::new())),
             edge_store: Arc::new(RwLock::new(EdgeStore::new())),
             kind_registry: Arc::new(RwLock::new(KindRegistry::new())),
+            artefact_store: Arc::new(RwLock::new(ArtefactStore::new())),
         }
     }
 
@@ -127,6 +132,15 @@ impl McpContext {
         self.entity_store = entity_store;
         self.edge_store = edge_store;
         self.kind_registry = kind_registry;
+        self
+    }
+
+    /// Attach a shared artefact store (agent-ux-12). When unset the context
+    /// uses its own in-process instance, which is fine for tests but means
+    /// HTTP and MCP would see different stores in prod — `corecruxd::main`
+    /// is the wiring point.
+    pub fn with_artefact_store(mut self, artefact_store: Arc<RwLock<ArtefactStore>>) -> Self {
+        self.artefact_store = artefact_store;
         self
     }
 
@@ -148,6 +162,7 @@ impl McpContext {
             entity_store: Arc::clone(&self.entity_store),
             edge_store: Arc::clone(&self.edge_store),
             kind_registry: Arc::clone(&self.kind_registry),
+            artefact_store: Arc::clone(&self.artefact_store),
         }
     }
 
@@ -1210,6 +1225,151 @@ mod tests {
         }
         std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
         std::env::remove_var(crate::tools::freshness::FEATURE_FLAG_ENV);
+    }
+
+    /// Sibling envelope-filter contract for `artefact_list` (agent-ux-12).
+    /// Mirrors `envelope_on_query_facts_omits_reserved_prefix_entries`: the
+    /// envelope's `memories_used[]` must never expose a reserved-prefix
+    /// mime_type, even though the underlying artefact store can hold them
+    /// (reserved-prefix mime entries are filtered at list time too — this
+    /// test is the master-plan-mandated defence-in-depth probe).
+    #[tokio::test]
+    async fn envelope_on_artefact_list_omits_reserved_prefix_entries() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+
+        let _guard = envelope_env_lock().lock().await;
+        let _artefact_guard = crate::tools::artefacts::artefact_flag_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::artefacts::FEATURE_FLAG_ENV, "1");
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // One public + two reserved-prefix mime artefacts under the same
+        // passport. Only the public one may appear in the envelope.
+        for (mime, body) in [
+            ("text/plain", "alpha"),
+            ("__ops::secret", "must-not-leak"),
+            ("__bootstrap__::seed", "must-not-leak-either"),
+        ] {
+            let resp = dispatch(
+                rpc(
+                    "tools/call",
+                    json!({
+                        "name": "artefact_put",
+                        "arguments": {
+                            "mime_type": mime,
+                            "content_bytes_base64": B64.encode(body.as_bytes()),
+                        }
+                    }),
+                ),
+                &ctx,
+                None,
+            )
+            .await;
+            assert!(resp.error.is_none(), "artefact_put err: {:?}", resp.error);
+        }
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "artefact_list", "arguments": {"top_k": 20}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        // Envelope wrapper engaged because (a) flag on, (b) opted in via
+        // tool_emits_envelope, (c) per-tool builder is registered.
+        assert!(result["payload"].is_object());
+        let env = &result["envelope"];
+        let memories = env["memories_used"].as_array().unwrap();
+        assert_eq!(
+            memories.len(),
+            1,
+            "artefact_list envelope must strip reserved-prefix mime entries (got {} entries)",
+            memories.len()
+        );
+        assert_eq!(memories[0]["topic"], "text/plain");
+        for m in memories {
+            let topic = m["topic"].as_str().unwrap();
+            assert!(
+                !topic.starts_with("__"),
+                "artefact_list envelope leaked reserved mime {topic}"
+            );
+        }
+        assert_eq!(env["autonomy_consumed"]["capability"], "artefacts:read");
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::artefacts::FEATURE_FLAG_ENV);
+    }
+
+    /// Sibling omit-test: artefact_put and artefact_get do NOT opt into the
+    /// envelope wrapper. They handle opaque bytes (writes/reads of
+    /// arbitrary content) and would emit too much chatter if wrapped — the
+    /// envelope is for memory-adjacent surfaces only.
+    #[tokio::test]
+    async fn envelope_on_artefact_put_get_remain_unwrapped() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+
+        let _guard = envelope_env_lock().lock().await;
+        let _artefact_guard = crate::tools::artefacts::artefact_flag_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::artefacts::FEATURE_FLAG_ENV, "1");
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // artefact_put — must keep legacy shape.
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "artefact_put",
+                    "arguments": {
+                        "mime_type": "text/plain",
+                        "content_bytes_base64": B64.encode(b"no-envelope-here"),
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "artefact_put must NOT carry an envelope wrapper"
+        );
+        assert!(result.get("payload").is_none());
+        let id = result["structuredContent"]["artefact_id"].as_str().unwrap().to_string();
+
+        // artefact_get — also must keep legacy shape.
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "artefact_get", "arguments": {"artefact_id": id}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "artefact_get must NOT carry an envelope wrapper"
+        );
+        assert!(result.get("payload").is_none());
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::artefacts::FEATURE_FLAG_ENV);
     }
 
     #[tokio::test]

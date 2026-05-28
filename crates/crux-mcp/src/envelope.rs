@@ -230,6 +230,12 @@ pub async fn build_envelope_for_tool(name: &str, args: &Value, ctx: &McpContext)
         // memories_used[] gives non-freshness readers (audit
         // consumers) the same reserved-prefix-safe view.
         "memory_freshness" => Some(build_envelope_for_query_facts(args, ctx).await),
+        // agent-ux-12: artefact_list surfaces parked artefact ids as
+        // memories_used[] entries so the host can render "I parked this for
+        // you" affordances. Reserved-prefix mime types are stripped by the
+        // builder (defence-in-depth — the underlying list filter already
+        // enforces T.1).
+        "artefact_list" => Some(crate::tools::artefacts::build_envelope_for_artefact_list(args, ctx).await),
         _ => None,
     }
 }

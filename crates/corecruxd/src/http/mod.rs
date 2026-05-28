@@ -257,6 +257,8 @@ pub struct AppState {
     pub edge_store: Arc<RwLock<corecrux_memory::EdgeStore>>,
     /// Substrate kind registry. Lens crates register at startup.
     pub kind_registry: Arc<RwLock<corecrux_memory::KindRegistry>>,
+    /// Content-addressed artefact store (agent-ux-12, calm deferred output).
+    pub artefact_store: Arc<RwLock<corecrux_memory::ArtefactStore>>,
 }
 
 pub fn router(state: AppState) -> Router {

@@ -66,6 +66,7 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
             entity_store: Arc::clone(&ctx.entity_store),
             edge_store: Arc::clone(&ctx.edge_store),
             kind_registry: Arc::clone(&ctx.kind_registry),
+            artefact_store: Arc::clone(&ctx.artefact_store),
         }
     };
 
