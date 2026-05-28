@@ -23,21 +23,23 @@
 //! Vault path. That posture works for the legacy ed25519/X.509 split
 //! shipped in PR #123 commit `407bbab`. The single-flag posture in
 //! this module is the public, daemon-wide runtime surface specified
-//! by the ExecPlan
-//! `corecruxd-c2pa-vault-pki-runtime-enablement-2026-05-29` — it
-//! intentionally treats `vault` as a first-class backend rather than
-//! a guarded escape hatch. Both surfaces co-exist; the dual-flag
-//! posture in `output_attest` is the lower-level guard that stays
-//! authoritative when both are set.
+//! by the ExecPlan `corecruxd-c2pa-vault-pki-runtime-enablement-2026-05-29`
+//! — it intentionally treats `vault` as a first-class backend rather
+//! than a guarded escape hatch. Both surfaces co-exist; the dual-flag
+//! posture in `output_attest` is retained as a backward-compatible
+//! fallback (see [`Self::from_canonical_env`] returning `None`).
 //!
-//! ## Default OFF
+//! ## Default OFF (caller-applied)
 //!
-//! When `CORECRUX_C2PA_SIGNER` is unset, empty, or `in_process`, this
-//! module returns the in-process Ed25519 signer and never constructs
-//! a Vault client. The Vault path is reached only by explicit
-//! `CORECRUX_C2PA_SIGNER=vault`.
+//! [`C2paSignerKind::from_canonical_env`] returns `Option<Self>`:
+//! - `Some(InProcess)` for `CORECRUX_C2PA_SIGNER=in_process` or any
+//!   unknown value (with a warning).
+//! - `Some(Vault)` for `CORECRUX_C2PA_SIGNER=vault`.
+//! - `None` when the env var is unset or empty, so the caller can
+//!   apply its own policy (e.g. honouring the PR #123 dual-flag pair
+//!   as a legacy fallback before defaulting to `InProcess`).
 //!
-//! Unknown values log a warning and fall back to `in_process` rather
+//! Unknown values log a warning and fall back to `InProcess` rather
 //! than failing startup — the ExecPlan's M6 flip is an explicit
 //! operator-attended action, so a typo in an env file should not
 //! silently switch the trust anchor.
@@ -57,12 +59,13 @@ use corecrux_receipts::vault_pki_x509_signer::VaultPkiX509Signer;
 use corecrux_receipts::C2paSigner;
 use ed25519_dalek::SigningKey;
 
-/// Environment variable consumed by [`C2paSignerKind::from_env`].
+/// Environment variable consumed by [`C2paSignerKind::from_canonical_env`].
 ///
 /// Recognised values:
-/// - unset / empty / `in_process` → [`C2paSignerKind::InProcess`]
-/// - `vault` → [`C2paSignerKind::Vault`]
-/// - anything else → [`C2paSignerKind::InProcess`] with a tracing warning
+/// - unset / empty → `None` (caller applies its own fallback)
+/// - `in_process` → `Some(C2paSignerKind::InProcess)`
+/// - `vault` → `Some(C2paSignerKind::Vault)`
+/// - anything else → `Some(C2paSignerKind::InProcess)` with a tracing warning
 pub const SIGNER_FLAG_ENV: &str = "CORECRUX_C2PA_SIGNER";
 
 /// String value selecting the legacy in-process Ed25519 signer.
@@ -74,7 +77,8 @@ pub const SIGNER_VALUE_VAULT: &str = "vault";
 
 /// Selector for the C2PA manifest signer backend.
 ///
-/// Resolved from `CORECRUX_C2PA_SIGNER` via [`Self::from_env`].
+/// Resolved from `CORECRUX_C2PA_SIGNER` via
+/// [`Self::from_canonical_env`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C2paSignerKind {
     /// Legacy in-process Ed25519 CROWN signer
@@ -90,27 +94,26 @@ pub enum C2paSignerKind {
 }
 
 impl C2paSignerKind {
-    /// Read `CORECRUX_C2PA_SIGNER` from the environment and resolve
-    /// the selector. Unrecognised values fall back to
-    /// [`C2paSignerKind::InProcess`] with a warning — see module
+    /// Read the canonical single env (`CORECRUX_C2PA_SIGNER`) and
+    /// resolve the selector. Returns `None` when the env var is unset
+    /// or empty, so the caller can apply its own legacy fallback (e.g.
+    /// the PR #123 dual-flag pair). Unrecognised values fall back to
+    /// `Some(C2paSignerKind::InProcess)` with a warning — see module
     /// docs for the rationale.
-    pub fn from_env() -> Self {
-        match std::env::var(SIGNER_FLAG_ENV) {
-            Err(_) => Self::InProcess,
-            Ok(raw) => {
-                let normalised = raw.trim().to_ascii_lowercase();
-                match normalised.as_str() {
-                    "" | SIGNER_VALUE_IN_PROCESS => Self::InProcess,
-                    SIGNER_VALUE_VAULT => Self::Vault,
-                    other => {
-                        tracing::warn!(
-                            env = SIGNER_FLAG_ENV,
-                            value = other,
-                            "unknown CORECRUX_C2PA_SIGNER value; defaulting to in_process"
-                        );
-                        Self::InProcess
-                    }
-                }
+    pub fn from_canonical_env() -> Option<Self> {
+        let raw = std::env::var(SIGNER_FLAG_ENV).ok()?;
+        let normalised = raw.trim().to_ascii_lowercase();
+        match normalised.as_str() {
+            "" => None,
+            SIGNER_VALUE_IN_PROCESS => Some(Self::InProcess),
+            SIGNER_VALUE_VAULT => Some(Self::Vault),
+            other => {
+                tracing::warn!(
+                    env = SIGNER_FLAG_ENV,
+                    value = other,
+                    "unknown CORECRUX_C2PA_SIGNER value; defaulting to in_process"
+                );
+                Some(Self::InProcess)
             }
         }
     }
@@ -235,46 +238,50 @@ mod tests {
         SigningKey::from_bytes(&[0x42u8; 32])
     }
 
-    /// 1. Default (env unset) resolves to InProcess.
+    /// 1. Default (env unset) resolves to `None` so the caller applies
+    ///    its own fallback policy.
     #[test]
     #[serial(c2pa_signer_env)]
-    fn c2pa_signer_kind_from_env_default_in_process() {
+    fn c2pa_signer_kind_from_canonical_env_default_none() {
         std::env::remove_var(SIGNER_FLAG_ENV);
-        assert_eq!(C2paSignerKind::from_env(), C2paSignerKind::InProcess);
+        assert_eq!(C2paSignerKind::from_canonical_env(), None);
     }
 
-    /// 2. `vault` resolves to Vault.
+    /// 2. `vault` resolves to `Some(Vault)`.
     #[test]
     #[serial(c2pa_signer_env)]
-    fn c2pa_signer_kind_from_env_explicit_vault() {
+    fn c2pa_signer_kind_from_canonical_env_explicit_vault() {
         std::env::set_var(SIGNER_FLAG_ENV, "vault");
-        assert_eq!(C2paSignerKind::from_env(), C2paSignerKind::Vault);
+        assert_eq!(C2paSignerKind::from_canonical_env(), Some(C2paSignerKind::Vault));
         std::env::remove_var(SIGNER_FLAG_ENV);
     }
 
     /// 3. `in_process` (and `IN_PROCESS` upper-case variant via the
-    ///    trim+to_ascii_lowercase pass) resolves to InProcess.
+    ///    trim+to_ascii_lowercase pass) resolves to `Some(InProcess)`.
+    ///    Empty string falls through to `None` (caller fallback).
     #[test]
     #[serial(c2pa_signer_env)]
-    fn c2pa_signer_kind_from_env_in_process_explicit() {
+    fn c2pa_signer_kind_from_canonical_env_in_process_explicit() {
         std::env::set_var(SIGNER_FLAG_ENV, "in_process");
-        assert_eq!(C2paSignerKind::from_env(), C2paSignerKind::InProcess);
+        assert_eq!(C2paSignerKind::from_canonical_env(), Some(C2paSignerKind::InProcess));
         std::env::set_var(SIGNER_FLAG_ENV, "  IN_PROCESS  ");
-        assert_eq!(C2paSignerKind::from_env(), C2paSignerKind::InProcess);
+        assert_eq!(C2paSignerKind::from_canonical_env(), Some(C2paSignerKind::InProcess));
         std::env::set_var(SIGNER_FLAG_ENV, "");
-        assert_eq!(C2paSignerKind::from_env(), C2paSignerKind::InProcess);
+        assert_eq!(C2paSignerKind::from_canonical_env(), None);
         std::env::remove_var(SIGNER_FLAG_ENV);
     }
 
-    /// 4. Unknown values warn + fall back to InProcess (do NOT crash
-    ///    the daemon).
+    /// 4. Unknown values warn + fall back to `Some(InProcess)` (do NOT
+    ///    crash the daemon, do NOT fall through to caller fallback —
+    ///    the operator explicitly set the env var to something, so
+    ///    honour their intent to use the single-flag surface).
     #[test]
     #[serial(c2pa_signer_env)]
-    fn c2pa_signer_kind_from_env_unknown_falls_back() {
+    fn c2pa_signer_kind_from_canonical_env_unknown_falls_back() {
         std::env::set_var(SIGNER_FLAG_ENV, "weird");
-        assert_eq!(C2paSignerKind::from_env(), C2paSignerKind::InProcess);
+        assert_eq!(C2paSignerKind::from_canonical_env(), Some(C2paSignerKind::InProcess));
         std::env::set_var(SIGNER_FLAG_ENV, "vault-pki-p256"); // wrong, not the accepted shape
-        assert_eq!(C2paSignerKind::from_env(), C2paSignerKind::InProcess);
+        assert_eq!(C2paSignerKind::from_canonical_env(), Some(C2paSignerKind::InProcess));
         std::env::remove_var(SIGNER_FLAG_ENV);
     }
 

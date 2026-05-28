@@ -1260,12 +1260,15 @@ version = "0.2.0"
 dependencies = [
  "base64",
  "blake3",
+ "corecrux-receipts",
  "ed25519-dalek",
  "hex",
  "serde",
  "serde_json",
+ "serial_test",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
