@@ -335,11 +335,12 @@ pub(crate) fn projection_class_of(c: HorizonClass) -> decay::HorizonClass {
 /// Test-support hook: shared mutex serializing access to
 /// `CORECRUXD_FEATURE_FRESHNESS` across this module's tests and the
 /// cross-module envelope tests in `crate::dispatch::tests` that also
-/// need to toggle the flag deterministically.
+/// need to toggle the flag deterministically. Delegates to
+/// [`crate::test_env_lock`] so every env-mutating test in this crate
+/// shares one process-wide `tokio::sync::Mutex`.
 #[cfg(test)]
 pub(crate) fn tests_support_flag_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    crate::test_env_lock()
 }
 
 #[cfg(test)]

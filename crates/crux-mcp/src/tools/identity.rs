@@ -760,24 +760,26 @@ pub(crate) mod tests {
         decode_passport_link_device_body_v1, decode_passport_merge_body_v1, decode_passport_split_body_v1,
     };
 
-    pub(crate) fn flag_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    // Delegates to the crate-wide test env lock so identity tests
+    // serialise against every other env-mutating test in this crate
+    // (see `crate::test_env_lock` for the full rationale).
+    pub(crate) fn flag_lock() -> &'static tokio::sync::Mutex<()> {
+        crate::test_env_lock()
     }
 
     struct FeatureFlagGuard {
         prior: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
     }
     impl FeatureFlagGuard {
-        fn enabled() -> Self {
-            let lock = flag_lock().lock().unwrap_or_else(|p| p.into_inner());
+        async fn enabled() -> Self {
+            let lock = flag_lock().lock().await;
             let prior = env::var(FEATURE_FLAG_ENV).ok();
             env::set_var(FEATURE_FLAG_ENV, "1");
             Self { prior, _lock: lock }
         }
-        fn disabled() -> Self {
-            let lock = flag_lock().lock().unwrap_or_else(|p| p.into_inner());
+        async fn disabled() -> Self {
+            let lock = flag_lock().lock().await;
             let prior = env::var(FEATURE_FLAG_ENV).ok();
             env::remove_var(FEATURE_FLAG_ENV);
             Self { prior, _lock: lock }
@@ -834,7 +836,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_split_requires_feature_flag() {
-        let _g = FeatureFlagGuard::disabled();
+        let _g = FeatureFlagGuard::disabled().await;
         let ctx = agent_ctx("personal::alice");
         let err = handle_passport_split(
             &json!({
@@ -851,7 +853,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_split_requires_token_budget() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("personal::alice");
         let err = handle_passport_split(
             &json!({
@@ -868,7 +870,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_split_requires_passport() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = McpContext::new_default("test-node"); // anonymous
         let err = handle_passport_split(
             &json!({
@@ -885,7 +887,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_split_requires_operator_tier() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("personal::alice");
         // Issue without promoting — stays at unverified.
         handle_issue_passport(&json!({}), &ctx).await.unwrap();
@@ -905,7 +907,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_split_rejects_cross_tenant() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("personal::alice");
         promote_to_operator(&ctx).await;
         let err = handle_passport_split(
@@ -924,7 +926,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_split_forks_identity_and_emits_receipt() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("personal::alice");
         promote_to_operator(&ctx).await;
 
@@ -964,7 +966,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_split_rejects_duplicate_name() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("personal::alice");
         promote_to_operator(&ctx).await;
         // Pre-create the target name as an existing passport.
@@ -1007,7 +1009,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_merge_requires_explicit_conflict_policy() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("personal::alice");
         promote_to_operator(&ctx).await;
         let err = handle_passport_merge(
@@ -1026,7 +1028,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_merge_rejects_cross_tenant() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("personal::alice");
         promote_to_operator(&ctx).await;
         // Seed a foreign-tenant target passport.
@@ -1067,7 +1069,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_merge_error_on_conflict_returns_409_with_list() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         // Caller is the target; we'll seed a source passport under the
         // same tenant and create a (entity, key) conflict.
         let ctx = agent_ctx("personal::alice");
@@ -1132,7 +1134,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_merge_prefer_source_resolves_deterministically_and_retires_source() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("personal::alice");
         promote_to_operator(&ctx).await;
         // Seed source.
@@ -1208,7 +1210,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_merge_caller_must_own_one_side() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("personal::eve"); // unrelated caller
         promote_to_operator(&ctx).await;
         // Seed both passports as separate identities.
@@ -1253,7 +1255,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_link_device_requires_operator_tier() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("personal::alice");
         handle_issue_passport(&json!({}), &ctx).await.unwrap();
         let fp = blake3::hash(b"laptop-001").to_hex().to_string();
@@ -1272,7 +1274,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_link_device_requires_token_budget() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("personal::alice");
         promote_to_operator(&ctx).await;
         let fp = blake3::hash(b"laptop-001").to_hex().to_string();
@@ -1290,7 +1292,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_link_device_rejects_malformed_fingerprint() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("personal::alice");
         promote_to_operator(&ctx).await;
         let err = handle_passport_link_device(
@@ -1308,7 +1310,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_link_device_stores_binding_and_emits_receipt() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("personal::alice");
         promote_to_operator(&ctx).await;
         let fp = blake3::hash(b"laptop-001-attestation").to_hex().to_string();
@@ -1342,7 +1344,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn passport_link_device_defaults_capabilities_to_read_only() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("personal::alice");
         promote_to_operator(&ctx).await;
         let fp = blake3::hash(b"device-2").to_hex().to_string();

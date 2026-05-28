@@ -395,28 +395,29 @@ mod tests {
     use crate::dispatch::McpContext;
     use crate::tools::facts::{handle_query_facts, handle_store_fact};
 
-    // Tests that flip CORECRUXD_FEATURE_SCOPED_FORGET serialise on this
-    // mutex; cargo test runs the suite in parallel so env-var
-    // manipulation between tests must take a lock or the flag value
-    // races (observed: 2 spurious failures under parallel run).
-    fn flag_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    // Tests that flip CORECRUXD_FEATURE_SCOPED_FORGET serialise on the
+    // crate-wide test env lock; cargo test runs the suite in parallel
+    // so env-var manipulation between tests must take this lock or the
+    // flag value races (observed: 2 spurious failures under parallel
+    // run, and the wider traces.rs flake fixed in
+    // fix/crux-mcp-tools-traces-test-isolation-2026-05-29).
+    fn flag_lock() -> &'static tokio::sync::Mutex<()> {
+        crate::test_env_lock()
     }
 
     struct FeatureFlagGuard {
         prior: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
     }
     impl FeatureFlagGuard {
-        fn enabled() -> Self {
-            let lock = flag_lock().lock().unwrap_or_else(|p| p.into_inner());
+        async fn enabled() -> Self {
+            let lock = flag_lock().lock().await;
             let prior = env::var(FEATURE_FLAG_ENV).ok();
             env::set_var(FEATURE_FLAG_ENV, "1");
             Self { prior, _lock: lock }
         }
-        fn disabled() -> Self {
-            let lock = flag_lock().lock().unwrap_or_else(|p| p.into_inner());
+        async fn disabled() -> Self {
+            let lock = flag_lock().lock().await;
             let prior = env::var(FEATURE_FLAG_ENV).ok();
             env::remove_var(FEATURE_FLAG_ENV);
             Self { prior, _lock: lock }
@@ -471,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_does_not_mutate() {
-        let _guard = FeatureFlagGuard::disabled();
+        let _guard = FeatureFlagGuard::disabled().await;
         let ctx = agent_ctx("alice");
         handle_store_fact(&json!({"entity": "test-fixture-a", "key": "k", "value": "v"}), &ctx)
             .await
@@ -521,7 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_forget_requires_feature_flag() {
-        let _guard = FeatureFlagGuard::disabled();
+        let _guard = FeatureFlagGuard::disabled().await;
         let ctx = agent_ctx("alice");
         let err = handle_memory_forget(
             &json!({"scope": {"type": "entity_prefix", "value": "x"}, "reason": "test"}),
@@ -534,7 +535,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_forget_requires_passport() {
-        let _guard = FeatureFlagGuard::enabled();
+        let _guard = FeatureFlagGuard::enabled().await;
         let ctx = McpContext::new_default("test-node"); // anonymous
         let err = handle_memory_forget(
             &json!({"scope": {"type": "entity_prefix", "value": "x"}, "reason": "t"}),
@@ -548,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_forget_requires_reason() {
-        let _guard = FeatureFlagGuard::enabled();
+        let _guard = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("alice");
         let err = handle_memory_forget(&json!({"scope": {"type": "entity_prefix", "value": "x-"}}), &ctx)
             .await
@@ -559,7 +560,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_forget_soft_deletes_matching_facts() {
-        let _guard = FeatureFlagGuard::enabled();
+        let _guard = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("alice");
         handle_store_fact(&json!({"entity": "test-fixture-a", "key": "k1", "value": "v1"}), &ctx)
             .await
@@ -599,7 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_forget_skips_reserved_prefixes_even_with_matching_scope() {
-        let _guard = FeatureFlagGuard::enabled();
+        let _guard = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("alice");
         handle_store_fact(
             &json!({"entity": "__ops::config-audit", "key": "k", "value": "v"}),
@@ -624,7 +625,7 @@ mod tests {
         // CROWN-verifier compatibility check: the CBOR we hand back must
         // round-trip through `decode_forget_body_v1` (the same path the
         // v3 verifier uses to extract the body index).
-        let _guard = FeatureFlagGuard::enabled();
+        let _guard = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("alice");
         handle_store_fact(&json!({"entity": "tx-1", "key": "k", "value": "v"}), &ctx)
             .await
@@ -652,7 +653,7 @@ mod tests {
         // a scope would otherwise match. Alice stores a private fact;
         // Bob's forget under the same logical-entity scope must affect
         // zero facts.
-        let _guard = FeatureFlagGuard::enabled();
+        let _guard = FeatureFlagGuard::enabled().await;
         let alice = agent_ctx("alice");
         let bob = agent_ctx("bob");
         handle_store_fact(

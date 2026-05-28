@@ -36,3 +36,33 @@ pub mod server;
 pub mod tenant_category;
 pub mod tools;
 pub mod traces;
+
+/// Process-wide test lock for every env-var mutating test in `crux-mcp`.
+///
+/// Rust's `std::env::{set_var, remove_var, var}` are not thread-safe —
+/// they wrap C's `setenv` / `getenv` which mutate a single process-wide
+/// `environ` pointer array without synchronisation. Holding per-module
+/// locks is insufficient: concurrent threads each holding their own
+/// per-module lock still race on `environ`, and a sibling thread's
+/// concurrent `set_var` (for an unrelated variable) can interleave the
+/// underlying allocation/copy/swap so that a `var()` read briefly
+/// observes a stale or partially-updated array. The visible symptom is
+/// flakes like `tools::traces::tests::*` returning `Number(0)` when a
+/// preceding `set_var(FEATURE_FLAG, "1")` should have made
+/// `traces_enabled()` return true.
+///
+/// Every test in this crate that calls `std::env::set_var` /
+/// `std::env::remove_var` (or reads an env var whose value matters)
+/// MUST acquire this single lock. Module-local lock functions in this
+/// crate now delegate here so existing import paths keep working.
+///
+/// Not gated on `#[cfg(test)]` because a handful of test-helper
+/// functions (`tools::approvals::_approvals_test_lock`,
+/// `tools::artefacts::artefact_flag_lock`) are exposed `pub` for
+/// cross-module test wiring and must be callable from non-`test` build
+/// modes too. The function has no side effects when not invoked.
+#[doc(hidden)]
+pub fn test_env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}

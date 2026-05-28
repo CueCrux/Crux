@@ -431,13 +431,12 @@ pub(crate) mod tests {
     /// so all tests in this workspace that touch the C2PA signer env
     /// vars (`CORECRUX_C2PA_SIGNER`, `CORECRUXD_C2PA_SIGNER_BACKEND`,
     /// `CORECRUXD_FEATURE_C2PA_X509_SIGNER`) serialise behind a single
-    /// tokio::Mutex. Two-lock setups race because `std::Mutex` and
-    /// `tokio::Mutex` are independent. Exposing this as `pub(crate)`
-    /// keeps the rule one-place explicit instead of hidden across
-    /// modules.
+    /// process-wide `tokio::sync::Mutex`. Delegates to
+    /// [`crate::test_env_lock`] — per-module locks don't prevent
+    /// concurrent writes to `environ` from a sibling test holding a
+    /// different module's lock.
     pub(crate) fn flag_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        crate::test_env_lock()
     }
 
     fn clear_env() {

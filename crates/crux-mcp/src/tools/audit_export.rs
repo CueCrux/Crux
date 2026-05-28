@@ -329,24 +329,25 @@ mod tests {
     use crate::tools::facts::handle_store_fact;
     use corecrux_receipts::{verify_bundle_v1, AuditBundleManifestV1};
 
-    // Tests that flip the feature flag must serialise — env-var races
-    // are real (see the forget.rs pattern).
-    fn flag_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    // Tests that flip the feature flag must serialise on the crate-wide
+    // test env lock — env-var races are real (see the forget.rs pattern
+    // and the wider traces.rs flake fixed in
+    // fix/crux-mcp-tools-traces-test-isolation-2026-05-29).
+    fn flag_lock() -> &'static tokio::sync::Mutex<()> {
+        crate::test_env_lock()
     }
 
     struct FeatureFlagGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
     }
     impl FeatureFlagGuard {
-        fn enabled() -> Self {
-            let lock = flag_lock().lock().unwrap_or_else(|p| p.into_inner());
+        async fn enabled() -> Self {
+            let lock = flag_lock().lock().await;
             env::set_var(FEATURE_FLAG_ENV, "1");
             Self { _lock: lock }
         }
-        fn disabled() -> Self {
-            let lock = flag_lock().lock().unwrap_or_else(|p| p.into_inner());
+        async fn disabled() -> Self {
+            let lock = flag_lock().lock().await;
             env::remove_var(FEATURE_FLAG_ENV);
             Self { _lock: lock }
         }
@@ -371,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_export_disabled_by_default() {
-        let _g = FeatureFlagGuard::disabled();
+        let _g = FeatureFlagGuard::disabled().await;
         let ctx = agent_ctx("alice");
         let err = handle_audit_export_bundle(&json!({"token_budget": 1000}), &ctx)
             .await
@@ -381,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_export_requires_token_budget() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let ctx = agent_ctx("alice");
         let err = handle_audit_export_bundle(&json!({}), &ctx).await.unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
@@ -390,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_export_builds_self_verifying_bundle() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let td = tempfile::tempdir().unwrap();
         redirect_export_dir(&td);
 
@@ -415,7 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_export_strips_reserved_prefixes_for_non_operator() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let td = tempfile::tempdir().unwrap();
         redirect_export_dir(&td);
 
@@ -473,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_export_operator_sees_reserved_when_requested() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let td = tempfile::tempdir().unwrap();
         redirect_export_dir(&td);
 
@@ -500,7 +501,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_export_respects_since_until_window() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let td = tempfile::tempdir().unwrap();
         redirect_export_dir(&td);
 
@@ -518,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_export_manifest_round_trips() {
-        let _g = FeatureFlagGuard::enabled();
+        let _g = FeatureFlagGuard::enabled().await;
         let td = tempfile::tempdir().unwrap();
         redirect_export_dir(&td);
 

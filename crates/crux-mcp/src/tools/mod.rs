@@ -2167,8 +2167,12 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn sync_env_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        // Delegate to the crate-wide test env lock so sync-tests serialise
+        // against every other env-mutating test in this crate. Per-module
+        // locks don't prevent concurrent writes to `environ` from sibling
+        // threads holding a different module's lock (see
+        // `crate::test_env_lock` for the full rationale).
+        crate::test_env_lock()
     }
 }
 

@@ -358,9 +358,10 @@ mod tests {
 
     #[test]
     fn envelope_flag_default_off() {
-        // Use a unique env var probe — don't mutate FEATURE_FLAG_ENV here
-        // because other tests may run in parallel. Just assert that absent
-        // env, envelope_enabled() returns false.
+        // Hold the crate-wide test env lock so this sync test doesn't
+        // race the tokio-test suite. `blocking_lock` is safe here: this
+        // function is a plain `#[test]` (no tokio runtime in scope).
+        let _g = crate::test_env_lock().blocking_lock();
         std::env::remove_var(FEATURE_FLAG_ENV);
         assert!(!envelope_enabled());
     }

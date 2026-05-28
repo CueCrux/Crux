@@ -132,13 +132,14 @@ pub async fn _reset_requests_buffer_for_tests() {
 
 /// Shared mutex serialising any test that mutates the per-process
 /// requests buffer (and/or [`FEATURE_FLAG_ENV`]). Exposed publicly so
-/// the sibling dispatch envelope tests can hold it too — without the
-/// shared lock, the global buffer races between the approvals-suite
-/// tests and the envelope_omits_* dispatch tests.
+/// the sibling dispatch envelope tests can hold it too. Delegates to
+/// [`crate::test_env_lock`] so every env-mutating test in this crate
+/// shares one process-wide `tokio::sync::Mutex` — per-module locks
+/// don't prevent concurrent writes to `environ` from a sibling test
+/// holding a different module's lock.
 #[doc(hidden)]
 pub fn _approvals_test_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    crate::test_env_lock()
 }
 
 /// Public snapshot of the pending requests, for the work-panel
