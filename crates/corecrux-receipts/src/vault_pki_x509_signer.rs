@@ -398,6 +398,18 @@ impl VaultPkiX509Signer {
         })
     }
 
+    /// Borrow the active leaf state for inspection (corecruxctl
+    /// `c2pa-cert-status`). Returns `None` if `initialize()` has not
+    /// been called.
+    pub fn current_leaf_chain_pem(&self) -> Option<String> {
+        self.state.read().as_ref().map(|s| s.cert_chain_pem.clone())
+    }
+
+    /// Return the active leaf's `notAfter` SystemTime if loaded.
+    pub fn current_leaf_not_after(&self) -> Option<SystemTime> {
+        self.state.read().as_ref().map(|s| s.cert_not_after)
+    }
+
     /// Check whether the leaf is within `ROTATION_THRESHOLD_HOURS` of
     /// expiry. Returns `Ok(true)` when a rotation has been performed,
     /// `Ok(false)` when the leaf is still healthy.
@@ -451,6 +463,57 @@ impl VaultPkiX509Signer {
             cert_not_after,
         }))
     }
+}
+
+/// Implement [`crate::c2pa_manifest_v1::C2paSigner`] so the
+/// VaultPkiX509Signer can be passed to [`crate::c2pa_manifest_v1::sign_c2pa_manifest_via_signer`]
+/// without the c2pa module learning anything about Vault. The C2PA
+/// path hashes the canonical body with BLAKE3-32 and we sign the
+/// digest as a prehash (ECDSA accepts any 32-byte prehash; the
+/// algorithm identifier `es256` advertises SHA-256, but the prehash
+/// payload is opaque to the cryptographic layer — verifiers MUST
+/// rehash the same canonical bytes before comparing).
+impl crate::c2pa_manifest_v1::C2paSigner for VaultPkiX509Signer {
+    fn sign_body(
+        &self,
+        canonical_body_bytes: &[u8],
+    ) -> std::result::Result<crate::c2pa_manifest_v1::SignedManifestParts, crate::c2pa_manifest_v1::C2paManifestError>
+    {
+        let hash = blake3::hash(canonical_body_bytes);
+        let x509_sig = self
+            .sign(hash.as_bytes())
+            .map_err(|e| crate::c2pa_manifest_v1::C2paManifestError::Encode(format!("vault pki sign: {e}")))?;
+        // Key id for X.509 envelopes = SHA-256 hex of the leaf DER.
+        // Stable across reloads, doesn't collide with Ed25519 key ids,
+        // and lets verifiers cross-reference the chain.
+        let leaf_der = x509_sig.cert_chain_der.first().cloned().unwrap_or_default();
+        let key_id = format!("x509-sha256:{}", hex_lower(&sha256_digest(&leaf_der)));
+        Ok(crate::c2pa_manifest_v1::SignedManifestParts {
+            signature_bytes: x509_sig.signature_der,
+            signature_alg: "es256".to_string(),
+            key_id,
+            x5chain_pem: Some(x509_sig.cert_chain_pem),
+        })
+    }
+}
+
+fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let out = h.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&out);
+    arr
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
 }
 
 /// Default POST hook — synchronous ureq call to Vault PKI. Vault's
@@ -866,6 +929,79 @@ mod tests {
         assert!(!der.is_empty());
         let cert = Certificate::from_der(&der).unwrap();
         assert!(cert.tbs_certificate.serial_number.as_bytes().len() > 0);
+    }
+
+    #[test]
+    fn test_end_to_end_c2pa_envelope_via_x509_signer() {
+        // Build a C2PA manifest, sign through the VaultPkiX509Signer
+        // as a `C2paSigner` impl, parse the envelope back, and
+        // confirm the x5chain PEM round-trips and the alg is `es256`.
+        use crate::c2pa_manifest_v1::{
+            build_c2pa_manifest_v1, parse_jumbf_base64, sign_c2pa_manifest_via_signer, C2paManifestInputV1,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let signer = VaultPkiX509Signer::with_post_fn(test_config(&tmp), mock_post_fn(TestPki::new()));
+        signer.regenerate_leaf().unwrap();
+        let content = b"x509-end-to-end-content";
+        let manifest = build_c2pa_manifest_v1(&C2paManifestInputV1 {
+            content_bytes: content,
+            content_type: Some("image/png"),
+            crown_receipt_id: "r_x509_e2e",
+            signer_passport: "passport:test",
+            claim_generator: "cuecrux/test",
+            manifest_id: "urn:cuecrux:c2pa:e2e",
+            when: "2026-05-28T00:00:00Z",
+            model: None,
+        });
+        let signed = sign_c2pa_manifest_via_signer(manifest, &signer, "2026-05-28T00:00:00Z").unwrap();
+        assert_eq!(signed.signature_alg, "es256");
+        assert!(signed.key_id.starts_with("x509-sha256:"));
+        assert!(signed.x5chain_pem.is_some());
+        let envelope = signed.to_jumbf_base64();
+        let parsed = parse_jumbf_base64(&envelope).unwrap();
+        assert_eq!(parsed.signature_alg, "es256");
+        assert_eq!(parsed.signature, signed.signature);
+        assert!(parsed.x5chain_pem.is_some());
+    }
+
+    #[test]
+    fn test_strict_profile_assertion_on_returned_leaf() {
+        // After regenerate_leaf the in-memory chain's leaf cert must
+        // satisfy the strict C2PA profile: BasicConstraints CA:FALSE
+        // (since c2pa-leaf role sets basic_constraints_valid_for_non_ca).
+        // The test PKI mirrors Vault's profile by NOT marking the leaf
+        // as a CA. If a Vault drift introduced is_ca: true, this test
+        // would fail because the cert would carry CA:TRUE.
+        let tmp = tempfile::tempdir().unwrap();
+        let signer = VaultPkiX509Signer::with_post_fn(test_config(&tmp), mock_post_fn(TestPki::new()));
+        signer.regenerate_leaf().unwrap();
+        let chain_pem = signer.current_leaf_chain_pem().unwrap();
+        let leaf_pem = split_pem_certs(&chain_pem).into_iter().next().unwrap();
+        let leaf_der = pem_to_der(&leaf_pem).unwrap();
+        let leaf = Certificate::from_der(&leaf_der).unwrap();
+        // Walk the extensions and confirm any BasicConstraints
+        // extension says CA:FALSE.
+        // OID 2.5.29.19 = id-ce-basicConstraints.
+        if let Some(exts) = &leaf.tbs_certificate.extensions {
+            for ext in exts {
+                if ext.extn_id.to_string() == "2.5.29.19" {
+                    // The DER for BasicConstraints CA:FALSE is
+                    // SEQUENCE {} (empty) which encodes to 30 00.
+                    // CA:TRUE would include a BOOLEAN TRUE (01 01 ff).
+                    let bytes = ext.extn_value.as_bytes();
+                    assert!(
+                        !bytes.windows(3).any(|w| w == [0x01u8, 0x01, 0xff]),
+                        "leaf cert must not assert CA:TRUE"
+                    );
+                }
+            }
+        }
+        // And subject CN matches what we requested.
+        let subject = leaf.tbs_certificate.subject.to_string();
+        assert!(
+            subject.contains(DEFAULT_LEAF_CN),
+            "leaf subject CN must match config, got: {subject}"
+        );
     }
 
     #[test]

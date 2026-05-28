@@ -36,10 +36,11 @@ pub use audit_bundle_v1::{
 };
 pub use body_v1::{extract_body_index_v1, extract_linked_receipts_v1, ReceiptBodyIndexV1};
 pub use c2pa_manifest_v1::{
-    assert_crown_receipt_id_v1, build_c2pa_manifest_v1, canonical_body_bytes_v1, parse_jumbf_base64,
-    sign_c2pa_manifest_v1, verify_c2pa_manifest_v1, C2paActionV1, C2paManifestError, C2paManifestInputV1,
-    C2paManifestV1, C2paSignedManifestV1, C2paVerificationReportV1, C2PA_ACTION_CREATED, C2PA_MANIFEST_SCHEMA_V1,
-    C2PA_SPEC_VERSION, CUECRUX_CROWN_RECEIPT_LABEL, DIGITAL_SOURCE_TYPE_AI, SOFTWARE_AGENT_DEFAULT,
+    assert_crown_receipt_id_v1, build_c2pa_manifest_v1, canonical_body_bytes_v1, ed25519_signer, parse_jumbf_base64,
+    sign_c2pa_manifest_v1, sign_c2pa_manifest_via_signer, verify_c2pa_manifest_v1, C2paActionV1, C2paManifestError,
+    C2paManifestInputV1, C2paManifestV1, C2paSignedManifestV1, C2paSigner, C2paVerificationReportV1,
+    SignedManifestParts, C2PA_ACTION_CREATED, C2PA_MANIFEST_SCHEMA_V1, C2PA_SPEC_VERSION, CUECRUX_CROWN_RECEIPT_LABEL,
+    DIGITAL_SOURCE_TYPE_AI, SOFTWARE_AGENT_DEFAULT,
 };
 pub use export_v1::{
     build_receipt_export_v1, BuildReceiptExportInput, ExportError, ExportFileV1, ExportFormatV1, ExportRedactionV1,
