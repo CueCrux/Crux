@@ -1827,7 +1827,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 73; // 70 on main (incl. audit_export_bundle agent-ux-11) + 3 freshness (memory_freshness, memory_set_horizon, memory_reverify agent-ux-03 M3).
+    const TOOL_COUNT: usize = 72; // 69 on main (incl. audit_export_bundle agent-ux-11) + 3 freshness (memory_freshness, memory_set_horizon, memory_reverify agent-ux-03 M3).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
