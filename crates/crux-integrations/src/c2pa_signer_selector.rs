@@ -27,7 +27,7 @@
 //! — it intentionally treats `vault` as a first-class backend rather
 //! than a guarded escape hatch. Both surfaces co-exist; the dual-flag
 //! posture in `output_attest` is retained as a backward-compatible
-//! fallback (see [`Self::from_canonical_env`] returning `None`).
+//! fallback (see [`C2paSignerKind::from_canonical_env`] returning `None`).
 //!
 //! ## Default OFF (caller-applied)
 //!
