@@ -9,6 +9,10 @@ corecruxctl = "corecruxctl"
 fpr = "fpr"
 pfordelta = "pfordelta"
 FPR = "FPR"
+# COSE — CBOR Object Signing and Encryption (RFC 8152 / RFC 9360),
+# used in the C2PA X.509 envelope (`x5chain` header) wiring.
+COSE = "COSE"
+Cose = "Cose"
 # NLP tokenizer: stemming test data (intentional substrings)
 ment = "ment"
 ful = "ful"
