@@ -166,6 +166,22 @@ pub const TOOL_SURFACE: &[ToolSurfaceEntry] = &[
         tier: ToolTier::Local,
         marker: "[local]",
     },
+    // Identity continuity (agent-ux-08) — free-tier local surface.
+    ToolSurfaceEntry {
+        name: "passport_split",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
+    ToolSurfaceEntry {
+        name: "passport_merge",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
+    ToolSurfaceEntry {
+        name: "passport_link_device",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
     ToolSurfaceEntry {
         name: "issue_passport",
         tier: ToolTier::HostedGated,

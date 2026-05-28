@@ -16,6 +16,7 @@ mod c2pa_manifest_v1;
 mod candidate_digest_v1;
 mod export_v1;
 mod forget_v1;
+mod identity_v1;
 mod keyring_v1;
 mod memory_use_v1;
 mod store_v1;
@@ -50,6 +51,16 @@ pub use forget_v1::{
     ForgetReceiptError, ForgetReceiptSummaryV1, ForgetScopeV1, PermanentPurgeReceiptBodyV1,
     CONTENT_TYPE_FORGET_BODY_V1, CONTENT_TYPE_PERMANENT_PURGE_BODY_V1, EVT_RECEIPT_FORGET_BODY_V1,
     EVT_RECEIPT_PERMANENT_PURGE_BODY_V1, SCHEMA_FORGET_BODY_V1, SCHEMA_PERMANENT_PURGE_BODY_V1,
+};
+pub use identity_v1::{
+    decode_passport_link_device_body_v1, decode_passport_merge_body_v1, decode_passport_split_body_v1,
+    encode_passport_link_device_body_v1, encode_passport_merge_body_v1, encode_passport_split_body_v1,
+    extract_identity_receipt_schema_v1, IdentityReceiptError, MergeConflictPolicyV1, PassportLinkDeviceReceiptBodyV1,
+    PassportMergeConflictV1, PassportMergeReceiptBodyV1, PassportSplitReceiptBodyV1,
+    CONTENT_TYPE_PASSPORT_LINK_DEVICE_BODY_V1, CONTENT_TYPE_PASSPORT_MERGE_BODY_V1,
+    CONTENT_TYPE_PASSPORT_SPLIT_BODY_V1, EVT_RECEIPT_PASSPORT_LINK_DEVICE_BODY_V1, EVT_RECEIPT_PASSPORT_MERGE_BODY_V1,
+    EVT_RECEIPT_PASSPORT_SPLIT_BODY_V1, SCHEMA_PASSPORT_LINK_DEVICE_BODY_V1, SCHEMA_PASSPORT_MERGE_BODY_V1,
+    SCHEMA_PASSPORT_SPLIT_BODY_V1,
 };
 pub use keyring_v1::{Ed25519KeyEntryV1, Ed25519KeyRingV1, KeyRingError};
 pub use memory_use_v1::{
