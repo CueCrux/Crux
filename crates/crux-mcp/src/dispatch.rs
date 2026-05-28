@@ -592,11 +592,11 @@ mod tests {
 
     /// Serialize all envelope-related dispatch tests so the process-wide
     /// `CORECRUXD_FEATURE_AUDIT_ENVELOPE` env var doesn't race between
-    /// concurrent tokio tests. `tokio::sync::Mutex` is used so the guard
-    /// can be safely held across `.await` boundaries.
+    /// concurrent tokio tests. Delegates to [`crate::test_env_lock`] so
+    /// every env-mutating test in this crate shares one process-wide
+    /// `tokio::sync::Mutex` (see that function's doc for the rationale).
     fn envelope_env_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        crate::test_env_lock()
     }
 
     #[tokio::test]
@@ -832,8 +832,11 @@ mod tests {
     // the registry by accident.
     #[tokio::test]
     async fn envelope_omits_for_approval_request() {
+        // Single crate-wide env lock — every per-module lock helper in
+        // this crate now delegates to `crate::test_env_lock`, so the
+        // single `envelope_env_lock` acquisition also serialises against
+        // approvals/freshness/artefacts/identity/output_attest tests.
         let _guard = envelope_env_lock().lock().await;
-        let _g2 = crate::tools::approvals::_approvals_test_lock().lock().await;
         std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
         std::env::set_var(crate::tools::approvals::FEATURE_FLAG_ENV, "1");
         crate::tools::approvals::_reset_requests_buffer_for_tests().await;
@@ -879,8 +882,9 @@ mod tests {
 
     #[tokio::test]
     async fn envelope_omits_for_approval_decide() {
+        // Single crate-wide env lock; see the sibling
+        // `envelope_omits_for_approval_request` comment for rationale.
         let _guard = envelope_env_lock().lock().await;
-        let _g2 = crate::tools::approvals::_approvals_test_lock().lock().await;
         std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
         std::env::set_var(crate::tools::approvals::FEATURE_FLAG_ENV, "1");
         crate::tools::approvals::_reset_requests_buffer_for_tests().await;
@@ -1168,11 +1172,10 @@ mod tests {
         // dispatch::tests::envelope_on_query_facts_omits_reserved_prefix_entries
         // for the original spike contract.
         //
-        // Two env-var locks are acquired (envelope + freshness) because
-        // each is held by a different test module and either being
-        // toggled mid-call would race this test.
+        // Single crate-wide env lock — `freshness::tests_support_flag_lock`
+        // now delegates to `crate::test_env_lock`, the same mutex as
+        // `envelope_env_lock`, so one acquisition suffices.
         let _guard = envelope_env_lock().lock().await;
-        let _gf = crate::tools::freshness::tests_support_flag_lock().lock().await;
         std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
         std::env::set_var(crate::tools::freshness::FEATURE_FLAG_ENV, "1");
         let ctx = test_ctx();
@@ -1238,8 +1241,10 @@ mod tests {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
 
+        // Single crate-wide env lock — `artefacts::artefact_flag_lock`
+        // now delegates to `crate::test_env_lock`, same mutex as
+        // `envelope_env_lock`, so one acquisition suffices.
         let _guard = envelope_env_lock().lock().await;
-        let _artefact_guard = crate::tools::artefacts::artefact_flag_lock().lock().await;
         std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
         std::env::set_var(crate::tools::artefacts::FEATURE_FLAG_ENV, "1");
 
@@ -1317,8 +1322,9 @@ mod tests {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
 
+        // Single crate-wide env lock; see the sibling
+        // `envelope_on_artefact_list_omits_reserved_prefix_entries` comment.
         let _guard = envelope_env_lock().lock().await;
-        let _artefact_guard = crate::tools::artefacts::artefact_flag_lock().lock().await;
         std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
         std::env::set_var(crate::tools::artefacts::FEATURE_FLAG_ENV, "1");
 
@@ -1378,16 +1384,12 @@ mod tests {
     /// master ExecPlan documents in §"Cross-PR envelope-test interaction".
     #[tokio::test]
     async fn envelope_omits_for_output_attest() {
-        // Acquire the envelope env lock AND the output_attest
-        // resolver flag lock. Two-lock setups race because each test
-        // suite previously held a separate mutex; the resolver tests
-        // in `tools::output_attest` set CORECRUX_C2PA_SIGNER mid-run,
-        // and without the shared lock this dispatch would observe
-        // `Vault` and try to hit Vault PKI. Cross-locking both is
-        // safe (no deadlock — only this test holds both, the resolver
-        // tests hold only `flag_lock`).
+        // Single crate-wide env lock — `output_attest::tests::flag_lock`
+        // now delegates to `crate::test_env_lock`, the same mutex as
+        // `envelope_env_lock`. The resolver tests in `tools::output_attest`
+        // also serialise on the same lock, so the cross-suite race that
+        // used to require two acquisitions is now covered by one.
         let _guard = envelope_env_lock().lock().await;
-        let _flag_guard = crate::tools::output_attest::tests::flag_lock().lock().await;
         // Defensive belt-and-braces: clear the signer resolver inputs
         // in case any earlier test panicked between set and reset.
         std::env::remove_var("CORECRUX_C2PA_SIGNER");
@@ -1652,10 +1654,10 @@ mod tests {
 
     #[tokio::test]
     async fn envelope_omits_for_passport_split() {
+        // Single crate-wide env lock — `identity::tests::flag_lock`
+        // now delegates to `crate::test_env_lock`, same mutex as
+        // `envelope_env_lock`, so one acquisition suffices.
         let _guard = envelope_env_lock().lock().await;
-        let _identity_guard = crate::tools::identity::tests::flag_lock()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         // Use the explicit env var name to avoid taking another import.
         std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
         std::env::set_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY", "1");
@@ -1729,10 +1731,9 @@ mod tests {
 
     #[tokio::test]
     async fn envelope_omits_for_passport_merge() {
+        // Single crate-wide env lock; see the sibling
+        // `envelope_omits_for_passport_split` comment for rationale.
         let _guard = envelope_env_lock().lock().await;
-        let _identity_guard = crate::tools::identity::tests::flag_lock()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
         std::env::set_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY", "1");
 
@@ -1822,10 +1823,9 @@ mod tests {
 
     #[tokio::test]
     async fn envelope_omits_for_passport_link_device() {
+        // Single crate-wide env lock; see the sibling
+        // `envelope_omits_for_passport_split` comment for rationale.
         let _guard = envelope_env_lock().lock().await;
-        let _identity_guard = crate::tools::identity::tests::flag_lock()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
         std::env::set_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY", "1");
 

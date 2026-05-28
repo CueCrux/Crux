@@ -295,10 +295,11 @@ mod tests {
     }
 
     // Serialise the env-var mutation so concurrent tokio tests don't race
-    // on CORECRUXD_FEATURE_RECEIPT_VERIFY.
+    // on CORECRUXD_FEATURE_RECEIPT_VERIFY. Delegates to
+    // `crate::test_env_lock` so every env-mutating test in this crate
+    // shares one process-wide `tokio::sync::Mutex`.
     fn flag_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        crate::test_env_lock()
     }
 
     #[tokio::test]

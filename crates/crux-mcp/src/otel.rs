@@ -73,6 +73,10 @@ mod tests {
 
     #[test]
     fn feature_flag_default_off() {
+        // Hold the crate-wide test env lock so this sync test doesn't
+        // race the tokio-test suite (`blocking_lock` is safe here: plain
+        // `#[test]`, no tokio runtime in scope).
+        let _g = crate::test_env_lock().blocking_lock();
         std::env::remove_var(FEATURE_FLAG_ENV);
         assert!(!spans_enabled());
     }
@@ -80,6 +84,7 @@ mod tests {
     #[test]
     fn record_when_disabled_is_noop() {
         // Just assert this doesn't panic / blow up when the flag is off.
+        let _g = crate::test_env_lock().blocking_lock();
         std::env::remove_var(FEATURE_FLAG_ENV);
         record_tool_span_start("query_facts", Some("alice"));
         record_tool_span_start("query_facts", None);
@@ -90,6 +95,7 @@ mod tests {
         // Acceptance #7: with OTEL_EXPORTER_OTLP_ENDPOINT unset the
         // call must still succeed (degrade silently — no exporter, but
         // the local tracing layer still consumes the event).
+        let _g = crate::test_env_lock().blocking_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::set_var(FEATURE_FLAG_ENV, "1");
         record_tool_span_start("query_facts", Some("alice"));

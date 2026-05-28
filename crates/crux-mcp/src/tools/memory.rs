@@ -509,15 +509,19 @@ mod tests {
 
     /// Guard for the `CORECRUXD_FEATURE_MEMORY_PANEL` env var. The flag is
     /// process-global so we serialise tests that mutate it using an
-    /// async-aware mutex (held across awaits).
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// async-aware mutex (held across awaits). Delegates to the crate-wide
+    /// `crate::test_env_lock` so we serialise against every other
+    /// env-mutating test in this crate.
+    fn env_lock() -> &'static tokio::sync::Mutex<()> {
+        crate::test_env_lock()
+    }
 
     struct FlagGuard {
         _lock: tokio::sync::MutexGuard<'static, ()>,
     }
     impl FlagGuard {
         async fn enabled() -> Self {
-            let lock = ENV_LOCK.lock().await;
+            let lock = env_lock().lock().await;
             std::env::set_var(MEMORY_PANEL_FEATURE_FLAG, "1");
             Self { _lock: lock }
         }
@@ -541,7 +545,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_view_flag_off_returns_disabled_message() {
-        let _lock = ENV_LOCK.lock().await;
+        let _lock = env_lock().lock().await;
         std::env::remove_var(MEMORY_PANEL_FEATURE_FLAG);
         let ctx = test_ctx();
         let res = handle_memory_view(&json!({"top_k": 5, "token_budget": 500}), &ctx)

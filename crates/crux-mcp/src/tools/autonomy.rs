@@ -337,10 +337,11 @@ mod tests {
     };
 
     /// Serialize tests that mutate `FEATURE_FLAG_ENV` so they don't race
-    /// each other across the tokio test runtime.
+    /// each other across the tokio test runtime. Delegates to
+    /// [`crate::test_env_lock`] so every env-mutating test in this crate
+    /// shares one process-wide `tokio::sync::Mutex`.
     fn env_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        crate::test_env_lock()
     }
 
     fn local_only_router(passport: &str) -> RcxRouter {

@@ -46,12 +46,13 @@ pub const DEFAULT_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 pub const MAX_TTL_SECONDS: u64 = 90 * 24 * 60 * 60;
 
 /// Shared lock for tests that mutate the `CORECRUXD_FEATURE_ARTEFACTS` env
-/// var. Other test modules (e.g. `dispatch::tests`) acquire this same lock
-/// so a parallel run never observes a half-set flag.
+/// var. Delegates to [`crate::test_env_lock`] so every env-mutating test
+/// in this crate shares one process-wide `tokio::sync::Mutex` — per-module
+/// locks don't prevent concurrent writes to `environ` from a sibling test
+/// holding a different module's lock.
 #[doc(hidden)]
 pub fn artefact_flag_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    crate::test_env_lock()
 }
 
 pub fn artefacts_enabled() -> bool {

@@ -183,13 +183,15 @@ pub fn global() -> &'static Mutex<TraceStore> {
 }
 
 /// Test-only serialisation lock for tests that mutate the global trace
-/// store or `CORECRUXD_FEATURE_TOOL_TRACES` env var. Both this module and
-/// `tools::traces::tests` must take the SAME lock so the process-wide
-/// flag toggling doesn't race between modules.
+/// store or `CORECRUXD_FEATURE_TOOL_TRACES` env var. Delegates to the
+/// crate-wide [`crate::test_env_lock`] so every env-mutating test in
+/// `crux-mcp` shares the same `tokio::sync::Mutex` — per-module locks
+/// don't prevent concurrent writes to `environ` from a sibling test
+/// holding a different module's lock (see the function doc on
+/// [`crate::test_env_lock`]).
 #[cfg(test)]
 pub fn test_env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    crate::test_env_lock()
 }
 
 /// Record a single tool dispatch into the global per-passport ring.
