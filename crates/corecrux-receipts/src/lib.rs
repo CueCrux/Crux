@@ -9,6 +9,7 @@
 //! - Hashing/verification operates over the stored bytes exactly (no re-serialization).
 //! - Verification output is derived state (rebuildable).
 
+mod approval_decision_v1;
 mod audit_bundle_v1;
 mod body_v1;
 mod candidate_digest_v1;
@@ -20,6 +21,11 @@ mod store_v1;
 mod subject_index_v1;
 mod verify_v1;
 
+pub use approval_decision_v1::{
+    assert_approval_decision_kind_v1, build_approval_decision_body_v1, sign_approval_decision_v1,
+    ApprovalDecisionBodyInputV1, ApprovalDecisionV1, ApprovalRiskTierV1, APPROVAL_DECISION_BODY_SCHEMA_V1,
+    APPROVAL_DECISION_KIND_V1,
+};
 pub use audit_bundle_v1::{
     build_bundle_v1, decode_receipts_cbor, verify_bundle_v1, AuditBundleError, AuditBundleManifestV1,
     AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1, BuiltBundleV1, VerifyReportV1,
