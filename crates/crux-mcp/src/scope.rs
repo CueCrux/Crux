@@ -91,6 +91,8 @@ mod tests {
             version: 1,
             supersedes: None,
             private,
+            horizon_class: corecrux_memory::HorizonClass::None,
+            reverified_at: None,
         }
     }
 

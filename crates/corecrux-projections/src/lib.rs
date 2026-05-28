@@ -12,6 +12,7 @@
 mod ccxs;
 mod codec_v1;
 mod cold_segment_v1;
+pub mod decay;
 mod events;
 pub mod extraction;
 mod meta;

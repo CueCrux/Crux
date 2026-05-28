@@ -10,12 +10,34 @@ use super::{
     problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Path, Query, State, StatusCode,
 };
 
+/// Where `/v1/work` reads from.
+///
+/// - `Kanban` (default for backwards-compat with existing callers that omit
+///   the param) — the `__work__::*` fact table populated by `create_work`.
+/// - `Execplans` — the read-time aggregator over plan files under
+///   `$CRUX_EXECPLANS_ROOT` joined with facts under `entity = "execplan:<slug>"`.
+///   See [`crate::work_execplans`].
+/// - `All` — both, deduplicated by `id` (kanban wins on collision).
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum WorkSource {
+    Kanban,
+    Execplans,
+    /// Default. Includes both kanban-table items and the read-time ExecPlan
+    /// projection. ExecPlans are only included when `CRUX_EXECPLANS_ROOT` is
+    /// set; otherwise this behaves identically to `Kanban`.
+    #[default]
+    All,
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct ListWorkQuery {
     pub project_id: Option<String>,
     pub state: Option<String>,
     pub tenant_id: Option<String>,
     pub assignee_passport: Option<String>,
+    #[serde(default)]
+    pub source: WorkSource,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -120,22 +142,114 @@ pub(super) async fn get_work(
         }
     }
     let store = state.fact_store.read().await;
-    let items = crate::work::list_work(
-        &store,
-        q.project_id.as_deref(),
-        q.state.as_deref(),
-        q.tenant_id.as_deref(),
-        q.assignee_passport.as_deref(),
-    );
+
+    let kanban_items = if matches!(q.source, WorkSource::Kanban | WorkSource::All) {
+        crate::work::list_work(
+            &store,
+            q.project_id.as_deref(),
+            q.state.as_deref(),
+            q.tenant_id.as_deref(),
+            q.assignee_passport.as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
+
+    let execplan_items = if matches!(q.source, WorkSource::Execplans | WorkSource::All) {
+        execplan_items_for_query(&store, &q)
+    } else {
+        Vec::new()
+    };
     drop(store);
+
+    // Merge: kanban first (wins on id collision), then execplan items not
+    // already present. ExecPlan ids are namespaced (`execplan:<slug>`) so
+    // collisions are not expected in practice — the dedup is defence in depth.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(kanban_items.len());
+    let mut items = Vec::with_capacity(kanban_items.len() + execplan_items.len());
+    for w in kanban_items {
+        seen.insert(w.id.clone());
+        items.push(w);
+    }
+    for w in execplan_items {
+        if !seen.contains(&w.id) {
+            items.push(w);
+        }
+    }
+
+    // agent-ux-05 — risk-tiered HITL projection. When the caller asks for
+    // `state=pending_approval` (or no state filter at all), splice in the
+    // in-memory approval queue managed by `crux_mcp::tools::approvals`.
+    // Approval entries are emitted with `kind: "approval"` so the SPA can
+    // render them with a distinct row class. Tenant + state filters from
+    // `q` are honoured so cross-tenant approvers don't see other tenants'
+    // pending requests.
+    let want_approvals = match q.state.as_deref() {
+        Some("pending_approval") | None => true,
+        Some(_) => false,
+    };
+    let mut approval_entries: Vec<serde_json::Value> = if want_approvals {
+        crux_mcp::tools::approvals::pending_requests_for_work_panel().await
+    } else {
+        Vec::new()
+    };
+    if let Some(tenant) = q.tenant_id.as_deref() {
+        approval_entries.retain(|e| e.get("tenant_id").and_then(|v| v.as_str()) == Some(tenant));
+    }
+    let approval_count = approval_entries.len();
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "count": items.len(),
+            "count": items.len() + approval_count,
+            "source": match q.source {
+                WorkSource::Kanban => "kanban",
+                WorkSource::Execplans => "execplans",
+                WorkSource::All => "all",
+            },
             "work": items,
+            "approvals": approval_entries,
         })),
     )
         .into_response()
+}
+
+/// Build the ExecPlan slice of the response. Applies the same state /
+/// tenant / assignee filters that kanban uses so `?source=all&state=planned`
+/// returns a coherent merged list.
+fn execplan_items_for_query(
+    store: &corecrux_memory::fact_store::FactStore,
+    q: &ListWorkQuery,
+) -> Vec<crate::work::WorkItem> {
+    // No root configured = aggregator off. Return empty rather than 500.
+    let Some(root) = crate::work_execplans::execplans_root_from_env() else {
+        return Vec::new();
+    };
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let items = match crate::work_execplans::list_execplans(store, &root, now_unix_ms) {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(error = %err, root = %root.display(), "execplan-aggregator-io-error");
+            return Vec::new();
+        }
+    };
+    // ExecPlan items are workspace-scoped, not project-scoped — they live
+    // in a virtual `execplans` project (`VIRTUAL_PROJECT_ID`) that callers
+    // don't filter against explicitly. Skip `project_id` here so the common
+    // SPA pattern `?source=all&project_id=default` still surfaces them; the
+    // user disambiguates kanban vs execplans via the `source` chip.
+    items
+        .into_iter()
+        .filter(|w| {
+            q.state.as_deref().is_none_or(|s| w.state == s)
+                && q.tenant_id.as_deref().is_none_or(|t| w.tenant_id.as_deref() == Some(t))
+                && q.assignee_passport
+                    .as_deref()
+                    .is_none_or(|a| w.assignee_passport.as_deref() == Some(a))
+        })
+        .collect()
 }
 
 pub(super) async fn get_work_item(

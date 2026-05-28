@@ -27,6 +27,81 @@ enum JournalEvent {
     Delete { fact_id: String, deleted_at: String },
 }
 
+/// Per-fact freshness horizon class (child ExecPlan
+/// `agent-ux-03-freshness-decay-2026-05-27`).
+///
+/// Drives the deterministic decay function in
+/// `corecrux-projections::decay`: `volatile` facts go stale after a day,
+/// `medium` after about a month, `stable` after a year, and `none` never
+/// decays. The class is per-fact; callers either set it explicitly via
+/// `store_fact`/`memory_set_horizon` or accept the default of
+/// [`HorizonClass::None`] (preserves pre-freshness behaviour for legacy
+/// callers — strict backwards-compat).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum HorizonClass {
+    /// Goes stale quickly (default policy: 24 hours). Use for deploy state,
+    /// process IDs, currently-measured metrics that change daily.
+    Volatile,
+    /// Goes stale after about a month (default policy: 35 days). Use for
+    /// per-tenant counts in active backfill, preferences, traits.
+    Medium,
+    /// Goes stale after about a year (default policy: 365 days). Use for
+    /// architectural counts, naming conventions, layout decisions.
+    Stable,
+    /// Never decays. Use for identity, immutable history, user-pinned facts.
+    None,
+}
+
+impl HorizonClass {
+    /// Stable string form used in JSON-RPC and the journal.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Volatile => "volatile",
+            Self::Medium => "medium",
+            Self::Stable => "stable",
+            Self::None => "none",
+        }
+    }
+
+    /// Parse a free-text horizon class. Case-insensitive; returns `None`
+    /// for unknown values so callers can surface a typed param error.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "volatile" => Some(Self::Volatile),
+            "medium" => Some(Self::Medium),
+            "stable" => Some(Self::Stable),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// Default horizon class inferred from an entity prefix when none is
+    /// explicitly set on a fact. Matches the operator's
+    /// `freshness_horizon:` convention from CLAUDE.md §"Freshness
+    /// horizons": deploy state and reserved-prefix metrics are
+    /// short-lived, bench numbers and architectural records last longer.
+    pub fn default_for_entity(entity: &str) -> Self {
+        if entity.starts_with("__ops::") {
+            Self::Volatile
+        } else if entity.starts_with("bench:") || entity.starts_with("__bootstrap__::") {
+            Self::Stable
+        } else if entity.starts_with("execplan:") || entity.starts_with("incident:") {
+            Self::Medium
+        } else {
+            Self::None
+        }
+    }
+}
+
+impl Default for HorizonClass {
+    fn default() -> Self {
+        // Default for replay of pre-freshness journal entries: never
+        // decay, never lie about it.
+        Self::None
+    }
+}
+
 /// A single fact in the store.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Fact {
@@ -48,6 +123,18 @@ pub struct Fact {
     /// Private facts are never pushed to a remote during sync.
     #[serde(default)]
     pub private: bool,
+    /// Freshness horizon class — drives the deterministic decay function
+    /// in `corecrux-projections::decay`. Defaulted to
+    /// [`HorizonClass::None`] for replay of pre-freshness journal
+    /// entries (additive schema change; existing facts are treated as
+    /// never stale).
+    #[serde(default)]
+    pub horizon_class: HorizonClass,
+    /// Re-verification anchor — when set, decay is measured from this
+    /// timestamp instead of `stored_at`. Updated by `memory_reverify`
+    /// without rewriting the fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverified_at: Option<DateTime<Utc>>,
 }
 
 fn default_version() -> u32 {
@@ -66,6 +153,10 @@ pub struct StoreFact {
     /// If true, this fact will never be pushed to a remote during sync.
     #[serde(default)]
     pub private: bool,
+    /// Optional freshness horizon class — when omitted, falls back to
+    /// [`HorizonClass::default_for_entity`] using the entity name.
+    #[serde(default)]
+    pub horizon_class: Option<HorizonClass>,
 }
 
 fn default_confidence() -> f32 {
@@ -236,6 +327,10 @@ impl FactStore {
             None => (1, None),
         };
 
+        let horizon_class = req
+            .horizon_class
+            .unwrap_or_else(|| HorizonClass::default_for_entity(&req.entity));
+
         Fact {
             fact_id: fact_id.clone(),
             entity: req.entity.clone(),
@@ -249,6 +344,35 @@ impl FactStore {
             version,
             supersedes,
             private: req.private,
+            horizon_class,
+            reverified_at: None,
+        }
+    }
+
+    /// Update the horizon class for an existing fact in place. Returns
+    /// `true` if the fact existed. Used by `memory_set_horizon` so
+    /// callers can override the entity-prefix default after the fact
+    /// was written (e.g. pin a normally-volatile fact as `stable`).
+    pub fn set_horizon(&mut self, fact_id: &str, horizon_class: HorizonClass) -> bool {
+        if let Some(fact) = self.facts.get_mut(fact_id) {
+            fact.horizon_class = horizon_class;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Bump the `reverified_at` anchor on a fact, recording that an
+    /// agent (or operator) has re-confirmed the fact is still accurate.
+    /// Re-anchors decay without rewriting the value.
+    ///
+    /// Returns `true` if the fact existed.
+    pub fn reverify(&mut self, fact_id: &str, now: DateTime<Utc>) -> bool {
+        if let Some(fact) = self.facts.get_mut(fact_id) {
+            fact.reverified_at = Some(now);
+            true
+        } else {
+            false
         }
     }
 
@@ -638,6 +762,7 @@ mod tests {
             source_receipt: Some("crx_123".to_string()),
             confidence: 0.95,
             private: false,
+            horizon_class: None,
         });
 
         assert!(fact.fact_id.starts_with("f_"));
@@ -659,6 +784,7 @@ mod tests {
             source_receipt: None,
             confidence: 0.9,
             private: false,
+            horizon_class: None,
         });
         store.store(StoreFact {
             entity: "testing".to_string(),
@@ -667,6 +793,7 @@ mod tests {
             source_receipt: None,
             confidence: 0.8,
             private: false,
+            horizon_class: None,
         });
 
         let result = store.query(&FactQuery {
@@ -692,6 +819,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
 
         assert_eq!(store.count(), 1);
@@ -713,6 +841,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -745,6 +874,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
         store.store(StoreFact {
             entity: "proj".to_string(),
@@ -753,6 +883,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
 
         store.delete(&f1.fact_id);
@@ -773,6 +904,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 0.5,
                 private: false,
+                horizon_class: None,
             },
             StoreFact {
                 entity: "b".to_string(),
@@ -781,6 +913,7 @@ mod tests {
                 source_receipt: Some("rcpt".to_string()),
                 confidence: 0.9,
                 private: false,
+                horizon_class: None,
             },
         ];
 
@@ -802,6 +935,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
         store.store(StoreFact {
             entity: "beta".to_string(),
@@ -810,6 +944,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
 
         let result = store.query(&FactQuery {
@@ -836,6 +971,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -889,6 +1025,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
 
         // Query matching key name
@@ -923,6 +1060,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
 
         let result = store.query(&FactQuery {
@@ -946,6 +1084,7 @@ mod tests {
             source_receipt: None,
             confidence: 0.5,
             private: false,
+            horizon_class: None,
         });
         store.store(StoreFact {
             entity: "e".to_string(),
@@ -954,6 +1093,7 @@ mod tests {
             source_receipt: None,
             confidence: 0.9,
             private: false,
+            horizon_class: None,
         });
 
         let result = store.query(&FactQuery {
@@ -980,6 +1120,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -1006,6 +1147,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
 
         // Token budget smaller than the single fact — should still include it
@@ -1047,6 +1189,7 @@ mod tests {
             source_receipt: Some("r".to_string()),
             confidence: 0.75,
             private: false,
+            horizon_class: None,
         });
 
         let json = serde_json::to_string(&fact).unwrap();
@@ -1081,6 +1224,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 0.9,
                 private: false,
+                horizon_class: None,
             });
             let f2 = store.store(StoreFact {
                 entity: "proj".into(),
@@ -1089,6 +1233,7 @@ mod tests {
                 source_receipt: Some("r1".into()),
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
             let f3 = store.store(StoreFact {
                 entity: "other".into(),
@@ -1097,6 +1242,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 0.5,
                 private: false,
+                horizon_class: None,
             });
             ids = vec![f1.fact_id, f2.fact_id, f3.fact_id];
             assert_eq!(store.count(), 3);
@@ -1130,6 +1276,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
             fact_id = fact.fact_id;
             store.delete(&fact_id);
@@ -1159,6 +1306,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 0.8,
                 private: false,
+                horizon_class: None,
             });
             let v2 = store.store(StoreFact {
                 entity: "proj".into(),
@@ -1167,6 +1315,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 0.9,
                 private: false,
+                horizon_class: None,
             });
             assert_eq!(v1.version, 1);
             assert_eq!(v2.version, 2);
@@ -1200,6 +1349,7 @@ mod tests {
                         source_receipt: None,
                         confidence: 1.0,
                         private: false,
+                        horizon_class: None,
                     },
                     StoreFact {
                         entity: "b".into(),
@@ -1208,6 +1358,7 @@ mod tests {
                         source_receipt: None,
                         confidence: 1.0,
                         private: false,
+                        horizon_class: None,
                     },
                 ])
                 .unwrap();
@@ -1236,6 +1387,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
         store.delete("nonexistent");
 
@@ -1255,6 +1407,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -1280,6 +1433,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -1325,6 +1479,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
         store.store(StoreFact {
             entity: "e1".into(),
@@ -1333,6 +1488,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
 
         // All facts stored with Utc::now() so they share the same timestamp
@@ -1357,6 +1513,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -1378,6 +1535,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
         store.store(StoreFact {
             entity: "e".into(),
@@ -1386,6 +1544,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
 
         store.delete(&f1.fact_id);

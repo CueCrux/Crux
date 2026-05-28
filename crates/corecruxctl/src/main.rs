@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use corecruxctl::{
-    admin, audit_pack, evidence, explain, extensions, fixture_digest, gaps, inspect_receipt, parity, projections,
-    receipts, reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import, storage, structured_log, tooling_env,
-    verify_store,
+    admin, audit_export, audit_pack, c2pa_x509, evidence, explain, extensions, fixture_digest, gaps, inspect_receipt,
+    memory, output_verify, parity, projections, receipts, reconcile, replay, shard, shardmap, smoke, snapshot,
+    stage1_import, storage, structured_log, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -380,6 +380,182 @@ enum Command {
     Extensions {
         #[command(subcommand)]
         command: ExtensionsCommand,
+    },
+
+    /// Readable / editable memory panel (agent-ux-01). Operates against the
+    /// running daemon over HTTP; honours CRUX_AGENT_TOKEN.
+    #[command(name = "memory")]
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+
+    /// BYO Audit Trail export (agent-ux-11). Builds a signed,
+    /// third-party-verifiable tar.zst from the on-disk fact journal.
+    /// Read-only against the data dir — safe to run while the daemon
+    /// is up.
+    #[command(name = "audit-export")]
+    AuditExport {
+        /// Data directory (defaults to CORECRUXD_DATA_DIR).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output bundle path (e.g. ./audit-bundle.tar.zst).
+        #[arg(long)]
+        out: PathBuf,
+        /// RFC3339 lower bound, inclusive (optional).
+        #[arg(long)]
+        since: Option<String>,
+        /// RFC3339 upper bound, exclusive (optional; defaults to wall-clock now).
+        #[arg(long)]
+        until: Option<String>,
+        /// Restrict to entities starting with this prefix.
+        #[arg(long)]
+        scope_entity_prefix: Option<String>,
+        /// Operator-only: include reserved-prefix entries
+        /// (__agent::*, __ops::*, __bootstrap__::*).
+        #[arg(long, default_value_t = false)]
+        include_reserved: bool,
+        /// Optional caller label embedded in the manifest scope.
+        #[arg(long)]
+        caller: Option<String>,
+    },
+
+    /// Verify a BYO audit bundle OFFLINE — no daemon, no network.
+    /// Checks: bundle_format_version, content hashes, Ed25519 signature.
+    /// Exits non-zero on any failure.
+    #[command(name = "audit-verify")]
+    AuditVerify {
+        /// Path to the bundle (e.g. ./audit-bundle.tar.zst).
+        bundle: PathBuf,
+        /// Print the structured report as JSON to stdout.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Print the active C2PA leaf certificate's subject, issuer, validity
+    /// window, expiry urgency (green / yellow / red), and the local
+    /// trust anchor's SHA-256 fingerprint. Reads
+    /// `CORECRUXD_C2PA_LEAF_CERT_PATH` and `CORECRUXD_C2PA_ROOT_ANCHOR_PATH`
+    /// (or `--leaf-cert` / `--root-anchor`). Fully OFFLINE — no Vault
+    /// round-trip.
+    #[command(name = "c2pa-cert-status")]
+    C2paCertStatus {
+        /// Path to the leaf cert PEM (defaults to the env-derived path).
+        #[arg(long)]
+        leaf_cert: Option<PathBuf>,
+        /// Path to the root anchor PEM (defaults to the env-derived path).
+        #[arg(long)]
+        root_anchor: Option<PathBuf>,
+        /// Emit compact JSON instead of pretty.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Force-rotate the C2PA leaf certificate by minting a fresh CSR
+    /// and POSTing it to Vault PKI `pki-c2pa/sign/c2pa-leaf`. Requires
+    /// `VAULT_ADDR` + `VAULT_TOKEN` env vars. The new leaf key + chain
+    /// land at the configured paths atomically (write-temp + rename).
+    /// Use when the automatic <7d rotation hasn't fired yet or after
+    /// suspected key compromise.
+    #[command(name = "c2pa-rotate-leaf")]
+    C2paRotateLeaf {
+        /// Path to write the new leaf cert PEM (overrides env).
+        #[arg(long)]
+        leaf_cert: Option<PathBuf>,
+        /// Root anchor PEM (kept for reporting only).
+        #[arg(long)]
+        root_anchor: Option<PathBuf>,
+        /// Compact JSON output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Verify a C2PA manifest produced by the X.509 signer. Detects
+    /// whether the envelope carries an `x5chain` (vault-pki-p256) or
+    /// is a raw-Ed25519 legacy envelope, walks the X.509 chain to the
+    /// local anchor PEM, and verifies the leaf signature against the
+    /// canonical body bytes. Fully OFFLINE — no Vault round-trip.
+    #[command(name = "c2pa-verify")]
+    C2paVerify {
+        /// Path to the JUMBF envelope file (base64-encoded JSON).
+        #[arg(value_name = "FILE")]
+        manifest_path: PathBuf,
+        /// Optional content bytes to re-hash for the content-hash
+        /// assertion check.
+        #[arg(long, value_name = "PATH")]
+        content: Option<PathBuf>,
+        /// Local root anchor PEM. Defaults to the env-derived path.
+        #[arg(long)]
+        root_anchor: Option<PathBuf>,
+        /// Compact JSON output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Verify a C2PA Content Credentials manifest produced by `output_attest`
+    /// (agent-ux-07). Reads the JUMBF envelope from FILE, optionally
+    /// re-hashes the bound CONTENT bytes, and reports the four-way check
+    /// (canonical-hash, signature, content-hash, receipt cross-reference).
+    /// Works OFFLINE — no network calls; the verifying key is supplied via
+    /// `--pub-key-hex` or `CRUX_C2PA_VERIFY_PUBLIC_KEY_HEX`.
+    #[command(name = "output-verify")]
+    OutputVerify {
+        /// Path to the JUMBF envelope file (base64-encoded JSON, as
+        /// returned by the MCP tool's `manifest_jumbf_base64`).
+        #[arg(value_name = "FILE")]
+        manifest_path: PathBuf,
+        /// Optional content bytes to re-hash. If omitted, the
+        /// content-hash check is skipped and reported as `n/a`.
+        #[arg(long, value_name = "PATH")]
+        content: Option<PathBuf>,
+        /// Hex-encoded Ed25519 verifying key (32 bytes / 64 hex chars).
+        /// Defaults to env var `CRUX_C2PA_VERIFY_PUBLIC_KEY_HEX`.
+        #[arg(long)]
+        pub_key_hex: Option<String>,
+        /// Optional expected CROWN receipt id — if set, the manifest's
+        /// `crown_receipt_id` must match or the verifier exits non-zero.
+        #[arg(long)]
+        expected_receipt: Option<String>,
+        /// Emit compact JSON instead of pretty JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MemoryCommand {
+    /// List visible memory facts (newest first; reserved prefixes filtered).
+    Ls {
+        /// Maximum facts to return.
+        #[arg(long, default_value_t = 20)]
+        top_k: usize,
+        /// Optional entity to filter on.
+        #[arg(long)]
+        entity: Option<String>,
+    },
+    /// Print one fact with full metadata.
+    Show {
+        /// Fact id to look up.
+        fact_id: String,
+    },
+    /// Update the value of an existing fact (passport-attributed write).
+    Edit {
+        /// Fact id to update.
+        fact_id: String,
+        /// New value.
+        #[arg(long)]
+        value: String,
+        /// Optional human reason — stored as `memory_edit:<reason>` on the new fact.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Toggle pin state on a fact.
+    Pin {
+        /// Fact id to pin.
+        fact_id: String,
+        /// Set to remove the pin instead of adding it.
+        #[arg(long, default_value_t = false)]
+        off: bool,
     },
 }
 
@@ -1939,6 +2115,169 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(())
             }
         },
+
+        // ── memory panel (agent-ux-01) ──────────────────────────────
+        Command::Memory { command } => {
+            let client = memory::MemoryClient::from_env();
+            match command {
+                MemoryCommand::Ls { top_k, entity } => {
+                    let facts = client.list(top_k, entity.as_deref())?;
+                    print!("{}", memory::render_list(&facts));
+                    Ok(())
+                }
+                MemoryCommand::Show { fact_id } => {
+                    let fact = client.show(&fact_id)?;
+                    print!("{}", memory::render_fact(&fact));
+                    Ok(())
+                }
+                MemoryCommand::Edit { fact_id, value, reason } => {
+                    let new_fact = client.edit(&fact_id, &value, reason.as_deref())?;
+                    println!("edited {} → {} (v{})", fact_id, new_fact.fact_id, new_fact.version);
+                    Ok(())
+                }
+                MemoryCommand::Pin { fact_id, off } => {
+                    client.pin(&fact_id, !off)?;
+                    if off {
+                        println!("unpinned fact {fact_id}");
+                    } else {
+                        println!("pinned fact {fact_id}");
+                    }
+                    Ok(())
+                }
+            }
+        }
+        Command::AuditExport {
+            data_dir,
+            out,
+            since,
+            until,
+            scope_entity_prefix,
+            include_reserved,
+            caller,
+        } => {
+            let data_dir = data_dir
+                .or_else(|| std::env::var("CORECRUXD_DATA_DIR").ok().map(PathBuf::from))
+                .ok_or("audit-export requires --data-dir or CORECRUXD_DATA_DIR")?;
+            let (facts, receipts, bundle_id) = audit_export::run_audit_export(audit_export::AuditExportArgs {
+                data_dir,
+                out: out.clone(),
+                since,
+                until,
+                scope_entity_prefix,
+                include_reserved,
+                caller,
+            })?;
+            println!(
+                "audit-export OK: bundle_id={bundle_id} facts={facts} receipts={receipts} out={}",
+                out.display()
+            );
+            Ok(())
+        }
+        Command::AuditVerify { bundle, json } => {
+            let report = audit_export::run_audit_verify(&bundle)?;
+            if json {
+                let s = serde_json::to_string_pretty(&report)?;
+                println!("{s}");
+            } else {
+                println!(
+                    "audit-verify {}: bundle_id={} facts={} receipts={} sig={} events_hash={} receipts_hash={}",
+                    if report.ok { "OK" } else { "FAIL" },
+                    report.bundle_id,
+                    report.fact_count,
+                    report.receipt_count,
+                    report.signature_valid,
+                    report.events_jsonl_sha256_match,
+                    report.receipts_cbor_sha256_match,
+                );
+                if let Some(reason) = &report.failure_reason {
+                    eprintln!("failure: {reason}");
+                }
+            }
+            if !report.ok {
+                std::process::exit(2);
+            }
+            Ok(())
+        }
+        Command::OutputVerify {
+            manifest_path,
+            content,
+            pub_key_hex,
+            expected_receipt,
+            json,
+        } => {
+            let report = output_verify::run(&output_verify::Options {
+                manifest_path,
+                content,
+                pub_key_hex,
+                expected_receipt,
+            })?;
+            let rendered = if json {
+                serde_json::to_string(&report)?
+            } else {
+                serde_json::to_string_pretty(&report)?
+            };
+            println!("{rendered}");
+            if !report.ok {
+                return Err("C2PA manifest verification failed".into());
+            }
+            Ok(())
+        }
+        Command::C2paCertStatus {
+            leaf_cert,
+            root_anchor,
+            json,
+        } => {
+            let report = c2pa_x509::cert_status(&c2pa_x509::StatusOptions {
+                leaf_cert_path: leaf_cert,
+                root_anchor_path: root_anchor,
+            })?;
+            let rendered = if json {
+                serde_json::to_string(&report)?
+            } else {
+                serde_json::to_string_pretty(&report)?
+            };
+            println!("{rendered}");
+            Ok(())
+        }
+        Command::C2paRotateLeaf {
+            leaf_cert,
+            root_anchor,
+            json,
+        } => {
+            let report = c2pa_x509::rotate_leaf(&c2pa_x509::StatusOptions {
+                leaf_cert_path: leaf_cert,
+                root_anchor_path: root_anchor,
+            })?;
+            let rendered = if json {
+                serde_json::to_string(&report)?
+            } else {
+                serde_json::to_string_pretty(&report)?
+            };
+            println!("{rendered}");
+            Ok(())
+        }
+        Command::C2paVerify {
+            manifest_path,
+            content,
+            root_anchor,
+            json,
+        } => {
+            let report = c2pa_x509::c2pa_verify(&c2pa_x509::X509VerifyOptions {
+                manifest_path,
+                content,
+                root_anchor_path: root_anchor,
+            })?;
+            let rendered = if json {
+                serde_json::to_string(&report)?
+            } else {
+                serde_json::to_string_pretty(&report)?
+            };
+            println!("{rendered}");
+            if !report.ok {
+                return Err("C2PA X.509 manifest verification failed".into());
+            }
+            Ok(())
+        }
     }
 }
 

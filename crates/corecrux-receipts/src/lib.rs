@@ -9,21 +9,67 @@
 //! - Hashing/verification operates over the stored bytes exactly (no re-serialization).
 //! - Verification output is derived state (rebuildable).
 
+mod approval_decision_v1;
+mod audit_bundle_v1;
 mod body_v1;
+mod c2pa_manifest_v1;
 mod candidate_digest_v1;
 mod export_v1;
+mod forget_v1;
+mod identity_v1;
 mod keyring_v1;
+mod memory_use_v1;
 mod store_v1;
 mod subject_index_v1;
+pub mod vault_pki_x509_signer;
 mod verify_v1;
 
+pub use approval_decision_v1::{
+    assert_approval_decision_kind_v1, build_approval_decision_body_v1, sign_approval_decision_v1,
+    ApprovalDecisionBodyInputV1, ApprovalDecisionV1, ApprovalRiskTierV1, APPROVAL_DECISION_BODY_SCHEMA_V1,
+    APPROVAL_DECISION_KIND_V1,
+};
+pub use audit_bundle_v1::{
+    build_bundle_v1, decode_receipts_cbor, verify_bundle_v1, AuditBundleError, AuditBundleManifestV1,
+    AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1, BuiltBundleV1, VerifyReportV1,
+    BUNDLE_FORMAT_VERSION, EVENTS_FILENAME, MANIFEST_FILENAME, RECEIPTS_FILENAME,
+};
 pub use body_v1::{extract_body_index_v1, extract_linked_receipts_v1, ReceiptBodyIndexV1};
+pub use c2pa_manifest_v1::{
+    assert_crown_receipt_id_v1, build_c2pa_manifest_v1, canonical_body_bytes_v1, ed25519_signer, parse_jumbf_base64,
+    sign_c2pa_manifest_v1, sign_c2pa_manifest_via_signer, verify_c2pa_manifest_v1, C2paActionV1, C2paManifestError,
+    C2paManifestInputV1, C2paManifestV1, C2paSignedManifestV1, C2paSigner, C2paVerificationReportV1,
+    SignedManifestParts, C2PA_ACTION_CREATED, C2PA_MANIFEST_SCHEMA_V1, C2PA_SPEC_VERSION, CUECRUX_CROWN_RECEIPT_LABEL,
+    DIGITAL_SOURCE_TYPE_AI, SOFTWARE_AGENT_DEFAULT,
+};
 pub use export_v1::{
     build_receipt_export_v1, BuildReceiptExportInput, ExportError, ExportFileV1, ExportFormatV1, ExportRedactionV1,
     ReceiptEventHeaderRefV1, ReceiptExportBundleV1, ReceiptExportIncludeV1, ReceiptExportOptionsV1,
     ReplayExportManifestV1,
 };
+pub use forget_v1::{
+    blake3_hex, decode_forget_body_v1, decode_permanent_purge_body_v1, encode_forget_body_v1,
+    encode_permanent_purge_body_v1, extract_forget_summary_v1, ForgetFactRefV1, ForgetReceiptBodyV1,
+    ForgetReceiptError, ForgetReceiptSummaryV1, ForgetScopeV1, PermanentPurgeReceiptBodyV1,
+    CONTENT_TYPE_FORGET_BODY_V1, CONTENT_TYPE_PERMANENT_PURGE_BODY_V1, EVT_RECEIPT_FORGET_BODY_V1,
+    EVT_RECEIPT_PERMANENT_PURGE_BODY_V1, SCHEMA_FORGET_BODY_V1, SCHEMA_PERMANENT_PURGE_BODY_V1,
+};
+pub use identity_v1::{
+    decode_passport_link_device_body_v1, decode_passport_merge_body_v1, decode_passport_split_body_v1,
+    encode_passport_link_device_body_v1, encode_passport_merge_body_v1, encode_passport_split_body_v1,
+    extract_identity_receipt_schema_v1, IdentityReceiptError, MergeConflictPolicyV1, PassportLinkDeviceReceiptBodyV1,
+    PassportMergeConflictV1, PassportMergeReceiptBodyV1, PassportSplitReceiptBodyV1,
+    CONTENT_TYPE_PASSPORT_LINK_DEVICE_BODY_V1, CONTENT_TYPE_PASSPORT_MERGE_BODY_V1,
+    CONTENT_TYPE_PASSPORT_SPLIT_BODY_V1, EVT_RECEIPT_PASSPORT_LINK_DEVICE_BODY_V1, EVT_RECEIPT_PASSPORT_MERGE_BODY_V1,
+    EVT_RECEIPT_PASSPORT_SPLIT_BODY_V1, SCHEMA_PASSPORT_LINK_DEVICE_BODY_V1, SCHEMA_PASSPORT_MERGE_BODY_V1,
+    SCHEMA_PASSPORT_SPLIT_BODY_V1,
+};
 pub use keyring_v1::{Ed25519KeyEntryV1, Ed25519KeyRingV1, KeyRingError};
+pub use memory_use_v1::{
+    assert_memory_use_kind_v1, build_memory_use_body_v1, extract_memory_use_entries_v1, filter_reserved_entries,
+    is_reserved_entity_prefix, sign_memory_use_v1, MemoryUseBodyInputV1, MemoryUseEntryV1, MemoryUseIntentV1,
+    MEMORY_USE_BODY_SCHEMA_V1, MEMORY_USE_KIND_V1, RESERVED_ENTITY_PREFIXES_V1,
+};
 pub use store_v1::{
     load_verification_report_v1, store_verification_report_v1, verification_report_path_v1, ReceiptStoreError,
 };

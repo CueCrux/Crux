@@ -15,7 +15,7 @@ use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use corecrux_memory::{EdgeStore, EntityStore, FactStore, KindRegistry, SessionStore};
+use corecrux_memory::{ArtefactStore, EdgeStore, EntityStore, FactStore, KindRegistry, SessionStore};
 use corecrux_retrieval::IndexManager;
 use corecrux_types::UpdateStatus;
 
@@ -63,6 +63,9 @@ pub struct McpContext {
     pub edge_store: Arc<RwLock<EdgeStore>>,
     /// Substrate kind registry — populated at startup by lens crates.
     pub kind_registry: Arc<RwLock<KindRegistry>>,
+    /// Content-addressed artefact store (agent-ux-12, calm deferred output).
+    /// In-memory; opt-in for tools that want to park large payloads off-chat.
+    pub artefact_store: Arc<RwLock<ArtefactStore>>,
 }
 
 impl McpContext {
@@ -85,6 +88,7 @@ impl McpContext {
             entity_store: Arc::new(RwLock::new(EntityStore::new())),
             edge_store: Arc::new(RwLock::new(EdgeStore::new())),
             kind_registry: Arc::new(RwLock::new(KindRegistry::new())),
+            artefact_store: Arc::new(RwLock::new(ArtefactStore::new())),
         }
     }
 
@@ -114,6 +118,7 @@ impl McpContext {
             entity_store: Arc::new(RwLock::new(EntityStore::new())),
             edge_store: Arc::new(RwLock::new(EdgeStore::new())),
             kind_registry: Arc::new(RwLock::new(KindRegistry::new())),
+            artefact_store: Arc::new(RwLock::new(ArtefactStore::new())),
         }
     }
 
@@ -127,6 +132,15 @@ impl McpContext {
         self.entity_store = entity_store;
         self.edge_store = edge_store;
         self.kind_registry = kind_registry;
+        self
+    }
+
+    /// Attach a shared artefact store (agent-ux-12). When unset the context
+    /// uses its own in-process instance, which is fine for tests but means
+    /// HTTP and MCP would see different stores in prod — `corecruxd::main`
+    /// is the wiring point.
+    pub fn with_artefact_store(mut self, artefact_store: Arc<RwLock<ArtefactStore>>) -> Self {
+        self.artefact_store = artefact_store;
         self
     }
 
@@ -148,6 +162,7 @@ impl McpContext {
             entity_store: Arc::clone(&self.entity_store),
             edge_store: Arc::clone(&self.edge_store),
             kind_registry: Arc::clone(&self.kind_registry),
+            artefact_store: Arc::clone(&self.artefact_store),
         }
     }
 
@@ -281,10 +296,96 @@ async fn dispatch_tool_call(
     }
 
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let turn_id = args.get("turn_id").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    match tools::call_tool(name, &args, ctx).await {
-        Ok(result) => JsonRpcResponse::success(id, result),
+    // Emit an OTel-bridged tracing span around the dispatch when enabled
+    // (agent-ux-06 M4). The bridging via `tracing-opentelemetry` is wired
+    // in `corecruxd::main`; we keep this side lightweight (no direct
+    // `opentelemetry` dep in crux-mcp) so the MCP crate stays sync-able.
+    crate::otel::record_tool_span_start(name, ctx.agent.as_ref().map(|a| a.name.as_str()));
+
+    let outcome = tools::call_tool(name, &args, ctx).await;
+
+    // agent-ux-06 M2/M3: record into the per-passport trace ring.
+    let trace_outcome = if outcome.is_ok() {
+        crate::traces::TraceOutcome::Ok
+    } else {
+        crate::traces::TraceOutcome::Error
+    };
+    let passport = crate::scope::agent_name(ctx.agent.as_ref())
+        .unwrap_or(crate::traces::ANON_PASSPORT)
+        .to_string();
+    let predicted = build_predicted_effects(name, &args);
+    crate::traces::record_dispatch(&passport, name, turn_id.as_deref(), predicted, trace_outcome).await;
+
+    match outcome {
+        Ok(result) => {
+            let result = maybe_wrap_with_envelope(name, &args, ctx, result).await;
+            JsonRpcResponse::success(id, result)
+        }
         Err(e) => JsonRpcResponse::error(id, e.code, e.message),
+    }
+}
+
+/// Synthesise typed predicted effects for the trace ring based on
+/// well-known tool names + their args. Read-only tools emit a
+/// `fact_read`/`tool_dispatch` entry; mutating tools emit `fact_write`,
+/// `forget`, or `receipt_emit`. This stays a cheap lookup — the trace
+/// ring's purpose is observability, not full IR analysis.
+fn build_predicted_effects(name: &str, args: &serde_json::Value) -> Vec<crate::envelope::PredictedEffect> {
+    use crate::envelope::PredictedEffect;
+    let entity = args.get("entity").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    match name {
+        "store_fact" | "entity_upsert" | "edge_upsert" | "save_session" => {
+            vec![PredictedEffect::now("fact_write", entity, key)]
+        }
+        "delete_fact" | "entity_delete" | "edge_delete" | "delete_session" => {
+            vec![PredictedEffect::now("forget", entity, key)]
+        }
+        "memory_forget" | "memory_forget_dry_run" => {
+            vec![PredictedEffect::now("forget", entity, key)]
+        }
+        "memory_acknowledge_use" | "create_handoff" | "accept_handoff" | "record_decision" => {
+            vec![PredictedEffect::now("receipt_emit", entity, key)]
+        }
+        "query_facts" | "query" | "query_scan" | "query_expand" | "fact_history" => {
+            vec![PredictedEffect::now("fact_read", entity, key)]
+        }
+        _ => vec![PredictedEffect::now("tool_dispatch", entity, key)],
+    }
+}
+
+/// Conditionally wrap `payload` into the per-turn audit envelope.
+///
+/// Returns the raw `payload` unchanged unless ALL three conditions hold:
+///
+/// 1. [`crate::envelope::envelope_enabled`] (i.e. the
+///    `CORECRUXD_FEATURE_AUDIT_ENVELOPE` flag is on).
+/// 2. The tool is registered in
+///    [`crate::tools::tool_emits_envelope`].
+/// 3. A builder exists in
+///    [`crate::envelope::build_envelope_for_tool`] for this tool.
+///
+/// Older agents that don't read `envelope` see exactly the legacy payload
+/// shape any time any of these three conditions fails, preserving
+/// backwards-compat (master-plan §11 — "Backwards compat. Older agents
+/// that don't read the envelope field continue to work").
+async fn maybe_wrap_with_envelope(
+    name: &str,
+    args: &serde_json::Value,
+    ctx: &McpContext,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    if !crate::envelope::envelope_enabled() {
+        return payload;
+    }
+    if !tools::tool_emits_envelope(name) {
+        return payload;
+    }
+    match crate::envelope::build_envelope_for_tool(name, args, ctx).await {
+        Some(env) => env.wrap_payload(payload),
+        None => payload,
     }
 }
 
@@ -487,8 +588,854 @@ mod tests {
         assert!(err.message.contains("unknown tool"));
     }
 
+    // ── audit envelope (master ExecPlan agent-ux-best-in-class-master M2) ──
+
+    /// Serialize all envelope-related dispatch tests so the process-wide
+    /// `CORECRUXD_FEATURE_AUDIT_ENVELOPE` env var doesn't race between
+    /// concurrent tokio tests. `tokio::sync::Mutex` is used so the guard
+    /// can be safely held across `.await` boundaries.
+    fn envelope_env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    #[tokio::test]
+    async fn envelope_off_query_facts_response_has_no_envelope_field() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        let ctx = test_ctx();
+
+        // Seed one fact so query_facts has something to return.
+        dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "p", "key": "k", "value": "v"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "query_facts", "arguments": {"query": "v"}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        // Backwards-compat: no envelope, payload shape unchanged
+        // (content/text directly at the top level).
+        assert!(
+            result.get("envelope").is_none(),
+            "envelope must be absent when flag is off"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "payload wrapper must be absent when flag is off"
+        );
+        assert!(result["content"][0]["text"].as_str().unwrap().contains('v'));
+    }
+
+    #[tokio::test]
+    async fn envelope_on_query_facts_response_has_payload_and_envelope() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        let ctx = test_ctx();
+
+        dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "alpha", "key": "status", "value": "shipped",
+                                  "source_receipt": "r_test_001"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "query_facts", "arguments": {"query": "shipped"}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        // Both payload and envelope are present.
+        assert!(result["payload"].is_object());
+        assert!(result["envelope"].is_object());
+        // Payload preserves the original tool response shape.
+        assert!(result["payload"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("shipped"));
+        // Envelope is populated.
+        let env = &result["envelope"];
+        assert_eq!(env["memories_used"][0]["topic"], "alpha");
+        assert_eq!(env["memories_used"][0]["freshness"], "fresh");
+        assert_eq!(env["receipts_used"][0], "r_test_001");
+        assert_eq!(env["autonomy_consumed"]["capability"], "facts:read");
+        assert_eq!(env["autonomy_consumed"]["cost_credits"], 0);
+        assert!(env["predicted_effects"].as_array().unwrap().is_empty());
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+    }
+
+    /// Cross-PR envelope-contract sibling for agent-ux-11. The
+    /// `audit_export_bundle` tool is an audit-export surface — the bundle
+    /// IS the receipts artefact. The per-turn envelope (which is a
+    /// memory-query rationale) doesn't naturally apply, so the master
+    /// plan asks us to explicitly assert the negative: even with the
+    /// feature flag ON, `audit_export_bundle` must NOT emit an
+    /// `envelope` field.
+    #[tokio::test]
+    async fn envelope_omits_for_audit_export() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::audit_export::FEATURE_FLAG_ENV, "1");
+        let td = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::tools::audit_export::EXPORT_DIR_ENV, td.path());
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "operator-1".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // Seed one fact so the export has something to write.
+        dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "project-x", "key": "k", "value": "v"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "audit_export_bundle",
+                    "arguments": {"token_budget": 1000}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.expect("audit_export_bundle returned no result");
+        assert!(
+            result.get("envelope").is_none(),
+            "audit_export_bundle MUST NOT emit envelope (the bundle IS the receipts) — got {result:#?}"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "audit_export_bundle MUST NOT be wrapped in payload (the bundle IS the receipts) — got {result:#?}"
+        );
+        // The raw response shape stays intact.
+        assert!(result["bundle_id"].is_string());
+        assert!(result["bytes_path"].is_string());
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::audit_export::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::audit_export::EXPORT_DIR_ENV);
+    }
+
+    #[tokio::test]
+    async fn envelope_on_other_tools_remain_unwrapped() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        let ctx = test_ctx();
+
+        // store_fact is NOT opted into envelope — must keep legacy shape.
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "p", "key": "k", "value": "v"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(result.get("envelope").is_none());
+        assert!(result.get("payload").is_none());
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("stored fact"));
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+    }
+
+    /// `autonomy_contract` (agent-ux-10) is metadata-only — it MUST NOT
+    /// participate in the audit-envelope wrapper. Pinning this with a
+    /// dispatch-level test makes any accidental opt-in (e.g. someone adds
+    /// "autonomy_contract" to `tool_emits_envelope`) fail loud, matching
+    /// the child plan's "cross-PR envelope-test interaction" gate.
+    #[tokio::test]
+    async fn envelope_omits_for_autonomy_contract() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::autonomy::FEATURE_FLAG_ENV, "1");
+        let ctx = test_ctx();
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "autonomy_contract",
+                    "arguments": {"token_budget": 4000}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "autonomy_contract must NOT emit an envelope (metadata-only tool); got {result}"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "autonomy_contract must NOT use the payload/envelope wrapper shape"
+        );
+        // Tool still returns its own structuredContent under the legacy
+        // shape — assert the matrix made it through.
+        assert!(result["structuredContent"].is_object());
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::autonomy::FEATURE_FLAG_ENV);
+    }
+
+    // Sibling envelope-omits tests for agent-ux-05 (risk-tiered HITL).
+    // Both `approval_request` and `approval_decide` are write tools that
+    // must NOT opt into `tool_emits_envelope` — verifying via dispatch
+    // keeps the cross-PR contract green if a future change ever flips
+    // the registry by accident.
+    #[tokio::test]
+    async fn envelope_omits_for_approval_request() {
+        let _guard = envelope_env_lock().lock().await;
+        let _g2 = crate::tools::approvals::_approvals_test_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::approvals::FEATURE_FLAG_ENV, "1");
+        crate::tools::approvals::_reset_requests_buffer_for_tests().await;
+
+        // approval_request requires an authenticated passport; attach an
+        // agent identity exactly the way the memory_acknowledge_use test
+        // does (master plan sibling).
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "approval_request",
+                    "arguments": {
+                        "action_summary": "drop fixtures",
+                        "risk_tier": "high",
+                        "scope": "tenant-env",
+                        "tenant_id": "tenant-env",
+                        "token_budget": 500
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "approval_request MUST NOT emit envelope (write tool)"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "approval_request MUST NOT wrap response in payload"
+        );
+        std::env::remove_var(crate::tools::approvals::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+    }
+
+    #[tokio::test]
+    async fn envelope_omits_for_approval_decide() {
+        let _guard = envelope_env_lock().lock().await;
+        let _g2 = crate::tools::approvals::_approvals_test_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::approvals::FEATURE_FLAG_ENV, "1");
+        crate::tools::approvals::_reset_requests_buffer_for_tests().await;
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // Seed a request so approval_decide has a target.
+        let req_resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "approval_request",
+                    "arguments": {
+                        "action_summary": "drop fixtures",
+                        "risk_tier": "high",
+                        "scope": "tenant-env-2",
+                        "tenant_id": "tenant-env-2",
+                        "token_budget": 500
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let rid = req_resp.result.unwrap()["request_id"].as_str().unwrap().to_string();
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "approval_decide",
+                    "arguments": {
+                        "request_id": rid,
+                        "decision": "approve",
+                        "reviewer_tier": "elite",
+                        "reviewer_tenant_id": "tenant-env-2"
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "approval_decide MUST NOT emit envelope (write tool)"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "approval_decide MUST NOT wrap response in payload"
+        );
+        std::env::remove_var(crate::tools::approvals::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+    }
+
+    #[tokio::test]
+    async fn envelope_on_query_facts_omits_reserved_prefix_entries() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        let ctx = test_ctx();
+
+        // Public + reserved-prefix facts both matching the query.
+        for (entity, key) in [
+            ("project-x", "status"),
+            ("__ops::config-audit", "sha256:abc"),
+            ("__bootstrap__::pattern:x", "Retry"),
+        ] {
+            dispatch(
+                rpc(
+                    "tools/call",
+                    json!({
+                        "name": "store_fact",
+                        "arguments": {"entity": entity, "key": key, "value": "shipped"}
+                    }),
+                ),
+                &ctx,
+                None,
+            )
+            .await;
+        }
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "query_facts", "arguments": {"query": "shipped"}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        let env = &result["envelope"];
+        let memories = env["memories_used"].as_array().unwrap();
+        assert_eq!(
+            memories.len(),
+            1,
+            "reserved-prefix entries must not be exposed in the envelope"
+        );
+        assert_eq!(memories[0]["topic"], "project-x");
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+    }
+
+    /// Sibling envelope-filter contract for `memory_acknowledge_use`
+    /// (agent-ux-02). Mirrors the contract enforced by
+    /// `envelope_on_query_facts_omits_reserved_prefix_entries` so the
+    /// merge-result test the master plan asks every new envelope-emitting
+    /// tool to honour stays green for this surface too.
+    #[tokio::test]
+    async fn envelope_on_memory_acknowledge_use_omits_reserved_prefix_entries() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::memory_use::FEATURE_FLAG_ENV, "1");
+        crate::tools::memory_use::_reset_ack_buffer_for_tests().await;
+
+        // memory_acknowledge_use requires a passport — attach an agent.
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // Seed one public + two reserved-prefix facts. Capture each fact_id
+        // so we can pass them into the ack tool.
+        let mut ids: Vec<String> = Vec::new();
+        for (entity, key) in [
+            ("project-y", "status"),
+            ("__ops::config-audit", "sha256:ack"),
+            ("__bootstrap__::pattern:retry", "Retry"),
+        ] {
+            let resp = dispatch(
+                rpc(
+                    "tools/call",
+                    json!({
+                        "name": "store_fact",
+                        "arguments": {"entity": entity, "key": key, "value": "shipped-ack"}
+                    }),
+                ),
+                &ctx,
+                None,
+            )
+            .await;
+            let text = resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+            // "stored fact f_xxx (entity=..., key=..., ..."
+            let id = text
+                .trim_start_matches("stored fact ")
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            ids.push(id);
+        }
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "memory_acknowledge_use",
+                    "arguments": {
+                        "turn_id": "turn-envtest",
+                        "intent": "answer",
+                        "fact_ids": ids,
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        // The envelope wrapper engages because (a) feature flag on, (b) the
+        // tool is in `tool_emits_envelope`, (c) the per-tool builder is
+        // registered. Payload + envelope therefore both exist.
+        assert!(result["payload"].is_object());
+        let env = &result["envelope"];
+        let memories = env["memories_used"].as_array().unwrap();
+        assert_eq!(
+            memories.len(),
+            1,
+            "ack envelope must strip reserved-prefix entries (got {} entries)",
+            memories.len()
+        );
+        assert_eq!(memories[0]["topic"], "project-y");
+        for m in memories {
+            let topic = m["topic"].as_str().unwrap();
+            assert!(!topic.starts_with("__"), "ack envelope leaked reserved entity {topic}");
+        }
+        // autonomy_consumed identifies the capability as memory:acknowledge,
+        // not facts:read — proves the per-tool envelope builder ran (not the
+        // query_facts one).
+        assert_eq!(env["autonomy_consumed"]["capability"], "memory:acknowledge");
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::memory_use::FEATURE_FLAG_ENV);
+    }
+
+    /// Sibling envelope-filter contract for `receipt_verify` (agent-ux-04).
+    ///
+    /// `receipt_verify` is intentionally NOT in
+    /// [`crate::tools::tool_emits_envelope`] — it's a verifier, not a memory
+    /// retrieval, so it has no `memories_used[]` to filter. This test pins
+    /// that contract so a future change that flips the opt-in must also
+    /// rewire the envelope builder.
+    ///
+    /// Symmetric to `envelope_on_query_facts_omits_reserved_prefix_entries`
+    /// and `envelope_on_memory_acknowledge_use_omits_reserved_prefix_entries`:
+    /// every new envelope-eligible tool the master plan adds gets its own
+    /// reserved-prefix sibling, even if that tool's contract is "no
+    /// envelope at all".
+    #[tokio::test]
+    async fn envelope_on_receipt_verify_omits_reserved_prefix_entries() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        // Receipt-verify flag stays OFF — the handler must short-circuit to
+        // a "feature disabled" payload without hitting the loopback, AND the
+        // dispatcher must NOT wrap the response in an envelope (because the
+        // tool isn't opted in).
+        std::env::remove_var(crate::tools::receipt_verify::FEATURE_FLAG_ENV);
+        let ctx = test_ctx().with_agent(crate::agent::AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // Seed a reserved-prefix fact in the store. If the dispatcher ever
+        // wrongly opts receipt_verify into the envelope, the reserved-prefix
+        // filter contract would have to apply here too — but the envelope
+        // must not appear in the first place.
+        dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "__ops::config-audit", "key": "sha256:abc", "value": "x"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "receipt_verify", "arguments": {"receipt_id": "r_does_not_matter"}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        // Contract 1: no envelope wrapper (tool is not opted in).
+        assert!(
+            result.get("envelope").is_none(),
+            "receipt_verify must not be wrapped in an envelope (got {result:?})"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "receipt_verify response must keep the legacy unwrapped shape"
+        );
+        // Contract 2: with the flag off, payload is the disabled stub.
+        assert_eq!(result["feature_enabled"], false);
+        assert_eq!(result["verified"], false);
+        assert_eq!(result["errors"][0], "FEATURE_DISABLED");
+        // Contract 3: the response never carries an entity name from the
+        // reserved-prefix fact we seeded (defence in depth — the tool has
+        // nothing to do with the fact store, but proving it stays that way
+        // pins the invariant).
+        let payload_str = result.to_string();
+        assert!(
+            !payload_str.contains("__ops::"),
+            "receipt_verify response leaked reserved-prefix entity name: {payload_str}"
+        );
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+    }
+
+    #[tokio::test]
+    async fn envelope_on_memory_freshness_omits_reserved_prefix_entries() {
+        // Sibling test for agent-ux-03 M3: memory_freshness is the second
+        // tool opted into the envelope. Same reserved-prefix filter must
+        // apply or the envelope leaks ops/agent state. See
+        // dispatch::tests::envelope_on_query_facts_omits_reserved_prefix_entries
+        // for the original spike contract.
+        //
+        // Two env-var locks are acquired (envelope + freshness) because
+        // each is held by a different test module and either being
+        // toggled mid-call would race this test.
+        let _guard = envelope_env_lock().lock().await;
+        let _gf = crate::tools::freshness::tests_support_flag_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::freshness::FEATURE_FLAG_ENV, "1");
+        let ctx = test_ctx();
+        for (entity, key) in [
+            ("project-x", "status"),
+            ("__ops::config-audit", "sha256:abc"),
+            ("__bootstrap__::pattern:x", "Retry"),
+        ] {
+            dispatch(
+                rpc(
+                    "tools/call",
+                    json!({
+                        "name": "store_fact",
+                        "arguments": {"entity": entity, "key": key, "value": "shipped"}
+                    }),
+                ),
+                &ctx,
+                None,
+            )
+            .await;
+        }
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "memory_freshness", "arguments": {"top_k": 50, "token_budget": 1000}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        let env = &result["envelope"];
+        let memories = env["memories_used"].as_array().unwrap();
+        assert_eq!(
+            memories.len(),
+            1,
+            "memory_freshness envelope must filter reserved-prefix entries"
+        );
+        assert_eq!(memories[0]["topic"], "project-x");
+
+        // The tool payload (under "payload") must also not leak reserved
+        // entries.
+        let rows = result["payload"]["structuredContent"]["rows"].as_array().unwrap();
+        for r in rows {
+            let ent = r["entity"].as_str().unwrap();
+            assert!(
+                !ent.starts_with("__ops::") && !ent.starts_with("__bootstrap__::") && !ent.starts_with("__agent::"),
+                "payload leaked reserved entity {ent}"
+            );
+        }
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::freshness::FEATURE_FLAG_ENV);
+    }
+
+    /// Sibling envelope-filter contract for `artefact_list` (agent-ux-12).
+    /// Mirrors `envelope_on_query_facts_omits_reserved_prefix_entries`: the
+    /// envelope's `memories_used[]` must never expose a reserved-prefix
+    /// mime_type, even though the underlying artefact store can hold them
+    /// (reserved-prefix mime entries are filtered at list time too — this
+    /// test is the master-plan-mandated defence-in-depth probe).
+    #[tokio::test]
+    async fn envelope_on_artefact_list_omits_reserved_prefix_entries() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+
+        let _guard = envelope_env_lock().lock().await;
+        let _artefact_guard = crate::tools::artefacts::artefact_flag_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::artefacts::FEATURE_FLAG_ENV, "1");
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // One public + two reserved-prefix mime artefacts under the same
+        // passport. Only the public one may appear in the envelope.
+        for (mime, body) in [
+            ("text/plain", "alpha"),
+            ("__ops::secret", "must-not-leak"),
+            ("__bootstrap__::seed", "must-not-leak-either"),
+        ] {
+            let resp = dispatch(
+                rpc(
+                    "tools/call",
+                    json!({
+                        "name": "artefact_put",
+                        "arguments": {
+                            "mime_type": mime,
+                            "content_bytes_base64": B64.encode(body.as_bytes()),
+                        }
+                    }),
+                ),
+                &ctx,
+                None,
+            )
+            .await;
+            assert!(resp.error.is_none(), "artefact_put err: {:?}", resp.error);
+        }
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "artefact_list", "arguments": {"top_k": 20}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        // Envelope wrapper engaged because (a) flag on, (b) opted in via
+        // tool_emits_envelope, (c) per-tool builder is registered.
+        assert!(result["payload"].is_object());
+        let env = &result["envelope"];
+        let memories = env["memories_used"].as_array().unwrap();
+        assert_eq!(
+            memories.len(),
+            1,
+            "artefact_list envelope must strip reserved-prefix mime entries (got {} entries)",
+            memories.len()
+        );
+        assert_eq!(memories[0]["topic"], "text/plain");
+        for m in memories {
+            let topic = m["topic"].as_str().unwrap();
+            assert!(
+                !topic.starts_with("__"),
+                "artefact_list envelope leaked reserved mime {topic}"
+            );
+        }
+        assert_eq!(env["autonomy_consumed"]["capability"], "artefacts:read");
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::artefacts::FEATURE_FLAG_ENV);
+    }
+
+    /// Sibling omit-test: artefact_put and artefact_get do NOT opt into the
+    /// envelope wrapper. They handle opaque bytes (writes/reads of
+    /// arbitrary content) and would emit too much chatter if wrapped — the
+    /// envelope is for memory-adjacent surfaces only.
+    #[tokio::test]
+    async fn envelope_on_artefact_put_get_remain_unwrapped() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+
+        let _guard = envelope_env_lock().lock().await;
+        let _artefact_guard = crate::tools::artefacts::artefact_flag_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::artefacts::FEATURE_FLAG_ENV, "1");
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // artefact_put — must keep legacy shape.
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "artefact_put",
+                    "arguments": {
+                        "mime_type": "text/plain",
+                        "content_bytes_base64": B64.encode(b"no-envelope-here"),
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "artefact_put must NOT carry an envelope wrapper"
+        );
+        assert!(result.get("payload").is_none());
+        let id = result["structuredContent"]["artefact_id"].as_str().unwrap().to_string();
+
+        // artefact_get — also must keep legacy shape.
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "artefact_get", "arguments": {"artefact_id": id}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "artefact_get must NOT carry an envelope wrapper"
+        );
+        assert!(result.get("payload").is_none());
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::artefacts::FEATURE_FLAG_ENV);
+    }
+
+    /// Sibling envelope-omission test for `output_attest` (agent-ux-07).
+    /// The attestation tool is a write of a NEW receipt class — it must
+    /// NOT opt into the per-turn audit envelope, mirroring the rule the
+    /// master ExecPlan documents in §"Cross-PR envelope-test interaction".
+    #[tokio::test]
+    async fn envelope_omits_for_output_attest() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::output_attest::FEATURE_FLAG_ENV, "1");
+        // Provide a signer key + key id for the round-trip path.
+        let secret = [0x22u8; 32];
+        std::env::set_var(
+            "CORECRUXD_WRITE_CONFIRMATION_SIGNING_KEY_B64",
+            base64::engine::general_purpose::STANDARD.encode(secret),
+        );
+        std::env::set_var("CORECRUXD_WRITE_CONFIRMATION_KEY_ID", "envtest-key");
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(b"some-attested-bytes");
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "output_attest",
+                    "arguments": {
+                        "content_bytes_base64": payload_b64,
+                        "receipt_id": "r_envtest",
+                        "content_type": "image/png"
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        // output_attest is NOT in tool_emits_envelope → response shape stays legacy.
+        assert!(
+            result.get("envelope").is_none(),
+            "output_attest must not emit an envelope: got {result}"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "output_attest must not be wrapped: got {result}"
+        );
+        // The manifest payload is still present at the top level.
+        assert!(result["manifest"]["manifest_id"].is_string());
+        assert_eq!(result["manifest"]["crown_receipt_id"], "r_envtest");
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::output_attest::FEATURE_FLAG_ENV);
+        std::env::remove_var("CORECRUXD_WRITE_CONFIRMATION_SIGNING_KEY_B64");
+        std::env::remove_var("CORECRUXD_WRITE_CONFIRMATION_KEY_ID");
+    }
+
     #[tokio::test]
     async fn tools_call_store_and_query_facts() {
+        // Share the envelope env-var lock so this test isn't racy with the
+        // envelope_on_* tests that mutate CORECRUXD_FEATURE_AUDIT_ENVELOPE.
+        let _guard = envelope_env_lock().lock().await;
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
         let ctx = test_ctx();
 
         // Store a fact
@@ -531,5 +1478,403 @@ mod tests {
         assert!(resp.error.is_none());
         let text = resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
         assert!(text.contains("CueCrux"));
+    }
+
+    // ── agent-ux-06: typed action traces ─────────────────────────────────
+    //
+    // Sibling tests to `envelope_on_query_facts_omits_reserved_prefix_entries`
+    // (cross-PR envelope contract). Both assertions in the master plan's
+    // acceptance criteria — reserved-prefix filtering + per-passport
+    // isolation — exercised end-to-end through `dispatch_tool_call`.
+
+    #[tokio::test]
+    async fn envelope_traces_filter_reserved_prefixes() {
+        let _g = crate::traces::test_env_lock().lock().await;
+        std::env::set_var(crate::traces::FEATURE_FLAG_ENV, "1");
+
+        // Unique passport — tokio tests share the trace store; isolating
+        // by passport prevents cross-test pollution.
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "dispatch-envelope-traces-filter".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // Write to a reserved-prefix entity through the real dispatch path.
+        let _ = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "__ops::config-audit", "key": "sha256:abc", "value": "v"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        // And one public write so the trace ring has at least one survivor.
+        let _ = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "project-traces", "key": "status", "value": "v"}
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({"name": "tool_trace_recent", "arguments": {"top_k": 50, "token_budget": 2000}}),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        let traces = result["traces"].as_array().unwrap();
+        // Every recorded predicted_effect must NOT be a reserved-prefix entity.
+        for t in traces {
+            for eff in t["predicted_effects"].as_array().unwrap_or(&Vec::new()) {
+                let entity = eff["entity"].as_str().unwrap_or("");
+                assert!(
+                    !crate::envelope::is_reserved_entity(entity),
+                    "trace leaked reserved entity {entity}"
+                );
+            }
+        }
+        std::env::remove_var(crate::traces::FEATURE_FLAG_ENV);
+    }
+
+    #[tokio::test]
+    async fn envelope_traces_per_passport_isolated() {
+        let _g = crate::traces::test_env_lock().lock().await;
+        std::env::set_var(crate::traces::FEATURE_FLAG_ENV, "1");
+
+        let alice = test_ctx().with_agent(AgentIdentity {
+            name: "dispatch-envelope-traces-alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        let bob = test_ctx().with_agent(AgentIdentity {
+            name: "dispatch-envelope-traces-bob".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // Alice writes one fact; Bob writes another.
+        let _ = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "alice-only", "key": "k", "value": "v"}
+                }),
+            ),
+            &alice,
+            None,
+        )
+        .await;
+        let _ = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "store_fact",
+                    "arguments": {"entity": "bob-only", "key": "k", "value": "v"}
+                }),
+            ),
+            &bob,
+            None,
+        )
+        .await;
+
+        // Alice reads traces — should not see Bob's entries.
+        let resp = dispatch(
+            rpc("tools/call", json!({"name": "tool_trace_recent", "arguments": {}})),
+            &alice,
+            None,
+        )
+        .await;
+        let traces = resp.result.unwrap()["traces"].as_array().unwrap().clone();
+        for t in &traces {
+            for eff in t["predicted_effects"].as_array().unwrap_or(&Vec::new()) {
+                let entity = eff["entity"].as_str().unwrap_or("");
+                assert_ne!(entity, "bob-only", "alice leaked bob's trace");
+            }
+        }
+        // Bob symmetric check.
+        let resp = dispatch(
+            rpc("tools/call", json!({"name": "tool_trace_recent", "arguments": {}})),
+            &bob,
+            None,
+        )
+        .await;
+        let traces = resp.result.unwrap()["traces"].as_array().unwrap().clone();
+        for t in &traces {
+            for eff in t["predicted_effects"].as_array().unwrap_or(&Vec::new()) {
+                let entity = eff["entity"].as_str().unwrap_or("");
+                assert_ne!(entity, "alice-only", "bob leaked alice's trace");
+            }
+        }
+        std::env::remove_var(crate::traces::FEATURE_FLAG_ENV);
+    }
+
+    // ── envelope opt-out for identity-continuity (agent-ux-08) ──
+    //
+    // The three identity-continuity tools (passport_split, passport_merge,
+    // passport_link_device) MUST NOT be opted into the audit-envelope
+    // wrapper — they are writes, not reads, so the envelope (which is
+    // shaped for memory-use accountability) would be inappropriate. The
+    // tests below assert the dispatcher leaves their responses unwrapped
+    // even when CORECRUXD_FEATURE_AUDIT_ENVELOPE=1.
+    //
+    // Each tool can short-circuit before the dispatcher runs the envelope
+    // logic (e.g. feature flag off, missing token_budget). What matters
+    // for the envelope contract is the JsonRpcResponse SHAPE: when the
+    // tool returns successfully, the response MUST NOT carry `envelope`
+    // or `payload` wrappers.
+
+    #[tokio::test]
+    async fn envelope_omits_for_passport_split() {
+        let _guard = envelope_env_lock().lock().await;
+        let _identity_guard = crate::tools::identity::tests::flag_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Use the explicit env var name to avoid taking another import.
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY", "1");
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "personal::alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        // Promote to operator-tier (trusted) by issuing a passport then
+        // seeding 500 receipt-backed facts.
+        dispatch(
+            rpc("tools/call", json!({"name": "issue_passport", "arguments": {}})),
+            &ctx,
+            None,
+        )
+        .await;
+        {
+            let mut store = ctx.fact_store.write().await;
+            for i in 0..500 {
+                store.store(corecrux_memory::fact_store::StoreFact {
+                    entity: format!("seed-{i}"),
+                    key: "k".to_string(),
+                    value: "v".to_string(),
+                    source_receipt: Some(format!("receipt-{i}")),
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                });
+            }
+        }
+        // Refresh tier.
+        dispatch(
+            rpc("tools/call", json!({"name": "get_passport", "arguments": {}})),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "passport_split",
+                    "arguments": {
+                        "target_passport": "personal::alice",
+                        "new_passport_name": "personal::alice-work",
+                        "reason": "envelope opt-out test",
+                        "token_budget": 500,
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "passport_split must not be wrapped in audit envelope"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "passport_split must keep legacy payload shape"
+        );
+        // Sanity: real handler ran.
+        assert_eq!(result["new_passport_id"], "personal::alice-work");
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY");
+    }
+
+    #[tokio::test]
+    async fn envelope_omits_for_passport_merge() {
+        let _guard = envelope_env_lock().lock().await;
+        let _identity_guard = crate::tools::identity::tests::flag_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY", "1");
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "personal::alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        dispatch(
+            rpc("tools/call", json!({"name": "issue_passport", "arguments": {}})),
+            &ctx,
+            None,
+        )
+        .await;
+        {
+            let mut store = ctx.fact_store.write().await;
+            for i in 0..500 {
+                store.store(corecrux_memory::fact_store::StoreFact {
+                    entity: format!("seed-{i}"),
+                    key: "k".to_string(),
+                    value: "v".to_string(),
+                    source_receipt: Some(format!("receipt-{i}")),
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                });
+            }
+            // Pre-seed the source passport under the same tenant so the
+            // merge call succeeds.
+            use crate::tools::passport::PassportRecord;
+            store.store(corecrux_memory::fact_store::StoreFact {
+                entity: "__passport__::personal::alice-old".to_string(),
+                key: "passport".to_string(),
+                value: serde_json::to_string(&PassportRecord {
+                    principal_id: "personal::alice-old".to_string(),
+                    sponsor_id: None,
+                    reputation_tier: "trusted".to_string(),
+                    receipt_count: 500,
+                    issued_at: "2026-05-28T00:00:00Z".to_string(),
+                    passport_hash: "deadbeef".to_string(),
+                })
+                .unwrap(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+            });
+        }
+        dispatch(
+            rpc("tools/call", json!({"name": "get_passport", "arguments": {}})),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "passport_merge",
+                    "arguments": {
+                        "source_passport": "personal::alice-old",
+                        "target_passport": "personal::alice",
+                        "conflict_policy": "prefer_target",
+                        "reason": "envelope opt-out test",
+                        "token_budget": 500,
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "passport_merge must not be wrapped in audit envelope"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "passport_merge must keep legacy payload shape"
+        );
+        assert_eq!(result["merged_passport_id"], "personal::alice");
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY");
+    }
+
+    #[tokio::test]
+    async fn envelope_omits_for_passport_link_device() {
+        let _guard = envelope_env_lock().lock().await;
+        let _identity_guard = crate::tools::identity::tests::flag_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY", "1");
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "personal::alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        dispatch(
+            rpc("tools/call", json!({"name": "issue_passport", "arguments": {}})),
+            &ctx,
+            None,
+        )
+        .await;
+        {
+            let mut store = ctx.fact_store.write().await;
+            for i in 0..500 {
+                store.store(corecrux_memory::fact_store::StoreFact {
+                    entity: format!("seed-{i}"),
+                    key: "k".to_string(),
+                    value: "v".to_string(),
+                    source_receipt: Some(format!("receipt-{i}")),
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                });
+            }
+        }
+        dispatch(
+            rpc("tools/call", json!({"name": "get_passport", "arguments": {}})),
+            &ctx,
+            None,
+        )
+        .await;
+
+        let fp = blake3::hash(b"laptop-envelope-test").to_hex().to_string();
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "passport_link_device",
+                    "arguments": {
+                        "device_fingerprint": fp,
+                        "capabilities_subset": ["facts:read"],
+                        "token_budget": 500,
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "passport_link_device must not be wrapped in audit envelope"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "passport_link_device must keep legacy payload shape"
+        );
+        assert_eq!(result["passport_id"], "personal::alice");
+
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        std::env::remove_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY");
     }
 }

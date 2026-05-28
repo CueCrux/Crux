@@ -97,20 +97,24 @@ pub async fn handle_get_workspace_storyline(args: &Value, ctx: &McpContext) -> R
         let _ = write!(url, "&root={encoded}");
     }
 
+    let bearer = crate::tools::loopback_auth::loopback_bearer_token();
     let response = tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(15)))
             .build()
             .into();
-        agent
+        let mut req = agent
             .get(&url)
-            // Loopback to the same daemon — use dev-mode scope header so the
-            // route's `admin:read` requirement passes without bearer-token
-            // setup. In production deployments with bearer auth, this header
-            // is ignored and a real token would be required.
+            // Loopback to the same daemon: `X-Corecrux-Scopes` is consumed by
+            // `AuthMode::DevScopes`; `Authorization: Bearer` is required in
+            // `AuthMode::JwtHs256` / `JwtJwks`. Send both so the call works
+            // across all auth modes — see `tools::loopback_auth`.
             .header("X-Corecrux-Scopes", "admin:read")
-            .header("Accept", "*/*")
-            .call()
+            .header("Accept", "*/*");
+        if let Some(token) = &bearer {
+            req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+        req.call()
             .map(|mut r| {
                 let status = r.status().as_u16();
                 let mut buf = String::new();

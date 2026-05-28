@@ -75,6 +75,7 @@ mod wasm_dispatcher;
 #[cfg(feature = "wasm-extensions")]
 mod wasm_host;
 mod work;
+mod work_execplans;
 mod workspace_scan;
 
 use std::fs::{create_dir_all, OpenOptions};
@@ -370,6 +371,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
     }
 
+    // Create the shutdown broadcast channel up front so every background
+    // task spawned during startup can subscribe — including the routing
+    // reloader and capacity guard, which would otherwise outlive SIGTERM
+    // and hold the runtime open past `graceful_shutdown_on_sigterm`'s 5s
+    // budget. The signal handler is wired below once all subscribers exist.
+    let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
+
     spawn_routing_reloader(
         config.clone(),
         shard_store.clone(),
@@ -377,6 +385,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         routing_errors.clone(),
         metrics.clone(),
         node_id.clone(),
+        shutdown_tx.subscribe(),
     );
 
     let corruption_detected = Arc::new(RwLock::new(false));
@@ -411,12 +420,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             build.clone(),
             node_id.clone(),
             control_path.clone(),
+            shutdown_tx.subscribe(),
         );
     }
 
     let update_status = Arc::new(RwLock::new(update::initial_status(&config)));
 
-    let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
     spawn_shutdown_signal(shutdown_tx.clone());
     update::spawn_update_checker(config.clone(), update_status.clone(), shutdown_tx.subscribe());
 
@@ -506,6 +515,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             corecrux_memory::EdgeStore::new()
         })),
         kind_registry: Arc::new(RwLock::new(corecrux_memory::KindRegistry::new())),
+        artefact_store: Arc::new(RwLock::new(corecrux_memory::ArtefactStore::new())),
         update_status: update_status.clone(),
         event_bus: corecrux_memory::events::EventBus::new(1024),
         session: {
@@ -659,7 +669,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 state.entity_store.clone(),
                 state.edge_store.clone(),
                 state.kind_registry.clone(),
-            ),
+            )
+            .with_artefact_store(state.artefact_store.clone()),
         ))
     } else {
         None
@@ -1543,11 +1554,15 @@ fn spawn_routing_reloader(
     routing_errors: Arc<RwLock<Vec<String>>>,
     metrics: Metrics,
     node_id: String,
+    mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(config.routing_reload_interval_ms));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = shutdown_rx.recv() => break,
+                _ = interval.tick() => {}
+            }
 
             let current_version = { routing.read().await.current_version() };
             let loaded = match shard_store.load_current() {
@@ -1647,6 +1662,7 @@ fn spawn_capacity_guard(
     build: BuildInfo,
     node_id: String,
     control_path: std::path::PathBuf,
+    mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -1662,7 +1678,10 @@ fn spawn_capacity_guard(
         let mut last_auto_paused = false;
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = shutdown_rx.recv() => break,
+                _ = interval.tick() => {}
+            }
 
             let (total_bytes, free_bytes) = match measure_data_dir_space(&config.data_dir) {
                 Ok(space) => space,
@@ -3685,6 +3704,7 @@ mod tests {
             entity_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::EntityStore::new())),
             edge_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::EdgeStore::new())),
             kind_registry: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::KindRegistry::new())),
+            artefact_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::ArtefactStore::new())),
         };
 
         let router: axum::Router = crate::http::router(state);

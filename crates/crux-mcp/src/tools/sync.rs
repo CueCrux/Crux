@@ -473,6 +473,7 @@ mod tests {
                     source_receipt: Some(format!("receipt-{i}")),
                     confidence: 1.0,
                     private: false,
+                    horizon_class: None,
                 });
             }
         }
@@ -605,6 +606,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -713,6 +715,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
             store.store(StoreFact {
                 entity: "private:salary".to_string(),
@@ -721,6 +724,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
             store.store(StoreFact {
                 entity: "deploy".to_string(),
@@ -729,6 +733,7 @@ mod tests {
                 source_receipt: Some("sync:http://example.test:14800:f_remote".to_string()),
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -764,6 +769,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
             store.store(StoreFact {
                 entity: "business::acme::constraint::deploy".to_string(),
@@ -772,6 +778,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -866,6 +873,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 

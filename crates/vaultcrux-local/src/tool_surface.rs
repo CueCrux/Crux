@@ -50,6 +50,27 @@ pub const TOOL_SURFACE: &[ToolSurfaceEntry] = &[
         tier: ToolTier::Local,
         marker: "[local]",
     },
+    // agent-ux-01 readable/editable memory panel — free-tier local surface.
+    ToolSurfaceEntry {
+        name: "memory_view",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_edit",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_pin",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
+    ToolSurfaceEntry {
+        name: "memory_history",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
     ToolSurfaceEntry {
         name: "query_facts",
         tier: ToolTier::Local,
@@ -142,6 +163,22 @@ pub const TOOL_SURFACE: &[ToolSurfaceEntry] = &[
     },
     ToolSurfaceEntry {
         name: "update_status",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
+    // Identity continuity (agent-ux-08) — free-tier local surface.
+    ToolSurfaceEntry {
+        name: "passport_split",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
+    ToolSurfaceEntry {
+        name: "passport_merge",
+        tier: ToolTier::Local,
+        marker: "[local]",
+    },
+    ToolSurfaceEntry {
+        name: "passport_link_device",
         tier: ToolTier::Local,
         marker: "[local]",
     },

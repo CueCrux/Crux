@@ -26,7 +26,23 @@ pub const WORK_TRANSITION_ENTITY_PREFIX: &str = "__work_transition__";
 pub const WORK_GATE_ENTITY_PREFIX: &str = "__work_gate__";
 pub const RECORD_KEY: &str = "record";
 
-pub const WORK_STATES: &[&str] = &["planned", "in_progress", "blocked", "archive", "complete", "deployed"];
+/// Accepted work states.
+///
+/// `pending_approval` is the agent-ux-05 risk-tiered HITL state. It does not
+/// originate from the kanban write path (`create_work`); it surfaces from
+/// the in-memory approval queue managed by
+/// [`crux_mcp::tools::approvals`]. Validators accept it so the existing
+/// `/v1/work?state=pending_approval` path returns approval entries without
+/// rejecting the query.
+pub const WORK_STATES: &[&str] = &[
+    "planned",
+    "in_progress",
+    "blocked",
+    "archive",
+    "complete",
+    "deployed",
+    "pending_approval",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkError {
@@ -65,6 +81,15 @@ pub struct WorkItem {
     pub created_by_passport: String,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
+    /// ExecPlan-aggregator extension fields. Populated only for items produced
+    /// by `work_execplans::list_execplans`. Optional + `#[serde(default)]` so
+    /// the kanban path stays byte-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_milestone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,6 +173,9 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         created_by_passport: input.created_by_passport.clone(),
         created_at_unix_ms: now_unix_ms,
         updated_at_unix_ms: now_unix_ms,
+        plan_path: None,
+        current_milestone: None,
+        superseded_by: None,
     };
     write_record(store, &item)?;
     write_transition(
@@ -351,6 +379,7 @@ pub fn add_comment(
         source_receipt: None,
         confidence: 1.0,
         private: false,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -512,6 +541,7 @@ fn write_record(store: &mut FactStore, item: &WorkItem) -> Result<(), WorkError>
         source_receipt: None,
         confidence: 1.0,
         private: false,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -530,6 +560,7 @@ fn write_transition(store: &mut FactStore, tx: &WorkTransition) -> Result<(), Wo
         source_receipt: None,
         confidence: 1.0,
         private: false,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -545,6 +576,7 @@ fn write_gate(store: &mut FactStore, gate: &PendingGateAction) -> Result<(), Wor
         source_receipt: None,
         confidence: 1.0,
         private: false,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);

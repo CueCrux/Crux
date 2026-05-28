@@ -50,6 +50,7 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         source_receipt,
         confidence,
         private,
+        horizon_class: None,
     };
 
     let mut store = ctx.fact_store.write().await;
@@ -226,6 +227,19 @@ pub async fn handle_list_entities(_args: &Value, ctx: &McpContext) -> Result<Val
             "text": text
         }]
     }))
+}
+
+/// Crate-internal alias of [`query_visible_facts`] reused by
+/// [`crate::envelope`] so the envelope builder applies exactly the same
+/// visibility + budget rules as the real `query_facts` handler (no extra
+/// surface, no chance of leaking facts the caller couldn't query
+/// directly).
+pub(crate) fn envelope_query_visible_facts(
+    store: &corecrux_memory::FactStore,
+    q: &FactQuery,
+    agent_name: Option<&str>,
+) -> Vec<Fact> {
+    query_visible_facts(store, q, agent_name)
 }
 
 fn query_visible_facts(store: &corecrux_memory::FactStore, q: &FactQuery, agent_name: Option<&str>) -> Vec<Fact> {

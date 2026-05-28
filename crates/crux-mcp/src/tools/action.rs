@@ -62,6 +62,7 @@ async fn store_enrichment_capsule(ctx: &McpContext, proposal: &EnrichedActionPro
         source_receipt: Some(receipt.receipt_id.clone()),
         confidence: 1.0,
         private: true,
+        horizon_class: None,
     };
     ctx.fact_store.write().await.store(fact);
 }

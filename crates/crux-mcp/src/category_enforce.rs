@@ -163,6 +163,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: true,
+            horizon_class: None,
         });
     }
 
@@ -174,6 +175,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: true,
+            horizon_class: None,
         });
     }
 

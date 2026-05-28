@@ -31,6 +31,15 @@ On the first interaction of a session, read `PlanCrux/README.md` and `PlanCrux/b
 - gRPC: `127.0.0.1:4007`.
 - Do not change these defaults; see `Crux/CLAUDE.md` "Port 14800" rule.
 
+### ExecPlan Work board
+
+`GET /v1/work?source=all` (and the equivalent `mcp__crux__list_work(source="all")`) returns kanban work items **merged with** a read-time projection over `PlanCrux/.agent/execplans/*.md`. Aggregator is enabled when `CRUX_EXECPLANS_ROOT` is set in the daemon process env (typically `/srv/<workspace>/PlanCrux/.agent/execplans`).
+
+- ExecPlan items carry id prefix `execplan:<slug>`, virtual `project_id = "execplans"`, and extension fields `plan_path`, `current_milestone`, `superseded_by`.
+- State is derived from facts (`milestone:M<n>`, `gate:M<n>`) plus `Status:` / `Superseded by` lines in the markdown — see `Crux/crates/corecruxd/src/work_execplans.rs` `derive_state`.
+- The console SPA exposes a `Source: All | Kanban | ExecPlans` chip group; selection persists in `localStorage`.
+- Drift detector: `bash Crux/scripts/reconcile-execplan-sessions.sh` lists orphan sessions (registry entry, no `.md`) and unparseable plans. Prints, does not mutate.
+
 ### Container base images
 
 When writing Dockerfiles, prefer Chainguard images over upstream distros (Alpine, Debian, Ubuntu). Chainguard images are rebuilt daily with zero known CVEs. Map:

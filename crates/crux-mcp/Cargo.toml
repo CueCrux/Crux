@@ -11,6 +11,7 @@ chrono = { version = "0.4.40", default-features = false, features = ["clock", "s
 base64 = "0.22.1"
 ed25519-dalek = { version = "2.2.0", features = ["std"] }
 hex = "0.4.3"
+jsonwebtoken = { version = "10.3.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 rand = "0.10.1"
 regex = "1.11"
 serde = { version = "1.0.218", features = ["derive"] }
@@ -22,6 +23,8 @@ ureq = { version = "3.3.0", features = ["json"] }
 uuid = { version = "1.23.1", features = ["v4"] }
 xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
 corecrux-memory = { path = "../corecrux-memory" }
+corecrux-projections = { path = "../corecrux-projections" }
+corecrux-receipts = { path = "../corecrux-receipts" }
 corecrux-retrieval = { path = "../corecrux-retrieval" }
 crux-lens-features = { path = "../crux-lens-features" }
 corecrux-types = { path = "../corecrux-types" }
@@ -37,6 +40,8 @@ http-body-util = "0.1"
 tempfile = "3"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
+zstd = "0.13.3"
+tar = "0.4.44"
 
 [lints]
 workspace = true

@@ -18,15 +18,19 @@
 //! See `corecruxctl --help` for the live subcommand listing.
 
 pub mod admin;
+pub mod audit_export;
 pub mod audit_pack;
 pub mod benchmark;
+pub mod c2pa_x509;
 pub mod evidence;
 pub mod explain;
 pub mod extensions;
 pub mod fixture_digest;
 pub mod gaps;
 pub mod inspect_receipt;
+pub mod memory;
 pub mod ops;
+pub mod output_verify;
 pub mod parity;
 pub mod projections;
 pub mod quickstart;

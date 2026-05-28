@@ -315,6 +315,8 @@ mod tests {
             version: 1,
             supersedes: None,
             private: false,
+            horizon_class: crate::fact_store::HorizonClass::None,
+            reverified_at: None,
         }
     }
 

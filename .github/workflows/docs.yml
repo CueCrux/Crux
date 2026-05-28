@@ -34,7 +34,7 @@ jobs:
       - name: Build documentation
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --workspace --no-deps
+        run: bash scripts/ci-cargo-with-fallback.sh doc --workspace --no-deps
 
       - name: Prepare Pages artifact
         run: |

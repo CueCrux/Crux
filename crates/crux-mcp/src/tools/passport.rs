@@ -199,6 +199,7 @@ pub async fn handle_issue_passport(args: &Value, ctx: &McpContext) -> Result<Val
         source_receipt: None,
         confidence: 1.0,
         private: false,
+        horizon_class: None,
     };
 
     let mut store = ctx.fact_store.write().await;
@@ -264,6 +265,7 @@ pub async fn handle_get_passport(_args: &Value, ctx: &McpContext) -> Result<Valu
                     source_receipt: None,
                     confidence: 1.0,
                     private: false,
+                    horizon_class: None,
                 };
                 let mut store = ctx.fact_store.write().await;
                 store.store(req);
@@ -447,6 +449,7 @@ mod tests {
                     source_receipt: Some(format!("receipt-{i}")),
                     confidence: 1.0,
                     private: false,
+                    horizon_class: None,
                 });
             }
         }
@@ -505,6 +508,7 @@ mod tests {
                     source_receipt: Some(format!("receipt-{i}")),
                     confidence: 1.0,
                     private: false,
+                    horizon_class: None,
                 });
             }
         }

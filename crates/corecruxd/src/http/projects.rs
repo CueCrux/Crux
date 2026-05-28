@@ -504,6 +504,7 @@ pub(super) async fn put_project_layer(
         source_receipt: None,
         confidence: 1.0,
         private: false,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     let stored = store.store(sf);
@@ -576,6 +577,7 @@ pub(super) async fn delete_project_layer(
         source_receipt: None,
         confidence: 0.0,
         private: false,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     let stored = store.store(sf);

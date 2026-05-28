@@ -9,7 +9,11 @@
 //! MCP clients via the `tools/list` response.
 
 pub mod action;
+pub mod approvals;
+pub mod artefacts;
 pub mod audit;
+pub mod audit_export;
+pub mod autonomy;
 pub mod constraint;
 pub mod coordination;
 pub mod cuecrux_session;
@@ -19,16 +23,25 @@ pub mod entities;
 pub mod extensions;
 pub mod facts;
 pub mod features;
+pub mod forget;
+pub mod freshness;
 pub mod github;
 pub mod handoff;
+pub mod identity;
 pub mod kinds;
+pub mod loopback_auth;
+pub mod memory;
+pub mod memory_use;
 pub mod observations;
 pub mod observe;
+pub mod output_attest;
 pub mod passport;
 pub mod query;
+pub mod receipt_verify;
 pub mod sessions;
 pub mod storyline;
 pub mod sync;
+pub mod traces;
 pub mod update;
 
 use serde_json::{json, Value};
@@ -40,11 +53,44 @@ use crux_router::{McpToolCapability, RcxRouter};
 use rcx_capability_token::{DataEgressClass, RcxCapabilityToken};
 
 /// Describes a single MCP tool for the `tools/list` response.
+///
+/// The struct intentionally has only the three "wire-shape" fields. The
+/// per-tool **audit-envelope opt-in** is registered separately in
+/// [`tool_emits_envelope`] so adding new envelope-aware tools doesn't
+/// require touching every legacy `ToolDefinition { … }` literal in
+/// [`list_tools`]. See the docs on [`tool_emits_envelope`] for the opt-in
+/// pattern.
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+}
+
+/// Per-tool audit-envelope opt-in registry (master ExecPlan
+/// `agent-ux-best-in-class-master-2026-05-27`, M2).
+///
+/// Returns `true` iff the tool's responses should be wrapped with the
+/// per-turn audit envelope when the `CORECRUXD_FEATURE_AUDIT_ENVELOPE`
+/// feature flag is on. Wave-1 child plans #2 and #3 will add their new
+/// tools here; Wave-2 plans extend it further. Every entry MUST also have
+/// a matching arm in [`crate::envelope::build_envelope_for_tool`].
+///
+/// Default `false` for every tool not listed — older agents that ignore
+/// `envelope` and never-listed tools always see the unchanged `payload`
+/// shape.
+pub fn tool_emits_envelope(name: &str) -> bool {
+    // `memory_freshness` (agent-ux-03 M3) opts in to expose freshness info
+    // alongside the envelope-style memories_used[] view.
+    // `artefact_list` (agent-ux-12) is memory-adjacent — it surfaces parked
+    // artefact ids as the `memories_used[]` envelope entries so the host can
+    // render "I parked this for you" affordances next to the chat turn.
+    // `artefact_put` + `artefact_get` are opaque-byte read/write and do NOT
+    // opt in (no envelope on either).
+    matches!(
+        name,
+        "query_facts" | "memory_acknowledge_use" | "memory_freshness" | "artefact_list"
+    )
 }
 
 /// Non-breaking pointer added to every legacy tool's description at
@@ -72,6 +118,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             name: "cuecrux_session".to_string(),
             description: cuecrux_session::CUECRUX_SESSION_DESCRIPTION.to_string(),
             input_schema: cuecrux_session::tool_input_schema(),
+        },
+        // ── Autonomy contract (agent-ux-10) ────────────────────────
+        ToolDefinition {
+            name: "autonomy_contract".to_string(),
+            description: autonomy::AUTONOMY_CONTRACT_DESCRIPTION.to_string(),
+            input_schema: autonomy::tool_input_schema(),
         },
         // ── Retrieval ──────────────────────────────────────────────
         ToolDefinition {
@@ -248,6 +300,342 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 ]
             }),
         },
+        // ── Acknowledged memory use (agent-ux-02) ────────────────────
+        ToolDefinition {
+            name: "memory_acknowledge_use".to_string(),
+            description: "Declare which stored fact ids were consulted while producing the \
+                          current turn. Requires an authenticated passport. Reserved-prefix \
+                          entries (__agent::*, __ops::*, __bootstrap__::*) are stripped from \
+                          the acknowledgement. Per-turn audit envelope surfaces the filtered \
+                          list to the host so the consumer can render \"I used this\" \
+                          annotations. Gated by CORECRUXD_FEATURE_MEMORY_ACK=1 (default off)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "turn_id":  { "type": "string", "description": "Opaque per-host turn identifier" },
+                    "fact_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Stored fact ids the agent consulted in producing this turn"
+                    },
+                    "intent": {
+                        "type": "string",
+                        "description": "answer | decision | tool_call | implicit (default: answer)"
+                    },
+                    "retrieved_chunk_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Paid tier: chunks from memory-core retrieval. Free tier: ignored."
+                    },
+                    "confidence": { "type": "number", "description": "Optional 0..1 confidence" },
+                    "note":       { "type": "string", "description": "Optional free-form note" }
+                },
+                "required": ["turn_id"],
+                "examples": [
+                    { "turn_id": "turn-42", "fact_ids": ["f_01J_abc", "f_01J_def"], "intent": "answer" }
+                ]
+            }),
+        },
+        // ── Verifiable output receipts (agent-ux-07 — EU AI Act Art. 50) ─
+        ToolDefinition {
+            name: "output_attest".to_string(),
+            description: "Emit a C2PA-shaped Content Credentials manifest binding `content_bytes` to a \
+                          CROWN receipt id. The returned `manifest_jumbf_base64` is verifiable offline by \
+                          `corecruxctl output-verify` and online via the daemon `/v1/output/verify` route. \
+                          Reuses the daemon's existing Ed25519 CROWN signer (no new key class). \
+                          Requires an authenticated passport. Gated by CORECRUXD_FEATURE_C2PA_OUTPUT=1 \
+                          (default off). Engineering scaffolding aligned with EU AI Act Art. 50; legal \
+                          conformity assessment remains the operator's responsibility."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "content_bytes_base64": { "type": "string", "description": "Base64-encoded content bytes (one of content_bytes_base64 or content_path required)" },
+                    "content_path":         { "type": "string", "description": "Local file path the daemon reads (alternative to content_bytes_base64)" },
+                    "content_type":         { "type": "string", "description": "Optional MIME type (e.g. image/png)" },
+                    "receipt_id":           { "type": "string", "description": "CROWN receipt id this artefact is bound to" },
+                    "claim_generator":      { "type": "string", "description": "Optional claim_generator override (defaults to cuecrux/<version>)" },
+                    "token_budget":         { "type": "integer", "description": "Soft cap on content size in tokens (~bytes/4)" }
+                },
+                "required": ["receipt_id"],
+                "examples": [
+                    { "content_bytes_base64": "iVBORw0KGgo...", "receipt_id": "r_01J_abc", "content_type": "image/png", "token_budget": 4000 }
+                ]
+            }),
+        },
+        // ── Scoped forget (agent-ux-09 — GDPR Art. 17) ─────────────
+        ToolDefinition {
+            name: "memory_forget".to_string(),
+            description: "GDPR Art. 17 scoped erasure. Soft-deletes every fact matching a \
+                          TYPED scope ({entity_prefix|key_glob|passport_id|before_timestamp|\
+                          tenant_id}), filters out reserved prefixes, emits a signed `Forget` \
+                          receipt that names the initiating passport. Requires authenticated \
+                          agent identity and feature flag CORECRUXD_FEATURE_SCOPED_FORGET=1. \
+                          Use `memory_forget_dry_run` first to preview affected facts."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "object",
+                        "description": "Typed scope selector. `type` must be one of entity_prefix, key_glob, passport_id, before_timestamp, tenant_id.",
+                        "oneOf": [
+                            {"properties": {"type": {"const": "entity_prefix"}, "value": {"type": "string"}}, "required": ["type", "value"]},
+                            {"properties": {"type": {"const": "key_glob"},      "value": {"type": "string"}}, "required": ["type", "value"]},
+                            {"properties": {"type": {"const": "passport_id"},   "value": {"type": "string"}}, "required": ["type", "value"]},
+                            {"properties": {"type": {"const": "before_timestamp"}, "value": {"type": "string", "format": "date-time"}}, "required": ["type", "value"]},
+                            {"properties": {"type": {"const": "tenant_id"},     "value": {"type": "string"}}, "required": ["type", "value"]}
+                        ]
+                    },
+                    "reason":       { "type": "string", "description": "Human-readable reason for the forget (audit-record requirement)." },
+                    "tenant_id":    { "type": "string", "description": "Tenant the receipt is attributed to. Defaults to 'default'." },
+                    "token_budget": { "type": "integer", "description": "Optional cap on the number of facts the resolver will touch (QC.2)." }
+                },
+                "required": ["scope", "reason"],
+                "examples": [
+                    { "scope": {"type": "entity_prefix", "value": "test-fixture-"}, "reason": "cleanup after benchmark" },
+                    { "scope": {"type": "before_timestamp", "value": "2026-01-01T00:00:00Z"}, "reason": "annual purge", "tenant_id": "personal::myles" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_forget_dry_run".to_string(),
+            description: "Preview a scoped-forget without mutating the store. Returns the \
+                          count + list of facts that WOULD be soft-deleted. Reserved \
+                          prefixes (`__agent::`, `__ops::`, `__bootstrap__::`, `__agent_session::`) \
+                          are excluded. Respects `token_budget` (QC.2). Always available — \
+                          does not require the feature flag."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "object",
+                        "description": "Same typed scope as memory_forget."
+                    },
+                    "token_budget": { "type": "integer" }
+                },
+                "required": ["scope"],
+                "examples": [
+                    { "scope": {"type": "entity_prefix", "value": "test-fixture-"} },
+                    { "scope": {"type": "key_glob", "value": "secret*"}, "token_budget": 500 }
+                ]
+            }),
+        },
+        // ── Memory panel (agent-ux-01) ──────────────────────────────
+        ToolDefinition {
+            name: "memory_view".to_string(),
+            description: "Read consumer memory in a paginated, narrative-friendly shape. \
+                          Returns facts grouped by entity with version + confidence + pin \
+                          state. Reserved-prefix entries (__agent::*, __ops::*, \
+                          __bootstrap__::*, __memory_pin::*) are filtered out. Honours \
+                          `token_budget` (default 2000). Feature-flagged behind \
+                          CORECRUXD_FEATURE_MEMORY_PANEL=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity":       { "type": "string",  "description": "Filter to a specific entity" },
+                    "key":          { "type": "string",  "description": "Filter to a specific key within the entity" },
+                    "top_k":        { "type": "integer", "description": "Maximum facts to return", "default": 20 },
+                    "token_budget": { "type": "integer", "description": "Total token budget across returned facts (default 2000)" }
+                },
+                "examples": [
+                    { "token_budget": 2000, "top_k": 20 },
+                    { "entity": "person:alice", "token_budget": 500 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_edit".to_string(),
+            description: "Update the value of an existing fact. Creates a new version that \
+                          supersedes the prior fact; the audit trail (`memory_history` / \
+                          `fact_history`) preserves the chain. Requires an authenticated \
+                          agent identity. The optional `reason` is embedded in the new \
+                          fact's source_receipt as `memory_edit:<reason>`. Reserved-prefix \
+                          entities are refused."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "fact_id":   { "type": "string", "description": "Existing fact id to update" },
+                    "new_value": { "type": "string", "description": "Replacement value" },
+                    "reason":    { "type": "string", "description": "Why the edit was made (becomes the receipt note)" }
+                },
+                "required": ["fact_id", "new_value"],
+                "examples": [
+                    { "fact_id": "f_01J_abc", "new_value": "Munich", "reason": "moved 2026-04" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_pin".to_string(),
+            description: "Mark a fact as user-pinned (or unpin it). Pinned facts survive \
+                          decay (#3) and scoped-forget (#9). Pin state is per-agent and is \
+                          stored under the reserved `__memory_pin::<agent>::*` entity, so \
+                          it never leaks across agents."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "fact_id": { "type": "string",  "description": "Fact id to (un)pin" },
+                    "pinned":  { "type": "boolean", "description": "True to pin, false to unpin", "default": true }
+                },
+                "required": ["fact_id"],
+                "examples": [
+                    { "fact_id": "f_01J_abc", "pinned": true },
+                    { "fact_id": "f_01J_abc", "pinned": false }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_history".to_string(),
+            description: "Walk the version chain for a memory entry, returned in \
+                          consumer-friendly shape. Accepts either {entity, key} or \
+                          {fact_id}. Reserved-prefix entries are refused; the operator-side \
+                          `fact_history` tool still covers those."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity":  { "type": "string", "description": "Entity to walk" },
+                    "key":     { "type": "string", "description": "Key within the entity" },
+                    "fact_id": { "type": "string", "description": "Resolve (entity, key) via this fact id" }
+                },
+                "examples": [
+                    { "entity": "person:carol", "key": "city" },
+                    { "fact_id": "f_01J_abc" }
+                ]
+            }),
+        },
+        // ── Freshness + decay (agent-ux-03 M3) ─────────────────────
+        ToolDefinition {
+            name: "memory_freshness".to_string(),
+            description: "Freshness: list facts with their per-fact decay state \
+                          ({fresh|stale|unknown}) under the deterministic decay policy. \
+                          Reserved-prefix facts (__agent::, __ops::, __bootstrap__::) are \
+                          filtered. Read-only; pass `token_budget` (default 500) per QC.2. \
+                          Gated by CORECRUXD_FEATURE_FRESHNESS=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity":       { "type": "string", "description": "Optional entity filter" },
+                    "key":          { "type": "string", "description": "Optional key filter" },
+                    "top_k":        { "type": "integer", "description": "Maximum rows", "default": 20 },
+                    "token_budget": { "type": "integer", "description": "Token budget cap", "default": 500 }
+                },
+                "examples": [
+                    { "token_budget": 500 },
+                    { "entity": "execplan:agent-ux-03-freshness-decay-2026-05-27", "top_k": 50, "token_budget": 1000 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_set_horizon".to_string(),
+            description: "Freshness: pin or override the horizon_class on a fact \
+                          (`volatile`, `medium`, `stable`, `none`). Requires an \
+                          authenticated passport. Reserved-prefix facts cannot be \
+                          re-classified through this surface. Gated by \
+                          CORECRUXD_FEATURE_FRESHNESS=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "fact_id":        { "type": "string", "description": "Target fact id (f_…)" },
+                    "horizon_class":  { "type": "string", "enum": ["volatile", "medium", "stable", "none"] }
+                },
+                "required": ["fact_id", "horizon_class"],
+                "examples": [
+                    { "fact_id": "f_01J_abc", "horizon_class": "stable" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_reverify".to_string(),
+            description: "Freshness: re-anchor a fact's decay clock without rewriting the \
+                          value, recording a CROWN-verifiable `Reverify` receipt under \
+                          `__reverify_receipts__::<fact_id>`. Requires an authenticated \
+                          passport. Gated by CORECRUXD_FEATURE_FRESHNESS=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "fact_id": { "type": "string", "description": "Target fact id (f_…)" }
+                },
+                "required": ["fact_id"],
+                "examples": [
+                    { "fact_id": "f_01J_abc" }
+                ]
+            }),
+        },
+        // ── Artefacts (agent-ux-12 — calm deferred output) ────────
+        ToolDefinition {
+            name: "artefact_put".to_string(),
+            description: "Park a large byte payload under a passport-owned, BLAKE3-keyed id. \
+                          Returns `{artefact_id, size_bytes, mime_type, created_at, expires_at}` — \
+                          the content itself is fetched separately via `artefact_get`. Identical \
+                          bytes always produce the same id (content-addressed). Default TTL 7 days, \
+                          max 90 days. Requires an authenticated passport. Gated by \
+                          CORECRUXD_FEATURE_ARTEFACTS=1 (default off)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "content_bytes_base64": { "type": "string",  "description": "Base64-encoded content bytes (required for inline put)." },
+                    "mime_type":             { "type": "string",  "description": "Free-form MIME label (e.g. application/json, application/x-c2pa-manifest)." },
+                    "tool_origin":           { "type": "string",  "description": "Optional 'which tool produced this' label, surfaced in artefact_list." },
+                    "ttl_seconds":           { "type": "integer", "description": "Optional TTL in seconds. Default 7d. Max 90d. 0 = no expiry." },
+                    "token_budget":          { "type": "integer", "description": "Mandatory output-token cap (QC.2). Honoured by the response shape." }
+                },
+                "required": ["content_bytes_base64", "mime_type"],
+                "examples": [
+                    { "content_bytes_base64": "eyJzaGEyNTYiOiJhYmMifQ==", "mime_type": "application/json", "tool_origin": "audit_export_bundle", "token_budget": 500 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "artefact_get".to_string(),
+            description: "Fetch a previously-put artefact by id. Returns `{content_base64, mime_type, \
+                          size_bytes, created_at, expires_at}`. Cross-passport reads return \
+                          CAPABILITY_DENIED so the operator can audit. Reserved-prefix mime entries \
+                          are still readable by their owner — filtering only applies to list output. \
+                          Gated by CORECRUXD_FEATURE_ARTEFACTS=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "artefact_id":  { "type": "string",  "description": "Content-addressed id returned by artefact_put." },
+                    "token_budget": { "type": "integer", "description": "Mandatory output-token cap (QC.2)." }
+                },
+                "required": ["artefact_id"],
+                "examples": [
+                    { "artefact_id": "art_0123abcd…", "token_budget": 4000 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "artefact_list".to_string(),
+            description: "List metadata for artefacts owned by the calling passport. Reserved-prefix \
+                          mime entries are filtered out (T.1). Cross-passport entries are never \
+                          included. Newest-first, capped at `top_k`. Optional `scope` substring \
+                          filters by mime_type or tool_origin. This is the read surface the console \
+                          /artefacts panel calls. Gated by CORECRUXD_FEATURE_ARTEFACTS=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "top_k":        { "type": "integer", "description": "Max artefacts to return (default 20).", "default": 20 },
+                    "scope":        { "type": "string",  "description": "Optional mime_type / tool_origin substring filter." },
+                    "token_budget": { "type": "integer", "description": "Mandatory output-token cap (QC.2)." }
+                },
+                "examples": [
+                    { "token_budget": 500 },
+                    { "top_k": 50, "scope": "audit_export_bundle", "token_budget": 2000 }
+                ]
+            }),
+        },
         // ── Sessions ───────────────────────────────────────────────
         ToolDefinition {
             name: "get_session".to_string(),
@@ -378,6 +766,30 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["session_id", "observation_id"],
                 "examples": [
                     { "session_id": "my-session", "observation_id": "01HXXXXXXXXX" }
+                ]
+            }),
+        },
+        // ── Receipt verification (agent-ux-04 source-linked traceability) ──
+        ToolDefinition {
+            name: "receipt_verify".to_string(),
+            description: "Re-verify a CROWN receipt by id via the daemon's existing \
+                          /v1/receipts/{id}/verification route. Returns \
+                          `{verified, signer_passport, errors[]}` so a host IDE can render \
+                          a one-click verify badge next to receipt ids in chat. Requires an \
+                          authenticated agent identity (audit pattern: only the signer or an \
+                          operator should re-verify). Gated by \
+                          CORECRUXD_FEATURE_RECEIPT_VERIFY=1 (default off)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "receipt_id": { "type": "string", "description": "Receipt id to verify (e.g. r_01JXXXXXX)" },
+                    "tenant_id":  { "type": "string", "description": "Tenant id the receipt belongs to (default: \"default\")" }
+                },
+                "required": ["receipt_id"],
+                "examples": [
+                    { "receipt_id": "r_01JABC" },
+                    { "receipt_id": "r_01JABC", "tenant_id": "personal::myles" }
                 ]
             }),
         },
@@ -662,6 +1074,41 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 ]
             }),
         },
+        // ── BYO audit trail (agent-ux-11) ──────────────────────────
+        ToolDefinition {
+            name: "audit_export_bundle".to_string(),
+            description: "Bring-Your-Own audit-trail export (EU AI Act Art. 12). Builds a \
+                          self-contained, signed `tar.zst` bundle of every fact-event in \
+                          the time window plus the cross-references to source receipts. \
+                          The bundle re-verifies OFFLINE via `corecruxctl audit-verify` — \
+                          no daemon, no network. Reserved prefixes (__agent::*, __ops::*, \
+                          __bootstrap__::*) are filtered out unless the caller is \
+                          operator-tier (authenticated passport + scope.include_reserved). \
+                          REQUIRES `token_budget` (QC.2). Gated by \
+                          CORECRUXD_FEATURE_AUDIT_EXPORT=1 (default off)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "since_ts":     { "type": "string",  "description": "RFC3339 lower bound, inclusive (optional)" },
+                    "until_ts":     { "type": "string",  "description": "RFC3339 upper bound, exclusive (optional; defaults to now)" },
+                    "scope": {
+                        "type": "object",
+                        "description": "Optional scope filter.",
+                        "properties": {
+                            "entity_prefix":    { "type": "string",  "description": "Restrict to entities matching this prefix" },
+                            "include_reserved": { "type": "boolean", "description": "Operator-only: include reserved-prefix entries. Silently ignored for non-operator callers.", "default": false }
+                        }
+                    },
+                    "token_budget": { "type": "integer", "description": "REQUIRED — caps total tokens swept (QC.2)" }
+                },
+                "required": ["token_budget"],
+                "examples": [
+                    { "token_budget": 4000, "since_ts": "2026-05-01T00:00:00Z" },
+                    { "token_budget": 8000, "since_ts": "2026-01-01T00:00:00Z", "until_ts": "2026-06-01T00:00:00Z", "scope": {"entity_prefix": "project-"} }
+                ]
+            }),
+        },
         // ── Passport ───────────────────────────────────────────────
         ToolDefinition {
             name: "issue_passport".to_string(),
@@ -695,6 +1142,135 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {},
                 "examples": [{}]
+            }),
+        },
+        // ── Identity continuity (agent-ux-08) ──────────────────────
+        ToolDefinition {
+            name: "passport_split".to_string(),
+            description: "Fork a passport into a new identity that inherits the source's \
+                          facts via lineage read-through; future writes diverge to the new \
+                          id. Caller must own the source passport AND hold operator-tier \
+                          (trusted+). Cross-tenant splits are forbidden (T.1). Emits a \
+                          PassportSplit CROWN receipt. NOT REVERSIBLE at the fact level. \
+                          Gated behind CORECRUXD_FEATURE_IDENTITY_CONTINUITY=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target_passport": {
+                        "type": "string",
+                        "description": "Passport id to fork. Must equal the calling agent's passport."
+                    },
+                    "new_passport_name": {
+                        "type": "string",
+                        "description": "Name for the new passport. Must share the source's tenant prefix."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Human-readable rationale recorded in the receipt body."
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "Required positive cap on resolver work (QC.2).",
+                        "minimum": 1
+                    }
+                },
+                "required": ["target_passport", "new_passport_name", "token_budget"],
+                "examples": [
+                    {
+                        "target_passport": "personal::alice",
+                        "new_passport_name": "personal::alice-work",
+                        "reason": "separate work persona",
+                        "token_budget": 500
+                    }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "passport_merge".to_string(),
+            description: "Collapse two passports under one identity. Caller must own \
+                          the source OR target passport AND hold operator-tier (trusted+). \
+                          Cross-tenant merges are forbidden (T.1). `conflict_policy` is \
+                          MANDATORY and EXPLICIT: prefer_source | prefer_target | \
+                          error_on_conflict — never silently chosen. Emits a PassportMerge \
+                          CROWN receipt. The source passport is retired (sessions become \
+                          read-only references). NOT REVERSIBLE at the fact level. Gated \
+                          behind CORECRUXD_FEATURE_IDENTITY_CONTINUITY=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "source_passport": {
+                        "type": "string",
+                        "description": "Passport to retire into the target."
+                    },
+                    "target_passport": {
+                        "type": "string",
+                        "description": "Surviving passport id."
+                    },
+                    "conflict_policy": {
+                        "type": "string",
+                        "enum": ["prefer_source", "prefer_target", "error_on_conflict"],
+                        "description": "How to resolve (entity, key) conflicts. Required; never silent."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Human-readable rationale recorded in the receipt body."
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "Required positive cap on conflict-detection work (QC.2).",
+                        "minimum": 1
+                    }
+                },
+                "required": ["source_passport", "target_passport", "conflict_policy", "token_budget"],
+                "examples": [
+                    {
+                        "source_passport": "personal::alice-old",
+                        "target_passport": "personal::alice",
+                        "conflict_policy": "prefer_target",
+                        "reason": "consolidate after device retirement",
+                        "token_budget": 500
+                    }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "passport_link_device".to_string(),
+            description: "Bind an additional device fingerprint to the calling agent's \
+                          passport with a capability subset (defaults to facts:read). \
+                          Requires operator-tier (trusted+) on the calling passport. \
+                          Fingerprint MUST be a 64-char lowercase BLAKE3 hex digest \
+                          over the device's canonical attestation blob — raw attestations \
+                          are never stored. Emits a PassportLinkDevice CROWN receipt. \
+                          Gated behind CORECRUXD_FEATURE_IDENTITY_CONTINUITY=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "device_fingerprint": {
+                        "type": "string",
+                        "description": "64-char lowercase BLAKE3 hex digest of the device attestation."
+                    },
+                    "capabilities_subset": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Capability strings propagated to the linked device. Defaults to [facts:read]."
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "Required positive token budget (QC.2).",
+                        "minimum": 1
+                    }
+                },
+                "required": ["device_fingerprint", "token_budget"],
+                "examples": [
+                    {
+                        "device_fingerprint": "af2c4e3b6d8a9c1e0f7b5a3d2c1e8f4a9d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a",
+                        "capabilities_subset": ["facts:read"],
+                        "token_budget": 500
+                    }
+                ]
             }),
         },
         // ── Sync ──────────────────────────────────────────────────
@@ -1123,6 +1699,66 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "examples":[{"kind":"capability"}]
             }),
         },
+        // ── Typed action traces (agent-ux-06) ────────────────────────────
+        ToolDefinition {
+            name: "tool_trace_recent".to_string(),
+            description: traces::TOOL_DESCRIPTION.to_string(),
+            input_schema: traces::tool_input_schema(),
+        },
+        // ── Risk-tiered HITL (agent-ux-05) ───────────────────────
+        ToolDefinition {
+            name: "approval_request".to_string(),
+            description: "Risk-tiered HITL: queue an action for operator approval. Required: \
+                          action_summary, risk_tier (low|medium|high), scope (tenant_id or \
+                          resource path), token_budget. Optional: tenant_id, payload. Returns \
+                          immediately with {request_id, status: 'pending'|'feature_disabled', \
+                          risk_tier}. High-tier requests BLOCK on operator decision; medium/low \
+                          may auto-approve per tenant policy (out of scope for the M3 free tier). \
+                          Pending entries appear in list_work(state='pending_approval'). \
+                          Gated by CORECRUXD_FEATURE_APPROVAL_QUEUE=1 (default off)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action_summary": { "type": "string", "description": "Human-readable description of the action being requested." },
+                    "risk_tier":      { "type": "string", "enum": ["low", "medium", "high"], "description": "Risk classification." },
+                    "scope":           { "type": "string", "description": "Tenant id or scoped resource path the action targets." },
+                    "tenant_id":      { "type": "string", "description": "Tenant the request is raised in (defaults to scope when omitted)." },
+                    "payload":        { "type": "object", "description": "Optional structured payload (e.g. predicted_effects, original tool call)." },
+                    "token_budget":   { "type": "integer", "description": "QC.2 — required. Caps response size. Pass any positive integer." }
+                },
+                "required": ["action_summary", "risk_tier", "scope", "token_budget"],
+                "examples": [
+                    { "action_summary": "delete tenant prod fixtures", "risk_tier": "high", "scope": "business::acme", "tenant_id": "business::acme", "token_budget": 500 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "approval_decide".to_string(),
+            description: "Risk-tiered HITL: operator decision on a pending approval. Requires \
+                          OPERATOR-tier passport (elite/operator). Forwards the request through \
+                          the cross-tenant guard (T.1) — reviewer in tenant A cannot decide for \
+                          tenant B. Emits an ApprovalDecision CROWN receipt (the daemon HTTP \
+                          layer attaches the Ed25519 signature). Returns {ok, status, \
+                          reviewer_passport, decided_at, receipt_id, receipt_body_hash_hex}. \
+                          Non-operator callers receive a 403-style JSON-RPC error with \
+                          `why_denied` explaining the missing tier."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "request_id":         { "type": "string", "description": "Opaque request id minted by approval_request." },
+                    "decision":           { "type": "string", "enum": ["approve", "reject"], "description": "Operator decision." },
+                    "reviewer_notes":     { "type": "string", "description": "Optional free-text justification (embedded in the receipt body)." },
+                    "reviewer_tier":      { "type": "string", "description": "Reviewer's passport tier — forwarded by the daemon HTTP layer; tests pass 'elite' or 'operator'." },
+                    "reviewer_tenant_id": { "type": "string", "description": "Reviewer's tenant id — used to enforce the cross-tenant guard (T.1)." }
+                },
+                "required": ["request_id", "decision"],
+                "examples": [
+                    { "request_id": "ar_abcd1234", "decision": "approve", "reviewer_tier": "elite", "reviewer_tenant_id": "business::acme", "reviewer_notes": "approved per ticket #42" }
+                ]
+            }),
+        },
     ]
     .into_iter()
     .map(|mut t: ToolDefinition| {
@@ -1312,15 +1948,30 @@ fn rcx_capability_for_tool(tool_name: &str) -> String {
 pub fn tool_output_docs() -> Value {
     json!([
         { "tool": "cuecrux_session",    "output": "SessionPlan (see agents.cuecrux.com/schemas/SessionPlan.v1). Contains plan_id, session_id, passport, channels {bulk?, mcp}, capability_graph[], receipt {hash, signature?, signer_kid?, mode}, budget, minted_at, session_ttl_s." },
+        { "tool": "autonomy_contract",  "output": "{ feature_enabled, passport_id, tier, token_id, token_hash, capabilities: [{name, allowed, scope, backend_id, mode, cost_credits, why_denied?}], summary: {total_tools, returned, allowed, denied, truncated_by_token_budget} }. Disabled when CORECRUXD_FEATURE_AUTONOMY_CONTRACT is off (feature_enabled=false, empty capabilities)." },
         { "tool": "query",              "output": "{ results: [{doc_id, score, segment_index, token_count}], coverage: {score, gaps, below_floor}, meta: {backend, took_ms, segments_searched} }" },
         { "tool": "query_scan",         "output": "{ results: [{doc_id, score, token_count}], meta: {took_ms, segments_searched} }" },
         { "tool": "query_expand",       "output": "{ results: [{doc_id, content, token_count}] }" },
         { "tool": "store_fact",         "output": "{ fact_id, entity, key, value, stored_at, tokens, confidence }" },
         { "tool": "query_facts",        "output": "{ facts: [{fact_id, entity, key, value, confidence, stored_at}], total_tokens }" },
         { "tool": "delete_fact",        "output": "{ deleted: bool, fact_id }" },
+        { "tool": "memory_forget",         "output": "{ content: [...], forget_receipt_id, facts_affected, recovery_window_seconds, recovery_window_ends_at, receipt_body_cbor_hex, receipt_body_hash_hex, scope, passport_id }" },
+        { "tool": "memory_forget_dry_run", "output": "{ content: [...], scope, count, facts_that_would_be_affected: [{fact_id, entity, key, stored_at, tokens}], dry_run: true }" },
         { "tool": "list_entities",      "output": "{ entities: [string] }" },
         { "tool": "get_bootstrap",      "output": "{ facts: [{entity, key, value}], total_tokens }" },
         { "tool": "fact_history",       "output": "{ versions: [{fact_id, value, version, supersedes, confidence, stored_at, deleted}] }" },
+        { "tool": "memory_acknowledge_use", "output": "{ turn_id, intent, feature_enabled, receipt_ref, memories_used: [{fact_id, topic, age_days}], filtered_count, redacted_count, not_found_count, not_visible_count }" },
+        { "tool": "output_attest",          "output": "{ content: [...], manifest: { manifest_id, spec_version, manifest_jumbf_base64, content_hash_blake3_hex, crown_receipt_id, signer_key_id, signer_passport, verify_url, verify_command, ai_act_notice } } — agent-ux-07 C2PA Content Credentials emitter." },
+        { "tool": "memory_view",        "output": "{ content: [...], structuredContent: { facts: [{id, entity, key, value, version, stored_at, confidence, pinned, source_receipt}], total_tokens, returned } } — agent-ux-01 consumer surface; reserved prefixes filtered." },
+        { "tool": "memory_edit",        "output": "{ content: [...], structuredContent: { old_fact_id, new_fact: MemoryFact, reason } } — new fact supersedes old; reason embedded as `memory_edit:<reason>` source_receipt." },
+        { "tool": "memory_pin",         "output": "{ content: [...], structuredContent: { fact_id, pinned: bool } } — pin state stored under reserved __memory_pin::<agent>::*." },
+        { "tool": "memory_history",     "output": "{ content: [...], structuredContent: { versions: [{id, value, version, stored_at, supersedes, deleted, source_receipt}] } } — consumer-friendly version chain (excludes reserved prefixes)." },
+        { "tool": "memory_freshness",   "output": "{ rows: [{fact_id, entity, key, horizon_class, freshness, age_hours, stored_at, reverified_at?}], policy: {volatile_stale_hours, medium_stale_days, stable_stale_days}, now }" },
+        { "tool": "memory_set_horizon", "output": "{ fact_id, horizon_class, ok: bool }" },
+        { "tool": "memory_reverify",    "output": "{ fact_id, receipt_id, receipt_class: 'Reverify', reverified_at }" },
+        { "tool": "artefact_put",       "output": "{ content: [...], structuredContent: { artefact_id, mime_type, tool_origin, size_bytes, created_at, expires_at } } — id is `art_<blake3_hex>`; identical bytes coalesce." },
+        { "tool": "artefact_get",       "output": "{ content: [...], structuredContent: { artefact_id, mime_type, tool_origin, size_bytes, created_at, expires_at, content_base64 } } — cross-passport reads return CAPABILITY_DENIED." },
+        { "tool": "artefact_list",      "output": "{ content: [...], structuredContent: { artefacts: [{artefact_id, mime_type, tool_origin, size_bytes, created_at, expires_at}], count } } — passport-scoped, reserved-prefix mime entries filtered." },
         { "tool": "get_session",        "output": "{ session_id, state, updated_at, total_tokens }" },
         { "tool": "save_session",       "output": "{ session_id, updated_at }" },
         { "tool": "list_sessions",      "output": "{ sessions: [string] }" },
@@ -1329,6 +1980,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "list_observations",  "output": "{ session_id, count, observations: [{ observation_id, session_id, ts, provider, principal, kind, payload, receipt: {alg, signed_by, body_hash, signature} }] }" },
         { "tool": "get_observation",    "output": "Single observation record (same shape as list_observations entries), or a not-found text response." },
         { "tool": "verify_observation", "output": "{ observation_id, ok: bool, hash_match: bool, signature_valid: bool, recomputed_hash, receipt_hash, reason?: string }" },
+        { "tool": "receipt_verify", "output": "{ content: [...], receipt_id, tenant_id, feature_enabled: bool, verified: bool, signer_passport: string|null, errors: [string], http_status: int, report: VerificationReportV1 } — when feature off, omits report and returns errors:[FEATURE_DISABLED]. agent-ux-04 source-linked traceability." },
         { "tool": "get_agent_identity", "output": "{ agent_name: string }" },
         { "tool": "create_handoff",     "output": "{ package_json, content_hash, signature, relevant_fact_count }" },
         { "tool": "accept_handoff",     "output": "{ session_loaded, facts_loaded, verified: bool }" },
@@ -1339,8 +1991,12 @@ pub fn tool_output_docs() -> Value {
         { "tool": "audit_config",        "output": "{ content: [{type:'text', text:'config audited: path=… sha256=… auditor=…'}] } — fact written under __ops::config-audit key=sha256:<hash>." },
         { "tool": "check_config_audit",  "output": "{ content: [...], unaudited: [{path, sha256}], audited: [{path, sha256, audited_at, auditor, audited_path}] }" },
         { "tool": "enrich_action",      "output": "EnrichedActionProposal { schema, tenant_id, enrichment_mode, tool_call, narrative, affected_principals, affected_resources, state_diff, consequences, relationship_hits, consequence_metadata, enrichment_receipt }" },
+        { "tool": "audit_export_bundle", "output": "{ content: [...], bundle_id, bytes_path, manifest_signature_b64, fact_count, receipt_count, scope, since, until, events_jsonl_sha256, receipts_cbor_sha256 } — bundle persisted to CORECRUXD_AUDIT_EXPORT_DIR; verify offline via `corecruxctl audit-verify`. agent-ux-11 (EU AI Act Art. 12)." },
         { "tool": "issue_passport",     "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id }" },
         { "tool": "get_passport",       "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id, issued_at, passport_hash }" },
+        { "tool": "passport_split",        "output": "{ content: [...], new_passport_id, split_receipt_id, receipt_body_cbor_hex, receipt_body_hash_hex, tenant_id }" },
+        { "tool": "passport_merge",        "output": "{ content: [...], merged_passport_id, merge_receipt_id, conflicts_resolved, conflict_policy, receipt_body_cbor_hex, receipt_body_hash_hex, tenant_id, retired_passport_id }" },
+        { "tool": "passport_link_device",  "output": "{ content: [...], link_receipt_id, passport_id, device_fingerprint, capabilities_subset, receipt_body_cbor_hex, receipt_body_hash_hex, tenant_id }" },
         { "tool": "sync_pull",          "output": "{ tenant_id?, facts_pulled, cursor, total_pull_count, collection_cursor_count }" },
         { "tool": "sync_push",          "output": "{ mode?='tenant_promotion_preview', tenant_id?, facts_pushed?|would_promote?, preview_hash?, skipped_private?, skipped_synced?, skipped_not_allowlisted?, total_push_count?, collection_cursor_count? }" },
         { "tool": "sync_status",        "output": "{ mode, configured, background_sync_enabled, remote_url, api_key_configured, platform_online, degraded, degraded_reason, onboarding_hint, last_pull_at, last_push_at, pull_count, push_count, collection_pull_cursor_count, collection_push_cursor_count, tenant_manifest_supported, local_fact_count }" },
@@ -1371,7 +2027,10 @@ pub fn tool_output_docs() -> Value {
         { "tool": "feature_file_search",     "output": "{ content: [...], capabilities: [{id, name, system, files}], count }" },
         { "tool": "feature_coverage_report", "output": "{ content: [...], report: CoverageReport { total_capabilities, total_tested, total_audited, maturity, systems } }" },
         { "tool": "feature_trigger_audit",   "output": "{ content: [...], capability: <updated payload>, version }" },
-        { "tool": "feature_suggest_next",    "output": "{ content: [...], suggestions: [{kind, capability_id?, gap_type?, severity?, promise?, rationale}], count }" }
+        { "tool": "feature_suggest_next",    "output": "{ content: [...], suggestions: [{kind, capability_id?, gap_type?, severity?, promise?, rationale}], count }" },
+        { "tool": "tool_trace_recent",       "output": "{ content: [...], traces: [{tool, ts_us, turn_id?, predicted_effects: [{kind, entity, key, ts_us?}], outcome}], count, feature_disabled? } — per-passport; reserved-prefix effects stripped." },
+        { "tool": "approval_request",        "output": "{ content: [...], request_id, status: 'pending'|'feature_disabled', risk_tier, tenant_id, feature_enabled } — pending entries also visible via list_work(state='pending_approval')." },
+        { "tool": "approval_decide",         "output": "{ content: [...], ok, request_id, status: 'approved'|'rejected', reviewer_passport, decided_at, receipt_id, receipt_body_hash_hex, tenant_id, risk_tier } — non-operator callers receive a 403-style JSON-RPC error with `why_denied`." }
     ])
 }
 
@@ -1395,15 +2054,34 @@ pub async fn handle_get_agent_identity(_args: &Value, ctx: &McpContext) -> Resul
 pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     match name {
         "cuecrux_session" => cuecrux_session::handle_cuecrux_session(args, ctx).await,
+        "autonomy_contract" => autonomy::handle_autonomy_contract(args, ctx).await,
         "query" => query::handle_query(args, ctx).await,
         "query_scan" => query::handle_query_scan(args, ctx).await,
         "query_expand" => query::handle_query_expand(args, ctx).await,
         "store_fact" => facts::handle_store_fact(args, ctx).await,
         "query_facts" => facts::handle_query_facts(args, ctx).await,
         "delete_fact" => facts::handle_delete_fact(args, ctx).await,
+        "memory_forget" => forget::handle_memory_forget(args, ctx).await,
+        "memory_forget_dry_run" => forget::handle_memory_forget_dry_run(args, ctx).await,
         "list_entities" => facts::handle_list_entities(args, ctx).await,
         "get_bootstrap" => facts::handle_get_bootstrap(args, ctx).await,
         "fact_history" => facts::handle_fact_history(args, ctx).await,
+        "memory_acknowledge_use" => memory_use::handle_memory_acknowledge_use(args, ctx).await,
+        // C2PA Content Credentials emitter (agent-ux-07).
+        "output_attest" => output_attest::handle_output_attest(args, ctx).await,
+        // Memory panel (agent-ux-01).
+        "memory_view" => memory::handle_memory_view(args, ctx).await,
+        "memory_edit" => memory::handle_memory_edit(args, ctx).await,
+        "memory_pin" => memory::handle_memory_pin(args, ctx).await,
+        "memory_history" => memory::handle_memory_history(args, ctx).await,
+        // Freshness + decay (agent-ux-03 M3).
+        "memory_freshness" => freshness::handle_memory_freshness(args, ctx).await,
+        "memory_set_horizon" => freshness::handle_memory_set_horizon(args, ctx).await,
+        "memory_reverify" => freshness::handle_memory_reverify(args, ctx).await,
+        // Artefacts (agent-ux-12).
+        "artefact_put" => artefacts::handle_artefact_put(args, ctx).await,
+        "artefact_get" => artefacts::handle_artefact_get(args, ctx).await,
+        "artefact_list" => artefacts::handle_artefact_list(args, ctx).await,
         "get_session" => sessions::handle_get_session(args, ctx).await,
         "save_session" => sessions::handle_save_session(args, ctx).await,
         "list_sessions" => sessions::handle_list_sessions(args, ctx).await,
@@ -1412,6 +2090,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "list_observations" => observations::handle_list_observations(args, ctx).await,
         "get_observation" => observations::handle_get_observation(args, ctx).await,
         "verify_observation" => observations::handle_verify_observation(args, ctx).await,
+        "receipt_verify" => receipt_verify::handle_receipt_verify(args, ctx).await,
         "get_agent_identity" => handle_get_agent_identity(args, ctx).await,
         "create_handoff" => handoff::handle_create_handoff(args, ctx).await,
         "accept_handoff" => handoff::handle_accept_handoff(args, ctx).await,
@@ -1421,9 +2100,14 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "check_constraints" => constraint::handle_check_constraints(args, ctx).await,
         "audit_config" => audit::handle_audit_config(args, ctx).await,
         "check_config_audit" => audit::handle_check_config_audit(args, ctx).await,
+        "audit_export_bundle" => audit_export::handle_audit_export_bundle(args, ctx).await,
         "enrich_action" => action::handle_enrich_action(args, ctx).await,
         "issue_passport" => passport::handle_issue_passport(args, ctx).await,
         "get_passport" => passport::handle_get_passport(args, ctx).await,
+        // Identity continuity (agent-ux-08).
+        "passport_split" => identity::handle_passport_split(args, ctx).await,
+        "passport_merge" => identity::handle_passport_merge(args, ctx).await,
+        "passport_link_device" => identity::handle_passport_link_device(args, ctx).await,
         "sync_pull" => sync::handle_sync_pull(args, ctx).await,
         "sync_push" => sync::handle_sync_push(args, ctx).await,
         "sync_status" => sync::handle_sync_status(args, ctx).await,
@@ -1460,6 +2144,11 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "feature_coverage_report" => features::handle_feature_coverage_report(args, ctx).await,
         "feature_trigger_audit" => features::handle_feature_trigger_audit(args, ctx).await,
         "feature_suggest_next" => features::handle_feature_suggest_next(args, ctx).await,
+        // Typed action traces (agent-ux-06).
+        "tool_trace_recent" => traces::handle_tool_trace_recent(args, ctx).await,
+        // Risk-tiered HITL (agent-ux-05).
+        "approval_request" => approvals::handle_approval_request(args, ctx).await,
+        "approval_decide" => approvals::handle_approval_decide(args, ctx).await,
         name if extensions::is_extension_tool_name(name) => extensions::call_extension_tool(name, args, ctx).await,
         _ => Err(JsonRpcError {
             code: crate::protocol::METHOD_NOT_FOUND,
@@ -1496,7 +2185,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 61; // 55 prior + 4 Features lens tools + 2 audit tools (audit_config, check_config_audit).
+    const TOOL_COUNT: usize = 84; // 81 prior (incl. audit_export_bundle agent-ux-11 + freshness agent-ux-03 + autonomy_contract agent-ux-10 + receipt_verify agent-ux-04 + tool_trace_recent agent-ux-06 + 2 approvals agent-ux-05 + 3 artefacts agent-ux-12 + output_attest agent-ux-07) + 3 identity-continuity (agent-ux-08).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

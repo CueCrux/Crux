@@ -97,6 +97,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
             // A non-ops fact should not appear.
             store.store(StoreFact {
@@ -106,6 +107,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -128,6 +130,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
             store.store(StoreFact {
                 entity: "__ops__::coverage::retrieval".to_string(),
@@ -136,6 +139,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 

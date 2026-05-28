@@ -820,6 +820,7 @@ async fn store_workbench_fact(
         source_receipt: Some(receipt_id),
         confidence: 1.0,
         private: true,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce(&state.privacy_policy, &mut fact);
     state.fact_store.write().await.try_store(fact)?;

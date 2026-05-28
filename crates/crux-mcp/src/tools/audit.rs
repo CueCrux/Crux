@@ -74,6 +74,7 @@ pub async fn handle_audit_config(args: &Value, ctx: &McpContext) -> Result<Value
         source_receipt: None,
         confidence: 1.0,
         private: false,
+        horizon_class: None,
     };
 
     let mut store = ctx.fact_store.write().await;

@@ -35,8 +35,23 @@ jobs:
     name: Lint
     runs-on: [self-hosted, ci]
     env:
-      CARGO_HOME: /home/gha-runner/.cargo
+      # Per-job CARGO_HOME isolates the cargo package-cache file lock so the
+      # four concurrent jobs on this self-hosted runner don't serialise
+      # through one mutex. See run 26575505389 (40m Coverage block, 1h28m
+      # Test job stuck, runner cancelled). github.job + github.run_id give
+      # a unique cache dir per job per run; the seed step below symlinks
+      # the toolchain binaries from the shared CARGO_HOME so cargo/rustc
+      # discovery keeps working without copying gigabytes.
+      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
     steps:
+      - name: Seed per-job CARGO_HOME from shared toolchain
+        run: |
+          mkdir -p "$CARGO_HOME/bin"
+          for tool in /home/gha-runner/.cargo/bin/*; do
+            [ -e "$tool" ] || continue
+            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
+          done
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v6
       - name: Preflight (self-hosted runner toolchain)
         run: |
@@ -60,15 +75,24 @@ jobs:
       - run: cargo fmt --check
       - run: typos
       - run: bash scripts/assert-daemon-release-boundary.sh
-      - run: cargo clippy --workspace -- -D warnings
+      - run: bash scripts/ci-cargo-with-fallback.sh clippy --workspace -- -D warnings
 
   # ── Test, MSRV, Coverage: self-hosted ────────────────────────────────
   test:
     name: Test
     runs-on: [self-hosted, ci]
     env:
-      CARGO_HOME: /home/gha-runner/.cargo
+      # See `lint` job above for the per-job CARGO_HOME rationale.
+      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
     steps:
+      - name: Seed per-job CARGO_HOME from shared toolchain
+        run: |
+          mkdir -p "$CARGO_HOME/bin"
+          for tool in /home/gha-runner/.cargo/bin/*; do
+            [ -e "$tool" ] || continue
+            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
+          done
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v6
       - name: Preflight (self-hosted runner toolchain)
         run: |
@@ -84,11 +108,11 @@ jobs:
           fi
       - uses: dtolnay/rust-toolchain@stable
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - run: cargo build --workspace
+      - run: bash scripts/ci-cargo-with-fallback.sh build --workspace
       # `cargo test --workspace` (next step) already covers
       # `crux-integrations::community_packs`; the explicit invocation here
       # was duplicating that target's execution. Drop it.
-      - run: cargo test --workspace
+      - run: bash scripts/ci-cargo-with-fallback.sh test --workspace
       # Smoke now runs against the debug binary built by `cargo build
       # --workspace` above. The release build (previously a `cargo build
       # --release` step here) added ~2m45s to the critical path purely to
@@ -154,8 +178,17 @@ jobs:
     name: MSRV (1.88.0)
     runs-on: [self-hosted, ci]
     env:
-      CARGO_HOME: /home/gha-runner/.cargo
+      # See `lint` job above for the per-job CARGO_HOME rationale.
+      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
     steps:
+      - name: Seed per-job CARGO_HOME from shared toolchain
+        run: |
+          mkdir -p "$CARGO_HOME/bin"
+          for tool in /home/gha-runner/.cargo/bin/*; do
+            [ -e "$tool" ] || continue
+            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
+          done
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v6
       - name: Preflight (self-hosted runner toolchain)
         run: |
@@ -170,15 +203,24 @@ jobs:
           fi
       - uses: dtolnay/rust-toolchain@1.88.0
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - run: cargo build --workspace
+      - run: bash scripts/ci-cargo-with-fallback.sh build --workspace
 
   coverage:
     name: Coverage
     runs-on: [self-hosted, ci]
     env:
-      CARGO_HOME: /home/gha-runner/.cargo
+      # See `lint` job above for the per-job CARGO_HOME rationale.
+      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
       COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/main\.rs|.*/corecruxd/src/http/admin\.rs|.*/corecruxd/src/http/append\.rs|.*/corecruxd/src/http/query\.rs|.*/corecruxd/src/http/projections\.rs|.*/corecruxd/src/http/receipts\.rs|.*/corecruxctl/src/main\.rs|.*/corecruxctl/src/audit_pack\.rs)$'
     steps:
+      - name: Seed per-job CARGO_HOME from shared toolchain
+        run: |
+          mkdir -p "$CARGO_HOME/bin"
+          for tool in /home/gha-runner/.cargo/bin/*; do
+            [ -e "$tool" ] || continue
+            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
+          done
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: actions/checkout@v6
       - name: Preflight (self-hosted runner toolchain)
         run: |
@@ -198,11 +240,11 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - run: cargo build --bin corecruxd
+      - run: bash scripts/ci-cargo-with-fallback.sh build --bin corecruxd
       - name: Generate coverage reports
         run: |
           set -euo pipefail
-          cargo llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --lcov --output-path lcov.info
+          bash scripts/ci-cargo-with-fallback.sh llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --lcov --output-path lcov.info
           cargo llvm-cov report --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --summary-only | tee coverage-summary.txt
       - name: Enforce coverage thresholds
         run: |

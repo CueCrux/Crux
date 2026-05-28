@@ -16,6 +16,8 @@ use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
 
 const SCOPES: &str = "admin:read,facts:write";
 
+use crate::tools::loopback_auth::loopback_bearer_token;
+
 pub const LIST_PROJECTS_DESCRIPTION: &str =
     "List all projects defined on this daemon. Each project carries a planning_target (a tenant or a github repo URL), a default_passport_id, and counts of members + working tenants.";
 
@@ -56,16 +58,20 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 async fn loopback_get(url: String) -> Result<(u16, String), JsonRpcError> {
+    let bearer = loopback_bearer_token();
     tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(10)))
             .build()
             .into();
-        agent
+        let mut req = agent
             .get(&url)
             .header("X-Corecrux-Scopes", SCOPES)
-            .header("Accept", "application/json")
-            .call()
+            .header("Accept", "application/json");
+        if let Some(token) = &bearer {
+            req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+        req.call()
             .map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()))
             .map_err(|e| match e {
                 ureq::Error::StatusCode(code) => (code, format!("status {code}")),
@@ -86,17 +92,21 @@ async fn loopback_get(url: String) -> Result<(u16, String), JsonRpcError> {
 }
 
 async fn loopback_post(url: String, body: Value, expect_201: bool) -> Result<(u16, String), JsonRpcError> {
+    let bearer = loopback_bearer_token();
     tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(10)))
             .build()
             .into();
-        agent
+        let mut req = agent
             .post(&url)
             .header("X-Corecrux-Scopes", SCOPES)
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .send(body.to_string())
+            .header("Accept", "application/json");
+        if let Some(token) = &bearer {
+            req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+        req.send(body.to_string())
             .map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()))
             .map_err(|e| match e {
                 ureq::Error::StatusCode(code) => (code, format!("status {code}")),

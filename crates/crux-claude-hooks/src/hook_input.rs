@@ -29,6 +29,12 @@ pub struct HookInput {
     pub tool_name: Option<String>,
     #[serde(default)]
     pub tool_input: Option<Value>,
+    /// PostToolUse payload from the tool. For Claude Code MCP calls this
+    /// is the JSON result the tool returned; for envelope-emitting tools
+    /// it carries the per-turn audit envelope under `tool_response.envelope`.
+    /// agent-ux-02 M3 reads `memories_used[]` from here.
+    #[serde(default)]
+    pub tool_response: Option<Value>,
 
     // PreCompact fields
     #[serde(default)]
@@ -113,6 +119,7 @@ mod tests {
             hook_event_name: "PostToolUse".into(),
             tool_name: Some("Bash".into()),
             tool_input: Some(json!({"command": "ls"})),
+            tool_response: None,
             trigger: None,
             source: None,
         };
@@ -129,6 +136,7 @@ mod tests {
             hook_event_name: String::new(),
             tool_name: Some("Edit".into()),
             tool_input: Some(json!({"file_path": "/tmp/x.rs"})),
+            tool_response: None,
             trigger: None,
             source: None,
         };
