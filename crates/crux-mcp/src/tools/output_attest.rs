@@ -51,6 +51,7 @@ use corecrux_receipts::vault_pki_x509_signer::VaultPkiX509Signer;
 use corecrux_receipts::{
     build_c2pa_manifest_v1, ed25519_signer, sign_c2pa_manifest_via_signer, C2paManifestInputV1, C2PA_SPEC_VERSION,
 };
+use crux_integrations::c2pa_signer_selector::C2paSignerKind;
 
 /// Environment variable that gates `output_attest`. Default off.
 pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_C2PA_OUTPUT";
@@ -122,6 +123,54 @@ fn x509_backend_active() -> bool {
             .as_deref(),
         Ok(BACKEND_VAULT_PKI_P256)
     )
+}
+
+/// Fire a single `tracing::info!` line on the first invocation of the
+/// legacy dual-flag fallback path. Operators on the PR #123 contract
+/// stay on a fully supported surface — we just want a breadcrumb so
+/// they can correlate "I see Vault dispatch in the logs" with the
+/// flag pair that produced it.
+fn legacy_dual_flag_log_once() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        tracing::info!(
+            target: "crux_mcp::output_attest",
+            canonical_env = SIGNER_FLAG_ENV_NAME,
+            legacy_x509_env = X509_FEATURE_FLAG_ENV,
+            legacy_backend_env = BACKEND_ENV,
+            "CORECRUX_C2PA_SIGNER unset; honouring legacy dual-flag pair (PR #123) and dispatching to Vault PKI"
+        );
+    });
+}
+
+/// Mirrors `crux_integrations::c2pa_signer_selector::SIGNER_FLAG_ENV`
+/// for the breadcrumb above without forcing the legacy logger to take
+/// a runtime dependency on the selector module's const.
+const SIGNER_FLAG_ENV_NAME: &str = "CORECRUX_C2PA_SIGNER";
+
+/// Resolve the C2PA signer backend with the documented precedence:
+///
+/// 1. **Canonical single flag.** `CORECRUX_C2PA_SIGNER=vault|in_process`
+///    wins outright when set. Unknown values fall back to `InProcess`
+///    (see `C2paSignerKind::from_canonical_env`).
+/// 2. **Legacy PR #123 dual-flag fallback.** When the single flag is
+///    unset *and* `x509_backend_active()` returns true (both
+///    `CORECRUXD_FEATURE_C2PA_X509_SIGNER=1` AND
+///    `CORECRUXD_C2PA_SIGNER_BACKEND=vault-pki-p256` are set), dispatch
+///    to Vault. Emits a once-per-process info breadcrumb so the
+///    operator-visible log says which contract produced the choice.
+///    Dual-flag remains a fully supported surface — no deprecation.
+/// 3. **Default.** `InProcess` (the legacy Ed25519 CROWN signer).
+fn resolve_c2pa_signer_kind() -> C2paSignerKind {
+    if let Some(kind) = C2paSignerKind::from_canonical_env() {
+        return kind;
+    }
+    if x509_backend_active() {
+        legacy_dual_flag_log_once();
+        return C2paSignerKind::Vault;
+    }
+    C2paSignerKind::InProcess
 }
 
 fn load_signing_key() -> Option<(SigningKey, String)> {
@@ -268,48 +317,55 @@ pub async fn handle_output_attest(args: &Value, ctx: &McpContext) -> Result<Valu
 
     // ── 6. Sign via the selected backend ──────────────────────────────
     //
-    // Backend selector:
-    // - Default (`local-ed25519`): use the existing Ed25519 CROWN
-    //   signer key (env-loaded). Output byte-identical to PR #121.
-    // - `vault-pki-p256`: instantiate VaultPkiX509Signer from env,
-    //   opportunistically rotate (no-op if leaf is healthy), and emit
-    //   an envelope with `signature.alg = "es256"` + `x5chain`.
-    let backend_x509 = x509_backend_active();
-    let signed = if backend_x509 {
-        let signer = VaultPkiX509Signer::from_env().map_err(|e| JsonRpcError {
-            code: INVALID_PARAMS,
-            message: format!("VaultPkiX509Signer init failed: {e}"),
-            data: None,
-        })?;
-        signer.initialize().map_err(|e| JsonRpcError {
-            code: INVALID_PARAMS,
-            message: format!("VaultPkiX509Signer.initialize failed: {e}"),
-            data: None,
-        })?;
-        // Best-effort rotation — if it fails (Vault unreachable), we
-        // continue with the cached leaf as long as it's still valid.
-        let _ = signer.maybe_rotate_if_due();
-        sign_c2pa_manifest_via_signer(manifest, &signer, &when).map_err(|e| JsonRpcError {
-            code: INVALID_PARAMS,
-            message: format!("c2pa manifest signing (vault-pki-p256) failed: {e}"),
-            data: None,
-        })?
-    } else {
-        let (signing_key, key_id) = load_signing_key().ok_or_else(|| JsonRpcError {
-            code: INVALID_PARAMS,
-            message: format!(
-                "output_attest signer missing: set {SIGNING_KEY_ENV} or fall back to {FALLBACK_SIGNING_KEY_ENV}"
-            ),
-            data: None,
-        })?;
-        let legacy_signer = ed25519_signer(&signing_key, &key_id);
-        sign_c2pa_manifest_via_signer(manifest, &legacy_signer, &when).map_err(|e| JsonRpcError {
-            code: INVALID_PARAMS,
-            message: format!("c2pa manifest signing failed: {e}"),
-            data: None,
-        })?
+    // Backend selector — precedence (see `resolve_c2pa_signer_kind`):
+    // 1. `CORECRUX_C2PA_SIGNER=vault|in_process` (canonical single flag)
+    // 2. PR #123 dual-flag pair (`CORECRUXD_FEATURE_C2PA_X509_SIGNER=1`
+    //    + `CORECRUXD_C2PA_SIGNER_BACKEND=vault-pki-p256`) → Vault
+    // 3. Default → InProcess
+    //
+    // Behaviour-preserving for prod operators on the PR #123 contract;
+    // new for single-flag operators.
+    let signer_kind = resolve_c2pa_signer_kind();
+    let signed = match signer_kind {
+        C2paSignerKind::Vault => {
+            let signer = VaultPkiX509Signer::from_env().map_err(|e| JsonRpcError {
+                code: INVALID_PARAMS,
+                message: format!("VaultPkiX509Signer init failed: {e}"),
+                data: None,
+            })?;
+            signer.initialize().map_err(|e| JsonRpcError {
+                code: INVALID_PARAMS,
+                message: format!("VaultPkiX509Signer.initialize failed: {e}"),
+                data: None,
+            })?;
+            // Best-effort rotation — if it fails (Vault unreachable),
+            // we continue with the cached leaf as long as it's still
+            // valid.
+            let _ = signer.maybe_rotate_if_due();
+            sign_c2pa_manifest_via_signer(manifest, &signer, &when).map_err(|e| JsonRpcError {
+                code: INVALID_PARAMS,
+                message: format!("c2pa manifest signing (vault-pki-p256) failed: {e}"),
+                data: None,
+            })?
+        }
+        C2paSignerKind::InProcess => {
+            let (signing_key, key_id) = load_signing_key().ok_or_else(|| JsonRpcError {
+                code: INVALID_PARAMS,
+                message: format!(
+                    "output_attest signer missing: set {SIGNING_KEY_ENV} or fall back to {FALLBACK_SIGNING_KEY_ENV}"
+                ),
+                data: None,
+            })?;
+            let legacy_signer = ed25519_signer(&signing_key, &key_id);
+            sign_c2pa_manifest_via_signer(manifest, &legacy_signer, &when).map_err(|e| JsonRpcError {
+                code: INVALID_PARAMS,
+                message: format!("c2pa manifest signing failed: {e}"),
+                data: None,
+            })?
+        }
     };
     let envelope_b64 = signed.to_jumbf_base64();
+    let backend_x509 = matches!(signer_kind, C2paSignerKind::Vault);
 
     // ── 7. Build verify URL (best-effort) ─────────────────────────────
     let verify_url = ctx.daemon_base_url.as_deref().map(|base| {
@@ -359,7 +415,7 @@ pub async fn handle_output_attest(args: &Value, ctx: &McpContext) -> Result<Valu
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::agent::AgentIdentity;
     use crate::dispatch::McpContext;
@@ -371,7 +427,15 @@ mod tests {
         })
     }
 
-    fn flag_lock() -> &'static tokio::sync::Mutex<()> {
+    /// Shared with `dispatch::tests::envelope_omits_for_output_attest`
+    /// so all tests in this workspace that touch the C2PA signer env
+    /// vars (`CORECRUX_C2PA_SIGNER`, `CORECRUXD_C2PA_SIGNER_BACKEND`,
+    /// `CORECRUXD_FEATURE_C2PA_X509_SIGNER`) serialise behind a single
+    /// tokio::Mutex. Two-lock setups race because `std::Mutex` and
+    /// `tokio::Mutex` are independent. Exposing this as `pub(crate)`
+    /// keeps the rule one-place explicit instead of hidden across
+    /// modules.
+    pub(crate) fn flag_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
@@ -384,6 +448,7 @@ mod tests {
         std::env::remove_var(FALLBACK_KEY_ID_ENV);
         std::env::remove_var(BACKEND_ENV);
         std::env::remove_var(X509_FEATURE_FLAG_ENV);
+        std::env::remove_var(SIGNER_FLAG_ENV_NAME);
     }
 
     fn set_signer() {
@@ -486,14 +551,19 @@ mod tests {
         clear_env();
     }
 
-    #[test]
-    fn x509_backend_active_requires_both_flags() {
-        // Helper-level test (no Mcp context needed) — locks env to
-        // avoid stomping the async tests.
-        static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = M.lock().unwrap();
+    /// Reset all three env vars the resolver consults. Use at the
+    /// start AND end of every env-poking test so neither cross-test
+    /// pollution nor a panic mid-test bleeds state.
+    fn reset_resolver_env() {
+        std::env::remove_var(SIGNER_FLAG_ENV_NAME);
         std::env::remove_var(BACKEND_ENV);
         std::env::remove_var(X509_FEATURE_FLAG_ENV);
+    }
+
+    #[tokio::test]
+    async fn x509_backend_active_requires_both_flags() {
+        let _g = flag_lock().lock().await;
+        reset_resolver_env();
         assert!(!x509_backend_active(), "both env vars unset → off");
         std::env::set_var(X509_FEATURE_FLAG_ENV, "1");
         assert!(!x509_backend_active(), "flag on without backend → off");
@@ -503,7 +573,75 @@ mod tests {
         assert!(x509_backend_active(), "both set → on");
         std::env::set_var(X509_FEATURE_FLAG_ENV, "0");
         assert!(!x509_backend_active(), "flag off → off even if backend selected");
-        std::env::remove_var(BACKEND_ENV);
-        std::env::remove_var(X509_FEATURE_FLAG_ENV);
+        reset_resolver_env();
+    }
+
+    /// New-flag precedence: when the canonical single env is set to
+    /// `vault`, the resolver returns `Vault` regardless of whether the
+    /// legacy dual-flag pair is also set (or unset).
+    #[tokio::test]
+    async fn resolve_c2pa_signer_kind_single_flag_vault_takes_precedence() {
+        let _g = flag_lock().lock().await;
+        reset_resolver_env();
+        std::env::set_var(SIGNER_FLAG_ENV_NAME, "vault");
+        // Legacy pair: deliberately OFF. The single flag is the only
+        // signal we want to honour.
+        assert!(matches!(resolve_c2pa_signer_kind(), C2paSignerKind::Vault));
+        reset_resolver_env();
+    }
+
+    /// Single-flag wins over legacy: even with the legacy dual-flag
+    /// pair set to Vault, `CORECRUX_C2PA_SIGNER=in_process` overrides
+    /// to InProcess. This is the documented escape hatch for operators
+    /// migrating off the legacy contract.
+    #[tokio::test]
+    async fn resolve_c2pa_signer_kind_single_flag_in_process() {
+        let _g = flag_lock().lock().await;
+        reset_resolver_env();
+        std::env::set_var(SIGNER_FLAG_ENV_NAME, "in_process");
+        std::env::set_var(X509_FEATURE_FLAG_ENV, "1");
+        std::env::set_var(BACKEND_ENV, BACKEND_VAULT_PKI_P256);
+        assert!(matches!(resolve_c2pa_signer_kind(), C2paSignerKind::InProcess));
+        reset_resolver_env();
+    }
+
+    /// Legacy fallback: when the single flag is unset and the legacy
+    /// dual-flag pair points at Vault, dispatch to Vault. This is the
+    /// behaviour-preservation guarantee for PR #123 operators.
+    #[tokio::test]
+    async fn resolve_c2pa_signer_kind_falls_back_to_legacy_when_unset() {
+        let _g = flag_lock().lock().await;
+        reset_resolver_env();
+        // Single flag unset; legacy pair on.
+        std::env::set_var(X509_FEATURE_FLAG_ENV, "1");
+        std::env::set_var(BACKEND_ENV, BACKEND_VAULT_PKI_P256);
+        assert!(matches!(resolve_c2pa_signer_kind(), C2paSignerKind::Vault));
+        reset_resolver_env();
+    }
+
+    /// Unknown single-flag value (operator typo) falls back to
+    /// InProcess — same rule as `from_canonical_env`'s warn-and-default
+    /// path. Legacy pair must NOT take over; the operator wrote
+    /// something, so we honour their intent to use the single-flag
+    /// surface.
+    #[tokio::test]
+    async fn resolve_c2pa_signer_kind_unknown_single_flag_value_falls_to_in_process() {
+        let _g = flag_lock().lock().await;
+        reset_resolver_env();
+        std::env::set_var(SIGNER_FLAG_ENV_NAME, "vault-pki-p256"); // not the accepted shape
+        std::env::set_var(X509_FEATURE_FLAG_ENV, "1");
+        std::env::set_var(BACKEND_ENV, BACKEND_VAULT_PKI_P256);
+        assert!(matches!(resolve_c2pa_signer_kind(), C2paSignerKind::InProcess));
+        reset_resolver_env();
+    }
+
+    /// Default: nothing set → InProcess. The legacy CROWN Ed25519
+    /// signer is the documented out-of-the-box backend.
+    #[tokio::test]
+    async fn resolve_c2pa_signer_kind_default_is_in_process() {
+        let _g = flag_lock().lock().await;
+        reset_resolver_env();
+        assert!(matches!(resolve_c2pa_signer_kind(), C2paSignerKind::InProcess));
+        reset_resolver_env();
     }
 }
