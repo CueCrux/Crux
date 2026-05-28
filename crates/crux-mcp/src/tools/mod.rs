@@ -9,6 +9,7 @@
 //! MCP clients via the `tools/list` response.
 
 pub mod action;
+pub mod approvals;
 pub mod audit;
 pub mod audit_export;
 pub mod autonomy;
@@ -1469,6 +1470,60 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             description: traces::TOOL_DESCRIPTION.to_string(),
             input_schema: traces::tool_input_schema(),
         },
+        // ── Risk-tiered HITL (agent-ux-05) ───────────────────────
+        ToolDefinition {
+            name: "approval_request".to_string(),
+            description: "Risk-tiered HITL: queue an action for operator approval. Required: \
+                          action_summary, risk_tier (low|medium|high), scope (tenant_id or \
+                          resource path), token_budget. Optional: tenant_id, payload. Returns \
+                          immediately with {request_id, status: 'pending'|'feature_disabled', \
+                          risk_tier}. High-tier requests BLOCK on operator decision; medium/low \
+                          may auto-approve per tenant policy (out of scope for the M3 free tier). \
+                          Pending entries appear in list_work(state='pending_approval'). \
+                          Gated by CORECRUXD_FEATURE_APPROVAL_QUEUE=1 (default off)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action_summary": { "type": "string", "description": "Human-readable description of the action being requested." },
+                    "risk_tier":      { "type": "string", "enum": ["low", "medium", "high"], "description": "Risk classification." },
+                    "scope":           { "type": "string", "description": "Tenant id or scoped resource path the action targets." },
+                    "tenant_id":      { "type": "string", "description": "Tenant the request is raised in (defaults to scope when omitted)." },
+                    "payload":        { "type": "object", "description": "Optional structured payload (e.g. predicted_effects, original tool call)." },
+                    "token_budget":   { "type": "integer", "description": "QC.2 — required. Caps response size. Pass any positive integer." }
+                },
+                "required": ["action_summary", "risk_tier", "scope", "token_budget"],
+                "examples": [
+                    { "action_summary": "delete tenant prod fixtures", "risk_tier": "high", "scope": "business::acme", "tenant_id": "business::acme", "token_budget": 500 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "approval_decide".to_string(),
+            description: "Risk-tiered HITL: operator decision on a pending approval. Requires \
+                          OPERATOR-tier passport (elite/operator). Forwards the request through \
+                          the cross-tenant guard (T.1) — reviewer in tenant A cannot decide for \
+                          tenant B. Emits an ApprovalDecision CROWN receipt (the daemon HTTP \
+                          layer attaches the Ed25519 signature). Returns {ok, status, \
+                          reviewer_passport, decided_at, receipt_id, receipt_body_hash_hex}. \
+                          Non-operator callers receive a 403-style JSON-RPC error with \
+                          `why_denied` explaining the missing tier."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "request_id":         { "type": "string", "description": "Opaque request id minted by approval_request." },
+                    "decision":           { "type": "string", "enum": ["approve", "reject"], "description": "Operator decision." },
+                    "reviewer_notes":     { "type": "string", "description": "Optional free-text justification (embedded in the receipt body)." },
+                    "reviewer_tier":      { "type": "string", "description": "Reviewer's passport tier — forwarded by the daemon HTTP layer; tests pass 'elite' or 'operator'." },
+                    "reviewer_tenant_id": { "type": "string", "description": "Reviewer's tenant id — used to enforce the cross-tenant guard (T.1)." }
+                },
+                "required": ["request_id", "decision"],
+                "examples": [
+                    { "request_id": "ar_abcd1234", "decision": "approve", "reviewer_tier": "elite", "reviewer_tenant_id": "business::acme", "reviewer_notes": "approved per ticket #42" }
+                ]
+            }),
+        },
     ]
     .into_iter()
     .map(|mut t: ToolDefinition| {
@@ -1731,7 +1786,9 @@ pub fn tool_output_docs() -> Value {
         { "tool": "feature_coverage_report", "output": "{ content: [...], report: CoverageReport { total_capabilities, total_tested, total_audited, maturity, systems } }" },
         { "tool": "feature_trigger_audit",   "output": "{ content: [...], capability: <updated payload>, version }" },
         { "tool": "feature_suggest_next",    "output": "{ content: [...], suggestions: [{kind, capability_id?, gap_type?, severity?, promise?, rationale}], count }" },
-        { "tool": "tool_trace_recent",       "output": "{ content: [...], traces: [{tool, ts_us, turn_id?, predicted_effects: [{kind, entity, key, ts_us?}], outcome}], count, feature_disabled? } — per-passport; reserved-prefix effects stripped." }
+        { "tool": "tool_trace_recent",       "output": "{ content: [...], traces: [{tool, ts_us, turn_id?, predicted_effects: [{kind, entity, key, ts_us?}], outcome}], count, feature_disabled? } — per-passport; reserved-prefix effects stripped." },
+        { "tool": "approval_request",        "output": "{ content: [...], request_id, status: 'pending'|'feature_disabled', risk_tier, tenant_id, feature_enabled } — pending entries also visible via list_work(state='pending_approval')." },
+        { "tool": "approval_decide",         "output": "{ content: [...], ok, request_id, status: 'approved'|'rejected', reviewer_passport, decided_at, receipt_id, receipt_body_hash_hex, tenant_id, risk_tier } — non-operator callers receive a 403-style JSON-RPC error with `why_denied`." }
     ])
 }
 
@@ -1837,6 +1894,9 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "feature_suggest_next" => features::handle_feature_suggest_next(args, ctx).await,
         // Typed action traces (agent-ux-06).
         "tool_trace_recent" => traces::handle_tool_trace_recent(args, ctx).await,
+        // Risk-tiered HITL (agent-ux-05).
+        "approval_request" => approvals::handle_approval_request(args, ctx).await,
+        "approval_decide" => approvals::handle_approval_decide(args, ctx).await,
         name if extensions::is_extension_tool_name(name) => extensions::call_extension_tool(name, args, ctx).await,
         _ => Err(JsonRpcError {
             code: crate::protocol::METHOD_NOT_FOUND,
@@ -1873,7 +1933,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 75; // 74 on main (audit_export_bundle agent-ux-11 + 3 freshness agent-ux-03 + autonomy_contract agent-ux-10 + receipt_verify agent-ux-04) + tool_trace_recent (agent-ux-06).
+    const TOOL_COUNT: usize = 77; // 75 prior (incl. audit_export_bundle agent-ux-11 + freshness agent-ux-03 + autonomy_contract agent-ux-10 + receipt_verify agent-ux-04 + tool_trace_recent agent-ux-06) + 2 risk-tiered HITL (agent-ux-05: approval_request + approval_decide).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

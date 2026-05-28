@@ -297,12 +297,7 @@ mod tests {
         let sig = sign_approval_decision_v1(input.receipt_id, &bytes, hash, &signing, "kid-test", input.decided_at);
 
         // Signature must verify against the canonical body bytes.
-        let parsed_sig = ed25519_dalek::Signature::from_bytes(
-            sig.signature
-                .as_slice()
-                .try_into()
-                .expect("sig length"),
-        );
+        let parsed_sig = ed25519_dalek::Signature::from_bytes(sig.signature.as_slice().try_into().expect("sig length"));
         verifying
             .verify_strict(&bytes, &parsed_sig)
             .expect("approval-decision signature must verify under the reviewer's passport key");

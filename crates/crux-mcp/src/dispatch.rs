@@ -810,6 +810,122 @@ mod tests {
         std::env::remove_var(crate::tools::autonomy::FEATURE_FLAG_ENV);
     }
 
+    // Sibling envelope-omits tests for agent-ux-05 (risk-tiered HITL).
+    // Both `approval_request` and `approval_decide` are write tools that
+    // must NOT opt into `tool_emits_envelope` — verifying via dispatch
+    // keeps the cross-PR contract green if a future change ever flips
+    // the registry by accident.
+    #[tokio::test]
+    async fn envelope_omits_for_approval_request() {
+        let _guard = envelope_env_lock().lock().await;
+        let _g2 = crate::tools::approvals::_approvals_test_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::approvals::FEATURE_FLAG_ENV, "1");
+        crate::tools::approvals::_reset_requests_buffer_for_tests().await;
+
+        // approval_request requires an authenticated passport; attach an
+        // agent identity exactly the way the memory_acknowledge_use test
+        // does (master plan sibling).
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "approval_request",
+                    "arguments": {
+                        "action_summary": "drop fixtures",
+                        "risk_tier": "high",
+                        "scope": "tenant-env",
+                        "tenant_id": "tenant-env",
+                        "token_budget": 500
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "approval_request MUST NOT emit envelope (write tool)"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "approval_request MUST NOT wrap response in payload"
+        );
+        std::env::remove_var(crate::tools::approvals::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+    }
+
+    #[tokio::test]
+    async fn envelope_omits_for_approval_decide() {
+        let _guard = envelope_env_lock().lock().await;
+        let _g2 = crate::tools::approvals::_approvals_test_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        std::env::set_var(crate::tools::approvals::FEATURE_FLAG_ENV, "1");
+        crate::tools::approvals::_reset_requests_buffer_for_tests().await;
+
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+
+        // Seed a request so approval_decide has a target.
+        let req_resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "approval_request",
+                    "arguments": {
+                        "action_summary": "drop fixtures",
+                        "risk_tier": "high",
+                        "scope": "tenant-env-2",
+                        "tenant_id": "tenant-env-2",
+                        "token_budget": 500
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let rid = req_resp.result.unwrap()["request_id"].as_str().unwrap().to_string();
+
+        let resp = dispatch(
+            rpc(
+                "tools/call",
+                json!({
+                    "name": "approval_decide",
+                    "arguments": {
+                        "request_id": rid,
+                        "decision": "approve",
+                        "reviewer_tier": "elite",
+                        "reviewer_tenant_id": "tenant-env-2"
+                    }
+                }),
+            ),
+            &ctx,
+            None,
+        )
+        .await;
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("envelope").is_none(),
+            "approval_decide MUST NOT emit envelope (write tool)"
+        );
+        assert!(
+            result.get("payload").is_none(),
+            "approval_decide MUST NOT wrap response in payload"
+        );
+        std::env::remove_var(crate::tools::approvals::FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+    }
+
     #[tokio::test]
     async fn envelope_on_query_facts_omits_reserved_prefix_entries() {
         let _guard = envelope_env_lock().lock().await;
