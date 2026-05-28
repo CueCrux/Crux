@@ -192,6 +192,7 @@ mod tests {
                 source_receipt: Some("r_abc".to_string()),
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
             store.store(StoreFact {
                 entity: "__ops::config-audit".to_string(),
@@ -200,6 +201,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -242,6 +244,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
         let out_td = tempfile::tempdir().unwrap();
@@ -274,6 +277,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
         let out_td = tempfile::tempdir().unwrap();

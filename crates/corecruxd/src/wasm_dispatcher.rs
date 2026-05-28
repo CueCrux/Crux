@@ -187,6 +187,7 @@ impl HostFactStore for WasmFactStoreAdapter {
             source_receipt: None,
             confidence: req.confidence,
             private: false,
+            horizon_class: None,
         };
         // Final belt-and-braces: even if the grant allowed the prefix,
         // privacy gate has the last word over private prefixes.

@@ -439,6 +439,7 @@ pub fn offboard_tenant_mirror(store: &mut FactStore, tenant_id: &str, membership
                     source_receipt: Some(format!("sync-wipe:{tenant_id}")),
                     confidence: 1.0,
                     private: true,
+                    horizon_class: None,
                 });
                 tombstone_fact_ids.push(tombstone.fact_id);
             }
@@ -1264,6 +1265,8 @@ mod tests {
             version: 3,
             supersedes: Some("f_remote_prev".to_string()),
             private: false,
+            horizon_class: crate::fact_store::HorizonClass::None,
+            reverified_at: None,
         };
 
         store.store_synced(fact);
@@ -1300,6 +1303,8 @@ mod tests {
                 version: 1,
                 supersedes: None,
                 private: false,
+                horizon_class: crate::fact_store::HorizonClass::None,
+                reverified_at: None,
             };
             store.store_synced(fact);
             assert_eq!(store.count(), 1);
@@ -1349,6 +1354,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
 
         // Store a synced fact (should be excluded from push)
@@ -1365,6 +1371,8 @@ mod tests {
             version: 1,
             supersedes: None,
             private: false,
+            horizon_class: crate::fact_store::HorizonClass::None,
+            reverified_at: None,
         };
         store.store_synced(synced);
 
@@ -1390,6 +1398,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
         store.store(StoreFact {
             entity: "work::acme::constraint::deploy".to_string(),
@@ -1398,6 +1407,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
 
         let manifest = build_tenant_manifest(
@@ -1448,6 +1458,7 @@ mod tests {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -1484,6 +1495,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
         store.store(StoreFact {
             entity: "business::acme::private".to_string(),
@@ -1492,6 +1504,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: true,
+            horizon_class: None,
         });
         store.store_synced(Fact {
             fact_id: "f_synced_business".to_string(),
@@ -1506,6 +1519,8 @@ mod tests {
             version: 1,
             supersedes: None,
             private: false,
+            horizon_class: crate::fact_store::HorizonClass::None,
+            reverified_at: None,
         });
         store.store(StoreFact {
             entity: "business::acme::constraint::deploy".to_string(),
@@ -1514,6 +1529,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
 
         let preview = promotion_preview(&store, "business::acme", &["facts".to_string()], true);
@@ -1538,6 +1554,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
         let other = store.store(StoreFact {
             entity: "business::other::remote".to_string(),
@@ -1546,6 +1563,7 @@ mod tests {
             source_receipt: Some("sync:http://cloud:f_other".to_string()),
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
         store.store_synced(Fact {
             fact_id: "f_mirror_fact".to_string(),
@@ -1560,6 +1578,8 @@ mod tests {
             version: 1,
             supersedes: None,
             private: false,
+            horizon_class: crate::fact_store::HorizonClass::None,
+            reverified_at: None,
         });
 
         let receipt = offboard_tenant_mirror(&mut store, "business::acme", 11);

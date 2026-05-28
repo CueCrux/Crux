@@ -730,6 +730,7 @@ async fn store_receipts(state: &AppState, tenant_id: &str, service: Gpu1Service,
             .map(str::to_string),
         confidence: 1.0,
         private: true,
+        horizon_class: None,
     };
     crate::fact_privacy::enforce(&state.privacy_policy, &mut fact);
     state.fact_store.write().await.store(fact);

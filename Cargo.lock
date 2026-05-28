@@ -1230,6 +1230,7 @@ dependencies = [
  "blake3",
  "chrono",
  "corecrux-memory",
+ "corecrux-projections",
  "corecrux-receipts",
  "corecrux-retrieval",
  "corecrux-types",

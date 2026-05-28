@@ -197,6 +197,12 @@ pub async fn build_envelope_for_tool(name: &str, args: &Value, ctx: &McpContext)
         "memory_acknowledge_use" => {
             Some(crate::tools::memory_use::build_envelope_for_memory_acknowledge_use(args, ctx).await)
         }
+        // memory_freshness (child plan agent-ux-03 M3) opts in to the
+        // same envelope shape as query_facts. The freshness tool's own
+        // payload already carries per-fact freshness; the envelope's
+        // memories_used[] gives non-freshness readers (audit
+        // consumers) the same reserved-prefix-safe view.
+        "memory_freshness" => Some(build_envelope_for_query_facts(args, ctx).await),
         _ => None,
     }
 }
@@ -227,6 +233,9 @@ pub async fn build_envelope_for_query_facts(args: &Value, ctx: &McpContext) -> E
     drop(store);
 
     let now = Utc::now();
+    // Decay policy is process-env-derived; same inputs -> same output
+    // so re-querying the envelope on the same fact set is replay-safe.
+    let policy = corecrux_projections::decay::DecayPolicy::from_env();
     let mut memories_used: Vec<MemoryUsed> = Vec::with_capacity(facts.len());
     let mut receipts_used: Vec<String> = Vec::new();
     for f in &facts {
@@ -236,11 +245,29 @@ pub async fn build_envelope_for_query_facts(args: &Value, ctx: &McpContext) -> E
         let age_days = (now - f.stored_at).num_days();
         let age_days = if age_days < 0 { None } else { Some(age_days) };
         let topic = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
+        // Master ExecPlan M3 "envelope nudge": prefer the per-fact
+        // horizon_class -> decay::apply_at_chrono signal over the
+        // single-horizon spike heuristic. Falls back to the spike
+        // heuristic when the fact predates the freshness primitive
+        // (HorizonClass::None on a still-fresh fact would otherwise
+        // mask the staleness everyone wants to see).
+        let proj_class = crate::tools::freshness::projection_class_of(f.horizon_class);
+        let decay_signal =
+            corecrux_projections::decay::apply_at_chrono(proj_class, f.stored_at, f.reverified_at, now, policy);
+        let freshness = if matches!(f.horizon_class, corecrux_memory::HorizonClass::None) {
+            Freshness::from_age_days(age_days)
+        } else {
+            match decay_signal {
+                corecrux_projections::decay::Freshness::Fresh => Freshness::Fresh,
+                corecrux_projections::decay::Freshness::Stale => Freshness::Stale,
+                corecrux_projections::decay::Freshness::Unknown => Freshness::Unknown,
+            }
+        };
         memories_used.push(MemoryUsed {
             fact_id: f.fact_id.clone(),
             topic,
             age_days,
-            freshness: Freshness::from_age_days(age_days),
+            freshness,
         });
         if let Some(receipt) = &f.source_receipt {
             if !receipts_used.contains(receipt) {

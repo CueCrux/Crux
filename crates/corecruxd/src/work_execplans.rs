@@ -845,6 +845,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
     }
 

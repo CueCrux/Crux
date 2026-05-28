@@ -333,6 +333,7 @@ mod tests {
             source_receipt: Some("test".to_string()),
             confidence: 1.0,
             private: true,
+            horizon_class: None,
         });
         store.store(StoreFact {
             entity: format!("__extension_grant__::ext.example.quote::{TEST_PASSPORT}"),
@@ -341,6 +342,7 @@ mod tests {
             source_receipt: Some("test".to_string()),
             confidence: 1.0,
             private: true,
+            horizon_class: None,
         });
     }
 }

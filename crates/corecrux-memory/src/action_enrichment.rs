@@ -1165,6 +1165,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
 
         let proposal = enrich_action(
@@ -1196,6 +1197,7 @@ mod tests {
             source_receipt: Some("calendar:receipt".to_string()),
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
 
         let proposal = enrich_action(
@@ -1319,6 +1321,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
         store.store(StoreFact {
             entity: "business::acme::file::plan".to_string(),
@@ -1327,6 +1330,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
         store.store(StoreFact {
             entity: "business::acme::customer::acme".to_string(),
@@ -1335,6 +1339,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
         store.store(StoreFact {
             entity: "__constraints__::business::acme::policy".to_string(),
@@ -1343,6 +1348,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: true,
+            horizon_class: None,
         });
         store.store(StoreFact {
             entity: "business::acme::private::session".to_string(),
@@ -1351,6 +1357,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: true,
+            horizon_class: None,
         });
 
         let cases = [

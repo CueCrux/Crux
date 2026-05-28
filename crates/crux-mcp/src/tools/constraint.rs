@@ -105,6 +105,7 @@ pub async fn handle_declare_constraint(args: &Value, ctx: &McpContext) -> Result
         source_receipt: None,
         confidence: 1.0,
         private: false,
+        horizon_class: None,
     };
 
     let mut store = ctx.fact_store.write().await;

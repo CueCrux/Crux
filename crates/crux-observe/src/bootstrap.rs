@@ -132,6 +132,7 @@ impl BootstrapSeeder {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -143,6 +144,7 @@ impl BootstrapSeeder {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -154,6 +156,7 @@ impl BootstrapSeeder {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -165,6 +168,7 @@ impl BootstrapSeeder {
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
+                horizon_class: None,
             });
         }
 
@@ -181,6 +185,7 @@ impl BootstrapSeeder {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
 
         info!(facts_created = count, "bootstrap seed complete");
