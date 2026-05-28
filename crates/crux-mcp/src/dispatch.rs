@@ -1378,7 +1378,21 @@ mod tests {
     /// master ExecPlan documents in §"Cross-PR envelope-test interaction".
     #[tokio::test]
     async fn envelope_omits_for_output_attest() {
+        // Acquire the envelope env lock AND the output_attest
+        // resolver flag lock. Two-lock setups race because each test
+        // suite previously held a separate mutex; the resolver tests
+        // in `tools::output_attest` set CORECRUX_C2PA_SIGNER mid-run,
+        // and without the shared lock this dispatch would observe
+        // `Vault` and try to hit Vault PKI. Cross-locking both is
+        // safe (no deadlock — only this test holds both, the resolver
+        // tests hold only `flag_lock`).
         let _guard = envelope_env_lock().lock().await;
+        let _flag_guard = crate::tools::output_attest::tests::flag_lock().lock().await;
+        // Defensive belt-and-braces: clear the signer resolver inputs
+        // in case any earlier test panicked between set and reset.
+        std::env::remove_var("CORECRUX_C2PA_SIGNER");
+        std::env::remove_var(crate::tools::output_attest::X509_FEATURE_FLAG_ENV);
+        std::env::remove_var(crate::tools::output_attest::BACKEND_ENV);
         std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
         std::env::set_var(crate::tools::output_attest::FEATURE_FLAG_ENV, "1");
         // Provide a signer key + key id for the round-trip path.

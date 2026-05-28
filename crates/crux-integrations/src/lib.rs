@@ -8,6 +8,7 @@
 //! CLI, file watcher, and webhook recipes, but they do not execute code inside
 //! the daemon process.
 
+pub mod c2pa_signer_selector;
 pub mod signing;
 
 pub use signing::{fingerprint_from_public_key, sign_manifest, TrustedKeyEntry, TrustedKeyring};
