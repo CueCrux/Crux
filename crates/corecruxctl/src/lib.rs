@@ -21,6 +21,7 @@ pub mod admin;
 pub mod audit_export;
 pub mod audit_pack;
 pub mod benchmark;
+pub mod c2pa_x509;
 pub mod evidence;
 pub mod explain;
 pub mod extensions;

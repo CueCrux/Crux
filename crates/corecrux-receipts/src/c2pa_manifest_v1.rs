@@ -161,10 +161,22 @@ pub struct C2paSignedManifestV1 {
     pub canonical_body_bytes: Vec<u8>,
     /// BLAKE3 over `canonical_body_bytes`.
     pub canonical_body_hash: [u8; 32],
-    /// Ed25519 signature over `canonical_body_bytes`.
-    pub signature: [u8; 64],
+    /// Raw signature bytes. For Ed25519 (legacy / `local-ed25519`
+    /// backend) this is the 64-byte signature; for ECDSA P-256
+    /// (`vault-pki-p256` backend) this is the DER-encoded signature.
+    pub signature: Vec<u8>,
+    /// Signature algorithm string written into the envelope. One of
+    /// `"ed25519"` (legacy) or `"es256"` (P-256 ECDSA with SHA-256,
+    /// the JWA name for COSE algorithm `-7`).
+    pub signature_alg: String,
     pub key_id: String,
     pub signed_at: String,
+    /// Optional X.509 certificate chain (leaf first, then
+    /// intermediates, no root) for the `vault-pki-p256` backend.
+    /// `None` for the legacy `local-ed25519` backend — the JUMBF
+    /// envelope omits the `x5chain` field entirely in that case, so
+    /// existing PR #121 outputs remain byte-identical.
+    pub x5chain_pem: Option<String>,
 }
 
 impl C2paSignedManifestV1 {
@@ -193,6 +205,31 @@ impl C2paSignedManifestV1 {
             })
             .collect();
 
+        let mut signature_obj = serde_json::Map::new();
+        signature_obj.insert("alg".into(), serde_json::Value::String(self.signature_alg.clone()));
+        signature_obj.insert("key_id".into(), serde_json::Value::String(self.key_id.clone()));
+        signature_obj.insert("signed_at".into(), serde_json::Value::String(self.signed_at.clone()));
+        signature_obj.insert(
+            "signature_b64".into(),
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&self.signature)),
+        );
+        signature_obj.insert(
+            "signed_payload_hash_b64".into(),
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(self.canonical_body_hash)),
+        );
+        // RFC 9360 `x5chain` header — embed only when the signer
+        // backend supplied a chain. Legacy Ed25519 outputs are byte-
+        // identical to PR #121 because this branch is skipped.
+        if let Some(chain_pem) = &self.x5chain_pem {
+            let der_chain: Vec<serde_json::Value> = split_pem_certs(chain_pem)
+                .into_iter()
+                .filter_map(|pem| pem_cert_to_der(&pem).ok())
+                .map(|der| serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(der)))
+                .collect();
+            signature_obj.insert("x5chain".into(), serde_json::Value::Array(der_chain));
+            signature_obj.insert("x5chain_pem".into(), serde_json::Value::String(chain_pem.clone()));
+        }
+
         serde_json::json!({
             "format": "application/c2pa",
             "version": self.manifest.spec_version,
@@ -211,14 +248,7 @@ impl C2paSignedManifestV1 {
                     "signer_passport": self.manifest.signer_passport,
                 },
             },
-            "signature": {
-                "alg": "ed25519",
-                "key_id": self.key_id,
-                "signed_at": self.signed_at,
-                "signature_b64": base64::engine::general_purpose::STANDARD.encode(self.signature),
-                "signed_payload_hash_b64": base64::engine::general_purpose::STANDARD
-                    .encode(self.canonical_body_hash),
-            },
+            "signature": serde_json::Value::Object(signature_obj),
         })
     }
 
@@ -229,6 +259,52 @@ impl C2paSignedManifestV1 {
         let bytes = serde_json::to_vec(&json).unwrap_or_default();
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
+}
+
+/// Split a PEM concatenation into one PEM string per certificate.
+fn split_pem_certs(pem: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut inside = false;
+    for line in pem.lines() {
+        if line.starts_with("-----BEGIN CERTIFICATE-----") {
+            inside = true;
+            buf.clear();
+            buf.push_str(line);
+            buf.push('\n');
+        } else if line.starts_with("-----END CERTIFICATE-----") {
+            buf.push_str(line);
+            buf.push('\n');
+            out.push(buf.clone());
+            buf.clear();
+            inside = false;
+        } else if inside {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    out
+}
+
+/// Decode one PEM CERTIFICATE block into raw DER bytes.
+fn pem_cert_to_der(pem: &str) -> Result<Vec<u8>, C2paManifestError> {
+    let trimmed = pem.trim();
+    let start_marker = "-----BEGIN CERTIFICATE-----";
+    let end_marker = "-----END CERTIFICATE-----";
+    let start = trimmed
+        .find(start_marker)
+        .ok_or_else(|| C2paManifestError::Decode("missing BEGIN CERTIFICATE".into()))?;
+    let body_start = start + start_marker.len();
+    let end = trimmed[body_start..]
+        .find(end_marker)
+        .ok_or_else(|| C2paManifestError::Decode("missing END CERTIFICATE".into()))?;
+    let b64 = trimmed[body_start..body_start + end]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| C2paManifestError::Decode(format!("x5chain b64 decode: {e}")))
 }
 
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
@@ -338,27 +414,100 @@ pub fn canonical_body_bytes_v1(m: &C2paManifestV1) -> Result<Vec<u8>, C2paManife
     Ok(bytes)
 }
 
+/// Output of one signing pass. Backends implement [`C2paSigner`] and
+/// return this shape; [`sign_c2pa_manifest_via_signer`] glues a signer
+/// to the canonical-bytes pipeline.
+#[derive(Debug, Clone)]
+pub struct SignedManifestParts {
+    /// Raw signature bytes (Ed25519: 64 bytes; ECDSA P-256: DER-encoded).
+    pub signature_bytes: Vec<u8>,
+    /// Wire algorithm identifier. `"ed25519"` or `"es256"`.
+    pub signature_alg: String,
+    /// Key id to embed in the envelope.
+    pub key_id: String,
+    /// Optional X.509 chain (PEM, leaf+intermediates, no root). When
+    /// `Some`, the JUMBF envelope embeds the chain in an `x5chain`
+    /// header per RFC 9360.
+    pub x5chain_pem: Option<String>,
+}
+
+/// A pluggable C2PA signer. The Ed25519 legacy backend (used by
+/// existing PR #121 outputs) is provided by [`ed25519_signer`]; the
+/// Vault PKI X.509 backend lives in
+/// [`crate::vault_pki_x509_signer::VaultPkiX509Signer`].
+pub trait C2paSigner {
+    /// Sign the canonical body bytes. Implementations may sign the
+    /// bytes directly (Ed25519) or pre-hash + sign the digest (ECDSA);
+    /// the canonical-bytes-and-hash bookkeeping is the caller's
+    /// responsibility, the trait sees only the body.
+    fn sign_body(&self, canonical_body_bytes: &[u8]) -> Result<SignedManifestParts, C2paManifestError>;
+}
+
+/// Build an Ed25519 [`C2paSigner`] adapter for a `SigningKey` + key id
+/// pair. This is the legacy `local-ed25519` backend selected when no
+/// X.509 flag is set; behaviour matches PR #121 exactly.
+pub fn ed25519_signer<'a>(signing_key: &'a SigningKey, key_id: &'a str) -> impl C2paSigner + 'a {
+    Ed25519CompatSigner { signing_key, key_id }
+}
+
+struct Ed25519CompatSigner<'a> {
+    signing_key: &'a SigningKey,
+    key_id: &'a str,
+}
+
+impl C2paSigner for Ed25519CompatSigner<'_> {
+    fn sign_body(&self, canonical_body_bytes: &[u8]) -> Result<SignedManifestParts, C2paManifestError> {
+        let sig = self.signing_key.sign(canonical_body_bytes).to_bytes();
+        Ok(SignedManifestParts {
+            signature_bytes: sig.to_vec(),
+            signature_alg: "ed25519".to_string(),
+            key_id: self.key_id.to_string(),
+            x5chain_pem: None,
+        })
+    }
+}
+
 /// Sign a built manifest with the daemon's Ed25519 CROWN signer.
 ///
 /// The returned struct's `to_jumbf_base64()` is what the MCP tool
 /// returns to the caller; `verify_c2pa_manifest_v1` reads the same
 /// envelope back to validate.
+///
+/// Backwards compat: this is the legacy entry point used by PR #121;
+/// the emitted manifest is byte-identical to that PR's output (alg =
+/// `"ed25519"`, no `x5chain` field).
 pub fn sign_c2pa_manifest_v1(
     manifest: C2paManifestV1,
     signing_key: &SigningKey,
     key_id: &str,
     signed_at: &str,
 ) -> Result<C2paSignedManifestV1, C2paManifestError> {
+    let signer = ed25519_signer(signing_key, key_id);
+    sign_c2pa_manifest_via_signer(manifest, &signer, signed_at)
+}
+
+/// Backend-agnostic sign path. The Ed25519 legacy entry point
+/// [`sign_c2pa_manifest_v1`] is a thin wrapper that builds an Ed25519
+/// signer adapter. The Vault PKI X.509 backend passes a different
+/// adapter that pre-hashes the body and produces a DER-encoded P-256
+/// signature plus the x5chain bytes.
+pub fn sign_c2pa_manifest_via_signer<S: C2paSigner + ?Sized>(
+    manifest: C2paManifestV1,
+    signer: &S,
+    signed_at: &str,
+) -> Result<C2paSignedManifestV1, C2paManifestError> {
     let body = canonical_body_bytes_v1(&manifest)?;
     let hash = blake3::hash(&body);
-    let sig = signing_key.sign(&body).to_bytes();
+    let parts = signer.sign_body(&body)?;
     Ok(C2paSignedManifestV1 {
         manifest,
         canonical_body_bytes: body,
         canonical_body_hash: *hash.as_bytes(),
-        signature: sig,
-        key_id: key_id.to_string(),
+        signature: parts.signature_bytes,
+        signature_alg: parts.signature_alg,
+        key_id: parts.key_id,
         signed_at: signed_at.to_string(),
+        x5chain_pem: parts.x5chain_pem,
     })
 }
 
@@ -473,14 +622,17 @@ pub fn parse_jumbf_base64(envelope_b64: &str) -> Result<C2paSignedManifestV1, C2
     let sig_bytes = base64::engine::general_purpose::STANDARD
         .decode(sig_b64)
         .map_err(|e| C2paManifestError::SignatureDecode(e.to_string()))?;
-    if sig_bytes.len() != 64 {
+    // The legacy Ed25519 path required exactly 64 bytes; the new
+    // ES256 (P-256 ECDSA-SHA256) path produces a DER-encoded
+    // signature of variable length. We dispatch on the `alg` field
+    // and let `verify_c2pa_manifest_v1` enforce shape.
+    let signature_alg = sig.get("alg").and_then(|v| v.as_str()).unwrap_or("ed25519").to_string();
+    if signature_alg == "ed25519" && sig_bytes.len() != 64 {
         return Err(C2paManifestError::SignatureDecode(format!(
             "expected 64-byte ed25519 signature, got {}",
             sig_bytes.len()
         )));
     }
-    let mut signature = [0u8; 64];
-    signature.copy_from_slice(&sig_bytes);
     let key_id = sig
         .get("key_id")
         .and_then(|v| v.as_str())
@@ -491,15 +643,51 @@ pub fn parse_jumbf_base64(envelope_b64: &str) -> Result<C2paSignedManifestV1, C2
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    // x5chain — prefer the PEM form (round-trip-friendly), fall back
+    // to the DER array (RFC 9360 canonical form).
+    let x5chain_pem = sig
+        .get("x5chain_pem")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            sig.get("x5chain").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|item| {
+                        item.as_str().and_then(|s| {
+                            base64::engine::general_purpose::STANDARD
+                                .decode(s.as_bytes())
+                                .ok()
+                                .map(|der| der_to_pem_cert(&der))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        });
 
     Ok(C2paSignedManifestV1 {
         manifest,
         canonical_body_bytes,
         canonical_body_hash,
-        signature,
+        signature: sig_bytes,
+        signature_alg,
         key_id,
         signed_at,
+        x5chain_pem,
     })
+}
+
+/// Wrap raw DER bytes back into a PEM `CERTIFICATE` block. Used when
+/// the envelope only carried the RFC 9360 `x5chain` array.
+fn der_to_pem_cert(der: &[u8]) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+        out.push('\n');
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -538,8 +726,18 @@ pub fn verify_c2pa_manifest_v1(
     let recomputed = blake3::hash(&parsed.canonical_body_bytes);
     let canonical_hash_match = *recomputed.as_bytes() == parsed.canonical_body_hash;
 
-    let sig = ed25519_dalek::Signature::from_bytes(&parsed.signature);
-    let signature_valid = verifying_key.verify(&parsed.canonical_body_bytes, &sig).is_ok();
+    let signature_valid = if parsed.signature.len() == 64 {
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&parsed.signature);
+        let sig = ed25519_dalek::Signature::from_bytes(&arr);
+        verifying_key.verify(&parsed.canonical_body_bytes, &sig).is_ok()
+    } else {
+        // Non-64-byte signature → not the legacy Ed25519 envelope.
+        // verify_c2pa_manifest_v1 only handles Ed25519; X.509 chain
+        // verification lives in `corecruxctl c2pa-verify` and walks
+        // the x5chain to the local anchor PEM.
+        false
+    };
 
     let content_hash = blake3::hash(content_bytes).to_hex().to_string();
     let content_hash_match = content_hash == parsed.manifest.content_hash_blake3_hex;
@@ -658,7 +856,9 @@ mod tests {
         let content = b"sig-test-content";
         let manifest = build_c2pa_manifest_v1(&fixture_input(content, "r_tamper_sig"));
         let mut signed = sign_c2pa_manifest_v1(manifest, &sk, "key_test", "2026-05-27T12:00:00Z").unwrap();
-        signed.signature[0] ^= 0xff;
+        if let Some(first) = signed.signature.first_mut() {
+            *first ^= 0xff;
+        }
         let parsed = parse_jumbf_base64(&signed.to_jumbf_base64()).unwrap();
         let report = verify_c2pa_manifest_v1(&parsed, content, &vk).unwrap();
         assert!(!report.signature_valid);
@@ -689,6 +889,63 @@ mod tests {
         assert!(assert_crown_receipt_id_v1(&parsed, "r_xref_ok").is_ok());
         let err = assert_crown_receipt_id_v1(&parsed, "r_other").unwrap_err();
         assert!(matches!(err, C2paManifestError::ReceiptIdMismatch { .. }));
+    }
+
+    #[test]
+    fn backwards_compat_ed25519_envelope_bytes_unchanged() {
+        // Re-verify that the legacy Ed25519 entry point produces a
+        // JUMBF envelope whose decoded shape matches PR #121 — namely
+        // `signature.alg == "ed25519"` and no `x5chain` field.
+        let sk = SigningKey::from_bytes(&[19u8; 32]);
+        let manifest = build_c2pa_manifest_v1(&fixture_input(b"bc-test", "r_bc"));
+        let signed = sign_c2pa_manifest_v1(manifest, &sk, "k-legacy", "2026-05-28T00:00:00Z").unwrap();
+        let envelope_json = signed.to_jumbf_json();
+        assert_eq!(envelope_json["signature"]["alg"], "ed25519");
+        assert!(
+            envelope_json["signature"].get("x5chain").is_none(),
+            "legacy envelope must not embed x5chain"
+        );
+        assert!(
+            envelope_json["signature"].get("x5chain_pem").is_none(),
+            "legacy envelope must not embed x5chain_pem"
+        );
+        assert_eq!(signed.signature.len(), 64, "ed25519 raw sig stays 64 bytes");
+    }
+
+    #[test]
+    fn custom_signer_trait_round_trip() {
+        // A trivial in-test C2paSigner implementation — emulates the
+        // X.509 backend's output shape (es256 + x5chain_pem) without
+        // pulling in Vault.
+        struct FakeX509Signer;
+        impl C2paSigner for FakeX509Signer {
+            fn sign_body(&self, body: &[u8]) -> Result<SignedManifestParts, C2paManifestError> {
+                // Not a real ES256 signature — just bytes to prove
+                // the envelope round-trips.
+                let mut sig = vec![0u8; 70]; // typical DER P-256 size
+                sig[0..body.len().min(70)].copy_from_slice(&body[..body.len().min(70)]);
+                let fake_pem = "-----BEGIN CERTIFICATE-----\nQUFB\n-----END CERTIFICATE-----\n".to_string();
+                Ok(SignedManifestParts {
+                    signature_bytes: sig,
+                    signature_alg: "es256".into(),
+                    key_id: "x509-sha256:deadbeef".into(),
+                    x5chain_pem: Some(fake_pem),
+                })
+            }
+        }
+        let manifest = build_c2pa_manifest_v1(&fixture_input(b"x509-test", "r_x509"));
+        let signed = sign_c2pa_manifest_via_signer(manifest, &FakeX509Signer, "2026-05-28T00:00:00Z").unwrap();
+        assert_eq!(signed.signature_alg, "es256");
+        assert_eq!(signed.key_id, "x509-sha256:deadbeef");
+        assert!(signed.x5chain_pem.is_some());
+        let envelope = signed.to_jumbf_base64();
+        let parsed = parse_jumbf_base64(&envelope).unwrap();
+        assert_eq!(parsed.signature_alg, "es256");
+        assert_eq!(parsed.signature, signed.signature);
+        assert!(
+            parsed.x5chain_pem.is_some(),
+            "x5chain must round-trip through the envelope"
+        );
     }
 
     #[test]

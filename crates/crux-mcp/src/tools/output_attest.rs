@@ -47,10 +47,31 @@ use serde_json::{json, Value};
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INVALID_PARAMS};
 use crate::scope;
-use corecrux_receipts::{build_c2pa_manifest_v1, sign_c2pa_manifest_v1, C2paManifestInputV1, C2PA_SPEC_VERSION};
+use corecrux_receipts::vault_pki_x509_signer::VaultPkiX509Signer;
+use corecrux_receipts::{
+    build_c2pa_manifest_v1, ed25519_signer, sign_c2pa_manifest_via_signer, C2paManifestInputV1, C2PA_SPEC_VERSION,
+};
 
 /// Environment variable that gates `output_attest`. Default off.
 pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_C2PA_OUTPUT";
+
+/// Backend selector — when set to `vault-pki-p256` AND
+/// [`X509_FEATURE_FLAG_ENV`] is on, the daemon emits an X.509-signed
+/// manifest with an `x5chain` header instead of the legacy Ed25519
+/// envelope.
+///
+/// Accepted values: `local-ed25519` (default), `vault-pki-p256`.
+pub const BACKEND_ENV: &str = "CORECRUXD_C2PA_SIGNER_BACKEND";
+
+/// Independent feature flag for the X.509 backend (agent-ux-07 M6).
+/// Both this AND `BACKEND_ENV=vault-pki-p256` must be set to switch
+/// to the X.509 path; the dual gate prevents accidental promotion
+/// when only one knob is flipped.
+pub const X509_FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_C2PA_X509_SIGNER";
+
+/// Value strings.
+pub const BACKEND_LOCAL_ED25519: &str = "local-ed25519";
+pub const BACKEND_VAULT_PKI_P256: &str = "vault-pki-p256";
 
 /// Optional override for the C2PA signer key — base64-encoded 32-byte
 /// Ed25519 secret. Defaults to the existing
@@ -79,6 +100,28 @@ pub fn output_attest_enabled() -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Returns `true` when the X.509 (vault-pki-p256) backend should be
+/// used. Requires BOTH `CORECRUXD_FEATURE_C2PA_X509_SIGNER=1` AND
+/// `CORECRUXD_C2PA_SIGNER_BACKEND=vault-pki-p256`.
+fn x509_backend_active() -> bool {
+    let flag_on = match std::env::var(X509_FEATURE_FLAG_ENV) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "" | "0" | "false" | "off" | "no")
+        }
+        Err(_) => false,
+    };
+    if !flag_on {
+        return false;
+    }
+    matches!(
+        std::env::var(BACKEND_ENV)
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok(BACKEND_VAULT_PKI_P256)
+    )
 }
 
 fn load_signing_key() -> Option<(SigningKey, String)> {
@@ -208,16 +251,7 @@ pub async fn handle_output_attest(args: &Value, ctx: &McpContext) -> Result<Valu
         }
     }
 
-    // ── 5. Signer lookup ───────────────────────────────────────────────
-    let (signing_key, key_id) = load_signing_key().ok_or_else(|| JsonRpcError {
-        code: INVALID_PARAMS,
-        message: format!(
-            "output_attest signer missing: set {SIGNING_KEY_ENV} or fall back to {FALLBACK_SIGNING_KEY_ENV}"
-        ),
-        data: None,
-    })?;
-
-    // ── 6. Build + sign manifest ───────────────────────────────────────
+    // ── 5. Build manifest ──────────────────────────────────────────────
     let when = chrono::Utc::now().to_rfc3339();
     let manifest_id = format!("urn:cuecrux:c2pa:{}", uuid::Uuid::new_v4());
     let input = C2paManifestInputV1 {
@@ -231,11 +265,50 @@ pub async fn handle_output_attest(args: &Value, ctx: &McpContext) -> Result<Valu
         model: None,
     };
     let manifest = build_c2pa_manifest_v1(&input);
-    let signed = sign_c2pa_manifest_v1(manifest, &signing_key, &key_id, &when).map_err(|e| JsonRpcError {
-        code: INVALID_PARAMS,
-        message: format!("c2pa manifest signing failed: {e}"),
-        data: None,
-    })?;
+
+    // ── 6. Sign via the selected backend ──────────────────────────────
+    //
+    // Backend selector:
+    // - Default (`local-ed25519`): use the existing Ed25519 CROWN
+    //   signer key (env-loaded). Output byte-identical to PR #121.
+    // - `vault-pki-p256`: instantiate VaultPkiX509Signer from env,
+    //   opportunistically rotate (no-op if leaf is healthy), and emit
+    //   an envelope with `signature.alg = "es256"` + `x5chain`.
+    let backend_x509 = x509_backend_active();
+    let signed = if backend_x509 {
+        let signer = VaultPkiX509Signer::from_env().map_err(|e| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("VaultPkiX509Signer init failed: {e}"),
+            data: None,
+        })?;
+        signer.initialize().map_err(|e| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("VaultPkiX509Signer.initialize failed: {e}"),
+            data: None,
+        })?;
+        // Best-effort rotation — if it fails (Vault unreachable), we
+        // continue with the cached leaf as long as it's still valid.
+        let _ = signer.maybe_rotate_if_due();
+        sign_c2pa_manifest_via_signer(manifest, &signer, &when).map_err(|e| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("c2pa manifest signing (vault-pki-p256) failed: {e}"),
+            data: None,
+        })?
+    } else {
+        let (signing_key, key_id) = load_signing_key().ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!(
+                "output_attest signer missing: set {SIGNING_KEY_ENV} or fall back to {FALLBACK_SIGNING_KEY_ENV}"
+            ),
+            data: None,
+        })?;
+        let legacy_signer = ed25519_signer(&signing_key, &key_id);
+        sign_c2pa_manifest_via_signer(manifest, &legacy_signer, &when).map_err(|e| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("c2pa manifest signing failed: {e}"),
+            data: None,
+        })?
+    };
     let envelope_b64 = signed.to_jumbf_base64();
 
     // ── 7. Build verify URL (best-effort) ─────────────────────────────
@@ -247,6 +320,11 @@ pub async fn handle_output_attest(args: &Value, ctx: &McpContext) -> Result<Valu
         )
     });
 
+    let backend_name = if backend_x509 {
+        BACKEND_VAULT_PKI_P256
+    } else {
+        BACKEND_LOCAL_ED25519
+    };
     let response_json = json!({
         "manifest_id": manifest_id,
         "spec_version": C2PA_SPEC_VERSION,
@@ -254,9 +332,16 @@ pub async fn handle_output_attest(args: &Value, ctx: &McpContext) -> Result<Valu
         "content_hash_blake3_hex": signed.manifest.content_hash_blake3_hex,
         "crown_receipt_id": signed.manifest.crown_receipt_id,
         "signer_key_id": signed.key_id,
+        "signer_alg": signed.signature_alg,
         "signer_passport": signed.manifest.signer_passport,
+        "signer_backend": backend_name,
+        "x5chain_pem": signed.x5chain_pem,
         "verify_url": verify_url,
-        "verify_command": "corecruxctl output-verify <manifest_file>",
+        "verify_command": if backend_x509 {
+            "corecruxctl c2pa-verify <manifest_file>"
+        } else {
+            "corecruxctl output-verify <manifest_file>"
+        },
         "ai_act_notice": "Engineering scaffolding aligned with EU AI Act Art. 50; legal conformity assessment remains the operator's responsibility.",
     });
     let text_summary = format!(
@@ -297,6 +382,8 @@ mod tests {
         std::env::remove_var(KEY_ID_ENV);
         std::env::remove_var(FALLBACK_SIGNING_KEY_ENV);
         std::env::remove_var(FALLBACK_KEY_ID_ENV);
+        std::env::remove_var(BACKEND_ENV);
+        std::env::remove_var(X509_FEATURE_FLAG_ENV);
     }
 
     fn set_signer() {
@@ -397,5 +484,26 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("signer missing"), "got: {}", err.message);
         clear_env();
+    }
+
+    #[test]
+    fn x509_backend_active_requires_both_flags() {
+        // Helper-level test (no Mcp context needed) — locks env to
+        // avoid stomping the async tests.
+        static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = M.lock().unwrap();
+        std::env::remove_var(BACKEND_ENV);
+        std::env::remove_var(X509_FEATURE_FLAG_ENV);
+        assert!(!x509_backend_active(), "both env vars unset → off");
+        std::env::set_var(X509_FEATURE_FLAG_ENV, "1");
+        assert!(!x509_backend_active(), "flag on without backend → off");
+        std::env::set_var(BACKEND_ENV, BACKEND_LOCAL_ED25519);
+        assert!(!x509_backend_active(), "backend=local-ed25519 → off");
+        std::env::set_var(BACKEND_ENV, BACKEND_VAULT_PKI_P256);
+        assert!(x509_backend_active(), "both set → on");
+        std::env::set_var(X509_FEATURE_FLAG_ENV, "0");
+        assert!(!x509_backend_active(), "flag off → off even if backend selected");
+        std::env::remove_var(BACKEND_ENV);
+        std::env::remove_var(X509_FEATURE_FLAG_ENV);
     }
 }

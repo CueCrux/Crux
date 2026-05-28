@@ -18,6 +18,25 @@ thiserror = "2.0.12"
 zstd = "0.13.3"
 zip = "8.6.0"
 
+# C2PA X.509 trust-anchor signer (agent-ux-07 M6).
+# `p256` provides the local P-256 leaf key (ECDSA-with-SHA256).
+# `rcgen` builds the CSR that Vault PKI signs (Vault verifies the CSR's
+# public key matches the SubjectPublicKeyInfo it returns inside the leaf).
+# `x509-cert` parses Vault's returned PEM chain + the operator-supplied
+# root anchor PEM offline for the corecruxctl verifier path.
+# `der` is used to obtain DER bytes for chain validation.
+# `ureq` is the synchronous HTTP client used to POST CSRs to Vault PKI;
+# rustls-tls keeps the dep surface small (no openssl).
+p256 = { version = "0.13.2", default-features = false, features = ["std", "ecdsa", "pem"] }
+rcgen = { version = "0.13.2", features = ["x509-parser"] }
+x509-cert = { version = "0.2.5", default-features = false, features = ["std", "pem"] }
+der = { version = "0.7.10", default-features = false, features = ["std", "pem"] }
+ureq = { version = "2.12.1", default-features = false, features = ["tls", "json"] }
+url = "2.5.4"
+parking_lot = "0.12.3"
+# rand_core 0.6 matches p256 0.13's CryptoRng trait. We only use OsRng.
+rand_core = { version = "0.6.4", features = ["std", "getrandom"] }
+
 corecrux-types = { path = "../corecrux-types" }
 
 [dev-dependencies]
