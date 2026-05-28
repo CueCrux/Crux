@@ -134,11 +134,38 @@ pub struct AutonomyConsumed {
 
 /// A side-effect the tool predicts it WOULD perform if invoked with the
 /// same args. Read-side tools emit an empty vec.
+///
+/// ## Backwards compat
+///
+/// `ts_us` (microseconds since UNIX epoch) is OPTIONAL and skipped on
+/// serialisation when absent. Wave-1 (`agent-ux-best-in-class-master`
+/// M2 spike) wrote entries without a timestamp; child plan #06
+/// (`agent-ux-06-typed-action-traces`) adds the field so the typed-trace
+/// ring buffer can render a chronological timeline. Older parsers that
+/// don't know about `ts_us` ignore the extra key per serde's default
+/// behaviour.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PredictedEffect {
     pub kind: String,
     pub entity: String,
     pub key: String,
+    /// Microseconds since UNIX epoch when this effect was recorded.
+    /// Omitted when the effect was synthesised from a pre-trace builder
+    /// (e.g. the original M2 spike).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts_us: Option<i64>,
+}
+
+impl PredictedEffect {
+    /// Construct a trace-aware effect stamped with the current wall clock.
+    pub fn now(kind: impl Into<String>, entity: impl Into<String>, key: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            entity: entity.into(),
+            key: key.into(),
+            ts_us: Some(Utc::now().timestamp_micros()),
+        }
+    }
 }
 
 /// Hyperlinks the host can render to let the user verify / open the
@@ -561,5 +588,41 @@ mod tests {
         let ctx = test_ctx();
         let env = build_envelope_for_tool("not_a_tool", &json!({}), &ctx).await;
         assert!(env.is_none());
+    }
+
+    // ── agent-ux-06: predicted_effects.ts_us is backwards-compatible ─────
+    //
+    // Older payloads (M2 spike) shipped without `ts_us`. New consumers
+    // must still parse them, and old consumers must still parse new ones.
+
+    #[test]
+    fn predicted_effect_legacy_payload_parses_without_ts_us() {
+        // Legacy shape: {kind, entity, key} only.
+        let legacy = json!({"kind": "fact_write", "entity": "p", "key": "k"});
+        let parsed: PredictedEffect = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.kind, "fact_write");
+        assert_eq!(parsed.entity, "p");
+        assert_eq!(parsed.key, "k");
+        assert!(parsed.ts_us.is_none());
+    }
+
+    #[test]
+    fn predicted_effect_serialises_without_ts_us_when_absent() {
+        let eff = PredictedEffect {
+            kind: "fact_read".to_string(),
+            entity: "e".to_string(),
+            key: "k".to_string(),
+            ts_us: None,
+        };
+        let s = serde_json::to_string(&eff).unwrap();
+        assert!(!s.contains("ts_us"), "ts_us must be omitted when None: {s}");
+    }
+
+    #[test]
+    fn predicted_effect_serialises_with_ts_us_when_present() {
+        let eff = PredictedEffect::now("fact_write", "alpha", "status");
+        assert!(eff.ts_us.is_some());
+        let s = serde_json::to_string(&eff).unwrap();
+        assert!(s.contains("ts_us"), "ts_us must be present in JSON: {s}");
     }
 }

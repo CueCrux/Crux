@@ -37,6 +37,7 @@ pub mod receipt_verify;
 pub mod sessions;
 pub mod storyline;
 pub mod sync;
+pub mod traces;
 pub mod update;
 
 use serde_json::{json, Value};
@@ -1462,6 +1463,12 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "examples":[{"kind":"capability"}]
             }),
         },
+        // ── Typed action traces (agent-ux-06) ────────────────────────────
+        ToolDefinition {
+            name: "tool_trace_recent".to_string(),
+            description: traces::TOOL_DESCRIPTION.to_string(),
+            input_schema: traces::tool_input_schema(),
+        },
     ]
     .into_iter()
     .map(|mut t: ToolDefinition| {
@@ -1723,7 +1730,8 @@ pub fn tool_output_docs() -> Value {
         { "tool": "feature_file_search",     "output": "{ content: [...], capabilities: [{id, name, system, files}], count }" },
         { "tool": "feature_coverage_report", "output": "{ content: [...], report: CoverageReport { total_capabilities, total_tested, total_audited, maturity, systems } }" },
         { "tool": "feature_trigger_audit",   "output": "{ content: [...], capability: <updated payload>, version }" },
-        { "tool": "feature_suggest_next",    "output": "{ content: [...], suggestions: [{kind, capability_id?, gap_type?, severity?, promise?, rationale}], count }" }
+        { "tool": "feature_suggest_next",    "output": "{ content: [...], suggestions: [{kind, capability_id?, gap_type?, severity?, promise?, rationale}], count }" },
+        { "tool": "tool_trace_recent",       "output": "{ content: [...], traces: [{tool, ts_us, turn_id?, predicted_effects: [{kind, entity, key, ts_us?}], outcome}], count, feature_disabled? } — per-passport; reserved-prefix effects stripped." }
     ])
 }
 
@@ -1827,6 +1835,8 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "feature_coverage_report" => features::handle_feature_coverage_report(args, ctx).await,
         "feature_trigger_audit" => features::handle_feature_trigger_audit(args, ctx).await,
         "feature_suggest_next" => features::handle_feature_suggest_next(args, ctx).await,
+        // Typed action traces (agent-ux-06).
+        "tool_trace_recent" => traces::handle_tool_trace_recent(args, ctx).await,
         name if extensions::is_extension_tool_name(name) => extensions::call_extension_tool(name, args, ctx).await,
         _ => Err(JsonRpcError {
             code: crate::protocol::METHOD_NOT_FOUND,
@@ -1863,7 +1873,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 74; // 73 on main (incl. audit_export_bundle agent-ux-11 + 3 freshness agent-ux-03 + autonomy_contract agent-ux-10) + receipt_verify (agent-ux-04).
+    const TOOL_COUNT: usize = 75; // 74 on main (audit_export_bundle agent-ux-11 + 3 freshness agent-ux-03 + autonomy_contract agent-ux-10 + receipt_verify agent-ux-04) + tool_trace_recent (agent-ux-06).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
