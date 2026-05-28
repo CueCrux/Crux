@@ -24,6 +24,14 @@
 //! environment-variable driven; see `config.example.env`.
 
 mod auth;
+// c2pa_signer: runtime selector for the C2PA manifest signer backend
+// (CORECRUX_C2PA_SIGNER=vault|in_process). Public surface intended for
+// the follow-up wiring milestone (crux-mcp output_attest unification +
+// any future corecruxd-side manifest emitter). dead_code allowed until
+// then so the symbols stay live for downstream callers without the bin
+// warning noise.
+#[allow(dead_code)]
+mod c2pa_signer;
 mod config;
 mod console_index;
 mod control;
