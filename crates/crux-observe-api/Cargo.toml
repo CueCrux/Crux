@@ -1,0 +1,19 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+# See LICENCE.md in the repository root.
+
+[package]
+name = "crux-observe-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared serde wire types for the agent audit-chain data contract (agent_trace_node): inputs → reasoning → output → CROWN receipt."
+
+[dependencies]
+serde = { version = "1.0.218", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0.150"
+
+[lints]
+workspace = true
