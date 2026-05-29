@@ -8,6 +8,7 @@
 
 pub mod context_monitor;
 pub mod memory_ack_inline;
+pub mod observe_post;
 pub mod observe_pre;
 pub mod pre_compact;
 pub mod session_start;

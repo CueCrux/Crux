@@ -93,6 +93,7 @@ mod tests {
 
     #[test]
     fn mcp_url_defaults_when_env_absent() {
+        let _env = crate::test_support::env_guard();
         let prev = std::env::var("CRUX_MCP_URL").ok();
         std::env::remove_var("CRUX_MCP_URL");
         assert_eq!(mcp_url(), DEFAULT_MCP_URL);
@@ -103,6 +104,7 @@ mod tests {
 
     #[test]
     fn mcp_token_treats_empty_as_none() {
+        let _env = crate::test_support::env_guard();
         let prev = std::env::var("CRUX_AGENT_TOKEN").ok();
         std::env::set_var("CRUX_AGENT_TOKEN", "");
         assert!(mcp_token().is_none(), "empty CRUX_AGENT_TOKEN must yield None");

@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 use crate::hook_input::HookInput;
 use crate::hook_output::PreToolUseOutput;
 use crate::mcp_client;
+use crate::observe_capture;
 
 /// Tools that mutate files and therefore require a punchcard check.
 const WRITE_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
@@ -127,17 +128,13 @@ fn extract_structured(value: &Value) -> Option<Value> {
     serde_json::from_str(text).ok()
 }
 
-/// Best-effort, fire-and-forget audit-step capture. The record-step tool is
-/// a no-op-tolerant stub today; any error is swallowed so the hook never
-/// blocks the tool call.
+/// Best-effort, fire-and-forget audit-step capture: OPEN a step on the daemon
+/// observe surface for this tool call (`POST /v1/observe/sessions/{id}/steps`).
+/// The matching PostToolUse `observe-post` hook CLOSEs it. Gated by
+/// `CRUX_HOOK_OBSERVE_CAPTURE` (default OFF); any error / disabled surface /
+/// unreachable daemon is swallowed so the hook never blocks the tool call.
 fn capture_audit_step(input: &HookInput) {
-    let args = json!({
-        "session_id": input.session_id,
-        "tool_name": input.tool_name,
-        "hook_event": "PreToolUse",
-    });
-    // Ignore the result entirely — capture is advisory.
-    let _ = mcp_client::call_tool("record_audit_step", args);
+    observe_capture::open(input);
 }
 
 #[cfg(test)]
@@ -183,6 +180,7 @@ mod tests {
     fn write_tool_fails_open_when_daemon_unreachable() {
         // CRUX_MCP_URL points nowhere usable in the test env, so the probe
         // errors and we must ALLOW (fail-open).
+        let _env = crate::test_support::env_guard();
         let prev = std::env::var("CRUX_MCP_URL").ok();
         std::env::set_var("CRUX_MCP_URL", "http://127.0.0.1:1/mcp");
         let out = decide(&mk_input(Some("Edit"), Some("/tmp/x.rs")));
