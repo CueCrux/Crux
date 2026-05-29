@@ -895,6 +895,7 @@ dependencies = [
  "crux-lens-features",
  "crux-mcp",
  "crux-observe",
+ "crux-observe-api",
  "crux-router",
  "crux-session",
  "ed25519-dalek",

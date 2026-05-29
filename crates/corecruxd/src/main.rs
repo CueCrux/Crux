@@ -23,6 +23,7 @@
 //! workspace-scan + storyline materialiser. Configuration is
 //! environment-variable driven; see `config.example.env`.
 
+mod agentgraph_kinds;
 mod auth;
 mod config;
 mod console_index;
@@ -639,6 +640,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut reg = state.kind_registry.write().await;
         if let Err(e) = crux_lens_features::bootstrap_kinds(&mut reg) {
             tracing::warn!(error=%e, "features lens bootstrap_kinds returned an error; continuing");
+        }
+        // Agent-graph shared foundation (observe / orchestrators / punchcards).
+        if let Err(e) = crate::agentgraph_kinds::bootstrap(&mut reg) {
+            tracing::warn!(error=%e, "agentgraph_kinds bootstrap returned an error; continuing");
         }
     }
 

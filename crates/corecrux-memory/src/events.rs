@@ -27,6 +27,19 @@ pub enum CruxEvent {
     SessionStored { session_id: String },
     #[serde(rename = "session.deleted")]
     SessionDeleted { session_id: String },
+    /// Agent-graph: a new audit step was appended to a session's trace chain.
+    #[serde(rename = "observe.audit_step")]
+    AuditStep {
+        node_id: String,
+        session_id: String,
+        seq: u64,
+    },
+    /// Agent-graph: an orchestrator was created or its state/members changed.
+    #[serde(rename = "orchestrator.changed")]
+    OrchestratorChanged { id: String },
+    /// Agent-graph: a punchcard lease transitioned status.
+    #[serde(rename = "punchcard.changed")]
+    PunchcardChanged { id: String, status: String },
 }
 
 /// Broadcast-based event bus for store mutations.

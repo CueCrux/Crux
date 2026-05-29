@@ -427,6 +427,7 @@ fn mk_item(
         plan_path: Some(file.path.display().to_string()),
         current_milestone,
         superseded_by,
+        orchestrator_id: None,
     }
 }
 

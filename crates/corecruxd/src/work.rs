@@ -90,6 +90,10 @@ pub struct WorkItem {
     pub current_milestone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// Agent-graph: orchestrator this work item belongs to, if any. Additive
+    /// + `#[serde(default)]` so existing records remain byte-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -176,6 +180,7 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         plan_path: None,
         current_milestone: None,
         superseded_by: None,
+        orchestrator_id: None,
     };
     write_record(store, &item)?;
     write_transition(

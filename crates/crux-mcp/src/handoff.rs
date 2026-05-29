@@ -33,6 +33,11 @@ pub struct HandoffPackage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_agent: Option<String>,
     pub message: Option<String>,
+    /// Agent-graph: work item ids bundled with this handoff so the receiver
+    /// can pick up the queued work without a separate `list_work` round-trip.
+    /// Additive + `#[serde(default)]` so existing packages deserialise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_ids: Vec<String>,
 }
 
 /// An authenticated handoff package.
@@ -115,6 +120,7 @@ pub fn create_handoff(
         source_agent: request.source_agent.to_string(),
         target_agent: request.target_agent,
         message: request.message,
+        work_ids: Vec::new(),
     };
 
     let payload_json = serde_json::to_vec(&package)?;
