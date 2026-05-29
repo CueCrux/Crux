@@ -6,10 +6,10 @@
 //! backend the agent-observability navigator's *Audit-trail* surface
 //! reconstructs from.
 //!
-//! M0 freezes the `agent_trace_node` projection sketched in
-//! `PlanCrux/.agent/execplans/crux-audit-chain-data-contract-2026-05-29.md`
-//! (see the companion `.design.md` for the frozen schema + mapping table +
-//! reasoning-capture policy). The capture hooks (M2/M3), the reconstruction
+//! M0 freezes the `agent_trace_node` projection: its schema, the mapping table
+//! from mutation steps to trace nodes, and the reasoning-capture policy. The
+//! frozen contract lives here so it is versioned with the code that consumes
+//! it. The capture hooks (M2/M3), the reconstruction
 //! endpoint (M4), and the verify/export surface (M5) consume these types; the
 //! navigator UI ([`crux-agent-observability-graph-2026-05-29`]) consumes them
 //! directly so there is a single source of truth for the wire shape (R6).

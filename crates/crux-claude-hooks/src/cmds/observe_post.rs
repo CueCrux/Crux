@@ -5,7 +5,7 @@
 //! `PostToolUse` hook — the close half of the observe (capture) ExecPlan.
 //!
 //! Pairs with `observe-pre`: the PreToolUse hook OPENs an `agent_trace_node`
-//! step for the tool call, this hook CLOSEs it
+//! step for the tool call, this hook performs the CLOSE
 //! (`PATCH /v1/observe/sessions/{id}/steps/{node_id}`) by deriving the same
 //! deterministic `node_id` and appending the tool's outputs + terminal status.
 //!

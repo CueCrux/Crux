@@ -13,7 +13,7 @@
 //! ExecPlans, and handoffs (its *members*) under a single passport-attributed
 //! owner. Members are held *by reference* — the orchestrator never copies the
 //! member payload, it only stores `{type, ref}` tuples. `GET …/{id}/work`
-//! resolves those references to live [`WorkItem`]s at read time so a dangling
+//! resolves those references to live [`WorkItem`](crate::work::WorkItem)s at read time so a dangling
 //! reference surfaces as `missing: true` rather than failing the whole call.
 //!
 //! Storage: orchestrators persist as `orchestrator`-kind entities in the

@@ -130,7 +130,7 @@ fn extract_structured(value: &Value) -> Option<Value> {
 
 /// Best-effort, fire-and-forget audit-step capture: OPEN a step on the daemon
 /// observe surface for this tool call (`POST /v1/observe/sessions/{id}/steps`).
-/// The matching PostToolUse `observe-post` hook CLOSEs it. Gated by
+/// The matching PostToolUse `observe-post` hook performs the CLOSE. Gated by
 /// `CRUX_HOOK_OBSERVE_CAPTURE` (default OFF); any error / disabled surface /
 /// unreachable daemon is swallowed so the hook never blocks the tool call.
 fn capture_audit_step(input: &HookInput) {
