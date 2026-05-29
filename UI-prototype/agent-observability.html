@@ -133,6 +133,8 @@
   .gnode[data-kind="step"] .gkind, .gnode[data-kind="audit-group"] .gkind, .gnode[data-kind="receipt"] .gkind { color:var(--accent); }
   .gnode[data-kind="orchestrator"] .gstripe { background:var(--accent); }
   .gnode[data-kind="orchestrator"] .gkind { color:var(--accent); }
+  .gnode[data-kind="punchcard"] .gtitle, .gnode[data-kind="deny"] .gtitle { font-family:var(--font-mono); font-size:10.5px; font-weight:600; }
+  .gnode[data-kind="conformance"] .gkind, .gnode[data-kind="export"] .gkind { color:var(--accent); }
 
   /* Orchestrator builder modal */
   .modal { position:fixed; inset:0; background:rgba(2,2,3,.55); display:none; align-items:center; justify-content:center; z-index:50; }
@@ -283,7 +285,7 @@
 <script>
 /* ════════════ DUMMY GRAPH — flat node registry with id links (daemon-styled) ════════════ */
 const SCOPES = [
-  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-sessions','cx-orchestrators','cx-passport','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-settings','cx-raw'] },
+  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-settings','cx-raw'] },
   { id:'dx', label:'DX', tag:'Docs',         sections:['dx-articles','dx-readme','dx-sites'] },
   { id:'gx', label:'GX', tag:'Global',       sections:['gx-engrams','gx-bench','gx-sites','gx-factstore'] },
   { id:'ax', label:'AX', tag:'Agent',        sections:['ax-overview','ax-activity','ax-memory','ax-bulk','ax-snapshots','ax-tools','ax-handoff','ax-graph','ax-storybook','ax-dossiers','ax-story'] }
@@ -303,11 +305,30 @@ const N = {
   'cx-tenants':{kind:'panel',label:'Tenants',sub:'category + source',children:['t-lmem','t-lmes','t-personal']},
   'cx-raw':{kind:'panel',label:'Raw',sub:'JSON-RPC console',fields:[['endpoint','/mcp'],['port','14801']]},
   'cx-settings':{kind:'panel',label:'Settings',sub:'console defaults',children:['set-auth','set-embed','set-onboard','set-daemon']},
-  'cx-orchestrators':{kind:'panel',label:'Orchestrators',sub:'group plans for a session',fields:[['active','1'],['build','＋ Orchestrator (toolbar)']],children:['orc-sprint1']},
-  'orc-sprint1':{kind:'orchestrator',label:'Sprint 1 · retrieval lifts',sub:'ce:4e6c4e2a · 3 members',status:'run',
-    fields:[['assignee','ce:4e6c4e2a:local'],['state','active'],['members','3'],['created_by','ce:4e6c4e2a']],
+  'cx-orchestrators':{kind:'panel',label:'Orchestrators',sub:'/v1/orchestrators · group plans for a session',fields:[['endpoint','/v1/orchestrators'],['flag','CORECRUXD_ORCHESTRATORS=on'],['mcp','create_orchestrator · attach · detach · list'],['active','1'],['build','＋ Orchestrator (toolbar)']],children:['orc-sprint1']},
+
+  /* ── Punchcards (resource leases) — kind=punchcard · /v1/punchcards · default-OFF ── */
+  'cx-punchcards':{kind:'panel',label:'Punchcards',sub:'/v1/punchcards · resource leases',fields:[['endpoint','/v1/punchcards (acquire·release·check·force-release)'],['flag','CORECRUXD_PUNCHCARD=off|advisory|enforce'],['mcp','punch_in · punch_out · check_punchcard · list_punchcards · force_release'],['enforce','PreToolUse deny'],['held','3']],children:['pc-reconcile','pc-tree','pc-service','pc-expired']},
+  'pc-reconcile':{kind:'punchcard',label:'file://…/http/reconcile.rs',sub:'held · ce:4e6c4e2a · modify',status:'run',
+    fields:[['id','pc_01h…'],['resource','file://Crux/crates/corecruxd/src/http/reconcile.rs'],['mode','modify'],['holder','ce:4e6c4e2a:local'],['status','held'],['acquired','13:24Z'],['expires','14:24Z (TTL)'],['receipt_acquire','crn_pc1…']],
+    children:['pc-deny'],
+    doc:'PUNCHCARD pc_01h… · status held\nresource file://Crux/…/corecruxd/src/http/reconcile.rs\nmode modify · holder ce:4e6c4e2a:local\nacquired 13:24Z · expires 14:24Z (TTL)\nreceipt_acquire crn_pc1…\n\nReentrant for the holder (re-acquire refreshes TTL).\nAnother passport that tries to Edit/Write this file\nis denied at PreToolUse — reads are never blocked.\nPunch out on commit → records release_commit_sha.\n\nacquire POST /v1/punchcards/acquire · MCP punch_in\nrelease POST /v1/punchcards/release · MCP punch_out'},
+  'pc-deny':{kind:'deny',label:'PreToolUse · DENY',sub:'ce:8821fa0d Edit blocked',status:'err',
+    fields:[['event','PreToolUse'],['tool','Edit'],['by','ce:8821fa0d:local'],['verdict','deny (409 held)'],['held_by','ce:4e6c4e2a:local'],['check','POST /v1/punchcards/check']],
+    doc:'PreToolUse hook · DENY\n\nce:8821fa0d:local tried to Edit reconcile.rs.\ncheck_punchcard → held by ce:4e6c4e2a:local until\n14:24Z → the tool call is DENIED:\n\n  "reconcile.rs is held by ce:4e6c4e2a:local until\n   14:24Z. Read is allowed; modify is blocked."\n\nReads (Read / Grep / Glob) are never checked. This\nis the enforcement point — the daemon registry is\nthe source of truth, the hook is the enforcer.'},
+  'pc-tree':{kind:'punchcard',label:'tree://…/corecrux-memory',sub:'held · ce:4e6c4e2a · modify',status:'run',
+    fields:[['id','pc_02h…'],['resource','tree://Crux/crates/corecrux-memory'],['mode','modify'],['holder','ce:4e6c4e2a:local'],['overlap','file ⊂ tree']],
+    doc:'PUNCHCARD · tree lease (coarser)\n\nA tree:// lease covers every file beneath it, so\nfile://…/corecrux-memory/src/projection.rs is\nblocked for other passports by overlap (file ⊂\ntree). Default granularity is file://; tree:// is\nopt-in for genuine whole-subtree work.'},
+  'pc-service':{kind:'punchcard',label:'service://corecruxd@gpu-1',sub:'held · deploy',status:'run',
+    fields:[['id','pc_03h…'],['resource','service://corecruxd@gpu-1'],['mode','deploy'],['holder','ce:0c4419ab:remote'],['preflight','cargo-deploy aborts if held']],
+    doc:'PUNCHCARD · service deploy lease\n\nHolds corecruxd@gpu-1 during test/deploy so a\nsecond agent cannot deploy mid-test. cargo-deploy\npreflight calls POST /v1/punchcards/check → aborts\nwith the holder if held. Short default TTL on\nservice cards; force_release is the escape hatch.'},
+  'pc-expired':{kind:'punchcard',label:'file://…/work.rs',sub:'expired · swept',status:'idle',
+    fields:[['id','pc_00h…'],['status','expired'],['holder','ce:8821fa0d:local'],['cause','TTL lapsed → expiry sweep'],['recovery','deadlock-safe'],['manual','force_release (consent, Art.14)']],
+    doc:'PUNCHCARD · expired (auto-released)\n\nThe holder crashed; its TTL lapsed; the expiry\nsweep auto-released the card so the resource never\ndeadlocks — a fresh acquire now succeeds. FSM:\nheld → released | expired | force_released.\n\nManual escape hatch: POST /v1/punchcards/{id}/\nforce-release — destructive, so consent-gated +\nreceipted (Art. 14).'},
+  'orc-sprint1':{kind:'orchestrator',label:'Sprint 1 · retrieval lifts',sub:'orc_7a1c · ce:4e6c4e2a · 3 members',status:'run',
+    fields:[['id','orc_7a1c'],['assignee','ce:4e6c4e2a:local'],['state','active'],['tenant','default'],['members','3 (by ref)'],['resolve','GET /v1/orchestrators/{id}/work'],['filter','/v1/work?orchestrator=orc_7a1c']],
     children:['ep-trait','ep-agentux','ho1'],
-    doc:'ORCHESTRATOR · Sprint 1 · retrieval lifts\nassignee ce:4e6c4e2a:local · state active\n\nGroups the in-flight retrieval work so the session\nagent sees everything in one place:\n · execplan corecrux-trait-expansion (in_progress)\n · execplan agent-ux-best-in-class (in_progress)\n · handoff opus → sonnet (M4 Q500 A/B)\n\nMembers are references — live state resolves from\n/v1/work. Build via ＋ Orchestrator, or agents via\nMCP create_orchestrator / attach_to_orchestrator.'},
+    doc:'ORCHESTRATOR orc_7a1c · Sprint 1 · retrieval lifts\nentity kind=orchestrator · assignee ce:4e6c4e2a:local\nstate active · tenant default\n\nMembers (by reference — live state resolves, never\ncopied; cross-tenant attach rejected, T.1):\n · execplan corecrux-trait-expansion (in_progress)\n · execplan agent-ux-best-in-class (in_progress)\n · handoff opus → sonnet (carries work_ids)\n\nOne call gives the agent all its session work:\n  GET /v1/orchestrators/orc_7a1c/work\nReverse filter (WorkItem.orchestrator_id):\n  GET /v1/work?orchestrator=orc_7a1c\n\nBuilt via ＋ Orchestrator, or by an agent via MCP\ncreate_orchestrator + attach_to_orchestrator\n(detach_from_orchestrator / list_orchestrators too).'},
 
   /* ── Overview tiles (modelled on legacy console panel-overview) ── */
   'ov-node':{kind:'tile',label:'Daemon node',sub:'ce:4e6c4e2a:local',status:'run',fields:[['mode','local_only'],['facts','1,911'],['sessions','3 active'],['degraded','no'],['bg sync','off']],payload:'{ "node":"ce:4e6c4e2a:local","mode":"local_only",\n  "facts":1911,"degraded":false,"bg_sync":"off" }'},
@@ -393,10 +414,10 @@ const N = {
   'r4':{kind:'reasoning',label:'Defer remote approval',fields:[['re','scope cut']],doc:'Reasoning · scope cut\n\ncorecrux-decision (approval machinery) is not in\nthis repo. MVP is observe-only; M6 approval stays\nconditional on that crate being licensed in.'},
 
   /* ── AUDIT TRAIL (EU AI Act): per-step  inputs(read) → reasoning → output(commands) → CROWN receipt ── */
-  'au-trail':{kind:'audit-group',label:'Audit trail · 3 steps',sub:'EU AI Act · Art. 12 record-keeping',fields:[['steps','3'],['receipts','3 verified'],['actor','ce:4e6c4e2a:local']],children:['as1','as2','as3']},
+  'au-trail':{kind:'audit-group',label:'Audit trail · 3 steps',sub:'GET /v1/observe/sessions/{id}/audit',fields:[['endpoint','/v1/observe/sessions/{id}/audit'],['contract','agent_trace_node v1'],['flag','CORECRUXD_OBSERVE=on'],['steps','3'],['receipts','3 verified']],children:['as1','as2','as3','au-conformance','au-export']},
 
   'as1':{kind:'step',label:'Step 1 · diagnose M4',sub:'read-only',status:'ok',
-    fields:[['at','13:05Z'],['actor','ce:4e6c4e2a'],['receipt','crn_8f21…'],['risk','low']],
+    fields:[['node_id','trace_as1'],['seq','1'],['at','13:05Z'],['actor','ce:4e6c4e2a'],['reasoning_ref','blob:reasoning/trace_as1.txt'],['receipt','crn_8f21…'],['risk','low']],
     children:['in1','rr1','out1','rcpt1'],
     doc:'AUDIT STEP 1 · diagnose M4 reconciler\n2026-05-27T13:05Z · passport ce:4e6c4e2a:local\nreceipt crn_8f21… · risk low (read-only)\n\nINPUTS (read)\n · corecruxd/src/http/work.rs\n · corecrux-memory/src/projection.rs\n · query "reconcile projection" — 4 hits\n\nREASONING\n The read-time projection is not stably sorted\n before the kanban merge, so live rows drop.\n\nOUTPUT / COMMANDS\n none — diagnosis only, no mutation.'},
   'in1':{kind:'inputs-group',label:'1 · Inputs (read)',sub:'2 files + 1 query',children:['rd-work','rd-proj','q1']},
@@ -408,7 +429,7 @@ const N = {
   'rcpt1':{kind:'receipt',label:'CROWN crn_8f21…',sub:'verified · Ed25519',status:'ok',fields:[['receipt','crn_8f21…'],['signer','daemon-root'],['ts','13:05Z'],['class','verified'],['risk','low']],payload:'{ "receipt":"crn_8f21…","class":"verified",\n  "actor":"ce:4e6c4e2a:local","risk":"low",\n  "inputs":["work.rs","projection.rs","query"],\n  "mutations":0 }'},
 
   'as2':{kind:'step',label:'Step 2 · write reconciler',sub:'mutation',status:'run',
-    fields:[['at','13:14Z'],['actor','ce:4e6c4e2a'],['receipt','crn_b033…'],['risk','medium']],
+    fields:[['node_id','trace_as2'],['seq','2'],['at','13:14Z'],['actor','ce:4e6c4e2a'],['reasoning_ref','fact:decision:reconciler-sort'],['receipt','crn_b033…'],['risk','medium']],
     children:['in2','rr2','out2','rcpt2'],
     doc:'AUDIT STEP 2 · write reconciler\n2026-05-27T13:14Z · passport ce:4e6c4e2a:local\nreceipt crn_b033… · risk medium (writes code)\n\nINPUTS\n · Step 1 diagnosis (provenance →)\n\nREASONING\n Stable sort by updated_at; extract the merge into\n reconcile.rs so it is unit-testable in isolation.\n\nOUTPUT / COMMANDS\n · Write corecruxd/src/http/reconcile.rs (+140)\n · Edit corecrux-memory/src/projection.rs (+33 −12)'},
   'in2':{kind:'inputs-group',label:'1 · Inputs',sub:'← Step 1 diagnosis',children:['as1']},
@@ -417,13 +438,19 @@ const N = {
   'rcpt2':{kind:'receipt',label:'CROWN crn_b033…',sub:'verified · Ed25519',status:'ok',fields:[['receipt','crn_b033…'],['actor','ce:4e6c4e2a'],['class','verified'],['risk','medium'],['mutations','2']]},
 
   'as3':{kind:'step',label:'Step 3 · run tests',sub:'failed',status:'err',
-    fields:[['at','13:20Z'],['actor','ce:4e6c4e2a'],['receipt','crn_c7a9…'],['exit','101']],
+    fields:[['node_id','trace_as3'],['seq','3'],['at','13:20Z'],['actor','ce:4e6c4e2a'],['reasoning_ref','blob:reasoning/trace_as3.txt'],['receipt','crn_c7a9…'],['exit','101']],
     children:['in3','rr3','out3','rcpt3'],
     doc:'AUDIT STEP 3 · run tests\n2026-05-27T13:20Z · passport ce:4e6c4e2a:local\nreceipt crn_c7a9… · risk low (test run)\n\nINPUTS\n · corecruxd/tests/reconcile_test.rs\n\nREASONING\n Validate the reconciler. On failure, do not retry\n blindly — capture the failure and defer.\n\nOUTPUT / COMMANDS\n · Bash "cargo test reconcile" → exit 101 (4 failed)\n · logged session note 13:24; deferred pending\n   loopback-auth.'},
   'in3':{kind:'inputs-group',label:'1 · Inputs',sub:'reconcile_test.rs',children:['fb4']},
   'rr3':{kind:'reasoning',label:'2 · Reasoning',sub:'defer, do not retry',status:'err',doc:'Reasoning — Step 3\n\n4 tests red. Per the pre-deploy gate: do not retry\nblindly — capture the failure, log a note, and\ndefer until loopback-auth lands. Needs a 3-stale-\nentry fixture.'},
   'out3':{kind:'output-group',label:'3 · Output (commands)',sub:'bash + note',status:'err',children:['hk5','snote-au']},
   'rcpt3':{kind:'receipt',label:'CROWN crn_c7a9…',sub:'verified · Ed25519',status:'ok',fields:[['receipt','crn_c7a9…'],['actor','ce:4e6c4e2a'],['exit','101'],['risk','low']]},
+  'au-conformance':{kind:'conformance',label:'Conformance · 3/3',sub:'Art 12 / 13 / 15 / 10 ✓',status:'ok',
+    fields:[['endpoint','GET …/audit/conformance'],['Art.12 receipt_chain','3/3 ✓'],['Art.13 attributed','3/3 ✓'],['Art.15 enrich','n/a (no high-risk)'],['Art.10 private','3/3 ✓']],
+    doc:'AUDIT CONFORMANCE\nGET /v1/observe/sessions/{id}/audit/conformance\n\nArt.12 record-keeping  receipt_chain_ok  3/3 ✓\n  every mutation step has a step receipt AND each\n  mutating output a mutation_receipt_id\nArt.13 transparency    is_attributed     3/3 ✓\n  every node carries a passport actor\nArt.15 foresight       enrich_ok         n/a\n  no high-risk step → no enrich_ref required\nArt.10 data governance private           3/3 ✓\n\nFailures are enumerated, never silent (R2 / T.4).\nBacked by TraceNode::{receipt_chain_ok, is_attributed,\nenrich_ok} in crux-observe-api.'},
+  'au-export':{kind:'export',label:'Export bundle',sub:'audit_export_bundle',status:'ok',
+    fields:[['endpoint','GET …/audit/export'],['contents','steps + receipts + attestations'],['verify','receipt_verify / step'],['attest','output_attest']],
+    doc:'AUDIT EXPORT\nGET /v1/observe/sessions/{id}/audit/export\n\nEmits an EU-AI-Act bundle: the ordered AuditStep\nchain + each step CROWN receipt + output\nattestations. A tampered receipt fails\nreceipt_verify. MCP: audit_export_bundle.'},
 
   /* ── session notes ── */
   'snote-au':{kind:'note',label:'session note · 13:24',sub:'9c5a9271…',status:'idle',children:['sess-agentux'],
