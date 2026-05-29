@@ -167,6 +167,7 @@ async fn after_mutation(state: &AppState, id: &str, actor: &str) {
                 source_receipt: Some(receipt_id),
                 confidence: 1.0,
                 private: true,
+                horizon_class: None,
             };
             crate::fact_privacy::enforce(&state.privacy_policy, &mut fact);
             state.fact_store.write().await.store(fact);

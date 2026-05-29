@@ -81,6 +81,7 @@ sha2 = "0.11"
 corecrux-index = { path = "../corecrux-index" }
 serial_test = "3"
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
 wat = "1"
 
 [build-dependencies]

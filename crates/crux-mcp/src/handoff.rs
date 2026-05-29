@@ -629,6 +629,7 @@ mod tests {
             source_receipt: None,
             confidence: 1.0,
             private: false,
+            horizon_class: None,
         });
         let facts = vec![work_fact];
         let ids = collect_work_ids(Some(&state), &facts);
