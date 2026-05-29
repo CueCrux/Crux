@@ -5,9 +5,11 @@
 //! Punchcard MCP tools (punchcard plan).
 //!
 //! Thin loopback wrappers over the daemon's `/v1/punchcards/*` surface,
-//! mirroring the `coordination.rs` pattern. The HTTP endpoints are stubs
-//! today (gated default-OFF, 501 when called), so these handlers currently
-//! surface that 501 to the caller — by design for the Package S scaffold.
+//! mirroring the `coordination.rs` pattern. `check_punchcard` is the tool the
+//! shared PreToolUse hook calls before an Edit/Write/NotebookEdit; it loops
+//! back to `POST /v1/punchcards/check`, which always returns `200` so the hook
+//! can read `{held_by_other, enforce, holder_passport, resource}` and deny the
+//! edit only when `held_by_other && enforce`.
 
 use serde_json::{json, Value};
 
@@ -25,7 +27,10 @@ pub const LIST_PUNCHCARDS_DESCRIPTION: &str =
     "List active punchcard leases, optionally filtered by resource, holder, or tenant_id.";
 
 pub const FORCE_RELEASE_DESCRIPTION: &str =
-    "Force-release a punchcard lease held by another passport (operator override). Records the override in the lease's receipt chain.";
+    "Force-release a punchcard lease held by another passport (operator override). Destructive: requires confirm=true. Records the override in the lease's receipt chain.";
+
+pub const CHECK_PUNCHCARD_DESCRIPTION: &str =
+    "Check whether a resource (file://<path>, tree://<subtree>, or service://<name>) is leased by another passport. Returns { held_by_other, enforce, holder_passport, resource, expires_at_unix_ms }. The PreToolUse hook calls this before an edit and denies only when held_by_other && enforce.";
 
 fn required_str<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a str, JsonRpcError> {
     args.get(key).and_then(Value::as_str).ok_or_else(|| JsonRpcError {
@@ -97,7 +102,11 @@ pub async fn handle_list_punchcards(args: &Value, ctx: &McpContext) -> Result<Va
 
 pub async fn handle_force_release(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let id = required_str(args, "punchcard_id", "force_release")?;
-    let mut body = json!({});
+    // Destructive override: the daemon requires an explicit confirm:true. Pass
+    // the caller's value through (default false) so an unconfirmed call gets a
+    // 400 from the daemon rather than silently force-releasing.
+    let confirm = args.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+    let mut body = json!({ "confirm": confirm });
     for key in ["reason", "by_passport"] {
         if let Some(v) = args.get(key) {
             body[key] = v.clone();
@@ -105,5 +114,21 @@ pub async fn handle_force_release(args: &Value, ctx: &McpContext) -> Result<Valu
     }
     let base = loopback_base(ctx)?;
     let (_, resp) = loopback_post(format!("{base}/v1/punchcards/{id}/force-release"), body, false).await?;
+    Ok(text_content(serde_json::from_str(&resp).unwrap_or(Value::String(resp))))
+}
+
+/// `check_punchcard` — the PreToolUse hook's lease probe. Loops back to
+/// `POST /v1/punchcards/check`, which always returns `200` (fail-open), so the
+/// hook can read the body and deny only when `held_by_other && enforce`.
+pub async fn handle_check_punchcard(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let resource = required_str(args, "resource", "check_punchcard")?;
+    let mut body = json!({ "resource": resource });
+    for key in ["mode", "passport"] {
+        if let Some(v) = args.get(key) {
+            body[key] = v.clone();
+        }
+    }
+    let base = loopback_base(ctx)?;
+    let (_, resp) = loopback_post(format!("{base}/v1/punchcards/check"), body, false).await?;
     Ok(text_content(serde_json::from_str(&resp).unwrap_or(Value::String(resp))))
 }

@@ -1880,12 +1880,29 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "punchcard_id": { "type": "string" },
+                    "confirm":      { "type": "boolean", "description": "Required true — force-release is destructive (Art.14)." },
                     "reason":       { "type": "string" },
                     "by_passport":  { "type": "string", "description": "Operator passport performing the override." }
                 },
-                "required": ["punchcard_id"],
+                "required": ["punchcard_id", "confirm"],
                 "examples": [
-                    { "punchcard_id": "pc_abc123", "reason": "stale lease, holder offline" }
+                    { "punchcard_id": "pc_abc123", "confirm": true, "reason": "stale lease, holder offline" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "check_punchcard".to_string(),
+            description: punchcards::CHECK_PUNCHCARD_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "resource": { "type": "string", "description": "Resource URI: file://<path>, tree://<subtree>, or service://<name>." },
+                    "mode":     { "type": "string", "enum": ["modify","deploy"] },
+                    "passport": { "type": "string", "description": "Probing passport; defaults to the calling passport." }
+                },
+                "required": ["resource"],
+                "examples": [
+                    { "resource": "file:///home/x/main.rs", "mode": "modify" }
                 ]
             }),
         },
@@ -2168,7 +2185,8 @@ pub fn tool_output_docs() -> Value {
         { "tool": "punch_in",                 "output": "Punchcard lease record { id, resource, mode, holder_passport, tenant_id, status, acquired_at_unix_ms, expires_at_unix_ms?, receipt_acquire }. (Package S scaffold: 501 until the punchcard plan ships.)" },
         { "tool": "punch_out",                "output": "Released punchcard record (status=released, released_at_unix_ms, release_commit_sha?, receipt_release). (Package S scaffold: 501 until shipped.)" },
         { "tool": "list_punchcards",          "output": "{ count, punchcards: [Punchcard] }. (Package S scaffold: 501 until shipped.)" },
-        { "tool": "force_release",            "output": "Force-released punchcard record (status=force_released, receipt_release). (Package S scaffold: 501 until shipped.)" }
+        { "tool": "force_release",            "output": "Force-released punchcard record (status=force_released, force_released_by, receipt_release). Requires confirm=true (Art.14)." },
+        { "tool": "check_punchcard",          "output": "Lease probe { held_by_other, enforce, holder_passport, resource, mode, expires_at_unix_ms }. Always 200 (fail-open); the PreToolUse hook denies only when held_by_other && enforce." }
     ])
 }
 
@@ -2267,6 +2285,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "punch_out" => punchcards::handle_punch_out(args, ctx).await,
         "list_punchcards" => punchcards::handle_list_punchcards(args, ctx).await,
         "force_release" => punchcards::handle_force_release(args, ctx).await,
+        "check_punchcard" => punchcards::handle_check_punchcard(args, ctx).await,
         // GitHub (Plan B G5).
         "github_search" => github::handle_github_search(args, ctx).await,
         "github_recent_commits" => github::handle_github_recent_commits(args, ctx).await,
@@ -2337,7 +2356,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 92; // main 84 (agent-ux + identity-continuity) + 8 Package S scaffold (4 orchestrator + 4 punchcard).
+    const TOOL_COUNT: usize = 93; // main 84 (agent-ux + identity-continuity) + 9 backend (4 orchestrator + 4 punchcard + check_punchcard).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
