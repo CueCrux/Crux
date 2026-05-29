@@ -9025,6 +9025,7 @@ async fn work_post_then_list_then_patch_state_round_trip() {
             tenant_id: None,
             assignee_passport: None,
             source: super::work::WorkSource::default(),
+            orchestrator: None,
         }),
         dev_scope_headers("admin:read"),
     )

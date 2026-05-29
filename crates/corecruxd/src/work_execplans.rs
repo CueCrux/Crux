@@ -533,6 +533,21 @@ pub fn list_execplans(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::
     Ok(out)
 }
 
+/// Stamp `orchestrator_id` on the ExecPlan-derived [`WorkItem`]s whose `id`
+/// appears in `member_ids`. The kanban write path stamps `orchestrator_id`
+/// when a work item is attached; ExecPlan items are read-time projections with
+/// no persisted record, so the orchestrator linkage is applied here when the
+/// `/v1/work?orchestrator=<id>` filter resolves an orchestrator's members.
+///
+/// Mutates in place; items not in `member_ids` are left untouched.
+pub fn stamp_orchestrator_id(items: &mut [WorkItem], member_ids: &std::collections::HashSet<String>, orchestrator_id: &str) {
+    for item in items.iter_mut() {
+        if member_ids.contains(&item.id) {
+            item.orchestrator_id = Some(orchestrator_id.to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

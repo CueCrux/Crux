@@ -38,6 +38,14 @@ pub(super) struct ListWorkQuery {
     pub assignee_passport: Option<String>,
     #[serde(default)]
     pub source: WorkSource,
+    /// Agent-graph orchestrator filter (orchestrators plan). When set, the
+    /// merged work list is narrowed to the items belonging to this
+    /// orchestrator: kanban items are matched on their stamped
+    /// `orchestrator_id`, and ExecPlan items are stamped at read time from the
+    /// orchestrator's member list. Additive — omitting it preserves the prior
+    /// merged behaviour.
+    #[serde(default)]
+    pub orchestrator: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -155,11 +163,22 @@ pub(super) async fn get_work(
         Vec::new()
     };
 
-    let execplan_items = if matches!(q.source, WorkSource::Execplans | WorkSource::All) {
+    let mut execplan_items = if matches!(q.source, WorkSource::Execplans | WorkSource::All) {
         execplan_items_for_query(&store, &q)
     } else {
         Vec::new()
     };
+
+    // Orchestrator filter (agent-graph). Stamp `orchestrator_id` on the
+    // ExecPlan items that are members of the requested orchestrator (kanban
+    // items already carry it from the membership write path), then below we
+    // keep only items whose `orchestrator_id` matches.
+    if let Some(orc_id) = q.orchestrator.as_deref() {
+        let estore = state.entity_store.read().await;
+        let member_ids = crate::http::orchestrators::orchestrator_member_refs(&estore, orc_id);
+        drop(estore);
+        crate::work_execplans::stamp_orchestrator_id(&mut execplan_items, &member_ids, orc_id);
+    }
     drop(store);
 
     // Merge: kanban first (wins on id collision), then execplan items not
@@ -175,6 +194,11 @@ pub(super) async fn get_work(
         if !seen.contains(&w.id) {
             items.push(w);
         }
+    }
+
+    // Apply the orchestrator filter so it intersects both kanban + execplan sources.
+    if let Some(orc_id) = q.orchestrator.as_deref() {
+        items.retain(|w| w.orchestrator_id.as_deref() == Some(orc_id));
     }
 
     // agent-ux-05 — risk-tiered HITL projection. When the caller asks for

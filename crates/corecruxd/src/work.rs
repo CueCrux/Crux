@@ -537,6 +537,14 @@ fn get_gate(store: &FactStore, action_id: &str) -> Option<PendingGateAction> {
     None
 }
 
+/// Public re-write of an existing work item record. Used by the orchestrator
+/// surface to stamp / clear `orchestrator_id` without going through the full
+/// `update_work` state-machine (which would emit a spurious transition). The
+/// caller is responsible for having loaded a current copy via `get_work`.
+pub fn write_work_record(store: &mut FactStore, item: &WorkItem) -> Result<(), WorkError> {
+    write_record(store, item)
+}
+
 fn write_record(store: &mut FactStore, item: &WorkItem) -> Result<(), WorkError> {
     let value = serde_json::to_string(item)?;
     let mut sf = StoreFact {
