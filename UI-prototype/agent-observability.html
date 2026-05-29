@@ -1,0 +1,781 @@
+<!doctype html>
+<!--
+  Crux Console — graph navigator UX prototype
+  Home: Crux/UI-prototype/   ·   Tracks ExecPlan: PlanCrux/.agent/execplans/crux-agent-observability-graph-2026-05-29.md
+
+  Interaction model (operator spec, 2026-05-29):
+    1. Top pills = the daemon's four console scopes  CX / DX / GX / AX
+       (corecruxd/playground/index.html role="tablist" "Console scope").
+    2. Click a pill -> that scope's panels render as a vertical stack of nodes (left column).
+    3. Click a node -> its linked entities expand to the RIGHT as new nodes (Miller-columns graph).
+    4. Double-click a node -> FOCUS: the card expands into a full document panel (top-left) and
+       its linked nodes fan off to the right, same drill model.
+    5. Entities cross-link both ways: execplan -> milestones; milestone -> {gate fact, session
+       note, session}; session -> {execplan, facts, passport}; passport -> sessions. So clicking a
+       session loads the session and lists its execplan / facts / notes expanding rightward, etc.
+
+  Data is DUMMY but matches daemon style: passport ce:…:local tier/caps; sessions named
+  execplan:<slug>; gate facts {status,commit_sha,tests_passing}; bench {metric,corpus,run_id};
+  work states planned|in_progress|blocked|done. Graph is a flat node registry (N) with id links,
+  so cross-links and cycles (session<->execplan) work.
+
+  Faithful to prod: top menu from WebCrux apps/web/layouts/default.vue; palette = exact tokens from
+  WebCrux/packages/ui-theme/src/styles.css; wired dark/light toggle. Nodes are HTML cards + an SVG
+  edge layer (how React Flow renders / what Leptos view! emits). expand/re-root/select = Leptos
+  signals; column layout = dagre/reingold-tilford crates. JS here is prototype glue only.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Crux Console · graph navigator — UX prototype</title>
+<script>
+  (function(){ try{ if((localStorage.getItem('cx-theme')||'dark')==='dark') document.documentElement.classList.add('dark'); }catch(e){ document.documentElement.classList.add('dark'); } })();
+</script>
+<style>
+  :root {
+    --font-sans:'Public Sans', ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    --font-mono:'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    --radius-lg:12px; --radius-xl:16px; --radius-full:999px; --blur-sm:10px; --blur-md:18px; --transition-fast:.15s; --transition-base:.2s;
+    --bg-page:#f8fafc; --surface-muted:#e2e8f0;
+    --surface-glass:rgba(255,255,255,.85); --surface-glass-strong:rgba(255,255,255,.92); --surface-glass-muted:rgba(248,250,252,.88);
+    --border-light:rgba(148,163,184,.2); --border-default:rgba(148,163,184,.35); --border-strong:rgba(148,163,184,.55);
+    --text-primary:#0f172a; --text-secondary:rgba(71,85,105,.8); --text-muted:rgba(100,116,139,.6);
+    --shadow-sm:0 1px 2px rgba(15,23,42,.06),0 0 0 1px rgba(15,23,42,.04);
+    --shadow-lg:0 16px 40px rgba(15,23,42,.12),0 0 0 1px rgba(15,23,42,.03);
+    --shadow-focus:0 0 0 2px rgba(94,106,210,.4);
+    --backdrop-gradient:radial-gradient(circle at 20% 20%, rgba(94,106,210,.06), transparent 30%),radial-gradient(circle at 80% 10%, rgba(59,130,246,.08), transparent 26%),radial-gradient(circle at 50% 80%, rgba(139,92,246,.04), transparent 30%);
+    --accent:#5E6AD2;
+    --dot:rgba(148,163,184,.45); --edge:var(--border-strong);
+    --ok:#16a34a; --run:#d97706; --err:#dc2626; --idle:#64748b; --code-bg:#f1f5f9;
+  }
+  html.dark {
+    --bg-page:#020203; --surface-muted:#0a0a0c;
+    --surface-glass:rgba(255,255,255,.04); --surface-glass-strong:rgba(255,255,255,.06); --surface-glass-muted:rgba(255,255,255,.03);
+    --border-light:rgba(255,255,255,.06); --border-default:rgba(255,255,255,.08); --border-strong:rgba(255,255,255,.14);
+    --text-primary:#EDEDEF; --text-secondary:rgba(138,143,152,.9); --text-muted:rgba(138,143,152,.6);
+    --shadow-sm:0 1px 2px rgba(0,0,0,.4),0 0 0 1px rgba(255,255,255,.04);
+    --shadow-lg:0 20px 50px rgba(0,0,0,.6),0 0 0 1px rgba(255,255,255,.03);
+    --shadow-focus:0 0 0 2px rgba(94,106,210,.5);
+    --backdrop-gradient:radial-gradient(circle at 20% 20%, rgba(94,106,210,.08), transparent 30%),radial-gradient(circle at 80% 10%, rgba(59,130,246,.06), transparent 26%),radial-gradient(circle at 50% 80%, rgba(139,92,246,.05), transparent 30%);
+    --dot:rgba(148,163,184,.14); --ok:#34d399; --run:#fbbf24; --err:#f87171; --idle:#6b7689; --code-bg:#0a0e16;
+  }
+
+  * { box-sizing:border-box; } html, body { margin:0; height:100%; }
+  body { background-color:var(--bg-page); background-image:var(--backdrop-gradient); color:var(--text-primary); font:13px/1.45 var(--font-sans); display:flex; flex-direction:column; height:100vh; transition:background-color var(--transition-base) ease, color var(--transition-base) ease; }
+
+  /* WebCrux top menu */
+  .wc-header { position:sticky; top:0; z-index:30; border-bottom:1px solid var(--border-default); background:var(--surface-glass); backdrop-filter:blur(var(--blur-md)); -webkit-backdrop-filter:blur(var(--blur-md)); }
+  .wc-header-inner { max-width:90rem; margin:0 auto; display:flex; align-items:center; justify-content:space-between; gap:.75rem; padding:.6rem 1rem; }
+  .wc-brand { display:flex; align-items:center; gap:.7rem; text-decoration:none; } .wc-brand img { height:2.1rem; width:2.1rem; }
+  .logo-dark { display:none; } html.dark .logo-light { display:none; } html.dark .logo-dark { display:block; }
+  .wc-wordmark { font-size:1.6rem; line-height:1; font-weight:700; letter-spacing:-.02em; color:var(--text-primary); }
+  .wc-centre-pills { display:flex; align-items:center; gap:4px; padding:3px; background:var(--surface-glass-muted); border-radius:var(--radius-full); border:1px solid var(--border-light); }
+  .wc-centre-pill { padding:6px 16px; font-size:.82rem; font-weight:600; color:var(--text-secondary); border-radius:var(--radius-full); cursor:pointer; user-select:none; transition:color var(--transition-fast) ease, background var(--transition-fast) ease; }
+  .wc-centre-pill small { font-weight:500; opacity:.7; margin-left:5px; font-size:.72rem; }
+  .wc-centre-pill:hover { color:var(--text-primary); background:var(--surface-glass-strong); }
+  .wc-centre-pill--active { color:var(--text-primary); background:var(--surface-glass-strong); box-shadow:var(--shadow-sm); }
+  .wc-right { display:flex; align-items:center; gap:.5rem; }
+  .wc-icon-btn-sm { display:flex; height:2.125rem; width:2.125rem; align-items:center; justify-content:center; border-radius:var(--radius-full); border:1px solid var(--border-default); background:var(--surface-glass-strong); backdrop-filter:blur(var(--blur-sm)); color:var(--text-secondary); box-shadow:var(--shadow-sm); cursor:pointer; transition:all var(--transition-base) ease; }
+  .wc-icon-btn-sm:hover { border-color:var(--border-strong); color:var(--text-primary); } .wc-icon-btn-sm svg { width:1.05rem; height:1.05rem; }
+  .icon-moon { display:none; } html.dark .icon-sun { display:none; } html.dark .icon-moon { display:block; }
+  .wc-public-login { padding:8px 20px; font-size:.85rem; font-weight:600; color:#fff; background:linear-gradient(135deg, rgba(37,99,235,.95), rgba(96,165,250,.95)); border:none; border-radius:var(--radius-full); text-decoration:none; cursor:pointer; transition:transform var(--transition-fast) ease; }
+  .wc-public-login:hover { transform:translateY(-1px); }
+
+  /* sub-toolbar */
+  .toolbar { display:flex; align-items:center; gap:12px; padding:8px 16px; border-bottom:1px solid var(--border-default); background:var(--surface-glass-muted); min-height:42px; }
+  .crumbs { display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:12px; }
+  .crumbs .c { color:var(--text-secondary); cursor:pointer; } .crumbs .c:hover { color:var(--text-primary); }
+  .crumbs .c.head { color:var(--text-primary); font-weight:650; } .crumbs .sep { color:var(--text-muted); }
+  .focus-exit { font-size:11px; font-weight:600; color:var(--accent); border:1px solid var(--accent); background:transparent; border-radius:var(--radius-full); padding:2px 10px; cursor:pointer; }
+  .grow { flex:1; } .hint { color:var(--text-muted); font-size:11px; } .hint b { color:var(--text-secondary); font-weight:600; }
+
+  /* canvas */
+  main { flex:1; display:flex; min-height:0; }
+  .canvas-wrap { flex:1; position:relative; overflow:auto; background-image:radial-gradient(circle, var(--dot) 1px, transparent 1px); background-size:22px 22px; }
+  #edges { position:absolute; left:0; top:0; pointer-events:none; } #nodes { position:absolute; left:0; top:0; }
+
+  .gnode { position:absolute; box-sizing:border-box; padding:8px 11px 8px 15px; background:var(--surface-glass-strong); border:1.4px solid var(--border-default); border-radius:11px; cursor:pointer; box-shadow:var(--shadow-sm); overflow:hidden; user-select:none; transition:border-color .12s ease, box-shadow .12s ease, transform .12s ease; }
+  .gnode:hover { border-color:var(--accent); transform:translateY(-1px); }
+  .gnode.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent), 0 0 13px rgba(94,106,210,.4); }
+  .gnode .gstripe { position:absolute; left:0; top:8px; bottom:8px; width:4px; border-radius:0 2px 2px 0; background:var(--idle); }
+  .gnode .gkind { font-size:9px; letter-spacing:.6px; text-transform:uppercase; color:var(--text-muted); }
+  .gnode .gtitle { font-size:12.5px; font-weight:620; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .gnode .grow2 { display:flex; align-items:center; gap:6px; margin-top:2px; }
+  .gnode .gsub { font-size:10.5px; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .gnode .gchip { font-size:9.5px; font-weight:700; padding:1px 7px; border-radius:999px; white-space:nowrap; }
+  .gnode .gcaret { position:absolute; right:9px; top:50%; transform:translateY(-50%); color:var(--text-muted); font-size:14px; }
+  .gnode.leaf .gcaret { display:none; }
+
+  /* focus hero card = expanded document panel */
+  .gnode.hero { padding:14px 16px; cursor:default; display:flex; flex-direction:column; align-items:stretch; box-shadow:var(--shadow-lg); }
+  .gnode.hero:hover { transform:none; }
+  .gnode.hero .gtitle { font-size:15px; white-space:normal; line-height:1.25; margin-bottom:2px; }
+  .gnode.hero .herofields { display:grid; grid-template-columns:auto 1fr; gap:2px 10px; margin:8px 0 4px; font-size:10.5px; }
+  .gnode.hero .herofields .k { color:var(--text-muted); } .gnode.hero .herofields .v { color:var(--text-secondary); word-break:break-word; }
+  .gnode.hero .gdoc { margin-top:6px; padding-top:9px; border-top:1px solid var(--border-default); font-size:11px; line-height:1.55; color:var(--text-secondary); white-space:pre-wrap; word-break:break-word; overflow:auto; flex:1 1 auto; font-family:var(--font-mono); }
+  .gnode.hero .gcaret { display:none; }
+
+  .s-ok  .gstripe{background:var(--ok)}  .gnode.s-ok  .gchip{color:var(--ok);  background:color-mix(in srgb,var(--ok)  16%,transparent);}
+  .s-run .gstripe{background:var(--run); animation:pulse 1.2s ease-in-out infinite;} .gnode.s-run .gchip{color:var(--run); background:color-mix(in srgb,var(--run) 18%,transparent);}
+  .s-err .gstripe{background:var(--err)} .gnode.s-err .gchip{color:var(--err); background:color-mix(in srgb,var(--err) 16%,transparent);}
+  .s-idle .gstripe{background:var(--idle)} .gnode.s-idle .gchip{color:var(--idle); background:color-mix(in srgb,var(--idle) 16%,transparent);}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+  .edge { fill:none; stroke:var(--edge); stroke-width:1.6; }
+  .edge.active { stroke:var(--accent); stroke-width:2; stroke-dasharray:5 6; animation:dash 1s linear infinite; } @keyframes dash{to{stroke-dashoffset:-22}}
+
+  /* file + hook nodes: monospace, smaller */
+  .gnode[data-kind="file"] .gtitle, .gnode[data-kind="file-group"] .gtitle,
+  .gnode[data-kind="hook"] .gtitle, .gnode[data-kind="hook-group"] .gtitle { font-family:var(--font-mono); font-size:10.5px; font-weight:600; }
+  .gnode[data-kind="reasoning"] .gtitle, .gnode[data-kind="reasoning-group"] .gtitle { font-style:italic; }
+  .gnode[data-kind="read"] .gtitle, .gnode[data-kind="query"] .gtitle, .gnode[data-kind="receipt"] .gtitle { font-family:var(--font-mono); font-size:10.5px; font-weight:600; }
+  .gnode[data-kind="step"] .gkind, .gnode[data-kind="audit-group"] .gkind, .gnode[data-kind="receipt"] .gkind { color:var(--accent); }
+  .gnode[data-kind="orchestrator"] .gstripe { background:var(--accent); }
+  .gnode[data-kind="orchestrator"] .gkind { color:var(--accent); }
+  .gnode[data-kind="punchcard"] .gtitle, .gnode[data-kind="deny"] .gtitle { font-family:var(--font-mono); font-size:10.5px; font-weight:600; }
+  .gnode[data-kind="conformance"] .gkind, .gnode[data-kind="export"] .gkind { color:var(--accent); }
+
+  /* Orchestrator builder modal */
+  .modal { position:fixed; inset:0; background:rgba(2,2,3,.55); display:none; align-items:center; justify-content:center; z-index:50; }
+  .modal-panel { width:700px; max-width:92vw; max-height:86vh; overflow:auto; background:var(--surface-glass-strong); backdrop-filter:blur(var(--blur-md)); border:1px solid var(--border-default); border-radius:var(--radius-xl); box-shadow:var(--shadow-lg); padding:18px 20px; }
+  .modal-panel h2 { margin:0 0 4px; font-size:16px; color:var(--text-primary); }
+  .modal-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:14px; }
+  .builder-col h3 { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:var(--text-muted); margin:0 0 8px; }
+  .field-row { display:flex; gap:10px; align-items:center; margin-top:10px; }
+  .field-row input, .field-row select { background:var(--surface-glass); border:1px solid var(--border-default); border-radius:9px; padding:7px 10px; color:var(--text-primary); font:inherit; font-size:12px; }
+  .field-row input { flex:1; }
+  .filter-row { display:flex; gap:4px; margin-bottom:8px; }
+  .filter-row button { font-size:11px; padding:3px 10px; border-radius:var(--radius-full); border:1px solid var(--border-default); background:var(--surface-glass); color:var(--text-secondary); cursor:pointer; }
+  .filter-row button.on { border-color:var(--accent); color:var(--text-primary); }
+  .chip { display:flex; align-items:center; gap:6px; padding:6px 9px; border:1px solid var(--border-default); border-radius:9px; background:var(--surface-glass); margin-bottom:6px; cursor:grab; font-size:12px; color:var(--text-primary); }
+  .chip:hover { border-color:var(--accent); }
+  .chip .tag { font-size:9px; padding:1px 7px; border-radius:999px; margin-left:auto; background:var(--surface-glass-muted); color:var(--text-muted); }
+  .dropzone { min-height:170px; border:1.5px dashed var(--border-strong); border-radius:12px; padding:10px; background:var(--surface-glass-muted); }
+  .dropzone.over { border-color:var(--accent); background:color-mix(in srgb, var(--accent) 9%, transparent); }
+  .dropzone .empty { color:var(--text-muted); font-size:12px; text-align:center; padding:48px 12px; }
+  .member { display:flex; align-items:center; gap:6px; padding:6px 9px; border:1px solid var(--border-default); border-radius:8px; background:var(--surface-glass); margin-bottom:6px; font-size:12px; color:var(--text-primary); }
+  .member button { margin-left:auto; border:none; background:none; color:var(--text-muted); cursor:pointer; font-size:15px; line-height:1; }
+  .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:16px; }
+  .modal-actions button { padding:7px 16px; border-radius:var(--radius-full); border:1px solid var(--border-default); background:var(--surface-glass); color:var(--text-primary); cursor:pointer; font-weight:600; font-size:12px; }
+  .modal-actions .primary { background:linear-gradient(135deg, rgba(37,99,235,.95), rgba(96,165,250,.95)); color:#fff; border:none; }
+
+  /* hero width drag-grip */
+  .gnode.hero .hero-resize { position:absolute; top:0; right:0; bottom:0; width:10px; cursor:col-resize; }
+  .gnode.hero .hero-resize::after { content:""; position:absolute; right:2px; top:50%; transform:translateY(-50%); height:44px; width:3px; border-radius:2px; background:var(--border-strong); transition:background .12s ease; }
+  .gnode.hero .hero-resize:hover::after { background:var(--accent); }
+
+  /* breadcrumb-bar: active-sessions-only toggle */
+  .active-toggle { display:inline-flex; align-items:center; gap:6px; font-size:11px; font-weight:600; color:var(--text-secondary); background:var(--surface-glass-strong); border:1px solid var(--border-default); border-radius:var(--radius-full); padding:3px 11px; cursor:pointer; }
+  .active-toggle .led { width:8px; height:8px; border-radius:50%; background:var(--idle); }
+  .active-toggle:hover { color:var(--text-primary); }
+  .active-toggle.on { color:var(--text-primary); border-color:var(--accent); }
+  .active-toggle.on .led { background:var(--run); box-shadow:0 0 7px var(--run); }
+
+  /* resizable / hideable inspector */
+  .aside-resize { flex:0 0 7px; cursor:col-resize; position:relative; background:transparent; touch-action:none; }
+  .aside-resize::after { content:""; position:absolute; left:2px; top:0; bottom:0; width:2px; background:var(--border-default); transition:background .12s ease; }
+  .aside-resize:hover::after { background:var(--accent); }
+  .insp-toggle { font-size:11px; font-weight:600; color:var(--text-secondary); background:var(--surface-glass-strong); border:1px solid var(--border-default); border-radius:var(--radius-full); padding:3px 11px; cursor:pointer; margin-left:10px; }
+  .insp-toggle:hover { border-color:var(--accent); color:var(--text-primary); }
+  body.insp-hidden aside, body.insp-hidden .aside-resize { display:none; }
+
+  aside { width:316px; border-left:1px solid var(--border-default); background:var(--surface-glass); backdrop-filter:blur(var(--blur-sm)); padding:16px; overflow:auto; flex-shrink:0; }
+  aside h2 { font-size:11px; letter-spacing:.8px; text-transform:uppercase; color:var(--text-muted); margin:0 0 12px; }
+  .insp-title { font-size:16px; font-weight:680; margin-bottom:2px; color:var(--text-primary); word-break:break-word; }
+  .insp-kind { color:var(--text-muted); font-size:11px; text-transform:uppercase; letter-spacing:.7px; margin-bottom:14px; }
+  .kv { display:grid; grid-template-columns:90px 1fr; gap:6px 10px; margin-bottom:16px; }
+  .kv .k { color:var(--text-muted); } .kv .v { color:var(--text-primary); word-break:break-word; }
+  .links { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:14px; }
+  .links button { font-size:10.5px; color:var(--text-secondary); background:var(--surface-glass-muted); border:1px solid var(--border-default); border-radius:var(--radius-full); padding:2px 9px; cursor:pointer; }
+  .links button:hover { border-color:var(--accent); color:var(--text-primary); }
+  pre { background:var(--code-bg); border:1px solid var(--border-default); border-radius:8px; padding:10px; font-size:11px; color:var(--text-secondary); overflow:auto; margin:0 0 14px; font-family:var(--font-mono); white-space:pre-wrap; word-break:break-word; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; color:var(--text-muted); font-size:11px; padding:8px 16px; border-top:1px solid var(--border-default); background:var(--surface-glass); }
+  .legend i { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; vertical-align:middle; }
+  @media (max-width:760px){ aside{display:none} .wc-centre-pill small{display:none} }
+</style>
+</head>
+<body>
+  <header class="wc-header">
+    <div class="wc-header-inner">
+      <a class="wc-brand" href="#">
+        <img class="logo-light" src="assets/CueCrux-Arc-Loop.png" alt="CueCrux logo" />
+        <img class="logo-dark"  src="assets/CueCrux-Arc-Loop-White.png" alt="CueCrux logo" />
+        <span class="wc-wordmark">CueCrux</span>
+      </a>
+      <nav class="wc-centre-pills" id="scopePills"></nav>
+      <div class="wc-right">
+        <button class="wc-icon-btn-sm" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="currentColor"><path fill-rule="evenodd" d="M17.293 13.293a8 8 0 11-6.586-6.586 6 6 0 106.586 6.586z" clip-rule="evenodd"/></svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="currentColor"><path fill-rule="evenodd" d="M12 2.25a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0V3a.75.75 0 01.75-.75zm0 15.75a3.75 3.75 0 100-7.5 3.75 3.75 0 000 7.5zM5.47 5.47a.75.75 0 011.06 0l1.59 1.59a.75.75 0 11-1.06 1.06L5.47 6.53a.75.75 0 010-1.06zm11.41 11.41a.75.75 0 011.06 0l1.59 1.59a.75.75 0 11-1.06 1.06l-1.59-1.59a.75.75 0 010-1.06zM2.25 12a.75.75 0 01.75-.75h2.25a.75.75 0 010 1.5H3a.75.75 0 01-.75-.75zM18.75 12a.75.75 0 01.75-.75h2.25a.75.75 0 010 1.5H19.5a.75.75 0 01-.75-.75zM5.47 18.53a.75.75 0 000 1.06l1.59 1.59a.75.75 0 001.06-1.06l-1.59-1.59a.75.75 0 00-1.06 0zM15.88 6.06a.75.75 0 001.06-1.06l-1.59-1.59a.75.75 0 10-1.06 1.06l1.59 1.59z" clip-rule="evenodd"/></svg>
+        </button>
+        <a class="wc-public-login" href="#">Sign in</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="toolbar">
+    <div class="crumbs" id="breadcrumb"></div>
+    <button class="focus-exit" id="focusExit" style="display:none">↑ exit focus</button>
+    <button class="insp-toggle" id="orcNew" title="Create an orchestrator (group ExecPlans for a session)">＋ Orchestrator</button>
+    <button class="active-toggle" id="activeToggle" title="Show only running sessions"><span class="led"></span> Active sessions only</button>
+    <div class="grow"></div>
+    <span class="hint"><b>click</b> to expand · <b>double-click</b> to focus &amp; open the document</span>
+    <button class="insp-toggle" id="inspToggle" title="Show / hide inspector">⊟ Inspector</button>
+  </div>
+
+  <main>
+    <div class="canvas-wrap" id="canvas"><svg id="edges"></svg><div id="nodes"></div></div>
+    <div class="aside-resize" id="asideResize" title="Drag to resize · double-click to hide"></div>
+    <aside id="inspector">
+      <h2>Node inspector</h2>
+      <div class="insp-title" id="i-title">—</div>
+      <div class="insp-kind" id="i-kind">pick a node</div>
+      <div class="kv" id="i-kv"></div>
+      <h2 id="i-links-h" style="display:none">Linked</h2>
+      <div class="links" id="i-links"></div>
+      <h2>Payload</h2>
+      <pre id="i-payload">{ }</pre>
+    </aside>
+  </main>
+
+  <div class="legend">
+    <span><i style="background:var(--run)"></i>in_progress / live</span>
+    <span><i style="background:var(--ok)"></i>done / ok</span>
+    <span><i style="background:var(--err)"></i>blocked / error</span>
+    <span><i style="background:var(--idle)"></i>planned / idle</span>
+    <span style="margin-left:auto">accent edge = active drill path · double-click a node to open its document</span>
+  </div>
+
+  <!-- Orchestrator builder modal -->
+  <div class="modal" id="orcModal">
+    <div class="modal-panel">
+      <h2>New orchestrator</h2>
+      <p class="hint">Group ExecPlans + handoffs so a session agent sees all its work in one place. Agents create the same via MCP <b>create_orchestrator</b>.</p>
+      <div class="field-row">
+        <input id="orcName" type="text" placeholder="Orchestrator name (e.g. Sprint 1 · retrieval lifts)">
+        <select id="orcPassport" title="Assign passport">
+          <option value="ce:4e6c4e2a:local">ce:4e6c4e2a:local · anthropic</option>
+          <option value="ce:8821fa0d:local">ce:8821fa0d:local · sonnet-worker</option>
+          <option value="ce:0c4419ab:remote">ce:0c4419ab:remote · ops</option>
+        </select>
+      </div>
+      <div class="modal-grid">
+        <div class="builder-col">
+          <h3>Palette — drag onto the orchestrator</h3>
+          <div class="filter-row" id="orcFilters">
+            <button data-f="planned" class="on">Planned</button>
+            <button data-f="in_progress">In progress</button>
+            <button data-f="handoff">Handoffs</button>
+          </div>
+          <div id="orcPalette"></div>
+        </div>
+        <div class="builder-col">
+          <h3>Orchestrator (drop here)</h3>
+          <div class="dropzone" id="orcDropZone"><div id="orcDrop"></div></div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="orcCancel">Cancel</button>
+        <button class="primary" id="orcCreate">Create orchestrator</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+/* ════════════ DUMMY GRAPH — flat node registry with id links (daemon-styled) ════════════ */
+const SCOPES = [
+  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-settings','cx-raw'] },
+  { id:'dx', label:'DX', tag:'Docs',         sections:['dx-articles','dx-readme','dx-sites'] },
+  { id:'gx', label:'GX', tag:'Global',       sections:['gx-engrams','gx-bench','gx-sites','gx-factstore'] },
+  { id:'ax', label:'AX', tag:'Agent',        sections:['ax-overview','ax-activity','ax-memory','ax-bulk','ax-snapshots','ax-tools','ax-handoff','ax-graph','ax-storybook','ax-dossiers','ax-story'] }
+];
+
+const N = {
+  /* ── CX panels ── */
+  'cx-overview':{kind:'panel',label:'Overview',sub:'daemon at a glance',fields:[['mode','local_only'],['facts','1,911'],['sessions','3 active']],children:['ov-node','ov-work','ov-storage','ov-integrations','ov-tenants']},
+  'cx-projects':{kind:'panel',label:'Projects',sub:'4 tracked',fields:[['count','4'],['active','CueCrux']]},
+  'cx-work':{kind:'panel',label:'Work',sub:'kanban · /v1/work',children:['ep-agentux','ep-chaincrux','ep-trait','ep-cruxengine','ep-gemma','ep-plancrux','ep-verbatim']},
+  'cx-sessions':{kind:'panel',label:'Sessions',sub:'active · execplan-scoped',fields:[['active','3'],['passport','ce:4e6c4e2a:local']],children:['sess-agentux','sess-chaincrux','sess-trait']},
+  'cx-passport':{kind:'panel',label:'Passport',sub:'identities',children:['pp-main','pp-sonnet','pp-ops']},
+  'cx-integrations':{kind:'panel',label:'Integrations',sub:'packs & sources',fields:[['connected','3'],['packs','5']]},
+  'cx-extensions':{kind:'panel',label:'Extensions',sub:'installed',fields:[['count','2']]},
+  'cx-facts':{kind:'panel',label:'Facts',sub:'1,911 total',children:['fg-execplan','fg-bench','fg-incident','fg-design','fg-work']},
+  'cx-memory':{kind:'panel',label:'Memory',sub:'recent feed',children:['mem1','mem2','mem3']},
+  'cx-tenants':{kind:'panel',label:'Tenants',sub:'category + source',children:['t-lmem','t-lmes','t-personal']},
+  'cx-raw':{kind:'panel',label:'Raw',sub:'JSON-RPC console',fields:[['endpoint','/mcp'],['port','14801']]},
+  'cx-settings':{kind:'panel',label:'Settings',sub:'console defaults',children:['set-auth','set-embed','set-onboard','set-daemon']},
+  'cx-orchestrators':{kind:'panel',label:'Orchestrators',sub:'/v1/orchestrators · group plans for a session',fields:[['endpoint','/v1/orchestrators'],['flag','CORECRUXD_ORCHESTRATORS=on'],['mcp','create_orchestrator · attach · detach · list'],['active','1'],['build','＋ Orchestrator (toolbar)']],children:['orc-sprint1']},
+
+  /* ── Punchcards (resource leases) — kind=punchcard · /v1/punchcards · default-OFF ── */
+  'cx-punchcards':{kind:'panel',label:'Punchcards',sub:'/v1/punchcards · resource leases',fields:[['endpoint','/v1/punchcards (acquire·release·check·force-release)'],['flag','CORECRUXD_PUNCHCARD=off|advisory|enforce'],['mcp','punch_in · punch_out · check_punchcard · list_punchcards · force_release'],['enforce','PreToolUse deny'],['held','3']],children:['pc-reconcile','pc-tree','pc-service','pc-expired']},
+  'pc-reconcile':{kind:'punchcard',label:'file://…/http/reconcile.rs',sub:'held · ce:4e6c4e2a · modify',status:'run',
+    fields:[['id','pc_01h…'],['resource','file://Crux/crates/corecruxd/src/http/reconcile.rs'],['mode','modify'],['holder','ce:4e6c4e2a:local'],['status','held'],['acquired','13:24Z'],['expires','14:24Z (TTL)'],['receipt_acquire','crn_pc1…']],
+    children:['pc-deny'],
+    doc:'PUNCHCARD pc_01h… · status held\nresource file://Crux/…/corecruxd/src/http/reconcile.rs\nmode modify · holder ce:4e6c4e2a:local\nacquired 13:24Z · expires 14:24Z (TTL)\nreceipt_acquire crn_pc1…\n\nReentrant for the holder (re-acquire refreshes TTL).\nAnother passport that tries to Edit/Write this file\nis denied at PreToolUse — reads are never blocked.\nPunch out on commit → records release_commit_sha.\n\nacquire POST /v1/punchcards/acquire · MCP punch_in\nrelease POST /v1/punchcards/release · MCP punch_out'},
+  'pc-deny':{kind:'deny',label:'PreToolUse · DENY',sub:'ce:8821fa0d Edit blocked',status:'err',
+    fields:[['event','PreToolUse'],['tool','Edit'],['by','ce:8821fa0d:local'],['verdict','deny (409 held)'],['held_by','ce:4e6c4e2a:local'],['check','POST /v1/punchcards/check']],
+    doc:'PreToolUse hook · DENY\n\nce:8821fa0d:local tried to Edit reconcile.rs.\ncheck_punchcard → held by ce:4e6c4e2a:local until\n14:24Z → the tool call is DENIED:\n\n  "reconcile.rs is held by ce:4e6c4e2a:local until\n   14:24Z. Read is allowed; modify is blocked."\n\nReads (Read / Grep / Glob) are never checked. This\nis the enforcement point — the daemon registry is\nthe source of truth, the hook is the enforcer.'},
+  'pc-tree':{kind:'punchcard',label:'tree://…/corecrux-memory',sub:'held · ce:4e6c4e2a · modify',status:'run',
+    fields:[['id','pc_02h…'],['resource','tree://Crux/crates/corecrux-memory'],['mode','modify'],['holder','ce:4e6c4e2a:local'],['overlap','file ⊂ tree']],
+    doc:'PUNCHCARD · tree lease (coarser)\n\nA tree:// lease covers every file beneath it, so\nfile://…/corecrux-memory/src/projection.rs is\nblocked for other passports by overlap (file ⊂\ntree). Default granularity is file://; tree:// is\nopt-in for genuine whole-subtree work.'},
+  'pc-service':{kind:'punchcard',label:'service://corecruxd@gpu-1',sub:'held · deploy',status:'run',
+    fields:[['id','pc_03h…'],['resource','service://corecruxd@gpu-1'],['mode','deploy'],['holder','ce:0c4419ab:remote'],['preflight','cargo-deploy aborts if held']],
+    doc:'PUNCHCARD · service deploy lease\n\nHolds corecruxd@gpu-1 during test/deploy so a\nsecond agent cannot deploy mid-test. cargo-deploy\npreflight calls POST /v1/punchcards/check → aborts\nwith the holder if held. Short default TTL on\nservice cards; force_release is the escape hatch.'},
+  'pc-expired':{kind:'punchcard',label:'file://…/work.rs',sub:'expired · swept',status:'idle',
+    fields:[['id','pc_00h…'],['status','expired'],['holder','ce:8821fa0d:local'],['cause','TTL lapsed → expiry sweep'],['recovery','deadlock-safe'],['manual','force_release (consent, Art.14)']],
+    doc:'PUNCHCARD · expired (auto-released)\n\nThe holder crashed; its TTL lapsed; the expiry\nsweep auto-released the card so the resource never\ndeadlocks — a fresh acquire now succeeds. FSM:\nheld → released | expired | force_released.\n\nManual escape hatch: POST /v1/punchcards/{id}/\nforce-release — destructive, so consent-gated +\nreceipted (Art. 14).'},
+  'orc-sprint1':{kind:'orchestrator',label:'Sprint 1 · retrieval lifts',sub:'orc_7a1c · ce:4e6c4e2a · 3 members',status:'run',
+    fields:[['id','orc_7a1c'],['assignee','ce:4e6c4e2a:local'],['state','active'],['tenant','default'],['members','3 (by ref)'],['resolve','GET /v1/orchestrators/{id}/work'],['filter','/v1/work?orchestrator=orc_7a1c']],
+    children:['ep-trait','ep-agentux','ho1'],
+    doc:'ORCHESTRATOR orc_7a1c · Sprint 1 · retrieval lifts\nentity kind=orchestrator · assignee ce:4e6c4e2a:local\nstate active · tenant default\n\nMembers (by reference — live state resolves, never\ncopied; cross-tenant attach rejected, T.1):\n · execplan corecrux-trait-expansion (in_progress)\n · execplan agent-ux-best-in-class (in_progress)\n · handoff opus → sonnet (carries work_ids)\n\nOne call gives the agent all its session work:\n  GET /v1/orchestrators/orc_7a1c/work\nReverse filter (WorkItem.orchestrator_id):\n  GET /v1/work?orchestrator=orc_7a1c\n\nBuilt via ＋ Orchestrator, or by an agent via MCP\ncreate_orchestrator + attach_to_orchestrator\n(detach_from_orchestrator / list_orchestrators too).'},
+
+  /* ── Overview tiles (modelled on legacy console panel-overview) ── */
+  'ov-node':{kind:'tile',label:'Daemon node',sub:'ce:4e6c4e2a:local',status:'run',fields:[['mode','local_only'],['facts','1,911'],['sessions','3 active'],['degraded','no'],['bg sync','off']],payload:'{ "node":"ce:4e6c4e2a:local","mode":"local_only",\n  "facts":1911,"degraded":false,"bg_sync":"off" }'},
+  'ov-work':{kind:'tile',label:'Task totals',sub:'7 execplans',fields:[['planned','1'],['in_progress','3'],['blocked','1'],['done','2']],children:['ep-agentux','ep-chaincrux','ep-trait','ep-cruxengine','ep-gemma','ep-plancrux','ep-verbatim']},
+  'ov-storage':{kind:'tile',label:'Storage · by retrieval kind',sub:'chunks',fields:[['.ccxe','5.26 GiB'],['.ccxs','280 MB'],['.ccxdi','9.3M regions'],['bm25','153M postings']],payload:'{ "by_kind":{ ".ccxe":"5.26 GiB",".ccxs":"280 MB",\n  ".ccxdi":"9.3M regions","bm25":"153M postings" } }'},
+  'ov-integrations':{kind:'tile',label:'Pack activity',sub:'5 packs · 3 grants',fields:[['packs','5'],['grants','3'],['audit (24h)','12']]},
+  'ov-tenants':{kind:'tile',label:'Recent tenants',sub:'top by prefix',fields:[['shown','3'],['top','lme-m']],children:['t-lmem','t-lmes','t-personal']},
+
+  /* ── Settings tile sections (modelled on legacy panel-settings) ── */
+  'set-auth':{kind:'setting',label:'Access posture',sub:'auth mode',status:'ok',fields:[['current','local_only'],['options','open · token · strict']],payload:'{ "auth_mode":"local_only" }'},
+  'set-embed':{kind:'setting',label:'Embedding',sub:'semantic retrieval',status:'idle',fields:[['enabled','no'],['endpoint','—'],['model','—']],doc:'Embedding (semantic retrieval)\n\nCrux ships no embedding model. Point this at a\nlocal/remote endpoint speaking the standard\nembedding protocol:\n\n  Ollama   http://localhost:11434\n  TEI      http://localhost:8080\n  vLLM     http://vllm:8000\n\nEnabled: no · changes apply on next daemon restart.'},
+  'set-onboard':{kind:'setting',label:'Onboarding',sub:'re-run first-run wizard',fields:[['action','re-run on next load']]},
+  'set-daemon':{kind:'setting',label:'Daemon',sub:'restart process',fields:[['needs','restart: unless-stopped'],['caution','process exits if no policy']]},
+
+  /* ── execplans ── */
+  'ep-agentux':{kind:'execplan',label:'agent-ux-best-in-class-master',sub:'risk: medium',status:'in_progress',
+    fields:[['slug','agent-ux-best-in-class-master'],['state','in_progress'],['risk_class','medium'],['milestones','5'],['updated','2026-05-27']],
+    children:['m-au1','m-au2','m-au3','m-au4','m-au5'],
+    doc:'# agent-ux-best-in-class-master\nrisk: medium · state: in_progress\n\n## Purpose\nBring the agent UX to best-in-class: work\naggregator, /v1/work source merge, MCP loopback\nauth, SPA chip group, reconciler, and wizard\nguardrails.\n\n## Milestones\nM1 aggregator        ✓ done\nM2 work API          ✓ done\nM3 header decode     ✓ done\nM4 reconciler        · in_progress\nM5 wizard guardrails · planned\n\n## Progress\n19/19 work_execplans · 5/5 loopback_auth\n1118/1118 corecruxd · 261/261 crux-mcp green.\nAwaiting one cargo-deploy.\n\n— double-click a milestone on the right to open it.'},
+  'ep-chaincrux':{kind:'execplan',label:'chaincrux-cascade-route-integration',sub:'risk: medium',status:'blocked',
+    fields:[['state','blocked'],['risk_class','medium'],['milestones','4'],['blocker','M3 decide() unwired']],
+    children:['m-cc1','m-cc2','m-cc3','m-cc4'],
+    doc:'# chaincrux-cascade-route-integration\nstate: blocked\n\n## Purpose\nWire the cascade router so cascade_gate::decide()\nis actually invoked on the retrieve path.\n\n## Blocker (M3)\ndecide() is dead code — never called. Path C\nblocked until the route shim calls it. See\nincident:2026-05-25.\n\nM1 route shim   ✓   M2 cascade gate ✓\nM3 wire decide()✗   M4 A/B Q500     ·'},
+  'ep-trait':{kind:'execplan',label:'corecrux-trait-expansion-global-default-on',sub:'risk: medium',status:'in_progress',
+    fields:[['state','in_progress'],['milestones','3'],['pilot','50-tenant +2 R@5']],
+    children:['m-tr1','m-tr2','m-tr3'],
+    doc:'# corecrux-trait-expansion-global-default-on\nstate: in_progress\n\nFlip topology_trait_expansion lane to default-on\nafter the 50-tenant LME-M pilot (Δ +2 R@5 / +2\nR@50, zero regressions, +6ms p50).\n\nM1 overlay persist ✓  M2 50-tenant pilot ✓\nM3 global default-on · in_progress'},
+  'ep-cruxengine':{kind:'execplan',label:'cruxengine-carry-all-flag-off-merge',sub:'risk: low',status:'planned',fields:[['state','planned'],['risk_class','low']]},
+  'ep-gemma':{kind:'execplan',label:'engine-cheap-tier-llm-ab-gemma4-vs-gpt5p5',sub:'risk: low',status:'done',fields:[['state','done'],['result','gemma wins: 100% vs 50% schema']]},
+  'ep-plancrux':{kind:'execplan',label:'plancrux-retirement-master',sub:'risk: medium',status:'in_progress',fields:[['state','in_progress']]},
+  'ep-verbatim':{kind:'execplan',label:'verbatim-indexing-pointers-closeout',sub:'risk: low',status:'done',fields:[['state','done']]},
+
+  /* ── milestones (agent-ux richly cross-linked) ── */
+  'm-au1':{kind:'milestone',label:'M1 · aggregator',status:'done',fields:[['key','gate:M1'],['commit_sha','7f3a1c2'],['tests','green'],['files','3 changed']],children:['f-gate-au1','fls-au1']},
+  'm-au2':{kind:'milestone',label:'M2 · work API',status:'done',fields:[['key','gate:M2'],['commit_sha','9b21d04'],['tests','green']],children:['f-gate-au2']},
+  'm-au3':{kind:'milestone',label:'M3 · header decode',status:'done',fields:[['key','gate:M3'],['commit_sha','c4e8810'],['tests','green']],children:['f-gate-au3']},
+  'm-au4':{kind:'milestone',label:'M4 · reconciler',status:'in_progress',fields:[['key','gate:M4'],['commit_sha','—'],['tests','4 failing'],['files','4 changed (wip)']],
+    children:['f-gate-au4','fls-au4','snote-au','sess-agentux'],
+    doc:'M4 · reconciler — in_progress\n\nReconciles the read-time ExecPlan projection\nagainst the kanban Work table so stale entries\ndrop out of /v1/work?source=all.\n\nGate: 4 projection-diff tests red. Blocked on the\nloopback-auth fix landing first.\n\nLinked → gate:M4 fact · session note 13:24 · the\nlive session that owns this milestone.'},
+  'm-au5':{kind:'milestone',label:'M5 · wizard guardrails',status:'planned',fields:[['key','gate:M5'],['tests','—']]},
+  'm-cc1':{kind:'milestone',label:'M1 · route shim',status:'done',fields:[['key','gate:M1'],['commit_sha','2dbfdab']],children:['f-gate-cc1']},
+  'm-cc2':{kind:'milestone',label:'M2 · cascade gate',status:'done',fields:[['key','gate:M2'],['commit_sha','5a672d2']]},
+  'm-cc3':{kind:'milestone',label:'M3 · wire decide()',status:'blocked',fields:[['key','gate:M3'],['tests','—'],['blocker','decide() never invoked']],children:['f-gate-cc3','sess-chaincrux']},
+  'm-cc4':{kind:'milestone',label:'M4 · A/B Q500',status:'planned',fields:[['key','gate:M4']]},
+  'm-tr1':{kind:'milestone',label:'M1 · overlay persist',status:'done',fields:[['key','gate:M1'],['commit_sha','c00f88c']]},
+  'm-tr2':{kind:'milestone',label:'M2 · 50-tenant pilot',status:'done',fields:[['key','gate:M2'],['commit_sha','054b9d4']]},
+  'm-tr3':{kind:'milestone',label:'M3 · global default-on',status:'in_progress',fields:[['key','gate:M3'],['tests','pending']],children:['sess-trait']},
+
+  /* ── gate facts ── */
+  'f-gate-au1':{kind:'fact',label:'gate:M1',sub:'execplan:agent-ux',status:'ok',fields:[['entity','execplan:agent-ux-best-in-class-master'],['key','gate:M1'],['conf','0.99']],payload:'{ "key":"gate:M1",\n  "value":{ "status":"done","commit_sha":"7f3a1c2",\n    "tests_passing":true } }'},
+  'f-gate-au2':{kind:'fact',label:'gate:M2',sub:'execplan:agent-ux',status:'ok',fields:[['key','gate:M2'],['commit_sha','9b21d04']],payload:'{ "key":"gate:M2","value":{ "status":"done","commit_sha":"9b21d04","tests_passing":true } }'},
+  'f-gate-au3':{kind:'fact',label:'gate:M3',sub:'execplan:agent-ux',status:'ok',fields:[['key','gate:M3'],['commit_sha','c4e8810']],payload:'{ "key":"gate:M3","value":{ "status":"done","commit_sha":"c4e8810","tests_passing":true } }'},
+  'f-gate-au4':{kind:'fact',label:'gate:M4',sub:'execplan:agent-ux',status:'run',fields:[['key','gate:M4'],['status','in_progress'],['tests','4 failing']],payload:'{ "key":"gate:M4",\n  "value":{ "status":"in_progress","commit_sha":null,\n    "tests_passing":false,"failing":4 } }'},
+  'f-gate-cc1':{kind:'fact',label:'gate:M1',sub:'execplan:chaincrux',status:'ok',fields:[['key','gate:M1'],['commit_sha','2dbfdab']]},
+  'f-gate-cc3':{kind:'fact',label:'gate:M3',sub:'execplan:chaincrux',status:'err',fields:[['key','gate:M3'],['status','blocked']],payload:'{ "key":"gate:M3","value":{ "status":"blocked","reason":"decide() never invoked" } }'},
+
+  /* ── files changed per milestone (kind file / file-group) ── */
+  'fls-au1':{kind:'file-group',label:'Files · 3 changed',sub:'M1 aggregator',children:['fa1','fa2','fa3']},
+  'fa1':{kind:'file',label:'corecruxd/src/http/work_aggregate.rs',sub:'new file · +212',status:'ok',fields:[['change','created'],['added','212'],['removed','0'],['commit_sha','7f3a1c2']],payload:'+ pub fn aggregate_work(state: &AppState)\n+   -> Vec<WorkItem> {\n+   // merge kanban facts + read-time projection\n+ }'},
+  'fa2':{kind:'file',label:'corecruxd/src/http/mod.rs',sub:'modified · +8 −2',status:'run',fields:[['change','modified'],['added','8'],['removed','2'],['commit_sha','7f3a1c2']],payload:'  .route("/v1/work", get(self::work::list))\n+ .route("/v1/work/aggregate",\n+        get(work_aggregate::list))'},
+  'fa3':{kind:'file',label:'corecruxd/tests/work_execplans.rs',sub:'new file · +96',status:'ok',fields:[['change','created'],['added','96'],['removed','0']]},
+  'fls-au4':{kind:'file-group',label:'Files · 4 changed (wip)',sub:'M4 reconciler',children:['fb1','fb2','fb3','fb4']},
+  'fb1':{kind:'file',label:'corecruxd/src/http/reconcile.rs',sub:'new file · +140',status:'run',fields:[['change','created'],['added','140'],['removed','0'],['state','uncommitted']]},
+  'fb2':{kind:'file',label:'corecrux-memory/src/projection.rs',sub:'modified · +33 −12',status:'run',fields:[['change','modified'],['added','33'],['removed','12'],['state','uncommitted']]},
+  'fb3':{kind:'file',label:'corecruxd/src/http/work.rs',sub:'modified · +5 −1',status:'run',fields:[['change','modified'],['added','5'],['removed','1']]},
+  'fb4':{kind:'file',label:'corecruxd/tests/reconcile_test.rs',sub:'new file · 4 failing',status:'err',fields:[['change','created'],['added','58'],['tests','4 failing']],payload:'running 4 tests\n  reconcile::drops_stale ... FAILED\n  reconcile::stable_sort ... FAILED\n  reconcile::merge_order ... FAILED\n  reconcile::idempotent ... FAILED'},
+
+  /* ── session hooks (PostToolUse / SessionStart events) → link to the files they touched ── */
+  'hk-agentux':{kind:'hook-group',label:'Hooks · 5 fired',sub:'this session',fields:[['session','9c5a9271…'],['events','5'],['source','PostToolUse']],children:['hk1','hk2','hk3','hk4','hk5']},
+  'hk1':{kind:'hook',label:'SessionStart',sub:'boot banner injected',status:'ok',fields:[['event','SessionStart'],['ms','12']]},
+  'hk2':{kind:'hook',label:'PostToolUse · Read',sub:'×38 (grouped)',status:'ok',fields:[['event','PostToolUse'],['tool','Read'],['count','38']]},
+  'hk3':{kind:'hook',label:'PostToolUse · Write',sub:'reconcile.rs',status:'run',fields:[['event','PostToolUse'],['tool','Write'],['file','reconcile.rs']],children:['fb1']},
+  'hk4':{kind:'hook',label:'PostToolUse · Edit',sub:'projection.rs',status:'run',fields:[['event','PostToolUse'],['tool','Edit'],['file','projection.rs']],children:['fb2']},
+  'hk5':{kind:'hook',label:'PostToolUse · Bash',sub:'cargo test · exit 101',status:'err',fields:[['event','PostToolUse'],['tool','Bash'],['exit','101']]},
+
+  /* ── session detail groups: facts / reasoning / files written this session ── */
+  'sf-facts':{kind:'fact-group',label:'Facts · 5 written',sub:'this session',children:['f-dec-frontend','f-gate-au1','f-gate-au2','f-gate-au3','f-gate-au4']},
+  'sf-files':{kind:'file-group',label:'Files · 7 touched',sub:'this session',children:['fa1','fa2','fa3','fb1','fb2','fb3','fb4']},
+  'sf-reasoning':{kind:'reasoning-group',label:'Reasoning · 4 steps',sub:'captured at compact',children:['r1','r2','r3','r4']},
+  'r1':{kind:'reasoning',label:'Why Leptos + Trunk',status:'ok',fields:[['re','frontend']],doc:'Reasoning · frontend choice\n\nPure Rust→WASM satisfies "one daemon, no npm" and\nmatches the verified console precedent. React Flow\nlook is plain SVG+CSS → Leptos emits the same DOM;\nlayout covered by reingold-tilford / dagre-rs.'},
+  'r2':{kind:'reasoning',label:'Ingest via hook subcommand',fields:[['re','ingest']],doc:'Reasoning · ingest path\n\nReuse crux-claude-hooks (stdin JSON + authed\nclient) via an `observe` subcommand instead of a\nsecond HTTP listener — less surface, reuses the\nconfig-wizard wiring.'},
+  'r3':{kind:'reasoning',label:'Reconciler bug → projection order',status:'err',fields:[['re','M4 failure']],doc:'Reasoning · M4 failure\n\n4 diff tests red. Traced to the read-time\nprojection not being stably sorted before the\nkanban merge, so live rows drop. Fix: stable sort\nby updated_at; add a 3-stale-entry fixture.'},
+  'r4':{kind:'reasoning',label:'Defer remote approval',fields:[['re','scope cut']],doc:'Reasoning · scope cut\n\ncorecrux-decision (approval machinery) is not in\nthis repo. MVP is observe-only; M6 approval stays\nconditional on that crate being licensed in.'},
+
+  /* ── AUDIT TRAIL (EU AI Act): per-step  inputs(read) → reasoning → output(commands) → CROWN receipt ── */
+  'au-trail':{kind:'audit-group',label:'Audit trail · 3 steps',sub:'GET /v1/observe/sessions/{id}/audit',fields:[['endpoint','/v1/observe/sessions/{id}/audit'],['contract','agent_trace_node v1'],['flag','CORECRUXD_OBSERVE=on'],['steps','3'],['receipts','3 verified']],children:['as1','as2','as3','au-conformance','au-export']},
+
+  'as1':{kind:'step',label:'Step 1 · diagnose M4',sub:'read-only',status:'ok',
+    fields:[['node_id','trace_as1'],['seq','1'],['at','13:05Z'],['actor','ce:4e6c4e2a'],['reasoning_ref','blob:reasoning/trace_as1.txt'],['receipt','crn_8f21…'],['risk','low']],
+    children:['in1','rr1','out1','rcpt1'],
+    doc:'AUDIT STEP 1 · diagnose M4 reconciler\n2026-05-27T13:05Z · passport ce:4e6c4e2a:local\nreceipt crn_8f21… · risk low (read-only)\n\nINPUTS (read)\n · corecruxd/src/http/work.rs\n · corecrux-memory/src/projection.rs\n · query "reconcile projection" — 4 hits\n\nREASONING\n The read-time projection is not stably sorted\n before the kanban merge, so live rows drop.\n\nOUTPUT / COMMANDS\n none — diagnosis only, no mutation.'},
+  'in1':{kind:'inputs-group',label:'1 · Inputs (read)',sub:'2 files + 1 query',children:['rd-work','rd-proj','q1']},
+  'rd-work':{kind:'read',label:'corecruxd/src/http/work.rs',sub:'Read · 214 lines',fields:[['op','Read'],['lines','214']]},
+  'rd-proj':{kind:'read',label:'corecrux-memory/src/projection.rs',sub:'Read · 180 lines',fields:[['op','Read'],['lines','180']]},
+  'q1':{kind:'query',label:'query · "reconcile projection"',sub:'4 hits',fields:[['tool','query'],['hits','4'],['token_budget','2000']]},
+  'rr1':{kind:'reasoning',label:'2 · Reasoning',sub:'sort instability',doc:'Reasoning — Step 1\n\nMerge drops live rows because the projection\niterates in hash order; it needs a stable sort by\nupdated_at before merging with the kanban facts.'},
+  'out1':{kind:'output-group',label:'3 · Output',sub:'none (read-only)',fields:[['mutations','0']]},
+  'rcpt1':{kind:'receipt',label:'CROWN crn_8f21…',sub:'verified · Ed25519',status:'ok',fields:[['receipt','crn_8f21…'],['signer','daemon-root'],['ts','13:05Z'],['class','verified'],['risk','low']],payload:'{ "receipt":"crn_8f21…","class":"verified",\n  "actor":"ce:4e6c4e2a:local","risk":"low",\n  "inputs":["work.rs","projection.rs","query"],\n  "mutations":0 }'},
+
+  'as2':{kind:'step',label:'Step 2 · write reconciler',sub:'mutation',status:'run',
+    fields:[['node_id','trace_as2'],['seq','2'],['at','13:14Z'],['actor','ce:4e6c4e2a'],['reasoning_ref','fact:decision:reconciler-sort'],['receipt','crn_b033…'],['risk','medium']],
+    children:['in2','rr2','out2','rcpt2'],
+    doc:'AUDIT STEP 2 · write reconciler\n2026-05-27T13:14Z · passport ce:4e6c4e2a:local\nreceipt crn_b033… · risk medium (writes code)\n\nINPUTS\n · Step 1 diagnosis (provenance →)\n\nREASONING\n Stable sort by updated_at; extract the merge into\n reconcile.rs so it is unit-testable in isolation.\n\nOUTPUT / COMMANDS\n · Write corecruxd/src/http/reconcile.rs (+140)\n · Edit corecrux-memory/src/projection.rs (+33 −12)'},
+  'in2':{kind:'inputs-group',label:'1 · Inputs',sub:'← Step 1 diagnosis',children:['as1']},
+  'rr2':{kind:'reasoning',label:'2 · Reasoning',sub:'stable sort + extract',doc:'Reasoning — Step 2\n\nStable sort by updated_at; move the merge into a\nstandalone reconcile.rs so the diff logic can be\nunit-tested without the full daemon.'},
+  'out2':{kind:'output-group',label:'3 · Output (commands)',sub:'2 writes',status:'run',children:['fb1','fb2']},
+  'rcpt2':{kind:'receipt',label:'CROWN crn_b033…',sub:'verified · Ed25519',status:'ok',fields:[['receipt','crn_b033…'],['actor','ce:4e6c4e2a'],['class','verified'],['risk','medium'],['mutations','2']]},
+
+  'as3':{kind:'step',label:'Step 3 · run tests',sub:'failed',status:'err',
+    fields:[['node_id','trace_as3'],['seq','3'],['at','13:20Z'],['actor','ce:4e6c4e2a'],['reasoning_ref','blob:reasoning/trace_as3.txt'],['receipt','crn_c7a9…'],['exit','101']],
+    children:['in3','rr3','out3','rcpt3'],
+    doc:'AUDIT STEP 3 · run tests\n2026-05-27T13:20Z · passport ce:4e6c4e2a:local\nreceipt crn_c7a9… · risk low (test run)\n\nINPUTS\n · corecruxd/tests/reconcile_test.rs\n\nREASONING\n Validate the reconciler. On failure, do not retry\n blindly — capture the failure and defer.\n\nOUTPUT / COMMANDS\n · Bash "cargo test reconcile" → exit 101 (4 failed)\n · logged session note 13:24; deferred pending\n   loopback-auth.'},
+  'in3':{kind:'inputs-group',label:'1 · Inputs',sub:'reconcile_test.rs',children:['fb4']},
+  'rr3':{kind:'reasoning',label:'2 · Reasoning',sub:'defer, do not retry',status:'err',doc:'Reasoning — Step 3\n\n4 tests red. Per the pre-deploy gate: do not retry\nblindly — capture the failure, log a note, and\ndefer until loopback-auth lands. Needs a 3-stale-\nentry fixture.'},
+  'out3':{kind:'output-group',label:'3 · Output (commands)',sub:'bash + note',status:'err',children:['hk5','snote-au']},
+  'rcpt3':{kind:'receipt',label:'CROWN crn_c7a9…',sub:'verified · Ed25519',status:'ok',fields:[['receipt','crn_c7a9…'],['actor','ce:4e6c4e2a'],['exit','101'],['risk','low']]},
+  'au-conformance':{kind:'conformance',label:'Conformance · 3/3',sub:'Art 12 / 13 / 15 / 10 ✓',status:'ok',
+    fields:[['endpoint','GET …/audit/conformance'],['Art.12 receipt_chain','3/3 ✓'],['Art.13 attributed','3/3 ✓'],['Art.15 enrich','n/a (no high-risk)'],['Art.10 private','3/3 ✓']],
+    doc:'AUDIT CONFORMANCE\nGET /v1/observe/sessions/{id}/audit/conformance\n\nArt.12 record-keeping  receipt_chain_ok  3/3 ✓\n  every mutation step has a step receipt AND each\n  mutating output a mutation_receipt_id\nArt.13 transparency    is_attributed     3/3 ✓\n  every node carries a passport actor\nArt.15 foresight       enrich_ok         n/a\n  no high-risk step → no enrich_ref required\nArt.10 data governance private           3/3 ✓\n\nFailures are enumerated, never silent (R2 / T.4).\nBacked by TraceNode::{receipt_chain_ok, is_attributed,\nenrich_ok} in crux-observe-api.'},
+  'au-export':{kind:'export',label:'Export bundle',sub:'audit_export_bundle',status:'ok',
+    fields:[['endpoint','GET …/audit/export'],['contents','steps + receipts + attestations'],['verify','receipt_verify / step'],['attest','output_attest']],
+    doc:'AUDIT EXPORT\nGET /v1/observe/sessions/{id}/audit/export\n\nEmits an EU-AI-Act bundle: the ordered AuditStep\nchain + each step CROWN receipt + output\nattestations. A tampered receipt fails\nreceipt_verify. MCP: audit_export_bundle.'},
+
+  /* ── session notes ── */
+  'snote-au':{kind:'note',label:'session note · 13:24',sub:'9c5a9271…',status:'idle',children:['sess-agentux'],
+    fields:[['session','9c5a9271…'],['at','13:24Z']],
+    doc:'session note · 13:24Z\n\n"Reconciler diff mismatch traced to read-time\nprojection ordering — needs a stable sort by\nupdated_at before the merge.\n\nTODO: add a fixture for the 3-stale-entry case,\nthen re-run gate:M4."\n\n— author ce:4e6c4e2a:local'},
+
+  /* ── sessions (cross-link back to execplan / facts / passport) ── */
+  'sess-agentux':{kind:'session',label:'execplan:agent-ux-best-in-class-master',sub:'saved · 42 turns',status:'run',
+    fields:[['session_id','9c5a9271…'],['saved','2026-05-27T13:24Z'],['turns','42'],['tokens','312k in · 41k out'],['model','opus-4.8'],['passport','ce:4e6c4e2a:local'],['source','pre-compact hook']],
+    children:['au-trail','sf-facts','sf-reasoning','sf-files','hk-agentux','ep-agentux','pp-main'],
+    doc:'SAVED SESSION · execplan:agent-ux-best-in-class-master\nid 9c5a9271… · passport ce:4e6c4e2a:local\nsaved 2026-05-27T13:24Z via pre-compact hook\n42 turns · 312k in · 41k out · model opus-4.8\n\n── summary ───────────────────────────────\nResumed the agent-ux ExecPlan at M4. Built the work\naggregator (M1), /v1/work source merge (M2), header\ndecode (M3); started the reconciler (M4).\n\n── transcript (compacted) ────────────────\n[user]  resume M4, get the reconciler green\n[asst]  read http/work.rs + projection.rs; the read-\n        time projection is not stably sorted, so the\n        kanban merge drops live rows.\n[tool]  Read ×38 · grep EventBus · Edit projection.rs\n[asst]  wrote reconcile.rs; 4 diff tests still red —\n        needs a stable sort by updated_at before the\n        merge, plus a 3-stale-entry fixture.\n[user]  land loopback-auth first\n[asst]  deferred; logged session note 13:24.\n\n── decisions ─────────────────────────────\n· frontend = Leptos+Trunk WASM (no npm)\n· ingest via crux-claude-hooks subcommand\n· remote approval deferred (crate absent)\n\nOff this session → facts · reasoning · files ·\nhooks · execplan · passport.'},
+  'sess-chaincrux':{kind:'session',label:'execplan:chaincrux-cascade-route-integration',sub:'ttl 3600s',status:'err',
+    fields:[['session_id','1af0b3e2…'],['ttl','3600s'],['execplan','chaincrux-cascade-route-integration']],children:['ep-chaincrux','f-gate-cc3']},
+  'sess-trait':{kind:'session',label:'execplan:corecrux-trait-expansion-global-default-on',sub:'ttl 3600s',status:'run',
+    fields:[['session_id','77be5510…'],['ttl','3600s']],children:['ep-trait']},
+
+  /* ── passports ── */
+  'pp-main':{kind:'passport',label:'ce:4e6c4e2a:local',sub:'tier=local · anthropic',status:'ok',
+    fields:[['identity','anthropic'],['tier','local'],['category','system'],['caps','session_context · journal_append · proof_verify']],
+    children:['sess-agentux','sess-chaincrux','sess-trait'],
+    doc:'passport ce:4e6c4e2a:local\nidentity anthropic · tier local · category system\n\ncapabilities\n · session_context\n · journal_append\n · proof_verify\n\n3 active sessions (execplan-scoped). Issued at\nboot; every non-private write is attributed to\nthis passport. Click a session on the right.'},
+  'pp-sonnet':{kind:'passport',label:'ce:8821fa0d:local',sub:'tier=local · sonnet-worker',status:'idle',fields:[['identity','sonnet-worker'],['tier','local'],['category','work']]},
+  'pp-ops':{kind:'passport',label:'ce:0c4419ab:remote',sub:'tier=remote · ops',status:'ok',fields:[['identity','ops'],['tier','remote'],['category','system']]},
+
+  /* ── fact groups ── */
+  'fg-execplan':{kind:'fact-group',label:'execplan:*',sub:'412 facts',children:['f-dec-frontend','f-gate-au4','f-gate-cc3']},
+  'fg-bench':{kind:'fact-group',label:'bench:*',sub:'88 facts',children:['bench-q500']},
+  'fg-incident':{kind:'fact-group',label:'incident:*',sub:'37 facts'},
+  'fg-design':{kind:'fact-group',label:'design:*',sub:'61 facts'},
+  'fg-work':{kind:'fact-group',label:'__work__::*',sub:'19 facts'},
+  'f-dec-frontend':{kind:'fact',label:'decision:frontend',sub:'execplan:crux-agent-observability',status:'ok',fields:[['key','decision:frontend'],['choice','Leptos+Trunk WASM'],['commit_sha','(draft)']],payload:'{ "entity":"execplan:crux-agent-observability-graph-2026-05-29",\n  "key":"decision:frontend",\n  "value":{ "choice":"Leptos+Trunk WASM","commit_sha":"(draft)" } }'},
+
+  /* ── bench ── */
+  'bench-q500':{kind:'bench',label:'bench:lme-s-q500',sub:'437/500 = 87.4%',status:'ok',
+    fields:[['metric','answer_acc'],['value','0.874'],['corpus','LME-S'],['run_id','q500-0529']],
+    children:['bm-ssp','bm-ms'],
+    payload:'{ "entity":"bench:lme-s-q500",\n  "value":{ "metric":"answer_acc","value":0.874,\n    "corpus":"LME-S","lane_flags":"dossier+facts",\n    "commit_sha":"437a1c0","run_id":"q500-0529" } }'},
+  'bench-lmem':{kind:'bench',label:'bench:lme-m-r5',sub:'pilot',status:'run',fields:[['corpus','LME-M'],['metric','recall@5']]},
+  'bm-ssp':{kind:'metric',label:'SSP',sub:'83.3%',status:'ok',fields:[['metric','ssp_acc'],['value','0.833'],['corpus','LME-S']]},
+  'bm-ms':{kind:'metric',label:'MS',sub:'+10pp',status:'ok',fields:[['metric','ms_lift'],['value','+0.10'],['corpus','LME-S']]},
+
+  /* ── memory feed ── */
+  'mem1':{kind:'fact',label:'no-link-prune-substrate-bitrot',sub:'2026-05-29',status:'ok',fields:[['type','project'],['date','2026-05-29']]},
+  'mem2':{kind:'fact',label:'lme-s-entity-extraction-gap',sub:'2026-05-28',status:'ok',fields:[['type','project'],['date','2026-05-28']]},
+  'mem3':{kind:'fact',label:'vaultcrux-bff-jwt-env-file-trap',sub:'2026-05-28',status:'ok',fields:[['type','reference'],['date','2026-05-28']]},
+
+  /* ── tenants ── */
+  't-lmem':{kind:'tenant',label:'lme-m',sub:'category: work',status:'ok',fields:[['category','work'],['source','backfill']]},
+  't-lmes':{kind:'tenant',label:'lme-s',sub:'category: work',status:'ok',fields:[['category','work'],['source','backfill']]},
+  't-personal':{kind:'tenant',label:'personal',sub:'category: personal',status:'idle',fields:[['category','personal']]},
+
+  /* ── DX ── */
+  'dx-articles':{kind:'panel',label:'Articles',sub:'bundled docs',children:['doc-mcp','doc-plans','doc-agent']},
+  'dx-readme':{kind:'panel',label:'README',sub:'corecruxd',fields:[['crates','17'],['port','14800']]},
+  'dx-sites':{kind:'panel',label:'External docs',sub:'links',children:['site-cc','site-signals']},
+  'doc-mcp':{kind:'doc',label:'mcp-system-prompt.md',sub:'tool surface ref'},
+  'doc-plans':{kind:'doc',label:'PLANS.md',sub:'ExecPlan format',doc:'# PLANS.md\n\nRequired sections: Purpose, Non-goals, Context,\nConstraints, Proposed design, Milestones, Test\nplan, Rollout/rollback, Risks, Progress, Decision\nlog.\n\nQC.1 commit_sha on decisions · QC.2 token_budget\n· QC.5 file:line for existence claims.'},
+  'doc-agent':{kind:'doc',label:'agent-guide.md',sub:'QC / threat refs'},
+  'site-cc':{kind:'site',label:'cuecrux.com',sub:'marketing'},
+  'site-signals':{kind:'site',label:'signals.cuecrux.com',sub:'status'},
+
+  /* ── GX ── */
+  'gx-engrams':{kind:'panel',label:'Engrams',sub:'shared memory',children:['eng1','eng2']},
+  'gx-bench':{kind:'panel',label:'Bench',sub:'ScoreCrux board',children:['bench-q500','bench-lmem']},
+  'gx-sites':{kind:'panel',label:'Sites',sub:'hypernym surface',fields:[['entries','170,987']]},
+  'gx-factstore':{kind:'panel',label:'Fact store',sub:'online',fields:[['mode','local_only'],['facts','1,911']]},
+  'eng1':{kind:'engram',label:'retrieval-playbook',sub:'pinned',status:'ok'},
+  'eng2':{kind:'engram',label:'deploy-gate-checklist',sub:'pinned',status:'ok'},
+
+  /* ── AX ── */
+  'ax-overview':{kind:'panel',label:'Overview',sub:'agent cockpit',fields:[['active agents','2'],['handoffs','1 open']],children:['st-sess','ho1']},
+  'ax-activity':{kind:'panel',label:'Activity',sub:'live tool stream',status:'run',fields:[['events/min','~40']]},
+  'ax-memory':{kind:'panel',label:'Memory',sub:'agent recall',fields:[['acks today','12']]},
+  'ax-bulk':{kind:'panel',label:'Bulk',sub:'batch ops'},
+  'ax-snapshots':{kind:'panel',label:'Snapshots',sub:'session captures',children:['snap1']},
+  'ax-tools':{kind:'panel',label:'Tools',sub:'MCP surface',children:['tool-query','tool-store','tool-handoff']},
+  'ax-handoff':{kind:'panel',label:'Handoff',sub:'cross-session',children:['ho1']},
+  'ax-graph':{kind:'panel',label:'Graph',sub:'context graph'},
+  'ax-storybook':{kind:'panel',label:'Storybook',sub:'tile catalog'},
+  'ax-dossiers':{kind:'panel',label:'Dossiers',sub:'subject cards',children:['dos1']},
+  'ax-story':{kind:'panel',label:'Story',sub:'call trees',children:['st-sess']},
+  'snap1':{kind:'snapshot',label:'pre-compact 13:24',sub:'session 9c5a92…',status:'ok'},
+  'tool-query':{kind:'tool',label:'query',sub:'BM25 + graph',status:'ok'},
+  'tool-store':{kind:'tool',label:'store_fact',sub:'deliberate',status:'ok'},
+  'tool-handoff':{kind:'tool',label:'create_handoff',sub:'cross-session',status:'ok'},
+  'ho1':{kind:'handoff',label:'opus → sonnet',sub:'M4 Q500 A/B',status:'run',fields:[['from','ce:4e6c4e2a'],['to','ce:8821fa0d'],['state','claimed']]},
+  'dos1':{kind:'dossier',label:'lme-m / __origin__',sub:'score 0.99',status:'ok'},
+  'st-sess':{kind:'session',label:'LME-M Q500 run',sub:'2 agents · 312k tok',status:'run',children:['st-orch','st-explore2']},
+  'st-orch':{kind:'agent',label:'orchestrator',sub:'2 subagents',status:'run',children:['st-explore','st-plan']},
+  'st-explore':{kind:'subagent',label:'Explore: map daemon',sub:'38 files',status:'ok',children:['st-read','st-grep']},
+  'st-plan':{kind:'subagent',label:'Plan: schema',sub:'running…',status:'run'},
+  'st-explore2':{kind:'agent',label:'explore',sub:'12 tool calls',status:'ok'},
+  'st-read':{kind:'tool',label:'38 × Read',sub:'1 error',status:'err'},
+  'st-grep':{kind:'tool',label:'grep · EventBus',sub:'4 matches',status:'ok'}
+};
+Object.entries(N).forEach(([id,n])=>{ n.id=id; });
+
+/* ════════════ ENGINE ════════════ */
+const COL_W=188, HERO_W=336, COL_GAP=60, NODE_H=64, HERO_H=372, NODE_GAP=14, PAD_X=28, PAD_Y=22;
+const nodesEl=document.getElementById('nodes'), edgesEl=document.getElementById('edges');
+const norm = s => ({done:'ok',in_progress:'run',blocked:'err',planned:'idle',live:'run'}[s] || s || 'idle');
+const RAW = {in_progress:'in progress',done:'done',blocked:'blocked',planned:'planned',ok:'ok',run:'live',err:'error',idle:'idle',live:'live'};
+const chipText = s => RAW[s] || s;
+const childrenOf = node => (node.children||[]).map(id=>N[id]).filter(Boolean);
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+let activeScope='cx', columns=[], selectedId=null, focusMode=false, positions={}, activeOnly=false, heroUserW=null;
+
+function openScope(id){
+  activeScope=id; focusMode=false; selectedId=null; heroUserW=null;
+  const scope=SCOPES.find(s=>s.id===id);
+  const secs=scope.sections.map(x=>N[x]).filter(Boolean);
+  columns=[{parentId:null, nodes:secs}];
+  // default landing: auto-expand the scope's first tile (Overview) so its tiles show
+  const def=secs[0], defKids=def?childrenOf(def):[];
+  if(defKids.length){ columns.push({parentId:def.id, nodes:defKids}); selectedId=def.id; inspect(def); }
+  document.querySelectorAll('.wc-centre-pill').forEach(p=>p.classList.toggle('wc-centre-pill--active', p.dataset.scope===id));
+  document.getElementById('focusExit').style.display='none';
+  render();
+}
+function expand(node, col){
+  selectedId=node.id;
+  columns=columns.slice(0, col+1);
+  const kids=childrenOf(node);
+  if(kids.length) columns.push({parentId:node.id, nodes:kids});
+  inspect(node); render();
+}
+function focusNode(node){
+  focusMode=true; selectedId=node.id;
+  columns=[{parentId:null, nodes:[node]}];
+  const kids=childrenOf(node);
+  if(kids.length) columns.push({parentId:node.id, nodes:kids});
+  document.getElementById('focusExit').style.display='';
+  inspect(node); render();
+}
+function inspect(node){
+  document.getElementById('i-title').textContent=node.label;
+  document.getElementById('i-kind').textContent=node.kind + (node.status?` · ${chipText(node.status)}`:'');
+  const kv=document.getElementById('i-kv'); kv.innerHTML='';
+  (node.fields||[]).forEach(([k,v])=>{
+    const a=document.createElement('div'); a.className='k'; a.textContent=k;
+    const b=document.createElement('div'); b.className='v'; b.textContent=v;
+    kv.appendChild(a); kv.appendChild(b);
+  });
+  const lk=document.getElementById('i-links'), lkh=document.getElementById('i-links-h'); lk.innerHTML='';
+  const kids=childrenOf(node);
+  lkh.style.display = kids.length? '' : 'none';
+  kids.forEach(c=>{ const btn=document.createElement('button'); btn.textContent=c.label; btn.title=`expand ${c.kind}`; btn.onclick=()=>focusNode(c); lk.appendChild(btn); });
+  document.getElementById('i-payload').textContent=node.payload || (node.doc? node.doc : '{ }');
+}
+
+// active-session filter: hide non-running sessions when activeOnly is on
+const filt = ns => activeOnly ? ns.filter(n => n.kind!=='session' || norm(n.status)==='run') : ns;
+
+function render(){
+  positions={}; let maxBottom=0;
+  const canvasEl=document.getElementById('canvas');
+  const cw=canvasEl.clientWidth||1000, chh=canvasEl.clientHeight||640;
+  // focus hero: fills full visible height; width defaults to >= half the page, drag-resizable
+  const heroH=Math.max(360, chh-PAD_Y*2);
+  const halfPage=Math.max(480, Math.round(cw*0.5));
+  const hw = heroUserW ? Math.max(380, Math.min(cw-160, heroUserW)) : halfPage;
+  // filtered projection over columns (source of truth untouched)
+  const view=columns.map(co=>({parentId:co.parentId, nodes:filt(co.nodes)}));
+
+  const colX=[]; let x=PAD_X;
+  for(let c=0;c<view.length;c++){ colX[c]=x; x += ((focusMode&&c===0)?hw:COL_W) + COL_GAP; }
+  view.forEach((colObj,c)=>{
+    const w=(focusMode&&c===0)?hw:COL_W, h=(focusMode&&c===0)?heroH:NODE_H, n=colObj.nodes.length;
+    let startY;
+    if(c===0) startY=PAD_Y;
+    else { const pp=positions[`${c-1}:${colObj.parentId}`]; const H=n*NODE_H+(n-1)*NODE_GAP; const pc=pp?pp.y+pp.h/2:PAD_Y+H/2; startY=Math.max(PAD_Y, pc-H/2); }
+    colObj.nodes.forEach((node,j)=>{
+      const y=startY + j*(NODE_H+NODE_GAP);
+      positions[`${c}:${node.id}`]={x:colX[c],y,w,h,node,col:c};
+      maxBottom=Math.max(maxBottom, y+h);
+    });
+  });
+  const W=x+PAD_X, H=maxBottom+PAD_Y;
+  const spine=new Set(columns.map(c=>c.parentId).filter(Boolean)); if(selectedId) spine.add(selectedId);
+
+  let paths='';
+  for(let c=1;c<view.length;c++){
+    const pp=positions[`${c-1}:${view[c].parentId}`]; if(!pp) continue;
+    const x1=pp.x+pp.w, y1=pp.y+pp.h/2;
+    view[c].nodes.forEach(child=>{
+      const cp=positions[`${c}:${child.id}`]; if(!cp) return; const x2=cp.x, y2=cp.y+cp.h/2; const dx=Math.max(28,(x2-x1)/2);
+      paths += `<path class="edge${spine.has(child.id)?' active':''}" d="M ${x1} ${y1} C ${x1+dx} ${y1}, ${x2-dx} ${y2}, ${x2} ${y2}"/>`;
+    });
+  }
+  edgesEl.setAttribute('width',W); edgesEl.setAttribute('height',H); edgesEl.setAttribute('viewBox',`0 0 ${W} ${H}`);
+  edgesEl.style.width=W+'px'; edgesEl.style.height=H+'px'; edgesEl.innerHTML=paths;
+
+  nodesEl.style.width=W+'px'; nodesEl.style.height=H+'px'; nodesEl.innerHTML='';
+  Object.values(positions).forEach(p=>{
+    const node=p.node, s=norm(node.status), hasKids=childrenOf(node).length>0;
+    const isHero=focusMode && p.col===0;
+    const el=document.createElement('div');
+    el.className=`gnode s-${s}${node.id===selectedId?' sel':''}${hasKids?'':' leaf'}${isHero?' hero':''}`;
+    el.dataset.kind=node.kind;
+    el.style.left=p.x+'px'; el.style.top=p.y+'px'; el.style.width=p.w+'px'; el.style.height=p.h+'px';
+    if(isHero){
+      const ff=(node.fields||[]).slice(0,6).map(([k,v])=>`<span class="k">${esc(k)}</span><span class="v">${esc(v)}</span>`).join('');
+      const body = node.doc ? esc(node.doc) : (node.payload? esc(node.payload) : '');
+      el.innerHTML=`<div class="gstripe"></div><div class="gkind">${esc(node.kind)}</div>`+
+                   `<div class="gtitle">${esc(node.label)}</div>`+
+                   (ff?`<div class="herofields">${ff}</div>`:'')+
+                   (body?`<div class="gdoc">${body}</div>`:'')+
+                   `<div class="hero-resize" title="Drag to resize width"></div>`;
+      nodesEl.appendChild(el);
+      const grip=el.querySelector('.hero-resize');
+      if(grip) grip.addEventListener('pointerdown', e=>{
+        e.preventDefault(); e.stopPropagation();
+        const sx=e.clientX, sw=hw;
+        const mv=ev=>{ heroUserW=sw+(ev.clientX-sx); render(); };
+        const up=()=>{ document.removeEventListener('pointermove',mv); document.removeEventListener('pointerup',up); };
+        document.addEventListener('pointermove',mv); document.addEventListener('pointerup',up);
+      });
+      return; // hero is the focused root: no click/dblclick so the doc stays selectable
+    }
+    const row2 = node.status
+      ? `<div class="grow2"><span class="gchip">${chipText(node.status)}</span>${node.sub?`<span class="gsub">${esc(node.sub)}</span>`:''}</div>`
+      : (node.sub?`<div class="grow2"><span class="gsub">${esc(node.sub)}</span></div>`:'');
+    el.innerHTML=`<div class="gstripe"></div><div class="gkind">${esc(node.kind)}</div><div class="gtitle">${esc(node.label)}</div>${row2}<span class="gcaret">›</span>`;
+    el.addEventListener('click', ()=>expand(node, p.col));
+    el.addEventListener('dblclick', e=>{ e.preventDefault(); focusNode(node); });
+    nodesEl.appendChild(el);
+  });
+  renderCrumbs();
+}
+
+function renderCrumbs(){
+  const bc=document.getElementById('breadcrumb'); bc.innerHTML='';
+  const scope=SCOPES.find(s=>s.id===activeScope);
+  const head=document.createElement('span'); head.className='c head'; head.textContent=`${scope.label} · ${scope.tag}${focusMode?' · focus':''}`;
+  head.onclick=()=>openScope(activeScope); bc.appendChild(head);
+  for(let c=1;c<columns.length;c++){
+    const sep=document.createElement('span'); sep.className='sep'; sep.textContent='›'; bc.appendChild(sep);
+    const node=N[columns[c].parentId];
+    const seg=document.createElement('span'); seg.className='c'; seg.textContent=(node&&node.label)||columns[c].parentId;
+    const ci=c-1; seg.onclick=()=>{ if(node) expand(node, ci); }; bc.appendChild(seg);
+  }
+}
+
+/* chrome */
+const pillsEl=document.getElementById('scopePills');
+SCOPES.forEach(s=>{ const b=document.createElement('span'); b.className='wc-centre-pill'; b.dataset.scope=s.id; b.innerHTML=`${s.label}<small>${s.tag}</small>`; b.addEventListener('click',()=>openScope(s.id)); pillsEl.appendChild(b); });
+document.getElementById('focusExit').addEventListener('click', ()=>openScope(activeScope));
+document.getElementById('themeBtn').addEventListener('click', ()=>{ const d=document.documentElement.classList.toggle('dark'); try{ localStorage.setItem('cx-theme', d?'dark':'light'); }catch(e){} });
+
+/* inspector: drag-resize (left/right) + hide toggle */
+const aside=document.getElementById('inspector'), asideResize=document.getElementById('asideResize');
+let asideW=316;
+const setAsideW=w=>{ asideW=Math.max(240, Math.min(680, w)); aside.style.width=asideW+'px'; };
+asideResize.addEventListener('pointerdown', e=>{
+  e.preventDefault();
+  const startX=e.clientX, startW=asideW;
+  const move=ev=>setAsideW(startW + (startX - ev.clientX));   // drag left ⇒ wider (aside is on the right)
+  const up=()=>{ document.removeEventListener('pointermove',move); document.removeEventListener('pointerup',up); };
+  document.addEventListener('pointermove',move); document.addEventListener('pointerup',up);
+});
+asideResize.addEventListener('dblclick', ()=>document.body.classList.toggle('insp-hidden'));
+document.getElementById('inspToggle').addEventListener('click', ()=>{ document.body.classList.toggle('insp-hidden'); render(); });
+
+/* breadcrumb-bar: only show running sessions */
+document.getElementById('activeToggle').addEventListener('click', e=>{ activeOnly=!activeOnly; e.currentTarget.classList.toggle('on', activeOnly); render(); });
+
+/* keep the full-height focus hero fitted to the viewport */
+window.addEventListener('resize', ()=>render());
+
+/* ── Orchestrator builder (drag-drop): mirrors MCP create_orchestrator/attach ── */
+const $=id=>document.getElementById(id);
+let orcSeq=0, builderMembers=[], builderFilter='planned';
+function paletteItems(){
+  const all=Object.values(N);
+  if(builderFilter==='handoff') return all.filter(n=>n.kind==='handoff');
+  return all.filter(n=>n.kind==='execplan' && n.status===builderFilter);
+}
+function renderPalette(){
+  const el=$('orcPalette'); el.innerHTML='';
+  paletteItems().forEach(n=>{
+    const c=document.createElement('div'); c.className='chip'; c.draggable=true; c.dataset.id=n.id;
+    c.innerHTML=`<span>${esc(n.label)}</span><span class="tag">${esc(chipText(n.status)||n.kind)}</span>`;
+    c.addEventListener('dragstart', e=>e.dataTransfer.setData('text/plain', n.id));
+    c.addEventListener('click', ()=>addMember(n.id));
+    el.appendChild(c);
+  });
+  document.querySelectorAll('#orcFilters button').forEach(b=>b.classList.toggle('on', b.dataset.f===builderFilter));
+}
+function renderDrop(){
+  const el=$('orcDrop'); el.innerHTML='';
+  if(!builderMembers.length){ el.innerHTML='<div class="empty">Drag ExecPlans / handoffs here<br>(or click a palette item)</div>'; return; }
+  builderMembers.forEach(id=>{
+    const n=N[id]; const m=document.createElement('div'); m.className='member';
+    m.innerHTML=`<span>${esc(n?n.label:id)}</span><button title="remove">×</button>`;
+    m.querySelector('button').addEventListener('click', ()=>removeMember(id));
+    el.appendChild(m);
+  });
+}
+function addMember(id){ if(!builderMembers.includes(id)){ builderMembers.push(id); renderDrop(); } }
+function removeMember(id){ builderMembers=builderMembers.filter(x=>x!==id); renderDrop(); }
+function openBuilder(){ builderMembers=[]; builderFilter='planned'; $('orcName').value=''; renderPalette(); renderDrop(); $('orcModal').style.display='flex'; }
+function closeBuilder(){ $('orcModal').style.display='none'; }
+
+$('orcNew').addEventListener('click', openBuilder);
+$('orcCancel').addEventListener('click', closeBuilder);
+document.querySelectorAll('#orcFilters button').forEach(b=>b.addEventListener('click', ()=>{ builderFilter=b.dataset.f; renderPalette(); }));
+const dz=$('orcDropZone');
+dz.addEventListener('dragover', e=>{ e.preventDefault(); dz.classList.add('over'); });
+dz.addEventListener('dragleave', ()=>dz.classList.remove('over'));
+dz.addEventListener('drop', e=>{ e.preventDefault(); dz.classList.remove('over'); const id=e.dataTransfer.getData('text/plain'); if(id) addMember(id); });
+$('orcCreate').addEventListener('click', ()=>{
+  const name=($('orcName').value||'').trim()||'New orchestrator';
+  const pp=$('orcPassport').value;
+  const id='orc-user-'+(++orcSeq);
+  N[id]={kind:'orchestrator', label:name, sub:`${pp} · ${builderMembers.length} members`, status:'planned',
+    fields:[['assignee',pp],['state','planned'],['members',String(builderMembers.length)],['created_by',pp]],
+    children:[...builderMembers],
+    doc:`ORCHESTRATOR · ${name}\nassignee ${pp} · state planned\ncreated via builder — agents do the same via MCP\ncreate_orchestrator / attach_to_orchestrator.\n\n${builderMembers.length} members (by reference):\n`+(builderMembers.map(m=>' · '+(N[m]?N[m].label:m)).join('\n')||' (none yet — drag some in)')};
+  N['cx-orchestrators'].children.push(id);
+  closeBuilder();
+  openScope('cx'); expand(N['cx-orchestrators'],0); selectedId=id; inspect(N[id]); render();
+});
+
+openScope('cx');
+</script>
+</body>
+</html>

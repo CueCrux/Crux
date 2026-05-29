@@ -5,13 +5,19 @@
 //! `PreCompact` hook. Snapshots a minimal session-state record to the Crux
 //! daemon via MCP `save_session` before the harness compacts context.
 //! Best-effort: if the daemon is unreachable, we log and exit 0.
+//!
+//! It also runs the observe **M3 reasoning pass**: before context (and the
+//! model's reasoning for the turn) is compacted away, it attaches a
+//! `reasoning_ref` blob pointer to every audit step that lacks one — a
+//! reference, never raw chain-of-thought (R1), written `private: true`
+//! (Art. 10). Gated by `CRUX_HOOK_OBSERVE_CAPTURE`; best-effort.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Value};
 
-use crate::{hook_input::HookInput, mcp_client};
+use crate::{hook_input::HookInput, mcp_client, observe_capture};
 
 /// Cap on bytes read from `.agent/current-milestone` — the file is meant to
 /// hold a short label like "M3" or "M5: shell-pattern constraints", not a
@@ -53,6 +59,15 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
     // Fire and forget. Daemon-unreachable is non-fatal.
     if let Err(err) = mcp_client::call_tool("save_session", &args) {
         eprintln!("crux-hook pre-compact: save_session failed: {err}");
+    }
+
+    // M3 reasoning pass: attach a reasoning_ref blob pointer to every audit
+    // step still missing one, before the turn's reasoning is compacted away.
+    // Best-effort + gated by CRUX_HOOK_OBSERVE_CAPTURE; the helper returns 0
+    // when capture is off or the daemon is unreachable.
+    let patched = observe_capture::attach_reasoning_refs(&input.session_id);
+    if patched > 0 {
+        eprintln!("crux-hook pre-compact: attached reasoning_ref to {patched} audit step(s)");
     }
     Ok(())
 }
@@ -180,6 +195,7 @@ mod tests {
     #[test]
     fn daemon_unreachable_does_not_error() {
         // Point at a guaranteed-closed port to confirm graceful degradation.
+        let _env = crate::test_support::env_guard();
         let prev = std::env::var("CRUX_MCP_URL").ok();
         std::env::set_var("CRUX_MCP_URL", "http://127.0.0.1:1/mcp");
 

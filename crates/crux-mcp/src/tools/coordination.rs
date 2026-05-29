@@ -36,7 +36,7 @@ pub const UPDATE_WORK_STATE_DESCRIPTION: &str =
 pub const COMMENT_ON_WORK_DESCRIPTION: &str =
     "Post a comment on a work item. Use this to leave context for the next agent or human — what you tried, what blocked, what's next.";
 
-fn loopback_base(ctx: &McpContext) -> Result<String, JsonRpcError> {
+pub(crate) fn loopback_base(ctx: &McpContext) -> Result<String, JsonRpcError> {
     ctx.daemon_base_url
         .as_deref()
         .map(|s| s.trim_end_matches('/').to_string())
@@ -57,7 +57,7 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-async fn loopback_get(url: String) -> Result<(u16, String), JsonRpcError> {
+pub(crate) async fn loopback_get(url: String) -> Result<(u16, String), JsonRpcError> {
     let bearer = loopback_bearer_token();
     tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -91,7 +91,7 @@ async fn loopback_get(url: String) -> Result<(u16, String), JsonRpcError> {
     })
 }
 
-async fn loopback_post(url: String, body: Value, expect_201: bool) -> Result<(u16, String), JsonRpcError> {
+pub(crate) async fn loopback_post(url: String, body: Value, expect_201: bool) -> Result<(u16, String), JsonRpcError> {
     let bearer = loopback_bearer_token();
     tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -171,7 +171,42 @@ async fn loopback_patch(url: String, body: Value) -> Result<(u16, String), JsonR
     })
 }
 
-fn text_content(value: Value) -> Value {
+pub(crate) async fn loopback_delete(url: String) -> Result<(u16, String), JsonRpcError> {
+    tokio::task::spawn_blocking(move || {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(10)))
+            .build()
+            .into();
+        let bearer = loopback_bearer_token();
+        let mut request = agent
+            .delete(&url)
+            .header("X-Corecrux-Scopes", SCOPES)
+            .header("Accept", "application/json");
+        if let Some(token) = &bearer {
+            request = request.header("Authorization", &format!("Bearer {token}"));
+        }
+        request
+            .call()
+            .map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()))
+            .map_err(|e| match e {
+                ureq::Error::StatusCode(code) => (code, format!("status {code}")),
+                other => (0, other.to_string()),
+            })
+    })
+    .await
+    .map_err(|e| JsonRpcError {
+        code: INTERNAL_ERROR,
+        message: format!("loopback join error: {e}"),
+        data: None,
+    })?
+    .map_err(|(code, message)| JsonRpcError {
+        code: INTERNAL_ERROR,
+        message: format!("loopback request failed ({code}): {message}"),
+        data: None,
+    })
+}
+
+pub(crate) fn text_content(value: Value) -> Value {
     json!({
         "content": [
             { "type": "text", "text": value.to_string() }

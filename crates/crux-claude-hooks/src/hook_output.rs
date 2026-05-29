@@ -41,6 +41,61 @@ impl HookOutput {
     }
 }
 
+/// `PreToolUse` hook output. The Claude Code harness reads
+/// `permissionDecision` (`allow` | `deny` | `ask`) to decide whether the
+/// about-to-run tool call proceeds. The hook always exits 0 — a deny is
+/// communicated via this JSON, never via a non-zero exit code.
+#[derive(Debug, Serialize)]
+pub struct PreToolUseOutput {
+    #[serde(rename = "hookSpecificOutput")]
+    pub hook_specific_output: PreToolUseSpecificOutput,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PreToolUseSpecificOutput {
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    #[serde(rename = "permissionDecision")]
+    pub permission_decision: String,
+    #[serde(rename = "permissionDecisionReason")]
+    pub permission_decision_reason: String,
+}
+
+impl PreToolUseOutput {
+    fn new(decision: &str, reason: impl Into<String>) -> Self {
+        Self {
+            hook_specific_output: PreToolUseSpecificOutput {
+                hook_event_name: "PreToolUse".to_string(),
+                permission_decision: decision.to_string(),
+                permission_decision_reason: reason.into(),
+            },
+        }
+    }
+
+    /// Allow the tool call to proceed (the fail-open default).
+    pub fn allow() -> Self {
+        Self::new("allow", String::new())
+    }
+
+    /// Deny the tool call, surfacing `reason` to the agent.
+    pub fn deny(reason: impl Into<String>) -> Self {
+        Self::new("deny", reason)
+    }
+
+    /// Ask the operator to decide (reserved; not emitted by the scaffold).
+    pub fn ask(reason: impl Into<String>) -> Self {
+        Self::new("ask", reason)
+    }
+
+    /// Print the envelope to stdout. Serialisation errors propagate to the
+    /// caller, which logs them to stderr but exits 0.
+    pub fn emit(&self) -> anyhow::Result<()> {
+        let json = serde_json::to_string(self)?;
+        println!("{json}");
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +112,33 @@ mod tests {
                     "additionalContext": "watch out"
                 }
             })
+        );
+    }
+
+    #[test]
+    fn pre_tool_use_allow_shape() {
+        let out = PreToolUseOutput::allow();
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": ""
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn pre_tool_use_deny_shape() {
+        let out = PreToolUseOutput::deny("file held by another passport");
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecisionReason"],
+            "file held by another passport"
         );
     }
 }

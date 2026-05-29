@@ -65,6 +65,7 @@ corecrux-segment = { path = "../corecrux-segment" }
 corecrux-storage = { path = "../corecrux-storage" }
 corecrux-types = { path = "../corecrux-types" }
 crux-observe = { path = "../crux-observe" }
+crux-observe-api = { path = "../crux-observe-api" }
 crux-integrations = { path = "../crux-integrations" }
 crux-lens-features = { path = "../crux-lens-features" }
 crux-mcp = { path = "../crux-mcp" }
@@ -80,6 +81,7 @@ sha2 = "0.11"
 corecrux-index = { path = "../corecrux-index" }
 serial_test = "3"
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
 wat = "1"
 
 [build-dependencies]

@@ -34,8 +34,10 @@ pub mod memory;
 pub mod memory_use;
 pub mod observations;
 pub mod observe;
+pub mod orchestrators;
 pub mod output_attest;
 pub mod passport;
+pub mod punchcards;
 pub mod query;
 pub mod receipt_verify;
 pub mod sessions;
@@ -1733,6 +1735,25 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 ]
             }),
         },
+        // ── Orchestrators (Package S scaffold) ─────────────────────
+        ToolDefinition {
+            name: "create_orchestrator".to_string(),
+            description: orchestrators::CREATE_ORCHESTRATOR_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name":                { "type": "string" },
+                    "created_by_passport": { "type": "string", "description": "The passport authoring this orchestrator." },
+                    "assignee_passport":   { "type": "string" },
+                    "tenant_id":           { "type": "string" },
+                    "state":               { "type": "string", "enum": ["planned","active","done","archived"] }
+                },
+                "required": ["name", "created_by_passport"],
+                "examples": [
+                    { "name": "Q500 lift squad", "created_by_passport": "personal-default" }
+                ]
+            }),
+        },
         ToolDefinition {
             name: "approval_decide".to_string(),
             description: "Risk-tiered HITL: operator decision on a pending approval. Requires \
@@ -1756,6 +1777,132 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["request_id", "decision"],
                 "examples": [
                     { "request_id": "ar_abcd1234", "decision": "approve", "reviewer_tier": "elite", "reviewer_tenant_id": "business::acme", "reviewer_notes": "approved per ticket #42" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "attach_to_orchestrator".to_string(),
+            description: orchestrators::ATTACH_TO_ORCHESTRATOR_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "orchestrator_id": { "type": "string" },
+                    "member_ref":      { "type": "string", "description": "A passport id or a work item id to attach." }
+                },
+                "required": ["orchestrator_id", "member_ref"],
+                "examples": [
+                    { "orchestrator_id": "orc_abc123", "member_ref": "w_def456" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "detach_from_orchestrator".to_string(),
+            description: orchestrators::DETACH_FROM_ORCHESTRATOR_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "orchestrator_id": { "type": "string" },
+                    "member_ref":      { "type": "string" }
+                },
+                "required": ["orchestrator_id", "member_ref"],
+                "examples": [
+                    { "orchestrator_id": "orc_abc123", "member_ref": "w_def456" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "list_orchestrators".to_string(),
+            description: orchestrators::LIST_ORCHESTRATORS_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "tenant_id": { "type": "string" },
+                    "state":     { "type": "string", "enum": ["planned","active","done","archived"] }
+                },
+                "examples": [ {}, { "state": "active" } ]
+            }),
+        },
+        // ── Punchcards (Package S scaffold) ────────────────────────
+        ToolDefinition {
+            name: "punch_in".to_string(),
+            description: punchcards::PUNCH_IN_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "resource":           { "type": "string", "description": "Resource to lease, e.g. file:///path or a deploy-target id." },
+                    "holder_passport":    { "type": "string", "description": "The passport acquiring the lease." },
+                    "mode":               { "type": "string", "enum": ["modify","deploy"] },
+                    "tenant_id":          { "type": "string" },
+                    "reason":             { "type": "string" },
+                    "expires_at_unix_ms": { "type": "integer" }
+                },
+                "required": ["resource", "holder_passport"],
+                "examples": [
+                    { "resource": "file:///home/x/main.rs", "holder_passport": "personal-default", "mode": "modify" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "punch_out".to_string(),
+            description: punchcards::PUNCH_OUT_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "resource":           { "type": "string" },
+                    "holder_passport":    { "type": "string" },
+                    "release_commit_sha": { "type": "string" },
+                    "tenant_id":          { "type": "string" }
+                },
+                "required": ["resource", "holder_passport"],
+                "examples": [
+                    { "resource": "file:///home/x/main.rs", "holder_passport": "personal-default" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "list_punchcards".to_string(),
+            description: punchcards::LIST_PUNCHCARDS_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "resource":        { "type": "string" },
+                    "holder_passport": { "type": "string" },
+                    "tenant_id":       { "type": "string" },
+                    "status":          { "type": "string", "enum": ["held","released","expired","force_released"] }
+                },
+                "examples": [ {}, { "status": "held" } ]
+            }),
+        },
+        ToolDefinition {
+            name: "force_release".to_string(),
+            description: punchcards::FORCE_RELEASE_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "punchcard_id": { "type": "string" },
+                    "confirm":      { "type": "boolean", "description": "Required true — force-release is destructive (Art.14)." },
+                    "reason":       { "type": "string" },
+                    "by_passport":  { "type": "string", "description": "Operator passport performing the override." }
+                },
+                "required": ["punchcard_id", "confirm"],
+                "examples": [
+                    { "punchcard_id": "pc_abc123", "confirm": true, "reason": "stale lease, holder offline" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "check_punchcard".to_string(),
+            description: punchcards::CHECK_PUNCHCARD_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "resource": { "type": "string", "description": "Resource URI: file://<path>, tree://<subtree>, or service://<name>." },
+                    "mode":     { "type": "string", "enum": ["modify","deploy"] },
+                    "passport": { "type": "string", "description": "Probing passport; defaults to the calling passport." }
+                },
+                "required": ["resource"],
+                "examples": [
+                    { "resource": "file:///home/x/main.rs", "mode": "modify" }
                 ]
             }),
         },
@@ -2030,7 +2177,16 @@ pub fn tool_output_docs() -> Value {
         { "tool": "feature_suggest_next",    "output": "{ content: [...], suggestions: [{kind, capability_id?, gap_type?, severity?, promise?, rationale}], count }" },
         { "tool": "tool_trace_recent",       "output": "{ content: [...], traces: [{tool, ts_us, turn_id?, predicted_effects: [{kind, entity, key, ts_us?}], outcome}], count, feature_disabled? } — per-passport; reserved-prefix effects stripped." },
         { "tool": "approval_request",        "output": "{ content: [...], request_id, status: 'pending'|'feature_disabled', risk_tier, tenant_id, feature_enabled } — pending entries also visible via list_work(state='pending_approval')." },
-        { "tool": "approval_decide",         "output": "{ content: [...], ok, request_id, status: 'approved'|'rejected', reviewer_passport, decided_at, receipt_id, receipt_body_hash_hex, tenant_id, risk_tier } — non-operator callers receive a 403-style JSON-RPC error with `why_denied`." }
+        { "tool": "approval_decide",         "output": "{ content: [...], ok, request_id, status: 'approved'|'rejected', reviewer_passport, decided_at, receipt_id, receipt_body_hash_hex, tenant_id, risk_tier } — non-operator callers receive a 403-style JSON-RPC error with `why_denied`." },
+        { "tool": "create_orchestrator",      "output": "Orchestrator record { id, name, assignee_passport, created_by_passport, tenant_id, state, members[], created_at_unix_ms, updated_at_unix_ms }. (Package S scaffold: daemon endpoint stubbed → 501 until the orchestrators plan ships.)" },
+        { "tool": "attach_to_orchestrator",   "output": "Updated orchestrator record with the member added. (Package S scaffold: 501 until shipped.)" },
+        { "tool": "detach_from_orchestrator", "output": "Updated orchestrator record with the member removed. (Package S scaffold: 501 until shipped.)" },
+        { "tool": "list_orchestrators",       "output": "{ count, orchestrators: [Orchestrator] }. (Package S scaffold: 501 until shipped.)" },
+        { "tool": "punch_in",                 "output": "Punchcard lease record { id, resource, mode, holder_passport, tenant_id, status, acquired_at_unix_ms, expires_at_unix_ms?, receipt_acquire }. (Package S scaffold: 501 until the punchcard plan ships.)" },
+        { "tool": "punch_out",                "output": "Released punchcard record (status=released, released_at_unix_ms, release_commit_sha?, receipt_release). (Package S scaffold: 501 until shipped.)" },
+        { "tool": "list_punchcards",          "output": "{ count, punchcards: [Punchcard] }. (Package S scaffold: 501 until shipped.)" },
+        { "tool": "force_release",            "output": "Force-released punchcard record (status=force_released, force_released_by, receipt_release). Requires confirm=true (Art.14)." },
+        { "tool": "check_punchcard",          "output": "Lease probe { held_by_other, enforce, holder_passport, resource, mode, expires_at_unix_ms }. Always 200 (fail-open); the PreToolUse hook denies only when held_by_other && enforce." }
     ])
 }
 
@@ -2119,6 +2275,17 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "create_work" => coordination::handle_create_work(args, ctx).await,
         "update_work_state" => coordination::handle_update_work_state(args, ctx).await,
         "comment_on_work" => coordination::handle_comment_on_work(args, ctx).await,
+        // Orchestrators (Package S scaffold).
+        "create_orchestrator" => orchestrators::handle_create_orchestrator(args, ctx).await,
+        "attach_to_orchestrator" => orchestrators::handle_attach_to_orchestrator(args, ctx).await,
+        "detach_from_orchestrator" => orchestrators::handle_detach_from_orchestrator(args, ctx).await,
+        "list_orchestrators" => orchestrators::handle_list_orchestrators(args, ctx).await,
+        // Punchcards (Package S scaffold).
+        "punch_in" => punchcards::handle_punch_in(args, ctx).await,
+        "punch_out" => punchcards::handle_punch_out(args, ctx).await,
+        "list_punchcards" => punchcards::handle_list_punchcards(args, ctx).await,
+        "force_release" => punchcards::handle_force_release(args, ctx).await,
+        "check_punchcard" => punchcards::handle_check_punchcard(args, ctx).await,
         // GitHub (Plan B G5).
         "github_search" => github::handle_github_search(args, ctx).await,
         "github_recent_commits" => github::handle_github_recent_commits(args, ctx).await,
@@ -2189,7 +2356,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 84; // 81 prior (incl. audit_export_bundle agent-ux-11 + freshness agent-ux-03 + autonomy_contract agent-ux-10 + receipt_verify agent-ux-04 + tool_trace_recent agent-ux-06 + 2 approvals agent-ux-05 + 3 artefacts agent-ux-12 + output_attest agent-ux-07) + 3 identity-continuity (agent-ux-08).
+    const TOOL_COUNT: usize = 93; // main 84 (agent-ux + identity-continuity) + 9 backend (4 orchestrator + 4 punchcard + check_punchcard).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

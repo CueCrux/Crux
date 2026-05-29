@@ -33,6 +33,11 @@ pub struct HandoffPackage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_agent: Option<String>,
     pub message: Option<String>,
+    /// Agent-graph: work item ids bundled with this handoff so the receiver
+    /// can pick up the queued work without a separate `list_work` round-trip.
+    /// Additive + `#[serde(default)]` so existing packages deserialise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_ids: Vec<String>,
 }
 
 /// An authenticated handoff package.
@@ -107,6 +112,14 @@ pub fn create_handoff(
         Vec::new()
     };
 
+    // Agent-graph (orchestrators plan, M5): bundle the work item ids the
+    // receiver should pick up so it can resume without a separate `list_work`
+    // round-trip. Sources, in order of precedence:
+    //   1. work / execplan ids referenced anywhere in the session state JSON
+    //   2. `__work__::<project>::<work_id>` record facts pulled into the bundle
+    // Additive — empty when neither source yields ids (old behaviour).
+    let work_ids = collect_work_ids(session_state.as_ref(), &facts);
+
     let package = HandoffPackage {
         session_id: request.session_id.to_string(),
         session_state,
@@ -115,6 +128,7 @@ pub fn create_handoff(
         source_agent: request.source_agent.to_string(),
         target_agent: request.target_agent,
         message: request.message,
+        work_ids,
     };
 
     let payload_json = serde_json::to_vec(&package)?;
@@ -242,6 +256,55 @@ fn collect_relevant_facts(
             .then_with(|| left.fact_id.cmp(&right.fact_id))
     });
     facts
+}
+
+/// Collect work item ids to bundle on a handoff (orchestrators plan, M5).
+///
+/// Returns a deterministically-ordered, de-duplicated list drawn from:
+///   - `w_…` and `execplan:…` ids referenced anywhere in the session state
+///   - `__work__::<project>::<work_id>` entities present in the bundled facts
+///     (the trailing `::`-separated segment is the work id)
+fn collect_work_ids(session_state: Option<&serde_json::Value>, facts: &[Fact]) -> Vec<String> {
+    let mut ids: BTreeSet<String> = BTreeSet::new();
+    if let Some(state) = session_state {
+        collect_work_ids_from_value(state, &mut ids);
+    }
+    for fact in facts {
+        if fact.deleted {
+            continue;
+        }
+        if let Some(rest) = fact.entity.strip_prefix("__work__::") {
+            if let Some(work_id) = rest.rsplit("::").next() {
+                if !work_id.is_empty() {
+                    ids.insert(work_id.to_string());
+                }
+            }
+        }
+    }
+    ids.into_iter().collect()
+}
+
+/// Recursively harvest work/execplan ids from a JSON value. A string is taken
+/// as a work id when it starts with `w_` or `execplan:`.
+fn collect_work_ids_from_value(value: &serde_json::Value, ids: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.starts_with("w_") || text.starts_with("execplan:") {
+                ids.insert(text.clone());
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_work_ids_from_value(item, ids);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_work_ids_from_value(item, ids);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn extract_fact_ids(value: Option<&serde_json::Value>) -> BTreeSet<String> {
@@ -547,6 +610,76 @@ mod tests {
         assert!(result.session_loaded);
         assert_eq!(result.facts_loaded, 0);
         assert_eq!(recv_facts.count(), 0);
+    }
+
+    #[test]
+    fn collect_work_ids_from_session_and_facts() {
+        // Session state references a work id and an execplan id.
+        let state = json!({
+            "current": "w_alpha",
+            "queue": ["w_beta", "execplan:my-plan", "not-a-work-id"],
+            "nested": { "ref": "w_alpha" }
+        });
+        // A bundled __work__ record fact contributes a third work id.
+        let mut fs = FactStore::new();
+        let work_fact = fs.store(StoreFact {
+            entity: "__work__::default::w_gamma".to_string(),
+            key: "record".to_string(),
+            value: "{}".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+        });
+        let facts = vec![work_fact];
+        let ids = collect_work_ids(Some(&state), &facts);
+        // De-duplicated + sorted (BTreeSet): w_alpha appears once.
+        assert_eq!(
+            ids,
+            vec![
+                "execplan:my-plan".to_string(),
+                "w_alpha".to_string(),
+                "w_beta".to_string(),
+                "w_gamma".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn handoff_bundles_work_ids_and_old_packages_still_verify() {
+        let (sessions, facts) = seed_stores();
+        // Add a work id reference into the session state so the bundler picks it up.
+        let mut s = sessions;
+        let mut state = s.get("sess_handoff").unwrap().state.clone();
+        state["active_work"] = json!(["w_handoff_demo"]);
+        s.put("sess_handoff", state, None);
+
+        let signed = create_handoff(
+            &s,
+            &facts,
+            CreateHandoffRequest {
+                session_id: "sess_handoff",
+                stored_session_id: "sess_handoff",
+                include_facts: false,
+                source_agent: "agent-alpha",
+                target_agent: None,
+                message: None,
+            },
+            &HANDOFF_KEY,
+        )
+        .expect("create_handoff should succeed");
+
+        // The package carries the work id...
+        let payload: HandoffPackage =
+            serde_json::from_slice(&B64.decode(&signed.payload_b64).unwrap()).expect("decode package");
+        assert_eq!(payload.work_ids, vec!["w_handoff_demo".to_string()]);
+
+        // ...and still verifies end-to-end (additive field doesn't break the MAC).
+        let mut recv_sessions = SessionStore::new();
+        let mut recv_facts = FactStore::new();
+        let result = accept_handoff(&mut recv_sessions, &mut recv_facts, &signed, None, &HANDOFF_KEY)
+            .expect("accept_handoff should succeed");
+        assert!(result.verified);
     }
 
     #[test]

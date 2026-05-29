@@ -24,11 +24,14 @@ mod integrations_openai;
 pub mod invocation;
 pub(crate) mod observations;
 mod observe;
+mod observe_audit;
 mod openapi;
+mod orchestrators;
 mod passports;
 mod planes;
 mod projections;
 mod projects;
+mod punchcards;
 mod query;
 mod rcx_publish;
 mod receipts;
@@ -975,6 +978,11 @@ pub fn router(state: AppState) -> Router {
             "/v1/console/chunks/{chunkDigest}/preview",
             get(self::console::get_console_chunk_preview),
         )
+        // Agent-graph backends (Package S scaffold). Each surface is gated
+        // default-OFF and merged here so Wave-2 plans never touch this file.
+        .merge(self::observe_audit::routes())
+        .merge(self::orchestrators::routes())
+        .merge(self::punchcards::routes())
         .layer(middleware::from_fn_with_state(state.clone(), presence_middleware))
         .with_state(state)
         // Built-in web playground (stateless, merged after with_state)

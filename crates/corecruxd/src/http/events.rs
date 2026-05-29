@@ -62,6 +62,9 @@ pub(super) async fn event_stream(
                     corecrux_memory::events::CruxEvent::FactDeleted { .. } => "fact.deleted",
                     corecrux_memory::events::CruxEvent::SessionStored { .. } => "session.stored",
                     corecrux_memory::events::CruxEvent::SessionDeleted { .. } => "session.deleted",
+                    corecrux_memory::events::CruxEvent::AuditStep { .. } => "observe.audit_step",
+                    corecrux_memory::events::CruxEvent::OrchestratorChanged { .. } => "orchestrator.changed",
+                    corecrux_memory::events::CruxEvent::PunchcardChanged { .. } => "punchcard.changed",
                 };
                 if let Some(ref f) = filter {
                     if !f.contains(event_type) {

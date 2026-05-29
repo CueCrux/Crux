@@ -90,6 +90,10 @@ pub struct WorkItem {
     pub current_milestone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// Agent-graph: orchestrator this work item belongs to, if any. Additive
+    /// + `#[serde(default)]` so existing records remain byte-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -176,6 +180,7 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         plan_path: None,
         current_milestone: None,
         superseded_by: None,
+        orchestrator_id: None,
     };
     write_record(store, &item)?;
     write_transition(
@@ -530,6 +535,14 @@ fn get_gate(store: &FactStore, action_id: &str) -> Option<PendingGateAction> {
         }
     }
     None
+}
+
+/// Public re-write of an existing work item record. Used by the orchestrator
+/// surface to stamp / clear `orchestrator_id` without going through the full
+/// `update_work` state-machine (which would emit a spurious transition). The
+/// caller is responsible for having loaded a current copy via `get_work`.
+pub fn write_work_record(store: &mut FactStore, item: &WorkItem) -> Result<(), WorkError> {
+    write_record(store, item)
 }
 
 fn write_record(store: &mut FactStore, item: &WorkItem) -> Result<(), WorkError> {

@@ -895,6 +895,7 @@ dependencies = [
  "crux-lens-features",
  "crux-mcp",
  "crux-observe",
+ "crux-observe-api",
  "crux-router",
  "crux-session",
  "ed25519-dalek",
@@ -918,6 +919,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-opentelemetry",
@@ -1333,6 +1335,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "crux-observe-api"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
