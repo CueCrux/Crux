@@ -138,17 +138,14 @@ mod tests {
                         201,
                         r#"{"orchestrator":{"kind":"orchestrator","id":"orc_1","payload":{"id":"orc_1","name":"Coord","state":"planned","members":[]}}}"#,
                     ),
-                    ("GET", p) if p.starts_with("/v1/orchestrators/orc_1/members") => {
-                        (404, r#"{"detail":"unused"}"#)
-                    }
+                    ("GET", p) if p.starts_with("/v1/orchestrators/orc_1/members") => (404, r#"{"detail":"unused"}"#),
                     ("POST", "/v1/orchestrators/orc_1/members") => (
                         200,
                         r#"{"orchestrator":{"id":"orc_1","payload":{"members":[{"type":"work","ref":"w_1"}]}}}"#,
                     ),
-                    ("DELETE", p) if p.starts_with("/v1/orchestrators/orc_1/members/") => (
-                        200,
-                        r#"{"orchestrator":{"id":"orc_1","payload":{"members":[]}}}"#,
-                    ),
+                    ("DELETE", p) if p.starts_with("/v1/orchestrators/orc_1/members/") => {
+                        (200, r#"{"orchestrator":{"id":"orc_1","payload":{"members":[]}}}"#)
+                    }
                     ("GET", p) if p.starts_with("/v1/orchestrators") => (
                         200,
                         r#"{"orchestrators":[{"id":"orc_1","payload":{"state":"planned"}}],"count":1}"#,
@@ -193,24 +190,21 @@ mod tests {
         assert_eq!(created["orchestrator"]["id"], "orc_1");
 
         let attached = text_json(
-            handle_attach_to_orchestrator(
-                &json!({ "orchestrator_id": "orc_1", "member_ref": "w_1" }),
-                &ctx,
-            )
-            .await
-            .expect("attach"),
+            handle_attach_to_orchestrator(&json!({ "orchestrator_id": "orc_1", "member_ref": "w_1" }), &ctx)
+                .await
+                .expect("attach"),
         );
         assert_eq!(attached["orchestrator"]["payload"]["members"][0]["ref"], "w_1");
 
         let detached = text_json(
-            handle_detach_from_orchestrator(
-                &json!({ "orchestrator_id": "orc_1", "member_ref": "w_1" }),
-                &ctx,
-            )
-            .await
-            .expect("detach"),
+            handle_detach_from_orchestrator(&json!({ "orchestrator_id": "orc_1", "member_ref": "w_1" }), &ctx)
+                .await
+                .expect("detach"),
         );
-        assert!(detached["orchestrator"]["payload"]["members"].as_array().unwrap().is_empty());
+        assert!(detached["orchestrator"]["payload"]["members"]
+            .as_array()
+            .unwrap()
+            .is_empty());
 
         let listed = text_json(
             handle_list_orchestrators(&json!({ "tenant_id": "tenant-a", "state": "planned" }), &ctx)

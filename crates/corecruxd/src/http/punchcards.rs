@@ -44,7 +44,7 @@ use super::{
     problem_response, require_http_any_scope, AppState, HeaderMap, IntoResponse, Json, Query, Response, State,
     StatusCode,
 };
-use crate::agentgraph_kinds::{punchcard_mode, punchcard_enabled, PunchcardMode, PUNCHCARD_KIND};
+use crate::agentgraph_kinds::{punchcard_enabled, punchcard_mode, PunchcardMode, PUNCHCARD_KIND};
 
 /// Default lease TTL when a caller omits `ttl_secs`.
 const DEFAULT_TTL_SECS: u64 = 1800;
@@ -254,7 +254,10 @@ async fn sweep_expired(state: &AppState) -> usize {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("status".to_string(), json!("expired"));
         }
-        if store.upsert(PUNCHCARD_KIND, &id, payload, "system:punchcard-sweep", registry_opt).is_ok() {
+        if store
+            .upsert(PUNCHCARD_KIND, &id, payload, "system:punchcard-sweep", registry_opt)
+            .is_ok()
+        {
             state
                 .event_bus
                 .emit(corecrux_memory::events::CruxEvent::PunchcardChanged {
@@ -351,7 +354,11 @@ pub(super) async fn acquire(
                         id: id.clone(),
                         status: "held".to_string(),
                     });
-                (StatusCode::OK, Json(json!({"punchcard": rec.payload, "reentrant": true}))).into_response()
+                (
+                    StatusCode::OK,
+                    Json(json!({"punchcard": rec.payload, "reentrant": true})),
+                )
+                    .into_response()
             }
             Err(e) => problem_response(StatusCode::BAD_REQUEST, e.to_string()),
         };
@@ -525,11 +532,7 @@ pub(super) async fn list_punchcards(
     (StatusCode::OK, Json(json!({"punchcards": punchcards, "count": count}))).into_response()
 }
 
-pub(super) async fn check(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<CheckBody>,
-) -> Response {
+pub(super) async fn check(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<CheckBody>) -> Response {
     // `check` always returns 200 (even when disabled / no conflict) so the
     // PreToolUse hook can read the body and fail-open. When the surface is
     // disabled we report `enforce:false, held_by_other:false` → ALLOW.
@@ -571,10 +574,7 @@ pub(super) async fn check(
         let card_resource = payload_str(&rec.payload, "resource").unwrap_or_default();
         let card_holder = payload_str(&rec.payload, "holder_passport").unwrap_or_default();
         if card_holder != probe && resources_overlap(&card_resource, &body.resource) {
-            Some((
-                card_holder,
-                payload_i64(&rec.payload, "expires_at_unix_ms"),
-            ))
+            Some((card_holder, payload_i64(&rec.payload, "expires_at_unix_ms")))
         } else {
             None
         }
@@ -617,10 +617,7 @@ pub(super) async fn force_release(
             "force-release is destructive; resubmit with {\"confirm\": true}",
         );
     }
-    let by = body
-        .by_passport
-        .clone()
-        .unwrap_or_else(|| actor(&state, &headers));
+    let by = body.by_passport.clone().unwrap_or_else(|| actor(&state, &headers));
     let now = now_unix_ms();
     let registry = state.kind_registry.read().await;
     let registry_opt = registry.is_registered(PUNCHCARD_KIND).then_some(&*registry);
@@ -730,7 +727,8 @@ mod tests {
 
     #[test]
     fn released_card_is_never_expired_or_active() {
-        let p = json!({"status": "released", "resource": "file:///x", "holder_passport": "A", "expires_at_unix_ms": 1_000});
+        let p =
+            json!({"status": "released", "resource": "file:///x", "holder_passport": "A", "expires_at_unix_ms": 1_000});
         assert!(!is_expired_held(&p, 2_000));
         assert!(!is_active_held(&p, 500));
     }
@@ -970,10 +968,7 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CREATED);
-        let card_id = body_json(resp).await["punchcard"]["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let card_id = body_json(resp).await["punchcard"]["id"].as_str().unwrap().to_string();
 
         // Force the stored card's expiry into the past (simulate a crashed
         // holder whose TTL elapsed) without sleeping.
@@ -982,13 +977,11 @@ mod tests {
             let reg_opt = registry.is_registered(PUNCHCARD_KIND).then_some(&*registry);
             let mut store = state.entity_store.write().await;
             let mut payload = store.get(PUNCHCARD_KIND, &card_id).unwrap().payload.clone();
-            payload.as_object_mut().unwrap().insert(
-                "expires_at_unix_ms".to_string(),
-                json!(now_unix_ms() - 10_000),
-            );
-            store
-                .upsert(PUNCHCARD_KIND, &card_id, payload, "A", reg_opt)
-                .unwrap();
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("expires_at_unix_ms".to_string(), json!(now_unix_ms() - 10_000));
+            store.upsert(PUNCHCARD_KIND, &card_id, payload, "A", reg_opt).unwrap();
         }
 
         // B acquires the same resource: the sweep flips A's card to expired,
@@ -1117,10 +1110,7 @@ mod tests {
             JsonExtract(acquire_body("file:///proj/f.rs", 600)),
         )
         .await;
-        let card_id = body_json(resp).await["punchcard"]["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let card_id = body_json(resp).await["punchcard"]["id"].as_str().unwrap().to_string();
 
         // force-release without confirm → 400.
         let resp = force_release(

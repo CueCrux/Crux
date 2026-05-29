@@ -503,7 +503,9 @@ pub(super) async fn add_member(
             None => {
                 return problem_response(
                     StatusCode::BAD_REQUEST,
-                    format!("could not infer member type for '{member_ref}'; pass an explicit type (execplan|work|handoff)"),
+                    format!(
+                        "could not infer member type for '{member_ref}'; pass an explicit type (execplan|work|handoff)"
+                    ),
                 )
             }
         },

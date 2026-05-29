@@ -540,7 +540,11 @@ pub fn list_execplans(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::
 /// `/v1/work?orchestrator=<id>` filter resolves an orchestrator's members.
 ///
 /// Mutates in place; items not in `member_ids` are left untouched.
-pub fn stamp_orchestrator_id(items: &mut [WorkItem], member_ids: &std::collections::HashSet<String>, orchestrator_id: &str) {
+pub fn stamp_orchestrator_id(
+    items: &mut [WorkItem],
+    member_ids: &std::collections::HashSet<String>,
+    orchestrator_id: &str,
+) {
     for item in items.iter_mut() {
         if member_ids.contains(&item.id) {
             item.orchestrator_id = Some(orchestrator_id.to_string());

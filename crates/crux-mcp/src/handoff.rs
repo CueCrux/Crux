@@ -676,14 +676,8 @@ mod tests {
         // ...and still verifies end-to-end (additive field doesn't break the MAC).
         let mut recv_sessions = SessionStore::new();
         let mut recv_facts = FactStore::new();
-        let result = accept_handoff(
-            &mut recv_sessions,
-            &mut recv_facts,
-            &signed,
-            None,
-            &HANDOFF_KEY,
-        )
-        .expect("accept_handoff should succeed");
+        let result = accept_handoff(&mut recv_sessions, &mut recv_facts, &signed, None, &HANDOFF_KEY)
+            .expect("accept_handoff should succeed");
         assert!(result.verified);
     }
 
