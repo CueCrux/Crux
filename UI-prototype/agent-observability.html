@@ -27,10 +27,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Crux Console · graph navigator — UX prototype</title>
 <script>
   (function(){ try{ if((localStorage.getItem('cx-theme')||'dark')==='dark') document.documentElement.classList.add('dark'); }catch(e){ document.documentElement.classList.add('dark'); } })();
+  // brand logo fallback: if the asset 404s (file moved / embedded elsewhere), reveal the inline SVG mark instead of a broken image
+  function brandFallback(img){ img.style.display='none'; const fb=img.closest('.wc-brand'); const s=fb&&fb.querySelector('.wc-logo-fb'); if(s) s.style.display='block'; }
 </script>
 <style>
   :root {
@@ -69,6 +71,23 @@
   .wc-header-inner { max-width:90rem; margin:0 auto; display:flex; align-items:center; justify-content:space-between; gap:.75rem; padding:.6rem 1rem; }
   .wc-brand { display:flex; align-items:center; gap:.7rem; text-decoration:none; } .wc-brand img { height:2.1rem; width:2.1rem; }
   .logo-dark { display:none; } html.dark .logo-light { display:none; } html.dark .logo-dark { display:block; }
+  .wc-logo-fb { display:none; color:var(--accent); }   /* inline brand mark, revealed only if the logo asset fails to load */
+  /* ── accessibility guardrails (required by playground::tests) ── */
+  .skip-link { position:absolute; left:-9999px; top:0; z-index:100; background:var(--accent); color:#fff; padding:8px 14px; border-radius:0 0 8px 0; min-height: 44px; }
+  .skip-link:focus { left:0; }
+  .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:4px; }
+  @media (prefers-reduced-motion: reduce){ *,*::before,*::after { transition-duration:.001ms !important; animation-duration:.001ms !important; animation-iteration-count:1 !important; scroll-behavior:auto !important; } }
+  @media (pointer: coarse){ button, .wc-centre-pill, .search-input, input, select, .skip-link { min-height: 44px; } }
+  /* live/demo connection badge */
+  .live-badge { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--text-muted); background:var(--surface-glass-strong); border:1px solid var(--border-default); border-radius:var(--radius-full); padding:2px 8px; }
+  .live-badge.on { color:var(--ok); border-color:var(--ok); }
+  /* live-data status tiles (loading/empty/error/unavailable) — inert placeholders */
+  .gnode[data-kind="loading"], .gnode[data-kind="empty"], .gnode[data-kind="unavailable"], .gnode[data-kind="error"] { opacity:.9; font-style:italic; }
+  .gnode[data-kind="loading"] .gstripe { background:var(--run); animation:cxpulse 1s ease-in-out infinite; }
+  .gnode[data-kind="error"] .gstripe { background:var(--err); } .gnode[data-kind="error"] { cursor:pointer; }
+  .gnode[data-kind="unavailable"] .gstripe, .gnode[data-kind="empty"] .gstripe { background:var(--idle); }
+  @keyframes cxpulse { 0%,100%{opacity:.4} 50%{opacity:1} }
   .wc-wordmark { font-size:1.6rem; line-height:1; font-weight:700; letter-spacing:-.02em; color:var(--text-primary); }
   .wc-centre-pills { display:flex; align-items:center; gap:4px; padding:3px; background:var(--surface-glass-muted); border-radius:var(--radius-full); border:1px solid var(--border-light); }
   .wc-centre-pill { padding:6px 16px; font-size:.82rem; font-weight:600; color:var(--text-secondary); border-radius:var(--radius-full); cursor:pointer; user-select:none; transition:color var(--transition-fast) ease, background var(--transition-fast) ease; }
@@ -92,7 +111,9 @@
 
   /* canvas */
   main { flex:1; display:flex; min-height:0; }
-  .canvas-wrap { flex:1; position:relative; overflow:auto; background-image:radial-gradient(circle, var(--dot) 1px, transparent 1px); background-size:22px 22px; }
+  .canvas-wrap { flex:1; position:relative; overflow:hidden; }
+  /* inner scroller holds the graph; the build dock is a non-scrolling sibling so it stays pinned to the viewport, not the content */
+  #canvasScroll { position:absolute; inset:0; overflow:auto; background-image:radial-gradient(circle, var(--dot) 1px, transparent 1px); background-size:22px 22px; }
   #edges { position:absolute; left:0; top:0; pointer-events:none; } #nodes { position:absolute; left:0; top:0; }
 
   .gnode { position:absolute; box-sizing:border-box; padding:8px 11px 8px 15px; background:var(--surface-glass-strong); border:1.4px solid var(--border-default); border-radius:11px; cursor:pointer; box-shadow:var(--shadow-sm); overflow:hidden; user-select:none; transition:border-color .12s ease, box-shadow .12s ease, transform .12s ease; }
@@ -136,34 +157,86 @@
   .gnode[data-kind="punchcard"] .gtitle, .gnode[data-kind="deny"] .gtitle { font-family:var(--font-mono); font-size:10.5px; font-weight:600; }
   .gnode[data-kind="conformance"] .gkind, .gnode[data-kind="export"] .gkind { color:var(--accent); }
 
-  /* Orchestrator builder modal */
-  .modal { position:fixed; inset:0; background:rgba(2,2,3,.55); display:none; align-items:center; justify-content:center; z-index:50; }
-  .modal-panel { width:700px; max-width:92vw; max-height:86vh; overflow:auto; background:var(--surface-glass-strong); backdrop-filter:blur(var(--blur-md)); border:1px solid var(--border-default); border-radius:var(--radius-xl); box-shadow:var(--shadow-lg); padding:18px 20px; }
-  .modal-panel h2 { margin:0 0 4px; font-size:16px; color:var(--text-primary); }
-  .modal-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:14px; }
-  .builder-col h3 { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:var(--text-muted); margin:0 0 8px; }
-  .field-row { display:flex; gap:10px; align-items:center; margin-top:10px; }
-  .field-row input, .field-row select { background:var(--surface-glass); border:1px solid var(--border-default); border-radius:9px; padding:7px 10px; color:var(--text-primary); font:inherit; font-size:12px; }
-  .field-row input { flex:1; }
-  .filter-row { display:flex; gap:4px; margin-bottom:8px; }
-  .filter-row button { font-size:11px; padding:3px 10px; border-radius:var(--radius-full); border:1px solid var(--border-default); background:var(--surface-glass); color:var(--text-secondary); cursor:pointer; }
-  .filter-row button.on { border-color:var(--accent); color:var(--text-primary); }
-  .chip { display:flex; align-items:center; gap:6px; padding:6px 9px; border:1px solid var(--border-default); border-radius:9px; background:var(--surface-glass); margin-bottom:6px; cursor:grab; font-size:12px; color:var(--text-primary); }
-  .chip:hover { border-color:var(--accent); }
-  .chip .tag { font-size:9px; padding:1px 7px; border-radius:999px; margin-left:auto; background:var(--surface-glass-muted); color:var(--text-muted); }
-  .dropzone { min-height:170px; border:1.5px dashed var(--border-strong); border-radius:12px; padding:10px; background:var(--surface-glass-muted); }
-  .dropzone.over { border-color:var(--accent); background:color-mix(in srgb, var(--accent) 9%, transparent); }
-  .dropzone .empty { color:var(--text-muted); font-size:12px; text-align:center; padding:48px 12px; }
-  .member { display:flex; align-items:center; gap:6px; padding:6px 9px; border:1px solid var(--border-default); border-radius:8px; background:var(--surface-glass); margin-bottom:6px; font-size:12px; color:var(--text-primary); }
-  .member button { margin-left:auto; border:none; background:none; color:var(--text-muted); cursor:pointer; font-size:15px; line-height:1; }
-  .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:16px; }
-  .modal-actions button { padding:7px 16px; border-radius:var(--radius-full); border:1px solid var(--border-default); background:var(--surface-glass); color:var(--text-primary); cursor:pointer; font-weight:600; font-size:12px; }
-  .modal-actions .primary { background:linear-gradient(135deg, rgba(37,99,235,.95), rgba(96,165,250,.95)); color:#fff; border:none; }
-
   /* hero width drag-grip */
-  .gnode.hero .hero-resize { position:absolute; top:0; right:0; bottom:0; width:10px; cursor:col-resize; }
+  .gnode.hero .hero-resize { position:absolute; top:44px; right:0; bottom:0; width:10px; cursor:col-resize; }
   .gnode.hero .hero-resize::after { content:""; position:absolute; right:2px; top:50%; transform:translateY(-50%); height:44px; width:3px; border-radius:2px; background:var(--border-strong); transition:background .12s ease; }
   .gnode.hero .hero-resize:hover::after { background:var(--accent); }
+
+  /* ── search field (breadcrumb bar) ── */
+  .search-wrap { display:flex; align-items:center; gap:6px; background:var(--surface-glass-strong); border:1px solid var(--border-default); border-radius:var(--radius-full); padding:2px 4px 2px 10px; min-width:300px; }
+  .search-wrap:focus-within { border-color:var(--accent); }
+  .search-wrap svg { width:13px; height:13px; color:var(--text-muted); flex-shrink:0; }
+  .search-input { flex:1; border:none; background:transparent; color:var(--text-primary); font:inherit; font-size:12px; outline:none; padding:4px 0; }
+  .search-scope { border:none; background:var(--surface-glass-muted); color:var(--text-secondary); font:inherit; font-size:10.5px; border-radius:var(--radius-full); padding:3px 8px; cursor:pointer; }
+  .search-clear { border:none; background:none; color:var(--text-muted); cursor:pointer; font-size:14px; padding:0 6px; display:none; }
+  .search-wrap.has-q .search-clear { display:inline; }
+
+  /* ── artefact cards: smaller, monospace value, grid-attached via straight lines ── */
+  .gnode[data-kind="artefact"] { padding:6px 9px; border-style:dashed; }
+  .gnode[data-kind="artefact"] .gtitle { font-size:11px; font-weight:600; }
+  .gnode[data-kind="artefact"] .gsub { font-family:var(--font-mono); }
+  .gnode[data-kind="artefact"] .gcaret { display:none; }
+  .gnode[data-kind="document"] .gtitle { font-family:var(--font-mono); font-size:10.5px; font-weight:600; }
+  .edge.straight { stroke:var(--border-strong); stroke-width:1.3; fill:none; }
+  .edge.straight.active { stroke:var(--accent); }
+
+  /* hero "+ add artefact" affordance (focus mode) */
+  .hero-add { align-self:flex-start; margin-top:8px; font-size:11px; font-weight:600; color:var(--accent); background:transparent; border:1px dashed var(--accent); border-radius:var(--radius-full); padding:3px 11px; cursor:pointer; }
+  .hero-add:hover { background:color-mix(in srgb, var(--accent) 10%, transparent); }
+
+  /* document highlight (search) */
+  mark.hl { background:color-mix(in srgb, var(--run) 40%, transparent); color:var(--text-primary); border-radius:3px; padding:0 2px; }
+  .gnode.hero .seglinks { margin-top:8px; padding-top:8px; border-top:1px solid var(--border-default); display:flex; flex-wrap:wrap; gap:5px; }
+  .gnode.hero .seglinks .sl { font-size:10px; color:var(--text-secondary); background:var(--surface-glass-muted); border:1px solid var(--border-default); border-radius:var(--radius-full); padding:2px 8px; cursor:pointer; }
+  .gnode.hero .seglinks .sl:hover { border-color:var(--accent); color:var(--text-primary); }
+
+  /* ── floating build dock (pinned top-right of the canvas): the form card + the candidate palette beneath it ── */
+  #buildDock { display:none; position:absolute; top:12px; right:12px; z-index:6; flex-direction:column; align-items:flex-end; gap:10px;
+               max-width:calc(100% - 24px); max-height:calc(100% - 24px); pointer-events:none; }   /* dock is click-through; only its children capture */
+  body.building #buildDock { display:flex; }
+  #buildDock > * { pointer-events:auto; }
+  /* the form card (title · name · passport · search · count/Done) */
+  #buildCard { display:flex; flex-direction:column; gap:8px; width:624px; max-width:100%;
+               background:var(--surface-glass-strong); backdrop-filter:blur(var(--blur-md)); border:1px solid var(--accent); border-radius:var(--radius-xl); box-shadow:var(--shadow-lg); padding:12px 14px; }
+  .bc-head { display:flex; align-items:center; justify-content:space-between; }
+  .bc-title { font-size:13px; font-weight:680; color:var(--text-primary); }
+  .bc-close { border:none; background:none; color:var(--text-muted); font-size:20px; line-height:1; cursor:pointer; }
+  .bc-close:hover { color:var(--err); }
+  .bc-row { display:flex; gap:8px; }
+  #buildCard input, #buildCard select { background:var(--surface-glass); border:1px solid var(--border-default); border-radius:8px; padding:6px 9px; color:var(--text-primary); font:inherit; font-size:12px; }
+  #buildCard .bc-row input { flex:1; min-width:0; }
+  .bc-search { width:100%; box-sizing:border-box; }
+  .bc-foot { display:flex; align-items:center; justify-content:space-between; }
+  #bcCount { font-size:11px; color:var(--text-secondary); }
+  .bc-done { padding:6px 16px; border-radius:var(--radius-full); border:none; background:linear-gradient(135deg, rgba(37,99,235,.95), rgba(96,165,250,.95)); color:#fff; cursor:pointer; font-weight:600; font-size:12px; }
+  /* candidate palette: 4 columns of draggable cards, sitting ON the canvas directly under the card (out of the card box) */
+  #buildPalette { display:flex; flex-direction:column; gap:6px; align-items:flex-end; max-height:100%; min-height:0; }
+  /* chip background instead of a theme-flipping text-shadow → legible over the canvas in BOTH light and dark */
+  .bc-hint { font-size:10.5px; color:var(--text-secondary); background:var(--surface-glass-strong); backdrop-filter:blur(var(--blur-sm)); padding:3px 8px; border-radius:6px; }
+  /* flex-wrap (not a fixed grid) so a narrow canvas wraps 4→2→1 columns instead of clipping the left column off-screen */
+  .bc-cols { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; max-width:100%; min-height:0; }
+  .bc-col { display:flex; flex-direction:column; min-height:0; flex:0 0 152px; }
+  .bc-col h5 { margin:0 0 5px; font-size:9px; text-transform:uppercase; letter-spacing:.5px; color:var(--text-secondary); font-weight:700; align-self:flex-start; background:var(--surface-glass-strong); backdrop-filter:blur(var(--blur-sm)); padding:3px 7px; border-radius:6px; }
+  .bc-list { overflow:auto; display:flex; flex-direction:column; gap:5px; min-height:40px; max-height:38vh; padding:1px; }
+  .bc-card { padding:6px 8px; border:1px solid var(--border-default); border-left:3px solid var(--idle); border-radius:7px; background:var(--surface-glass-strong); backdrop-filter:blur(var(--blur-sm)); box-shadow:var(--shadow-sm);
+             font-size:10.5px; color:var(--text-primary); cursor:grab; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .bc-card:hover { border-color:var(--accent); } .bc-card:active { cursor:grabbing; }
+  .bc-card.s-run { border-left-color:var(--run); } .bc-card.s-ok { border-left-color:var(--ok); } .bc-card.s-err { border-left-color:var(--err); } .bc-card.s-idle { border-left-color:var(--idle); }
+  .bc-list .bc-empty { font-size:10px; color:var(--text-muted); padding:6px 2px; }
+  /* orchestrator node = drop target while building */
+  .gnode.dragover { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent), 0 0 16px rgba(94,106,210,.5); }
+  /* hero exit-× (#5a) */
+  .gnode.hero .hero-x { position:absolute; top:8px; right:11px; border:none; background:none; color:var(--text-muted); font-size:21px; line-height:1; cursor:pointer; z-index:3; }
+  .gnode.hero .hero-x:hover { color:var(--err); }
+  .gnode.hero .gkind { padding-right:22px; }
+  /* member detach (× on an attached tile while building/editing an orchestrator) */
+  .gnode .gdetach { position:absolute; top:3px; right:6px; border:none; background:none; color:var(--text-muted); font-size:15px; line-height:1; cursor:pointer; z-index:2; padding:0 2px; }
+  .gnode .gdetach:hover { color:var(--err); }
+  /* inspector actions (e.g. ✎ Edit orchestrator) */
+  .insp-actions { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 2px; }
+  .insp-actions:empty { display:none; }
+  .insp-actions button { padding:6px 12px; border-radius:var(--radius-full); border:1px solid var(--accent); background:var(--surface-glass-strong); color:var(--text-primary); font:inherit; font-size:12px; font-weight:600; cursor:pointer; }
+  .insp-actions button:hover { background:var(--accent); color:#fff; }
 
   /* breadcrumb-bar: active-sessions-only toggle */
   .active-toggle { display:inline-flex; align-items:center; gap:6px; font-size:11px; font-weight:600; color:var(--text-secondary); background:var(--surface-glass-strong); border:1px solid var(--border-default); border-radius:var(--radius-full); padding:3px 11px; cursor:pointer; }
@@ -171,6 +244,14 @@
   .active-toggle:hover { color:var(--text-primary); }
   .active-toggle.on { color:var(--text-primary); border-color:var(--accent); }
   .active-toggle.on .led { background:var(--run); box-shadow:0 0 7px var(--run); }
+  /* work-panel stage filter (shown only on the Work panel) */
+  .work-filter { display:inline-flex; align-items:center; gap:6px; }
+  .wf-label { font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--text-muted); font-weight:700; margin-right:1px; }
+  .wf-chip { display:inline-flex; align-items:center; gap:5px; font:inherit; font-size:11px; font-weight:600; color:var(--text-muted); background:var(--surface-glass-strong); border:1px solid var(--border-default); border-radius:var(--radius-full); padding:3px 10px; cursor:pointer; opacity:.55; }
+  .wf-chip::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--idle); }
+  .wf-chip.s-run::before { background:var(--run); } .wf-chip.s-err::before { background:var(--err); } .wf-chip.s-ok::before { background:var(--ok); } .wf-chip.s-idle::before { background:var(--idle); }
+  .wf-chip:hover { color:var(--text-secondary); }
+  .wf-chip.on { opacity:1; color:var(--text-primary); border-color:var(--accent); }
 
   /* resizable / hideable inspector */
   .aside-resize { flex:0 0 7px; cursor:col-resize; position:relative; background:transparent; touch-action:none; }
@@ -196,15 +277,20 @@
 </style>
 </head>
 <body>
+  <a class="skip-link" href="#canvas">Skip to console content</a>
+  <div id="liveStatus" class="sr-only" role="status" aria-live="polite"></div>
+  <input type="hidden" id="scopeHeader" value="" />
   <header class="wc-header">
     <div class="wc-header-inner">
       <a class="wc-brand" href="#">
-        <img class="logo-light" src="assets/CueCrux-Arc-Loop.png" alt="CueCrux logo" />
-        <img class="logo-dark"  src="assets/CueCrux-Arc-Loop-White.png" alt="CueCrux logo" />
+        <img class="logo-light" src="console-assets/CueCrux-Arc-Loop.png" alt="CueCrux logo" onerror="brandFallback(this)" />
+        <img class="logo-dark"  src="console-assets/CueCrux-Arc-Loop-White.png" alt="CueCrux logo" onerror="brandFallback(this)" />
+        <svg class="wc-logo-fb" viewBox="0 0 32 32" width="34" height="34" aria-hidden="true"><path d="M25.8 9.2A12 12 0 1 0 28 16" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round"/><circle cx="16" cy="16" r="3.6" fill="currentColor"/></svg>
         <span class="wc-wordmark">CueCrux</span>
       </a>
       <nav class="wc-centre-pills" id="scopePills"></nav>
       <div class="wc-right">
+        <span id="liveBadge" class="live-badge" title="live = connected to the daemon · demo = sample data">demo</span>
         <button class="wc-icon-btn-sm" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">
           <svg class="icon-moon" viewBox="0 0 24 24" fill="currentColor"><path fill-rule="evenodd" d="M17.293 13.293a8 8 0 11-6.586-6.586 6 6 0 106.586 6.586z" clip-rule="evenodd"/></svg>
           <svg class="icon-sun" viewBox="0 0 24 24" fill="currentColor"><path fill-rule="evenodd" d="M12 2.25a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0V3a.75.75 0 01.75-.75zm0 15.75a3.75 3.75 0 100-7.5 3.75 3.75 0 000 7.5zM5.47 5.47a.75.75 0 011.06 0l1.59 1.59a.75.75 0 11-1.06 1.06L5.47 6.53a.75.75 0 010-1.06zm11.41 11.41a.75.75 0 011.06 0l1.59 1.59a.75.75 0 11-1.06 1.06l-1.59-1.59a.75.75 0 010-1.06zM2.25 12a.75.75 0 01.75-.75h2.25a.75.75 0 010 1.5H3a.75.75 0 01-.75-.75zM18.75 12a.75.75 0 01.75-.75h2.25a.75.75 0 010 1.5H19.5a.75.75 0 01-.75-.75zM5.47 18.53a.75.75 0 000 1.06l1.59 1.59a.75.75 0 001.06-1.06l-1.59-1.59a.75.75 0 00-1.06 0zM15.88 6.06a.75.75 0 001.06-1.06l-1.59-1.59a.75.75 0 10-1.06 1.06l1.59 1.59z" clip-rule="evenodd"/></svg>
@@ -217,20 +303,64 @@
   <div class="toolbar">
     <div class="crumbs" id="breadcrumb"></div>
     <button class="focus-exit" id="focusExit" style="display:none">↑ exit focus</button>
-    <button class="insp-toggle" id="orcNew" title="Create an orchestrator (group ExecPlans for a session)">＋ Orchestrator</button>
+    <button class="insp-toggle" id="orcNew" title="Create an orchestrator (group ExecPlans for a session)" style="display:none">＋ Orchestrator</button>
     <button class="active-toggle" id="activeToggle" title="Show only running sessions"><span class="led"></span> Active sessions only</button>
+    <div class="work-filter" id="workFilter" style="display:none">
+      <span class="wf-label">Stage</span>
+      <button class="wf-chip on s-idle" data-stage="planned">Planned</button>
+      <button class="wf-chip on s-run" data-stage="in_progress">In&nbsp;progress</button>
+      <button class="wf-chip on s-err" data-stage="blocked">Blocked</button>
+      <button class="wf-chip on s-ok" data-stage="done">Done</button>
+    </div>
     <div class="grow"></div>
-    <span class="hint"><b>click</b> to expand · <b>double-click</b> to focus &amp; open the document</span>
+    <div class="search-wrap" id="searchWrap">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input class="search-input" id="searchInput" type="text" placeholder="Search titles or data…" autocomplete="off" />
+      <select class="search-scope" id="searchScope" title="Search scope">
+        <option value="all">All</option>
+        <option value="titles">Titles</option>
+        <option value="data">Data</option>
+      </select>
+      <button class="search-clear" id="searchClear" title="Clear search">×</button>
+    </div>
     <button class="insp-toggle" id="inspToggle" title="Show / hide inspector">⊟ Inspector</button>
   </div>
 
   <main>
-    <div class="canvas-wrap" id="canvas"><svg id="edges"></svg><div id="nodes"></div></div>
+    <div class="canvas-wrap" id="canvas">
+      <div id="canvasScroll"><svg id="edges"></svg><div id="nodes"></div></div>
+      <!-- floating build dock pinned top-right: the "New Orchestrator" form card, with the candidate-card palette on the canvas directly beneath it -->
+      <div id="buildDock">
+        <div id="buildCard">
+          <div class="bc-head"><span class="bc-title">New Orchestrator</span><button class="bc-close" id="bcClose" title="Cancel">×</button></div>
+          <div class="bc-row">
+            <input id="bcName" type="text" placeholder="Name…" />
+            <select id="bcPass" title="Assign passport">
+              <option value="ce:4e6c4e2a:local">ce:4e6c4e2a:local · anthropic</option>
+              <option value="ce:8821fa0d:local">ce:8821fa0d:local · sonnet-worker</option>
+              <option value="ce:0c4419ab:remote">ce:0c4419ab:remote · ops</option>
+            </select>
+          </div>
+          <input id="bcSearch" class="bc-search" type="text" placeholder="Search candidates…" />
+          <div class="bc-foot"><span id="bcCount">0 attached</span><button class="bc-done" id="bcDone">Done</button></div>
+        </div>
+        <div id="buildPalette">
+          <div class="bc-hint">Drag a card onto the orchestrator tile&nbsp;← to attach it.</div>
+          <div class="bc-cols">
+            <div class="bc-col"><h5>Planned</h5><div id="bc-planned" class="bc-list"></div></div>
+            <div class="bc-col"><h5>In&nbsp;progress</h5><div id="bc-in_progress" class="bc-list"></div></div>
+            <div class="bc-col"><h5>Handoffs</h5><div id="bc-handoff" class="bc-list"></div></div>
+            <div class="bc-col"><h5>Existing&nbsp;plans</h5><div id="bc-existing" class="bc-list"></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
     <div class="aside-resize" id="asideResize" title="Drag to resize · double-click to hide"></div>
     <aside id="inspector">
       <h2>Node inspector</h2>
       <div class="insp-title" id="i-title">—</div>
       <div class="insp-kind" id="i-kind">pick a node</div>
+      <div class="insp-actions" id="i-actions"></div>
       <div class="kv" id="i-kv"></div>
       <h2 id="i-links-h" style="display:none">Linked</h2>
       <div class="links" id="i-links"></div>
@@ -247,40 +377,7 @@
     <span style="margin-left:auto">accent edge = active drill path · double-click a node to open its document</span>
   </div>
 
-  <!-- Orchestrator builder modal -->
-  <div class="modal" id="orcModal">
-    <div class="modal-panel">
-      <h2>New orchestrator</h2>
-      <p class="hint">Group ExecPlans + handoffs so a session agent sees all its work in one place. Agents create the same via MCP <b>create_orchestrator</b>.</p>
-      <div class="field-row">
-        <input id="orcName" type="text" placeholder="Orchestrator name (e.g. Sprint 1 · retrieval lifts)">
-        <select id="orcPassport" title="Assign passport">
-          <option value="ce:4e6c4e2a:local">ce:4e6c4e2a:local · anthropic</option>
-          <option value="ce:8821fa0d:local">ce:8821fa0d:local · sonnet-worker</option>
-          <option value="ce:0c4419ab:remote">ce:0c4419ab:remote · ops</option>
-        </select>
-      </div>
-      <div class="modal-grid">
-        <div class="builder-col">
-          <h3>Palette — drag onto the orchestrator</h3>
-          <div class="filter-row" id="orcFilters">
-            <button data-f="planned" class="on">Planned</button>
-            <button data-f="in_progress">In progress</button>
-            <button data-f="handoff">Handoffs</button>
-          </div>
-          <div id="orcPalette"></div>
-        </div>
-        <div class="builder-col">
-          <h3>Orchestrator (drop here)</h3>
-          <div class="dropzone" id="orcDropZone"><div id="orcDrop"></div></div>
-        </div>
-      </div>
-      <div class="modal-actions">
-        <button id="orcCancel">Cancel</button>
-        <button class="primary" id="orcCreate">Create orchestrator</button>
-      </div>
-    </div>
-  </div>
+  <!-- (orchestrator builder is the floating #buildCard pinned top-right inside #canvas) -->
 
 <script>
 /* ════════════ DUMMY GRAPH — flat node registry with id links (daemon-styled) ════════════ */
@@ -293,7 +390,7 @@ const SCOPES = [
 
 const N = {
   /* ── CX panels ── */
-  'cx-overview':{kind:'panel',label:'Overview',sub:'daemon at a glance',fields:[['mode','local_only'],['facts','1,911'],['sessions','3 active']],children:['ov-node','ov-work','ov-storage','ov-integrations','ov-tenants']},
+  'cx-overview':{kind:'panel',label:'Overview',sub:'daemon at a glance',fields:[['mode','local_only'],['facts','1,911'],['sessions','3 active']],children:['ov-node','ov-work','ov-usage','ov-storage','ov-integrations','ov-tenants']},
   'cx-projects':{kind:'panel',label:'Projects',sub:'4 tracked',fields:[['count','4'],['active','CueCrux']]},
   'cx-work':{kind:'panel',label:'Work',sub:'kanban · /v1/work',children:['ep-agentux','ep-chaincrux','ep-trait','ep-cruxengine','ep-gemma','ep-plancrux','ep-verbatim']},
   'cx-sessions':{kind:'panel',label:'Sessions',sub:'active · execplan-scoped',fields:[['active','3'],['passport','ce:4e6c4e2a:local']],children:['sess-agentux','sess-chaincrux','sess-trait']},
@@ -308,7 +405,20 @@ const N = {
   'cx-orchestrators':{kind:'panel',label:'Orchestrators',sub:'/v1/orchestrators · group plans for a session',fields:[['endpoint','/v1/orchestrators'],['flag','CORECRUXD_ORCHESTRATORS=on'],['mcp','create_orchestrator · attach · detach · list'],['active','1'],['build','＋ Orchestrator (toolbar)']],children:['orc-sprint1']},
 
   /* ── Punchcards (resource leases) — kind=punchcard · /v1/punchcards · default-OFF ── */
-  'cx-punchcards':{kind:'panel',label:'Punchcards',sub:'/v1/punchcards · resource leases',fields:[['endpoint','/v1/punchcards (acquire·release·check·force-release)'],['flag','CORECRUXD_PUNCHCARD=off|advisory|enforce'],['mcp','punch_in · punch_out · check_punchcard · list_punchcards · force_release'],['enforce','PreToolUse deny'],['held','3']],children:['pc-reconcile','pc-tree','pc-service','pc-expired']},
+  'cx-punchcards':{kind:'panel',label:'Punchcards',sub:'/v1/punchcards · leases grouped by session',fields:[['endpoint','/v1/punchcards (acquire·release·check·force-release)'],['flag','CORECRUXD_PUNCHCARD=off|advisory|enforce'],['mcp','punch_in · punch_out · check_punchcard · list_punchcards · force_release'],['enforce','PreToolUse deny'],['grouped','by session / holder'],['held','3']],children:['pcg-agentux','pcg-deploy','pcg-expired']},
+  /* punchcards grouped by the session (holder) that acquired them */
+  'pcg-agentux':{kind:'punchcard-group',label:'Session 9c5a9271… · agent-ux',sub:'ce:4e6c4e2a:local · 2 held',status:'run',
+    fields:[['session_id','9c5a9271…'],['holder','ce:4e6c4e2a:local'],['execplan','agent-ux-best-in-class-master'],['held','2'],['filter','/v1/punchcards?session=9c5a9271']],
+    children:['pc-reconcile','pc-tree'],
+    doc:'PUNCHCARD GROUP · session 9c5a9271…\nholder ce:4e6c4e2a:local · execplan agent-ux\n\nTwo modify leases acquired during the reconciler\nwork (the file:// lease on reconcile.rs and the\ncoarser tree:// lease on corecrux-memory). Both\nrelease when this session punches out / commits.'},
+  'pcg-deploy':{kind:'punchcard-group',label:'Session · deploy @gpu-1',sub:'ce:0c4419ab:remote · 1 held',status:'run',
+    fields:[['holder','ce:0c4419ab:remote'],['held','1'],['kind','service lease']],
+    children:['pc-service'],
+    doc:'PUNCHCARD GROUP · deploy session\nholder ce:0c4419ab:remote\n\nOne service:// lease on corecruxd@gpu-1 held for\nthe duration of a deploy so a second agent cannot\ndeploy mid-test. Short TTL; force_release is the\nescape hatch.'},
+  'pcg-expired':{kind:'punchcard-group',label:'Released / swept',sub:'expiry sweep · 1',status:'idle',
+    fields:[['released','1'],['via','TTL expiry sweep']],
+    children:['pc-expired'],
+    doc:'PUNCHCARD GROUP · released / swept\n\nLeases that expired and were reclaimed by the\nexpiry sweep (or punched out). Kept here for the\naudit trail — they no longer block anyone.'},
   'pc-reconcile':{kind:'punchcard',label:'file://…/http/reconcile.rs',sub:'held · ce:4e6c4e2a · modify',status:'run',
     fields:[['id','pc_01h…'],['resource','file://Crux/crates/corecruxd/src/http/reconcile.rs'],['mode','modify'],['holder','ce:4e6c4e2a:local'],['status','held'],['acquired','13:24Z'],['expires','14:24Z (TTL)'],['receipt_acquire','crn_pc1…']],
     children:['pc-deny'],
@@ -331,8 +441,34 @@ const N = {
     doc:'ORCHESTRATOR orc_7a1c · Sprint 1 · retrieval lifts\nentity kind=orchestrator · assignee ce:4e6c4e2a:local\nstate active · tenant default\n\nMembers (by reference — live state resolves, never\ncopied; cross-tenant attach rejected, T.1):\n · execplan corecrux-trait-expansion (in_progress)\n · execplan agent-ux-best-in-class (in_progress)\n · handoff opus → sonnet (carries work_ids)\n\nOne call gives the agent all its session work:\n  GET /v1/orchestrators/orc_7a1c/work\nReverse filter (WorkItem.orchestrator_id):\n  GET /v1/work?orchestrator=orc_7a1c\n\nBuilt via ＋ Orchestrator, or by an agent via MCP\ncreate_orchestrator + attach_to_orchestrator\n(detach_from_orchestrator / list_orchestrators too).'},
 
   /* ── Overview tiles (modelled on legacy console panel-overview) ── */
-  'ov-node':{kind:'tile',label:'Daemon node',sub:'ce:4e6c4e2a:local',status:'run',fields:[['mode','local_only'],['facts','1,911'],['sessions','3 active'],['degraded','no'],['bg sync','off']],payload:'{ "node":"ce:4e6c4e2a:local","mode":"local_only",\n  "facts":1911,"degraded":false,"bg_sync":"off" }'},
+  'ov-node':{kind:'tile',label:'Daemon — Live',sub:'ce:4e6c4e2a:local',status:'run',
+    fields:[['mode','local_only'],['facts','1,930'],['sessions','3 active'],['degraded','no'],['bg sync','off']],
+    artefacts:['af-healthz','af-readyz','af-http','af-mcp','af-grpc','af-storage','af-receipts','af-sync','af-manifest','af-facts','af-segments','af-heap','af-jemalloc','af-uptime','af-build','af-authmode'],
+    doc:'DAEMON — Live\nnode ce:4e6c4e2a:local · mode local_only\n\nFocus shows the live health surface attached as\nartefacts (the ~16 cards from the legacy console\nindex), wired straight off the node in a grid.\nHit + add artefact to monitor another endpoint or\ndatum.',
+    payload:'{ "node":"ce:4e6c4e2a:local","mode":"local_only",\n  "facts":1930,"degraded":false,"bg_sync":"off" }'},
+  /* ── Artefacts: the legacy daemon-health cards, attached to ov-node (kind=artefact, straight-line grid) ── */
+  'af-healthz':{kind:'artefact',label:'GET /healthz',sub:'200 OK',status:'ok',fields:[['endpoint','/healthz'],['poll','10s']]},
+  'af-readyz':{kind:'artefact',label:'GET /readyz',sub:'200 ready',status:'ok',fields:[['endpoint','/readyz']]},
+  'af-http':{kind:'artefact',label:'HTTP :14800',sub:'listening',status:'ok',fields:[['port','14800']]},
+  'af-mcp':{kind:'artefact',label:'MCP :14801',sub:'listening',status:'ok',fields:[['port','14801'],['tools','93']]},
+  'af-grpc':{kind:'artefact',label:'gRPC :4007',sub:'listening',status:'ok',fields:[['port','4007']]},
+  'af-storage':{kind:'artefact',label:'Storage shards',sub:'22 sealed',status:'ok',fields:[['sealed','22'],['size','5.8 GiB']]},
+  'af-receipts':{kind:'artefact',label:'CROWN signer',sub:'Ed25519 ready',status:'ok',fields:[['alg','Ed25519']]},
+  'af-sync':{kind:'artefact',label:'Sync mode',sub:'local_only',status:'idle',fields:[['mode','local_only'],['pulls/pushes','0 / 0']]},
+  'af-manifest':{kind:'artefact',label:'Tenant manifest',sub:'present',status:'ok',fields:[['tenants','500']]},
+  'af-facts':{kind:'artefact',label:'Fact count',sub:'1,930',status:'ok',fields:[['facts','1,930'],['endpoint','/v1/facts']]},
+  'af-segments':{kind:'artefact',label:'Segments loaded',sub:'78.9% heap',status:'ok',fields:[['coverage','78.9%']]},
+  'af-heap':{kind:'artefact',label:'Heap RSS',sub:'43.6 GiB',status:'run',fields:[['rss','43.6 GiB'],['watch','OOM<64']]},
+  'af-jemalloc':{kind:'artefact',label:'jemalloc retained',sub:'18.9 GiB',status:'idle',fields:[['retained','18.9 GiB']]},
+  'af-uptime':{kind:'artefact',label:'Uptime',sub:'6d 4h',status:'ok',fields:[['since','2026-05-23']]},
+  'af-build':{kind:'artefact',label:'Build sha',sub:'7417c9f',status:'ok',fields:[['sha','7417c9f'],['profile','release']]},
+  'af-authmode':{kind:'artefact',label:'Auth mode',sub:'local_only',status:'idle',fields:[['mode','local_only']]},
   'ov-work':{kind:'tile',label:'Task totals',sub:'7 execplans',fields:[['planned','1'],['in_progress','3'],['blocked','1'],['done','2']],children:['ep-agentux','ep-chaincrux','ep-trait','ep-cruxengine','ep-gemma','ep-plancrux','ep-verbatim']},
+  'ov-usage':{kind:'tile',label:'Token usage · this week',sub:'3 sessions · opus-4.8',status:'run',
+    fields:[['this week','517k in · 67k out'],['sessions','3'],['busiest','agent-ux · 312k/41k'],['daily avg','~83k tok/day'],['source','save_session / pre-compact hook']],
+    children:['sess-agentux','sess-chaincrux','sess-trait'],
+    payload:'{ "window":"2026-05-24..2026-05-30",\n  "tokens":{ "in":517000,"out":67000 },\n  "by_session":{\n    "agent-ux":{ "in":312000,"out":41000,"turns":42 },\n    "chaincrux":{ "in":110000,"out":14000,"turns":18 },\n    "trait":{ "in":95000,"out":12000,"turns":15 } } }',
+    doc:'TOKEN USAGE · this week (2026-05-24 → 05-30)\n\nPer-session token counts come from the pre-compact\n/ save_session hook (turns + tokens in/out captured\nper session, keyed by passport). This tile rolls\nthem up by time window.\n\n  agent-ux    312k in · 41k out  · 42 turns\n  chaincrux   110k in · 14k out  · 18 turns\n  trait        95k in · 12k out  · 15 turns\n  ──────────────────────────────────────────\n  week        517k in · 67k out  · model opus-4.8\n\nDrill a session on the right for its own usage.\nThe daemon stores per-session usage; weekly is\nderived here by summing over the window.'},
   'ov-storage':{kind:'tile',label:'Storage · by retrieval kind',sub:'chunks',fields:[['.ccxe','5.26 GiB'],['.ccxs','280 MB'],['.ccxdi','9.3M regions'],['bm25','153M postings']],payload:'{ "by_kind":{ ".ccxe":"5.26 GiB",".ccxs":"280 MB",\n  ".ccxdi":"9.3M regions","bm25":"153M postings" } }'},
   'ov-integrations':{kind:'tile',label:'Pack activity',sub:'5 packs · 3 grants',fields:[['packs','5'],['grants','3'],['audit (24h)','12']]},
   'ov-tenants':{kind:'tile',label:'Recent tenants',sub:'top by prefix',fields:[['shown','3'],['top','lme-m']],children:['t-lmem','t-lmes','t-personal']},
@@ -463,9 +599,9 @@ const N = {
     children:['au-trail','sf-facts','sf-reasoning','sf-files','hk-agentux','ep-agentux','pp-main'],
     doc:'SAVED SESSION · execplan:agent-ux-best-in-class-master\nid 9c5a9271… · passport ce:4e6c4e2a:local\nsaved 2026-05-27T13:24Z via pre-compact hook\n42 turns · 312k in · 41k out · model opus-4.8\n\n── summary ───────────────────────────────\nResumed the agent-ux ExecPlan at M4. Built the work\naggregator (M1), /v1/work source merge (M2), header\ndecode (M3); started the reconciler (M4).\n\n── transcript (compacted) ────────────────\n[user]  resume M4, get the reconciler green\n[asst]  read http/work.rs + projection.rs; the read-\n        time projection is not stably sorted, so the\n        kanban merge drops live rows.\n[tool]  Read ×38 · grep EventBus · Edit projection.rs\n[asst]  wrote reconcile.rs; 4 diff tests still red —\n        needs a stable sort by updated_at before the\n        merge, plus a 3-stale-entry fixture.\n[user]  land loopback-auth first\n[asst]  deferred; logged session note 13:24.\n\n── decisions ─────────────────────────────\n· frontend = Leptos+Trunk WASM (no npm)\n· ingest via crux-claude-hooks subcommand\n· remote approval deferred (crate absent)\n\nOff this session → facts · reasoning · files ·\nhooks · execplan · passport.'},
   'sess-chaincrux':{kind:'session',label:'execplan:chaincrux-cascade-route-integration',sub:'ttl 3600s',status:'err',
-    fields:[['session_id','1af0b3e2…'],['ttl','3600s'],['execplan','chaincrux-cascade-route-integration']],children:['ep-chaincrux','f-gate-cc3']},
+    fields:[['session_id','1af0b3e2…'],['ttl','3600s'],['tokens','110k in · 14k out'],['turns','18'],['model','opus-4.8'],['execplan','chaincrux-cascade-route-integration']],children:['ep-chaincrux','f-gate-cc3']},
   'sess-trait':{kind:'session',label:'execplan:corecrux-trait-expansion-global-default-on',sub:'ttl 3600s',status:'run',
-    fields:[['session_id','77be5510…'],['ttl','3600s']],children:['ep-trait']},
+    fields:[['session_id','77be5510…'],['ttl','3600s'],['tokens','95k in · 12k out'],['turns','15'],['model','opus-4.8']],children:['ep-trait']},
 
   /* ── passports ── */
   'pp-main':{kind:'passport',label:'ce:4e6c4e2a:local',sub:'tier=local · anthropic',status:'ok',
@@ -498,9 +634,37 @@ const N = {
   'mem3':{kind:'fact',label:'vaultcrux-bff-jwt-env-file-trap',sub:'2026-05-28',status:'ok',fields:[['type','reference'],['date','2026-05-28']]},
 
   /* ── tenants ── */
-  't-lmem':{kind:'tenant',label:'lme-m',sub:'category: work',status:'ok',fields:[['category','work'],['source','backfill']]},
-  't-lmes':{kind:'tenant',label:'lme-s',sub:'category: work',status:'ok',fields:[['category','work'],['source','backfill']]},
-  't-personal':{kind:'tenant',label:'personal',sub:'category: personal',status:'idle',fields:[['category','personal']]},
+  't-lmem':{kind:'tenant',label:'lme-m',sub:'category: work · 2 docs',status:'ok',
+    fields:[['category','work'],['source','LME-M backfill'],['indexed','~253M frames']],children:['doc-lmem-1','doc-lmem-2'],
+    doc:'TENANT lme-m (LongMemEval-M)\ncategory work · source LME-M backfill\n\nLong-form multi-session corpus (~253M frames).\nIngested documents (sample) below — click one to\nopen it; search highlights the matching chunk.'},
+  't-lmes':{kind:'tenant',label:'lme-s',sub:'category: work · 3 docs',status:'ok',
+    fields:[['category','work'],['source','LME-S backfill'],['indexed','6.6M chunks'],['traits','.ccxs 408/500']],children:['doc-lmes-1','doc-lmes-2','doc-lmes-3'],
+    doc:'TENANT lme-s (LongMemEval-S)\ncategory work · source LME-S backfill\n\n6.6M indexed chunks; .ccxs traits on 408/500\ntenants. Ingested documents (sample) below — click\none to open it; search highlights the matching\nchunk and shows semantic / graph links.'},
+  't-personal':{kind:'tenant',label:'personal',sub:'category: personal · 1 doc',status:'idle',
+    fields:[['category','personal'],['source','local']],children:['doc-personal-1'],
+    doc:'TENANT personal\ncategory personal · local-only, never synced.'},
+
+  /* ── ingested documents (LME-S / LME-M sample corpus; searchable + chunked) ── */
+  'doc-lmes-1':{kind:'document',label:'lme-s / sess_7f3a · travel',sub:'12 chunks · ingested 2026-05-16',status:'ok',
+    fields:[['doc_id','answer_sharegpt_5Lzox6N_0'],['tenant','lme-s'],['chunks','12'],['tokens','3.1k']],
+    seglinks:[['semantic → sess_91be (hotels)','doc-lmes-2'],['graph → diet prefs','doc-lmes-3']],
+    doc:'DOCUMENT  lme-s / sess_7f3a\nsource LongMemEval-S · answer_sharegpt_5Lzox6N_0\ningested 2026-05-16 · 12 chunks · BM25 + graph fused\n\n[chunk 2] User: I am planning a trip to Lisbon in\nOctober for about ten days.\n\n[chunk 3] User: I prefer boutique hotels near the\nwater, and I am vegetarian.\n\n[chunk 4] Assistant: Noted — boutique, waterfront,\nvegetarian-friendly. Lisbon in October is mild and\nless crowded than the summer.\n\n[chunk 9] User: Remember that I am allergic to\nshellfish when you suggest restaurants.'},
+  'doc-lmes-2':{kind:'document',label:'lme-s / sess_91be · hotels',sub:'8 chunks · ingested 2026-05-16',status:'ok',
+    fields:[['doc_id','answer_sharegpt_91be2x_0'],['tenant','lme-s'],['chunks','8']],
+    seglinks:[['semantic → sess_7f3a (travel)','doc-lmes-1']],
+    doc:'DOCUMENT  lme-s / sess_91be\nsource LongMemEval-S · answer_sharegpt_91be2x_0\n\n[chunk 1] User: Shortlist three boutique hotels in\nLisbon under 250 EUR with a sea view.\n\n[chunk 5] Assistant: 1) Memmo Alfama — rooftop,\nTagus view. 2) Santiago de Alfama. 3) The Lumiares.'},
+  'doc-lmes-3':{kind:'document',label:'lme-s / sess_c401 · diet',sub:'5 chunks',status:'ok',
+    fields:[['doc_id','answer_sharegpt_c401aa_0'],['tenant','lme-s'],['chunks','5']],
+    doc:'DOCUMENT  lme-s / sess_c401\n\n[chunk 2] User: I am vegetarian and allergic to\nshellfish — keep that in mind for any food advice.'},
+  'doc-lmem-1':{kind:'document',label:'lme-m / strm_4413 · org',sub:'long-form',status:'ok',
+    fields:[['doc_id','__longmemeval_m_7161e7e2'],['tenant','lme-m']],
+    doc:'DOCUMENT  lme-m / strm_4413\nmulti-session stream.\n\n[frame 118] User: my manager is Dana; I report\ninto the platform team.'},
+  'doc-lmem-2':{kind:'document',label:'lme-m / strm_77be · prefs',sub:'long-form',status:'ok',
+    fields:[['doc_id','__longmemeval_m_77be55'],['tenant','lme-m']],
+    doc:'DOCUMENT  lme-m / strm_77be\n\n[frame 42] User: I prefer dark mode and concise\nanswers.'},
+  'doc-personal-1':{kind:'document',label:'personal / note_01',sub:'private',status:'idle',
+    fields:[['tenant','personal'],['private','true']],
+    doc:'DOCUMENT  personal / note_01 (private — not synced)\n\nGrocery list and a dentist appointment on Tuesday.'},
 
   /* ── DX ── */
   'dx-articles':{kind:'panel',label:'Articles',sub:'bundled docs',children:['doc-mcp','doc-plans','doc-agent']},
@@ -549,7 +713,7 @@ const N = {
 Object.entries(N).forEach(([id,n])=>{ n.id=id; });
 
 /* ════════════ ENGINE ════════════ */
-const COL_W=188, HERO_W=336, COL_GAP=60, NODE_H=64, HERO_H=372, NODE_GAP=14, PAD_X=28, PAD_Y=22;
+const COL_W=188, COL_GAP=60, NODE_H=64, NODE_GAP=14, PAD_X=28, PAD_Y=22;   // hero size is computed live in render()
 const nodesEl=document.getElementById('nodes'), edgesEl=document.getElementById('edges');
 const norm = s => ({done:'ok',in_progress:'run',blocked:'err',planned:'idle',live:'run'}[s] || s || 'idle');
 const RAW = {in_progress:'in progress',done:'done',blocked:'blocked',planned:'planned',ok:'ok',run:'live',err:'error',idle:'idle',live:'live'};
@@ -557,10 +721,238 @@ const chipText = s => RAW[s] || s;
 const childrenOf = node => (node.children||[]).map(id=>N[id]).filter(Boolean);
 const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 
-let activeScope='cx', columns=[], selectedId=null, focusMode=false, positions={}, activeOnly=false, heroUserW=null;
+let activeScope='cx', columns=[], selectedId=null, focusMode=false, positions={}, activeOnly=false, heroUserW=null, focusTrail=[], preFocus=null;
+const workStages={planned:true, in_progress:true, blocked:true, done:true};   // Work-panel stage filter (item 3)
+
+/* ════════════ live-data layer (M1 foundation seam) ════════════
+   Mirrors the existing console's auth/fetch (playground/index.html headers()/api()).
+   Panels lazy-load from /v1/* on first expand; render()/childrenOf/focus/search/loop-guard
+   stay UNCHANGED because children are merged into N before childrenOf runs. */
+let LIVE = false;                 // true after a successful /readyz probe
+const loadState = {};             // node id -> 'loading'|'done'|'error'|'unavailable'
+const LOADERS = {};               // node id (or {match}) -> {endpoint, transform, noun, flagHint}
+const DUMMY_CHILDREN = {};        // id -> original dummy children (degrade-to-demo)
+
+function $scopeHeader(){ const el=document.getElementById('scopeHeader'); return el ? (el.value||'').trim() : ''; }
+function currentBoundPassportId(){ try{ return localStorage.getItem('crux-console-bound-passport')||''; }catch{ return ''; } }
+function apiHeaders(){
+  const scopes=$scopeHeader(); const out=scopes?{'X-Corecrux-Scopes':scopes}:{};
+  try{ const pid=currentBoundPassportId(); if(pid) out['X-Corecrux-Passport-Id']=pid; }catch{}
+  return out;
+}
+async function api(path){
+  const r=await fetch(path,{headers:apiHeaders()});
+  const text=await r.text(); let data; try{ data=JSON.parse(text); }catch{ data={text}; }
+  if(!r.ok) throw {status:r.status, data}; return data;
+}
+async function postApi(path, body){
+  const h=apiHeaders(); h['Content-Type']='application/json';
+  const r=await fetch(path,{method:'POST',headers:h,body:JSON.stringify(body||{})});
+  const text=await r.text(); let data; try{ data=JSON.parse(text); }catch{ data={text}; }
+  if(!r.ok) throw {status:r.status, data}; return data;
+}
+async function patchApi(path, body){
+  const h=apiHeaders(); h['Content-Type']='application/json';
+  const r=await fetch(path,{method:'PATCH',headers:h,body:JSON.stringify(body||{})});
+  const text=await r.text(); let data; try{ data=JSON.parse(text); }catch{ data={text}; }
+  if(!r.ok) throw {status:r.status, data}; return data;
+}
+async function deleteApi(path){
+  const r=await fetch(path,{method:'DELETE',headers:apiHeaders()});
+  if(!r.ok && r.status!==204){ const text=await r.text(); let data; try{ data=JSON.parse(text); }catch{ data={text}; } throw {status:r.status, data}; }
+  return true;
+}
+function idFor(kind, key){ return kind+':'+key; }   // shared id namespace → loop-guard sees cross-panel cycles
+function announce(msg){ const el=document.getElementById('liveStatus'); if(el) el.textContent=msg; }
+function makeStatusNode(id, kind, label){
+  return { id, kind, label, sub:'', status: kind==='error'?'blocked':(kind==='loading'?'in_progress':'planned'), fields:[], children:[], __status:true };
+}
+function mergeChildren(node, kids){
+  kids.forEach(k=>{ if(!Array.isArray(k.children)) k.children=[]; N[k.id]=k; });
+  node.children = kids.map(k=>k.id);
+}
+function refreshOpenColumns(node){ columns.forEach(c=>{ if(c.parentId===node.id) c.nodes=childrenOf(node); }); }  // re-project an already-open column after a (re)load
+function loaderFor(node){
+  if(!node) return null;
+  if(LOADERS[node.id]) return LOADERS[node.id];
+  for(const k in LOADERS){ const e=LOADERS[k]; if(typeof e.match==='function' && e.match(node)) return e; }
+  return null;
+}
+async function ensureLoaded(node){
+  if(!LIVE || !node) return;
+  const m=loaderFor(node); if(!m) return;
+  if(loadState[node.id]==='done' || loadState[node.id]==='loading') return;
+  loadState[node.id]='loading';
+  const t=setTimeout(()=>{ mergeChildren(node,[makeStatusNode(node.id+'::loading','loading','Loading '+(m.noun||'data')+'…')]); refreshOpenColumns(node); render(); }, 120);
+  try{
+    const json=await api(typeof m.endpoint==='function'? m.endpoint(node) : m.endpoint);
+    clearTimeout(t);
+    const kids=(m.transform(json, node)||[]).filter(Boolean);
+    mergeChildren(node, kids.length? kids : [makeStatusNode(node.id+'::empty','empty','No '+(m.noun||'items'))]);
+    loadState[node.id]='done';
+  }catch(e){
+    clearTimeout(t); const st=e&&e.status;
+    if(st===501){ loadState[node.id]='unavailable'; mergeChildren(node,[makeStatusNode(node.id+'::501','unavailable', m.flagHint||'Surface disabled (501)')]); }
+    else if(st===401 || st===403){ if(DUMMY_CHILDREN[node.id]) node.children=DUMMY_CHILDREN[node.id].slice(); loadState[node.id]='done'; announce('Not authorised — demo data for '+(node.label||node.id)); }
+    else { loadState[node.id]='error'; mergeChildren(node,[makeStatusNode(node.id+'::error','error','Failed: '+(st||'network')+' — click to retry')]); }
+  }
+  refreshOpenColumns(node); render();
+}
+function retryLoad(statusNode){
+  const pid=Object.keys(N).find(k=>(N[k].children||[]).includes(statusNode.id));
+  if(pid){ loadState[pid]='idle'; ensureLoaded(N[pid]); }
+}
+function prefetchScope(id){ const sc=SCOPES.find(s=>s.id===id); if(!sc) return; sc.sections.forEach(sid=>{ const n=N[sid]; if(n && loaderFor(n)) ensureLoaded(n); }); }
+function updateLiveBadge(){ const b=document.getElementById('liveBadge'); if(b){ b.textContent=LIVE?'live':'demo'; b.classList.toggle('on', LIVE); } announce(LIVE?'Connected — live data':'Demo data'); }
+// ── per-panel transforms (json → child nodes) ──
+const WSTATE = { planned:'planned', in_progress:'in_progress', blocked:'blocked', complete:'done', deployed:'done', archive:'done', done:'done' };
+function txWork(json){   // M3 — kanban WorkItem[] → execplan nodes (status drives the stage filter)
+  const items = json.work || json.items || (Array.isArray(json)? json : []);
+  return items.map(w=>({
+    id: idFor('work', w.id), kind:'execplan',
+    label: w.title || w.id,
+    sub: w.current_milestone || w.plan_path || w.state || '',
+    status: WSTATE[w.state] || 'planned',
+    fields: [['state',w.state],['risk_class',w.risk_class],['plan_path',w.plan_path],['milestone',w.current_milestone],['assignee',w.assignee_passport],['orchestrator',w.orchestrator_id],['linked_pr',w.linked_pr]].filter(([,v])=>v!=null && v!==''),
+    children: [],
+    doc: (w.body || w.title || '') + (w.plan_path? '\n\nplan: '+w.plan_path : ''),
+    payload: JSON.stringify(w, null, 2),
+  }));
+}
+function ovField(v){ return (v===0||v)? String(v) : '—'; }
+function txOverview(json){   // M2 — refresh the fixed Overview tiles' fields from /v1/console/summary (real keys; keeps tiles' artefacts/docs)
+  const sum=json||{}, d=sum.daemon||{}, st=sum.stores||{}, integ=sum.integrations||{}, cap=sum.capacity||{};
+  const set=(id,fields,sub)=>{ const n=N[id]; if(n){ n.fields=fields.filter(([,v])=>v!=null); if(sub!=null && sub!=='—') n.sub=sub; } };
+  const gb = b=>(Number(b||0)/1073741824).toFixed(1)+' GiB';
+  set('ov-node', [['auth',ovField(d.auth_mode)],['facts',ovField(st.facts)],['sessions',ovField(st.sessions)],['dataplane', d.dataplane_enabled!=null?(d.dataplane_enabled?'on':'off'):null],['mcp agents',ovField(d.mcp_agent_count)]], ovField(d.node_id));
+  if(cap.total_bytes!=null) set('ov-storage', [['free',gb(cap.free_bytes)],['total',gb(cap.total_bytes)],['free %', cap.free_ratio!=null?Math.round(cap.free_ratio*100)+'%':null],['auto-paused', cap.auto_paused?'yes':'no']]);
+  set('ov-integrations', [['enabled', integ.enabled!=null?(integ.enabled?'yes':'no'):null],['packs',ovField(integ.builtin_pack_count)],['safe mode', integ.safe_mode?'on':'off']]);
+  return ['ov-node','ov-work','ov-usage','ov-storage','ov-integrations','ov-tenants'].map(id=>N[id]).filter(Boolean);
+}
+function st2(s){ s=(s||'').toLowerCase();
+  if(['active','running','held','in_progress','run'].includes(s)) return 'run';
+  if(['complete','done','released','ok','success'].includes(s)) return 'ok';
+  if(['blocked','error','expired','force_released','err','cancelled'].includes(s)) return 'err';
+  return 'idle';
+}
+function txSessions(json){   // M4 — /v1/console/sessions returns {sessions:[id-string]} (ids only, by design); detail via the audit drill
+  const ss = json.sessions || json.active || (Array.isArray(json)? json : []);
+  return ss.map(s=>{
+    const isStr = typeof s==='string';
+    const id = isStr? s : (s.session_id || s.id || s.sid || '');
+    const ep = isStr? '' : (s.execplan || s.plan_slug || s.label || '');
+    const toks = isStr? null : (s.tokens || (s.tokens_in!=null? (Math.round((s.tokens_in||0)/1000)+'k in · '+Math.round((s.tokens_out||0)/1000)+'k out') : null));
+    return { id: idFor('sess', id), kind:'session', __sessId:id,
+      label: ep? ('execplan:'+ep) : (id||'session'),
+      sub: isStr? 'session · open for audit chain →' : ([s.turns!=null? s.turns+' turns':null, toks, s.ttl? ('ttl '+s.ttl):null].filter(Boolean).join(' · ') || (s.saved||'')),
+      status: isStr? 'idle' : st2(s.status || (s.active?'active':'idle')),
+      fields: isStr? [['session_id',id]] : [['session_id',id],['turns',s.turns],['tokens',toks],['model',s.model],['passport',s.passport||s.passport_id],['execplan',ep],['ttl',s.ttl]].filter(([,v])=>v!=null&&v!==''),
+      children:[], doc: isStr? '' : (s.summary||s.doc||''), payload: JSON.stringify(s,null,2) };
+  });
+}
+function txOrchestrators(json){   // M5 read — members resolved on drill (shared work: ids → loop-guard safe)
+  const orcs = json.orchestrators || (Array.isArray(json)? json : []);
+  return orcs.map(o=>({
+    id: idFor('orc', o.id), kind:'orchestrator', __orcId:o.id, __memberCount:(o.members||[]).length,
+    label: o.name || o.id,
+    sub: (o.created_by_passport||'') + ' · ' + ((o.members||[]).length) + ' members',
+    status: st2(o.state),
+    fields:[['id',o.id],['assignee',o.created_by_passport],['state',o.state],['members',String((o.members||[]).length)],['resolve','/v1/orchestrators/'+o.id+'/work']].filter(([,v])=>v!=null),
+    children:[],
+    doc:'ORCHESTRATOR '+o.id+' · '+(o.name||'')+'\nstate '+(o.state||'')+'\nmembers (by reference):\n'+(o.members||[]).map(m=>' · '+(m.type||'')+' '+(m.ref||'')).join('\n'),
+    payload: JSON.stringify(o,null,2) }));
+}
+function txOrcMembers(json){   // M5 drill — /v1/orchestrators/{id}/work → {members:[{type,ref,work,missing}]}
+  const ms = json.members || (Array.isArray(json)? json : []);
+  return ms.map(m=> m.work ? txWork({work:[m.work]})[0]
+                           : makeStatusNode(idFor('work', m.ref||'?')+'::missing','unavailable','missing member: '+(m.ref||'?')));
+}
+function txPunchcards(json){   // M6 — group by holder/session
+  const cards = json.punchcards || (Array.isArray(json)? json : []);
+  const byHolder={};
+  cards.forEach(c=>{ const h=c.holder_passport||c.holder||'—'; (byHolder[h]=byHolder[h]||[]).push(c); });
+  const leaves = cards.map(c=>({ id: idFor('pc', c.id), kind:'punchcard',
+    label: c.resource, sub:[c.status,c.holder_passport||c.holder,c.mode].filter(Boolean).join(' · '),
+    status: st2(c.status),
+    fields:[['id',c.id],['resource',c.resource],['mode',c.mode],['holder',c.holder_passport||c.holder],['status',c.status],['acquired',c.acquired_at_unix_ms||c.acquired_at],['expires',c.expires_at_unix_ms||c.expires_at]].filter(([,v])=>v!=null),
+    children:[], payload: JSON.stringify(c,null,2) }));
+  const groups = Object.entries(byHolder).map(([h,ls])=>({ id: idFor('pcg', h), kind:'punchcard-group',
+    label:'Holder · '+h, sub: h+' · '+ls.length+' held', status: ls.some(l=>(l.status||'')==='held')?'run':'idle',
+    fields:[['holder',h],['held',String(ls.length)]], children: ls.map(l=>idFor('pc', l.id)) }));
+  return groups.concat(leaves);
+}
+function entityPrefix(e){ e=e||''; const i=e.indexOf(':'); return i>0? e.slice(0,i): (e||'other'); }
+function txFacts(json){   // M7 facts — group by entity prefix (single fetch yields groups + leaves)
+  const facts = json.facts || (Array.isArray(json)? json : []);
+  const fid = (f,i)=> idFor('fact', f.fact_id||f.id||(f.entity+'/'+f.key+'/'+i));
+  const leaves = facts.map((f,i)=>({ id: fid(f,i), kind:'fact', label: f.key||f.entity, sub: f.entity||'',
+    status: f.deleted?'idle':'ok',
+    fields:[['entity',f.entity],['key',f.key],['conf',f.confidence],['stored',f.stored_at],['private',f.private]].filter(([,v])=>v!=null),
+    children:[], payload:(typeof f.value==='string'? f.value : JSON.stringify(f.value,null,2)) }));
+  const byPfx={}; facts.forEach((f,i)=>{ const p=entityPrefix(f.entity); (byPfx[p]=byPfx[p]||[]).push(fid(f,i)); });
+  const groups = Object.entries(byPfx).map(([p,ids])=>({ id: idFor('fg', p), kind:'fact-group',
+    label: p+' · '+ids.length, sub:'entity prefix', fields:[['prefix',p],['count',String(ids.length)]], children: ids }));
+  return groups.concat(leaves);
+}
+function txMemory(json){   // M7 memory — recent facts, flat
+  const facts = json.facts || (Array.isArray(json)? json : []);
+  return facts.slice(0,20).map((f,i)=>({ id: idFor('mem', f.fact_id||f.id||i), kind:'fact', label: f.key||f.entity, sub: f.entity||'',
+    status:'ok', fields:[['entity',f.entity],['stored',f.stored_at]].filter(([,v])=>v!=null), children:[],
+    payload:(typeof f.value==='string'? f.value : JSON.stringify(f.value,null,2)) }));
+}
+function txTenants(json){   // M8
+  const ts = json.tenants || (Array.isArray(json)? json : []);
+  return ts.map(t=>({ id: idFor('tenant', t.tenant_id||t.id), kind:'tenant', label: t.tenant_id||t.id,
+    sub:[t.category,t.source].filter(Boolean).join(' · '), status: t.category==='system'?'idle':'ok',
+    fields:[['tenant_id',t.tenant_id||t.id],['category',t.category],['override',t.override],['source',t.source],['chunks',t.chunk_visibility]].filter(([,v])=>v!=null),
+    children:[], payload: JSON.stringify(t,null,2) }));
+}
+function txPassports(json){   // M8
+  const ps = json.passports || (json.passport? [json.passport] : (Array.isArray(json)? json : []));
+  return ps.map(p=>({ id: idFor('pp', p.id), kind:'passport', label: p.id,
+    sub:[p.category,p.reputation_tier].filter(Boolean).join(' · '), status:'ok',
+    fields:[['id',p.id],['category',p.category],['tier',p.reputation_tier],['receipts',p.receipt_count],['gate',p.agent_work_gate]].filter(([,v])=>v!=null),
+    children:[], payload: JSON.stringify(p,null,2) }));
+}
+function txAudit(json){   // M9 — session audit chain → step nodes
+  const steps = json.steps || (Array.isArray(json)? json : []);
+  return steps.map((s,i)=>({ id: idFor('step', (s.node_id||s.session_id||'')+'/'+(s.seq!=null?s.seq:i)), kind:'step',
+    label:(s.seq!=null? (s.seq+' · '):'')+(s.label||s.kind||'step'), sub:[s.actor,s.status].filter(Boolean).join(' · '),
+    status: st2(s.status), fields:[['kind',s.kind],['actor',s.actor],['risk',s.risk_class],['status',s.status],['receipt',s.receipt_id],['reasoning',s.reasoning_ref]].filter(([,v])=>v!=null),
+    children:[], doc:'AUDIT STEP '+(s.seq!=null?s.seq:'')+'\n'+(s.label||'')+'\nactor '+(s.actor||'')+' · status '+(s.status||'')+(s.inputs?('\ninputs: '+JSON.stringify(s.inputs)):'')+(s.outputs?('\noutputs: '+JSON.stringify(s.outputs)):''),
+    payload: JSON.stringify(s,null,2) }));
+}
+function registerLoaders(){
+  LOADERS['cx-overview']      = { endpoint:'/v1/console/summary',     noun:'tiles',         transform: txOverview };       // M2
+  LOADERS['cx-work']          = { endpoint:'/v1/work?source=all',     noun:'work items',    transform: txWork };           // M3
+  LOADERS['cx-sessions']      = { endpoint:'/v1/console/sessions',    noun:'sessions',      transform: txSessions };       // M4
+  LOADERS['cx-orchestrators'] = { endpoint:'/v1/orchestrators',       noun:'orchestrators', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txOrchestrators };  // M5
+  LOADERS['cx-punchcards']    = { endpoint:'/v1/punchcards',          noun:'leases',        flagHint:'Punchcards disabled — set CORECRUXD_PUNCHCARD=advisory|enforce', transform: txPunchcards };  // M6
+  LOADERS['cx-facts']         = { endpoint:'/v1/console/facts?top_k=100', noun:'facts',     transform: txFacts };          // M7
+  LOADERS['cx-memory']        = { endpoint:'/v1/console/facts?top_k=20',  noun:'memories',  transform: txMemory };         // M7
+  LOADERS['cx-tenants']       = { endpoint:'/v1/console/tenants',     noun:'tenants',       transform: txTenants };        // M8
+  LOADERS['cx-passport']      = { endpoint:'/v1/passports',           noun:'passports',     transform: txPassports };      // M8
+  // drill-down loaders (prefix match): orchestrator members + session audit chain
+  LOADERS['__orc_members'] = { match:n=> n.kind==='orchestrator' && n.__orcId, endpoint:n=>'/v1/orchestrators/'+n.__orcId+'/work', noun:'members', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txOrcMembers };  // M5 drill
+  LOADERS['__sess_audit']  = { match:n=> n.kind==='session' && n.__sessId, endpoint:n=>'/v1/observe/sessions/'+n.__sessId+'/audit', noun:'audit steps', flagHint:'Observe disabled — set CORECRUXD_OBSERVE=1', transform: txAudit };  // M9 drill
+}
+async function bootProbe(){
+  Object.values(N).forEach(n=>{ if(Array.isArray(n.children)) DUMMY_CHILDREN[n.id]=n.children.slice(); });   // snapshot dummy for degrade
+  const el=document.getElementById('scopeHeader');
+  if(el && !(el.value||'').trim()){ try{ el.value=localStorage.getItem('crux-console-scopes')||'admin:read,facts:read,console:read'; }catch{ el.value='admin:read,facts:read,console:read'; } }
+  try{ const r=await fetch('/readyz',{cache:'no-store'}); LIVE=!!(r&&r.ok); }catch{ LIVE=false; }
+  registerLoaders(); updateLiveBadge();
+  if(LIVE) prefetchScope(activeScope);
+}
+// debug/test handle (used by the Node smoke harness; inert in prod)
+try{ globalThis.__cx = { get LIVE(){return LIVE;}, setLive:(v)=>{LIVE=v;}, N, LOADERS, loadState, ensureLoaded, mergeChildren, makeStatusNode, bootProbe, prefetchScope, api, idFor }; }catch{}
 
 function openScope(id){
-  activeScope=id; focusMode=false; selectedId=null; heroUserW=null;
+  if(buildingId) teardownBuild();   // (fix) leaving the build canvas must tear down build mode, not leak it across scopes
+  activeScope=id; focusMode=false; selectedId=null; heroUserW=null; focusTrail=[]; preFocus=null;
+  searchActive=false; searchHighlight=''; searchReturn=null; focusFromSearch=false;
+  Object.keys(workStages).forEach(k=>workStages[k]=true);   // fresh scope → fresh stage filter (don't carry a hidden filter across scopes)
+  document.querySelectorAll('#workFilter .wf-chip').forEach(ch=>ch.classList.add('on'));
   const scope=SCOPES.find(s=>s.id===id);
   const secs=scope.sections.map(x=>N[x]).filter(Boolean);
   columns=[{parentId:null, nodes:secs}];
@@ -570,21 +962,44 @@ function openScope(id){
   document.querySelectorAll('.wc-centre-pill').forEach(p=>p.classList.toggle('wc-centre-pill--active', p.dataset.scope===id));
   document.getElementById('focusExit').style.display='none';
   render();
+  if(LIVE) prefetchScope(id);   // lazy-load every panel in this scope so search/drill see live data
 }
 function expand(node, col){
   selectedId=node.id;
   columns=columns.slice(0, col+1);
-  const kids=childrenOf(node);
+  const path=columns.map(c=>c.parentId).filter(Boolean); path.push(node.id);   // ancestors already on the spine
+  const kids=childrenOf(node).filter(k=>!path.includes(k.id));                  // loop guard: never drill back into an ancestor
   if(kids.length) columns.push({parentId:node.id, nodes:kids});
   inspect(node); render();
 }
-function focusNode(node){
+function focusNode(node, arg){
+  const fromSearch=focusFromSearch; focusFromSearch=false;
+  if(!fromSearch) searchHighlight='';   // (fix) don't leak a stale search highlight into a normally-focused doc
+  // snapshot the tree the first time we enter focus, so the card "×" can return us
+  if(!focusMode) preFocus={columns:columns.map(c=>({parentId:c.parentId, nodes:c.nodes.slice()})), selectedId, scope:activeScope};
+  // build the FULL breadcrumb trail (scope › … › node) even though focus collapses columns
+  let trail;
+  if(Array.isArray(arg)) trail=arg;                                         // explicit (crumb click / inspector Linked)
+  else if(focusMode && focusTrail.includes(node.id))
+    trail=focusTrail.slice(0, focusTrail.indexOf(node.id)+1);               // jump BACK up to an already-visited node (e.g. seglink to an ancestor) — never truncate
+  else if(focusMode && focusTrail.length && node.id!==focusTrail[focusTrail.length-1])
+    trail=focusTrail.concat(node.id);                                       // drilling deeper WITHIN focus (dblclick or seglink) — preserve ancestors
+  else if(typeof arg==='number'){ trail=columns.slice(1, arg+1).map(c=>c.parentId); trail.push(node.id); }  // initial focus from Miller columns
+  else { trail=[]; if(node.kind==='document'){ const o=Object.keys(N).find(k=>N[k].kind==='tenant'&&(N[k].children||[]).includes(node.id)); if(o) trail.push(o); } trail.push(node.id); }
+  focusTrail=trail;
   focusMode=true; selectedId=node.id;
   columns=[{parentId:null, nodes:[node]}];
-  const kids=childrenOf(node);
+  const kids=childrenOf(node).filter(k=>!focusTrail.includes(k.id));   // loop guard: hide children already on the breadcrumb trail
   if(kids.length) columns.push({parentId:node.id, nodes:kids});
   document.getElementById('focusExit').style.display='';
   inspect(node); render();
+}
+function exitFocus(){
+  focusMode=false; focusTrail=[]; searchHighlight='';
+  document.getElementById('focusExit').style.display='none';
+  if(searchReturn!=null){ const q=searchReturn; searchReturn=null; preFocus=null; document.getElementById('searchInput').value=q; doSearch(q, document.getElementById('searchScope').value); return; }  // (fix) return to search results
+  if(preFocus && preFocus.scope===activeScope){ columns=preFocus.columns; selectedId=preFocus.selectedId; preFocus=null; render(); }
+  else { preFocus=null; openScope(activeScope); }
 }
 function inspect(node){
   document.getElementById('i-title').textContent=node.label;
@@ -596,14 +1011,39 @@ function inspect(node){
     kv.appendChild(a); kv.appendChild(b);
   });
   const lk=document.getElementById('i-links'), lkh=document.getElementById('i-links-h'); lk.innerHTML='';
-  const kids=childrenOf(node);
+  const path=(focusMode?focusTrail:columns.map(c=>c.parentId).filter(Boolean)).filter(id=>id!==node.id);
+  const kids=childrenOf(node).filter(c=>!path.includes(c.id));   // loop guard: don't offer a Linked jump back to an ancestor
   lkh.style.display = kids.length? '' : 'none';
-  kids.forEach(c=>{ const btn=document.createElement('button'); btn.textContent=c.label; btn.title=`expand ${c.kind}`; btn.onclick=()=>focusNode(c); lk.appendChild(btn); });
+  kids.forEach(c=>{ const btn=document.createElement('button'); btn.textContent=c.label; btn.title=`expand ${c.kind}`;
+    // pass the FULL ancestry trail (path = ancestors of `node`, + node, + c) so a Linked jump from Miller mode breadcrumbs the same as a dblclick
+    btn.onclick=async ()=>{ await ensureLoaded(c); focusMode ? focusNode(c) : focusNode(c, path.concat(node.id, c.id)); };
+    lk.appendChild(btn); });
   document.getElementById('i-payload').textContent=node.payload || (node.doc? node.doc : '{ }');
+  const acts=document.getElementById('i-actions'); acts.innerHTML='';
+  if(node.kind==='orchestrator' && node.id!==buildingId){   // edit entry point (not while it's already the build target)
+    const eb=document.createElement('button'); eb.textContent='✎ Edit orchestrator';
+    eb.title='Open this orchestrator in the builder to rename, reassign, add or remove members';
+    eb.onclick=()=>editOrc(node.id);
+    acts.appendChild(eb);
+  }
 }
 
 // active-session filter: hide non-running sessions when activeOnly is on
-const filt = ns => activeOnly ? ns.filter(n => n.kind!=='session' || norm(n.status)==='run') : ns;
+const filt = (ns, parentId) => {
+  let out = activeOnly ? ns.filter(n => n.kind!=='session' || norm(n.status)==='run') : ns;
+  if(parentId==='cx-work') out = out.filter(n => n.kind!=='execplan' || workStages[n.status]!==false);   // stage filter, scoped to the Work panel column
+  return out;
+};
+// if a filter (stage / active-only) hides a node we had drilled INTO, drop its now-orphaned descendant columns so the breadcrumb + selection stay truthful
+function pruneOrphanColumns(){
+  for(let c=1;c<columns.length;c++){
+    if(!filt(columns[c-1].nodes, columns[c-1].parentId).some(n=>n.id===columns[c].parentId)){
+      columns.length=c;
+      if(selectedId && !columns.some(co=>(co.nodes||[]).some(n=>n.id===selectedId))) selectedId=columns[c-1]?.parentId||null;
+      break;
+    }
+  }
+}
 
 function render(){
   positions={}; let maxBottom=0;
@@ -614,7 +1054,7 @@ function render(){
   const halfPage=Math.max(480, Math.round(cw*0.5));
   const hw = heroUserW ? Math.max(380, Math.min(cw-160, heroUserW)) : halfPage;
   // filtered projection over columns (source of truth untouched)
-  const view=columns.map(co=>({parentId:co.parentId, nodes:filt(co.nodes)}));
+  const view=columns.map(co=>({parentId:co.parentId, nodes:filt(co.nodes, co.parentId)}));
 
   const colX=[]; let x=PAD_X;
   for(let c=0;c<view.length;c++){ colX[c]=x; x += ((focusMode&&c===0)?hw:COL_W) + COL_GAP; }
@@ -629,6 +1069,37 @@ function render(){
       maxBottom=Math.max(maxBottom, y+h);
     });
   });
+  // ── artefact grid: artefacts render alongside their parent (focus hero, OR any node in the
+  //    last column — so Daemon-Live's 16 cards show the moment Overview loads), straight-line grid ──
+  const artefacts=[]; let straight='';
+  const artParents=[];
+  if(!searchActive){                              // (fix) never render artefacts inside search results
+    if(focusMode && view[0] && view[0].nodes[0] && (view[0].nodes[0].artefacts||[]).length) artParents.push({node:view[0].nodes[0], col:0, hero:true});
+    // (fix #6) ANY visible artefact-bearing node — not just the last column — keeps its cards shown
+    else if(!focusMode) view.forEach((co,ci)=>co.nodes.forEach(n=>{ if((n.artefacts||[]).length) artParents.push({node:n, col:ci}); }));
+  }
+  const gutterX=x+30;   // far-right gutter for non-focus grids (so drilling a sibling never hides them)
+  let stackY=PAD_Y;
+  artParents.forEach(({node:pn, col, hero})=>{
+    const pp=positions[`${col}:${pn.id}`]; if(!pp) return;
+    const AW=158, AH=52, AGX=14, AGY=12, acols=3;
+    const gx0 = hero ? (pp.x+pp.w+COL_GAP+26) : gutterX;
+    const baseY = hero ? PAD_Y : Math.max(PAD_Y, stackY);
+    const mine=[];
+    pn.artefacts.forEach((aid,i)=>{ const an=N[aid]; if(!an) return;
+      const r=Math.floor(i/acols), cc=i%acols;
+      const a={x:gx0+cc*(AW+AGX), y:baseY+r*(AH+AGY), w:AW, h:AH, node:an};
+      mine.push(a); artefacts.push(a); maxBottom=Math.max(maxBottom, a.y+a.h);
+    });
+    const busX=gx0-28, hy=pp.y+pp.h/2;
+    const ys=mine.map(a=>a.y+a.h/2).concat(hy), top=Math.min(...ys), bot=Math.max(...ys);
+    straight += `<path class="edge straight active" d="M ${pp.x+pp.w} ${hy} L ${busX} ${hy}"/>`;
+    straight += `<path class="edge straight active" d="M ${busX} ${top} L ${busX} ${bot}"/>`;
+    mine.forEach(a=>{ straight += `<path class="edge straight" d="M ${busX} ${a.y+a.h/2} L ${a.x} ${a.y+a.h/2}"/>`; });
+    x=Math.max(x, gx0+acols*(AW+AGX)+PAD_X);
+    if(!hero) stackY=baseY+Math.ceil(pn.artefacts.length/acols)*(AH+AGY)+34;
+  });
+
   const W=x+PAD_X, H=maxBottom+PAD_Y;
   const spine=new Set(columns.map(c=>c.parentId).filter(Boolean)); if(selectedId) spine.add(selectedId);
 
@@ -642,11 +1113,11 @@ function render(){
     });
   }
   edgesEl.setAttribute('width',W); edgesEl.setAttribute('height',H); edgesEl.setAttribute('viewBox',`0 0 ${W} ${H}`);
-  edgesEl.style.width=W+'px'; edgesEl.style.height=H+'px'; edgesEl.innerHTML=paths;
+  edgesEl.style.width=W+'px'; edgesEl.style.height=H+'px'; edgesEl.innerHTML=paths+straight;
 
   nodesEl.style.width=W+'px'; nodesEl.style.height=H+'px'; nodesEl.innerHTML='';
   Object.values(positions).forEach(p=>{
-    const node=p.node, s=norm(node.status), hasKids=childrenOf(node).length>0;
+    const node=p.node, s=norm(node.status), hasKids=childrenOf(node).length>0 || (node.artefacts&&node.artefacts.length>0);
     const isHero=focusMode && p.col===0;
     const el=document.createElement('div');
     el.className=`gnode s-${s}${node.id===selectedId?' sel':''}${hasKids?'':' leaf'}${isHero?' hero':''}`;
@@ -654,13 +1125,21 @@ function render(){
     el.style.left=p.x+'px'; el.style.top=p.y+'px'; el.style.width=p.w+'px'; el.style.height=p.h+'px';
     if(isHero){
       const ff=(node.fields||[]).slice(0,6).map(([k,v])=>`<span class="k">${esc(k)}</span><span class="v">${esc(v)}</span>`).join('');
-      const body = node.doc ? esc(node.doc) : (node.payload? esc(node.payload) : '');
-      el.innerHTML=`<div class="gstripe"></div><div class="gkind">${esc(node.kind)}</div>`+
+      let body = node.doc ? esc(node.doc) : (node.payload? esc(node.payload) : '');
+      if(searchHighlight && body) body=hl(body, searchHighlight);
+      const seg=(node.seglinks||[]).map(([lbl,ref])=>`<span class="sl" data-ref="${esc(ref)}">${esc(lbl)}</span>`).join('');
+      el.innerHTML=`<button class="hero-x" title="Exit focus">×</button>`+
+                   `<div class="gstripe"></div><div class="gkind">${esc(node.kind)}</div>`+
                    `<div class="gtitle">${esc(node.label)}</div>`+
                    (ff?`<div class="herofields">${ff}</div>`:'')+
                    (body?`<div class="gdoc">${body}</div>`:'')+
+                   (seg?`<div class="seglinks">${seg}</div>`:'')+
+                   `<button class="hero-add">＋ add artefact</button>`+
                    `<div class="hero-resize" title="Drag to resize width"></div>`;
       nodesEl.appendChild(el);
+      const xbtn=el.querySelector('.hero-x'); if(xbtn) xbtn.addEventListener('click', e=>{ e.stopPropagation(); exitFocus(); });
+      el.querySelectorAll('.seglinks .sl').forEach(s2=>s2.addEventListener('click', async ()=>{ const r=s2.dataset.ref; if(N[r]){ await ensureLoaded(N[r]); focusNode(N[r]); } }));
+      const add=el.querySelector('.hero-add'); if(add) add.addEventListener('click', e=>{ e.stopPropagation(); addArtefact(node); });
       const grip=el.querySelector('.hero-resize');
       if(grip) grip.addEventListener('pointerdown', e=>{
         e.preventDefault(); e.stopPropagation();
@@ -674,19 +1153,57 @@ function render(){
     const row2 = node.status
       ? `<div class="grow2"><span class="gchip">${chipText(node.status)}</span>${node.sub?`<span class="gsub">${esc(node.sub)}</span>`:''}</div>`
       : (node.sub?`<div class="grow2"><span class="gsub">${esc(node.sub)}</span></div>`:'');
-    el.innerHTML=`<div class="gstripe"></div><div class="gkind">${esc(node.kind)}</div><div class="gtitle">${esc(node.label)}</div>${row2}<span class="gcaret">›</span>`;
-    el.addEventListener('click', ()=>expand(node, p.col));
-    el.addEventListener('dblclick', e=>{ e.preventDefault(); focusNode(node); });
+    const isMember = buildingId && p.col>0 && (N[buildingId].children||[]).includes(node.id);   // attached to the orchestrator being built/edited
+    el.innerHTML=`<div class="gstripe"></div><div class="gkind">${esc(node.kind)}</div><div class="gtitle">${esc(node.label)}</div>${row2}<span class="gcaret">›</span>`
+                 + (isMember?`<button class="gdetach" title="Remove from orchestrator">×</button>`:'');
+    el.addEventListener('click', async ()=>{ if(searchActive){ openSearchResult(node); return; } if(node.__status){ if(node.kind==='error') retryLoad(node); return; } await ensureLoaded(node); expand(node, p.col); });
+    el.addEventListener('dblclick', async e=>{ e.preventDefault(); if(node.__status) return; await ensureLoaded(node); focusNode(node, p.col); });
+    if(isMember){ const db=el.querySelector('.gdetach'); if(db) db.addEventListener('click', e=>{ e.stopPropagation(); removeFromBuild(node.id); }); }
+    if(node.kind==='orchestrator' && node.id===buildingId){   // (fix) only the orchestrator being built is a drop target
+      el.addEventListener('dragover', e=>{ e.preventDefault(); el.classList.add('dragover'); });
+      el.addEventListener('dragleave', ()=>el.classList.remove('dragover'));
+      el.addEventListener('drop', e=>{ e.preventDefault(); el.classList.remove('dragover'); const id=e.dataTransfer.getData('text/plain'); if(id) dropOntoOrc(node, id); });
+    }
     nodesEl.appendChild(el);
   });
+  // artefact cards
+  artefacts.forEach(a=>{
+    const node=a.node, s=norm(node.status);
+    const el=document.createElement('div'); el.className=`gnode s-${s}`; el.dataset.kind='artefact';
+    el.style.left=a.x+'px'; el.style.top=a.y+'px'; el.style.width=a.w+'px'; el.style.height=a.h+'px';
+    el.innerHTML=`<div class="gstripe"></div><div class="gtitle">${esc(node.label)}</div><div class="grow2"><span class="gsub">${esc(node.sub||'')}</span></div>`;
+    el.addEventListener('click', ()=>{ selectedId=node.id; inspect(node); render(); });
+    nodesEl.appendChild(el);
+  });
+  // #1: ＋ Orchestrator only visible while on the Orchestrators panel (or mid-build)
+  document.getElementById('orcNew').style.display =
+    (!searchActive && !focusMode && (buildingId || selectedId==='cx-orchestrators'
+      || columns.some(c=>c.parentId==='cx-orchestrators'))) ? '' : 'none';
+  // item 3: stage filter only visible while on the Work panel
+  document.getElementById('workFilter').style.display =
+    (!searchActive && !focusMode && (selectedId==='cx-work' || columns.some(c=>c.parentId==='cx-work'))) ? 'inline-flex' : 'none';
   renderCrumbs();
 }
 
 function renderCrumbs(){
   const bc=document.getElementById('breadcrumb'); bc.innerHTML='';
+  if(searchActive){
+    const s=document.createElement('span'); s.className='c head'; s.textContent=`Search “${searchHighlight}” · ${searchResults.length} result${searchResults.length===1?'':'s'}`; bc.appendChild(s);
+    return;
+  }
   const scope=SCOPES.find(s=>s.id===activeScope);
   const head=document.createElement('span'); head.className='c head'; head.textContent=`${scope.label} · ${scope.tag}${focusMode?' · focus':''}`;
-  head.onclick=()=>openScope(activeScope); bc.appendChild(head);
+  head.onclick=()=>{ if(focusMode) exitFocus(); else openScope(activeScope); }; bc.appendChild(head);
+  if(focusMode){
+    // #5b: show the FULL path (scope › … › focused node) even in focus mode
+    focusTrail.forEach((id,i)=>{
+      const sep=document.createElement('span'); sep.className='sep'; sep.textContent='›'; bc.appendChild(sep);
+      const node=N[id]; const seg=document.createElement('span'); seg.className='c'+(i===focusTrail.length-1?' head':'');
+      seg.textContent=(node&&node.label)||id;
+      seg.onclick=()=>{ if(node) focusNode(node, focusTrail.slice(0,i+1)); }; bc.appendChild(seg);
+    });
+    return;
+  }
   for(let c=1;c<columns.length;c++){
     const sep=document.createElement('span'); sep.className='sep'; sep.textContent='›'; bc.appendChild(sep);
     const node=N[columns[c].parentId];
@@ -698,7 +1215,7 @@ function renderCrumbs(){
 /* chrome */
 const pillsEl=document.getElementById('scopePills');
 SCOPES.forEach(s=>{ const b=document.createElement('span'); b.className='wc-centre-pill'; b.dataset.scope=s.id; b.innerHTML=`${s.label}<small>${s.tag}</small>`; b.addEventListener('click',()=>openScope(s.id)); pillsEl.appendChild(b); });
-document.getElementById('focusExit').addEventListener('click', ()=>openScope(activeScope));
+document.getElementById('focusExit').addEventListener('click', ()=>exitFocus());
 document.getElementById('themeBtn').addEventListener('click', ()=>{ const d=document.documentElement.classList.toggle('dark'); try{ localStorage.setItem('cx-theme', d?'dark':'light'); }catch(e){} });
 
 /* inspector: drag-resize (left/right) + hide toggle */
@@ -712,70 +1229,210 @@ asideResize.addEventListener('pointerdown', e=>{
   const up=()=>{ document.removeEventListener('pointermove',move); document.removeEventListener('pointerup',up); };
   document.addEventListener('pointermove',move); document.addEventListener('pointerup',up);
 });
-asideResize.addEventListener('dblclick', ()=>document.body.classList.toggle('insp-hidden'));
+asideResize.addEventListener('dblclick', ()=>{ document.body.classList.toggle('insp-hidden'); render(); });
 document.getElementById('inspToggle').addEventListener('click', ()=>{ document.body.classList.toggle('insp-hidden'); render(); });
 
 /* breadcrumb-bar: only show running sessions */
-document.getElementById('activeToggle').addEventListener('click', e=>{ activeOnly=!activeOnly; e.currentTarget.classList.toggle('on', activeOnly); render(); });
+document.getElementById('activeToggle').addEventListener('click', e=>{ activeOnly=!activeOnly; e.currentTarget.classList.toggle('on', activeOnly); pruneOrphanColumns(); render(); });
+document.querySelectorAll('#workFilter .wf-chip').forEach(ch=>ch.addEventListener('click', ()=>{ const st=ch.dataset.stage; workStages[st]=!workStages[st]; ch.classList.toggle('on', workStages[st]); pruneOrphanColumns(); render(); }));
 
 /* keep the full-height focus hero fitted to the viewport */
 window.addEventListener('resize', ()=>render());
 
-/* ── Orchestrator builder (drag-drop): mirrors MCP create_orchestrator/attach ── */
 const $=id=>document.getElementById(id);
-let orcSeq=0, builderMembers=[], builderFilter='planned';
-function paletteItems(){
-  const all=Object.values(N);
-  if(builderFilter==='handoff') return all.filter(n=>n.kind==='handoff');
-  return all.filter(n=>n.kind==='execplan' && n.status===builderFilter);
-}
-function renderPalette(){
-  const el=$('orcPalette'); el.innerHTML='';
-  paletteItems().forEach(n=>{
-    const c=document.createElement('div'); c.className='chip'; c.draggable=true; c.dataset.id=n.id;
-    c.innerHTML=`<span>${esc(n.label)}</span><span class="tag">${esc(chipText(n.status)||n.kind)}</span>`;
-    c.addEventListener('dragstart', e=>e.dataTransfer.setData('text/plain', n.id));
-    c.addEventListener('click', ()=>addMember(n.id));
-    el.appendChild(c);
-  });
-  document.querySelectorAll('#orcFilters button').forEach(b=>b.classList.toggle('on', b.dataset.f===builderFilter));
-}
-function renderDrop(){
-  const el=$('orcDrop'); el.innerHTML='';
-  if(!builderMembers.length){ el.innerHTML='<div class="empty">Drag ExecPlans / handoffs here<br>(or click a palette item)</div>'; return; }
-  builderMembers.forEach(id=>{
-    const n=N[id]; const m=document.createElement('div'); m.className='member';
-    m.innerHTML=`<span>${esc(n?n.label:id)}</span><button title="remove">×</button>`;
-    m.querySelector('button').addEventListener('click', ()=>removeMember(id));
-    el.appendChild(m);
-  });
-}
-function addMember(id){ if(!builderMembers.includes(id)){ builderMembers.push(id); renderDrop(); } }
-function removeMember(id){ builderMembers=builderMembers.filter(x=>x!==id); renderDrop(); }
-function openBuilder(){ builderMembers=[]; builderFilter='planned'; $('orcName').value=''; renderPalette(); renderDrop(); $('orcModal').style.display='flex'; }
-function closeBuilder(){ $('orcModal').style.display='none'; }
 
-$('orcNew').addEventListener('click', openBuilder);
-$('orcCancel').addEventListener('click', closeBuilder);
-document.querySelectorAll('#orcFilters button').forEach(b=>b.addEventListener('click', ()=>{ builderFilter=b.dataset.f; renderPalette(); }));
-const dz=$('orcDropZone');
-dz.addEventListener('dragover', e=>{ e.preventDefault(); dz.classList.add('over'); });
-dz.addEventListener('dragleave', ()=>dz.classList.remove('over'));
-dz.addEventListener('drop', e=>{ e.preventDefault(); dz.classList.remove('over'); const id=e.dataTransfer.getData('text/plain'); if(id) addMember(id); });
-$('orcCreate').addEventListener('click', ()=>{
-  const name=($('orcName').value||'').trim()||'New orchestrator';
-  const pp=$('orcPassport').value;
+/* ── search (#5): titles / data / all → result tiles → click drills to the doc ── */
+let searchActive=false, searchHighlight='', searchResults=[], focusFromSearch=false, searchReturn=null;
+function hl(escaped, term){
+  const t=esc(String(term||'')); if(!t) return escaped;
+  const re=new RegExp('('+t.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','ig');
+  return escaped.replace(re,'<mark class="hl">$1</mark>');
+}
+function matchNode(node, q, scope){
+  const ql=q.toLowerCase();
+  const inTitle=((node.label||'')+' '+(node.sub||'')).toLowerCase().includes(ql);
+  const data=[(node.doc||''),(node.payload||''),...(node.fields||[]).map(f=>f.join(' '))].join(' ').toLowerCase();
+  const inData=data.includes(ql);
+  return scope==='titles'?inTitle : scope==='data'?inData : (inTitle||inData);
+}
+function doSearch(q, scope){
+  q=(q||'').trim();
+  $('searchWrap').classList.toggle('has-q', !!q);
+  if(!q){ exitSearch(); return; }
+  if(buildingId) teardownBuild();   // (fix) searching mid-build tears down the builder instead of leaving it stuck open
+  searchActive=true; searchHighlight=q; focusMode=false; selectedId=null;
+  searchResults=Object.values(N).filter(n=>n.kind!=='panel' && !n.__status && matchNode(n,q,scope));
+  columns=[{parentId:null, nodes:searchResults}];
+  document.getElementById('focusExit').style.display='none';
+  render();
+}
+function exitSearch(){ searchActive=false; searchHighlight=''; openScope(activeScope); }
+function openSearchResult(node){
+  // documents → open the full-height doc (chunk highlighted, semantic/graph links shown);
+  // any other kind → focus it. Keep the highlight for THIS doc; remember the query so the × returns to results.
+  searchReturn=document.getElementById('searchInput').value; focusFromSearch=true; searchActive=false;
+  focusNode(node);
+}
+$('searchInput').addEventListener('input', e=>doSearch(e.target.value, $('searchScope').value));
+$('searchScope').addEventListener('change', ()=>doSearch($('searchInput').value, $('searchScope').value));
+$('searchClear').addEventListener('click', ()=>{ $('searchInput').value=''; doSearch('', $('searchScope').value); });
+$('searchInput').addEventListener('keydown', e=>{ if(e.key==='Escape'){ $('searchInput').value=''; doSearch('', $('searchScope').value); } });
+
+/* ── artefacts (#2): + add a monitored endpoint/datum to the focused tile ── */
+let afSeq=0;
+function addArtefact(node){
+  const label = (typeof prompt==='function') ? prompt('Artefact label (e.g. "GET /v1/work")') : null;
+  if(!label) return;
+  const data = ((typeof prompt==='function') ? prompt('Endpoint or datum to monitor:', '/v1/…') : '') || '';
+  const id='af-user-'+(++afSeq);
+  N[id]={kind:'artefact', label, sub:data, status:'idle', fields:[['source',data||'—'],['added','just now']]};
+  node.artefacts=(node.artefacts||[]).concat(id);
+  render();
+}
+
+/* ── orchestrator builder: floating top-right dock (#buildCard form + #buildPalette 4 cols: Planned/In progress/Handoffs/Existing) + search + drag-to-tree ── */
+let orcSeq=0, buildingId=null, buildTouched=false, editSnap=null;
+const isEditing=()=>!!editSnap && editSnap.id===buildingId;
+function passportOf(orc){ const f=(orc.fields||[]).find(([k])=>k==='assignee'); return f?f[1]:''; }
+function cleanSub(orc){ return `${passportOf(orc)} · ${(orc.children||[]).length} members`; }   // committed sub (no building…/editing… suffix)
+function showBuildingOrc(){  // build canvas: the orchestrator tile (drop target) + its attached members
+  const orc=N[buildingId]; if(!orc) return;
+  focusMode=false; selectedId=buildingId; focusTrail=[];
+  columns=[ {parentId:null, nodes:[orc]}, {parentId:buildingId, nodes:childrenOf(orc)} ];
+}
+function openBuilder(){
+  if(buildingId) return;            // re-entry guard: a second click must not orphan the in-progress orchestrator
+  if(searchActive) exitSearch();
   const id='orc-user-'+(++orcSeq);
-  N[id]={kind:'orchestrator', label:name, sub:`${pp} · ${builderMembers.length} members`, status:'planned',
-    fields:[['assignee',pp],['state','planned'],['members',String(builderMembers.length)],['created_by',pp]],
-    children:[...builderMembers],
-    doc:`ORCHESTRATOR · ${name}\nassignee ${pp} · state planned\ncreated via builder — agents do the same via MCP\ncreate_orchestrator / attach_to_orchestrator.\n\n${builderMembers.length} members (by reference):\n`+(builderMembers.map(m=>' · '+(N[m]?N[m].label:m)).join('\n')||' (none yet — drag some in)')};
+  // stamp .id on the freshly-created node (the load-time id pass at the top ran before this node existed;
+  // without it node.id===buildingId is false and the drop-target handler never attaches → DnD silently dead)
+  N[id]={kind:'orchestrator', id, label:'New orchestrator', sub:'building…', status:'planned',
+    fields:[['assignee','ce:4e6c4e2a:local'],['state','planned'],['members','0']], children:[],
+    doc:'ORCHESTRATOR (building)\nDrag a card from the New Orchestrator card (top-right)\nonto this tile to attach it as a member. Agents do the\nsame via MCP create_orchestrator + attach_to_orchestrator.'};
   N['cx-orchestrators'].children.push(id);
-  closeBuilder();
-  openScope('cx'); expand(N['cx-orchestrators'],0); selectedId=id; inspect(N[id]); render();
-});
+  buildingId=id; activeScope='cx'; buildTouched=false; editSnap=null;
+  $('bcName').value=''; $('bcPass').selectedIndex=0; $('bcSearch').value='';
+  document.body.classList.add('building');
+  showBuildingOrc(); renderBuildCard(); render();
+}
+function editOrc(id){              // open an EXISTING orchestrator in the same dock to rename / reassign / add-remove members
+  if(buildingId) return;
+  if(searchActive) exitSearch();
+  const orc=N[id]; if(!orc || orc.kind!=='orchestrator') return;
+  editSnap={ id, label:orc.label, sub:orc.sub, fields:(orc.fields||[]).map(p=>p.slice()), children:(orc.children||[]).slice() };  // snapshot for ×-cancel revert
+  buildingId=id; activeScope='cx'; buildTouched=true;   // existing orc: never silently discarded
+  $('bcName').value=orc.label||'';
+  const pp=passportOf(orc), sel=$('bcPass'); sel.selectedIndex=0;
+  Array.from(sel.options||[]).forEach((o,i)=>{ if(o.value===pp) sel.selectedIndex=i; });
+  $('bcSearch').value='';
+  document.body.classList.add('building');
+  showBuildingOrc(); renderBuildCard(); render();
+}
+function restoreSnap(){ const o=editSnap&&N[editSnap.id]; if(!o) return; o.label=editSnap.label; o.sub=editSnap.sub; o.fields=editSnap.fields.map(p=>p.slice()); o.children=editSnap.children.slice(); }
+function builderItems(f){
+  const all=Object.values(N), orc=N[buildingId], q=($('bcSearch').value||'').trim().toLowerCase();
+  let items;
+  if(f==='handoff') items=all.filter(n=>n.kind==='handoff');
+  else if(f==='existing') items=all.filter(n=>n.kind==='orchestrator' && n.id!==buildingId);
+  else items=all.filter(n=>n.kind==='execplan' && n.status===f);
+  if(orc) items=items.filter(n=>!orc.children.includes(n.id));   // attached cards leave the pool
+  if(q) items=items.filter(n=>(n.label||'').toLowerCase().includes(q));
+  return items;
+}
+function renderBuildCard(){  // populates the 4 columns of the floating card (NOT the inputs → they keep focus)
+  const orc=N[buildingId];
+  $('bcCount').textContent=`${orc?orc.children.length:0} attached`;
+  [['planned','bc-planned'],['in_progress','bc-in_progress'],['handoff','bc-handoff'],['existing','bc-existing']].forEach(([f,elid])=>{
+    const el=$(elid); el.innerHTML='';
+    const items=builderItems(f);
+    if(!items.length){ const e=document.createElement('div'); e.className='bc-empty'; e.textContent='—'; el.appendChild(e); return; }
+    items.forEach(n=>{
+      const c=document.createElement('div'); c.className='bc-card s-'+norm(n.status); c.draggable=true; c.dataset.id=n.id; c.title=n.label; c.textContent=n.label;
+      c.tabIndex=0; c.setAttribute('role','button'); c.setAttribute('aria-label','Attach '+n.label);   // keyboard-attachable, not pointer-only
+      c.addEventListener('dragstart', e=>{ e.dataTransfer.setData('text/plain', n.id); e.dataTransfer.effectAllowed='copy'; });
+      c.addEventListener('click', ()=>addToBuild(n.id));   // click also attaches
+      c.addEventListener('keydown', e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); addToBuild(n.id); } });
+      el.appendChild(c);
+    });
+  });
+}
+function addToBuild(id){ const orc=N[buildingId]; if(orc && !orc.children.includes(id)){ buildTouched=true; orc.children.push(id); syncBuild(); } }
+function removeFromBuild(id){ const orc=N[buildingId]; if(orc){ orc.children=(orc.children||[]).filter(x=>x!==id); buildTouched=true; syncBuild(); } }   // detach a member
+function dropOntoOrc(orc, id){ if(orc.id===buildingId) addToBuild(id); }   // drop a card onto the orchestrator tile
+function syncBuild(){
+  const orc=N[buildingId]; if(!orc) return;
+  const editing=isEditing();
+  const pp=$('bcPass').value, nm=($('bcName').value||'').trim()|| (editing?(editSnap.label||'Orchestrator'):'New orchestrator');
+  if(($('bcName').value||'').trim() || orc.children.length) buildTouched=true;   // once engaged, never silently discard
+  const state = editing ? (orc.status||'planned') : 'planned';   // editing preserves the orc's real state
+  orc.label=nm; orc.sub=`${pp} · ${orc.children.length} members · ${editing?'editing…':'building…'}`;
+  orc.fields=[['assignee',pp],['state',state],['members',String(orc.children.length)]];
+  showBuildingOrc(); renderBuildCard(); render();
+}
+function endBuild(){ document.body.classList.remove('building'); const id=buildingId; buildingId=null; editSnap=null; return id; }
+function orcRealId(nodeId){ return (nodeId && nodeId.startsWith('orc:'))? nodeId.slice(4) : nodeId; }
+function memberRefs(orc){   // child node ids → {type,ref} for the daemon (strip the id namespace prefix)
+  return (orc.children||[]).map(cid=>{
+    const isHandoff = cid.startsWith('handoff:') || /^ho\d/.test(cid) || cid.startsWith('handoff');
+    const ref = cid.includes(':') ? cid.split(':').slice(1).join(':') : cid;
+    return { type: isHandoff ? 'handoff' : 'execplan', ref };
+  });
+}
+async function commitBuildLive(orc){   // M5 — Done writes to the daemon (POST create / PATCH + member diff on edit)
+  const name = orc.label || 'New orchestrator';
+  const members = memberRefs(orc);
+  if(isEditing() && editSnap && !/^orc-user-/.test(editSnap.id)){
+    const realId = orcRealId(editSnap.id);
+    await patchApi('/v1/orchestrators/'+realId, { name });
+    const before = (editSnap.children||[]).map(c=> c.includes(':')? c.split(':').slice(1).join(':') : c);
+    const after  = members.map(m=>m.ref);
+    for(const m of members){ if(!before.includes(m.ref)) await postApi('/v1/orchestrators/'+realId+'/members', m); }
+    for(const r of before){ if(!after.includes(r)) await deleteApi('/v1/orchestrators/'+realId+'/members/'+encodeURIComponent(r)); }
+  } else {
+    const created = await postApi('/v1/orchestrators', { name });
+    const realId = created.id || (created.orchestrator && created.orchestrator.id) || created.orchestrator_id;
+    for(const m of members){ if(realId) await postApi('/v1/orchestrators/'+realId+'/members', m); }
+  }
+  loadState['cx-orchestrators']='idle';
+  await ensureLoaded(N['cx-orchestrators']);   // refetch — the live list is now authoritative
+}
+async function finishBuild(){     // Done: commit name/passport/members; writes to the daemon when live
+  const orc=N[buildingId]; if(!orc){ endBuild(); return; }
+  if(LIVE && loaderFor(N['cx-orchestrators'])){
+    let saved=true;
+    try{ await commitBuildLive(orc); }catch(e){ saved=false; announce('Orchestrator save failed ('+((e&&e.status)||'network')+') — '+(e&&e.data&&e.data.error||'see daemon')); }
+    const did=buildingId;
+    if(!isEditing()){ N['cx-orchestrators'].children=(N['cx-orchestrators'].children||[]).filter(x=>x!==did); delete N[did]; }   // drop client draft; live list is authoritative
+    endBuild();
+    openScope('cx'); expand(N['cx-orchestrators'], 0);
+    announce(saved? 'Orchestrator saved' : 'Saved with errors');
+    return;
+  }
+  orc.sub=cleanSub(orc);   // demo/offline: client-only
+  const id=endBuild(); if(id && N[id]) focusNode(N[id]);
+}
+function teardownBuild(){          // navigate-away: discard an UNTOUCHED new draft; otherwise commit (keep) in place. No revert.
+  if(!buildingId) return;
+  const orc=N[buildingId], id=buildingId;
+  if(orc && !isEditing() && !buildTouched && (orc.children||[]).length===0){
+    N['cx-orchestrators'].children=N['cx-orchestrators'].children.filter(x=>x!==id); delete N[id];
+  } else if(orc){ orc.sub=cleanSub(orc); }
+  endBuild();
+}
+function cancelBuild(){            // × : revert an existing-orc edit to its snapshot; discard an untouched new draft
+  if(isEditing()){ restoreSnap(); endBuild(); }   // full revert (label/sub/fields/members), no cleanSub rewrite
+  else teardownBuild();
+  openScope('cx'); expand(N['cx-orchestrators'], 0);
+}
+$('orcNew').addEventListener('click', openBuilder);
+$('bcName').addEventListener('input', syncBuild);
+$('bcPass').addEventListener('change', syncBuild);
+$('bcSearch').addEventListener('input', renderBuildCard);
+$('bcDone').addEventListener('click', finishBuild);
+$('bcClose').addEventListener('click', cancelBuild);
 
-openScope('cx');
+openScope('cx');   // immediate render with dummy data
+bootProbe();        // probe /readyz; if live, lazy-replace panels with real /v1 data
 </script>
 </body>
 </html>
