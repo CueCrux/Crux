@@ -89,9 +89,10 @@ function makeFetch() {
   f.route(u => /\/v1\/work/.test(u), { ok: true, status: 200, body: { work: [
     { id: 'agentux', title: 'agent-ux-best-in-class', state: 'in_progress', risk_class: 'medium', plan_path: 'PlanCrux/.agent/execplans/agent-ux.md', current_milestone: 'M4', orchestrator_id: 'orc_7a1c' },
     { id: 'gemma', title: 'engine-cheap-tier-llm', state: 'complete', current_milestone: 'M7' }] } });
-  f.route(u => /\/v1\/console\/summary/.test(u), { ok: true, status: 200, body: {
-    daemon: { mode: 'local_only', active_sessions: 3, degraded: false, background_sync: false, passport: 'ce:4e6c4e2a:local' },
-    stores: { facts: 1953 }, integrations: { packs: 5, grants: 3 } } });
+  f.route(u => /\/v1\/console\/summary/.test(u), { ok: true, status: 200, body: {   // real /v1/console/summary shape
+    daemon: { auth_mode: 'jwt_hs256', node_id: 'ce:4e6c4e2a:local', dataplane_enabled: false, mcp_agent_count: 2 },
+    stores: { facts: 1953, sessions: 3 }, integrations: { enabled: true, builtin_pack_count: 5, safe_mode: true },
+    capacity: { total_bytes: 1e12, free_bytes: 2e11, free_ratio: 0.2, auto_paused: false } } });
   const env = buildSandbox(f);
   await flush();   // boot prefetch populates cx-overview + cx-work from the real transforms
   ok(env.s.__cx.LIVE === true, 'boot: /readyz ok → LIVE true');
@@ -112,7 +113,7 @@ function makeFetch() {
   // M2 — Overview tiles refreshed in place from /v1/console/summary
   ok(env.s.__cx.loadState['cx-overview'] === 'done', 'M2 overview: summary loaded');
   const ovNode = env.s.__cx.N['ov-node'];
-  ok(ovNode && JSON.stringify(ovNode.fields).includes('local_only'), 'M2 overview: ov-node fields refreshed from live summary (mode=local_only)');
+  ok(ovNode && JSON.stringify(ovNode.fields).includes('jwt_hs256'), 'M2 overview: ov-node fields refreshed from live summary (auth_mode)');
   ok(ovNode && JSON.stringify(ovNode.fields).includes('1953'), 'M2 overview: live fact count wired');
 
   // ── B) 501 → calm unavailable empty-state ──
@@ -166,8 +167,8 @@ function makeFetch() {
   // ── G) M4–M9 read transforms + M5 live builder write (fresh live env) ──
   const f3 = makeFetch();
   f3.route(u => /\/v1\/work/.test(u), { ok: true, status: 200, body: { work: [{ id: 'agentux', title: 'agent-ux-plan', state: 'in_progress' }] } });
-  f3.route(u => /\/v1\/console\/sessions/.test(u), { ok: true, status: 200, body: { sessions: [{ session_id: '9c5a', execplan: 'agent-ux', turns: 42, tokens_in: 312000, tokens_out: 41000, model: 'opus-4.8', active: true }] } });
-  f3.route(u => /\/v1\/orchestrators\/[^/]+\/work/.test(u), { ok: true, status: 200, body: { work: [{ id: 'agentux', title: 'agent-ux', state: 'in_progress' }] } });
+  f3.route(u => /\/v1\/console\/sessions/.test(u), { ok: true, status: 200, body: { count: 2, sessions: ['9c5a9271', '1af0b3e2'], state_preview: 'ids_only' } });   // real shape: id strings
+  f3.route(u => /\/v1\/orchestrators\/[^/]+\/work/.test(u), { ok: true, status: 200, body: { orchestrator_id: 'orc_7a1c', count: 1, members: [{ type: 'execplan', ref: 'agentux', work: { id: 'agentux', title: 'agent-ux', state: 'in_progress' } }] } });   // real shape: members[].work
   f3.route(u => /\/v1\/orchestrators$/.test(u), { ok: true, status: 200, body: { orchestrators: [{ id: 'orc_7a1c', name: 'Sprint 1', state: 'active', created_by_passport: 'ce:4e6c4e2a:local', members: [{ type: 'execplan', ref: 'agentux' }] }] } });
   f3.route(u => /\/v1\/punchcards/.test(u), { ok: true, status: 200, body: { punchcards: [
     { id: 'pc1', resource: 'file://x', mode: 'modify', holder_passport: 'ce:4e6c4e2a:local', status: 'held' },
@@ -184,7 +185,7 @@ function makeFetch() {
   const cxp = () => env3.s.document.querySelectorAll('.wc-centre-pill').filter(p => p.dataset.scope === 'cx').forEach(p => p.fire('click'));
 
   await tile(env3, 'panel', 'Sessions').fire('click'); await flush();
-  ok(!!tile(env3, 'session', 'execplan:agent-ux'), 'M4 sessions: live session tile');
+  ok(!!tile(env3, 'session', '9c5a9271'), 'M4 sessions: live session id tile (ids-only shape)');
   await tile(env3, 'panel', 'Orchestrators').fire('click'); await flush();
   ok(!!tile(env3, 'orchestrator', 'Sprint 1'), 'M5 orchestrators: live orchestrator tile');
   await tile(env3, 'orchestrator', 'Sprint 1').fire('dblclick'); await flush();

@@ -820,12 +820,13 @@ function txWork(json){   // M3 — kanban WorkItem[] → execplan nodes (status 
   }));
 }
 function ovField(v){ return (v===0||v)? String(v) : '—'; }
-function txOverview(json){   // M2 — refresh the fixed Overview tiles' fields from /v1/console/summary (keep their artefacts/docs)
-  const sum=json||{}, d=sum.daemon||{}, st=sum.stores||{}, integ=sum.integrations||{};
+function txOverview(json){   // M2 — refresh the fixed Overview tiles' fields from /v1/console/summary (real keys; keeps tiles' artefacts/docs)
+  const sum=json||{}, d=sum.daemon||{}, st=sum.stores||{}, integ=sum.integrations||{}, cap=sum.capacity||{};
   const set=(id,fields,sub)=>{ const n=N[id]; if(n){ n.fields=fields.filter(([,v])=>v!=null); if(sub!=null && sub!=='—') n.sub=sub; } };
-  set('ov-node', [['mode',ovField(d.mode)],['facts',ovField(st.facts ?? st.fact_count)],['sessions',ovField(d.active_sessions ?? sum.sessions)],['degraded', d.degraded!=null? (d.degraded?'yes':'no') : null],['bg sync', d.background_sync!=null? (d.background_sync?'on':'off') : null]], ovField(d.passport||d.node));
-  set('ov-storage', st.by_kind? Object.entries(st.by_kind).map(([k,v])=>[k,ovField(v)]) : [['facts',ovField(st.facts)]]);
-  set('ov-integrations', [['packs',ovField(integ.packs)],['grants',ovField(integ.grants)]]);
+  const gb = b=>(Number(b||0)/1073741824).toFixed(1)+' GiB';
+  set('ov-node', [['auth',ovField(d.auth_mode)],['facts',ovField(st.facts)],['sessions',ovField(st.sessions)],['dataplane', d.dataplane_enabled!=null?(d.dataplane_enabled?'on':'off'):null],['mcp agents',ovField(d.mcp_agent_count)]], ovField(d.node_id));
+  if(cap.total_bytes!=null) set('ov-storage', [['free',gb(cap.free_bytes)],['total',gb(cap.total_bytes)],['free %', cap.free_ratio!=null?Math.round(cap.free_ratio*100)+'%':null],['auto-paused', cap.auto_paused?'yes':'no']]);
+  set('ov-integrations', [['enabled', integ.enabled!=null?(integ.enabled?'yes':'no'):null],['packs',ovField(integ.builtin_pack_count)],['safe mode', integ.safe_mode?'on':'off']]);
   return ['ov-node','ov-work','ov-usage','ov-storage','ov-integrations','ov-tenants'].map(id=>N[id]).filter(Boolean);
 }
 function st2(s){ s=(s||'').toLowerCase();
@@ -834,18 +835,19 @@ function st2(s){ s=(s||'').toLowerCase();
   if(['blocked','error','expired','force_released','err','cancelled'].includes(s)) return 'err';
   return 'idle';
 }
-function txSessions(json){   // M4 — session list
+function txSessions(json){   // M4 — /v1/console/sessions returns {sessions:[id-string]} (ids only, by design); detail via the audit drill
   const ss = json.sessions || json.active || (Array.isArray(json)? json : []);
   return ss.map(s=>{
-    const id = s.session_id || s.id || s.sid || '';
-    const ep = s.execplan || s.plan_slug || s.label || '';
-    const toks = s.tokens || (s.tokens_in!=null? (Math.round((s.tokens_in||0)/1000)+'k in · '+Math.round((s.tokens_out||0)/1000)+'k out') : null);
+    const isStr = typeof s==='string';
+    const id = isStr? s : (s.session_id || s.id || s.sid || '');
+    const ep = isStr? '' : (s.execplan || s.plan_slug || s.label || '');
+    const toks = isStr? null : (s.tokens || (s.tokens_in!=null? (Math.round((s.tokens_in||0)/1000)+'k in · '+Math.round((s.tokens_out||0)/1000)+'k out') : null));
     return { id: idFor('sess', id), kind:'session', __sessId:id,
       label: ep? ('execplan:'+ep) : (id||'session'),
-      sub: [s.turns!=null? s.turns+' turns':null, toks, s.ttl? ('ttl '+s.ttl):null].filter(Boolean).join(' · ') || (s.saved||''),
-      status: st2(s.status || (s.active?'active':'idle')),
-      fields:[['session_id',id],['turns',s.turns],['tokens',toks],['model',s.model],['passport',s.passport||s.passport_id],['execplan',ep],['ttl',s.ttl]].filter(([,v])=>v!=null&&v!==''),
-      children:[], doc: s.summary||s.doc||'', payload: JSON.stringify(s,null,2) };
+      sub: isStr? 'session · open for audit chain →' : ([s.turns!=null? s.turns+' turns':null, toks, s.ttl? ('ttl '+s.ttl):null].filter(Boolean).join(' · ') || (s.saved||'')),
+      status: isStr? 'idle' : st2(s.status || (s.active?'active':'idle')),
+      fields: isStr? [['session_id',id]] : [['session_id',id],['turns',s.turns],['tokens',toks],['model',s.model],['passport',s.passport||s.passport_id],['execplan',ep],['ttl',s.ttl]].filter(([,v])=>v!=null&&v!==''),
+      children:[], doc: isStr? '' : (s.summary||s.doc||''), payload: JSON.stringify(s,null,2) };
   });
 }
 function txOrchestrators(json){   // M5 read — members resolved on drill (shared work: ids → loop-guard safe)
@@ -859,6 +861,11 @@ function txOrchestrators(json){   // M5 read — members resolved on drill (shar
     children:[],
     doc:'ORCHESTRATOR '+o.id+' · '+(o.name||'')+'\nstate '+(o.state||'')+'\nmembers (by reference):\n'+(o.members||[]).map(m=>' · '+(m.type||'')+' '+(m.ref||'')).join('\n'),
     payload: JSON.stringify(o,null,2) }));
+}
+function txOrcMembers(json){   // M5 drill — /v1/orchestrators/{id}/work → {members:[{type,ref,work,missing}]}
+  const ms = json.members || (Array.isArray(json)? json : []);
+  return ms.map(m=> m.work ? txWork({work:[m.work]})[0]
+                           : makeStatusNode(idFor('work', m.ref||'?')+'::missing','unavailable','missing member: '+(m.ref||'?')));
 }
 function txPunchcards(json){   // M6 — group by holder/session
   const cards = json.punchcards || (Array.isArray(json)? json : []);
@@ -926,7 +933,7 @@ function registerLoaders(){
   LOADERS['cx-tenants']       = { endpoint:'/v1/console/tenants',     noun:'tenants',       transform: txTenants };        // M8
   LOADERS['cx-passport']      = { endpoint:'/v1/passports',           noun:'passports',     transform: txPassports };      // M8
   // drill-down loaders (prefix match): orchestrator members + session audit chain
-  LOADERS['__orc_members'] = { match:n=> n.kind==='orchestrator' && n.__orcId, endpoint:n=>'/v1/orchestrators/'+n.__orcId+'/work', noun:'members', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txWork };  // M5 drill
+  LOADERS['__orc_members'] = { match:n=> n.kind==='orchestrator' && n.__orcId, endpoint:n=>'/v1/orchestrators/'+n.__orcId+'/work', noun:'members', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txOrcMembers };  // M5 drill
   LOADERS['__sess_audit']  = { match:n=> n.kind==='session' && n.__sessId, endpoint:n=>'/v1/observe/sessions/'+n.__sessId+'/audit', noun:'audit steps', flagHint:'Observe disabled — set CORECRUXD_OBSERVE=1', transform: txAudit };  // M9 drill
 }
 async function bootProbe(){
