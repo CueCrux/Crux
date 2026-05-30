@@ -71,7 +71,7 @@ function makeFetch() {
   let routes = [{ test: u => /\/readyz/.test(u), resp: { ok: true, status: 200, body: 'ok' } }];
   const fetchImpl = (url, opts) => {
     calls.push({ url, opts });
-    const r = routes.find(x => x.test(url));
+    const r = routes.find(x => x.test(url, opts || {}));
     const { ok = true, status = 200, body = {} } = (r && r.resp) || { ok: false, status: 404, body: {} };
     return Promise.resolve({ ok, status, text: () => Promise.resolve(typeof body === 'string' ? body : JSON.stringify(body)) });
   };
@@ -162,6 +162,54 @@ function makeFetch() {
   env2.getById('orcNew').fire('click'); await flush();
   ok(env2.s.document.body.classList.contains('building'), 'regression: orchestrator builder still opens');
   env2.getById('bcClose').fire('click'); await flush();
+
+  // ── G) M4–M9 read transforms + M5 live builder write (fresh live env) ──
+  const f3 = makeFetch();
+  f3.route(u => /\/v1\/work/.test(u), { ok: true, status: 200, body: { work: [{ id: 'agentux', title: 'agent-ux-plan', state: 'in_progress' }] } });
+  f3.route(u => /\/v1\/console\/sessions/.test(u), { ok: true, status: 200, body: { sessions: [{ session_id: '9c5a', execplan: 'agent-ux', turns: 42, tokens_in: 312000, tokens_out: 41000, model: 'opus-4.8', active: true }] } });
+  f3.route(u => /\/v1\/orchestrators\/[^/]+\/work/.test(u), { ok: true, status: 200, body: { work: [{ id: 'agentux', title: 'agent-ux', state: 'in_progress' }] } });
+  f3.route(u => /\/v1\/orchestrators$/.test(u), { ok: true, status: 200, body: { orchestrators: [{ id: 'orc_7a1c', name: 'Sprint 1', state: 'active', created_by_passport: 'ce:4e6c4e2a:local', members: [{ type: 'execplan', ref: 'agentux' }] }] } });
+  f3.route(u => /\/v1\/punchcards/.test(u), { ok: true, status: 200, body: { punchcards: [
+    { id: 'pc1', resource: 'file://x', mode: 'modify', holder_passport: 'ce:4e6c4e2a:local', status: 'held' },
+    { id: 'pc2', resource: 'service://y', mode: 'deploy', holder_passport: 'ce:0c44:remote', status: 'held' }] } });
+  f3.route(u => /\/v1\/console\/facts/.test(u), { ok: true, status: 200, body: { facts: [
+    { fact_id: 'f1', entity: 'execplan:agent-ux', key: 'gate:M4', value: 'done' },
+    { fact_id: 'f2', entity: 'bench:lme-s', key: 'r5', value: '98' }] } });
+  f3.route(u => /\/v1\/console\/tenants/.test(u), { ok: true, status: 200, body: { tenants: [{ tenant_id: 'lme-s', category: 'work', source: 'ingest' }] } });
+  f3.route(u => /\/v1\/passports/.test(u), { ok: true, status: 200, body: { passports: [{ id: 'ce:4e6c4e2a:local', category: 'system', reputation_tier: 'local', receipt_count: 12 }] } });
+  // live-write routes (method-aware): POST create + member POST
+  f3.route((u, o) => /\/v1\/orchestrators$/.test(u) && o.method === 'POST', { ok: true, status: 200, body: { id: 'orc_new' } });
+  f3.route(u => /\/v1\/orchestrators\/orc_new\/members/.test(u), { ok: true, status: 200, body: {} });
+  const env3 = buildSandbox(f3); await flush();
+  const cxp = () => env3.s.document.querySelectorAll('.wc-centre-pill').filter(p => p.dataset.scope === 'cx').forEach(p => p.fire('click'));
+
+  await tile(env3, 'panel', 'Sessions').fire('click'); await flush();
+  ok(!!tile(env3, 'session', 'execplan:agent-ux'), 'M4 sessions: live session tile');
+  await tile(env3, 'panel', 'Orchestrators').fire('click'); await flush();
+  ok(!!tile(env3, 'orchestrator', 'Sprint 1'), 'M5 orchestrators: live orchestrator tile');
+  await tile(env3, 'orchestrator', 'Sprint 1').fire('dblclick'); await flush();
+  ok(!!tile(env3, 'execplan', 'agent-ux'), 'M5 orchestrators: members resolved via /{id}/work drill');
+  cxp(); await flush();
+  await tile(env3, 'panel', 'Punchcards').fire('click'); await flush();
+  ok(ofKind(env3, 'punchcard-group').length === 2, 'M6 punchcards: grouped into 2 holder groups');
+  await tile(env3, 'panel', 'Facts').fire('click'); await flush();
+  ok(ofKind(env3, 'fact-group').length >= 2, 'M7 facts: grouped by entity prefix');
+  await tile(env3, 'panel', 'Tenants').fire('click'); await flush();
+  ok(!!tile(env3, 'tenant', 'lme-s'), 'M8 tenants: live tenant tile');
+  await tile(env3, 'panel', 'Passport').fire('click'); await flush();
+  ok(!!tile(env3, 'passport', 'ce:4e6c4e2a'), 'M8 passport: live passport tile');
+
+  // M5 live write: build an orchestrator → Done POSTs create + member
+  await tile(env3, 'panel', 'Work').fire('click'); await flush();   // populate work:agentux as a candidate
+  cxp(); await flush();
+  env3.getById('orcNew').fire('click'); await flush();
+  env3.s.addToBuild('work:agentux'); await flush();
+  env3.getById('bcName').value = 'New Sprint'; env3.getById('bcName').fire('input'); await flush();
+  await env3.getById('bcDone').fire('click'); await flush();
+  const postCreate = f3.calls.find(c => /\/v1\/orchestrators$/.test(c.url) && c.opts && c.opts.method === 'POST');
+  ok(!!postCreate, 'M5 write: Done POSTs /v1/orchestrators (create)');
+  ok(postCreate && JSON.parse(postCreate.opts.body).name === 'New Sprint', 'M5 write: create body carries the name');
+  ok(f3.calls.some(c => /\/orchestrators\/orc_new\/members/.test(c.url) && c.opts && c.opts.method === 'POST'), 'M5 write: member POSTed to the new orchestrator');
 
   console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

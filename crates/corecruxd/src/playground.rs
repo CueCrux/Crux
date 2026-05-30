@@ -15,6 +15,11 @@ use axum::Router;
 use tower_http::cors::CorsLayer;
 
 const PLAYGROUND_HTML: &str = include_str!("../playground/index.html");
+// Frozen pre-graph-navigator console, served at `/console-classic` as an instant
+// in-binary fallback during the graph-console cutover bake window. Removed (with
+// this const) in a follow-up once panel parity is confirmed. See ExecPlan
+// crux-console-graph-cutover-2026-05-30.
+const CLASSIC_HTML: &str = include_str!("../playground/index.classic.html");
 const CONSOLE_DEV_PATH_ENV: &str = "CORECRUXD_CONSOLE_DEV_PATH";
 
 // Bundled PNG assets — embedded so the binary can serve them with no on-disk
@@ -33,6 +38,12 @@ fn embedded_asset(name: &str) -> Option<&'static [u8]> {
 
 async fn serve_console() -> impl IntoResponse {
     Html(resolve_console_html().into_owned())
+}
+
+/// Fallback to the frozen pre-graph-navigator console (no dev override) — the
+/// cutover escape hatch served from the same binary.
+async fn serve_classic() -> impl IntoResponse {
+    Html(CLASSIC_HTML)
 }
 
 async fn redirect_to_console() -> impl IntoResponse {
@@ -96,6 +107,7 @@ pub fn routes(enabled: bool) -> Router {
     Router::new()
         .route("/", get(redirect_to_console))
         .route("/console", get(serve_console))
+        .route("/console-classic", get(serve_classic))
         .route("/playground", get(serve_console))
         .route("/console-assets/{name}", get(serve_console_asset))
         .layer(CorsLayer::permissive())

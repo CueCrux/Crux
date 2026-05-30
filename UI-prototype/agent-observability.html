@@ -828,9 +828,106 @@ function txOverview(json){   // M2 — refresh the fixed Overview tiles' fields 
   set('ov-integrations', [['packs',ovField(integ.packs)],['grants',ovField(integ.grants)]]);
   return ['ov-node','ov-work','ov-usage','ov-storage','ov-integrations','ov-tenants'].map(id=>N[id]).filter(Boolean);
 }
+function st2(s){ s=(s||'').toLowerCase();
+  if(['active','running','held','in_progress','run'].includes(s)) return 'run';
+  if(['complete','done','released','ok','success'].includes(s)) return 'ok';
+  if(['blocked','error','expired','force_released','err','cancelled'].includes(s)) return 'err';
+  return 'idle';
+}
+function txSessions(json){   // M4 — session list
+  const ss = json.sessions || json.active || (Array.isArray(json)? json : []);
+  return ss.map(s=>{
+    const id = s.session_id || s.id || s.sid || '';
+    const ep = s.execplan || s.plan_slug || s.label || '';
+    const toks = s.tokens || (s.tokens_in!=null? (Math.round((s.tokens_in||0)/1000)+'k in · '+Math.round((s.tokens_out||0)/1000)+'k out') : null);
+    return { id: idFor('sess', id), kind:'session', __sessId:id,
+      label: ep? ('execplan:'+ep) : (id||'session'),
+      sub: [s.turns!=null? s.turns+' turns':null, toks, s.ttl? ('ttl '+s.ttl):null].filter(Boolean).join(' · ') || (s.saved||''),
+      status: st2(s.status || (s.active?'active':'idle')),
+      fields:[['session_id',id],['turns',s.turns],['tokens',toks],['model',s.model],['passport',s.passport||s.passport_id],['execplan',ep],['ttl',s.ttl]].filter(([,v])=>v!=null&&v!==''),
+      children:[], doc: s.summary||s.doc||'', payload: JSON.stringify(s,null,2) };
+  });
+}
+function txOrchestrators(json){   // M5 read — members resolved on drill (shared work: ids → loop-guard safe)
+  const orcs = json.orchestrators || (Array.isArray(json)? json : []);
+  return orcs.map(o=>({
+    id: idFor('orc', o.id), kind:'orchestrator', __orcId:o.id, __memberCount:(o.members||[]).length,
+    label: o.name || o.id,
+    sub: (o.created_by_passport||'') + ' · ' + ((o.members||[]).length) + ' members',
+    status: st2(o.state),
+    fields:[['id',o.id],['assignee',o.created_by_passport],['state',o.state],['members',String((o.members||[]).length)],['resolve','/v1/orchestrators/'+o.id+'/work']].filter(([,v])=>v!=null),
+    children:[],
+    doc:'ORCHESTRATOR '+o.id+' · '+(o.name||'')+'\nstate '+(o.state||'')+'\nmembers (by reference):\n'+(o.members||[]).map(m=>' · '+(m.type||'')+' '+(m.ref||'')).join('\n'),
+    payload: JSON.stringify(o,null,2) }));
+}
+function txPunchcards(json){   // M6 — group by holder/session
+  const cards = json.punchcards || (Array.isArray(json)? json : []);
+  const byHolder={};
+  cards.forEach(c=>{ const h=c.holder_passport||c.holder||'—'; (byHolder[h]=byHolder[h]||[]).push(c); });
+  const leaves = cards.map(c=>({ id: idFor('pc', c.id), kind:'punchcard',
+    label: c.resource, sub:[c.status,c.holder_passport||c.holder,c.mode].filter(Boolean).join(' · '),
+    status: st2(c.status),
+    fields:[['id',c.id],['resource',c.resource],['mode',c.mode],['holder',c.holder_passport||c.holder],['status',c.status],['acquired',c.acquired_at_unix_ms||c.acquired_at],['expires',c.expires_at_unix_ms||c.expires_at]].filter(([,v])=>v!=null),
+    children:[], payload: JSON.stringify(c,null,2) }));
+  const groups = Object.entries(byHolder).map(([h,ls])=>({ id: idFor('pcg', h), kind:'punchcard-group',
+    label:'Holder · '+h, sub: h+' · '+ls.length+' held', status: ls.some(l=>(l.status||'')==='held')?'run':'idle',
+    fields:[['holder',h],['held',String(ls.length)]], children: ls.map(l=>idFor('pc', l.id)) }));
+  return groups.concat(leaves);
+}
+function entityPrefix(e){ e=e||''; const i=e.indexOf(':'); return i>0? e.slice(0,i): (e||'other'); }
+function txFacts(json){   // M7 facts — group by entity prefix (single fetch yields groups + leaves)
+  const facts = json.facts || (Array.isArray(json)? json : []);
+  const fid = (f,i)=> idFor('fact', f.fact_id||f.id||(f.entity+'/'+f.key+'/'+i));
+  const leaves = facts.map((f,i)=>({ id: fid(f,i), kind:'fact', label: f.key||f.entity, sub: f.entity||'',
+    status: f.deleted?'idle':'ok',
+    fields:[['entity',f.entity],['key',f.key],['conf',f.confidence],['stored',f.stored_at],['private',f.private]].filter(([,v])=>v!=null),
+    children:[], payload:(typeof f.value==='string'? f.value : JSON.stringify(f.value,null,2)) }));
+  const byPfx={}; facts.forEach((f,i)=>{ const p=entityPrefix(f.entity); (byPfx[p]=byPfx[p]||[]).push(fid(f,i)); });
+  const groups = Object.entries(byPfx).map(([p,ids])=>({ id: idFor('fg', p), kind:'fact-group',
+    label: p+' · '+ids.length, sub:'entity prefix', fields:[['prefix',p],['count',String(ids.length)]], children: ids }));
+  return groups.concat(leaves);
+}
+function txMemory(json){   // M7 memory — recent facts, flat
+  const facts = json.facts || (Array.isArray(json)? json : []);
+  return facts.slice(0,20).map((f,i)=>({ id: idFor('mem', f.fact_id||f.id||i), kind:'fact', label: f.key||f.entity, sub: f.entity||'',
+    status:'ok', fields:[['entity',f.entity],['stored',f.stored_at]].filter(([,v])=>v!=null), children:[],
+    payload:(typeof f.value==='string'? f.value : JSON.stringify(f.value,null,2)) }));
+}
+function txTenants(json){   // M8
+  const ts = json.tenants || (Array.isArray(json)? json : []);
+  return ts.map(t=>({ id: idFor('tenant', t.tenant_id||t.id), kind:'tenant', label: t.tenant_id||t.id,
+    sub:[t.category,t.source].filter(Boolean).join(' · '), status: t.category==='system'?'idle':'ok',
+    fields:[['tenant_id',t.tenant_id||t.id],['category',t.category],['override',t.override],['source',t.source],['chunks',t.chunk_visibility]].filter(([,v])=>v!=null),
+    children:[], payload: JSON.stringify(t,null,2) }));
+}
+function txPassports(json){   // M8
+  const ps = json.passports || (json.passport? [json.passport] : (Array.isArray(json)? json : []));
+  return ps.map(p=>({ id: idFor('pp', p.id), kind:'passport', label: p.id,
+    sub:[p.category,p.reputation_tier].filter(Boolean).join(' · '), status:'ok',
+    fields:[['id',p.id],['category',p.category],['tier',p.reputation_tier],['receipts',p.receipt_count],['gate',p.agent_work_gate]].filter(([,v])=>v!=null),
+    children:[], payload: JSON.stringify(p,null,2) }));
+}
+function txAudit(json){   // M9 — session audit chain → step nodes
+  const steps = json.steps || (Array.isArray(json)? json : []);
+  return steps.map((s,i)=>({ id: idFor('step', (s.node_id||s.session_id||'')+'/'+(s.seq!=null?s.seq:i)), kind:'step',
+    label:(s.seq!=null? (s.seq+' · '):'')+(s.label||s.kind||'step'), sub:[s.actor,s.status].filter(Boolean).join(' · '),
+    status: st2(s.status), fields:[['kind',s.kind],['actor',s.actor],['risk',s.risk_class],['status',s.status],['receipt',s.receipt_id],['reasoning',s.reasoning_ref]].filter(([,v])=>v!=null),
+    children:[], doc:'AUDIT STEP '+(s.seq!=null?s.seq:'')+'\n'+(s.label||'')+'\nactor '+(s.actor||'')+' · status '+(s.status||'')+(s.inputs?('\ninputs: '+JSON.stringify(s.inputs)):'')+(s.outputs?('\noutputs: '+JSON.stringify(s.outputs)):''),
+    payload: JSON.stringify(s,null,2) }));
+}
 function registerLoaders(){
-  LOADERS['cx-overview'] = { endpoint:'/v1/console/summary',  noun:'tiles',      transform: txOverview };  // M2
-  LOADERS['cx-work']     = { endpoint:'/v1/work?source=all',  noun:'work items', transform: txWork };      // M3
+  LOADERS['cx-overview']      = { endpoint:'/v1/console/summary',     noun:'tiles',         transform: txOverview };       // M2
+  LOADERS['cx-work']          = { endpoint:'/v1/work?source=all',     noun:'work items',    transform: txWork };           // M3
+  LOADERS['cx-sessions']      = { endpoint:'/v1/console/sessions',    noun:'sessions',      transform: txSessions };       // M4
+  LOADERS['cx-orchestrators'] = { endpoint:'/v1/orchestrators',       noun:'orchestrators', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txOrchestrators };  // M5
+  LOADERS['cx-punchcards']    = { endpoint:'/v1/punchcards',          noun:'leases',        flagHint:'Punchcards disabled — set CORECRUXD_PUNCHCARD=advisory|enforce', transform: txPunchcards };  // M6
+  LOADERS['cx-facts']         = { endpoint:'/v1/console/facts?top_k=100', noun:'facts',     transform: txFacts };          // M7
+  LOADERS['cx-memory']        = { endpoint:'/v1/console/facts?top_k=20',  noun:'memories',  transform: txMemory };         // M7
+  LOADERS['cx-tenants']       = { endpoint:'/v1/console/tenants',     noun:'tenants',       transform: txTenants };        // M8
+  LOADERS['cx-passport']      = { endpoint:'/v1/passports',           noun:'passports',     transform: txPassports };      // M8
+  // drill-down loaders (prefix match): orchestrator members + session audit chain
+  LOADERS['__orc_members'] = { match:n=> n.kind==='orchestrator' && n.__orcId, endpoint:n=>'/v1/orchestrators/'+n.__orcId+'/work', noun:'members', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txWork };  // M5 drill
+  LOADERS['__sess_audit']  = { match:n=> n.kind==='session' && n.__sessId, endpoint:n=>'/v1/observe/sessions/'+n.__sessId+'/audit', noun:'audit steps', flagHint:'Observe disabled — set CORECRUXD_OBSERVE=1', transform: txAudit };  // M9 drill
 }
 async function bootProbe(){
   Object.values(N).forEach(n=>{ if(Array.isArray(n.children)) DUMMY_CHILDREN[n.id]=n.children.slice(); });   // snapshot dummy for degrade
@@ -1266,8 +1363,45 @@ function syncBuild(){
   showBuildingOrc(); renderBuildCard(); render();
 }
 function endBuild(){ document.body.classList.remove('building'); const id=buildingId; buildingId=null; editSnap=null; return id; }
-function finishBuild(){            // Done: commit name/passport/members, drop the building…/editing… suffix
-  const orc=N[buildingId]; if(orc) orc.sub=cleanSub(orc);
+function orcRealId(nodeId){ return (nodeId && nodeId.startsWith('orc:'))? nodeId.slice(4) : nodeId; }
+function memberRefs(orc){   // child node ids → {type,ref} for the daemon (strip the id namespace prefix)
+  return (orc.children||[]).map(cid=>{
+    const isHandoff = cid.startsWith('handoff:') || /^ho\d/.test(cid) || cid.startsWith('handoff');
+    const ref = cid.includes(':') ? cid.split(':').slice(1).join(':') : cid;
+    return { type: isHandoff ? 'handoff' : 'execplan', ref };
+  });
+}
+async function commitBuildLive(orc){   // M5 — Done writes to the daemon (POST create / PATCH + member diff on edit)
+  const name = orc.label || 'New orchestrator';
+  const members = memberRefs(orc);
+  if(isEditing() && editSnap && !/^orc-user-/.test(editSnap.id)){
+    const realId = orcRealId(editSnap.id);
+    await patchApi('/v1/orchestrators/'+realId, { name });
+    const before = (editSnap.children||[]).map(c=> c.includes(':')? c.split(':').slice(1).join(':') : c);
+    const after  = members.map(m=>m.ref);
+    for(const m of members){ if(!before.includes(m.ref)) await postApi('/v1/orchestrators/'+realId+'/members', m); }
+    for(const r of before){ if(!after.includes(r)) await deleteApi('/v1/orchestrators/'+realId+'/members/'+encodeURIComponent(r)); }
+  } else {
+    const created = await postApi('/v1/orchestrators', { name });
+    const realId = created.id || (created.orchestrator && created.orchestrator.id) || created.orchestrator_id;
+    for(const m of members){ if(realId) await postApi('/v1/orchestrators/'+realId+'/members', m); }
+  }
+  loadState['cx-orchestrators']='idle';
+  await ensureLoaded(N['cx-orchestrators']);   // refetch — the live list is now authoritative
+}
+async function finishBuild(){     // Done: commit name/passport/members; writes to the daemon when live
+  const orc=N[buildingId]; if(!orc){ endBuild(); return; }
+  if(LIVE && loaderFor(N['cx-orchestrators'])){
+    let saved=true;
+    try{ await commitBuildLive(orc); }catch(e){ saved=false; announce('Orchestrator save failed ('+((e&&e.status)||'network')+') — '+(e&&e.data&&e.data.error||'see daemon')); }
+    const did=buildingId;
+    if(!isEditing()){ N['cx-orchestrators'].children=(N['cx-orchestrators'].children||[]).filter(x=>x!==did); delete N[did]; }   // drop client draft; live list is authoritative
+    endBuild();
+    openScope('cx'); expand(N['cx-orchestrators'], 0);
+    announce(saved? 'Orchestrator saved' : 'Saved with errors');
+    return;
+  }
+  orc.sub=cleanSub(orc);   // demo/offline: client-only
   const id=endBuild(); if(id && N[id]) focusNode(N[id]);
 }
 function teardownBuild(){          // navigate-away: discard an UNTOUCHED new draft; otherwise commit (keep) in place. No revert.
