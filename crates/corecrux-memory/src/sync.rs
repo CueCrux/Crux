@@ -1267,6 +1267,7 @@ mod tests {
             private: false,
             horizon_class: crate::fact_store::HorizonClass::None,
             reverified_at: None,
+            superseded_by: None,
         };
 
         store.store_synced(fact);
@@ -1305,6 +1306,7 @@ mod tests {
                 private: false,
                 horizon_class: crate::fact_store::HorizonClass::None,
                 reverified_at: None,
+                superseded_by: None,
             };
             store.store_synced(fact);
             assert_eq!(store.count(), 1);
@@ -1373,6 +1375,7 @@ mod tests {
             private: false,
             horizon_class: crate::fact_store::HorizonClass::None,
             reverified_at: None,
+            superseded_by: None,
         };
         store.store_synced(synced);
 
@@ -1521,6 +1524,7 @@ mod tests {
             private: false,
             horizon_class: crate::fact_store::HorizonClass::None,
             reverified_at: None,
+            superseded_by: None,
         });
         store.store(StoreFact {
             entity: "business::acme::constraint::deploy".to_string(),
@@ -1580,6 +1584,7 @@ mod tests {
             private: false,
             horizon_class: crate::fact_store::HorizonClass::None,
             reverified_at: None,
+            superseded_by: None,
         });
 
         let receipt = offboard_tenant_mirror(&mut store, "business::acme", 11);

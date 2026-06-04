@@ -205,12 +205,18 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "value":          { "type": "string",  "description": "Fact value" },
                     "source_receipt": { "type": "string",  "description": "CROWN receipt reference" },
                     "confidence":     { "type": "number",  "description": "Confidence score 0..1", "default": 1.0 },
-                    "private":        { "type": "boolean", "description": "If true, scoped to the calling agent", "default": false }
+                    "private":        { "type": "boolean", "description": "If true, scoped to the calling agent", "default": false },
+                    "supersedes":     {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional fact_ids this new fact EXPLICITLY retires (cross-entity supersession). Each must exist and be visible to you, else the call is rejected. Retired facts are hidden from query_facts by default. Reversible."
+                    }
                 },
                 "required": ["entity", "key", "value"],
                 "examples": [
                     { "entity": "project-alpha", "key": "status", "value": "Phase 1 complete", "confidence": 0.95 },
-                    { "entity": "my-agent", "key": "internal_state", "value": "Waiting for confirmation", "private": true }
+                    { "entity": "my-agent", "key": "internal_state", "value": "Waiting for confirmation", "private": true },
+                    { "entity": "bench:lme-s", "key": "baseline", "value": "90.0%", "supersedes": ["f_oldbaseline86"] }
                 ]
             }),
         },
@@ -227,11 +233,13 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                     "query":        { "type": "string",  "description": "Keyword search across fact values, keys, and entities" },
                     "entity":       { "type": "string",  "description": "Filter to a specific entity" },
                     "top_k":        { "type": "integer", "description": "Maximum facts to return", "default": 10 },
-                    "token_budget": { "type": "integer", "description": "Optional token budget" }
+                    "token_budget": { "type": "integer", "description": "Optional token budget" },
+                    "include_superseded": { "type": "boolean", "description": "If true, also return facts explicitly retired via cross-entity supersession (their `superseded_by` is exposed). Default false (retired facts are hidden).", "default": false }
                 },
                 "examples": [
                     { "query": "deployment strategy", "token_budget": 2000 },
-                    { "entity": "project-alpha", "top_k": 5 }
+                    { "entity": "project-alpha", "top_k": 5 },
+                    { "entity": "bench:lme-s", "include_superseded": true }
                 ]
             }),
         },
@@ -532,6 +540,29 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "examples": [
                     { "token_budget": 500 },
                     { "entity": "execplan:agent-ux-03-freshness-decay-2026-05-27", "top_k": 50, "token_budget": 1000 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_sweep_candidates".to_string(),
+            description: "Janitor (read-only): list facts that are EITHER stale (per the \
+                          deterministic decay policy) OR explicitly cross-entity superseded \
+                          (retired by a newer fact), as archive/reverify candidates. \
+                          NON-mutating — like memory_forget_dry_run, nothing is changed. \
+                          Reserved-prefix facts are filtered. Each row carries a `reason` \
+                          ({stale|superseded|stale+superseded}). Pass `token_budget` \
+                          (default 500) per QC.2. Enabled by default; set \
+                          CORECRUXD_FEATURE_FRESHNESS=0 to disable."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "top_k":        { "type": "integer", "description": "Maximum candidate rows", "default": 50 },
+                    "token_budget": { "type": "integer", "description": "Token budget cap", "default": 500 }
+                },
+                "examples": [
+                    { "token_budget": 500 },
+                    { "top_k": 100, "token_budget": 2000 }
                 ]
             }),
         },
@@ -2101,8 +2132,8 @@ pub fn tool_output_docs() -> Value {
         { "tool": "query",              "output": "{ results: [{doc_id, score, segment_index, token_count}], coverage: {score, gaps, below_floor}, meta: {backend, took_ms, segments_searched} }" },
         { "tool": "query_scan",         "output": "{ results: [{doc_id, score, token_count}], meta: {took_ms, segments_searched} }" },
         { "tool": "query_expand",       "output": "{ results: [{doc_id, content, token_count}] }" },
-        { "tool": "store_fact",         "output": "{ fact_id, entity, key, value, stored_at, tokens, confidence }" },
-        { "tool": "query_facts",        "output": "{ facts: [{fact_id, entity, key, value, confidence, stored_at}], total_tokens }" },
+        { "tool": "store_fact",         "output": "{ fact_id, entity, key, version, superseded_fact_ids: [string] }. `superseded_fact_ids` lists facts this write explicitly retired via the `supersedes` param (M6 cross-entity supersession)." },
+        { "tool": "query_facts",        "output": "{ rows: [{fact_id, entity, key, value, confidence, effective_confidence, horizon_class, freshness, age_hours, superseded_by?}] }. Superseded (retired) facts are excluded by default; pass include_superseded=true to include them (then `superseded_by` is populated)." },
         { "tool": "delete_fact",        "output": "{ deleted: bool, fact_id }" },
         { "tool": "memory_forget",         "output": "{ content: [...], forget_receipt_id, facts_affected, recovery_window_seconds, recovery_window_ends_at, receipt_body_cbor_hex, receipt_body_hash_hex, scope, passport_id }" },
         { "tool": "memory_forget_dry_run", "output": "{ content: [...], scope, count, facts_that_would_be_affected: [{fact_id, entity, key, stored_at, tokens}], dry_run: true }" },
@@ -2116,6 +2147,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "memory_pin",         "output": "{ content: [...], structuredContent: { fact_id, pinned: bool } } — pin state stored under reserved __memory_pin::<agent>::*." },
         { "tool": "memory_history",     "output": "{ content: [...], structuredContent: { versions: [{id, value, version, stored_at, supersedes, deleted, source_receipt}] } } — consumer-friendly version chain (excludes reserved prefixes)." },
         { "tool": "memory_freshness",   "output": "{ rows: [{fact_id, entity, key, horizon_class, freshness, age_hours, stored_at, reverified_at?}], policy: {volatile_stale_hours, medium_stale_days, stable_stale_days}, now }" },
+        { "tool": "memory_sweep_candidates", "output": "{ content: [...], structuredContent: { rows: [{fact_id, entity, key, reason: 'stale'|'superseded'|'stale+superseded', freshness, horizon_class, age_hours, superseded_by?, stored_at}], dry_run: true, now } } — read-only janitor; nothing mutated." },
         { "tool": "memory_set_horizon", "output": "{ fact_id, horizon_class, ok: bool }" },
         { "tool": "memory_reverify",    "output": "{ fact_id, receipt_id, receipt_class: 'Reverify', reverified_at }" },
         { "tool": "artefact_put",       "output": "{ content: [...], structuredContent: { artefact_id, mime_type, tool_origin, size_bytes, created_at, expires_at } } — id is `art_<blake3_hex>`; identical bytes coalesce." },
@@ -2234,6 +2266,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "memory_history" => memory::handle_memory_history(args, ctx).await,
         // Freshness + decay (agent-ux-03 M3).
         "memory_freshness" => freshness::handle_memory_freshness(args, ctx).await,
+        "memory_sweep_candidates" => freshness::handle_memory_sweep_candidates(args, ctx).await,
         "memory_set_horizon" => freshness::handle_memory_set_horizon(args, ctx).await,
         "memory_reverify" => freshness::handle_memory_reverify(args, ctx).await,
         // Artefacts (agent-ux-12).
@@ -2358,7 +2391,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 93; // main 84 (agent-ux + identity-continuity) + 9 backend (4 orchestrator + 4 punchcard + check_punchcard).
+    const TOOL_COUNT: usize = 94; // main 85 (agent-ux + identity-continuity + memory_sweep_candidates) + 9 backend (4 orchestrator + 4 punchcard + check_punchcard).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

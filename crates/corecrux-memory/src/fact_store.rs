@@ -25,6 +25,16 @@ enum JournalEvent {
     StoreBatch { facts: Vec<Fact> },
     #[serde(rename = "delete")]
     Delete { fact_id: String, deleted_at: String },
+    /// Cross-entity supersession (M6): `fact_id` is retired by `by_fact_id`.
+    #[serde(rename = "supersede")]
+    Supersede {
+        fact_id: String,
+        by_fact_id: String,
+        superseded_at: String,
+    },
+    /// Reverse of `Supersede` (M6): un-retire `fact_id`.
+    #[serde(rename = "clear_supersede")]
+    ClearSupersede { fact_id: String, cleared_at: String },
 }
 
 /// Per-fact freshness horizon class (child ExecPlan
@@ -135,6 +145,16 @@ pub struct Fact {
     /// without rewriting the fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reverified_at: Option<DateTime<Utc>>,
+    /// Cross-entity supersession marker (M6). When set, this fact has been
+    /// EXPLICITLY retired by a newer fact (identified by fact_id) that may
+    /// live under a *different* entity — unlike `supersedes`/`version`,
+    /// which only chains within the same `(entity, key)` pair. Reversible
+    /// soft-state: set by `mark_superseded`, cleared by `clear_superseded`.
+    /// `query_facts` hides these by default (opt back in with
+    /// `include_superseded`); `memory_view` / `fact_history` still show them.
+    /// `#[serde(default)]` so pre-M6 on-disk facts deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
 }
 
 fn default_version() -> u32 {
@@ -286,6 +306,18 @@ impl FactStore {
                         fact.deleted = true;
                     }
                 }
+                Ok(JournalEvent::Supersede {
+                    fact_id, by_fact_id, ..
+                }) => {
+                    if let Some(fact) = self.facts.get_mut(&fact_id) {
+                        fact.superseded_by = Some(by_fact_id);
+                    }
+                }
+                Ok(JournalEvent::ClearSupersede { fact_id, .. }) => {
+                    if let Some(fact) = self.facts.get_mut(&fact_id) {
+                        fact.superseded_by = None;
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(line_no = line_no + 1, ?err, "fact-journal-parse-skip");
                 }
@@ -346,6 +378,7 @@ impl FactStore {
             private: req.private,
             horizon_class,
             reverified_at: None,
+            superseded_by: None,
         }
     }
 
@@ -370,6 +403,57 @@ impl FactStore {
     pub fn reverify(&mut self, fact_id: &str, now: DateTime<Utc>) -> bool {
         if let Some(fact) = self.facts.get_mut(fact_id) {
             fact.reverified_at = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark `target_fact_id` as explicitly superseded by `by_fact_id` (M6).
+    ///
+    /// This is the cross-entity retirement primitive: unlike the
+    /// `(entity, key)` version chain (`supersedes`/`version`), the
+    /// superseding fact may live under a *different* entity. Reversible
+    /// soft-state — never hard-deletes the target. The mutation is
+    /// journaled (mirrors soft-delete's `try_delete`) so it survives a
+    /// restart. Returns `true` if the target existed.
+    ///
+    /// Idempotent: re-marking with the same `by_fact_id` is a no-op write
+    /// of the same value (still journaled for an explicit audit trail).
+    pub fn mark_superseded(&mut self, target_fact_id: &str, by_fact_id: &str) -> bool {
+        if !self.facts.contains_key(target_fact_id) {
+            return false;
+        }
+        if let Err(err) = self.append_journal(&JournalEvent::Supersede {
+            fact_id: target_fact_id.to_string(),
+            by_fact_id: by_fact_id.to_string(),
+            superseded_at: Utc::now().to_rfc3339(),
+        }) {
+            tracing::warn!(?err, "fact-journal-append-failed");
+        }
+        if let Some(fact) = self.facts.get_mut(target_fact_id) {
+            fact.superseded_by = Some(by_fact_id.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reverse of [`mark_superseded`] (M6): un-retire a fact by clearing
+    /// its `superseded_by` marker. Journaled for restart-survival.
+    /// Returns `true` if the fact existed.
+    pub fn clear_superseded(&mut self, fact_id: &str) -> bool {
+        if !self.facts.contains_key(fact_id) {
+            return false;
+        }
+        if let Err(err) = self.append_journal(&JournalEvent::ClearSupersede {
+            fact_id: fact_id.to_string(),
+            cleared_at: Utc::now().to_rfc3339(),
+        }) {
+            tracing::warn!(?err, "fact-journal-append-failed");
+        }
+        if let Some(fact) = self.facts.get_mut(fact_id) {
+            fact.superseded_by = None;
             true
         } else {
             false
@@ -1558,5 +1642,144 @@ mod tests {
 
         let live_fact = result.facts.iter().find(|f| f.fact_id != f1.fact_id).unwrap();
         assert!(!live_fact.deleted);
+    }
+
+    // ── M6: cross-entity supersession ───────────────────────────────
+
+    #[test]
+    fn mark_and_clear_superseded_in_memory() {
+        let mut store = FactStore::new();
+        let old = store.store(StoreFact {
+            entity: "bench:lme-s".into(),
+            key: "baseline".into(),
+            value: "86.8%".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+        });
+        let new = store.store(StoreFact {
+            entity: "bench:lme-s-v2".into(),
+            key: "baseline".into(),
+            value: "90.0%".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+        });
+
+        assert!(store.get(&old.fact_id).unwrap().superseded_by.is_none());
+        // mark
+        assert!(store.mark_superseded(&old.fact_id, &new.fact_id));
+        assert_eq!(
+            store.get(&old.fact_id).unwrap().superseded_by.as_deref(),
+            Some(new.fact_id.as_str())
+        );
+        // clear (reversible)
+        assert!(store.clear_superseded(&old.fact_id));
+        assert!(store.get(&old.fact_id).unwrap().superseded_by.is_none());
+
+        // nonexistent target -> false, no panic.
+        assert!(!store.mark_superseded("f_nope", &new.fact_id));
+        assert!(!store.clear_superseded("f_nope"));
+    }
+
+    #[test]
+    fn mark_superseded_persists_across_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old_id, new_id): (String, String);
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let old = store.store(StoreFact {
+                entity: "execplan:a".into(),
+                key: "decision".into(),
+                value: "do X".into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+            });
+            let new = store.store(StoreFact {
+                entity: "execplan:b".into(),
+                key: "decision".into(),
+                value: "do Y instead".into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+            });
+            assert!(store.mark_superseded(&old.fact_id, &new.fact_id));
+            old_id = old.fact_id;
+            new_id = new.fact_id;
+        }
+        // Replay: the supersession marker survives the restart.
+        {
+            let store = FactStore::with_persistence(dir.path()).unwrap();
+            assert_eq!(
+                store.get(&old_id).unwrap().superseded_by.as_deref(),
+                Some(new_id.as_str()),
+                "supersede marker must survive journal replay"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_superseded_persists_across_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_id: String;
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let old = store.store(StoreFact {
+                entity: "e".into(),
+                key: "k".into(),
+                value: "v".into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+            });
+            let new = store.store(StoreFact {
+                entity: "e2".into(),
+                key: "k".into(),
+                value: "v2".into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+            });
+            store.mark_superseded(&old.fact_id, &new.fact_id);
+            // Now reverse it; the clear must also persist (not just the mark).
+            assert!(store.clear_superseded(&old.fact_id));
+            old_id = old.fact_id;
+        }
+        {
+            let store = FactStore::with_persistence(dir.path()).unwrap();
+            assert!(
+                store.get(&old_id).unwrap().superseded_by.is_none(),
+                "clear must survive replay (mark then clear -> None)"
+            );
+        }
+    }
+
+    #[test]
+    fn fact_without_superseded_by_deserializes_as_none() {
+        // Backward-compat: a pre-M6 on-disk fact has no `superseded_by`
+        // field. It must deserialize as None (no panic, no error).
+        let legacy = r#"{
+            "fact_id": "f_legacy",
+            "entity": "proj",
+            "key": "k",
+            "value": "v",
+            "source_receipt": null,
+            "confidence": 1.0,
+            "stored_at": "2026-01-01T00:00:00Z",
+            "tokens": 4,
+            "deleted": false,
+            "version": 1
+        }"#;
+        let fact: Fact = serde_json::from_str(legacy).unwrap();
+        assert!(fact.superseded_by.is_none());
+        assert!(fact.reverified_at.is_none());
+        assert_eq!(fact.horizon_class, HorizonClass::None);
     }
 }

@@ -154,6 +154,7 @@ async fn sync_promotion_confirm_applies_remote_records() {
         private: false,
         horizon_class: corecrux_memory::HorizonClass::None,
         reverified_at: None,
+        superseded_by: None,
     };
     let record = corecrux_memory::sync::SyncCollectionRecord {
         collection: "facts".to_string(),
@@ -216,6 +217,7 @@ async fn sync_offboard_signs_wipe_receipt_and_stores_proof() {
             private: false,
             horizon_class: corecrux_memory::HorizonClass::None,
             reverified_at: None,
+            superseded_by: None,
         });
     }
 
@@ -6416,6 +6418,7 @@ async fn m11_closure_suite_exercises_hybrid_workbench_replay_and_offboarding() {
             private: false,
             horizon_class: corecrux_memory::HorizonClass::None,
             reverified_at: None,
+            superseded_by: None,
         });
         evidence
     };

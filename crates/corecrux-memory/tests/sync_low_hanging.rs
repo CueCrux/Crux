@@ -267,6 +267,7 @@ fn push_tenant_promotion_posts_collection_records() {
         private: false,
         horizon_class: corecrux_memory::HorizonClass::None,
         reverified_at: None,
+        superseded_by: None,
     };
     let record = corecrux_memory::sync::SyncCollectionRecord {
         collection: "facts".to_string(),
@@ -373,6 +374,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         private: false,
         horizon_class: corecrux_memory::HorizonClass::None,
         reverified_at: None,
+        superseded_by: None,
     });
 
     let deleted = store.store(StoreFact {
@@ -425,6 +427,7 @@ fn push_returns_zero_when_no_non_private_local_facts_exist() {
         private: false,
         horizon_class: corecrux_memory::HorizonClass::None,
         reverified_at: None,
+        superseded_by: None,
     });
 
     let deleted = store.store(StoreFact {
@@ -594,6 +597,7 @@ fn push_batches_local_facts_and_updates_cursor() {
         private: false,
         horizon_class: corecrux_memory::HorizonClass::None,
         reverified_at: None,
+        superseded_by: None,
     });
 
     let result = client.push(&store).unwrap();
