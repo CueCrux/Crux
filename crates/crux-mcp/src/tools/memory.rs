@@ -13,9 +13,10 @@
 //! plus the new `__memory_pin::*` family) are NEVER returned from these
 //! tools. They remain operator-only via `store_fact`/`query_facts`.
 //!
-//! Feature flag: gated by `CORECRUXD_FEATURE_MEMORY_PANEL=1` at the daemon
-//! layer (callers without the flag still see the tools listed but every
-//! handler short-circuits with a "feature disabled" message).
+//! Feature flag: `CORECRUXD_FEATURE_MEMORY_PANEL` is ON by default (opt-out)
+//! at the daemon layer. Set it to `0`/`false`/`off`/`no` to short-circuit
+//! every handler with a "feature disabled" message (the tools stay listed
+//! either way).
 //!
 //! Rationale (agent-ux-01): host IDEs and the upcoming console memory panel
 //! need a "consumer-shaped" view of the fact store that is safe to render
@@ -56,15 +57,24 @@ pub const RESERVED_ENTITY_PREFIXES: &[&str] = &[
 /// consumer-shaped view but used by `memory_view` to flag pinned facts.
 const MEMORY_PIN_PREFIX: &str = "__memory_pin::";
 
-/// Environment flag that gates the entire surface. Default OFF so the new
-/// behaviour ships dark until M3 console panel lands behind the operator's
-/// onboarding.
+/// Environment flag that gates the entire surface. Default ON (opt-out):
+/// an unset var enables the panel. Set it to `0`/`false`/`off`/`no` to
+/// ship the surface dark behind the kill switch.
 pub const MEMORY_PANEL_FEATURE_FLAG: &str = "CORECRUXD_FEATURE_MEMORY_PANEL";
 
+/// Returns true if the memory-panel surface is enabled.
+///
+/// Default-on (opt-out): an UNSET env var means enabled. Only an explicit
+/// `""`/`0`/`false`/`off`/`no` (case-insensitive) disables it. Mirrors
+/// [`crate::tools::freshness::freshness_enabled`].
 fn memory_panel_enabled() -> bool {
-    std::env::var(MEMORY_PANEL_FEATURE_FLAG)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    match std::env::var(MEMORY_PANEL_FEATURE_FLAG) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "" | "0" | "false" | "off" | "no")
+        }
+        Err(_) => true,
+    }
 }
 
 fn entity_is_reserved(entity: &str) -> bool {
@@ -102,7 +112,7 @@ fn feature_disabled_response(tool: &str) -> Value {
         "content": [{
             "type": "text",
             "text": format!(
-                "{tool}: memory panel disabled (set {MEMORY_PANEL_FEATURE_FLAG}=1 to enable)"
+                "{tool}: memory panel explicitly disabled (unset {MEMORY_PANEL_FEATURE_FLAG} to re-enable; it is on by default)"
             )
         }],
         "isError": false
@@ -544,15 +554,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_view_flag_off_returns_disabled_message() {
+    async fn memory_view_flag_explicit_off_returns_disabled_message() {
         let _lock = env_lock().lock().await;
-        std::env::remove_var(MEMORY_PANEL_FEATURE_FLAG);
+        // Default-on now, so the panel only short-circuits on an explicit
+        // opt-out value.
+        std::env::set_var(MEMORY_PANEL_FEATURE_FLAG, "0");
         let ctx = test_ctx();
         let res = handle_memory_view(&json!({"top_k": 5, "token_budget": 500}), &ctx)
             .await
             .unwrap();
         let text = res["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("memory panel disabled"));
+        assert!(text.contains("memory panel"));
+        assert!(text.contains("disabled"));
+        std::env::remove_var(MEMORY_PANEL_FEATURE_FLAG);
+    }
+
+    #[tokio::test]
+    async fn memory_panel_default_on_contract() {
+        let _lock = env_lock().lock().await;
+        // (a) UNSET -> enabled.
+        std::env::remove_var(MEMORY_PANEL_FEATURE_FLAG);
+        assert!(memory_panel_enabled(), "unset env must default to enabled");
+        // (b) explicit disable values -> disabled.
+        for v in ["0", "false", "off", "no", ""] {
+            std::env::set_var(MEMORY_PANEL_FEATURE_FLAG, v);
+            assert!(!memory_panel_enabled(), "value {v:?} must disable");
+        }
+        // (c) =1 -> enabled.
+        std::env::set_var(MEMORY_PANEL_FEATURE_FLAG, "1");
+        assert!(memory_panel_enabled(), "=1 must enable");
+        std::env::remove_var(MEMORY_PANEL_FEATURE_FLAG);
     }
 
     #[tokio::test]

@@ -34,8 +34,10 @@ use crate::scope;
 
 /// Environment flag that gates freshness write/read surfaces.
 ///
-/// When unset/`0`/`false`, all three MCP handlers return a "feature
-/// disabled" error so freshness can ship behind a kill switch.
+/// Enabled by default (opt-out). Only an explicit
+/// `""`/`0`/`false`/`off`/`no` value makes all three MCP handlers return
+/// a "feature disabled" error, so freshness can still ship behind a kill
+/// switch via `CORECRUXD_FEATURE_FRESHNESS=0`.
 pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_FRESHNESS";
 
 /// Receipt class string used on the `Reverify` CROWN receipts emitted
@@ -44,20 +46,25 @@ pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_FRESHNESS";
 pub const REVERIFY_RECEIPT_CLASS: &str = "Reverify";
 
 /// Returns true if the freshness feature flag is enabled.
+///
+/// Default-on (opt-out): an UNSET env var means enabled. Only an explicit
+/// `""`/`0`/`false`/`off`/`no` (case-insensitive) disables the surface.
 pub fn freshness_enabled() -> bool {
     match std::env::var(FEATURE_FLAG_ENV) {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !matches!(v.as_str(), "" | "0" | "false" | "off" | "no")
         }
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
 fn feature_disabled_error() -> JsonRpcError {
     JsonRpcError {
         code: crate::dispatch::CAPABILITY_DENIED,
-        message: format!("freshness feature disabled (set {FEATURE_FLAG_ENV}=1 to enable)"),
+        message: format!(
+            "freshness feature explicitly disabled (unset {FEATURE_FLAG_ENV} to re-enable; it is on by default)"
+        ),
         data: Some(json!({"flag": FEATURE_FLAG_ENV})),
     }
 }
@@ -353,8 +360,15 @@ mod tests {
     fn enable() {
         std::env::set_var(FEATURE_FLAG_ENV, "1");
     }
+    /// Reset to the default (unset) state. Since the flag is default-on,
+    /// unsetting it re-enables the surface; tests that need it OFF must
+    /// call [`disable_explicit`].
     fn disable() {
         std::env::remove_var(FEATURE_FLAG_ENV);
+    }
+    /// Explicitly opt out via `=0` (the kill switch).
+    fn disable_explicit() {
+        std::env::set_var(FEATURE_FLAG_ENV, "0");
     }
 
     fn test_ctx() -> McpContext {
@@ -373,12 +387,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flag_off_returns_capability_denied() {
+    async fn flag_explicit_off_returns_capability_denied() {
         let _g = flag_lock().lock().await;
-        disable();
+        disable_explicit();
         let ctx = test_ctx();
         let err = handle_memory_freshness(&json!({}), &ctx).await.unwrap_err();
         assert_eq!(err.code, crate::dispatch::CAPABILITY_DENIED);
+        disable();
+    }
+
+    #[tokio::test]
+    async fn flag_default_on_contract() {
+        let _g = flag_lock().lock().await;
+        // (a) UNSET -> enabled.
+        disable();
+        assert!(freshness_enabled(), "unset env must default to enabled");
+        // (b) explicit disable values -> disabled.
+        for v in ["0", "false", "off", "no", ""] {
+            std::env::set_var(FEATURE_FLAG_ENV, v);
+            assert!(!freshness_enabled(), "value {v:?} must disable");
+        }
+        // (c) =1 -> enabled.
+        enable();
+        assert!(freshness_enabled(), "=1 must enable");
+        disable();
     }
 
     #[tokio::test]

@@ -192,7 +192,18 @@ impl Envelope {
     /// Wrap an existing payload value into the public envelope shape.
     ///
     /// `payload` should be the tool's existing response value (the same
-    /// thing it would return when the feature flag is off).
+    /// thing it would return when the feature flag is off) — it is already
+    /// MCP-content-shaped (carries `content` and, for structured tools,
+    /// `structuredContent`).
+    ///
+    /// MCP-spec compliance (agent-ux M3 bugfix): the result MUST keep
+    /// `content` at the top level so spec-compliant clients can render it.
+    /// We therefore DO NOT bury the payload under a non-standard `payload`
+    /// key (which replaced `content` at the top level and rendered these
+    /// tools invisible). Instead we lift the payload to be the result and
+    /// fold the audit `envelope` into `structuredContent.envelope` (and
+    /// mirror it under `_meta.envelope`), preserving the audit-trail
+    /// receipt (threat T.4) without shadowing `content`.
     pub fn wrap_payload(self, payload: Value) -> Value {
         let envelope = serde_json::to_value(&self).unwrap_or_else(|_| {
             json!({
@@ -203,8 +214,90 @@ impl Envelope {
                 "links": {},
             })
         });
-        json!({ "payload": payload, "envelope": envelope })
+        fold_envelope_into_result(payload, envelope)
     }
+}
+
+/// Normalise a tool result so it always conforms to the MCP `tools/call`
+/// result shape (`result.content` present, plus `result.structuredContent`
+/// when structured data exists) while preserving the audit `envelope`.
+///
+/// The historical bug: results were emitted as `{ "payload": <content>,
+/// "envelope": <receipt> }`, which placed the receipt at the top level and
+/// LEFT NO top-level `content` — spec-compliant MCP clients silently saw an
+/// empty result. The MCP spec requires `result.content` (an array with at
+/// least a text item) for every `tools/call` response.
+///
+/// Behaviour:
+/// - `payload` is the tool's already-content-shaped value. We lift it to be
+///   the result so `content` / `structuredContent` surface at the top level.
+/// - `envelope` is folded under `structuredContent.envelope` (creating
+///   `structuredContent` if absent) and mirrored under `_meta.envelope` so
+///   audit consumers can find it in either location.
+///
+/// Defensive: this only ever lifts `payload`; callers (`wrap_payload`) only
+/// invoke it with a freshly-built content-shaped payload, so there is no
+/// double-wrapping risk. The companion [`normalize_result_shape`] guards the
+/// dispatch boundary against any residual `{payload, envelope}` value.
+fn fold_envelope_into_result(payload: Value, envelope: Value) -> Value {
+    let mut result = match payload {
+        Value::Object(_) => payload,
+        // A non-object payload can't host `content`; wrap it as a text item
+        // so the result is still spec-shaped.
+        other => json!({
+            "content": [{"type": "text", "text": other.to_string()}],
+            "structuredContent": { "value": other }
+        }),
+    };
+
+    if let Value::Object(map) = &mut result {
+        // Fold the envelope into structuredContent.envelope (create if absent).
+        match map.get_mut("structuredContent") {
+            Some(Value::Object(sc)) => {
+                sc.insert("envelope".to_string(), envelope.clone());
+            }
+            _ => {
+                map.insert(
+                    "structuredContent".to_string(),
+                    json!({ "envelope": envelope.clone() }),
+                );
+            }
+        }
+        // Mirror under _meta.envelope for audit consumers that look there.
+        match map.get_mut("_meta") {
+            Some(Value::Object(meta)) => {
+                meta.insert("envelope".to_string(), envelope);
+            }
+            _ => {
+                map.insert("_meta".to_string(), json!({ "envelope": envelope }));
+            }
+        }
+    }
+
+    result
+}
+
+/// Defensive dispatch-boundary normaliser: if a tool result still carries
+/// the legacy `{ "payload": …, "envelope": … }` shape (i.e. it has
+/// `payload` but no top-level `content`), lift the payload and fold the
+/// envelope per [`fold_envelope_into_result`]. Any already-spec-shaped
+/// result (one that already has top-level `content`) passes through
+/// untouched, so tools that return `content` directly are never
+/// double-wrapped.
+pub fn normalize_result_shape(result: Value) -> Value {
+    let is_legacy_wrapper = result.get("payload").is_some()
+        && result.get("content").is_none()
+        && result.get("envelope").is_some();
+    if !is_legacy_wrapper {
+        return result;
+    }
+    let mut obj = match result {
+        Value::Object(map) => map,
+        other => return other,
+    };
+    let payload = obj.remove("payload").unwrap_or(Value::Null);
+    let envelope = obj.remove("envelope").unwrap_or_else(|| json!({}));
+    fold_envelope_into_result(payload, envelope)
 }
 
 // ── per-tool builders ─────────────────────────────────────────────────────
@@ -484,12 +577,67 @@ mod tests {
         };
         let payload = json!({"content": [{"type": "text", "text": "hi"}]});
         let wrapped = env.wrap_payload(payload.clone());
-        assert_eq!(wrapped["payload"], payload);
-        assert_eq!(wrapped["envelope"]["receipts_used"][0], "r1");
-        assert_eq!(wrapped["envelope"]["autonomy_consumed"]["capability"], "facts:read");
-        assert!(wrapped["envelope"]["memories_used"].is_array());
-        assert!(wrapped["envelope"]["predicted_effects"].is_array());
-        assert!(wrapped["envelope"]["links"].is_object());
+        // MCP-spec shape: content is preserved at the TOP level (not buried
+        // under a non-standard `payload` key that shadows it).
+        assert!(wrapped.get("payload").is_none(), "must not bury content under payload");
+        assert_eq!(wrapped["content"], payload["content"]);
+        // The audit envelope is folded under structuredContent.envelope and
+        // mirrored under _meta.envelope.
+        assert_eq!(wrapped["structuredContent"]["envelope"]["receipts_used"][0], "r1");
+        assert_eq!(
+            wrapped["structuredContent"]["envelope"]["autonomy_consumed"]["capability"],
+            "facts:read"
+        );
+        assert!(wrapped["structuredContent"]["envelope"]["memories_used"].is_array());
+        assert!(wrapped["structuredContent"]["envelope"]["predicted_effects"].is_array());
+        assert!(wrapped["structuredContent"]["envelope"]["links"].is_object());
+        assert_eq!(wrapped["_meta"]["envelope"]["receipts_used"][0], "r1");
+    }
+
+    /// Regression test for the M3 normalisation helper. Input is the legacy
+    /// `{payload:{content,structuredContent}, envelope}` shape; output must
+    /// be spec-shaped (top-level `content`) with the envelope folded into
+    /// `structuredContent.envelope` and mirrored under `_meta.envelope`.
+    #[test]
+    fn fold_envelope_lifts_payload_and_preserves_existing_structured_content() {
+        let payload = json!({
+            "content": [{"type": "text", "text": "two rows"}],
+            "structuredContent": {"rows": [{"entity": "a"}, {"entity": "b"}]}
+        });
+        let envelope = json!({"receipts_used": ["r9"], "memories_used": []});
+        let out = fold_envelope_into_result(payload, envelope);
+        // Content surfaces at the top level.
+        assert_eq!(out["content"][0]["text"], "two rows");
+        // Pre-existing structuredContent fields are kept …
+        assert_eq!(out["structuredContent"]["rows"][1]["entity"], "b");
+        // … and the envelope is folded in alongside them (not replacing them).
+        assert_eq!(out["structuredContent"]["envelope"]["receipts_used"][0], "r9");
+        // Mirrored under _meta.
+        assert_eq!(out["_meta"]["envelope"]["receipts_used"][0], "r9");
+    }
+
+    /// `normalize_result_shape` must lift a residual legacy wrapper but
+    /// pass an already-spec-shaped result through untouched (no double-wrap).
+    #[test]
+    fn normalize_result_shape_lifts_legacy_and_passes_spec_through() {
+        // Legacy wrapper → lifted.
+        let legacy = json!({
+            "payload": {"content": [{"type": "text", "text": "hi"}]},
+            "envelope": {"receipts_used": ["r1"]}
+        });
+        let fixed = normalize_result_shape(legacy);
+        assert!(fixed.get("payload").is_none());
+        assert!(fixed.get("envelope").is_none());
+        assert_eq!(fixed["content"][0]["text"], "hi");
+        assert_eq!(fixed["structuredContent"]["envelope"]["receipts_used"][0], "r1");
+
+        // Already-spec-shaped → untouched (no double-wrap).
+        let spec = json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "structuredContent": {"k": "v"}
+        });
+        let passthrough = normalize_result_shape(spec.clone());
+        assert_eq!(passthrough, spec);
     }
 
     #[tokio::test]

@@ -432,8 +432,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                           Returns facts grouped by entity with version + confidence + pin \
                           state. Reserved-prefix entries (__agent::*, __ops::*, \
                           __bootstrap__::*, __memory_pin::*) are filtered out. Honours \
-                          `token_budget` (default 2000). Feature-flagged behind \
-                          CORECRUXD_FEATURE_MEMORY_PANEL=1."
+                          `token_budget` (default 2000). Enabled by default; set \
+                          CORECRUXD_FEATURE_MEMORY_PANEL=0 to disable."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -518,7 +518,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                           ({fresh|stale|unknown}) under the deterministic decay policy. \
                           Reserved-prefix facts (__agent::, __ops::, __bootstrap__::) are \
                           filtered. Read-only; pass `token_budget` (default 500) per QC.2. \
-                          Gated by CORECRUXD_FEATURE_FRESHNESS=1."
+                          Enabled by default; set CORECRUXD_FEATURE_FRESHNESS=0 to disable."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -539,8 +539,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             description: "Freshness: pin or override the horizon_class on a fact \
                           (`volatile`, `medium`, `stable`, `none`). Requires an \
                           authenticated passport. Reserved-prefix facts cannot be \
-                          re-classified through this surface. Gated by \
-                          CORECRUXD_FEATURE_FRESHNESS=1."
+                          re-classified through this surface. Enabled by default; \
+                          set CORECRUXD_FEATURE_FRESHNESS=0 to disable."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -559,7 +559,8 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             description: "Freshness: re-anchor a fact's decay clock without rewriting the \
                           value, recording a CROWN-verifiable `Reverify` receipt under \
                           `__reverify_receipts__::<fact_id>`. Requires an authenticated \
-                          passport. Gated by CORECRUXD_FEATURE_FRESHNESS=1."
+                          passport. Enabled by default; set CORECRUXD_FEATURE_FRESHNESS=0 \
+                          to disable."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
