@@ -9,10 +9,76 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
+use chrono::Utc;
+
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
 use crate::scope;
-use corecrux_memory::fact_store::{Fact, FactQuery, StoreFact};
+use corecrux_memory::fact_store::{Fact, FactQuery, HorizonClass, StoreFact};
+use corecrux_projections::decay;
+
+/// Parse an operator's free-text `freshness_horizon:` line into a
+/// [`HorizonClass`]. Conservative by design: anything unrecognised maps
+/// to [`HorizonClass::None`] (never decays) rather than guessing.
+///
+/// Rules (first match wins, case-insensitive):
+/// - contains "hour" -> volatile
+/// - "stable"/"frozen"/"immutable"/"historical" -> stable
+/// - "architect" -> stable
+/// - "year" -> stable
+/// - "month" -> medium
+/// - "week" -> medium
+/// - "day"/"days" preceded by a number <= 2 -> volatile, else -> medium
+/// - anything else -> none
+///
+/// Note: M2/M3 (`HorizonClass::default_for_entity`) still applies when
+/// neither this nor an explicit `horizon_class` is supplied — this parser
+/// only runs when `freshness_horizon` text is provided and `horizon_class`
+/// is absent.
+pub(crate) fn parse_freshness_horizon(text: &str) -> HorizonClass {
+    let lower = text.to_ascii_lowercase();
+
+    if lower.contains("hour") {
+        return HorizonClass::Volatile;
+    }
+    if lower.contains("stable")
+        || lower.contains("frozen")
+        || lower.contains("immutable")
+        || lower.contains("historical")
+        || lower.contains("architect")
+        || lower.contains("year")
+    {
+        return HorizonClass::Stable;
+    }
+    if lower.contains("month") {
+        return HorizonClass::Medium;
+    }
+    if lower.contains("week") {
+        return HorizonClass::Medium;
+    }
+    if lower.contains("day") {
+        // Find a number adjacent to a "day"/"days" mention; <= 2 days is
+        // volatile, otherwise it reads as a roughly-weekly cadence.
+        if let Some(n) = nearest_day_count(&lower) {
+            return if n <= 2 { HorizonClass::Volatile } else { HorizonClass::Medium };
+        }
+        // "day" without a parseable count -> medium (conservative,
+        // doesn't claim sub-day volatility).
+        return HorizonClass::Medium;
+    }
+    HorizonClass::None
+}
+
+/// Extract the integer that qualifies a "day"/"days" mention, if any.
+/// Returns the first standalone number found in the text (operator lines
+/// like "re-verify before relying after 3 days" put the count before the
+/// unit). `None` when no number is present.
+fn nearest_day_count(lower: &str) -> Option<u64> {
+    lower
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|tok| !tok.is_empty())
+        .find_map(|tok| tok.parse::<u64>().ok())
+}
 
 /// `store_fact` — persist a key-value fact against an entity.
 ///
@@ -30,6 +96,25 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     let confidence = args.get("confidence").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
     let private = args.get("private").and_then(|v| v.as_bool()).unwrap_or(false);
     let agent_name = scope::agent_name(ctx.agent.as_ref());
+
+    // Freshness horizon (M4): an explicit `horizon_class` always wins; if
+    // absent, parse the operator's free-text `freshness_horizon` line; if
+    // both are absent leave `None` so the entity-prefix default (M2/M3)
+    // applies — strict backwards-compat for callers that send neither.
+    let horizon_class: Option<HorizonClass> = match args.get("horizon_class").and_then(|v| v.as_str()) {
+        Some(s) => Some(HorizonClass::parse(s).ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("invalid horizon_class: {s}"),
+            data: Some(json!({
+                "param": "horizon_class",
+                "allowed": ["volatile", "medium", "stable", "none"],
+            })),
+        })?),
+        None => args
+            .get("freshness_horizon")
+            .and_then(|v| v.as_str())
+            .map(parse_freshness_horizon),
+    };
 
     let entity = match (private, agent_name) {
         (true, Some(agent_name)) => scope::private_entity_for_agent(agent_name, entity_raw),
@@ -50,7 +135,7 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         source_receipt,
         confidence,
         private,
-        horizon_class: None,
+        horizon_class,
     };
 
     let mut store = ctx.fact_store.write().await;
@@ -155,17 +240,44 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
         }));
     }
 
-    let text = visible
-        .into_iter()
-        .map(|f| {
-            let entity = scope::visible_entity_for_agent(&f, agent_name).unwrap_or_else(|| f.entity.clone());
-            format!("[{}] {} = {} (confidence={:.2})", entity, f.key, f.value, f.confidence)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // M4: compute freshness at recall time using the SAME decay logic as
+    // `memory_freshness`. Result ORDERING is unchanged (M5) — we only ADD
+    // `freshness` + `age_hours` to each row and surface them in the text.
+    let policy = decay::DecayPolicy::from_env();
+    let now = Utc::now();
+
+    let mut lines: Vec<String> = Vec::with_capacity(visible.len());
+    let mut rows: Vec<Value> = Vec::with_capacity(visible.len());
+    for f in &visible {
+        let entity = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
+        let class = crate::tools::freshness::projection_class_of(f.horizon_class);
+        let fresh = decay::apply_at_chrono(class, f.stored_at, f.reverified_at, now, policy);
+        let anchor = f.reverified_at.unwrap_or(f.stored_at);
+        let age_hours = (now - anchor).num_hours().max(0);
+        lines.push(format!(
+            "[{}] {} = {} (confidence={:.2}, freshness={}, age_hours={})",
+            entity,
+            f.key,
+            f.value,
+            f.confidence,
+            fresh.as_str(),
+            age_hours
+        ));
+        rows.push(json!({
+            "fact_id": f.fact_id,
+            "entity": entity,
+            "key": f.key,
+            "value": f.value,
+            "confidence": f.confidence,
+            "horizon_class": f.horizon_class.as_str(),
+            "freshness": fresh.as_str(),
+            "age_hours": age_hours,
+        }));
+    }
 
     Ok(json!({
-        "content": [{ "type": "text", "text": text }]
+        "content": [{ "type": "text", "text": lines.join("\n") }],
+        "structuredContent": { "rows": rows }
     }))
 }
 
@@ -645,5 +757,172 @@ mod tests {
         let data = err.data.unwrap();
         assert_eq!(data["param"], "entity");
         assert_eq!(data["required"], true);
+    }
+
+    // ── M4: freshness horizon at write time ─────────────────────────
+
+    #[test]
+    fn parse_freshness_horizon_table() {
+        use HorizonClass::*;
+        let cases: &[(&str, HorizonClass)] = &[
+            // hours -> volatile
+            ("re-verify in 6 hours", Volatile),
+            ("every hour", Volatile),
+            // small-day counts -> volatile
+            ("re-verify before relying after 1 day", Volatile),
+            ("re-verify before relying after 2 days", Volatile),
+            ("re-verify before relying after 3 days", Medium),
+            ("after 7 days", Medium),
+            ("day", Medium), // "day" w/o a number -> medium (conservative)
+            // weeks / months -> medium
+            ("re-check weekly", Medium),
+            ("good for about a week", Medium),
+            ("re-verify each month", Medium),
+            ("monthly", Medium),
+            // years / architectural / stable words -> stable
+            ("architectural count", Stable),
+            ("re-verify after a year", Stable),
+            ("stable historical run", Stable),
+            ("baseline frozen", Stable),
+            ("immutable identity fact", Stable),
+            ("historical run", Stable),
+            // unrecognised -> none (do NOT guess)
+            ("", None),
+            ("some opaque note", None),
+            ("re-verify before relying", None),
+            ("forever", None),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                parse_freshness_horizon(text),
+                *expected,
+                "freshness_horizon parse mismatch for {text:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn store_fact_explicit_horizon_class_persists() {
+        let ctx = test_ctx();
+        let r = handle_store_fact(
+            &json!({"entity": "deploy", "key": "state", "value": "live", "horizon_class": "VOLATILE"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let txt = r["content"][0]["text"].as_str().unwrap();
+        let fact_id = txt.split_whitespace().nth(2).unwrap();
+        let store = ctx.fact_store.read().await;
+        let fact = store.get(fact_id).unwrap();
+        assert_eq!(fact.horizon_class, HorizonClass::Volatile);
+    }
+
+    #[tokio::test]
+    async fn store_fact_invalid_horizon_class_rejected() {
+        let ctx = test_ctx();
+        let err = handle_store_fact(
+            &json!({"entity": "e", "key": "k", "value": "v", "horizon_class": "weekly"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(err.data.unwrap()["param"], "horizon_class");
+    }
+
+    #[tokio::test]
+    async fn store_fact_freshness_horizon_parsed_when_class_absent() {
+        let ctx = test_ctx();
+        let r = handle_store_fact(
+            &json!({
+                "entity": "deploy", "key": "state", "value": "live",
+                "freshness_horizon": "re-verify before relying after 1 day"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let txt = r["content"][0]["text"].as_str().unwrap();
+        let fact_id = txt.split_whitespace().nth(2).unwrap();
+        let store = ctx.fact_store.read().await;
+        assert_eq!(store.get(fact_id).unwrap().horizon_class, HorizonClass::Volatile);
+    }
+
+    #[tokio::test]
+    async fn store_fact_explicit_class_wins_over_freshness_horizon() {
+        let ctx = test_ctx();
+        let r = handle_store_fact(
+            &json!({
+                "entity": "e", "key": "k", "value": "v",
+                "horizon_class": "stable",
+                "freshness_horizon": "re-verify in 6 hours"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let txt = r["content"][0]["text"].as_str().unwrap();
+        let fact_id = txt.split_whitespace().nth(2).unwrap();
+        let store = ctx.fact_store.read().await;
+        assert_eq!(store.get(fact_id).unwrap().horizon_class, HorizonClass::Stable);
+    }
+
+    #[tokio::test]
+    async fn store_fact_no_horizon_params_unchanged() {
+        // Backward-compat: omitting both params leaves horizon_class at the
+        // entity-prefix default (None for a plain entity).
+        let ctx = test_ctx();
+        let r = handle_store_fact(&json!({"entity": "plain", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        let txt = r["content"][0]["text"].as_str().unwrap();
+        let fact_id = txt.split_whitespace().nth(2).unwrap();
+        let store = ctx.fact_store.read().await;
+        assert_eq!(store.get(fact_id).unwrap().horizon_class, HorizonClass::None);
+    }
+
+    #[tokio::test]
+    async fn query_facts_rows_include_freshness_and_age() {
+        let ctx = test_ctx();
+        handle_store_fact(&json!({"entity": "alpha", "key": "status", "value": "active"}), &ctx)
+            .await
+            .unwrap();
+
+        let result = handle_query_facts(&json!({"query": "active", "entity": "alpha"}), &ctx)
+            .await
+            .unwrap();
+        // Text still carries the legacy fields plus the new annotation.
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("active"));
+        assert!(text.contains("confidence="));
+        assert!(text.contains("freshness="));
+        assert!(text.contains("age_hours="));
+        // Structured rows carry the computed fields.
+        let rows = result["structuredContent"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["freshness"], "fresh"); // horizon=none -> always fresh
+        assert!(row["age_hours"].is_number());
+        assert_eq!(row["key"], "status");
+        assert_eq!(row["value"], "active");
+        assert_eq!(row["horizon_class"], "none");
+    }
+
+    #[test]
+    fn backdated_volatile_fact_classifies_stale() {
+        // Decay is computed via the SAME decay::apply_at_chrono path that
+        // query_facts/memory_freshness use. Construct a volatile fact
+        // stored 48h ago; the default 24h volatile threshold -> stale.
+        use chrono::Duration;
+        let policy = decay::DecayPolicy::default_const();
+        let now = Utc::now();
+        let stored_at = now - Duration::hours(48);
+        let class = crate::tools::freshness::projection_class_of(HorizonClass::Volatile);
+        let fresh = decay::apply_at_chrono(class, stored_at, None, now, policy);
+        assert_eq!(fresh, decay::Freshness::Stale);
+
+        // A fresh (just-stored) volatile fact is still fresh.
+        let fresh_now = decay::apply_at_chrono(class, now, None, now, policy);
+        assert_eq!(fresh_now, decay::Freshness::Fresh);
     }
 }
