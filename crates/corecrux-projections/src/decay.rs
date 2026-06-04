@@ -188,6 +188,38 @@ pub fn apply_at_chrono(
     apply_at(class, anchor.timestamp_millis(), now.timestamp_millis(), policy)
 }
 
+/// Ranking-time demotion factor applied to a fact's STORED confidence
+/// when it has decayed to [`Freshness::Stale`]. A stale fact ranks as if
+/// it had half its recorded confidence, so a fresh correction with equal
+/// stored confidence sorts ahead of it.
+///
+/// This is deliberately a single fixed constant (not env-tunable): the
+/// demotion is a ranking heuristic, not a policy threshold, and keeping
+/// it constant preserves deterministic ordering across machines/runs.
+pub const STALE_DEMOTION_FACTOR: f64 = 0.5;
+
+/// Ranking-time EFFECTIVE confidence for a fact, given its STORED
+/// confidence and its computed [`Freshness`].
+///
+/// This is a pure helper used ONLY to order recall results — it never
+/// mutates the stored confidence. Rules:
+///
+/// - [`Freshness::Fresh`]   -> stored confidence unchanged.
+/// - [`Freshness::Unknown`] -> stored confidence unchanged. An
+///   unclassified / clock-skewed fact is not punished; we only demote
+///   facts we can *positively* prove are stale.
+/// - [`Freshness::Stale`]   -> stored confidence multiplied by
+///   [`STALE_DEMOTION_FACTOR`] (0.5), so a stale fact sinks below an
+///   equally-confident fresh one.
+///
+/// Pure: same `(stored, freshness)` -> same output.
+pub fn effective_confidence(stored: f64, freshness: Freshness) -> f64 {
+    match freshness {
+        Freshness::Fresh | Freshness::Unknown => stored,
+        Freshness::Stale => stored * STALE_DEMOTION_FACTOR,
+    }
+}
+
 /// Age in days between `written_ms` and `now_ms`. Returns `None` if
 /// either is non-positive or written is in the future.
 pub fn age_days(written_ms: i64, now_ms: i64) -> Option<i64> {
@@ -339,6 +371,20 @@ mod tests {
             apply_at_chrono(HorizonClass::Medium, written, Some(reverified), now, p()),
             Freshness::Fresh
         );
+    }
+
+    #[test]
+    fn effective_confidence_table() {
+        // Fresh + Unknown pass through unchanged; only Stale is demoted.
+        assert_eq!(effective_confidence(1.0, Freshness::Fresh), 1.0);
+        assert_eq!(effective_confidence(0.8, Freshness::Fresh), 0.8);
+        assert_eq!(effective_confidence(1.0, Freshness::Unknown), 1.0);
+        assert_eq!(effective_confidence(0.3, Freshness::Unknown), 0.3);
+        assert_eq!(effective_confidence(1.0, Freshness::Stale), 0.5);
+        assert_eq!(effective_confidence(0.8, Freshness::Stale), 0.4);
+        // A demoted high-confidence stale fact ranks below a fresh
+        // mid-confidence fact: 1.0*0.5 = 0.5 < 0.6.
+        assert!(effective_confidence(1.0, Freshness::Stale) < effective_confidence(0.6, Freshness::Fresh));
     }
 
     #[test]

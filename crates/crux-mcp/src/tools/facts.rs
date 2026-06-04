@@ -60,7 +60,11 @@ pub(crate) fn parse_freshness_horizon(text: &str) -> HorizonClass {
         // Find a number adjacent to a "day"/"days" mention; <= 2 days is
         // volatile, otherwise it reads as a roughly-weekly cadence.
         if let Some(n) = nearest_day_count(&lower) {
-            return if n <= 2 { HorizonClass::Volatile } else { HorizonClass::Medium };
+            return if n <= 2 {
+                HorizonClass::Volatile
+            } else {
+                HorizonClass::Medium
+            };
         }
         // "day" without a parseable count -> medium (conservative,
         // doesn't claim sub-day volatility).
@@ -241,8 +245,10 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     }
 
     // M4: compute freshness at recall time using the SAME decay logic as
-    // `memory_freshness`. Result ORDERING is unchanged (M5) — we only ADD
-    // `freshness` + `age_hours` to each row and surface them in the text.
+    // `memory_freshness`. M5: results are now ranked by effective_confidence
+    // (see `query_visible_facts`); here we surface both the STORED
+    // `confidence` (unchanged) and the recall-time `effective_confidence`
+    // so the demotion is visible/explainable to the caller.
     let policy = decay::DecayPolicy::from_env();
     let now = Utc::now();
 
@@ -252,14 +258,16 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
         let entity = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
         let class = crate::tools::freshness::projection_class_of(f.horizon_class);
         let fresh = decay::apply_at_chrono(class, f.stored_at, f.reverified_at, now, policy);
+        let effective_confidence = decay::effective_confidence(f.confidence as f64, fresh);
         let anchor = f.reverified_at.unwrap_or(f.stored_at);
         let age_hours = (now - anchor).num_hours().max(0);
         lines.push(format!(
-            "[{}] {} = {} (confidence={:.2}, freshness={}, age_hours={})",
+            "[{}] {} = {} (confidence={:.2}, effective_confidence={:.2}, freshness={}, age_hours={})",
             entity,
             f.key,
             f.value,
             f.confidence,
+            effective_confidence,
             fresh.as_str(),
             age_hours
         ));
@@ -269,6 +277,7 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
             "key": f.key,
             "value": f.value,
             "confidence": f.confidence,
+            "effective_confidence": effective_confidence,
             "horizon_class": f.horizon_class.as_str(),
             "freshness": fresh.as_str(),
             "age_hours": age_hours,
@@ -375,10 +384,23 @@ fn query_visible_facts(store: &corecrux_memory::FactStore, q: &FactQuery, agent_
         })
         .collect();
 
+    // M5: rank by a time-decayed EFFECTIVE confidence rather than the raw
+    // stored confidence, so a stale fact sinks below an equally-confident
+    // fresh one. The STORED confidence is never mutated — this is purely a
+    // sort key, computed at recall time from the same decay logic
+    // (`apply_at_chrono` + `projection_class_of`) used elsewhere. Tie-break
+    // on `stored_at` desc so the most-recent fact wins on equal effective
+    // confidence.
+    let policy = decay::DecayPolicy::from_env();
+    let now = Utc::now();
+    let eff = |fact: &Fact| -> f64 {
+        let class = crate::tools::freshness::projection_class_of(fact.horizon_class);
+        let fresh = decay::apply_at_chrono(class, fact.stored_at, fact.reverified_at, now, policy);
+        decay::effective_confidence(fact.confidence as f64, fresh)
+    };
     results.sort_by(|left, right| {
-        right
-            .confidence
-            .partial_cmp(&left.confidence)
+        eff(right)
+            .partial_cmp(&eff(left))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| right.stored_at.cmp(&left.stored_at))
     });
@@ -924,5 +946,137 @@ mod tests {
         // A fresh (just-stored) volatile fact is still fresh.
         let fresh_now = decay::apply_at_chrono(class, now, None, now, policy);
         assert_eq!(fresh_now, decay::Freshness::Fresh);
+    }
+
+    // ── M5: stale facts are demoted in ranking ──────────────────────
+
+    use chrono::{DateTime, Duration};
+    use corecrux_memory::fact_store::Fact;
+
+    /// Build a fact directly (all fields public) and inject it via
+    /// `store_synced` so we can backdate `stored_at` — mirrors the M4
+    /// backdated-construction approach since `stored_at` isn't settable
+    /// through the public store API.
+    fn synth_fact(
+        fact_id: &str,
+        entity: &str,
+        value: &str,
+        confidence: f32,
+        horizon_class: HorizonClass,
+        stored_at: DateTime<Utc>,
+        reverified_at: Option<DateTime<Utc>>,
+    ) -> Fact {
+        Fact {
+            fact_id: fact_id.to_string(),
+            entity: entity.to_string(),
+            key: "state".to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence,
+            stored_at,
+            tokens: 8,
+            deleted: false,
+            version: 1,
+            supersedes: None,
+            private: false,
+            horizon_class,
+            reverified_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn query_facts_demotes_stale_below_equal_confidence_fresh() {
+        let ctx = test_ctx();
+        let now = Utc::now();
+        {
+            let mut store = ctx.fact_store.write().await;
+            // STALE: volatile, stored 48h ago (> 24h threshold), conf 1.0.
+            store.store_synced(synth_fact(
+                "f_stale",
+                "deploy",
+                "old-state",
+                1.0,
+                HorizonClass::Volatile,
+                now - Duration::hours(48),
+                None,
+            ));
+            // FRESH: volatile, stored just now, equal stored confidence 1.0.
+            store.store_synced(synth_fact(
+                "f_fresh",
+                "deploy",
+                "new-state",
+                1.0,
+                HorizonClass::Volatile,
+                now,
+                None,
+            ));
+        }
+
+        let result = handle_query_facts(&json!({"entity": "deploy"}), &ctx).await.unwrap();
+        let rows = result["structuredContent"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        // Fresh fact ranks first despite equal STORED confidence.
+        assert_eq!(rows[0]["fact_id"], "f_fresh");
+        assert_eq!(rows[0]["freshness"], "fresh");
+        assert_eq!(rows[1]["fact_id"], "f_stale");
+        assert_eq!(rows[1]["freshness"], "stale");
+        // STORED confidence is preserved (not mutated); only the
+        // recall-time effective_confidence is demoted on the stale row.
+        assert_eq!(rows[1]["confidence"], 1.0);
+        assert_eq!(rows[1]["effective_confidence"], 0.5);
+        assert_eq!(rows[0]["confidence"], 1.0);
+        assert_eq!(rows[0]["effective_confidence"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn query_facts_reverified_stale_regains_rank() {
+        let ctx = test_ctx();
+        let now = Utc::now();
+        {
+            let mut store = ctx.fact_store.write().await;
+            // Stored 48h ago BUT reverified just now -> decay clock
+            // re-anchored -> treated fresh again, regains its rank.
+            store.store_synced(synth_fact(
+                "f_reverified",
+                "deploy",
+                "re-anchored-state",
+                1.0,
+                HorizonClass::Volatile,
+                now - Duration::hours(48),
+                Some(now),
+            ));
+            // A fresh competitor with LOWER stored confidence: the
+            // reverified fact should now outrank it (full effective conf).
+            store.store_synced(synth_fact(
+                "f_lower",
+                "deploy",
+                "other-state",
+                0.6,
+                HorizonClass::Volatile,
+                now,
+                None,
+            ));
+        }
+
+        let result = handle_query_facts(&json!({"entity": "deploy"}), &ctx).await.unwrap();
+        let rows = result["structuredContent"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        // Reverified fact is fresh again and outranks the lower-confidence
+        // fresh fact.
+        assert_eq!(rows[0]["fact_id"], "f_reverified");
+        assert_eq!(rows[0]["freshness"], "fresh");
+        assert_eq!(rows[0]["effective_confidence"], 1.0);
+        assert_eq!(rows[1]["fact_id"], "f_lower");
+    }
+
+    #[tokio::test]
+    async fn query_facts_text_exposes_effective_confidence() {
+        let ctx = test_ctx();
+        handle_store_fact(&json!({"entity": "alpha", "key": "state", "value": "active"}), &ctx)
+            .await
+            .unwrap();
+        let result = handle_query_facts(&json!({"entity": "alpha"}), &ctx).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("effective_confidence="));
     }
 }

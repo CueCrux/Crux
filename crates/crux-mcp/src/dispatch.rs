@@ -693,10 +693,7 @@ mod tests {
             result["content"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
             "result.content must be a non-empty array; got {result:#?}"
         );
-        assert!(result["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("shipped"));
+        assert!(result["content"][0]["text"].as_str().unwrap().contains("shipped"));
         // The audit envelope is preserved under structuredContent.envelope
         // (and mirrored under _meta.envelope).
         let env = &result["structuredContent"]["envelope"];
@@ -708,10 +705,7 @@ mod tests {
         assert_eq!(env["autonomy_consumed"]["cost_credits"], 0);
         assert!(env["predicted_effects"].as_array().unwrap().is_empty());
         // Mirrored under _meta for audit consumers that look there.
-        assert_eq!(
-            result["_meta"]["envelope"]["receipts_used"][0],
-            "r_test_001"
-        );
+        assert_eq!(result["_meta"]["envelope"]["receipts_used"][0], "r_test_001");
         std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
     }
 

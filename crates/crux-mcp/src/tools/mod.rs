@@ -217,8 +217,9 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "query_facts".to_string(),
             description: "Query the fact store by keyword, entity, or both. Results are \
-                          ranked by confidence. Private facts are visible only to \
-                          their owning agent."
+                          ranked by time-decayed effective confidence (stale facts are \
+                          demoted; stored confidence is preserved). Private facts are \
+                          visible only to their owning agent."
                 .to_string(),
             input_schema: json!({
                 "type": "object",

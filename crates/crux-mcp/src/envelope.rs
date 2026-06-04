@@ -257,10 +257,7 @@ fn fold_envelope_into_result(payload: Value, envelope: Value) -> Value {
                 sc.insert("envelope".to_string(), envelope.clone());
             }
             _ => {
-                map.insert(
-                    "structuredContent".to_string(),
-                    json!({ "envelope": envelope.clone() }),
-                );
+                map.insert("structuredContent".to_string(), json!({ "envelope": envelope.clone() }));
             }
         }
         // Mirror under _meta.envelope for audit consumers that look there.
@@ -285,9 +282,8 @@ fn fold_envelope_into_result(payload: Value, envelope: Value) -> Value {
 /// untouched, so tools that return `content` directly are never
 /// double-wrapped.
 pub fn normalize_result_shape(result: Value) -> Value {
-    let is_legacy_wrapper = result.get("payload").is_some()
-        && result.get("content").is_none()
-        && result.get("envelope").is_some();
+    let is_legacy_wrapper =
+        result.get("payload").is_some() && result.get("content").is_none() && result.get("envelope").is_some();
     if !is_legacy_wrapper {
         return result;
     }
