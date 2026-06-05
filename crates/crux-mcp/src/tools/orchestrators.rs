@@ -13,18 +13,23 @@ use serde_json::{json, Value};
 
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INVALID_PARAMS};
-use crate::tools::coordination::{loopback_base, loopback_delete, loopback_get, loopback_post, text_content};
+use crate::tools::coordination::{
+    loopback_base, loopback_delete, loopback_get, loopback_patch, loopback_post, text_content,
+};
 
 pub const CREATE_ORCHESTRATOR_DESCRIPTION: &str =
     "Create a multi-agent orchestrator — a coordinator that groups work items and member passports under one umbrella. Returns the minted orchestrator record.";
 
 pub const ATTACH_TO_ORCHESTRATOR_DESCRIPTION: &str =
-    "Attach a member (passport or work item) to an orchestrator so it shows up in the coordinator's roster.";
+    "Attach a member to an orchestrator's roster. `member_ref` may be a work item id (w_…), an execplan id (execplan:…), a handoff id (ho_…), or a passport (id like `claude-work`, or principal_id like `ce:…:local`). The member type is inferred from the ref; pass an explicit `member_type` (passport|work|execplan|handoff) to override.";
 
 pub const DETACH_FROM_ORCHESTRATOR_DESCRIPTION: &str = "Detach a member from an orchestrator.";
 
 pub const LIST_ORCHESTRATORS_DESCRIPTION: &str =
     "List orchestrators defined on this daemon, optionally filtered by tenant_id or state.";
+
+pub const UPDATE_ORCHESTRATOR_DESCRIPTION: &str =
+    "Update an orchestrator's name, assignee_passport, or state (planned|active|done|archived). Use state=archived to close out an orchestrator. Returns the updated record.";
 
 fn required_str<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a str, JsonRpcError> {
     args.get(key).and_then(Value::as_str).ok_or_else(|| JsonRpcError {
@@ -63,7 +68,12 @@ pub async fn handle_create_orchestrator(args: &Value, ctx: &McpContext) -> Resul
 pub async fn handle_attach_to_orchestrator(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let id = required_str(args, "orchestrator_id", "attach_to_orchestrator")?;
     let member = required_str(args, "member_ref", "attach_to_orchestrator")?;
-    let body = json!({ "member_ref": member });
+    let mut body = json!({ "member_ref": member });
+    // Optional explicit type (passport|work|execplan|handoff). When omitted the
+    // daemon infers it from the ref (id prefix, else passport-store lookup).
+    if let Some(t) = args.get("member_type").and_then(Value::as_str) {
+        body["type"] = json!(t);
+    }
     let base = loopback_base(ctx)?;
     let (_, resp) = loopback_post(
         format!("{base}/v1/orchestrators/{id}/members"),
@@ -98,6 +108,26 @@ pub async fn handle_list_orchestrators(args: &Value, ctx: &McpContext) -> Result
     };
     let base = loopback_base(ctx)?;
     let (_, resp) = loopback_get(format!("{base}/v1/orchestrators{qs}")).await?;
+    Ok(text_content(serde_json::from_str(&resp).unwrap_or(Value::String(resp))))
+}
+
+pub async fn handle_update_orchestrator(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let id = required_str(args, "orchestrator_id", "update_orchestrator")?;
+    let mut body = json!({});
+    for key in ["name", "assignee_passport", "state"] {
+        if let Some(v) = args.get(key) {
+            body[key] = v.clone();
+        }
+    }
+    if body.as_object().is_some_and(|o| o.is_empty()) {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "update_orchestrator: pass at least one of name, assignee_passport, state".to_string(),
+            data: None,
+        });
+    }
+    let base = loopback_base(ctx)?;
+    let (_, resp) = loopback_patch(format!("{base}/v1/orchestrators/{id}"), body, ctx.scope_identity()).await?;
     Ok(text_content(serde_json::from_str(&resp).unwrap_or(Value::String(resp))))
 }
 
@@ -145,6 +175,14 @@ mod tests {
                         r#"{"orchestrator":{"kind":"orchestrator","id":"orc_1","payload":{"id":"orc_1","name":"Coord","state":"planned","members":[]}}}"#,
                     ),
                     ("GET", p) if p.starts_with("/v1/orchestrators/orc_1/members") => (404, r#"{"detail":"unused"}"#),
+                    ("PATCH", "/v1/orchestrators/orc_1") => (
+                        200,
+                        r#"{"orchestrator":{"id":"orc_1","payload":{"id":"orc_1","state":"archived"}}}"#,
+                    ),
+                    ("POST", "/v1/orchestrators/orc_1/members") if req.contains("\"type\":\"passport\"") => (
+                        200,
+                        r#"{"orchestrator":{"id":"orc_1","payload":{"members":[{"type":"passport","ref":"claude-work"}]}}}"#,
+                    ),
                     ("POST", "/v1/orchestrators/orc_1/members") => (
                         200,
                         r#"{"orchestrator":{"id":"orc_1","payload":{"members":[{"type":"work","ref":"w_1"}]}}}"#,
@@ -219,6 +257,48 @@ mod tests {
         );
         assert_eq!(listed["count"], 1);
 
+        stop_loopback(&base, stop, handle);
+    }
+
+    #[tokio::test]
+    async fn update_orchestrator_patches_via_loopback() {
+        let (base, stop, handle) = serve_orchestrator_loopback();
+        let ctx = McpContext::new_default("node-a").with_daemon_base_url(base.clone());
+        let updated = text_json(
+            handle_update_orchestrator(&json!({ "orchestrator_id": "orc_1", "state": "archived" }), &ctx)
+                .await
+                .expect("update"),
+        );
+        assert_eq!(updated["orchestrator"]["payload"]["state"], "archived");
+        stop_loopback(&base, stop, handle);
+    }
+
+    #[tokio::test]
+    async fn update_orchestrator_requires_a_field() {
+        let ctx = McpContext::new_default("node-a").with_daemon_base_url("http://127.0.0.1:9");
+        assert_eq!(
+            handle_update_orchestrator(&json!({ "orchestrator_id": "orc_1" }), &ctx)
+                .await
+                .expect_err("no fields")
+                .code,
+            INVALID_PARAMS
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_forwards_explicit_passport_member_type() {
+        let (base, stop, handle) = serve_orchestrator_loopback();
+        let ctx = McpContext::new_default("node-a").with_daemon_base_url(base.clone());
+        let attached = text_json(
+            handle_attach_to_orchestrator(
+                &json!({ "orchestrator_id": "orc_1", "member_ref": "claude-work", "member_type": "passport" }),
+                &ctx,
+            )
+            .await
+            .expect("attach passport"),
+        );
+        assert_eq!(attached["orchestrator"]["payload"]["members"][0]["type"], "passport");
+        assert_eq!(attached["orchestrator"]["payload"]["members"][0]["ref"], "claude-work");
         stop_loopback(&base, stop, handle);
     }
 

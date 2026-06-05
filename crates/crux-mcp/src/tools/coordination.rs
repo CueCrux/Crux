@@ -151,7 +151,11 @@ pub(crate) async fn loopback_post(
     })
 }
 
-async fn loopback_patch(url: String, body: Value, passport: Option<String>) -> Result<(u16, String), JsonRpcError> {
+pub(crate) async fn loopback_patch(
+    url: String,
+    body: Value,
+    passport: Option<String>,
+) -> Result<(u16, String), JsonRpcError> {
     let bearer = loopback_bearer_token();
     tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
