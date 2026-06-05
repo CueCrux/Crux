@@ -439,7 +439,7 @@ impl FactStore {
         }
     }
 
-    /// Reverse of [`mark_superseded`] (M6): un-retire a fact by clearing
+    /// Reverse of [`Self::mark_superseded`] (M6): un-retire a fact by clearing
     /// its `superseded_by` marker. Journaled for restart-survival.
     /// Returns `true` if the fact existed.
     pub fn clear_superseded(&mut self, fact_id: &str) -> bool {

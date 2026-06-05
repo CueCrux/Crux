@@ -277,7 +277,7 @@ fn fold_envelope_into_result(payload: Value, envelope: Value) -> Value {
 /// Defensive dispatch-boundary normaliser: if a tool result still carries
 /// the legacy `{ "payload": …, "envelope": … }` shape (i.e. it has
 /// `payload` but no top-level `content`), lift the payload and fold the
-/// envelope per [`fold_envelope_into_result`]. Any already-spec-shaped
+/// envelope per `fold_envelope_into_result`. Any already-spec-shaped
 /// result (one that already has top-level `content`) passes through
 /// untouched, so tools that return `content` directly are never
 /// double-wrapped.
