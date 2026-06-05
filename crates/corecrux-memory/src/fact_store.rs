@@ -518,6 +518,7 @@ impl FactStore {
         if let Err(err) = self.append_journal(&JournalEvent::Store { fact: fact.clone() }) {
             tracing::warn!(?err, "fact-journal-append-failed");
         }
+        self.supersede_prior_version(&fact);
         self.after_fact_stored(&fact);
         fact
     }
@@ -527,8 +528,29 @@ impl FactStore {
         let fact = self.build_fact(req);
         self.append_journal(&JournalEvent::Store { fact: fact.clone() })?;
         self.insert_fact_indexes(&fact);
+        self.supersede_prior_version(&fact);
         self.after_fact_stored(&fact);
         Ok(fact)
+    }
+
+    /// Retire the immediate predecessor of a freshly-stored `(entity, key)`
+    /// version in the recall plane. [`Self::build_fact`] sets `fact.supersedes`
+    /// to the prior non-deleted version's id when a chain already exists;
+    /// marking that predecessor `superseded_by` the new fact makes `query_facts`
+    /// return latest-version-wins, while `include_superseded` / `memory_view` /
+    /// `memory_history` keep the full chain visible. Reuses the journaled
+    /// [`Self::mark_superseded`] primitive so the retirement survives a restart.
+    ///
+    /// Without this, a re-`store` of an existing `(entity, key)` (the path
+    /// `memory_edit` and any value update take) left BOTH versions live in
+    /// recall — `query_facts` returned the stale value alongside the corrected
+    /// one. The explicit `store_fact(supersedes=[…])` param is unaffected: it
+    /// retires *cross-entity* facts and still runs after the store; re-marking
+    /// the same predecessor here is idempotent.
+    fn supersede_prior_version(&mut self, fact: &Fact) {
+        if let Some(prev_id) = fact.supersedes.clone() {
+            self.mark_superseded(&prev_id, &fact.fact_id);
+        }
     }
 
     /// Store multiple facts in a batch.
@@ -542,6 +564,7 @@ impl FactStore {
         self.append_journal(&JournalEvent::StoreBatch { facts: facts.clone() })?;
         for fact in &facts {
             self.insert_fact_indexes(fact);
+            self.supersede_prior_version(fact);
             self.after_fact_stored(fact);
         }
         Ok(facts)
@@ -1842,6 +1865,120 @@ mod tests {
                 "clear must survive replay (mark then clear -> None)"
             );
         }
+    }
+
+    // ── latest-version-wins recall (probe finding 1) ─────────────────
+
+    #[test]
+    fn store_same_key_auto_supersedes_prior_version_in_recall() {
+        let mut store = FactStore::new();
+        let v1 = store.store(StoreFact {
+            entity: "person:carol".into(),
+            key: "city".into(),
+            value: "Berlin".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        // Re-store the SAME (entity,key): a plain value update (the path
+        // memory_edit and any re-store take). The prior version must be
+        // retired in the recall plane so query returns latest-wins.
+        let v2 = store.store(StoreFact {
+            entity: "person:carol".into(),
+            key: "city".into(),
+            value: "Munich".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+
+        assert_eq!(v2.version, 2);
+        assert_eq!(v2.supersedes.as_deref(), Some(v1.fact_id.as_str()));
+        assert_eq!(
+            store.get(&v1.fact_id).unwrap().superseded_by.as_deref(),
+            Some(v2.fact_id.as_str()),
+            "prior version must be auto-marked superseded_by the new version"
+        );
+        assert!(
+            store.get(&v2.fact_id).unwrap().superseded_by.is_none(),
+            "the new (latest) version is never superseded"
+        );
+    }
+
+    #[test]
+    fn distinct_keys_are_not_auto_superseded() {
+        let mut store = FactStore::new();
+        let a = store.store(StoreFact {
+            entity: "person:carol".into(),
+            key: "city".into(),
+            value: "Berlin".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let b = store.store(StoreFact {
+            entity: "person:carol".into(),
+            key: "role".into(),
+            value: "PM".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        assert!(store.get(&a.fact_id).unwrap().superseded_by.is_none());
+        assert!(store.get(&b.fact_id).unwrap().superseded_by.is_none());
+        assert_eq!(a.version, 1);
+        assert_eq!(b.version, 1);
+    }
+
+    #[test]
+    fn auto_supersede_survives_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (v1_id, v2_id): (String, String);
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let v1 = store
+                .try_store(StoreFact {
+                    entity: "test-fixture-x".into(),
+                    key: "baseline".into(),
+                    value: "86.8%".into(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                    actor: None,
+                })
+                .unwrap();
+            let v2 = store
+                .try_store(StoreFact {
+                    entity: "test-fixture-x".into(),
+                    key: "baseline".into(),
+                    value: "89.3%".into(),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                    actor: None,
+                })
+                .unwrap();
+            v1_id = v1.fact_id;
+            v2_id = v2.fact_id;
+        }
+        // The auto-supersession (a journaled `Supersede` event) survives restart.
+        let store = FactStore::with_persistence(dir.path()).unwrap();
+        assert_eq!(
+            store.get(&v1_id).unwrap().superseded_by.as_deref(),
+            Some(v2_id.as_str()),
+            "auto-supersede marker must survive journal replay"
+        );
+        assert!(store.get(&v2_id).unwrap().superseded_by.is_none());
     }
 
     #[test]

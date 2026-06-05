@@ -312,17 +312,16 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
     let fact_id = require_str(args, "fact_id")?;
     let new_value = require_str(args, "new_value")?;
     let reason = args.get("reason").and_then(|v| v.as_str()).map(str::to_string);
-    let agent_name = scope::agent_name(ctx.agent.as_ref());
 
     // Edits require an authenticated agent so the new version carries an
     // attributable actor (QC.3 — passport-attributed writes).
-    if agent_name.is_none() {
+    let Some(agent_name) = scope::agent_name(ctx.agent.as_ref()) else {
         return Err(JsonRpcError {
             code: INVALID_PARAMS,
             message: "memory_edit requires an authenticated agent identity".to_string(),
             data: Some(json!({"requires_agent_identity": true})),
         });
-    }
+    };
 
     // agent-passport M5: identity-scoped visibility so the OWNER can edit its
     // own passport-keyed private fact, and a DIFFERENT passport cannot. The raw
@@ -350,9 +349,37 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
         });
     }
 
+    // Durable authorship (agent-passport M1), mirroring `handle_store_fact`:
+    // flag-ON resolve the agent token-name to a passport_id (falling back to the
+    // raw name so a flag-ON edit is never anonymous, QC.3); flag-OFF leave
+    // `None`. Without this the edited version carried `actor: null` while the
+    // original carried `claude-work`, silently breaking the attribution chain.
+    let actor: Option<String> = if ctx.agent_passports_enabled {
+        Some(
+            crate::agent_passport::resolve_agent_passport(agent_name, &ctx.agent_passport_map)
+                .unwrap_or_else(|| agent_name.to_string()),
+        )
+    } else {
+        None
+    };
+
+    // Whether the OLD fact is pinned for this agent (pin state is keyed by
+    // fact_id, so an edit mints a new id and would otherwise drop the pin — and
+    // with it the decay/scoped-forget protection the pin conferred). Computed
+    // under the read borrow before we mutate.
+    let old_pin_entity = pin_entity(agent_name, fact_id);
+    let was_pinned = store
+        .all_facts()
+        .filter(|f| !f.deleted && f.entity == old_pin_entity && f.key == "pinned")
+        .max_by_key(|f| f.stored_at)
+        .is_some_and(|f| f.value == "1" || f.value.eq_ignore_ascii_case("true"));
+
     // The store's append-only model means we write a NEW StoreFact with the
-    // same entity+key; supersession is computed by the store itself. The
-    // reason becomes the source_receipt so the audit trail is intact.
+    // same entity+key; supersession of the prior version is applied by the
+    // store itself (`supersede_prior_version`) so default recall returns the
+    // edited value, not both. The reason becomes the source_receipt so the
+    // audit trail is intact; the prior horizon_class is preserved so an edit
+    // doesn't silently reset a pinned/overridden decay horizon.
     let req = StoreFact {
         entity: existing.entity.clone(),
         key: existing.key.clone(),
@@ -360,14 +387,32 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
         source_receipt: reason.clone().map(|r| format!("memory_edit:{r}")),
         confidence: existing.confidence,
         private: existing.private,
-        horizon_class: None,
-        actor: None,
+        horizon_class: Some(existing.horizon_class),
+        actor,
     };
     let new_fact = store.try_store(req).map_err(|err| JsonRpcError {
         code: INTERNAL_ERROR,
         message: "memory_edit: fact journal append failed".to_string(),
         data: Some(json!({"error": err.to_string()})),
     })?;
+
+    // Carry the pin to the new version so decay (#3) + scoped-forget (#9)
+    // protection follow the edit instead of being silently dropped.
+    if was_pinned {
+        let new_pin_entity = pin_entity(agent_name, &new_fact.fact_id);
+        if let Err(err) = store.try_store(StoreFact {
+            entity: new_pin_entity,
+            key: "pinned".to_string(),
+            value: "1".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        }) {
+            tracing::warn!(?err, fact_id = %new_fact.fact_id, "memory_edit: pin carry-over append failed");
+        }
+    }
 
     Ok(json!({
         "content": [{
@@ -379,7 +424,7 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
         }],
         "structuredContent": {
             "old_fact_id": fact_id,
-            "new_fact": fact_to_memory_json_id(&new_fact, id_ref, &alias_refs, false),
+            "new_fact": fact_to_memory_json_id(&new_fact, id_ref, &alias_refs, was_pinned),
             "reason": reason,
         }
     }))
@@ -560,7 +605,7 @@ mod tests {
     use super::*;
     use crate::agent::AgentIdentity;
     use crate::dispatch::McpContext;
-    use crate::tools::facts::handle_store_fact;
+    use crate::tools::facts::{handle_query_facts, handle_store_fact};
 
     /// Guard for the `CORECRUXD_FEATURE_MEMORY_PANEL` env var. The flag is
     /// process-global so we serialise tests that mutate it using an
@@ -816,6 +861,114 @@ mod tests {
         assert_eq!(new_fact["value"], "Munich");
         assert_eq!(new_fact["version"], 2);
         assert_eq!(new_fact["source_receipt"], "memory_edit:moved 2026-04");
+    }
+
+    #[tokio::test]
+    async fn memory_edit_hides_prior_version_in_default_recall() {
+        // Probe finding 1: after an in-place edit, default query_facts must
+        // return ONLY the edited value — not the stale + corrected pair.
+        let _guard = FlagGuard::enabled().await;
+        let alice = alice_ctx();
+        let stored = handle_store_fact(
+            &json!({"entity": "person:frank", "key": "city", "value": "Berlin"}),
+            &alice,
+        )
+        .await
+        .unwrap();
+        let old_id = stored["structuredContent"]["fact_id"].as_str().unwrap().to_string();
+
+        handle_memory_edit(&json!({"fact_id": old_id, "new_value": "Munich"}), &alice)
+            .await
+            .unwrap();
+
+        // Default recall: only the edited value.
+        let q = handle_query_facts(
+            &json!({"entity": "person:frank", "token_budget": 500}),
+            &alice,
+        )
+        .await
+        .unwrap();
+        let rows = q["structuredContent"]["rows"].as_array().unwrap();
+        let city_rows: Vec<&Value> = rows.iter().filter(|r| r["key"] == "city").collect();
+        assert_eq!(city_rows.len(), 1, "default recall must collapse to the latest version");
+        assert_eq!(city_rows[0]["value"], "Munich");
+
+        // include_superseded brings the retired version back, marked.
+        let q2 = handle_query_facts(
+            &json!({"entity": "person:frank", "include_superseded": true, "token_budget": 500}),
+            &alice,
+        )
+        .await
+        .unwrap();
+        let rows2 = q2["structuredContent"]["rows"].as_array().unwrap();
+        let city_rows2: Vec<&Value> = rows2.iter().filter(|r| r["key"] == "city").collect();
+        assert_eq!(city_rows2.len(), 2, "include_superseded exposes the full chain");
+        let retired = city_rows2.iter().find(|r| r["value"] == "Berlin").unwrap();
+        assert!(retired["superseded_by"].is_string(), "retired version carries superseded_by");
+    }
+
+    #[tokio::test]
+    async fn memory_edit_carries_pin_to_new_version() {
+        // Probe finding 2: editing a pinned fact must not drop the pin.
+        let _guard = FlagGuard::enabled().await;
+        let alice = alice_ctx();
+        let stored = handle_store_fact(&json!({"entity": "person:gina", "key": "role", "value": "PM"}), &alice)
+            .await
+            .unwrap();
+        let old_id = stored["structuredContent"]["fact_id"].as_str().unwrap().to_string();
+
+        handle_memory_pin(&json!({"fact_id": old_id, "pinned": true}), &alice)
+            .await
+            .unwrap();
+
+        let edited = handle_memory_edit(&json!({"fact_id": old_id, "new_value": "EM"}), &alice)
+            .await
+            .unwrap();
+        let new_id = edited["structuredContent"]["new_fact"]["id"].as_str().unwrap();
+        assert_eq!(
+            edited["structuredContent"]["new_fact"]["pinned"], true,
+            "edit response reports the carried pin"
+        );
+
+        // memory_view shows the NEW (latest, non-superseded) fact as pinned.
+        let view = handle_memory_view(&json!({"entity": "person:gina", "token_budget": 500}), &alice)
+            .await
+            .unwrap();
+        let facts = view["structuredContent"]["facts"].as_array().unwrap();
+        let new_row = facts.iter().find(|f| f["id"] == new_id).unwrap();
+        assert_eq!(new_row["pinned"], true, "pin followed the edit to the new version");
+    }
+
+    #[tokio::test]
+    async fn memory_edit_stamps_actor_under_passports() {
+        // Probe finding 12: the edited version must carry the editor's passport
+        // actor, not null.
+        let _guard = FlagGuard::enabled().await;
+        let map = crate::agent_passport::AgentPassportMap::builtin_default();
+        let base = test_ctx();
+        let claude = base
+            .with_agent(AgentIdentity {
+                name: "anthropic".to_string(),
+                token_hash: [0u8; 32],
+            })
+            .with_agent_passports(true, map);
+        seed_test_passport(&base, "claude-work", "work").await;
+
+        let stored = handle_store_fact(&json!({"entity": "person:hank", "key": "city", "value": "Oslo"}), &claude)
+            .await
+            .unwrap();
+        let old_id = stored["structuredContent"]["fact_id"].as_str().unwrap().to_string();
+
+        let edited = handle_memory_edit(
+            &json!({"fact_id": old_id, "new_value": "Bergen", "reason": "moved"}),
+            &claude,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            edited["structuredContent"]["new_fact"]["actor"], "claude-work",
+            "edited version must be passport-attributed (not null)"
+        );
     }
 
     #[tokio::test]
