@@ -42,7 +42,20 @@ pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_SCOPED_FORGET";
 
 /// Reserved entity prefixes that scoped-forget MUST NOT touch through
 /// the user-facing surface. Operator-only override is out of scope here.
-const RESERVED_PREFIXES: &[&str] = &["__agent::", "__ops::", "__bootstrap__::", "__agent_session::"];
+/// `__memory_pin::` is included so a scope can never erase the pin records
+/// themselves (which would defeat the pin-survives-forget guarantee).
+const RESERVED_PREFIXES: &[&str] = &[
+    "__agent::",
+    "__ops::",
+    "__bootstrap__::",
+    "__agent_session::",
+    "__memory_pin::",
+];
+
+/// Reserved entity prefix under which per-agent pin state lives. Mirrors
+/// [`crate::tools::memory`]'s `MEMORY_PIN_PREFIX`. Pin records are
+/// `__memory_pin::<agent>::<fact_id>` with key `"pinned"` and value `"1"`/`"0"`.
+const MEMORY_PIN_PREFIX: &str = "__memory_pin::";
 
 /// Default recovery window (free tier) before `PermanentPurge`. Override
 /// per-tenant via `CORECRUXD_FORGET_RECOVERY_WINDOW_DAYS`.
@@ -157,11 +170,48 @@ fn scope_matches(scope: &ForgetScopeV1, fact: &Fact, before_ts: Option<DateTime<
     }
 }
 
+/// Fact ids the caller has pinned (latest pin state == pinned). Pins live
+/// under `__memory_pin::<agent>::<fact_id>` (key `"pinned"`), keyed by the
+/// caller's RAW agent name (the same keying `memory_pin`/`memory_view` use —
+/// out of agent-passport M5 scope). Returns empty for an unauthenticated
+/// caller. Used to honour the pin-survives-scoped-forget guarantee.
+fn pinned_fact_ids(
+    store: &corecrux_memory::FactStore,
+    agent_name: Option<&str>,
+) -> std::collections::HashSet<String> {
+    let Some(agent) = agent_name else {
+        return std::collections::HashSet::new();
+    };
+    let prefix = format!("{MEMORY_PIN_PREFIX}{agent}::");
+    let mut latest: std::collections::HashMap<String, (chrono::DateTime<chrono::Utc>, bool)> =
+        std::collections::HashMap::new();
+    for f in store.all_facts() {
+        if f.deleted || !f.entity.starts_with(&prefix) || f.key != "pinned" {
+            continue;
+        }
+        let id = f.entity[prefix.len()..].to_string();
+        let pinned_val = f.value == "1" || f.value.eq_ignore_ascii_case("true");
+        latest
+            .entry(id)
+            .and_modify(|(ts, v)| {
+                if f.stored_at > *ts {
+                    *ts = f.stored_at;
+                    *v = pinned_val;
+                }
+            })
+            .or_insert((f.stored_at, pinned_val));
+    }
+    latest.into_iter().filter_map(|(id, (_, p))| p.then_some(id)).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn resolve_scope<'a>(
     store: &'a corecrux_memory::FactStore,
     scope: &ForgetScopeV1,
     identity: Option<&str>,
     aliases: &[&str],
+    agent_name: Option<&str>,
+    include_pinned: bool,
     token_budget: Option<usize>,
 ) -> Vec<&'a Fact> {
     let before_ts = match scope {
@@ -180,6 +230,17 @@ fn resolve_scope<'a>(
         .filter(|fact| scope::fact_visible_to_identity(fact, identity, aliases))
         .filter(|fact| scope_matches(scope, fact, before_ts))
         .collect();
+
+    // Pinned facts survive scoped-forget (#9) by default: the pin marks a fact
+    // load-bearing. `include_pinned: true` overrides this for a true GDPR
+    // Art.17 erasure (a pin protects convenience, not a legal-erasure block).
+    if !include_pinned {
+        let pinned = pinned_fact_ids(store, agent_name);
+        if !pinned.is_empty() {
+            matches.retain(|fact| !pinned.contains(&fact.fact_id));
+        }
+    }
+
     matches.sort_by(|left, right| left.stored_at.cmp(&right.stored_at));
 
     if let Some(budget) = token_budget {
@@ -249,14 +310,18 @@ fn build_receipt_body(
 pub async fn handle_memory_forget_dry_run(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let scope = parse_scope(args)?;
     let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize);
+    let include_pinned = args.get("include_pinned").and_then(|v| v.as_bool()).unwrap_or(false);
     // agent-passport M5: identity-scoped visibility (flag-OFF == raw name).
     let identity = ctx.scope_identity();
     let id_ref = identity.as_deref();
     let aliases = ctx.scope_aliases();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
+    // Raw agent name drives the pin lookup (pins are keyed by raw name). Dry-run
+    // mirrors the live forget's pin exclusion so preview == effect.
+    let agent_name = scope::agent_name(ctx.agent.as_ref());
 
     let store = ctx.fact_store.read().await;
-    let matches = resolve_scope(&store, &scope, id_ref, &alias_refs, token_budget);
+    let matches = resolve_scope(&store, &scope, id_ref, &alias_refs, agent_name, include_pinned, token_budget);
     let count = matches.len();
 
     let preview: Vec<Value> = matches
@@ -333,13 +398,16 @@ pub async fn handle_memory_forget(args: &Value, ctx: &McpContext) -> Result<Valu
         .unwrap_or("default")
         .to_string();
     let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize);
+    // Pinned facts survive by default; `include_pinned: true` is the explicit
+    // GDPR Art.17 override that erases them too.
+    let include_pinned = args.get("include_pinned").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Resolve matches under a read lock first so we can compute the
     // pre-forget value hashes before we mutate (the value disappears on
     // soft-delete + journal append).
     let to_forget: Vec<Fact> = {
         let store = ctx.fact_store.read().await;
-        resolve_scope(&store, &scope, id_ref, &alias_refs, token_budget)
+        resolve_scope(&store, &scope, id_ref, &alias_refs, Some(agent_name), include_pinned, token_budget)
             .into_iter()
             .cloned()
             .collect()
@@ -413,6 +481,7 @@ mod tests {
     use crate::agent::AgentIdentity;
     use crate::dispatch::McpContext;
     use crate::tools::facts::{handle_query_facts, handle_store_fact};
+    use crate::tools::memory::handle_memory_pin;
 
     // Tests that flip CORECRUXD_FEATURE_SCOPED_FORGET serialise on the
     // crate-wide test env lock; cargo test runs the suite in parallel
@@ -615,6 +684,88 @@ mod tests {
             .await
             .unwrap();
         assert!(q["content"][0]["text"].as_str().unwrap().contains("production-x"));
+    }
+
+    #[tokio::test]
+    async fn forget_skips_pinned_fact_by_default() {
+        // Probe finding 3: a pinned fact must survive scoped-forget.
+        let _guard = FeatureFlagGuard::enabled().await;
+        let ctx = agent_ctx("alice");
+        let keep = handle_store_fact(&json!({"entity": "test-fixture-pin-a", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        let keep_id = keep["structuredContent"]["fact_id"].as_str().unwrap().to_string();
+        handle_store_fact(&json!({"entity": "test-fixture-pin-b", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        handle_memory_pin(&json!({"fact_id": keep_id, "pinned": true}), &ctx)
+            .await
+            .unwrap();
+
+        let resp = handle_memory_forget(
+            &json!({"scope": {"type": "entity_prefix", "value": "test-fixture-pin-"}, "reason": "cleanup"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["facts_affected"], 1, "only the UNpinned fact is forgotten");
+
+        // Pinned fact survives; unpinned is gone.
+        let kept = handle_query_facts(&json!({"entity": "test-fixture-pin-a"}), &ctx).await.unwrap();
+        assert!(kept["content"][0]["text"].as_str().unwrap().contains("test-fixture-pin-a"));
+        let gone = handle_query_facts(&json!({"entity": "test-fixture-pin-b"}), &ctx).await.unwrap();
+        assert_eq!(gone["content"][0]["text"].as_str().unwrap(), "no facts found");
+    }
+
+    #[tokio::test]
+    async fn forget_include_pinned_erases_pinned_fact() {
+        // GDPR Art.17 override: include_pinned erases even pinned facts.
+        let _guard = FeatureFlagGuard::enabled().await;
+        let ctx = agent_ctx("alice");
+        let pinned = handle_store_fact(&json!({"entity": "test-fixture-ip", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        let pid = pinned["structuredContent"]["fact_id"].as_str().unwrap().to_string();
+        handle_memory_pin(&json!({"fact_id": pid, "pinned": true}), &ctx).await.unwrap();
+
+        let resp = handle_memory_forget(
+            &json!({
+                "scope": {"type": "entity_prefix", "value": "test-fixture-ip"},
+                "reason": "gdpr erasure",
+                "include_pinned": true,
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["facts_affected"], 1, "include_pinned overrides the pin guard");
+    }
+
+    #[tokio::test]
+    async fn dry_run_mirrors_pin_exclusion_and_include_pinned_override() {
+        let _guard = FeatureFlagGuard::enabled().await;
+        let ctx = agent_ctx("alice");
+        let pinned = handle_store_fact(&json!({"entity": "test-fixture-dp", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        let pid = pinned["structuredContent"]["fact_id"].as_str().unwrap().to_string();
+        handle_memory_pin(&json!({"fact_id": pid, "pinned": true}), &ctx).await.unwrap();
+
+        let preview = handle_memory_forget_dry_run(
+            &json!({"scope": {"type": "entity_prefix", "value": "test-fixture-dp"}}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(preview["count"], 0, "dry-run excludes the pinned fact (preview == effect)");
+
+        let preview2 = handle_memory_forget_dry_run(
+            &json!({"scope": {"type": "entity_prefix", "value": "test-fixture-dp"}, "include_pinned": true}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(preview2["count"], 1, "include_pinned exposes the pinned fact");
     }
 
     #[tokio::test]
