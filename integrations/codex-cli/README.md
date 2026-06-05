@@ -1,4 +1,74 @@
-# Crux Daemon ⇆ Codex CLI tailer
+# Crux Daemon ⇆ Codex CLI
+
+First-party Codex CLI adapters for Crux Daemon:
+
+- `hooks/crux-session-start.py` injects a Crux boot banner when a Codex
+  session starts.
+- `codex-tailer.py` watches Codex session JSONL files and stores observations
+  in Crux.
+
+## Startup banner hook
+
+The startup hook mirrors the working Claude `crux-hook session-start` flow
+for Codex. It is installed for `SessionStart` and `UserPromptSubmit`; the
+second event is a first-prompt fallback for Codex hosts that do not fire
+`SessionStart`. The script deduplicates by session id, calls the Crux MCP
+endpoint for `sync_status`, `update_status`, `get_agent_identity`,
+`get_passport`, and `get_bootstrap(topic="patterns", token_budget=500)`,
+then emits Codex `hookSpecificOutput.additionalContext`.
+
+### Install
+
+Copy the hook to a stable path:
+
+```bash
+sudo mkdir -p /usr/local/share/crux/integrations/codex-cli/hooks
+sudo install -m 0755 \
+  hooks/crux-session-start.py \
+  /usr/local/share/crux/integrations/codex-cli/hooks/crux-session-start.py
+```
+
+Merge `hooks.snippet.json` into `~/.codex/hooks.json`, then enable Codex
+hooks in `~/.codex/config.toml`:
+
+```toml
+[features]
+hooks = true
+```
+
+The snippet sets `CRUX_CODEX_AGENT_NAME=openai` so the hook reads the named
+token from `~/.config/cuecrux/crux-tokens/MCP_AGENT_TOKENS_CSV` at runtime.
+No token is stored in `hooks.json`. Override with:
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `CRUX_MCP_URL` | `~/.config/cuecrux/env` or `http://127.0.0.1:14801/mcp` | MCP endpoint. |
+| `CRUX_CODEX_AGENT_NAME` | unset | Named agent token to read from `CRUX_AGENT_TOKENS` or the token CSV. |
+| `CRUX_AGENT_TOKEN` | unset | Direct bearer token fallback. |
+| `CRUX_AGENT_TOKENS_FILE` | `~/.config/cuecrux/crux-tokens/MCP_AGENT_TOKENS_CSV` | Named token CSV path. |
+| `CRUX_CODEX_HOOK_TIMEOUT` | `2.0` | Per-MCP-call timeout, clamped to 0.2-10s. |
+
+### Verify
+
+```bash
+CRUX_CODEX_AGENT_NAME=openai \
+python3 hooks/crux-session-start.py <<'JSON' | jq .
+{"hook_event_name":"SessionStart","session_id":"smoke"}
+JSON
+
+CRUX_CODEX_AGENT_NAME=openai \
+python3 hooks/crux-session-start.py <<'JSON' | jq .
+{"hook_event_name":"UserPromptSubmit","session_id":"smoke-prompt","prompt":"hello"}
+JSON
+```
+
+The hook is fail-open. If the daemon or token is unavailable it logs to
+`~/.codex/hooks/crux-session-start.errors.log` and exits 0.
+
+Codex may require you to trust newly installed hooks in its Hooks settings UI
+before they run automatically.
+
+## JSONL observation tailer
 
 First-party adapter that watches the per-session JSONL files OpenAI's Codex
 CLI writes (`~/.codex/sessions/YYYY/MM/rollout-*.jsonl`) and POSTs each new

@@ -47,3 +47,9 @@ sync_cursor.json
 console/settings.json
 LOCK
 .install-uuid
+
+# Claude Code subagent scratch worktrees (orphaned isolation:worktree dirs)
+.claude/
+
+# crux-console-ui build artifacts (WASM/JS bundles are generated, not source)
+crates/crux-console-ui/dist/

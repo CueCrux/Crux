@@ -1,0 +1,29 @@
+{
+  "_comment": "Crux Daemon startup banner for OpenAI Codex CLI. Merge the hooks block into ~/.codex/hooks.json. The command reads CRUX_CODEX_AGENT_NAME/openai from the local token CSV at runtime; no token is stored here.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CRUX_CODEX_AGENT_NAME=openai python3 /usr/local/share/crux/integrations/codex-cli/hooks/crux-session-start.py",
+            "async": false,
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CRUX_CODEX_AGENT_NAME=openai python3 /usr/local/share/crux/integrations/codex-cli/hooks/crux-session-start.py",
+            "async": false,
+            "timeout": 8
+          }
+        ]
+      }
+    ]
+  }
+}
