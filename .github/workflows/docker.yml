@@ -57,3 +57,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Stamp the build sha into corecruxd --version / the boot banner
+          # (the build context has no .git, so build.rs can't derive it).
+          build-args: |
+            GIT_SHA=${{ github.sha }}
