@@ -11,6 +11,13 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY proto/ proto/
 
+# Git sha for `corecruxd --version` / the boot banner. The build context does
+# NOT include `.git`, so corecruxd's build.rs cannot derive it via `git` here —
+# the CI Docker workflow passes it as a build-arg. Defaults to `unknown` for a
+# plain `docker build` with no arg.
+ARG GIT_SHA=unknown
+ENV CORECRUX_GIT_SHA=${GIT_SHA}
+
 RUN cargo build --release --bin corecruxd --bin corecruxctl
 
 # --- Runtime stage ---
