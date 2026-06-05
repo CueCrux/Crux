@@ -127,8 +127,75 @@ fn build_wasm_engine_for_appstate() -> Option<std::sync::Arc<crate::wasm_host::W
     }
 }
 
+/// CLI action decided from `corecruxd`'s argv.
+///
+/// `corecruxd` is an environment-configured daemon with NO argument parsing
+/// for its runtime behaviour — all configuration flows through env vars (see
+/// `config.example.env`). The only flags it honours are the ubiquitous
+/// `--version`/`--help` short-circuits, handled before any config load so they
+/// never start the daemon or touch the filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliAction {
+    /// Print version line and exit 0.
+    Version,
+    /// Print usage note and exit 0.
+    Help,
+    /// No recognised flag — start the daemon normally.
+    Run,
+}
+
+/// Decide what to do from the process arguments (excluding argv[0]).
+///
+/// A deliberately tiny hand-rolled matcher rather than pulling in `clap` —
+/// keeping the env-only design intact. Only the first argument is inspected.
+fn parse_cli_arg(args: &[String]) -> CliAction {
+    match args.first().map(String::as_str) {
+        Some("--version" | "-V" | "version") => CliAction::Version,
+        Some("--help" | "-h" | "help") => CliAction::Help,
+        _ => CliAction::Run,
+    }
+}
+
+/// Single-line version string, e.g. `corecruxd 0.1.0 (abc1234)`.
+fn version_line() -> String {
+    format!(
+        "corecruxd {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("CORECRUX_GIT_SHA").unwrap_or("unknown")
+    )
+}
+
+/// One-paragraph usage note for `--help`.
+fn help_text() -> String {
+    format!(
+        "{line}\n\n\
+corecruxd is the Crux Daemon: an environment-configured, long-running process\n\
+(HTTP 14800, gRPC 4007, MCP 14801). It takes no runtime configuration flags —\n\
+all configuration is supplied via environment variables; see config.example.env.\n\
+The only recognised flags are:\n\
+  --version, -V    print the version and git sha, then exit\n\
+  --help, -h       print this message, then exit\n",
+        line = version_line()
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Short-circuit --version / --help BEFORE load_config() so they never start
+    // the daemon, read env, or touch the filesystem. Preserves the env-only design.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match parse_cli_arg(&args) {
+        CliAction::Version => {
+            println!("{}", version_line());
+            return Ok(());
+        }
+        CliAction::Help => {
+            println!("{}", help_text());
+            return Ok(());
+        }
+        CliAction::Run => {}
+    }
+
     let config = load_config();
     if !config.auth_mode_explicitly_set {
         return Err(std::io::Error::new(
@@ -1949,8 +2016,9 @@ fn anonymous_passport_claim_body(public_key_hex: &str, daemon_version: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        anonymous_passport_claim_body, reconcile_control_from_evidence, shard_map_advertise_addr,
-        validate_mcp_bind_posture, validate_network_auth_posture, ControlCheckpointRecord, ControlMutationRecord,
+        anonymous_passport_claim_body, parse_cli_arg, reconcile_control_from_evidence, shard_map_advertise_addr,
+        validate_mcp_bind_posture, validate_network_auth_posture, version_line, CliAction, ControlCheckpointRecord,
+        ControlMutationRecord,
     };
     use crate::auth::AuthMode;
     use crate::config::CommitLevel;
@@ -1972,6 +2040,31 @@ mod tests {
             http_listen_addr: None,
             grpc_listen_addr: None,
         }
+    }
+
+    #[test]
+    fn parse_cli_arg_decides_action() {
+        let v = |s: &str| s.to_string();
+        assert_eq!(parse_cli_arg(&[v("--version")]), CliAction::Version);
+        assert_eq!(parse_cli_arg(&[v("-V")]), CliAction::Version);
+        assert_eq!(parse_cli_arg(&[v("version")]), CliAction::Version);
+        assert_eq!(parse_cli_arg(&[v("--help")]), CliAction::Help);
+        assert_eq!(parse_cli_arg(&[v("-h")]), CliAction::Help);
+        assert_eq!(parse_cli_arg(&[v("help")]), CliAction::Help);
+        // No args → run the daemon.
+        assert_eq!(parse_cli_arg(&[]), CliAction::Run);
+        // Unrecognised first arg → run (env-only design ignores unknown flags here).
+        assert_eq!(parse_cli_arg(&[v("--serve")]), CliAction::Run);
+        // Only the first arg is inspected.
+        assert_eq!(parse_cli_arg(&[v("serve"), v("--version")]), CliAction::Run);
+    }
+
+    #[test]
+    fn version_line_includes_pkg_version() {
+        let line = version_line();
+        assert!(line.starts_with("corecruxd "), "got: {line}");
+        assert!(line.contains(env!("CARGO_PKG_VERSION")), "got: {line}");
+        assert!(line.contains('('), "got: {line}");
     }
 
     #[test]
