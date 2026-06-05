@@ -206,7 +206,7 @@ impl McpContext {
     /// * **Flag ON:** the resolved passport_id (`anthropic` → `claude-work`),
     ///   so a private fact's owner key agrees with the M1 `actor` stamp and the
     ///   M4 tenant-group. An unmapped name falls back to the raw name so a
-    ///   flag-ON private write is never mis-keyed (mirrors the QC.3
+    ///   flag-ON private write is never keyed wrongly (mirrors the QC.3
     ///   never-anonymous rule on `actor`).
     ///
     /// Returns `None` for an unauthenticated caller (no agent identity) under

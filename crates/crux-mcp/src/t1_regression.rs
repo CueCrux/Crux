@@ -741,7 +741,10 @@ async fn t1_memory_sweep_candidates_shared_pool_and_private_filtered() {
     let owner = handle_memory_sweep_candidates(&json!({"top_k": 100, "token_budget": 2000}), &claude)
         .await
         .unwrap();
-    assert!(rows_have_fact_id(&owner, &shared_old_id), "owner sees shared sweep candidate");
+    assert!(
+        rows_have_fact_id(&owner, &shared_old_id),
+        "owner sees shared sweep candidate"
+    );
     assert!(
         !rows_have_fact_id(&owner, &secret_old_id),
         "private facts are reserved-filtered even for the owner on memory_sweep_candidates"
@@ -750,7 +753,10 @@ async fn t1_memory_sweep_candidates_shared_pool_and_private_filtered() {
     let other = handle_memory_sweep_candidates(&json!({"top_k": 100, "token_budget": 2000}), &codex)
         .await
         .unwrap();
-    assert!(rows_have_fact_id(&other, &shared_old_id), "shared sweep candidate visible to other");
+    assert!(
+        rows_have_fact_id(&other, &shared_old_id),
+        "shared sweep candidate visible to other"
+    );
     assert!(
         !rows_have_fact_id(&other, &secret_old_id),
         "T.1: the owner's private sweep candidate is never exposed to a different passport"
@@ -853,7 +859,10 @@ async fn t1_memory_forget_owner_can_other_cannot() {
     )
     .await
     .unwrap();
-    assert_eq!(other_forget["facts_affected"], 0, "T.1: cross-passport forget must be a no-op");
+    assert_eq!(
+        other_forget["facts_affected"], 0,
+        "T.1: cross-passport forget must be a no-op"
+    );
     {
         let store = base.fact_store.read().await;
         assert!(
@@ -923,7 +932,10 @@ async fn t1_memory_acknowledge_use_visibility_gate_distinguishes_owner_from_othe
     )
     .await
     .unwrap();
-    assert_eq!(other["filtered_count"], 1, "shared fact is acknowledged for a different passport too");
+    assert_eq!(
+        other["filtered_count"], 1,
+        "shared fact is acknowledged for a different passport too"
+    );
     assert_eq!(
         other["not_visible_count"], 1,
         "T.1: the owner's private fact is not_visible to a different passport"
@@ -966,12 +978,9 @@ async fn t1_memory_edit_and_pin_owner_can_other_cannot() {
     assert_eq!(pinned["structuredContent"]["pinned"], true);
 
     // DIFFERENT passport is refused on edit and pin (fact invisible to it).
-    let edit_err = handle_memory_edit(
-        &json!({"fact_id": fid, "new_value": "hijack", "reason": "x"}),
-        &codex,
-    )
-    .await
-    .unwrap_err();
+    let edit_err = handle_memory_edit(&json!({"fact_id": fid, "new_value": "hijack", "reason": "x"}), &codex)
+        .await
+        .unwrap_err();
     assert_eq!(edit_err.code, crate::protocol::INVALID_PARAMS);
     assert_eq!(edit_err.data.unwrap()["reason"], "reserved_or_invisible");
 

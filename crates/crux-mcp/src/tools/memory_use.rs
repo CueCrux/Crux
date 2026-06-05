@@ -214,7 +214,8 @@ pub async fn handle_memory_acknowledge_use(args: &Value, ctx: &McpContext) -> Re
         }
         let age_days = (now - fact.stored_at).num_days();
         let age_days = if age_days < 0 { None } else { Some(age_days) };
-        let topic = scope::visible_entity_for_identity(fact, id_ref, &alias_refs).unwrap_or_else(|| fact.entity.clone());
+        let topic =
+            scope::visible_entity_for_identity(fact, id_ref, &alias_refs).unwrap_or_else(|| fact.entity.clone());
         filtered_entries.push(AckFactEntry {
             fact_id: fact.fact_id.clone(),
             entity: fact.entity.clone(),
