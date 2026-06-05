@@ -5618,6 +5618,7 @@ async fn version_endpoint_returns_build_info_and_features() {
         behind_by: 0,
         checked_at: Some("2026-04-09T12:00:00Z".to_string()),
         error: None,
+        comparison_stale: false,
         upgrade_hint: "current".to_string(),
     };
     let resp = get_version(State(state)).await.into_response();

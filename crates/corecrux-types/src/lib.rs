@@ -149,6 +149,13 @@ pub struct UpdateStatus {
     pub checked_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// True when the ahead/behind comparison used a locally cached tracking ref
+    /// because `git fetch` failed. The reported `ahead_by`/`behind_by` may be
+    /// out of date, so consumers (banner, /v1/version) should present "drift
+    /// unverified" rather than a confident count. Survives `public_view()`
+    /// redaction, unlike `error`.
+    #[serde(default)]
+    pub comparison_stale: bool,
     pub upgrade_hint: String,
 }
 
@@ -176,6 +183,7 @@ impl Default for UpdateStatus {
             behind_by: 0,
             checked_at: None,
             error: None,
+            comparison_stale: false,
             upgrade_hint: "Update checks are disabled.".to_string(),
         }
     }
