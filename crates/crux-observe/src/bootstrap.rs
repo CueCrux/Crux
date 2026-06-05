@@ -3,7 +3,7 @@
 // See LICENCE.md in the repository root.
 
 //! Bootstrap seeder — loads embedded documentation, patterns, and error
-//! resolution guides into the fact store on first run.
+//! resolution guides into the fact store on startup.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,7 +60,7 @@ const SENTINEL_KEY: &str = "seeded";
 
 // ── Public types ───────────────────────────────────────────────────────────
 
-/// Seeds the fact store with embedded bootstrap data on first run.
+/// Seeds the fact store with embedded bootstrap data.
 pub struct BootstrapSeeder {
     fact_store: Arc<RwLock<FactStore>>,
 }
@@ -99,105 +99,46 @@ impl BootstrapSeeder {
         !result.facts.is_empty()
     }
 
-    /// Load embedded data into the fact store. Idempotent — returns early if
-    /// the sentinel fact already exists.
+    /// Load embedded data into the fact store.
+    ///
+    /// Idempotent for unchanged stores. If a store was seeded by an older
+    /// binary, add newly embedded bootstrap facts that are still missing.
     pub async fn seed(&self) -> SeedResult {
-        if self.is_seeded().await {
-            return SeedResult {
-                facts_created: 0,
-                already_seeded: true,
-            };
-        }
-
-        // SAFETY: Bootstrap JSON files are compile-time constants — deserialization cannot fail.
-        #[allow(clippy::expect_used)]
-        let docs: Vec<DocEntry> = serde_json::from_str(BOOTSTRAP_DOCS).expect("bootstrap docs.json is invalid");
-        #[allow(clippy::expect_used)]
-        let patterns: Vec<PatternEntry> =
-            serde_json::from_str(BOOTSTRAP_PATTERNS).expect("bootstrap patterns.json is invalid");
-        #[allow(clippy::expect_used)]
-        let resolutions: Vec<ResolutionEntry> =
-            serde_json::from_str(BOOTSTRAP_RESOLUTIONS).expect("bootstrap resolutions.json is invalid");
-        #[allow(clippy::expect_used)]
-        let tool_outputs: Vec<ToolOutputEntry> =
-            serde_json::from_str(BOOTSTRAP_TOOL_OUTPUTS).expect("bootstrap tool-outputs.json is invalid");
-
-        let mut reqs: Vec<StoreFact> = Vec::new();
-
-        for doc in &docs {
-            reqs.push(StoreFact {
-                entity: bootstrap_entity("doc", &doc.slug),
-                key: doc.title.clone(),
-                value: doc.content.clone(),
-                source_receipt: None,
-                confidence: 1.0,
-                private: false,
-                horizon_class: None,
-                actor: None,
-            });
-        }
-
-        for pat in &patterns {
-            reqs.push(StoreFact {
-                entity: bootstrap_entity("pattern", &pat.slug),
-                key: pat.title.clone(),
-                value: pat.content.clone(),
-                source_receipt: None,
-                confidence: 1.0,
-                private: false,
-                horizon_class: None,
-                actor: None,
-            });
-        }
-
-        for res in &resolutions {
-            reqs.push(StoreFact {
-                entity: bootstrap_entity("resolution", &res.code),
-                key: res.title.clone(),
-                value: res.content.clone(),
-                source_receipt: None,
-                confidence: 1.0,
-                private: false,
-                horizon_class: None,
-                actor: None,
-            });
-        }
-
-        for to in &tool_outputs {
-            reqs.push(StoreFact {
-                entity: bootstrap_entity("tool-output", &to.tool),
-                key: format!("{} output schema", to.tool),
-                value: to.output.clone(),
-                source_receipt: None,
-                confidence: 1.0,
-                private: false,
-                horizon_class: None,
-                actor: None,
-            });
-        }
-
-        let count = reqs.len();
+        let already_seeded = self.is_seeded().await;
+        let reqs = embedded_bootstrap_facts();
 
         let mut store = self.fact_store.write().await;
-        store.store_bulk(reqs);
+        let reqs = if already_seeded {
+            reqs.into_iter()
+                .filter(|req| !bootstrap_fact_exists(&store, req))
+                .collect()
+        } else {
+            reqs
+        };
 
-        // Write sentinel
-        store.store(StoreFact {
-            entity: SENTINEL_ENTITY.to_string(),
-            key: SENTINEL_KEY.to_string(),
-            value: Utc::now().to_rfc3339(),
-            source_receipt: None,
-            confidence: 1.0,
-            private: false,
-            horizon_class: None,
-            actor: None,
-        });
+        let count = reqs.len();
+        if count > 0 {
+            store.store_bulk(reqs);
+        }
 
-        info!(facts_created = count, "bootstrap seed complete");
+        if !already_seeded {
+            store.store(StoreFact {
+                entity: SENTINEL_ENTITY.to_string(),
+                key: SENTINEL_KEY.to_string(),
+                value: Utc::now().to_rfc3339(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+
+        info!(facts_created = count, already_seeded, "bootstrap seed complete");
 
         SeedResult {
             facts_created: count,
-            already_seeded: false,
+            already_seeded,
         }
     }
 
@@ -247,6 +188,84 @@ impl BootstrapSeeder {
             last_seed_at,
         }
     }
+}
+
+fn embedded_bootstrap_facts() -> Vec<StoreFact> {
+    // SAFETY: Bootstrap JSON files are compile-time constants — deserialization cannot fail.
+    #[allow(clippy::expect_used)]
+    let docs: Vec<DocEntry> = serde_json::from_str(BOOTSTRAP_DOCS).expect("bootstrap docs.json is invalid");
+    #[allow(clippy::expect_used)]
+    let patterns: Vec<PatternEntry> =
+        serde_json::from_str(BOOTSTRAP_PATTERNS).expect("bootstrap patterns.json is invalid");
+    #[allow(clippy::expect_used)]
+    let resolutions: Vec<ResolutionEntry> =
+        serde_json::from_str(BOOTSTRAP_RESOLUTIONS).expect("bootstrap resolutions.json is invalid");
+    #[allow(clippy::expect_used)]
+    let tool_outputs: Vec<ToolOutputEntry> =
+        serde_json::from_str(BOOTSTRAP_TOOL_OUTPUTS).expect("bootstrap tool-outputs.json is invalid");
+
+    let mut reqs: Vec<StoreFact> = Vec::new();
+
+    for doc in &docs {
+        reqs.push(StoreFact {
+            entity: bootstrap_entity("doc", &doc.slug),
+            key: doc.title.clone(),
+            value: doc.content.clone(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    for pat in &patterns {
+        reqs.push(StoreFact {
+            entity: bootstrap_entity("pattern", &pat.slug),
+            key: pat.title.clone(),
+            value: pat.content.clone(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    for res in &resolutions {
+        reqs.push(StoreFact {
+            entity: bootstrap_entity("resolution", &res.code),
+            key: res.title.clone(),
+            value: res.content.clone(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    for to in &tool_outputs {
+        reqs.push(StoreFact {
+            entity: bootstrap_entity("tool-output", &to.tool),
+            key: format!("{} output schema", to.tool),
+            value: to.output.clone(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    reqs
+}
+
+fn bootstrap_fact_exists(store: &FactStore, req: &StoreFact) -> bool {
+    store
+        .get_by_entity(&req.entity)
+        .into_iter()
+        .any(|fact| fact.key.as_str() == req.key.as_str())
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -333,6 +352,61 @@ mod tests {
         let second = seeder.seed().await;
         assert!(second.already_seeded);
         assert_eq!(second.facts_created, 0);
+    }
+
+    #[tokio::test]
+    async fn seed_adds_missing_facts_after_sentinel() {
+        let store = Arc::new(RwLock::new(FactStore::new()));
+        {
+            let mut guard = store.write().await;
+            guard.store(StoreFact {
+                entity: SENTINEL_ENTITY.to_string(),
+                key: SENTINEL_KEY.to_string(),
+                value: Utc::now().to_rfc3339(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+            guard.store(StoreFact {
+                entity: bootstrap_entity("doc", "quickstart"),
+                key: "Five-Minute Quickstart".to_string(),
+                value: "already present".to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+        }
+
+        let seeder = BootstrapSeeder::new(Arc::clone(&store));
+        let result = seeder.seed().await;
+        let (docs, patterns, resolutions, tool_outputs) = bootstrap_counts();
+
+        assert!(result.already_seeded);
+        assert_eq!(result.facts_created, docs + patterns + resolutions + tool_outputs - 1);
+
+        let guard = store.read().await;
+        let first_connect = guard.query(&FactQuery {
+            query: None,
+            entity: Some(bootstrap_entity("doc", "first-connect-agent")),
+            entity_prefix: None,
+            top_k: 1,
+            token_budget: None,
+        });
+        assert_eq!(first_connect.facts.len(), 1);
+
+        let quickstart = guard.query(&FactQuery {
+            query: None,
+            entity: Some(bootstrap_entity("doc", "quickstart")),
+            entity_prefix: None,
+            top_k: 10,
+            token_budget: None,
+        });
+        assert_eq!(quickstart.facts.len(), 1);
+        assert_eq!(quickstart.facts[0].value, "already present");
     }
 
     #[tokio::test]
