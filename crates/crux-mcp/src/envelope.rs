@@ -60,10 +60,35 @@ use corecrux_memory::fact_store::FactQuery;
 /// Environment variable that gates envelope emission. Default off.
 pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_AUDIT_ENVELOPE";
 
+/// Ephemeral reserved entity prefixes — daemon-minted bookkeeping facts that
+/// accumulate forever and crowd `memory_view` recency. They are reserved
+/// (never user content) and are the ONLY entities the ephemeral GC
+/// (`corecruxd::ephemeral_gc`) is permitted to soft-delete.
+///
+/// - `__session_binding__::<hex>` — minted every boot
+///   (`corecruxd::session_bindings`).
+/// - `__reverify_receipts__::*` — minted by `memory_reverify`
+///   (`crate::tools::freshness`).
+pub const EPHEMERAL_RESERVED_PREFIXES: &[&str] = &["__session_binding__::", "__reverify_receipts__::"];
+
 /// Reserved entity prefixes — facts under any of these MUST NOT appear in
 /// the envelope's `memories_used`. Mirrors the workspace privacy rule for
-/// `__agent::*`, `__ops::*`, `__bootstrap__::*`.
-pub const RESERVED_PREFIXES: &[&str] = &["__agent::", "__ops::", "__bootstrap__::"];
+/// `__agent::*`, `__ops::*`, `__bootstrap__::*`, plus the daemon-minted
+/// ephemeral bookkeeping prefixes ([`EPHEMERAL_RESERVED_PREFIXES`]).
+pub const RESERVED_PREFIXES: &[&str] = &[
+    "__agent::",
+    "__ops::",
+    "__bootstrap__::",
+    "__session_binding__::",
+    "__reverify_receipts__::",
+];
+
+/// Return true if the entity is one of the daemon-minted ephemeral
+/// bookkeeping prefixes that the ephemeral GC may soft-delete. This is a
+/// strict subset of [`is_reserved_entity`].
+pub fn is_ephemeral_reserved_entity(entity: &str) -> bool {
+    EPHEMERAL_RESERVED_PREFIXES.iter().any(|p| entity.starts_with(p))
+}
 
 /// Number of days after which a fact is considered "stale" by default. The
 /// freshness primitive proper (child plan #3 — Freshness + decay) will

@@ -41,6 +41,7 @@ mod http;
 mod context_graph;
 mod dossier;
 mod encrypted_secrets;
+mod ephemeral_gc;
 mod extension_grants;
 mod extension_outbound;
 mod extension_registry;
@@ -650,6 +651,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Clone handles before state is moved into the router.
     let session_store_handle = state.session_store.clone();
     let sync_fact_store_handle = state.fact_store.clone();
+    // Ephemeral reserved-fact GC. Gated at spawn by CORECRUXD_EPHEMERAL_GC
+    // (default OFF); the flag is read once at boot, so toggling requires a
+    // restart — same convention as the other background-task flags. The
+    // task soft-deletes only `__session_binding__::*` /
+    // `__reverify_receipts__::*` facts past retain, via the journaled
+    // delete path. See `crate::ephemeral_gc`.
+    ephemeral_gc::spawn_ephemeral_gc(
+        config.ephemeral_gc_enabled,
+        state.fact_store.clone(),
+        shutdown_tx.subscribe(),
+    );
     let github_fact_store_handle = state.fact_store.clone();
     let github_encryption_key = state.integration_encryption_key.clone();
     let mcp_app = if config.mcp_enabled {

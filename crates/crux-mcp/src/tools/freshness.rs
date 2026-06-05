@@ -21,16 +21,21 @@
 //! state never leaks via this surface — matches the envelope-spike
 //! invariant tested in `dispatch::tests::envelope_on_query_facts_omits_reserved_prefix_entries`.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use corecrux_memory::fact_store::HorizonClass;
 use corecrux_projections::decay;
 
 use crate::dispatch::McpContext;
-use crate::envelope::is_reserved_entity;
+use crate::envelope::{is_ephemeral_reserved_entity, is_reserved_entity};
 use crate::protocol::{JsonRpcError, INVALID_PARAMS};
 use crate::scope;
+
+/// Retain window (days) used by the `memory_sweep_candidates` ephemeral
+/// DRY-RUN pass. Mirrors the default in `corecruxd::ephemeral_gc` so the
+/// preview matches what the GC would actually remove.
+const EPHEMERAL_SWEEP_RETAIN_DAYS: i64 = 30;
 
 /// Environment flag that gates freshness write/read surfaces.
 ///
@@ -233,11 +238,78 @@ pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> R
         rows.push(row);
     }
 
+    // Second pass: surface ephemeral daemon-minted bookkeeping facts
+    // (`__session_binding__::*`, `__reverify_receipts__::*`) that the
+    // ephemeral GC (`corecruxd::ephemeral_gc`, gated by
+    // `CORECRUXD_EPHEMERAL_GC=1`) would soft-delete. This is the DRY-RUN
+    // view an operator inspects before enabling the GC. These entities are
+    // reserved (excluded from the first pass via `is_reserved_entity`), so
+    // they are added here under a distinct `reason: "ephemeral"` tag. The
+    // retain window mirrors the GC default (30 days); for session bindings
+    // only superseded (non-newest) versions past the window qualify.
+    let ephemeral_retain = chrono::Duration::days(EPHEMERAL_SWEEP_RETAIN_DAYS);
+    if !rows.is_empty() || used_tokens < token_budget {
+        // Determine newest stored_at per session-binding entity so we never
+        // flag the live binding for a session.
+        let mut newest_binding_at: std::collections::HashMap<&str, DateTime<Utc>> = std::collections::HashMap::new();
+        for f in store.all_facts().filter(|f| !f.deleted) {
+            if f.entity.starts_with("__session_binding__::") {
+                let e = newest_binding_at.entry(f.entity.as_str()).or_insert(f.stored_at);
+                if f.stored_at > *e {
+                    *e = f.stored_at;
+                }
+            }
+        }
+        let mut ephemeral: Vec<&corecrux_memory::Fact> = store
+            .all_facts()
+            .filter(|f| !f.deleted)
+            .filter(|f| is_ephemeral_reserved_entity(&f.entity))
+            .filter(|f| !f.private)
+            .filter(|f| {
+                let past_retain = (now - f.stored_at) > ephemeral_retain;
+                if !past_retain {
+                    return false;
+                }
+                if f.entity.starts_with("__session_binding__::") {
+                    // Keep the newest binding for each session; only older
+                    // superseded versions are deletable.
+                    newest_binding_at
+                        .get(f.entity.as_str())
+                        .is_some_and(|newest| f.stored_at < *newest)
+                } else {
+                    // __reverify_receipts__::* — any version past retain.
+                    true
+                }
+            })
+            .collect();
+        ephemeral.sort_by(|a, b| a.stored_at.cmp(&b.stored_at));
+        for f in ephemeral.iter().take(top_k) {
+            let age_hours = (now - f.stored_at).num_hours().max(0);
+            let topic = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
+            let row = json!({
+                "fact_id": f.fact_id,
+                "entity": topic,
+                "key": f.key,
+                "reason": "ephemeral",
+                "freshness": "stale",
+                "horizon_class": f.horizon_class.as_str(),
+                "age_hours": age_hours,
+                "superseded_by": f.superseded_by,
+                "stored_at": f.stored_at.to_rfc3339(),
+            });
+            used_tokens += f.tokens.max(8);
+            if used_tokens > token_budget && !rows.is_empty() {
+                break;
+            }
+            rows.push(row);
+        }
+    }
+
     let text = if rows.is_empty() {
-        "no sweep candidates (nothing stale or superseded)".to_string()
+        "no sweep candidates (nothing stale, superseded, or ephemeral)".to_string()
     } else {
         format!(
-            "{} sweep candidate(s): stale or cross-entity superseded facts; see structured `rows` — read-only, nothing was mutated",
+            "{} sweep candidate(s): stale, cross-entity superseded, or ephemeral daemon-minted facts; see structured `rows` — read-only, nothing was mutated",
             rows.len()
         )
     };
