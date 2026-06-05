@@ -16,7 +16,12 @@ RUN cargo build --release --bin corecruxd --bin corecruxctl
 # --- Runtime stage ---
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
+# git is required at runtime: the daemon's update-check (update.rs) shells out
+# to `git fetch`/`git rev-list` against the /repo bind mount to compute
+# ahead/behind. Without git the fetch silently fails and the banner reports a
+# confidently-wrong drift count from the stale cached tracking ref.
+# TODO(hygiene): evaluate cgr.dev/chainguard runtime base (CLAUDE.md §9)
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/corecruxd /usr/local/bin/corecruxd
 COPY --from=builder /build/target/release/corecruxctl /usr/local/bin/corecruxctl

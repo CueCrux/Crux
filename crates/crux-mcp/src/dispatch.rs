@@ -2017,4 +2017,218 @@ mod tests {
         std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
         std::env::remove_var("CORECRUXD_FEATURE_IDENTITY_CONTINUITY");
     }
+
+    // ── MCP response-shape contract (CI guard) ──────────────────────────
+    //
+    // Drives EVERY registered MCP tool through `dispatch` (hermetic, no
+    // live daemon) and asserts the JSON-RPC `result` is spec-shaped:
+    // a non-empty top-level `content` array with NO top-level `payload`
+    // or `envelope` keys. This is the regression guard for the bug class
+    // fixed in `envelope.rs::normalize_result_shape` (the
+    // `{payload, envelope}` legacy wrapper that left no top-level
+    // `content` and made the tool invisible to MCP clients).
+
+    /// Pure shape-check used by the contract test AND unit-tested directly
+    /// on a known-good and a deliberately-broken value (so the guard is
+    /// proven able to fail). A spec-shaped `tools/call` result has a
+    /// non-empty top-level `content` array and carries neither a top-level
+    /// `payload` nor a top-level `envelope` key.
+    fn result_is_spec_shaped(result: &serde_json::Value) -> Result<(), String> {
+        if result.get("payload").is_some() {
+            return Err("has top-level `payload` (legacy wrapper)".to_string());
+        }
+        if result.get("envelope").is_some() {
+            return Err("has top-level `envelope` (shadows content)".to_string());
+        }
+        match result.get("content").and_then(|c| c.as_array()) {
+            Some(arr) if !arr.is_empty() => Ok(()),
+            Some(_) => Err("top-level `content` array is empty".to_string()),
+            None => Err("missing top-level `content` array".to_string()),
+        }
+    }
+
+    /// Minimal, valid-shaped stub arguments per tool. The goal is NOT to
+    /// make every tool succeed (many require real state and will return a
+    /// JSON-RPC error with these stubs — that's allowed by the contract);
+    /// the goal is to drive each handler far enough to exercise its
+    /// success path where it can, and to never panic. Required fields are
+    /// taken from each tool's `input_schema.required`.
+    fn stub_args_for(name: &str) -> serde_json::Value {
+        match name {
+            "query" | "query_scan" => json!({"tenant_id": "t", "query": "q", "token_budget": 1000}),
+            "query_expand" => json!({"tenant_id": "t", "result_ids": []}),
+            "store_fact" => json!({"entity": "e", "key": "k", "value": "v"}),
+            "query_facts" => json!({"query": "v", "token_budget": 1000}),
+            "delete_fact" | "memory_history" | "memory_reverify" => json!({"fact_id": "f_stub"}),
+            "get_bootstrap" => json!({"topic": "patterns", "token_budget": 500}),
+            "fact_history" => json!({"entity": "e", "key": "k"}),
+            "memory_acknowledge_use" => json!({"turn_id": "turn_stub"}),
+            "output_attest" => json!({"receipt_id": "r_stub"}),
+            "memory_forget" => json!({"scope": [{"type": "key_glob", "value": "*"}], "reason": "test"}),
+            "memory_forget_dry_run" => json!({"scope": [{"type": "key_glob", "value": "*"}]}),
+            "memory_edit" => json!({"fact_id": "f_stub", "new_value": "v2"}),
+            "memory_pin" => json!({"fact_id": "f_stub"}),
+            "memory_set_horizon" => json!({"fact_id": "f_stub", "horizon_class": "standard"}),
+            "memory_freshness" => json!({"query": "v", "token_budget": 1000}),
+            "artefact_put" => json!({"content_bytes_base64": "AAAA", "mime_type": "text/plain"}),
+            "artefact_get" => json!({"artefact_id": "a_stub"}),
+            "get_session" | "list_observations" | "delete_session" => json!({"session_id": "s_stub"}),
+            "save_session" => json!({"session_id": "s_stub", "state": {}}),
+            "get_observation" | "verify_observation" => {
+                json!({"session_id": "s_stub", "observation_id": "o_stub"})
+            }
+            "receipt_verify" => json!({"receipt_id": "r_stub"}),
+            "create_handoff" => json!({"session_id": "s_stub"}),
+            "accept_handoff" => json!({"package": {}}),
+            "record_decision" => json!({"action": "do thing", "rationale": "because"}),
+            "declare_constraint" => json!({"constraint_type": "policy", "assertion": "must hold"}),
+            "audit_config" => json!({"path": "/tmp/x", "sha256": "0".repeat(64), "auditor": "p_stub"}),
+            "check_config_audit" => json!({"paths": ["/tmp/x"]}),
+            "enrich_action" => json!({"tool_name": "query"}),
+            "get_passport" => json!({"token_budget": 500}),
+            "passport_split" => {
+                json!({"target_passport": "p_a", "new_passport_name": "p_b", "token_budget": 500})
+            }
+            "passport_merge" => json!({
+                "source_passport": "p_a", "target_passport": "p_b",
+                "conflict_policy": "prefer_target", "token_budget": 500
+            }),
+            "passport_link_device" => json!({"device_fingerprint": "fp_stub", "token_budget": 500}),
+            "get_project_context" => json!({"project_id": "proj_stub"}),
+            "create_work" => json!({"project_id": "proj_stub", "title": "t", "created_by_passport": "p_stub"}),
+            "update_work_state" => json!({"work_id": "w_stub", "state": "in_progress", "by_passport": "p_stub"}),
+            "comment_on_work" => json!({"work_id": "w_stub", "author_passport": "p_stub", "body": "hi"}),
+            "github_search" => json!({"query": "q"}),
+            "github_recent_commits" | "github_open_prs" | "github_open_issues" => json!({"repo": "owner/repo"}),
+            "entity_upsert" => json!({"kind": "capability", "id": "X", "payload": {}}),
+            "entity_get" | "entity_delete" | "entity_history" => json!({"kind": "capability", "id": "X"}),
+            "edge_upsert" | "edge_get" | "edge_delete" => json!({
+                "from_kind": "capability", "from_id": "A", "edge_kind": "depends_on",
+                "to_kind": "capability", "to_id": "B"
+            }),
+            "feature_file_search" => json!({"path": "src"}),
+            "feature_trigger_audit" => json!({"id": "X", "status": "passed"}),
+            "kind_get" => json!({"kind": "capability"}),
+            "approval_request" => json!({
+                "action_summary": "do thing", "risk_tier": "low", "scope": "test", "token_budget": 500
+            }),
+            "create_orchestrator" => json!({"name": "orch", "created_by_passport": "p_stub"}),
+            "approval_decide" => json!({"request_id": "req_stub", "decision": "approve"}),
+            "attach_to_orchestrator" | "detach_from_orchestrator" => {
+                json!({"orchestrator_id": "orch_stub", "member_ref": "m_stub"})
+            }
+            "punch_in" | "punch_out" => json!({"resource": "res", "holder_passport": "p_stub"}),
+            "check_punchcard" | "force_release" => json!({"resource": "res"}),
+            "list_punchcards" => json!({"punchcard_id": "pc_stub", "confirm": true}),
+            // Tools with no required fields default to an empty object.
+            _ => json!({}),
+        }
+    }
+
+    /// Core hermetic sweep: run every tool through dispatch with stub args
+    /// and collect any spec-shape violation. Caller controls the env-flag
+    /// state. Returns the list of human-readable violations (empty == pass).
+    async fn collect_spec_shape_violations(ctx: &McpContext, flag_on: bool) -> Vec<String> {
+        let mut violations = Vec::new();
+        for tool in tools::list_tools() {
+            let name = tool.name.clone();
+            let args = stub_args_for(&name);
+            let resp = dispatch(rpc("tools/call", json!({"name": name, "arguments": args})), ctx, None).await;
+
+            match (resp.result, resp.error) {
+                // Error responses are allowed (stub args), but must be
+                // well-formed JSON-RPC errors with a message and no result.
+                (None, Some(err)) => {
+                    if err.message.is_empty() {
+                        violations.push(format!("{name}: JSON-RPC error with empty message"));
+                    }
+                }
+                (Some(result), None) => {
+                    if let Err(why) = result_is_spec_shaped(&result) {
+                        violations.push(format!("{name}: {why}"));
+                    }
+                    // When the flag is ON and the tool opts into envelopes,
+                    // any envelope must live under structuredContent.envelope
+                    // (never top-level — already covered above — but assert
+                    // the positive placement so a regression that drops the
+                    // fold is caught here too).
+                    if flag_on && tools::tool_emits_envelope(&name) {
+                        let folded = result
+                            .get("structuredContent")
+                            .and_then(|s| s.get("envelope"))
+                            .is_some();
+                        if result.get("structuredContent").is_some() && !folded {
+                            violations.push(format!(
+                                "{name}: structuredContent present but envelope not folded under it"
+                            ));
+                        }
+                    }
+                }
+                (Some(_), Some(_)) => {
+                    violations.push(format!("{name}: response has BOTH result and error set"));
+                }
+                (None, None) => {
+                    violations.push(format!("{name}: response has neither result nor error"));
+                }
+            }
+        }
+        violations
+    }
+
+    #[tokio::test]
+    async fn all_tools_spec_shaped_envelope_off() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        let ctx = test_ctx();
+        let violations = collect_spec_shape_violations(&ctx, false).await;
+        assert!(
+            violations.is_empty(),
+            "MCP response-shape contract violated (envelope OFF) by {} tool(s):\n  {}",
+            violations.len(),
+            violations.join("\n  ")
+        );
+    }
+
+    #[tokio::test]
+    async fn all_tools_spec_shaped_envelope_on() {
+        let _guard = envelope_env_lock().lock().await;
+        std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
+        let ctx = test_ctx();
+        let violations = collect_spec_shape_violations(&ctx, true).await;
+        // Always clear the process-wide flag before asserting so a failure
+        // doesn't leak the env var into sibling tests.
+        std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
+        assert!(
+            violations.is_empty(),
+            "MCP response-shape contract violated (envelope ON) by {} tool(s):\n  {}",
+            violations.len(),
+            violations.join("\n  ")
+        );
+    }
+
+    /// Proves the contract CAN fail: the shape-check rejects a deliberately
+    /// broken legacy-shaped value and accepts a known-good one. This is the
+    /// hermetic stand-in for the test-plan's "deliberately break one tool's
+    /// shape" requirement.
+    #[test]
+    fn result_is_spec_shaped_rejects_legacy_wrapper() {
+        // Good: top-level content, no payload/envelope.
+        let good = json!({"content": [{"type": "text", "text": "ok"}]});
+        assert!(result_is_spec_shaped(&good).is_ok());
+
+        // Bad: legacy `{payload, envelope}` shape with no top-level content.
+        let legacy = json!({
+            "payload": {"content": [{"type": "text", "text": "x"}]},
+            "envelope": {"memories_used": []}
+        });
+        assert!(result_is_spec_shaped(&legacy).is_err());
+
+        // Bad: empty content array.
+        let empty = json!({"content": []});
+        assert!(result_is_spec_shaped(&empty).is_err());
+
+        // Bad: top-level envelope shadowing content.
+        let shadowed = json!({"content": [{"text": "x"}], "envelope": {}});
+        assert!(result_is_spec_shaped(&shadowed).is_err());
+    }
 }

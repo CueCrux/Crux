@@ -60,6 +60,7 @@ mod tests {
             behind_by: 2,
             checked_at: Some("2026-04-09T12:00:00Z".to_string()),
             error: None,
+            comparison_stale: false,
             upgrade_hint: "upgrade available".to_string(),
         };
 

@@ -38,6 +38,7 @@ pub fn initial_status(config: &Config) -> UpdateStatus {
             behind_by: 0,
             checked_at: None,
             error: None,
+            comparison_stale: false,
             upgrade_hint: "Update checks are disabled. Set CORECRUXD_UPDATE_CHECK_ENABLED=1 to compare this checkout against the tracked branch.".to_string(),
         };
     }
@@ -58,6 +59,7 @@ pub fn initial_status(config: &Config) -> UpdateStatus {
         behind_by: 0,
         checked_at: None,
         error: Some("update check pending".to_string()),
+        comparison_stale: false,
         upgrade_hint: "Update check is starting. If this node runs from a git checkout, the current tracked-branch status will appear shortly.".to_string(),
     }
 }
@@ -176,6 +178,10 @@ pub async fn refresh_status(config: &Config) -> UpdateStatus {
     };
     let state = derive_state(ahead_by, behind_by);
     let error = fetch_warning;
+    // Fetch failed → the ahead/behind counts came from a stale cached tracking
+    // ref. Flag it so the banner / /v1/version present "drift unverified"
+    // rather than a confident (and possibly wrong) number.
+    let comparison_stale = error.is_some();
 
     UpdateStatus {
         enabled: true,
@@ -190,7 +196,8 @@ pub async fn refresh_status(config: &Config) -> UpdateStatus {
         behind_by,
         checked_at,
         error: error.clone(),
-        upgrade_hint: upgrade_hint(state, error.is_some()),
+        comparison_stale,
+        upgrade_hint: upgrade_hint(state, comparison_stale),
     }
 }
 
@@ -222,6 +229,7 @@ fn unavailable_status(
         behind_by: 0,
         checked_at,
         error: Some(error),
+        comparison_stale: false,
         upgrade_hint: "Update checks require a readable git checkout and a tracked branch. Continue serving traffic locally and configure CORECRUXD_UPDATE_CHECK_REPO_DIR if the service starts outside the repo.".to_string(),
     }
 }
@@ -246,6 +254,7 @@ fn error_status(
         behind_by: 0,
         checked_at,
         error: Some(error),
+        comparison_stale: false,
         upgrade_hint: "Update comparison failed. Keep the node running locally, inspect git connectivity, and use the upgrade playbooks before attempting maintenance.".to_string(),
     }
 }
@@ -364,6 +373,17 @@ fn repo_dir_candidates(config: &Config) -> Vec<PathBuf> {
 
 async fn run_git(repo_dir: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new("git");
+    // Harden every invocation against ownership/bareness refusals.
+    //
+    // Production case: /repo is a host-owned bind mount but the daemon runs as a
+    // different in-container uid, so modern git refuses with "detected dubious
+    // ownership in repository" unless safe.directory covers the path. We scope
+    // safe.directory to the exact repo_dir so we never globally trust arbitrary
+    // checkouts. safe.bareRepository=all additionally lets `git -C <bare>` work
+    // under a host/CI global of safe.bareRepository=explicit (the same refusal
+    // that otherwise breaks the test harness's bare seed repos).
+    command.arg("-c").arg(format!("safe.directory={}", repo_dir.display()));
+    command.arg("-c").arg("safe.bareRepository=all");
     command.arg("-C").arg(repo_dir);
     command.args(args);
     command.kill_on_drop(true);
@@ -410,7 +430,18 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
-        let output = StdCommand::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        // Mirror run_git's ownership/bareness hardening so the fixtures behave
+        // the same under a sandbox global of safe.bareRepository=explicit.
+        let output = StdCommand::new("git")
+            .arg("-c")
+            .arg(format!("safe.directory={}", dir.display()))
+            .arg("-c")
+            .arg("safe.bareRepository=all")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
         assert!(
             output.status.success(),
             "git {:?} failed: {}",
@@ -489,6 +520,7 @@ mod tests {
             behind_by: 0,
             checked_at: Some("2026-04-10T00:00:00Z".to_string()),
             error: Some("git fetch failed".to_string()),
+            comparison_stale: true,
             upgrade_hint: "investigate".to_string(),
         };
 
@@ -497,6 +529,9 @@ mod tests {
         assert_eq!(public.current_commit.as_deref(), Some("abc123"));
         assert!(public.repo_dir.is_none());
         assert!(public.error.is_none());
+        // comparison_stale survives redaction so the public banner can still
+        // flag "drift unverified" even with error stripped.
+        assert!(public.comparison_stale);
     }
 
     #[tokio::test]
@@ -609,6 +644,64 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("using the locally cached tracking ref")));
+        assert!(status.upgrade_hint.contains("cached tracking ref"));
+        // Honest staleness: the count came from a stale cached ref, so the
+        // comparison is flagged unverified rather than presented confidently.
+        assert!(status.comparison_stale);
+    }
+
+    #[tokio::test]
+    async fn refresh_status_behind_count_reflects_fetched_remote_not_stale_cache() {
+        // Advance the remote by N commits *after* the local checkout was cloned,
+        // so the local repo's cached origin/main is still at the seed commit.
+        // A working `git fetch` must refresh the tracking ref; if it silently
+        // failed we'd see behind_by == 0 from the stale cache.
+        let fixture = setup_tracked_repo();
+        let n = 3;
+        for i in 0..n {
+            write_commit(
+                &fixture.seed,
+                "remote.txt",
+                &format!("remote {i}\n"),
+                &format!("remote {i}"),
+            );
+        }
+        git(&fixture.seed, &["push"]);
+        let config = test_config(Some(fixture.local.clone()));
+
+        let status = refresh_status(&config).await;
+
+        assert_eq!(status.state, UpdateCheckState::Behind);
+        assert_eq!(status.ahead_by, 0);
+        assert_eq!(status.behind_by, n as u64);
+        // Fetch genuinely succeeded → no staleness flag, count is trustworthy.
+        assert!(!status.comparison_stale);
+        assert!(status.error.is_none());
+        assert_ne!(status.current_commit, status.latest_commit);
+    }
+
+    #[tokio::test]
+    async fn refresh_status_fetch_failure_does_not_present_unqualified_count() {
+        // Remote advances, but the local origin URL is broken so fetch cannot
+        // reach it. The status must NOT confidently report the real drift; it
+        // must flag comparison_stale and carry the fetch-failure error.
+        let fixture = setup_tracked_repo();
+        write_commit(&fixture.seed, "remote.txt", "remote\n", "remote");
+        git(&fixture.seed, &["push"]);
+        let broken_remote = fixture.local.join("missing-remote.git");
+        let broken_remote = broken_remote.display().to_string();
+        git(&fixture.local, &["remote", "set-url", "origin", broken_remote.as_str()]);
+        let config = test_config(Some(fixture.local.clone()));
+
+        let status = refresh_status(&config).await;
+
+        // Fetch failed → comparison is unverified. The cached ref still matches
+        // local HEAD (Current), but the staleness signal is what callers gate on.
+        assert!(status.comparison_stale);
+        assert!(status
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("git fetch") && error.contains("failed")));
         assert!(status.upgrade_hint.contains("cached tracking ref"));
     }
 }
