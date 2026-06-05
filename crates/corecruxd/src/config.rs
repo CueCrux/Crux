@@ -213,6 +213,11 @@ pub struct Config {
     pub update_check_interval_secs: u64,
     pub update_check_repo_dir: Option<PathBuf>,
 
+    // Ephemeral reserved-fact GC: soft-deletes stale daemon-minted
+    // bookkeeping facts (`__session_binding__::*`, `__reverify_receipts__::*`)
+    // via the journaled delete path. Default OFF.
+    pub ephemeral_gc_enabled: bool,
+
     // Embedded console + declarative integration library.
     pub integrations_enabled: bool,
     pub integrations_safe_mode: bool,
@@ -822,6 +827,7 @@ pub fn load_config() -> Config {
             .ok()
             .map(PathBuf::from)
             .filter(|path| !path.as_os_str().is_empty()),
+        ephemeral_gc_enabled: env_bool("CORECRUXD_EPHEMERAL_GC").unwrap_or(false),
         integrations_enabled: std::env::var("CORECRUXD_INTEGRATIONS_ENABLED")
             .ok()
             .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
@@ -1115,6 +1121,8 @@ mod tests {
         assert_eq!(cfg.append_group_commit_max_delay_ms, 0);
         assert!(!cfg.enable_directory_compaction);
         assert_eq!(cfg.dir_l0_max_runs, 8);
+        // Ephemeral GC is default OFF.
+        assert!(!cfg.ephemeral_gc_enabled);
     }
 
     #[test]
