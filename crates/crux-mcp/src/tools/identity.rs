@@ -299,6 +299,10 @@ pub async fn handle_passport_split(args: &Value, ctx: &McpContext) -> Result<Val
         receipt_count: 0,
         issued_at: now.to_rfc3339(),
         passport_hash: body_hash_hex.clone(),
+        // agent-passport M4: a split stays within the source's tenant-group
+        // (the cross-tenant guard already forbids leaving it), so the fork
+        // inherits it. Recording only — no visibility change.
+        tenant_group: source.tenant_group.clone(),
     };
     let canonical = serde_json::to_string(&new_record).unwrap_or_default();
     let new_entity = format!("{PASSPORT_PREFIX}{new_name}");
@@ -991,6 +995,7 @@ pub(crate) mod tests {
                     receipt_count: 0,
                     issued_at: "2026-05-28T00:00:00Z".to_string(),
                     passport_hash: "0000".to_string(),
+                    tenant_group: None,
                 })
                 .unwrap(),
                 source_receipt: None,
@@ -1053,6 +1058,7 @@ pub(crate) mod tests {
                     receipt_count: 500,
                     issued_at: "2026-05-28T00:00:00Z".to_string(),
                     passport_hash: "ffff".to_string(),
+                    tenant_group: None,
                 })
                 .unwrap(),
                 source_receipt: None,
@@ -1097,6 +1103,7 @@ pub(crate) mod tests {
                     receipt_count: 500,
                     issued_at: "2026-05-28T00:00:00Z".to_string(),
                     passport_hash: "abcd".to_string(),
+                    tenant_group: None,
                 })
                 .unwrap(),
                 source_receipt: None,
@@ -1163,6 +1170,7 @@ pub(crate) mod tests {
                     receipt_count: 500,
                     issued_at: "2026-05-28T00:00:00Z".to_string(),
                     passport_hash: "abcd".to_string(),
+                    tenant_group: None,
                 })
                 .unwrap(),
                 source_receipt: None,
@@ -1243,6 +1251,7 @@ pub(crate) mod tests {
                         receipt_count: 500,
                         issued_at: "2026-05-28T00:00:00Z".to_string(),
                         passport_hash: "abcd".to_string(),
+                        tenant_group: None,
                     })
                     .unwrap(),
                     source_receipt: None,

@@ -35,6 +35,16 @@ pub(crate) struct PassportRecord {
     pub receipt_count: u64,
     pub issued_at: String,
     pub passport_hash: String,
+    /// agent-passport M4: the tenant-group (collaboration boundary / shared
+    /// pool) this passport belongs to, recorded at auto-issue/mint time from
+    /// [`crate::agent_passport::AgentPassportMap`]. `None` for passports issued
+    /// without a mapped tenant-group (flag-off, unmapped agents, or pre-M4
+    /// records — `serde(default)` keeps those deserialising).
+    ///
+    /// This field is RECORDED ONLY. M4 does not consult it for any visibility
+    /// decision; M5 (gated) is where group-visibility enforcement reads it.
+    #[serde(default)]
+    pub tenant_group: Option<String>,
 }
 
 // ── Tier resolution ───────────────────────────────────────────────────────
@@ -214,7 +224,7 @@ pub async fn handle_issue_passport(args: &Value, ctx: &McpContext) -> Result<Val
         }));
     }
 
-    let record = mint_passport(ctx, &principal, sponsor_id.clone()).await;
+    let record = mint_passport(ctx, &principal, sponsor_id.clone(), agent_tenant_group(ctx)).await;
 
     Ok(json!({
         "content": [{
@@ -230,14 +240,32 @@ pub async fn handle_issue_passport(args: &Value, ctx: &McpContext) -> Result<Val
     }))
 }
 
+/// Resolve the calling agent's tenant-group (agent-passport M4), recorded on
+/// the minted passport so M5 can enforce on it and `get_passport` can surface
+/// it. `None` when the flag is off, the agent is anonymous, or the agent is
+/// not in the passport map — recording only, no visibility effect.
+pub(crate) fn agent_tenant_group(ctx: &McpContext) -> Option<String> {
+    if !ctx.agent_passports_enabled {
+        return None;
+    }
+    let agent_name = scope::agent_name(ctx.agent.as_ref())?;
+    crate::agent_passport::resolve_agent_group(agent_name, &ctx.agent_passport_map).map(|g| g.tenant)
+}
+
 /// Mint and persist a passport for `principal` (the resolved passport-key name)
 /// and return the stored record.
 ///
 /// Shared by `handle_issue_passport` and the agent-passport M2 auto-issue path
 /// so both code paths produce byte-identical records. Callers MUST check
 /// `get_agent_passport` first for idempotency — this function unconditionally
-/// writes.
-async fn mint_passport(ctx: &McpContext, principal: &str, sponsor_id: Option<String>) -> PassportRecord {
+/// writes. `tenant_group` (agent-passport M4) is recorded on the record but
+/// drives no visibility behaviour.
+async fn mint_passport(
+    ctx: &McpContext,
+    principal: &str,
+    sponsor_id: Option<String>,
+    tenant_group: Option<String>,
+) -> PassportRecord {
     let receipt_count = count_receipts(ctx).await;
     let tier = resolve_tier(receipt_count);
 
@@ -249,6 +277,7 @@ async fn mint_passport(ctx: &McpContext, principal: &str, sponsor_id: Option<Str
         receipt_count,
         issued_at: chrono::Utc::now().to_rfc3339(),
         passport_hash: String::new(),
+        tenant_group,
     };
     let hash_input = serde_json::to_string(&record).unwrap_or_default();
     record.passport_hash = blake3::hash(hash_input.as_bytes()).to_hex().to_string();
@@ -287,12 +316,14 @@ pub(crate) async fn auto_issue_if_mapped(ctx: &McpContext) -> Option<PassportRec
     let agent_name = scope::agent_name(ctx.agent.as_ref())?;
     // Only auto-issue for agents that resolve to a passport_id; unmapped agents
     // fall back to the explicit issue_passport() flow.
-    let passport_id = crate::agent_passport::resolve_agent_passport(agent_name, &ctx.agent_passport_map)?;
+    let group = crate::agent_passport::resolve_agent_group(agent_name, &ctx.agent_passport_map)?;
 
     if let Some(existing) = get_agent_passport(ctx).await {
         return Some(existing);
     }
-    Some(mint_passport(ctx, &passport_id, None).await)
+    // agent-passport M4: record the resolved tenant-group on the minted
+    // passport (recording only — no visibility change).
+    Some(mint_passport(ctx, &group.passport, None, Some(group.tenant)).await)
 }
 
 /// `get_passport` — return the calling agent's passport.
@@ -373,11 +404,12 @@ pub async fn handle_get_passport(_args: &Value, ctx: &McpContext) -> Result<Valu
                 "content": [{
                     "type": "text",
                     "text": format!(
-                        "passport for {} (tier={}, receipts={}, sponsor={}, issued={}, hash={}).{}",
+                        "passport for {} (tier={}, receipts={}, sponsor={}, group={}, issued={}, hash={}).{}",
                         record.principal_id,
                         record.reputation_tier,
                         record.receipt_count,
                         record.sponsor_id.as_deref().unwrap_or("none"),
+                        record.tenant_group.as_deref().unwrap_or("none"),
                         record.issued_at,
                         &record.passport_hash[..16],
                         upgrade_hint
@@ -680,6 +712,120 @@ mod tests {
         assert!(text.contains("passport for claude-work"));
         assert!(text.contains("tier=basic"), "got: {text}");
         assert!(text.contains("receipts=10"));
+    }
+
+    // ── agent-passport M4: tenant-group recording ──────────────────
+
+    #[tokio::test]
+    async fn flag_on_anthropic_records_tenant_group_work() {
+        // Flag-ON + mapped: the auto-issued passport records tenant_group=work
+        // and get_passport surfaces it (recording only — no visibility change).
+        let base = test_ctx();
+        let anthropic = anthropic_mapped_ctx(&base);
+
+        let result = handle_get_passport(&json!({}), &anthropic).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("passport for claude-work"), "got: {text}");
+        assert!(text.contains("group=work"), "got: {text}");
+
+        // The recorded fact carries tenant_group on the PassportRecord.
+        let rec = super::get_agent_passport(&anthropic).await.unwrap();
+        assert_eq!(rec.tenant_group.as_deref(), Some("work"));
+    }
+
+    #[tokio::test]
+    async fn flag_on_openai_records_tenant_group_work() {
+        let base = test_ctx();
+        let openai = base
+            .with_agent(AgentIdentity {
+                name: "openai".to_string(),
+                token_hash: [0u8; 32],
+            })
+            .with_agent_passports(true, AgentPassportMap::builtin_default());
+
+        let result = handle_get_passport(&json!({}), &openai).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("passport for codex-work"), "got: {text}");
+        assert!(text.contains("group=work"), "got: {text}");
+
+        let rec = super::get_agent_passport(&openai).await.unwrap();
+        assert_eq!(rec.tenant_group.as_deref(), Some("work"));
+    }
+
+    #[tokio::test]
+    async fn flag_on_custom_tenant_recorded_from_env_shape() {
+        // A custom env map with an explicit `:tenant` segment is recorded.
+        let map = AgentPassportMap::from_pairs_str("anthropic:claude-work:research");
+        let base = test_ctx();
+        let anthropic = base
+            .with_agent(AgentIdentity {
+                name: "anthropic".to_string(),
+                token_hash: [0u8; 32],
+            })
+            .with_agent_passports(true, map);
+
+        handle_get_passport(&json!({}), &anthropic).await.unwrap();
+        let rec = super::get_agent_passport(&anthropic).await.unwrap();
+        assert_eq!(rec.tenant_group.as_deref(), Some("research"));
+    }
+
+    #[tokio::test]
+    async fn flag_off_records_no_tenant_group() {
+        // Flag-OFF: explicit issue_passport keyed to the raw name records no
+        // group; get_passport shows group=none.
+        let ctx = test_ctx();
+        let alice = alice_ctx(&ctx);
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+
+        let result = handle_get_passport(&json!({}), &alice).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("group=none"), "got: {text}");
+
+        let rec = super::get_agent_passport(&alice).await.unwrap();
+        assert_eq!(rec.tenant_group, None);
+    }
+
+    #[tokio::test]
+    async fn pre_m4_passport_fact_without_group_still_loads() {
+        // serde(default): a passport fact written before M4 (no tenant_group
+        // field) must still deserialise into PassportRecord.
+        let ctx = test_ctx();
+        let legacy = r#"{"principal_id":"legacy","sponsor_id":null,"reputation_tier":"unverified","receipt_count":0,"issued_at":"2026-01-01T00:00:00Z","passport_hash":"abc"}"#;
+        let rec: PassportRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(rec.principal_id, "legacy");
+        assert_eq!(rec.tenant_group, None);
+        let _ = ctx; // silence unused in case of future edits
+    }
+
+    #[tokio::test]
+    async fn tenant_group_survives_tier_refresh() {
+        // get_passport's tier-refresh re-stores the record; tenant_group must
+        // survive the rewrite.
+        let base = test_ctx();
+        let anthropic = anthropic_mapped_ctx(&base);
+        handle_get_passport(&json!({}), &anthropic).await.unwrap(); // auto-issue
+
+        // Drive a tier change via receipts so the refresh path re-stores.
+        {
+            let mut store = base.fact_store.write().await;
+            for i in 0..10 {
+                store.store(StoreFact {
+                    entity: format!("rcpt-{i}"),
+                    key: "k".to_string(),
+                    value: "v".to_string(),
+                    source_receipt: Some(format!("receipt-{i}")),
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                    actor: None,
+                });
+            }
+        }
+        handle_get_passport(&json!({}), &anthropic).await.unwrap();
+
+        let rec = super::get_agent_passport(&anthropic).await.unwrap();
+        assert_eq!(rec.reputation_tier, "basic");
+        assert_eq!(rec.tenant_group.as_deref(), Some("work"));
     }
 
     // ── require_passport_tier ──────────────────────────────────────
