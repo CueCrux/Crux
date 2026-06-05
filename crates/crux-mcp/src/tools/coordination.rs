@@ -391,7 +391,13 @@ pub async fn handle_comment_on_work(args: &Value, ctx: &McpContext) -> Result<Va
         "body": body_text,
     });
     let base = loopback_base(ctx)?;
-    let (_, resp_body) = loopback_post(format!("{base}/v1/work/{id}/comments"), payload, true, ctx.scope_identity()).await?;
+    let (_, resp_body) = loopback_post(
+        format!("{base}/v1/work/{id}/comments"),
+        payload,
+        true,
+        ctx.scope_identity(),
+    )
+    .await?;
     Ok(text_content(
         serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body)),
     ))
@@ -583,7 +589,13 @@ mod tests {
                 let mut buf = [0u8; 8192];
                 let read = stream.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..read]);
-                let method = req.lines().next().unwrap_or_default().split_whitespace().next().unwrap_or_default();
+                let method = req
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default();
                 let has_bearer = req.to_ascii_lowercase().contains("authorization: bearer ");
                 let (status, body) = if method == "PATCH" && !has_bearer {
                     (401, r#"{"error":"missing bearer"}"#)

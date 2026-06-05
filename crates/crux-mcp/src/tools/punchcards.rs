@@ -62,7 +62,13 @@ pub async fn handle_punch_in(args: &Value, ctx: &McpContext) -> Result<Value, Js
         }
     }
     let base = loopback_base(ctx)?;
-    let (_, resp) = loopback_post(format!("{base}/v1/punchcards/acquire"), body, true, ctx.scope_identity()).await?;
+    let (_, resp) = loopback_post(
+        format!("{base}/v1/punchcards/acquire"),
+        body,
+        true,
+        ctx.scope_identity(),
+    )
+    .await?;
     Ok(text_content(serde_json::from_str(&resp).unwrap_or(Value::String(resp))))
 }
 
@@ -79,7 +85,13 @@ pub async fn handle_punch_out(args: &Value, ctx: &McpContext) -> Result<Value, J
         }
     }
     let base = loopback_base(ctx)?;
-    let (_, resp) = loopback_post(format!("{base}/v1/punchcards/release"), body, false, ctx.scope_identity()).await?;
+    let (_, resp) = loopback_post(
+        format!("{base}/v1/punchcards/release"),
+        body,
+        false,
+        ctx.scope_identity(),
+    )
+    .await?;
     Ok(text_content(serde_json::from_str(&resp).unwrap_or(Value::String(resp))))
 }
 

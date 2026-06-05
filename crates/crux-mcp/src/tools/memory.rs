@@ -882,12 +882,9 @@ mod tests {
             .unwrap();
 
         // Default recall: only the edited value.
-        let q = handle_query_facts(
-            &json!({"entity": "person:frank", "token_budget": 500}),
-            &alice,
-        )
-        .await
-        .unwrap();
+        let q = handle_query_facts(&json!({"entity": "person:frank", "token_budget": 500}), &alice)
+            .await
+            .unwrap();
         let rows = q["structuredContent"]["rows"].as_array().unwrap();
         let city_rows: Vec<&Value> = rows.iter().filter(|r| r["key"] == "city").collect();
         assert_eq!(city_rows.len(), 1, "default recall must collapse to the latest version");
@@ -904,7 +901,10 @@ mod tests {
         let city_rows2: Vec<&Value> = rows2.iter().filter(|r| r["key"] == "city").collect();
         assert_eq!(city_rows2.len(), 2, "include_superseded exposes the full chain");
         let retired = city_rows2.iter().find(|r| r["value"] == "Berlin").unwrap();
-        assert!(retired["superseded_by"].is_string(), "retired version carries superseded_by");
+        assert!(
+            retired["superseded_by"].is_string(),
+            "retired version carries superseded_by"
+        );
     }
 
     #[tokio::test]
@@ -954,9 +954,12 @@ mod tests {
             .with_agent_passports(true, map);
         seed_test_passport(&base, "claude-work", "work").await;
 
-        let stored = handle_store_fact(&json!({"entity": "person:hank", "key": "city", "value": "Oslo"}), &claude)
-            .await
-            .unwrap();
+        let stored = handle_store_fact(
+            &json!({"entity": "person:hank", "key": "city", "value": "Oslo"}),
+            &claude,
+        )
+        .await
+        .unwrap();
         let old_id = stored["structuredContent"]["fact_id"].as_str().unwrap().to_string();
 
         let edited = handle_memory_edit(

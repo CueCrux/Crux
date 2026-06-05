@@ -175,10 +175,7 @@ fn scope_matches(scope: &ForgetScopeV1, fact: &Fact, before_ts: Option<DateTime<
 /// caller's RAW agent name (the same keying `memory_pin`/`memory_view` use —
 /// out of agent-passport M5 scope). Returns empty for an unauthenticated
 /// caller. Used to honour the pin-survives-scoped-forget guarantee.
-fn pinned_fact_ids(
-    store: &corecrux_memory::FactStore,
-    agent_name: Option<&str>,
-) -> std::collections::HashSet<String> {
+fn pinned_fact_ids(store: &corecrux_memory::FactStore, agent_name: Option<&str>) -> std::collections::HashSet<String> {
     let Some(agent) = agent_name else {
         return std::collections::HashSet::new();
     };
@@ -321,7 +318,15 @@ pub async fn handle_memory_forget_dry_run(args: &Value, ctx: &McpContext) -> Res
     let agent_name = scope::agent_name(ctx.agent.as_ref());
 
     let store = ctx.fact_store.read().await;
-    let matches = resolve_scope(&store, &scope, id_ref, &alias_refs, agent_name, include_pinned, token_budget);
+    let matches = resolve_scope(
+        &store,
+        &scope,
+        id_ref,
+        &alias_refs,
+        agent_name,
+        include_pinned,
+        token_budget,
+    );
     let count = matches.len();
 
     let preview: Vec<Value> = matches
@@ -413,10 +418,18 @@ pub async fn handle_memory_forget(args: &Value, ctx: &McpContext) -> Result<Valu
     // soft-delete + journal append).
     let to_forget: Vec<Fact> = {
         let store = ctx.fact_store.read().await;
-        resolve_scope(&store, &scope, id_ref, &alias_refs, Some(agent_name), include_pinned, token_budget)
-            .into_iter()
-            .cloned()
-            .collect()
+        resolve_scope(
+            &store,
+            &scope,
+            id_ref,
+            &alias_refs,
+            Some(agent_name),
+            include_pinned,
+            token_budget,
+        )
+        .into_iter()
+        .cloned()
+        .collect()
     };
 
     let now = Utc::now();
@@ -717,9 +730,16 @@ mod tests {
         assert_eq!(resp["facts_affected"], 1, "only the UNpinned fact is forgotten");
 
         // Pinned fact survives; unpinned is gone.
-        let kept = handle_query_facts(&json!({"entity": "test-fixture-pin-a"}), &ctx).await.unwrap();
-        assert!(kept["content"][0]["text"].as_str().unwrap().contains("test-fixture-pin-a"));
-        let gone = handle_query_facts(&json!({"entity": "test-fixture-pin-b"}), &ctx).await.unwrap();
+        let kept = handle_query_facts(&json!({"entity": "test-fixture-pin-a"}), &ctx)
+            .await
+            .unwrap();
+        assert!(kept["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("test-fixture-pin-a"));
+        let gone = handle_query_facts(&json!({"entity": "test-fixture-pin-b"}), &ctx)
+            .await
+            .unwrap();
         assert_eq!(gone["content"][0]["text"].as_str().unwrap(), "no facts found");
     }
 
@@ -732,7 +752,9 @@ mod tests {
             .await
             .unwrap();
         let pid = pinned["structuredContent"]["fact_id"].as_str().unwrap().to_string();
-        handle_memory_pin(&json!({"fact_id": pid, "pinned": true}), &ctx).await.unwrap();
+        handle_memory_pin(&json!({"fact_id": pid, "pinned": true}), &ctx)
+            .await
+            .unwrap();
 
         let resp = handle_memory_forget(
             &json!({
@@ -755,7 +777,9 @@ mod tests {
             .await
             .unwrap();
         let pid = pinned["structuredContent"]["fact_id"].as_str().unwrap().to_string();
-        handle_memory_pin(&json!({"fact_id": pid, "pinned": true}), &ctx).await.unwrap();
+        handle_memory_pin(&json!({"fact_id": pid, "pinned": true}), &ctx)
+            .await
+            .unwrap();
 
         let preview = handle_memory_forget_dry_run(
             &json!({"scope": {"type": "entity_prefix", "value": "test-fixture-dp"}}),
