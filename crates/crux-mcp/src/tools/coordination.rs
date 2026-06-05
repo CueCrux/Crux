@@ -140,16 +140,23 @@ pub(crate) async fn loopback_post(url: String, body: Value, expect_201: bool) ->
 }
 
 async fn loopback_patch(url: String, body: Value) -> Result<(u16, String), JsonRpcError> {
+    let bearer = loopback_bearer_token();
     tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(10)))
             .build()
             .into();
-        let request = agent
+        // PATCH was the ONE loopback helper missing the bearer token — every
+        // other verb (get/post/delete) attaches it. Under JWT auth modes that
+        // omission produced a 401 on update_work_state (the only PATCH caller).
+        let mut request = agent
             .patch(&url)
             .header("X-Corecrux-Scopes", SCOPES)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json");
+        if let Some(token) = &bearer {
+            request = request.header("Authorization", &format!("Bearer {token}"));
+        }
         request
             .send(body.to_string())
             .map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()))
@@ -535,6 +542,65 @@ mod tests {
         assert_eq!(comment["work_id"], "w1");
 
         stop_loopback(&base, stop, handle);
+    }
+
+    /// Loopback stub whose PATCH route returns 401 unless the request carries
+    /// an `Authorization: Bearer` header — directly encoding the M3 fix.
+    fn serve_patch_requires_auth() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind patch-auth loopback");
+        listener.set_nonblocking(true).expect("nonblocking loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                let mut buf = [0u8; 8192];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..read]);
+                let method = req.lines().next().unwrap_or_default().split_whitespace().next().unwrap_or_default();
+                let has_bearer = req.to_ascii_lowercase().contains("authorization: bearer ");
+                let (status, body) = if method == "PATCH" && !has_bearer {
+                    (401, r#"{"error":"missing bearer"}"#)
+                } else {
+                    (200, r#"{"applied":true,"work":{"id":"w1","state":"in_progress"}}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (base, stop, handle)
+    }
+
+    #[tokio::test]
+    async fn update_work_state_patch_attaches_bearer() {
+        // Probe finding 5: PATCH must carry the loopback bearer (it was the one
+        // helper missing it → 401). Force the raw-token fallback so a token is
+        // available regardless of JWT-secret env.
+        let _lock = crate::test_env_lock().lock().await;
+        std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+        std::env::set_var("CRUX_AGENT_TOKEN", "tok_test_patch_m3");
+
+        let (base, stop, handle) = serve_patch_requires_auth();
+        let ctx = McpContext::new_default("node-a").with_daemon_base_url(base.clone());
+        let res = handle_update_work_state(
+            &json!({"work_id": "w1", "state": "in_progress", "by_passport": "p1"}),
+            &ctx,
+        )
+        .await;
+        stop_loopback(&base, stop, handle);
+        std::env::remove_var("CRUX_AGENT_TOKEN");
+
+        let updated = text_json(res.expect("patch with bearer should succeed (not 401)"));
+        assert_eq!(updated["applied"], true);
     }
 
     #[tokio::test]
