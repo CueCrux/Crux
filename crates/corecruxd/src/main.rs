@@ -144,7 +144,7 @@ enum CliAction {
     Run,
 }
 
-/// Decide what to do from the process arguments (excluding argv[0]).
+/// Decide what to do from the process arguments (excluding `argv[0]`).
 ///
 /// A deliberately tiny hand-rolled matcher rather than pulling in `clap` —
 /// keeping the env-only design intact. Only the first argument is inspected.
