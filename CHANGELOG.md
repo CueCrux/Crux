@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-05
+
+### Fixed
+
+- `corecruxd --version` and the boot banner now report the real short git sha in
+  container builds instead of `(unknown)`. The Docker builder has no `.git`, so
+  `build.rs` now honours a `CORECRUX_GIT_SHA` env (set from a `GIT_SHA` build-arg
+  the Docker workflow passes as `github.sha`), falling back to `git` then
+  `unknown`. Makes deploy audits able to confirm the running commit.
+
 ## [0.3.0] - 2026-06-05
 
 ### Fixed
