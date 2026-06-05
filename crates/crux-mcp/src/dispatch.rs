@@ -2117,6 +2117,7 @@ mod tests {
             "attach_to_orchestrator" | "detach_from_orchestrator" => {
                 json!({"orchestrator_id": "orch_stub", "member_ref": "m_stub"})
             }
+            "update_orchestrator" => json!({"orchestrator_id": "orch_stub", "state": "archived"}),
             "punch_in" | "punch_out" => json!({"resource": "res", "holder_passport": "p_stub"}),
             "check_punchcard" | "force_release" => json!({"resource": "res"}),
             "list_punchcards" => json!({"punchcard_id": "pc_stub", "confirm": true}),

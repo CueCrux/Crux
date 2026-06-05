@@ -221,6 +221,8 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                     "source_receipt": { "type": "string",  "description": "CROWN receipt reference" },
                     "confidence":     { "type": "number",  "description": "Confidence score 0..1", "default": 1.0 },
                     "private":        { "type": "boolean", "description": "If true, scoped to the calling agent", "default": false },
+                    "horizon_class":  { "type": "string", "enum": ["volatile", "medium", "stable", "none"], "description": "Freshness decay class set at write time (no second memory_set_horizon call needed). Omit to use the entity-prefix default." },
+                    "freshness_horizon": { "type": "string", "description": "Free-text horizon line (e.g. 're-verify before relying after 7 days'); parsed to a horizon_class when horizon_class is omitted." },
                     "supersedes":     {
                         "type": "array",
                         "items": { "type": "string" },
@@ -231,7 +233,7 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                 "examples": [
                     { "entity": "project-alpha", "key": "status", "value": "Phase 1 complete", "confidence": 0.95 },
                     { "entity": "my-agent", "key": "internal_state", "value": "Waiting for confirmation", "private": true },
-                    { "entity": "bench:lme-s", "key": "baseline", "value": "90.0%", "supersedes": ["f_oldbaseline86"] }
+                    { "entity": "bench:lme-s", "key": "baseline", "value": "90.0%", "horizon_class": "volatile", "supersedes": ["f_oldbaseline86"] }
                 ]
             }),
         },
@@ -1432,7 +1434,7 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "project_id":           { "type": "string" },
+                    "project_id":           { "type": "string", "description": "An EXISTING project id (from list_projects). There is no implicit 'default' project; an unknown id returns 'project not found'." },
                     "title":                { "type": "string" },
                     "body":                 { "type": "string" },
                     "state":                { "type": "string", "enum": ["planned", "in_progress", "blocked", "archive", "complete", "deployed"] },
@@ -1444,7 +1446,7 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                 },
                 "required": ["project_id", "title", "created_by_passport"],
                 "examples": [
-                    { "project_id": "default", "title": "fix flaky test", "created_by_passport": "personal-default" }
+                    { "project_id": "<an-existing-project-id>", "title": "fix flaky test", "created_by_passport": "personal-default" }
                 ]
             }),
         },
@@ -1835,11 +1837,13 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                 "type": "object",
                 "properties": {
                     "orchestrator_id": { "type": "string" },
-                    "member_ref":      { "type": "string", "description": "A passport id or a work item id to attach." }
+                    "member_ref":      { "type": "string", "description": "A work item id (w_…), execplan id (execplan:…), handoff id (ho_…), or passport (id like `claude-work` or principal_id like `ce:…:local`)." },
+                    "member_type":     { "type": "string", "enum": ["passport","work","execplan","handoff"], "description": "Optional explicit member type; inferred from member_ref when omitted." }
                 },
                 "required": ["orchestrator_id", "member_ref"],
                 "examples": [
-                    { "orchestrator_id": "orc_abc123", "member_ref": "w_def456" }
+                    { "orchestrator_id": "orc_abc123", "member_ref": "w_def456" },
+                    { "orchestrator_id": "orc_abc123", "member_ref": "claude-work", "member_type": "passport" }
                 ]
             }),
         },
@@ -1868,6 +1872,23 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                     "state":     { "type": "string", "enum": ["planned","active","done","archived"] }
                 },
                 "examples": [ {}, { "state": "active" } ]
+            }),
+        },
+        ToolDefinition {
+            name: "update_orchestrator".to_string(),
+            description: orchestrators::UPDATE_ORCHESTRATOR_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "orchestrator_id":   { "type": "string" },
+                    "name":              { "type": "string" },
+                    "assignee_passport": { "type": "string" },
+                    "state":             { "type": "string", "enum": ["planned","active","done","archived"] }
+                },
+                "required": ["orchestrator_id"],
+                "examples": [
+                    { "orchestrator_id": "orc_abc123", "state": "archived" }
+                ]
             }),
         },
         // ── Punchcards (Package S scaffold) ────────────────────────
@@ -2252,6 +2273,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "attach_to_orchestrator",   "output": "Updated orchestrator record with the member added. (Package S scaffold: 501 until shipped.)" },
         { "tool": "detach_from_orchestrator", "output": "Updated orchestrator record with the member removed. (Package S scaffold: 501 until shipped.)" },
         { "tool": "list_orchestrators",       "output": "{ count, orchestrators: [Orchestrator] }. (Package S scaffold: 501 until shipped.)" },
+        { "tool": "update_orchestrator",      "output": "Updated orchestrator record { id, name, assignee_passport, state, members[], … } after a name/assignee/state change (state=archived closes it out)." },
         { "tool": "punch_in",                 "output": "Punchcard lease record { id, resource, mode, holder_passport, tenant_id, status, acquired_at_unix_ms, expires_at_unix_ms?, receipt_acquire }. (Package S scaffold: 501 until the punchcard plan ships.)" },
         { "tool": "punch_out",                "output": "Released punchcard record (status=released, released_at_unix_ms, release_commit_sha?, receipt_release). (Package S scaffold: 501 until shipped.)" },
         { "tool": "list_punchcards",          "output": "{ count, punchcards: [Punchcard] }. (Package S scaffold: 501 until shipped.)" },
@@ -2351,6 +2373,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "attach_to_orchestrator" => orchestrators::handle_attach_to_orchestrator(args, ctx).await,
         "detach_from_orchestrator" => orchestrators::handle_detach_from_orchestrator(args, ctx).await,
         "list_orchestrators" => orchestrators::handle_list_orchestrators(args, ctx).await,
+        "update_orchestrator" => orchestrators::handle_update_orchestrator(args, ctx).await,
         // Punchcards (Package S scaffold).
         "punch_in" => punchcards::handle_punch_in(args, ctx).await,
         "punch_out" => punchcards::handle_punch_out(args, ctx).await,
@@ -2427,7 +2450,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 94; // main 85 (agent-ux + identity-continuity + memory_sweep_candidates) + 9 backend (4 orchestrator + 4 punchcard + check_punchcard).
+    const TOOL_COUNT: usize = 95; // main 85 (agent-ux + identity-continuity + memory_sweep_candidates) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

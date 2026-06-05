@@ -36,6 +36,18 @@ use crate::agentgraph_kinds::{orchestrators_enabled, ORCHESTRATOR_KIND};
 const MEMBER_TYPE_EXECPLAN: &str = "execplan";
 const MEMBER_TYPE_WORK: &str = "work";
 const MEMBER_TYPE_HANDOFF: &str = "handoff";
+/// A member that is an agent/human principal. The orchestrator concept groups
+/// work items AND member passports; this is the latter. Validated against the
+/// passport store by id or principal_id.
+const MEMBER_TYPE_PASSPORT: &str = "passport";
+
+/// `true` when `member_ref` names a registered passport (by its `id` such as
+/// `claude-work`, or by its `principal_id` such as `ce:4e6c4e2a:local`).
+fn passport_ref_exists(store: &corecrux_memory::FactStore, member_ref: &str) -> bool {
+    crate::passports::list_passports(store, None)
+        .iter()
+        .any(|p| p.id == member_ref || p.principal_id == member_ref)
+}
 
 /// Default state for a freshly minted orchestrator. The substrate kind schema
 /// constrains state to `planned | active | done | archived`.
@@ -470,10 +482,19 @@ async fn validate_member(
             // persist them, so existence cannot be verified server-side. The
             // reference is accepted and resolved best-effort at read time.
         }
+        MEMBER_TYPE_PASSPORT => {
+            let store = state.fact_store.read().await;
+            let found = passport_ref_exists(&store, member_ref);
+            drop(store);
+            if !found {
+                return Err((StatusCode::NOT_FOUND, format!("passport '{member_ref}' not found")));
+            }
+            // Passports are workspace principals — no tenant containment check.
+        }
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                format!("unknown member type '{other}' (expected execplan|work|handoff)"),
+                format!("unknown member type '{other}' (expected passport|work|execplan|handoff)"),
             ));
         }
     }
@@ -503,12 +524,24 @@ pub(super) async fn add_member(
         _ => match infer_member_type(&member_ref) {
             Some(t) => t.to_string(),
             None => {
-                return problem_response(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "could not infer member type for '{member_ref}'; pass an explicit type (execplan|work|handoff)"
-                    ),
-                )
+                // No id-prefix match (w_/execplan:/ho_). A passport ref has no
+                // stable prefix, so resolve it against the passport store before
+                // giving up — this is what lets `attach_to_orchestrator` accept a
+                // passport member without an explicit type.
+                let is_passport = {
+                    let store = state.fact_store.read().await;
+                    passport_ref_exists(&store, &member_ref)
+                };
+                if is_passport {
+                    MEMBER_TYPE_PASSPORT.to_string()
+                } else {
+                    return problem_response(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "could not resolve member '{member_ref}'; pass an explicit type (passport|work|execplan|handoff)"
+                        ),
+                    );
+                }
             }
         },
     };
@@ -712,6 +745,10 @@ fn resolve_members_against(
                 Some(w) => json!({ "type": m.member_type, "ref": m.member_ref, "work": w }),
                 None => json!({ "type": m.member_type, "ref": m.member_ref, "missing": true }),
             },
+            // Passport members are validated at attach time and carry no
+            // resolvable kanban/execplan payload — echo the reference plainly
+            // (not "missing", which would misreport a valid principal).
+            MEMBER_TYPE_PASSPORT => json!({ "type": m.member_type, "ref": m.member_ref }),
             // Handoffs are not server-persisted: echo the reference, flag it as
             // unresolvable server-side (not an error).
             _ => json!({ "type": m.member_type, "ref": m.member_ref, "missing": true }),
@@ -931,5 +968,49 @@ mod tests {
         crate::work_execplans::stamp_orchestrator_id(&mut execplans, &member_ids, "orc_9");
         assert_eq!(execplans[0].orchestrator_id.as_deref(), Some("orc_9"));
         assert_eq!(execplans[1].orchestrator_id, None);
+    }
+
+    // ── passport members (probe finding 6) ───────────────────────────
+
+    #[test]
+    fn passport_ref_exists_matches_id_and_principal() {
+        use corecrux_memory::fact_store::{FactStore, StoreFact};
+        let mut store = FactStore::new();
+        let rec = json!({
+            "id": "claude-work",
+            "principal_id": "ce:abc:local",
+            "public_key_hex": "deadbeef",
+            "category": "work",
+            "issued_at_unix_ms": 1u64,
+        });
+        store.store(StoreFact {
+            entity: "__passport__::claude-work".to_string(),
+            key: "record".to_string(),
+            value: rec.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        });
+        assert!(passport_ref_exists(&store, "claude-work"), "match by passport id");
+        assert!(passport_ref_exists(&store, "ce:abc:local"), "match by principal_id");
+        assert!(!passport_ref_exists(&store, "nope"), "unknown ref does not match");
+    }
+
+    #[test]
+    fn resolve_passport_member_echoes_without_missing() {
+        let members = vec![MemberRef {
+            member_type: MEMBER_TYPE_PASSPORT.to_string(),
+            member_ref: "claude-work".to_string(),
+        }];
+        let resolved = resolve_members_against(&members, &[], &[]);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0]["type"], "passport");
+        assert_eq!(resolved[0]["ref"], "claude-work");
+        assert!(
+            resolved[0].get("missing").is_none(),
+            "a validated passport member must not be reported missing"
+        );
     }
 }

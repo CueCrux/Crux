@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **New-tool probe fixes** (memory / freshness / coordination surface). A probe
+  of the freshness/memory + orchestrator/punchcard/work tools surfaced 12 issues;
+  all are fixed (ExecPlan `crux-new-tool-probe-fixes-2026-06-05`):
+  - **Latest-version-wins recall.** `FactStore::store`/`try_store` now retire the
+    prior `(entity, key)` version (`superseded_by`) so `query_facts` returns the
+    current value instead of every historical version. Re-stores and `memory_edit`
+    were leaking stale values into recall; `include_superseded` / `memory_view` /
+    `memory_history` still expose the full chain.
+  - **`memory_edit`** now stamps the editor's passport `actor` (was `null`),
+    preserves the prior `horizon_class` (was reset to the entity default), and
+    carries the user pin to the new version (was silently dropped — losing decay
+    and scoped-forget protection).
+  - **Scoped-forget honours pins.** Pinned facts survive `memory_forget` by
+    default (documented #9 contract); `include_pinned: true` overrides for a
+    GDPR Art.17 erasure. `__memory_pin::` added to the forget reserved prefixes.
+  - **`update_work_state` 401.** The MCP `loopback_patch` helper was the only
+    loopback verb not attaching the bearer token; it now does.
+  - **Anonymous coordination writes.** MCP loopback writes forward
+    `X-Corecrux-Passport-Id` from the session, and the punchcard
+    acquire/release bodies accept `holder_passport` (preferred over the header
+    actor), so orchestrator/punchcard/work writes are attributed to a real
+    passport instead of `anonymous`.
+  - **Orchestrator passport members.** `attach_to_orchestrator` accepts a
+    `passport` member (validated against the passport store by id or
+    principal_id) instead of returning an opaque 400; the error now names all
+    accepted types.
+  - **`memory_forget_dry_run`** returns `facts_that_would_be_affected` under
+    `structuredContent` so MCP clients actually receive it.
+  - **`create_work`** documents that `project_id` must be an existing project
+    (no implicit `default`).
+  - **Loopback error surfacing.** The MCP→daemon loopback helpers now disable
+    `ureq`'s `http_status_as_error`, read the response body on 4xx/5xx, and
+    surface the daemon's problem+json `detail` (e.g. `daemon returned 404:
+    project not found` / `passport 'x' not found`) instead of a bare
+    `status 404`. All four verbs (get/post/patch/delete) share one agent +
+    status-error path; transport failures are reported distinctly.
+
+### Changed
+
+- **New `update_orchestrator` MCP tool** wraps `PATCH /v1/orchestrators/{id}`
+  (name / assignee / state incl. `archived`) so an orchestrator can be closed
+  out via MCP.
+- **`store_fact`** advertises `horizon_class` + `freshness_horizon` in its
+  schema (the handler already read them) so a freshness horizon is settable in
+  one call.
+- **Envelope `memories_used`** carries `age_hours` alongside `age_days` for
+  unit consistency with the freshness/query rows.
+
 ### Added
 
 - **GitHub shared memory** — selected GitHub repos become a searchable corpus
