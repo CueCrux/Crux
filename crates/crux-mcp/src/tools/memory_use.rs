@@ -308,6 +308,9 @@ pub async fn build_envelope_for_memory_acknowledge_use(args: &Value, ctx: &McpCo
                 fact_id: f.fact_id,
                 topic: f.topic,
                 age_days: f.age_days,
+                // The ack buffer only tracked day precision; derive hours from it
+                // so the field is populated consistently (24× the day count).
+                age_hours: f.age_days.map(|d| d * 24),
                 freshness: crate::envelope::Freshness::from_age_days(f.age_days),
             });
         }

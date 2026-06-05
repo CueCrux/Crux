@@ -806,7 +806,10 @@ async fn t1_memory_forget_owner_can_other_cannot() {
     )
     .await
     .unwrap();
-    assert_eq!(owner_dry["count"], 1, "owner dry-run must preview the fact it can see");
+    assert_eq!(
+        owner_dry["structuredContent"]["count"], 1,
+        "owner dry-run must preview the fact it can see"
+    );
 
     let owner_forget = handle_memory_forget(
         &json!({

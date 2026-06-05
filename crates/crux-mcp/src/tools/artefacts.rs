@@ -297,10 +297,13 @@ pub async fn build_envelope_for_artefact_list(args: &Value, ctx: &McpContext) ->
                 .map(|m| {
                     let age_days = (now - m.created_at).num_days();
                     let age_days = if age_days < 0 { None } else { Some(age_days) };
+                    let age_hours = (now - m.created_at).num_hours();
+                    let age_hours = if age_hours < 0 { None } else { Some(age_hours) };
                     MemoryUsed {
                         fact_id: m.artefact_id.clone(),
                         topic: m.mime_type.clone(),
                         age_days,
+                        age_hours,
                         freshness: crate::envelope::Freshness::from_age_days(age_days),
                     }
                 })

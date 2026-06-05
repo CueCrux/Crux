@@ -347,12 +347,18 @@ pub async fn handle_memory_forget_dry_run(args: &Value, ctx: &McpContext) -> Res
         )
     };
 
+    // The structured payload lives under `structuredContent` so MCP clients
+    // actually receive it — sibling top-level keys are dropped by the protocol
+    // envelope (probe finding 10: the array was referenced in the text but
+    // never reached the caller).
     Ok(json!({
         "content": [{ "type": "text", "text": text }],
-        "scope": scope,
-        "count": count,
-        "facts_that_would_be_affected": preview,
-        "dry_run": true,
+        "structuredContent": {
+            "scope": scope,
+            "count": count,
+            "facts_that_would_be_affected": preview,
+            "dry_run": true,
+        }
     }))
 }
 
@@ -578,8 +584,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(resp["count"], 2);
-        assert_eq!(resp["dry_run"], true);
+        assert_eq!(resp["structuredContent"]["count"], 2);
+        assert_eq!(resp["structuredContent"]["dry_run"], true);
 
         // post-check: facts still queryable
         let q = handle_query_facts(&json!({"entity": "test-fixture-a"}), &ctx)
@@ -605,7 +611,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(resp["count"], 0);
+        assert_eq!(resp["structuredContent"]["count"], 0);
     }
 
     #[tokio::test]
@@ -757,7 +763,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(preview["count"], 0, "dry-run excludes the pinned fact (preview == effect)");
+        assert_eq!(
+            preview["structuredContent"]["count"], 0,
+            "dry-run excludes the pinned fact (preview == effect)"
+        );
 
         let preview2 = handle_memory_forget_dry_run(
             &json!({"scope": {"type": "entity_prefix", "value": "test-fixture-dp"}, "include_pinned": true}),
@@ -765,7 +774,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(preview2["count"], 1, "include_pinned exposes the pinned fact");
+        assert_eq!(
+            preview2["structuredContent"]["count"], 1,
+            "include_pinned exposes the pinned fact"
+        );
     }
 
     #[tokio::test]
@@ -869,6 +881,6 @@ mod tests {
         .await
         .unwrap();
         // budget=5 with ~1-token-per-fact stored values trims well under 20.
-        assert!((resp["count"].as_u64().unwrap()) < 20);
+        assert!((resp["structuredContent"]["count"].as_u64().unwrap()) < 20);
     }
 }

@@ -144,6 +144,11 @@ pub struct MemoryUsed {
     pub fact_id: String,
     pub topic: String,
     pub age_days: Option<i64>,
+    /// Age in hours alongside `age_days`, so a single response is unit-consistent
+    /// with the freshness/query rows (which report `age_hours`). `#[serde(default)]`
+    /// keeps older serialised envelopes deserialisable.
+    #[serde(default)]
+    pub age_hours: Option<i64>,
     pub freshness: Freshness,
 }
 
@@ -391,6 +396,8 @@ pub async fn build_envelope_for_query_facts(args: &Value, ctx: &McpContext) -> E
         }
         let age_days = (now - f.stored_at).num_days();
         let age_days = if age_days < 0 { None } else { Some(age_days) };
+        let age_hours = (now - f.stored_at).num_hours();
+        let age_hours = if age_hours < 0 { None } else { Some(age_hours) };
         let topic = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
         // Master ExecPlan M3 "envelope nudge": prefer the per-fact
         // horizon_class -> decay::apply_at_chrono signal over the
@@ -414,6 +421,7 @@ pub async fn build_envelope_for_query_facts(args: &Value, ctx: &McpContext) -> E
             fact_id: f.fact_id.clone(),
             topic,
             age_days,
+            age_hours,
             freshness,
         });
         if let Some(receipt) = &f.source_receipt {
@@ -581,6 +589,11 @@ mod tests {
         assert_eq!(envelope.memories_used[0].freshness, Freshness::Fresh);
         // The fact was just stored — age should be 0 days.
         assert_eq!(envelope.memories_used[0].age_days, Some(0));
+        // age_hours is populated alongside age_days for unit consistency.
+        assert_eq!(envelope.memories_used[0].age_hours, Some(0));
+        // Both units survive serialisation into the wire envelope.
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert!(json["memories_used"][0].get("age_hours").is_some());
     }
 
     #[tokio::test]

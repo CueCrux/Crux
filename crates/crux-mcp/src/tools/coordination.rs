@@ -28,7 +28,7 @@ pub const LIST_WORK_DESCRIPTION: &str =
     "List work items, optionally filtered by project_id, state (planned/in_progress/blocked/archive/complete/deployed), tenant_id, or assignee_passport. Use this to learn what other agents have queued, are working on, or have shipped — the kanban surface that makes agent collaboration possible.";
 
 pub const CREATE_WORK_DESCRIPTION: &str =
-    "Create a new work item under a project. Defaults: state=planned, assignee=current passport. Use this to record a unit of work you're about to take on (or one you're proposing for another agent or human to pick up).";
+    "Create a new work item under a project. `project_id` must be an EXISTING project id (call list_projects first — there is no implicit 'default' project; an unknown id returns 'project not found'). Defaults: state=planned, assignee=current passport. Use this to record a unit of work you're about to take on (or one you're proposing for another agent or human to pick up).";
 
 pub const UPDATE_WORK_STATE_DESCRIPTION: &str =
     "Move a work item to a new state. If your passport has agent_work_gate=true, the move queues for human approval (response status 202) instead of applying directly.";

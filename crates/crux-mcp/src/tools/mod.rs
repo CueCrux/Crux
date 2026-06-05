@@ -221,6 +221,8 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                     "source_receipt": { "type": "string",  "description": "CROWN receipt reference" },
                     "confidence":     { "type": "number",  "description": "Confidence score 0..1", "default": 1.0 },
                     "private":        { "type": "boolean", "description": "If true, scoped to the calling agent", "default": false },
+                    "horizon_class":  { "type": "string", "enum": ["volatile", "medium", "stable", "none"], "description": "Freshness decay class set at write time (no second memory_set_horizon call needed). Omit to use the entity-prefix default." },
+                    "freshness_horizon": { "type": "string", "description": "Free-text horizon line (e.g. 're-verify before relying after 7 days'); parsed to a horizon_class when horizon_class is omitted." },
                     "supersedes":     {
                         "type": "array",
                         "items": { "type": "string" },
@@ -231,7 +233,7 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                 "examples": [
                     { "entity": "project-alpha", "key": "status", "value": "Phase 1 complete", "confidence": 0.95 },
                     { "entity": "my-agent", "key": "internal_state", "value": "Waiting for confirmation", "private": true },
-                    { "entity": "bench:lme-s", "key": "baseline", "value": "90.0%", "supersedes": ["f_oldbaseline86"] }
+                    { "entity": "bench:lme-s", "key": "baseline", "value": "90.0%", "horizon_class": "volatile", "supersedes": ["f_oldbaseline86"] }
                 ]
             }),
         },
@@ -1432,7 +1434,7 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "project_id":           { "type": "string" },
+                    "project_id":           { "type": "string", "description": "An EXISTING project id (from list_projects). There is no implicit 'default' project; an unknown id returns 'project not found'." },
                     "title":                { "type": "string" },
                     "body":                 { "type": "string" },
                     "state":                { "type": "string", "enum": ["planned", "in_progress", "blocked", "archive", "complete", "deployed"] },
@@ -1444,7 +1446,7 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                 },
                 "required": ["project_id", "title", "created_by_passport"],
                 "examples": [
-                    { "project_id": "default", "title": "fix flaky test", "created_by_passport": "personal-default" }
+                    { "project_id": "<an-existing-project-id>", "title": "fix flaky test", "created_by_passport": "personal-default" }
                 ]
             }),
         },
