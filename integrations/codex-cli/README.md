@@ -4,18 +4,24 @@ First-party Codex CLI adapters for Crux Daemon:
 
 - `hooks/crux-session-start.py` injects a Crux boot banner when a Codex
   session starts.
+- `crux-mcp-stdio.py` exposes Crux MCP tools to the Codex model through
+  Codex's stdio MCP server config.
 - `codex-tailer.py` watches Codex session JSONL files and stores observations
   in Crux.
 
 ## Startup banner hook
 
-The startup hook mirrors the working Claude `crux-hook session-start` flow
-for Codex. It is installed for `SessionStart` and `UserPromptSubmit`; the
-second event is a first-prompt fallback for Codex hosts that do not fire
-`SessionStart`. The script deduplicates by session id, calls the Crux MCP
+The startup hook prefers the shared `~/.local/bin/crux-boot-banner` used by
+the other first-party agent integrations. It resolves the Codex/OpenAI agent
+token at runtime, exports it to the shared banner process, and emits Codex
+`hookSpecificOutput.additionalContext`. If the shared banner is not installed,
+the script falls back to a compact local banner that calls the Crux MCP
 endpoint for `sync_status`, `update_status`, `get_agent_identity`,
-`get_passport`, and `get_bootstrap(topic="patterns", token_budget=500)`,
-then emits Codex `hookSpecificOutput.additionalContext`.
+`get_passport`, and `get_bootstrap(topic="patterns", token_budget=500)`.
+
+The hook is installed for `SessionStart` and `UserPromptSubmit`; the second
+event is a first-prompt fallback for Codex hosts that do not fire
+`SessionStart`. The script deduplicates by session id.
 
 ### Install
 
@@ -47,6 +53,7 @@ No token is stored in `hooks.json`. Override with:
 | `CRUX_AGENT_TOKEN` | unset | Direct bearer token fallback. |
 | `CRUX_AGENT_TOKENS_FILE` | `~/.config/cuecrux/crux-tokens/MCP_AGENT_TOKENS_CSV` | Named token CSV path. |
 | `CRUX_CODEX_HOOK_TIMEOUT` | `2.0` | Per-MCP-call timeout, clamped to 0.2-10s. |
+| `CRUX_CONSOLE_BASE` | unset or `~/.config/cuecrux/env` | Optional console link base passed to the shared banner. |
 
 ### Verify
 
@@ -67,6 +74,62 @@ The hook is fail-open. If the daemon or token is unavailable it logs to
 
 Codex may require you to trust newly installed hooks in its Hooks settings UI
 before they run automatically.
+
+## In-session MCP tools
+
+Codex must see Crux tools through an MCP server named `crux` before the model
+can call tools such as `sync_status`, `get_bootstrap`, `store_fact`,
+`query_facts`, and `cuecrux_session` directly.
+
+Codex streamable HTTP MCP support may work with newer Codex releases, but
+Codex CLI `0.137.0-alpha.4` failed the Crux daemon handshake with native HTTP
+and with `mcp-remote`. The supported compatibility path is the stdio bridge:
+
+```bash
+install -m 0755 crux-mcp-stdio.py ~/.codex/crux-mcp-stdio.py
+```
+
+Add this to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.crux]
+command = "bash"
+args = ["-lc", "exec python3 \"$HOME/.codex/crux-mcp-stdio.py\""]
+```
+
+Keep bearer material out of `config.toml`. The bridge resolves auth in this
+order:
+
+1. `CRUX_AGENT_TOKEN`
+2. `CRUX_CODEX_AGENT_NAME` from `CRUX_AGENT_TOKENS`
+3. `CRUX_CODEX_AGENT_NAME` from `~/.config/cuecrux/crux-tokens/MCP_AGENT_TOKENS_CSV`
+4. fallback agent name `openai`
+
+Endpoint discovery is similarly ordered:
+
+1. `CRUX_MCP_URLS` comma- or semicolon-separated candidates
+2. `CRUX_MCP_URL`
+3. `CRUX_MCP_URL` in `~/.config/cuecrux/env`
+4. `http://127.0.0.1:14801/mcp`
+
+Use localhost when Codex and the daemon run on the same host. Use the
+Tailscale MagicDNS name or tailnet IP when Codex connects to another node.
+Use an HTTPS reverse proxy only when the daemon is intentionally exposed
+outside the tailnet. In every case, set the endpoint through env or
+`~/.config/cuecrux/env`, never by embedding a bearer token in the URL.
+
+### Verify model-visible tools
+
+```bash
+codex mcp get crux
+
+codex exec --json --disable hooks --skip-git-repo-check \
+  --sandbox danger-full-access \
+  'Use the crux MCP tool sync_status and report only local_only.'
+```
+
+The JSON stream should include an `mcp_tool_call` item with
+`server:"crux"` and `tool:"sync_status"`.
 
 ## JSONL observation tailer
 
