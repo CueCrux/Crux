@@ -91,7 +91,12 @@ pub(crate) async fn loopback_get(url: String) -> Result<(u16, String), JsonRpcEr
     })
 }
 
-pub(crate) async fn loopback_post(url: String, body: Value, expect_201: bool) -> Result<(u16, String), JsonRpcError> {
+pub(crate) async fn loopback_post(
+    url: String,
+    body: Value,
+    expect_201: bool,
+    passport: Option<String>,
+) -> Result<(u16, String), JsonRpcError> {
     let bearer = loopback_bearer_token();
     tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -105,6 +110,13 @@ pub(crate) async fn loopback_post(url: String, body: Value, expect_201: bool) ->
             .header("Accept", "application/json");
         if let Some(token) = &bearer {
             req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+        // Forward the bound session passport so the daemon attributes the write
+        // to a real principal instead of falling back to "anonymous" (the
+        // loopback JWT's `sub` carries no passport claim). Honoured by
+        // `corecruxd::auth::http_passport_id`.
+        if let Some(pid) = &passport {
+            req = req.header("X-Corecrux-Passport-Id", pid);
         }
         req.send(body.to_string())
             .map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()))
@@ -139,7 +151,7 @@ pub(crate) async fn loopback_post(url: String, body: Value, expect_201: bool) ->
     })
 }
 
-async fn loopback_patch(url: String, body: Value) -> Result<(u16, String), JsonRpcError> {
+async fn loopback_patch(url: String, body: Value, passport: Option<String>) -> Result<(u16, String), JsonRpcError> {
     let bearer = loopback_bearer_token();
     tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -156,6 +168,9 @@ async fn loopback_patch(url: String, body: Value) -> Result<(u16, String), JsonR
             .header("Accept", "application/json");
         if let Some(token) = &bearer {
             request = request.header("Authorization", &format!("Bearer {token}"));
+        }
+        if let Some(pid) = &passport {
+            request = request.header("X-Corecrux-Passport-Id", pid);
         }
         request
             .send(body.to_string())
@@ -178,7 +193,7 @@ async fn loopback_patch(url: String, body: Value) -> Result<(u16, String), JsonR
     })
 }
 
-pub(crate) async fn loopback_delete(url: String) -> Result<(u16, String), JsonRpcError> {
+pub(crate) async fn loopback_delete(url: String, passport: Option<String>) -> Result<(u16, String), JsonRpcError> {
     tokio::task::spawn_blocking(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(10)))
@@ -191,6 +206,9 @@ pub(crate) async fn loopback_delete(url: String) -> Result<(u16, String), JsonRp
             .header("Accept", "application/json");
         if let Some(token) = &bearer {
             request = request.header("Authorization", &format!("Bearer {token}"));
+        }
+        if let Some(pid) = &passport {
+            request = request.header("X-Corecrux-Passport-Id", pid);
         }
         request
             .call()
@@ -299,7 +317,7 @@ pub async fn handle_create_work(args: &Value, ctx: &McpContext) -> Result<Value,
         }
     }
     let base = loopback_base(ctx)?;
-    let (_, resp_body) = loopback_post(format!("{base}/v1/work"), body, true).await?;
+    let (_, resp_body) = loopback_post(format!("{base}/v1/work"), body, true, ctx.scope_identity()).await?;
     Ok(text_content(
         serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body)),
     ))
@@ -336,7 +354,7 @@ pub async fn handle_update_work_state(args: &Value, ctx: &McpContext) -> Result<
         body["blocker_reason"] = reason.clone();
     }
     let base = loopback_base(ctx)?;
-    let (_, resp_body) = loopback_patch(format!("{base}/v1/work/{id}"), body).await?;
+    let (_, resp_body) = loopback_patch(format!("{base}/v1/work/{id}"), body, ctx.scope_identity()).await?;
     Ok(text_content(
         serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body)),
     ))
@@ -369,7 +387,7 @@ pub async fn handle_comment_on_work(args: &Value, ctx: &McpContext) -> Result<Va
         "body": body_text,
     });
     let base = loopback_base(ctx)?;
-    let (_, resp_body) = loopback_post(format!("{base}/v1/work/{id}/comments"), payload, true).await?;
+    let (_, resp_body) = loopback_post(format!("{base}/v1/work/{id}/comments"), payload, true, ctx.scope_identity()).await?;
     Ok(text_content(
         serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body)),
     ))
@@ -578,6 +596,68 @@ mod tests {
             }
         });
         (base, stop, handle)
+    }
+
+    /// Loopback stub whose POST /v1/work echoes the received
+    /// `X-Corecrux-Passport-Id` header into the response body.
+    fn serve_capture_passport() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind passport loopback");
+        listener.set_nonblocking(true).expect("nonblocking loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                let mut buf = [0u8; 8192];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..read]);
+                let seen = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("x-corecrux-passport-id:"))
+                    .and_then(|l| l.split_once(':'))
+                    .map(|(_, v)| v.trim().to_string())
+                    .unwrap_or_default();
+                let body = format!(r#"{{"id":"w1","seen_passport":"{seen}"}}"#);
+                let response = format!(
+                    "HTTP/1.1 201 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (base, stop, handle)
+    }
+
+    #[tokio::test]
+    async fn create_work_forwards_session_passport_header() {
+        // Probe finding 4: loopback writes must forward the bound session
+        // passport so the daemon attributes the write to a real principal.
+        let (base, stop, handle) = serve_capture_passport();
+        let ctx = McpContext::new_default("node-a")
+            .with_daemon_base_url(base.clone())
+            .with_agent(crate::agent::AgentIdentity {
+                name: "anthropic".to_string(),
+                token_hash: [0u8; 32],
+            });
+        let created = text_json(
+            handle_create_work(
+                &json!({"project_id": "p", "title": "t", "created_by_passport": "ce:x"}),
+                &ctx,
+            )
+            .await
+            .expect("create_work"),
+        );
+        stop_loopback(&base, stop, handle);
+        assert_eq!(
+            created["seen_passport"], "anthropic",
+            "loopback POST must forward X-Corecrux-Passport-Id from the session"
+        );
     }
 
     #[tokio::test]

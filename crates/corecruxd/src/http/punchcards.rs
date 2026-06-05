@@ -89,6 +89,11 @@ pub(super) struct AcquireBody {
     pub ttl_secs: Option<u64>,
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// Explicit lease holder. When set, wins over the request's authenticated
+    /// passport — this is the `holder_passport` the MCP `punch_in` tool sends,
+    /// which was previously dropped (the lease recorded `anonymous`).
+    #[serde(default)]
+    pub holder_passport: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -103,6 +108,10 @@ pub(super) struct ReleaseBody {
     pub resource: Option<String>,
     #[serde(default)]
     pub release_commit_sha: Option<String>,
+    /// Explicit lease holder (see [`AcquireBody::holder_passport`]). Used to
+    /// match the held card by (resource, holder) when releasing by resource.
+    #[serde(default)]
+    pub holder_passport: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,7 +299,13 @@ pub(super) async fn acquire(
     if body.resource.trim().is_empty() {
         return problem_response(StatusCode::BAD_REQUEST, "resource must not be empty");
     }
-    let holder = actor(&state, &headers);
+    // Explicit body `holder_passport` wins over the request's authenticated
+    // passport (which is itself the header passport, else "anonymous").
+    let holder = body
+        .holder_passport
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| actor(&state, &headers));
 
     // Expiry sweep first so a crashed holder's card cannot block us.
     sweep_expired(&state).await;
@@ -425,7 +440,11 @@ pub(super) async fn release(
     if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:write", "admin:write"]) {
         return p.into_response();
     }
-    let holder = actor(&state, &headers);
+    let holder = body
+        .holder_passport
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| actor(&state, &headers));
     let now = now_unix_ms();
     let registry = state.kind_registry.read().await;
     let registry_opt = registry.is_registered(PUNCHCARD_KIND).then_some(&*registry);
@@ -793,6 +812,7 @@ mod tests {
             reason: Some("test".to_string()),
             ttl_secs: Some(ttl_secs),
             tenant_id: None,
+            holder_passport: None,
         }
     }
 
@@ -861,6 +881,7 @@ mod tests {
                 id: None,
                 resource: Some("file:///proj/x.rs".to_string()),
                 release_commit_sha: Some("deadbeef".to_string()),
+                holder_passport: None,
             }),
         )
         .await;
@@ -935,6 +956,7 @@ mod tests {
                 id: None,
                 resource: Some("file:///proj/y.rs".to_string()),
                 release_commit_sha: None,
+                holder_passport: None,
             }),
         )
         .await;
@@ -1006,6 +1028,37 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn acquire_prefers_body_holder_passport_over_header() {
+        // Probe finding 4: punch_in's explicit holder_passport must win, so the
+        // lease records the real passport instead of the header/anonymous actor.
+        std::env::set_var("CORECRUXD_PUNCHCARD", "advisory");
+        let state = state_with_kind().await;
+
+        let resp = acquire(
+            StateExtract(state.clone()),
+            headers_for("anonymous"), // header actor says "anonymous"
+            JsonExtract(AcquireBody {
+                resource: "file:///proj/h.rs".to_string(),
+                mode: "modify".to_string(),
+                reason: None,
+                ttl_secs: Some(600),
+                tenant_id: None,
+                holder_passport: Some("ce:probe:local".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["punchcard"]["holder_passport"], "ce:probe:local",
+            "explicit body holder_passport must win over the header actor"
+        );
+
+        std::env::remove_var("CORECRUXD_PUNCHCARD");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn tree_lease_blocks_contained_file() {
         std::env::set_var("CORECRUXD_PUNCHCARD", "enforce");
         let state = state_with_kind().await;
@@ -1062,6 +1115,7 @@ mod tests {
                 reason: Some("cargo-deploy".to_string()),
                 ttl_secs: Some(600),
                 tenant_id: None,
+                holder_passport: None,
             }),
         )
         .await;
@@ -1200,6 +1254,7 @@ mod tests {
                 reason: None,
                 ttl_secs: Some(600),
                 tenant_id: Some("tenant-1".to_string()),
+                holder_passport: None,
             }),
         )
         .await;
@@ -1212,6 +1267,7 @@ mod tests {
                 reason: None,
                 ttl_secs: Some(600),
                 tenant_id: Some("tenant-2".to_string()),
+                holder_passport: None,
             }),
         )
         .await;

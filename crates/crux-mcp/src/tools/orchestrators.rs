@@ -56,7 +56,7 @@ pub async fn handle_create_orchestrator(args: &Value, ctx: &McpContext) -> Resul
         }
     }
     let base = loopback_base(ctx)?;
-    let (_, resp) = loopback_post(format!("{base}/v1/orchestrators"), body, true).await?;
+    let (_, resp) = loopback_post(format!("{base}/v1/orchestrators"), body, true, ctx.scope_identity()).await?;
     Ok(text_content(serde_json::from_str(&resp).unwrap_or(Value::String(resp))))
 }
 
@@ -65,7 +65,13 @@ pub async fn handle_attach_to_orchestrator(args: &Value, ctx: &McpContext) -> Re
     let member = required_str(args, "member_ref", "attach_to_orchestrator")?;
     let body = json!({ "member_ref": member });
     let base = loopback_base(ctx)?;
-    let (_, resp) = loopback_post(format!("{base}/v1/orchestrators/{id}/members"), body, false).await?;
+    let (_, resp) = loopback_post(
+        format!("{base}/v1/orchestrators/{id}/members"),
+        body,
+        false,
+        ctx.scope_identity(),
+    )
+    .await?;
     Ok(text_content(serde_json::from_str(&resp).unwrap_or(Value::String(resp))))
 }
 
@@ -74,7 +80,7 @@ pub async fn handle_detach_from_orchestrator(args: &Value, ctx: &McpContext) -> 
     let member = required_str(args, "member_ref", "detach_from_orchestrator")?;
     let base = loopback_base(ctx)?;
     let url = format!("{base}/v1/orchestrators/{id}/members/{}", urlencoding(member));
-    let (_, resp) = loopback_delete(url).await?;
+    let (_, resp) = loopback_delete(url, ctx.scope_identity()).await?;
     Ok(text_content(serde_json::from_str(&resp).unwrap_or(Value::String(resp))))
 }
 
