@@ -160,18 +160,24 @@ fn scope_matches(scope: &ForgetScopeV1, fact: &Fact, before_ts: Option<DateTime<
 fn resolve_scope<'a>(
     store: &'a corecrux_memory::FactStore,
     scope: &ForgetScopeV1,
-    agent_name: Option<&str>,
+    identity: Option<&str>,
+    aliases: &[&str],
     token_budget: Option<usize>,
 ) -> Vec<&'a Fact> {
     let before_ts = match scope {
         ForgetScopeV1::BeforeTimestamp { value } => parse_before_ts(value).ok(),
         _ => None,
     };
+    // agent-passport M5: forget can only ever touch what the caller can SEE —
+    // the visibility check is identity-scoped so the OWNER of a passport-keyed
+    // private fact can forget its OWN fact, and a DIFFERENT passport still
+    // cannot. Flag-OFF `identity` is the raw agent name and `aliases` is empty,
+    // so this is byte-for-byte the prior `scope::fact_visible_to_agent` call.
     let mut matches: Vec<&Fact> = store
         .all_facts()
         .filter(|fact| !fact.deleted)
         .filter(|fact| !is_reserved(&fact.entity))
-        .filter(|fact| scope::fact_visible_to_agent(fact, agent_name))
+        .filter(|fact| scope::fact_visible_to_identity(fact, identity, aliases))
         .filter(|fact| scope_matches(scope, fact, before_ts))
         .collect();
     matches.sort_by(|left, right| left.stored_at.cmp(&right.stored_at));
@@ -243,16 +249,20 @@ fn build_receipt_body(
 pub async fn handle_memory_forget_dry_run(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let scope = parse_scope(args)?;
     let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize);
-    let agent_name = scope::agent_name(ctx.agent.as_ref());
+    // agent-passport M5: identity-scoped visibility (flag-OFF == raw name).
+    let identity = ctx.scope_identity();
+    let id_ref = identity.as_deref();
+    let aliases = ctx.scope_aliases();
+    let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
     let store = ctx.fact_store.read().await;
-    let matches = resolve_scope(&store, &scope, agent_name, token_budget);
+    let matches = resolve_scope(&store, &scope, id_ref, &alias_refs, token_budget);
     let count = matches.len();
 
     let preview: Vec<Value> = matches
         .iter()
         .map(|f| {
-            let entity = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
+            let entity = scope::visible_entity_for_identity(f, id_ref, &alias_refs).unwrap_or_else(|| f.entity.clone());
             json!({
                 "fact_id": f.fact_id,
                 "entity": entity,
@@ -297,7 +307,16 @@ pub async fn handle_memory_forget(args: &Value, ctx: &McpContext) -> Result<Valu
         message: "memory_forget requires an authenticated agent identity (passport)".to_string(),
         data: Some(json!({"param": "passport", "requires_agent_identity": true})),
     })?;
-    let passport_id = agent_name.to_string();
+    // agent-passport M5: the *scope identity* (passport_id flag-ON; raw name
+    // flag-OFF) drives visibility, so the OWNER can forget its own passport-
+    // keyed private facts and a DIFFERENT passport cannot. The receipt's
+    // `passport_id` is stamped with the resolved scope identity for consistent
+    // attribution (flag-OFF this is exactly the raw `agent_name`).
+    let identity = ctx.scope_identity();
+    let id_ref = identity.as_deref();
+    let aliases = ctx.scope_aliases();
+    let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
+    let passport_id = identity.clone().unwrap_or_else(|| agent_name.to_string());
 
     let scope = parse_scope(args)?;
     let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -320,7 +339,7 @@ pub async fn handle_memory_forget(args: &Value, ctx: &McpContext) -> Result<Valu
     // soft-delete + journal append).
     let to_forget: Vec<Fact> = {
         let store = ctx.fact_store.read().await;
-        resolve_scope(&store, &scope, Some(agent_name), token_budget)
+        resolve_scope(&store, &scope, id_ref, &alias_refs, token_budget)
             .into_iter()
             .cloned()
             .collect()
@@ -350,7 +369,7 @@ pub async fn handle_memory_forget(args: &Value, ctx: &McpContext) -> Result<Valu
         // forget could have already soft-deleted this fact_id.
         let still_visible = store
             .get(&f.fact_id)
-            .is_some_and(|cur| !cur.deleted && scope::fact_visible_to_agent(cur, Some(agent_name)));
+            .is_some_and(|cur| !cur.deleted && scope::fact_visible_to_identity(cur, id_ref, &alias_refs));
         if still_visible
             && store.try_delete(&f.fact_id).map_err(|err| JsonRpcError {
                 code: INTERNAL_ERROR,

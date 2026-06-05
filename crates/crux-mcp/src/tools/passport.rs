@@ -108,9 +108,7 @@ fn tier_rank(tier: &str) -> u8 {
 pub(crate) fn passport_key_name(ctx: &McpContext) -> Option<String> {
     let agent_name = scope::agent_name(ctx.agent.as_ref())?;
     if ctx.agent_passports_enabled {
-        if let Some(passport_id) =
-            crate::agent_passport::resolve_agent_passport(agent_name, &ctx.agent_passport_map)
-        {
+        if let Some(passport_id) = crate::agent_passport::resolve_agent_passport(agent_name, &ctx.agent_passport_map) {
             return Some(passport_id);
         }
     }
@@ -657,11 +655,17 @@ mod tests {
         let anthropic = anthropic_mapped_ctx(&base);
 
         let r1 = handle_issue_passport(&json!({}), &anthropic).await.unwrap();
-        assert!(r1["content"][0]["text"].as_str().unwrap().contains("passport issued for claude-work"));
+        assert!(r1["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("passport issued for claude-work"));
 
         // Auto-issue afterwards must find the existing one, not duplicate.
         let r2 = handle_issue_passport(&json!({}), &anthropic).await.unwrap();
-        assert!(r2["content"][0]["text"].as_str().unwrap().contains("passport already exists for claude-work"));
+        assert!(r2["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("passport already exists for claude-work"));
     }
 
     #[tokio::test]

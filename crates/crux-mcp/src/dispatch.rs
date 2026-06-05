@@ -196,6 +196,64 @@ impl McpContext {
         self
     }
 
+    /// Resolve the *scope identity* used for private-fact ownership and
+    /// visibility (agent-passport M5). This is the single string threaded into
+    /// every `scope::*` call.
+    ///
+    /// * **Flag OFF (default):** the raw agent token-name (`anthropic`,
+    ///   `alice`, …) — byte-for-byte the pre-M5 behaviour. `scope::*` keys
+    ///   private facts under `__agent::<name>::` exactly as before.
+    /// * **Flag ON:** the resolved passport_id (`anthropic` → `claude-work`),
+    ///   so a private fact's owner key agrees with the M1 `actor` stamp and the
+    ///   M4 tenant-group. An unmapped name falls back to the raw name so a
+    ///   flag-ON private write is never mis-keyed (mirrors the QC.3
+    ///   never-anonymous rule on `actor`).
+    ///
+    /// Returns `None` for an unauthenticated caller (no agent identity) under
+    /// either flag state — anonymous callers have no private scope.
+    pub fn scope_identity(&self) -> Option<String> {
+        let name = self.agent.as_ref()?.name.as_str();
+        if self.agent_passports_enabled {
+            Some(
+                crate::agent_passport::resolve_agent_passport(name, &self.agent_passport_map)
+                    .unwrap_or_else(|| name.to_string()),
+            )
+        } else {
+            Some(name.to_string())
+        }
+    }
+
+    /// Back-compat alias names for the caller's private-fact ownership under
+    /// flag-ON (agent-passport M5). Empty when the flag is off (no rekeying
+    /// happened, so no alias is needed).
+    ///
+    /// When the flag is ON the *current* writes are keyed by [`Self::scope_identity`]
+    /// (the passport_id). But private facts written while the flag was OFF were
+    /// keyed by the raw agent token-name. To keep those legacy private facts
+    /// visible to their original owner (and ONLY their original owner) after the
+    /// flag flips, the raw token-name is returned here as an alias. The read
+    /// helpers (`scope::*_for_identity`) match a private fact's owner against the
+    /// identity OR any alias.
+    ///
+    /// The alias is the caller's OWN raw name only — never another agent's — so
+    /// it can never widen visibility to a different principal.
+    pub fn scope_aliases(&self) -> Vec<String> {
+        match (&self.agent, self.agent_passports_enabled) {
+            (Some(agent), true) => {
+                // Only an alias when the resolved identity actually differs
+                // from the raw name (i.e. the name was remapped). When the
+                // name is unmapped, identity == raw name and no alias is
+                // needed.
+                let raw = agent.name.as_str();
+                match self.scope_identity() {
+                    Some(id) if id != raw => vec![raw.to_string()],
+                    _ => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Configure the loopback URL used by tools that call back into the
     /// corecruxd HTTP server (e.g., `cuecrux_session`).
     pub fn with_daemon_base_url(mut self, url: impl Into<String>) -> Self {

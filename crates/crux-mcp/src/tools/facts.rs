@@ -17,6 +17,16 @@ use crate::scope;
 use corecrux_memory::fact_store::{Fact, FactQuery, HorizonClass, StoreFact};
 use corecrux_projections::decay;
 
+/// Resolve the (scope_identity, aliases) pair for `ctx` (agent-passport M5).
+///
+/// Flag-OFF: identity is the raw agent name and aliases is empty — every
+/// `scope::*_for_identity` call below then behaves byte-for-byte like the prior
+/// `scope::*_for_agent(agent_name)` call. Flag-ON: identity is the passport_id
+/// and aliases carries the caller's own raw name for legacy-private back-compat.
+fn scope_ctx(ctx: &McpContext) -> (Option<String>, Vec<String>) {
+    (ctx.scope_identity(), ctx.scope_aliases())
+}
+
 /// Parse an operator's free-text `freshness_horizon:` line into a
 /// [`HorizonClass`]. Conservative by design: anything unrecognised maps
 /// to [`HorizonClass::None`] (never decays) rather than guessing.
@@ -101,6 +111,17 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     let private = args.get("private").and_then(|v| v.as_bool()).unwrap_or(false);
     let agent_name = scope::agent_name(ctx.agent.as_ref());
 
+    // agent-passport M5: the *scope identity* is what private facts are keyed
+    // by and matched against. Flag-OFF it is exactly `agent_name` (raw token-
+    // name) — byte-for-byte the pre-M5 path. Flag-ON it is the resolved
+    // passport_id (e.g. `claude-work`), so a private fact's owner key agrees
+    // with the M1 `actor` stamp. `scope_aliases` carries the caller's OWN raw
+    // name so its legacy (flag-off-written) private facts stay visible.
+    let scope_identity = ctx.scope_identity();
+    let scope_id_ref = scope_identity.as_deref();
+    let aliases = ctx.scope_aliases();
+    let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
+
     // Freshness horizon (M4): an explicit `horizon_class` always wins; if
     // absent, parse the operator's free-text `freshness_horizon` line; if
     // both are absent leave `None` so the entity-prefix default (M2/M3)
@@ -120,8 +141,11 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
             .map(parse_freshness_horizon),
     };
 
-    let entity = match (private, agent_name) {
-        (true, Some(agent_name)) => scope::private_entity_for_agent(agent_name, entity_raw),
+    // agent-passport M5: key a private fact by the scope identity. Flag-OFF
+    // `scope_id_ref == agent_name` so this is identical to the prior
+    // `private_entity_for_agent(agent_name, …)` call.
+    let entity = match (private, scope_id_ref) {
+        (true, Some(owner)) => scope::private_entity_for_agent(owner, entity_raw),
         (true, None) => {
             return Err(JsonRpcError {
                 code: INVALID_PARAMS,
@@ -148,6 +172,15 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         None
     };
 
+    // agent-passport M5: the entity the category check runs against. For a
+    // private fact use the LOGICAL (pre-`__agent::`-prefix) entity; otherwise
+    // the stored entity. Computed BEFORE `entity` is moved into `req`.
+    let enforce_entity: String = if private {
+        entity_raw.to_string()
+    } else {
+        entity.clone()
+    };
+
     let req = StoreFact {
         entity,
         key: key.to_string(),
@@ -160,15 +193,43 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     };
 
     let mut store = ctx.fact_store.write().await;
-    // M3.5 NOTE (updated by agent-passport M1): the agent→passport mapping
-    // now exists behind `CORECRUXD_AGENT_PASSPORTS` — see
-    // `crate::agent_passport`. When that flag is on, the resolved passport_id
-    // is stamped onto the fact as `actor` above (attribution only). We still
-    // deliberately do NOT call
-    // `category_enforce::check_passport_can_write_entity` here: enforcement
-    // (403-ing a passport that may not write a given tenant-category entity)
-    // is tracked in M5 and stays gated behind its own switch so M1 can ship
-    // attribution without risking blocking operator MCP writes.
+
+    // agent-passport M5: tenant-category WRITE ENFORCEMENT. FLAG-GATED.
+    //   * Flag OFF (default): skipped entirely — byte-for-byte the prior path
+    //     (this closes the M3.5 NOTE without changing flag-off behaviour).
+    //   * Flag ON: resolve the caller's passport_id and reject a write whose
+    //     entity category is incompatible with the passport category (e.g. a
+    //     `work` passport writing a `personal` entity). System entities
+    //     (`__*__`, including the `__agent::` prefix of a private fact) are
+    //     exempt inside `check_passport_can_write_entity`, so private writes
+    //     and daemon bookkeeping are never blocked. On violation we return a
+    //     JsonRpcError and DO NOT store.
+    if ctx.agent_passports_enabled {
+        if let Some(pid) = &scope_identity {
+            // Enforce against the LOGICAL (pre-private-prefix) entity for a
+            // private fact, and the stored entity otherwise. A private fact's
+            // stored entity is `__agent::…` which classifies System (exempt)
+            // either way; using the logical entity keeps the check meaningful
+            // if private-prefixing ever changes.
+            if let Err(e) = crate::category_enforce::check_passport_can_write_entity(
+                &store,
+                Some(pid.as_str()),
+                enforce_entity.as_str(),
+            ) {
+                return Err(JsonRpcError {
+                    code: INVALID_PARAMS,
+                    message: e.to_string(),
+                    data: Some(json!({
+                        "param": "entity",
+                        "category_enforcement": true,
+                        "passport_id": pid,
+                        "entity": enforce_entity,
+                    })),
+                });
+            }
+        }
+    }
+
     let fact = store.try_store(req).map_err(|err| JsonRpcError {
         code: INTERNAL_ERROR,
         message: "fact journal append failed".to_string(),
@@ -224,7 +285,10 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
                 continue;
             }
             match store.get(r) {
-                Some(target) if scope::fact_visible_to_agent(target, agent_name) => {}
+                // T.1: you can only supersede a fact you can SEE. Uses the M5
+                // identity-scoped visibility (flag-off it reduces to the raw
+                // agent_name check, since identity == name and aliases empty).
+                Some(target) if scope::fact_visible_to_identity(target, scope_id_ref, &alias_refs) => {}
                 _ => bad.push(r.clone()),
             }
         }
@@ -243,7 +307,8 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         }
     }
 
-    let display_entity = scope::visible_entity_for_agent(&fact, agent_name).unwrap_or_else(|| fact.entity.clone());
+    let display_entity =
+        scope::visible_entity_for_identity(&fact, scope_id_ref, &alias_refs).unwrap_or_else(|| fact.entity.clone());
 
     let supersedes_msg = match &fact.supersedes {
         Some(prev) => format!(", supersedes={prev}, version={}", fact.version),
@@ -277,14 +342,16 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
 pub async fn handle_fact_history(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let entity = require_str(args, "entity")?;
     let key = require_str(args, "key")?;
-    let agent_name = scope::agent_name(ctx.agent.as_ref());
+    let (identity, aliases) = scope_ctx(ctx);
+    let id_ref = identity.as_deref();
+    let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
     let store = ctx.fact_store.read().await;
     let mut history: Vec<&Fact> = store
         .all_facts()
         .filter(|fact| fact.key == key)
-        .filter(|fact| scope::entity_matches_for_agent(fact, entity, agent_name))
-        .filter(|fact| scope::fact_visible_to_agent(fact, agent_name))
+        .filter(|fact| scope::entity_matches_for_identity(fact, entity, id_ref, &alias_refs))
+        .filter(|fact| scope::fact_visible_to_identity(fact, id_ref, &alias_refs))
         .collect();
     history.sort_by_key(|fact| fact.version);
 
@@ -301,7 +368,8 @@ pub async fn handle_fact_history(args: &Value, ctx: &McpContext) -> Result<Value
             let sup = f.supersedes.as_deref().unwrap_or("-");
             // M3: attribution surfaced on read. "-" for legacy/flag-off writes.
             let actor = f.actor.as_deref().unwrap_or("-");
-            let display_entity = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
+            let display_entity =
+                scope::visible_entity_for_identity(f, id_ref, &alias_refs).unwrap_or_else(|| f.entity.clone());
             format!(
                 "v{}: [{}] {} = {} (confidence={:.2}, stored_at={}, supersedes={}, actor={}){}",
                 f.version, display_entity, f.fact_id, f.value, f.confidence, f.stored_at, sup, actor, status
@@ -329,7 +397,9 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
         .get("include_superseded")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let agent_name = scope::agent_name(ctx.agent.as_ref());
+    let (identity, aliases) = scope_ctx(ctx);
+    let id_ref = identity.as_deref();
+    let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
     let q = FactQuery {
         query,
@@ -340,7 +410,7 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     };
 
     let store = ctx.fact_store.read().await;
-    let visible = query_visible_facts_opts(&store, &q, agent_name, include_superseded);
+    let visible = query_visible_facts_opts(&store, &q, id_ref, &alias_refs, include_superseded);
 
     if visible.is_empty() {
         return Ok(json!({
@@ -359,7 +429,7 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     let mut lines: Vec<String> = Vec::with_capacity(visible.len());
     let mut rows: Vec<Value> = Vec::with_capacity(visible.len());
     for f in &visible {
-        let entity = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
+        let entity = scope::visible_entity_for_identity(f, id_ref, &alias_refs).unwrap_or_else(|| f.entity.clone());
         let class = crate::tools::freshness::projection_class_of(f.horizon_class);
         let fresh = decay::apply_at_chrono(class, f.stored_at, f.reverified_at, now, policy);
         let effective_confidence = decay::effective_confidence(f.confidence as f64, fresh);
@@ -403,12 +473,15 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
 /// `delete_fact` — soft-delete a fact by its ID.
 pub async fn handle_delete_fact(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let fact_id = require_str(args, "fact_id")?;
-    let agent_name = scope::agent_name(ctx.agent.as_ref());
+    let (identity, aliases) = scope_ctx(ctx);
+    let id_ref = identity.as_deref();
+    let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
     let mut store = ctx.fact_store.write().await;
     let deleted = store
         .get(fact_id)
-        .is_some_and(|fact| scope::fact_visible_to_agent(fact, agent_name))
+        // T.1: you can only delete a fact you can SEE (identity-scoped).
+        .is_some_and(|fact| scope::fact_visible_to_identity(fact, id_ref, &alias_refs))
         && store.try_delete(fact_id).map_err(|err| JsonRpcError {
             code: INTERNAL_ERROR,
             message: "fact journal append failed".to_string(),
@@ -436,11 +509,13 @@ pub async fn handle_delete_fact(args: &Value, ctx: &McpContext) -> Result<Value,
 /// `list_entities` — discover all entity names in the fact store.
 pub async fn handle_list_entities(_args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
     let store = ctx.fact_store.read().await;
-    let agent_name = scope::agent_name(ctx.agent.as_ref());
+    let (identity, aliases) = scope_ctx(ctx);
+    let id_ref = identity.as_deref();
+    let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
     let entities: Vec<String> = store
         .all_facts()
         .filter(|fact| !fact.deleted)
-        .filter_map(|fact| scope::visible_entity_for_agent(fact, agent_name))
+        .filter_map(|fact| scope::visible_entity_for_identity(fact, id_ref, &alias_refs))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -476,36 +551,41 @@ pub(crate) fn envelope_query_visible_facts(
 }
 
 fn query_visible_facts(store: &corecrux_memory::FactStore, q: &FactQuery, agent_name: Option<&str>) -> Vec<Fact> {
-    query_visible_facts_opts(store, q, agent_name, false)
+    // Agent-only callers (the envelope builder) are NOT passport-rekeyed:
+    // pass an empty alias set, so this reduces to the raw agent_name check.
+    query_visible_facts_opts(store, q, agent_name, &[], false)
 }
 
 /// As [`query_visible_facts`] but with an explicit `include_superseded`
-/// toggle (M6). When `false` (the default recall behaviour), facts whose
-/// `superseded_by` marker is set are excluded — they've been explicitly
-/// retired by a newer fact (possibly under a different entity).
+/// toggle (M6) and the M5 identity/alias scoping. `identity` is the resolved
+/// scope identity (flag-OFF: the raw agent name; flag-ON: the passport_id);
+/// `aliases` carries the caller's own legacy names for back-compat (empty
+/// flag-OFF). When `include_superseded` is `false` (the default recall
+/// behaviour), facts whose `superseded_by` marker is set are excluded.
 fn query_visible_facts_opts(
     store: &corecrux_memory::FactStore,
     q: &FactQuery,
-    agent_name: Option<&str>,
+    identity: Option<&str>,
+    aliases: &[&str],
     include_superseded: bool,
 ) -> Vec<Fact> {
     let mut results: Vec<&Fact> = store
         .all_facts()
         .filter(|fact| !fact.deleted)
         .filter(|fact| include_superseded || fact.superseded_by.is_none())
-        .filter(|fact| scope::fact_visible_to_agent(fact, agent_name))
+        .filter(|fact| scope::fact_visible_to_identity(fact, identity, aliases))
         .filter(|fact| {
             q.entity_prefix
                 .as_ref()
-                .is_none_or(|prefix| scope::entity_prefix_matches_for_agent(fact, prefix, agent_name))
+                .is_none_or(|prefix| scope::entity_prefix_matches_for_identity(fact, prefix, identity, aliases))
         })
         .filter(|fact| {
             q.entity
                 .as_ref()
-                .is_none_or(|entity| scope::entity_matches_for_agent(fact, entity, agent_name))
+                .is_none_or(|entity| scope::entity_matches_for_identity(fact, entity, identity, aliases))
         })
         .filter(|fact| match &q.query {
-            Some(query) => fact_matches_query(fact, query, agent_name),
+            Some(query) => fact_matches_query(fact, query, identity, aliases),
             None => true,
         })
         .collect();
@@ -551,12 +631,12 @@ fn query_visible_facts_opts(
     results.into_iter().cloned().collect()
 }
 
-fn fact_matches_query(fact: &Fact, query: &str, agent_name: Option<&str>) -> bool {
+fn fact_matches_query(fact: &Fact, query: &str, identity: Option<&str>, aliases: &[&str]) -> bool {
     let query_lower = query.to_lowercase();
     let terms: Vec<&str> = query_lower.split_whitespace().collect();
     let value_lower = fact.value.to_lowercase();
     let key_lower = fact.key.to_lowercase();
-    let entity_lower = scope::visible_entity_for_agent(fact, agent_name)
+    let entity_lower = scope::visible_entity_for_identity(fact, identity, aliases)
         .unwrap_or_else(|| fact.entity.clone())
         .to_lowercase();
 
@@ -648,6 +728,33 @@ mod tests {
         McpContext::new_default("test-node")
     }
 
+    /// agent-passport M5: seed a passport record so the flag-ON write
+    /// enforcement (`check_passport_can_write_entity`) can resolve a category.
+    /// Without this, a flag-ON write by a mapped agent is rejected as
+    /// `LegacyOrMissingPassport` — which is the correct, designed behaviour for
+    /// an unminted passport, but the M1/M3 attribution tests below want a
+    /// *successful* write, so they mint the passport first.
+    async fn seed_passport(ctx: &McpContext, id: &str, category: &str) {
+        let record = json!({
+            "id": id,
+            "principal_id": format!("test::{id}"),
+            "public_key_hex": "deadbeef",
+            "category": category,
+            "issued_at_unix_ms": 1u64,
+        });
+        let mut store = ctx.fact_store.write().await;
+        store.store(StoreFact {
+            entity: format!("__passport__::{id}"),
+            key: "record".to_string(),
+            value: record.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
     #[tokio::test]
     async fn store_fact_basic() {
         let ctx = test_ctx();
@@ -685,6 +792,8 @@ mod tests {
             name: "anthropic".to_string(),
             token_hash: [0u8; 32],
         });
+        // M5: a flag-ON write requires a minted passport with a category.
+        seed_passport(&ctx, "claude-work", "work").await;
         let result = handle_store_fact(&json!({"entity": "proj", "key": "k", "value": "v"}), &ctx)
             .await
             .unwrap();
@@ -698,6 +807,7 @@ mod tests {
             name: "openai".to_string(),
             token_hash: [2u8; 32],
         });
+        seed_passport(&ctx, "codex-work", "work").await;
         let result = handle_store_fact(&json!({"entity": "proj", "key": "k", "value": "v"}), &ctx)
             .await
             .unwrap();
@@ -713,6 +823,9 @@ mod tests {
             name: "windows-host".to_string(),
             token_hash: [3u8; 32],
         });
+        // Unmapped agent → identity falls back to the raw name `windows-host`;
+        // mint that passport so the M5 enforcement can resolve its category.
+        seed_passport(&ctx, "windows-host", "work").await;
         let result = handle_store_fact(&json!({"entity": "proj", "key": "k", "value": "v"}), &ctx)
             .await
             .unwrap();
@@ -748,10 +861,17 @@ mod tests {
         // Shared base context (single fact store, Arc-shared by every
         // derived context below). `base` stays valid for the shared read.
         let base = test_ctx();
+        // M5: mint the two work passports so their flag-ON writes pass
+        // enforcement. Both write `work`-category entities (the default).
+        seed_passport(&base, "claude-work", "work").await;
+        seed_passport(&base, "codex-work", "work").await;
 
         // claude-work writes a decision (flag ON, anthropic → claude-work).
         let claude = base
-            .with_agent(AgentIdentity { name: "anthropic".to_string(), token_hash: [0u8; 32] })
+            .with_agent(AgentIdentity {
+                name: "anthropic".to_string(),
+                token_hash: [0u8; 32],
+            })
             .with_agent_passports(true, map.clone());
         handle_store_fact(
             &json!({"entity": "execplan:x", "key": "decision:topic", "value": "needle-claude"}),
@@ -763,7 +883,10 @@ mod tests {
         // codex-work writes a bench fact (flag ON, openai → codex-work), same
         // shared (non-private) pool / same underlying fact store.
         let codex = base
-            .with_agent(AgentIdentity { name: "openai".to_string(), token_hash: [2u8; 32] })
+            .with_agent(AgentIdentity {
+                name: "openai".to_string(),
+                token_hash: [2u8; 32],
+            })
             .with_agent_passports(true, map.clone());
         handle_store_fact(
             &json!({"entity": "bench:y", "key": "metric", "value": "needle-codex"}),
@@ -773,7 +896,10 @@ mod tests {
         .unwrap();
 
         // Legacy / flag-OFF write — actor must be null on read.
-        let legacy = base.with_agent(AgentIdentity { name: "legacy".to_string(), token_hash: [9u8; 32] });
+        let legacy = base.with_agent(AgentIdentity {
+            name: "legacy".to_string(),
+            token_hash: [9u8; 32],
+        });
         assert!(!legacy.agent_passports_enabled, "legacy write must be flag-OFF");
         handle_store_fact(
             &json!({"entity": "legacy:z", "key": "k", "value": "needle-legacy"}),
@@ -791,8 +917,7 @@ mod tests {
         let actor_for = |value: &str| -> Value {
             rows.iter()
                 .find(|r| r["value"].as_str() == Some(value))
-                .unwrap_or_else(|| panic!("row for {value} missing — shared visibility regressed"))
-                ["actor"]
+                .unwrap_or_else(|| panic!("row for {value} missing — shared visibility regressed"))["actor"]
                 .clone()
         };
 
@@ -808,18 +933,26 @@ mod tests {
     #[tokio::test]
     async fn fact_history_text_includes_actor() {
         let map = crate::agent_passport::AgentPassportMap::builtin_default();
-        let claude = test_ctx()
-            .with_agent_passports(true, map)
-            .with_agent(AgentIdentity { name: "anthropic".to_string(), token_hash: [0u8; 32] });
-        handle_store_fact(&json!({"entity": "execplan:h", "key": "decision:x", "value": "v1"}), &claude)
-            .await
-            .unwrap();
+        let claude = test_ctx().with_agent_passports(true, map).with_agent(AgentIdentity {
+            name: "anthropic".to_string(),
+            token_hash: [0u8; 32],
+        });
+        seed_passport(&claude, "claude-work", "work").await;
+        handle_store_fact(
+            &json!({"entity": "execplan:h", "key": "decision:x", "value": "v1"}),
+            &claude,
+        )
+        .await
+        .unwrap();
 
         let res = handle_fact_history(&json!({"entity": "execplan:h", "key": "decision:x"}), &claude)
             .await
             .unwrap();
         let text = res["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("actor=claude-work"), "history line should attribute the writer: {text}");
+        assert!(
+            text.contains("actor=claude-work"),
+            "history line should attribute the writer: {text}"
+        );
 
         // Legacy / flag-off fact shows actor=-.
         let legacy = test_ctx();

@@ -81,14 +81,23 @@ fn entity_is_reserved(entity: &str) -> bool {
     RESERVED_ENTITY_PREFIXES.iter().any(|p| entity.starts_with(p))
 }
 
-fn fact_visible_in_memory_panel(fact: &Fact, agent_name: Option<&str>) -> bool {
+/// Identity-scoped memory-panel visibility (agent-passport M5).
+/// `identity`/`aliases` come from [`McpContext::scope_identity`] /
+/// [`McpContext::scope_aliases`]. Flag-OFF (identity == raw agent name, empty
+/// aliases) it reduces byte-for-byte to the pre-M5 agent-scoped check
+/// (`scope::fact_visible_to_agent` + `scope::visible_entity_for_agent` against
+/// the raw name); flag-ON it additionally lets the passport-keyed owner see its
+/// own private fact. This is the ONLY memory-panel visibility helper — the
+/// agent-scoped variant was retired in M5 once every panel handler converted.
+fn fact_visible_in_memory_panel_id(fact: &Fact, identity: Option<&str>, aliases: &[&str]) -> bool {
     if fact.deleted {
         return false;
     }
-    if !scope::fact_visible_to_agent(fact, agent_name) {
+    if !scope::fact_visible_to_identity(fact, identity, aliases) {
         return false;
     }
-    let visible_entity = scope::visible_entity_for_agent(fact, agent_name).unwrap_or_else(|| fact.entity.clone());
+    let visible_entity =
+        scope::visible_entity_for_identity(fact, identity, aliases).unwrap_or_else(|| fact.entity.clone());
     !entity_is_reserved(&visible_entity)
 }
 
@@ -119,9 +128,13 @@ fn feature_disabled_response(tool: &str) -> Value {
     })
 }
 
-/// Render a fact as a `MemoryFact` JSON object (the agent-ux-01 wire shape).
-fn fact_to_memory_json(fact: &Fact, agent_name: Option<&str>, pinned: bool) -> Value {
-    let entity = scope::visible_entity_for_agent(fact, agent_name).unwrap_or_else(|| fact.entity.clone());
+/// Render a fact as a `MemoryFact` JSON object (the agent-ux-01 wire shape),
+/// identity-scoped (agent-passport M5). Flag-OFF (`identity` == raw agent name,
+/// empty `aliases`) the entity unwrap is byte-for-byte the pre-M5
+/// `scope::visible_entity_for_agent(fact, agent_name)` path; flag-ON the
+/// passport-keyed owner sees its own private entity unwrapped.
+fn fact_to_memory_json_id(fact: &Fact, identity: Option<&str>, aliases: &[&str], pinned: bool) -> Value {
+    let entity = scope::visible_entity_for_identity(fact, identity, aliases).unwrap_or_else(|| fact.entity.clone());
     json!({
         "id": fact.fact_id,
         "entity": entity,
@@ -132,8 +145,6 @@ fn fact_to_memory_json(fact: &Fact, agent_name: Option<&str>, pinned: bool) -> V
         "confidence": fact.confidence,
         "pinned": pinned,
         "source_receipt": fact.source_receipt,
-        // M3: attribution surfaced on read. Null for legacy/flag-off writes;
-        // the stored actor (never inferred or backfilled).
         "actor": fact.actor,
     })
 }
@@ -157,7 +168,15 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
     // tool description spells out the recommendation.
     let budget = token_budget.unwrap_or(2000);
 
+    // agent-passport M5: identity-scoped visibility. `agent_name` is still used
+    // for the pin-state prefix (`__memory_pin::<agent>::…`), which is keyed by
+    // raw agent name and out of scope for M5 — leaving it unchanged can only
+    // ever narrow, never widen, the caller's own pin set.
     let agent_name = scope::agent_name(ctx.agent.as_ref());
+    let identity = ctx.scope_identity();
+    let id_ref = identity.as_deref();
+    let aliases = ctx.scope_aliases();
+    let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
     let q = FactQuery {
         query: None,
@@ -170,9 +189,9 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
     let store = ctx.fact_store.read().await;
     let mut visible: Vec<Fact> = store
         .all_facts()
-        .filter(|fact| fact_visible_in_memory_panel(fact, agent_name))
+        .filter(|fact| fact_visible_in_memory_panel_id(fact, id_ref, &alias_refs))
         .filter(|fact| match &q.entity {
-            Some(want) => scope::visible_entity_for_agent(fact, agent_name)
+            Some(want) => scope::visible_entity_for_identity(fact, id_ref, &alias_refs)
                 .as_deref()
                 .is_some_and(|e| e == want),
             None => true,
@@ -244,7 +263,7 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
 
     let facts_json: Vec<Value> = selected
         .iter()
-        .map(|f| fact_to_memory_json(f, agent_name, pinned_ids.contains(&f.fact_id)))
+        .map(|f| fact_to_memory_json_id(f, id_ref, &alias_refs, pinned_ids.contains(&f.fact_id)))
         .collect();
 
     let text = if selected.is_empty() {
@@ -253,7 +272,8 @@ pub async fn handle_memory_view(args: &Value, ctx: &McpContext) -> Result<Value,
         selected
             .iter()
             .map(|f| {
-                let entity = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
+                let entity =
+                    scope::visible_entity_for_identity(f, id_ref, &alias_refs).unwrap_or_else(|| f.entity.clone());
                 let pinned = if pinned_ids.contains(&f.fact_id) {
                     " [pinned]"
                 } else {
@@ -304,6 +324,16 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
         });
     }
 
+    // agent-passport M5: identity-scoped visibility so the OWNER can edit its
+    // own passport-keyed private fact, and a DIFFERENT passport cannot. The raw
+    // `agent_name` is still surfaced on the edited-fact JSON below (it names the
+    // caller, not the fact owner). Flag-OFF identity == raw name + empty
+    // aliases, so this is byte-for-byte the prior agent-scoped check.
+    let identity = ctx.scope_identity();
+    let id_ref = identity.as_deref();
+    let aliases = ctx.scope_aliases();
+    let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
+
     let mut store = ctx.fact_store.write().await;
     let existing = store.get(fact_id).cloned().ok_or_else(|| JsonRpcError {
         code: INVALID_PARAMS,
@@ -311,7 +341,7 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
         data: Some(json!({"fact_id": fact_id})),
     })?;
 
-    if !fact_visible_in_memory_panel(&existing, agent_name) {
+    if !fact_visible_in_memory_panel_id(&existing, id_ref, &alias_refs) {
         // Either reserved-prefix or not visible to this agent — refuse.
         return Err(JsonRpcError {
             code: INVALID_PARAMS,
@@ -349,7 +379,7 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
         }],
         "structuredContent": {
             "old_fact_id": fact_id,
-            "new_fact": fact_to_memory_json(&new_fact, agent_name, false),
+            "new_fact": fact_to_memory_json_id(&new_fact, id_ref, &alias_refs, false),
             "reason": reason,
         }
     }))
@@ -373,6 +403,16 @@ pub async fn handle_memory_pin(args: &Value, ctx: &McpContext) -> Result<Value, 
         data: Some(json!({"requires_agent_identity": true})),
     })?;
 
+    // agent-passport M5: identity-scoped visibility so the OWNER can pin its
+    // own passport-keyed private fact, and a DIFFERENT passport cannot. The pin
+    // state is still stored under `__memory_pin::<agent_name>::…` (keyed by the
+    // raw caller name — out of M5 scope, same as memory_view). Flag-OFF identity
+    // == raw name + empty aliases, so the check is byte-for-byte unchanged.
+    let identity = ctx.scope_identity();
+    let id_ref = identity.as_deref();
+    let aliases = ctx.scope_aliases();
+    let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
+
     let mut store = ctx.fact_store.write().await;
     let target = store.get(fact_id).cloned().ok_or_else(|| JsonRpcError {
         code: INVALID_PARAMS,
@@ -380,7 +420,7 @@ pub async fn handle_memory_pin(args: &Value, ctx: &McpContext) -> Result<Value, 
         data: Some(json!({"fact_id": fact_id})),
     })?;
 
-    if !fact_visible_in_memory_panel(&target, Some(agent_name)) {
+    if !fact_visible_in_memory_panel_id(&target, id_ref, &alias_refs) {
         return Err(JsonRpcError {
             code: INVALID_PARAMS,
             message: "fact is not pinnable through the memory panel".to_string(),
@@ -551,6 +591,29 @@ mod tests {
         McpContext::new_default("test-node")
     }
 
+    /// agent-passport M5: mint a passport record so a flag-ON write can resolve
+    /// its category (otherwise `LegacyOrMissingPassport` rejects the write).
+    async fn seed_test_passport(ctx: &McpContext, id: &str, category: &str) {
+        let record = json!({
+            "id": id,
+            "principal_id": format!("test::{id}"),
+            "public_key_hex": "deadbeef",
+            "category": category,
+            "issued_at_unix_ms": 1u64,
+        });
+        let mut store = ctx.fact_store.write().await;
+        store.store(StoreFact {
+            entity: format!("__passport__::{id}"),
+            key: "record".to_string(),
+            value: record.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
     fn alice_ctx() -> McpContext {
         test_ctx().with_agent(AgentIdentity {
             name: "alice".to_string(),
@@ -625,17 +688,29 @@ mod tests {
 
         // claude-work writes one fact (flag ON, anthropic → claude-work).
         let claude = base
-            .with_agent(AgentIdentity { name: "anthropic".to_string(), token_hash: [0u8; 32] })
+            .with_agent(AgentIdentity {
+                name: "anthropic".to_string(),
+                token_hash: [0u8; 32],
+            })
             .with_agent_passports(true, map);
+        // M5: mint the claude-work passport (work category) so the flag-ON
+        // write to the work-category entity `person:bob` passes enforcement.
+        seed_test_passport(&base, "claude-work", "work").await;
         handle_store_fact(&json!({"entity": "person:bob", "key": "city", "value": "NYC"}), &claude)
             .await
             .unwrap();
 
         // Legacy / flag-off write (same shared pool) → actor null.
-        let legacy = base.with_agent(AgentIdentity { name: "legacy".to_string(), token_hash: [9u8; 32] });
-        handle_store_fact(&json!({"entity": "person:bob", "key": "job", "value": "engineer"}), &legacy)
-            .await
-            .unwrap();
+        let legacy = base.with_agent(AgentIdentity {
+            name: "legacy".to_string(),
+            token_hash: [9u8; 32],
+        });
+        handle_store_fact(
+            &json!({"entity": "person:bob", "key": "job", "value": "engineer"}),
+            &legacy,
+        )
+        .await
+        .unwrap();
 
         let res = handle_memory_view(&json!({"token_budget": 500, "top_k": 10}), &base)
             .await
@@ -644,8 +719,7 @@ mod tests {
         let actor_for = |value: &str| -> serde_json::Value {
             arr.iter()
                 .find(|f| f["value"].as_str() == Some(value))
-                .unwrap_or_else(|| panic!("memory_view row for {value} missing"))
-                ["actor"]
+                .unwrap_or_else(|| panic!("memory_view row for {value} missing"))["actor"]
                 .clone()
         };
         assert_eq!(actor_for("NYC"), json!("claude-work"));

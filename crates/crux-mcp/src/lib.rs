@@ -38,6 +38,16 @@ pub mod tenant_category;
 pub mod tools;
 pub mod traces;
 
+/// agent-passport M5 T.1 regression suite — the merge bar for the
+/// cross-tenant-leak surface. Exhaustively probes write-enforcement,
+/// private-scope hardening, adversarial cross-tenant reads, migration
+/// back-compat, and the flag-OFF byte-for-byte control across `query_facts`,
+/// `memory_view`, `fact_history`, `delete_fact`, supersede, and the `query`
+/// (BM25 retrieval) path. See the module header for the exact guarantee
+/// matrix.
+#[cfg(test)]
+mod t1_regression;
+
 /// Process-wide test lock for every env-var mutating test in `crux-mcp`.
 ///
 /// Rust's `std::env::{set_var, remove_var, var}` are not thread-safe —
