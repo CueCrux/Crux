@@ -35,6 +35,12 @@ const TENANT_METADATA_PREFIX: &str = "__tenant_metadata__";
 const TENANT_METADATA_CATEGORY_KEY: &str = "category";
 const PASSPORT_PREFIX: &str = "__passport__";
 const PASSPORT_RECORD_KEY: &str = "record";
+/// Key used by MCP-issued passports (`issue_passport` / auto-issue). Unlike the
+/// daemon `record` (which carries an explicit `category`), these carry only a
+/// `tenant_group` (the collaboration boundary, agent-passport M4). We map that
+/// group to the enforceable category so agent-passport writes resolve without a
+/// separate daemon mint. See `passport_category_for`.
+const PASSPORT_MCP_KEY: &str = "passport";
 
 #[derive(Debug, thiserror::Error)]
 pub enum CategoryEnforcementError {
@@ -87,19 +93,46 @@ pub fn extract_tenant_prefix(entity_id: &str) -> &str {
 struct PassportCategorySlice {
     #[serde(default)]
     category: String,
+    /// Present on MCP-issued passports (agent-passport M4); absent on daemon
+    /// `record`s. Used as the category fallback when no explicit `category`.
+    #[serde(default)]
+    tenant_group: Option<String>,
 }
 
+/// Resolve a passport's enforceable category.
+///
+/// Precedence: the daemon `record`'s explicit `category` wins. If there is no
+/// daemon record (or it carries no category) — the case for MCP-issued
+/// passports like `claude-work`/`codex-work` — fall back to the MCP `passport`
+/// record's `tenant_group`, mapped through [`TenantCategory::parse_user_input`].
+/// A `tenant_group` that isn't a valid category (e.g. a custom group name)
+/// yields `None`, so enforcement still fails closed rather than guessing.
 fn passport_category_for(store: &FactStore, passport_id: &str) -> Option<String> {
     let entity = format!("{PASSPORT_PREFIX}::{passport_id}");
-    let facts: Vec<&corecrux_memory::fact_store::Fact> = store
-        .get_by_entity(&entity)
-        .into_iter()
+    let facts: Vec<&corecrux_memory::fact_store::Fact> = store.get_by_entity(&entity);
+
+    // 1) Daemon record with an explicit category (newest version wins).
+    if let Some(latest) = facts
+        .iter()
         .filter(|f| f.key == PASSPORT_RECORD_KEY)
-        .collect();
-    // Newest first (supersession picks the live version).
-    let latest = facts.into_iter().max_by_key(|f| f.version)?;
-    let slice: PassportCategorySlice = serde_json::from_str(&latest.value).ok()?;
-    Some(slice.category)
+        .max_by_key(|f| f.version)
+    {
+        if let Ok(slice) = serde_json::from_str::<PassportCategorySlice>(&latest.value) {
+            if !slice.category.trim().is_empty() {
+                return Some(slice.category);
+            }
+        }
+    }
+
+    // 2) MCP-issued passport: derive the category from tenant_group.
+    let mcp = facts
+        .iter()
+        .filter(|f| f.key == PASSPORT_MCP_KEY)
+        .max_by_key(|f| f.version)?;
+    let slice: PassportCategorySlice = serde_json::from_str(&mcp.value).ok()?;
+    let group = slice.tenant_group?;
+    let category = TenantCategory::parse_user_input(group.trim()).ok()?;
+    Some(category.as_str().to_string())
 }
 
 /// Check that a writer (identified by an optional passport_id) is permitted to
@@ -166,6 +199,77 @@ mod tests {
             horizon_class: None,
             actor: None,
         });
+    }
+
+    /// Seed an MCP-issued passport (key `passport`) carrying a `tenant_group`
+    /// but NO `category` — the shape `issue_passport`/auto-issue writes.
+    fn seed_mcp_passport(store: &mut FactStore, id: &str, tenant_group: Option<&str>) {
+        let mut record = serde_json::json!({
+            "principal_id": id,
+            "reputation_tier": "basic",
+            "receipt_count": 0u64,
+            "issued_at": "2026-06-05T00:00:00Z",
+            "passport_hash": "deadbeef",
+        });
+        if let Some(g) = tenant_group {
+            record["tenant_group"] = serde_json::json!(g);
+        }
+        store.store(StoreFact {
+            entity: format!("__passport__::{id}"),
+            key: "passport".to_string(),
+            value: record.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    #[test]
+    fn mcp_passport_tenant_group_resolves_category_and_enforces() {
+        // The agent-passport seam: claude-work is issued MCP-side (key=passport,
+        // tenant_group=work, NO daemon record). It must resolve to category=work
+        // so a work-entity write passes and a personal-entity write is blocked.
+        let mut store = FactStore::new();
+        seed_mcp_passport(&mut store, "claude-work", Some("work"));
+        assert!(check_passport_can_write_entity(&store, Some("claude-work"), "work::a").is_ok());
+        let blocked = check_passport_can_write_entity(&store, Some("claude-work"), "personal::a");
+        assert!(matches!(
+            blocked,
+            Err(CategoryEnforcementError::CategoryMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn mcp_passport_unknown_tenant_group_fails_closed() {
+        // A custom group that isn't a real category must NOT be guessed — the
+        // write fails closed (rather than silently allowed).
+        let mut store = FactStore::new();
+        seed_mcp_passport(&mut store, "p-research", Some("research"));
+        let r = check_passport_can_write_entity(&store, Some("p-research"), "work::a");
+        assert!(matches!(r, Err(CategoryEnforcementError::LegacyOrMissingPassport(_))));
+    }
+
+    #[test]
+    fn mcp_passport_missing_tenant_group_fails_closed() {
+        let mut store = FactStore::new();
+        seed_mcp_passport(&mut store, "p-nogroup", None);
+        let r = check_passport_can_write_entity(&store, Some("p-nogroup"), "work::a");
+        assert!(matches!(r, Err(CategoryEnforcementError::LegacyOrMissingPassport(_))));
+    }
+
+    #[test]
+    fn daemon_record_category_takes_precedence_over_mcp_tenant_group() {
+        // If both records exist, the explicit daemon `category` wins.
+        let mut store = FactStore::new();
+        seed_mcp_passport(&mut store, "dual", Some("work"));
+        seed_passport(&mut store, "dual", "personal");
+        assert!(check_passport_can_write_entity(&store, Some("dual"), "personal::a").is_ok());
+        assert!(matches!(
+            check_passport_can_write_entity(&store, Some("dual"), "work::a"),
+            Err(CategoryEnforcementError::CategoryMismatch { .. })
+        ));
     }
 
     fn set_override(store: &mut FactStore, tenant: &str, cat: TenantCategory) {
