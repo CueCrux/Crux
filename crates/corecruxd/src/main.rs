@@ -186,11 +186,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_cli_arg(&args) {
         CliAction::Version => {
-            println!("{}", version_line());
+            // Intentional stdout: this is the CLI --version contract.
+            #[allow(clippy::print_stdout)]
+            {
+                println!("{}", version_line());
+            }
             return Ok(());
         }
         CliAction::Help => {
-            println!("{}", help_text());
+            #[allow(clippy::print_stdout)]
+            {
+                println!("{}", help_text());
+            }
             return Ok(());
         }
         CliAction::Run => {}

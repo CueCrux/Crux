@@ -144,11 +144,7 @@ pub async fn run_sweep_once(store: &Arc<RwLock<FactStore>>, now: DateTime<Utc>, 
 /// toggling it requires a restart — same convention as the other
 /// `CORECRUXD_*` background-task flags.) The task runs hourly until the
 /// shutdown signal is received.
-pub fn spawn_ephemeral_gc(
-    enabled: bool,
-    store: Arc<RwLock<FactStore>>,
-    mut shutdown: broadcast::Receiver<()>,
-) {
+pub fn spawn_ephemeral_gc(enabled: bool, store: Arc<RwLock<FactStore>>, mut shutdown: broadcast::Receiver<()>) {
     if !enabled {
         return;
     }
@@ -227,7 +223,10 @@ mod tests {
         let retain = Duration::days(DEFAULT_RETAIN_DAYS);
         let selected = select_ephemeral_candidates(&facts, now, retain);
         assert!(selected.contains(&"r1".to_string()), "old reverify receipt selected");
-        assert!(selected.contains(&"b_old".to_string()), "superseded old binding selected");
+        assert!(
+            selected.contains(&"b_old".to_string()),
+            "superseded old binding selected"
+        );
         assert!(!selected.contains(&"b_new".to_string()), "newest binding kept");
         assert_eq!(selected.len(), 2);
     }
@@ -274,8 +273,18 @@ mod tests {
         // Backdate everything except the newest binding to 45 days ago via
         // a fresh slice fed to the pure selector — verify selection first.
         let backdated = vec![
-            fact("__reverify_receipts__::f1", &receipt_id, now - Duration::days(45), false),
-            fact("__session_binding__::aaaa", &old_binding_id, now - Duration::days(45), false),
+            fact(
+                "__reverify_receipts__::f1",
+                &receipt_id,
+                now - Duration::days(45),
+                false,
+            ),
+            fact(
+                "__session_binding__::aaaa",
+                &old_binding_id,
+                now - Duration::days(45),
+                false,
+            ),
             fact("__session_binding__::aaaa", &new_binding_id, now, false),
             fact("user::notes", &user_id, now - Duration::days(45), false),
         ];
