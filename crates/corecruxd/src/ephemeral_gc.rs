@@ -182,6 +182,7 @@ mod tests {
             confidence: 1.0,
             private,
             horizon_class: None,
+            actor: None,
         })
     }
 
@@ -205,6 +206,7 @@ mod tests {
             horizon_class: Default::default(),
             reverified_at: None,
             superseded_by: None,
+            actor: None,
         }
     }
 
