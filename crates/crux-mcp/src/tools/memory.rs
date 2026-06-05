@@ -132,6 +132,9 @@ fn fact_to_memory_json(fact: &Fact, agent_name: Option<&str>, pinned: bool) -> V
         "confidence": fact.confidence,
         "pinned": pinned,
         "source_receipt": fact.source_receipt,
+        // M3: attribution surfaced on read. Null for legacy/flag-off writes;
+        // the stored actor (never inferred or backfilled).
+        "actor": fact.actor,
     })
 }
 
@@ -609,6 +612,44 @@ mod tests {
         // entities are present and unwrapped (no internal prefix exposure)
         let entities: Vec<&str> = arr.iter().map(|f| f["entity"].as_str().unwrap()).collect();
         assert!(entities.iter().all(|e| *e == "person:bob"));
+    }
+
+    #[tokio::test]
+    async fn memory_view_rows_carry_actor_and_null_for_legacy() {
+        // agent-passport M3: attribution surfaced on the memory_view read.
+        let _guard = FlagGuard::enabled().await;
+        let map = crate::agent_passport::AgentPassportMap::builtin_default();
+
+        // Shared base context — every derived context Arc-shares this store.
+        let base = test_ctx();
+
+        // claude-work writes one fact (flag ON, anthropic → claude-work).
+        let claude = base
+            .with_agent(AgentIdentity { name: "anthropic".to_string(), token_hash: [0u8; 32] })
+            .with_agent_passports(true, map);
+        handle_store_fact(&json!({"entity": "person:bob", "key": "city", "value": "NYC"}), &claude)
+            .await
+            .unwrap();
+
+        // Legacy / flag-off write (same shared pool) → actor null.
+        let legacy = base.with_agent(AgentIdentity { name: "legacy".to_string(), token_hash: [9u8; 32] });
+        handle_store_fact(&json!({"entity": "person:bob", "key": "job", "value": "engineer"}), &legacy)
+            .await
+            .unwrap();
+
+        let res = handle_memory_view(&json!({"token_budget": 500, "top_k": 10}), &base)
+            .await
+            .unwrap();
+        let arr = res["structuredContent"]["facts"].as_array().unwrap();
+        let actor_for = |value: &str| -> serde_json::Value {
+            arr.iter()
+                .find(|f| f["value"].as_str() == Some(value))
+                .unwrap_or_else(|| panic!("memory_view row for {value} missing"))
+                ["actor"]
+                .clone()
+        };
+        assert_eq!(actor_for("NYC"), json!("claude-work"));
+        assert_eq!(actor_for("engineer"), serde_json::Value::Null);
     }
 
     #[tokio::test]

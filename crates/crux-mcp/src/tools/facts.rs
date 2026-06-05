@@ -299,10 +299,12 @@ pub async fn handle_fact_history(args: &Value, ctx: &McpContext) -> Result<Value
         .map(|f| {
             let status = if f.deleted { " [deleted]" } else { "" };
             let sup = f.supersedes.as_deref().unwrap_or("-");
+            // M3: attribution surfaced on read. "-" for legacy/flag-off writes.
+            let actor = f.actor.as_deref().unwrap_or("-");
             let display_entity = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
             format!(
-                "v{}: [{}] {} = {} (confidence={:.2}, stored_at={}, supersedes={}){}",
-                f.version, display_entity, f.fact_id, f.value, f.confidence, f.stored_at, sup, status
+                "v{}: [{}] {} = {} (confidence={:.2}, stored_at={}, supersedes={}, actor={}){}",
+                f.version, display_entity, f.fact_id, f.value, f.confidence, f.stored_at, sup, actor, status
             )
         })
         .collect::<Vec<_>>()
@@ -386,6 +388,9 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
             // M6: present (non-null) only when this fact has been retired
             // and the caller opted in via include_superseded.
             "superseded_by": f.superseded_by,
+            // M3: attribution surfaced on read. Null for legacy/flag-off
+            // writes; the stored actor (never inferred or backfilled).
+            "actor": f.actor,
         }));
     }
 
@@ -727,6 +732,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored_actor(&ctx, &result).await, None);
+    }
+
+    // ── agent-passport M3: attribution surfaced on read ────────────────
+
+    /// Two distinct actors (claude-work, codex-work) write facts via the
+    /// flag-ON path; a third writes with the flag OFF (legacy actor=None).
+    /// `query_facts` rows must carry the correct `actor` per fact, and the
+    /// legacy fact must show `actor: null`. Shared visibility is intact —
+    /// all three non-private facts are visible from a single shared read.
+    #[tokio::test]
+    async fn query_facts_rows_carry_actor_per_writer_and_null_for_legacy() {
+        let map = crate::agent_passport::AgentPassportMap::builtin_default();
+
+        // Shared base context (single fact store, Arc-shared by every
+        // derived context below). `base` stays valid for the shared read.
+        let base = test_ctx();
+
+        // claude-work writes a decision (flag ON, anthropic → claude-work).
+        let claude = base
+            .with_agent(AgentIdentity { name: "anthropic".to_string(), token_hash: [0u8; 32] })
+            .with_agent_passports(true, map.clone());
+        handle_store_fact(
+            &json!({"entity": "execplan:x", "key": "decision:topic", "value": "needle-claude"}),
+            &claude,
+        )
+        .await
+        .unwrap();
+
+        // codex-work writes a bench fact (flag ON, openai → codex-work), same
+        // shared (non-private) pool / same underlying fact store.
+        let codex = base
+            .with_agent(AgentIdentity { name: "openai".to_string(), token_hash: [2u8; 32] })
+            .with_agent_passports(true, map.clone());
+        handle_store_fact(
+            &json!({"entity": "bench:y", "key": "metric", "value": "needle-codex"}),
+            &codex,
+        )
+        .await
+        .unwrap();
+
+        // Legacy / flag-OFF write — actor must be null on read.
+        let legacy = base.with_agent(AgentIdentity { name: "legacy".to_string(), token_hash: [9u8; 32] });
+        assert!(!legacy.agent_passports_enabled, "legacy write must be flag-OFF");
+        handle_store_fact(
+            &json!({"entity": "legacy:z", "key": "k", "value": "needle-legacy"}),
+            &legacy,
+        )
+        .await
+        .unwrap();
+
+        // Single shared read sees all three (shared visibility intact).
+        let res = handle_query_facts(&json!({"query": "needle", "token_budget": 500}), &base)
+            .await
+            .unwrap();
+        let rows = res["structuredContent"]["rows"].as_array().unwrap();
+
+        let actor_for = |value: &str| -> Value {
+            rows.iter()
+                .find(|r| r["value"].as_str() == Some(value))
+                .unwrap_or_else(|| panic!("row for {value} missing — shared visibility regressed"))
+                ["actor"]
+                .clone()
+        };
+
+        assert_eq!(actor_for("needle-claude"), json!("claude-work"));
+        assert_eq!(actor_for("needle-codex"), json!("codex-work"));
+        // Legacy fact: actor serialized as JSON null.
+        assert_eq!(actor_for("needle-legacy"), Value::Null);
+
+        // Shared visibility re-confirmed: all three present from one read.
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn fact_history_text_includes_actor() {
+        let map = crate::agent_passport::AgentPassportMap::builtin_default();
+        let claude = test_ctx()
+            .with_agent_passports(true, map)
+            .with_agent(AgentIdentity { name: "anthropic".to_string(), token_hash: [0u8; 32] });
+        handle_store_fact(&json!({"entity": "execplan:h", "key": "decision:x", "value": "v1"}), &claude)
+            .await
+            .unwrap();
+
+        let res = handle_fact_history(&json!({"entity": "execplan:h", "key": "decision:x"}), &claude)
+            .await
+            .unwrap();
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("actor=claude-work"), "history line should attribute the writer: {text}");
+
+        // Legacy / flag-off fact shows actor=-.
+        let legacy = test_ctx();
+        handle_store_fact(&json!({"entity": "legacy:h", "key": "k", "value": "v"}), &legacy)
+            .await
+            .unwrap();
+        let res = handle_fact_history(&json!({"entity": "legacy:h", "key": "k"}), &legacy)
+            .await
+            .unwrap();
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("actor=-"), "legacy history line shows no actor: {text}");
     }
 
     #[tokio::test]
