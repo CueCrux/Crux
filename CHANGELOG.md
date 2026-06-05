@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `structuredContent` so MCP clients actually receive it.
   - **`create_work`** documents that `project_id` must be an existing project
     (no implicit `default`).
+  - **Loopback error surfacing.** The MCP→daemon loopback helpers now disable
+    `ureq`'s `http_status_as_error`, read the response body on 4xx/5xx, and
+    surface the daemon's problem+json `detail` (e.g. `daemon returned 404:
+    project not found` / `passport 'x' not found`) instead of a bare
+    `status 404`. All four verbs (get/post/patch/delete) share one agent +
+    status-error path; transport failures are reported distinctly.
 
 ### Changed
 

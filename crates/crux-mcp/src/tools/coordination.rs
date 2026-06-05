@@ -57,13 +57,76 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// Build the loopback HTTP agent. `http_status_as_error(false)` is the crux of
+/// the error-surfacing behaviour: ureq otherwise raises a 4xx/5xx as an opaque
+/// `StatusCode` error and never reads the body, flattening the daemon's
+/// problem+json detail (`"project not found"`, `"passport 'x' not found"`,
+/// validation messages) to a bare `"status NNN"`. With it OFF, error responses
+/// come back as a normal response whose body we read and surface.
+fn loopback_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
+/// Turn a NON-success daemon response into a `JsonRpcError` that carries the
+/// daemon's own error detail so the agent sees WHY the call failed, not just the
+/// code. Prefers the structured `detail`/`error`/`message`/`title` field of a
+/// problem+json / error body, falling back to the raw (truncated) body.
+fn loopback_status_error(status: u16, body: &str) -> JsonRpcError {
+    let detail = serde_json::from_str::<Value>(body).ok().and_then(|v| {
+        ["detail", "error", "message", "title"]
+            .iter()
+            .find_map(|k| v.get(*k).and_then(Value::as_str).map(str::to_string))
+    });
+    let message = match detail {
+        Some(d) => format!("daemon returned {status}: {d}"),
+        None if !body.trim().is_empty() => format!("daemon returned {status}: {}", truncate(body, 512)),
+        None => format!("daemon returned {status}"),
+    };
+    JsonRpcError {
+        code: INTERNAL_ERROR,
+        message,
+        data: Some(json!({ "status": status, "body": truncate(body, 1024) })),
+    }
+}
+
+/// Unwrap the `spawn_blocking` join + transport-level result into `(status,
+/// body)`. With `http_status_as_error(false)` the inner `Err` is ONLY a
+/// transport failure (connection refused, timeout) — never an HTTP status — so
+/// it maps to a clear transport error distinct from a daemon status error.
+fn loopback_transport_result(
+    joined: Result<Result<(u16, String), String>, tokio::task::JoinError>,
+) -> Result<(u16, String), JsonRpcError> {
+    joined
+        .map_err(|e| JsonRpcError {
+            code: INTERNAL_ERROR,
+            message: format!("loopback join error: {e}"),
+            data: None,
+        })?
+        .map_err(|transport| JsonRpcError {
+            code: INTERNAL_ERROR,
+            message: format!("loopback transport error: {transport}"),
+            data: None,
+        })
+}
+
+/// `true` when a status code is a success for the given verb contract. POST
+/// honours `expect_201`; all other verbs accept any 2xx (200/202 in practice).
+fn loopback_ok(status: u16, expect_201: bool) -> bool {
+    if expect_201 {
+        status == 201
+    } else {
+        (200..300).contains(&status)
+    }
+}
+
 pub(crate) async fn loopback_get(url: String) -> Result<(u16, String), JsonRpcError> {
     let bearer = loopback_bearer_token();
-    tokio::task::spawn_blocking(move || {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(10)))
-            .build()
-            .into();
+    let joined = tokio::task::spawn_blocking(move || {
+        let agent = loopback_agent();
         let mut req = agent
             .get(&url)
             .header("X-Corecrux-Scopes", SCOPES)
@@ -73,22 +136,15 @@ pub(crate) async fn loopback_get(url: String) -> Result<(u16, String), JsonRpcEr
         }
         req.call()
             .map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()))
-            .map_err(|e| match e {
-                ureq::Error::StatusCode(code) => (code, format!("status {code}")),
-                other => (0, other.to_string()),
-            })
+            .map_err(|e| e.to_string())
     })
-    .await
-    .map_err(|e| JsonRpcError {
-        code: INTERNAL_ERROR,
-        message: format!("loopback join error: {e}"),
-        data: None,
-    })?
-    .map_err(|(code, message)| JsonRpcError {
-        code: INTERNAL_ERROR,
-        message: format!("loopback request failed ({code}): {message}"),
-        data: None,
-    })
+    .await;
+    let (status, body) = loopback_transport_result(joined)?;
+    if loopback_ok(status, false) {
+        Ok((status, body))
+    } else {
+        Err(loopback_status_error(status, &body))
+    }
 }
 
 pub(crate) async fn loopback_post(
@@ -98,11 +154,8 @@ pub(crate) async fn loopback_post(
     passport: Option<String>,
 ) -> Result<(u16, String), JsonRpcError> {
     let bearer = loopback_bearer_token();
-    tokio::task::spawn_blocking(move || {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(10)))
-            .build()
-            .into();
+    let joined = tokio::task::spawn_blocking(move || {
+        let agent = loopback_agent();
         let mut req = agent
             .post(&url)
             .header("X-Corecrux-Scopes", SCOPES)
@@ -120,35 +173,15 @@ pub(crate) async fn loopback_post(
         }
         req.send(body.to_string())
             .map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()))
-            .map_err(|e| match e {
-                ureq::Error::StatusCode(code) => (code, format!("status {code}")),
-                other => (0, other.to_string()),
-            })
+            .map_err(|e| e.to_string())
     })
-    .await
-    .map_err(|e| JsonRpcError {
-        code: INTERNAL_ERROR,
-        message: format!("loopback join error: {e}"),
-        data: None,
-    })
-    .and_then(|res| {
-        res.map_err(|(code, message)| JsonRpcError {
-            code: INTERNAL_ERROR,
-            message: format!("loopback request failed ({code}): {message}"),
-            data: None,
-        })
-    })
-    .and_then(|(status, body)| {
-        if (expect_201 && status != 201) || (!expect_201 && status != 200 && status != 202) {
-            Err(JsonRpcError {
-                code: INTERNAL_ERROR,
-                message: format!("daemon returned {status}: {}", truncate(&body, 512)),
-                data: None,
-            })
-        } else {
-            Ok((status, body))
-        }
-    })
+    .await;
+    let (status, resp_body) = loopback_transport_result(joined)?;
+    if loopback_ok(status, expect_201) {
+        Ok((status, resp_body))
+    } else {
+        Err(loopback_status_error(status, &resp_body))
+    }
 }
 
 pub(crate) async fn loopback_patch(
@@ -157,11 +190,8 @@ pub(crate) async fn loopback_patch(
     passport: Option<String>,
 ) -> Result<(u16, String), JsonRpcError> {
     let bearer = loopback_bearer_token();
-    tokio::task::spawn_blocking(move || {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(10)))
-            .build()
-            .into();
+    let joined = tokio::task::spawn_blocking(move || {
+        let agent = loopback_agent();
         // PATCH was the ONE loopback helper missing the bearer token — every
         // other verb (get/post/delete) attaches it. Under JWT auth modes that
         // omission produced a 401 on update_work_state (the only PATCH caller).
@@ -179,31 +209,21 @@ pub(crate) async fn loopback_patch(
         request
             .send(body.to_string())
             .map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()))
-            .map_err(|e| match e {
-                ureq::Error::StatusCode(code) => (code, format!("status {code}")),
-                other => (0, other.to_string()),
-            })
+            .map_err(|e| e.to_string())
     })
-    .await
-    .map_err(|e| JsonRpcError {
-        code: INTERNAL_ERROR,
-        message: format!("loopback join error: {e}"),
-        data: None,
-    })?
-    .map_err(|(code, message)| JsonRpcError {
-        code: INTERNAL_ERROR,
-        message: format!("loopback request failed ({code}): {message}"),
-        data: None,
-    })
+    .await;
+    let (status, resp_body) = loopback_transport_result(joined)?;
+    if loopback_ok(status, false) {
+        Ok((status, resp_body))
+    } else {
+        Err(loopback_status_error(status, &resp_body))
+    }
 }
 
 pub(crate) async fn loopback_delete(url: String, passport: Option<String>) -> Result<(u16, String), JsonRpcError> {
-    tokio::task::spawn_blocking(move || {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(10)))
-            .build()
-            .into();
-        let bearer = loopback_bearer_token();
+    let bearer = loopback_bearer_token();
+    let joined = tokio::task::spawn_blocking(move || {
+        let agent = loopback_agent();
         let mut request = agent
             .delete(&url)
             .header("X-Corecrux-Scopes", SCOPES)
@@ -217,22 +237,15 @@ pub(crate) async fn loopback_delete(url: String, passport: Option<String>) -> Re
         request
             .call()
             .map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()))
-            .map_err(|e| match e {
-                ureq::Error::StatusCode(code) => (code, format!("status {code}")),
-                other => (0, other.to_string()),
-            })
+            .map_err(|e| e.to_string())
     })
-    .await
-    .map_err(|e| JsonRpcError {
-        code: INTERNAL_ERROR,
-        message: format!("loopback join error: {e}"),
-        data: None,
-    })?
-    .map_err(|(code, message)| JsonRpcError {
-        code: INTERNAL_ERROR,
-        message: format!("loopback request failed ({code}): {message}"),
-        data: None,
-    })
+    .await;
+    let (status, body) = loopback_transport_result(joined)?;
+    if loopback_ok(status, false) {
+        Ok((status, body))
+    } else {
+        Err(loopback_status_error(status, &body))
+    }
 }
 
 pub(crate) fn text_content(value: Value) -> Value {
@@ -697,6 +710,60 @@ mod tests {
 
         let updated = text_json(res.expect("patch with bearer should succeed (not 401)"));
         assert_eq!(updated["applied"], true);
+    }
+
+    /// Loopback stub that returns a 404 problem+json body on POST /v1/work,
+    /// mirroring the daemon's real "project not found" response.
+    fn serve_problem_json() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind problem loopback");
+        listener.set_nonblocking(true).expect("nonblocking loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"type":"about:blank","title":"Not Found","status":404,"detail":"project not found"}"#;
+                let response = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/problem+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (base, stop, handle)
+    }
+
+    #[tokio::test]
+    async fn loopback_error_surfaces_daemon_problem_detail() {
+        // Probe finding 11 (deep fix): a daemon 4xx must surface its problem+json
+        // `detail`, not a bare "status 404". Disabling ureq's http_status_as_error
+        // is what lets the body through.
+        let (base, stop, handle) = serve_problem_json();
+        let ctx = McpContext::new_default("node-a").with_daemon_base_url(base.clone());
+        let err = handle_create_work(
+            &json!({"project_id": "ghost", "title": "t", "created_by_passport": "p1"}),
+            &ctx,
+        )
+        .await
+        .expect_err("unknown project must error");
+        stop_loopback(&base, stop, handle);
+        assert!(
+            err.message.contains("project not found"),
+            "error must carry the daemon detail, got: {}",
+            err.message
+        );
+        assert_eq!(
+            err.data.as_ref().and_then(|d| d.get("status")).and_then(|s| s.as_u64()),
+            Some(404)
+        );
     }
 
     #[tokio::test]
