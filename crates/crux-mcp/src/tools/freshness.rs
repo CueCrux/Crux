@@ -34,8 +34,10 @@ use crate::scope;
 
 /// Environment flag that gates freshness write/read surfaces.
 ///
-/// When unset/`0`/`false`, all three MCP handlers return a "feature
-/// disabled" error so freshness can ship behind a kill switch.
+/// Enabled by default (opt-out). Only an explicit
+/// `""`/`0`/`false`/`off`/`no` value makes all three MCP handlers return
+/// a "feature disabled" error, so freshness can still ship behind a kill
+/// switch via `CORECRUXD_FEATURE_FRESHNESS=0`.
 pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_FRESHNESS";
 
 /// Receipt class string used on the `Reverify` CROWN receipts emitted
@@ -44,20 +46,25 @@ pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_FRESHNESS";
 pub const REVERIFY_RECEIPT_CLASS: &str = "Reverify";
 
 /// Returns true if the freshness feature flag is enabled.
+///
+/// Default-on (opt-out): an UNSET env var means enabled. Only an explicit
+/// `""`/`0`/`false`/`off`/`no` (case-insensitive) disables the surface.
 pub fn freshness_enabled() -> bool {
     match std::env::var(FEATURE_FLAG_ENV) {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !matches!(v.as_str(), "" | "0" | "false" | "off" | "no")
         }
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
 fn feature_disabled_error() -> JsonRpcError {
     JsonRpcError {
         code: crate::dispatch::CAPABILITY_DENIED,
-        message: format!("freshness feature disabled (set {FEATURE_FLAG_ENV}=1 to enable)"),
+        message: format!(
+            "freshness feature explicitly disabled (unset {FEATURE_FLAG_ENV} to re-enable; it is on by default)"
+        ),
         data: Some(json!({"flag": FEATURE_FLAG_ENV})),
     }
 }
@@ -145,6 +152,101 @@ pub async fn handle_memory_freshness(args: &Value, ctx: &McpContext) -> Result<V
                 "medium_stale_days": policy.medium_stale_days,
                 "stable_stale_days": policy.stable_stale_days,
             },
+            "now": now.to_rfc3339(),
+        }
+    }))
+}
+
+/// `memory_sweep_candidates` — lightweight, NON-mutating janitor view
+/// (M6). Returns facts that are EITHER `freshness=stale` (per the M4/M5
+/// decay path) OR explicitly cross-entity superseded
+/// (`superseded_by.is_some()`), so an operator can decide what to
+/// archive / reverify / forget. Read-only — mirrors
+/// `memory_forget_dry_run` (no writes, passport-optional). Reserved
+/// prefixes are filtered. Honours `token_budget` (default 500, QC.2).
+pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    if !freshness_enabled() {
+        return Err(feature_disabled_error());
+    }
+
+    let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(50).min(500) as usize;
+    let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).unwrap_or(500) as usize;
+    let agent_name = scope::agent_name(ctx.agent.as_ref());
+    let policy = decay::DecayPolicy::from_env();
+    let now = Utc::now();
+
+    let store = ctx.fact_store.read().await;
+
+    // Candidate set: visible, non-deleted, non-reserved facts that are
+    // stale OR superseded. Note we deliberately DON'T pre-filter
+    // superseded facts (this surface is precisely about surfacing them).
+    let mut candidates: Vec<(&corecrux_memory::Fact, decay::Freshness, &'static str)> = store
+        .all_facts()
+        .filter(|f| !f.deleted)
+        .filter(|f| scope::fact_visible_to_agent(f, agent_name))
+        .filter(|f| !is_reserved_entity(&f.entity))
+        .filter_map(|f| {
+            let fresh = decay::apply_at_chrono(
+                projection_class_of(f.horizon_class),
+                f.stored_at,
+                f.reverified_at,
+                now,
+                policy,
+            );
+            let is_stale = fresh == decay::Freshness::Stale;
+            let is_superseded = f.superseded_by.is_some();
+            let reason = match (is_stale, is_superseded) {
+                (true, true) => "stale+superseded",
+                (true, false) => "stale",
+                (false, true) => "superseded",
+                (false, false) => return None,
+            };
+            Some((f, fresh, reason))
+        })
+        .collect();
+
+    // Stalest first, then superseded — sort by age descending so the most
+    // overdue archive candidates lead.
+    candidates.sort_by(|a, b| a.0.stored_at.cmp(&b.0.stored_at));
+
+    let mut rows: Vec<Value> = Vec::new();
+    let mut used_tokens: usize = 0;
+    for (f, fresh, reason) in candidates.iter().take(top_k) {
+        let anchor = f.reverified_at.unwrap_or(f.stored_at);
+        let age_hours = (now - anchor).num_hours().max(0);
+        let topic = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
+        let row = json!({
+            "fact_id": f.fact_id,
+            "entity": topic,
+            "key": f.key,
+            "reason": reason,
+            "freshness": fresh.as_str(),
+            "horizon_class": f.horizon_class.as_str(),
+            "age_hours": age_hours,
+            "superseded_by": f.superseded_by,
+            "stored_at": f.stored_at.to_rfc3339(),
+        });
+        used_tokens += f.tokens.max(8);
+        if used_tokens > token_budget && !rows.is_empty() {
+            break;
+        }
+        rows.push(row);
+    }
+
+    let text = if rows.is_empty() {
+        "no sweep candidates (nothing stale or superseded)".to_string()
+    } else {
+        format!(
+            "{} sweep candidate(s): stale or cross-entity superseded facts; see structured `rows` — read-only, nothing was mutated",
+            rows.len()
+        )
+    };
+
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": {
+            "rows": rows,
+            "dry_run": true,
             "now": now.to_rfc3339(),
         }
     }))
@@ -353,8 +455,15 @@ mod tests {
     fn enable() {
         std::env::set_var(FEATURE_FLAG_ENV, "1");
     }
+    /// Reset to the default (unset) state. Since the flag is default-on,
+    /// unsetting it re-enables the surface; tests that need it OFF must
+    /// call [`disable_explicit`].
     fn disable() {
         std::env::remove_var(FEATURE_FLAG_ENV);
+    }
+    /// Explicitly opt out via `=0` (the kill switch).
+    fn disable_explicit() {
+        std::env::set_var(FEATURE_FLAG_ENV, "0");
     }
 
     fn test_ctx() -> McpContext {
@@ -373,12 +482,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flag_off_returns_capability_denied() {
+    async fn flag_explicit_off_returns_capability_denied() {
         let _g = flag_lock().lock().await;
-        disable();
+        disable_explicit();
         let ctx = test_ctx();
         let err = handle_memory_freshness(&json!({}), &ctx).await.unwrap_err();
         assert_eq!(err.code, crate::dispatch::CAPABILITY_DENIED);
+        disable();
+    }
+
+    #[tokio::test]
+    async fn flag_default_on_contract() {
+        let _g = flag_lock().lock().await;
+        // (a) UNSET -> enabled.
+        disable();
+        assert!(freshness_enabled(), "unset env must default to enabled");
+        // (b) explicit disable values -> disabled.
+        for v in ["0", "false", "off", "no", ""] {
+            std::env::set_var(FEATURE_FLAG_ENV, v);
+            assert!(!freshness_enabled(), "value {v:?} must disable");
+        }
+        // (c) =1 -> enabled.
+        enable();
+        assert!(freshness_enabled(), "=1 must enable");
+        disable();
     }
 
     #[tokio::test]
@@ -537,6 +664,87 @@ mod tests {
         let rows = res["structuredContent"]["rows"].as_array().unwrap();
         let row = rows.iter().find(|r| r["fact_id"] == fact_id.as_str()).unwrap();
         assert_eq!(row["freshness"], "fresh");
+        disable();
+    }
+
+    #[tokio::test]
+    async fn memory_sweep_candidates_lists_stale_and_superseded() {
+        let _g = flag_lock().lock().await;
+        enable();
+        let alice = agent_ctx("alice");
+
+        // Fact A: fresh + not superseded -> NOT a candidate.
+        handle_store_fact(&json!({"entity": "p", "key": "fresh", "value": "ok"}), &alice)
+            .await
+            .unwrap();
+
+        // Fact B: superseded (cross-entity) by a new fact -> candidate.
+        let old = handle_store_fact(&json!({"entity": "p", "key": "old", "value": "stale-baseline"}), &alice)
+            .await
+            .unwrap();
+        let old_id = old["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .to_string();
+        handle_store_fact(
+            &json!({"entity": "p2", "key": "new", "value": "new-baseline", "supersedes": [old_id]}),
+            &alice,
+        )
+        .await
+        .unwrap();
+
+        let res = handle_memory_sweep_candidates(&json!({"top_k": 50, "token_budget": 2000}), &alice)
+            .await
+            .unwrap();
+        assert_eq!(res["structuredContent"]["dry_run"], true);
+        let rows = res["structuredContent"]["rows"].as_array().unwrap();
+        // The superseded old fact is a candidate; the fresh fact is not.
+        let old_row = rows.iter().find(|r| r["fact_id"] == old_id.as_str());
+        assert!(old_row.is_some(), "superseded fact must be a sweep candidate");
+        assert!(old_row.unwrap()["reason"].as_str().unwrap().contains("superseded"));
+        assert!(
+            !rows.iter().any(|r| r["key"] == "fresh"),
+            "a fresh, non-superseded fact must not be a candidate"
+        );
+        disable();
+    }
+
+    #[tokio::test]
+    async fn memory_sweep_candidates_is_read_only() {
+        let _g = flag_lock().lock().await;
+        enable();
+        let alice = agent_ctx("alice");
+        let f = handle_store_fact(&json!({"entity": "p", "key": "k", "value": "v"}), &alice)
+            .await
+            .unwrap();
+        let id = f["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .to_string();
+        handle_memory_sweep_candidates(&json!({"token_budget": 500}), &alice)
+            .await
+            .unwrap();
+        // The fact is unchanged (not deleted, not superseded).
+        let store = alice.fact_store.read().await;
+        let fact = store.get(&id).unwrap();
+        assert!(!fact.deleted);
+        assert!(fact.superseded_by.is_none());
+        disable();
+    }
+
+    #[tokio::test]
+    async fn memory_sweep_candidates_disabled_returns_capability_denied() {
+        let _g = flag_lock().lock().await;
+        disable_explicit();
+        let ctx = test_ctx();
+        let err = handle_memory_sweep_candidates(&json!({}), &ctx).await.unwrap_err();
+        assert_eq!(err.code, crate::dispatch::CAPABILITY_DENIED);
         disable();
     }
 

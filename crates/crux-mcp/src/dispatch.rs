@@ -321,6 +321,12 @@ async fn dispatch_tool_call(
     match outcome {
         Ok(result) => {
             let result = maybe_wrap_with_envelope(name, &args, ctx, result).await;
+            // MCP-spec guard (agent-ux M3 bugfix): every tools/call result
+            // must keep `result.content` at the top level. `wrap_payload`
+            // already emits the spec shape, but normalise defensively here
+            // so any residual legacy `{payload, envelope}` value is lifted
+            // (and never double-wrapped) before it reaches the client.
+            let result = crate::envelope::normalize_result_shape(result);
             JsonRpcResponse::success(id, result)
         }
         Err(e) => JsonRpcResponse::error(id, e.code, e.message),
@@ -643,7 +649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn envelope_on_query_facts_response_has_payload_and_envelope() {
+    async fn envelope_on_query_facts_response_is_spec_shaped_and_carries_envelope() {
         let _guard = envelope_env_lock().lock().await;
         std::env::set_var(crate::envelope::FEATURE_FLAG_ENV, "1");
         let ctx = test_ctx();
@@ -672,22 +678,34 @@ mod tests {
         )
         .await;
         let result = resp.result.unwrap();
-        // Both payload and envelope are present.
-        assert!(result["payload"].is_object());
-        assert!(result["envelope"].is_object());
-        // Payload preserves the original tool response shape.
-        assert!(result["payload"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("shipped"));
-        // Envelope is populated.
-        let env = &result["envelope"];
+        // MCP-spec shape: top-level `content` must be present and non-empty
+        // (the bug placed the receipt at the top level and left no
+        // top-level content, making the tool invisible to clients).
+        assert!(
+            result.get("payload").is_none(),
+            "result must NOT use the non-standard top-level payload wrapper"
+        );
+        assert!(
+            result.get("envelope").is_none(),
+            "envelope must NOT sit at the top level shadowing content"
+        );
+        assert!(
+            result["content"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "result.content must be a non-empty array; got {result:#?}"
+        );
+        assert!(result["content"][0]["text"].as_str().unwrap().contains("shipped"));
+        // The audit envelope is preserved under structuredContent.envelope
+        // (and mirrored under _meta.envelope).
+        let env = &result["structuredContent"]["envelope"];
+        assert!(env.is_object(), "envelope must be folded into structuredContent");
         assert_eq!(env["memories_used"][0]["topic"], "alpha");
         assert_eq!(env["memories_used"][0]["freshness"], "fresh");
         assert_eq!(env["receipts_used"][0], "r_test_001");
         assert_eq!(env["autonomy_consumed"]["capability"], "facts:read");
         assert_eq!(env["autonomy_consumed"]["cost_credits"], 0);
         assert!(env["predicted_effects"].as_array().unwrap().is_empty());
+        // Mirrored under _meta for audit consumers that look there.
+        assert_eq!(result["_meta"]["envelope"]["receipts_used"][0], "r_test_001");
         std::env::remove_var(crate::envelope::FEATURE_FLAG_ENV);
     }
 
@@ -981,7 +999,7 @@ mod tests {
         )
         .await;
         let result = resp.result.unwrap();
-        let env = &result["envelope"];
+        let env = &result["structuredContent"]["envelope"];
         let memories = env["memories_used"].as_array().unwrap();
         assert_eq!(
             memories.len(),
@@ -1060,9 +1078,13 @@ mod tests {
         let result = resp.result.unwrap();
         // The envelope wrapper engages because (a) feature flag on, (b) the
         // tool is in `tool_emits_envelope`, (c) the per-tool builder is
-        // registered. Payload + envelope therefore both exist.
-        assert!(result["payload"].is_object());
-        let env = &result["envelope"];
+        // registered. After M3 normalisation the result is MCP-spec shaped:
+        // content at the top level, envelope folded under structuredContent.
+        assert!(
+            result["content"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "ack result.content must be a non-empty array; got {result:#?}"
+        );
+        let env = &result["structuredContent"]["envelope"];
         let memories = env["memories_used"].as_array().unwrap();
         assert_eq!(
             memories.len(),
@@ -1207,7 +1229,13 @@ mod tests {
         )
         .await;
         let result = resp.result.unwrap();
-        let env = &result["envelope"];
+        // MCP-spec shape after the M3 normalisation: content lives at the
+        // top level, the envelope is folded under structuredContent.envelope.
+        assert!(
+            result["content"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "memory_freshness result.content must be a non-empty array; got {result:#?}"
+        );
+        let env = &result["structuredContent"]["envelope"];
         let memories = env["memories_used"].as_array().unwrap();
         assert_eq!(
             memories.len(),
@@ -1216,9 +1244,9 @@ mod tests {
         );
         assert_eq!(memories[0]["topic"], "project-x");
 
-        // The tool payload (under "payload") must also not leak reserved
-        // entries.
-        let rows = result["payload"]["structuredContent"]["rows"].as_array().unwrap();
+        // The tool payload (now lifted to the top level) must also not leak
+        // reserved entries.
+        let rows = result["structuredContent"]["rows"].as_array().unwrap();
         for r in rows {
             let ent = r["entity"].as_str().unwrap();
             assert!(
@@ -1289,9 +1317,14 @@ mod tests {
         .await;
         let result = resp.result.unwrap();
         // Envelope wrapper engaged because (a) flag on, (b) opted in via
-        // tool_emits_envelope, (c) per-tool builder is registered.
-        assert!(result["payload"].is_object());
-        let env = &result["envelope"];
+        // tool_emits_envelope, (c) per-tool builder is registered. After M3
+        // normalisation the result is MCP-spec shaped: content at the top
+        // level, envelope folded under structuredContent.
+        assert!(
+            result["content"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "artefact_list result.content must be a non-empty array; got {result:#?}"
+        );
+        let env = &result["structuredContent"]["envelope"];
         let memories = env["memories_used"].as_array().unwrap();
         assert_eq!(
             memories.len(),

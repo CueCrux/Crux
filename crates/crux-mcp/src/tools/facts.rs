@@ -9,10 +9,80 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
+use chrono::Utc;
+
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
 use crate::scope;
-use corecrux_memory::fact_store::{Fact, FactQuery, StoreFact};
+use corecrux_memory::fact_store::{Fact, FactQuery, HorizonClass, StoreFact};
+use corecrux_projections::decay;
+
+/// Parse an operator's free-text `freshness_horizon:` line into a
+/// [`HorizonClass`]. Conservative by design: anything unrecognised maps
+/// to [`HorizonClass::None`] (never decays) rather than guessing.
+///
+/// Rules (first match wins, case-insensitive):
+/// - contains "hour" -> volatile
+/// - "stable"/"frozen"/"immutable"/"historical" -> stable
+/// - "architect" -> stable
+/// - "year" -> stable
+/// - "month" -> medium
+/// - "week" -> medium
+/// - "day"/"days" preceded by a number <= 2 -> volatile, else -> medium
+/// - anything else -> none
+///
+/// Note: M2/M3 (`HorizonClass::default_for_entity`) still applies when
+/// neither this nor an explicit `horizon_class` is supplied — this parser
+/// only runs when `freshness_horizon` text is provided and `horizon_class`
+/// is absent.
+pub(crate) fn parse_freshness_horizon(text: &str) -> HorizonClass {
+    let lower = text.to_ascii_lowercase();
+
+    if lower.contains("hour") {
+        return HorizonClass::Volatile;
+    }
+    if lower.contains("stable")
+        || lower.contains("frozen")
+        || lower.contains("immutable")
+        || lower.contains("historical")
+        || lower.contains("architect")
+        || lower.contains("year")
+    {
+        return HorizonClass::Stable;
+    }
+    if lower.contains("month") {
+        return HorizonClass::Medium;
+    }
+    if lower.contains("week") {
+        return HorizonClass::Medium;
+    }
+    if lower.contains("day") {
+        // Find a number adjacent to a "day"/"days" mention; <= 2 days is
+        // volatile, otherwise it reads as a roughly-weekly cadence.
+        if let Some(n) = nearest_day_count(&lower) {
+            return if n <= 2 {
+                HorizonClass::Volatile
+            } else {
+                HorizonClass::Medium
+            };
+        }
+        // "day" without a parseable count -> medium (conservative,
+        // doesn't claim sub-day volatility).
+        return HorizonClass::Medium;
+    }
+    HorizonClass::None
+}
+
+/// Extract the integer that qualifies a "day"/"days" mention, if any.
+/// Returns the first standalone number found in the text (operator lines
+/// like "re-verify before relying after 3 days" put the count before the
+/// unit). `None` when no number is present.
+fn nearest_day_count(lower: &str) -> Option<u64> {
+    lower
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|tok| !tok.is_empty())
+        .find_map(|tok| tok.parse::<u64>().ok())
+}
 
 /// `store_fact` — persist a key-value fact against an entity.
 ///
@@ -30,6 +100,25 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
     let confidence = args.get("confidence").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
     let private = args.get("private").and_then(|v| v.as_bool()).unwrap_or(false);
     let agent_name = scope::agent_name(ctx.agent.as_ref());
+
+    // Freshness horizon (M4): an explicit `horizon_class` always wins; if
+    // absent, parse the operator's free-text `freshness_horizon` line; if
+    // both are absent leave `None` so the entity-prefix default (M2/M3)
+    // applies — strict backwards-compat for callers that send neither.
+    let horizon_class: Option<HorizonClass> = match args.get("horizon_class").and_then(|v| v.as_str()) {
+        Some(s) => Some(HorizonClass::parse(s).ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("invalid horizon_class: {s}"),
+            data: Some(json!({
+                "param": "horizon_class",
+                "allowed": ["volatile", "medium", "stable", "none"],
+            })),
+        })?),
+        None => args
+            .get("freshness_horizon")
+            .and_then(|v| v.as_str())
+            .map(parse_freshness_horizon),
+    };
 
     let entity = match (private, agent_name) {
         (true, Some(agent_name)) => scope::private_entity_for_agent(agent_name, entity_raw),
@@ -50,7 +139,7 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         source_receipt,
         confidence,
         private,
-        horizon_class: None,
+        horizon_class,
     };
 
     let mut store = ctx.fact_store.write().await;
@@ -70,21 +159,102 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         message: "fact journal append failed".to_string(),
         data: Some(json!({"error": err.to_string()})),
     })?;
+
+    // M6 cross-entity supersession: if `supersedes` named existing fact_ids,
+    // EXPLICITLY retire each one (reversible soft-state) now that the new
+    // fact has a stable id. Every referenced fact MUST exist AND be visible
+    // to the caller (T.1 no cross-tenant retirement; T.3 passport-attributed
+    // write). We do NOT silently skip bad refs — we collect them and reject
+    // the whole batch with a clear error so the caller knows what failed.
+    // The new fact itself is already persisted; the supersession marks are
+    // additive soft-state, so a rejection here leaves the store consistent
+    // (target facts unchanged) and the new fact simply doesn't retire
+    // anything.
+    let supersedes_refs: Vec<String> = match args.get("supersedes") {
+        Some(Value::Array(items)) => {
+            let mut refs = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(s) => refs.push(s.to_string()),
+                    None => {
+                        return Err(JsonRpcError {
+                            code: INVALID_PARAMS,
+                            message: "supersedes must be an array of fact_id strings".to_string(),
+                            data: Some(json!({"param": "supersedes"})),
+                        });
+                    }
+                }
+            }
+            refs
+        }
+        Some(Value::Null) | None => Vec::new(),
+        Some(_) => {
+            return Err(JsonRpcError {
+                code: INVALID_PARAMS,
+                message: "supersedes must be an array of fact_id strings".to_string(),
+                data: Some(json!({"param": "supersedes"})),
+            });
+        }
+    };
+
+    let mut superseded_ok: Vec<String> = Vec::new();
+    if !supersedes_refs.is_empty() {
+        // First pass: validate every ref is visible + exists. Reject the
+        // whole batch before mutating so a single bad ref can't leave a
+        // partial retirement.
+        let mut bad: Vec<String> = Vec::new();
+        for r in &supersedes_refs {
+            if r == &fact.fact_id {
+                bad.push(r.clone());
+                continue;
+            }
+            match store.get(r) {
+                Some(target) if scope::fact_visible_to_agent(target, agent_name) => {}
+                _ => bad.push(r.clone()),
+            }
+        }
+        if !bad.is_empty() {
+            return Err(JsonRpcError {
+                code: INVALID_PARAMS,
+                message: "one or more supersedes fact_ids do not exist or are not visible to you".to_string(),
+                data: Some(json!({"param": "supersedes", "invalid_refs": bad})),
+            });
+        }
+        // Second pass: all refs validated — apply the retirement.
+        for r in &supersedes_refs {
+            if store.mark_superseded(r, &fact.fact_id) {
+                superseded_ok.push(r.clone());
+            }
+        }
+    }
+
     let display_entity = scope::visible_entity_for_agent(&fact, agent_name).unwrap_or_else(|| fact.entity.clone());
 
     let supersedes_msg = match &fact.supersedes {
         Some(prev) => format!(", supersedes={prev}, version={}", fact.version),
         None => format!(", version={}", fact.version),
     };
+    let retired_msg = if superseded_ok.is_empty() {
+        String::new()
+    } else {
+        format!(", retired={}", superseded_ok.join(","))
+    };
 
     Ok(json!({
         "content": [{
             "type": "text",
             "text": format!(
-                "stored fact {} (entity={}, key={}{})",
-                fact.fact_id, display_entity, fact.key, supersedes_msg
+                "stored fact {} (entity={}, key={}{}{})",
+                fact.fact_id, display_entity, fact.key, supersedes_msg, retired_msg
             )
-        }]
+        }],
+        "structuredContent": {
+            "fact_id": fact.fact_id,
+            "entity": display_entity,
+            "key": fact.key,
+            "version": fact.version,
+            "superseded_fact_ids": superseded_ok,
+        }
     }))
 }
 
@@ -136,6 +306,12 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     let entity = args.get("entity").and_then(|v| v.as_str()).map(|s| s.to_string());
     let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).map(|v| v as usize);
+    // M6: superseded (cross-entity retired) facts are hidden from recall by
+    // default; opt back in with `include_superseded: true`.
+    let include_superseded = args
+        .get("include_superseded")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let agent_name = scope::agent_name(ctx.agent.as_ref());
 
     let q = FactQuery {
@@ -147,7 +323,7 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     };
 
     let store = ctx.fact_store.read().await;
-    let visible = query_visible_facts(&store, &q, agent_name);
+    let visible = query_visible_facts_opts(&store, &q, agent_name, include_superseded);
 
     if visible.is_empty() {
         return Ok(json!({
@@ -155,17 +331,52 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
         }));
     }
 
-    let text = visible
-        .into_iter()
-        .map(|f| {
-            let entity = scope::visible_entity_for_agent(&f, agent_name).unwrap_or_else(|| f.entity.clone());
-            format!("[{}] {} = {} (confidence={:.2})", entity, f.key, f.value, f.confidence)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // M4: compute freshness at recall time using the SAME decay logic as
+    // `memory_freshness`. M5: results are now ranked by effective_confidence
+    // (see `query_visible_facts`); here we surface both the STORED
+    // `confidence` (unchanged) and the recall-time `effective_confidence`
+    // so the demotion is visible/explainable to the caller.
+    let policy = decay::DecayPolicy::from_env();
+    let now = Utc::now();
+
+    let mut lines: Vec<String> = Vec::with_capacity(visible.len());
+    let mut rows: Vec<Value> = Vec::with_capacity(visible.len());
+    for f in &visible {
+        let entity = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
+        let class = crate::tools::freshness::projection_class_of(f.horizon_class);
+        let fresh = decay::apply_at_chrono(class, f.stored_at, f.reverified_at, now, policy);
+        let effective_confidence = decay::effective_confidence(f.confidence as f64, fresh);
+        let anchor = f.reverified_at.unwrap_or(f.stored_at);
+        let age_hours = (now - anchor).num_hours().max(0);
+        lines.push(format!(
+            "[{}] {} = {} (confidence={:.2}, effective_confidence={:.2}, freshness={}, age_hours={})",
+            entity,
+            f.key,
+            f.value,
+            f.confidence,
+            effective_confidence,
+            fresh.as_str(),
+            age_hours
+        ));
+        rows.push(json!({
+            "fact_id": f.fact_id,
+            "entity": entity,
+            "key": f.key,
+            "value": f.value,
+            "confidence": f.confidence,
+            "effective_confidence": effective_confidence,
+            "horizon_class": f.horizon_class.as_str(),
+            "freshness": fresh.as_str(),
+            "age_hours": age_hours,
+            // M6: present (non-null) only when this fact has been retired
+            // and the caller opted in via include_superseded.
+            "superseded_by": f.superseded_by,
+        }));
+    }
 
     Ok(json!({
-        "content": [{ "type": "text", "text": text }]
+        "content": [{ "type": "text", "text": lines.join("\n") }],
+        "structuredContent": { "rows": rows }
     }))
 }
 
@@ -239,13 +450,29 @@ pub(crate) fn envelope_query_visible_facts(
     q: &FactQuery,
     agent_name: Option<&str>,
 ) -> Vec<Fact> {
+    // Envelope mirrors query_facts' DEFAULT recall surface: superseded
+    // (cross-entity retired) facts are excluded.
     query_visible_facts(store, q, agent_name)
 }
 
 fn query_visible_facts(store: &corecrux_memory::FactStore, q: &FactQuery, agent_name: Option<&str>) -> Vec<Fact> {
+    query_visible_facts_opts(store, q, agent_name, false)
+}
+
+/// As [`query_visible_facts`] but with an explicit `include_superseded`
+/// toggle (M6). When `false` (the default recall behaviour), facts whose
+/// `superseded_by` marker is set are excluded — they've been explicitly
+/// retired by a newer fact (possibly under a different entity).
+fn query_visible_facts_opts(
+    store: &corecrux_memory::FactStore,
+    q: &FactQuery,
+    agent_name: Option<&str>,
+    include_superseded: bool,
+) -> Vec<Fact> {
     let mut results: Vec<&Fact> = store
         .all_facts()
         .filter(|fact| !fact.deleted)
+        .filter(|fact| include_superseded || fact.superseded_by.is_none())
         .filter(|fact| scope::fact_visible_to_agent(fact, agent_name))
         .filter(|fact| {
             q.entity_prefix
@@ -263,10 +490,23 @@ fn query_visible_facts(store: &corecrux_memory::FactStore, q: &FactQuery, agent_
         })
         .collect();
 
+    // M5: rank by a time-decayed EFFECTIVE confidence rather than the raw
+    // stored confidence, so a stale fact sinks below an equally-confident
+    // fresh one. The STORED confidence is never mutated — this is purely a
+    // sort key, computed at recall time from the same decay logic
+    // (`apply_at_chrono` + `projection_class_of`) used elsewhere. Tie-break
+    // on `stored_at` desc so the most-recent fact wins on equal effective
+    // confidence.
+    let policy = decay::DecayPolicy::from_env();
+    let now = Utc::now();
+    let eff = |fact: &Fact| -> f64 {
+        let class = crate::tools::freshness::projection_class_of(fact.horizon_class);
+        let fresh = decay::apply_at_chrono(class, fact.stored_at, fact.reverified_at, now, policy);
+        decay::effective_confidence(fact.confidence as f64, fresh)
+    };
     results.sort_by(|left, right| {
-        right
-            .confidence
-            .partial_cmp(&left.confidence)
+        eff(right)
+            .partial_cmp(&eff(left))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| right.stored_at.cmp(&left.stored_at))
     });
@@ -645,5 +885,444 @@ mod tests {
         let data = err.data.unwrap();
         assert_eq!(data["param"], "entity");
         assert_eq!(data["required"], true);
+    }
+
+    // ── M4: freshness horizon at write time ─────────────────────────
+
+    #[test]
+    fn parse_freshness_horizon_table() {
+        use HorizonClass::*;
+        let cases: &[(&str, HorizonClass)] = &[
+            // hours -> volatile
+            ("re-verify in 6 hours", Volatile),
+            ("every hour", Volatile),
+            // small-day counts -> volatile
+            ("re-verify before relying after 1 day", Volatile),
+            ("re-verify before relying after 2 days", Volatile),
+            ("re-verify before relying after 3 days", Medium),
+            ("after 7 days", Medium),
+            ("day", Medium), // "day" w/o a number -> medium (conservative)
+            // weeks / months -> medium
+            ("re-check weekly", Medium),
+            ("good for about a week", Medium),
+            ("re-verify each month", Medium),
+            ("monthly", Medium),
+            // years / architectural / stable words -> stable
+            ("architectural count", Stable),
+            ("re-verify after a year", Stable),
+            ("stable historical run", Stable),
+            ("baseline frozen", Stable),
+            ("immutable identity fact", Stable),
+            ("historical run", Stable),
+            // unrecognised -> none (do NOT guess)
+            ("", None),
+            ("some opaque note", None),
+            ("re-verify before relying", None),
+            ("forever", None),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                parse_freshness_horizon(text),
+                *expected,
+                "freshness_horizon parse mismatch for {text:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn store_fact_explicit_horizon_class_persists() {
+        let ctx = test_ctx();
+        let r = handle_store_fact(
+            &json!({"entity": "deploy", "key": "state", "value": "live", "horizon_class": "VOLATILE"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let txt = r["content"][0]["text"].as_str().unwrap();
+        let fact_id = txt.split_whitespace().nth(2).unwrap();
+        let store = ctx.fact_store.read().await;
+        let fact = store.get(fact_id).unwrap();
+        assert_eq!(fact.horizon_class, HorizonClass::Volatile);
+    }
+
+    #[tokio::test]
+    async fn store_fact_invalid_horizon_class_rejected() {
+        let ctx = test_ctx();
+        let err = handle_store_fact(
+            &json!({"entity": "e", "key": "k", "value": "v", "horizon_class": "weekly"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(err.data.unwrap()["param"], "horizon_class");
+    }
+
+    #[tokio::test]
+    async fn store_fact_freshness_horizon_parsed_when_class_absent() {
+        let ctx = test_ctx();
+        let r = handle_store_fact(
+            &json!({
+                "entity": "deploy", "key": "state", "value": "live",
+                "freshness_horizon": "re-verify before relying after 1 day"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let txt = r["content"][0]["text"].as_str().unwrap();
+        let fact_id = txt.split_whitespace().nth(2).unwrap();
+        let store = ctx.fact_store.read().await;
+        assert_eq!(store.get(fact_id).unwrap().horizon_class, HorizonClass::Volatile);
+    }
+
+    #[tokio::test]
+    async fn store_fact_explicit_class_wins_over_freshness_horizon() {
+        let ctx = test_ctx();
+        let r = handle_store_fact(
+            &json!({
+                "entity": "e", "key": "k", "value": "v",
+                "horizon_class": "stable",
+                "freshness_horizon": "re-verify in 6 hours"
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let txt = r["content"][0]["text"].as_str().unwrap();
+        let fact_id = txt.split_whitespace().nth(2).unwrap();
+        let store = ctx.fact_store.read().await;
+        assert_eq!(store.get(fact_id).unwrap().horizon_class, HorizonClass::Stable);
+    }
+
+    #[tokio::test]
+    async fn store_fact_no_horizon_params_unchanged() {
+        // Backward-compat: omitting both params leaves horizon_class at the
+        // entity-prefix default (None for a plain entity).
+        let ctx = test_ctx();
+        let r = handle_store_fact(&json!({"entity": "plain", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        let txt = r["content"][0]["text"].as_str().unwrap();
+        let fact_id = txt.split_whitespace().nth(2).unwrap();
+        let store = ctx.fact_store.read().await;
+        assert_eq!(store.get(fact_id).unwrap().horizon_class, HorizonClass::None);
+    }
+
+    #[tokio::test]
+    async fn query_facts_rows_include_freshness_and_age() {
+        let ctx = test_ctx();
+        handle_store_fact(&json!({"entity": "alpha", "key": "status", "value": "active"}), &ctx)
+            .await
+            .unwrap();
+
+        let result = handle_query_facts(&json!({"query": "active", "entity": "alpha"}), &ctx)
+            .await
+            .unwrap();
+        // Text still carries the legacy fields plus the new annotation.
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("active"));
+        assert!(text.contains("confidence="));
+        assert!(text.contains("freshness="));
+        assert!(text.contains("age_hours="));
+        // Structured rows carry the computed fields.
+        let rows = result["structuredContent"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["freshness"], "fresh"); // horizon=none -> always fresh
+        assert!(row["age_hours"].is_number());
+        assert_eq!(row["key"], "status");
+        assert_eq!(row["value"], "active");
+        assert_eq!(row["horizon_class"], "none");
+    }
+
+    #[test]
+    fn backdated_volatile_fact_classifies_stale() {
+        // Decay is computed via the SAME decay::apply_at_chrono path that
+        // query_facts/memory_freshness use. Construct a volatile fact
+        // stored 48h ago; the default 24h volatile threshold -> stale.
+        use chrono::Duration;
+        let policy = decay::DecayPolicy::default_const();
+        let now = Utc::now();
+        let stored_at = now - Duration::hours(48);
+        let class = crate::tools::freshness::projection_class_of(HorizonClass::Volatile);
+        let fresh = decay::apply_at_chrono(class, stored_at, None, now, policy);
+        assert_eq!(fresh, decay::Freshness::Stale);
+
+        // A fresh (just-stored) volatile fact is still fresh.
+        let fresh_now = decay::apply_at_chrono(class, now, None, now, policy);
+        assert_eq!(fresh_now, decay::Freshness::Fresh);
+    }
+
+    // ── M5: stale facts are demoted in ranking ──────────────────────
+
+    use chrono::{DateTime, Duration};
+    use corecrux_memory::fact_store::Fact;
+
+    /// Build a fact directly (all fields public) and inject it via
+    /// `store_synced` so we can backdate `stored_at` — mirrors the M4
+    /// backdated-construction approach since `stored_at` isn't settable
+    /// through the public store API.
+    fn synth_fact(
+        fact_id: &str,
+        entity: &str,
+        value: &str,
+        confidence: f32,
+        horizon_class: HorizonClass,
+        stored_at: DateTime<Utc>,
+        reverified_at: Option<DateTime<Utc>>,
+    ) -> Fact {
+        Fact {
+            fact_id: fact_id.to_string(),
+            entity: entity.to_string(),
+            key: "state".to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence,
+            stored_at,
+            tokens: 8,
+            deleted: false,
+            version: 1,
+            supersedes: None,
+            private: false,
+            horizon_class,
+            reverified_at,
+            superseded_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn query_facts_demotes_stale_below_equal_confidence_fresh() {
+        let ctx = test_ctx();
+        let now = Utc::now();
+        {
+            let mut store = ctx.fact_store.write().await;
+            // STALE: volatile, stored 48h ago (> 24h threshold), conf 1.0.
+            store.store_synced(synth_fact(
+                "f_stale",
+                "deploy",
+                "old-state",
+                1.0,
+                HorizonClass::Volatile,
+                now - Duration::hours(48),
+                None,
+            ));
+            // FRESH: volatile, stored just now, equal stored confidence 1.0.
+            store.store_synced(synth_fact(
+                "f_fresh",
+                "deploy",
+                "new-state",
+                1.0,
+                HorizonClass::Volatile,
+                now,
+                None,
+            ));
+        }
+
+        let result = handle_query_facts(&json!({"entity": "deploy"}), &ctx).await.unwrap();
+        let rows = result["structuredContent"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        // Fresh fact ranks first despite equal STORED confidence.
+        assert_eq!(rows[0]["fact_id"], "f_fresh");
+        assert_eq!(rows[0]["freshness"], "fresh");
+        assert_eq!(rows[1]["fact_id"], "f_stale");
+        assert_eq!(rows[1]["freshness"], "stale");
+        // STORED confidence is preserved (not mutated); only the
+        // recall-time effective_confidence is demoted on the stale row.
+        assert_eq!(rows[1]["confidence"], 1.0);
+        assert_eq!(rows[1]["effective_confidence"], 0.5);
+        assert_eq!(rows[0]["confidence"], 1.0);
+        assert_eq!(rows[0]["effective_confidence"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn query_facts_reverified_stale_regains_rank() {
+        let ctx = test_ctx();
+        let now = Utc::now();
+        {
+            let mut store = ctx.fact_store.write().await;
+            // Stored 48h ago BUT reverified just now -> decay clock
+            // re-anchored -> treated fresh again, regains its rank.
+            store.store_synced(synth_fact(
+                "f_reverified",
+                "deploy",
+                "re-anchored-state",
+                1.0,
+                HorizonClass::Volatile,
+                now - Duration::hours(48),
+                Some(now),
+            ));
+            // A fresh competitor with LOWER stored confidence: the
+            // reverified fact should now outrank it (full effective conf).
+            store.store_synced(synth_fact(
+                "f_lower",
+                "deploy",
+                "other-state",
+                0.6,
+                HorizonClass::Volatile,
+                now,
+                None,
+            ));
+        }
+
+        let result = handle_query_facts(&json!({"entity": "deploy"}), &ctx).await.unwrap();
+        let rows = result["structuredContent"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        // Reverified fact is fresh again and outranks the lower-confidence
+        // fresh fact.
+        assert_eq!(rows[0]["fact_id"], "f_reverified");
+        assert_eq!(rows[0]["freshness"], "fresh");
+        assert_eq!(rows[0]["effective_confidence"], 1.0);
+        assert_eq!(rows[1]["fact_id"], "f_lower");
+    }
+
+    #[tokio::test]
+    async fn query_facts_text_exposes_effective_confidence() {
+        let ctx = test_ctx();
+        handle_store_fact(&json!({"entity": "alpha", "key": "state", "value": "active"}), &ctx)
+            .await
+            .unwrap();
+        let result = handle_query_facts(&json!({"entity": "alpha"}), &ctx).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("effective_confidence="));
+    }
+
+    // ── M6: cross-entity supersession ───────────────────────────────
+
+    /// Extract a fact_id from a `store_fact` text response.
+    fn fact_id_of(resp: &Value) -> String {
+        resp["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn store_fact_supersedes_marks_and_query_hides_then_shows() {
+        let ctx = test_ctx();
+        // Old baseline under one entity.
+        let old = handle_store_fact(
+            &json!({"entity": "bench:lme-s", "key": "baseline", "value": "86.8 percent"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let old_id = fact_id_of(&old);
+
+        // New baseline under a DIFFERENT entity, retiring the old one.
+        let new = handle_store_fact(
+            &json!({
+                "entity": "bench:lme-s-v2", "key": "baseline", "value": "90.0 percent",
+                "supersedes": [old_id]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let new_id = fact_id_of(&new);
+        // Response surfaces what it retired.
+        assert!(new["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("retired={old_id}")));
+        assert_eq!(new["structuredContent"]["superseded_fact_ids"][0], old_id.as_str());
+
+        // Default query OMITS the superseded old fact.
+        let res = handle_query_facts(&json!({"query": "percent"}), &ctx).await.unwrap();
+        let rows = res["structuredContent"]["rows"].as_array().unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r["fact_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&new_id.as_str()), "new fact should be present");
+        assert!(
+            !ids.contains(&old_id.as_str()),
+            "superseded fact must be hidden by default"
+        );
+
+        // include_superseded=true brings it back WITH superseded_by set.
+        let res = handle_query_facts(&json!({"query": "percent", "include_superseded": true}), &ctx)
+            .await
+            .unwrap();
+        let rows = res["structuredContent"]["rows"].as_array().unwrap();
+        let old_row = rows.iter().find(|r| r["fact_id"] == old_id.as_str()).unwrap();
+        assert_eq!(old_row["superseded_by"], new_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn store_fact_supersedes_nonexistent_ref_errors_and_leaves_targets_unchanged() {
+        let ctx = test_ctx();
+        // A real fact we will NOT touch.
+        let real = handle_store_fact(&json!({"entity": "e", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        let real_id = fact_id_of(&real);
+
+        let err = handle_store_fact(
+            &json!({
+                "entity": "e2", "key": "k", "value": "v2",
+                "supersedes": [real_id, "f_does_not_exist"]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        let invalid = err.data.unwrap()["invalid_refs"].as_array().unwrap().clone();
+        assert!(invalid.iter().any(|v| v == "f_does_not_exist"));
+
+        // The valid ref was NOT marked — whole batch rejected, no partial state.
+        let store = ctx.fact_store.read().await;
+        assert!(store.get(&real_id).unwrap().superseded_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_fact_cannot_supersede_other_agents_private_fact() {
+        // T.1: you can only supersede facts you can see. Alice's private
+        // fact is invisible to Bob, so Bob's supersede ref is rejected.
+        let ctx = test_ctx();
+        let alice = ctx.with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        let bob = ctx.with_agent(AgentIdentity {
+            name: "bob".to_string(),
+            token_hash: [1u8; 32],
+        });
+
+        let secret = handle_store_fact(
+            &json!({"entity": "notes", "key": "s", "value": "hidden", "private": true}),
+            &alice,
+        )
+        .await
+        .unwrap();
+        let secret_id = fact_id_of(&secret);
+
+        let err = handle_store_fact(
+            &json!({"entity": "pub", "key": "k", "value": "v", "supersedes": [secret_id]}),
+            &bob,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        let invalid = err.data.unwrap()["invalid_refs"].as_array().unwrap().clone();
+        assert!(invalid.iter().any(|v| v == secret_id.as_str()));
+
+        // Alice's fact is untouched.
+        let store = ctx.fact_store.read().await;
+        assert!(store.get(&secret_id).unwrap().superseded_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_fact_supersedes_wrong_type_rejected() {
+        let ctx = test_ctx();
+        let err = handle_store_fact(
+            &json!({"entity": "e", "key": "k", "value": "v", "supersedes": "not-an-array"}),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(err.data.unwrap()["param"], "supersedes");
     }
 }
