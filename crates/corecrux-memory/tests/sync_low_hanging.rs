@@ -268,6 +268,7 @@ fn push_tenant_promotion_posts_collection_records() {
         horizon_class: corecrux_memory::HorizonClass::None,
         reverified_at: None,
         superseded_by: None,
+        actor: None,
     };
     let record = corecrux_memory::sync::SyncCollectionRecord {
         collection: "facts".to_string(),
@@ -321,6 +322,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
     store.store(StoreFact {
         entity: "alpha".to_string(),
@@ -330,6 +332,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
     store.store(StoreFact {
         entity: "beta".to_string(),
@@ -339,6 +342,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
     store.store(StoreFact {
         entity: "finance:ledger".to_string(),
@@ -348,6 +352,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
     store.store(StoreFact {
         entity: "flagged".to_string(),
@@ -357,6 +362,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         confidence: 1.0,
         private: true,
         horizon_class: None,
+        actor: None,
     });
 
     store.store_synced(Fact {
@@ -375,6 +381,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         horizon_class: corecrux_memory::HorizonClass::None,
         reverified_at: None,
         superseded_by: None,
+        actor: None,
     });
 
     let deleted = store.store(StoreFact {
@@ -385,6 +392,7 @@ fn push_preview_counts_pushable_private_synced_and_deleted_facts() {
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
     assert!(store.delete(&deleted.fact_id));
 
@@ -410,6 +418,7 @@ fn push_returns_zero_when_no_non_private_local_facts_exist() {
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
 
     store.store_synced(Fact {
@@ -428,6 +437,7 @@ fn push_returns_zero_when_no_non_private_local_facts_exist() {
         horizon_class: corecrux_memory::HorizonClass::None,
         reverified_at: None,
         superseded_by: None,
+        actor: None,
     });
 
     let deleted = store.store(StoreFact {
@@ -438,6 +448,7 @@ fn push_returns_zero_when_no_non_private_local_facts_exist() {
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
     assert!(store.delete(&deleted.fact_id));
 
@@ -571,6 +582,7 @@ fn push_batches_local_facts_and_updates_cursor() {
             confidence: 0.75,
             private: false,
             horizon_class: None,
+            actor: None,
         });
     }
     store.store(StoreFact {
@@ -581,6 +593,7 @@ fn push_batches_local_facts_and_updates_cursor() {
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
     store.store_synced(Fact {
         fact_id: "f_synced_skip".to_string(),
@@ -598,6 +611,7 @@ fn push_batches_local_facts_and_updates_cursor() {
         horizon_class: corecrux_memory::HorizonClass::None,
         reverified_at: None,
         superseded_by: None,
+        actor: None,
     });
 
     let result = client.push(&store).unwrap();

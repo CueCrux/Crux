@@ -334,6 +334,7 @@ mod tests {
             confidence: 1.0,
             private: true,
             horizon_class: None,
+            actor: None,
         });
         store.store(StoreFact {
             entity: format!("__extension_grant__::ext.example.quote::{TEST_PASSPORT}"),
@@ -343,6 +344,7 @@ mod tests {
             confidence: 1.0,
             private: true,
             horizon_class: None,
+            actor: None,
         });
     }
 }

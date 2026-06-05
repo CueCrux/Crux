@@ -294,6 +294,7 @@ fn write_record(store: &mut FactStore, record: &PassportRecord) -> Result<(), Pa
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);

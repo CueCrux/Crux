@@ -1166,6 +1166,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         let proposal = enrich_action(
@@ -1198,6 +1199,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         let proposal = enrich_action(
@@ -1322,6 +1324,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         store.store(StoreFact {
             entity: "business::acme::file::plan".to_string(),
@@ -1331,6 +1334,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         store.store(StoreFact {
             entity: "business::acme::customer::acme".to_string(),
@@ -1340,6 +1344,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         store.store(StoreFact {
             entity: "__constraints__::business::acme::policy".to_string(),
@@ -1349,6 +1354,7 @@ mod tests {
             confidence: 1.0,
             private: true,
             horizon_class: None,
+            actor: None,
         });
         store.store(StoreFact {
             entity: "business::acme::private::session".to_string(),
@@ -1358,6 +1364,7 @@ mod tests {
             confidence: 1.0,
             private: true,
             horizon_class: None,
+            actor: None,
         });
 
         let cases = [

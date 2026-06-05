@@ -200,6 +200,7 @@ pub async fn handle_issue_passport(args: &Value, ctx: &McpContext) -> Result<Val
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     };
 
     let mut store = ctx.fact_store.write().await;
@@ -266,6 +267,7 @@ pub async fn handle_get_passport(_args: &Value, ctx: &McpContext) -> Result<Valu
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 };
                 let mut store = ctx.fact_store.write().await;
                 store.store(req);
@@ -450,6 +452,7 @@ mod tests {
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 });
             }
         }
@@ -509,6 +512,7 @@ mod tests {
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 });
             }
         }

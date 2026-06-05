@@ -312,6 +312,7 @@ pub async fn handle_passport_split(args: &Value, ctx: &McpContext) -> Result<Val
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
     // Record the split lineage on BOTH passports so future reads can
     // resolve the read-through chain.
@@ -329,6 +330,7 @@ pub async fn handle_passport_split(args: &Value, ctx: &McpContext) -> Result<Val
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
     store.store(StoreFact {
         entity: format!("{PASSPORT_PREFIX}{}", source.principal_id),
@@ -342,6 +344,7 @@ pub async fn handle_passport_split(args: &Value, ctx: &McpContext) -> Result<Val
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
 
     Ok(json!({
@@ -547,6 +550,7 @@ pub async fn handle_passport_merge(args: &Value, ctx: &McpContext) -> Result<Val
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
     store.store(StoreFact {
         entity: source_entity,
@@ -562,6 +566,7 @@ pub async fn handle_passport_merge(args: &Value, ctx: &McpContext) -> Result<Val
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
     // Record on the target too.
     store.store(StoreFact {
@@ -578,6 +583,7 @@ pub async fn handle_passport_merge(args: &Value, ctx: &McpContext) -> Result<Val
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
     drop(store);
 
@@ -722,6 +728,7 @@ pub async fn handle_passport_link_device(args: &Value, ctx: &McpContext) -> Resu
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     });
     drop(store);
 
@@ -817,6 +824,7 @@ pub(crate) mod tests {
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 });
             }
         }
@@ -989,6 +997,7 @@ pub(crate) mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
         let err = handle_passport_split(
@@ -1050,6 +1059,7 @@ pub(crate) mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
         let err = handle_passport_merge(
@@ -1093,6 +1103,7 @@ pub(crate) mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             // Create conflict: both passports have an `__agent::<name>::prefs`
             // entity with key=city, different values.
@@ -1104,6 +1115,7 @@ pub(crate) mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             store.store(StoreFact {
                 entity: "__agent::personal::alice::prefs".to_string(),
@@ -1113,6 +1125,7 @@ pub(crate) mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
         let err = handle_passport_merge(
@@ -1156,6 +1169,7 @@ pub(crate) mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             store.store(StoreFact {
                 entity: "__agent::personal::alice-old::prefs".to_string(),
@@ -1165,6 +1179,7 @@ pub(crate) mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             store.store(StoreFact {
                 entity: "__agent::personal::alice::prefs".to_string(),
@@ -1174,6 +1189,7 @@ pub(crate) mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
         let resp = handle_passport_merge(
@@ -1233,6 +1249,7 @@ pub(crate) mod tests {
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 });
             }
         }

@@ -366,6 +366,7 @@ pub async fn handle_memory_reverify(args: &Value, ctx: &McpContext) -> Result<Va
         confidence: 1.0,
         private: false,
         horizon_class: Some(HorizonClass::Stable),
+        actor: None,
     };
     let mut store = ctx.fact_store.write().await;
     let _ = store.try_store(req).map_err(|err| JsonRpcError {
@@ -766,6 +767,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         let id = f.fact_id.clone();
         drop(store);

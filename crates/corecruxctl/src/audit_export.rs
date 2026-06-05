@@ -193,6 +193,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             store.store(StoreFact {
                 entity: "__ops::config-audit".to_string(),
@@ -202,6 +203,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
 
@@ -245,6 +247,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
         let out_td = tempfile::tempdir().unwrap();
@@ -278,6 +281,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
         let out_td = tempfile::tempdir().unwrap();

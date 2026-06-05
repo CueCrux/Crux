@@ -56,6 +56,7 @@ pub(super) async fn post_scan(State(state): State<AppState>, headers: HeaderMap)
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         };
         crate::fact_privacy::enforce_global(&mut sf);
         store.store(sf);

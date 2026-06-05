@@ -212,6 +212,7 @@ pub fn accept_handoff(
             confidence: fact.confidence,
             private,
             horizon_class: None,
+            actor: None,
         });
     }
 
@@ -370,6 +371,7 @@ mod tests {
             confidence: 0.95,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         facts.store(StoreFact {
             entity: "__decisions__::sess_handoff".to_string(),
@@ -379,6 +381,7 @@ mod tests {
             confidence: 0.9,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         let linked = facts.store(StoreFact {
             entity: "deploy".to_string(),
@@ -388,6 +391,7 @@ mod tests {
             confidence: 0.85,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         let mut session = sessions.get("sess_handoff").unwrap().state.clone();
         session["context_refs"] = json!([linked.fact_id.clone()]);
@@ -401,6 +405,7 @@ mod tests {
             confidence: 0.8,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         facts.store(StoreFact {
             entity: scope::private_entity_for_agent("agent-alpha", "notes"),
@@ -410,6 +415,7 @@ mod tests {
             confidence: 1.0,
             private: true,
             horizon_class: None,
+            actor: None,
         });
 
         (sessions, facts)
@@ -630,6 +636,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         let facts = vec![work_fact];
         let ids = collect_work_ids(Some(&state), &facts);

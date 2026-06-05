@@ -63,6 +63,7 @@ async fn store_enrichment_capsule(ctx: &McpContext, proposal: &EnrichedActionPro
         confidence: 1.0,
         private: true,
         horizon_class: None,
+        actor: None,
     };
     ctx.fact_store.write().await.store(fact);
 }

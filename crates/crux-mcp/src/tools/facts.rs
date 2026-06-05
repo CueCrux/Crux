@@ -132,6 +132,22 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         (false, _) => entity_raw.to_string(),
     };
 
+    // Durable authorship (agent-passport M1). FLAG-GATED:
+    // * Flag OFF (default): `actor = None` — byte-for-byte the pre-M1 path.
+    // * Flag ON: resolve the agent token-name (`anthropic`, `openai`, …) to a
+    //   passport_id (`claude-work`, `codex-work`, …) via the context map. If
+    //   the name is unmapped we fall back to the RAW agent name so a flag-ON
+    //   write is NEVER anonymous (QC.3); only a truly unauthenticated caller
+    //   (no agent identity) leaves `actor = None`.
+    let actor: Option<String> = if ctx.agent_passports_enabled {
+        agent_name.map(|name| {
+            crate::agent_passport::resolve_agent_passport(name, &ctx.agent_passport_map)
+                .unwrap_or_else(|| name.to_string())
+        })
+    } else {
+        None
+    };
+
     let req = StoreFact {
         entity,
         key: key.to_string(),
@@ -140,20 +156,19 @@ pub async fn handle_store_fact(args: &Value, ctx: &McpContext) -> Result<Value, 
         confidence,
         private,
         horizon_class,
+        actor,
     };
 
     let mut store = ctx.fact_store.write().await;
-    // M3.5 NOTE: We deliberately do NOT call
-    // `category_enforce::check_passport_can_write_entity` here yet. The check
-    // requires an identifiable passport_id, but on prod the MCP agent names
-    // (`windows-host`, `openai`, `anthropic`, `tailnet`) don't match any
-    // passport_id (`agent-claude`, `personal-default`). There is no agent→passport
-    // mapping at this layer — sessions resolve passports via category-default
-    // (`session_bindings::resolve`), but `handle_store_fact` carries no session
-    // context. Wiring the check naively would 403 every operator MCP write after
-    // deploy. Designing the agent→passport resolution is a separate ExecPlan.
-    // The follow-up design must define a stable agent-to-passport mapping
-    // before this layer can enforce tenant-category writes safely.
+    // M3.5 NOTE (updated by agent-passport M1): the agent→passport mapping
+    // now exists behind `CORECRUXD_AGENT_PASSPORTS` — see
+    // `crate::agent_passport`. When that flag is on, the resolved passport_id
+    // is stamped onto the fact as `actor` above (attribution only). We still
+    // deliberately do NOT call
+    // `category_enforce::check_passport_can_write_entity` here: enforcement
+    // (403-ing a passport that may not write a given tenant-category entity)
+    // is tracked in M5 and stays gated behind its own switch so M1 can ship
+    // attribution without risking blocking operator MCP writes.
     let fact = store.try_store(req).map_err(|err| JsonRpcError {
         code: INTERNAL_ERROR,
         message: "fact journal append failed".to_string(),
@@ -648,6 +663,72 @@ mod tests {
         assert_eq!(err.code, INVALID_PARAMS);
     }
 
+    // ── agent-passport M1: actor attribution ────────────────────────────
+
+    /// Read the persisted `actor` for the fact returned by a store_fact call.
+    async fn stored_actor(ctx: &McpContext, result: &Value) -> Option<String> {
+        let fid = result["structuredContent"]["fact_id"].as_str().unwrap();
+        let store = ctx.fact_store.read().await;
+        store.get(fid).and_then(|f| f.actor.clone())
+    }
+
+    #[tokio::test]
+    async fn store_fact_flag_on_anthropic_maps_to_claude_work() {
+        // Flag ON + built-in default map + anthropic-named agent → claude-work.
+        let map = crate::agent_passport::AgentPassportMap::builtin_default();
+        let ctx = test_ctx().with_agent_passports(true, map).with_agent(AgentIdentity {
+            name: "anthropic".to_string(),
+            token_hash: [0u8; 32],
+        });
+        let result = handle_store_fact(&json!({"entity": "proj", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(stored_actor(&ctx, &result).await, Some("claude-work".to_string()));
+    }
+
+    #[tokio::test]
+    async fn store_fact_flag_on_openai_maps_to_codex_work() {
+        let map = crate::agent_passport::AgentPassportMap::builtin_default();
+        let ctx = test_ctx().with_agent_passports(true, map).with_agent(AgentIdentity {
+            name: "openai".to_string(),
+            token_hash: [2u8; 32],
+        });
+        let result = handle_store_fact(&json!({"entity": "proj", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(stored_actor(&ctx, &result).await, Some("codex-work".to_string()));
+    }
+
+    #[tokio::test]
+    async fn store_fact_flag_on_unmapped_agent_falls_back_to_raw_name() {
+        // QC.3: flag-ON writes are never anonymous — an unmapped name stamps
+        // the raw agent name rather than None.
+        let map = crate::agent_passport::AgentPassportMap::builtin_default();
+        let ctx = test_ctx().with_agent_passports(true, map).with_agent(AgentIdentity {
+            name: "windows-host".to_string(),
+            token_hash: [3u8; 32],
+        });
+        let result = handle_store_fact(&json!({"entity": "proj", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(stored_actor(&ctx, &result).await, Some("windows-host".to_string()));
+    }
+
+    #[tokio::test]
+    async fn store_fact_flag_off_records_no_actor() {
+        // Proves no behaviour change: with the flag OFF, the SAME anthropic
+        // agent records actor = None (byte-for-byte the pre-M1 path).
+        let ctx = test_ctx().with_agent(AgentIdentity {
+            name: "anthropic".to_string(),
+            token_hash: [0u8; 32],
+        });
+        assert!(!ctx.agent_passports_enabled, "flag must default OFF");
+        let result = handle_store_fact(&json!({"entity": "proj", "key": "k", "value": "v"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(stored_actor(&ctx, &result).await, None);
+    }
+
     #[tokio::test]
     async fn store_and_query_roundtrip() {
         let ctx = test_ctx();
@@ -1088,6 +1169,7 @@ mod tests {
             horizon_class,
             reverified_at,
             superseded_by: None,
+            actor: None,
         }
     }
 

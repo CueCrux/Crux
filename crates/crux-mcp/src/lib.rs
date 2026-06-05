@@ -25,6 +25,7 @@
 #![deny(clippy::unwrap_used)]
 
 pub mod agent;
+pub mod agent_passport;
 pub mod category_enforce;
 pub mod dispatch;
 pub mod envelope;

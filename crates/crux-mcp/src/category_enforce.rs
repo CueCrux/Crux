@@ -164,6 +164,7 @@ mod tests {
             confidence: 1.0,
             private: true,
             horizon_class: None,
+            actor: None,
         });
     }
 
@@ -176,6 +177,7 @@ mod tests {
             confidence: 1.0,
             private: true,
             horizon_class: None,
+            actor: None,
         });
     }
 

@@ -94,6 +94,7 @@ mod tests {
             horizon_class: corecrux_memory::HorizonClass::None,
             reverified_at: None,
             superseded_by: None,
+            actor: None,
         }
     }
 

@@ -66,6 +66,16 @@ pub struct McpContext {
     /// Content-addressed artefact store (agent-ux-12, calm deferred output).
     /// In-memory; opt-in for tools that want to park large payloads off-chat.
     pub artefact_store: Arc<RwLock<ArtefactStore>>,
+    /// Feature flag (`CORECRUXD_AGENT_PASSPORTS`, default OFF): when true,
+    /// `store_fact` resolves the calling agent's token-name to a passport_id
+    /// via [`McpContext::agent_passport_map`] and stamps it as the fact's
+    /// `actor` (agent-passport M1). When false, behaviour is byte-for-byte
+    /// the pre-M1 path (no actor written, no mapping applied).
+    pub agent_passports_enabled: bool,
+    /// Agent→passport mapping consulted only when `agent_passports_enabled`
+    /// is true. Empty by default so a stray value cannot change behaviour
+    /// while the flag is off.
+    pub agent_passport_map: crate::agent_passport::AgentPassportMap,
 }
 
 impl McpContext {
@@ -89,6 +99,11 @@ impl McpContext {
             edge_store: Arc::new(RwLock::new(EdgeStore::new())),
             kind_registry: Arc::new(RwLock::new(KindRegistry::new())),
             artefact_store: Arc::new(RwLock::new(ArtefactStore::new())),
+            // Flag OFF + empty map by default: every existing test sees the
+            // pre-M1 behaviour (no actor stamped) unless it opts in via
+            // `with_agent_passports`.
+            agent_passports_enabled: false,
+            agent_passport_map: crate::agent_passport::AgentPassportMap::empty(),
         }
     }
 
@@ -119,6 +134,8 @@ impl McpContext {
             edge_store: Arc::new(RwLock::new(EdgeStore::new())),
             kind_registry: Arc::new(RwLock::new(KindRegistry::new())),
             artefact_store: Arc::new(RwLock::new(ArtefactStore::new())),
+            agent_passports_enabled: false,
+            agent_passport_map: crate::agent_passport::AgentPassportMap::empty(),
         }
     }
 
@@ -163,7 +180,20 @@ impl McpContext {
             edge_store: Arc::clone(&self.edge_store),
             kind_registry: Arc::clone(&self.kind_registry),
             artefact_store: Arc::clone(&self.artefact_store),
+            agent_passports_enabled: self.agent_passports_enabled,
+            agent_passport_map: self.agent_passport_map.clone(),
         }
+    }
+
+    /// Configure the agent→passport feature (agent-passport M1). When
+    /// `enabled` is true, `store_fact` resolves the calling agent name to a
+    /// passport_id via `map` and stamps it as the fact `actor`. Wired from
+    /// `corecruxd::main` off the `CORECRUXD_AGENT_PASSPORTS` flag; tests use
+    /// it directly to exercise the flag-ON path.
+    pub fn with_agent_passports(mut self, enabled: bool, map: crate::agent_passport::AgentPassportMap) -> Self {
+        self.agent_passports_enabled = enabled;
+        self.agent_passport_map = map;
+        self
     }
 
     /// Configure the loopback URL used by tools that call back into the
@@ -1718,6 +1748,7 @@ mod tests {
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 });
             }
         }
@@ -1791,6 +1822,7 @@ mod tests {
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 });
             }
             // Pre-seed the source passport under the same tenant so the
@@ -1812,6 +1844,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
         dispatch(
@@ -1883,6 +1916,7 @@ mod tests {
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 });
             }
         }

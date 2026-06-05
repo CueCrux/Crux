@@ -328,6 +328,7 @@ pub async fn handle_memory_edit(args: &Value, ctx: &McpContext) -> Result<Value,
         confidence: existing.confidence,
         private: existing.private,
         horizon_class: None,
+        actor: None,
     };
     let new_fact = store.try_store(req).map_err(|err| JsonRpcError {
         code: INTERNAL_ERROR,
@@ -397,6 +398,7 @@ pub async fn handle_memory_pin(args: &Value, ctx: &McpContext) -> Result<Value, 
         // accidental cloud sync).
         private: false, // entity itself is reserved-prefix; do not double-scope
         horizon_class: None,
+        actor: None,
     };
     store.try_store(req).map_err(|err| JsonRpcError {
         code: INTERNAL_ERROR,
