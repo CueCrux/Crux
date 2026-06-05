@@ -155,6 +155,15 @@ pub struct Fact {
     /// `#[serde(default)]` so pre-M6 on-disk facts deserialize as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// Durable authorship: the resolved passport_id (or raw agent name) that
+    /// wrote this fact. Set by the MCP `store_fact` path when the
+    /// `CORECRUXD_AGENT_PASSPORTS` flag is on (agent-passport M1). Additive
+    /// schema change — `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// exactly mirrors `supersedes` / `reverified_at` / `superseded_by` so the
+    /// ~2.1k existing on-disk facts and pre-M1 journal-replay entries
+    /// deserialize as `actor = None` and serialize without the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
 
 fn default_version() -> u32 {
@@ -177,6 +186,11 @@ pub struct StoreFact {
     /// [`HorizonClass::default_for_entity`] using the entity name.
     #[serde(default)]
     pub horizon_class: Option<HorizonClass>,
+    /// Optional durable authorship (resolved passport_id or raw agent name).
+    /// Defaults to `None` so callers that don't set it (and the flag-OFF MCP
+    /// path) write `actor = None` — byte-for-byte the pre-M1 behaviour.
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 fn default_confidence() -> f32 {
@@ -379,6 +393,7 @@ impl FactStore {
             horizon_class,
             reverified_at: None,
             superseded_by: None,
+            actor: req.actor,
         }
     }
 
@@ -835,6 +850,33 @@ fn estimate_tokens(text: &str) -> usize {
 mod tests {
     use super::*;
 
+    /// Backward-compat (agent-passport M1): a JSON fact written before the
+    /// `actor` field existed (e.g. one of the ~2.1k prod facts, or a
+    /// pre-M1 journal-replay entry) must deserialize with `actor = None`.
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]` is what
+    /// guarantees this — exactly the pattern used by `superseded_by`.
+    #[test]
+    fn fact_without_actor_key_deserializes_to_none() {
+        // Note: no `actor` key, no `version` key, no `superseded_by` key —
+        // the shape of an old on-disk fact.
+        let json = r#"{
+            "fact_id": "f_legacy_0001",
+            "entity": "deployment",
+            "key": "strategy",
+            "value": "canary",
+            "source_receipt": null,
+            "confidence": 1.0,
+            "stored_at": "2026-01-01T00:00:00Z",
+            "tokens": 1,
+            "deleted": false
+        }"#;
+        let fact: Fact = serde_json::from_str(json).expect("legacy fact must deserialize");
+        assert_eq!(fact.actor, None, "legacy facts must load with actor = None");
+        // And it must not re-serialize the key (skip_serializing_if).
+        let round = serde_json::to_string(&fact).unwrap();
+        assert!(!round.contains("\"actor\""), "actor=None must not serialize a key");
+    }
+
     #[test]
     fn store_and_retrieve_fact() {
         let mut store = FactStore::new();
@@ -847,6 +889,7 @@ mod tests {
             confidence: 0.95,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         assert!(fact.fact_id.starts_with("f_"));
@@ -869,6 +912,7 @@ mod tests {
             confidence: 0.9,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         store.store(StoreFact {
             entity: "testing".to_string(),
@@ -878,6 +922,7 @@ mod tests {
             confidence: 0.8,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         let result = store.query(&FactQuery {
@@ -904,6 +949,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         assert_eq!(store.count(), 1);
@@ -926,6 +972,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
 
@@ -959,6 +1006,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         store.store(StoreFact {
             entity: "proj".to_string(),
@@ -968,6 +1016,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         store.delete(&f1.fact_id);
@@ -989,6 +1038,7 @@ mod tests {
                 confidence: 0.5,
                 private: false,
                 horizon_class: None,
+                actor: None,
             },
             StoreFact {
                 entity: "b".to_string(),
@@ -998,6 +1048,7 @@ mod tests {
                 confidence: 0.9,
                 private: false,
                 horizon_class: None,
+                actor: None,
             },
         ];
 
@@ -1020,6 +1071,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         store.store(StoreFact {
             entity: "beta".to_string(),
@@ -1029,6 +1081,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         let result = store.query(&FactQuery {
@@ -1056,6 +1109,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
 
@@ -1110,6 +1164,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         // Query matching key name
@@ -1145,6 +1200,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         let result = store.query(&FactQuery {
@@ -1169,6 +1225,7 @@ mod tests {
             confidence: 0.5,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         store.store(StoreFact {
             entity: "e".to_string(),
@@ -1178,6 +1235,7 @@ mod tests {
             confidence: 0.9,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         let result = store.query(&FactQuery {
@@ -1205,6 +1263,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
 
@@ -1232,6 +1291,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         // Token budget smaller than the single fact — should still include it
@@ -1274,6 +1334,7 @@ mod tests {
             confidence: 0.75,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         let json = serde_json::to_string(&fact).unwrap();
@@ -1309,6 +1370,7 @@ mod tests {
                 confidence: 0.9,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             let f2 = store.store(StoreFact {
                 entity: "proj".into(),
@@ -1318,6 +1380,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             let f3 = store.store(StoreFact {
                 entity: "other".into(),
@@ -1327,6 +1390,7 @@ mod tests {
                 confidence: 0.5,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             ids = vec![f1.fact_id, f2.fact_id, f3.fact_id];
             assert_eq!(store.count(), 3);
@@ -1361,6 +1425,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             fact_id = fact.fact_id;
             store.delete(&fact_id);
@@ -1391,6 +1456,7 @@ mod tests {
                 confidence: 0.8,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             let v2 = store.store(StoreFact {
                 entity: "proj".into(),
@@ -1400,6 +1466,7 @@ mod tests {
                 confidence: 0.9,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             assert_eq!(v1.version, 1);
             assert_eq!(v2.version, 2);
@@ -1434,6 +1501,7 @@ mod tests {
                         confidence: 1.0,
                         private: false,
                         horizon_class: None,
+                        actor: None,
                     },
                     StoreFact {
                         entity: "b".into(),
@@ -1443,6 +1511,7 @@ mod tests {
                         confidence: 1.0,
                         private: false,
                         horizon_class: None,
+                        actor: None,
                     },
                 ])
                 .unwrap();
@@ -1472,6 +1541,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         store.delete("nonexistent");
 
@@ -1492,6 +1562,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
 
@@ -1518,6 +1589,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
 
@@ -1564,6 +1636,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         store.store(StoreFact {
             entity: "e1".into(),
@@ -1573,6 +1646,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         // All facts stored with Utc::now() so they share the same timestamp
@@ -1598,6 +1672,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
 
@@ -1620,6 +1695,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         store.store(StoreFact {
             entity: "e".into(),
@@ -1629,6 +1705,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         store.delete(&f1.fact_id);
@@ -1657,6 +1734,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         let new = store.store(StoreFact {
             entity: "bench:lme-s-v2".into(),
@@ -1666,6 +1744,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
 
         assert!(store.get(&old.fact_id).unwrap().superseded_by.is_none());
@@ -1698,6 +1777,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             let new = store.store(StoreFact {
                 entity: "execplan:b".into(),
@@ -1707,6 +1787,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             assert!(store.mark_superseded(&old.fact_id, &new.fact_id));
             old_id = old.fact_id;
@@ -1737,6 +1818,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             let new = store.store(StoreFact {
                 entity: "e2".into(),
@@ -1746,6 +1828,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             store.mark_superseded(&old.fact_id, &new.fact_id);
             // Now reverse it; the clear must also persist (not just the mark).

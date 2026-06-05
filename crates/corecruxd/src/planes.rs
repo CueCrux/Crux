@@ -249,6 +249,7 @@ pub fn delete_plane(store: &mut FactStore, project_id: &str, plane_id: &str) -> 
                 confidence: 0.0,
                 private: true,
                 horizon_class: None,
+                actor: None,
             };
             crate::fact_privacy::enforce_global(&mut sf);
             store.store(sf);
@@ -287,6 +288,7 @@ pub fn add_member(
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -307,6 +309,7 @@ pub fn remove_member(
         confidence: 0.0,
         private: true,
         horizon_class: None,
+        actor: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -338,6 +341,7 @@ pub fn add_tenant(
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -358,6 +362,7 @@ pub fn remove_tenant(
         confidence: 0.0,
         private: true,
         horizon_class: None,
+        actor: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -374,6 +379,7 @@ fn write_plane_record(store: &mut FactStore, record: &PlaneRecord) -> Result<(),
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);

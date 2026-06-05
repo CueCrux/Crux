@@ -318,6 +318,7 @@ mod tests {
             horizon_class: crate::fact_store::HorizonClass::None,
             reverified_at: None,
             superseded_by: None,
+            actor: None,
         }
     }
 

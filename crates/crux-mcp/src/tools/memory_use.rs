@@ -173,6 +173,18 @@ pub async fn handle_memory_acknowledge_use(args: &Value, ctx: &McpContext) -> Re
     //   - skip ids the agent can't see (scope::fact_visible_to_agent)
     //   - skip ids whose entity has a reserved prefix
     //   - record entity + topic + age for the envelope renderer
+    // agent-passport M5: identity-scoped visibility so the OWNER can ack its
+    // own passport-keyed private facts, and a DIFFERENT passport cannot. The
+    // raw `agent_name` is still used for receipt_ref / buffer actor / envelope
+    // scope (out of M5 scope — those name the caller, not a fact owner).
+    // Flag-OFF the identity is the raw agent name and aliases is empty, so the
+    // `scope::*_for_identity` calls below are byte-for-byte the prior
+    // `scope::*_for_agent(Some(agent_name))` path.
+    let identity = ctx.scope_identity();
+    let id_ref = identity.as_deref();
+    let aliases = ctx.scope_aliases();
+    let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
+
     let store = ctx.fact_store.read().await;
     let now = chrono::Utc::now();
     let mut filtered_entries: Vec<AckFactEntry> = Vec::with_capacity(fact_ids.len());
@@ -189,7 +201,7 @@ pub async fn handle_memory_acknowledge_use(args: &Value, ctx: &McpContext) -> Re
             not_found_count += 1;
             continue;
         }
-        if !scope::fact_visible_to_agent(fact, Some(agent_name)) {
+        if !scope::fact_visible_to_identity(fact, id_ref, &alias_refs) {
             not_visible_count += 1;
             continue;
         }
@@ -202,7 +214,8 @@ pub async fn handle_memory_acknowledge_use(args: &Value, ctx: &McpContext) -> Re
         }
         let age_days = (now - fact.stored_at).num_days();
         let age_days = if age_days < 0 { None } else { Some(age_days) };
-        let topic = scope::visible_entity_for_agent(fact, Some(agent_name)).unwrap_or_else(|| fact.entity.clone());
+        let topic =
+            scope::visible_entity_for_identity(fact, id_ref, &alias_refs).unwrap_or_else(|| fact.entity.clone());
         filtered_entries.push(AckFactEntry {
             fact_id: fact.fact_id.clone(),
             entity: fact.entity.clone(),

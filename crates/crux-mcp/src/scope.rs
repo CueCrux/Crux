@@ -34,6 +34,42 @@ pub fn visible_entity_for_agent(fact: &Fact, agent_name: Option<&str>) -> Option
     Some(fact.entity.clone())
 }
 
+/// Flag-ON (agent-passport M5) variant of [`visible_entity_for_agent`] that
+/// matches a private fact's `__agent::<owner>::` key against EITHER the
+/// caller's resolved scope-identity (passport_id, e.g. `claude-work`) OR a set
+/// of legacy alias names (the raw agent token-name, e.g. `anthropic`).
+///
+/// The alias set exists purely for **back-compat**: a private fact written
+/// while the flag was OFF is keyed under the raw agent name; once the flag is
+/// flipped on the same agent now resolves to a passport_id, so without the
+/// alias its own legacy private facts would be stranded (owner `anthropic` vs
+/// identity `claude-work`). Including the raw name in `aliases` keeps those
+/// facts visible to their original owner and ONLY their original owner.
+///
+/// Visibility is still **owning-identity-ONLY**: a DIFFERENT passport
+/// (`codex-work`/`openai`) matches neither the owner's passport_id nor the
+/// owner's raw name, so it is denied. This deliberately does NOT implement
+/// group-shared private visibility (see scope.rs module note / M5 report):
+/// proving group-sharing safe across all read paths is deferred.
+///
+/// Non-private facts are unaffected (shared pool, visible to all).
+pub fn visible_entity_for_identity(fact: &Fact, identity: Option<&str>, aliases: &[&str]) -> Option<String> {
+    if let Some((owner, logical)) = split_private_entity(&fact.entity) {
+        let owned = identity == Some(owner) || aliases.contains(&owner);
+        return owned.then(|| logical.to_string());
+    }
+    if fact.private {
+        return None;
+    }
+    Some(fact.entity.clone())
+}
+
+/// Flag-ON companion to [`fact_visible_to_agent`]. See
+/// [`visible_entity_for_identity`].
+pub fn fact_visible_to_identity(fact: &Fact, identity: Option<&str>, aliases: &[&str]) -> bool {
+    visible_entity_for_identity(fact, identity, aliases).is_some()
+}
+
 pub fn fact_visible_to_agent(fact: &Fact, agent_name: Option<&str>) -> bool {
     visible_entity_for_agent(fact, agent_name).is_some()
 }
@@ -48,6 +84,37 @@ pub fn entity_matches_for_agent(fact: &Fact, requested_entity: &str, agent_name:
 pub fn entity_prefix_matches_for_agent(fact: &Fact, requested_prefix: &str, agent_name: Option<&str>) -> bool {
     fact.entity.starts_with(requested_prefix)
         || visible_entity_for_agent(fact, agent_name)
+            .as_deref()
+            .is_some_and(|entity| entity.starts_with(requested_prefix))
+}
+
+/// Flag-ON (M5) identity-scoped variant of [`entity_matches_for_agent`].
+pub fn entity_matches_for_identity(
+    fact: &Fact,
+    requested_entity: &str,
+    identity: Option<&str>,
+    aliases: &[&str],
+) -> bool {
+    // NOTE: the bare `fact.entity == requested_entity` arm is preserved for
+    // parity with the agent-scoped version, but a private fact's STORED entity
+    // is `__agent::<owner>::…` which only equals `requested_entity` if the
+    // caller literally asked for that scoped name — they never do via the
+    // logical API. The owner check below is what enforces T.1.
+    fact.entity == requested_entity
+        || visible_entity_for_identity(fact, identity, aliases)
+            .as_deref()
+            .is_some_and(|entity| entity == requested_entity)
+}
+
+/// Flag-ON (M5) identity-scoped variant of [`entity_prefix_matches_for_agent`].
+pub fn entity_prefix_matches_for_identity(
+    fact: &Fact,
+    requested_prefix: &str,
+    identity: Option<&str>,
+    aliases: &[&str],
+) -> bool {
+    fact.entity.starts_with(requested_prefix)
+        || visible_entity_for_identity(fact, identity, aliases)
             .as_deref()
             .is_some_and(|entity| entity.starts_with(requested_prefix))
 }
@@ -94,6 +161,7 @@ mod tests {
             horizon_class: corecrux_memory::HorizonClass::None,
             reverified_at: None,
             superseded_by: None,
+            actor: None,
         }
     }
 

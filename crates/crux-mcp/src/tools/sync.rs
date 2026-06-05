@@ -474,6 +474,7 @@ mod tests {
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 });
             }
         }
@@ -607,6 +608,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
 
@@ -716,6 +718,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             store.store(StoreFact {
                 entity: "private:salary".to_string(),
@@ -725,6 +728,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             store.store(StoreFact {
                 entity: "deploy".to_string(),
@@ -734,6 +738,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
 
@@ -770,6 +775,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             store.store(StoreFact {
                 entity: "business::acme::constraint::deploy".to_string(),
@@ -779,6 +785,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
 
@@ -874,6 +881,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
 

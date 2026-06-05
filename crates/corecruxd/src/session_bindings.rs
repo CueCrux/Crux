@@ -82,6 +82,7 @@ pub fn write_binding(store: &mut FactStore, binding: &SessionBinding) -> Result<
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);

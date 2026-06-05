@@ -240,6 +240,7 @@ pub(super) async fn post_tenant_offboard(
             confidence: 1.0,
             private: true,
             horizon_class: None,
+            actor: None,
         });
     }
 

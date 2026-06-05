@@ -66,6 +66,16 @@ pub struct McpContext {
     /// Content-addressed artefact store (agent-ux-12, calm deferred output).
     /// In-memory; opt-in for tools that want to park large payloads off-chat.
     pub artefact_store: Arc<RwLock<ArtefactStore>>,
+    /// Feature flag (`CORECRUXD_AGENT_PASSPORTS`, default OFF): when true,
+    /// `store_fact` resolves the calling agent's token-name to a passport_id
+    /// via [`McpContext::agent_passport_map`] and stamps it as the fact's
+    /// `actor` (agent-passport M1). When false, behaviour is byte-for-byte
+    /// the pre-M1 path (no actor written, no mapping applied).
+    pub agent_passports_enabled: bool,
+    /// Agent→passport mapping consulted only when `agent_passports_enabled`
+    /// is true. Empty by default so a stray value cannot change behaviour
+    /// while the flag is off.
+    pub agent_passport_map: crate::agent_passport::AgentPassportMap,
 }
 
 impl McpContext {
@@ -89,6 +99,11 @@ impl McpContext {
             edge_store: Arc::new(RwLock::new(EdgeStore::new())),
             kind_registry: Arc::new(RwLock::new(KindRegistry::new())),
             artefact_store: Arc::new(RwLock::new(ArtefactStore::new())),
+            // Flag OFF + empty map by default: every existing test sees the
+            // pre-M1 behaviour (no actor stamped) unless it opts in via
+            // `with_agent_passports`.
+            agent_passports_enabled: false,
+            agent_passport_map: crate::agent_passport::AgentPassportMap::empty(),
         }
     }
 
@@ -119,6 +134,8 @@ impl McpContext {
             edge_store: Arc::new(RwLock::new(EdgeStore::new())),
             kind_registry: Arc::new(RwLock::new(KindRegistry::new())),
             artefact_store: Arc::new(RwLock::new(ArtefactStore::new())),
+            agent_passports_enabled: false,
+            agent_passport_map: crate::agent_passport::AgentPassportMap::empty(),
         }
     }
 
@@ -163,6 +180,77 @@ impl McpContext {
             edge_store: Arc::clone(&self.edge_store),
             kind_registry: Arc::clone(&self.kind_registry),
             artefact_store: Arc::clone(&self.artefact_store),
+            agent_passports_enabled: self.agent_passports_enabled,
+            agent_passport_map: self.agent_passport_map.clone(),
+        }
+    }
+
+    /// Configure the agent→passport feature (agent-passport M1). When
+    /// `enabled` is true, `store_fact` resolves the calling agent name to a
+    /// passport_id via `map` and stamps it as the fact `actor`. Wired from
+    /// `corecruxd::main` off the `CORECRUXD_AGENT_PASSPORTS` flag; tests use
+    /// it directly to exercise the flag-ON path.
+    pub fn with_agent_passports(mut self, enabled: bool, map: crate::agent_passport::AgentPassportMap) -> Self {
+        self.agent_passports_enabled = enabled;
+        self.agent_passport_map = map;
+        self
+    }
+
+    /// Resolve the *scope identity* used for private-fact ownership and
+    /// visibility (agent-passport M5). This is the single string threaded into
+    /// every `scope::*` call.
+    ///
+    /// * **Flag OFF (default):** the raw agent token-name (`anthropic`,
+    ///   `alice`, …) — byte-for-byte the pre-M5 behaviour. `scope::*` keys
+    ///   private facts under `__agent::<name>::` exactly as before.
+    /// * **Flag ON:** the resolved passport_id (`anthropic` → `claude-work`),
+    ///   so a private fact's owner key agrees with the M1 `actor` stamp and the
+    ///   M4 tenant-group. An unmapped name falls back to the raw name so a
+    ///   flag-ON private write is never keyed wrongly (mirrors the QC.3
+    ///   never-anonymous rule on `actor`).
+    ///
+    /// Returns `None` for an unauthenticated caller (no agent identity) under
+    /// either flag state — anonymous callers have no private scope.
+    pub fn scope_identity(&self) -> Option<String> {
+        let name = self.agent.as_ref()?.name.as_str();
+        if self.agent_passports_enabled {
+            Some(
+                crate::agent_passport::resolve_agent_passport(name, &self.agent_passport_map)
+                    .unwrap_or_else(|| name.to_string()),
+            )
+        } else {
+            Some(name.to_string())
+        }
+    }
+
+    /// Back-compat alias names for the caller's private-fact ownership under
+    /// flag-ON (agent-passport M5). Empty when the flag is off (no rekeying
+    /// happened, so no alias is needed).
+    ///
+    /// When the flag is ON the *current* writes are keyed by [`Self::scope_identity`]
+    /// (the passport_id). But private facts written while the flag was OFF were
+    /// keyed by the raw agent token-name. To keep those legacy private facts
+    /// visible to their original owner (and ONLY their original owner) after the
+    /// flag flips, the raw token-name is returned here as an alias. The read
+    /// helpers (`scope::*_for_identity`) match a private fact's owner against the
+    /// identity OR any alias.
+    ///
+    /// The alias is the caller's OWN raw name only — never another agent's — so
+    /// it can never widen visibility to a different principal.
+    pub fn scope_aliases(&self) -> Vec<String> {
+        match (&self.agent, self.agent_passports_enabled) {
+            (Some(agent), true) => {
+                // Only an alias when the resolved identity actually differs
+                // from the raw name (i.e. the name was remapped). When the
+                // name is unmapped, identity == raw name and no alias is
+                // needed.
+                let raw = agent.name.as_str();
+                match self.scope_identity() {
+                    Some(id) if id != raw => vec![raw.to_string()],
+                    _ => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -1718,6 +1806,7 @@ mod tests {
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 });
             }
         }
@@ -1791,6 +1880,7 @@ mod tests {
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 });
             }
             // Pre-seed the source passport under the same tenant so the
@@ -1806,12 +1896,14 @@ mod tests {
                     receipt_count: 500,
                     issued_at: "2026-05-28T00:00:00Z".to_string(),
                     passport_hash: "deadbeef".to_string(),
+                    tenant_group: None,
                 })
                 .unwrap(),
                 source_receipt: None,
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
         }
         dispatch(
@@ -1883,6 +1975,7 @@ mod tests {
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 });
             }
         }

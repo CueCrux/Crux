@@ -79,6 +79,7 @@ pub(super) async fn post_generate(
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         };
         crate::fact_privacy::enforce_global(&mut sf);
         store.store(sf);

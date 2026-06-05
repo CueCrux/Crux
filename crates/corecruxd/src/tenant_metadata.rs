@@ -96,6 +96,7 @@ pub fn set_tenant_category_override(
         confidence: 1.0,
         private: false, // enforce_global flips this to true via the reserved prefix
         horizon_class: None,
+        actor: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     store.store(sf);
@@ -218,6 +219,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         };
         crate::fact_privacy::enforce_global(&mut sf);
         store.store(sf);

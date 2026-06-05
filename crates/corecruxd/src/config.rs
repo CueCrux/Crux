@@ -138,6 +138,11 @@ pub struct Config {
     // CoreCrux v5: build .ccxi companion indexes at seal time for BM25 retrieval.
     pub build_ccxi: bool,
 
+    // agent-passport M1: when true, the MCP `store_fact` path resolves the
+    // calling agent token-name to a passport_id and stamps it as the fact
+    // `actor`. Default OFF — attribution only, no enforcement (M5).
+    pub agent_passports_enabled: bool,
+
     // Phase 8 receipts: bytes-first fetch + signature verification projection.
     pub receipts_verify_enabled: bool,
     pub receipts_recompute_candidate_digest: bool,
@@ -515,6 +520,10 @@ pub fn load_config() -> Config {
         .ok()
         .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
 
+    // agent-passport M1: default OFF. Only the env var enables it (no file
+    // override needed — this is a deliberate, operator-set switch).
+    let agent_passports_enabled = env_bool("CORECRUXD_AGENT_PASSPORTS").unwrap_or(false);
+
     let projections_enabled = std::env::var("CORECRUXD_PROJECTIONS_ENABLED")
         .ok()
         .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
@@ -698,6 +707,7 @@ pub fn load_config() -> Config {
         io_backend,
 
         build_ccxi,
+        agent_passports_enabled,
 
         projections_enabled,
         projections_batch_frames,
