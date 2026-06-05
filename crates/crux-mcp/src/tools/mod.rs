@@ -114,6 +114,21 @@ preferred routing, min-tier, and cost class. Call it once per session for the co
 /// each tool's description — cheap affordance for agents that skip the
 /// hint at the head of the list.
 pub fn list_tools() -> Vec<ToolDefinition> {
+    list_tools_local_surface(false)
+}
+
+/// Like [`list_tools`], but flag-aware for the agent-passport feature
+/// (`CORECRUXD_AGENT_PASSPORTS`).
+///
+/// When `agent_passports_enabled` is true, `issue_passport` is promoted to the
+/// **local** tool surface (marker `[local]`, no `[hosted]`) so a mapped agent
+/// on a local-tier install can reach it to bootstrap its passport + tier
+/// ladder (agent-passport M2). This is the ONLY behaviour the flag changes
+/// here; every other tool keeps its static surface tier from
+/// [`vaultcrux_local::tool_surface`]. With the flag off this is byte-for-byte
+/// identical to the pre-M2 `list_tools()` (the two gating assertions in this
+/// module's tests still hold).
+pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefinition> {
     vec![
         // ── Session Handshake (master-plan §6) ────────────────────
         ToolDefinition {
@@ -1942,7 +1957,15 @@ pub fn list_tools() -> Vec<ToolDefinition> {
     ]
     .into_iter()
     .map(|mut t: ToolDefinition| {
-        let marker = vaultcrux_local::tool_surface::marker_for_tool(&t.name);
+        // agent-passport M2: when the flag is on, `issue_passport` is reachable
+        // on a local-tier install, so it is marked `[local]` rather than the
+        // static `[hosted]` from the tool-surface table. No other tool is
+        // affected, and flag-off uses the static marker unchanged.
+        let marker = if agent_passports_enabled && t.name == "issue_passport" {
+            "[local]"
+        } else {
+            vaultcrux_local::tool_surface::marker_for_tool(&t.name)
+        };
         if !t.description.starts_with(marker) {
             t.description = format!("{marker} {}", t.description);
         }
@@ -1971,10 +1994,12 @@ pub async fn list_tools_json_for_context(ctx: &McpContext, now_unix_seconds: u64
         .rcx_router
         .as_ref()
         .map(|router| ToolAuthMetadata::from_token(router.token()));
-    let mut tools = ctx
-        .rcx_router
-        .as_ref()
-        .map_or_else(list_tools, |router| list_tools_for_rcx_router(router, now_unix_seconds));
+    let mut tools = ctx.rcx_router.as_ref().map_or_else(
+        // Local-tier install (no RCX capability token): the agent-passport
+        // flag promotes `issue_passport` into the local surface (M2).
+        || list_tools_local_surface(ctx.agent_passports_enabled),
+        |router| list_tools_for_rcx_router(router, now_unix_seconds),
+    );
     let mut extension_tools = extensions::list_extension_tools(ctx).await;
     if let Some(router) = ctx.rcx_router.as_ref() {
         let capabilities: Vec<McpToolCapability> = extension_tools
@@ -2097,11 +2122,22 @@ pub fn rcx_mcp_tool_capability(tool_name: &str) -> McpToolCapability {
 }
 
 pub fn rcx_local_capabilities() -> Vec<String> {
+    rcx_local_capabilities_with_flag(false)
+}
+
+/// Flag-aware local capability surface for agent-passport M2.
+///
+/// When `agent_passports_enabled` is true, `issue_passport` is included in the
+/// local capability set so a mapped agent on a local-tier install can reach it
+/// (see [`list_tools_local_surface`]). Flag-off is identical to
+/// [`rcx_local_capabilities`] — the static `[hosted]` tier excludes it.
+pub fn rcx_local_capabilities_with_flag(agent_passports_enabled: bool) -> Vec<String> {
     let mut seen = HashSet::new();
     list_tools()
         .into_iter()
         .filter_map(|tool| {
-            if !vaultcrux_local::tool_surface::is_local_tool(&tool.name) {
+            let promoted_local = agent_passports_enabled && tool.name == "issue_passport";
+            if !promoted_local && !vaultcrux_local::tool_surface::is_local_tool(&tool.name) {
                 return None;
             }
             let capability = rcx_capability_for_tool(&tool.name);
@@ -2573,6 +2609,8 @@ mod tests {
 
     #[test]
     fn list_tools_marks_local_and_hosted_gated_surfaces() {
+        // Flag-OFF (the default `list_tools()` surface): issue_passport stays
+        // [hosted]-gated exactly as before agent-passport M2.
         let tools = list_tools();
         let by_name = |n: &str| tools.iter().find(|t| t.name == n).unwrap();
 
@@ -2580,6 +2618,19 @@ mod tests {
         assert!(by_name("enrich_action").description.starts_with("[local]"));
         assert!(by_name("sync_status").description.starts_with("[local]"));
         assert!(by_name("issue_passport").description.starts_with("[hosted]"));
+        assert!(by_name("sync_pull").description.starts_with("[hosted]"));
+        assert!(by_name("sync_push").description.starts_with("[hosted]"));
+    }
+
+    #[test]
+    fn agent_passport_flag_promotes_issue_passport_to_local() {
+        // Flag-ON: issue_passport is reachable on a local-tier install, so it
+        // is marked [local]. The two sync tools stay [hosted] (M2 is scoped to
+        // issue_passport only).
+        let tools = list_tools_local_surface(true);
+        let by_name = |n: &str| tools.iter().find(|t| t.name == n).unwrap();
+
+        assert!(by_name("issue_passport").description.starts_with("[local]"));
         assert!(by_name("sync_pull").description.starts_with("[hosted]"));
         assert!(by_name("sync_push").description.starts_with("[hosted]"));
     }
@@ -2605,11 +2656,24 @@ mod tests {
 
     #[test]
     fn rcx_local_capabilities_excludes_hosted_gated_tools() {
+        // Flag-OFF: hosted-gated tools (including issue_passport) absent from
+        // the local capability surface — unchanged from before M2.
         let capabilities = rcx_local_capabilities();
 
         assert!(capabilities.contains(&"corecrux.query.local".to_string()));
         assert!(capabilities.contains(&"crux-mcp.sync_status".to_string()));
         assert!(!capabilities.contains(&"crux-mcp.issue_passport".to_string()));
+        assert!(!capabilities.contains(&"crux-mcp.sync_pull".to_string()));
+        assert!(!capabilities.contains(&"crux-mcp.sync_push".to_string()));
+    }
+
+    #[test]
+    fn agent_passport_flag_includes_issue_passport_capability() {
+        // Flag-ON: issue_passport joins the local capability surface; the sync
+        // tools stay hosted-gated.
+        let capabilities = rcx_local_capabilities_with_flag(true);
+
+        assert!(capabilities.contains(&"crux-mcp.issue_passport".to_string()));
         assert!(!capabilities.contains(&"crux-mcp.sync_pull".to_string()));
         assert!(!capabilities.contains(&"crux-mcp.sync_push".to_string()));
     }

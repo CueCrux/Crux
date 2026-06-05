@@ -55,6 +55,14 @@ pub fn tool_input_schema() -> Value {
 }
 
 pub async fn handle_cuecrux_session(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    // agent-passport M2: opening a session is the natural "first contact" for a
+    // mapped agent, so bootstrap its MCP passport here (keyed to the resolved
+    // passport_id, e.g. `claude-work`). Idempotent and a no-op when the flag is
+    // off or the agent is unmapped; runs before the loopback so the tier ladder
+    // is engaged even on the very first session. The minted passport lives in
+    // the crux-mcp passport store (see tools::passport boundary note).
+    super::passport::auto_issue_if_mapped(ctx).await;
+
     let Some(base_url) = ctx.daemon_base_url.as_deref() else {
         return Err(JsonRpcError {
             code: INTERNAL_ERROR,
