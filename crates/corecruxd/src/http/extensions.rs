@@ -732,6 +732,7 @@ pub(super) async fn invoke_extension_tool(
                 confidence: w.confidence,
                 private: false,
                 horizon_class: None,
+                actor: None,
             };
             crate::fact_privacy::enforce_global(&mut sf);
             store.store(sf);

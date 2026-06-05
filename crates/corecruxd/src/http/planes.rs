@@ -316,6 +316,7 @@ pub(super) async fn put_plane_layer(
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     let stored = store.store(sf);
@@ -409,6 +410,7 @@ pub(super) async fn delete_plane_layer(
         confidence: 0.0,
         private: false,
         horizon_class: None,
+        actor: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     let stored = store.store(sf);

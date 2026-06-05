@@ -756,6 +756,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .with_shared_rcx_router(rcx_router)
             .with_data_dir(state.data_dir.clone())
             .with_passport_public_key(state.passport_public_key_hex.clone())
+            .with_agent_passports(
+                config.agent_passports_enabled,
+                if config.agent_passports_enabled {
+                    // Flag ON: prefer CRUX_AGENT_PASSPORTS override, else the
+                    // built-in default map (agent-passport M1).
+                    crux_mcp::agent_passport::AgentPassportMap::from_env_or_default()
+                } else {
+                    // Flag OFF: empty map — never consulted, byte-for-byte
+                    // the pre-M1 behaviour.
+                    crux_mcp::agent_passport::AgentPassportMap::empty()
+                },
+            )
             .with_substrate(
                 state.entity_store.clone(),
                 state.edge_store.clone(),

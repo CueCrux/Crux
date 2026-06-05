@@ -36,6 +36,9 @@ rcx-capability-token = { path = "../rcx-capability-token" }
 vaultcrux-local = { path = "../vaultcrux-local" }
 
 [dev-dependencies]
+# agent-passport M5 T.1 regression suite builds a real `.ccxi` segment to prove
+# the `query` retrieval path's tenant-hash isolation end-to-end.
+corecrux-index = { path = "../corecrux-index" }
 http-body-util = "0.1"
 tempfile = "3"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "test-util"] }

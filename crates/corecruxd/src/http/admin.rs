@@ -2286,6 +2286,7 @@ pub(super) async fn post_sharing_backfill(
             confidence: fact.confidence,
             private: true,
             horizon_class: None,
+            actor: None,
         };
         crate::fact_privacy::enforce_global(&mut sf); // belt + braces — already true
         store.store(sf);

@@ -128,6 +128,7 @@ async fn store_enrichment_capsule(state: &AppState, proposal: &EnrichedActionPro
         confidence: 1.0,
         private: true,
         horizon_class: None,
+        actor: None,
     };
     crate::fact_privacy::enforce(&state.privacy_policy, &mut fact);
     state.fact_store.write().await.try_store(fact)?;

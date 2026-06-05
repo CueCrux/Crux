@@ -1291,6 +1291,7 @@ dependencies = [
  "base64",
  "blake3",
  "chrono",
+ "corecrux-index",
  "corecrux-memory",
  "corecrux-projections",
  "corecrux-receipts",

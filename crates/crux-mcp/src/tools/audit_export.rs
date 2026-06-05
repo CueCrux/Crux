@@ -161,6 +161,16 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
     let until_dt = parse_rfc3339_opt(args, "until_ts")?;
 
     let agent_name = scope::agent_name(ctx.agent.as_ref());
+    // agent-passport M5: identity-scoped per-fact visibility so the OWNER of a
+    // passport-keyed private fact can export its OWN fact (and a DIFFERENT
+    // passport cannot). The raw `agent_name` is still used for the operator
+    // `include_reserved` gate and the `caller` manifest field — those name the
+    // caller, not the fact owner. Flag-OFF identity == raw name + empty aliases,
+    // so the per-fact check below is byte-for-byte the prior agent-scoped path.
+    let identity = ctx.scope_identity();
+    let id_ref = identity.as_deref();
+    let aliases = ctx.scope_aliases();
+    let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
     let scope_arg = args.get("scope").cloned().unwrap_or_else(|| json!({}));
     let requested_entity_prefix = scope_arg
         .get("entity_prefix")
@@ -209,8 +219,10 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
                 continue;
             }
             // Visibility — a non-operator caller never sees another
-            // agent's private facts.
-            if !scope::fact_visible_to_agent(fact, agent_name) && !include_reserved {
+            // agent's private facts. Identity-scoped (M5) so the OWNER can
+            // export its own passport-keyed private fact. The `include_reserved`
+            // operator bypass is preserved unchanged.
+            if !scope::fact_visible_to_identity(fact, id_ref, &alias_refs) && !include_reserved {
                 continue;
             }
             if tokens_used.saturating_add(fact.tokens) > token_budget && !out.is_empty() {

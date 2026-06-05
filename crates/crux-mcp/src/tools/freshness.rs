@@ -102,7 +102,15 @@ pub async fn handle_memory_freshness(args: &Value, ctx: &McpContext) -> Result<V
     let key = args.get("key").and_then(|v| v.as_str()).map(|s| s.to_string());
     let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(20).min(500) as usize;
     let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).unwrap_or(500) as usize;
-    let agent_name = scope::agent_name(ctx.agent.as_ref());
+    // agent-passport M5: identity-scoped visibility, so the OWNER of a
+    // passport-keyed private fact (`__agent::<passport_id>::…`) can see its own
+    // fact here. Flag-OFF the identity is the raw agent name and aliases is
+    // empty, so the `scope::*_for_identity` calls below are byte-for-byte the
+    // prior `scope::*_for_agent(agent_name)` path.
+    let identity = ctx.scope_identity();
+    let id_ref = identity.as_deref();
+    let aliases = ctx.scope_aliases();
+    let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
     let policy = decay::DecayPolicy::from_env();
     let now = Utc::now();
 
@@ -113,7 +121,7 @@ pub async fn handle_memory_freshness(args: &Value, ctx: &McpContext) -> Result<V
     let mut candidates: Vec<&corecrux_memory::Fact> = store
         .all_facts()
         .filter(|f| !f.deleted)
-        .filter(|f| scope::fact_visible_to_agent(f, agent_name))
+        .filter(|f| scope::fact_visible_to_identity(f, id_ref, &alias_refs))
         .filter(|f| !is_reserved_entity(&f.entity))
         .filter(|f| entity.as_deref().is_none_or(|e| f.entity == e))
         .filter(|f| key.as_deref().is_none_or(|k| f.key == k))
@@ -127,7 +135,7 @@ pub async fn handle_memory_freshness(args: &Value, ctx: &McpContext) -> Result<V
         let class = projection_class_of(f.horizon_class);
         let fresh = decay::apply_at_chrono(class, f.stored_at, f.reverified_at, now, policy);
         let age_hours = (now - anchor).num_hours().max(0);
-        let topic = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
+        let topic = scope::visible_entity_for_identity(f, id_ref, &alias_refs).unwrap_or_else(|| f.entity.clone());
         let row = json!({
             "fact_id": f.fact_id,
             "entity": topic,
@@ -176,7 +184,12 @@ pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> R
 
     let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(50).min(500) as usize;
     let token_budget = args.get("token_budget").and_then(|v| v.as_u64()).unwrap_or(500) as usize;
-    let agent_name = scope::agent_name(ctx.agent.as_ref());
+    // agent-passport M5: identity-scoped visibility (see memory_freshness).
+    // Flag-OFF this reduces to the raw agent-name check, unchanged.
+    let identity = ctx.scope_identity();
+    let id_ref = identity.as_deref();
+    let aliases = ctx.scope_aliases();
+    let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
     let policy = decay::DecayPolicy::from_env();
     let now = Utc::now();
 
@@ -188,7 +201,7 @@ pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> R
     let mut candidates: Vec<(&corecrux_memory::Fact, decay::Freshness, &'static str)> = store
         .all_facts()
         .filter(|f| !f.deleted)
-        .filter(|f| scope::fact_visible_to_agent(f, agent_name))
+        .filter(|f| scope::fact_visible_to_identity(f, id_ref, &alias_refs))
         .filter(|f| !is_reserved_entity(&f.entity))
         .filter_map(|f| {
             let fresh = decay::apply_at_chrono(
@@ -219,7 +232,7 @@ pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> R
     for (f, fresh, reason) in candidates.iter().take(top_k) {
         let anchor = f.reverified_at.unwrap_or(f.stored_at);
         let age_hours = (now - anchor).num_hours().max(0);
-        let topic = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
+        let topic = scope::visible_entity_for_identity(f, id_ref, &alias_refs).unwrap_or_else(|| f.entity.clone());
         let row = json!({
             "fact_id": f.fact_id,
             "entity": topic,
@@ -285,7 +298,7 @@ pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> R
         ephemeral.sort_by(|a, b| a.stored_at.cmp(&b.stored_at));
         for f in ephemeral.iter().take(top_k) {
             let age_hours = (now - f.stored_at).num_hours().max(0);
-            let topic = scope::visible_entity_for_agent(f, agent_name).unwrap_or_else(|| f.entity.clone());
+            let topic = scope::visible_entity_for_identity(f, id_ref, &alias_refs).unwrap_or_else(|| f.entity.clone());
             let row = json!({
                 "fact_id": f.fact_id,
                 "entity": topic,
@@ -438,6 +451,7 @@ pub async fn handle_memory_reverify(args: &Value, ctx: &McpContext) -> Result<Va
         confidence: 1.0,
         private: false,
         horizon_class: Some(HorizonClass::Stable),
+        actor: None,
     };
     let mut store = ctx.fact_store.write().await;
     let _ = store.try_store(req).map_err(|err| JsonRpcError {
@@ -838,6 +852,7 @@ mod tests {
             confidence: 1.0,
             private: false,
             horizon_class: None,
+            actor: None,
         });
         let id = f.fact_id.clone();
         drop(store);

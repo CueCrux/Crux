@@ -35,6 +35,16 @@ pub(crate) struct PassportRecord {
     pub receipt_count: u64,
     pub issued_at: String,
     pub passport_hash: String,
+    /// agent-passport M4: the tenant-group (collaboration boundary / shared
+    /// pool) this passport belongs to, recorded at auto-issue/mint time from
+    /// [`crate::agent_passport::AgentPassportMap`]. `None` for passports issued
+    /// without a mapped tenant-group (flag-off, unmapped agents, or pre-M4
+    /// records — `serde(default)` keeps those deserialising).
+    ///
+    /// This field is RECORDED ONLY. M4 does not consult it for any visibility
+    /// decision; M5 (gated) is where group-visibility enforcement reads it.
+    #[serde(default)]
+    pub tenant_group: Option<String>,
 }
 
 // ── Tier resolution ───────────────────────────────────────────────────────
@@ -65,12 +75,50 @@ fn tier_rank(tier: &str) -> u8 {
     }
 }
 
+// ── MCP-vs-daemon passport boundary ───────────────────────────────────────
+//
+// There are TWO passport stores keyed off the same `__passport__::` prefix:
+//
+//   * THIS module (crux-mcp) stores under `__passport__::{name}` key=`passport`
+//     with the [`PassportRecord`] below (principal/sponsor/tier/receipt/hash).
+//     `issue_passport`, `get_passport`, and the sync tier-gate
+//     (`require_passport_tier`) read EXCLUSIVELY this store. It is the store
+//     the reputation/tier ladder runs on.
+//   * `corecruxd::passports` stores under `__passport__::{id}` key=`record`
+//     with a richer record (category / agent_work_gate / public_key_hex) and
+//     seeds `personal-default` / `work-default` / `public-default`.
+//
+// They share the entity prefix but use DIFFERENT keys, so they never collide
+// in the FactStore. agent-passport M2 stays entirely within THIS (MCP) store
+// to avoid a split-brain: the auto-issued passport is keyed to the resolved
+// passport_id (e.g. `claude-work`) so it agrees with M1's `actor` attribution,
+// but it does NOT touch or duplicate the daemon-seeded defaults.
+
 // ── Shared helpers (used by sync gate) ────────────────────────────────────
+
+/// Resolve the entity-name component used to key this agent's MCP passport.
+///
+/// Flag-OFF (or unmapped agent): the raw agent token-name — identical to the
+/// pre-M2 behaviour, so `__passport__::anthropic`.
+///
+/// Flag-ON + mapped agent (agent-passport M2): the resolved passport_id from
+/// [`McpContext::agent_passport_map`], e.g. `anthropic` → `claude-work`, so the
+/// passport is keyed to the same id M1 stamps as the fact `actor`. This keeps
+/// attribution and the passport in agreement.
+pub(crate) fn passport_key_name(ctx: &McpContext) -> Option<String> {
+    let agent_name = scope::agent_name(ctx.agent.as_ref())?;
+    if ctx.agent_passports_enabled {
+        if let Some(passport_id) = crate::agent_passport::resolve_agent_passport(agent_name, &ctx.agent_passport_map) {
+            return Some(passport_id);
+        }
+    }
+    Some(agent_name.to_string())
+}
 
 /// Look up the calling agent's passport from the fact store.
 /// Returns `None` if no passport exists or the agent is anonymous.
 pub(crate) async fn get_agent_passport(ctx: &McpContext) -> Option<PassportRecord> {
-    let agent_name = scope::agent_name(ctx.agent.as_ref())?;
+    let agent_name = passport_key_name(ctx)?;
 
     let entity = format!("{PASSPORT_PREFIX}{agent_name}");
     let q = FactQuery {
@@ -150,7 +198,7 @@ pub(crate) async fn require_passport_tier(ctx: &McpContext, required_tier: &str)
 /// `unverified` tier on first call. Subsequent calls return the existing
 /// passport (idempotent).
 pub async fn handle_issue_passport(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let agent_name = scope::agent_name(ctx.agent.as_ref()).ok_or_else(|| JsonRpcError {
+    let principal = passport_key_name(ctx).ok_or_else(|| JsonRpcError {
         code: INVALID_PARAMS,
         message: "issue_passport requires an authenticated agent identity".to_string(),
         data: Some(json!({"requires_agent_identity": true})),
@@ -158,7 +206,7 @@ pub async fn handle_issue_passport(args: &Value, ctx: &McpContext) -> Result<Val
 
     let sponsor_id = args.get("sponsor_id").and_then(|v| v.as_str()).map(String::from);
 
-    // Check if passport already exists.
+    // Check if passport already exists (idempotent).
     if let Some(existing) = get_agent_passport(ctx).await {
         return Ok(json!({
             "content": [{
@@ -174,23 +222,66 @@ pub async fn handle_issue_passport(args: &Value, ctx: &McpContext) -> Result<Val
         }));
     }
 
+    let record = mint_passport(ctx, &principal, sponsor_id.clone(), agent_tenant_group(ctx)).await;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": format!(
+                "passport issued for {} (tier={}, receipts={}, sponsor={})",
+                record.principal_id,
+                record.reputation_tier,
+                record.receipt_count,
+                sponsor_id.as_deref().unwrap_or("none")
+            )
+        }]
+    }))
+}
+
+/// Resolve the calling agent's tenant-group (agent-passport M4), recorded on
+/// the minted passport so M5 can enforce on it and `get_passport` can surface
+/// it. `None` when the flag is off, the agent is anonymous, or the agent is
+/// not in the passport map — recording only, no visibility effect.
+pub(crate) fn agent_tenant_group(ctx: &McpContext) -> Option<String> {
+    if !ctx.agent_passports_enabled {
+        return None;
+    }
+    let agent_name = scope::agent_name(ctx.agent.as_ref())?;
+    crate::agent_passport::resolve_agent_group(agent_name, &ctx.agent_passport_map).map(|g| g.tenant)
+}
+
+/// Mint and persist a passport for `principal` (the resolved passport-key name)
+/// and return the stored record.
+///
+/// Shared by `handle_issue_passport` and the agent-passport M2 auto-issue path
+/// so both code paths produce byte-identical records. Callers MUST check
+/// `get_agent_passport` first for idempotency — this function unconditionally
+/// writes. `tenant_group` (agent-passport M4) is recorded on the record but
+/// drives no visibility behaviour.
+async fn mint_passport(
+    ctx: &McpContext,
+    principal: &str,
+    sponsor_id: Option<String>,
+    tenant_group: Option<String>,
+) -> PassportRecord {
     let receipt_count = count_receipts(ctx).await;
     let tier = resolve_tier(receipt_count);
 
     // Build record (hash everything except passport_hash itself).
     let mut record = PassportRecord {
-        principal_id: agent_name.to_string(),
-        sponsor_id: sponsor_id.clone(),
+        principal_id: principal.to_string(),
+        sponsor_id,
         reputation_tier: tier.to_string(),
         receipt_count,
         issued_at: chrono::Utc::now().to_rfc3339(),
         passport_hash: String::new(),
+        tenant_group,
     };
     let hash_input = serde_json::to_string(&record).unwrap_or_default();
     record.passport_hash = blake3::hash(hash_input.as_bytes()).to_hex().to_string();
 
     let canonical = serde_json::to_string(&record).unwrap_or_default();
-    let entity = format!("{PASSPORT_PREFIX}{agent_name}");
+    let entity = format!("{PASSPORT_PREFIX}{principal}");
 
     let req = StoreFact {
         entity,
@@ -200,30 +291,44 @@ pub async fn handle_issue_passport(args: &Value, ctx: &McpContext) -> Result<Val
         confidence: 1.0,
         private: false,
         horizon_class: None,
+        actor: None,
     };
 
     let mut store = ctx.fact_store.write().await;
     store.store(req);
+    record
+}
 
-    Ok(json!({
-        "content": [{
-            "type": "text",
-            "text": format!(
-                "passport issued for {} (tier={}, receipts={}, sponsor={})",
-                agent_name,
-                tier,
-                receipt_count,
-                sponsor_id.as_deref().unwrap_or("none")
-            )
-        }]
-    }))
+/// agent-passport M2 auto-issue: when the flag is on and the calling agent is
+/// *mapped* to a passport_id, ensure a passport exists, minting one keyed to
+/// the resolved id (e.g. `claude-work`) on first session. Idempotent — a second
+/// call finds the existing passport and writes nothing.
+///
+/// No-op when the flag is off, the agent is anonymous, or the agent is not in
+/// the passport map (those agents keep the pre-M2 "call issue_passport()"
+/// flow). Returns the (possibly freshly minted) record when one exists.
+pub(crate) async fn auto_issue_if_mapped(ctx: &McpContext) -> Option<PassportRecord> {
+    if !ctx.agent_passports_enabled {
+        return None;
+    }
+    let agent_name = scope::agent_name(ctx.agent.as_ref())?;
+    // Only auto-issue for agents that resolve to a passport_id; unmapped agents
+    // fall back to the explicit issue_passport() flow.
+    let group = crate::agent_passport::resolve_agent_group(agent_name, &ctx.agent_passport_map)?;
+
+    if let Some(existing) = get_agent_passport(ctx).await {
+        return Some(existing);
+    }
+    // agent-passport M4: record the resolved tenant-group on the minted
+    // passport (recording only — no visibility change).
+    Some(mint_passport(ctx, &group.passport, None, Some(group.tenant)).await)
 }
 
 /// `get_passport` — return the calling agent's passport.
 ///
 /// Recalculates the receipt count and upgrades the tier if thresholds are met.
 pub async fn handle_get_passport(_args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
-    let Some(agent_name) = scope::agent_name(ctx.agent.as_ref()) else {
+    let Some(agent_name) = passport_key_name(ctx) else {
         return Ok(json!({
             "content": [{
                 "type": "text",
@@ -231,6 +336,11 @@ pub async fn handle_get_passport(_args: &Value, ctx: &McpContext) -> Result<Valu
             }]
         }));
     };
+
+    // agent-passport M2: a mapped agent under the flag bootstraps its passport
+    // on first access, so `get_passport` returns a tier instead of "none".
+    // No-op when the flag is off or the agent is unmapped.
+    auto_issue_if_mapped(ctx).await;
 
     let passport = get_agent_passport(ctx).await;
 
@@ -266,6 +376,7 @@ pub async fn handle_get_passport(_args: &Value, ctx: &McpContext) -> Result<Valu
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 };
                 let mut store = ctx.fact_store.write().await;
                 store.store(req);
@@ -291,11 +402,12 @@ pub async fn handle_get_passport(_args: &Value, ctx: &McpContext) -> Result<Valu
                 "content": [{
                     "type": "text",
                     "text": format!(
-                        "passport for {} (tier={}, receipts={}, sponsor={}, issued={}, hash={}).{}",
+                        "passport for {} (tier={}, receipts={}, sponsor={}, group={}, issued={}, hash={}).{}",
                         record.principal_id,
                         record.reputation_tier,
                         record.receipt_count,
                         record.sponsor_id.as_deref().unwrap_or("none"),
+                        record.tenant_group.as_deref().unwrap_or("none"),
                         record.issued_at,
                         &record.passport_hash[..16],
                         upgrade_hint
@@ -450,6 +562,7 @@ mod tests {
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 });
             }
         }
@@ -458,6 +571,265 @@ mod tests {
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("tier=basic"));
         assert!(text.contains("receipts=10"));
+    }
+
+    // ── agent-passport M2: auto-issue + resolved key ───────────────
+
+    use crate::agent_passport::AgentPassportMap;
+
+    /// Context for `anthropic` with the flag ON and the built-in default map
+    /// (`anthropic` → `claude-work`).
+    fn anthropic_mapped_ctx(ctx: &McpContext) -> McpContext {
+        ctx.with_agent(AgentIdentity {
+            name: "anthropic".to_string(),
+            token_hash: [0u8; 32],
+        })
+        .with_agent_passports(true, AgentPassportMap::builtin_default())
+    }
+
+    #[tokio::test]
+    async fn flag_off_get_passport_still_none_for_anthropic() {
+        // Flag-OFF: no auto-issue; get_passport reports "no passport" keyed to
+        // the raw token-name — pre-M2 behaviour preserved.
+        let ctx = test_ctx();
+        let anthropic = ctx.with_agent(AgentIdentity {
+            name: "anthropic".to_string(),
+            token_hash: [0u8; 32],
+        });
+        let result = handle_get_passport(&json!({}), &anthropic).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no passport for anthropic"));
+        assert!(text.contains("issue_passport()"));
+    }
+
+    #[tokio::test]
+    async fn flag_on_get_passport_auto_issues_claude_work() {
+        // Flag-ON + mapped: get_passport bootstraps the passport keyed to the
+        // RESOLVED id (`claude-work`), not the raw token-name, and returns a
+        // tier instead of "none".
+        let base = test_ctx();
+        let anthropic = anthropic_mapped_ctx(&base);
+
+        let result = handle_get_passport(&json!({}), &anthropic).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("passport for claude-work"), "got: {text}");
+        assert!(text.contains("tier=unverified"));
+
+        // The fact is keyed to the resolved id, not the raw name.
+        {
+            let store = base.fact_store.read().await;
+            assert!(store
+                .all_facts()
+                .any(|f| f.entity == "__passport__::claude-work" && f.key == "passport" && !f.deleted));
+            assert!(!store
+                .all_facts()
+                .any(|f| f.entity == "__passport__::anthropic" && f.key == "passport"));
+        }
+    }
+
+    #[tokio::test]
+    async fn flag_on_cuecrux_session_first_contact_auto_issue_is_idempotent() {
+        // Two auto-issue calls (simulating two sessions) must yield exactly one
+        // passport — no duplicate on the second contact.
+        let base = test_ctx();
+        let anthropic = anthropic_mapped_ctx(&base);
+
+        let r1 = super::auto_issue_if_mapped(&anthropic).await;
+        assert!(r1.is_some());
+        let r2 = super::auto_issue_if_mapped(&anthropic).await;
+        assert!(r2.is_some());
+
+        let store = base.fact_store.read().await;
+        let count = store
+            .all_facts()
+            .filter(|f| f.entity == "__passport__::claude-work" && f.key == "passport" && !f.deleted)
+            .count();
+        assert_eq!(count, 1, "auto-issue must be idempotent (one passport)");
+    }
+
+    #[tokio::test]
+    async fn flag_on_issue_passport_reachable_and_keys_resolved_id() {
+        // Direct issue_passport call under the flag keys to the resolved id and
+        // is idempotent with the auto-issue path.
+        let base = test_ctx();
+        let anthropic = anthropic_mapped_ctx(&base);
+
+        let r1 = handle_issue_passport(&json!({}), &anthropic).await.unwrap();
+        assert!(r1["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("passport issued for claude-work"));
+
+        // Auto-issue afterwards must find the existing one, not duplicate.
+        let r2 = handle_issue_passport(&json!({}), &anthropic).await.unwrap();
+        assert!(r2["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("passport already exists for claude-work"));
+    }
+
+    #[tokio::test]
+    async fn flag_on_unmapped_agent_does_not_auto_issue() {
+        // Flag-ON but the agent is not in the map: no auto-issue; the explicit
+        // issue_passport() flow still applies (keyed to the raw name).
+        let base = test_ctx();
+        let unmapped = base
+            .with_agent(AgentIdentity {
+                name: "windows-host".to_string(),
+                token_hash: [0u8; 32],
+            })
+            .with_agent_passports(true, AgentPassportMap::builtin_default());
+
+        assert!(super::auto_issue_if_mapped(&unmapped).await.is_none());
+        let result = handle_get_passport(&json!({}), &unmapped).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no passport for windows-host"));
+    }
+
+    #[tokio::test]
+    async fn flag_on_tier_ladder_engages_for_mapped_agent() {
+        // After the auto-issued passport exists, adding receipts drives the
+        // tier ladder via get_passport (resolve_tier mapping exercised).
+        let base = test_ctx();
+        let anthropic = anthropic_mapped_ctx(&base);
+
+        handle_get_passport(&json!({}), &anthropic).await.unwrap(); // auto-issue
+
+        {
+            let mut store = base.fact_store.write().await;
+            for i in 0..10 {
+                store.store(StoreFact {
+                    entity: format!("rcpt-{i}"),
+                    key: "k".to_string(),
+                    value: "v".to_string(),
+                    source_receipt: Some(format!("receipt-{i}")),
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                    actor: None,
+                });
+            }
+        }
+
+        let result = handle_get_passport(&json!({}), &anthropic).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("passport for claude-work"));
+        assert!(text.contains("tier=basic"), "got: {text}");
+        assert!(text.contains("receipts=10"));
+    }
+
+    // ── agent-passport M4: tenant-group recording ──────────────────
+
+    #[tokio::test]
+    async fn flag_on_anthropic_records_tenant_group_work() {
+        // Flag-ON + mapped: the auto-issued passport records tenant_group=work
+        // and get_passport surfaces it (recording only — no visibility change).
+        let base = test_ctx();
+        let anthropic = anthropic_mapped_ctx(&base);
+
+        let result = handle_get_passport(&json!({}), &anthropic).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("passport for claude-work"), "got: {text}");
+        assert!(text.contains("group=work"), "got: {text}");
+
+        // The recorded fact carries tenant_group on the PassportRecord.
+        let rec = super::get_agent_passport(&anthropic).await.unwrap();
+        assert_eq!(rec.tenant_group.as_deref(), Some("work"));
+    }
+
+    #[tokio::test]
+    async fn flag_on_openai_records_tenant_group_work() {
+        let base = test_ctx();
+        let openai = base
+            .with_agent(AgentIdentity {
+                name: "openai".to_string(),
+                token_hash: [0u8; 32],
+            })
+            .with_agent_passports(true, AgentPassportMap::builtin_default());
+
+        let result = handle_get_passport(&json!({}), &openai).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("passport for codex-work"), "got: {text}");
+        assert!(text.contains("group=work"), "got: {text}");
+
+        let rec = super::get_agent_passport(&openai).await.unwrap();
+        assert_eq!(rec.tenant_group.as_deref(), Some("work"));
+    }
+
+    #[tokio::test]
+    async fn flag_on_custom_tenant_recorded_from_env_shape() {
+        // A custom env map with an explicit `:tenant` segment is recorded.
+        let map = AgentPassportMap::from_pairs_str("anthropic:claude-work:research");
+        let base = test_ctx();
+        let anthropic = base
+            .with_agent(AgentIdentity {
+                name: "anthropic".to_string(),
+                token_hash: [0u8; 32],
+            })
+            .with_agent_passports(true, map);
+
+        handle_get_passport(&json!({}), &anthropic).await.unwrap();
+        let rec = super::get_agent_passport(&anthropic).await.unwrap();
+        assert_eq!(rec.tenant_group.as_deref(), Some("research"));
+    }
+
+    #[tokio::test]
+    async fn flag_off_records_no_tenant_group() {
+        // Flag-OFF: explicit issue_passport keyed to the raw name records no
+        // group; get_passport shows group=none.
+        let ctx = test_ctx();
+        let alice = alice_ctx(&ctx);
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+
+        let result = handle_get_passport(&json!({}), &alice).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("group=none"), "got: {text}");
+
+        let rec = super::get_agent_passport(&alice).await.unwrap();
+        assert_eq!(rec.tenant_group, None);
+    }
+
+    #[tokio::test]
+    async fn pre_m4_passport_fact_without_group_still_loads() {
+        // serde(default): a passport fact written before M4 (no tenant_group
+        // field) must still deserialise into PassportRecord.
+        let ctx = test_ctx();
+        let legacy = r#"{"principal_id":"legacy","sponsor_id":null,"reputation_tier":"unverified","receipt_count":0,"issued_at":"2026-01-01T00:00:00Z","passport_hash":"abc"}"#;
+        let rec: PassportRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(rec.principal_id, "legacy");
+        assert_eq!(rec.tenant_group, None);
+        let _ = ctx; // silence unused in case of future edits
+    }
+
+    #[tokio::test]
+    async fn tenant_group_survives_tier_refresh() {
+        // get_passport's tier-refresh re-stores the record; tenant_group must
+        // survive the rewrite.
+        let base = test_ctx();
+        let anthropic = anthropic_mapped_ctx(&base);
+        handle_get_passport(&json!({}), &anthropic).await.unwrap(); // auto-issue
+
+        // Drive a tier change via receipts so the refresh path re-stores.
+        {
+            let mut store = base.fact_store.write().await;
+            for i in 0..10 {
+                store.store(StoreFact {
+                    entity: format!("rcpt-{i}"),
+                    key: "k".to_string(),
+                    value: "v".to_string(),
+                    source_receipt: Some(format!("receipt-{i}")),
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                    actor: None,
+                });
+            }
+        }
+        handle_get_passport(&json!({}), &anthropic).await.unwrap();
+
+        let rec = super::get_agent_passport(&anthropic).await.unwrap();
+        assert_eq!(rec.reputation_tier, "basic");
+        assert_eq!(rec.tenant_group.as_deref(), Some("work"));
     }
 
     // ── require_passport_tier ──────────────────────────────────────
@@ -509,6 +881,7 @@ mod tests {
                     confidence: 1.0,
                     private: false,
                     horizon_class: None,
+                    actor: None,
                 });
             }
         }

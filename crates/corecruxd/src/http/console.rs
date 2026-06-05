@@ -873,6 +873,7 @@ pub(super) async fn post_console_fact_add(
         // __project_layer__::, github::, etc.).
         private: false,
         horizon_class: None,
+        actor: None,
     };
     crate::fact_privacy::enforce_global(&mut sf);
     let stored = store.store(sf);

@@ -165,6 +165,7 @@ where
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
 
             // Ring buffer eviction.
@@ -289,6 +290,7 @@ mod tests {
                 confidence: 1.0,
                 private: false,
                 horizon_class: None,
+                actor: None,
             });
             all_ids.push(fact.fact_id.clone());
 
