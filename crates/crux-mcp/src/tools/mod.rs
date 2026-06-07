@@ -27,6 +27,7 @@ pub mod forget;
 pub mod freshness;
 pub mod github;
 pub mod handoff;
+pub mod hardening;
 pub mod identity;
 pub mod kinds;
 pub mod loopback_auth;
@@ -725,6 +726,32 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
             }),
         },
         ToolDefinition {
+            name: "session_checkpoint".to_string(),
+            description: "Store a compact, typed checkpoint for resuming an agent session. \
+                          Requires token_budget so checkpoint output stays bounded."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id":        { "type": "string",  "description": "Session identifier" },
+                    "objective":         { "type": "string",  "description": "Current concrete objective" },
+                    "current_milestone": { "type": "string",  "description": "Current milestone or gate" },
+                    "decisions":         { "type": "array",   "items": {}, "description": "Key decisions made" },
+                    "open_questions":    { "type": "array",   "items": {}, "description": "Known blockers or questions" },
+                    "files_touched":     { "type": "array",   "items": { "type": "string" }, "description": "Files touched or expected" },
+                    "commands_run":      { "type": "array",   "items": { "type": "string" }, "description": "Important verification commands" },
+                    "test_status":       { "description": "Current test/gate status" },
+                    "next_action":       { "type": "string",  "description": "Next concrete action" },
+                    "ttl_seconds":       { "type": "integer", "description": "Optional time-to-live in seconds" },
+                    "token_budget":      { "type": "integer", "description": "Mandatory output-token cap" }
+                },
+                "required": ["session_id", "token_budget"],
+                "examples": [
+                    { "session_id": "audit-1", "current_milestone": "M2", "next_action": "run focused tests", "token_budget": 500 }
+                ]
+            }),
+        },
+        ToolDefinition {
             name: "list_sessions".to_string(),
             description: "List active session IDs visible to you. Returns a sorted list.".to_string(),
             input_schema: json!({
@@ -744,6 +771,67 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                 "required": ["session_id"],
                 "examples": [
                     { "session_id": "session-42" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "route_access_matrix".to_string(),
+            description: "Return the current high-risk HTTP route access matrix used by agent hardening checks."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "examples": [{}]
+            }),
+        },
+        ToolDefinition {
+            name: "execplan_gate".to_string(),
+            description: "Record an ExecPlan milestone gate as a stable fact under execplan:<slug>."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "slug":          { "type": "string",  "description": "ExecPlan slug without execplan: prefix" },
+                    "milestone":     { "type": "string",  "description": "Milestone id, e.g. M2 or gate:M2" },
+                    "status":        { "type": "string",  "enum": ["passed", "failed", "blocked", "skipped"] },
+                    "commit_sha":    { "type": "string",  "description": "Source commit SHA for the gate" },
+                    "tests_passing": { "type": "boolean", "description": "Whether relevant tests passed" },
+                    "artifacts":     { "type": "array",   "items": { "type": "string" }, "description": "Related files, logs, or PR links" },
+                    "notes":         { "type": "string",  "description": "Short gate note" },
+                    "token_budget":  { "type": "integer", "description": "Mandatory output-token cap" }
+                },
+                "required": ["slug", "milestone", "status", "commit_sha", "token_budget"],
+                "examples": [
+                    { "slug": "crux-daemon-hardening", "milestone": "M2", "status": "passed", "commit_sha": "abc1234", "token_budget": 500 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "auth_posture_audit".to_string(),
+            description: "Return a compact local auth-posture checklist for the current MCP daemon context."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "examples": [{}]
+            }),
+        },
+        ToolDefinition {
+            name: "egress_policy_check".to_string(),
+            description: "Check whether a proposed URL egress target matches the local conservative egress policy."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target":              { "type": "string",  "description": "Target URL to check" },
+                    "purpose":             { "type": "string",  "description": "Audit purpose for the egress" },
+                    "allow_loopback_http": { "type": "boolean", "description": "Allow http:// loopback targets", "default": true },
+                    "allow_plain_http":    { "type": "boolean", "description": "Allow external plain HTTP", "default": false }
+                },
+                "required": ["target"],
+                "examples": [
+                    { "target": "https://api.example.com/v1", "purpose": "metadata lookup" },
+                    { "target": "http://127.0.0.1:14800/readyz", "purpose": "local readiness probe" }
                 ]
             }),
         },
@@ -2333,8 +2421,13 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "artefact_list" => artefacts::handle_artefact_list(args, ctx).await,
         "get_session" => sessions::handle_get_session(args, ctx).await,
         "save_session" => sessions::handle_save_session(args, ctx).await,
+        "session_checkpoint" => sessions::handle_session_checkpoint(args, ctx).await,
         "list_sessions" => sessions::handle_list_sessions(args, ctx).await,
         "delete_session" => sessions::handle_delete_session(args, ctx).await,
+        "route_access_matrix" => hardening::handle_route_access_matrix(args, ctx).await,
+        "execplan_gate" => hardening::handle_execplan_gate(args, ctx).await,
+        "auth_posture_audit" => hardening::handle_auth_posture_audit(args, ctx).await,
+        "egress_policy_check" => hardening::handle_egress_policy_check(args, ctx).await,
         "get_gaps" => observe::handle_get_gaps(args, ctx).await,
         "list_observations" => observations::handle_list_observations(args, ctx).await,
         "get_observation" => observations::handle_get_observation(args, ctx).await,

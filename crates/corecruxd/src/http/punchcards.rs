@@ -89,9 +89,8 @@ pub(super) struct AcquireBody {
     pub ttl_secs: Option<u64>,
     #[serde(default)]
     pub tenant_id: Option<String>,
-    /// Explicit lease holder. When set, wins over the request's authenticated
-    /// passport — this is the `holder_passport` the MCP `punch_in` tool sends,
-    /// which was previously dropped (the lease recorded `anonymous`).
+    /// Explicit lease holder. In authenticated modes this must match the
+    /// bound request passport unless the caller has an override scope.
     #[serde(default)]
     pub holder_passport: Option<String>,
 }
@@ -237,6 +236,29 @@ fn actor(state: &AppState, headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "anonymous".into())
 }
 
+fn requested_passport(value: Option<&String>) -> Option<String> {
+    value.map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_holder_passport(
+    state: &AppState,
+    headers: &HeaderMap,
+    requested: Option<&String>,
+    override_scopes: &[&str],
+) -> Result<String, Response> {
+    let actual = actor(state, headers);
+    let Some(requested) = requested_passport(requested) else {
+        return Ok(actual);
+    };
+    if requested == actual || state.auth.mode() == crate::auth::AuthMode::Off {
+        return Ok(requested);
+    }
+    require_http_any_scope(&state.auth, headers, override_scopes)
+        .map(|()| requested)
+        .map_err(IntoResponse::into_response)
+}
+
 /// Sweep expired `held` cards to `expired` and emit a `PunchcardChanged`.
 ///
 /// Runs under a held write lock on the entity store. Returns the number of
@@ -299,13 +321,15 @@ pub(super) async fn acquire(
     if body.resource.trim().is_empty() {
         return problem_response(StatusCode::BAD_REQUEST, "resource must not be empty");
     }
-    // Explicit body `holder_passport` wins over the request's authenticated
-    // passport (which is itself the header passport, else "anonymous").
-    let holder = body
-        .holder_passport
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| actor(&state, &headers));
+    let holder = match resolve_holder_passport(
+        &state,
+        &headers,
+        body.holder_passport.as_ref(),
+        &["admin:write", "passport:impersonate"],
+    ) {
+        Ok(holder) => holder,
+        Err(response) => return response,
+    };
 
     // Expiry sweep first so a crashed holder's card cannot block us.
     sweep_expired(&state).await;
@@ -440,11 +464,15 @@ pub(super) async fn release(
     if let Err(p) = require_http_any_scope(&state.auth, &headers, &["facts:write", "admin:write"]) {
         return p.into_response();
     }
-    let holder = body
-        .holder_passport
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| actor(&state, &headers));
+    let holder = match resolve_holder_passport(
+        &state,
+        &headers,
+        body.holder_passport.as_ref(),
+        &["admin:write", "passport:impersonate"],
+    ) {
+        Ok(holder) => holder,
+        Err(response) => return response,
+    };
     let now = now_unix_ms();
     let registry = state.kind_registry.read().await;
     let registry_opt = registry.is_registered(PUNCHCARD_KIND).then_some(&*registry);
@@ -574,8 +602,15 @@ pub(super) async fn check(State(state): State<AppState>, headers: HeaderMap, Jso
     // Sweep so an expired holder doesn't show as a live conflict.
     sweep_expired(&state).await;
 
-    // The probing passport: explicit `passport` field wins, else the header.
-    let probe = body.passport.clone().unwrap_or_else(|| actor(&state, &headers));
+    let probe = match resolve_holder_passport(
+        &state,
+        &headers,
+        body.passport.as_ref(),
+        &["admin:read", "admin:write", "passport:impersonate"],
+    ) {
+        Ok(passport) => passport,
+        Err(response) => return response,
+    };
     let enforce = punchcard_mode() == PunchcardMode::Enforce;
     let now = now_unix_ms();
 
@@ -636,7 +671,15 @@ pub(super) async fn force_release(
             "force-release is destructive; resubmit with {\"confirm\": true}",
         );
     }
-    let by = body.by_passport.clone().unwrap_or_else(|| actor(&state, &headers));
+    let by = match resolve_holder_passport(
+        &state,
+        &headers,
+        body.by_passport.as_ref(),
+        &["admin:write", "passport:impersonate"],
+    ) {
+        Ok(passport) => passport,
+        Err(response) => return response,
+    };
     let now = now_unix_ms();
     let registry = state.kind_registry.read().await;
     let registry_opt = registry.is_registered(PUNCHCARD_KIND).then_some(&*registry);
@@ -805,6 +848,12 @@ mod tests {
         h
     }
 
+    fn dev_headers_for(scopes: &str, passport: &str) -> HeaderMap {
+        let mut h = headers_for(passport);
+        h.insert("x-corecrux-scopes", axum::http::HeaderValue::from_str(scopes).unwrap());
+        h
+    }
+
     fn acquire_body(resource: &str, ttl_secs: u64) -> AcquireBody {
         AcquireBody {
             resource: resource.to_string(),
@@ -828,6 +877,25 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn holder_body_override_requires_override_scope_in_authenticated_mode() {
+        std::env::set_var("CORECRUXD_PUNCHCARD", "enforce");
+        let mut state = state_with_kind().await;
+        state.auth = crate::auth::Authz::from_env(crate::auth::AuthMode::DevScopes).expect("dev auth");
+        let mut body = acquire_body("file:///spoof.rs", 60);
+        body.holder_passport = Some("passport-b".to_string());
+
+        let resp = acquire(
+            StateExtract(state),
+            dev_headers_for("facts:write", "passport-a"),
+            JsonExtract(body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        std::env::remove_var("CORECRUXD_PUNCHCARD");
     }
 
     #[tokio::test]
