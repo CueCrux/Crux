@@ -30,7 +30,7 @@ zip = "8.6.0"
 p256 = { version = "0.13.2", default-features = false, features = ["std", "ecdsa", "pem"] }
 rcgen = { version = "0.13.2", features = ["x509-parser"] }
 x509-cert = { version = "0.2.5", default-features = false, features = ["std", "pem"] }
-der = { version = "0.7.10", default-features = false, features = ["std", "pem"] }
+der = { version = "0.8.0", default-features = false, features = ["std", "pem"] }
 ureq = { version = "2.12.1", default-features = false, features = ["tls", "json"] }
 url = "2.5.4"
 parking_lot = "0.12.3"
