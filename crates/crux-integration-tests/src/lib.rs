@@ -11,7 +11,7 @@ use std::fs::OpenOptions;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -29,6 +29,37 @@ fn repo_root() -> PathBuf {
 }
 
 fn build_corecruxd_binary(repo_root: &std::path::Path) -> Result<PathBuf, String> {
+    // This nested `cargo build` runs *inside* an outer `cargo test --workspace`,
+    // concurrently with other test binaries that spawn the corecruxd executable.
+    // On loaded CI runners that race surfaces a transient `Text file busy`
+    // (ETXTBSY, os error 26) when the linker rewrites the executable while
+    // another process holds it open, or a transient `Resource temporarily
+    // unavailable` (EAGAIN) when forking under memory pressure. Retry those with
+    // backoff rather than giving up — previously a single transient failure was
+    // memoised by `default_binary_path`'s OnceLock and failed *every* test in
+    // the process.
+    const BUILD_ATTEMPTS: usize = 5;
+    let mut last_err = String::new();
+    for attempt in 1..=BUILD_ATTEMPTS {
+        match try_build_corecruxd_binary(repo_root) {
+            Ok(path) => return Ok(path),
+            Err(err) => {
+                let transient = err.contains("Text file busy")
+                    || err.contains("os error 26")
+                    || err.contains("Resource temporarily unavailable")
+                    || err.contains("os error 11");
+                last_err = err;
+                if !transient || attempt == BUILD_ATTEMPTS {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+            }
+        }
+    }
+    Err(last_err)
+}
+
+fn try_build_corecruxd_binary(repo_root: &std::path::Path) -> Result<PathBuf, String> {
     let output = Command::new("cargo")
         .current_dir(repo_root)
         .args(["build", "--message-format=json", "--bin", "corecruxd"])
@@ -75,13 +106,24 @@ fn build_corecruxd_binary(repo_root: &std::path::Path) -> Result<PathBuf, String
 }
 
 fn default_binary_path() -> Result<PathBuf, String> {
-    static BUILD_RESULT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    BUILD_RESULT
-        .get_or_init(|| {
-            let repo_root = repo_root();
-            build_corecruxd_binary(&repo_root)
-        })
-        .clone()
+    // Cache only a *successful* build path. A failed/transient build must never
+    // be memoised, otherwise one ETXTBSY poisons every test in the process (the
+    // original `OnceLock<Result<..>>` did exactly that). The mutex serialises
+    // concurrent first-builds so parallel tests don't fire N racing `cargo
+    // build`s at the same target dir.
+    static CACHED: OnceLock<PathBuf> = OnceLock::new();
+    static BUILD_LOCK: Mutex<()> = Mutex::new(());
+
+    if let Some(path) = CACHED.get() {
+        return Ok(path.clone());
+    }
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(path) = CACHED.get() {
+        return Ok(path.clone());
+    }
+    let path = build_corecruxd_binary(&repo_root())?;
+    let _ = CACHED.set(path.clone());
+    Ok(path)
 }
 
 /// A running corecruxd instance for integration tests.
