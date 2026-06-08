@@ -8,5 +8,9 @@ description = "Daemon-side RCX Capability Token router primitives."
 [dependencies]
 rcx-capability-token = { path = "../rcx-capability-token" }
 
+[dev-dependencies]
+ed25519-dalek = { version = "2.1.1", features = ["std"] }
+hex = "0.4"
+
 [lints]
 workspace = true

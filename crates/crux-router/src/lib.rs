@@ -486,6 +486,161 @@ pub fn mint_signed_free_local_token(
     token
 }
 
+/// Build a PAID local token: a free local token rebranded to a paying tier
+/// (`RcxTier::Pro`) that additionally carries every premium `corecrux.lane.*`
+/// capability and a bundled credit balance. This is the free → paid step:
+/// CoreCrux hard-gates premium lanes on these capabilities + a positive
+/// balance (`OverdraftPolicy::Forbid`). Signature is left zeroed — sign via
+/// [`mint_signed_paid_local_token`] or set it on the returned token.
+#[allow(clippy::too_many_arguments)]
+pub fn build_paid_local_token(
+    passport_fpr: impl Into<String>,
+    daemon_instance_id: impl Into<String>,
+    tenant_id: impl Into<String>,
+    extra_local_capabilities: Vec<String>,
+    credit_balance: u64,
+    per_call_cost: u64,
+    issued_at: u64,
+    expires_at: u64,
+) -> RcxCapabilityToken {
+    let passport_fpr = passport_fpr.into();
+    let tenant_id = tenant_id.into();
+    let short_fpr: String = passport_fpr.trim_start_matches("p_").chars().take(16).collect();
+    let mut token = mint_free_local_token(
+        passport_fpr,
+        daemon_instance_id,
+        tenant_id.clone(),
+        extra_local_capabilities,
+        issued_at,
+        expires_at,
+        [0_u8; RCX_CT_SIGNATURE_LEN],
+    );
+    token.token_id = format!("rcxct_paid_{short_fpr}_{tenant_id}");
+    token.tier = RcxTier::Pro;
+    // Append the premium lane capabilities to the local backend.
+    if let Some(backend) = token.backends.first_mut() {
+        backend
+            .permitted_capabilities
+            .extend(rcx_capability_token::corecrux_premium_lane_capabilities(per_call_cost));
+    }
+    // Bundled credit amount; hard gate (Forbid) so an exhausted balance denies.
+    token.credits.balance = Some(credit_balance);
+    token
+}
+
+/// Mint + sign a paid local token (see [`build_paid_local_token`]).
+#[allow(clippy::too_many_arguments)]
+pub fn mint_signed_paid_local_token(
+    passport_fpr: impl Into<String>,
+    daemon_instance_id: impl Into<String>,
+    tenant_id: impl Into<String>,
+    extra_local_capabilities: Vec<String>,
+    credit_balance: u64,
+    per_call_cost: u64,
+    issued_at: u64,
+    expires_at: u64,
+    sign_hash: impl FnOnce(&[u8; rcx_capability_token::RCX_CT_HASH_LEN]) -> [u8; RCX_CT_SIGNATURE_LEN],
+) -> RcxCapabilityToken {
+    let mut token = build_paid_local_token(
+        passport_fpr,
+        daemon_instance_id,
+        tenant_id,
+        extra_local_capabilities,
+        credit_balance,
+        per_call_cost,
+        issued_at,
+        expires_at,
+    );
+    token.signature.sig = sign_hash(&token.token_hash());
+    token
+}
+
+/// Per-call credit cost for one premium lane, read from the token's
+/// capabilities (0 if the lane is not present / has no cost).
+pub fn lane_call_cost(token: &RcxCapabilityToken, lane_slug: &str) -> u64 {
+    let capability = rcx_capability_token::corecrux_lane_capability(lane_slug);
+    token
+        .backends
+        .iter()
+        .flat_map(|backend| backend.permitted_capabilities.iter())
+        .find(|cap| cap.capability == capability)
+        .and_then(|cap| cap.credit_cost.as_ref())
+        .map_or(0, |cost| cost.cost)
+}
+
+/// Debit a usage report for the premium lanes used this request against a
+/// [`crate::hosted::CreditLedger`]. Sums per-lane cost from the token, then
+/// debits once. This is the M4 ledger-side of the CoreCrux→Crux usage report
+/// (the HTTP ingest route is wired in M5). Hard gate: a `Forbid` token whose
+/// balance can't cover the cost returns `Err(CreditDebitDenied)`.
+pub fn debit_lane_usage(
+    ledger: &mut crate::hosted::CreditLedger,
+    token: &RcxCapabilityToken,
+    lanes_used: &[&str],
+) -> Result<crate::hosted::CreditDebit, crate::hosted::CreditDebitDenied> {
+    let cost: u64 = lanes_used.iter().map(|slug| lane_call_cost(token, slug)).sum();
+    ledger.try_debit(cost)
+}
+
+/// A premium-lane usage report from a CoreCrux retrieval daemon
+/// (`corecrux.lane.usage.v1`). Plain struct — the daemon HTTP route owns JSON
+/// (de)serialisation so this crate stays serde-free and pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageReport {
+    pub token_hash: String,
+    pub tenant_id: String,
+    pub lanes_used: Vec<String>,
+    /// Credits CoreCrux computed from the (verified) token's per-lane costs.
+    pub credits_used: u64,
+}
+
+/// Receipt for an ingested usage report: whether the debit was applied and the
+/// resulting balance, or why it was denied (hard gate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageReceipt {
+    pub token_hash: String,
+    pub accepted: bool,
+    pub debited: u64,
+    pub balance_after: Option<u64>,
+    pub denied_reason: Option<String>,
+}
+
+/// Ingest a usage report against a credit ledger (the Crux billing side of the
+/// CoreCrux→Crux report). Applies a refill first, then debits
+/// `report.credits_used`. A `Forbid` ledger that can't cover the cost yields an
+/// `accepted: false` receipt with the balance unchanged (hard gate).
+///
+/// Note: CoreCrux is first-party and computes `credits_used` from the verified
+/// token's lane costs; in the current stateless model the ledger is supplied by
+/// the caller (reconstructed from the token / a persistent store when one
+/// exists — see ExecPlan M5 note on the persistent-ledger boundary).
+pub fn ingest_usage_report(
+    report: &UsageReport,
+    ledger: &mut crate::hosted::CreditLedger,
+    now_unix_seconds: u64,
+) -> UsageReceipt {
+    let _ = ledger.apply_refill(now_unix_seconds);
+    match ledger.try_debit(report.credits_used) {
+        Ok(debit) => UsageReceipt {
+            token_hash: report.token_hash.clone(),
+            accepted: true,
+            debited: debit.cost,
+            balance_after: debit.balance_after,
+            denied_reason: None,
+        },
+        Err(denied) => UsageReceipt {
+            token_hash: report.token_hash.clone(),
+            accepted: false,
+            debited: 0,
+            balance_after: ledger.balance(),
+            denied_reason: Some(format!(
+                "insufficient_credit: need {} have {}",
+                denied.cost, denied.available
+            )),
+        },
+    }
+}
+
 fn first_validation_reason(issues: &[TokenValidationIssue]) -> DenialReason {
     if issues.iter().any(|issue| issue.code == "token_expired") {
         DenialReason::TokenExpired
@@ -798,5 +953,139 @@ mod tests {
             "router decision mean latency exceeded 1ms: {}ns (real cost is sub-microsecond; check for a hot-path regression)",
             mean.as_nanos()
         );
+    }
+
+    fn paid_token(balance: u64, per_call: u64) -> RcxCapabilityToken {
+        build_paid_local_token(
+            "p_0123456789abcdef0123456789abcdef",
+            "daemon_01HV0000000000000000000000",
+            "default",
+            vec!["corecrux.query.local".to_string()],
+            balance,
+            per_call,
+            1_776_989_600,
+            1_780_143_200,
+        )
+    }
+
+    #[test]
+    fn paid_token_carries_all_premium_lanes_and_is_structurally_valid() {
+        let token = paid_token(100, 2);
+        assert_eq!(token.tier, RcxTier::Pro);
+        assert!(token.token_id.starts_with("rcxct_paid_"));
+        assert_eq!(token.credits.balance, Some(100));
+        // all 11 premium lanes present with cost 2; the free baseline is absent
+        for slug in rcx_capability_token::CORECRUX_PREMIUM_LANE_SLUGS {
+            assert_eq!(lane_call_cost(&token, slug), 2, "lane {slug} cost");
+        }
+        assert_eq!(lane_call_cost(&token, "bm25"), 0, "free baseline never minted");
+        // Pro tier needs no team/enterprise scope → structurally valid.
+        assert!(token.validate_basic(1_776_989_601).valid);
+    }
+
+    #[test]
+    fn debit_lane_usage_charges_sum_then_hard_gate_denies_when_exhausted() {
+        let token = paid_token(5, 2);
+        let mut ledger = crate::hosted::CreditLedger::from_token(&token, 1_776_989_600);
+        // two premium lanes @2 = 4 debited, balance 5 → 1
+        let debit = debit_lane_usage(&mut ledger, &token, &["topology", "event"]).expect("debit ok");
+        assert_eq!(debit.cost, 4);
+        assert_eq!(ledger.balance(), Some(1));
+        // next 2-lane call costs 4 but only 1 left + Forbid overdraft → denied
+        let denied = debit_lane_usage(&mut ledger, &token, &["trait", "navtree"]).unwrap_err();
+        assert_eq!(denied.cost, 4);
+        assert_eq!(denied.available, 1);
+        // balance unchanged after a denied debit
+        assert_eq!(ledger.balance(), Some(1));
+    }
+
+    #[test]
+    fn free_token_has_no_premium_lane_capabilities() {
+        let token = mint_free_local_token(
+            "p_0123456789abcdef0123456789abcdef",
+            "daemon_01HV0000000000000000000000",
+            "default",
+            vec!["corecrux.query.local".to_string()],
+            1_776_989_600,
+            1_780_143_200,
+            [0_u8; RCX_CT_SIGNATURE_LEN],
+        );
+        for slug in rcx_capability_token::CORECRUX_PREMIUM_LANE_SLUGS {
+            assert_eq!(lane_call_cost(&token, slug), 0, "free token must not carry {slug}");
+        }
+    }
+
+    #[test]
+    fn paid_token_signature_verifies_over_token_hash() {
+        // Cross-convention guard: a token signed by mint_signed_paid_local_token
+        // (Ed25519 over token_hash) must verify over token_hash with the public
+        // key — exactly what CoreCrux's corecrux-rcx-token::verify does. If this
+        // breaks, real paid tokens would fail verification in the retrieval daemon.
+        use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let verifying: VerifyingKey = signing.verifying_key();
+        let token = mint_signed_paid_local_token(
+            "p_0123456789abcdef0123456789abcdef",
+            "daemon_01HV0000000000000000000000",
+            "default",
+            vec!["corecrux.query.local".to_string()],
+            100,
+            2,
+            1_776_989_600,
+            1_780_143_200,
+            |hash| signing.sign(hash).to_bytes(),
+        );
+        let sig = ed25519_dalek::Signature::from_bytes(&token.signature.sig);
+        assert!(verifying.verify(&token.token_hash(), &sig).is_ok());
+        assert!(token.validate_basic(1_776_989_601).valid);
+    }
+
+    /// Operator helper for the M6 sidelab runbook: prints a trust-root public
+    /// key + a signed paid-token hex to paste into the daemon config + the
+    /// `X-RCX-Token` header. Run: `cargo test -p crux-router -- --ignored
+    /// --nocapture print_sidelab_paid_token`.
+    #[test]
+    #[ignore = "operator runbook helper; prints a token, not an assertion"]
+    fn print_sidelab_paid_token() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let pubkey_hex = hex::encode(signing.verifying_key().to_bytes());
+        let token = mint_signed_paid_local_token(
+            "p_0123456789abcdef0123456789abcdef",
+            "daemon_01HV0000000000000000000000",
+            "default",
+            vec!["corecrux.query.local".to_string()],
+            100,           // bundled credit balance
+            2,             // per-lane per-call cost
+            1_776_989_600, // issued_at
+            4_102_444_800, // far-future expiry for a long-lived sidelab token
+            |hash| signing.sign(hash).to_bytes(),
+        );
+        let token_hex = hex::encode(token.to_canonical_cbor());
+        println!("TRUST_ROOT_PUBKEY_HEX={pubkey_hex}");
+        println!("X_RCX_TOKEN_HEX={token_hex}");
+    }
+
+    #[test]
+    fn ingest_usage_report_debits_then_hard_gate_denies() {
+        let token = paid_token(10, 2);
+        let mut ledger = crate::hosted::CreditLedger::from_token(&token, 1_776_989_600);
+        let report = UsageReport {
+            token_hash: token.token_hash_hex(),
+            tenant_id: "default".to_string(),
+            lanes_used: vec!["topology".to_string(), "event".to_string()],
+            credits_used: 8,
+        };
+        let receipt = ingest_usage_report(&report, &mut ledger, 1_776_989_600);
+        assert!(receipt.accepted);
+        assert_eq!(receipt.debited, 8);
+        assert_eq!(receipt.balance_after, Some(2));
+
+        // a second report for 8 exceeds the remaining 2 → hard-gate denied
+        let receipt2 = ingest_usage_report(&report, &mut ledger, 1_776_989_600);
+        assert!(!receipt2.accepted);
+        assert_eq!(receipt2.debited, 0);
+        assert_eq!(receipt2.balance_after, Some(2));
+        assert!(receipt2.denied_reason.unwrap().contains("insufficient_credit"));
     }
 }
