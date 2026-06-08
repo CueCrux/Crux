@@ -582,6 +582,65 @@ pub fn debit_lane_usage(
     ledger.try_debit(cost)
 }
 
+/// A premium-lane usage report from a CoreCrux retrieval daemon
+/// (`corecrux.lane.usage.v1`). Plain struct — the daemon HTTP route owns JSON
+/// (de)serialisation so this crate stays serde-free and pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageReport {
+    pub token_hash: String,
+    pub tenant_id: String,
+    pub lanes_used: Vec<String>,
+    /// Credits CoreCrux computed from the (verified) token's per-lane costs.
+    pub credits_used: u64,
+}
+
+/// Receipt for an ingested usage report: whether the debit was applied and the
+/// resulting balance, or why it was denied (hard gate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageReceipt {
+    pub token_hash: String,
+    pub accepted: bool,
+    pub debited: u64,
+    pub balance_after: Option<u64>,
+    pub denied_reason: Option<String>,
+}
+
+/// Ingest a usage report against a credit ledger (the Crux billing side of the
+/// CoreCrux→Crux report). Applies a refill first, then debits
+/// `report.credits_used`. A `Forbid` ledger that can't cover the cost yields an
+/// `accepted: false` receipt with the balance unchanged (hard gate).
+///
+/// Note: CoreCrux is first-party and computes `credits_used` from the verified
+/// token's lane costs; in the current stateless model the ledger is supplied by
+/// the caller (reconstructed from the token / a persistent store when one
+/// exists — see ExecPlan M5 note on the persistent-ledger boundary).
+pub fn ingest_usage_report(
+    report: &UsageReport,
+    ledger: &mut crate::hosted::CreditLedger,
+    now_unix_seconds: u64,
+) -> UsageReceipt {
+    let _ = ledger.apply_refill(now_unix_seconds);
+    match ledger.try_debit(report.credits_used) {
+        Ok(debit) => UsageReceipt {
+            token_hash: report.token_hash.clone(),
+            accepted: true,
+            debited: debit.cost,
+            balance_after: debit.balance_after,
+            denied_reason: None,
+        },
+        Err(denied) => UsageReceipt {
+            token_hash: report.token_hash.clone(),
+            accepted: false,
+            debited: 0,
+            balance_after: ledger.balance(),
+            denied_reason: Some(format!(
+                "insufficient_credit: need {} have {}",
+                denied.cost, denied.available
+            )),
+        },
+    }
+}
+
 fn first_validation_reason(issues: &[TokenValidationIssue]) -> DenialReason {
     if issues.iter().any(|issue| issue.code == "token_expired") {
         DenialReason::TokenExpired
@@ -921,5 +980,28 @@ mod tests {
         for slug in rcx_capability_token::CORECRUX_PREMIUM_LANE_SLUGS {
             assert_eq!(lane_call_cost(&token, slug), 0, "free token must not carry {slug}");
         }
+    }
+
+    #[test]
+    fn ingest_usage_report_debits_then_hard_gate_denies() {
+        let token = paid_token(10, 2);
+        let mut ledger = crate::hosted::CreditLedger::from_token(&token, 1_776_989_600);
+        let report = UsageReport {
+            token_hash: token.token_hash_hex(),
+            tenant_id: "default".to_string(),
+            lanes_used: vec!["topology".to_string(), "event".to_string()],
+            credits_used: 8,
+        };
+        let receipt = ingest_usage_report(&report, &mut ledger, 1_776_989_600);
+        assert!(receipt.accepted);
+        assert_eq!(receipt.debited, 8);
+        assert_eq!(receipt.balance_after, Some(2));
+
+        // a second report for 8 exceeds the remaining 2 → hard-gate denied
+        let receipt2 = ingest_usage_report(&report, &mut ledger, 1_776_989_600);
+        assert!(!receipt2.accepted);
+        assert_eq!(receipt2.debited, 0);
+        assert_eq!(receipt2.balance_after, Some(2));
+        assert!(receipt2.denied_reason.unwrap().contains("insufficient_credit"));
     }
 }
