@@ -73,6 +73,9 @@ pub fn global_policy() -> &'static PrivacyPolicy {
 }
 
 const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
+    "__agent::",
+    "__ops::",
+    "__ops__::",
     "__ax__::",
     "__ax_session::",
     "__constraints__::",

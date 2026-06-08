@@ -2,8 +2,8 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! Session state tool handlers: `get_session`, `save_session`, `list_sessions`,
-//! `delete_session`.
+//! Session state tool handlers: `get_session`, `save_session`,
+//! `session_checkpoint`, `list_sessions`, `delete_session`.
 
 use serde_json::{json, Value};
 
@@ -60,6 +60,57 @@ pub async fn handle_save_session(args: &Value, ctx: &McpContext) -> Result<Value
             "type": "text",
             "text": format!("saved session {} ({} tokens)", session_id, session.total_tokens)
         }]
+    }))
+}
+
+/// `session_checkpoint` — store a compact, typed resumability checkpoint.
+pub async fn handle_session_checkpoint(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let session_id = require_str(args, "session_id")?;
+    let token_budget = require_u64(args, "token_budget")?;
+    if token_budget == 0 {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "token_budget must be greater than zero".to_string(),
+            data: Some(json!({"param": "token_budget"})),
+        });
+    }
+    let ttl_seconds = args.get("ttl_seconds").and_then(|v| v.as_u64());
+    let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
+    let state = json!({
+        "schema": "crux.session_checkpoint.v1",
+        "session_id": session_id,
+        "agent": ctx.scope_identity(),
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+        "objective": args.get("objective").cloned().unwrap_or(Value::Null),
+        "current_milestone": args.get("current_milestone").cloned().unwrap_or(Value::Null),
+        "decisions": args.get("decisions").cloned().unwrap_or_else(|| json!([])),
+        "open_questions": args.get("open_questions").cloned().unwrap_or_else(|| json!([])),
+        "files_touched": args.get("files_touched").cloned().unwrap_or_else(|| json!([])),
+        "commands_run": args.get("commands_run").cloned().unwrap_or_else(|| json!([])),
+        "test_status": args.get("test_status").cloned().unwrap_or(Value::Null),
+        "next_action": args.get("next_action").cloned().unwrap_or(Value::Null),
+        "token_budget": token_budget,
+    });
+
+    let mut store = ctx.session_store.write().await;
+    let session = store
+        .try_put(&stored_session_id, state, ttl_seconds)
+        .map_err(|err| JsonRpcError {
+            code: INTERNAL_ERROR,
+            message: "session journal append failed".to_string(),
+            data: Some(json!({"error": err.to_string()})),
+        })?;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": format!("checkpointed session {} ({} tokens)", session_id, session.total_tokens)
+        }],
+        "structuredContent": {
+            "session_id": session_id,
+            "updated_at": session.updated_at,
+            "total_tokens": session.total_tokens
+        }
     }))
 }
 
@@ -124,6 +175,14 @@ fn require_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, JsonRpcError
     })
 }
 
+fn require_u64(args: &Value, field: &str) -> Result<u64, JsonRpcError> {
+    args.get(field).and_then(Value::as_u64).ok_or_else(|| JsonRpcError {
+        code: INVALID_PARAMS,
+        message: format!("missing required param: {field}"),
+        data: Some(json!({"param": field, "required": true})),
+    })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -178,6 +237,33 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_requires_and_stores_token_budget() {
+        let ctx = test_ctx();
+        let err = handle_session_checkpoint(&json!({"session_id": "s1"}), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+
+        let result = handle_session_checkpoint(
+            &json!({
+                "session_id": "s1",
+                "current_milestone": "M2",
+                "next_action": "run tests",
+                "token_budget": 500
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["structuredContent"]["session_id"], "s1");
+
+        let stored = handle_get_session(&json!({"session_id": "s1"}), &ctx).await.unwrap();
+        let text = stored["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"schema\": \"crux.session_checkpoint.v1\""));
+        assert!(text.contains("\"token_budget\": 500"));
     }
 
     #[tokio::test]
