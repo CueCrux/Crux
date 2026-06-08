@@ -20,6 +20,53 @@ pub const RCX_TEAM_DECISIONS_SYNC_CAPABILITY: &str = "vaultcrux.team.decisions.s
 pub const RCX_CUSTOMER_BACKEND_PREFIX: &str = "customer:";
 pub const RCX_ENTERPRISE_ENCRYPTED_BLOB_MIRROR_CAPABILITY: &str = "vaultcrux.enterprise.encrypted_blob.mirror";
 
+// ── CoreCrux retrieval-lane registry (free → paid) ───────────────────────────
+//
+// The AMR lane authority in CoreCrux (`corecrux-rcx-token::lanes`) gates the 11
+// premium retrieval lanes on a verified token capability. These constants are
+// the MINT side: a paid token carries one `corecrux.lane.<slug>` capability per
+// premium lane. The slugs MUST stay identical to the CoreCrux `lanes::Lane`
+// vocabulary (free baseline bm25/dense/sparse are never minted — never gated).
+pub const CORECRUX_LANE_CAPABILITY_PREFIX: &str = "corecrux.lane.";
+
+/// The 11 premium retrieval-lane slugs. Order is the canonical lane order.
+pub const CORECRUX_PREMIUM_LANE_SLUGS: [&str; 11] = [
+    "topology",
+    "trait",
+    "entity",
+    "event",
+    "event_count",
+    "projection",
+    "navtree",
+    "vernacular",
+    "indexing",
+    "hyde",
+    "amr_orchestration",
+];
+
+/// Full capability name for a lane slug, e.g. `corecrux.lane.topology`.
+pub fn corecrux_lane_capability(slug: &str) -> String {
+    format!("{CORECRUX_LANE_CAPABILITY_PREFIX}{slug}")
+}
+
+/// Permitted-capability set for a PAID token: every premium lane, each costing
+/// `per_call_cost` credits per call (Text egress). Free tokens carry none of
+/// these, so their premium lanes are hard-gated off in CoreCrux.
+pub fn corecrux_premium_lane_capabilities(per_call_cost: u64) -> Vec<PermittedCapability> {
+    CORECRUX_PREMIUM_LANE_SLUGS
+        .iter()
+        .map(|slug| PermittedCapability {
+            capability: corecrux_lane_capability(slug),
+            data_egress_classes: vec![DataEgressClass::Text],
+            required_attestations: Vec::new(),
+            credit_cost: Some(CreditCost {
+                unit: CreditCostUnit::Call,
+                cost: per_call_cost,
+            }),
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RcxTier {
     Free,
@@ -790,6 +837,24 @@ mod tests {
 
     const FREE_LOCAL_VERIFIED_CBOR_HEX: &str = "af6474696572646672656566697373756572a26a6973737565725f6f7267656c6f63616c6c70617373706f72745f6b69647822705f30313233343536373839616263646566303132333435363738396162636465666763726564697473a466726566696c6ca266616d6f756e74f666706572696f64646e6f6e656762616c616e6365f6696f766572647261667466666f726269646f6f76657264726166745f6c696d6974f6677375626a656374a26c70617373706f72745f6670727822705f3031323334353637383961626364656630313233343536373839616263646566726461656d6f6e5f696e7374616e63655f696478216461656d6f6e5f3031485630303030303030303030303030303030303030303030686261636b656e647381a46a6261636b656e645f6964656c6f63616c6c656e64706f696e745f75726cf66e74727573745f726f6f745f6b69647822705f3031323334353637383961626364656630313233343536373839616263646566767065726d69747465645f6361706162696c697469657381a46a6361706162696c69747974636f7265637275782e71756572792e6c6f63616c6b6372656469745f636f7374f673646174615f6567726573735f636c617373657381646e6f6e657572657175697265645f6174746573746174696f6e73806866616c6c6261636ba4696f6e5f657870697279667265667573657171756575655f74746c5f7365636f6e6473f6746f6e5f637265646974735f65786861757374656466726566757365766f6e5f6261636b656e645f756e726561636861626c656672656675736568746f6b656e5f6964782372637863745f667265655f303132333435363738396162636465665f64656661756c74696973737565645f61741a69eab5a0697369676e6174757265a363616c676765643235353139636b69647822705f3031323334353637383961626364656630313233343536373839616263646566637369675840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111116a657870697265735f61741a6a1ad4606a7265766f636174696f6ea26763726c5f75726cf66c707573685f6368616e6e656cf66c737065635f76657273696f6e6a7263782d63742f312e306c74656e616e745f73636f7065a26974656e616e745f69646764656661756c746c646973706c61795f6e616d65654c6f63616c6d726563656970745f636c6173736876657269666965646f726566726573685f68696e745f61741a6a1ac650";
     const FREE_LOCAL_VERIFIED_TOKEN_HASH: &str = "fec9ac825cd4f1f2ccbb3c4cf95495d61416e867818413153e86cc4539b3cee9";
+
+    #[test]
+    fn corecrux_premium_lane_registry_is_complete_and_named() {
+        let caps = corecrux_premium_lane_capabilities(3);
+        assert_eq!(caps.len(), 11, "exactly 11 premium lanes");
+        for (cap, slug) in caps.iter().zip(CORECRUX_PREMIUM_LANE_SLUGS) {
+            assert_eq!(cap.capability, format!("corecrux.lane.{slug}"));
+            assert_eq!(cap.credit_cost.as_ref().map(|c| c.cost), Some(3));
+            assert_eq!(cap.data_egress_classes, vec![DataEgressClass::Text]);
+        }
+        // free baseline must NOT appear in the premium registry
+        for free in ["bm25", "dense", "sparse"] {
+            assert!(
+                !CORECRUX_PREMIUM_LANE_SLUGS.contains(&free),
+                "{free} is free, not premium"
+            );
+        }
+    }
 
     #[test]
     fn free_fixture_has_stable_canonical_bytes() {

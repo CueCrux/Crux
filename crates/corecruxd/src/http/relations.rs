@@ -8,7 +8,10 @@
 //! edges through these endpoints. The graph is held in `AppState.projection_state`
 //! and persisted to `data_dir/relations.jsonl`.
 
-use super::{problem_response, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Query, State, StatusCode};
+use super::{
+    problem_response, require_http_any_scope_for_tenant, require_http_scopes, AppState, HeaderMap, IntoResponse, Json,
+    Query, State, StatusCode,
+};
 use corecrux_projections::query::graph_expand::{graph_expand, GraphExpandRequest};
 use corecrux_projections::{dequantize_confidence_f32, tenant_hash_xxhash64, RelationTypeV1};
 
@@ -62,11 +65,14 @@ pub(super) async fn post_relation(
     headers: HeaderMap,
     Json(body): Json<PutRelationBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["facts:write"]) {
-        return problem.into_response();
-    }
-    if body.tenant_id.trim().is_empty() {
+    let tenant_id = body.tenant_id.trim().to_string();
+    if tenant_id.is_empty() {
         return problem_response(StatusCode::BAD_REQUEST, "tenant_id must not be empty");
+    }
+    if let Err(problem) =
+        require_http_any_scope_for_tenant(&state.auth, &headers, &["facts:write", "admin:write"], &tenant_id)
+    {
+        return problem.into_response();
     }
     if !(0.0..=1.0).contains(&body.confidence) {
         return problem_response(StatusCode::BAD_REQUEST, "confidence must be in [0.0, 1.0]");
@@ -83,7 +89,7 @@ pub(super) async fn post_relation(
     }
     let now = current_micros();
     let record = crate::relations::RelationRecord {
-        tenant_id: body.tenant_id.trim().to_string(),
+        tenant_id,
         from_id: body.from_id,
         to_id: body.to_id,
         edge_type: body.edge_type.trim().to_ascii_lowercase(),

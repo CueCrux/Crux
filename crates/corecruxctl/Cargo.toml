@@ -9,7 +9,7 @@ build = "build.rs"
 base64 = "0.22.1"
 blake3 = "1.8.5"
 clap = { version = "4.6.1", features = ["derive"] }
-chrono = { version = "0.4.40", default-features = false, features = ["clock"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 ciborium = "0.2.2"
 crc32c = "0.6.8"
 ed25519-dalek = { version = "2.2.0", features = ["std"] }
@@ -25,11 +25,11 @@ tonic = { version = "0.14.6", features = ["transport"] }
 ureq = { version = "3.3.0", features = ["json"] }
 url = "2.5.7"
 urlencoding = "2.1"
-uuid = { version = "1.23.1", features = ["v4"] }
+uuid = { version = "1.23.2", features = ["v4"] }
 xxhash-rust = { version = "0.8.10", features = ["xxh64"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 rand = "0.10.1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # C2PA X.509 verifier surface (corecruxctl c2pa-verify, c2pa-cert-status,
 # c2pa-rotate-leaf — agent-ux-07 M6). Matches the versions in corecrux-receipts.

@@ -269,6 +269,27 @@ pub async fn get_session_plan(
             );
         }
     };
+    let ctx = match crate::auth::passport_bound_context(&state.auth, &headers) {
+        Ok(ctx) => ctx,
+        Err(problem) => return problem.into_response(),
+    };
+    if !ctx.has_scope("admin:read") {
+        let store = state.fact_store.read().await;
+        let allowed = crate::session_bindings::list_bindings(&store)
+            .into_iter()
+            .any(|binding| {
+                binding.session_id_hex.eq_ignore_ascii_case(&session_id_hex)
+                    && ctx.passport_id.as_deref() == Some(binding.passport_id.as_str())
+            });
+        drop(store);
+        if !allowed {
+            return problem(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "session plan is not bound to the request passport",
+            );
+        }
+    }
     let plan = match crux_session::SessionPlan::from_canonical_cbor(&entry.plan_cbor) {
         Ok(plan) => plan,
         Err(err) => {

@@ -2,7 +2,7 @@
 # Licensed under the CueCrux Community Licence (CCL v1.0).
 
 # --- Builder stage ---
-FROM rust:1.84-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 
 RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
 
