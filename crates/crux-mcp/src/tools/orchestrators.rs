@@ -161,9 +161,42 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
+                // Read the FULL request (headers + Content-Length body). A single
+                // read() on the nonblocking socket can return before the body
+                // arrives in a later TCP segment, in which case the body-dependent
+                // `"type":"passport"` branch below would miss and fall through to
+                // the default `"work"` member -- a flake on loaded CI runners.
+                stream.set_nonblocking(false).ok();
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut data = Vec::new();
                 let mut buf = [0u8; 8192];
-                let read = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..read]);
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            data.extend_from_slice(&buf[..n]);
+                            if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let headers = String::from_utf8_lossy(&data[..pos]);
+                                let content_len = headers
+                                    .lines()
+                                    .find_map(|l| {
+                                        let (k, v) = l.split_once(':')?;
+                                        if k.trim().eq_ignore_ascii_case("content-length") {
+                                            v.trim().parse::<usize>().ok()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                if data.len() >= pos + 4 + content_len {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let req = String::from_utf8_lossy(&data);
                 let mut lines = req.lines();
                 let mut parts = lines.next().unwrap_or_default().split_whitespace();
                 let method = parts.next().unwrap_or_default();
