@@ -2300,8 +2300,13 @@ pub fn tool_output_docs() -> Value {
         { "tool": "artefact_list",      "output": "{ content: [...], structuredContent: { artefacts: [{artefact_id, mime_type, tool_origin, size_bytes, created_at, expires_at}], count } } — passport-scoped, reserved-prefix mime entries filtered." },
         { "tool": "get_session",        "output": "{ session_id, state, updated_at, total_tokens }" },
         { "tool": "save_session",       "output": "{ session_id, updated_at }" },
+        { "tool": "session_checkpoint", "output": "{ content: [...], structuredContent: { session_id, updated_at, total_tokens } } — stores a compact crux.session_checkpoint.v1 state (objective, current_milestone, decisions, open_questions, files_touched, commands_run, test_status, next_action) scoped to the calling agent; requires token_budget>0." },
         { "tool": "list_sessions",      "output": "{ sessions: [string] }" },
         { "tool": "delete_session",     "output": "{ deleted: bool, session_id }" },
+        { "tool": "route_access_matrix", "output": "{ content: [...], structuredContent: { routes: [{route, required_any_scope: [string], passport_binding, tenant_binding, notes}] } } — static high-risk HTTP route gate matrix used by agent hardening checks." },
+        { "tool": "execplan_gate",       "output": "{ content: [...], structuredContent: { fact_id, entity, key, commit_sha, status } } — records a milestone gate as a stable fact under execplan:<slug> key gate:<milestone>; status one of passed|failed|blocked|skipped; requires token_budget>0." },
+        { "tool": "auth_posture_audit",  "output": "{ content: [...], structuredContent: { schema: 'crux.auth_posture_audit.v1', checked_at, mcp_agent, daemon_loopback_configured: bool, rcx_router_configured: bool, agent_passports_enabled: bool, data_dir_configured: bool, notes: [string], recommended_checks: [string] } } — local auth-posture checklist; HTTP auth mode is not exposed through MCP." },
+        { "tool": "egress_policy_check", "output": "{ content: [...], structuredContent: { schema: 'crux.egress_policy_check.v1', target, purpose, allowed: bool, scheme, host, reasons: [string] } } — checks a URL against the conservative egress policy (https allowed; http only loopback or explicit allow_plain_http)." },
         { "tool": "get_gaps",           "output": "{ gaps: [{entity, key, value, stored_at}], total_tokens }" },
         { "tool": "list_observations",  "output": "{ session_id, count, observations: [{ observation_id, session_id, ts, provider, principal, kind, payload, receipt: {alg, signed_by, body_hash, signature} }] }" },
         { "tool": "get_observation",    "output": "Single observation record (same shape as list_observations entries), or a not-found text response." },
@@ -2543,7 +2548,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 95; // main 85 (agent-ux + identity-continuity + memory_sweep_candidates) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard).
+    const TOOL_COUNT: usize = 100; // main 90 (agent-ux + identity-continuity + memory_sweep_candidates + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
