@@ -689,7 +689,23 @@ pub async fn handle_get_bootstrap(args: &Value, ctx: &McpContext) -> Result<Valu
     let store = ctx.fact_store.read().await;
     let result = store.query(&q);
 
-    if result.facts.is_empty() {
+    let mut lines: Vec<String> = result
+        .facts
+        .iter()
+        .map(|f| format!("[{}] {} = {}", f.entity, f.key, f.value))
+        .collect();
+
+    // M4 (CRC-v1 self-describing schema layer): the `tool-output` topic is
+    // served on demand from the canonical CRC-v1 schema — no persisted
+    // boot-seed required. Synthesized entries are appended to any operator-
+    // written tool-output facts.
+    if topic.as_deref().map(normalize_bootstrap_topic).as_deref() == Some("tool-output") {
+        for (entity, key, value) in crate::crc_v1::tool_output_catalogue() {
+            lines.push(format!("[{entity}] {key} = {value}"));
+        }
+    }
+
+    if lines.is_empty() {
         let msg = match &topic {
             Some(t) => format!("no bootstrap knowledge for topic '{t}'"),
             None => "no bootstrap knowledge found".to_string(),
@@ -699,15 +715,8 @@ pub async fn handle_get_bootstrap(args: &Value, ctx: &McpContext) -> Result<Valu
         }));
     }
 
-    let text = result
-        .facts
-        .iter()
-        .map(|f| format!("[{}] {} = {}", f.entity, f.key, f.value))
-        .collect::<Vec<_>>()
-        .join("\n");
-
     Ok(json!({
-        "content": [{ "type": "text", "text": text }]
+        "content": [{ "type": "text", "text": lines.join("\n") }]
     }))
 }
 

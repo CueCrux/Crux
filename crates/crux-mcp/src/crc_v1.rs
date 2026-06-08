@@ -280,6 +280,63 @@ pub fn wrap_facts(rows: &[Value], entity: Option<&str>, query: Option<&str>) -> 
     Value::Object(out)
 }
 
+// ── M4: self-describing schema layer ────────────────────────────────────────
+
+/// Canonical URL of the CRC-v1 schema (the conformance oracle in
+/// `docs/contracts/crc-v1.schema.json`).
+pub const SCHEMA_URL: &str = "https://cuecrux.com/contracts/crc-v1.schema.json";
+
+/// The CRC-v1 `kind` a tool emits when negotiated, or `None` for tools that
+/// stay legacy-only.
+fn tool_output_kind(tool: &str) -> Option<&'static str> {
+    match tool {
+        "query" | "query_scan" => Some("search"),
+        "query_expand" => Some("addressed"),
+        "query_facts" => Some("fact"),
+        _ => None,
+    }
+}
+
+/// The `x-crux-output-schema` advertisement attached to a tool's `tools/list`
+/// entry (MCP has no native `outputSchema`). `None` for non-CRC-v1 tools.
+/// Tells a client what shape to expect IF it negotiates `contract:"v1"`.
+pub fn output_schema_advert(tool: &str) -> Option<Value> {
+    let kind = tool_output_kind(tool)?;
+    Some(json!({
+        "$ref": SCHEMA_URL,
+        "contract": "crc-v1",
+        "kind": kind,
+        "when": "negotiated via contract:\"v1\"; absent => legacy shape (byte-identical)",
+    }))
+}
+
+/// Synthesized `__bootstrap__::tool-output:*` entries served by
+/// `get_bootstrap("tool-output")` — the self-describing schema layer, computed
+/// on demand (no persisted boot-seed required). Each entry is `(entity, key,
+/// value)`, matching the shape `get_bootstrap` already renders.
+pub fn tool_output_catalogue() -> Vec<(String, String, Value)> {
+    let mut out = vec![(
+        "__bootstrap__::tool-output:_contract".to_string(),
+        "crc-v1".to_string(),
+        json!({
+            "schema": SCHEMA_URL,
+            "negotiate": "contract:\"v1\" arg (MCP) | Accept-Contract: crc-v1 (HTTP)",
+            "envelope": "pointers + cost_estimate + agent_decision + envelope{freshness,receipts,links} + next",
+            "default_when_negotiated": "hydrate=pointer (cheap); expand via next.expand",
+        }),
+    )];
+    for tool in ["query", "query_scan", "query_expand", "query_facts"] {
+        if let Some(kind) = tool_output_kind(tool) {
+            out.push((
+                format!("__bootstrap__::tool-output:{tool}"),
+                tool.to_string(),
+                json!({"contract": "crc-v1", "kind": kind, "schema": SCHEMA_URL}),
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +348,25 @@ mod tests {
         assert!(requested(&json!({"contract": "V1"})));
         assert!(!requested(&json!({})));
         assert!(!requested(&json!({"contract": "legacy"})));
+    }
+
+    #[test]
+    fn m4_output_schema_advert_and_catalogue() {
+        // Advertised only for CRC-v1 tools; carries the schema ref + kind.
+        let adv = output_schema_advert("query_facts").unwrap();
+        assert_eq!(adv["kind"], "fact");
+        assert_eq!(adv["contract"], "crc-v1");
+        assert!(adv["$ref"].as_str().unwrap().ends_with("crc-v1.schema.json"));
+        assert_eq!(output_schema_advert("query").unwrap()["kind"], "search");
+        assert_eq!(output_schema_advert("query_expand").unwrap()["kind"], "addressed");
+        assert!(output_schema_advert("store_fact").is_none());
+        // Bootstrap catalogue: a _contract entry + one per CRC-v1 tool.
+        let cat = tool_output_catalogue();
+        assert!(cat.iter().any(|(e, _, _)| e == "__bootstrap__::tool-output:_contract"));
+        assert!(cat
+            .iter()
+            .any(|(e, _, _)| e == "__bootstrap__::tool-output:query_facts"));
+        assert!(cat.iter().all(|(_, _, v)| v.get("schema").is_some()));
     }
 
     #[test]
