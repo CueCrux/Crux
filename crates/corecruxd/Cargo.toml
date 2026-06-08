@@ -24,7 +24,7 @@ axum = "0.8.9"
 utoipa = { version = "5", features = ["axum_extras"] }
 base64 = "0.22.1"
 blake3 = "1.8.5"
-chrono = { version = "0.4.40", default-features = false, features = ["clock"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 crc32fast = "1.4.2"
 ed25519-dalek = { version = "2.2.0", features = ["std"] }
 fs2 = "0.4.3"
