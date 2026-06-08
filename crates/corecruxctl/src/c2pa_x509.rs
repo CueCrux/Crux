@@ -486,8 +486,9 @@ mod tests {
     use tempfile::TempDir;
 
     struct TestPki {
-        key_pair: KeyPair,
-        cert: rcgen::Certificate,
+        // rcgen 0.14 bundles the issuing params + signing key into an `Issuer`,
+        // which is what CSR `signed_by` now consumes (single argument).
+        root_issuer: rcgen::Issuer<'static, KeyPair>,
         root_pem: String,
     }
     impl TestPki {
@@ -500,15 +501,12 @@ mod tests {
             let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
             let cert = params.self_signed(&kp).unwrap();
             let root_pem = cert.pem();
-            Self {
-                key_pair: kp,
-                cert,
-                root_pem,
-            }
+            let root_issuer = rcgen::Issuer::new(params, kp);
+            Self { root_issuer, root_pem }
         }
         fn sign_csr(&self, csr_pem: &str) -> String {
             let csr_params = rcgen::CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
-            csr_params.signed_by(&self.cert, &self.key_pair).unwrap().pem()
+            csr_params.signed_by(&self.root_issuer).unwrap().pem()
         }
     }
 
