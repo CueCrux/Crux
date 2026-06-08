@@ -983,6 +983,57 @@ mod tests {
     }
 
     #[test]
+    fn paid_token_signature_verifies_over_token_hash() {
+        // Cross-convention guard: a token signed by mint_signed_paid_local_token
+        // (Ed25519 over token_hash) must verify over token_hash with the public
+        // key — exactly what CoreCrux's corecrux-rcx-token::verify does. If this
+        // breaks, real paid tokens would fail verification in the retrieval daemon.
+        use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let verifying: VerifyingKey = signing.verifying_key();
+        let token = mint_signed_paid_local_token(
+            "p_0123456789abcdef0123456789abcdef",
+            "daemon_01HV0000000000000000000000",
+            "default",
+            vec!["corecrux.query.local".to_string()],
+            100,
+            2,
+            1_776_989_600,
+            1_780_143_200,
+            |hash| signing.sign(hash).to_bytes(),
+        );
+        let sig = ed25519_dalek::Signature::from_bytes(&token.signature.sig);
+        assert!(verifying.verify(&token.token_hash(), &sig).is_ok());
+        assert!(token.validate_basic(1_776_989_601).valid);
+    }
+
+    /// Operator helper for the M6 sidelab runbook: prints a trust-root public
+    /// key + a signed paid-token hex to paste into the daemon config + the
+    /// `X-RCX-Token` header. Run: `cargo test -p crux-router -- --ignored
+    /// --nocapture print_sidelab_paid_token`.
+    #[test]
+    #[ignore = "operator runbook helper; prints a token, not an assertion"]
+    fn print_sidelab_paid_token() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let pubkey_hex = hex::encode(signing.verifying_key().to_bytes());
+        let token = mint_signed_paid_local_token(
+            "p_0123456789abcdef0123456789abcdef",
+            "daemon_01HV0000000000000000000000",
+            "default",
+            vec!["corecrux.query.local".to_string()],
+            100,           // bundled credit balance
+            2,             // per-lane per-call cost
+            1_776_989_600, // issued_at
+            4_102_444_800, // far-future expiry for a long-lived sidelab token
+            |hash| signing.sign(hash).to_bytes(),
+        );
+        let token_hex = hex::encode(token.to_canonical_cbor());
+        println!("TRUST_ROOT_PUBKEY_HEX={pubkey_hex}");
+        println!("X_RCX_TOKEN_HEX={token_hex}");
+    }
+
+    #[test]
     fn ingest_usage_report_debits_then_hard_gate_denies() {
         let token = paid_token(10, 2);
         let mut ledger = crate::hosted::CreditLedger::from_token(&token, 1_776_989_600);
