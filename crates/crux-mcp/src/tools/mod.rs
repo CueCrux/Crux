@@ -2175,12 +2175,19 @@ fn tools_to_json(tools: Vec<ToolDefinition>, auth: Option<ToolAuthMetadata>) -> 
                 crux_meta["receipt_class"] = json!(&auth.receipt_class);
                 crux_meta["tier"] = json!(&auth.tier);
             }
-            let tool = json!({
+            // M4 (CRC-v1 self-describing): advertise the negotiated output shape.
+            // MCP has no native `outputSchema`, so attach the CRC-v1 schema ref
+            // under an `x-crux-output-schema` extension for tools that emit it.
+            let output_advert = crate::crc_v1::output_schema_advert(&t.name);
+            let mut tool = json!({
                 "name": t.name,
                 "description": t.description,
                 "inputSchema": input_schema,
                 "_meta": { "crux": crux_meta },
             });
+            if let Some(adv) = output_advert {
+                tool["x-crux-output-schema"] = adv;
+            }
             tool
         })
         .collect();
