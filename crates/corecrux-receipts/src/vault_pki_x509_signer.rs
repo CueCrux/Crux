@@ -682,8 +682,9 @@ mod tests {
     /// Build a tiny in-test root CA + leaf-signer using rcgen, so the
     /// mock Vault hook can mint real-looking leaves.
     struct TestPki {
-        root_key_pair: KeyPair,
-        root_cert: rcgen::Certificate,
+        /// rcgen 0.14 bundles the issuing params + signing key into an `Issuer`,
+        /// which is what CSR `signed_by` now consumes (single argument).
+        root_issuer: rcgen::Issuer<'static, KeyPair>,
         root_pem: String,
     }
 
@@ -697,17 +698,14 @@ mod tests {
             let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
             let cert = params.self_signed(&key_pair).unwrap();
             let root_pem = cert.pem();
-            Self {
-                root_key_pair: key_pair,
-                root_cert: cert,
-                root_pem,
-            }
+            let root_issuer = rcgen::Issuer::new(params, key_pair);
+            Self { root_issuer, root_pem }
         }
 
         /// Sign a leaf CSR (PEM) with this root. Returns leaf PEM.
         fn sign_csr(&self, csr_pem: &str) -> String {
             let csr_params = rcgen::CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
-            let leaf = csr_params.signed_by(&self.root_cert, &self.root_key_pair).unwrap();
+            let leaf = csr_params.signed_by(&self.root_issuer).unwrap();
             leaf.pem()
         }
     }
