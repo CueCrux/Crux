@@ -1,0 +1,8 @@
+{
+  "_note": "REFERENCE ONLY - this is the CURRENT (legacy) /v1/query/text-search shape a caller gets with NO contract negotiation. It is NOT CRC-v1 (no 'contract' field) and MUST remain byte-identical post-change. The validator intentionally does NOT accept this as CRC-v1; byte-identity is a per-repo golden test, not a schema check.",
+  "results": [{"segment_index": 3, "doc_id": 8801, "score": 12.4, "bm25_score": 9.0, "cosine_score": 3.4, "content": "On March 3 I saw Dr. Smith...", "tenant_hash": 12345}],
+  "business_objects": [],
+  "read_pointers": [],
+  "nav_path": [],
+  "meta": {"backend": "corecruxd", "took_ms": 14}
+}
