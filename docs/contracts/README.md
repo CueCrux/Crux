@@ -1,12 +1,11 @@
 # Crux Response Contract v1 (CRC-v1)
 
 **Status:** M0 — spec frozen. Canonical home for the portfolio-wide response contract.
-**ExecPlan:** `PlanCrux/.agent/execplans/crux-response-contract-v1-default-schema-2026-06-08.md`
 **Oracle:** [`crc-v1.schema.json`](crc-v1.schema.json) is the single source of truth. Every emitting endpoint serialises through it; CI validates real responses against it; the daemon serves it verbatim via `get_bootstrap(topic="tool-output")`.
 
 ## What it is
 
-A unified, **pointer-first, progressively-hydrated** response envelope shared across CoreCrux `/v1/query/*`, VaultCrux `/v1/memory/retrieve`, and the Crux daemon HTTP + MCP surface. Instead of every endpoint stuffing full content in an ad-hoc JSON shape (~56K tok/q on the LME bench), a CRC-v1 response returns **cheap pointers + a cost_estimate + an agent_decision + a freshness/receipts envelope**, and the caller hydrates only what it needs (~1.6–7.5K tok/q at equal recall — see `AuditCrux/reports/lme-s-agentnative-token-efficiency-CONSOLIDATED.md`).
+A unified, **pointer-first, progressively-hydrated** response envelope shared across CoreCrux `/v1/query/*`, VaultCrux `/v1/memory/retrieve`, and the Crux daemon HTTP + MCP surface. Instead of every endpoint stuffing full content in an ad-hoc JSON shape (~56K tok/q on the LME bench), a CRC-v1 response returns **cheap pointers + a cost_estimate + an agent_decision + a freshness/receipts envelope**, and the caller hydrates only what it needs (~1.6–7.5K tok/q at equal recall, measured on the agent-native LME benchmark).
 
 ## The negotiation channel (why this is back-compat-safe)
 

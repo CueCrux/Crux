@@ -4,7 +4,7 @@
 
 //! Crux Response Contract v1 (CRC-v1) — daemon-side negotiated reshapers.
 //!
-//! Mirrors `CoreCrux/crates/corecruxd/src/crc_v1.rs` for the Crux daemon's MCP
+//! Mirrors the CoreCrux daemon's CRC-v1 reshaper for the Crux daemon's MCP
 //! tools. CRC-v1 is opt-in per call (`contract: "v1"` arg); absent → the tool's
 //! legacy payload, unchanged. `default-on` is the ExecPlan M6 operator gate.
 //!
