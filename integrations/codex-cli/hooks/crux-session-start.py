@@ -38,6 +38,30 @@ def main() -> int:
     if should_skip_seen_session(hook_input, hook_event_name):
         return 0
 
+    # Prefer the shared Crux banner used by Claude and other first-party
+    # agents. It emits Codex-compatible hookSpecificOutput JSON and keeps the
+    # rich boot table in one implementation.
+    banner = os.path.expanduser("~/.local/bin/crux-boot-banner")
+    if os.access(banner, os.X_OK):
+        env = os.environ.copy()
+        env["CRUX_MCP_URL"] = mcp_url()
+        tok = resolve_token()
+        if tok:
+            env["CRUX_AGENT_TOKEN"] = tok
+        if not env.get("CRUX_CONSOLE_BASE"):
+            console = read_env_file_value(
+                Path(os.path.expanduser(DEFAULT_ENV_FILE)), "CRUX_CONSOLE_BASE"
+            )
+            if console:
+                env["CRUX_CONSOLE_BASE"] = console
+        mark_session_seen(hook_input)
+        try:
+            os.execve(banner, [banner], env)
+        except OSError as err:
+            log_error(f"exec crux-boot-banner failed: {err}")
+
+    # Legacy fallback: compact daemon-only banner for hosts that have not
+    # installed the shared banner binary yet.
     try:
         client = McpClient(mcp_url(), token=resolve_token(), timeout=timeout_seconds())
         sections = build_sections(client)

@@ -63,6 +63,38 @@ The onboarding playbooks are maintained in-repo at
 store on startup so agents can pull them at runtime without a hosted
 dependency.
 
+## First Connect Endpoint Selection
+
+When you are connecting to Crux Daemon for the first time, discover endpoints
+in this order:
+
+1. Same host: HTTP `http://127.0.0.1:14800`, MCP `http://127.0.0.1:14801/mcp`, gRPC `127.0.0.1:4007`.
+2. Tailnet host: use the Tailscale MagicDNS name or `100.x.y.z` tailnet IP with the same ports.
+3. Remote HTTPS: use an operator-provided reverse proxy only when the daemon is intentionally exposed outside the local host or tailnet.
+
+Do not inline bearer tokens into URLs, MCP config files, or hook definitions.
+Resolve them from `CRUX_AGENT_TOKEN`, `CRUX_AGENT_TOKENS`, a token CSV such as
+`~/.config/cuecrux/crux-tokens/MCP_AGENT_TOKENS_CSV`, or the host's secret
+manager.
+
+Run these checks before assuming integration is complete:
+
+```
+1. GET /readyz on the HTTP endpoint.
+2. GET /v1/version on the HTTP endpoint.
+3. MCP initialize, then tools/list.
+4. call cuecrux_session to get the typed capability plan.
+5. call sync_status(), update_status(), and get_bootstrap(topic="patterns", token_budget=500).
+6. store_fact followed by query_facts(token_budget=500) for an end-to-end memory check.
+```
+
+If the agent host supports native streamable HTTP MCP, configure the MCP URL
+and bearer-token environment variable directly. If Codex CLI cannot complete
+the Crux HTTP MCP startup handshake, use the first-party stdio bridge under
+`integrations/codex-cli/crux-mcp-stdio.py`; it speaks Codex stdio JSON-RPC on
+stdin/stdout and forwards calls to the Crux HTTP MCP endpoint selected by
+`CRUX_MCP_URLS`, `CRUX_MCP_URL`, `~/.config/cuecrux/env`, or localhost.
+
 ## Authentication
 
 HTTP and MCP use different authentication models:
