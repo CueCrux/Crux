@@ -20,14 +20,10 @@ use serde_json::{json, Map, Value};
 /// (`"v1"`/`"crc-v1"`). Session-level negotiation (`cuecrux_session`) is a
 /// follow-up (M4); absent → false → legacy payload.
 pub fn requested(params: &Value) -> bool {
-    params
-        .get("contract")
-        .and_then(|v| v.as_str())
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            v == "v1" || v == "crc-v1"
-        })
-        .unwrap_or(false)
+    params.get("contract").and_then(|v| v.as_str()).is_some_and(|v| {
+        let v = v.trim().to_ascii_lowercase();
+        v == "v1" || v == "crc-v1"
+    })
 }
 
 fn shared_envelope() -> Value {
@@ -120,7 +116,7 @@ pub fn wrap_query(inner: Value) -> Value {
         Some(Value::Object(m)) => m,
         _ => Map::new(),
     };
-    for (k, v) in src.into_iter() {
+    for (k, v) in src {
         meta.entry(k).or_insert(v); // coverage, total_candidates, … preserved
     }
     search_envelope(
@@ -146,7 +142,7 @@ pub fn wrap_scan(inner: Value) -> Value {
         Some(Value::Object(m)) => m,
         _ => Map::new(),
     };
-    for (k, v) in src.into_iter() {
+    for (k, v) in src {
         meta.entry(k).or_insert(v);
     }
     search_envelope(
@@ -172,10 +168,116 @@ pub fn wrap_expand(inner: Value) -> Value {
         Some(Value::Object(m)) => m,
         _ => Map::new(),
     };
-    for (k, v) in src.into_iter() {
+    for (k, v) in src {
         meta.entry(k).or_insert(v); // tokens_loaded, errors, … preserved
     }
     search_envelope("addressed", hits, meta, Value::Null)
+}
+
+/// Stringify a fact value for the epitome/content (values are usually short
+/// strings; objects are JSON-encoded).
+fn value_str(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Reshape `query_facts` rows into a CRC-v1 `kind:"fact"` envelope. This is the
+/// addressed-recall surface: it is NOT routed through the BM25 ranker, it echoes
+/// `next.canonical_slug` so the next turn re-addresses by key, and it carries
+/// `envelope.freshness` inline (effective_confidence / age / supersession) so a
+/// re-verify turn is unnecessary — the agent-query-eval "freshness on addressed
+/// recall" win.
+///
+/// Composition note: the caller keeps the legacy `structuredContent.rows` and
+/// nests this under `structuredContent.crc_v1` so the daemon's audit-envelope
+/// wrapper (which overwrites `structuredContent.envelope`) does NOT collide.
+pub fn wrap_facts(rows: &[Value], entity: Option<&str>, query: Option<&str>) -> Value {
+    let mut pointers = Vec::with_capacity(rows.len());
+    let mut content = Vec::with_capacity(rows.len());
+    let mut memories_used = Vec::with_capacity(rows.len());
+    let mut full_cost: u64 = 0;
+    for r in rows {
+        let fid = r.get("fact_id").and_then(Value::as_str).unwrap_or("");
+        if fid.is_empty() {
+            continue;
+        }
+        let ent = r.get("entity").and_then(Value::as_str).unwrap_or("");
+        let key = r.get("key").and_then(Value::as_str).unwrap_or("");
+        let val = r.get("value").map(value_str).unwrap_or_default();
+        let mut epitome: String = format!("{ent} {key} = {val}");
+        if epitome.len() > 80 {
+            epitome.truncate(80);
+        }
+        full_cost += (val.len() / 4) as u64;
+        pointers.push(json!({
+            "id": fid,
+            "score": r.get("effective_confidence").cloned().unwrap_or(Value::Null),
+            "epitome": epitome,
+            "reason": "Exact",
+        }));
+        content.push(json!({"id": fid, "text": val}));
+        memories_used.push(json!({
+            "fact_id": fid,
+            "topic": ent,
+            "freshness": r.get("freshness").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    let n = pointers.len() as u64;
+    // Freshness summarised from the top (most-relevant / highest-confidence) row;
+    // a present-but-null object when there are no rows (INV-4: fact => freshness).
+    let top = rows.first();
+    let freshness = json!({
+        "effective_confidence": top.and_then(|r| r.get("effective_confidence")).cloned().unwrap_or(Value::Null),
+        "age_hours": top.and_then(|r| r.get("age_hours")).cloned().unwrap_or(Value::Null),
+        "horizon_class": top.and_then(|r| r.get("horizon_class")).cloned().unwrap_or(Value::Null),
+        "superseded_by": top.and_then(|r| r.get("superseded_by")).cloned().unwrap_or(Value::Null),
+    });
+    let canonical_slug = entity.map(|s| s.to_string()).or_else(|| {
+        top.and_then(|r| r.get("entity"))
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+    });
+    let addressed = entity.is_some();
+
+    let mut out = Map::new();
+    out.insert("contract".into(), json!("crc-v1"));
+    out.insert("kind".into(), json!("fact"));
+    out.insert("hydrate_tier".into(), json!("full")); // values returned inline
+    out.insert("pointers".into(), Value::Array(pointers));
+    out.insert("content".into(), Value::Array(content));
+    out.insert(
+        "cost_estimate".into(),
+        json!({"pointer": n.saturating_mul(40), "summary": n.saturating_mul(150), "full": full_cost}),
+    );
+    out.insert("agent_decision".into(), Value::Null);
+    out.insert(
+        "envelope".into(),
+        json!({
+            "freshness": freshness,
+            "receipts_used": [],
+            "memories_used": memories_used,
+            "autonomy_consumed": {"capability": "facts:read", "cost_credits": 0, "scope": "agent"},
+            "links": {"open_in_console": "https://crux.cuecrux.com/console#/facts"}
+        }),
+    );
+    out.insert(
+        "next".into(),
+        json!({
+            "canonical_slug": canonical_slug,
+            "resolution_pointer": Value::Null,
+            "expand": Value::Null,
+        }),
+    );
+    out.insert(
+        "meta".into(),
+        json!({
+            "resolved_by": if addressed { "entity+key" } else { "query" },
+            "ranked": query.is_some() && !addressed,
+        }),
+    );
+    Value::Object(out)
 }
 
 #[cfg(test)]
@@ -189,6 +291,28 @@ mod tests {
         assert!(requested(&json!({"contract": "V1"})));
         assert!(!requested(&json!({})));
         assert!(!requested(&json!({"contract": "legacy"})));
+    }
+
+    #[test]
+    fn wrap_facts_is_fact_kind_with_inline_freshness() {
+        let rows = vec![json!({
+            "fact_id": "f_abc", "entity": "bench:q500", "key": "baseline",
+            "value": "89.3%", "effective_confidence": 1.0, "freshness": "fresh",
+            "age_hours": 6, "horizon_class": "medium", "superseded_by": null
+        })];
+        let out = wrap_facts(&rows, Some("bench:q500"), None);
+        assert_eq!(out["kind"], "fact");
+        assert!(out["agent_decision"].is_null());
+        assert_eq!(out["pointers"][0]["id"], "f_abc");
+        assert_eq!(out["pointers"][0]["reason"], "Exact");
+        assert_eq!(out["content"][0]["text"], "89.3%");
+        // INV-4: kind=fact => envelope.freshness present + canonical_slug echoed
+        assert!(!out["envelope"]["freshness"].is_null());
+        assert_eq!(out["envelope"]["freshness"]["effective_confidence"], 1.0);
+        assert_eq!(out["next"]["canonical_slug"], "bench:q500");
+        assert_eq!(out["meta"]["resolved_by"], "entity+key");
+        // addressed recall is not ranked
+        assert_eq!(out["meta"]["ranked"], false);
     }
 
     #[test]

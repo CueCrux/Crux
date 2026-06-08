@@ -402,8 +402,9 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
     let q = FactQuery {
-        query,
-        entity,
+        // cloned so `query`/`entity` remain available for the CRC-v1 reshape below
+        query: query.clone(),
+        entity: entity.clone(),
         entity_prefix: None,
         top_k,
         token_budget,
@@ -461,6 +462,21 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
             // M3: attribution surfaced on read. Null for legacy/flag-off
             // writes; the stored actor (never inferred or backfilled).
             "actor": f.actor,
+        }));
+    }
+
+    // CRC-v1 (kind=fact addressed recall) when negotiated. We KEEP the legacy
+    // `structuredContent.rows` and nest the envelope under `structuredContent.crc_v1`
+    // so the dispatch audit-envelope wrapper (which overwrites
+    // `structuredContent.envelope`) composes without collision. content[text]
+    // carries the CRC-v1 envelope for text-reading agents. Absent contract →
+    // legacy shape, byte-identical.
+    if crate::crc_v1::requested(args) {
+        let crc = crate::crc_v1::wrap_facts(&rows, entity.as_deref(), query.as_deref());
+        let text = serde_json::to_string_pretty(&crc).unwrap_or_default();
+        return Ok(json!({
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": { "rows": rows, "crc_v1": crc }
         }));
     }
 
