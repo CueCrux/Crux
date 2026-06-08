@@ -1304,6 +1304,69 @@ async fn put_facts_bulk_rejects_private_true_over_http() {
         .contains("private facts require MCP agent identity"));
 }
 
+#[tokio::test]
+async fn put_fact_forces_reserved_prefix_private_before_store() {
+    let state = test_app_state(16);
+    let body = corecrux_memory::fact_store::StoreFact {
+        entity: "__ops__::deploy".to_string(),
+        key: "status".to_string(),
+        value: "ready".to_string(),
+        source_receipt: None,
+        confidence: 1.0,
+        private: false,
+        horizon_class: None,
+        actor: None,
+    };
+
+    let resp = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let store = state.fact_store.read().await;
+    let fact = store.all_facts().find(|fact| fact.entity == "__ops__::deploy").unwrap();
+    assert!(fact.private);
+}
+
+#[tokio::test]
+async fn put_facts_bulk_forces_reserved_prefix_private_before_store() {
+    let state = test_app_state(16);
+    let body = vec![
+        corecrux_memory::fact_store::StoreFact {
+            entity: "__bootstrap__::patterns".to_string(),
+            key: "p1".to_string(),
+            value: "pattern".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        },
+        corecrux_memory::fact_store::StoreFact {
+            entity: "public".to_string(),
+            key: "k".to_string(),
+            value: "v".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        },
+    ];
+
+    let resp = facts::put_facts_bulk(State(state.clone()), HeaderMap::new(), Json(body))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let store = state.fact_store.read().await;
+    let reserved = store
+        .all_facts()
+        .find(|fact| fact.entity == "__bootstrap__::patterns")
+        .unwrap();
+    assert!(reserved.private);
+    let public = store.all_facts().find(|fact| fact.entity == "public").unwrap();
+    assert!(!public.private);
+}
+
 // ── Fact Store (GET /v1/facts/{factId}) ─────────────────────────
 
 #[tokio::test]
@@ -8335,6 +8398,10 @@ async fn active_sessions_requires_admin_read() {
 async fn session_plan_read_through_returns_sealed_v1_plan() {
     let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
     state.session = Some(Arc::new(super::session::SessionServices::local_default("node-a")));
+    {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
+    }
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let create_resp = super::session::post_session(
@@ -8357,7 +8424,7 @@ async fn session_plan_read_through_returns_sealed_v1_plan() {
     let read_resp = super::session::get_session_plan(
         State(state),
         Path(session_id.clone()),
-        dev_scope_headers("sessions:read"),
+        dev_scope_passport_headers("sessions:read", "personal-default"),
     )
     .await;
     assert_eq!(read_resp.status(), StatusCode::OK);

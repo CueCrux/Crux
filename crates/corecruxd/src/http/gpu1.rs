@@ -393,12 +393,17 @@ async fn handle_compute(
     payload: Result<Value, String>,
     fallback_result: Value,
 ) -> Response {
-    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &[service.capability(), "admin:write"]) {
-        return problem.into_response();
-    }
     let tenant_id = tenant_id.trim().to_string();
     if tenant_id.is_empty() {
         return problem_response(StatusCode::BAD_REQUEST, "tenant_id must not be empty");
+    }
+    if let Err(problem) = require_http_any_scope_for_tenant(
+        &state.auth,
+        &headers,
+        &[service.capability(), "admin:write"],
+        &tenant_id,
+    ) {
+        return problem.into_response();
     }
     if evidence.len() > 100 {
         return problem_response(StatusCode::BAD_REQUEST, "selected evidence must not exceed 100 items");
