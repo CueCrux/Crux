@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cuecrux.com/contracts/crc-v1.schema.json",
+  "title": "Crux Response Contract v1 (CRC-v1)",
+  "description": "The unified, pointer-first, progressively-hydrated response envelope shared across CoreCrux /v1/query/*, VaultCrux /v1/memory/retrieve, and the Crux daemon HTTP + MCP surface. A response is CRC-v1 ONLY when the caller negotiated it (Accept-Contract: crc-v1 / contract:\"v1\" / ?contract=v1); otherwise endpoints return their legacy shape byte-identically. This schema is the single conformance oracle: every emitting endpoint must serialize through it, and it is the same document served by get_bootstrap(topic=\"tool-output\").",
+  "type": "object",
+  "required": ["contract", "kind", "hydrate_tier"],
+  "additionalProperties": true,
+  "properties": {
+    "contract": { "const": "crc-v1" },
+    "kind": {
+      "description": "Routing class. search = fuzzy ranked retrieval; addressed = exact key resolve routed AROUND the ranker; fact = fact-store resolve; session = session-state resolve.",
+      "enum": ["search", "addressed", "fact", "session"]
+    },
+    "hydrate_tier": {
+      "description": "Echo of the requested/served hydration. CRC-v1 DEFAULT is 'pointer'.",
+      "enum": ["pointer", "summary", "full"]
+    },
+    "pointers": {
+      "description": "Cheap addressable handles. Present for kind=search|addressed at every tier (a pointer is always returnable). epitome is capped (~40 tok at pointer tier).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string", "description": "Opaque handle usable verbatim in the expand/fetch-content call (e.g. \"<segment_index>:<doc_id>\" or a fact_id/slug)." },
+          "score": { "type": ["number", "null"] },
+          "epitome": { "type": ["string", "null"], "description": "<=40-token preview at pointer tier." },
+          "reason": { "type": ["string", "null"], "enum": ["EntityMatch", "TopicMatch", "KeyFact", "Exact", null] }
+        }
+      }
+    },
+    "content": {
+      "description": "Hydrated bodies. MUST be absent or empty when hydrate_tier=pointer; populated at summary|full. Each item carries the same id as its pointer so callers can join.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string" },
+          "text": { "type": ["string", "null"] },
+          "token_count": { "type": ["integer", "null"] }
+        }
+      }
+    },
+    "cost_estimate": {
+      "description": "Token cost to hydrate the current result set at each tier. Lets a caller decide whether to expand. Required for retrieval kinds (search/addressed); optional for fact/session.",
+      "type": "object",
+      "required": ["pointer", "summary", "full"],
+      "additionalProperties": false,
+      "properties": {
+        "pointer": { "type": "integer", "minimum": 0 },
+        "summary": { "type": "integer", "minimum": 0 },
+        "full": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "agent_decision": {
+      "description": "Retrieval-routing transparency + next-step guidance. Promoted from CoreCrux AgentDecisionV1. Present (non-null) for kind=search; null otherwise.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "load_bearing_lane": { "enum": ["Bm25", "Dense", "Topology", "Indexing", "Tie", "Unknown"] },
+            "fused_confidence": { "type": ["number", "null"] },
+            "suggested_next_lane": { "type": ["string", "null"], "enum": ["Indexing", "None", "EscalateEngine", null] },
+            "lane_attribution": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "properties": { "share": { "type": "number" }, "confidence": { "type": ["number", "null"] } }
+              }
+            },
+            "read_pointers": { "type": "array", "items": { "type": "object" } }
+          }
+        }
+      ]
+    },
+    "envelope": {
+      "description": "Audit + freshness metadata. Extended from the daemon's 4-tool audit envelope to ALL reads. freshness is present for kind=addressed|fact (where supersession/decay applies).",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "freshness": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "effective_confidence": { "type": ["number", "null"] },
+                "age_hours": { "type": ["number", "null"] },
+                "horizon_class": { "type": ["string", "null"] },
+                "superseded_by": { "type": ["string", "null"] }
+              }
+            }
+          ]
+        },
+        "receipts_used": { "type": "array", "items": { "type": "string" } },
+        "memories_used": { "type": "array", "items": { "type": "object" } },
+        "autonomy_consumed": {
+          "type": ["object", "null"],
+          "properties": {
+            "capability": { "type": "string" },
+            "cost_credits": { "type": "number" },
+            "scope": { "type": "string" }
+          }
+        },
+        "links": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "verify": { "type": ["string", "null"] },
+            "open_in_console": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    "next": {
+      "description": "Self-correction affordances. expand tells the caller exactly how to hydrate the pointers it wants; resolution_pointer points at a __bootstrap__::resolution:* playbook on low-coverage/empty/timeout.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "expand": { "type": ["string", "null"], "description": "Endpoint + how to selectively hydrate (e.g. \"POST /v1/query/fetch-content {refs:[id...], hydrate:full}\")." },
+        "resolution_pointer": { "type": ["string", "null"] },
+        "canonical_slug": { "type": ["string", "null"], "description": "For addressed/session kinds: echo the canonical key so the next turn re-addresses by slot, not re-search." }
+      }
+    },
+    "meta": {
+      "description": "Per-endpoint diagnostics (backend, took_ms, score_space, lane diagnostics, bandit_variant, etc.). Free-form; never load-bearing for the contract.",
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "hydrate_tier": { "const": "pointer" } } },
+      "then": {
+        "description": "At pointer tier, no hydrated bodies may be returned (the whole point of the cheap default).",
+        "properties": { "content": { "maxItems": 0 } }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "search" } } },
+      "then": { "required": ["pointers", "cost_estimate"] }
+    }
+  ]
+}
