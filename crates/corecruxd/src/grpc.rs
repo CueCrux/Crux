@@ -1699,6 +1699,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn replication_auth_bearer_defaults_and_normalizes() {
         std::env::remove_var("CORECRUXD_REPLICATION_AUTH_BEARER");
         assert_eq!(replication_auth_bearer_value(), "Bearer replication:write");
@@ -3154,6 +3155,7 @@ mod tests {
     // ── replication_auth_bearer_value ────────────────────────────────
 
     #[test]
+    #[serial_test::serial]
     fn replication_auth_bearer_value_nonempty() {
         let val = replication_auth_bearer_value();
         // Should return some string even if env var isn't set
