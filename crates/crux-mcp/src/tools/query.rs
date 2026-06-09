@@ -79,28 +79,34 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
         })
         .collect();
 
+    let mut inner = json!({
+        "results": results_json,
+        "total_candidates": result.total_candidates,
+        "coverage": {
+            "score": result.coverage.score,
+            "missing_tokens": result.coverage.missing_tokens,
+            "below_floor": result.coverage.below_floor,
+        },
+        "meta": {
+            "source_label": "local_tenant_index",
+            "score_space": SCORE_SPACE_BM25_LEXICAL,
+            "score_merge_rule": SCORE_MERGE_RULE_SINGLE_SPACE,
+            "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,
+            "semantic_profile_id": null,
+            "local_semantic_profile_id": local_semantic_profile_id.clone(),
+            "local_semantic_profile": semantic_profile.clone(),
+            "embedding_fingerprint": embedding_fingerprint.clone(),
+        }
+    });
+    // CRC-v1: reshape into the pointer-first envelope when negotiated; absent →
+    // legacy payload unchanged.
+    if crate::crc_v1::requested(params) {
+        inner = crate::crc_v1::wrap_query(inner);
+    }
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string_pretty(&json!({
-                "results": results_json,
-                "total_candidates": result.total_candidates,
-                "coverage": {
-                    "score": result.coverage.score,
-                    "missing_tokens": result.coverage.missing_tokens,
-                    "below_floor": result.coverage.below_floor,
-                },
-                "meta": {
-                    "source_label": "local_tenant_index",
-                    "score_space": SCORE_SPACE_BM25_LEXICAL,
-                    "score_merge_rule": SCORE_MERGE_RULE_SINGLE_SPACE,
-                    "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,
-                    "semantic_profile_id": null,
-                    "local_semantic_profile_id": local_semantic_profile_id.clone(),
-                    "local_semantic_profile": semantic_profile.clone(),
-                    "embedding_fingerprint": embedding_fingerprint.clone(),
-                }
-            })).unwrap_or_default()
+            "text": serde_json::to_string_pretty(&inner).unwrap_or_default()
         }]
     }))
 }
@@ -146,23 +152,27 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
         })
         .collect();
 
+    let mut inner = json!({
+        "scan": scan,
+        "total_candidates": result.total_candidates,
+        "meta": {
+            "source_label": "local_tenant_index",
+            "score_space": SCORE_SPACE_BM25_LEXICAL,
+            "score_merge_rule": SCORE_MERGE_RULE_SINGLE_SPACE,
+            "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,
+            "semantic_profile_id": null,
+            "local_semantic_profile_id": local_semantic_profile_id.clone(),
+            "local_semantic_profile": semantic_profile.clone(),
+            "embedding_fingerprint": embedding_fingerprint.clone(),
+        }
+    });
+    if crate::crc_v1::requested(params) {
+        inner = crate::crc_v1::wrap_scan(inner);
+    }
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string_pretty(&json!({
-                "scan": scan,
-                "total_candidates": result.total_candidates,
-                "meta": {
-                    "source_label": "local_tenant_index",
-                    "score_space": SCORE_SPACE_BM25_LEXICAL,
-                    "score_merge_rule": SCORE_MERGE_RULE_SINGLE_SPACE,
-                    "mixed_profile_merge_rule": MIXED_PROFILE_MERGE_RULE,
-                    "semantic_profile_id": null,
-                    "local_semantic_profile_id": local_semantic_profile_id.clone(),
-                    "local_semantic_profile": semantic_profile.clone(),
-                    "embedding_fingerprint": embedding_fingerprint.clone(),
-                }
-            })).unwrap_or_default()
+            "text": serde_json::to_string_pretty(&inner).unwrap_or_default()
         }]
     }))
 }
@@ -251,6 +261,10 @@ pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Val
 
     if !errors.is_empty() {
         response["errors"] = json!(errors);
+    }
+    // CRC-v1: pointer-first envelope (kind=addressed) when negotiated.
+    if crate::crc_v1::requested(params) {
+        response = crate::crc_v1::wrap_expand(response);
     }
 
     Ok(json!({
