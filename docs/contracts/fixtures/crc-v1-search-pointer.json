@@ -1,0 +1,26 @@
+{
+  "contract": "crc-v1",
+  "kind": "search",
+  "hydrate_tier": "pointer",
+  "pointers": [
+    {"id": "3:8801", "score": 12.4, "epitome": "Dr. Smith appointment on March 3 re: knee", "reason": "TopicMatch"},
+    {"id": "7:2140", "score": 9.1, "epitome": "Dr. Thompson visit March 20, follow-up", "reason": "TopicMatch"}
+  ],
+  "cost_estimate": {"pointer": 80, "summary": 300, "full": 2150},
+  "agent_decision": {
+    "load_bearing_lane": "Bm25",
+    "fused_confidence": null,
+    "suggested_next_lane": "None",
+    "lane_attribution": {"bm25": {"share": 0.72, "confidence": 0.6}, "dense": {"share": 0.28, "confidence": null}},
+    "read_pointers": []
+  },
+  "envelope": {
+    "freshness": null,
+    "receipts_used": [],
+    "memories_used": [],
+    "autonomy_consumed": {"capability": "retrieve:read", "cost_credits": 0, "scope": "agent:anthropic"},
+    "links": {"verify": null, "open_in_console": null}
+  },
+  "next": {"expand": "POST /v1/query/fetch-content {refs:[\"3:8801\"], hydrate:\"full\"}", "resolution_pointer": null, "canonical_slug": null},
+  "meta": {"backend": "corecruxd", "took_ms": 14, "score_space": "bm25+cosine", "bandit_variant": "fused-v3"}
+}

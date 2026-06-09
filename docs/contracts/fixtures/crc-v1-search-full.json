@@ -1,0 +1,12 @@
+{
+  "contract": "crc-v1",
+  "kind": "search",
+  "hydrate_tier": "full",
+  "pointers": [{"id": "3:8801", "score": 12.4, "epitome": "Dr. Smith appointment on March 3", "reason": "TopicMatch"}],
+  "content": [{"id": "3:8801", "text": "On March 3 I saw Dr. Smith about my knee; she ordered an MRI.", "token_count": 18}],
+  "cost_estimate": {"pointer": 40, "summary": 150, "full": 18},
+  "agent_decision": {"load_bearing_lane": "Dense", "fused_confidence": 0.81, "suggested_next_lane": "None", "lane_attribution": {"dense": {"share": 0.9, "confidence": 0.8}}, "read_pointers": []},
+  "envelope": {"freshness": null, "receipts_used": [], "memories_used": [], "autonomy_consumed": null, "links": {}},
+  "next": {"expand": null, "resolution_pointer": null},
+  "meta": {"backend": "corecruxd", "took_ms": 21}
+}

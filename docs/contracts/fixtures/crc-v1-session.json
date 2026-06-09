@@ -1,0 +1,10 @@
+{
+  "contract": "crc-v1",
+  "kind": "session",
+  "hydrate_tier": "full",
+  "content": [{"id": "execplan:crux-response-contract-v1", "text": "{\"headline\":\"CRC-v1 M0 spec frozen\"}", "token_count": 12}],
+  "agent_decision": null,
+  "envelope": {"freshness": {"effective_confidence": 1.0, "age_hours": 0, "horizon_class": "stable", "superseded_by": null}, "receipts_used": [], "memories_used": [], "autonomy_consumed": null, "links": {"open_in_console": "https://crux.cuecrux.com/console#/work"}},
+  "next": {"canonical_slug": "execplan:crux-response-contract-v1", "resolution_pointer": null},
+  "meta": {"resolved_by": "session_id", "ranked": false}
+}
