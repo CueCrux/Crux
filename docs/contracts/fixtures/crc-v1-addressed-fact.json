@@ -1,0 +1,16 @@
+{
+  "contract": "crc-v1",
+  "kind": "fact",
+  "hydrate_tier": "full",
+  "pointers": [{"id": "f_8db94dd9", "score": null, "epitome": "bench:armA-vs-armB net +13/+12", "reason": "Exact"}],
+  "content": [{"id": "f_8db94dd9", "text": "{\"metric\":\"paired_net_correct\",\"value\":\"+13/+12\"}", "token_count": 22}],
+  "agent_decision": null,
+  "envelope": {
+    "freshness": {"effective_confidence": 1.0, "age_hours": 6, "horizon_class": "medium", "superseded_by": null},
+    "receipts_used": [], "memories_used": [{"fact_id": "f_8db94dd9", "topic": "bench:q500-failretest", "freshness": "fresh"}],
+    "autonomy_consumed": {"capability": "facts:read", "cost_credits": 0, "scope": "agent:anthropic"},
+    "links": {"verify": null, "open_in_console": "https://crux.cuecrux.com/console#/facts"}
+  },
+  "next": {"canonical_slug": "bench:q500-failretest-cohort-2026-06-08", "resolution_pointer": null},
+  "meta": {"resolved_by": "entity+key", "ranked": false}
+}

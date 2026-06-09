@@ -88,6 +88,41 @@ fn fact_visible_for_http_write(fact: &corecrux_memory::fact_store::Fact, ctx: &c
     raw_admin_write(ctx) || crux_mcp::scope::fact_visible_to_agent(fact, ctx.passport_id.as_deref())
 }
 
+#[allow(clippy::result_large_err)]
+fn prepare_fact_write_checked(
+    state: &AppState,
+    store: &corecrux_memory::FactStore,
+    ctx: &crate::auth::HttpScopeContext,
+    mut fact: corecrux_memory::fact_store::StoreFact,
+) -> Result<corecrux_memory::fact_store::StoreFact, Response> {
+    if fact.private {
+        return Err(problem_response(
+            StatusCode::BAD_REQUEST,
+            "private facts require MCP agent identity; HTTP /v1/facts does not support private=true",
+        ));
+    }
+    crate::fact_privacy::enforce(&state.privacy_policy, &mut fact);
+    if let Err(e) =
+        crux_mcp::category_enforce::check_passport_can_write_entity(store, ctx.passport_id.as_deref(), &fact.entity)
+    {
+        return Err(problem_response(StatusCode::FORBIDDEN, e.to_string()));
+    }
+    Ok(fact)
+}
+
+#[allow(clippy::result_large_err)]
+fn try_store_fact_checked(
+    state: &AppState,
+    store: &mut corecrux_memory::FactStore,
+    ctx: &crate::auth::HttpScopeContext,
+    fact: corecrux_memory::fact_store::StoreFact,
+) -> Result<corecrux_memory::fact_store::Fact, Response> {
+    let fact = prepare_fact_write_checked(state, store, ctx, fact)?;
+    store
+        .try_store(fact)
+        .map_err(|err| problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
 fn fact_matches_query(fact: &corecrux_memory::fact_store::Fact, query: &str, agent_name: Option<&str>) -> bool {
     let query_lower = query.to_lowercase();
     let terms: Vec<&str> = query_lower.split_whitespace().collect();
@@ -203,21 +238,10 @@ pub(super) async fn put_fact(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
-    if body.private {
-        return problem_response(
-            StatusCode::BAD_REQUEST,
-            "private facts require MCP agent identity; HTTP /v1/facts does not support private=true",
-        );
-    }
     let mut store = state.fact_store.write().await;
-    if let Err(e) =
-        crux_mcp::category_enforce::check_passport_can_write_entity(&store, ctx.passport_id.as_deref(), &body.entity)
-    {
-        return problem_response(StatusCode::FORBIDDEN, e.to_string());
-    }
-    let fact = match store.try_store(body) {
+    let fact = match try_store_fact_checked(&state, &mut store, &ctx, body) {
         Ok(fact) => fact,
-        Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        Err(response) => return response,
     };
     (StatusCode::CREATED, axum::Json(serde_json::json!(fact))).into_response()
 }
@@ -249,16 +273,14 @@ pub(super) async fn put_facts_bulk(
         );
     }
     let mut store = state.fact_store.write().await;
-    for fact in &body {
-        if let Err(e) = crux_mcp::category_enforce::check_passport_can_write_entity(
-            &store,
-            ctx.passport_id.as_deref(),
-            &fact.entity,
-        ) {
-            return problem_response(StatusCode::FORBIDDEN, e.to_string());
+    let mut checked = Vec::with_capacity(body.len());
+    for fact in body {
+        match prepare_fact_write_checked(&state, &store, &ctx, fact) {
+            Ok(fact) => checked.push(fact),
+            Err(response) => return response,
         }
     }
-    let facts = match store.try_store_bulk(body) {
+    let facts = match store.try_store_bulk(checked) {
         Ok(facts) => facts,
         Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };

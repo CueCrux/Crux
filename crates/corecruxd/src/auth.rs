@@ -260,6 +260,7 @@ fn extract_scopes_grpc_dev(meta: &MetadataMap) -> Option<BTreeSet<String>> {
 #[derive(Debug, Clone)]
 struct AuthContext {
     subject: Option<String>,
+    passport_id: Option<String>,
     scopes: BTreeSet<String>,
     tenants: TenantAllow,
 }
@@ -339,6 +340,25 @@ fn subject_from_claims(claims: &serde_json::Value) -> Option<String> {
     None
 }
 
+fn passport_from_claims(claims: &serde_json::Value) -> Option<String> {
+    for key in [
+        "passport_id",
+        "passportId",
+        "passport",
+        "passport_fpr",
+        "passportFpr",
+        "pid",
+    ] {
+        if let Some(passport) = claims.get(key).and_then(|v| v.as_str()) {
+            let trimmed = passport.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    subject_from_claims(claims)
+}
+
 fn verify_jwt_hs256(cfg: &JwtHs256Config, token: &str) -> Result<AuthContext, String> {
     use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 
@@ -359,8 +379,10 @@ fn verify_jwt_hs256(cfg: &JwtHs256Config, token: &str) -> Result<AuthContext, St
     let scopes = scopes_from_claims(&data.claims);
     let tenants = tenants_from_claims(&data.claims);
     let subject = subject_from_claims(&data.claims);
+    let passport_id = passport_from_claims(&data.claims);
     Ok(AuthContext {
         subject,
+        passport_id,
         scopes,
         tenants,
     })
@@ -545,8 +567,10 @@ fn verify_jwt_jwks(cfg: &JwtJwksConfig, token: &str) -> Result<AuthContext, Stri
     let scopes = scopes_from_claims(&data.claims);
     let tenants = tenants_from_claims(&data.claims);
     let subject = subject_from_claims(&data.claims);
+    let passport_id = passport_from_claims(&data.claims);
     Ok(AuthContext {
         subject,
+        passport_id,
         scopes,
         tenants,
     })
@@ -666,6 +690,7 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
     match auth.mode {
         AuthMode::Off => Ok(AuthContext {
             subject: None,
+            passport_id: None,
             scopes: BTreeSet::new(),
             tenants: TenantAllow::Any,
         }),
@@ -680,6 +705,7 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
             })?;
             Ok(AuthContext {
                 subject: None,
+                passport_id: None,
                 scopes,
                 tenants: TenantAllow::Any,
             })
@@ -759,13 +785,54 @@ pub fn http_passport_id(headers: &HeaderMap) -> Option<String> {
 }
 
 #[allow(clippy::result_large_err)]
-pub fn http_scope_context(auth: &Authz, headers: &HeaderMap) -> Result<HttpScopeContext, ProblemResponse> {
+pub fn passport_bound_context(auth: &Authz, headers: &HeaderMap) -> Result<HttpScopeContext, ProblemResponse> {
     let ctx = http_ctx(auth, headers)?;
+    let passport_id = bind_http_passport(auth.mode, &ctx, http_passport_id(headers))?;
     Ok(HttpScopeContext {
         scopes: ctx.scopes.into_iter().collect(),
-        passport_id: http_passport_id(headers),
+        passport_id,
         scope_bypass: auth.mode == AuthMode::Off,
     })
+}
+
+#[allow(clippy::result_large_err)]
+pub fn http_scope_context(auth: &Authz, headers: &HeaderMap) -> Result<HttpScopeContext, ProblemResponse> {
+    passport_bound_context(auth, headers)
+}
+
+#[allow(clippy::result_large_err)]
+fn bind_http_passport(
+    mode: AuthMode,
+    ctx: &AuthContext,
+    header_passport: Option<String>,
+) -> Result<Option<String>, ProblemResponse> {
+    if matches!(mode, AuthMode::Off | AuthMode::DevScopes) {
+        return Ok(header_passport);
+    }
+
+    match (ctx.passport_id.as_deref(), header_passport.as_deref()) {
+        (claim, None) => Ok(claim.map(str::to_string)),
+        (Some(claim), Some(header)) if claim == header => Ok(Some(claim.to_string())),
+        (_, Some(header)) if can_override_passport_header(&ctx.scopes) => Ok(Some(header.to_string())),
+        (None, Some(_)) => Err(ProblemResponse(
+            ProblemDetails::forbidden("passport header is not bound to the bearer token").with_extensions(
+                serde_json::json!({
+                    "code": "PASSPORT_HEADER_UNBOUND",
+                }),
+            ),
+        )),
+        (Some(_), Some(_)) => Err(ProblemResponse(
+            ProblemDetails::forbidden("passport header does not match bearer token").with_extensions(
+                serde_json::json!({
+                    "code": "PASSPORT_HEADER_MISMATCH",
+                }),
+            ),
+        )),
+    }
+}
+
+fn can_override_passport_header(scopes: &BTreeSet<String>) -> bool {
+    scopes.iter().any(|s| s == "passport:impersonate" || s == "admin:write")
 }
 
 #[allow(clippy::result_large_err)]
@@ -773,6 +840,7 @@ fn grpc_ctx(auth: &Authz, meta: &MetadataMap) -> Result<AuthContext, Status> {
     match auth.mode {
         AuthMode::Off => Ok(AuthContext {
             subject: None,
+            passport_id: None,
             scopes: BTreeSet::new(),
             tenants: TenantAllow::Any,
         }),
@@ -789,6 +857,7 @@ fn grpc_ctx(auth: &Authz, meta: &MetadataMap) -> Result<AuthContext, Status> {
             })?;
             Ok(AuthContext {
                 subject: None,
+                passport_id: None,
                 scopes,
                 tenants: TenantAllow::Any,
             })
@@ -898,6 +967,35 @@ pub fn require_http_any_scope(auth: &Authz, headers: &HeaderMap, any_of: &[&str]
             "missingAnyScope": any_of
         })),
     ))
+}
+
+#[allow(clippy::result_large_err)]
+pub fn require_http_any_scope_for_tenant(
+    auth: &Authz,
+    headers: &HeaderMap,
+    any_of: &[&str],
+    tenant_id: &str,
+) -> Result<(), ProblemResponse> {
+    if auth.mode == AuthMode::Off {
+        return Ok(());
+    }
+
+    let ctx = http_ctx(auth, headers)?;
+    let Some(matched_scope) = any_of.iter().find(|scope| ctx.scopes.iter().any(|s| s == **scope)) else {
+        return Err(ProblemResponse(
+            ProblemDetails::forbidden("insufficient scopes").with_extensions(serde_json::json!({
+                "code": "MISSING_SCOPE",
+                "missingAnyScope": any_of
+            })),
+        ));
+    };
+
+    if matched_scope.starts_with("admin:") {
+        return Ok(());
+    }
+
+    require_tenant_allowed(&ctx.tenants, tenant_id)?;
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
@@ -1180,6 +1278,42 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     fn env_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn hs256_auth_headers(mut claims: serde_json::Value) -> (Authz, HeaderMap) {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", "secret");
+        std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+        std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+
+        let obj = claims.as_object_mut().expect("claims object");
+        obj.insert(
+            "exp".to_string(),
+            serde_json::json!(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600
+            ),
+        );
+        obj.insert("iss".to_string(), serde_json::json!("corecrux-test"));
+        obj.insert("aud".to_string(), serde_json::json!("corecrux"));
+
+        let auth = Authz::from_env(AuthMode::JwtHs256).expect("auth from env");
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .expect("jwt");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        (auth, headers)
     }
 
     // ── AuthMode parsing ──────────────────────────────────────────────────
@@ -1528,6 +1662,23 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         assert_eq!(subject_from_claims(&claims), None);
     }
 
+    // ── passport_from_claims ──────────────────────────────────────────────
+
+    #[test]
+    fn passport_from_claims_prefers_explicit_passport_claim() {
+        let claims = serde_json::json!({
+            "sub": "subject-id",
+            "passport_id": "passport-id",
+        });
+        assert_eq!(passport_from_claims(&claims), Some("passport-id".to_string()));
+    }
+
+    #[test]
+    fn passport_from_claims_falls_back_to_subject() {
+        let claims = serde_json::json!({ "sub": "subject-id" });
+        assert_eq!(passport_from_claims(&claims), Some("subject-id".to_string()));
+    }
+
     // ── missing_scopes ────────────────────────────────────────────────────
 
     #[test]
@@ -1727,6 +1878,72 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         headers.insert("x-corecrux-scopes", "a:read".parse().unwrap());
         // DevScopes mode sets TenantAllow::Any, so any tenant is allowed
         require_http_scopes_for_tenant(&auth, &headers, &["a:read"], "any-tenant").unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn passport_bound_context_rejects_mismatched_jwt_passport_header() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        let (auth, mut headers) = hs256_auth_headers(serde_json::json!({
+            "scope": "facts:write",
+            "tenant_id": "t1",
+            "passport_id": "passport-a",
+        }));
+        headers.insert("x-corecrux-passport-id", "passport-b".parse().unwrap());
+
+        let err = passport_bound_context(&auth, &headers).unwrap_err();
+        assert_eq!(err.0.status, 403);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn passport_bound_context_uses_verified_jwt_passport() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        let (auth, mut headers) = hs256_auth_headers(serde_json::json!({
+            "scope": "facts:write",
+            "tenant_id": "t1",
+            "passport_id": "passport-a",
+        }));
+        let ctx = passport_bound_context(&auth, &headers).expect("bound context");
+        assert_eq!(ctx.passport_id.as_deref(), Some("passport-a"));
+
+        headers.insert("x-corecrux-passport-id", "passport-a".parse().unwrap());
+        let ctx = passport_bound_context(&auth, &headers).expect("matching header");
+        assert_eq!(ctx.passport_id.as_deref(), Some("passport-a"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn require_http_any_scope_for_tenant_checks_tenant_for_non_admin_scope() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        let (auth, headers) = hs256_auth_headers(serde_json::json!({
+            "scope": "gpu1:answer",
+            "tenant_id": "tenant-a",
+            "passport_id": "passport-a",
+        }));
+
+        require_http_any_scope_for_tenant(&auth, &headers, &["gpu1:answer", "admin:write"], "tenant-a")
+            .expect("tenant allowed");
+        let err = require_http_any_scope_for_tenant(&auth, &headers, &["gpu1:answer", "admin:write"], "tenant-b")
+            .unwrap_err();
+        assert_eq!(err.0.status, 403);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn require_http_any_scope_for_tenant_allows_admin_scope_without_tenant_claim() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+        let (auth, headers) = hs256_auth_headers(serde_json::json!({
+            "scope": "admin:write",
+            "passport_id": "passport-a",
+        }));
+
+        require_http_any_scope_for_tenant(&auth, &headers, &["gpu1:answer", "admin:write"], "tenant-b")
+            .expect("admin scope bypasses tenant binding");
     }
 
     // ── extract_bearer_token_grpc ─────────────────────────────────────────
