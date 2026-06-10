@@ -471,7 +471,7 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     // `structuredContent.envelope`) composes without collision. content[text]
     // carries the CRC-v1 envelope for text-reading agents. Absent contract →
     // legacy shape, byte-identical.
-    if crate::crc_v1::requested(args) {
+    if crate::crc_v1::enabled(args) {
         let crc = crate::crc_v1::wrap_facts(&rows, entity.as_deref(), query.as_deref());
         let text = serde_json::to_string_pretty(&crc).unwrap_or_default();
         return Ok(json!({
@@ -1030,7 +1030,7 @@ mod tests {
         .unwrap();
 
         // alice can see it.
-        let result = handle_query_facts(&json!({"query": "hidden"}), &agent_ctx)
+        let result = handle_query_facts(&json!({"query": "hidden", "contract": "legacy"}), &agent_ctx)
             .await
             .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -1359,9 +1359,12 @@ mod tests {
             .await
             .unwrap();
 
-        let result = handle_query_facts(&json!({"query": "active", "entity": "alpha"}), &ctx)
-            .await
-            .unwrap();
+        let result = handle_query_facts(
+            &json!({"query": "active", "entity": "alpha", "contract": "legacy"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
         // Text still carries the legacy fields plus the new annotation.
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("active"));
@@ -1526,7 +1529,9 @@ mod tests {
         handle_store_fact(&json!({"entity": "alpha", "key": "state", "value": "active"}), &ctx)
             .await
             .unwrap();
-        let result = handle_query_facts(&json!({"entity": "alpha"}), &ctx).await.unwrap();
+        let result = handle_query_facts(&json!({"entity": "alpha", "contract": "legacy"}), &ctx)
+            .await
+            .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("effective_confidence="));
     }
