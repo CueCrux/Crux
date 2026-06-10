@@ -15,7 +15,7 @@
 //!
 //! Modes (process flag `CORECRUXD_TOOL_SURFACE`, default `full`):
 //! - `full` — unchanged ~100-tool surface (byte-for-byte the pre-M1 behaviour).
-//! - `minimal` (M1) — the [`CORE_FLOOR`] only (~11 tools), so a cold agent can
+//! - `minimal` (M1) — the [`CORE_FLOOR`] only (~14 tools), so a cold agent can
 //!   still bootstrap (discover → retrieve → remember → session continuity) and
 //!   reach everything else by name.
 //! - `dynamic` (M2/M3/M4) — the floor plus up to [`DYNAMIC_TOP_N`] tools scored
@@ -36,8 +36,8 @@ use super::ToolDefinition;
 use crate::traces::TraceEntry;
 
 /// Count of intent-relevant tools surfaced *beyond* the [`CORE_FLOOR`] in
-/// `dynamic` mode. Floor (~11) + this ≈ a ~23-tool intent-targeted surface —
-/// still a ~4× cut from the full ~95, but with the right tools for the task.
+/// `dynamic` mode. Floor (~14) + this ≈ a ~26-tool intent-targeted surface —
+/// still a large cut from the full ~95, but with the right tools for the task.
 pub const DYNAMIC_TOP_N: usize = 12;
 
 /// How long a declared intent keeps shaping the surface (seconds). A stale
@@ -47,10 +47,11 @@ const INTENT_TTL_SECONDS: i64 = 3600;
 /// Always-surfaced core set (ExecPlan C4). Lets an agent with zero prior calls
 /// run the core loop — discover (`cuecrux_session`), retrieve (`query*`),
 /// remember (`store_fact`/`query_facts`/`get_bootstrap`/`memory_view`), keep
-/// session continuity (`save_session`/`get_session`), and self-identify
-/// (`get_agent_identity`). Every name here is asserted to exist in the full
-/// surface by the `core_floor_names_exist_in_full_surface` test, so a typo
-/// fails the build rather than silently shrinking the floor.
+/// session continuity (`save_session`/`get_session`), self-identify
+/// (`get_agent_identity`/`get_passport`), verify a receipt (`receipt_verify`),
+/// and read sync posture (`sync_status`). Every name here is asserted to exist
+/// in the full surface by the `core_floor_names_exist_in_full_surface` test, so
+/// a typo fails the build rather than silently shrinking the floor.
 pub const CORE_FLOOR: &[&str] = &[
     "cuecrux_session", // discovery — the collapsed-surface entry point (always first)
     "query",
@@ -63,6 +64,9 @@ pub const CORE_FLOOR: &[&str] = &[
     "save_session",
     "get_session",
     "get_agent_identity",
+    "get_passport",   // identity — bootstrap passport/tier without knowing the tool name
+    "receipt_verify", // proof — verify a CROWN receipt offline
+    "sync_status",    // ops — daemon sync posture (local_only/degraded) for cold-start decisions
 ];
 
 /// How the `tools/list` surface is shaped before serialisation.
