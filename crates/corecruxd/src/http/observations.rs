@@ -69,6 +69,33 @@ pub(super) struct PostObservationsBatchBody {
     pub items: Vec<PostObservationBody>,
 }
 
+/// Incoming body for `POST /v1/mediation/receipts` — an externally-mediated
+/// (gateway) tool call to be recorded as a passport-attributed CROWN receipt.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct PostMediationReceiptBody {
+    /// Passport the call is attributed to. The caller must be able to *resolve*
+    /// it (capability-bound) or the ingest is rejected — this is what blocks
+    /// forged attribution.
+    pub passport_id: String,
+    /// Upstream MCP server the tool belongs to (e.g. `playwright`, `openclaw`).
+    pub tool_server: String,
+    pub tool: String,
+    /// Hash of the (redacted) tool arguments — never the raw args.
+    #[serde(default)]
+    pub args_sha: Option<String>,
+    /// `allow` | `deny`.
+    pub decision: String,
+    /// `ok` | `denied` | `error` | `pending`.
+    pub outcome: String,
+    /// Gateway-side timestamp of the tool call (recorded as `client_ts`; the
+    /// server still owns the canonical `ts`).
+    #[serde(default)]
+    pub ts: Option<DateTime<Utc>>,
+    /// Originating agent session id — used only to group the mediation log.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 /// Receipt envelope returned to the caller.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct ReceiptEnvelopeV1 {
@@ -679,6 +706,113 @@ pub(super) async fn post_observations_batch(
         }
     }
     (StatusCode::CREATED, Json(PostObservationsBatchResponse { items })).into_response()
+}
+
+/// Shape a mediation-receipt body into a scoped session id + an observation
+/// body. Pure (no IO) so the mapping is unit-testable. The mediation log is
+/// grouped per originating session (or per passport when none is supplied).
+fn mediation_observation(body: &PostMediationReceiptBody) -> (String, PostObservationBody) {
+    let group = body
+        .session_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&body.passport_id);
+    let scoped = format!("mediation::{group}");
+    let payload = serde_json::json!({
+        "tool_server": body.tool_server,
+        "tool": body.tool,
+        "args_sha": body.args_sha,
+        "decision": body.decision,
+        "outcome": body.outcome,
+        "mediator": "crux-gateway",
+    });
+    let obs = PostObservationBody {
+        kind: "tool_mediation".to_string(),
+        provider: "crux-gateway".to_string(),
+        client_ts: body.ts,
+        payload,
+    };
+    (scoped, obs)
+}
+
+/// `POST /v1/mediation/receipts` — record a CROWN receipt (and, in a
+/// dataplane-enabled deployment, a `/v1/projections/entity/timeline` row via the
+/// observation stream) for an externally-mediated tool call, attributed to a
+/// passport the caller can resolve.
+///
+/// - **T.3 (authenticated):** rejects an unauthenticated caller.
+/// - **T.1 + anti-forgery (capability-bound):** the caller may only ingest a
+///   receipt for a passport it can `resolve_principal` for; the resolve is
+///   tenant-scoped, so a mediator for tenant A cannot attribute to tenant B.
+/// - **T.4 (audit):** always recorded through the signed-observation path
+///   (`append_one` → CROWN receipt + JSONL + best-effort dataplane stream),
+///   never a raw store write.
+pub(super) async fn post_mediation_receipt(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PostMediationReceiptBody>,
+) -> Response {
+    // T.3: caller must be authenticated (resolves the caller's scope context).
+    if let Err(p) = crate::auth::http_scope_context(&state.auth, &headers) {
+        return p.into_response();
+    }
+    if body.passport_id.trim().is_empty() || body.tool.trim().is_empty() || body.tool_server.trim().is_empty() {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "passport_id, tool_server and tool are required",
+        );
+    }
+    if !matches!(body.decision.as_str(), "allow" | "deny") {
+        return problem_response(StatusCode::BAD_REQUEST, "decision must be 'allow' or 'deny'");
+    }
+
+    // Capability-bound (anti-forgery + T.1): resolve the target passport, then
+    // tenant-scope on the *resolved* tenant. An unresolvable passport cannot be
+    // attributed to (no forging a receipt for an identity you can't resolve).
+    let resolved = {
+        let store = state.fact_store.read().await;
+        crate::principal::resolve_by_passport(&store, &body.passport_id, None)
+    };
+    let resolved = match resolved {
+        Ok(r) => r,
+        Err(_) => {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "cannot attribute receipt: passport '{}' is not resolvable",
+                    body.passport_id
+                ),
+            );
+        }
+    };
+    if let Err(p) = crate::auth::require_http_any_scope_for_tenant(
+        &state.auth,
+        &headers,
+        &["sessions:write", "admin:write"],
+        &resolved.tenant_id,
+    ) {
+        return p.into_response();
+    }
+
+    // T.4: record through the signed-observation path. principal = the
+    // attributed passport, so the CROWN receipt body carries the attribution.
+    let (scoped, obs_body) = mediation_observation(&body);
+    match append_one(&state, &scoped, &body.passport_id, obs_body, None) {
+        Ok((resp, _tip)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "observation_id": resp.observation_id,
+                "ts": resp.ts,
+                "receipt": resp.receipt,
+                "passport_id": body.passport_id,
+                "principal": body.passport_id,
+                "tenant_id": resolved.tenant_id,
+                "session_id": scoped,
+            })),
+        )
+            .into_response(),
+        Err((status, msg)) => problem_response(status, msg),
+    }
 }
 
 pub(super) async fn get_observations(
@@ -2032,6 +2166,131 @@ mod tests {
         state.passport_fpr = key.passport_fpr().to_string();
         state.passport_public_key_hex = key.public_key_hex().to_string();
         state
+    }
+
+    // ── Mediation receipts (B2) ──────────────────────────────────────────
+
+    #[test]
+    fn mediation_observation_shapes_payload_and_groups_by_session() {
+        let body = PostMediationReceiptBody {
+            passport_id: "work-default".to_string(),
+            tool_server: "playwright".to_string(),
+            tool: "browser_navigate".to_string(),
+            args_sha: Some("deadbeef".to_string()),
+            decision: "allow".to_string(),
+            outcome: "ok".to_string(),
+            ts: None,
+            session_id: Some("sess-1".to_string()),
+        };
+        let (scoped, obs) = mediation_observation(&body);
+        assert_eq!(scoped, "mediation::sess-1");
+        assert_eq!(obs.kind, "tool_mediation");
+        assert_eq!(obs.provider, "crux-gateway");
+        assert_eq!(obs.payload["tool"], "browser_navigate");
+        assert_eq!(obs.payload["decision"], "allow");
+
+        // No session_id → grouped by passport.
+        let mut b2 = body.clone();
+        b2.session_id = None;
+        assert_eq!(mediation_observation(&b2).0, "mediation::work-default");
+    }
+
+    /// Seed the daemon passport store into a stub state's fact store so
+    /// `resolve_by_passport` succeeds.
+    async fn seed_passports_into(state: &AppState) {
+        let mut store = state.fact_store.write().await;
+        crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed");
+    }
+
+    #[tokio::test]
+    async fn post_mediation_receipt_happy_path_records_attributed_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+        seed_passports_into(&state).await;
+
+        let resp = post_mediation_receipt(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(PostMediationReceiptBody {
+                passport_id: "work-default".to_string(),
+                tool_server: "openclaw".to_string(),
+                tool: "openclaw_status".to_string(),
+                args_sha: Some("abc123".to_string()),
+                decision: "allow".to_string(),
+                outcome: "ok".to_string(),
+                ts: None,
+                session_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = response_to_json(resp).await;
+        assert_eq!(body["receipt"]["alg"], "ed25519");
+        assert_eq!(body["receipt"]["signed_by"], key.passport_fpr());
+        assert_eq!(body["passport_id"], "work-default");
+        assert_eq!(body["session_id"], "mediation::work-default");
+
+        // The persisted JSONL line is attributed to the passport (principal).
+        let file = observation_file_path(&state.data_dir, "mediation::work-default");
+        let records = read_observations(&file).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].principal, "work-default");
+        assert_eq!(records[0].kind, "tool_mediation");
+    }
+
+    #[tokio::test]
+    async fn post_mediation_receipt_rejects_unresolvable_passport() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+        seed_passports_into(&state).await;
+
+        // No such passport → cannot attribute → 400 (forged-attribution guard).
+        let resp = post_mediation_receipt(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(PostMediationReceiptBody {
+                passport_id: "ghost-passport".to_string(),
+                tool_server: "openclaw".to_string(),
+                tool: "openclaw_status".to_string(),
+                args_sha: None,
+                decision: "allow".to_string(),
+                outcome: "ok".to_string(),
+                ts: None,
+                session_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_mediation_receipt_rejects_bad_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("passport.key");
+        let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
+        let state = stub_state_with_passport(tmp.path(), &key);
+        seed_passports_into(&state).await;
+
+        let resp = post_mediation_receipt(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(PostMediationReceiptBody {
+                passport_id: "work-default".to_string(),
+                tool_server: "openclaw".to_string(),
+                tool: "openclaw_status".to_string(),
+                args_sha: None,
+                decision: "maybe".to_string(), // invalid
+                outcome: "ok".to_string(),
+                ts: None,
+                session_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

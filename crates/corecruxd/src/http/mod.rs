@@ -844,6 +844,13 @@ pub fn router(state: AppState) -> Router {
             "/v1/principal/resolve",
             get(self::principal::get_resolve_principal),
         )
+        // Mediation receipts: an external mediator (the gateway) ingests a
+        // CROWN receipt for a proxied tool call, attributed to a resolvable
+        // passport (capability-bound; never a raw write).
+        .route(
+            "/v1/mediation/receipts",
+            axum::routing::post(self::observations::post_mediation_receipt),
+        )
         // RCX Registry publish preview/emit for local passports.
         .route(
             "/v1/rcx/publish/passports/{passportId}/preview",
