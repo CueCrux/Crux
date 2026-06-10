@@ -29,6 +29,7 @@ mod openapi;
 mod orchestrators;
 mod passports;
 mod planes;
+mod policy;
 mod principal;
 mod projections;
 mod projects;
@@ -850,6 +851,12 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/mediation/receipts",
             axum::routing::post(self::observations::post_mediation_receipt),
+        )
+        // Canonical tool tier/capability policy — the single source the gateway
+        // and daemon authorize against (no ladder drift).
+        .route(
+            "/v1/policy/capabilities",
+            get(self::policy::get_policy_capabilities),
         )
         // RCX Registry publish preview/emit for local passports.
         .route(
