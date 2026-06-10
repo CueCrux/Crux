@@ -110,6 +110,24 @@ pub fn list_bindings(store: &FactStore) -> Vec<SessionBinding> {
     out
 }
 
+/// Point lookup of the binding for a single session id (hex). Returns the
+/// latest `record` fact under `__session_binding__::{session_id_hex}`, or
+/// `None` if no binding exists. Cheaper than [`list_bindings`] when the caller
+/// already knows the session id (the `resolve_principal` path).
+pub fn get_binding(store: &FactStore, session_id_hex: &str) -> Option<SessionBinding> {
+    let result = store.query(&FactQuery {
+        query: None,
+        entity: Some(format!("{SESSION_BINDING_ENTITY_PREFIX}::{session_id_hex}")),
+        entity_prefix: None,
+        top_k: 8,
+        token_budget: None,
+    });
+    crate::fact_helpers::dedup_latest(result.facts)
+        .into_iter()
+        .find(|f| f.key == SESSION_BINDING_RECORD_KEY)
+        .and_then(|f| serde_json::from_str::<SessionBinding>(&f.value).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +259,12 @@ mod tests {
         // Sorted by bound_at_unix_ms descending → b2 first.
         assert_eq!(listed[0].session_id_hex, "bbbb");
         assert_eq!(listed[1].session_id_hex, "aaaa");
+
+        // Point lookup returns the right binding, and None for an unknown id.
+        let got = get_binding(&store, "aaaa").expect("aaaa present");
+        assert_eq!(got.session_id_hex, "aaaa");
+        assert_eq!(got.project_id.as_deref(), Some("proj-x"));
+        assert!(get_binding(&store, "zzzz").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
