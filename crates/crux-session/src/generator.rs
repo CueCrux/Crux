@@ -27,7 +27,7 @@ use std::collections::HashSet;
 use blake3::Hasher;
 
 use crate::canonical::CborValue;
-use crate::catalog::{tier_meets, CatalogEntry, DEFAULT_CATALOG};
+use crate::catalog::{tier_meets, CatalogEntry, CAPABILITY_EDGES, DEFAULT_CATALOG};
 use crate::intent::{
     apply_intent_shaping_with_affinity, default_intent_table, hash_capability_graph_with_intent, IntentTable,
 };
@@ -146,10 +146,27 @@ pub fn generate_graph(input: GenerateInput<'_>) -> GeneratedGraph {
         |c| affinity_by_cap.get(&c.cap).copied().unwrap_or(""),
     );
 
+    // Step 12 — Edge construction (master-plan §5.4). Emit a graph edge for
+    // each statically-configured relationship whose BOTH endpoints survived
+    // filtering. Edges to dropped/excluded capabilities are not emitted. Order
+    // follows the static table (which is itself deterministic), so the edge
+    // list is reproducible for the graph hash.
+    let surviving: HashSet<&str> = caps.iter().map(|c| c.cap.as_str()).collect();
+    let edges: Vec<Edge> = CAPABILITY_EDGES
+        .iter()
+        .filter(|e| surviving.contains(e.from) && surviving.contains(e.to))
+        .map(|e| Edge {
+            from: e.from.to_string(),
+            to: e.to.to_string(),
+            kind: e.kind.to_string(),
+            weight: Some(e.weight),
+        })
+        .collect();
+
     let hash = hash_capability_graph_with_intent(&caps, input.hints.intent.as_deref());
     GeneratedGraph {
         capabilities: caps,
-        edges: Vec::new(),
+        edges,
         excluded: Vec::new(),
         hash,
     }
@@ -326,6 +343,71 @@ mod tests {
         for cap in &graph.capabilities {
             assert_eq!(cap.prefer, "mcp", "{}", cap.cap);
         }
+    }
+
+    #[test]
+    fn edges_emitted_only_when_both_endpoints_survive() {
+        let flags = HashSet::new();
+        let hints = GraphHints::default();
+
+        // `audit.byo_trail` (affinity=audit) and `trace.typed_actions`
+        // (affinity=trace) are both min_tier=None → both visible on a passport
+        // carrying both affinities, so the cross-affinity composes_with edge
+        // is emitted.
+        let both = passport("local", &["audit", "trace"]);
+        let g_both = generate_default(&both, &hints, None, &flags);
+        assert!(
+            g_both
+                .edges
+                .iter()
+                .any(|e| e.from == "audit.byo_trail" && e.to == "trace.typed_actions"),
+            "expected audit.byo_trail→trace.typed_actions edge when both endpoints visible"
+        );
+
+        // Drop the `trace` affinity → `trace.typed_actions` is filtered out →
+        // the edge must NOT be emitted (Step 12 both-endpoints rule).
+        let audit_only = passport("local", &["audit"]);
+        let g_audit = generate_default(&audit_only, &hints, None, &flags);
+        assert!(
+            !g_audit.edges.iter().any(|e| e.to == "trace.typed_actions"),
+            "edge to a filtered endpoint must be dropped"
+        );
+        let names: HashSet<&str> = g_audit.capabilities.iter().map(|c| c.cap.as_str()).collect();
+        for e in &g_audit.edges {
+            assert!(
+                names.contains(e.from.as_str()) && names.contains(e.to.as_str()),
+                "edge {}→{} has an endpoint absent from nodes",
+                e.from,
+                e.to
+            );
+        }
+    }
+
+    #[test]
+    fn local_wildcard_passport_has_nonempty_graph_edges() {
+        let pp = passport("local", &["*"]);
+        let flags = HashSet::new();
+        let g = generate_default(&pp, &GraphHints::default(), None, &flags);
+        assert!(!g.edges.is_empty(), "local wildcard graph should carry edges");
+        let names: HashSet<&str> = g.capabilities.iter().map(|c| c.cap.as_str()).collect();
+        for e in &g.edges {
+            assert!(
+                names.contains(e.from.as_str()) && names.contains(e.to.as_str()),
+                "edge {}→{} endpoint missing from nodes",
+                e.from,
+                e.to
+            );
+            assert!(e.weight.map(|w| w <= 100).unwrap_or(true), "weight out of 0–100");
+        }
+    }
+
+    #[test]
+    fn edge_set_is_deterministic() {
+        let pp = passport("local", &["*"]);
+        let flags = HashSet::new();
+        let g1 = generate_default(&pp, &GraphHints::default(), None, &flags);
+        let g2 = generate_default(&pp, &GraphHints::default(), None, &flags);
+        assert_eq!(g1.edges, g2.edges, "edge set must be reproducible");
     }
 
     #[test]
