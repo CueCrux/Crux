@@ -973,6 +973,148 @@ async fn console_read_endpoints_require_admin_scope_in_dev_mode() {
     assert_eq!(allowed.status(), StatusCode::OK);
 }
 
+// ── Mediation-plane hardening (B4: T.1 cross-tenant / T.3 unauth) ──────────
+
+async fn seed_default_passports(state: &AppState) {
+    let mut store = state.fact_store.write().await;
+    crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
+}
+
+fn resolve_query(passport_id: &str) -> axum::extract::Query<principal::ResolvePrincipalQuery> {
+    axum::extract::Query(principal::ResolvePrincipalQuery {
+        session_id: None,
+        passport_id: Some(passport_id.to_string()),
+    })
+}
+
+#[tokio::test]
+async fn resolve_principal_unauthenticated_denied_t3() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_default_passports(&state).await;
+    // No credentials → 401 (T.3 anonymous denied).
+    let resp = principal::get_resolve_principal(
+        State(state.clone()),
+        resolve_query("personal-default"),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn resolve_principal_insufficient_scope_denied() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_default_passports(&state).await;
+    // Authenticated but lacks sessions:read / admin:read → 403 at the tenant guard.
+    let resp = principal::get_resolve_principal(
+        State(state.clone()),
+        resolve_query("personal-default"),
+        dev_scope_headers("facts:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn mediation_receipt_unauthenticated_denied_t3() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = observations::post_mediation_receipt(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(observations::PostMediationReceiptBody {
+            passport_id: "personal-default".to_string(),
+            tool_server: "openclaw".to_string(),
+            tool: "openclaw_status".to_string(),
+            args_sha: None,
+            decision: "allow".to_string(),
+            outcome: "ok".to_string(),
+            ts: None,
+            session_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn resolve_principal_cross_tenant_denied_t1() {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+    std::env::set_var("CORECRUXD_JWT_HS256_SECRET", "secret");
+    std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
+    std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
+
+    let state = test_app_state_with_auth(16, AuthMode::JwtHs256);
+    seed_default_passports(&state).await;
+
+    #[derive(serde::Serialize)]
+    struct Claims<'a> {
+        exp: usize,
+        iss: &'a str,
+        aud: &'a str,
+        scope: &'a str,
+        tenant_id: &'a str,
+    }
+    let bearer_for = |tenant: &str| {
+        let claims = Claims {
+            exp: (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600) as usize,
+            iss: "corecrux-test",
+            aud: "corecrux",
+            scope: "sessions:read",
+            tenant_id: tenant,
+        };
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .expect("jwt");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    };
+
+    // `personal-default` resolves to tenant "personal". A token scoped to a
+    // different tenant must be denied (T.1 — no cross-tenant resolution).
+    let denied = principal::get_resolve_principal(
+        State(state.clone()),
+        resolve_query("personal-default"),
+        bearer_for("work::other"),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "cross-tenant resolve must be denied"
+    );
+
+    // Same passport, token scoped to its own tenant → allowed (positive control).
+    let ok = principal::get_resolve_principal(
+        State(state.clone()),
+        resolve_query("personal-default"),
+        bearer_for("personal"),
+    )
+    .await
+    .into_response();
+    assert_eq!(ok.status(), StatusCode::OK, "same-tenant resolve must succeed");
+
+    std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+    std::env::remove_var("CORECRUXD_JWT_ISS");
+    std::env::remove_var("CORECRUXD_JWT_AUD");
+}
+
 #[tokio::test]
 async fn console_redacts_private_facts_and_session_state() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);

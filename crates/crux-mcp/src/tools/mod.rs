@@ -41,6 +41,7 @@ pub mod passport;
 pub mod punchcards;
 pub mod query;
 pub mod receipt_verify;
+pub mod resolve_principal;
 pub mod sessions;
 pub mod storyline;
 pub mod surface;
@@ -945,6 +946,11 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                 "properties": {},
                 "examples": [{}]
             }),
+        },
+        ToolDefinition {
+            name: "resolve_principal".to_string(),
+            description: resolve_principal::RESOLVE_PRINCIPAL_DESCRIPTION.to_string(),
+            input_schema: resolve_principal::tool_input_schema(),
         },
         // ── Handoff ────────────────────────────────────────────────
         ToolDefinition {
@@ -2357,6 +2363,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "verify_observation", "output": "{ observation_id, ok: bool, hash_match: bool, signature_valid: bool, recomputed_hash, receipt_hash, reason?: string }" },
         { "tool": "receipt_verify", "output": "{ content: [...], receipt_id, tenant_id, feature_enabled: bool, verified: bool, signer_passport: string|null, errors: [string], http_status: int, report: VerificationReportV1 } — when feature off, omits report and returns errors:[FEATURE_DISABLED]. agent-ux-04 source-linked traceability." },
         { "tool": "get_agent_identity", "output": "{ agent_name: string }" },
+        { "tool": "resolve_principal",  "output": "{ content: [...], principal: { passport_id, category, tier, tier_rank: int, capabilities: [string], tenant_id, agent_work_gate: bool, resolved_via: 'session'|'passport' }, resolved_param: 'session_id'|'passport_id' } — loopback to GET /v1/principal/resolve; tenant-scoped server-side. agent→passport resolution parity for the MCP surface." },
         { "tool": "create_handoff",     "output": "{ package_json, content_hash, signature, relevant_fact_count }" },
         { "tool": "accept_handoff",     "output": "{ session_loaded, facts_loaded, verified: bool }" },
         { "tool": "record_decision",    "output": "{ decision_id, decision_hash, entity, action }" },
@@ -2483,6 +2490,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "verify_observation" => observations::handle_verify_observation(args, ctx).await,
         "receipt_verify" => receipt_verify::handle_receipt_verify(args, ctx).await,
         "get_agent_identity" => handle_get_agent_identity(args, ctx).await,
+        "resolve_principal" => resolve_principal::handle_resolve_principal(args, ctx).await,
         "create_handoff" => handoff::handle_create_handoff(args, ctx).await,
         "accept_handoff" => handoff::handle_accept_handoff(args, ctx).await,
         "record_decision" => decision::handle_record_decision(args, ctx).await,
@@ -2592,7 +2600,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 100; // main 90 (agent-ux + identity-continuity + memory_sweep_candidates + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard).
+    const TOOL_COUNT: usize = 101; // main 91 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

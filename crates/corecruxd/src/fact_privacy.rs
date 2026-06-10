@@ -94,6 +94,7 @@ const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "__workbench__::",
     "__answer_replay_capsule__::",
     "__passport__::",
+    "__session_binding__::",
     "__bootstrap__::",
     "__project__::",
     "__tenant_metadata__::",
@@ -207,6 +208,9 @@ mod tests {
         assert!(p.is_always_private("__work__::abc123"));
         assert!(p.is_always_private("__constraints__::no-mocks"));
         assert!(p.is_always_private("github::CueCrux/PlanCrux::commit/abc"));
+        // B4 (T.1): session bindings carry passport_id/tenant_id and must never
+        // sync — born private at ingest like __passport__::.
+        assert!(p.is_always_private("__session_binding__::deadbeefcafef00d"));
     }
 
     #[test]
