@@ -35,6 +35,7 @@ pub mod otel;
 pub mod protocol;
 pub mod scope;
 pub mod server;
+pub mod sse;
 pub mod tenant_category;
 pub mod tools;
 pub mod traces;
