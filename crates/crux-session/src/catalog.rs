@@ -372,6 +372,145 @@ pub const DEFAULT_CATALOG: &[CatalogEntry] = &[
     },
 ];
 
+/// A statically-configured relationship between two catalog capabilities
+/// (Session-Handshake master plan §5.4 + §9 "edge construction from a
+/// statically-configured capability relationship table").
+///
+/// `from`/`to` are capability names that MUST exist in [`DEFAULT_CATALOG`]
+/// (enforced by `edge_table_endpoints_exist` test). The generator emits an
+/// edge into the graph only when BOTH endpoints survive per-passport
+/// filtering (master-plan Step 12) — edges to filtered/excluded capabilities
+/// are dropped.
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogEdge {
+    pub from: &'static str,
+    pub to: &'static str,
+    /// One of `produces_input_for` | `alternative_to` | `composes_with` (§5.4).
+    pub kind: &'static str,
+    /// Relationship strength on a 0–100 integer scale (the spec's 0.0–1.0
+    /// ×100). `Edge.weight` is `Option<u64>`; we always supply a value here.
+    pub weight: u64,
+}
+
+/// Valid edge kinds (Session-Handshake master plan §5.4).
+pub const EDGE_PRODUCES_INPUT_FOR: &str = "produces_input_for";
+pub const EDGE_ALTERNATIVE_TO: &str = "alternative_to";
+pub const EDGE_COMPOSES_WITH: &str = "composes_with";
+
+/// The built-in capability relationship table.
+///
+/// Every endpoint is a real [`DEFAULT_CATALOG`] capability name (QC.5: this is
+/// an advertisement, never an auth/rate-limit input). Edges are emitted by the
+/// generator only when both endpoints clear filtering, so a local-tier graph
+/// shows the subset whose endpoints are both visible.
+pub const CAPABILITY_EDGES: &[CatalogEdge] = &[
+    // ── produces_input_for — output of `from` is a valid input to `to` ──────
+    CatalogEdge {
+        from: "proof_document",
+        to: "proof_verify",
+        kind: EDGE_PRODUCES_INPUT_FOR,
+        weight: 90,
+    },
+    CatalogEdge {
+        from: "output.verifiable_receipts",
+        to: "proof_verify",
+        kind: EDGE_PRODUCES_INPUT_FOR,
+        weight: 85,
+    },
+    CatalogEdge {
+        from: "memory_put",
+        to: "memory_get",
+        kind: EDGE_PRODUCES_INPUT_FOR,
+        weight: 80,
+    },
+    CatalogEdge {
+        from: "annotation_add",
+        to: "memory_get",
+        kind: EDGE_PRODUCES_INPUT_FOR,
+        weight: 60,
+    },
+    CatalogEdge {
+        from: "audit_replay",
+        to: "get_counterfactual_summary",
+        kind: EDGE_PRODUCES_INPUT_FOR,
+        weight: 75,
+    },
+    CatalogEdge {
+        from: "economy_quote",
+        to: "economy_spend",
+        kind: EDGE_PRODUCES_INPUT_FOR,
+        weight: 85,
+    },
+    // ── composes_with — commonly used together (co-occurrence, not a dep) ───
+    CatalogEdge {
+        from: "memory.readable_editable",
+        to: "memory.freshness",
+        kind: EDGE_COMPOSES_WITH,
+        weight: 70,
+    },
+    CatalogEdge {
+        from: "memory.scoped_forget",
+        to: "memory.readable_editable",
+        kind: EDGE_COMPOSES_WITH,
+        weight: 65,
+    },
+    CatalogEdge {
+        from: "trace.source_linked",
+        to: "trace.typed_actions",
+        kind: EDGE_COMPOSES_WITH,
+        weight: 70,
+    },
+    CatalogEdge {
+        from: "approval.risk_tiered",
+        to: "autonomy.contract",
+        kind: EDGE_COMPOSES_WITH,
+        weight: 60,
+    },
+    CatalogEdge {
+        from: "identity.continuity",
+        to: "autonomy.contract",
+        kind: EDGE_COMPOSES_WITH,
+        weight: 55,
+    },
+    CatalogEdge {
+        from: "output.calm_deferred",
+        to: "output.verifiable_receipts",
+        kind: EDGE_COMPOSES_WITH,
+        weight: 60,
+    },
+    CatalogEdge {
+        from: "audit.byo_trail",
+        to: "trace.typed_actions",
+        kind: EDGE_COMPOSES_WITH,
+        weight: 65,
+    },
+    CatalogEdge {
+        from: "audit.byo_trail",
+        to: "audit_replay",
+        kind: EDGE_COMPOSES_WITH,
+        weight: 70,
+    },
+    CatalogEdge {
+        from: "retrieve",
+        to: "memory_get",
+        kind: EDGE_COMPOSES_WITH,
+        weight: 50,
+    },
+    CatalogEdge {
+        from: "journal_append",
+        to: "journal_stream",
+        kind: EDGE_COMPOSES_WITH,
+        weight: 55,
+    },
+    // ── alternative_to — equivalent semantics, substitutable ───────────────
+    CatalogEdge {
+        from: "memory_get",
+        to: "memory.readable_editable",
+        kind: EDGE_ALTERNATIVE_TO,
+        weight: 60,
+    },
+];
+
 /// Ordered list of tier names, lowest to highest. Used by the tier filter.
 pub const TIER_ORDER: &[&str] = &["local", "free", "starter", "pro", "team", "enterprise"];
 
@@ -412,6 +551,53 @@ mod tests {
         "audit.byo_trail",            // dim 11
         "output.calm_deferred",       // dim 12
     ];
+
+    /// Every edge endpoint must name a real catalog capability, and every
+    /// edge kind must be one of the three spec kinds. A typo here would
+    /// silently produce an edge the generator can never emit (both-endpoints
+    /// rule) or, worse, a malformed `kind` on the wire.
+    #[test]
+    fn edge_table_endpoints_exist_and_kinds_valid() {
+        let names: HashSet<&str> = DEFAULT_CATALOG.iter().map(|e| e.cap).collect();
+        let valid_kinds = [EDGE_PRODUCES_INPUT_FOR, EDGE_ALTERNATIVE_TO, EDGE_COMPOSES_WITH];
+        for edge in CAPABILITY_EDGES {
+            assert!(
+                names.contains(edge.from),
+                "edge `from` endpoint `{}` is not a catalog capability",
+                edge.from
+            );
+            assert!(
+                names.contains(edge.to),
+                "edge `to` endpoint `{}` is not a catalog capability",
+                edge.to
+            );
+            assert_ne!(edge.from, edge.to, "self-edge on `{}`", edge.from);
+            assert!(
+                valid_kinds.contains(&edge.kind),
+                "edge kind `{}` (on {}→{}) is not a spec kind",
+                edge.kind,
+                edge.from,
+                edge.to
+            );
+            assert!(edge.weight <= 100, "edge weight {} exceeds 0–100 scale", edge.weight);
+        }
+    }
+
+    /// No duplicate (from, to, kind) triple — a duplicate would emit the same
+    /// edge twice and perturb the graph hash for no reason.
+    #[test]
+    fn edge_table_has_no_duplicate_triples() {
+        let mut seen: HashSet<(&str, &str, &str)> = HashSet::new();
+        for edge in CAPABILITY_EDGES {
+            assert!(
+                seen.insert((edge.from, edge.to, edge.kind)),
+                "duplicate edge triple: {}→{} ({})",
+                edge.from,
+                edge.to,
+                edge.kind
+            );
+        }
+    }
 
     #[test]
     fn catalog_has_no_duplicate_capability_names() {
