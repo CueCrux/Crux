@@ -370,9 +370,12 @@ mod tests {
     #[tokio::test]
     async fn query_expand_invalid_id_format() {
         let ctx = test_ctx();
-        let result = handle_query_expand(&json!({"tenant_id": "t1", "result_ids": ["bad_format"]}), &ctx)
-            .await
-            .unwrap();
+        let result = handle_query_expand(
+            &json!({"tenant_id": "t1", "result_ids": ["bad_format"], "contract": "legacy"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("invalid result_id"));
         // Verify the new response shape: chunks + tokens_loaded + errors
@@ -386,9 +389,12 @@ mod tests {
     async fn query_expand_response_matches_http_shape() {
         let ctx = test_ctx();
         // With an empty index, valid IDs will produce segment-not-found errors.
-        let result = handle_query_expand(&json!({"tenant_id": "t1", "result_ids": ["0:0", "1:5"]}), &ctx)
-            .await
-            .unwrap();
+        let result = handle_query_expand(
+            &json!({"tenant_id": "t1", "result_ids": ["0:0", "1:5"], "contract": "legacy"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert!(parsed.get("chunks").is_some());

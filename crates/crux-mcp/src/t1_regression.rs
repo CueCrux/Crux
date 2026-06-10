@@ -499,7 +499,7 @@ async fn t1_query_path_tenant_a_doc_invisible_to_tenant_b() {
 
     // tenant-A queries its own term → finds doc 0.
     let res_a = handle_query(
-        &json!({"tenant_id": "tenant-a", "query": "terraform", "limit": 5}),
+        &json!({"tenant_id": "tenant-a", "query": "terraform", "limit": 5, "contract": "legacy"}),
         &ctx,
     )
     .await
@@ -515,7 +515,7 @@ async fn t1_query_path_tenant_a_doc_invisible_to_tenant_b() {
     // tenant-B queries tenant-A's term → finds NOTHING (the A doc is filtered
     // out by the tenant_hash boundary).
     let res_b = handle_query(
-        &json!({"tenant_id": "tenant-b", "query": "terraform", "limit": 5}),
+        &json!({"tenant_id": "tenant-b", "query": "terraform", "limit": 5, "contract": "legacy"}),
         &ctx,
     )
     .await
