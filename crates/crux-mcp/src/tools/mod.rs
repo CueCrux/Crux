@@ -43,6 +43,7 @@ pub mod query;
 pub mod receipt_verify;
 pub mod sessions;
 pub mod storyline;
+pub mod surface;
 pub mod sync;
 pub mod traces;
 pub mod update;
@@ -2099,6 +2100,16 @@ pub fn list_tools_json_for_rcx_router(router: &RcxRouter, now_unix_seconds: u64)
 }
 
 pub async fn list_tools_json_for_context(ctx: &McpContext, now_unix_seconds: u64) -> Value {
+    // The surface mode is a process flag (`CORECRUXD_TOOL_SURFACE`); the core
+    // takes it explicitly so tests can drive a mode without mutating env.
+    list_tools_json_for_context_with_mode(ctx, now_unix_seconds, surface::ToolSurfaceMode::from_env()).await
+}
+
+pub(crate) async fn list_tools_json_for_context_with_mode(
+    ctx: &McpContext,
+    now_unix_seconds: u64,
+    mode: surface::ToolSurfaceMode,
+) -> Value {
     let auth = ctx
         .rcx_router
         .as_ref()
@@ -2122,6 +2133,32 @@ pub async fn list_tools_json_for_context(ctx: &McpContext, now_unix_seconds: u64
         extension_tools.retain(|tool| allowed.contains(&tool.name));
     }
     tools.extend(extension_tools);
+    // Surface shaping (dynamic-tool-surface M1/M3) runs LAST, after authz
+    // filtering + extension merge, so it only ever narrows the already-authorised
+    // set — it cannot widen authorisation. `Full` (the default) is the identity,
+    // so flag-off is byte-for-byte the pre-M1 surface. Tools shaped out stay
+    // callable via `tools/call` (dispatch is by-name) and discoverable through
+    // the `cuecrux_session` capability graph.
+    let tools = match mode {
+        // M3/M4: `dynamic` = floor + top-N tools scored by the agent's declared
+        // intent (M2/M3) blended with recent tool-use from the trace ring (M4).
+        // No intent and no recent activity ⇒ floor only (identical to `minimal`).
+        surface::ToolSurfaceMode::Dynamic => {
+            let passport_key =
+                passport::passport_key_name(ctx).unwrap_or_else(|| crate::traces::ANON_PASSPORT.to_string());
+            let intent = surface::current_intent(&passport_key);
+            // M4: blend the declared intent with the agent's recent tool-use.
+            // Empty when tool-traces are disabled → intent-only behaviour.
+            let trace_boosts = if crate::traces::traces_enabled() {
+                let recent = crate::traces::global().lock().await.recent(&passport_key, 20);
+                surface::trace_boosts_from_recent(&recent)
+            } else {
+                std::collections::HashMap::new()
+            };
+            surface::shape_dynamic_weighted(tools, intent.as_deref(), &trace_boosts, surface::DYNAMIC_TOP_N)
+        }
+        other => surface::apply_surface_mode(tools, other),
+    };
     tools_to_json(tools, auth)
 }
 
@@ -2559,6 +2596,40 @@ mod tests {
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
+    }
+
+    /// M3 end-to-end (race-free — drives the mode-parameterised core directly,
+    /// no env mutation): an anon agent that declared `audit_review` gets a
+    /// surface = floor + audit-relevant tools, with irrelevant tools shaped out
+    /// and the full set still far larger.
+    #[tokio::test]
+    async fn dynamic_listing_reshapes_by_declared_intent() {
+        let pk = crate::traces::ANON_PASSPORT;
+        surface::clear_intent_for_test(pk);
+        surface::record_intent(pk, "audit_review");
+
+        let ctx = test_ctx();
+        let json = list_tools_json_for_context_with_mode(&ctx, 0, surface::ToolSurfaceMode::Dynamic).await;
+        let names: Vec<&str> = json["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+
+        assert!(names.contains(&"cuecrux_session"), "floor present");
+        assert!(names.contains(&"audit_config"), "audit intent surfaces audit tools");
+        assert!(
+            !names.contains(&"github_search"),
+            "irrelevant tool shaped out under dynamic"
+        );
+        assert!(names.len() < list_tools().len(), "dynamic surface smaller than full");
+
+        // With no intent, the same path collapses to the floor.
+        surface::clear_intent_for_test(pk);
+        let json2 = list_tools_json_for_context_with_mode(&ctx, 0, surface::ToolSurfaceMode::Dynamic).await;
+        let n2 = json2["tools"].as_array().expect("tools array").len();
+        assert_eq!(n2, surface::CORE_FLOOR.len(), "no intent ⇒ floor only");
     }
 
     #[test]

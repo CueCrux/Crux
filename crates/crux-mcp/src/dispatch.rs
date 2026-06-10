@@ -326,7 +326,12 @@ pub async fn dispatch(req: JsonRpcRequest, ctx: &McpContext, _agent: Option<&Age
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {
-                    "tools": {}
+                    // `listChanged` (M3.5): the server can push
+                    // `notifications/tools/list_changed` over an SSE stream
+                    // (GET /mcp, Accept: text/event-stream) when the dynamic
+                    // surface is reshaped. Additive — clients that ignore it
+                    // simply re-list on their own cadence.
+                    "tools": { "listChanged": true }
                 },
                 "serverInfo": {
                     "name": SERVER_NAME,
@@ -617,6 +622,39 @@ mod tests {
         assert!(names.contains(&"query_facts"));
         assert!(names.contains(&"get_session"));
         assert!(names.contains(&"update_status"));
+    }
+
+    #[tokio::test]
+    async fn shaped_out_tool_is_still_dispatchable_c3() {
+        // C3 (dynamic-tool-surface): a tool absent from the `minimal` advertised
+        // surface stays callable via `tools/call` — dispatch is by-name and
+        // never consults the surface mode. `list_sessions` is deliberately NOT
+        // in CORE_FLOOR, yet must still route (not "unknown tool"). This is the
+        // safety property that makes surface truncation lossless.
+        use crate::tools::surface::{apply_surface_mode, ToolSurfaceMode, CORE_FLOOR};
+        assert!(
+            !CORE_FLOOR.contains(&"list_sessions"),
+            "test premise: list_sessions must be a non-floor tool"
+        );
+        let minimal = apply_surface_mode(crate::tools::list_tools(), ToolSurfaceMode::Minimal);
+        assert!(
+            !minimal.iter().any(|t| t.name == "list_sessions"),
+            "list_sessions should be shaped out of the minimal surface"
+        );
+        let ctx = test_ctx();
+        let resp = dispatch(
+            rpc("tools/call", json!({ "name": "list_sessions", "arguments": {} })),
+            &ctx,
+            None,
+        )
+        .await;
+        if let Some(err) = resp.error {
+            assert!(
+                !err.message.contains("unknown tool"),
+                "dispatch must still route a shaped-out tool, got: {}",
+                err.message
+            );
+        }
     }
 
     #[tokio::test]

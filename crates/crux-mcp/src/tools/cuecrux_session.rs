@@ -82,6 +82,14 @@ pub async fn handle_cuecrux_session(args: &Value, ctx: &McpContext) -> Result<Va
     if let Some(intent) = args.get("intent").and_then(Value::as_str) {
         if !intent.is_empty() {
             body.insert("intent".into(), Value::String(intent.to_string()));
+            // dynamic-tool-surface M2: persist the declared intent (keyed by
+            // passport) so the next `tools/list` can shape the surface to the
+            // task. Stateless HTTP can't push `tools/list_changed`, so this is
+            // read on the subsequent listing rather than pushed now. No-op for
+            // surface mode `full`/`minimal`; harmless to record either way.
+            let passport_key =
+                super::passport::passport_key_name(ctx).unwrap_or_else(|| crate::traces::ANON_PASSPORT.to_string());
+            super::surface::record_intent(&passport_key, intent);
         }
     }
     if let Some(hints) = args.get("hints").cloned() {
