@@ -10,7 +10,7 @@
 //! every API turn. This module shrinks the *advertised* surface without
 //! removing capability: a tool dropped from `tools/list` stays callable via
 //! `tools/call` (dispatch is by-name and gated only by
-//! [`super::super::dispatch::enforce_rcx_tool_capability`], not by the surface),
+//! `enforce_rcx_tool_capability`, not by the surface),
 //! and remains discoverable through the `cuecrux_session` capability graph.
 //!
 //! Modes (process flag `CORECRUXD_TOOL_SURFACE`, default `full`):
@@ -49,7 +49,7 @@ const INTENT_TTL_SECONDS: i64 = 3600;
 /// remember (`store_fact`/`query_facts`/`get_bootstrap`/`memory_view`), keep
 /// session continuity (`save_session`/`get_session`), and self-identify
 /// (`get_agent_identity`). Every name here is asserted to exist in the full
-/// surface by [`tests::core_floor_names_exist_in_full_surface`], so a typo
+/// surface by the `core_floor_names_exist_in_full_surface` test, so a typo
 /// fails the build rather than silently shrinking the floor.
 pub const CORE_FLOOR: &[&str] = &[
     "cuecrux_session", // discovery — the collapsed-surface entry point (always first)
@@ -243,8 +243,8 @@ const TRACE_BOOST_PER_HIT: i32 = 4;
 const TRACE_BOOST_CAP: i32 = 12;
 
 /// Per-tool recency boost from recent dispatch history (M4 "what the agent just
-/// did" signal): each occurrence in the trace window adds [`TRACE_BOOST_PER_HIT`],
-/// capped at [`TRACE_BOOST_CAP`]. Floor tools are skipped (already pinned).
+/// did" signal): each occurrence in the trace window adds `TRACE_BOOST_PER_HIT`,
+/// capped at `TRACE_BOOST_CAP`. Floor tools are skipped (already pinned).
 pub fn trace_boosts_from_recent(entries: &[TraceEntry]) -> HashMap<String, i32> {
     let mut boosts: HashMap<String, i32> = HashMap::new();
     for e in entries {
