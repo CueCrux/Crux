@@ -7,18 +7,18 @@
 
 A unified, **pointer-first, progressively-hydrated** response envelope shared across CoreCrux `/v1/query/*`, VaultCrux `/v1/memory/retrieve`, and the Crux daemon HTTP + MCP surface. Instead of every endpoint stuffing full content in an ad-hoc JSON shape (~56K tok/q on the LME bench), a CRC-v1 response returns **cheap pointers + a cost_estimate + an agent_decision + a freshness/receipts envelope**, and the caller hydrates only what it needs (~1.6–7.5K tok/q at equal recall, measured on the agent-native LME benchmark).
 
-## The negotiation channel (why this is back-compat-safe)
+## Default-on, with a legacy escape hatch
 
-CRC-v1 is **opt-in per request**, never a silent flag flip. A response is CRC-v1 **only** when the caller asked for it:
+CRC-v1 is the **default** response contract — there are no legacy consumers to preserve, so every read endpoint returns the pointer-first envelope **by default**. A caller that can't yet parse it opts out to the old full payload:
 
-| Surface | How to negotiate |
+| Surface | Opt OUT to legacy (full payload) |
 |---|---|
-| HTTP | `Accept-Contract: crc-v1` request header (or `?contract=v1`) |
-| MCP tool call | `contract: "v1"` argument, or once-per-session via `cuecrux_session(contract="v1")` |
+| HTTP | `Accept-Contract: legacy` request header (also `v0`/`none`/`off`, or `?contract=legacy`) |
+| MCP tool call | `contract: "legacy"` argument |
 
-If the caller does **not** negotiate, the endpoint returns its **current legacy shape, byte-identical** — preserving CROWN receipt byte-identity and every existing client. This sidesteps the receipt-stability blocker that stalled the earlier `FEATURE_CORECRUX_AGENT_PAYLOAD_V1` default-on attempt.
+When opted out, the endpoint returns its **legacy shape, byte-identical** to pre-CRC-v1 — preserving CROWN receipt byte-identity for anyone who needs the old shape. The explicit opt-IN forms (`Accept-Contract: crc-v1` / `contract:"v1"`) still work but are redundant now that CRC-v1 is the default.
 
-`default-on` per endpoint (legacy callers also get CRC-v1) is a **separate operator human-gate** (M6, `eu-ai-act` profile), flipped one endpoint at a time.
+**Default hydration is `pointer`** (cheap epitomes); ask for `?hydrate=full|summary` to get content inline within the CRC-v1 envelope, or opt out to `legacy` for the old full payload.
 
 ## Shape (see the schema for the authority)
 
@@ -58,7 +58,7 @@ If the caller does **not** negotiate, the endpoint returns its **current legacy 
 
 1. `hydrate_tier=pointer` ⇒ `content` absent/empty (the cheap default actually stays cheap).
 2. `kind=search` ⇒ `pointers` and `cost_estimate` present.
-3. Legacy (no negotiation) responses are **byte-identical** to pre-CRC-v1 (per-repo golden test; not expressible in this schema).
+3. Opted-out responses (`Accept-Contract: legacy`) are **byte-identical** to pre-CRC-v1 (per-repo golden test; not expressible in this schema).
 4. The schema served by `get_bootstrap("tool-output")` is **this exact file** — drift between schema, serializer, and bootstrap seed is the failure mode M4 guards.
 
 ## Vendoring

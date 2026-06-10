@@ -471,7 +471,7 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     // `structuredContent.envelope`) composes without collision. content[text]
     // carries the CRC-v1 envelope for text-reading agents. Absent contract →
     // legacy shape, byte-identical.
-    if crate::crc_v1::requested(args) {
+    if crate::crc_v1::enabled(args) {
         let crc = crate::crc_v1::wrap_facts(&rows, entity.as_deref(), query.as_deref());
         let text = serde_json::to_string_pretty(&crc).unwrap_or_default();
         return Ok(json!({

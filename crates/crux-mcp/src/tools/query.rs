@@ -100,7 +100,7 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
     });
     // CRC-v1: reshape into the pointer-first envelope when negotiated; absent →
     // legacy payload unchanged.
-    if crate::crc_v1::requested(params) {
+    if crate::crc_v1::enabled(params) {
         inner = crate::crc_v1::wrap_query(inner);
     }
     Ok(json!({
@@ -166,7 +166,7 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
             "embedding_fingerprint": embedding_fingerprint.clone(),
         }
     });
-    if crate::crc_v1::requested(params) {
+    if crate::crc_v1::enabled(params) {
         inner = crate::crc_v1::wrap_scan(inner);
     }
     Ok(json!({
@@ -263,7 +263,7 @@ pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Val
         response["errors"] = json!(errors);
     }
     // CRC-v1: pointer-first envelope (kind=addressed) when negotiated.
-    if crate::crc_v1::requested(params) {
+    if crate::crc_v1::enabled(params) {
         response = crate::crc_v1::wrap_expand(response);
     }
 

@@ -5,8 +5,8 @@
 //! Crux Response Contract v1 (CRC-v1) — daemon-side negotiated reshapers.
 //!
 //! Mirrors the CoreCrux daemon's CRC-v1 reshaper for the Crux daemon's MCP
-//! tools. CRC-v1 is opt-in per call (`contract: "v1"` arg); absent → the tool's
-//! legacy payload, unchanged. `default-on` is the ExecPlan M6 operator gate.
+//! tools. CRC-v1 is the DEFAULT; a caller opts out to the legacy payload with
+//! `contract: "legacy"` (see [`enabled`]).
 //!
 //! The daemon's `query`/`query_scan` already return metadata-only pointers and
 //! `query_expand` returns chunk metadata, so these are pure relabelers into the
@@ -24,6 +24,17 @@ pub fn requested(params: &Value) -> bool {
         let v = v.trim().to_ascii_lowercase();
         v == "v1" || v == "crc-v1"
     })
+}
+
+/// CRC-v1 is the **default** for the daemon tools. Returns `true` unless the
+/// caller explicitly opts out to the legacy payload with `contract:"legacy"`
+/// (also `v0`/`none`/`off`). Absent => CRC-v1. The legacy escape is the door for
+/// any consumer that can't yet parse the pointer-first envelope.
+pub fn enabled(params: &Value) -> bool {
+    !params
+        .get("contract")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "legacy" | "v0" | "none" | "off"))
 }
 
 fn shared_envelope() -> Value {
@@ -348,6 +359,20 @@ mod tests {
         assert!(requested(&json!({"contract": "V1"})));
         assert!(!requested(&json!({})));
         assert!(!requested(&json!({"contract": "legacy"})));
+    }
+
+    #[test]
+    fn enabled_defaults_on_and_opts_out_to_legacy() {
+        // Default: no contract arg => CRC-v1 enabled.
+        assert!(enabled(&json!({})));
+        // Explicit crc-v1 or unknown => still enabled (default).
+        assert!(enabled(&json!({"contract": "v1"})));
+        assert!(enabled(&json!({"contract": "whatever"})));
+        // Explicit opt-out to legacy (synonyms, any case).
+        assert!(!enabled(&json!({"contract": "legacy"})));
+        assert!(!enabled(&json!({"contract": "V0"})));
+        assert!(!enabled(&json!({"contract": "none"})));
+        assert!(!enabled(&json!({"contract": " off "})));
     }
 
     #[test]
