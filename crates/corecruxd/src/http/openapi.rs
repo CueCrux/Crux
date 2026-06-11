@@ -39,6 +39,10 @@ use utoipa::OpenApi;
         super::query::post_query_text_search_expand,
         super::query::post_query_graph_expand,
         super::query::post_query_time_range,
+        // Receipts
+        super::receipts::get_receipt_body_v1,
+        super::receipts::get_receipt_signature_v1,
+        super::receipts::get_receipt_verification_v1,
     ),
     components(schemas(
         corecrux_memory::fact_store::Fact,

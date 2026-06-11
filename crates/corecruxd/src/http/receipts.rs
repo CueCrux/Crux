@@ -6,6 +6,22 @@
 
 use super::*;
 
+#[utoipa::path(
+    get,
+    path = "/v1/receipts/{receiptId}",
+    tag = "Receipts",
+    params(
+        ("receiptId" = String, Path, description = "Receipt identifier"),
+        ("tenant_id" = String, Query, description = "Tenant the receipt belongs to"),
+    ),
+    responses(
+        (status = 200, description = "Receipt body (JSON envelope, or raw CBOR when requested via Accept header)"),
+        (status = 404, description = "Receipt body not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 501, description = "Dataplane disabled"),
+    ),
+    security(("bearer_auth" = []))
+)]
 #[tracing::instrument(level = "info", skip(state, headers), fields(%receipt_id, tenant_id = %q.tenant_id))]
 pub(super) async fn get_receipt_body_v1(
     State(state): State<AppState>,
@@ -88,6 +104,22 @@ pub(super) async fn get_receipt_body_v1(
         .into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/receipts/{receiptId}/signature",
+    tag = "Receipts",
+    params(
+        ("receiptId" = String, Path, description = "Receipt identifier"),
+        ("tenant_id" = String, Query, description = "Tenant the receipt belongs to"),
+    ),
+    responses(
+        (status = 200, description = "Receipt signature event (JSON envelope, or raw CBOR when requested via Accept header)"),
+        (status = 404, description = "Receipt signature not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 501, description = "Dataplane disabled"),
+    ),
+    security(("bearer_auth" = []))
+)]
 #[tracing::instrument(level = "info", skip(state, headers), fields(%receipt_id, tenant_id = %q.tenant_id))]
 pub(super) async fn get_receipt_signature_v1(
     State(state): State<AppState>,
@@ -170,6 +202,22 @@ pub(super) async fn get_receipt_signature_v1(
         .into_response()
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/receipts/{receiptId}/verification",
+    tag = "Receipts",
+    params(
+        ("receiptId" = String, Path, description = "Receipt identifier"),
+        ("tenant_id" = String, Query, description = "Tenant the receipt belongs to"),
+    ),
+    responses(
+        (status = 200, description = "Receipt verification report (signature + hash-chain checks)"),
+        (status = 404, description = "Receipt body not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 501, description = "Dataplane disabled"),
+    ),
+    security(("bearer_auth" = []))
+)]
 #[tracing::instrument(level = "info", skip(state, headers), fields(%receipt_id, tenant_id = %q.tenant_id))]
 pub(super) async fn get_receipt_verification_v1(
     State(state): State<AppState>,

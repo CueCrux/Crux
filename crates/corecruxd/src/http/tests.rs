@@ -11308,3 +11308,84 @@ async fn get_gpus_501_is_platform_upgrade_aware() {
     let resp = routing::get_gpus(State(state), HeaderMap::new()).await.into_response();
     assert_platform_upgrade_501(resp, "gpus").await;
 }
+
+// ── OpenAPI contract: /v1/openapi.json (integration-surface plan M0) ─────
+
+#[tokio::test]
+async fn openapi_json_route_serves_valid_openapi_3_document() {
+    use tower::ServiceExt;
+
+    let state = test_app_state(16);
+    let app = router(state);
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/openapi.json")
+                .body(axum::body::Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .expect("content-type header")
+        .to_str()
+        .expect("content-type str")
+        .to_string();
+    assert!(
+        content_type.starts_with("application/json"),
+        "unexpected content-type: {content_type}"
+    );
+
+    let doc = json_body(resp).await;
+
+    // Valid OpenAPI 3.x document shape.
+    let version = doc["openapi"].as_str().expect("openapi version field");
+    assert!(version.starts_with("3."), "expected OpenAPI 3.x, got {version}");
+    assert_eq!(doc["info"]["title"], "Crux Daemon API");
+    assert!(doc["info"]["version"].as_str().is_some_and(|v| !v.is_empty()));
+
+    // Every annotated route group is present in `paths`.
+    let paths = doc["paths"].as_object().expect("paths object");
+    for expected in [
+        // Health
+        "/healthz",
+        "/readyz",
+        "/metrics",
+        "/v1/version",
+        // Facts
+        "/v1/facts",
+        "/v1/facts/bulk",
+        "/v1/facts/{factId}",
+        "/v1/facts/entity/{entity}",
+        "/v1/facts/export",
+        // Sessions
+        "/v1/sessions/{sessionId}/state",
+        // Events
+        "/v1/events/stream",
+        // Query
+        "/v1/query/text-search",
+        "/v1/query/text-search/expand",
+        "/v1/query/graph-expand",
+        "/v1/query/time-range",
+        // Receipts
+        "/v1/receipts/{receiptId}",
+        "/v1/receipts/{receiptId}/signature",
+        "/v1/receipts/{receiptId}/verification",
+    ] {
+        assert!(paths.contains_key(expected), "missing path in OpenAPI spec: {expected}");
+    }
+
+    // Component schemas + the bearer security scheme survive serialization.
+    let schemas = doc["components"]["schemas"].as_object().expect("components.schemas");
+    for expected in ["Fact", "StoreFact", "FactQuery", "SessionState"] {
+        assert!(schemas.contains_key(expected), "missing schema: {expected}");
+    }
+    assert!(
+        doc["components"]["securitySchemes"]["bearer_auth"].is_object(),
+        "missing bearer_auth security scheme"
+    );
+}
