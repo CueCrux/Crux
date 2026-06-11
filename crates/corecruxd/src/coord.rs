@@ -328,6 +328,17 @@ pub fn assemble_active(
             .iter()
             .find(|i| i.session_id_hex == b.session_id_hex && i.is_live(now_unix_ms))
             .cloned();
+        // Per-session recency gate. Presence is passport-level and bindings
+        // are kept forever (newest per session), so "passport live" alone
+        // would resurrect every binding that passport ever minted — the
+        // v0.4.4 dogfood put 200 historical boots on the board. A session
+        // row is live only when the session itself shows recent life:
+        // a live declared intent, or a binding minted within the presence
+        // window (a fresh boot that hasn't announced yet).
+        let recently_bound = now_unix_ms < b.bound_at_unix_ms.saturating_add(ttl_ms);
+        if intent.is_none() && !recently_bound {
+            continue;
+        }
         let session_leases: Vec<LeaseSummary> = leases
             .iter()
             .filter(|l| l.holder_passport == b.passport_id)
@@ -435,9 +446,12 @@ mod tests {
 
     #[test]
     fn assemble_filters_by_presence_ttl() {
-        let bindings = vec![binding("aaaa", "p1", None, 100), binding("bbbb", "p2", None, 100)];
-        let mut presence = BTreeMap::new();
         let now: u64 = 10_000_000;
+        let bindings = vec![
+            binding("aaaa", "p1", None, now - 5_000),
+            binding("bbbb", "p2", None, now - 5_000),
+        ];
+        let mut presence = BTreeMap::new();
         presence.insert("p1".to_string(), now - 10_000); // 10s ago — live
         presence.insert("p2".to_string(), now - 2_000_000); // long gone (>15 min)
         let view = assemble_active(&bindings, &presence, &[], &[], vec![], None, 900, now);
@@ -458,9 +472,9 @@ mod tests {
     fn assemble_project_filter_keeps_unscoped_sessions() {
         let now: u64 = 1_000_000;
         let bindings = vec![
-            binding("aaaa", "p1", Some("proj"), 100),
-            binding("bbbb", "p2", Some("other"), 100),
-            binding("cccc", "p3", None, 100),
+            binding("aaaa", "p1", Some("proj"), now - 1_000),
+            binding("bbbb", "p2", Some("other"), now - 1_000),
+            binding("cccc", "p3", None, now - 1_000),
         ];
         let mut presence = BTreeMap::new();
         for p in ["p1", "p2", "p3"] {
@@ -476,7 +490,10 @@ mod tests {
     #[test]
     fn assemble_joins_live_intent_and_passport_leases() {
         let now: u64 = 1_000_000;
-        let bindings = vec![binding("aaaa", "p1", None, 100), binding("bbbb", "p2", None, 100)];
+        let bindings = vec![
+            binding("aaaa", "p1", None, now - 1_000),
+            binding("bbbb", "p2", None, now - 1_000),
+        ];
         let mut presence = BTreeMap::new();
         presence.insert("p1".to_string(), now - 1_000);
         presence.insert("p2".to_string(), now - 1_000);
@@ -504,6 +521,34 @@ mod tests {
         assert_eq!(a.leases.len(), 1);
         assert_eq!(a.leases[0].resource, "file://src/a.rs");
         assert_eq!(b.leases[0].resource, "tree://src/b");
+    }
+
+    #[test]
+    fn stale_bindings_of_a_live_passport_stay_off_the_board() {
+        // Regression for the v0.4.4 dogfood flood: one live passport
+        // resurrected ~200 historical boot bindings. An old binding with no
+        // live intent must be dropped; the same binding with a live intent
+        // stays.
+        let now: u64 = 1_000_000_000;
+        let old_bound = now - 86_400_000; // a day-old boot
+        let bindings = vec![
+            binding("old1", "p1", None, old_bound),
+            binding("old2", "p1", None, old_bound),
+            binding("fresh", "p1", None, now - 1_000),
+        ];
+        let mut presence = BTreeMap::new();
+        presence.insert("p1".to_string(), now - 1_000); // passport is live
+                                                        // No intents: only the fresh boot shows.
+        let view = assemble_active(&bindings, &presence, &[], &[], vec![], None, 900, now);
+        let ids: Vec<&str> = view.active_sessions.iter().map(|s| s.session_id_hex.as_str()).collect();
+        assert_eq!(ids, vec!["fresh"], "stale bindings dropped: {ids:?}");
+
+        // A live intent revives exactly that old session.
+        let intents = vec![intent("old1", "still-working", now + 100_000)];
+        let view = assemble_active(&bindings, &presence, &intents, &[], vec![], None, 900, now);
+        let ids: Vec<&str> = view.active_sessions.iter().map(|s| s.session_id_hex.as_str()).collect();
+        assert!(ids.contains(&"old1"), "live intent keeps old session: {ids:?}");
+        assert!(!ids.contains(&"old2"), "intent-less old session still dropped");
     }
 
     #[test]
@@ -556,7 +601,10 @@ mod tests {
     #[test]
     fn assemble_sorts_most_recent_heartbeat_first() {
         let now: u64 = 1_000_000;
-        let bindings = vec![binding("aaaa", "p1", None, 100), binding("bbbb", "p2", None, 200)];
+        let bindings = vec![
+            binding("aaaa", "p1", None, now - 2_000),
+            binding("bbbb", "p2", None, now - 1_000),
+        ];
         let mut presence = BTreeMap::new();
         presence.insert("p1".to_string(), now - 50_000);
         presence.insert("p2".to_string(), now - 1_000);
