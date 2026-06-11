@@ -5,7 +5,91 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+> **Cadence:** weekly rolling builds are cut from `main`; versioned releases
+> ship every 4–8 weeks. Every versioned release gets human-readable notes
+> here — if you tag a release, you write its entry.
+
 ## [Unreleased]
+
+### Added
+
+- *(unmerged branch `feat/openapi-m0`)* OpenAPI: receipts routes covered in
+  `/v1/openapi.json` plus a route-level contract test (M0).
+- *(unmerged branch `feat/upgrade-aware-501s`)* Upgrade-aware `501` responses
+  on platform-only endpoints (HTTP + MCP) that signpost the hosted platform
+  instead of a bare not-implemented (W1.A3).
+- Workspace wizard: live-session coordination protocol in `workspace-cuecrux`
+  (v2 → v3).
+
+### Changed
+
+- CI: `paths-ignore` replaced with a skip-but-report change-scope gate.
+
+## [0.4.6] - 2026-06-11
+
+### Added
+
+- Console: Live board panel (`#/coord`) — coordination plane viewer (#166).
+
+## [0.4.5] - 2026-06-11
+
+### Fixed
+
+- Coord board per-session recency gate (#165).
+
+## [0.4.4] - 2026-06-11
+
+### Fixed
+
+- Coordination follow-up: announce overlap warnings, plus presence touch at
+  bind/announce — board liveness fix (#164).
+
+## [0.4.3] - 2026-06-11
+
+### Added
+
+- Coordination plane: live-session board for concurrent agent sessions —
+  `/v1/coord`, `coord_status` / `coord_announce` MCP tools, boot digest (#163).
+- Console: receipts view + CROWN verify panel with `#/receipts` deep link
+  (#162).
+
+## [0.4.2] - 2026-06-11
+
+### Added
+
+- Agent→passport resolution + mediation receipts for external mediators
+  (B0–B4) (#161).
+
+## [0.4.1] - 2026-06-10
+
+### Added
+
+- MCP tool-surface floor additions: `get_passport`, `receipt_verify`,
+  `sync_status` (#160).
+
+### Changed
+
+- CRC-v1 default-on, with a legacy opt-out (#159).
+
+## [0.4.0] - 2026-06-10
+
+### Added
+
+- Graph-driven dynamic MCP tool surface + capability-graph edges (#158).
+- CRC-v1 pointer-first response contract: spec + daemon search tools (M0+M2)
+  (#156).
+- `corecrux.lane.*` registry with free→paid minting and usage-report ingest
+  (#154).
+
+### Changed
+
+- Hardened daemon auth and agent helpers (#153).
+- Dependency bumps (opentelemetry_sdk, wasmtime, rcgen, sha2, chrono, uuid,
+  and others).
+
+### Fixed
+
+- Flaky gRPC replication-auth env-test race serialized (#157).
 
 ## [0.3.1] - 2026-06-05
 
@@ -222,5 +306,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo-deny` supply chain and licence audit in CI
 - `cargo-audit` CVE scanning in CI
 
-[unreleased]: https://github.com/CueCrux/Crux/compare/v0.1.0...HEAD
+[unreleased]: https://github.com/CueCrux/Crux/compare/v0.4.6...HEAD
+[0.4.6]: https://github.com/CueCrux/Crux/compare/v0.4.5...v0.4.6
+[0.4.5]: https://github.com/CueCrux/Crux/compare/v0.4.4...v0.4.5
+[0.4.4]: https://github.com/CueCrux/Crux/compare/v0.4.3...v0.4.4
+[0.4.3]: https://github.com/CueCrux/Crux/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/CueCrux/Crux/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/CueCrux/Crux/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/CueCrux/Crux/compare/v0.3.1...v0.4.0
 [0.1.0]: https://github.com/CueCrux/Crux/releases/tag/v0.1.0

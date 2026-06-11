@@ -2251,6 +2251,18 @@ fn tools_to_json(tools: Vec<ToolDefinition>, auth: Option<ToolAuthMetadata>) -> 
                 crux_meta["receipt_class"] = json!(&auth.receipt_class);
                 crux_meta["tier"] = json!(&auth.tier);
             }
+            // Upgrade-aware catalogue annotation: hosted/metered tools are
+            // already listed (not hidden) on local installs with a `[hosted]`
+            // description marker. Mirror that decision as structured metadata
+            // so agents don't have to parse description prefixes. Honest
+            // signpost only — no filtering or dispatch change.
+            if t.description.starts_with("[hosted]") {
+                crux_meta["upgrade"] = json!({
+                    "platform_available": true,
+                    "requires": "rcx_capability_token",
+                    "docs": format!("https://crux.cuecrux.com/docs/platform/{}", t.name),
+                });
+            }
             // M4 (CRC-v1 self-describing): advertise the negotiated output shape.
             // MCP has no native `outputSchema`, so attach the CRC-v1 schema ref
             // under an `x-crux-output-schema` extension for tools that emit it.
@@ -2899,6 +2911,29 @@ mod tests {
         assert_eq!(
             enrich["_meta"]["crux"]["consequence_metadata"]["reversibility"],
             "unknown"
+        );
+    }
+
+    #[test]
+    fn list_tools_json_annotates_hosted_tools_with_upgrade_metadata() {
+        // Upgrade-aware catalogue: every `[hosted]`-marked tool carries a
+        // structured `_meta.crux.upgrade` signpost; local tools carry none.
+        let listed = list_tools_json();
+        let tools = listed["tools"].as_array().unwrap();
+
+        let sync_pull = tools
+            .iter()
+            .find(|tool| tool["name"] == "sync_pull")
+            .expect("sync_pull listed");
+        let upgrade = &sync_pull["_meta"]["crux"]["upgrade"];
+        assert_eq!(upgrade["platform_available"], true);
+        assert_eq!(upgrade["requires"], "rcx_capability_token");
+        assert_eq!(upgrade["docs"], "https://crux.cuecrux.com/docs/platform/sync_pull");
+
+        let query = tools.iter().find(|tool| tool["name"] == "query").expect("query listed");
+        assert!(
+            query["_meta"]["crux"]["upgrade"].is_null(),
+            "local tool must not carry an upgrade annotation"
         );
     }
 

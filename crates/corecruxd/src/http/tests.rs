@@ -2885,12 +2885,7 @@ async fn metrics_returns_prometheus_text() {
 async fn get_gpus_returns_501_without_dataplane() {
     let state = test_app_state(16);
     let resp = routing::get_gpus(State(state), HeaderMap::new()).await.into_response();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
-    let body = json_body(resp).await;
-    assert!(body["detail"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("proprietary edition"));
+    assert_platform_upgrade_501(resp, "gpus").await;
 }
 
 // ── get_shards ──────────────────────────────────────────────────
@@ -11203,6 +11198,115 @@ async fn wasm_summarise_extension_end_to_end_or_skip() {
         result["fact_count"].as_u64().unwrap_or(0) >= 2,
         "fact_count too low: {body:#?}"
     );
+}
+
+// ── upgrade-aware 501s ──────────────────────────────────────────
+//
+// Platform-only endpoints keep status 501 but return RFC 7807 problem
+// details with structured upgrade extensions instead of bare errors.
+
+async fn assert_platform_upgrade_501(resp: Response, capability: &str) {
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let body = json_body(resp).await;
+    assert_eq!(body["status"], 501, "problem status mismatch: {body:#?}");
+    assert_eq!(
+        body["platform_available"], true,
+        "missing platform_available: {body:#?}"
+    );
+    assert_eq!(body["capability"], capability, "capability mismatch: {body:#?}");
+    assert_eq!(
+        body["docs"],
+        format!("https://crux.cuecrux.com/docs/platform/{capability}"),
+        "docs link mismatch: {body:#?}"
+    );
+    assert_eq!(body["requires"], "rcx_capability_token", "missing requires: {body:#?}");
+}
+
+#[allow(deprecated)]
+#[serial_test::serial]
+#[tokio::test]
+async fn post_query_graph_expand_501_is_platform_upgrade_aware() {
+    std::env::set_var("CORECRUXD_QUERY_GRAPH_EXPAND", "1");
+    let state = test_app_state(16); // dataplane disabled by default
+    let body = query::GraphExpandBody {
+        tenant_id: "tenant-a".to_string(),
+        seed_artifact_ids: vec![1],
+        edge_types: vec![],
+        max_hops: 2,
+        budget: 50,
+        min_confidence: 0.0,
+        include_state: false,
+    };
+    let resp = query::post_query_graph_expand(State(state), HeaderMap::new(), Json(body))
+        .await
+        .into_response();
+    std::env::remove_var("CORECRUXD_QUERY_GRAPH_EXPAND");
+    assert_platform_upgrade_501(resp, "graph_expand").await;
+}
+
+#[allow(deprecated)]
+#[serial_test::serial]
+#[tokio::test]
+async fn post_query_time_range_501_is_platform_upgrade_aware() {
+    std::env::set_var("CORECRUXD_QUERY_TIME_RANGE", "1");
+    let state = test_app_state(16);
+    let body = query::TimeRangeBody {
+        tenant_id: "tenant-a".to_string(),
+        start_micros: 1000,
+        end_micros: 2000,
+        artifact_ids: vec![],
+        include_relations: false,
+        limit: 10,
+    };
+    let resp = query::post_query_time_range(State(state), HeaderMap::new(), Json(body))
+        .await
+        .into_response();
+    std::env::remove_var("CORECRUXD_QUERY_TIME_RANGE");
+    assert_platform_upgrade_501(resp, "time_range").await;
+}
+
+#[tokio::test]
+async fn post_admin_append_501_is_platform_upgrade_aware() {
+    let state = test_app_state(16);
+    let body = append::AppendBody {
+        tenant_id: "tenant-a".to_string(),
+        stream_type: "test".to_string(),
+        stream_id: "stream-1".to_string(),
+        expected_next_seq: 0,
+        events: vec![append::AppendEventBody {
+            event_id: "ev1".to_string(),
+            occurred_at: "2026-01-01T00:00:00Z".to_string(),
+            event_type: "test.v1".to_string(),
+            content_type: "application/json".to_string(),
+            payload: "{}".to_string(),
+        }],
+    };
+    let resp = append::post_admin_append(State(state), HeaderMap::new(), Json(body))
+        .await
+        .into_response();
+    assert_platform_upgrade_501(resp, "admin_append").await;
+}
+
+#[tokio::test]
+async fn get_proj_meta_501_is_platform_upgrade_aware() {
+    let state = test_app_state(16);
+    let resp = get_proj_meta(
+        State(state),
+        Query(ProjMetaQuery {
+            shard_id: "shard-0001".to_string(),
+        }),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_platform_upgrade_501(resp, "projections_meta").await;
+}
+
+#[tokio::test]
+async fn get_gpus_501_is_platform_upgrade_aware() {
+    let state = test_app_state(16);
+    let resp = routing::get_gpus(State(state), HeaderMap::new()).await.into_response();
+    assert_platform_upgrade_501(resp, "gpus").await;
 }
 
 // ── OpenAPI contract: /v1/openapi.json (integration-surface plan M0) ─────

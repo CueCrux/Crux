@@ -5,8 +5,9 @@
 //! Projection-query routes — `/v1/projections/entity/{count,timeline,current-state}` + admin rebuild.
 
 use super::{
-    hex16, map_http_dataplane_error, problem_response, require_http_scopes, AppState, DependentsQuery, HeaderMap,
-    IntoResponse, Json, Path, PressureQuery, ProjMetaQuery, Query, RelationsQuery, State, StatusCode, TenantQuery,
+    hex16, map_http_dataplane_error, platform_upgrade_response, problem_response, require_http_scopes, AppState,
+    DependentsQuery, HeaderMap, IntoResponse, Json, Path, PressureQuery, ProjMetaQuery, Query, RelationsQuery, State,
+    StatusCode, TenantQuery,
 };
 
 pub(super) async fn get_proj_meta(
@@ -19,7 +20,7 @@ pub(super) async fn get_proj_meta(
     }
 
     if !state.http_dataplane.enabled() {
-        return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
+        return platform_upgrade_response("projections_meta");
     }
     let meta = match state.http_dataplane.projection_meta(&q.shard_id).await {
         Ok(meta) => meta,
