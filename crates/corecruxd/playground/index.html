@@ -400,7 +400,7 @@
 <script>
 /* ════════════ DUMMY GRAPH — flat node registry with id links (daemon-styled) ════════════ */
 const SCOPES = [
-  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-receipts','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-settings','cx-raw'] },
+  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-receipts','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-settings','cx-raw'] },
   { id:'dx', label:'DX', tag:'Docs',         sections:['dx-articles','dx-readme','dx-sites'] },
   { id:'gx', label:'GX', tag:'Global',       sections:['gx-engrams','gx-bench','gx-sites','gx-factstore'] },
   { id:'ax', label:'AX', tag:'Agent',        sections:['ax-overview','ax-activity','ax-memory','ax-bulk','ax-snapshots','ax-tools','ax-handoff','ax-graph','ax-storybook','ax-dossiers','ax-story'] }
@@ -437,6 +437,20 @@ const N = {
   'cx-raw':{kind:'panel',label:'Raw',sub:'JSON-RPC console',fields:[['endpoint','/mcp'],['port','14801']]},
   'cx-settings':{kind:'panel',label:'Settings',sub:'console defaults',children:['set-auth','set-embed','set-onboard','set-daemon']},
   'cx-orchestrators':{kind:'panel',label:'Orchestrators',sub:'/v1/orchestrators · group plans for a session',fields:[['endpoint','/v1/orchestrators'],['flag','CORECRUXD_ORCHESTRATORS=on'],['mcp','create_orchestrator · attach · detach · list'],['active','1'],['build','＋ Orchestrator (toolbar)']],children:['orc-sprint1']},
+
+  /* ── Live board (coordination plane) — /v1/coord/active · #/coord deep link · default-OFF ── */
+  'cx-coord':{kind:'panel',label:'Live board',sub:'who is working right now · /v1/coord/active',
+    fields:[['endpoint','GET /v1/coord/active · POST /v1/coord/announce'],['flag','CORECRUXD_COORD=1'],['mcp','coord_status · coord_announce'],['liveness','auto-enroll on session bind · live intent OR fresh boot'],['overlaps','advisory — execplan · path · lease'],['deep link','/console#/coord']],
+    children:['co-demo-ov','co-demo1','co-demo2'],
+    doc:'LIVE BOARD · coordination plane\n\nEvery bound session auto-enrolls; announcing a\nfocus (execplan / milestone / paths) keeps it live\nand feeds overlap warnings. Assembled at read time\nfrom presence × session bindings × declared\nintents × punchcard leases + work in flight.\n\n  GET  /v1/coord/active?project_id=\n  POST /v1/coord/announce  (ttl_seconds:0 clears)\n\nAgents call coord_status at boot (the session-start\nhook injects a digest) and coord_announce on every\nexecplan/milestone switch. Overlap rows are a\nsignal to coordinate — advisory, never a lock.'},
+  'co-demo1':{kind:'coord-session',label:'fa0a2f95 · claude-work',sub:'presence-coordination @ M5 · seen 12s ago',status:'run',
+    fields:[['session','fa0a2f95… (demo)'],['passport','claude-work'],['execplan','crux-agent-presence-coordination-2026-06-11'],['milestone','M5'],['paths','crates/corecruxd/src'],['holds','tree://crates/corecruxd']],
+    doc:'LIVE SESSION (demo)\n\nA bound session with a declared intent: execplan,\nmilestone, expected paths, plus the punchcard\nleases its passport holds. The sub-line shows the\npassport heartbeat age; rows age out when the\nintent expires and the presence window lapses.'},
+  'co-demo2':{kind:'coord-session',label:'b17c277d · claude-research',sub:'review pass · seen 40s ago',status:'run',
+    fields:[['session','b17c277d… (demo)'],['passport','claude-research'],['note','review pass'],['paths','crates/corecruxd/src/coord.rs']]},
+  'co-demo-ov':{kind:'coord-overlap',label:'⚠ Overlap · fa0a2f95 × b17c277d',sub:'paths crates/corecruxd/src ∩ …/coord.rs',status:'blocked',
+    fields:[['kind','intent_path'],['sessions','fa0a2f95 × b17c277d'],['advisory','coordinate via work comments — not a lock (demo)']],
+    doc:'OVERLAP WARNING (demo)\n\nTwo live sessions have staked out overlapping\npaths (component-aware containment, the punchcard\nrule). Advisory by design: a crashed session must\nnever deadlock its peers. The same warnings come\nback from POST /v1/coord/announce the moment a\nsession declares its focus.'},
 
   /* ── Punchcards (resource leases) — kind=punchcard · /v1/punchcards · default-OFF ── */
   'cx-punchcards':{kind:'panel',label:'Punchcards',sub:'/v1/punchcards · leases grouped by session',fields:[['endpoint','/v1/punchcards (acquire·release·check·force-release)'],['flag','CORECRUXD_PUNCHCARD=off|advisory|enforce'],['mcp','punch_in · punch_out · check_punchcard · list_punchcards · force_release'],['enforce','PreToolUse deny'],['grouped','by session / holder'],['held','3']],children:['pcg-agentux','pcg-deploy','pcg-expired']},
@@ -827,7 +841,7 @@ async function ensureLoaded(node){
     loadState[node.id]='done';
   }catch(e){
     clearTimeout(t); const st=e&&e.status;
-    if(st===501){ loadState[node.id]='unavailable'; mergeChildren(node,[makeStatusNode(node.id+'::501','unavailable', m.flagHint||'Surface disabled (501)')]); }
+    if(st===501 || (st===404 && m.treat404AsDisabled)){ loadState[node.id]='unavailable'; mergeChildren(node,[makeStatusNode(node.id+'::'+st,'unavailable', m.flagHint||'Surface disabled ('+st+')')]); }
     else if(st===401 || st===403){ if(DUMMY_CHILDREN[node.id]) node.children=DUMMY_CHILDREN[node.id].slice(); loadState[node.id]='done'; announce('Not authorised — demo data for '+(node.label||node.id)); }
     else { loadState[node.id]='error'; mergeChildren(node,[makeStatusNode(node.id+'::error','error','Failed: '+(st||'network')+' — click to retry')]); }
   }
@@ -915,6 +929,38 @@ function txPunchcards(json){   // M6 — group by holder/session
     label:'Holder · '+h, sub: h+' · '+ls.length+' held', status: ls.some(l=>(l.status||'')==='held')?'run':'idle',
     fields:[['holder',h],['held',String(ls.length)]], children: ls.map(l=>idFor('pc', l.id)) }));
   return groups.concat(leaves);
+}
+/* coord live board — mirror of the daemon's component-aware containment rule */
+function coordPathsOverlap(a,b){ a=(a||'').replace(/\/+$/,''); b=(b||'').replace(/\/+$/,''); if(!a||!b) return false; if(a===b) return true; const s=a.length<b.length?a:b, l=a.length<b.length?b:a; return l.startsWith(s)&&l[s.length]==='/'; }
+function coordFocusPaths(s){ const out=(((s.intent||{}).paths)||[]).filter(Boolean); (s.leases||[]).forEach(l=>{ if(l.resource) out.push(String(l.resource).replace(/^[a-z]+:\/\//,'').replace(/^\/+/,'')); }); return out; }
+function txCoord(json){   // live board — sessions + client-side pairwise overlap warnings + work in flight
+  const ses = json.active_sessions||[];
+  const ago = ms => { if(ms==null) return null; const s=Math.max(0,Math.round(((json.now_unix_ms||Date.now())-ms)/1000)); return s<60? 'seen '+s+'s ago' : 'seen '+Math.round(s/60)+'m ago'; };
+  const leaves = ses.map(s=>{ const i=s.intent||{};
+    return { id:idFor('co', s.session_id_hex), kind:'coord-session',
+      label:(s.session_id_hex||'?').slice(0,8)+' · '+(s.passport_id||'—'),
+      sub:[ i.execplan_slug? (i.execplan_slug+(i.milestone?' @ '+i.milestone:'')) : null, i.note, ago(s.last_seen_at_unix_ms) ].filter(Boolean).join(' · '),
+      status:'run',
+      fields:[['session',s.session_id_hex],['passport',s.passport_id],['tenant',s.tenant_id],['project',s.project_id],['execplan',i.execplan_slug],['milestone',i.milestone],['paths',(i.paths||[]).join(', ')||null],['note',i.note],['holds',(s.leases||[]).map(l=>l.resource).join(', ')||null],['bound',s.bound_at_unix_ms],['last seen',s.last_seen_at_unix_ms],['active until',s.active_until_unix_ms]].filter(([,v])=>v!=null&&v!==''),
+      children:[], payload: JSON.stringify(s,null,2) };
+  });
+  const warns=[];
+  for(let x=0;x<ses.length;x++) for(let y=x+1;y<ses.length;y++){
+    const a=ses[x], b=ses[y], sa=(a.session_id_hex||'?').slice(0,8), sb=(b.session_id_hex||'?').slice(0,8);
+    const ea=(a.intent||{}).execplan_slug, eb=(b.intent||{}).execplan_slug;
+    if(ea&&ea===eb) warns.push({k:'execplan', sa, sb, d:'same execplan · '+ea});
+    const hit=coordFocusPaths(a).find(pa=>coordFocusPaths(b).some(pb=>coordPathsOverlap(pa,pb)));
+    if(hit) warns.push({k:'path', sa, sb, d:'paths overlap near '+hit});
+  }
+  const warnNodes = warns.map((w,i)=>({ id:idFor('cow', w.sa+'-'+w.sb+'-'+w.k+'-'+i), kind:'coord-overlap',
+    label:'⚠ Overlap · '+w.sa+' × '+w.sb, sub:w.d, status:'blocked',
+    fields:[['kind',w.k],['sessions',w.sa+' × '+w.sb],['detail',w.d],['advisory','coordinate via work comments — not a lock']], children:[] }));
+  const work=(json.work_in_flight||[]);
+  const workNodes = work.length? [{ id:idFor('cowk','inflight'), kind:'coord-work',
+    label:'Work in flight · '+work.length, sub:work.slice(0,4).map(w=>w.title||w.id).join(' · '), status:'run',
+    fields:work.slice(0,8).map(w=>[w.id,(w.title||'')+' ('+(w.state||'')+')']), children:[],
+    payload: JSON.stringify(work,null,2) }] : [];
+  return warnNodes.concat(leaves).concat(workNodes);
 }
 function entityPrefix(e){ e=e||''; const i=e.indexOf(':'); return i>0? e.slice(0,i): (e||'other'); }
 function txFacts(json){   // M7 facts — group by entity prefix (single fetch yields groups + leaves)
@@ -1015,6 +1061,7 @@ function registerLoaders(){
   LOADERS['cx-sessions']      = { endpoint:'/v1/console/sessions',    noun:'sessions',      transform: txSessions };       // M4
   LOADERS['cx-orchestrators'] = { endpoint:'/v1/orchestrators',       noun:'orchestrators', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txOrchestrators };  // M5
   LOADERS['cx-punchcards']    = { endpoint:'/v1/punchcards',          noun:'leases',        flagHint:'Punchcards disabled — set CORECRUXD_PUNCHCARD=advisory|enforce', transform: txPunchcards };  // M6
+  LOADERS['cx-coord']         = { endpoint:'/v1/coord/active',        noun:'live sessions', flagHint:'Coordination plane disabled — set CORECRUXD_COORD=1', treat404AsDisabled:true, transform: txCoord };  // live board (coord plane returns 404 when off)
   LOADERS['cx-facts']         = { endpoint:'/v1/console/facts?top_k=100', noun:'facts',     transform: txFacts };          // M7
   LOADERS['cx-memory']        = { endpoint:'/v1/console/facts?top_k=20',  noun:'memories',  transform: txMemory };         // M7
   LOADERS['cx-tenants']       = { endpoint:'/v1/console/tenants',     noun:'tenants',       transform: txTenants };        // M8
@@ -1607,8 +1654,17 @@ async function receiptsDeepLink(){
   if(m[1]){ openVerify(decodeURIComponent(m[1])); if(LIVE) await runVerifyLookup(); }
 }
 
+/* boot-time deep link: #/coord opens the Live board panel */
+async function coordDeepLink(){
+  let h=''; try{ h=(typeof location!=='undefined' && location.hash)||''; }catch{ h=''; }
+  if(!/^#\/coord$/.test(h)) return;
+  openScope('cx');
+  const p=N['cx-coord'];
+  if(p){ await ensureLoaded(p); expand(p, 0); }
+}
+
 openScope('cx');   // immediate render with dummy data
-bootProbe().then(receiptsDeepLink);        // probe /readyz; if live, lazy-replace panels with real /v1 data; then honour a #/receipts deep link
+bootProbe().then(()=>{ receiptsDeepLink(); coordDeepLink(); });   // probe /readyz; if live, lazy-replace panels with real /v1 data; then honour #/receipts · #/coord deep links
 </script>
 </body>
 </html>
