@@ -858,6 +858,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_fact_two_aliased_tokens_resolve_to_one_principal() {
+        // Continuity-substrate M0 gate (crux-agent-passport-binding M0.2/M0.3):
+        // two DISTINCT agent tokens (distinct names, distinct token hashes)
+        // aliased to ONE passport_id must stamp the SAME principal on their
+        // facts — the lever that makes the cross-provider demo prove
+        // provider-portability rather than a same-token tautology. A third,
+        // differently-mapped token must stay distinct (no accidental collision).
+        let map = crate::agent_passport::AgentPassportMap::from_pairs_str(
+            "anthropic:demo-principal:work,openai:demo-principal:work,tailnet:other-principal:work",
+        );
+
+        let base = test_ctx();
+        seed_passport(&base, "demo-principal", "work").await;
+        seed_passport(&base, "other-principal", "work").await;
+
+        let token_a = base
+            .with_agent(AgentIdentity {
+                name: "anthropic".to_string(),
+                token_hash: [0u8; 32],
+            })
+            .with_agent_passports(true, map.clone());
+        let token_b = base
+            .with_agent(AgentIdentity {
+                name: "openai".to_string(),
+                token_hash: [2u8; 32],
+            })
+            .with_agent_passports(true, map.clone());
+        let token_c = base
+            .with_agent(AgentIdentity {
+                name: "tailnet".to_string(),
+                token_hash: [4u8; 32],
+            })
+            .with_agent_passports(true, map);
+
+        // Both aliased tokens resolve to one scope identity (private-fact
+        // ownership) and stamp one actor (fact attribution).
+        assert_eq!(token_a.scope_identity().as_deref(), Some("demo-principal"));
+        assert_eq!(token_a.scope_identity(), token_b.scope_identity());
+        assert_ne!(token_b.scope_identity(), token_c.scope_identity());
+
+        let result_a = handle_store_fact(&json!({"entity": "proj", "key": "ka", "value": "va"}), &token_a)
+            .await
+            .unwrap();
+        let result_b = handle_store_fact(&json!({"entity": "proj", "key": "kb", "value": "vb"}), &token_b)
+            .await
+            .unwrap();
+        let result_c = handle_store_fact(&json!({"entity": "proj", "key": "kc", "value": "vc"}), &token_c)
+            .await
+            .unwrap();
+
+        let actor_a = stored_actor(&token_a, &result_a).await;
+        let actor_b = stored_actor(&token_b, &result_b).await;
+        let actor_c = stored_actor(&token_c, &result_c).await;
+        assert_eq!(actor_a, Some("demo-principal".to_string()));
+        assert_eq!(actor_a, actor_b, "two aliased tokens must share one principal");
+        assert_eq!(
+            actor_c,
+            Some("other-principal".to_string()),
+            "a differently-mapped token must stay distinct"
+        );
+    }
+
+    #[tokio::test]
     async fn store_fact_flag_off_records_no_actor() {
         // Proves no behaviour change: with the flag OFF, the SAME anthropic
         // agent records actor = None (byte-for-byte the pre-M1 path).
