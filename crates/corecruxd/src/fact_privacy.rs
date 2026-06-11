@@ -95,6 +95,7 @@ const DEFAULT_PRIVATE_PREFIXES: &[&str] = &[
     "__answer_replay_capsule__::",
     "__passport__::",
     "__session_binding__::",
+    "__coord__::",
     "__bootstrap__::",
     "__project__::",
     "__tenant_metadata__::",
@@ -211,6 +212,9 @@ mod tests {
         // B4 (T.1): session bindings carry passport_id/tenant_id and must never
         // sync — born private at ingest like __passport__::.
         assert!(p.is_always_private("__session_binding__::deadbeefcafef00d"));
+        // Coord intents/claims name sessions, passports, and repo paths —
+        // strictly local, born private (coordination-plane ExecPlan T.1).
+        assert!(p.is_always_private("__coord__::proj::deadbeef"));
     }
 
     #[test]

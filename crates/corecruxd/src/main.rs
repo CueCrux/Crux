@@ -28,6 +28,7 @@ mod auth;
 mod config;
 mod console_index;
 mod control;
+mod coord;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]
 mod dataplane_store;
@@ -519,6 +520,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         data_dir: config.data_dir.clone(),
         mcp_enabled: config.mcp_enabled,
         console_enabled: config.console_enabled,
+        coord_enabled: config.coord_enabled,
+        coord_presence_ttl_secs: config.coord_presence_ttl_secs,
         integrations_enabled: config.integrations_enabled,
         integrations_safe_mode: config.integrations_safe_mode,
         integrations_allow_executable_helpers: config.integrations_allow_executable_helpers,
@@ -3782,6 +3785,8 @@ mod tests {
             data_dir: tmp.path().to_path_buf(),
             mcp_enabled: true,
             console_enabled: true,
+            coord_enabled: false,
+            coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
             integrations_enabled: true,
             integrations_safe_mode: false,
             integrations_allow_executable_helpers: false,

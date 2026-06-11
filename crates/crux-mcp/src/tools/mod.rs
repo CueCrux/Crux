@@ -1579,6 +1579,39 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                 ]
             }),
         },
+        ToolDefinition {
+            name: "coord_status".to_string(),
+            description: coordination::COORD_STATUS_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Optional project filter; sessions bound to no project are always included." }
+                },
+                "examples": [ {}, { "project_id": "default" } ]
+            }),
+        },
+        ToolDefinition {
+            name: "coord_announce".to_string(),
+            description: coordination::COORD_ANNOUNCE_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id":    { "type": "string", "description": "Your bound session id (hex) — the one cuecrux_session minted." },
+                    "project_id":    { "type": "string" },
+                    "by_passport":   { "type": "string", "description": "Optional; the session binding's passport wins when the session is bound." },
+                    "execplan_slug": { "type": "string" },
+                    "milestone":     { "type": "string" },
+                    "paths":         { "type": "array", "items": { "type": "string" }, "description": "Repo-relative files/dirs you expect to touch (informational; use punch_in for an enforceable lease)." },
+                    "note":          { "type": "string" },
+                    "ttl_seconds":   { "type": "integer", "description": "Intent lifetime (default 14400 = 4h, max 86400). 0 clears your intent." }
+                },
+                "required": ["session_id", "project_id"],
+                "examples": [
+                    { "session_id": "deadbeefcafe", "project_id": "default", "execplan_slug": "crux-agent-presence-coordination-2026-06-11", "milestone": "M3", "paths": ["crates/crux-mcp/src/tools/coordination.rs"] },
+                    { "session_id": "deadbeefcafe", "project_id": "default", "ttl_seconds": 0 }
+                ]
+            }),
+        },
         // ── GitHub indexed corpus (Plan B G5) ───────────────────
         ToolDefinition {
             name: "github_search".to_string(),
@@ -2389,6 +2422,8 @@ pub fn tool_output_docs() -> Value {
         { "tool": "create_work",        "output": "WorkItem record (same shape as list_work entries, includes the freshly minted id)." },
         { "tool": "update_work_state",  "output": "{ applied: bool, work?: WorkItem, queued?: { action_id, work_id, requested_by_passport, target_state, status: 'pending', requested_at_unix_ms } }" },
         { "tool": "comment_on_work",    "output": "{ id, work_id, author_passport, body, posted_at_unix_ms }" },
+        { "tool": "coord_status",       "output": "{ now_unix_ms, presence_ttl_secs, project_id?, active_sessions: [{ session_id_hex, passport_id, tenant_id, project_id?, bound_at_unix_ms, last_seen_at_unix_ms, active_until_unix_ms, intent?: { execplan_slug?, milestone?, paths, note?, announced_at_unix_ms, expires_at_unix_ms }, leases?: [{ punchcard_id, resource, mode, holder_passport, expires_at_unix_ms }] }], work_in_flight: [WorkItem] }" },
+        { "tool": "coord_announce",     "output": "{ intent: { project_id, session_id_hex, passport_id, execplan_slug?, milestone?, paths, note?, announced_at_unix_ms, expires_at_unix_ms }, cleared: bool }" },
         { "tool": "github_search",         "output": "{ count, facts: [{ entity, key, value, ... }] } — value strings hold JSON-encoded CommitRecord / PrRecord / IssueRecord / CommentRecord depending on the entity prefix." },
         { "tool": "github_recent_commits", "output": "{ count, facts: [Fact] } — entities are `github::owner/repo::commit/{sha}`; value JSON contains sha, message, author_name, author_login?, committed_at, parents[], html_url." },
         { "tool": "github_open_prs",       "output": "{ count, facts: [Fact] } — entities are `github::owner/repo::pr/{number}`; value JSON contains title, state, author_login?, head_sha, base_branch, body, merged_at?, closed_at?, html_url." },
@@ -2518,6 +2553,9 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "create_work" => coordination::handle_create_work(args, ctx).await,
         "update_work_state" => coordination::handle_update_work_state(args, ctx).await,
         "comment_on_work" => coordination::handle_comment_on_work(args, ctx).await,
+        // Coordination plane — live-session board (presence-coordination plan).
+        "coord_status" => coordination::handle_coord_status(args, ctx).await,
+        "coord_announce" => coordination::handle_coord_announce(args, ctx).await,
         // Orchestrators (Package S scaffold).
         "create_orchestrator" => orchestrators::handle_create_orchestrator(args, ctx).await,
         "attach_to_orchestrator" => orchestrators::handle_attach_to_orchestrator(args, ctx).await,
@@ -2600,7 +2638,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 101; // main 91 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard).
+    const TOOL_COUNT: usize = 103; // main 93 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
@@ -2732,6 +2770,9 @@ mod tests {
         assert!(names.contains(&"sync_push".to_string()));
         assert!(names.contains(&"sync_status".to_string()));
         assert!(names.contains(&"update_status".to_string()));
+        // Coordination plane (2)
+        assert!(names.contains(&"coord_status".to_string()));
+        assert!(names.contains(&"coord_announce".to_string()));
     }
 
     #[test]

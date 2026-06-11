@@ -218,6 +218,12 @@ pub struct Config {
     // via the journaled delete path. Default OFF.
     pub ephemeral_gc_enabled: bool,
 
+    // Multi-agent coordination plane (`/v1/coord/*`, `crate::coord`):
+    // presence-joined session board + advisory claims. Default OFF.
+    pub coord_enabled: bool,
+    // Liveness horizon for the coord active view, in seconds.
+    pub coord_presence_ttl_secs: u64,
+
     // Embedded console + declarative integration library.
     pub integrations_enabled: bool,
     pub integrations_safe_mode: bool,
@@ -828,6 +834,12 @@ pub fn load_config() -> Config {
             .map(PathBuf::from)
             .filter(|path| !path.as_os_str().is_empty()),
         ephemeral_gc_enabled: env_bool("CORECRUXD_EPHEMERAL_GC").unwrap_or(false),
+        coord_enabled: env_bool("CORECRUXD_COORD").unwrap_or(false),
+        coord_presence_ttl_secs: std::env::var("CORECRUXD_COORD_PRESENCE_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(crate::coord::DEFAULT_PRESENCE_TTL_SECS)
+            .clamp(60, crate::coord::MAX_TTL_SECS),
         integrations_enabled: std::env::var("CORECRUXD_INTEGRATIONS_ENABLED")
             .ok()
             .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
@@ -1123,6 +1135,9 @@ mod tests {
         assert_eq!(cfg.dir_l0_max_runs, 8);
         // Ephemeral GC is default OFF.
         assert!(!cfg.ephemeral_gc_enabled);
+        // Coordination plane is default OFF; presence TTL defaults to 15 min.
+        assert!(!cfg.coord_enabled);
+        assert_eq!(cfg.coord_presence_ttl_secs, crate::coord::DEFAULT_PRESENCE_TTL_SECS);
     }
 
     #[test]
