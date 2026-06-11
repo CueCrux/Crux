@@ -212,12 +212,27 @@ pub(super) async fn post_coord_announce(
     if let Err(e) = crate::coord::write_intent(&mut store, &intent) {
         return problem_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
+    // Advisory overlap check against the other live intents + held leases,
+    // computed in the same call so the announcing session learns who it
+    // collides with the moment it declares an execplan. Never blocking.
+    let peer_intents = crate::coord::list_intents(&store, Some(&intent.project_id));
     drop(store);
+    let leases = live_lease_summaries(&state, now as i64).await;
+    let overlaps = crate::coord::find_overlaps(&intent, &peer_intents, &leases, now);
+    let peers = peer_intents
+        .iter()
+        .filter(|p| p.session_id_hex != intent.session_id_hex && p.is_live(now))
+        .count();
 
     let cleared = ttl_secs == 0;
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "intent": intent, "cleared": cleared })),
+        Json(serde_json::json!({
+            "intent": intent,
+            "cleared": cleared,
+            "live_peer_intents": peers,
+            "overlaps": overlaps,
+        })),
     )
         .into_response()
 }
@@ -400,6 +415,66 @@ mod tests {
         let sessions = view["active_sessions"].as_array().expect("sessions array");
         assert_eq!(sessions.len(), 1, "session still live (presence)");
         assert!(sessions[0].get("intent").is_none(), "cleared intent hidden");
+    }
+
+    #[tokio::test]
+    async fn announce_returns_peer_overlaps() {
+        let state = test_app_state(1);
+        seed_live_session(&state, "aaaa", "proj").await;
+
+        // Session A declares a directory focus.
+        let mut a = announce_body("aaaa", "proj");
+        a.paths = vec!["crates/corecruxd/src".to_string()];
+        let resp = post_coord_announce(StateExtract(state.clone()), HeaderMap::new(), JsonExtract(a))
+            .await
+            .into_response();
+        assert_eq!(body_json(resp).await["overlaps"].as_array().map(Vec::len), Some(0));
+
+        // A different passport holds a lease inside that directory.
+        {
+            let mut reg = state.kind_registry.write().await;
+            crate::agentgraph_kinds::bootstrap(&mut reg).expect("bootstrap kinds");
+        }
+        {
+            let reg = state.kind_registry.read().await;
+            let mut estore = state.entity_store.write().await;
+            let payload = json!({
+                "id": "pc_other",
+                "resource": "tree://crates/corecruxd/src/http",
+                "mode": "modify",
+                "holder_passport": "other-passport",
+                "tenant_id": "default",
+                "status": "held",
+                "acquired_at_unix_ms": 0,
+                "expires_at_unix_ms": i64::MAX,
+            });
+            estore
+                .upsert(PUNCHCARD_KIND, "pc_other", payload, "other-passport", Some(&reg))
+                .expect("seed peer punchcard");
+        }
+
+        // Session B (unbound; explicit different passport) announces an
+        // overlapping file under A's directory + the same execplan slug.
+        let mut b = announce_body("bbbb", "proj");
+        b.by_passport = Some("other-passport".to_string());
+        b.paths = vec!["crates/corecruxd/src/coord.rs".to_string()];
+        let resp = post_coord_announce(StateExtract(state), HeaderMap::new(), JsonExtract(b))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["live_peer_intents"], 1);
+        let kinds: Vec<&str> = body["overlaps"]
+            .as_array()
+            .expect("overlaps array")
+            .iter()
+            .filter_map(|w| w["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"execplan"), "same slug flagged: {kinds:?}");
+        assert!(kinds.contains(&"intent_path"), "path containment flagged: {kinds:?}");
+        // B's own lease would be excluded, but this lease belongs to B's
+        // passport — so from B's announce it's self, not a conflict.
+        assert!(!kinds.contains(&"lease"), "own lease not flagged: {kinds:?}");
     }
 
     #[tokio::test]
