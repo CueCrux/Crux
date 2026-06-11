@@ -53,6 +53,26 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
         }
     }
 
+    // Live-session coordination digest (presence-coordination plan M5):
+    // who else is live on this daemon right now, their declared focus, and
+    // the punchcard leases they hold. Best-effort; silent when the daemon's
+    // coord plane is disabled (CORECRUXD_COORD unset → 404).
+    if std::env::var("CRUX_HOOK_COORD").as_deref() != Ok("off") {
+        match mcp_client::call_tool("coord_status", json!({})) {
+            Ok(result) => {
+                if let Some(digest) = render_coord_digest(&extract_text(&result)) {
+                    sections.push(digest);
+                }
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                if !msg.contains("404") {
+                    eprintln!("crux-hook session-start: coord_status failed: {err}");
+                }
+            }
+        }
+    }
+
     // Warn-only config-audit: hash known agent-config files, ask the daemon
     // which content hashes are unreviewed, surface inline. Operators clear
     // by calling `audit_config(...)` after review.
@@ -93,6 +113,69 @@ fn extract_text(result: &Value) -> String {
         }
     }
     serde_json::to_string_pretty(result).unwrap_or_default()
+}
+
+/// Render the `coord_status` payload into a compact "live sessions" digest.
+/// Returns `None` when there is nothing worth injecting (no live peers and
+/// nothing in flight) so quiet daemons stay quiet.
+fn render_coord_digest(text: &str) -> Option<String> {
+    use std::fmt::Write as _;
+    let v: Value = serde_json::from_str(text).ok()?;
+    let sessions = v.get("active_sessions").and_then(Value::as_array)?;
+    let work = v
+        .get("work_in_flight")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if sessions.is_empty() && work.is_empty() {
+        return None;
+    }
+    let mut lines = vec![format!(
+        "**Crux coord — live sessions ({}), work in flight ({})**",
+        sessions.len(),
+        work.len()
+    )];
+    for s in sessions.iter().take(6) {
+        let session = s.get("session_id_hex").and_then(Value::as_str).unwrap_or("?");
+        let passport = s.get("passport_id").and_then(Value::as_str).unwrap_or("?");
+        let mut line = format!("- `{session}` ({passport})");
+        if let Some(intent) = s.get("intent") {
+            if let Some(slug) = intent.get("execplan_slug").and_then(Value::as_str) {
+                let _ = write!(line, " · {slug}");
+                if let Some(ms) = intent.get("milestone").and_then(Value::as_str) {
+                    let _ = write!(line, " @ {ms}");
+                }
+            }
+            if let Some(note) = intent.get("note").and_then(Value::as_str) {
+                let _ = write!(line, " · {note}");
+            }
+            if let Some(paths) = intent.get("paths").and_then(Value::as_array) {
+                let shown: Vec<&str> = paths.iter().filter_map(Value::as_str).take(3).collect();
+                if !shown.is_empty() {
+                    let _ = write!(line, " · paths: {}", shown.join(", "));
+                }
+            }
+        }
+        if let Some(leases) = s.get("leases").and_then(Value::as_array) {
+            let held: Vec<&str> = leases
+                .iter()
+                .filter_map(|l| l.get("resource").and_then(Value::as_str))
+                .take(3)
+                .collect();
+            if !held.is_empty() {
+                let _ = write!(line, " · holds: {}", held.join(", "));
+            }
+        }
+        lines.push(line);
+    }
+    if sessions.len() > 6 {
+        lines.push(format!("- …and {} more (call coord_status)", sessions.len() - 6));
+    }
+    lines.push(
+        "Coordinate before touching another session's paths/leases; announce your own focus with coord_announce."
+            .to_string(),
+    );
+    Some(lines.join("\n"))
 }
 
 fn render_sync_status(result: &Value) -> String {
@@ -161,5 +244,37 @@ mod tests {
     fn sync_unhealthy_when_behind() {
         let r = json!({"content": [{"text": "Sync is BEHIND remote"}]});
         assert!(!sync_is_healthy(&r));
+    }
+
+    #[test]
+    fn coord_digest_quiet_when_empty() {
+        let text = r#"{"now_unix_ms":1,"presence_ttl_secs":900,"active_sessions":[],"work_in_flight":[]}"#;
+        assert!(render_coord_digest(text).is_none());
+        assert!(render_coord_digest("not json").is_none());
+    }
+
+    #[test]
+    fn coord_digest_renders_focus_and_leases() {
+        let text = r#"{
+            "now_unix_ms": 1,
+            "presence_ttl_secs": 900,
+            "active_sessions": [{
+                "session_id_hex": "aaaa",
+                "passport_id": "claude-work",
+                "intent": {
+                    "execplan_slug": "crux-agent-presence-coordination-2026-06-11",
+                    "milestone": "M5",
+                    "paths": ["crates/crux-claude-hooks/src"]
+                },
+                "leases": [{"resource": "tree://crates/crux-claude-hooks"}]
+            }],
+            "work_in_flight": [{"id": "w1"}]
+        }"#;
+        let digest = render_coord_digest(text).expect("digest");
+        assert!(digest.contains("live sessions (1)"));
+        assert!(digest.contains("work in flight (1)"));
+        assert!(digest.contains("crux-agent-presence-coordination-2026-06-11 @ M5"));
+        assert!(digest.contains("holds: tree://crates/crux-claude-hooks"));
+        assert!(digest.contains("coord_announce"));
     }
 }

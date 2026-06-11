@@ -40,6 +40,13 @@ To name the current milestone for the hook, operators write a short label to `.a
 - `create_handoff(session_id, include_facts, target_agent?)` — Bundle session state plus relevant non-private facts for another agent.
 - `accept_handoff(package)` — Receive and verify a server-authenticated handoff package.
 
+### Live-session board (requires `CORECRUXD_COORD=1` on the daemon)
+For concurrent sessions sharing one source tree. Liveness is automatic (presence heartbeat + session binding); only the *focus declaration* is yours to make.
+- `coord_status(project_id?)` — Who else is live right now: per-session passport, heartbeat, declared focus (execplan/milestone/paths), punchcard leases held, plus work items in flight. Call at session start (the `session-start` hook injects a digest automatically) and before editing files another session may be touching.
+- `coord_announce(session_id, project_id, execplan_slug?, milestone?, paths?, note?, ttl_seconds?)` — Declare what this session is working on. Re-announce on focus change (it replaces); `ttl_seconds: 0` clears on the way out; default TTL 4 h. Stored as a private `__coord__::` fact attributed to your session's passport.
+
+Protocol for multi-session work: announce your focus at boot and on every execplan/milestone switch → check `coord_status` before multi-file edits → take a `punch_in` lease (`tree://<dir>` or `file://<path>`) for paths you'll mutate → prefer `create_handoff` over letting leases/intents time out. Conflicts are advisory: a peer's intent or lease on your target path is a signal to coordinate via work-item comments, not a lock.
+
 ## Observability
 - `sync_status()` — Check whether this node is local-only, sync-enabled, or degraded before planning remote integration work.
 - `update_status()` — Check whether this checkout is current, behind, ahead, diverged, disabled, or unavailable before proposing an upgrade.
