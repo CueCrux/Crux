@@ -269,6 +269,51 @@ function makeFetch() {
   env2.s.openVerify('crn_whatever'); await env2.getById('vcGo').fire('click'); await flush();
   ok(/[Dd]emo mode/.test(env2.getById('vcStatus').textContent), 'receipts demo: live verify refused in demo mode (no fake PASS)');
 
+  // ── J) coord live board: #/coord deep link, live transform, overlaps, 404-disabled ──
+  const f5 = makeFetch();
+  f5.route(u => /\/v1\/coord\/active/.test(u), { ok: true, status: 200, body: {
+    now_unix_ms: 1000000, presence_ttl_secs: 900,
+    active_sessions: [
+      { session_id_hex: 'aaaa1111bbbb', passport_id: 'claude-work', tenant_id: 'personal',
+        bound_at_unix_ms: 990000, last_seen_at_unix_ms: 999000, active_until_unix_ms: 1899000,
+        intent: { execplan_slug: 'shared-plan', milestone: 'M2', paths: ['crates/corecruxd/src'] },
+        leases: [{ resource: 'tree://crates/corecruxd' }] },
+      { session_id_hex: 'cccc2222dddd', passport_id: 'claude-research', tenant_id: 'personal',
+        bound_at_unix_ms: 990000, last_seen_at_unix_ms: 998000, active_until_unix_ms: 1898000,
+        intent: { execplan_slug: 'shared-plan', paths: ['crates/corecruxd/src/coord.rs'], note: 'review pass' } }
+    ],
+    work_in_flight: [{ id: 'w_1', title: 'coord plane', state: 'in_progress' }]
+  } });
+  const env5 = buildSandbox(f5, '#/coord');
+  await flush(10);
+  ok(env5.s.__cx.loadState['cx-coord'] === 'done', 'coord: deep link #/coord loaded the live board');
+  const coNode = env5.s.__cx.N['co:aaaa1111bbbb'];
+  ok(!!coNode && coNode.kind === 'coord-session' && /claude-work/.test(coNode.label), 'coord: live session node built (session8 · passport)');
+  ok(!!coNode && /shared-plan @ M2/.test(coNode.sub), 'coord: sub line carries execplan @ milestone');
+  ok(!!coNode && JSON.stringify(coNode.fields).includes('tree://crates/corecruxd'), 'coord: held lease joined onto the session');
+  const ovIds = (env5.s.__cx.N['cx-coord'].children || []).filter(id => id.startsWith('cow:'));
+  ok(ovIds.length >= 2, 'coord: execplan + path overlap warnings computed client-side');
+  const coOvNode = env5.s.__cx.N[ovIds[0]];
+  ok(!!coOvNode && coOvNode.status === "blocked" && /Overlap/.test(coOvNode.label), "coord: overlap node renders blocked");
+  ok((env5.s.__cx.N['cx-coord'].children || []).includes('cowk:inflight'), 'coord: work-in-flight summary node present');
+  // sibling string-prefix paths are NOT an overlap (component-aware rule)
+  ok(env5.s.coordPathsOverlap('src/work', 'src/work/item.rs') === true
+     && env5.s.coordPathsOverlap('src/work', 'src/work.rs') === false, 'coord: containment rule is path-component aware');
+
+  // coord plane off: 404 → calm flag-hint empty-state (treat404AsDisabled)
+  const f6 = makeFetch();
+  f6.route(u => /\/v1\/coord\/active/.test(u), { ok: false, status: 404, body: { detail: 'coordination plane disabled' } });
+  const env6 = buildSandbox(f6, '#/coord');
+  await flush(10);
+  ok(env6.s.__cx.loadState['cx-coord'] === 'unavailable', 'coord: 404 maps to unavailable, not error');
+  ok((env6.s.__cx.N['cx-coord'].children || []).some(id => /CORECRUXD_COORD/.test((env6.s.__cx.N[id] || {}).label || '')), 'coord: 404 empty-state shows the CORECRUXD_COORD=1 hint');
+
+  // demo mode: panel renders dummy sessions + overlap offline
+  env2.s.exitFocus(); await flush();
+  await tile(env2, 'panel', 'Live board').fire('click'); await flush();
+  ok(!!tile(env2, 'coord-session', 'fa0a2f95'), 'coord demo: dummy live-session tile renders offline');
+  ok(!!tile(env2, 'coord-overlap', 'Overlap'), 'coord demo: dummy overlap tile renders offline');
+
   console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();
