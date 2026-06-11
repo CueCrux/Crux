@@ -510,10 +510,17 @@ pub async fn post_session(State(state): State<AppState>, headers: HeaderMap, bod
         }
     };
     if let Some(b) = binding.as_ref() {
-        let mut store = state.fact_store.write().await;
-        if let Err(err) = crate::session_bindings::write_binding(&mut store, b) {
-            tracing::warn!(?err, "failed to persist session binding fact");
+        {
+            let mut store = state.fact_store.write().await;
+            if let Err(err) = crate::session_bindings::write_binding(&mut store, b) {
+                tracing::warn!(?err, "failed to persist session binding fact");
+            }
         }
+        // Binding a session enrolls it on the coordination board; give its
+        // passport an immediate presence heartbeat so the session is "live"
+        // from the moment it boots, not from its first passport-stamped
+        // HTTP write (MCP traffic doesn't pass the presence middleware).
+        state.presence.touch(&b.passport_id, "POST", "/session(bind)").await;
     }
 
     build_plan_response(&sealed, prefer_cbor, binding.as_ref())

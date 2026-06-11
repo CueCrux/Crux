@@ -138,6 +138,107 @@ pub fn list_intents(store: &FactStore, project_id: Option<&str>) -> Vec<CoordInt
     out
 }
 
+/// `true` when two repo-relative paths overlap: equal, or one is a
+/// path-component prefix of the other (`src/work` covers `src/work/item.rs`
+/// but not `src/work.rs`). Trailing slashes are normalised. Mirrors the
+/// punchcard `path_contains` containment rule.
+pub fn paths_overlap(a: &str, b: &str) -> bool {
+    let a = a.trim_end_matches('/');
+    let b = b.trim_end_matches('/');
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let (shorter, longer) = if a.len() < b.len() { (a, b) } else { (b, a) };
+    longer.starts_with(shorter) && longer.as_bytes().get(shorter.len()) == Some(&b'/')
+}
+
+/// Strip a punchcard resource URI (`file://p`, `tree://p`) down to its path
+/// for comparison against intent paths. Unknown schemes pass through.
+fn lease_resource_path(resource: &str) -> &str {
+    resource
+        .split_once("://")
+        .map_or(resource, |(_, rest)| rest)
+        .trim_start_matches('/')
+}
+
+/// An advisory overlap between a session's announced focus and a peer's
+/// declared intent or held lease. Returned from `announce` so the moment a
+/// session declares an execplan it learns who it collides with. Never
+/// blocking — coordination signal only.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OverlapWarning {
+    pub peer_session_id_hex: String,
+    pub peer_passport_id: String,
+    /// `execplan` | `intent_path` | `lease`
+    pub kind: String,
+    /// The peer's overlapping thing (slug, path, or lease resource).
+    pub theirs: String,
+    /// The announced thing it overlaps with.
+    pub yours: String,
+}
+
+/// Compute advisory overlaps between `announced` and the other live
+/// sessions' intents + held punchcard leases. Self-overlap (same session,
+/// or a lease held by the announcing passport) is excluded.
+pub fn find_overlaps(
+    announced: &CoordIntent,
+    peer_intents: &[CoordIntent],
+    leases: &[LeaseSummary],
+    now_unix_ms: u64,
+) -> Vec<OverlapWarning> {
+    let mut out = Vec::new();
+    for peer in peer_intents {
+        if peer.session_id_hex == announced.session_id_hex || !peer.is_live(now_unix_ms) {
+            continue;
+        }
+        if let (Some(mine), Some(theirs)) = (announced.execplan_slug.as_deref(), peer.execplan_slug.as_deref()) {
+            if mine == theirs {
+                out.push(OverlapWarning {
+                    peer_session_id_hex: peer.session_id_hex.clone(),
+                    peer_passport_id: peer.passport_id.clone(),
+                    kind: "execplan".to_string(),
+                    theirs: theirs.to_string(),
+                    yours: mine.to_string(),
+                });
+            }
+        }
+        for mine in &announced.paths {
+            for theirs in &peer.paths {
+                if paths_overlap(mine, theirs) {
+                    out.push(OverlapWarning {
+                        peer_session_id_hex: peer.session_id_hex.clone(),
+                        peer_passport_id: peer.passport_id.clone(),
+                        kind: "intent_path".to_string(),
+                        theirs: theirs.clone(),
+                        yours: mine.clone(),
+                    });
+                }
+            }
+        }
+    }
+    for lease in leases {
+        if lease.holder_passport == announced.passport_id {
+            continue;
+        }
+        let lease_path = lease_resource_path(&lease.resource);
+        for mine in &announced.paths {
+            if paths_overlap(mine.trim_start_matches('/'), lease_path) {
+                out.push(OverlapWarning {
+                    peer_session_id_hex: String::new(),
+                    peer_passport_id: lease.holder_passport.clone(),
+                    kind: "lease".to_string(),
+                    theirs: lease.resource.clone(),
+                    yours: mine.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// A live punchcard lease, summarised for the active view. Sourced from the
 /// substrate entity store (`PUNCHCARD_KIND`) — punchcards are passport-held,
 /// so the join key is `holder_passport`.
@@ -403,6 +504,53 @@ mod tests {
         assert_eq!(a.leases.len(), 1);
         assert_eq!(a.leases[0].resource, "file://src/a.rs");
         assert_eq!(b.leases[0].resource, "tree://src/b");
+    }
+
+    #[test]
+    fn paths_overlap_component_aware() {
+        assert!(paths_overlap("src/work.rs", "src/work.rs"));
+        assert!(paths_overlap("src/work", "src/work/item.rs"));
+        assert!(paths_overlap("src/work/item.rs", "src/work"));
+        assert!(paths_overlap("src/work/", "src/work/item.rs"));
+        // Sibling that shares a string prefix is NOT an overlap.
+        assert!(!paths_overlap("src/work", "src/work.rs"));
+        assert!(!paths_overlap("src/work.rs", "src/worker.rs"));
+        assert!(!paths_overlap("", "src/a"));
+    }
+
+    #[test]
+    fn find_overlaps_flags_execplan_paths_and_leases_but_not_self() {
+        let now: u64 = 1_000_000;
+        let mut mine = intent("aaaa", "shared-plan", now + 100_000);
+        mine.passport_id = "p1".to_string();
+        mine.paths = vec!["crates/corecruxd/src".to_string()];
+
+        let mut peer = intent("bbbb", "shared-plan", now + 100_000);
+        peer.passport_id = "p2".to_string();
+        peer.paths = vec!["crates/corecruxd/src/coord.rs".to_string()];
+
+        let mut expired_peer = intent("cccc", "shared-plan", now - 1);
+        expired_peer.paths = vec!["crates/corecruxd/src".to_string()];
+
+        let leases = vec![
+            lease("p2", "tree://crates/corecruxd/src/http"), // peer lease — overlaps
+            lease("p1", "tree://crates/corecruxd"),          // own lease — excluded
+            lease("p3", "file://README.md"),                 // disjoint
+        ];
+
+        let warnings = find_overlaps(&mine, &[mine.clone(), peer, expired_peer], &leases, now);
+        let kinds: Vec<&str> = warnings.iter().map(|w| w.kind.as_str()).collect();
+        assert!(kinds.contains(&"execplan"), "same slug flagged: {warnings:?}");
+        assert!(kinds.contains(&"intent_path"), "path containment flagged");
+        assert!(kinds.contains(&"lease"), "peer lease flagged");
+        assert_eq!(
+            warnings.len(),
+            3,
+            "self, expired, own-lease, disjoint all excluded: {warnings:?}"
+        );
+        let lease_w = warnings.iter().find(|w| w.kind == "lease").expect("lease warning");
+        assert_eq!(lease_w.peer_passport_id, "p2");
+        assert_eq!(lease_w.theirs, "tree://crates/corecruxd/src/http");
     }
 
     #[test]
