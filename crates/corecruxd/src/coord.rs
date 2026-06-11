@@ -12,7 +12,7 @@
 //!   tool-call boundaries; the daemon owns a board assembled at read time
 //!   from surfaces that already exist — the presence tracker
 //!   ([`crate::presence`]), session bindings ([`crate::session_bindings`]),
-//!   punchcard leases ([`crate::http::punchcards`] /
+//!   punchcard leases (`http/punchcards.rs` /
 //!   [`crate::agentgraph_kinds::PUNCHCARD_KIND`]), kanban work items
 //!   ([`crate::work`]) — plus the one thing none of them carry: the
 //!   session's *declared intent* ([`CoordIntent`], stored here).
