@@ -9,6 +9,7 @@ mod admin;
 mod append;
 mod cloud;
 mod console;
+mod coord;
 mod dataplane;
 mod dossier;
 mod engrams;
@@ -163,6 +164,11 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub mcp_enabled: bool,
     pub console_enabled: bool,
+    /// Multi-agent coordination plane (`/v1/coord/*`). Default OFF
+    /// (`CORECRUXD_COORD=1`); when off, coord routes return 404.
+    pub coord_enabled: bool,
+    /// Liveness horizon for the coord active view, in seconds.
+    pub coord_presence_ttl_secs: u64,
     pub integrations_enabled: bool,
     pub integrations_safe_mode: bool,
     pub integrations_allow_executable_helpers: bool,
@@ -539,6 +545,13 @@ pub fn router(state: AppState) -> Router {
         )
         // OpenAPI spec
         .route("/v1/openapi.json", get(self::openapi::openapi_json))
+        // Multi-agent coordination plane — presence-joined session board
+        // (flag-gated by `CORECRUXD_COORD`; 404 when off).
+        .route("/v1/coord/active", get(self::coord::get_coord_active))
+        .route(
+            "/v1/coord/announce",
+            axum::routing::post(self::coord::post_coord_announce),
+        )
         // Work coordination — kanban over `__work__::*` facts.
         .route("/v1/work", get(self::work::get_work))
         .route("/v1/work", axum::routing::post(self::work::post_work))

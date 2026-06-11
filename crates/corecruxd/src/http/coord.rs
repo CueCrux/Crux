@@ -1,0 +1,415 @@
+// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+// Licensed under the CueCrux Community Licence (CCL v1.0).
+// See LICENCE.md in the repository root.
+
+//! HTTP surface for the multi-agent coordination plane ([`crate::coord`]).
+//!
+//! - `GET /v1/coord/active` — merged "who is live, what are they doing"
+//!   board: presence ⋈ session bindings ⋈ declared intents ⋈ punchcard
+//!   leases + kanban work in flight.
+//! - `POST /v1/coord/announce` — declare (or clear, with `ttl_seconds: 0`)
+//!   this session's focus.
+//!
+//! All routes are gated by `CORECRUXD_COORD=1`; when the flag is off they
+//! return 404 so the surface is invisible rather than half-alive.
+
+use serde_json::Value;
+
+use super::{
+    problem_response, require_http_any_scope, require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Query,
+    State, StatusCode,
+};
+use crate::agentgraph_kinds::PUNCHCARD_KIND;
+use crate::coord::{CoordIntent, LeaseSummary};
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ActiveQuery {
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct AnnounceBody {
+    pub session_id: String,
+    pub project_id: String,
+    /// Announcing passport. Optional — resolved from the session binding
+    /// (authoritative) or the authenticated request passport when omitted.
+    #[serde(default, alias = "passport_id", alias = "author_passport")]
+    pub by_passport: Option<String>,
+    #[serde(default)]
+    pub execplan_slug: Option<String>,
+    #[serde(default)]
+    pub milestone: Option<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Intent lifetime. Defaults to [`crate::coord::DEFAULT_INTENT_TTL_SECS`];
+    /// `0` clears the current intent (expires immediately).
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn coord_disabled_response() -> axum::response::Response {
+    problem_response(
+        StatusCode::NOT_FOUND,
+        "coordination plane disabled (set CORECRUXD_COORD=1)".to_string(),
+    )
+}
+
+/// Live `held` punchcards from the substrate entity store, summarised for
+/// the active view. Read-only — the punchcard surface's own handlers sweep
+/// expired cards on acquire/list; here an expired card is simply filtered.
+async fn live_lease_summaries(state: &AppState, now_ms: i64) -> Vec<LeaseSummary> {
+    let store = state.entity_store.read().await;
+    let query = corecrux_memory::EntityQuery {
+        kind: Some(PUNCHCARD_KIND.to_string()),
+        limit: None,
+        include_deleted: false,
+    };
+    store
+        .list(&query)
+        .into_iter()
+        .filter_map(|rec| {
+            let p: &Value = &rec.payload;
+            if p.get("status").and_then(Value::as_str) != Some("held") {
+                return None;
+            }
+            let expires = p.get("expires_at_unix_ms").and_then(Value::as_i64).unwrap_or(i64::MAX);
+            if expires <= now_ms {
+                return None;
+            }
+            Some(LeaseSummary {
+                punchcard_id: rec.id.clone(),
+                resource: p
+                    .get("resource")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                mode: p.get("mode").and_then(Value::as_str).unwrap_or("modify").to_string(),
+                holder_passport: p
+                    .get("holder_passport")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                reason: p.get("reason").and_then(Value::as_str).map(str::to_string),
+                expires_at_unix_ms: expires,
+            })
+        })
+        .collect()
+}
+
+/// `GET /v1/coord/active?project_id=` — merged "who is live, what are they
+/// doing" view.
+pub(super) async fn get_coord_active(
+    State(state): State<AppState>,
+    Query(q): Query<ActiveQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !state.coord_enabled {
+        return coord_disabled_response();
+    }
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let now = now_unix_ms();
+    let store = state.fact_store.read().await;
+    let bindings = crate::session_bindings::list_bindings(&store);
+    let intents = crate::coord::list_intents(&store, q.project_id.as_deref());
+    let mut work_in_flight = crate::work::list_work(&store, q.project_id.as_deref(), Some("in_progress"), None, None);
+    work_in_flight.extend(crate::work::list_work(
+        &store,
+        q.project_id.as_deref(),
+        Some("blocked"),
+        None,
+        None,
+    ));
+    drop(store);
+
+    let leases = live_lease_summaries(&state, now as i64).await;
+
+    let presence_by_passport: std::collections::BTreeMap<String, u64> = state
+        .presence
+        .snapshot()
+        .await
+        .into_iter()
+        .map(|e| (e.passport_id, e.last_seen_at_unix_ms))
+        .collect();
+
+    let view = crate::coord::assemble_active(
+        &bindings,
+        &presence_by_passport,
+        &intents,
+        &leases,
+        work_in_flight,
+        q.project_id.as_deref(),
+        state.coord_presence_ttl_secs,
+        now,
+    );
+    (StatusCode::OK, Json(view)).into_response()
+}
+
+/// `POST /v1/coord/announce` — declare this session's focus. Re-announcing
+/// replaces; `ttl_seconds: 0` clears.
+pub(super) async fn post_coord_announce(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AnnounceBody>,
+) -> impl IntoResponse {
+    if !state.coord_enabled {
+        return coord_disabled_response();
+    }
+    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["facts:write", "admin:write"]) {
+        return problem.into_response();
+    }
+    if body.session_id.trim().is_empty() || body.project_id.trim().is_empty() {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "session_id and project_id must not be empty".to_string(),
+        );
+    }
+
+    let now = now_unix_ms();
+    let ttl_secs = body
+        .ttl_seconds
+        .unwrap_or(crate::coord::DEFAULT_INTENT_TTL_SECS)
+        .min(crate::coord::MAX_TTL_SECS);
+
+    let mut store = state.fact_store.write().await;
+    // Passport resolution order: session binding (authoritative) → explicit
+    // body passport → authenticated request passport. Never anonymous.
+    let passport_id = crate::session_bindings::get_binding(&store, body.session_id.trim())
+        .map(|b| b.passport_id)
+        .or_else(|| body.by_passport.clone().filter(|p| !p.trim().is_empty()))
+        .or_else(|| {
+            crate::auth::http_scope_context(&state.auth, &headers)
+                .ok()
+                .and_then(|ctx| ctx.passport_id)
+        });
+    let Some(passport_id) = passport_id else {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "no passport: pass by_passport, bind the session, or authenticate with a passport header".to_string(),
+        );
+    };
+
+    let intent = CoordIntent {
+        project_id: body.project_id.trim().to_string(),
+        session_id_hex: body.session_id.trim().to_string(),
+        passport_id,
+        execplan_slug: body.execplan_slug.filter(|s| !s.trim().is_empty()),
+        milestone: body.milestone.filter(|s| !s.trim().is_empty()),
+        paths: body.paths,
+        note: body.note.filter(|s| !s.trim().is_empty()),
+        announced_at_unix_ms: now,
+        expires_at_unix_ms: now.saturating_add(ttl_secs.saturating_mul(1000)),
+    };
+    if let Err(e) = crate::coord::write_intent(&mut store, &intent) {
+        return problem_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    drop(store);
+
+    let cleared = ttl_secs == 0;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "intent": intent, "cleared": cleared })),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::tests::test_app_state;
+    use axum::body::to_bytes;
+    use axum::extract::{Json as JsonExtract, Query as QueryExtract, State as StateExtract};
+    use axum::response::Response;
+    use serde_json::json;
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("read body");
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    }
+
+    fn announce_body(session: &str, project: &str) -> AnnounceBody {
+        AnnounceBody {
+            session_id: session.to_string(),
+            project_id: project.to_string(),
+            by_passport: Some("personal-default".to_string()),
+            execplan_slug: Some("plan-x".to_string()),
+            milestone: Some("M2".to_string()),
+            paths: vec!["crates/corecruxd/src/coord.rs".to_string()],
+            note: None,
+            ttl_seconds: None,
+        }
+    }
+
+    /// Bind a session + touch presence so the active view has a live row.
+    async fn seed_live_session(state: &AppState, session: &str, project: &str) {
+        {
+            let mut store = state.fact_store.write().await;
+            crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
+            let binding = crate::session_bindings::resolve(
+                &store,
+                crate::session_bindings::ResolveInput {
+                    session_id_hex: session,
+                    project_id: Some(project.to_string()),
+                    tenant_id: None,
+                    passport_id: None,
+                    now_unix_ms: now_unix_ms(),
+                },
+            )
+            .expect("resolve binding");
+            crate::session_bindings::write_binding(&mut store, &binding).expect("write binding");
+        }
+        state
+            .presence
+            .touch("personal-default", "POST", "/v1/coord/announce")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn coord_disabled_returns_404() {
+        let mut state = test_app_state(1);
+        state.coord_enabled = false;
+        let resp = get_coord_active(
+            StateExtract(state.clone()),
+            QueryExtract(ActiveQuery { project_id: None }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = post_coord_announce(
+            StateExtract(state),
+            HeaderMap::new(),
+            JsonExtract(announce_body("aaaa", "proj")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn announce_then_active_roundtrip_with_lease_join() {
+        let state = test_app_state(1);
+        seed_live_session(&state, "aaaa", "proj").await;
+
+        // Announce focus for the bound session.
+        let resp = post_coord_announce(
+            StateExtract(state.clone()),
+            HeaderMap::new(),
+            JsonExtract(announce_body("aaaa", "proj")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["intent"]["execplan_slug"], "plan-x");
+        assert_eq!(body["cleared"], false);
+        // Binding is authoritative for the passport even though by_passport
+        // was also supplied.
+        assert_eq!(body["intent"]["passport_id"], "personal-default");
+
+        // Seed one held punchcard for the same passport (direct entity-store
+        // write; the punchcard HTTP surface is env-gated and swept elsewhere).
+        {
+            let mut reg = state.kind_registry.write().await;
+            crate::agentgraph_kinds::bootstrap(&mut reg).expect("bootstrap kinds");
+        }
+        {
+            let reg = state.kind_registry.read().await;
+            let mut estore = state.entity_store.write().await;
+            let payload = json!({
+                "id": "pc_test1",
+                "resource": "tree://crates/corecruxd",
+                "mode": "modify",
+                "holder_passport": "personal-default",
+                "tenant_id": "default",
+                "status": "held",
+                "acquired_at_unix_ms": 0,
+                "expires_at_unix_ms": i64::MAX,
+            });
+            estore
+                .upsert(PUNCHCARD_KIND, "pc_test1", payload, "personal-default", Some(&reg))
+                .expect("seed punchcard");
+        }
+
+        let resp = get_coord_active(
+            StateExtract(state.clone()),
+            QueryExtract(ActiveQuery {
+                project_id: Some("proj".to_string()),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let view = body_json(resp).await;
+        let sessions = view["active_sessions"].as_array().expect("sessions array");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["session_id_hex"], "aaaa");
+        assert_eq!(sessions[0]["intent"]["execplan_slug"], "plan-x");
+        assert_eq!(sessions[0]["intent"]["milestone"], "M2");
+        let leases = sessions[0]["leases"].as_array().expect("leases array");
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0]["resource"], "tree://crates/corecruxd");
+
+        // Project scoping: another project sees no sessions.
+        let resp = get_coord_active(
+            StateExtract(state),
+            QueryExtract(ActiveQuery {
+                project_id: Some("other".to_string()),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        let view = body_json(resp).await;
+        assert_eq!(view["active_sessions"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[tokio::test]
+    async fn announce_zero_ttl_clears_intent() {
+        let state = test_app_state(1);
+        seed_live_session(&state, "bbbb", "proj").await;
+
+        let mut body = announce_body("bbbb", "proj");
+        body.ttl_seconds = Some(0);
+        let resp = post_coord_announce(StateExtract(state.clone()), HeaderMap::new(), JsonExtract(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["cleared"], true);
+
+        let resp = get_coord_active(
+            StateExtract(state),
+            QueryExtract(ActiveQuery {
+                project_id: Some("proj".to_string()),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        let view = body_json(resp).await;
+        let sessions = view["active_sessions"].as_array().expect("sessions array");
+        assert_eq!(sessions.len(), 1, "session still live (presence)");
+        assert!(sessions[0].get("intent").is_none(), "cleared intent hidden");
+    }
+
+    #[tokio::test]
+    async fn announce_without_binding_or_passport_is_rejected() {
+        let state = test_app_state(1);
+        let mut body = announce_body("unbound", "proj");
+        body.by_passport = None;
+        let resp = post_coord_announce(StateExtract(state), HeaderMap::new(), JsonExtract(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}

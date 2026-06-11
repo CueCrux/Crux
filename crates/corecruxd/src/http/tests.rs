@@ -304,6 +304,8 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
         data_dir: root.clone(),
         mcp_enabled: true,
         console_enabled: true,
+        coord_enabled: true,
+        coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
         integrations_enabled: true,
         integrations_safe_mode: false,
         integrations_allow_executable_helpers: false,
