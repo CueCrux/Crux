@@ -217,6 +217,16 @@ pub(super) async fn post_coord_announce(
     // collides with the moment it declares an execplan. Never blocking.
     let peer_intents = crate::coord::list_intents(&store, Some(&intent.project_id));
     drop(store);
+    // Announcing IS a liveness signal: touch presence for the resolved
+    // passport so the session shows on the board even when the caller's
+    // transport (MCP loopback, raw curl) doesn't carry the passport header
+    // the presence middleware keys on. Without this, deployed smoke showed
+    // bound+announced sessions filtered out of /v1/coord/active because the
+    // presence map had no row for their passport.
+    state
+        .presence
+        .touch(&intent.passport_id, "POST", "/v1/coord/announce")
+        .await;
     let leases = live_lease_summaries(&state, now as i64).await;
     let overlaps = crate::coord::find_overlaps(&intent, &peer_intents, &leases, now);
     let peers = peer_intents
@@ -415,6 +425,53 @@ mod tests {
         let sessions = view["active_sessions"].as_array().expect("sessions array");
         assert_eq!(sessions.len(), 1, "session still live (presence)");
         assert!(sessions[0].get("intent").is_none(), "cleared intent hidden");
+    }
+
+    #[tokio::test]
+    async fn announce_alone_marks_session_live() {
+        // Regression for the v0.4.3 deploy gap: bound + announced sessions
+        // were invisible on the board because nothing had touched presence
+        // for their passport (MCP traffic bypasses the presence middleware).
+        let state = test_app_state(1);
+        {
+            let mut store = state.fact_store.write().await;
+            crate::passports::seed_defaults_if_missing(&state.data_dir, &mut store, 1).expect("seed passports");
+            let binding = crate::session_bindings::resolve(
+                &store,
+                crate::session_bindings::ResolveInput {
+                    session_id_hex: "dddd",
+                    project_id: Some("proj".to_string()),
+                    tenant_id: None,
+                    passport_id: None,
+                    now_unix_ms: now_unix_ms(),
+                },
+            )
+            .expect("resolve binding");
+            crate::session_bindings::write_binding(&mut store, &binding).expect("write binding");
+        }
+        // Deliberately NO presence.touch here — announce must provide it.
+        let resp = post_coord_announce(
+            StateExtract(state.clone()),
+            HeaderMap::new(),
+            JsonExtract(announce_body("dddd", "proj")),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = get_coord_active(
+            StateExtract(state),
+            QueryExtract(ActiveQuery {
+                project_id: Some("proj".to_string()),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        let view = body_json(resp).await;
+        let sessions = view["active_sessions"].as_array().expect("sessions array");
+        assert_eq!(sessions.len(), 1, "announce alone must make the session live: {view}");
+        assert_eq!(sessions[0]["session_id_hex"], "dddd");
     }
 
     #[tokio::test]
