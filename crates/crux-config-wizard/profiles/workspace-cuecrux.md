@@ -1,7 +1,7 @@
 +++
 name = "workspace-cuecrux"
-version = 2
-description = "CueCrux workspace specifics: ExecPlan paths, daemon ports, Chainguard rule, JobClaw/MirrorClaw, three-place wiring. CueCrux-internal — only enable inside the CueCrux planning monorepo."
+version = 3
+description = "CueCrux workspace specifics: ExecPlan paths, daemon ports, live-session coordination protocol, Chainguard rule, JobClaw/MirrorClaw, three-place wiring. CueCrux-internal — only enable inside the CueCrux planning monorepo."
 targets = ["claude_md", "agents_md"]
 order = 90
 risk_class = "low"
@@ -39,6 +39,19 @@ On the first interaction of a session, read `PlanCrux/README.md` and `PlanCrux/b
 - State is derived from facts (`milestone:M<n>`, `gate:M<n>`) plus `Status:` / `Superseded by` lines in the markdown — see `Crux/crates/corecruxd/src/work_execplans.rs` `derive_state`.
 - The console SPA exposes a `Source: All | Kanban | ExecPlans` chip group; selection persists in `localStorage`.
 - Drift detector: `bash Crux/scripts/reconcile-execplan-sessions.sh` lists orphan sessions (registry entry, no `.md`) and unparseable plans. Prints, does not mutate.
+
+### Live-session coordination (multi-session, same tree)
+
+The daemon's coordination plane (`CORECRUXD_COORD=1`, live on host crux since v0.4.5) gives concurrent Claude sessions a shared board: who is live, what each is doing, and where they collide. Console view: [`/console#/coord`](https://crux.cuecrux.com/console#/coord). Liveness is automatic (session bind + announce touch presence); only the focus declaration is yours to make.
+
+Protocol when other sessions may be active on the same repo:
+
+1. **Boot**: read the boot banner's `— LIVE SESSIONS —` section (or call `coord_status`). It lists peers' focus, paths, leases, and ⚠ overlap rows.
+2. **Announce on every ExecPlan or milestone switch**: `coord_announce(session_id, project_id, execplan_slug, milestone, paths, note?)`. Re-announce replaces; `ttl_seconds: 0` clears on the way out. The response carries `overlaps[]` — surface any to the operator before proceeding.
+3. **Lease before multi-file mutation**: `punch_in` a `tree://<dir>` or `file://<path>` punchcard for paths you will modify. The PreToolUse hook checks leases on every Edit/Write.
+4. **Exit cleanly**: prefer `create_handoff` (bundles facts + work ids) over letting intents/leases time out; clear your intent with a zero-TTL announce when finishing.
+
+Semantics: everything is **advisory** — overlap warnings and intents never block; punchcards block only in `enforce` mode. A peer's intent or lease on your target path means coordinate (work-item comments, handoff), not stop. One write-agent per *claimed path-set* supersedes the older one-write-agent-per-tree rule when claims are in place.
 
 ### Container base images
 
