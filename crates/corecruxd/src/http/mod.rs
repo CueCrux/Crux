@@ -1240,6 +1240,25 @@ fn problem_response(status: StatusCode, detail: impl Into<String>) -> Response {
     problem_for_status(status, detail).into_response()
 }
 
+/// Upgrade-aware `501 Not Implemented` for capabilities that exist on the
+/// CueCrux platform but not in the free local daemon build.
+///
+/// Same status as the bare 501 it replaces — only the problem-details payload
+/// changes: structured extensions tell the caller the capability is real,
+/// where it lives, and what it requires. Honest signpost, no dark patterns.
+fn platform_upgrade_response(capability: &str) -> Response {
+    let pd = ProblemDetails::not_implemented(format!(
+        "`{capability}` is not available in the local daemon build. It is available via the CueCrux platform (metered)."
+    ))
+    .with_extensions(serde_json::json!({
+        "platform_available": true,
+        "capability": capability,
+        "docs": format!("https://crux.cuecrux.com/docs/platform/{capability}"),
+        "requires": "rcx_capability_token",
+    }));
+    ProblemResponse(pd).into_response()
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct TenantQuery {
     tenant_id: String,

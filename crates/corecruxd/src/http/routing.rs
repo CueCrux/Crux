@@ -5,8 +5,8 @@
 //! RCX routing + status routes — `/v1/route`, `/v1/routing/status`, `/v1/gpus`, `/v1/shards`.
 
 use super::{
-    format_u64_hex, problem_response, require_http_scopes, stream_hash_xxhash64, AppState, HeaderMap, IntoResponse,
-    Json, State, StatusCode,
+    format_u64_hex, platform_upgrade_response, problem_response, require_http_scopes, stream_hash_xxhash64, AppState,
+    HeaderMap, IntoResponse, Json, State, StatusCode,
 };
 
 #[derive(Debug, serde::Deserialize)]
@@ -240,7 +240,7 @@ pub(super) async fn get_gpus(State(state): State<AppState>, headers: HeaderMap) 
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
         return problem.into_response();
     }
-    problem_response(StatusCode::NOT_IMPLEMENTED, "requires the proprietary edition")
+    platform_upgrade_response("gpus")
 }
 
 #[derive(serde::Serialize)]
