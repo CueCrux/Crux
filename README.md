@@ -468,5 +468,6 @@ Crux Daemon is source-available under the
 - Offering Crux as a competing managed service is prohibited.
 - Three years after each versioned release, the code converts to Apache 2.0.
 - Curated content is covered separately by `LICENCE-CONTENT.md`.
+- Plain-English answers to the common questions: [`docs/LICENCE-FAQ.md`](docs/LICENCE-FAQ.md).
 
 Copyright (c) 2026 CueCrux Ltd. All rights reserved.
