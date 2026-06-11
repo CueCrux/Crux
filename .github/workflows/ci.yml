@@ -6,20 +6,8 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - ".agent/**"
-      - "LICENSE*"
-      - "LICENCE*"
   pull_request:
     branches: [main]
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - ".agent/**"
-      - "LICENSE*"
-      - "LICENCE*"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -30,9 +18,56 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # ── Change scope ─────────────────────────────────────────────────────
+  # Skip-but-report replacement for the old `paths-ignore` filters. With
+  # paths-ignore, a docs-only PR never triggered this workflow, so the
+  # REQUIRED checks (Lint / Test / MSRV / Coverage) stayed "expected"
+  # forever and the PR was unmergeable without an admin bypass (first hit:
+  # PR #167, a one-file .md fragment bump). Now the workflow always runs;
+  # this cheap job decides whether anything outside the docs set changed,
+  # and the heavy jobs skip when it didn't. GitHub treats skipped required
+  # checks as satisfied, so docs-only PRs merge cleanly while code PRs get
+  # the full gate.
+  changes:
+    name: Detect change scope
+    runs-on: [self-hosted, ci]
+    outputs:
+      code: ${{ steps.scope.outputs.code }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Classify changed files
+        id: scope
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+            git fetch --quiet origin "${{ github.base_ref }}"
+            files=$(git diff --name-only "$(git merge-base "$base" HEAD)"..HEAD)
+          else
+            before="${{ github.event.before }}"
+            if [ -z "$before" ] || ! git cat-file -e "$before" 2>/dev/null; then
+              before="HEAD~1"
+            fi
+            files=$(git diff --name-only "$before"..HEAD)
+          fi
+          echo "changed files:"; echo "$files" | sed 's/^/  /'
+          # Docs set mirrors the old paths-ignore: *.md anywhere, docs/,
+          # .agent/, LICENSE*/LICENCE*. Anything else (or an empty diff,
+          # the safe default) counts as code.
+          if [ -n "$files" ] && ! echo "$files" | grep -qEv '\.md$|^docs/|^\.agent/|^LICENSE|^LICENCE'; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "docs-only change set — heavy jobs will skip (and report skipped)"
+          else
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          fi
+
   # ── Lint ─────────────────────────────────────────────────────────────
   lint:
     name: Lint
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, ci]
     env:
       # Per-job CARGO_HOME isolates the cargo package-cache file lock so the
@@ -80,6 +115,8 @@ jobs:
   # ── Test, MSRV, Coverage: self-hosted ────────────────────────────────
   test:
     name: Test
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, ci]
     env:
       # See `lint` job above for the per-job CARGO_HOME rationale.
@@ -176,6 +213,8 @@ jobs:
 
   msrv:
     name: MSRV (1.88.0)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, ci]
     env:
       # See `lint` job above for the per-job CARGO_HOME rationale.
@@ -207,6 +246,8 @@ jobs:
 
   coverage:
     name: Coverage
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, ci]
     env:
       # See `lint` job above for the per-job CARGO_HOME rationale.
