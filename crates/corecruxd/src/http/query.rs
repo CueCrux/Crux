@@ -130,7 +130,7 @@ pub(super) async fn post_query_graph_expand(
     }
 
     if !state.http_dataplane.enabled() {
-        return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
+        return platform_upgrade_response("graph_expand");
     }
 
     if body.seed_artifact_ids.is_empty() {
@@ -256,7 +256,7 @@ pub(super) async fn post_query_time_range(
     }
 
     if !state.http_dataplane.enabled() {
-        return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
+        return platform_upgrade_response("time_range");
     }
 
     if body.start_micros >= body.end_micros {

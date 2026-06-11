@@ -42,7 +42,7 @@ pub(super) async fn post_admin_append(
     }
 
     if !state.http_dataplane.enabled() {
-        return problem_response(StatusCode::NOT_IMPLEMENTED, "dataplane disabled");
+        return platform_upgrade_response("admin_append");
     }
 
     if body.events.is_empty() {
