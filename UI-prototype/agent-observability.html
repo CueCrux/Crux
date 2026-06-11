@@ -150,8 +150,8 @@
   .gnode[data-kind="file"] .gtitle, .gnode[data-kind="file-group"] .gtitle,
   .gnode[data-kind="hook"] .gtitle, .gnode[data-kind="hook-group"] .gtitle { font-family:var(--font-mono); font-size:10.5px; font-weight:600; }
   .gnode[data-kind="reasoning"] .gtitle, .gnode[data-kind="reasoning-group"] .gtitle { font-style:italic; }
-  .gnode[data-kind="read"] .gtitle, .gnode[data-kind="query"] .gtitle, .gnode[data-kind="receipt"] .gtitle { font-family:var(--font-mono); font-size:10.5px; font-weight:600; }
-  .gnode[data-kind="step"] .gkind, .gnode[data-kind="audit-group"] .gkind, .gnode[data-kind="receipt"] .gkind { color:var(--accent); }
+  .gnode[data-kind="read"] .gtitle, .gnode[data-kind="query"] .gtitle, .gnode[data-kind="receipt"] .gtitle, .gnode[data-kind="signature"] .gtitle { font-family:var(--font-mono); font-size:10.5px; font-weight:600; }
+  .gnode[data-kind="step"] .gkind, .gnode[data-kind="audit-group"] .gkind, .gnode[data-kind="receipt"] .gkind, .gnode[data-kind="verification"] .gkind, .gnode[data-kind="signature"] .gkind { color:var(--accent); }
   .gnode[data-kind="orchestrator"] .gstripe { background:var(--accent); }
   .gnode[data-kind="orchestrator"] .gkind { color:var(--accent); }
   .gnode[data-kind="punchcard"] .gtitle, .gnode[data-kind="deny"] .gtitle { font-family:var(--font-mono); font-size:10.5px; font-weight:600; }
@@ -196,15 +196,21 @@
   body.building #buildDock { display:flex; }
   #buildDock > * { pointer-events:auto; }
   /* the form card (title · name · passport · search · count/Done) */
-  #buildCard { display:flex; flex-direction:column; gap:8px; width:624px; max-width:100%;
+  #buildCard, #verifyCard { display:flex; flex-direction:column; gap:8px; width:624px; max-width:100%;
                background:var(--surface-glass-strong); backdrop-filter:blur(var(--blur-md)); border:1px solid var(--accent); border-radius:var(--radius-xl); box-shadow:var(--shadow-lg); padding:12px 14px; }
   .bc-head { display:flex; align-items:center; justify-content:space-between; }
   .bc-title { font-size:13px; font-weight:680; color:var(--text-primary); }
   .bc-close { border:none; background:none; color:var(--text-muted); font-size:20px; line-height:1; cursor:pointer; }
   .bc-close:hover { color:var(--err); }
   .bc-row { display:flex; gap:8px; }
-  #buildCard input, #buildCard select { background:var(--surface-glass); border:1px solid var(--border-default); border-radius:8px; padding:6px 9px; color:var(--text-primary); font:inherit; font-size:12px; }
-  #buildCard .bc-row input { flex:1; min-width:0; }
+  #buildCard input, #buildCard select, #verifyCard input { background:var(--surface-glass); border:1px solid var(--border-default); border-radius:8px; padding:6px 9px; color:var(--text-primary); font:inherit; font-size:12px; }
+  #buildCard .bc-row input, #verifyCard .bc-row input { flex:1; min-width:0; }
+  /* receipt verify dock (pinned top-right like the build dock): paste id → watch /verification + /signature resolve */
+  #verifyDock { display:none; position:absolute; top:12px; right:12px; z-index:7; flex-direction:column; align-items:flex-end; max-width:calc(100% - 24px); }
+  body.verifying #verifyDock { display:flex; }
+  #verifyCard { width:520px; }
+  #verifyCard input { font-family:var(--font-mono); }
+  #vcStatus { font-size:11px; color:var(--text-secondary); min-height:14px; max-width:380px; word-break:break-word; }
   .bc-search { width:100%; box-sizing:border-box; }
   .bc-foot { display:flex; align-items:center; justify-content:space-between; }
   #bcCount { font-size:11px; color:var(--text-secondary); }
@@ -304,6 +310,7 @@
     <div class="crumbs" id="breadcrumb"></div>
     <button class="focus-exit" id="focusExit" style="display:none">↑ exit focus</button>
     <button class="insp-toggle" id="orcNew" title="Create an orchestrator (group ExecPlans for a session)" style="display:none">＋ Orchestrator</button>
+    <button class="insp-toggle" id="rcptVerify" title="Verify a CROWN receipt (GET /v1/receipts/{id}/verification + /signature)" style="display:none">✓ Verify receipt</button>
     <button class="active-toggle" id="activeToggle" title="Show only running sessions"><span class="led"></span> Active sessions only</button>
     <div class="work-filter" id="workFilter" style="display:none">
       <span class="wf-label">Stage</span>
@@ -354,6 +361,17 @@
           </div>
         </div>
       </div>
+      <!-- floating receipt-verify dock pinned top-right: paste a CROWN receipt id → fetch /verification + /signature → PASS/FAIL node fans onto the canvas -->
+      <div id="verifyDock">
+        <div id="verifyCard">
+          <div class="bc-head"><span class="bc-title">Verify a CROWN receipt</span><button class="bc-close" id="vcClose" title="Close">×</button></div>
+          <div class="bc-row">
+            <input id="vcId" type="text" placeholder="Receipt id (crn_…)" autocomplete="off" aria-label="Receipt id" />
+            <input id="vcTenant" type="text" placeholder="tenant_id" autocomplete="off" aria-label="Tenant id" style="flex:0 0 132px" />
+          </div>
+          <div class="bc-foot"><span id="vcStatus" aria-live="polite">GET /verification + /signature · needs receipts:read</span><button class="bc-done" id="vcGo">Verify</button></div>
+        </div>
+      </div>
     </div>
     <div class="aside-resize" id="asideResize" title="Drag to resize · double-click to hide"></div>
     <aside id="inspector">
@@ -382,7 +400,7 @@
 <script>
 /* ════════════ DUMMY GRAPH — flat node registry with id links (daemon-styled) ════════════ */
 const SCOPES = [
-  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-settings','cx-raw'] },
+  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-receipts','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-settings','cx-raw'] },
   { id:'dx', label:'DX', tag:'Docs',         sections:['dx-articles','dx-readme','dx-sites'] },
   { id:'gx', label:'GX', tag:'Global',       sections:['gx-engrams','gx-bench','gx-sites','gx-factstore'] },
   { id:'ax', label:'AX', tag:'Agent',        sections:['ax-overview','ax-activity','ax-memory','ax-bulk','ax-snapshots','ax-tools','ax-handoff','ax-graph','ax-storybook','ax-dossiers','ax-story'] }
@@ -395,6 +413,22 @@ const N = {
   'cx-work':{kind:'panel',label:'Work',sub:'kanban · /v1/work',children:['ep-agentux','ep-chaincrux','ep-trait','ep-cruxengine','ep-gemma','ep-plancrux','ep-verbatim']},
   'cx-sessions':{kind:'panel',label:'Sessions',sub:'active · execplan-scoped',fields:[['active','3'],['passport','ce:4e6c4e2a:local']],children:['sess-agentux','sess-chaincrux','sess-trait']},
   'cx-passport':{kind:'panel',label:'Passport',sub:'identities',children:['pp-main','pp-sonnet','pp-ops']},
+
+  /* ── Receipts (CROWN proof verifier) — kind=receipt/verification/signature · /v1/receipts/{id} ── */
+  'cx-receipts':{kind:'panel',label:'Receipts',sub:'CROWN · verify Ed25519 proofs',
+    fields:[['endpoint','/v1/receipts/{id} · /signature · /verification'],['scope','receipts:read'],['enumerate','no list endpoint — lookup by id (browser-local recent list)'],['verify','✓ Verify receipt (toolbar)']],
+    children:['rcv-demo'],
+    doc:'RECEIPTS · CROWN proof verifier\n\nEvery daemon mutation seals an Ed25519-signed\nCROWN receipt into an append-only stream. This\npanel replays the proof chain for any receipt id:\n\n  GET /v1/receipts/{id}              body + hashes\n  GET /v1/receipts/{id}/signature    sig event\n  GET /v1/receipts/{id}/verification PASS / FAIL\n\nThe daemon has no receipt enumeration endpoint, so\nthe list below is this browser’s lookup history.\nUse ✓ Verify receipt (toolbar) or deep-link\n/console#/receipts/{id} to watch a receipt verify.'},
+  'rcv-demo':{kind:'receipt',label:'CROWN crn_8f21…',sub:'default · demo · drill →',status:'ok',
+    fields:[['receipt_id','crn_8f21…'],['tenant','default'],['seq','1'],['occurred','13:05Z'],['payload_hash','9f2c41d8…']],
+    children:['rcv-demo-ver','rcv-demo-sig'],
+    doc:'CROWN RECEIPT crn_8f21… (demo)\ntenant default · seq 1 · occurred 13:05Z\n\nThe receipt body is an event in the receipt stream;\nits canonical bytes are hashed and signed. Anyone\nwith receipts:read can replay the three calls and\ncheck the chain offline.\n\nDrill right: the verification verdict (PASS/FAIL +\nkey id) and the detached signature event.'},
+  'rcv-demo-ver':{kind:'verification',label:'PASS · Ed25519 signature valid',sub:'kid daemon-root · payload hash matches',status:'ok',
+    fields:[['signature_valid','true'],['alg','Ed25519'],['kid','daemon-root'],['payload_hash_ok','true'],['error_code','OK'],['verified_at','13:05:02Z'],['verifier','corecruxd']],
+    doc:'VERIFICATION REPORT (demo)\nGET /v1/receipts/crn_8f21…/verification\n\nsignature_valid  true (Ed25519)\nkid              daemon-root\npayload_hash     matches stored body\nerror_code       OK\n\nFAIL cases carry an error_code (BODY_HASH_MISMATCH,\nSIG_MISSING, SIG_PARSE_ERROR, …) and flip this node\nred.'},
+  'rcv-demo-sig':{kind:'signature',label:'Signature event',sub:'seq 2 · application/cbor',status:'ok',
+    fields:[['seq','2'],['occurred','13:05:01Z'],['ingested','13:05:01Z'],['content_type','application/cbor'],['payload_hash','41c09be2…']],
+    doc:'SIGNATURE EVENT (demo)\nGET /v1/receipts/crn_8f21…/signature\n\nThe detached Ed25519 signature over the canonical\nreceipt-body bytes, stored as its own event in the\nsame receipt stream (body seq 1, sig seq 2).'},
   'cx-integrations':{kind:'panel',label:'Integrations',sub:'packs & sources',fields:[['connected','3'],['packs','5']]},
   'cx-extensions':{kind:'panel',label:'Extensions',sub:'installed',fields:[['count','2']]},
   'cx-facts':{kind:'panel',label:'Facts',sub:'1,911 total',children:['fg-execplan','fg-bench','fg-incident','fg-design','fg-work']},
@@ -785,7 +819,8 @@ async function ensureLoaded(node){
   loadState[node.id]='loading';
   const t=setTimeout(()=>{ mergeChildren(node,[makeStatusNode(node.id+'::loading','loading','Loading '+(m.noun||'data')+'…')]); refreshOpenColumns(node); render(); }, 120);
   try{
-    const json=await api(typeof m.endpoint==='function'? m.endpoint(node) : m.endpoint);
+    // loaders normally name one endpoint; m.fetch is the multi-call seam (e.g. receipts = /verification + /signature)
+    const json=await (m.fetch? m.fetch(node) : api(typeof m.endpoint==='function'? m.endpoint(node) : m.endpoint));
     clearTimeout(t);
     const kids=(m.transform(json, node)||[]).filter(Boolean);
     mergeChildren(node, kids.length? kids : [makeStatusNode(node.id+'::empty','empty','No '+(m.noun||'items'))]);
@@ -922,6 +957,58 @@ function txAudit(json){   // M9 — session audit chain → step nodes
     children:[], doc:'AUDIT STEP '+(s.seq!=null?s.seq:'')+'\n'+(s.label||'')+'\nactor '+(s.actor||'')+' · status '+(s.status||'')+(s.inputs?('\ninputs: '+JSON.stringify(s.inputs)):'')+(s.outputs?('\noutputs: '+JSON.stringify(s.outputs)):''),
     payload: JSON.stringify(s,null,2) }));
 }
+/* ── receipts (CROWN verify): /v1/receipts/{id} + /signature + /verification (receipts:read, tenant-scoped) ── */
+function receiptTenant(){ try{ return localStorage.getItem('crux-console-receipt-tenant')||'default'; }catch{ return 'default'; } }
+function rcptUrl(rid, part, tenant){ return '/v1/receipts/'+encodeURIComponent(rid)+(part?'/'+part:'')+'?tenant_id='+encodeURIComponent(tenant||receiptTenant()); }
+function rcptShort(h){ h=String(h||''); return h.length>18? h.slice(0,18)+'…' : h; }
+function recentReceiptLookups(){ try{ return JSON.parse(localStorage.getItem('crux-console-receipt-recent')||'[]'); }catch{ return []; } }
+function rememberReceiptLookup(rid, tenant, ok){
+  const list=recentReceiptLookups().filter(r=>!(r.rid===rid && r.tenant===tenant));
+  list.unshift({ rid, tenant, ok:!!ok, at:new Date().toISOString().slice(0,16)+'Z' });
+  try{ localStorage.setItem('crux-console-receipt-recent', JSON.stringify(list.slice(0,20))); }catch{}
+}
+function rcptNode(rid, tenant, body){   // body = GET /v1/receipts/{id} response (nullable — verification can pass without the JSON body view)
+  const f=[['receipt_id',rid],['tenant',tenant]];
+  if(body){ f.push(['seq',body.seq],['occurred',body.occurredAt],['ingested',body.ingestedAt],['payload_hash',rcptShort(body.payloadHash)],['content_type',body.contentType]); }
+  return { id: idFor('rcpt', rid), kind:'receipt', __rid:rid, __rtenant:tenant,
+    label:'CROWN '+rid, sub:(tenant||'default')+' · drill → verification', status:'ok',
+    fields: f.filter(([,v])=>v!=null && v!==''), children:[],
+    doc:'CROWN RECEIPT '+rid+'\ntenant '+(tenant||'default')+'\n\nDrill right for the verification verdict (PASS/FAIL\n+ key id) and the detached Ed25519 signature event.',
+    payload: body? JSON.stringify(body,null,2) : undefined };
+}
+function txReceiptRecent(json){   // no daemon enumeration endpoint — this browser's lookup history (localStorage)
+  return (json.recent||[]).map(r=>({ id: idFor('rcpt', r.rid), kind:'receipt', __rid:r.rid, __rtenant:r.tenant,
+    label:'CROWN '+r.rid, sub:[(r.tenant||'default'), (r.ok?'PASS ✓':'FAIL ✗'), r.at].filter(Boolean).join(' · '),
+    status: r.ok?'ok':'err',
+    fields:[['receipt_id',r.rid],['tenant',r.tenant],['last_checked',r.at],['last_result',r.ok?'PASS':'FAIL']].filter(([,v])=>v!=null&&v!==''),
+    children:[],
+    doc:'CROWN RECEIPT '+r.rid+'\ntenant '+(r.tenant||'default')+'\n\nBrowser-local lookup history entry (the daemon has\nno receipt enumeration endpoint). Drill to re-fetch\n/verification + /signature live.' }));
+}
+function txReceiptVerify(json, node){   // {ver: VerificationReportV1, sig: signature event | {_error}} → PASS/FAIL + signature nodes
+  const rid=(node&&node.__rid)||'', ver=json.ver||{}, sig=json.sig||{};
+  const sigInfo=ver.signature||{}, integ=ver.integrity||{};
+  const pass=ver.signature_valid===true;
+  const kids=[{ id: idFor('rcptver', rid), kind:'verification',
+    label: pass? 'PASS · Ed25519 signature valid' : 'FAIL · '+(ver.error_code||'verification failed'),
+    sub:[sigInfo.key_id?('kid '+sigInfo.key_id):null, integ.payload_hash_matches!=null?('payload hash '+(integ.payload_hash_matches?'matches':'MISMATCH')):null].filter(Boolean).join(' · '),
+    status: pass?'ok':'err',
+    fields:[['signature_valid',String(ver.signature_valid)],['alg',sigInfo.alg],['kid',sigInfo.key_id],['pubkey',rcptShort(ver.pubkey_fingerprint)],
+            ['payload_hash_ok',integ.payload_hash_matches!=null?String(integ.payload_hash_matches):null],['error_code',ver.error_code],
+            ['verified_at',ver.verified_at],['verifier',ver.verifier_build]].filter(([,v])=>v!=null&&v!==''),
+    children:[], payload: JSON.stringify(ver,null,2) }];
+  if(sig._error){
+    kids.push({ id: idFor('rcptsig', rid), kind:'signature', label:'Signature unavailable',
+      sub:'GET /signature failed ('+((sig._error&&sig._error.status)||'network')+')', status:'err',
+      fields:[['status',String((sig._error&&sig._error.status)||'network')]], children:[],
+      payload: JSON.stringify((sig._error&&sig._error.data)||{},null,2) });
+  } else {
+    kids.push({ id: idFor('rcptsig', rid), kind:'signature', label:'Signature event',
+      sub:['seq '+sig.seq, sig.contentType].filter(v=>v!=null&&v!=='').join(' · '), status:'ok',
+      fields:[['seq',sig.seq],['occurred',sig.occurredAt],['ingested',sig.ingestedAt],['payload_hash',rcptShort(sig.payloadHash)],['content_type',sig.contentType]].filter(([,v])=>v!=null&&v!==''),
+      children:[], payload: JSON.stringify(sig,null,2) });
+  }
+  return kids;
+}
 function registerLoaders(){
   LOADERS['cx-overview']      = { endpoint:'/v1/console/summary',     noun:'tiles',         transform: txOverview };       // M2
   LOADERS['cx-work']          = { endpoint:'/v1/work?source=all',     noun:'work items',    transform: txWork };           // M3
@@ -932,14 +1019,22 @@ function registerLoaders(){
   LOADERS['cx-memory']        = { endpoint:'/v1/console/facts?top_k=20',  noun:'memories',  transform: txMemory };         // M7
   LOADERS['cx-tenants']       = { endpoint:'/v1/console/tenants',     noun:'tenants',       transform: txTenants };        // M8
   LOADERS['cx-passport']      = { endpoint:'/v1/passports',           noun:'passports',     transform: txPassports };      // M8
-  // drill-down loaders (prefix match): orchestrator members + session audit chain
+  // receipts: no daemon list endpoint — the panel projects this browser's lookup history (no network)
+  LOADERS['cx-receipts']      = { fetch: async()=>({ recent: recentReceiptLookups() }), noun:'verified receipts yet — use ✓ Verify receipt (toolbar)', transform: txReceiptRecent };
+  // drill-down loaders (prefix match): orchestrator members + session audit chain + receipt verify
   LOADERS['__orc_members'] = { match:n=> n.kind==='orchestrator' && n.__orcId, endpoint:n=>'/v1/orchestrators/'+n.__orcId+'/work', noun:'members', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txOrcMembers };  // M5 drill
   LOADERS['__sess_audit']  = { match:n=> n.kind==='session' && n.__sessId, endpoint:n=>'/v1/observe/sessions/'+n.__sessId+'/audit', noun:'audit steps', flagHint:'Observe disabled — set CORECRUXD_OBSERVE=1', transform: txAudit };  // M9 drill
+  LOADERS['__receipt_verify'] = { match:n=> n.kind==='receipt' && n.__rid, noun:'verification', flagHint:'Dataplane disabled — receipt streams unavailable (501)',
+    fetch: async n=>{ const t=n.__rtenant||receiptTenant();
+      const ver=await api(rcptUrl(n.__rid,'verification',t));                         // throws → standard 401/404/501 handling
+      const sig=await api(rcptUrl(n.__rid,'signature',t)).catch(e=>({_error:e}));     // soft-fail: verdict still renders
+      return { ver, sig }; },
+    transform: txReceiptVerify };
 }
 async function bootProbe(){
   Object.values(N).forEach(n=>{ if(Array.isArray(n.children)) DUMMY_CHILDREN[n.id]=n.children.slice(); });   // snapshot dummy for degrade
   const el=document.getElementById('scopeHeader');
-  if(el && !(el.value||'').trim()){ try{ el.value=localStorage.getItem('crux-console-scopes')||'admin:read,facts:read,console:read'; }catch{ el.value='admin:read,facts:read,console:read'; } }
+  if(el && !(el.value||'').trim()){ try{ el.value=localStorage.getItem('crux-console-scopes')||'admin:read,facts:read,console:read,receipts:read'; }catch{ el.value='admin:read,facts:read,console:read,receipts:read'; } }
   try{ const r=await fetch('/readyz',{cache:'no-store'}); LIVE=!!(r&&r.ok); }catch{ LIVE=false; }
   registerLoaders(); updateLiveBadge();
   if(LIVE) prefetchScope(activeScope);
@@ -1025,6 +1120,18 @@ function inspect(node){
     eb.title='Open this orchestrator in the builder to rename, reassign, add or remove members';
     eb.onclick=()=>editOrc(node.id);
     acts.appendChild(eb);
+  }
+  if(node.id==='cx-receipts'){
+    const vb=document.createElement('button'); vb.textContent='✓ Verify a receipt…';
+    vb.title='Fetch /verification + /signature for a receipt id and watch it verify';
+    vb.onclick=()=>openVerify();
+    acts.appendChild(vb);
+  }
+  if(node.kind==='receipt' && node.__rid){
+    const vb=document.createElement('button'); vb.textContent='✓ Re-verify receipt';
+    vb.title='Open the verifier prefilled with this receipt id';
+    vb.onclick=()=>openVerify(node.__rid);
+    acts.appendChild(vb);
   }
 }
 
@@ -1179,6 +1286,10 @@ function render(){
   document.getElementById('orcNew').style.display =
     (!searchActive && !focusMode && (buildingId || selectedId==='cx-orchestrators'
       || columns.some(c=>c.parentId==='cx-orchestrators'))) ? '' : 'none';
+  // ✓ Verify receipt only visible while on the Receipts panel (same rule as orcNew)
+  document.getElementById('rcptVerify').style.display =
+    (!searchActive && !focusMode && (selectedId==='cx-receipts'
+      || columns.some(c=>c.parentId==='cx-receipts'))) ? '' : 'none';
   // item 3: stage filter only visible while on the Work panel
   document.getElementById('workFilter').style.display =
     (!searchActive && !focusMode && (selectedId==='cx-work' || columns.some(c=>c.parentId==='cx-work'))) ? 'inline-flex' : 'none';
@@ -1431,8 +1542,73 @@ $('bcSearch').addEventListener('input', renderBuildCard);
 $('bcDone').addEventListener('click', finishBuild);
 $('bcClose').addEventListener('click', cancelBuild);
 
+/* ── receipt verifier: floating top-right dock (#verifyCard) — paste an id, watch /verification + /signature resolve ── */
+function openVerify(prefill){
+  if(buildingId) teardownBuild();   // the two docks share the top-right corner — never stack them
+  document.body.classList.add('verifying');
+  $('vcTenant').value=receiptTenant();
+  if(prefill) $('vcId').value=prefill;
+  $('vcStatus').textContent='GET /verification + /signature · needs receipts:read';
+  $('vcId').focus();
+}
+function closeVerify(){ document.body.classList.remove('verifying'); }
+async function runVerifyLookup(){
+  const rid=($('vcId').value||'').trim(), tenant=(($('vcTenant').value||'').trim())||'default';
+  const out=$('vcStatus');
+  if(!rid){ out.textContent='Receipt id required.'; return; }
+  try{ localStorage.setItem('crux-console-receipt-tenant', tenant); }catch{}
+  if(!LIVE){ out.textContent='Demo mode — connect to a daemon to verify real receipts.'; announce('Demo mode — receipt verification needs a live daemon'); return; }
+  out.textContent='Verifying '+rid+' …';
+  let body=null, ver, sig;
+  try{
+    [body, ver, sig]=await Promise.all([
+      api(rcptUrl(rid,'',tenant)).catch(()=>null),                 // body view is optional
+      api(rcptUrl(rid,'verification',tenant)),                     // the verdict — hard-fail
+      api(rcptUrl(rid,'signature',tenant)).catch(e=>({_error:e})), // soft-fail
+    ]);
+  }catch(e){
+    const st=(e&&e.status)||'network';
+    out.textContent= st===404? 'Not found — no receipt stream '+rid+' in tenant '+tenant+'.'
+      : st===501? 'Dataplane disabled on this daemon (501) — receipt streams unavailable.'
+      : (st===401||st===403)? 'Not authorised ('+st+') — the console scope header needs receipts:read.'
+      : 'Verification fetch failed ('+st+').';
+    announce('Receipt verification failed: '+st);
+    return;
+  }
+  const pass=ver.signature_valid===true;
+  rememberReceiptLookup(rid, tenant, pass);
+  loadState['cx-receipts']='idle';
+  await ensureLoaded(N['cx-receipts']);          // refresh the recent list first…
+  const rnode=rcptNode(rid, tenant, body);       // …then overlay the detailed node + verdict children
+  N[rnode.id]=rnode;
+  if(!(N['cx-receipts'].children||[]).includes(rnode.id)) N['cx-receipts'].children=[rnode.id].concat(N['cx-receipts'].children||[]);
+  mergeChildren(rnode, txReceiptVerify({ ver, sig }, rnode));
+  loadState[rnode.id]='done';
+  const kid=(ver.signature&&ver.signature.key_id)?(' · kid '+ver.signature.key_id):'';
+  out.textContent= pass? ('✓ PASS — Ed25519 signature valid'+kid+(ver.verified_at?(' · '+ver.verified_at):''))
+                       : ('✗ FAIL — '+(ver.error_code||'verification failed'));
+  announce('Receipt '+rid+': '+(pass?'PASS':'FAIL'));
+  if(searchActive) exitSearch();
+  activeScope='cx'; focusNode(rnode);            // the demo moment: receipt hero + PASS/FAIL verdict fanned right
+}
+$('rcptVerify').addEventListener('click', ()=>openVerify());
+$('vcGo').addEventListener('click', runVerifyLookup);
+$('vcClose').addEventListener('click', closeVerify);
+$('vcId').addEventListener('keydown', e=>{ if(e.key==='Enter') runVerifyLookup(); });
+$('vcTenant').addEventListener('keydown', e=>{ if(e.key==='Enter') runVerifyLookup(); });
+/* boot-time deep link: #/receipts opens the panel · #/receipts/<id> also opens the verifier (and auto-verifies when live) */
+async function receiptsDeepLink(){
+  let h=''; try{ h=(typeof location!=='undefined' && location.hash)||''; }catch{ h=''; }
+  const m=h.match(/^#\/receipts(?:\/([^/?#]+))?$/);
+  if(!m) return;
+  openScope('cx');
+  const p=N['cx-receipts'];
+  if(p){ await ensureLoaded(p); expand(p, 0); }
+  if(m[1]){ openVerify(decodeURIComponent(m[1])); if(LIVE) await runVerifyLookup(); }
+}
+
 openScope('cx');   // immediate render with dummy data
-bootProbe();        // probe /readyz; if live, lazy-replace panels with real /v1 data
+bootProbe().then(receiptsDeepLink);        // probe /readyz; if live, lazy-replace panels with real /v1 data; then honour a #/receipts deep link
 </script>
 </body>
 </html>

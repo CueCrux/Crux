@@ -22,7 +22,7 @@ const code = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(x => x[1]).
 try { new Function(code); } catch (e) { console.error('FAIL parse:', e.message); process.exit(1); }
 
 // ── DOM stub ──
-function buildSandbox(fetchImpl) {
+function buildSandbox(fetchImpl, hash) {
   const ALL = [], REG = new Map();
   function makeEl(t, ns) {
     const C = new Set();
@@ -57,7 +57,7 @@ function buildSandbox(fetchImpl) {
   function DataTransfer() { const d = {}; return { effectAllowed: '', dropEffect: '', setData: (k, v) => d[k] = v, getData: k => d[k] || '' }; }
   [...html.matchAll(/\bid="([^"]+)"/g)].forEach(x => getById(x[1]));
   ['planned', 'in_progress', 'blocked', 'done'].forEach(st => { const c = makeEl('button'); c.className = 'wf-chip on'; c.dataset.stage = st; getById('workFilter').appendChild(c); });
-  const s = { document, window, localStorage, console, DataTransfer, fetch: fetchImpl, setTimeout, clearTimeout, queueMicrotask, brandFallback: () => {} };
+  const s = { document, window, localStorage, console, DataTransfer, fetch: fetchImpl, setTimeout, clearTimeout, queueMicrotask, brandFallback: () => {}, location: { hash: hash || '' } };
   s.globalThis = s; s.requestAnimationFrame = fn => fn();
   vm.createContext(s);
   vm.runInContext(code, s, { filename: 'console.js' });
@@ -211,6 +211,63 @@ function makeFetch() {
   ok(!!postCreate, 'M5 write: Done POSTs /v1/orchestrators (create)');
   ok(postCreate && JSON.parse(postCreate.opts.body).name === 'New Sprint', 'M5 write: create body carries the name');
   ok(f3.calls.some(c => /\/orchestrators\/orc_new\/members/.test(c.url) && c.opts && c.opts.method === 'POST'), 'M5 write: member POSTed to the new orchestrator');
+
+  // ── H) receipts: lookup → /verification + /signature → PASS/FAIL verdict (the verify-panel demo moment) ──
+  const PASS_REPORT = { schema: 'cuecrux.receipt.verification.v1', receipt_id: 'crn_x', tenant_id: 'default', payload_hash: 'aa11', signature: { alg: 'Ed25519', key_id: 'daemon-root' },
+    integrity: { payload_hash_matches: true, canonical_bytes_parse_ok: true }, signature_valid: true, pubkey_fingerprint: 'fp:12345678', error_code: 'OK', verified_at: '2026-06-11T10:00:00Z', verifier_build: 'corecruxd 0.4.2' };
+  const SIG_EVENT = { tenant_id: 'default', receipt_id: 'crn_x', seq: 2, occurredAt: '2026-06-11T09:59:58Z', ingestedAt: '2026-06-11T09:59:59Z', contentType: 'application/cbor', payloadBase64: 'QUFBQQ==', payloadHash: 'bb22' };
+  const BODY_EVENT = { tenant_id: 'default', receipt_id: 'crn_x', seq: 1, occurredAt: '2026-06-11T09:59:57Z', ingestedAt: '2026-06-11T09:59:58Z', contentType: 'application/cbor', payloadBase64: 'QkJCQg==', payloadHash: 'aa11' };
+  const f4 = makeFetch();
+  f4.route(u => /\/v1\/receipts\/crn_x\/verification\?tenant_id=default/.test(u), { ok: true, status: 200, body: PASS_REPORT });
+  f4.route(u => /\/v1\/receipts\/crn_x\/signature\?tenant_id=default/.test(u), { ok: true, status: 200, body: SIG_EVENT });
+  f4.route(u => /\/v1\/receipts\/crn_x\?tenant_id=default/.test(u), { ok: true, status: 200, body: BODY_EVENT });
+  f4.route(u => /\/v1\/receipts\/crn_bad\/verification/.test(u), { ok: true, status: 200, body: Object.assign({}, PASS_REPORT, { receipt_id: 'crn_bad', signature_valid: false, error_code: 'BODY_HASH_MISMATCH', integrity: { payload_hash_matches: false, canonical_bytes_parse_ok: true } }) });
+  f4.route(u => /\/v1\/receipts\/crn_bad\/signature/.test(u), { ok: true, status: 200, body: Object.assign({}, SIG_EVENT, { receipt_id: 'crn_bad' }) });
+  f4.route(u => /\/v1\/receipts\/crn_bad\?/.test(u), { ok: true, status: 200, body: Object.assign({}, BODY_EVENT, { receipt_id: 'crn_bad' }) });
+  f4.route(u => /\/v1\/receipts\/crn_missing/.test(u), { ok: false, status: 404, body: { error: 'receipt body not found' } });
+  // deep link: #/receipts/crn_x auto-opens the verifier and verifies once live
+  const env4 = buildSandbox(f4, '#/receipts/crn_x'); await flush(14);
+  ok(env4.s.__cx.LIVE === true, 'receipts: deep-link env is live');
+  const verCall = f4.calls.find(c => /\/v1\/receipts\/crn_x\/verification\?tenant_id=default/.test(c.url));
+  ok(!!verCall, 'receipts: deep link #/receipts/crn_x fetched /verification?tenant_id=default');
+  ok(verCall && verCall.opts.headers && /receipts:read/.test(verCall.opts.headers['X-Corecrux-Scopes'] || ''), 'receipts: scope header carries receipts:read by default');
+  ok(f4.calls.some(c => /\/v1\/receipts\/crn_x\/signature\?tenant_id=default/.test(c.url)), 'receipts: /signature fetched alongside /verification');
+  const rNode = env4.s.__cx.N['rcpt:crn_x'];
+  ok(!!rNode && rNode.kind === 'receipt', 'receipts: lookup built the receipt node');
+  const vNode = env4.s.__cx.N['rcptver:crn_x'];
+  ok(!!vNode && /PASS/.test(vNode.label) && vNode.status === 'ok', 'receipts: verification node renders PASS (green)');
+  ok(vNode && JSON.stringify(vNode.fields).includes('daemon-root'), 'receipts: verdict carries the signature kid');
+  ok(vNode && JSON.stringify(vNode.fields).includes('2026-06-11T10:00:00Z'), 'receipts: verdict carries verified_at timestamp');
+  const sNode = env4.s.__cx.N['rcptsig:crn_x'];
+  ok(!!sNode && sNode.status === 'ok' && JSON.stringify(sNode.fields).includes('09:59:58Z'), 'receipts: signature node carries the sig event timestamps');
+  ok(/PASS/.test(env4.getById('vcStatus').textContent) && /daemon-root/.test(env4.getById('vcStatus').textContent), 'receipts: verify card status line shows PASS + kid');
+  ok((env4.s.__cx.N['cx-receipts'].children || []).includes('rcpt:crn_x'), 'receipts: panel recent list includes the verified receipt');
+  ok(/crn_x/.test(env4.s.localStorage.getItem('crux-console-receipt-recent') || ''), 'receipts: lookup persisted to browser-local recent history');
+  // drill loader: a recent-list receipt with unloaded children re-fetches /verification on click
+  env4.s.exitFocus(); await flush();
+  env4.s.__cx.loadState['rcpt:crn_x'] = 'idle'; env4.s.__cx.N['rcpt:crn_x'].children = [];
+  await env4.s.__cx.ensureLoaded(env4.s.__cx.N['rcpt:crn_x']); await flush();
+  ok(f4.calls.filter(c => /\/v1\/receipts\/crn_x\/verification/.test(c.url)).length >= 2, 'receipts: drill re-fetches /verification for an unloaded receipt node');
+  ok((env4.s.__cx.N['rcpt:crn_x'].children || []).includes('rcptver:crn_x'), 'receipts: drill merges the verdict child');
+  // FAIL path: signature_valid=false renders a red FAIL node with the error_code
+  env4.s.openVerify('crn_bad'); env4.getById('vcTenant').value = 'default';
+  await env4.getById('vcGo').fire('click'); await flush(10);
+  const badNode = env4.s.__cx.N['rcptver:crn_bad'];
+  ok(!!badNode && /FAIL/.test(badNode.label) && /BODY_HASH_MISMATCH/.test(badNode.label) && badNode.status === 'err', 'receipts: invalid signature renders FAIL + error_code (red)');
+  ok(/FAIL/.test(env4.getById('vcStatus').textContent), 'receipts: verify card status line shows FAIL');
+  // 404 path: calm not-found message, no node
+  env4.s.openVerify('crn_missing'); env4.getById('vcTenant').value = 'default';
+  await env4.getById('vcGo').fire('click'); await flush(10);
+  ok(/Not found/.test(env4.getById('vcStatus').textContent), 'receipts: missing receipt → calm not-found status');
+  ok(!env4.s.__cx.N['rcpt:crn_missing'], 'receipts: failed lookup does not fabricate a receipt node');
+
+  // ── I) receipts demo mode: panel demos offline; verify card refuses to fake a verdict ──
+  await tile(env2, 'panel', 'Receipts').fire('click'); await flush();
+  ok(!!tile(env2, 'receipt', 'crn_8f21'), 'receipts demo: dummy CROWN receipt tile renders offline');
+  await tile(env2, 'receipt', 'crn_8f21').fire('dblclick'); await flush();
+  ok(ofKind(env2, 'verification').length >= 1, 'receipts demo: demo verdict node fans out on drill');
+  env2.s.openVerify('crn_whatever'); await env2.getById('vcGo').fire('click'); await flush();
+  ok(/[Dd]emo mode/.test(env2.getById('vcStatus').textContent), 'receipts demo: live verify refused in demo mode (no fake PASS)');
 
   console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
