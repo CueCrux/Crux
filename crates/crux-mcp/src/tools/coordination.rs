@@ -36,6 +36,12 @@ pub const UPDATE_WORK_STATE_DESCRIPTION: &str =
 pub const COMMENT_ON_WORK_DESCRIPTION: &str =
     "Post a comment on a work item. Use this to leave context for the next agent or human — what you tried, what blocked, what's next.";
 
+pub const COORD_STATUS_DESCRIPTION: &str =
+    "See which other agent sessions are live RIGHT NOW and what each is doing: presence heartbeat, declared focus (execplan/milestone/paths), punchcard leases held, and work items in flight. Call at session start and before editing files another session may be touching. Requires CORECRUXD_COORD=1 on the daemon.";
+
+pub const COORD_ANNOUNCE_DESCRIPTION: &str =
+    "Declare what this session is working on (execplan slug, milestone, paths, free-text note) so concurrent sessions can coordinate. Re-announce whenever your focus changes; pass ttl_seconds=0 to clear on the way out. The intent is stored as a private fact attributed to your session's passport. Requires CORECRUXD_COORD=1 on the daemon.";
+
 pub(crate) fn loopback_base(ctx: &McpContext) -> Result<String, JsonRpcError> {
     ctx.daemon_base_url
         .as_deref()
@@ -416,6 +422,55 @@ pub async fn handle_comment_on_work(args: &Value, ctx: &McpContext) -> Result<Va
     ))
 }
 
+pub async fn handle_coord_status(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let qs = match args
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        Some(pid) => format!("?project_id={}", urlencoding(pid)),
+        None => String::new(),
+    };
+    let base = loopback_base(ctx)?;
+    let (_, body) = loopback_get(format!("{base}/v1/coord/active{qs}")).await?;
+    Ok(text_content(serde_json::from_str(&body).unwrap_or(Value::String(body))))
+}
+
+pub async fn handle_coord_announce(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let mut payload = json!({});
+    for key in ["session_id", "project_id"] {
+        let v = args.get(key).and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError {
+            code: INVALID_PARAMS,
+            message: format!("coord_announce: {key} is required"),
+            data: None,
+        })?;
+        payload[key] = json!(v);
+    }
+    for key in [
+        "by_passport",
+        "execplan_slug",
+        "milestone",
+        "paths",
+        "note",
+        "ttl_seconds",
+    ] {
+        if let Some(v) = args.get(key) {
+            payload[key] = v.clone();
+        }
+    }
+    let base = loopback_base(ctx)?;
+    let (_, resp_body) = loopback_post(
+        format!("{base}/v1/coord/announce"),
+        payload,
+        false,
+        ctx.scope_identity(),
+    )
+    .await?;
+    Ok(text_content(
+        serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body)),
+    ))
+}
+
 fn urlencoding(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -482,6 +537,14 @@ mod tests {
                     ("POST", "/v1/work/w1/comments") => (
                         201,
                         r#"{"id":"c1","work_id":"w1","author_passport":"p1","body":"note"}"#,
+                    ),
+                    ("GET", p) if p.starts_with("/v1/coord/active") => (
+                        200,
+                        r#"{"now_unix_ms":1,"presence_ttl_secs":900,"active_sessions":[{"session_id_hex":"aaaa","passport_id":"p1"}],"work_in_flight":[]}"#,
+                    ),
+                    ("POST", "/v1/coord/announce") => (
+                        200,
+                        r#"{"intent":{"project_id":"alpha","session_id_hex":"aaaa","passport_id":"p1","execplan_slug":"plan-x"},"cleared":false}"#,
                     ),
                     _ => (404, r#"{"error":"not found"}"#),
                 };
@@ -581,6 +644,39 @@ mod tests {
             .expect("comment"),
         );
         assert_eq!(comment["work_id"], "w1");
+
+        let status = text_json(
+            handle_coord_status(&json!({"project_id": "alpha"}), &ctx)
+                .await
+                .expect("coord status"),
+        );
+        assert_eq!(status["active_sessions"][0]["session_id_hex"], "aaaa");
+
+        let announced = text_json(
+            handle_coord_announce(
+                &json!({
+                    "session_id": "aaaa",
+                    "project_id": "alpha",
+                    "execplan_slug": "plan-x",
+                    "milestone": "M3",
+                    "paths": ["crates/crux-mcp/src/tools/coordination.rs"]
+                }),
+                &ctx,
+            )
+            .await
+            .expect("coord announce"),
+        );
+        assert_eq!(announced["intent"]["execplan_slug"], "plan-x");
+        assert_eq!(announced["cleared"], false);
+
+        // Required-arg validation does not hit the network.
+        assert_eq!(
+            handle_coord_announce(&json!({"project_id": "alpha"}), &ctx)
+                .await
+                .expect_err("missing session_id")
+                .code,
+            INVALID_PARAMS
+        );
 
         stop_loopback(&base, stop, handle);
     }
