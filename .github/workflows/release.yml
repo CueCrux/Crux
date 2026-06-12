@@ -50,6 +50,9 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           version: "25.x"
+          # Authenticate the action's GitHub API lookup — anonymous calls share
+          # the hosted-runner IP rate limit and flaked v0.4.9 twice (10:40Z, 10:50Z).
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run tests
         run: |
