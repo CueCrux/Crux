@@ -1378,7 +1378,13 @@ function applyStorageTile(sb){   // gap-closure M3: ov-storage dash tile ⇄ /v1
   n.fields=ks.map(k0=>[k0.label||k0.kind, [(k0.available?'':'empty'), k0.chunks? fmtK(k0.chunks)+' rows':null, k0.bytes? gib(k0.bytes):null].filter(Boolean).join(' · ')||'—']);
   n.payload=JSON.stringify({by_kind:ks},null,2);
 }
-function txOverviewPlus(json){ const kids=txOverview(json.sum||json); applyUsageTile(json.usage); applyStorageTile(json.storage); return kids; }
+function applyUpdateBadge(ver){   // gap-closure M5: git-behind state on the overview tile, not just the boot banner
+  const n=N['ov-node'], up=ver&&ver.update; if(!n||!up||!up.state||up.state==='disabled') return;
+  n.fields=(n.fields||[]).filter(([k])=>k!=='update')
+    .concat([['update',(up.state||'?')+(up.behind_by?' · '+up.behind_by+' behind':'')+(up.comparison_stale?' (unverified)':'')]]);
+  if(up.state==='diverged'||up.state==='ahead') n.status='blocked'; else if(up.state==='behind') n.status='run';
+}
+function txOverviewPlus(json){ const kids=txOverview(json.sum||json); applyUsageTile(json.usage); applyStorageTile(json.storage); applyUpdateBadge(json.ver); return kids; }
 /* ── live events stream (gap-closure M4): /v1/events/stream SSE → ring buffer →
      Activity page tail + CX dash ticker. EventSource can't send the scopes header,
      so this reads the stream via fetch; environments without ReadableStream
@@ -1428,7 +1434,8 @@ async function startEventStream(){
 function registerLoaders(){
   LOADERS['cx-overview']      = { noun:'tiles', transform: txOverviewPlus,                                                  // M2/M3
     fetch: async()=>({ sum: await api('/v1/console/summary'), usage: await usageRollup(7).catch(()=>null),
-                       storage: await api('/v1/console/storage-breakdown').catch(()=>null) }) };
+                       storage: await api('/v1/console/storage-breakdown').catch(()=>null),
+                       ver: await api('/v1/version').catch(()=>null) }) };
   LOADERS['cx-work']          = { endpoint:'/v1/work?source=all',     noun:'work items',    transform: txWork };           // M3
   LOADERS['cx-sessions']      = { endpoint:'/v1/console/sessions',    noun:'sessions',      transform: txSessions };       // M4
   LOADERS['cx-orchestrators'] = { endpoint:'/v1/orchestrators',       noun:'orchestrators', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txOrchestrators };  // M5
@@ -2612,6 +2619,11 @@ const PAGES={
   {h:'Daemon',controls:[
    {t:'info',label:'build',v:'7417c9f · v0.4.2 · :14800'},
    {t:'btn',label:'Restart daemon',hint:'needs restart: unless-stopped policy',danger:true}]},
+  {h:'Update & bootstrap',sub:'/v1/version · /v1/bootstrap/status',controls:[
+   {t:'info',label:'update state',v:'behind · 37 commits behind (demo)'},
+   {t:'info',label:'bootstrap',v:'seeded · 8 patterns (demo)'}]},
+  {h:'Ops health',sub:'__ops__ facts · /v1/ops/{health,errors} · needs CORECRUXD_OBSERVE=1',controls:[
+   {t:'info',label:'daemon',v:'ok (demo)'}]},
   {h:'Appearance',sub:'applies immediately',controls:[
    {t:'theme'},{t:'info',label:'canvas',v:'2D | 3D toolbar switch'}]}]},
  'cx-integrations':{title:'Integrations',sub:'declarative packs — installed packs are inert until a passport grant exists',sections:[
@@ -2911,7 +2923,7 @@ function setCtrl(pageId,k,v){ const c=pageCtrl(pageId,k); if(c) c.v=v; confPut(p
 const infoRow=(label,v)=>({t:'info',label,v});
 const PAGE_WIRES={
  'cx-settings':{
-  load: async()=>{
+  load: async def=>{
     const s=await api('/v1/console/settings'); const a=s.auth||{}, e=s.embedding||{};
     const am=pageCtrl('cx-settings','auth_mode');
     if(am && Array.isArray(a.supported_modes) && a.supported_modes.length) am.options=a.supported_modes.slice();
@@ -2921,6 +2933,41 @@ const PAGE_WIRES={
     const mm=pageCtrl('cx-settings','embed_model'), mv=e.chosen_model||e.active_model;
     if(mm && mv && mm.options.indexOf(mv)<0) mm.options=mm.options.concat([mv]);
     if(mv) setCtrl('cx-settings','embed_model', mv);
+    /* gap-closure M5: ops + update surfaces — version is public; ops/bootstrap 501 when observe is off */
+    const [ver,oh,oe,bs]=await Promise.all([
+      api('/v1/version').catch(()=>null),
+      api('/v1/ops/health').catch(err=>({_err:err})),
+      api('/v1/ops/errors?top_k=8').catch(err=>({_err:err})),
+      api('/v1/bootstrap/status').catch(err=>({_err:err}))]);
+    const secByH=h=>def.sections.find(s0=>s0.h===h);
+    const factLine=f=>(typeof f.value==='string'? f.value : JSON.stringify(f.value)).slice(0,70)+(f.stored_at?' · '+String(f.stored_at).slice(0,16):'');
+    const comp=en=>String(en||'').replace(/^__ops__::(health|error)(::)?/,'')||'daemon';
+    if(ver){
+      const d=secByH('Daemon');
+      if(d) d.controls=[infoRow('build',[(ver.version||''),((ver.commit||ver.build_sha||(ver.update&&ver.update.current_commit)||'')+'').slice(0,9),':14800'].filter(Boolean).join(' · ')||'—')]
+        .concat(d.controls.filter(c=>c.t!=='info'));
+    }
+    const us=secByH('Update & bootstrap');
+    if(us){ const rows=[];
+      if(ver&&ver.update){ const up=ver.update;
+        rows.push(infoRow('update state',(up.state||'unknown')+(up.behind_by?' · '+up.behind_by+' commits behind':'')+(up.ahead_by?' · '+up.ahead_by+' ahead':'')+(up.comparison_stale?' · drift unverified':'')));
+        if(up.tracking_ref) rows.push(infoRow('tracking', up.tracking_ref+(up.checked_at?' · checked '+String(up.checked_at).slice(0,16):'')));
+        if(up.state==='behind'&&up.upgrade_hint) rows.push(infoRow('upgrade', up.upgrade_hint)); }
+      if(!bs._err) rows.push(infoRow('bootstrap',(bs.seeded?'seeded':'not seeded')+(bs.fact_count!=null?' · '+bs.fact_count+' facts':'')+((bs.categories&&bs.categories.length)?' · '+bs.categories.length+' categories':'')));
+      else if(bs._err.status===501) rows.push(infoRow('bootstrap','observe plane off — set CORECRUXD_OBSERVE=1'));
+      if(rows.length) us.controls=rows;
+    }
+    const ohSec=secByH('Ops health');
+    if(ohSec){
+      if(!oh._err){ const hs=oh.health||[];
+        ohSec.controls=hs.length? hs.map(f=>infoRow(comp(f.entity), factLine(f)))
+          : [infoRow('no health facts','components report via __ops__::health::*')];
+      } else ohSec.controls=[infoRow(oh._err.status===501?'observe plane off':'unavailable',
+          oh._err.status===501? 'set CORECRUXD_OBSERVE=1 to collect __ops__ facts' : ('/v1/ops/health → '+(oh._err.status||'network')))];
+      if(!oe._err){ const es=oe.facts||[];
+        ohSec.sub='/v1/ops/{health,errors} · '+es.length+' recent errors';
+        ohSec.controls=ohSec.controls.concat(es.slice(0,6).map(f=>infoRow('⚠ '+comp(f.entity), factLine(f)))); }
+    }
   },
   set:{
     auth_mode: v=>putApi('/v1/console/settings',{auth_mode:v}).then(r=>r.restart_required?'saved · restart required':'saved to daemon'),

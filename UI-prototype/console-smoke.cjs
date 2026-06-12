@@ -456,6 +456,28 @@ function makeFetch() {
   await lastBtn(env10, 'Clear').fire('click'); await flush(6);
   ok(env10.ALL.filter(e => /no events yet/.test(e._text || '')).length >= 1, 'M4 events: Clear empties the tail');
 
+  // ── O) M5 — ops + update surfaces (settings sections + overview update badge) ──
+  f7.route(u => /\/v1\/version/.test(u), { ok: true, status: 200, body: { version: 'v0.4.2',
+    update: { enabled: true, state: 'behind', remote: 'origin', ref: 'main', tracking_ref: 'origin/main', ahead_by: 0, behind_by: 37, checked_at: '2026-06-12T08:56:54Z', comparison_stale: false, upgrade_hint: 'cut a v* tag — :latest tracks releases' } } });
+  f7.route(u => /\/v1\/ops\/health/.test(u), { ok: true, status: 200, body: { health: [{ entity: '__ops__::health::sync', key: 'status', value: 'ok · local_only', stored_at: '2026-06-12T08:00:00Z' }] } });
+  f7.route(u => /\/v1\/ops\/errors/.test(u), { ok: true, status: 200, body: { facts: [{ entity: '__ops__::error::append', key: 'err', value: 'disk stall 1.2s', stored_at: '2026-06-12T07:00:00Z' }], total_tokens: 12 } });
+  f7.route(u => /\/v1\/bootstrap\/status/.test(u), { ok: true, status: 200, body: { seeded: true, fact_count: 8, categories: ['patterns'], last_seed_at: '2026-06-01T00:00:00Z' } });
+  env7.s.closePage(); env7.s.openPage('cx-settings'); await flush(12);
+  ok(env7.ALL.some(e => /behind · 37 commits behind/.test(e._text || '')), 'M5 update: git-behind state rendered from /v1/version');
+  ok(env7.ALL.some(e => /cut a v\* tag/.test(e._text || '')), 'M5 update: upgrade hint surfaced when behind');
+  ok(env7.ALL.some(e => /seeded · 8 facts/.test(e._text || '')), 'M5 bootstrap: status row from /v1/bootstrap/status');
+  ok(env7.ALL.some(e => /ok · local_only/.test(e._text || '')), 'M5 ops: health component row from /v1/ops/health');
+  ok(env7.ALL.some(e => /⚠ append/.test(e._text || '')), 'M5 ops: recent error row from /v1/ops/errors');
+  // observe off → 501 → calm flag hint
+  f7.route(u => /\/v1\/ops\/health/.test(u), { ok: false, status: 501, body: { detail: 'self-observation not enabled' } });
+  f7.route(u => /\/v1\/ops\/errors/.test(u), { ok: false, status: 501, body: {} });
+  f7.route(u => /\/v1\/bootstrap\/status/.test(u), { ok: false, status: 501, body: {} });
+  env7.s.closePage(); env7.s.openPage('cx-settings'); await flush(12);
+  ok(env7.ALL.some(e => /observe plane off/.test(e._text || '')), 'M5 ops: 501 renders the CORECRUXD_OBSERVE hint');
+  // overview tile badge (unit-level: applyUpdateBadge is also fed by the cx-overview loader)
+  env7.s.applyUpdateBadge({ update: { state: 'behind', behind_by: 37 } });
+  ok(JSON.stringify(env7.s.__cx.N['ov-node'].fields).includes('37 behind'), 'M5 update: ov-node tile carries the behind badge');
+
   console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();
