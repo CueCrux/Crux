@@ -417,6 +417,14 @@ pub struct Config {
     // Liveness horizon for the coord active view, in seconds.
     pub coord_presence_ttl_secs: u64,
 
+    // Provider-agnostic injection-bundle surface (`/v1/context`,
+    // `crate::http::context_surface`). Default OFF.
+    pub context_surface_enabled: bool,
+
+    // OpenAI function-calling shim over the MCP tool surface
+    // (`crate::http::openai_shim`). Default OFF.
+    pub openai_shim_enabled: bool,
+
     // Embedded console + declarative integration library.
     pub integrations_enabled: bool,
     pub integrations_safe_mode: bool,
@@ -1033,6 +1041,8 @@ pub fn load_config() -> Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(crate::coord::DEFAULT_PRESENCE_TTL_SECS)
             .clamp(60, crate::coord::MAX_TTL_SECS),
+        context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE").unwrap_or(false),
+        openai_shim_enabled: env_bool("CORECRUXD_OPENAI_SHIM").unwrap_or(false),
         integrations_enabled: std::env::var("CORECRUXD_INTEGRATIONS_ENABLED")
             .ok()
             .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),

@@ -51,6 +51,7 @@ mod fact_privacy;
 mod integrations_github;
 mod integrations_github_sync;
 mod integrations_openai;
+mod mcp_stdio;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod metrics;
 mod onboarding;
@@ -144,6 +145,9 @@ enum CliAction {
     Version,
     /// Print usage note and exit 0.
     Help,
+    /// Run the bundled stdio⇄HTTP MCP bridge instead of the daemon
+    /// (provider-integration-surfaces M5; see `crate::mcp_stdio`).
+    McpStdio,
     /// No recognised flag — start the daemon normally.
     Run,
 }
@@ -156,6 +160,7 @@ fn parse_cli_arg(args: &[String]) -> CliAction {
     match args.first().map(String::as_str) {
         Some("--version" | "-V" | "version") => CliAction::Version,
         Some("--help" | "-h" | "help") => CliAction::Help,
+        Some("mcp-stdio") => CliAction::McpStdio,
         _ => CliAction::Run,
     }
 }
@@ -178,7 +183,10 @@ corecruxd is the Crux Daemon: an environment-configured, long-running process\n\
 all configuration is supplied via environment variables; see config.example.env.\n\
 The only recognised flags are:\n\
   --version, -V    print the version and git sha, then exit\n\
-  --help, -h       print this message, then exit\n",
+  --help, -h       print this message, then exit\n\
+  mcp-stdio        run the bundled stdio\u{21c4}HTTP MCP bridge (not the daemon);\n\
+                   env: CRUX_MCP_URL (default http://127.0.0.1:14801/mcp),\n\
+                   CRUX_AGENT_TOKEN (optional bearer)\n",
         line = version_line()
     )
 }
@@ -203,6 +211,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("{}", help_text());
             }
             return Ok(());
+        }
+        CliAction::McpStdio => {
+            std::process::exit(mcp_stdio::run());
         }
         CliAction::Run => {}
     }
@@ -524,6 +535,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         console_enabled: config.console_enabled,
         coord_enabled: config.coord_enabled,
         coord_presence_ttl_secs: config.coord_presence_ttl_secs,
+        context_surface_enabled: config.context_surface_enabled,
+        openai_shim_enabled: config.openai_shim_enabled,
+        mcp_context: None,
         integrations_enabled: config.integrations_enabled,
         integrations_safe_mode: config.integrations_safe_mode,
         integrations_allow_executable_helpers: config.integrations_allow_executable_helpers,
@@ -747,12 +761,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     let github_fact_store_handle = state.fact_store.clone();
     let github_encryption_key = state.integration_encryption_key.clone();
-    let mcp_app = if config.mcp_enabled {
+    // Build the MCP dispatch context once and share it between the MCP
+    // server (:14801) and the HTTP OpenAI tools shim (`/v1/openai/*`,
+    // provider-integration-surfaces M2) — single source for the tool surface.
+    let mcp_context = if config.mcp_enabled {
         // Loopback URL the cuecrux_session tool uses to call corecruxd's
         // POST /session. This mirrors master-plan §6.2 ("POST to the
         // Layer 1 handshake endpoint internally").
         let daemon_base = format!("http://127.0.0.1:{}", config.http_addr.port());
-        Some(crux_mcp::server::router(
+        Some(
             crux_mcp::dispatch::McpContext::new_shared(
                 node_id.clone(),
                 state.fact_store.clone(),
@@ -783,11 +800,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 state.kind_registry.clone(),
             )
             .with_artefact_store(state.artefact_store.clone()),
-        ))
+        )
     } else {
         None
     };
+    let mcp_app = mcp_context.clone().map(crux_mcp::server::router);
 
+    let mut state = state;
+    state.mcp_context = mcp_context.map(std::sync::Arc::new);
     // Ingress hardening (crux-http-ingress-hardening-2026-06-11 M1): body
     // limit + problem+json 413s, applied before TraceLayer so rejected
     // requests still show up in traces.
@@ -3865,6 +3885,9 @@ mod tests {
             console_enabled: true,
             coord_enabled: false,
             coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
+            context_surface_enabled: false,
+            openai_shim_enabled: false,
+            mcp_context: None,
             integrations_enabled: true,
             integrations_safe_mode: false,
             integrations_allow_executable_helpers: false,

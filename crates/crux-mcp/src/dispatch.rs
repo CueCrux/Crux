@@ -26,6 +26,11 @@ use crate::tools;
 pub const CAPABILITY_DENIED: i32 = -32030;
 
 /// Shared state passed to every MCP handler.
+///
+/// `Clone` is shallow: all stores are `Arc`-shared handles, so a clone is a
+/// second view onto the same state (used by `corecruxd` to hand one context
+/// to both the MCP router and the HTTP OpenAI tools shim — single source).
+#[derive(Clone)]
 pub struct McpContext {
     /// Entity fact store.
     pub fact_store: Arc<RwLock<FactStore>>,

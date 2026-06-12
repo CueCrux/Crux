@@ -10,6 +10,7 @@ mod agent_usage;
 mod append;
 mod cloud;
 mod console;
+mod context_surface;
 mod coord;
 mod dataplane;
 mod dossier;
@@ -28,6 +29,7 @@ pub mod invocation;
 pub(crate) mod observations;
 mod observe;
 mod observe_audit;
+mod openai_shim;
 mod openapi;
 mod orchestrators;
 mod passports;
@@ -171,6 +173,16 @@ pub struct AppState {
     pub coord_enabled: bool,
     /// Liveness horizon for the coord active view, in seconds.
     pub coord_presence_ttl_secs: u64,
+    /// Provider-agnostic injection-bundle surface (`/v1/context`). Default
+    /// OFF (`CORECRUXD_CONTEXT_SURFACE=1`); when off, routes return 404.
+    pub context_surface_enabled: bool,
+    /// OpenAI function-calling shim over the MCP tool surface
+    /// (`/v1/openai/tools.json` + `/v1/openai/invoke`). Default OFF
+    /// (`CORECRUXD_OPENAI_SHIM=1`); when off, routes return 404.
+    pub openai_shim_enabled: bool,
+    /// Shared MCP dispatch context for the OpenAI shim — one source for the
+    /// MCP server (:14801) and the shim (:14800). `None` when MCP disabled.
+    pub mcp_context: Option<Arc<crux_mcp::dispatch::McpContext>>,
     pub integrations_enabled: bool,
     pub integrations_safe_mode: bool,
     pub integrations_allow_executable_helpers: bool,
@@ -549,6 +561,14 @@ pub fn router(state: AppState) -> Router {
         )
         // OpenAPI spec
         .route("/v1/openapi.json", get(self::openapi::openapi_json))
+        // Provider-agnostic injection-bundle surface (context_bundle/v1).
+        // Gated by CORECRUXD_CONTEXT_SURFACE (default OFF → 404).
+        .route("/v1/context", get(self::context_surface::get_context))
+        .route("/v1/context", axum::routing::post(self::context_surface::post_context))
+        // OpenAI function-calling shim over the MCP tool surface.
+        // Gated by CORECRUXD_OPENAI_SHIM (default OFF → 404).
+        .route("/v1/openai/tools.json", get(self::openai_shim::get_tools_json))
+        .route("/v1/openai/invoke", axum::routing::post(self::openai_shim::post_invoke))
         // Multi-agent coordination plane — presence-joined session board
         // (flag-gated by `CORECRUXD_COORD`; 404 when off).
         .route("/v1/coord/active", get(self::coord::get_coord_active))

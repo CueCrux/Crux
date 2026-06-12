@@ -489,7 +489,7 @@ fn read_observations(file_path: &Path) -> std::io::Result<Vec<ObservationRecordV
 /// callers pass `None`, which triggers a tail-read of the on-disk file.
 /// Returns the response *plus* the new chain tip so the batch loop can
 /// thread it forward.
-fn append_one(
+pub(super) fn append_one(
     state: &AppState,
     scoped_session_id: &str,
     principal: &str,

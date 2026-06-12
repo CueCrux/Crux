@@ -137,7 +137,7 @@ fn fact_matches_query(fact: &corecrux_memory::fact_store::Fact, query: &str, age
         .any(|term| value_lower.contains(term) || key_lower.contains(term) || entity_lower.contains(term))
 }
 
-fn query_visible_http_facts(
+pub(super) fn query_visible_http_facts(
     store: &corecrux_memory::FactStore,
     q: &corecrux_memory::fact_store::FactQuery,
     ctx: &crate::auth::HttpScopeContext,

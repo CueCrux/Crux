@@ -280,7 +280,7 @@ fn test_routing() -> RoutingTable {
     .expect("routing table")
 }
 
-fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> AppState {
+pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> AppState {
     let build = corecrux_types::BuildInfo {
         version: "test".to_string(),
         commit: "test".to_string(),
@@ -306,6 +306,9 @@ fn test_app_state_with_auth(action_max_pending: usize, auth_mode: AuthMode) -> A
         console_enabled: true,
         coord_enabled: true,
         coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
+        context_surface_enabled: true,
+        openai_shim_enabled: false,
+        mcp_context: None,
         integrations_enabled: true,
         integrations_safe_mode: false,
         integrations_allow_executable_helpers: false,
