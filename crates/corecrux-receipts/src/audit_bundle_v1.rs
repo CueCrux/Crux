@@ -631,4 +631,26 @@ mod tests {
         assert_eq!(refs[0].fact_id, "f_001");
         assert_eq!(refs[0].receipt_id, "r_abc");
     }
+
+    // Adversarial archive inputs (ExecPlan crux-storage-fault-hardening-2026-06-11, M1):
+    // typed errors, never panics, never silent success.
+
+    #[test]
+    fn verify_bundle_rejects_garbage_and_empty_bytes() {
+        assert!(verify_bundle_v1(b"definitely not a tar.zst archive").is_err());
+        assert!(verify_bundle_v1(&[]).is_err());
+    }
+
+    #[test]
+    fn verify_bundle_rejects_truncated_archive_at_every_depth() {
+        let built = build_bundle_v1(sample_input()).expect("build");
+        let mut full: Vec<u8> = Vec::new();
+        built.write_tar_zst(&mut full).unwrap();
+        for cut in [1usize, full.len() / 4, full.len() / 2, full.len() - 1] {
+            match verify_bundle_v1(&full[..cut]) {
+                Err(_) => {}
+                Ok(report) => panic!("truncation to {cut} bytes verified: {report:?}"),
+            }
+        }
+    }
 }

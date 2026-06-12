@@ -1339,8 +1339,10 @@ dependencies = [
 name = "crux-observe"
 version = "0.3.1"
 dependencies = [
+ "blake3",
  "chrono",
  "corecrux-memory",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

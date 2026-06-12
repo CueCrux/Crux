@@ -1765,3 +1765,288 @@ fn constants_are_stable() {
         "application/cbor; profile=cuecrux-receipt-sig-v1"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial receipt suite (ExecPlan crux-storage-fault-hardening-2026-06-11, M1)
+//
+// Forgery, replay, truncation, and malformed-CBOR attacks. Every case must
+// produce a typed report / typed error — never a panic, never a silent OK.
+// ---------------------------------------------------------------------------
+
+fn adversarial_build_info() -> corecrux_types::BuildInfo {
+    corecrux_types::BuildInfo {
+        version: "0.0.1".to_string(),
+        commit: "deadbeef".to_string(),
+    }
+}
+
+fn keyring_with(key_id: &str, vk: &ed25519_dalek::VerifyingKey) -> Ed25519KeyRingV1 {
+    Ed25519KeyRingV1 {
+        v: 1,
+        keys: vec![Ed25519KeyEntryV1 {
+            key_id: key_id.to_string(),
+            pub_key_base64: base64::engine::general_purpose::STANDARD.encode(vk.as_bytes()),
+        }],
+    }
+}
+
+/// Forgery: signature produced by an attacker key, presented under the
+/// keyring's trusted key_id. Hashes all match; only ed25519 catches it.
+#[test]
+fn verify_forged_signature_wrong_key_is_sig_invalid() {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(20260612);
+    let mut trusted_bytes = [0u8; 32];
+    rng.fill_bytes(&mut trusted_bytes);
+    let trusted = SigningKey::from_bytes(&trusted_bytes);
+    let mut attacker_bytes = [0u8; 32];
+    rng.fill_bytes(&mut attacker_bytes);
+    let attacker = SigningKey::from_bytes(&attacker_bytes);
+
+    let keyring = keyring_with("k1", &trusted.verifying_key());
+
+    let body = encode_body_cbor();
+    let stored_hash = *blake3::hash(&body).as_bytes();
+    // Attacker signs the body with their own key but claims trusted key_id "k1".
+    let forged_sig64 = attacker.sign(&body).to_bytes().to_vec();
+
+    let sig = ReceiptSigV1 {
+        schema: "cuecrux.receipt.sig.v1".to_string(),
+        receipt_id: "r-forge-1".to_string(),
+        alg: "ed25519".to_string(),
+        key_id: "k1".to_string(),
+        signed_at: "2026-06-12T00:00:00Z".to_string(),
+        signature: forged_sig64,
+        signed_payload_hash: stored_hash.to_vec(),
+    };
+    let sig_bytes = encode_sig_cbor(&sig);
+    let build = adversarial_build_info();
+
+    let report = verify_receipt_v1(VerifyReceiptInput {
+        tenant_id: "tenant-a",
+        receipt_id: "r-forge-1",
+        body_bytes: &body,
+        stored_body_payload_hash: stored_hash,
+        sig_bytes: Some(&sig_bytes),
+        keyring: Some(&keyring),
+        verified_at: "2026-06-12T00:00:01Z",
+        verifier_build: &build,
+        recompute_candidate_digest: false,
+    })
+    .expect("verify");
+
+    assert!(report.integrity.payload_hash_matches);
+    assert!(!report.signature_valid);
+    assert_eq!(report.error_code, "SIG_INVALID");
+}
+
+/// Truncated signature event bytes (storage tear / partial write) must be a
+/// parse error, not a panic.
+#[test]
+fn verify_truncated_sig_cbor_is_sig_parse_error() {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(20260613);
+    let mut sk_bytes = [0u8; 32];
+    rng.fill_bytes(&mut sk_bytes);
+    let sk = SigningKey::from_bytes(&sk_bytes);
+    let keyring = keyring_with("k1", &sk.verifying_key());
+
+    let body = encode_body_cbor();
+    let stored_hash = *blake3::hash(&body).as_bytes();
+    let sig = ReceiptSigV1 {
+        schema: "cuecrux.receipt.sig.v1".to_string(),
+        receipt_id: "r-trunc-1".to_string(),
+        alg: "ed25519".to_string(),
+        key_id: "k1".to_string(),
+        signed_at: "2026-06-12T00:00:00Z".to_string(),
+        signature: sk.sign(&body).to_bytes().to_vec(),
+        signed_payload_hash: stored_hash.to_vec(),
+    };
+    let full = encode_sig_cbor(&sig);
+    let build = adversarial_build_info();
+
+    // Truncate at several depths, including 0 and 1 bytes.
+    for cut in [0usize, 1, full.len() / 4, full.len() / 2, full.len() - 1] {
+        let report = verify_receipt_v1(VerifyReceiptInput {
+            tenant_id: "tenant-a",
+            receipt_id: "r-trunc-1",
+            body_bytes: &body,
+            stored_body_payload_hash: stored_hash,
+            sig_bytes: Some(&full[..cut]),
+            keyring: Some(&keyring),
+            verified_at: "2026-06-12T00:00:01Z",
+            verifier_build: &build,
+            recompute_candidate_digest: false,
+        })
+        .expect("verify");
+        assert_eq!(report.error_code, "SIG_PARSE_ERROR", "cut={cut}");
+        assert!(!report.signature_valid, "cut={cut}");
+    }
+}
+
+/// Replay: a stale (body, sig) pair from an older receipt presented against a
+/// newer stored payload hash. The verifier must flag the body, and must not
+/// report the (internally consistent) stale signature as overall success.
+#[test]
+fn verify_replayed_stale_body_and_sig_is_body_hash_mismatch() {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(20260614);
+    let mut sk_bytes = [0u8; 32];
+    rng.fill_bytes(&mut sk_bytes);
+    let sk = SigningKey::from_bytes(&sk_bytes);
+    let keyring = keyring_with("k1", &sk.verifying_key());
+
+    // Old receipt content the attacker replays.
+    let stale_body = encode_body_cbor();
+    let stale_hash = *blake3::hash(&stale_body).as_bytes();
+    let stale_sig = ReceiptSigV1 {
+        schema: "cuecrux.receipt.sig.v1".to_string(),
+        receipt_id: "r-replay-1".to_string(),
+        alg: "ed25519".to_string(),
+        key_id: "k1".to_string(),
+        signed_at: "2026-06-01T00:00:00Z".to_string(),
+        signature: sk.sign(&stale_body).to_bytes().to_vec(),
+        signed_payload_hash: stale_hash.to_vec(),
+    };
+    let stale_sig_bytes = encode_sig_cbor(&stale_sig);
+
+    // The current event header stores the hash of the *new* body.
+    let new_body = encode_body_cbor_with_retrieval_trace("DIGEST-NEW");
+    let stored_hash_now = *blake3::hash(&new_body).as_bytes();
+    assert_ne!(stale_hash, stored_hash_now);
+
+    let build = adversarial_build_info();
+    let report = verify_receipt_v1(VerifyReceiptInput {
+        tenant_id: "tenant-a",
+        receipt_id: "r-replay-1",
+        body_bytes: &stale_body,
+        stored_body_payload_hash: stored_hash_now,
+        sig_bytes: Some(&stale_sig_bytes),
+        keyring: Some(&keyring),
+        verified_at: "2026-06-12T00:00:01Z",
+        verifier_build: &build,
+        recompute_candidate_digest: false,
+    })
+    .expect("verify");
+
+    assert!(!report.integrity.payload_hash_matches);
+    assert_eq!(report.error_code, "BODY_HASH_MISMATCH");
+}
+
+/// DOCUMENTED CURRENT BEHAVIOUR (P2 candidate, not asserted as desirable):
+/// `verify_receipt_v1` does not validate the `schema` string inside the sig
+/// CBOR, so a downgraded/unknown schema label still verifies as OK when the
+/// cryptographic checks pass. The sig envelope itself is not signed, so this
+/// is a transparency gap rather than a forgery vector — flagged in the
+/// ExecPlan decision log. If schema enforcement is added, update this test to
+/// assert the new typed error instead.
+#[test]
+fn verify_sig_schema_string_is_currently_not_validated() {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(20260615);
+    let mut sk_bytes = [0u8; 32];
+    rng.fill_bytes(&mut sk_bytes);
+    let sk = SigningKey::from_bytes(&sk_bytes);
+    let keyring = keyring_with("k1", &sk.verifying_key());
+
+    let body = encode_body_cbor();
+    let stored_hash = *blake3::hash(&body).as_bytes();
+    let sig = ReceiptSigV1 {
+        schema: "cuecrux.receipt.sig.v0".to_string(), // downgraded label
+        receipt_id: "r-schema-1".to_string(),
+        alg: "ed25519".to_string(),
+        key_id: "k1".to_string(),
+        signed_at: "2026-06-12T00:00:00Z".to_string(),
+        signature: sk.sign(&body).to_bytes().to_vec(),
+        signed_payload_hash: stored_hash.to_vec(),
+    };
+    let sig_bytes = encode_sig_cbor(&sig);
+    let build = adversarial_build_info();
+
+    let report = verify_receipt_v1(VerifyReceiptInput {
+        tenant_id: "tenant-a",
+        receipt_id: "r-schema-1",
+        body_bytes: &body,
+        stored_body_payload_hash: stored_hash,
+        sig_bytes: Some(&sig_bytes),
+        keyring: Some(&keyring),
+        verified_at: "2026-06-12T00:00:01Z",
+        verifier_build: &build,
+        recompute_candidate_digest: false,
+    })
+    .expect("verify");
+
+    // Current behaviour: schema string ignored, verification succeeds.
+    assert_eq!(report.error_code, "OK");
+    assert!(report.signature_valid);
+}
+
+/// A validly-signed but non-CBOR body must report BODY_CBOR_PARSE_ERROR while
+/// still acknowledging the valid signature (corrupt-producer diagnosis path).
+#[test]
+fn verify_non_cbor_body_with_valid_signature_is_body_cbor_parse_error() {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(20260616);
+    let mut sk_bytes = [0u8; 32];
+    rng.fill_bytes(&mut sk_bytes);
+    let sk = SigningKey::from_bytes(&sk_bytes);
+    let keyring = keyring_with("k1", &sk.verifying_key());
+
+    let body: &[u8] = &[0xFF, 0xFF, 0xFF, 0x00, 0x13, 0x37];
+    let stored_hash = *blake3::hash(body).as_bytes();
+    let sig = ReceiptSigV1 {
+        schema: "cuecrux.receipt.sig.v1".to_string(),
+        receipt_id: "r-noncbor-1".to_string(),
+        alg: "ed25519".to_string(),
+        key_id: "k1".to_string(),
+        signed_at: "2026-06-12T00:00:00Z".to_string(),
+        signature: sk.sign(body).to_bytes().to_vec(),
+        signed_payload_hash: stored_hash.to_vec(),
+    };
+    let sig_bytes = encode_sig_cbor(&sig);
+    let build = adversarial_build_info();
+
+    let report = verify_receipt_v1(VerifyReceiptInput {
+        tenant_id: "tenant-a",
+        receipt_id: "r-noncbor-1",
+        body_bytes: body,
+        stored_body_payload_hash: stored_hash,
+        sig_bytes: Some(&sig_bytes),
+        keyring: Some(&keyring),
+        verified_at: "2026-06-12T00:00:01Z",
+        verifier_build: &build,
+        recompute_candidate_digest: false,
+    })
+    .expect("verify");
+
+    assert!(report.integrity.payload_hash_matches);
+    assert!(!report.integrity.canonical_bytes_parse_ok);
+    assert!(report.signature_valid);
+    assert_eq!(report.error_code, "BODY_CBOR_PARSE_ERROR");
+}
+
+/// Malformed receipts.cbor inputs (bundle ingestion path) must be typed
+/// errors, never panics.
+#[test]
+fn decode_receipts_cbor_rejects_malformed_inputs() {
+    use crate::audit_bundle_v1::decode_receipts_cbor;
+
+    // Empty.
+    assert!(decode_receipts_cbor(&[]).is_err());
+    // Garbage.
+    assert!(decode_receipts_cbor(&[0xFF, 0xFF, 0xFF, 0xFF]).is_err());
+    // Wrong CBOR type: a map where an array of receipt refs is expected.
+    let mut map_bytes = Vec::new();
+    ciborium::ser::into_writer(
+        &ciborium::value::Value::Map(vec![(
+            ciborium::value::Value::Text("not".to_string()),
+            ciborium::value::Value::Text("an array".to_string()),
+        )]),
+        &mut map_bytes,
+    )
+    .expect("encode");
+    assert!(decode_receipts_cbor(&map_bytes).is_err());
+    // Array of wrong element type.
+    let mut arr_bytes = Vec::new();
+    ciborium::ser::into_writer(
+        &ciborium::value::Value::Array(vec![ciborium::value::Value::Integer(7.into())]),
+        &mut arr_bytes,
+    )
+    .expect("encode");
+    assert!(decode_receipts_cbor(&arr_bytes).is_err());
+}

@@ -3544,6 +3544,10 @@ async fn post_query_graph_expand_uses_http_dataplane_fake() {
 
 // ── post_query_time_range (feature gate + validation) ───────────
 
+// Serialized: reads CORECRUXD_QUERY_TIME_RANGE (expects unset). Without this,
+// it can run concurrently with the #[serial] test that sets the flag and
+// observe a leaked value (process-global env), returning 501 not 404.
+#[serial_test::serial]
 #[tokio::test]
 async fn post_query_time_range_returns_not_found_when_disabled() {
     let state = test_app_state(16);
@@ -11530,4 +11534,61 @@ async fn agent_usage_empty_ledger_is_200_zeroes() {
     let body = json_body(resp).await;
     assert_eq!(body["calls_total"], 0);
     assert_eq!(body["error_rate"], 0.0);
+}
+
+// ── ingress hardening M1: SSE longevity gate ──────────────────────────
+//
+// Gate for crux-http-ingress-hardening-2026-06-11 M1: an idle SSE session
+// must survive >30s (the router-wide TimeoutLayer + the new shutdown drain
+// cap must not kill long-lived streams). Long-running, so ignored by
+// default — run with:
+//   cargo test -p corecruxd sse_session_survives_30s_idle -- --ignored
+#[tokio::test]
+#[ignore = "long-running (>35s wall clock); M1 gate, re-run during M5 sidecar validation"]
+async fn sse_session_survives_30s_idle() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let state = test_app_state(1);
+    let app = super::ingress::apply_ingress_limits(router(state), &crate::config::IngressConfig::default(), None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    tokio::spawn(crate::serve_http_listener(
+        listener,
+        app,
+        shutdown_rx,
+        Some(std::time::Duration::from_secs(30)),
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+    conn.write_all(b"GET /v1/events/stream HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n")
+        .await
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+    let mut received = Vec::new();
+    let mut closed = false;
+    while std::time::Instant::now() < deadline {
+        let mut buf = [0u8; 1024];
+        match tokio::time::timeout(std::time::Duration::from_secs(20), conn.read(&mut buf)).await {
+            Ok(Ok(0)) => {
+                closed = true;
+                break;
+            }
+            Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
+            Ok(Err(err)) => panic!("SSE connection errored before 35s elapsed: {err}"),
+            // No bytes for 20s is fine in itself (keep-alive cadence is 15s);
+            // keep waiting until the deadline.
+            Err(_elapsed) => {}
+        }
+    }
+    assert!(!closed, "SSE connection was closed before 35s of idle time");
+    let text = String::from_utf8_lossy(&received);
+    assert!(text.starts_with("HTTP/1.1 200"), "unexpected SSE response: {text}");
+    // 15s keep-alive cadence → at least two keep-alive comment frames in 35s.
+    assert!(
+        text.matches(':').count() >= 2,
+        "expected SSE keep-alive frames over 35s idle, got: {text}"
+    );
 }

@@ -98,7 +98,7 @@ fn read_ledger_payloads(
                 .as_str()
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|d| d.with_timezone(&Utc));
-            if ts.map(|t| t < since).unwrap_or(false) {
+            if ts.is_some_and(|t| t < since) {
                 continue;
             }
         }
