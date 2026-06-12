@@ -182,3 +182,97 @@ fn leak_canary_non_matching_output_byte_identical() {
         "non-matching log output must be unchanged by the redaction writer"
     );
 }
+
+// ── M3: ops-facts sink (OpsObserveLayer → FactStore) ───────────────
+
+/// Drain the ops fact store until `want` facts exist (the layer writes via
+/// spawned tasks) or a timeout elapses; returns all fact values concatenated.
+async fn wait_for_ops_facts(
+    store: &std::sync::Arc<tokio::sync::RwLock<corecrux_memory::FactStore>>,
+    want: usize,
+) -> Vec<String> {
+    for _ in 0..200 {
+        {
+            let s = store.read().await;
+            let values: Vec<String> = s
+                .all_facts()
+                .filter(|f| f.entity.starts_with("__ops__::"))
+                .map(|f| f.value.clone())
+                .collect();
+            if values.len() >= want {
+                return values;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("ops facts did not appear within timeout");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn leak_canary_ops_facts_sink_on_mode() {
+    use crux_observe::ops_layer::OpsObserveLayer;
+
+    let store = Arc::new(tokio::sync::RwLock::new(corecrux_memory::FactStore::new()));
+    let redactor = Arc::new(Redactor::with_mode(RedactMode::On));
+    let layer = OpsObserveLayer::with_redactor(Arc::clone(&store), "canary-node".into(), 100, true, redactor);
+
+    let subscriber = tracing_subscriber::registry().with(layer);
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::warn!(api_key = FIX_SK, attempt = 3, "upstream call failed");
+        tracing::error!(password = FIX_PW, token_budget = 500, "login rejected, saw {FIX_JWT}");
+    });
+
+    let values = wait_for_ops_facts(&store, 2).await;
+    let all = values.join("\n");
+
+    // Zero plaintext fixture secrets in any durable fact value.
+    for (name, secret) in [("sk", FIX_SK), ("password", FIX_PW), ("jwt", FIX_JWT)] {
+        assert!(
+            !all.contains(secret),
+            "ops-facts sink leaked fixture {name} secret:\n{all}"
+        );
+    }
+    // Markers present with correct rule ids: field rules on named fields,
+    // value-shape rule on the free-text message.
+    assert!(all.contains("[REDACTED:fld.api_key#"), "got: {all}");
+    assert!(all.contains("[REDACTED:fld.password#"), "got: {all}");
+    assert!(all.contains("[REDACTED:jwt#"), "got: {all}");
+    // Fact values stay parseable as their event JSON.
+    for v in &values {
+        assert!(
+            serde_json::from_str::<serde_json::Value>(v).is_ok(),
+            "redacted ops fact value no longer parses: {v}"
+        );
+    }
+    // False-positive budget: token_budget telemetry survives in the fact body.
+    assert!(all.contains("\"token_budget\":500"), "got: {all}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn leak_canary_ops_facts_sink_audit_mode_counts_only() {
+    use crux_observe::ops_layer::OpsObserveLayer;
+
+    let store = Arc::new(tokio::sync::RwLock::new(corecrux_memory::FactStore::new()));
+    let redactor = Arc::new(Redactor::with_mode(RedactMode::Audit));
+    let layer = OpsObserveLayer::with_redactor(
+        Arc::clone(&store),
+        "canary-node".into(),
+        100,
+        true,
+        Arc::clone(&redactor),
+    );
+
+    let subscriber = tracing_subscriber::registry().with(layer);
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::warn!(api_key = FIX_SK, "upstream call failed");
+    });
+
+    let values = wait_for_ops_facts(&store, 1).await;
+    let all = values.join("\n");
+    assert!(all.contains(FIX_SK), "audit mode must not alter stored fields");
+    assert!(!all.contains("[REDACTED:"), "audit mode must not insert markers");
+    assert!(
+        redactor.counts().iter().any(|(k, _)| k == "fld.api_key"),
+        "audit mode must still count rule hits"
+    );
+}
