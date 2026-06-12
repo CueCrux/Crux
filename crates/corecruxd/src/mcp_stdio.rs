@@ -168,9 +168,39 @@ mod tests {
         std::thread::spawn(move || {
             for body in responses {
                 let Ok((mut sock, _)) = listener.accept() else { return };
-                let mut buf = [0u8; 65536];
-                let n = sock.read(&mut buf).unwrap_or(0);
-                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+                // Read the whole request, not just the first TCP segment: ureq
+                // may flush headers and body in separate writes, so a single
+                // read() can capture the headers but miss the JSON-RPC body and
+                // flake the body assertion. Drain headers, then Content-Length
+                // bytes of body.
+                let mut raw: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 8192];
+                let request = loop {
+                    let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
+                    if let Some(body_start) = header_end {
+                        let head = String::from_utf8_lossy(&raw[..body_start]);
+                        let content_len = head
+                            .lines()
+                            .find_map(|l| {
+                                l.split_once(':').and_then(|(k, v)| {
+                                    k.trim()
+                                        .eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                            })
+                            .unwrap_or(0);
+                        if raw.len() >= body_start + content_len {
+                            break String::from_utf8_lossy(&raw).to_string();
+                        }
+                    }
+                    match sock.read(&mut chunk) {
+                        Ok(0) => break String::from_utf8_lossy(&raw).to_string(),
+                        Ok(n) => raw.extend_from_slice(&chunk[..n]),
+                        Err(_) => break String::from_utf8_lossy(&raw).to_string(),
+                    }
+                };
+                let _ = tx.send(request);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),

@@ -10,7 +10,7 @@
 //! session state — in a stable, versioned JSON shape that any harness
 //! (OpenAI SDK loops, Codex CLI, Cursor rules, LangChain) can inject at
 //! session start. The semantics are owned by the normative spec
-//! `PlanCrux/docs/master-plan/shared/Context-Bundle-v1-Spec.md` (child plan E,
+//! `Context-Bundle-v1-Spec` (planning monorepo, shared plane; child plan E,
 //! `context-mediation-injection-2026-06-11`); this module owns the transport.
 //!
 //! Gating: `CORECRUXD_CONTEXT_SURFACE=1`, default OFF. When off the routes
