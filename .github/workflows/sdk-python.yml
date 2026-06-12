@@ -9,17 +9,22 @@ jobs:
   build-and-publish:
     name: Build & Publish
     runs-on: [self-hosted, ci]
-    defaults:
-      run:
-        working-directory: sdks/python
+    # PyPI Trusted Publishing (OIDC) — no PYPI_TOKEN secret. Requires a
+    # (pending) trusted publisher on pypi.org for project `corecrux-client`:
+    # owner CueCrux, repository Crux, workflow sdk-python.yml.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - run: pip install build
+        working-directory: sdks/python
       - run: python -m build
-      - run: pip install twine && twine upload dist/*
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        working-directory: sdks/python
+      - name: Publish to PyPI (OIDC)
+        uses: pypa/gh-action-pypi-publish@6733eb7d741f0b11ec6a39b58540dab7590f9b7d # v1.14.0
+        with:
+          packages-dir: sdks/python/dist
