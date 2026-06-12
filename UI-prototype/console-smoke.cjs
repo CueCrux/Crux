@@ -339,6 +339,9 @@ function makeFetch() {
     packs: [{ id: 'git-pack', version: '1.0', status: 'enabled' }, { id: 'fs-pack', version: '1.0', status: 'disabled' }], grants: [{}] } });
   f7.route((u, o) => /\/v1\/console\/integrations\/fs-pack\/install/.test(u) && o.method === 'POST', { ok: true, status: 201, body: {} });
   f7.route(u => /\/v1\/integrations\/github\/status/.test(u), { ok: true, status: 200, body: { connected: true, username: 'myles' } });
+  f7.route(u => /\/v1\/integrations\/github\/repos\/accessible/.test(u), { ok: true, status: 200, body: { repos: [{ full_name: 'CueCrux/Crux' }, { full_name: 'CueCrux/AuditCrux' }] } });
+  f7.route(u => /\/v1\/integrations\/github\/repos$/.test(u), { ok: true, status: 200, body: { repos: [{ full_name: 'CueCrux/Crux' }] } });
+  f7.route((u, o) => /\/v1\/integrations\/github\/repos\/CueCrux\/AuditCrux\/select/.test(u) && o.method === 'POST', { ok: true, status: 200, body: {} });
   f7.route(u => /\/v1\/integrations\/openai\/status/.test(u), { ok: true, status: 200, body: { connected: false, available_models: ['gpt-4o'], default_model: null } });
   const env7 = buildSandbox(f7); await flush();
   const lastBtn = (env, label) => env.ALL.filter(e => e._text === label && e._listeners && e._listeners.click).pop();
@@ -361,6 +364,12 @@ function makeFetch() {
   env7.s.closePage(); env7.s.openPage('cx-projects'); await flush(10);
   ok((env7.s.pageCtrl('cx-projects', 'proj_passport').options || []).includes('ce:8821fa0d:local'), 'M1 projects: passport options from /v1/console/passports');
   ok(env7.ALL.some(e => e._text === 'CueCrux'), 'M1 projects: tracked list rendered from /v1/projects');
+  // GitHub-connected repo picker: accessible repos populate the select; Add repo POSTs /select
+  ok((env7.s.pageCtrl('cx-projects', 'gh_addrepo').options || []).includes('CueCrux/AuditCrux'), 'M1 projects: accessible repos populate the picker when GitHub is connected');
+  ok(env7.ALL.some(e => /CueCrux\/Crux · tracked/.test(e.dataset && e.dataset['aria-label'] || '')), 'M1 projects: added GitHub repo surfaces as a tracked toggle');
+  env7.s.confSet('cx-projects.gh_addrepo', 'CueCrux/AuditCrux');
+  await lastBtn(env7, 'Add repo').fire('click'); await flush(8);
+  ok(f7.calls.some(c => /github\/repos\/CueCrux\/AuditCrux\/select/.test(c.url) && c.opts && c.opts.method === 'POST'), 'M1 projects: Add repo POSTs repos/{owner}/{repo}/select');
   env7.s.confSet('cx-projects.proj_id', 'newproj');
   await lastBtn(env7, 'Create project').fire('click'); await flush(8);
   const postP = f7.calls.find(c => /\/v1\/projects$/.test(c.url) && c.opts && c.opts.method === 'POST');

@@ -3263,6 +3263,13 @@ const PAGES={
     {t:'btn',label:'Save cuecrux',hint:'PATCH /v1/projects/cuecrux — kept locally until the daemon grows an update route'}]},
    {t:'btn',label:'Browse as graph',action:'graph'}],
    doc:'Track first, then search: a repo must be TRACKED (scans · code health ·\nWork board) before its SEARCH toggle applies. Both are stored locally —\nthe daemon project model carries no repo list yet (gap, noted).\nExecPlan storage: repo-first is recommended — plans live as markdown in\nthe planning repo (.agent/execplans), get PR review + history, and the\ndaemon projects them read-time; daemon-native suits repo-less tasks.'},
+  {h:'Add repos · GitHub',sub:'activates when the GitHub integration is connected — pick from your accessible repos',wide:true,controls:[
+   {t:'info',label:'github',v:'not connected — connect under Integrations to add repos'},
+   {t:'select',k:'gh_addrepo',label:'repo',options:['— connect GitHub first —'],v:'— connect GitHub first —',
+    desc:'Accessible repos load from GET /v1/integrations/github/repos/accessible once connected.'},
+   {t:'btn',label:'Add repo',hint:'POST /v1/integrations/github/repos/{owner}/{repo}/select — added repos appear as tracked/searched toggles in every project'},
+   {t:'btn',label:'Set as planning repo',hint:'POST …/repos/{owner}/{repo}/planning — designates where ExecPlans live'},
+   {t:'btn',label:'Open Integrations',action:'openpage',page:'cx-integrations'}]},
   {h:'New project',wide:true,showIf:'show_new',controls:[
    {t:'input',k:'proj_name',label:'name',ph:'My project'},
    {t:'input',k:'proj_id',label:'id',ph:'proj-slug',mono:true},
@@ -4022,10 +4029,34 @@ const PAGE_WIRES={
   }},
  'cx-projects':{
   load: async def=>{
-    const [pr,pp]=await Promise.all([api('/v1/projects').catch(e=>({_err:e})), api('/v1/console/passports').catch(e=>({_err:e}))]);
+    const [pr,pp,gh]=await Promise.all([api('/v1/projects').catch(e=>({_err:e})), api('/v1/console/passports').catch(e=>({_err:e})),
+      api('/v1/integrations/github/status').catch(e=>({_err:e}))]);
     if(!pp._err){ const ids=(pp.passports||[]).map(p=>p.id).filter(Boolean);
       const sel=pageCtrl('cx-projects','proj_passport');
       if(sel&&ids.length){ sel.options=ids; if(ids.indexOf(confGet('cx-projects.proj_passport',sel.v))<0) setCtrl('cx-projects','proj_passport',ids[0]); } }
+    /* Add repos rides the GitHub integration: picker activates on connection */
+    const repoName=r=>r&&(r.full_name||((r.owner&&(r.owner.login||r.owner))?((r.owner.login||r.owner)+'/'+(r.name||r.repo||'')):(r.name||r.repo)))||null;
+    let ghRepos=[];
+    const ghSec=def.sections.find(s=>/^Add repos/.test(s.h));
+    if(ghSec){
+      if(!gh._err && gh.connected){
+        const [acc,sel2]=await Promise.all([
+          api('/v1/integrations/github/repos/accessible').catch(()=>null),
+          api('/v1/integrations/github/repos').catch(()=>null)]);
+        const names=(((acc||{}).repos)||((acc||{}).accessible)||[]).map(repoName).filter(Boolean);
+        ghRepos=((((sel2||{}).repos)||((sel2||{}).selected)||[]).map(repoName)).filter(Boolean);
+        ghSec.sub='GitHub connected'+(gh.username?' · '+gh.username:'')+' · '+names.length+' accessible · '+ghRepos.length+' added';
+        const selCtl=ghSec.controls.find(c=>c.k==='gh_addrepo');
+        if(selCtl&&names.length){ selCtl.options=names; if(names.indexOf(confGet('cx-projects.gh_addrepo',selCtl.v))<0) setCtrl('cx-projects','gh_addrepo',names[0]); }
+        ghSec.controls=[infoRow('github','connected'+(gh.username?' · '+gh.username:''))]
+          .concat(ghRepos.slice(0,12).map(rn=>infoRow('added',rn)))
+          .concat(ghSec.controls.filter(c=>c.t!=='info'));
+      } else {
+        ghSec.sub='activates when the GitHub integration is connected';
+        ghSec.controls=[infoRow('github','not connected — connect under Integrations to add repos')]
+          .concat(ghSec.controls.filter(c=>c.t!=='info'));
+      }
+    }
     if(!pr._err){ const list=pr.projects||[];
       def.sections[0].h='Projects · '+list.length;
       const head=def.sections[0].controls.filter(c=>c.t==='search'||(c.t==='btn'&&c.action==='showsec'));
@@ -4033,21 +4064,32 @@ const PAGE_WIRES={
       const storageDefault=t=>/^tenant:/.test(String(t||''))? 'daemon-native' : 'planning repo (recommended)';
       def.sections[0].controls=head.concat(list.length? list.map(p=>{
           const id=String(p.id||p.name), pid=id.replace(/[^a-zA-Z0-9]/g,'_');
+          /* GitHub-added repos surface as tracked→searched toggle pairs in every project */
+          const repoPairs=ghRepos.slice(0,10).flatMap(rn=>{ const slug=rn.replace(/[^a-zA-Z0-9]/g,'_');
+            return [
+             {t:'toggle',k:'pr_'+pid+'_track_'+slug,label:rn+' · tracked',v:true,
+              desc:'Actively tracked: workspace scans, code health and the Work board watch this repo.'},
+             {t:'toggle',k:'pr_'+pid+'_search_'+slug,label:rn+' · searched',v:true,
+              desc:'Included in project-scoped search. Only applies while the repo is tracked.'}]; });
+          const planOpts=[p.planning_target].concat(ghRepos.map(rn=>'github:'+rn)).concat(['(daemon-native)']).filter(Boolean)
+            .filter((v,i,a)=>a.indexOf(v)===i);
           return {t:'exp',label:p.name||p.id,sub:[p.planning_target,(p.working_tenants||[]).join(', ')||null].filter(Boolean).join(' · ')||'project',
             badge:p.archived?'archived':'active',
             controls:[
-             {t:'input',k:'pr_'+pid+'_planrepo',label:'planning repo / target',v:p.planning_target||'',mono:true,
-              desc:'Where .agent/execplans lives (github:owner/repo or a path); tenant:… = daemon-native.'},
+             {t:'select',k:'pr_'+pid+'_planrepo',label:'planning repo',options:planOpts,v:p.planning_target||planOpts[0],
+              desc:'Which repo holds .agent/execplans (added GitHub repos appear here); (daemon-native) keeps plans as kanban work items.'},
              {t:'select',k:'pr_'+pid+'_storage',label:'execplan storage',
               options:['planning repo (recommended)','daemon-native','hybrid — repo files + daemon kanban'],v:storageDefault(p.planning_target),
-              desc:'Repo: PR-reviewable markdown projected onto the Work board. Daemon-native: work items only. Hybrid: repo source of truth + kanban overlay.'},
+              desc:'Repo: PR-reviewable markdown projected onto the Work board. Daemon-native: work items only. Hybrid: repo source of truth + kanban overlay.'}]
+            .concat(repoPairs.length? repoPairs : [
              {t:'toggle',k:'pr_'+pid+'_track',label:'tracked',v:!p.archived,
               desc:'Actively tracked: workspace scans, code health and the Work board watch this project.'},
              {t:'toggle',k:'pr_'+pid+'_search',label:'included in search',v:true,
-              desc:'Project-scoped search inclusion. Only applies while tracked. Stored locally — the daemon project model carries no repo list yet.'},
+              desc:'Project-scoped search inclusion. Only applies while tracked. Add repos via GitHub below for per-repo toggles.'}])
+            .concat([
              {t:'input',k:'pr_'+pid+'_tenants',label:'working tenants',v:(p.working_tenants||[]).join(', '),mono:true},
              {t:'info',label:'default passport',v:p.default_passport_id||'—'},
-             {t:'btn',label:'Save '+id,hint:'PATCH /v1/projects/'+id+' — falls back to local if the route is absent'}]};
+             {t:'btn',label:'Save '+id,hint:'PATCH /v1/projects/'+id+' — falls back to local if the route is absent'}])};
         })
         : [infoRow('none yet','＋ New project above')]).concat(tail); }
   },
@@ -4062,6 +4104,22 @@ const PAGE_WIRES={
     })();
   },
   act:{
+    'Add repo': async ctx=>{
+      const rn=pageVal('cx-projects','gh_addrepo');
+      if(!rn||/^—/.test(rn)) throw {status:'connect GitHub first — Integrations page'};
+      const [owner,...rest]=String(rn).split('/'); const repo=rest.join('/');
+      if(!owner||!repo) throw {status:'pick an owner/repo'};
+      await postApi('/v1/integrations/github/repos/'+encodeURIComponent(owner)+'/'+encodeURIComponent(repo)+'/select',{});
+      ctx.reload(); return 'repo added · '+rn;
+    },
+    'Set as planning repo': async ctx=>{
+      const rn=pageVal('cx-projects','gh_addrepo');
+      if(!rn||/^—/.test(rn)) throw {status:'connect GitHub first — Integrations page'};
+      const [owner,...rest]=String(rn).split('/'); const repo=rest.join('/');
+      if(!owner||!repo) throw {status:'pick an owner/repo'};
+      await postApi('/v1/integrations/github/repos/'+encodeURIComponent(owner)+'/'+encodeURIComponent(repo)+'/planning',{});
+      ctx.reload(); return 'planning repo · '+rn;
+    },
     'Create project': async ctx=>{
       const id=pageVal('cx-projects','proj_id'); if(!id) throw {status:'id required'};
       await postApi('/v1/projects',{ id, name:pageVal('cx-projects','proj_name')||id,
@@ -4200,6 +4258,7 @@ function renderControl(pageId,c){
       if(c.action==='open3d'){ closePage(); setView('3d'); return; }
       if(c.action==='rpc'){ sendRpc(pageId); return; }
       if(c.action==='showsec'){ confPut(pageId+'.'+c.key, c.value!==undefined? c.value : true); openPage(pageId,{__wired:true}); return; }
+      if(c.action==='openpage'){ openPage(c.page); return; }
       if(c.action==='folder'){   /* browser folder picker → derive the doc prefix from the selection */
         (async()=>{
           try{
