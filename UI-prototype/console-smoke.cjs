@@ -513,6 +513,41 @@ function makeFetch() {
   ok(/bind a passport/.test(env10.getById('cxToast').textContent || ''), 'M6 gates: unbound passport refuses with attribution message');
   ok(!f10.calls.some(c => /gate\/act_1\/reject/.test(c.url)), 'M6 gates: no reject call without attribution');
 
+  // ── Q) M7 — query workbench + entities browser + passport presence ──
+  f10.route(u => /\/v1\/kinds/.test(u), { ok: true, status: 200, body: { kinds: [{ kind: 'capability' }, { kind: 'document' }], count: 2 } });
+  f10.route((u, o) => /\/v1\/query\/text-search$/.test(u) && o.method === 'POST', { ok: true, status: 200, body: {
+    results: [{ result_id: '0:226200', rank: 1, segment_index: 0, doc_id: 226200, score: 0.913, frame_offset: 0, token_count: 412 }],
+    coverage: { score: 0.9, gaps: [], below_floor: 0 }, meta: { backend: 'corecrux-v5-bm25', took_ms: 12, segments_searched: 3, total_docs: 100, total_candidates: 8 } } });
+  f10.route((u, o) => /\/v1\/query\/graph-expand/.test(u) && o.method === 'POST', { ok: false, status: 404, body: { detail: 'not enabled' } });
+  f10.route(u => /\/v1\/entities\/capability\/cap-1\/history/.test(u), { ok: true, status: 200, body: { versions: [{}, {}], count: 2 } });
+  f10.route(u => /\/v1\/entities\/capability\/cap-1$/.test(u), { ok: true, status: 200, body: { entity: { id: 'cap-1', kind: 'capability', name: 'Receipts verify' } } });
+  env10.s.closePage(); env10.s.openPage('cx-workbench'); await flush(10);
+  ok((env10.s.pageCtrl('cx-workbench', 'wbe_kind').options || []).includes('document'), 'M7 entities: kind options from /v1/kinds');
+  env10.s.confSet('cx-workbench.wbq_query', 'cascade');
+  await lastBtn(env10, 'Run text search').fire('click'); await flush(10);
+  const tsCall = f10.calls.find(c => /query\/text-search$/.test(c.url) && c.opts && c.opts.method === 'POST');
+  ok(!!tsCall && JSON.parse(tsCall.opts.body).query === 'cascade', 'M7 query: text-search POSTs the query');
+  ok(env10.ALL.some(e => /#1 · doc 226200/.test(e._text || '')), 'M7 query: result row rendered with rank + doc id');
+  ok((env10.s.__cx.N['cx-workbench'].children || []).includes('wbres:0:226200'), 'M7 query: results merged as graph nodes for column browsing');
+  env10.s.confSet('cx-workbench.wbq_seeds', '12');
+  await lastBtn(env10, 'Graph expand').fire('click'); await flush(8);
+  ok(/dataplane lane off/.test(env10.getById('cxToast').textContent || ''), 'M7 query: disabled lane (404) toasts the flag hint');
+  env10.s.confSet('cx-workbench.wbe_id', 'cap-1');
+  await lastBtn(env10, 'Load entity').fire('click'); await flush(10);
+  ok(env10.ALL.some(e => /2 versions/.test(e._text || '')), 'M7 entities: history version count rendered');
+  // presence joined onto the passports panel
+  const f11 = makeFetch();
+  f11.route(u => /\/v1\/passports$/.test(u), { ok: true, status: 200, body: { passports: [{ id: 'claude-work', category: 'agent', reputation_tier: 'basic' }] } });
+  f11.route(u => /\/v1\/passports\/presence/.test(u), { ok: true, status: 200, body: { count: 2, presence: [
+    { passport_id: 'claude-work', last_seen_at_unix_ms: Date.now() - 5000, last_route: '/v1/work', last_method: 'GET', call_count: 41 },
+    { passport_id: 'ghost-agent', last_seen_at_unix_ms: Date.now() - 65000, last_route: '/mcp', last_method: 'POST', call_count: 7 }] } });
+  const env11 = buildSandbox(f11); await flush(6);
+  await tile(env11, 'panel', 'Passport').fire('click'); await flush(8);
+  const ppNode = env11.s.__cx.N['pp:claude-work'];
+  ok(!!ppNode && /seen 5s ago/.test(ppNode.sub || ''), 'M7 presence: live passport row carries last-seen');
+  ok(ppNode && JSON.stringify(ppNode.fields).includes('GET /v1/work'), 'M7 presence: last route joined onto the passport');
+  ok(!!env11.s.__cx.N['ppx:ghost-agent'], 'M7 presence: presence-only passport appears as its own row');
+
   console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

@@ -1307,6 +1307,21 @@ function txPassports(json){   // M8
     fields:[['id',p.id],['category',p.category],['tier',p.reputation_tier],['receipts',p.receipt_count],['gate',p.agent_work_gate]].filter(([,v])=>v!=null),
     children:[], payload: JSON.stringify(p,null,2) }));
 }
+function txPassportsPresence(json){   // gap-closure M7 — join /v1/passports/presence onto the passport panel
+  const base=txPassports(json.pp||{});
+  const pres=((json.pr||{}).presence)||[];
+  const ago=ms=>{ const s=Math.max(0,Math.round((Date.now()-ms)/1000)); return s<60? s+'s ago' : (s<3600? Math.round(s/60)+'m ago' : Math.round(s/3600)+'h ago'); };
+  pres.forEach(p=>{
+    const n=base.find(b=>b.id===idFor('pp',p.passport_id));
+    if(n){ n.status='run'; n.sub=(n.sub?n.sub+' · ':'')+'seen '+ago(p.last_seen_at_unix_ms);
+      n.fields=(n.fields||[]).concat([['last seen',ago(p.last_seen_at_unix_ms)],['last route',p.last_method+' '+p.last_route],['calls',p.call_count]]); }
+    else base.push({ id:idFor('ppx',p.passport_id), kind:'presence', label:p.passport_id,
+      sub:'seen '+ago(p.last_seen_at_unix_ms)+' · '+p.call_count+' calls', status:'run',
+      fields:[['passport',p.passport_id],['last route',p.last_method+' '+p.last_route],['calls',p.call_count]],
+      children:[], payload:JSON.stringify(p,null,2) });
+  });
+  return base;
+}
 function txAudit(json){   // M9 — session audit chain → step nodes
   const steps = json.steps || (Array.isArray(json)? json : []);
   return steps.map((s,i)=>({ id: idFor('step', (s.node_id||s.session_id||'')+'/'+(s.seq!=null?s.seq:i)), kind:'step',
@@ -1470,7 +1485,8 @@ function registerLoaders(){
   LOADERS['cx-facts']         = { endpoint:'/v1/console/facts?top_k=100', noun:'facts',     transform: txFacts };          // M7
   LOADERS['cx-memory']        = { endpoint:'/v1/console/facts?top_k=20',  noun:'memories',  transform: txMemory };         // M7
   LOADERS['cx-tenants']       = { endpoint:'/v1/console/tenants',     noun:'tenants',       transform: txTenants };        // M8
-  LOADERS['cx-passport']      = { endpoint:'/v1/passports',           noun:'passports',     transform: txPassports };      // M8
+  LOADERS['cx-passport']      = { noun:'passports', transform: txPassportsPresence,                                        // M8 + gap-closure M7 presence
+    fetch: async()=>({ pp: await api('/v1/passports'), pr: await api('/v1/passports/presence').catch(()=>null) }) };
   // receipts: no daemon list endpoint — the panel projects this browser's lookup history (no network)
   LOADERS['cx-receipts']      = { fetch: async()=>({ recent: recentReceiptLookups() }), noun:'verified receipts yet — use ✓ Verify receipt (toolbar)', transform: txReceiptRecent };
   LOADERS['cx-gates']         = { endpoint:'/v1/work/gate/pending', noun:'pending gates', transform: txGates };            // M6
@@ -2937,7 +2953,20 @@ const PAGES={
   {h:'Feature registry',sub:'/v1/features/capabilities (post-M5 cutover)',controls:[
    {t:'info',label:'gap analysis',v:'2 critical · 5 high'},
    {t:'info',label:'promise coverage',v:'78% audited'},
-   {t:'btn',label:'Record capability audit',hint:'POST …/capabilities/{id}/audit'}]}]},
+   {t:'btn',label:'Record capability audit',hint:'POST …/capabilities/{id}/audit'}]},
+  {h:'Query workbench',sub:'/v1/query/* · dataplane lanes (text-search · graph-expand · time-range)',controls:[
+   {t:'input',k:'wbq_tenant',label:'tenant',v:'default',mono:true},
+   {t:'input',k:'wbq_query',label:'text search',ph:'retrieval cascade',mono:true},
+   {t:'btn',label:'Run text search'},
+   {t:'input',k:'wbq_seeds',label:'graph seeds · artifact ids',ph:'12, 44',mono:true},
+   {t:'btn',label:'Graph expand'},
+   {t:'select',k:'wbq_window',label:'time window',options:['24h','7d','30d'],v:'24h'},
+   {t:'btn',label:'Time range'},
+   {t:'btn',label:'Browse results as graph',action:'graph'}]},
+  {h:'Entities',sub:'/v1/entities/{kind}/{id} + /history',controls:[
+   {t:'select',k:'wbe_kind',label:'kind',options:['capability'],v:'capability'},
+   {t:'input',k:'wbe_id',label:'id',ph:'entity id',mono:true},
+   {t:'btn',label:'Load entity'}]}]},
 };
 function openSettings(){ openPage('cx-settings'); }
 function closeSettings(){ closePage(); }
@@ -3131,6 +3160,68 @@ const PAGE_WIRES={
       : [infoRow('—','sessions show here when save_session uses execplan:<slug> ids')];
   },
   set:{ win: ()=>{ if(openPageId==='cx-usage') openPage('cx-usage'); return null; } }},
+ 'cx-workbench':{
+  load: async def=>{   // gap-closure M7: kinds feed the entities browser; everything else is action-driven
+    const ks=await api('/v1/kinds').catch(()=>null);
+    const sel=pageCtrl('cx-workbench','wbe_kind');
+    const names=ks? (ks.kinds||[]).map(k0=>k0.kind||k0.name||k0.id).filter(Boolean) : [];
+    if(sel&&names.length){ sel.options=names; if(names.indexOf(confGet('cx-workbench.wbe_kind',sel.v))<0) setCtrl('cx-workbench','wbe_kind',names[0]); }
+  },
+  actAny:(label,ctx)=>{
+    const def=PAGES['cx-workbench'];
+    const setResults=(rows,sub)=>{ const sec={h:'Results',sub:sub||'',controls:rows.length?rows:[infoRow('none','no matches')]}
+      ; const i=def.sections.findIndex(s0=>s0.h==='Results'); if(i>=0) def.sections[i]=sec; else def.sections.push(sec); ctx.reopen(); };
+    const mergeGraph=nodes=>{ const wb=N['cx-workbench']; if(wb&&nodes.length) mergeChildren(wb,nodes); };
+    const flagged=(e,flag)=>{ if(e&&(e.status===404||e.status===400)) throw {status:'dataplane lane off — '+flag}; throw e; };
+    if(label==='Run text search') return (async()=>{
+      const q=pageVal('cx-workbench','wbq_query'); if(!q) throw {status:'enter a query'};
+      const r=await postApi('/v1/query/text-search',{tenant_id:pageVal('cx-workbench','wbq_tenant')||'default', query:q, limit:10})
+        .catch(e=>flagged(e,'BM25 index (.ccxi) not built or dataplane disabled'));
+      const res=r.results||[];
+      setResults(res.map(x=>infoRow('#'+x.rank+' · doc '+x.doc_id,'score '+(x.score!=null?x.score.toFixed(3):'—')+' · seg '+x.segment_index+' · '+(x.token_count||0)+' tok')),
+        'text-search · '+res.length+' hits · '+((r.meta&&r.meta.took_ms)!=null?r.meta.took_ms+'ms':'')+(r.coverage&&r.coverage.score!=null?' · coverage '+r.coverage.score.toFixed(2):''));
+      mergeGraph(res.map(x=>({ id:idFor('wbres',x.result_id||x.segment_index+':'+x.doc_id), kind:'chunk',
+        label:'#'+x.rank+' · doc '+x.doc_id, sub:'score '+(x.score!=null?x.score.toFixed(3):'—'),
+        status:'ok', fields:[['result_id',x.result_id],['segment',x.segment_index],['score',x.score],['tokens',x.token_count]].filter(([,v])=>v!=null),
+        children:[], payload:JSON.stringify(x,null,2) })));
+      return 'text-search · '+res.length+' hits';
+    })();
+    if(label==='Graph expand') return (async()=>{
+      const seeds=String(pageVal('cx-workbench','wbq_seeds')||'').split(',').map(s=>parseInt(s.trim(),10)).filter(n=>!isNaN(n));
+      if(!seeds.length) throw {status:'enter seed artifact ids'};
+      const r=await postApi('/v1/query/graph-expand',{tenant_id:pageVal('cx-workbench','wbq_tenant')||'default', seed_artifact_ids:seeds, max_hops:2, budget:50})
+        .catch(e=>flagged(e,'set CORECRUXD_QUERY_GRAPH_EXPAND=1'));
+      const arts=r.artifacts||[];
+      setResults(arts.map(a=>infoRow('artifact '+a.artifact_id,'hop '+a.hop_distance+' · score '+(a.score!=null?a.score.toFixed(3):'—')+(a.edge_types_used&&a.edge_types_used.length?' · '+a.edge_types_used.join(','):''))),
+        'graph-expand · '+arts.length+' artifacts · '+((r.traversal_stats||{}).nodes_visited||0)+' visited');
+      return 'graph-expand · '+arts.length+' artifacts';
+    })();
+    if(label==='Time range') return (async()=>{
+      const days={'24h':1,'7d':7,'30d':30}[pageVal('cx-workbench','wbq_window')]||1;
+      const end=Date.now()*1000, start=end-days*86400000000;
+      const r=await postApi('/v1/query/time-range',{tenant_id:pageVal('cx-workbench','wbq_tenant')||'default', start_micros:start, end_micros:end, limit:50})
+        .catch(e=>flagged(e,'set CORECRUXD_QUERY_TIME_RANGE=1'));
+      const ch=r.artifacts_changed||[];
+      setResults(ch.map(a=>infoRow('artifact '+a.artifact_id,(a.living_status||'')+' · conf '+(a.confidence!=null?a.confidence.toFixed(2):'—')+(a.relation_change_count?' · '+a.relation_change_count+' relation changes':''))),
+        'time-range · '+ch.length+' changed · '+((r.scan_stats||{}).artifacts_scanned||0)+' scanned');
+      return 'time-range · '+ch.length+' changed';
+    })();
+    if(label==='Load entity') return (async()=>{
+      const kind=pageVal('cx-workbench','wbe_kind'), id=pageVal('cx-workbench','wbe_id');
+      if(!id) throw {status:'enter an entity id'};
+      const base='/v1/entities/'+encodeURIComponent(kind)+'/'+encodeURIComponent(id);
+      const [er,hr]=await Promise.all([api(base), api(base+'/history').catch(()=>null)]);
+      const ent=er.entity||er;
+      const rows=[infoRow(kind+'/'+id, JSON.stringify(ent).slice(0,80))]
+        .concat(hr? [infoRow('history',(hr.count!=null?hr.count:(hr.versions||[]).length)+' versions')] : []);
+      setResults(rows,'entity · '+kind+'/'+id);
+      mergeGraph([{ id:idFor('wbent',kind+'/'+id), kind:'entity', label:kind+'/'+id,
+        sub:(hr&&hr.count!=null? hr.count+' versions':''), status:'ok', fields:[['kind',kind],['id',id]],
+        children:[], payload:JSON.stringify({entity:ent,history:hr},null,2) }]);
+      return 'entity loaded · '+kind+'/'+id;
+    })();
+    return null;
+  }},
  'cx-gates':{
   load: async def=>{
     const g=await api('/v1/work/gate/pending');
