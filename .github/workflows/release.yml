@@ -79,6 +79,13 @@ jobs:
       - name: Install cosign
         # sigstore/cosign-installer v4.1.2 (pinned SHA — floating tags are a T.5 vector)
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          # Pin cosign 2.x: v3.0 `sign-blob` writes a Sigstore bundle by default
+          # and the legacy --output-signature/--output-certificate-only call
+          # below leaves the bundle path empty → "create bundle file: open :
+          # no such file or directory" (v0.4.8 release-signing failure). 2.4.x
+          # keeps the .sig/.pem contract the dist/* upload + SLSA subjects expect.
+          cosign-release: 'v2.4.3'
 
       - name: Sign artifacts (cosign keyless)
         # Sign the per-suffix files only: the three binaries, the SBOM, and
