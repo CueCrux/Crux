@@ -200,6 +200,14 @@ pub struct AppState {
     /// Deliberately ephemeral: a restart refills everyone (errs toward
     /// the user).
     pub quota_ledger: Arc<std::sync::Mutex<crux_router::quota::QuotaLedger>>,
+    /// G21b assembly cache over
+    /// `corecrux_projections::assembly_cache::AssemblyCache` — memoizes
+    /// assembled `/v1/context` bundles keyed by
+    /// (passport, session, facts-chain-head). `None` unless
+    /// `CORECRUXD_ASSEMBLY_CACHE=1` (default OFF); invalidation is
+    /// structural (any fact write moves the chain head). Ephemeral by
+    /// design: restart = cold = always safe.
+    pub assembly_cache: Option<Arc<std::sync::Mutex<corecrux_projections::assembly_cache::AssemblyCache>>>,
     /// OpenAI function-calling shim over the MCP tool surface
     /// (`/v1/openai/tools.json` + `/v1/openai/invoke`). Default OFF
     /// (`CORECRUXD_OPENAI_SHIM=1`); when off, routes return 404.

@@ -522,6 +522,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     spawn_shutdown_signal(shutdown_tx.clone());
     update::spawn_update_checker(config.clone(), update_status.clone(), shutdown_tx.subscribe());
 
+    /// Bounded memo of assembled /v1/context bundles (G21b). Eviction is
+    /// deterministic oldest-first inside the cache; 256 entries is plenty
+    /// for a per-(passport, session, chain-head) memo on a local daemon.
+    const ASSEMBLY_CACHE_MAX_ENTRIES: usize = 256;
+
     let state = AppState {
         lock_held: true,
         build: build.clone(),
@@ -539,6 +544,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         context_surface_enabled: config.context_surface_enabled,
         stream_receipts_enabled: config.stream_receipts_enabled,
         quota_enabled: config.quota_enabled,
+        assembly_cache: config.assembly_cache_enabled.then(|| {
+            Arc::new(std::sync::Mutex::new(
+                corecrux_projections::assembly_cache::AssemblyCache::new(ASSEMBLY_CACHE_MAX_ENTRIES),
+            ))
+        }),
         quota_hosted_surfaces: Arc::new(config.quota_hosted_surfaces.clone()),
         quota_ledger: Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
         openai_shim_enabled: config.openai_shim_enabled,
@@ -3896,6 +3906,7 @@ mod tests {
             context_surface_enabled: false,
             stream_receipts_enabled: false,
             quota_enabled: false,
+            assembly_cache: None,
             quota_hosted_surfaces: std::sync::Arc::new(Vec::new()),
             quota_ledger: std::sync::Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
             openai_shim_enabled: false,

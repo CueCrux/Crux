@@ -30,6 +30,7 @@
 //! prefix. Volatile material (`assembled_at`, `budget`, `receipt_ref`,
 //! identity echo) lives outside the stable region.
 
+use corecrux_projections::assembly_cache::AssemblyKey;
 use corecrux_projections::context_bundle::{
     self as cb, render_markdown_stable, AuxItem, AuxSection, ContextBundle, SectionKind, BUNDLE_VERSION,
     DEFAULT_REQUESTED_BUDGET, FREE_TIER_CEILING,
@@ -180,6 +181,82 @@ async fn gather_session_state(
     })
 }
 
+// ── Assembly cache (G21b wiring, CORECRUXD_ASSEMBLY_CACHE) ───────────────
+
+/// Build the structural cache key for one assembly request
+/// (`corecrux_projections::assembly_cache::AssemblyKey`).
+///
+/// `facts_chain_head` is a digest over every mutation-relevant fact field
+/// (id, version, supersession, re-verify anchor, deletion, horizon) — any
+/// fact write moves it, which IS the invalidation mechanism (no bus, no
+/// staleness window). Folded into the same digest, because they also
+/// change the assembled bundle without moving the fact chain:
+///
+/// - the requested session's state (the `session_state` section),
+/// - the request identity (`entity` / `query` / `token_budget` — the
+///   merged `AssemblyKey` carries only passport/session, so request shape
+///   rides in the head),
+/// - the current UTC hour (freshness *classes* may flip at horizon
+///   crossings without a write; an entry therefore serves at most one
+///   hour of class lag).
+async fn assembly_cache_key(
+    state: &AppState,
+    ctx: &crate::auth::HttpScopeContext,
+    req: &ContextRequest,
+    principal: &str,
+    now_ms: i64,
+) -> AssemblyKey {
+    let mut per_fact: Vec<[u8; 32]> = {
+        let store = state.fact_store.read().await;
+        store
+            .all_facts()
+            .map(|f| {
+                let mut h = blake3::Hasher::new();
+                h.update(f.fact_id.as_bytes());
+                h.update(&f.version.to_le_bytes());
+                h.update(&[u8::from(f.deleted), u8::from(f.private)]);
+                h.update(f.superseded_by.as_deref().unwrap_or("").as_bytes());
+                h.update(
+                    &f.reverified_at
+                        .map(|t| t.timestamp_millis())
+                        .unwrap_or_default()
+                        .to_le_bytes(),
+                );
+                h.update(f.horizon_class.as_str().as_bytes());
+                *h.finalize().as_bytes()
+            })
+            .collect()
+    };
+    // The store iterates a HashMap — sort for a deterministic head.
+    per_fact.sort_unstable();
+
+    let mut head = blake3::Hasher::new();
+    for h in &per_fact {
+        head.update(h);
+    }
+    // Session-state slice (rides outside the fact chain).
+    if let Some(session_id) = req.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let scoped = super::facts::scoped_session_id_for_http(ctx, session_id);
+        let store = state.session_store.read().await;
+        if let Some(session) = store.get(&scoped) {
+            head.update(serde_json::to_string(&session.state).unwrap_or_default().as_bytes());
+        }
+    }
+    // Request identity.
+    head.update(req.entity.as_deref().unwrap_or("").as_bytes());
+    head.update(&[0]);
+    head.update(req.query.as_deref().unwrap_or("").as_bytes());
+    head.update(&req.token_budget.unwrap_or(0).to_le_bytes());
+    // Freshness epoch (hour bucket).
+    head.update(&(now_ms / 3_600_000).to_le_bytes());
+
+    AssemblyKey {
+        passport: principal.to_string(),
+        session_id: req.session_id.clone(),
+        facts_chain_head: format!("blake3:{}", head.finalize().to_hex()),
+    }
+}
+
 // ── Receipting (spec §4 rule 7) ───────────────────────────────────────────
 
 fn bundle_fact_ids(bundle: &ContextBundle) -> Vec<String> {
@@ -309,9 +386,34 @@ async fn handle_context(state: AppState, headers: HeaderMap, req: ContextRequest
         policy: decay::DecayPolicy::from_env(),
     };
 
-    let facts = gather_facts(&state, &ctx, &req).await;
-    let aux: Vec<AuxSection> = gather_session_state(&state, &ctx, &req).await.into_iter().collect();
-    let bundle = cb::assemble(&bundle_req, facts, aux);
+    // G21b assembly cache (CORECRUXD_ASSEMBLY_CACHE, default OFF →
+    // `assembly_cache` is None and this surface behaves exactly as
+    // before). A hit skips gather + assemble entirely; the receipt below
+    // is still minted per serve (every serve is receipted).
+    let cache_key = if state.assembly_cache.is_some() {
+        Some(assembly_cache_key(&state, &ctx, &req, &principal, bundle_req.now_ms).await)
+    } else {
+        None
+    };
+    let cached: Option<ContextBundle> = match (&state.assembly_cache, &cache_key) {
+        (Some(cache), Some(key)) => {
+            let mut cache = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.get(key).cloned()
+        }
+        _ => None,
+    };
+    let bundle = if let Some(bundle) = cached {
+        bundle
+    } else {
+        let facts = gather_facts(&state, &ctx, &req).await;
+        let aux: Vec<AuxSection> = gather_session_state(&state, &ctx, &req).await.into_iter().collect();
+        let bundle = cb::assemble(&bundle_req, facts, aux);
+        if let (Some(cache), Some(key)) = (&state.assembly_cache, cache_key) {
+            let mut cache = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.insert(key, bundle.clone());
+        }
+        bundle
+    };
 
     // Receipt the assembly (spec §4 rule 7).
     let (receipt_ref, receipt_error) = match mint_bundle_receipt(&state, &principal, req.session_id.as_deref(), &bundle)
@@ -741,6 +843,92 @@ mod tests {
             .expect("content")
             .starts_with("## Crux Context"));
         assert!(bundle["metadata"]["stable_hash"].as_str().is_some());
+    }
+
+    // ── G21b assembly-cache wiring (CORECRUXD_ASSEMBLY_CACHE) ────────────
+
+    fn cached_state() -> AppState {
+        let mut state = enabled_state();
+        state.assembly_cache = Some(std::sync::Arc::new(std::sync::Mutex::new(
+            corecrux_projections::assembly_cache::AssemblyCache::new(8),
+        )));
+        state
+    }
+
+    fn cache_stats(state: &AppState) -> corecrux_projections::assembly_cache::CacheStats {
+        state
+            .assembly_cache
+            .as_ref()
+            .expect("cache enabled")
+            .lock()
+            .expect("lock")
+            .stats()
+    }
+
+    #[tokio::test]
+    async fn assembly_cache_hits_on_identical_request() {
+        let state = cached_state();
+        store_fact(&state, "execplan:demo", "milestone:M1", "shipped").await;
+
+        let a = get_bundle(&state, req(None, Some("shipped"), Some(2000))).await;
+        let b = get_bundle(&state, req(None, Some("shipped"), Some(2000))).await;
+        assert_eq!(a["stable_hash"], b["stable_hash"]);
+        assert_eq!(a["sections"], b["sections"]);
+        let stats = cache_stats(&state);
+        assert_eq!(stats.misses, 1, "first request assembles");
+        assert_eq!(stats.hits, 1, "second identical request is served from the memo");
+        // Every serve is receipted, hit or miss.
+        assert!(b["receipt_ref"].as_str().is_some() || b.get("receipt_error").is_some());
+    }
+
+    #[tokio::test]
+    async fn fact_write_moves_the_chain_head_and_invalidates() {
+        let state = cached_state();
+        store_fact(&state, "execplan:demo", "milestone:M1", "shipped").await;
+        let _ = get_bundle(&state, req(None, None, Some(2000))).await;
+
+        // A fact write between requests → structural miss, fresh assembly
+        // that includes the new fact.
+        store_fact(&state, "bench:lme-s", "baseline", "91.7%").await;
+        let bundle = get_bundle(&state, req(None, None, Some(2000))).await;
+        let stats = cache_stats(&state);
+        assert_eq!(stats.hits, 0, "chain head moved — the stale entry must not serve");
+        assert_eq!(stats.misses, 2);
+        assert!(facts_items(&bundle).iter().any(|i| i["entity"] == "bench:lme-s"));
+    }
+
+    #[tokio::test]
+    async fn request_shape_is_part_of_the_cache_identity() {
+        let state = cached_state();
+        store_fact(&state, "execplan:demo", "milestone:M1", "shipped").await;
+        store_fact(&state, "bench:lme-s", "baseline", "91.7%").await;
+
+        let a = get_bundle(&state, req(Some("execplan:demo"), None, Some(2000))).await;
+        let b = get_bundle(&state, req(Some("bench:lme-s"), None, Some(2000))).await;
+        assert_ne!(a["sections"], b["sections"], "different addresses are different bundles");
+        assert_eq!(cache_stats(&state).hits, 0, "different request shapes must not collide");
+    }
+
+    #[tokio::test]
+    async fn session_state_change_invalidates() {
+        let state = cached_state();
+        {
+            let mut s = state.session_store.write().await;
+            s.put("sess-1", json!({"next": "M2"}), None);
+        }
+        let request = || ContextRequest {
+            session_id: Some("sess-1".to_string()),
+            ..req(None, None, Some(2000))
+        };
+        let _ = get_bundle(&state, request()).await;
+        {
+            let mut s = state.session_store.write().await;
+            s.put("sess-1", json!({"next": "M3"}), None);
+        }
+        let bundle = get_bundle(&state, request()).await;
+        assert_eq!(cache_stats(&state).hits, 0, "session-state change must invalidate");
+        let as_text = serde_json::to_string(&bundle["sections"]).expect("serialize");
+        assert!(as_text.contains("M3"), "fresh session state must be served");
     }
 
     #[tokio::test]

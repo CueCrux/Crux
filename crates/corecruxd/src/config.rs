@@ -432,6 +432,9 @@ pub struct Config {
     // Default OFF.
     pub stream_receipts_enabled: bool,
 
+    // G21b assembly cache for /v1/context bundles. Default OFF.
+    pub assembly_cache_enabled: bool,
+
     // G20 per-surface request quota (`crate::http::quota`). Default OFF.
     pub quota_enabled: bool,
     // Path prefixes classified as hosted (quota-limited) surfaces.
@@ -1077,6 +1080,7 @@ pub fn load_config() -> Config {
             .clamp(60, crate::coord::MAX_TTL_SECS),
         context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE").unwrap_or(false),
         stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS").unwrap_or(false),
+        assembly_cache_enabled: env_bool("CORECRUXD_ASSEMBLY_CACHE").unwrap_or(false),
         quota_enabled: env_bool("CORECRUXD_QUOTA").unwrap_or(false),
         quota_hosted_surfaces: std::env::var("CORECRUXD_QUOTA_HOSTED_SURFACES")
             .ok()
