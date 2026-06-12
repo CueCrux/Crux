@@ -107,7 +107,7 @@ function makeFetch() {
   const workCall = f.calls.find(c => /\/v1\/work\?/.test(c.url));
   ok(!!workCall && /^\/v1\//.test(workCall.url), 'M3 work: same-origin /v1/work fetch issued');
   ok(workCall && workCall.opts.headers && /read/.test(workCall.opts.headers['X-Corecrux-Scopes'] || ''), 'M3 work: X-Corecrux-Scopes header attached');
-  await tile(env, 'panel', 'Work').fire('click'); await flush();
+  await tile(env, 'panel', 'ExecPlans').fire('click'); await flush();
   ok(!!tile(env, 'execplan', 'agent-ux-best-in-class'), 'M3 work: live WorkItem → execplan tile');
   ok(f.calls.filter(c => /\/v1\/work\?/.test(c.url)).length === 1, 'M3 work: cached (prefetch loaded it; click did not refetch)');
   const chip = st => env.s.document.querySelectorAll('#workFilter .wf-chip').find(c => c.dataset.stage === st);
@@ -148,7 +148,7 @@ function makeFetch() {
   const env2 = buildSandbox(f2); await flush();
   ok(env2.s.__cx.LIVE === false, 'demo: /readyz fail → LIVE false');
   ok(env2.getById('liveBadge').textContent === 'demo', 'demo: badge shows "demo"');
-  await tile(env2, 'panel', 'Work').fire('click'); await flush();
+  await tile(env2, 'panel', 'ExecPlans').fire('click'); await flush();
   ok(ofKind(env2, 'execplan').length >= 1, 'demo: dummy execplans still render (offline still demos)');
 
   // ── F) demo-mode regression: the async click/dblclick wrappers don't break existing UX ──
@@ -206,7 +206,7 @@ function makeFetch() {
   ok(!!tile(env3, 'passport', 'ce:4e6c4e2a'), 'M8 passport: live passport tile');
 
   // M5 live write: build an orchestrator → Done POSTs create + member
-  await tile(env3, 'panel', 'Work').fire('click'); await flush();   // populate work:agentux as a candidate
+  await tile(env3, 'panel', 'ExecPlans').fire('click'); await flush();   // populate work:agentux as a candidate
   cxp(); await flush();
   env3.getById('orcNew').fire('click'); await flush();
   env3.s.addToBuild('work:agentux'); await flush();
@@ -434,9 +434,9 @@ function makeFetch() {
   const env10 = buildSandbox(f10); await flush(8);
   ok(/live · 1 of 2/.test(env10.s.__cx.N['ov-storage'].sub || ''), 'M3 storage: ov-storage dash tile live from storage-breakdown');
   env10.s.openPage('cx-documents'); await flush(12);
-  ok((env10.s.pageCtrl('cx-documents', 'doc_tenant').options || []).join(',') === 'lme-s,personal', 'M3 documents: tenant select from /v1/console/tenants');
-  ok(env10.ALL.some(e => /documents \/ sess_7f3a_travel/.test(e._text || '')), 'M3 documents: chunk metadata rows from /chunks');
-  ok(env10.ALL.some(e => /more available/.test(e._text || '')), 'M3 documents: next_cursor surfaces as "more available"');
+  ok(env10.ALL.some(e => e._text === 'lme-s') && env10.ALL.some(e => e._text === 'personal'), 'M3 documents: tenants render as expandable rows from /v1/console/tenants');
+  ok(env10.ALL.some(e => /documents \/ sess_7f3a_travel/.test(e._text || '')), 'M3 documents: chunk metadata rows from /chunks inside the tenant row');
+  ok(env10.ALL.some(e => /2 tenants/.test(e._text || '')), 'M3 documents: tenant count surfaces in the section sub');
   ok(env10.ALL.some(e => /1 pending/.test(e._text || '')), 'M3 documents: pipeline queue counts ingest:queue facts');
   env10.s.confSet('cx-documents.ing_path', '~/corpus/**/*.md');
   await lastBtn(env10, 'Queue ingest').fire('click'); await flush(8);
@@ -493,7 +493,7 @@ function makeFetch() {
     { action_id: 'act_1', work_id: 'release-readiness', requested_by_passport: 'claude-work', requested_action: 'update_state', target_state: 'deployed', status: 'pending', requested_at_unix_ms: 1765000000000 }] } });
   f10.route((u, o) => /\/v1\/work\/gate\/act_1\/approve/.test(u) && o.method === 'POST', { ok: true, status: 200, body: { id: 'release-readiness', state: 'deployed' } });
   // drill: live work node fans out comments + transitions
-  await tile(env10, 'panel', 'Work').fire('click'); await flush(8);
+  await tile(env10, 'panel', 'ExecPlans').fire('click'); await flush(8);
   const wNode = env10.s.__cx.N['work:gapwork'];
   ok(!!wNode && wNode.__workId === 'gapwork', 'M6 thread: live work item carries __workId');
   await env10.s.__cx.ensureLoaded(wNode); await flush(8);
