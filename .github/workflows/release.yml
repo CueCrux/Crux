@@ -38,7 +38,10 @@ jobs:
             os: macos-14
             suffix: darwin-arm64
           - target: x86_64-apple-darwin
-            os: macos-13
+            # macos-13 is retired — jobs targeting it queue forever (stranded the
+            # v0.4.7/v0.5.0/v0.5.1 release runs). macos-15-intel is GitHub's
+            # supported Intel image; probed green on run 27429963193.
+            os: macos-15-intel
             suffix: darwin-amd64
     steps:
       - uses: actions/checkout@v6

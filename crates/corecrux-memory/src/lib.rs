@@ -38,6 +38,7 @@ pub mod fact_store;
 pub mod identity_link;
 pub mod kind_registry;
 pub mod replay;
+pub mod result_envelope;
 pub mod semantic;
 pub mod session_store;
 pub mod sync;
@@ -52,4 +53,9 @@ pub use edge_store::{EdgeError, EdgeQuery, EdgeRecord, EdgeStore};
 pub use entity_store::{EntityError, EntityQuery, EntityRecord, EntityStore};
 pub use fact_store::{Fact, FactStore, HorizonClass};
 pub use kind_registry::{KindError, KindRegistration, KindRegistry};
+pub use result_envelope::{
+    result_envelope_content_hash, verify_result_envelope, CompanionArtifact, EnvelopeEdge, EnvelopeEntity,
+    EnvelopeFact, EnvelopePayload, EnvelopeVerifyError, PlatformSignature, ResultEnvelope, TrustedPlatformKey,
+    RESULT_ENVELOPE_SCHEMA_V1,
+};
 pub use session_store::{SessionState, SessionStore};

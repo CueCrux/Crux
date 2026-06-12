@@ -441,7 +441,7 @@ pub fn compare(file1: &str, file2: &str) -> Result<(), Box<dyn std::error::Error
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::TcpListener;
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -509,9 +509,7 @@ mod tests {
                     continue;
                 };
 
-                let mut buf = [0u8; 8192];
-                let read = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..read]);
+                let req = crate::test_support::read_full_request(&mut stream);
                 let mut parts = req.lines().next().unwrap_or_default().split_whitespace();
                 let method = parts.next().unwrap_or_default();
                 let path = parts.next().unwrap_or_default();
