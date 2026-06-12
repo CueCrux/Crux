@@ -119,8 +119,8 @@ fn load_signing_key(state: &AppState) -> Result<SigningKey, String> {
         .as_slice()
         .try_into()
         .map_err(|_| format!("passport key is {} bytes, expected 32", decoded.len()))?;
-    let key = crux_session::LocalPassportKey::from_seed(seed)
-        .map_err(|err| format!("passport key parse failed: {err}"))?;
+    let key =
+        crux_session::LocalPassportKey::from_seed(seed).map_err(|err| format!("passport key parse failed: {err}"))?;
     if key.passport_fpr() != state.passport_fpr {
         return Err(format!(
             "passport signer mismatch: state={}, key={}",
@@ -243,7 +243,10 @@ pub(super) fn mint_stream_receipt(
     let scoped = format!("mediation::{session_id}");
     let obs_body = PostObservationBody {
         kind: draft.kind.clone(),
-        provider: draft.provider.clone().unwrap_or_else(|| "crux-stream-receipts".to_string()),
+        provider: draft
+            .provider
+            .clone()
+            .unwrap_or_else(|| "crux-stream-receipts".to_string()),
         client_ts: None,
         payload: json!({
             "receipt_id": receipt_id,
@@ -285,7 +288,10 @@ pub(super) fn handle_stream_receipt_draft(state: &AppState, headers: &HeaderMap,
     let draft: StreamReceiptDraft = match serde_json::from_value(raw.clone()) {
         Ok(d) => d,
         Err(err) => {
-            return problem_response(StatusCode::BAD_REQUEST, format!("malformed stream receipt draft: {err}"));
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                format!("malformed stream receipt draft: {err}"),
+            );
         }
     };
     let actor = ctx.passport_id.clone().unwrap_or_else(|| "operator".to_string());
@@ -423,7 +429,10 @@ mod tests {
         // canonical bytes without a CBOR decoder dependency.
         let body_text = String::from_utf8_lossy(&body);
         assert!(body_text.contains("f_pub"));
-        assert!(!body_text.contains("f_secret"), "reserved-prefix entry must be filtered");
+        assert!(
+            !body_text.contains("f_secret"),
+            "reserved-prefix entry must be filtered"
+        );
 
         let sig_hex = payload["sig"]["signature_hex"].as_str().expect("sig hex");
         let sig_bytes: [u8; 64] = hex::decode(sig_hex).expect("hex").try_into().expect("64 bytes");
@@ -529,12 +538,9 @@ mod tests {
         // tool-mediation parse rejects the draft, nothing is recorded.
         let mut state_off = signing_state();
         state_off.stream_receipts_enabled = false;
-        let resp = crate::http::observations::post_mediation_receipt(
-            State(state_off.clone()),
-            HeaderMap::new(),
-            Json(draft),
-        )
-        .await;
+        let resp =
+            crate::http::observations::post_mediation_receipt(State(state_off.clone()), HeaderMap::new(), Json(draft))
+                .await;
         let status = resp.status();
         if status != StatusCode::UNPROCESSABLE_ENTITY {
             let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.expect("body");

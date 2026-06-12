@@ -45,7 +45,10 @@ use super::{problem_response, AppState, HeaderMap, Request};
 const ANONYMOUS_PASSPORT: &str = "anonymous";
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn caller_passport(headers: &HeaderMap) -> String {
@@ -56,7 +59,10 @@ fn caller_passport(headers: &HeaderMap) -> String {
 /// Returns the matched prefix (the surface name) for hosted requests,
 /// `None` for local compute.
 fn hosted_surface_for(path: &str, prefixes: &[String]) -> Option<String> {
-    prefixes.iter().find(|p| !p.is_empty() && path.starts_with(p.as_str())).cloned()
+    prefixes
+        .iter()
+        .find(|p| !p.is_empty() && path.starts_with(p.as_str()))
+        .cloned()
 }
 
 /// Per-surface request-quota middleware (gate 3). Pass-through when
@@ -79,7 +85,10 @@ pub(super) async fn quota_middleware(
     };
     let passport = caller_passport(req.headers());
     let decision = {
-        let mut ledger = state.quota_ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ledger = state
+            .quota_ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         ledger.check(&passport, &surface, SurfaceClass::Hosted, now_secs())
     };
     let header_pairs = decision.headers();
@@ -136,7 +145,10 @@ pub(super) async fn get_quota(State(state): State<AppState>, headers: HeaderMap)
     };
     let passport = ctx.passport_id.clone().unwrap_or_else(|| caller_passport(&headers));
     let snapshot = {
-        let mut ledger = state.quota_ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ledger = state
+            .quota_ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         ledger.snapshot(&passport, now_secs())
     };
     let surfaces: Vec<serde_json::Value> = snapshot
@@ -212,7 +224,10 @@ mod tests {
         assert_eq!(body["local_compute"], "unlimited");
         assert_eq!(body["surfaces"][0]["surface"], "/v1/hosted-offload");
         assert_eq!(body["surfaces"][0]["limit"], 5);
-        assert_eq!(body["surfaces"][0]["remaining"], 5, "untouched surface reports a full bucket");
+        assert_eq!(
+            body["surfaces"][0]["remaining"], 5,
+            "untouched surface reports a full bucket"
+        );
     }
 
     /// Drive the real router so the middleware layer is exercised
@@ -235,7 +250,10 @@ mod tests {
         for _ in 0..5 {
             let (status, headers) = router_status(&state, "/healthz").await;
             assert_eq!(status, StatusCode::OK);
-            assert!(headers.get("X-Crux-Quota-Limit").is_none(), "flag off emits no quota headers");
+            assert!(
+                headers.get("X-Crux-Quota-Limit").is_none(),
+                "flag off emits no quota headers"
+            );
         }
     }
 
@@ -266,15 +284,24 @@ mod tests {
         }
         let (status, headers) = router_status(&state, "/healthz").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(headers.get("X-Crux-Quota-Limit").and_then(|v| v.to_str().ok()), Some("2"));
-        assert_eq!(headers.get("X-Crux-Quota-Remaining").and_then(|v| v.to_str().ok()), Some("1"));
+        assert_eq!(
+            headers.get("X-Crux-Quota-Limit").and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+        assert_eq!(
+            headers.get("X-Crux-Quota-Remaining").and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
 
         let (status, _) = router_status(&state, "/healthz").await;
         assert_eq!(status, StatusCode::OK);
 
         let (status, headers) = router_status(&state, "/healthz").await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(headers.get("X-Crux-Quota-Remaining").and_then(|v| v.to_str().ok()), Some("0"));
+        assert_eq!(
+            headers.get("X-Crux-Quota-Remaining").and_then(|v| v.to_str().ok()),
+            Some("0")
+        );
         assert!(
             headers.get("Retry-After").is_some(),
             "429 must carry Retry-After (spec backpressure contract)"

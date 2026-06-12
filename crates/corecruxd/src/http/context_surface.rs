@@ -84,10 +84,7 @@ fn projection_class(class: corecrux_memory::fact_store::HorizonClass) -> decay::
 /// recorded (`actor`) — a private fact without a recorded owner relies on
 /// the fetch-time scope, exactly as before the canonical-assembler swap.
 fn fact_input(fact: corecrux_memory::fact_store::Fact, addressed: bool) -> cb::FactInput {
-    let written_ms = fact
-        .reverified_at
-        .unwrap_or(fact.stored_at)
-        .timestamp_millis();
+    let written_ms = fact.reverified_at.unwrap_or(fact.stored_at).timestamp_millis();
     cb::FactInput {
         private: fact.private && fact.actor.is_some(),
         owner: fact.actor,
@@ -108,7 +105,11 @@ fn fact_input(fact: corecrux_memory::fact_store::Fact, addressed: bool) -> cb::F
 /// Gather candidate facts under the caller's scope. Superseded facts are
 /// excluded (spec §4 rule 2); stale facts are included with their `stale`
 /// annotation, never silently presented as current.
-async fn gather_facts(state: &AppState, ctx: &crate::auth::HttpScopeContext, req: &ContextRequest) -> Vec<cb::FactInput> {
+async fn gather_facts(
+    state: &AppState,
+    ctx: &crate::auth::HttpScopeContext,
+    req: &ContextRequest,
+) -> Vec<cb::FactInput> {
     let store = state.fact_store.read().await;
 
     let mut out: Vec<cb::FactInput> = Vec::new();
@@ -446,11 +447,7 @@ async fn handle_context(state: AppState, headers: HeaderMap, req: ContextRequest
             )
                 .into_response()
         }
-        "openai_messages" => (
-            StatusCode::OK,
-            Json(render_openai_messages(&bundle_json, &bundle)),
-        )
-            .into_response(),
+        "openai_messages" => (StatusCode::OK, Json(render_openai_messages(&bundle_json, &bundle))).into_response(),
         "json" => (StatusCode::OK, Json(bundle_json)).into_response(),
         other => problem_response(
             StatusCode::BAD_REQUEST,
@@ -781,11 +778,11 @@ mod tests {
         // Canonical AuxItem shape: deterministic `id` + rendered `text`.
         assert_eq!(ss["items"][0]["id"], "sess-1");
         let text = ss["items"][0]["text"].as_str().expect("text");
-        assert!(text.contains("\"next\":\"M2\""), "state must ride in the item text: {text}");
         assert!(
-            !text.contains("updated_at"),
-            "no timestamps in stable region"
+            text.contains("\"next\":\"M2\""),
+            "state must ride in the item text: {text}"
         );
+        assert!(!text.contains("updated_at"), "no timestamps in stable region");
     }
 
     #[tokio::test]
@@ -905,7 +902,10 @@ mod tests {
 
         let a = get_bundle(&state, req(Some("execplan:demo"), None, Some(2000))).await;
         let b = get_bundle(&state, req(Some("bench:lme-s"), None, Some(2000))).await;
-        assert_ne!(a["sections"], b["sections"], "different addresses are different bundles");
+        assert_ne!(
+            a["sections"], b["sections"],
+            "different addresses are different bundles"
+        );
         assert_eq!(cache_stats(&state).hits, 0, "different request shapes must not collide");
     }
 
