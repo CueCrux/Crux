@@ -320,7 +320,7 @@ fn sanitize_session_id_for_filename(session_id: &str) -> String {
         .collect()
 }
 
-fn observation_file_path(data_dir: &Path, scoped_session_id: &str) -> PathBuf {
+pub(super) fn observation_file_path(data_dir: &Path, scoped_session_id: &str) -> PathBuf {
     let filename = format!("{}.jsonl", sanitize_session_id_for_filename(scoped_session_id));
     observations_dir(data_dir).join(filename)
 }
@@ -747,11 +747,40 @@ fn mediation_observation(body: &PostMediationReceiptBody) -> (String, PostObserv
 /// - **T.4 (audit):** always recorded through the signed-observation path
 ///   (`append_one` → CROWN receipt + JSONL + best-effort dataplane stream),
 ///   never a raw store write.
+///
+/// G19 (`Streaming-Receipts-Spec` §5): when `CORECRUXD_STREAM_RECEIPTS=1`,
+/// the route also accepts stream/context receipt *drafts* (`kind` one of
+/// `context_injected` / `stream_completed` / `stream_aborted`) and lifts
+/// them into canonical signed `stream_v1` receipts — see
+/// [`super::stream_receipts`]. With the flag off (default) those drafts hit
+/// the legacy tool-mediation parse and are rejected, exactly as before.
 pub(super) async fn post_mediation_receipt(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<PostMediationReceiptBody>,
+    Json(raw): Json<serde_json::Value>,
 ) -> Response {
+    // G19 dispatch — flag-gated, kind-discriminated, otherwise inert.
+    if state.stream_receipts_enabled {
+        if let Some(kind) = raw.get("kind").and_then(serde_json::Value::as_str) {
+            if super::stream_receipts::is_stream_receipt_kind(kind) {
+                return super::stream_receipts::handle_stream_receipt_draft(&state, &headers, &raw);
+            }
+        }
+    }
+    let body: PostMediationReceiptBody = match serde_json::from_value(raw) {
+        Ok(body) => body,
+        Err(err) => {
+            // Mirror the axum `Json<T>` extractor's rejection status so the
+            // legacy contract is unchanged by the Value-based dispatch.
+            let pd = corecrux_types::ProblemDetails::new(
+                StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                "https://errors.cuecrux.com/unprocessable-entity",
+                "Unprocessable Entity",
+            )
+            .with_detail(format!("invalid body: {err}"));
+            return crate::problem::ProblemResponse(pd).into_response();
+        }
+    };
     // T.3: caller must be authenticated (resolves the caller's scope context).
     if let Err(p) = crate::auth::http_scope_context(&state.auth, &headers) {
         return p.into_response();
@@ -2213,16 +2242,14 @@ mod tests {
         let resp = post_mediation_receipt(
             State(state.clone()),
             HeaderMap::new(),
-            Json(PostMediationReceiptBody {
-                passport_id: "work-default".to_string(),
-                tool_server: "openclaw".to_string(),
-                tool: "openclaw_status".to_string(),
-                args_sha: Some("abc123".to_string()),
-                decision: "allow".to_string(),
-                outcome: "ok".to_string(),
-                ts: None,
-                session_id: None,
-            }),
+            Json(serde_json::json!({
+                "passport_id": "work-default",
+                "tool_server": "openclaw",
+                "tool": "openclaw_status",
+                "args_sha": "abc123",
+                "decision": "allow",
+                "outcome": "ok",
+            })),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CREATED);
@@ -2252,16 +2279,13 @@ mod tests {
         let resp = post_mediation_receipt(
             State(state.clone()),
             HeaderMap::new(),
-            Json(PostMediationReceiptBody {
-                passport_id: "ghost-passport".to_string(),
-                tool_server: "openclaw".to_string(),
-                tool: "openclaw_status".to_string(),
-                args_sha: None,
-                decision: "allow".to_string(),
-                outcome: "ok".to_string(),
-                ts: None,
-                session_id: None,
-            }),
+            Json(serde_json::json!({
+                "passport_id": "ghost-passport",
+                "tool_server": "openclaw",
+                "tool": "openclaw_status",
+                "decision": "allow",
+                "outcome": "ok",
+            })),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -2278,16 +2302,13 @@ mod tests {
         let resp = post_mediation_receipt(
             State(state.clone()),
             HeaderMap::new(),
-            Json(PostMediationReceiptBody {
-                passport_id: "work-default".to_string(),
-                tool_server: "openclaw".to_string(),
-                tool: "openclaw_status".to_string(),
-                args_sha: None,
-                decision: "maybe".to_string(), // invalid
-                outcome: "ok".to_string(),
-                ts: None,
-                session_id: None,
-            }),
+            Json(serde_json::json!({
+                "passport_id": "work-default",
+                "tool_server": "openclaw",
+                "tool": "openclaw_status",
+                "decision": "maybe", // invalid
+                "outcome": "ok",
+            })),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);

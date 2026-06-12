@@ -42,6 +42,7 @@ mod projections;
 mod projects;
 mod punchcards;
 mod query;
+mod quota;
 mod rcx_publish;
 mod receipts;
 mod relations;
@@ -50,6 +51,7 @@ mod result_envelope;
 mod routing;
 pub mod session;
 mod storybook;
+mod stream_receipts;
 mod sync;
 mod work;
 mod workbench;
@@ -179,6 +181,33 @@ pub struct AppState {
     /// Provider-agnostic injection-bundle surface (`/v1/context`). Default
     /// OFF (`CORECRUXD_CONTEXT_SURFACE=1`); when off, routes return 404.
     pub context_surface_enabled: bool,
+    /// G19 stream/context receipt wiring (`Streaming-Receipts-Spec` §5):
+    /// `/v1/mediation/receipts` lifts `context_injected` /
+    /// `stream_completed` / `stream_aborted` drafts into canonical signed
+    /// receipts, and SSE surfaces mint `stream_aborted` on disconnect.
+    /// Default OFF (`CORECRUXD_STREAM_RECEIPTS=1`).
+    pub stream_receipts_enabled: bool,
+    /// G20 per-surface request quota (`GET /v1/quota` + middleware over
+    /// `crux_router::quota::QuotaLedger`). Default OFF
+    /// (`CORECRUXD_QUOTA=1`); when off the middleware passes through and
+    /// the route returns 404. Local compute is never rate-limited.
+    pub quota_enabled: bool,
+    /// Path prefixes classified as hosted surfaces for quota purposes
+    /// (`CORECRUXD_QUOTA_HOSTED_SURFACES`, comma-separated). Empty default
+    /// = every surface is local compute = unlimited.
+    pub quota_hosted_surfaces: Arc<Vec<String>>,
+    /// Token-bucket ledger, one bucket per (passport, surface).
+    /// Deliberately ephemeral: a restart refills everyone (errs toward
+    /// the user).
+    pub quota_ledger: Arc<std::sync::Mutex<crux_router::quota::QuotaLedger>>,
+    /// G21b assembly cache over
+    /// `corecrux_projections::assembly_cache::AssemblyCache` — memoizes
+    /// assembled `/v1/context` bundles keyed by
+    /// (passport, session, facts-chain-head). `None` unless
+    /// `CORECRUXD_ASSEMBLY_CACHE=1` (default OFF); invalidation is
+    /// structural (any fact write moves the chain head). Ephemeral by
+    /// design: restart = cold = always safe.
+    pub assembly_cache: Option<Arc<std::sync::Mutex<corecrux_projections::assembly_cache::AssemblyCache>>>,
     /// OpenAI function-calling shim over the MCP tool surface
     /// (`/v1/openai/tools.json` + `/v1/openai/invoke`). Default OFF
     /// (`CORECRUXD_OPENAI_SHIM=1`); when off, routes return 404.
@@ -589,6 +618,8 @@ pub fn router(state: AppState) -> Router {
         )
         // OpenAPI spec
         .route("/v1/openapi.json", get(self::openapi::openapi_json))
+        // G20 quota state (gated by CORECRUXD_QUOTA, default OFF → 404).
+        .route("/v1/quota", get(self::quota::get_quota))
         // Provider-agnostic injection-bundle surface (context_bundle/v1).
         // Gated by CORECRUXD_CONTEXT_SURFACE (default OFF → 404).
         .route("/v1/context", get(self::context_surface::get_context))
@@ -1070,6 +1101,9 @@ pub fn router(state: AppState) -> Router {
         .merge(self::orchestrators::routes())
         .merge(self::punchcards::routes())
         .layer(middleware::from_fn_with_state(state.clone(), presence_middleware))
+        // G20 per-surface request quota (pass-through unless CORECRUXD_QUOTA=1
+        // AND the path matches a configured hosted-surface prefix).
+        .layer(middleware::from_fn_with_state(state.clone(), self::quota::quota_middleware))
         .with_state(state)
         // Built-in web playground (stateless, merged after with_state)
         .merge(crate::playground::routes(console_enabled))

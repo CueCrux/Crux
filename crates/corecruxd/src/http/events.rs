@@ -52,8 +52,15 @@ pub(super) async fn event_stream(
         .types
         .map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
 
+    // G19 (`Streaming-Receipts-Spec` §3/§5): the SSE event stream is
+    // infinite, so every teardown is a client disconnect — the guard mints
+    // a `stream_aborted` receipt on drop. Inert unless
+    // CORECRUXD_STREAM_RECEIPTS=1.
+    let abort_guard = super::stream_receipts::SseAbortGuard::new(&state, &headers, "v1/events/stream");
+
     let rx = state.event_bus.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(move |result| {
+        let _hold_until_stream_drop = &abort_guard;
         let filter = filter.clone();
         match result {
             Ok(event) => {
