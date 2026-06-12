@@ -11797,3 +11797,160 @@ async fn memory_import_double_import_is_idempotent() {
     }
     assert_eq!(state.fact_store.read().await.count(), 1);
 }
+
+// ── /v1/identity/links — identity federation (identity-memory-portability M5) ──
+
+/// Seed default passports on `state` and build a fully cross-signed
+/// CreateLinkRequest from `personal-default` to a synthetic remote passport.
+async fn signed_link_request(state: &AppState) -> (crate::identity_links::CreateLinkRequest, String) {
+    use ed25519_dalek::{Signer, SigningKey};
+    seed_default_passports(state).await;
+    let store = state.fact_store.read().await;
+    let local = crate::passports::get_passport(&store, "personal-default").expect("local passport");
+    drop(store);
+    let local_key =
+        crux_session::LocalPassportKey::from_path(&state.data_dir.join("passports").join("personal-default.key"))
+            .expect("local key");
+
+    let remote_key = SigningKey::from_bytes(&[42_u8; 32]);
+    let remote_pub = remote_key.verifying_key().to_bytes();
+    let remote_fpr = corecrux_memory::cruxpack::passport_fpr_from_public_key(&remote_pub);
+
+    let created_at = "2026-06-12T00:00:00Z";
+    let statement =
+        corecrux_memory::identity_link::LinkStatement::memory_read(&local.principal_id, &remote_fpr, created_at);
+    let hash = corecrux_memory::identity_link::statement_hash(&statement);
+    (
+        crate::identity_links::CreateLinkRequest {
+            local_passport_id: "personal-default".to_string(),
+            remote_fpr: remote_fpr.clone(),
+            remote_public_key_hex: hex::encode(remote_pub),
+            created_at: created_at.to_string(),
+            sig_local: hex::encode(local_key.sign_hash(&hash)),
+            sig_remote: hex::encode(remote_key.sign(&hash).to_bytes()),
+        },
+        remote_fpr,
+    )
+}
+
+#[tokio::test]
+async fn identity_links_disabled_returns_404() {
+    let mut state = test_app_state(16);
+    state.identity_links_enabled = false;
+    let (req, _) = signed_link_request(&state).await;
+    let resp = identity_links::post_identity_link(State(state.clone()), HeaderMap::new(), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = identity_links::get_identity_links(State(state), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn identity_link_create_requires_admin_write_t3() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let (req, _) = signed_link_request(&state).await;
+    // No credentials → 401.
+    let resp = identity_links::post_identity_link(State(state.clone()), HeaderMap::new(), Json(req.clone()))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // facts:write is not enough — link creation is an operator action.
+    let resp = identity_links::post_identity_link(State(state), dev_scope_headers("facts:write"), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn identity_link_lifecycle_create_resolve_revoke_deny() {
+    let state = test_app_state(16);
+    let (req, remote_fpr) = signed_link_request(&state).await;
+
+    // Unlinked remote fpr → 404 (resolver fallback finds nothing).
+    let resp = principal::get_resolve_principal(State(state.clone()), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "unlinked passport must be denied");
+
+    // Create the link (201).
+    let resp = identity_links::post_identity_link(State(state.clone()), HeaderMap::new(), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp).await;
+    let link_id = body["link_id"].as_str().expect("link_id").to_string();
+
+    // The remote fpr now resolves — capped to memory.read, hop attributed.
+    let resp = principal::get_resolve_principal(State(state.clone()), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let principal = json_body(resp).await;
+    assert_eq!(principal["passport_id"], "personal-default");
+    assert_eq!(principal["resolved_via"], format!("identity_link:{link_id}"));
+    let caps: Vec<String> = principal["capabilities"]
+        .as_array()
+        .expect("caps")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    for cap in &caps {
+        assert!(
+            crate::principal::MEMORY_READ_CAPABILITIES.contains(&cap.as_str()),
+            "linked passport must never hold non-memory.read capability {cap}"
+        );
+    }
+
+    // List shows it.
+    let resp = identity_links::get_identity_links(State(state.clone()), HeaderMap::new())
+        .await
+        .into_response();
+    let listed = json_body(resp).await;
+    assert_eq!(listed["links"].as_array().expect("links").len(), 1);
+
+    // Revoke (200) — receipts: version chain grew, record not deleted.
+    let resp = identity_links::post_identity_link_revoke(State(state.clone()), HeaderMap::new(), Path(link_id.clone()))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    {
+        let entities = state.entity_store.read().await;
+        let history = entities.history("identity_link", &link_id);
+        assert_eq!(history.len(), 2, "create + revoke = two receipted versions");
+    }
+
+    // Revoked → denied again (T.3: same 404 as unlinked).
+    let resp = principal::get_resolve_principal(State(state.clone()), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "revoked link must be denied");
+}
+
+#[tokio::test]
+async fn identity_link_forged_signature_rejected() {
+    use ed25519_dalek::{Signer, SigningKey};
+    let state = test_app_state(16);
+    let (mut req, remote_fpr) = signed_link_request(&state).await;
+    // Forge the remote signature with an attacker key.
+    let attacker = SigningKey::from_bytes(&[99_u8; 32]);
+    let store = state.fact_store.read().await;
+    let local = crate::passports::get_passport(&store, "personal-default").expect("local");
+    drop(store);
+    let statement =
+        corecrux_memory::identity_link::LinkStatement::memory_read(&local.principal_id, &remote_fpr, &req.created_at);
+    let hash = corecrux_memory::identity_link::statement_hash(&statement);
+    req.sig_remote = hex::encode(attacker.sign(&hash).to_bytes());
+
+    let resp = identity_links::post_identity_link(State(state.clone()), HeaderMap::new(), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // And the forged remote never resolves.
+    let resp = principal::get_resolve_principal(State(state), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

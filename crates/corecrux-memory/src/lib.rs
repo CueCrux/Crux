@@ -35,6 +35,7 @@ pub mod embeddings;
 pub mod entity_store;
 pub mod events;
 pub mod fact_store;
+pub mod identity_link;
 pub mod kind_registry;
 pub mod replay;
 pub mod semantic;

@@ -27,6 +27,7 @@ pub mod explain;
 pub mod extensions;
 pub mod fixture_digest;
 pub mod gaps;
+pub mod identity_cli;
 pub mod inspect_receipt;
 pub mod memory;
 pub mod memory_pack;

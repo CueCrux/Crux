@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use corecruxctl::{
-    admin, audit_export, audit_pack, c2pa_x509, evidence, explain, extensions, fixture_digest, gaps, inspect_receipt,
-    memory, memory_pack, output_verify, parity, projections, receipts, reconcile, replay, shard, shardmap, smoke,
-    snapshot, stage1_import, storage, structured_log, tooling_env, verify_store,
+    admin, audit_export, audit_pack, c2pa_x509, evidence, explain, extensions, fixture_digest, gaps, identity_cli,
+    inspect_receipt, memory, memory_pack, output_verify, parity, projections, receipts, reconcile, replay, shard,
+    shardmap, smoke, snapshot, stage1_import, storage, structured_log, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -390,6 +390,14 @@ enum Command {
         command: MemoryCommand,
     },
 
+    /// Identity-federation helpers — fingerprint card + link-statement
+    /// signing (the cross-signature ceremony, G4).
+    #[command(name = "identity")]
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommand,
+    },
+
     /// BYO Audit Trail export (agent-ux-11). Builds a signed,
     /// third-party-verifiable tar.zst from the on-disk fact journal.
     /// Read-only against the data dir — safe to run while the daemon
@@ -593,6 +601,39 @@ enum MemoryCommand {
         /// Verify + plan only; write nothing.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IdentityCommand {
+    /// Print this daemon's passport fingerprint + public key (the identity
+    /// card you carry to the peer daemon when drafting a link statement).
+    Fpr {
+        /// Daemon data directory (or CORECRUXD_DATA_DIR).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Explicit passport key file (defaults to <data-dir>/passport.key).
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+    },
+    /// Sign a canonical identity-link statement hash with this machine's
+    /// passport key (either side of the cross-signature ceremony).
+    SignLink {
+        /// Daemon data directory (or CORECRUXD_DATA_DIR).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Explicit passport key file (defaults to <data-dir>/passport.key).
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// Fingerprint of the passport on the GRANTING daemon.
+        #[arg(long)]
+        local_fpr: String,
+        /// Fingerprint of the passport being granted memory.read.
+        #[arg(long)]
+        remote_fpr: String,
+        /// RFC 3339 statement timestamp — must match on both sides.
+        #[arg(long)]
+        created_at: String,
     },
 }
 
@@ -2238,6 +2279,38 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         }
+
+        // ── identity federation (G4) ───────────────────────────────
+        Command::Identity { command } => match command {
+            IdentityCommand::Fpr { data_dir, key_file } => {
+                let data_dir = data_dir
+                    .or_else(|| std::env::var("CORECRUXD_DATA_DIR").ok().map(PathBuf::from))
+                    .ok_or("identity fpr requires --data-dir or CORECRUXD_DATA_DIR")?;
+                let card = identity_cli::run_identity_fpr(&data_dir, key_file.as_deref())?;
+                println!("{}", serde_json::to_string_pretty(&card)?);
+                Ok(())
+            }
+            IdentityCommand::SignLink {
+                data_dir,
+                key_file,
+                local_fpr,
+                remote_fpr,
+                created_at,
+            } => {
+                let data_dir = data_dir
+                    .or_else(|| std::env::var("CORECRUXD_DATA_DIR").ok().map(PathBuf::from))
+                    .ok_or("identity sign-link requires --data-dir or CORECRUXD_DATA_DIR")?;
+                let out = identity_cli::run_identity_sign_link(&identity_cli::SignLinkArgs {
+                    data_dir,
+                    key_file,
+                    local_fpr,
+                    remote_fpr,
+                    created_at,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                Ok(())
+            }
+        },
         Command::AuditExport {
             data_dir,
             out,

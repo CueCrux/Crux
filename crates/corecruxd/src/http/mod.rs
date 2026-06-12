@@ -22,6 +22,7 @@ mod facts;
 mod features;
 mod gpu1;
 mod health;
+mod identity_links;
 pub mod ingress;
 mod integrations_github;
 mod integrations_openai;
@@ -430,6 +431,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/facts", get(self::facts::query_facts))
         .route("/v1/facts/bulk", axum::routing::put(self::facts::put_facts_bulk))
         .route("/v1/memory/import", axum::routing::post(self::memory_import::post_memory_import))
+        .route(
+            "/v1/identity/links",
+            axum::routing::post(self::identity_links::post_identity_link),
+        )
+        .route("/v1/identity/links", get(self::identity_links::get_identity_links))
+        .route(
+            "/v1/identity/links/{linkId}/revoke",
+            axum::routing::post(self::identity_links::post_identity_link_revoke),
+        )
         .route("/v1/facts/{factId}", get(self::facts::get_fact))
         .route("/v1/facts/{factId}", axum::routing::delete(self::facts::delete_fact))
         .route("/v1/facts/entity/{entity}", get(self::facts::get_facts_by_entity))

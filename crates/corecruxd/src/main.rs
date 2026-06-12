@@ -48,6 +48,7 @@ mod extension_outbound;
 mod extension_registry;
 mod fact_helpers;
 mod fact_privacy;
+mod identity_links;
 mod integrations_github;
 mod integrations_github_sync;
 mod integrations_openai;
