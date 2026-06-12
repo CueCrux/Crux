@@ -237,6 +237,11 @@
   .dash-exprow b { color:var(--text-muted); font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .dash-exprow span { color:var(--text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .dash-exprow.dash-expsub span { color:var(--text-muted); font-size:9.5px; }
+  /* expansion bodies that embed a full page (same UI as the rail button) */
+  .dash-pagebody { overflow:auto; }
+  .dash-pagesec { margin-bottom:14px; }
+  .dash-pagesec h2 { margin:0 0 2px; font-size:12.5px; font-weight:700; color:var(--text-primary); }
+  .dash-pagesec pre { margin-top:8px; }
   /* GX bench donuts */
   .gx-donuts { display:flex; gap:26px; margin-top:12px; flex-wrap:wrap; }
   .gx-d { display:flex; flex-direction:column; align-items:center; gap:2px; }
@@ -470,10 +475,10 @@
   .sp-btn.danger:hover { border-color:var(--err); }
   .sp-headsub { font-family:var(--font-mono); font-size:10px; color:var(--text-muted); margin-right:8px; max-width:46%; }
   .sp-row { display:flex; align-items:center; gap:10px; padding:5px 0; }
-  .sp-card .frow { display:grid; grid-template-columns:168px 1fr; gap:10px; padding:5px 0;
+  .sp-card .frow, .dash-pagesec .frow { display:grid; grid-template-columns:168px 1fr; gap:10px; padding:5px 0;
     font-family:var(--font-mono); font-size:10.5px; background:none; border-radius:0; }
-  .sp-card .frow .fk { color:var(--text-muted); }
-  .sp-card .frow .fv { color:var(--text-primary); word-break:break-word; }
+  .sp-card .frow .fk, .dash-pagesec .frow .fk { color:var(--text-muted); }
+  .sp-card .frow .fv, .dash-pagesec .frow .fv { color:var(--text-primary); word-break:break-word; }
   .sp-lab { flex:0 0 168px; font-family:var(--font-mono); font-size:10.5px; color:var(--text-muted); }
   .sp-input { flex:1; min-width:0; font-size:11.5px; padding:5px 10px; border-radius:9px;
     border:1px solid var(--border-default); background:var(--surface-glass-strong); color:var(--text-primary); }
@@ -2021,28 +2026,53 @@ function renderScopeDash(){
       y=r.y+r.h+10; return r;
     }
     const key=activeScope+':'+id, open=!!window.__scopeOpen[key];
-    const fieldRows=(n.fields||[]), kidRows=kids;
-    /* full detail lives IN the expansion — children carry their fields too */
-    const kidLines=kidRows.map(c=>({k:c.kind, v:c.label+(c.sub?' · '+c.sub:''),
-      extra:(c.fields||[]).slice(0,3).map(([fk,fv])=>fk+' '+fv).join(' · ')}));
-    const bodyN=open? fieldRows.length+kidLines.reduce((a,l)=>a+(l.extra?2:1),0) : 0;
-    const h=60+(open? bodyN*21+16 : 0);
-    const body=open? `<div class="dash-exp">`+
-        fieldRows.map(([k,v])=>`<div class="dash-exprow"><b>${esc(String(k))}</b><span>${esc(String(v))}</span></div>`).join('')+
-        kidLines.map(l=>`<div class="dash-exprow"><b>${esc(l.k)}</b><span>${esc(l.v)}</span></div>`+
-          (l.extra?`<div class="dash-exprow dash-expsub"><b></b><span>${esc(l.extra)}</span></div>`:'')).join('')+
-        `</div>` : '';
-    const r=mk(PAD, y, W, h, 's-'+norm(n.status),
-      `<div class="gstripe"></div>`+
-      `<div class="dash-g"><span class="dash-ico">${sbSvg(SB_ICONS[id]||SB_ICONS.__dot)}</span>`+
+    const pdef=PAGES[id];
+    /* the expansion IS the section's page — same controls UI as the rail button */
+    let h=60;
+    if(open){
+      if(pdef){
+        const est=pdef.sections.reduce((a,s)=>a+36+((s.controls||[]).length*38)+(s.doc?96:0),0);
+        h=60+Math.min(est,520)+20;
+      } else {
+        const bodyN=(n.fields||[]).length+kids.length;
+        h=60+bodyN*21+16;
+      }
+    }
+    const r=mk(PAD, y, W, h, 's-'+norm(n.status), `<div class="gstripe"></div>`, null);
+    const head=document.createElement('div'); head.className='dash-g';
+    head.innerHTML=`<span class="dash-ico">${sbSvg(SB_ICONS[id]||SB_ICONS.__dot)}</span>`+
       `<span class="dash-g-main"><span class="gtitle">${esc(n.label)}</span><span class="gsub">${esc(n.sub||'')}</span></span>`+
-      `${kids.length?`<span class="gcount">${kids.length}</span>`:''}<span class="dash-caret">${open?'▾':'›'}</span></div>`+body,
-      null);
-    r.el.addEventListener('click',()=>{
+      `${kids.length?`<span class="gcount">${kids.length}</span>`:''}<span class="dash-caret">${open?'▾':'›'}</span>`;
+    head.style.cursor='pointer';
+    head.addEventListener('click',()=>{   /* only the header toggles — controls inside stay clickable */
       window.__scopeOpen[key]=!open;
-      if(!open && typeof ensureLoaded==='function') Promise.resolve(ensureLoaded(n)).then(()=>{ if(dashMode) render(); }).catch(()=>{});
+      if(!open){
+        if(typeof ensureLoaded==='function') Promise.resolve(ensureLoaded(n)).then(()=>{ if(dashMode) render(); }).catch(()=>{});
+        if(pdef && LIVE && PAGE_WIRES[id] && PAGE_WIRES[id].load)
+          Promise.resolve(PAGE_WIRES[id].load(pdef)).then(()=>{ if(dashMode) render(); }).catch(()=>{});
+      }
       render();
     });
+    r.el.appendChild(head);
+    if(open){
+      const body=document.createElement('div'); body.className='dash-exp dash-pagebody';
+      if(pdef){
+        EXP_ROWS[id]=[];
+        body.style.maxHeight=(h-60-20)+'px';
+        pdef.sections.forEach(sec=>{
+          const sc=document.createElement('div'); sc.className='dash-pagesec';
+          const h2=document.createElement('h2'); h2.textContent=sec.h; sc.appendChild(h2);
+          if(sec.sub){ const su=document.createElement('div'); su.className='sp-sub'; su.textContent=sec.sub; sc.appendChild(su); }
+          (sec.controls||[]).forEach(c=>sc.appendChild(renderControl(id,c)));
+          if(sec.doc){ const pre=document.createElement('pre'); pre.textContent=sec.doc; sc.appendChild(pre); }
+          body.appendChild(sc);
+        });
+      } else {
+        body.innerHTML=(n.fields||[]).map(([k,v])=>`<div class="dash-exprow"><b>${esc(String(k))}</b><span>${esc(String(v))}</span></div>`).join('')+
+          kids.map(c=>`<div class="dash-exprow"><b>${esc(c.kind)}</b><span>${esc(c.label)}${c.sub?' · '+esc(c.sub):''}</span></div>`).join('');
+      }
+      r.el.appendChild(body);
+    }
     y=r.y+r.h+10; return r; };
 
   if(activeScope==='dx'){
@@ -2722,7 +2752,7 @@ function updateSidebarActive(){
 /* panels with both views: does the operator prefer the graph/kanban for this id?
    story / storybook / graph are node-graph-first by design (operator request). */
 const GRAPH_FIRST={'ax-story':1,'ax-storybook':1,'ax-graph':1};
-const DUAL_VIEW={'cx-work':'Kanban','cx-receipts':'Graph'};   /* rail pull-out: graph-flavour label per panel */
+const DUAL_VIEW={'cx-work':'Kanban','cx-receipts':'Graph','cx-sessions':'Graph'};   /* rail pull-out: graph-flavour label per panel */
 function prefersGraph(id){ if(GRAPH_FIRST[id]) return true;
   return confGet(id+'.view', DUAL_VIEW[id]?'kanban':null)==='kanban'; }
 async function soloPanel(id, opts){
@@ -3032,8 +3062,22 @@ function receiptsListSections(){
      .concat(kids.map(receiptExpRow))
      .concat([{t:'btn',label:'Browse as graph',action:'graph'}])}];
 }
+/* ── sessions list view ── */
+function sessionExpRow(s){
+  const links=(s.children||[]).map(cid=>N[cid]).filter(Boolean);
+  return {t:'exp',label:s.label,sub:s.sub||'',badge:RAW[norm(s.status)]||'session',
+    controls:(s.fields||[]).map(([k,v])=>({t:'info',label:String(k),v:String(v)}))
+      .concat(links.map(l=>({t:'info',label:'↳ '+l.kind,v:l.label+(l.sub?' · '+l.sub:'')})))};
+}
+function sessionsListSections(){
+  const kids=((N['cx-sessions']||{}).children||[]).map(cid=>N[cid]).filter(Boolean);
+  return [{h:'Sessions',sub:'active + saved — list view; graph from the rail pull-out',wide:true,
+    controls:[{t:'search',ph:'Filter sessions…'}].concat(kids.map(sessionExpRow))
+      .concat([{t:'btn',label:'Browse as graph',action:'graph'}])}];
+}
 const PAGES={
  'cx-work':{title:'ExecPlans',sub:'list view · kanban available from the rail pull-out',sections:workListSections()},
+ 'cx-sessions':{title:'Sessions',sub:'execplan-scoped sessions — searchable list; graph from the rail pull-out',sections:sessionsListSections()},
  'cx-receipts':{title:'Receipts',sub:'CROWN · Ed25519 proofs — searchable list; graph from the rail pull-out',sections:receiptsListSections()},
  'cx-facts':{title:'Facts',sub:'the durable record — grouped by entity prefix, cascading into linked nodes',sections:factsCascadeSections()},
  'cx-tenants':{title:'Tenants',sub:'memory stores · AMR lane routing — defaults at the top, per-tenant overrides below',sections:[
@@ -3177,14 +3221,14 @@ const PAGES={
     desc:'Regenerates managed profile sections in workspace CLAUDE.md files with a reviewable diff.',controls:[
     {t:'info',label:'kind',v:'config tool'},
     {t:'info',label:'signed by',v:'daemon-root · first_party'}]}]},
-  {h:'Trusted signing keys',sub:'manifests verify against this keyring',controls:[
+  {h:'Trusted signing keys',sub:'manifests verify against this keyring',wide:true,controls:[
    {t:'info',label:'daemon-root',v:'fp:12345678 · tier partner'},
    {t:'input',k:'key_fpr',label:'passport fingerprint',ph:'fp:…',mono:true},
    {t:'select',k:'key_tier',label:'trust tier',options:['unknown','community_reviewed','locally_signed','first_party'],v:'community_reviewed'},
    {t:'input',k:'key_pub',label:'public key',ph:'ed25519:…',mono:true},
    {t:'btn',label:'Add key'}],
    doc:'Dev bypass: CORECRUXD_EXTENSIONS_ALLOW_UNSIGNED=1 lets unsigned manifests install for local testing only.'},
-  {h:'Install manifest',controls:[
+  {h:'Install manifest',wide:true,controls:[
    {t:'input',k:'manifest_url',label:'manifest URL / path',ph:'https://… or ./ext.json',mono:true},
    {t:'btn',label:'Install'}]}]},
  'cx-raw':{title:'Raw · JSON-RPC console',sub:'/mcp on :14801 · scopes header attaches automatically',sections:[
@@ -3197,18 +3241,30 @@ const PAGES={
    {t:'info',label:'endpoint',v:'POST /mcp · :14801'},
    {t:'input',k:'rpc_scopes',label:'X-Corecrux-Scopes',v:'read',mono:true},
    {t:'btn',label:'Browse recent calls as graph',action:'graph'}]}]},
- 'cx-projects':{title:'Projects',sub:'each project pairs a planning target with allowed passports + working tenants',sections:[
-  {h:'New project',controls:[
+ 'cx-projects':{title:'Projects',sub:'a project pairs repos to search, a planning repo for ExecPlans, passports and working tenants',sections:[
+  {h:'New project',wide:true,controls:[
    {t:'input',k:'proj_name',label:'name',ph:'My project'},
    {t:'input',k:'proj_id',label:'id',ph:'proj-slug',mono:true},
-   {t:'input',k:'proj_plan',label:'planning target',ph:'tenant:… or github:owner/repo',mono:true},
+   {t:'input',k:'proj_plan',label:'planning repo / target',ph:'github:owner/repo or tenant:…',mono:true,
+    desc:'Where generated ExecPlans live (.agent/execplans in the repo, or a daemon tenant). The Work board projects repo plans read-time.'},
+   {t:'select',k:'proj_storage',label:'execplan storage',options:['planning repo (recommended)','daemon-native','hybrid — repo files + daemon kanban'],v:'planning repo (recommended)',
+    desc:'Repo: plans are PR-reviewable markdown, survive daemon rebuilds, and project onto the Work board (source=all). Daemon-native: kanban work items only — quick tasks without a repo. Hybrid: repo is source of truth, daemon overlays live state.'},
    {t:'select',k:'proj_passport',label:'default passport',options:['ce:4e6c4e2a:local','ce:8821fa0d:local','ce:0c4419ab:remote'],v:'ce:4e6c4e2a:local'},
    {t:'input',k:'proj_tenants',label:'working tenants',ph:'default, lme-s',mono:true},
    {t:'btn',label:'Create project'}]},
-  {h:'Tracked',controls:[
-   {t:'info',label:'CueCrux',v:'active · 12 repos · 3 sessions'},
-   {t:'info',label:'Crux daemon · AuditCrux · PlanCrux',v:'see graph for detail'},
-   {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+  {h:'Tracked',sub:'click a project to expand repos · planning · tenants',wide:true,controls:[
+   {t:'search',ph:'Filter projects…'},
+   {t:'exp',label:'CueCrux',sub:'workspace · 12 repos · 3 sessions',badge:'active',open:true,controls:[
+    {t:'info',label:'planning repo',v:'PlanCrux — .agent/execplans · projected to the Work board (source=all)'},
+    {t:'info',label:'execplan storage',v:'hybrid — repo files are the source of truth, daemon kanban overlays state'},
+    {t:'toggle',k:'pr_cuecrux_crux',label:'search: Crux',v:true,desc:'Include this repo in project-scoped search and workspace scans.'},
+    {t:'toggle',k:'pr_cuecrux_auditcrux',label:'search: AuditCrux',v:true,desc:'Include this repo in project-scoped search and workspace scans.'},
+    {t:'toggle',k:'pr_cuecrux_plancrux',label:'search: PlanCrux',v:true,desc:'Include this repo in project-scoped search and workspace scans.'},
+    {t:'toggle',k:'pr_cuecrux_cruxengine',label:'search: CruxEngine',v:false,desc:'Include this repo in project-scoped search and workspace scans.'},
+    {t:'info',label:'working tenants',v:'default · lme-s'},
+    {t:'info',label:'default passport',v:'ce:4e6c4e2a:local'}]},
+   {t:'btn',label:'Browse as graph',action:'graph'}],
+   doc:'Repo-search toggles are project-scoped and stored locally — the daemon\nproject model carries no repo list yet (daemon gap, noted).\nExecPlan storage: repo-first is recommended. Plans live as markdown in\nthe planning repo (.agent/execplans), get PR review and history, and the\ndaemon projects them onto the Work board read-time; daemon-native work\nitems suit quick tasks that have no repo.'}]},
  'dx-articles':{title:'Articles',sub:'bundled docs + synced docs:: facts',sections:[
   {h:'Docs tenant override',sub:'load articles from facts under docs::<tenant>::*',controls:[
    {t:'input',k:'docs_tenant',label:'tenant id',ph:'cuecrux-docs',mono:true},
@@ -3747,6 +3803,16 @@ const PAGE_WIRES={
     })();
     return null;
   }},
+ 'cx-sessions':{
+  load: async def=>{
+    const n=N['cx-sessions']; await ensureLoaded(n);
+    const kids=childrenOf(n).filter(k=>!k.__status);
+    if(!kids.length) return;
+    const head=def.sections[0].controls.filter(c=>c.t==='search');
+    const tail=def.sections[0].controls.filter(c=>c.t==='btn'&&c.action==='graph');
+    def.sections[0].sub=kids.length+' sessions · /v1/console/sessions';
+    def.sections[0].controls=head.concat(kids.map(sessionExpRow)).concat(tail);
+  }},
  'cx-receipts':{
   load: async def=>{
     const n=N['cx-receipts']; await ensureLoaded(n);
@@ -3953,9 +4019,22 @@ const PAGE_WIRES={
       if(sel&&ids.length){ sel.options=ids; if(ids.indexOf(confGet('cx-projects.proj_passport',sel.v))<0) setCtrl('cx-projects','proj_passport',ids[0]); } }
     if(!pr._err){ const list=pr.projects||[];
       def.sections[1].h='Tracked · '+list.length;
-      def.sections[1].controls=(list.length? list.map(p=>infoRow(p.name||p.id,
-          [p.planning_target,(p.working_tenants||[]).join(', ')||null,p.archived?'archived':null].filter(Boolean).join(' · ')||'—'))
-        : [infoRow('none yet','create one on the left')]).concat([{t:'btn',label:'Browse as graph',action:'graph'}]); }
+      const head=def.sections[1].controls.filter(c=>c.t==='search');
+      const tail=def.sections[1].controls.filter(c=>c.t==='btn'&&c.action==='graph');
+      const storageOf=t=>{ t=String(t||''); return /^tenant:/.test(t)? 'daemon-native (kanban work items)'
+        : t? 'planning repo — '+t+' · projected to the Work board' : 'unset — defaults to daemon-native'; };
+      def.sections[1].controls=head.concat(list.length? list.map(p=>{
+          const pid=String(p.id||p.name).replace(/[^a-zA-Z0-9]/g,'_');
+          return {t:'exp',label:p.name||p.id,sub:[p.planning_target,(p.working_tenants||[]).join(', ')||null].filter(Boolean).join(' · ')||'project',
+            badge:p.archived?'archived':'active',
+            controls:[
+             {t:'info',label:'execplan storage',v:storageOf(p.planning_target)},
+             {t:'info',label:'working tenants',v:(p.working_tenants||[]).join(' · ')||'—'},
+             {t:'info',label:'default passport',v:p.default_passport_id||'—'},
+             {t:'toggle',k:'pr_'+pid+'_search',label:'include in project-scoped search',v:true,
+              desc:'Local setting — the daemon project model carries no repo list yet (noted gap).'}]};
+        })
+        : [infoRow('none yet','create one on the left')]).concat(tail); }
   },
   act:{
     'Create project': async ctx=>{

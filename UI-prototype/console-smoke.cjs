@@ -192,6 +192,7 @@ function makeFetch() {
 
   await tile(env3, 'panel', 'Sessions').fire('click'); await flush();
   ok(!!tile(env3, 'session', '9c5a9271'), 'M4 sessions: live session id tile (ids-only shape)');
+  cxp(); await flush();   // sessions now solos into its graph — return to the dash
   await tile(env3, 'panel', 'Orchestrators').fire('click'); await flush();
   ok(!!tile(env3, 'orchestrator', 'Sprint 1'), 'M5 orchestrators: live orchestrator tile');
   await tile(env3, 'orchestrator', 'Sprint 1').fire('dblclick'); await flush();
