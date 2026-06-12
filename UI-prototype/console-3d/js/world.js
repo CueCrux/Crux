@@ -26,17 +26,18 @@ export const THEMES = {
     edgeOpacity: 0.46, hemi: [0xffffff, 0xc4d2e6, 1.15], sun: 1.6,
   },
   dark: {
-    bg: 0x06070b, fogNear: 90, fogFar: 290,
-    ground: 0x0a0c12, clay: 0x232733, clayShade: 0x1a1d27,
+    /* lightened (operator request): brighter surfaces, fog pushed far out */
+    bg: 0x12151d, fogNear: 200, fogFar: 560,
+    ground: 0x181c26, clay: 0x323848, clayShade: 0x272d3b,
     ink: 0xededef, accent: 0x7d88e8,
-    inkCss: '#e9ebf2', inkSubCss: 'rgba(160,166,180,.85)', accentCss: '#97a1f2',
-    dot: 0x3d4d6e, dotOpacity: 0.8,
-    bossBase: 0x1a1e26,   /* dark grey washers */
+    inkCss: '#eef0f6', inkSubCss: 'rgba(176,182,196,.9)', accentCss: '#9aa4f4',
+    dot: 0x4a5b80, dotOpacity: 0.8,
+    bossBase: 0x262c38,   /* dark grey washers */
     status: { ok: 0x22c55e, run: 0xf59e0b, err: 0xef4444, idle: 0x64748b },
-    stateTint: { done: 0x24402f, in_progress: 0x44351a, blocked: 0x442222, planned: 0x2a3040 },
+    stateTint: { done: 0x2c4d39, in_progress: 0x534222, blocked: 0x532c2c, planned: 0x333a4c },
     edge: { binds: 0x7d88e8, drives: 0x60a5fa, gates: 0xf59e0b, seals: 0x34d399,
             chain: 0x2dd4bf, coord: 0x22d3ee, handoff: 0xa78bfa },
-    edgeOpacity: 0.58, hemi: [0x6f7ea6, 0x10131c, 0.9], sun: 1.0,
+    edgeOpacity: 0.58, hemi: [0x8a97ba, 0x1a1f2c, 1.1], sun: 1.25,
   },
 };
 

@@ -223,6 +223,18 @@
   .dx-doc { margin-top:10px; font-family:var(--font-mono); font-size:11px; line-height:1.6; color:var(--text-secondary);
     white-space:pre-wrap; word-break:break-word; }
   .dash-chip a { color:var(--accent); text-decoration:none; } .dash-chip a:hover { text-decoration:underline; }
+  .dx-link { display:inline-block; margin-top:10px; font-family:var(--font-mono); font-size:11px; color:var(--accent); text-decoration:none; }
+  .dx-link:hover { text-decoration:underline; }
+  .dash-card.dx-tab-on { border-color:color-mix(in srgb, var(--accent) 55%, transparent);
+    box-shadow:0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent), var(--shadow-card); }
+  /* scope list rows: in-place accordion */
+  .dash-caret { flex:none; margin-left:4px; color:var(--text-muted); font-size:13px; }
+  .dash-exp { margin-top:9px; border-top:1px solid var(--border-light); padding-top:7px; }
+  .dash-exprow { display:grid; grid-template-columns:130px 1fr; gap:10px; font-family:var(--font-mono); font-size:10.5px; padding:2.5px 0 2.5px 48px; }
+  .dash-exprow b { color:var(--text-muted); font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .dash-exprow span { color:var(--text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .dash-expgo { margin-top:6px; padding-left:48px; font-family:var(--font-mono); font-size:10px; font-weight:700; color:var(--accent); cursor:pointer; }
+  .dash-expgo:hover { text-decoration:underline; }
   /* GX bench donuts */
   .gx-donuts { display:flex; gap:26px; margin-top:12px; flex-wrap:wrap; }
   .gx-d { display:flex; flex-direction:column; align-items:center; gap:2px; }
@@ -1885,6 +1897,16 @@ const DX_DOCS=[
   {id:'corecrux',t:'CoreCrux — GPU lanes + AMR',body:'The paid retrieval substrate: dense, graph/topology,\nentity & trait, event and navigational lanes over your\ncorpus, routed per-query by AMR (Adaptive Manifest\nRouting). Rents compute, never custody — enrichment is\nprocessed, returned to your store, then deleted.\n\nSubscriptions: https://vaultcrux.com'},
   {id:'cruxengine',t:'CruxEngine — frontier ingest',body:'Frontier-model ingest + extraction over your corpus:\nentities, events, traits and summaries land back in your\nlocal store with a receipt per hop. Activates with a\nplatform subscription; the daemon stays fully functional\nwithout it.'}]},
 ];
+const DX_README=[
+ {g:'README · corecruxd',items:[
+  {id:'rd-build',t:'Build & test',body:'cargo build --release   # CPU-only daemon\ncargo test --workspace\ncargo fmt --check\ncargo clippy --workspace -- -D warnings'},
+  {id:'rd-rules',t:'Key rules',body:'· No GPU/CUDA code — the daemon is CPU-only\n· Licence headers on every .rs (CCL v1.0)\n· Port 14800 is fixed — do not change the default\n· No proprietary crates in this repo\n\n17 crates · HTTP :14800 · MCP :14801 · gRPC :4007'},
+  {id:'rd-arch',t:'Architecture',body:'corecruxd          HTTP (axum) + gRPC (tonic) daemon\ncorecruxctl        CLI with subcommands\ncorecrux-retrieval BM25 + graph signal fusion (CPU)\ncorecrux-storage   append-only shards · sealed segments\ncorecrux-receipts  Ed25519 CROWN receipt signing'}]}];
+const DX_EXTERNAL=[
+ {g:'External surfaces',items:[
+  {id:'ex-cc',t:'cuecrux.com',url:'https://cuecrux.com',body:'Marketing surface — what Crux is, who it is for.'},
+  {id:'ex-sig',t:'signals.cuecrux.com',url:'https://signals.cuecrux.com',body:'Status / signals surface — uptime and release notes.'},
+  {id:'ex-vault',t:'vaultcrux.com — subscriptions',url:'https://vaultcrux.com',body:'Platform subscriptions: CoreCrux retrieval lanes + AMR,\nCruxEngine frontier ingest. The daemon stays fully\nfunctional without one.'}]}];
 function donutSvg(pct,color,label){
   const r=34, c=2*Math.PI*r, on=Math.max(0,Math.min(100,pct))*c/100;
   return `<svg viewBox="0 0 100 100" class="gx-donut" role="img" aria-label="${esc(label)} ${pct}%">`+
@@ -1915,26 +1937,54 @@ function renderScopeDash(){
     `<div class="dash-title">${esc(scope.tag)}</div>`+
     `<div class="gsub">${esc(SCOPE_DESC[activeScope]||'every card is an operator page — click to configure')}</div>`, null);
   let y=hero.y+hero.h+GAP;
-  const listRow=id=>{ const n=N[id]; const kids=childrenOf(n).length;
-    const r=mk(PAD, y, W, 60, 's-'+norm(n.status),
+  /* scope list rows expand IN PLACE (accordion) — no page card; graph-first
+     rows (story / storybook / graph) keep their direct node-graph click */
+  window.__scopeOpen=window.__scopeOpen||{};
+  const listRow=id=>{ const n=N[id]; const kids=childrenOf(n);
+    if(GRAPH_FIRST[id]){
+      const r=mk(PAD, y, W, 60, 's-'+norm(n.status),
+        `<div class="gstripe"></div>`+
+        `<div class="dash-g"><span class="dash-ico">${sbSvg(SB_ICONS[id]||SB_ICONS.__dot)}</span>`+
+        `<span class="dash-g-main"><span class="gtitle">${esc(n.label)}</span><span class="gsub">${esc(n.sub||'')} · opens as node graph</span></span>`+
+        `${kids.length?`<span class="gcount">${kids.length}</span>`:''}</div>`, id);
+      y=r.y+r.h+10; return r;
+    }
+    const key=activeScope+':'+id, open=!!window.__scopeOpen[key];
+    const fieldRows=(n.fields||[]), kidRows=kids;
+    const bodyN=open? fieldRows.length+kidRows.length+1 : 0;
+    const h=60+(open? bodyN*21+18 : 0);
+    const body=open? `<div class="dash-exp">`+
+        fieldRows.map(([k,v])=>`<div class="dash-exprow"><b>${esc(String(k))}</b><span>${esc(String(v))}</span></div>`).join('')+
+        kidRows.map(c=>`<div class="dash-exprow"><b>${esc(c.kind)}</b><span>${esc(c.label)}${c.sub?' · '+esc(c.sub):''}</span></div>`).join('')+
+        `<div class="dash-expgo">open full view ›</div></div>` : '';
+    const r=mk(PAD, y, W, h, 's-'+norm(n.status),
       `<div class="gstripe"></div>`+
       `<div class="dash-g"><span class="dash-ico">${sbSvg(SB_ICONS[id]||SB_ICONS.__dot)}</span>`+
       `<span class="dash-g-main"><span class="gtitle">${esc(n.label)}</span><span class="gsub">${esc(n.sub||'')}</span></span>`+
-      `${kids?`<span class="gcount">${kids}</span>`:''}</div>`, id);
+      `${kids.length?`<span class="gcount">${kids.length}</span>`:''}<span class="dash-caret">${open?'▾':'›'}</span></div>`+body,
+      null);
+    r.el.addEventListener('click',e=>{
+      const t=e&&e.target;
+      if(t&&t.classList&&t.classList.contains('dash-expgo')){ dashOpen(id); return; }
+      window.__scopeOpen[key]=!open;
+      if(!open && typeof ensureLoaded==='function') Promise.resolve(ensureLoaded(n)).then(()=>{ if(dashMode) render(); }).catch(()=>{});
+      render();
+    });
     y=r.y+r.h+10; return r; };
 
   if(activeScope==='dx'){
-    /* version + platform card: daemon build, CoreCrux / CruxEngine when the platform is active */
+    nodesEl.innerHTML=''; y=PAD;   /* dx replaces the generic hero with ONE merged docs + version card */
     if(LIVE && !window.__dxVerTried){ window.__dxVerTried=true;
       api('/v1/version').then(v=>{ window.__dxVer=v; if(activeScope==='dx'&&dashMode) render(); }).catch(()=>{}); }
     const v=window.__dxVer||{};
     const dver=v.version||v.daemon_version||'v0.4.9';
     const cc=v.corecrux_version||null, ce=v.cruxengine_version||null;
     const platform=(cc||ce)?'active':'inactive';
-    const info=mk(PAD, y, W, 118, 'dash-hero',
+    const info=mk(PAD, y, W, 150, 'dash-hero s-run',
       `<div class="gstripe"></div>`+
-      `<div class="ghead"><span class="gkind">crux daemon · ${esc(String(dver))}</span><span class="gchip">${platform==='active'?'platform active':'platform inactive'}</span></div>`+
+      `<div class="ghead"><span class="gkind">DX · Docs — crux daemon ${esc(String(dver))}</span><span class="gchip">${platform==='active'?'platform active':'platform inactive'}</span></div>`+
       `<div class="dash-title">Documentation</div>`+
+      `<div class="gsub">${esc(SCOPE_DESC.dx)}</div>`+
       `<div class="dash-chips">`+
       `<span class="dash-chip"><b>daemon</b>${esc(String(dver))} · build ${esc(fOf(N['af-build'],'sha')||'—')}</span>`+
       `<span class="dash-chip"><b>CoreCrux</b>${esc(cc||'— · activates with a subscription')}</span>`+
@@ -1942,24 +1992,31 @@ function renderScopeDash(){
       `<span class="dash-chip"><b>subscription</b><a href="https://vaultcrux.com" target="_blank" rel="noopener">vaultcrux.com ↗</a></span>`+
       `</div>`, null);
     y=info.y+info.h+GAP;
-    /* the three doc cards — shorter */
-    const cols=Math.min(3, ids.length)||1, gw=(W-(cols-1)*GAP)/cols, gh=96;
-    ids.forEach((id,i)=>{ const n=N[id];
-      mk(PAD+(i%cols)*(gw+GAP), y+Math.floor(i/cols)*(gh+GAP), gw, gh, 's-'+norm(n.status),
+    /* the three doc cards are TABS — they swap the reader below, no new cards */
+    const TABS=[['dx-articles','articles'],['dx-readme','readme'],['dx-sites','external']];
+    const curTab=confGet('dx.tab','articles');
+    const cols=Math.min(3, TABS.length), gw=(W-(cols-1)*GAP)/cols, gh=84;
+    TABS.forEach(([id,tab],i)=>{ const n=N[id]; if(!n) return;
+      const cell=mk(PAD+(i%cols)*(gw+GAP), y, gw, gh, 's-'+norm(n.status)+(tab===curTab?' dx-tab-on':''),
         `<div class="gstripe"></div>`+
         `<div class="dash-g"><span class="dash-ico">${sbSvg(SB_ICONS[id]||SB_ICONS.__dot)}</span>`+
-        `<span class="dash-g-main"><span class="gtitle">${esc(n.label)}</span><span class="gsub">${esc(n.sub||'')}</span></span></div>`, id); });
-    y+=Math.ceil(ids.length/cols)*(gh+GAP);
-    /* reader: cascading article list (20%) + body */
-    const docs=DX_DOCS.concat(window.__dxDocs?[window.__dxDocs]:[]);
+        `<span class="dash-g-main"><span class="gtitle">${esc(n.label)}</span><span class="gsub">${esc(n.sub||'')}</span></span></div>`, null);
+      cell.el.addEventListener('click',()=>{ confPut('dx.tab',tab); render(); });
+    });
+    y+=gh+GAP;
+    /* reader: cascading list (20%) + body — content swaps with the tab */
     if(LIVE && !window.__dxDocsTried){ window.__dxDocsTried=true;
       api('/v1/console/facts?q='+encodeURIComponent('docs::')+'&top_k=50').then(r=>{
         const fs=(r.facts||[]).filter(f=>/^docs::/.test(String(f.entity||'')));
         if(fs.length){ window.__dxDocs={g:'Synced · platform',items:fs.slice(0,20).map(f=>({id:'sync:'+(f.fact_id||f.key),
           t:String(f.key||f.entity), body:String(typeof f.value==='string'?f.value:JSON.stringify(f.value,null,2))}))};
           if(activeScope==='dx'&&dashMode) render(); } }).catch(()=>{}); }
+    const docs= curTab==='readme' ? DX_README
+              : curTab==='external' ? DX_EXTERNAL
+              : DX_DOCS.concat(window.__dxDocs?[window.__dxDocs]:[]);
     window.__dxOpen=window.__dxOpen||{};
-    const curId=confGet('dx.doc', (docs[0]&&docs[0].items[0]||{}).id);
+    const docKey='dx.doc.'+curTab;
+    const curId=confGet(docKey, (docs[0]&&docs[0].items[0]||{}).id);
     let cur=null; docs.forEach(g0=>g0.items.forEach(it=>{ if(it.id===curId) cur=it; }));
     cur=cur||(docs[0]&&docs[0].items[0])||{t:'—',body:'no articles'};
     const listW=Math.max(170, Math.round(W*0.2)), readerH=420;
@@ -1973,12 +2030,13 @@ function renderScopeDash(){
       if(open) g0.items.forEach(it=>{
         const a=document.createElement('div'); a.className='dx-item'+(it.id===curId?' on':'');
         a.textContent=it.t;
-        a.addEventListener('click',()=>{ confPut('dx.doc',it.id); render(); });
+        a.addEventListener('click',()=>{ confPut(docKey,it.id); render(); });
         list.el.appendChild(a);
       });
     });
     const body=mk(PAD+listW+GAP, y, W-listW-GAP, readerH, 'dx-body',
-      `<div class="gstripe"></div><div class="dash-title">${esc(cur.t)}</div><pre class="dx-doc">${esc(cur.body||'')}</pre>`, null);
+      `<div class="gstripe"></div><div class="dash-title">${esc(cur.t)}</div><pre class="dx-doc">${esc(cur.body||'')}</pre>`+
+      (cur.url?`<a class="dx-link" href="${esc(cur.url)}" target="_blank" rel="noopener">${esc(cur.url)} ↗</a>`:''), null);
     y=Math.max(list.y+list.h, body.y+body.h)+GAP;
   } else if(activeScope==='gx'){
     ids.forEach(id=>{
