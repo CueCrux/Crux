@@ -211,6 +211,12 @@ pub struct LedgerMetrics {
 
 /// Global metrics handles — usable (and unit-testable) even before
 /// [`register_metrics`] wires them into a scrape registry.
+// The `.expect()`s below are on prometheus opts/label construction with static
+// literal names and bucket lists — infallible by construction (same pattern as
+// corecruxd's Metrics::new). expect_used is workspace-warn, denied in CI via
+// -D warnings; allow it here deliberately rather than thread Results through an
+// infallible static initialiser.
+#[allow(clippy::expect_used)]
 pub fn metrics() -> &'static LedgerMetrics {
     static METRICS: OnceLock<LedgerMetrics> = OnceLock::new();
     METRICS.get_or_init(|| LedgerMetrics {
