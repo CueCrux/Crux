@@ -1368,10 +1368,19 @@ function applyUsageTile(u){   // refresh the ov-usage dash tile in place (txOver
   n.payload=JSON.stringify({window:u.window,tokens:u.tokens,by_session:u.by_session},null,2);
   n.children=[];   // live rollup replaces the dummy per-session children
 }
-function txOverviewPlus(json){ const kids=txOverview(json.sum||json); applyUsageTile(json.usage); return kids; }
+function applyStorageTile(sb){   // gap-closure M3: ov-storage dash tile ⇄ /v1/console/storage-breakdown
+  const n=N['ov-storage']; const ks=(sb&&sb.kinds)||[];
+  if(!n || !ks.length || !ks.some(k0=>k0.available)) return;   // nothing indexed → keep the demo tile
+  const gib=b=>{ b=Number(b)||0; return b>=1073741824? (b/1073741824).toFixed(2)+' GiB' : (b>=1048576? Math.round(b/1048576)+' MiB' : (b? Math.round(b/1024)+' KiB':'')); };
+  n.sub='live · '+ks.filter(k0=>k0.available).length+' of '+ks.length+' kinds populated';
+  n.fields=ks.map(k0=>[k0.label||k0.kind, [(k0.available?'':'empty'), k0.chunks? fmtK(k0.chunks)+' rows':null, k0.bytes? gib(k0.bytes):null].filter(Boolean).join(' · ')||'—']);
+  n.payload=JSON.stringify({by_kind:ks},null,2);
+}
+function txOverviewPlus(json){ const kids=txOverview(json.sum||json); applyUsageTile(json.usage); applyStorageTile(json.storage); return kids; }
 function registerLoaders(){
-  LOADERS['cx-overview']      = { noun:'tiles', transform: txOverviewPlus,                                                  // M2
-    fetch: async()=>({ sum: await api('/v1/console/summary'), usage: await usageRollup(7).catch(()=>null) }) };
+  LOADERS['cx-overview']      = { noun:'tiles', transform: txOverviewPlus,                                                  // M2/M3
+    fetch: async()=>({ sum: await api('/v1/console/summary'), usage: await usageRollup(7).catch(()=>null),
+                       storage: await api('/v1/console/storage-breakdown').catch(()=>null) }) };
   LOADERS['cx-work']          = { endpoint:'/v1/work?source=all',     noun:'work items',    transform: txWork };           // M3
   LOADERS['cx-sessions']      = { endpoint:'/v1/console/sessions',    noun:'sessions',      transform: txSessions };       // M4
   LOADERS['cx-orchestrators'] = { endpoint:'/v1/orchestrators',       noun:'orchestrators', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txOrchestrators };  // M5
@@ -2996,6 +3005,61 @@ const PAGE_WIRES={
       : [infoRow('—','sessions show here when save_session uses execplan:<slug> ids')];
   },
   set:{ win: ()=>{ if(openPageId==='cx-usage') openPage('cx-usage'); return null; } }},
+ 'cx-documents':{
+  load: async def=>{
+    const [tn,sb,qf]=await Promise.all([
+      api('/v1/console/tenants').catch(e=>({_err:e})),
+      api('/v1/console/storage-breakdown').catch(e=>({_err:e})),
+      api('/v1/console/facts?q='+encodeURIComponent('ingest:queue')+'&top_k=20').catch(e=>({_err:e}))]);
+    if(!tn._err){
+      const ts=tn.tenants||[], ids=ts.map(t=>t.tenant_id);
+      const sel=pageCtrl('cx-documents','doc_tenant');
+      if(sel&&ids.length){ sel.options=ids; if(ids.indexOf(confGet('cx-documents.doc_tenant',sel.v))<0) setCtrl('cx-documents','doc_tenant',ids[0]); }
+      const ingSel=pageCtrl('cx-documents','ing_tenant'); if(ingSel&&ids.length) ingSel.options=ids.concat(['new tenant…']);
+      def.sections[0].sub='/v1/console/tenants · '+ts.length+' tenants'+(tn.dataplane_enabled===false?' · dataplane off (metadata only)':'');
+      def.sections[0].controls=[sel].filter(Boolean)
+        .concat(ts.slice(0,8).map(t=>infoRow(t.tenant_id,[t.category,t.override?('override '+t.override):null].filter(Boolean).join(' · ')||'—')))
+        .concat([{t:'btn',label:'Browse documents as graph',action:'graph'}]);
+    }
+    const cur=pageVal('cx-documents','doc_tenant');
+    if(cur){
+      try{
+        const ch=await api('/v1/console/tenants/'+encodeURIComponent(cur)+'/chunks?limit=12');
+        const rows=(ch.chunks||[]).map(c=>infoRow((c.stream_type||'stream')+' / '+String(c.stream_id||'').slice(0,20),
+          [c.event_type, c.payload_bytes? Math.max(1,Math.round(c.payload_bytes/1024))+' KiB':null, (c.occurred_at||'').slice(0,10)].filter(Boolean).join(' · ')));
+        def.sections[1].sub=cur+' · '+(ch.chunks||[]).length+' chunks shown'+((ch.page&&ch.page.next_cursor)?' · more available':'');
+        def.sections[1].controls=rows.length? rows : [infoRow('no chunks','tenant has no indexed chunk metadata yet')];
+      }catch(e){
+        def.sections[1].sub=cur+' · chunks unavailable ('+((e&&e.status)||'network')+')';
+        def.sections[1].controls=[infoRow(e&&e.status===403?'not authorised':'unavailable',
+          e&&e.status===403? ('needs tenant:chunks:read scope for '+cur) : 'chunk index not readable')];
+      }
+    }
+    if(!sb._err || !qf._err){
+      const px=def.sections[3].controls.filter(c=>c.t==='btn');
+      const rows=[];
+      if(!qf._err){ const qn=(qf.facts||[]).filter(f=>f.entity==='ingest:queue').length; rows.push(infoRow('queue', qn+' pending')); }
+      if(!sb._err) (sb.kinds||[]).forEach(k0=>rows.push(infoRow(k0.label||k0.kind,
+        [(k0.available?null:'empty'), k0.chunks? fmtK(k0.chunks)+' rows':null, k0.bytes? (k0.bytes/1073741824).toFixed(2)+' GiB':null].filter(Boolean).join(' · ')||'available')));
+      def.sections[3].controls=rows.concat(px);
+      applyStorageTile(sb._err? null : sb);
+    }
+  },
+  set:{ doc_tenant: ()=>{ if(openPageId==='cx-documents') openPage('cx-documents'); return null; } },
+  act:{
+    'Scan path': async()=>{   /* daemon scans CORECRUXD_WORKSPACE_PATH — the typed path rides the queue fact, not this call */
+      try{ const r=await postApi('/v1/workspace/scan',{});
+        const st=r.stats||{}; return 'scan '+(r.scan_id||'done')+(st.modules!=null?' · '+st.modules+' modules':'')+(r.duration_ms!=null?' · '+r.duration_ms+'ms':'');
+      }catch(e){ if(e&&e.status===412) throw {status:'CORECRUXD_WORKSPACE_PATH not configured'}; throw e; } },
+    'Queue ingest': async()=>{
+      const path=pageVal('cx-documents','ing_path'); if(!path) throw {status:'enter a source path first'};
+      const tenant=pageVal('cx-documents','ing_tenant');
+      await postApi('/v1/console/facts/add',{ entity:'ingest:queue', key:'path:'+path,
+        value: JSON.stringify({ path, tenant, chunking:pageVal('cx-documents','ing_chunking'),
+          watch:!!pageVal('cx-documents','ing_watch'), ner:!!pageVal('cx-documents','ing_ner'),
+          dossiers:!!pageVal('cx-documents','ing_dossiers'), queued_at:new Date().toISOString(), status:'queued' }) });
+      return 'queued · ingest:queue fact stored for '+tenant; },
+  }},
  'cx-projects':{
   load: async def=>{
     const [pr,pp]=await Promise.all([api('/v1/projects').catch(e=>({_err:e})), api('/v1/console/passports').catch(e=>({_err:e}))]);

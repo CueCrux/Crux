@@ -412,6 +412,37 @@ function makeFetch() {
   env9.s.openPage('cx-usage'); await flush(10);
   ok(env9.ALL.some(e => /CORECRUXD_OBSERVE/.test(e._text || '')), 'M2 usage: zero observations → explainer, not fake bars');
 
+  // ── M) M3 — documents/ingest live (tenants, chunks, storage breakdown, scan, queue fact) ──
+  const f10 = makeFetch();
+  f10.route(u => /\/v1\/console\/tenants$/.test(u), { ok: true, status: 200, body: { dataplane_enabled: false, tenants: [
+    { tenant_id: 'lme-s', category: 'work', override: null }, { tenant_id: 'personal', category: 'personal', override: null }] } });
+  f10.route(u => /\/v1\/console\/tenants\/lme-s\/chunks/.test(u), { ok: true, status: 200, body: { tenant_id: 'lme-s',
+    chunks: [{ chunk_digest: 'd1', stream_type: 'documents', stream_id: 'sess_7f3a_travel', event_type: 'knowledge.document.ingested.v1', payload_bytes: 4096, occurred_at: '2026-05-16T08:00:00Z' }],
+    page: { limit: 12, next_cursor: 'c2' } } });
+  f10.route(u => /\/v1\/console\/storage-breakdown/.test(u), { ok: true, status: 200, body: { kinds: [
+    { kind: 'text_search', label: 'Text Search', available: true, chunks: 6600000, bytes: 5260000000 },
+    { kind: 'projections', label: 'Projections', available: false, chunks: 0, bytes: 0 }] } });
+  f10.route(u => /\/v1\/console\/facts\?q=ingest/.test(u), { ok: true, status: 200, body: { facts: [{ entity: 'ingest:queue', key: 'path:~/docs' }] } });
+  f10.route((u, o) => /\/v1\/console\/facts\/add/.test(u) && o.method === 'POST', { ok: true, status: 200, body: { fact_id: 'f_new' } });
+  f10.route((u, o) => /\/v1\/workspace\/scan/.test(u) && o.method === 'POST', { ok: true, status: 200, body: { scan_id: 's1', root_path: '/src', duration_ms: 412, stats: { modules: 17 } } });
+  f10.route(u => /\/v1\/console\/summary/.test(u), { ok: true, status: 200, body: { daemon: {}, stores: {} } });
+  const env10 = buildSandbox(f10); await flush(8);
+  ok(/live · 1 of 2/.test(env10.s.__cx.N['ov-storage'].sub || ''), 'M3 storage: ov-storage dash tile live from storage-breakdown');
+  env10.s.openPage('cx-documents'); await flush(12);
+  ok((env10.s.pageCtrl('cx-documents', 'doc_tenant').options || []).join(',') === 'lme-s,personal', 'M3 documents: tenant select from /v1/console/tenants');
+  ok(env10.ALL.some(e => /documents \/ sess_7f3a_travel/.test(e._text || '')), 'M3 documents: chunk metadata rows from /chunks');
+  ok(env10.ALL.some(e => /more available/.test(e._text || '')), 'M3 documents: next_cursor surfaces as "more available"');
+  ok(env10.ALL.some(e => /1 pending/.test(e._text || '')), 'M3 documents: pipeline queue counts ingest:queue facts');
+  env10.s.confSet('cx-documents.ing_path', '~/corpus/**/*.md');
+  await lastBtn(env10, 'Queue ingest').fire('click'); await flush(8);
+  const qPost = f10.calls.find(c => /facts\/add/.test(c.url) && c.opts && c.opts.method === 'POST');
+  ok(!!qPost, 'M3 ingest: Queue ingest POSTs /v1/console/facts/add');
+  ok(qPost && JSON.parse(qPost.opts.body).entity === 'ingest:queue', 'M3 ingest: fact entity is ingest:queue');
+  ok(qPost && /corpus/.test(JSON.parse(JSON.parse(qPost.opts.body).value).path), 'M3 ingest: fact value carries the queued path');
+  await lastBtn(env10, 'Scan path').fire('click'); await flush(8);
+  ok(f10.calls.some(c => /workspace\/scan/.test(c.url) && c.opts && c.opts.method === 'POST'), 'M3 scan: Scan path POSTs /v1/workspace/scan');
+  ok(/17 modules/.test(env10.getById('cxToast').textContent || ''), 'M3 scan: toast carries scan stats');
+
   console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();
