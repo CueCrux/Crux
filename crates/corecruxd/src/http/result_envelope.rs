@@ -24,7 +24,7 @@
 //! `artefact_put`-ing them is deferred (see the `companion_artifacts` note in
 //! the import-receipt value and the module-level TODO below).
 //!
-//! Spec: `PlanCrux/docs/master-plan/daemon/Result-Envelope-Spec-v0_1.md` §3.
+//! Spec: `Result-Envelope-Spec-v0_1.md` §3.
 //!
 //! TODO(W3): pull + `artefact_put` companion blobs (gated by
 //! `CORECRUXD_FEATURE_ARTEFACTS`), with the indefinite-TTL class resolved in

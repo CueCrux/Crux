@@ -12,7 +12,7 @@
 //! payload through *existing* store surfaces (bulk facts / entity_upsert /
 //! edge_upsert) — no new write paths.
 //!
-//! Spec: `PlanCrux/docs/master-plan/daemon/Result-Envelope-Spec-v0_1.md`
+//! Spec: `Result-Envelope-Spec-v0_1.md`
 //! (child of `crux-growth-upsell-master-2026-06-11`, W2.D2).
 //!
 //! This module owns only the *verification* primitive (the one new requirement
