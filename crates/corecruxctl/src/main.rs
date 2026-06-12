@@ -17,8 +17,8 @@ use clap::{Parser, Subcommand};
 
 use corecruxctl::{
     admin, audit_export, audit_pack, c2pa_x509, evidence, explain, extensions, fixture_digest, gaps, inspect_receipt,
-    memory, output_verify, parity, projections, receipts, reconcile, replay, shard, shardmap, smoke, snapshot,
-    stage1_import, storage, structured_log, tooling_env, verify_store,
+    memory, memory_pack, output_verify, parity, projections, receipts, reconcile, replay, shard, shardmap, smoke,
+    snapshot, stage1_import, storage, structured_log, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -556,6 +556,43 @@ enum MemoryCommand {
         /// Set to remove the pin instead of adding it.
         #[arg(long, default_value_t = false)]
         off: bool,
+    },
+    /// Export the local memory store to a signed `.cruxpack` file
+    /// (read-only against --data-dir; private + erased facts excluded —
+    /// see Memory-Portability-v1).
+    Export {
+        /// Daemon data directory (or CORECRUXD_DATA_DIR).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output `.cruxpack` path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Tenant identity recorded in the manifest (import gate, T.1).
+        #[arg(long, default_value = "local")]
+        tenant: String,
+        /// Only include facts stored at/after this RFC 3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// Opt private + reserved-prefix facts in. Prints a summary and
+        /// requires typing 'include private' at the prompt.
+        #[arg(long, default_value_t = false)]
+        include_private: bool,
+    },
+    /// Import a `.cruxpack` into the running daemon via POST
+    /// /v1/memory/import. Requires CRUX_MEMORY_IMPORT=1 (CLI and daemon).
+    Import {
+        /// Path to the `.cruxpack` file.
+        #[arg(long)]
+        file: PathBuf,
+        /// Tenant to import into — must match the pack manifest (T.1).
+        #[arg(long, default_value = "local")]
+        tenant: String,
+        /// Principal remap entries `src=dst` (repeatable).
+        #[arg(long = "map-principal")]
+        map_principal: Vec<String>,
+        /// Verify + plan only; write nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
 }
 
@@ -2142,6 +2179,61 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     } else {
                         println!("pinned fact {fact_id}");
                     }
+                    Ok(())
+                }
+                MemoryCommand::Export {
+                    data_dir,
+                    out,
+                    tenant,
+                    since,
+                    include_private,
+                } => {
+                    let data_dir = data_dir
+                        .or_else(|| std::env::var("CORECRUXD_DATA_DIR").ok().map(PathBuf::from))
+                        .ok_or("memory export requires --data-dir or CORECRUXD_DATA_DIR")?;
+                    let report = memory_pack::run_memory_export(
+                        &memory_pack::MemoryExportArgs {
+                            data_dir,
+                            out: out.clone(),
+                            tenant,
+                            since,
+                            include_private,
+                        },
+                        |summary| {
+                            print!("{}", memory_pack::render_private_summary(summary));
+                            print!("Type '{}' to proceed: ", memory_pack::INCLUDE_PRIVATE_CONFIRM_PHRASE);
+                            use std::io::Write as _;
+                            let _ = std::io::stdout().flush();
+                            let mut line = String::new();
+                            if std::io::stdin().read_line(&mut line).is_err() {
+                                return false;
+                            }
+                            line.trim() == memory_pack::INCLUDE_PRIVATE_CONFIRM_PHRASE
+                        },
+                    )?;
+                    println!(
+                        "memory export OK: facts={} sessions={} passport_fpr={} hash={} out={}",
+                        report.facts,
+                        report.sessions,
+                        report.passport_fpr,
+                        report.blake3_content_hash,
+                        out.display()
+                    );
+                    Ok(())
+                }
+                MemoryCommand::Import {
+                    file,
+                    tenant,
+                    map_principal,
+                    dry_run,
+                } => {
+                    let response = memory_pack::run_memory_import(&memory_pack::MemoryImportArgs {
+                        file,
+                        tenant,
+                        map_principal,
+                        dry_run,
+                    })?;
+                    println!("{}", serde_json::to_string_pretty(&response)?);
                     Ok(())
                 }
             }

@@ -263,4 +263,20 @@ mod tests {
         enforce(&p, &mut f);
         assert!(f.private);
     }
+
+    /// Drift guard for the `.cruxpack` exporter (Memory-Portability-v1 §3):
+    /// every born-private prefix the daemon enforces MUST also be on the
+    /// exporter's reserved list, so adding a prefix here can never silently
+    /// make those facts exportable. (The exporter list is allowed to be a
+    /// superset — CLI-side reserved prefixes ride along.)
+    #[test]
+    fn cruxpack_reserved_prefixes_cover_daemon_private_prefixes() {
+        for prefix in DEFAULT_PRIVATE_PREFIXES {
+            assert!(
+                corecrux_memory::cruxpack::CRUXPACK_RESERVED_PREFIXES.contains(prefix),
+                "born-private prefix '{prefix}' is missing from CRUXPACK_RESERVED_PREFIXES — \
+                 facts under it could leak into a .cruxpack export"
+            );
+        }
+    }
 }

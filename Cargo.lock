@@ -701,6 +701,8 @@ version = "0.3.1"
 dependencies = [
  "blake3",
  "chrono",
+ "ed25519-dalek",
+ "hex",
  "serde",
  "serde_json",
  "tempfile",
@@ -854,6 +856,7 @@ dependencies = [
  "corecrux-types",
  "crc32c",
  "crux-integrations",
+ "crux-session",
  "ed25519-dalek",
  "fs2",
  "hex",
