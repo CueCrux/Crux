@@ -1051,10 +1051,9 @@ pub fn load_config() -> Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppendLaneScope, CommitLevel, IngressConfig, StoreLockStrategy,
-        DEFAULT_GRPC_KEEPALIVE_INTERVAL_SECS, DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS,
-        DEFAULT_GRPC_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_REQUEST_BODY_BYTES,
-        DEFAULT_RATE_LIMIT_BURST, DEFAULT_RATE_LIMIT_RPS, DEFAULT_SHUTDOWN_DRAIN_SECS,
+        AppendLaneScope, CommitLevel, IngressConfig, StoreLockStrategy, DEFAULT_GRPC_KEEPALIVE_INTERVAL_SECS,
+        DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS, DEFAULT_GRPC_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_INFLIGHT,
+        DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_RATE_LIMIT_BURST, DEFAULT_RATE_LIMIT_RPS, DEFAULT_SHUTDOWN_DRAIN_SECS,
     };
 
     #[test]
@@ -1091,25 +1090,15 @@ mod tests {
         assert_eq!(cfg.rate_limit_rps, 10);
         assert_eq!(cfg.rate_limit_burst, 20);
         assert_eq!(cfg.rate_limit_exempt_cidrs, vec!["10.0.0.0/8", "192.168.1.1/32"]);
-        assert_eq!(
-            cfg.shutdown_drain_cap(),
-            Some(std::time::Duration::from_secs(5))
-        );
-        assert_eq!(
-            cfg.grpc_keepalive_interval(),
-            Some(std::time::Duration::from_secs(15))
-        );
-        assert_eq!(
-            cfg.grpc_keepalive_timeout(),
-            Some(std::time::Duration::from_secs(5))
-        );
+        assert_eq!(cfg.shutdown_drain_cap(), Some(std::time::Duration::from_secs(5)));
+        assert_eq!(cfg.grpc_keepalive_interval(), Some(std::time::Duration::from_secs(15)));
+        assert_eq!(cfg.grpc_keepalive_timeout(), Some(std::time::Duration::from_secs(5)));
         assert_eq!(cfg.grpc_max_streams(), Some(256));
     }
 
     #[test]
     fn ingress_config_burst_clamps_up_to_rps() {
-        let cfg =
-            IngressConfig::from_values(None, None, None, Some("500"), Some("100"), None, None, None, None);
+        let cfg = IngressConfig::from_values(None, None, None, Some("500"), Some("100"), None, None, None, None);
         assert_eq!(cfg.rate_limit_rps, 500);
         assert_eq!(cfg.rate_limit_burst, 500, "burst below rps must clamp up");
     }
@@ -1142,8 +1131,7 @@ mod tests {
     fn ingress_config_keepalive_timeout_inert_when_interval_disabled() {
         // Interval 0 disables keep-alive entirely; a configured timeout
         // must not leak through on its own.
-        let cfg =
-            IngressConfig::from_values(None, None, None, None, None, None, Some("0"), Some("10"), None);
+        let cfg = IngressConfig::from_values(None, None, None, None, None, None, Some("0"), Some("10"), None);
         assert_eq!(cfg.grpc_keepalive_interval(), None);
         assert_eq!(cfg.grpc_keepalive_timeout(), None);
     }

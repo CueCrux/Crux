@@ -787,9 +787,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Ingress hardening (crux-http-ingress-hardening-2026-06-11 M1): body
     // limit + problem+json 413s, applied before TraceLayer so rejected
     // requests still show up in traces.
-    let app: Router =
-        http::ingress::apply_ingress_limits(http::router(state), &config.ingress, Some(&metrics))
-            .layer(TraceLayer::new_for_http());
+    let app: Router = http::ingress::apply_ingress_limits(http::router(state), &config.ingress, Some(&metrics))
+        .layer(TraceLayer::new_for_http());
 
     // Session TTL reaper — runs every 60s, removes expired sessions.
     {
@@ -1629,11 +1628,8 @@ async fn serve_http_listener(
     // `into_make_service_with_connect_info` exposes the peer address as a
     // `ConnectInfo<SocketAddr>` request extension — the rate limiter's
     // per-IP fallback key (crux-http-ingress-hardening M3).
-    let serve = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown);
+    let serve =
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown);
     match drain_cap {
         None => serve.await,
         Some(cap) => {
@@ -4188,12 +4184,7 @@ mod serve_http_tests {
             }),
         );
         let (tx, rx) = broadcast::channel::<()>(1);
-        let server = tokio::spawn(serve_http_listener(
-            listener,
-            app,
-            rx,
-            Some(Duration::from_millis(300)),
-        ));
+        let server = tokio::spawn(serve_http_listener(listener, app, rx, Some(Duration::from_millis(300))));
 
         // Park one request inside the slow handler.
         #[allow(clippy::unwrap_used)]

@@ -301,7 +301,11 @@ fn cidr_contains(cidr: &(IpAddr, u8), ip: IpAddr) -> bool {
     let (net, prefix) = *cidr;
     match (net, ip) {
         (IpAddr::V4(net), IpAddr::V4(ip)) => {
-            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - u32::from(prefix)) };
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - u32::from(prefix))
+            };
             (u32::from(net) & mask) == (u32::from(ip) & mask)
         }
         (IpAddr::V6(net), IpAddr::V6(ip)) => {
@@ -343,11 +347,11 @@ async fn handle_ingress_error(err: tower::BoxError) -> Response {
             "https://errors.cuecrux.com/overloaded",
             "Service Overloaded",
         );
-        pd.detail = Some(
-            "server is at its in-flight request capacity (CORECRUXD_MAX_INFLIGHT); retry shortly".to_string(),
-        );
+        pd.detail =
+            Some("server is at its in-flight request capacity (CORECRUXD_MAX_INFLIGHT); retry shortly".to_string());
         let mut resp = ProblemResponse(pd).into_response();
-        resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         return resp;
     }
     tracing::error!(%err, "unexpected ingress middleware error");
@@ -398,7 +402,10 @@ mod tests {
     use crate::config::IngressConfig;
 
     fn test_router() -> Router {
-        Router::new().route("/echo", post(|body: Bytes| async move { format!("{} bytes", body.len()) }))
+        Router::new().route(
+            "/echo",
+            post(|body: Bytes| async move { format!("{} bytes", body.len()) }),
+        )
     }
 
     fn cfg(limit: usize) -> IngressConfig {
@@ -536,7 +543,10 @@ mod tests {
         let app = apply_ingress_limits(slow_router(release.clone()), &cfg, None);
 
         // Park one request inside /slow-a, occupying the single permit.
-        let first = tokio::spawn(app.clone().oneshot(Request::get("/slow-a").body(Body::empty()).unwrap()));
+        let first = tokio::spawn(
+            app.clone()
+                .oneshot(Request::get("/slow-a").body(Body::empty()).unwrap()),
+        );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // A second request — on a DIFFERENT route — must shed: the cap is
@@ -560,7 +570,10 @@ mod tests {
         let first = first.await.unwrap().unwrap();
         assert_eq!(first.status(), StatusCode::OK);
 
-        let parked = tokio::spawn(app.clone().oneshot(Request::get("/slow-a").body(Body::empty()).unwrap()));
+        let parked = tokio::spawn(
+            app.clone()
+                .oneshot(Request::get("/slow-a").body(Body::empty()).unwrap()),
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         release.notify_waiters();
         assert_eq!(parked.await.unwrap().unwrap().status(), StatusCode::OK);
@@ -575,8 +588,14 @@ mod tests {
         };
         let app = apply_ingress_limits(slow_router(release.clone()), &cfg, None);
 
-        let first = tokio::spawn(app.clone().oneshot(Request::get("/slow-a").body(Body::empty()).unwrap()));
-        let second = tokio::spawn(app.clone().oneshot(Request::get("/slow-b").body(Body::empty()).unwrap()));
+        let first = tokio::spawn(
+            app.clone()
+                .oneshot(Request::get("/slow-a").body(Body::empty()).unwrap()),
+        );
+        let second = tokio::spawn(
+            app.clone()
+                .oneshot(Request::get("/slow-b").body(Body::empty()).unwrap()),
+        );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         release.notify_waiters();
         assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
@@ -589,8 +608,14 @@ mod tests {
         let metrics = test_metrics();
         let app = apply_ingress_limits(slow_router(release.clone()), &IngressConfig::default(), Some(&metrics));
 
-        let first = tokio::spawn(app.clone().oneshot(Request::get("/slow-a").body(Body::empty()).unwrap()));
-        let second = tokio::spawn(app.clone().oneshot(Request::get("/slow-b").body(Body::empty()).unwrap()));
+        let first = tokio::spawn(
+            app.clone()
+                .oneshot(Request::get("/slow-a").body(Body::empty()).unwrap()),
+        );
+        let second = tokio::spawn(
+            app.clone()
+                .oneshot(Request::get("/slow-b").body(Body::empty()).unwrap()),
+        );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let rendered = metrics.render().unwrap();
@@ -628,7 +653,10 @@ mod tests {
         };
         let app = apply_ingress_limits(slow_router(release.clone()), &cfg, Some(&metrics));
 
-        let first = tokio::spawn(app.clone().oneshot(Request::get("/slow-a").body(Body::empty()).unwrap()));
+        let first = tokio::spawn(
+            app.clone()
+                .oneshot(Request::get("/slow-a").body(Body::empty()).unwrap()),
+        );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let shed = app
@@ -851,9 +879,7 @@ mod tests {
         let limiter = HttpRateLimiter::new(&rate_cfg(1, 1), None);
         let t0 = Instant::now();
         for _ in 0..5 {
-            assert!(limiter
-                .check(None, Some(normalize_ip(mapped)), t0)
-                .is_ok());
+            assert!(limiter.check(None, Some(normalize_ip(mapped)), t0).is_ok());
         }
     }
 }
