@@ -27,6 +27,8 @@ mch = "mch"
 pn = "pn"
 # Hetzner Helsinki datacentre code in the bare-metal runner hostname runner-hel1
 hel = "hel"
+# in-toto attestation format — SLSA provenance files are *.intoto.jsonl
+intoto = "intoto"
 
 [default.extend-identifiers]
 # Acceptable variant spelling (used in struct fields and function names)
