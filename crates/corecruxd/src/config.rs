@@ -428,6 +428,19 @@ pub struct Config {
     // `crate::http::context_surface`). Default OFF.
     pub context_surface_enabled: bool,
 
+    // G19 stream/context receipt wiring (`crate::http::stream_receipts`).
+    // Default OFF.
+    pub stream_receipts_enabled: bool,
+
+    // G21b assembly cache for /v1/context bundles. Default OFF.
+    pub assembly_cache_enabled: bool,
+
+    // G20 per-surface request quota (`crate::http::quota`). Default OFF.
+    pub quota_enabled: bool,
+    // Path prefixes classified as hosted (quota-limited) surfaces.
+    // Comma-separated; empty default = everything is local compute.
+    pub quota_hosted_surfaces: Vec<String>,
+
     // OpenAI function-calling shim over the MCP tool surface
     // (`crate::http::openai_shim`). Default OFF.
     pub openai_shim_enabled: bool,
@@ -1066,6 +1079,19 @@ pub fn load_config() -> Config {
             .unwrap_or(crate::coord::DEFAULT_PRESENCE_TTL_SECS)
             .clamp(60, crate::coord::MAX_TTL_SECS),
         context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE").unwrap_or(false),
+        stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS").unwrap_or(false),
+        assembly_cache_enabled: env_bool("CORECRUXD_ASSEMBLY_CACHE").unwrap_or(false),
+        quota_enabled: env_bool("CORECRUXD_QUOTA").unwrap_or(false),
+        quota_hosted_surfaces: std::env::var("CORECRUXD_QUOTA_HOSTED_SURFACES")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
         memory_import_enabled: env_bool("CRUX_MEMORY_IMPORT").unwrap_or(false),
         identity_links_enabled: env_bool("CORECRUXD_IDENTITY_LINKS").unwrap_or(false),
         openai_shim_enabled: env_bool("CORECRUXD_OPENAI_SHIM").unwrap_or(false),

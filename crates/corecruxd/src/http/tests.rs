@@ -307,6 +307,11 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         coord_enabled: true,
         coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
         context_surface_enabled: true,
+        stream_receipts_enabled: false,
+        quota_enabled: false,
+        assembly_cache: None,
+        quota_hosted_surfaces: Arc::new(Vec::new()),
+        quota_ledger: Arc::new(std::sync::Mutex::new(crux_router::quota::QuotaLedger::new())),
         openai_shim_enabled: false,
         memory_import_enabled: true,
         identity_links_enabled: true,
@@ -1031,16 +1036,13 @@ async fn mediation_receipt_unauthenticated_denied_t3() {
     let resp = observations::post_mediation_receipt(
         State(state.clone()),
         HeaderMap::new(),
-        Json(observations::PostMediationReceiptBody {
-            passport_id: "personal-default".to_string(),
-            tool_server: "openclaw".to_string(),
-            tool: "openclaw_status".to_string(),
-            args_sha: None,
-            decision: "allow".to_string(),
-            outcome: "ok".to_string(),
-            ts: None,
-            session_id: None,
-        }),
+        Json(serde_json::json!({
+            "passport_id": "personal-default",
+            "tool_server": "openclaw",
+            "tool": "openclaw_status",
+            "decision": "allow",
+            "outcome": "ok",
+        })),
     )
     .await
     .into_response();
