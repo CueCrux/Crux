@@ -567,6 +567,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         corruption_detected,
         capacity,
         admin_force_seal_enabled: config.admin_force_seal_enabled,
+        retention_days: config.retention_days,
         retrieval_index: {
             let mut idx = corecrux_retrieval::IndexManager::new();
             if config.build_ccxi {
@@ -3917,6 +3918,7 @@ mod tests {
             corruption_detected: std::sync::Arc::new(tokio::sync::RwLock::new(false)),
             capacity: std::sync::Arc::new(tokio::sync::RwLock::new(crate::http::CapacityState::default())),
             admin_force_seal_enabled: false,
+            retention_days: None,
             retrieval_index: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_retrieval::IndexManager::new())),
             fact_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::FactStore::new())),
             extension_rate_table: std::sync::Arc::new(crate::extension_outbound::RateTable::new()),

@@ -337,6 +337,7 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         admin_actions: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
         corruption_detected: Arc::new(RwLock::new(false)),
         admin_force_seal_enabled: false,
+        retention_days: None,
         retrieval_index: Arc::new(RwLock::new(corecrux_retrieval::IndexManager::new())),
         fact_store: Arc::new(RwLock::new(corecrux_memory::FactStore::new())),
         extension_rate_table: Arc::new(crate::extension_outbound::RateTable::new()),

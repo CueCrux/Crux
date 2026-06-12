@@ -213,6 +213,10 @@ pub struct AppState {
     pub corruption_detected: Arc<RwLock<bool>>,
     pub capacity: Arc<RwLock<CapacityState>>,
     pub admin_force_seal_enabled: bool,
+    /// Fact-store retention window in days (launch-gate 5.1 / W2.E2). `None` =
+    /// retention off; the `compact-facts` admin action then only scrubs already
+    /// soft-deleted facts. Sourced from `CORECRUXD_RETENTION_DAYS`.
+    pub retention_days: Option<u32>,
     /// CoreCrux v5: loaded .ccxi companion indexes for BM25 text retrieval.
     pub retrieval_index: Arc<RwLock<corecrux_retrieval::IndexManager>>,
     /// Crux Daemon fact store (receipted entity memory).

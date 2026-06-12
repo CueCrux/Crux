@@ -9,13 +9,11 @@ jobs:
   build-and-publish:
     name: Build & Publish
     runs-on: [self-hosted, ci]
-    # npm Trusted Publishing (OIDC) — no NPM_TOKEN secret. Requires the
-    # @cuecrux/client package to exist on npmjs.com with a trusted publisher
-    # configured (owner CueCrux, repository Crux, workflow sdk-typescript.yml).
-    # First-ever publish is manual from an operator login; CI is tokenless after.
+    # Publishes @cuecrux SDK packages using the NPM_TOKEN granular-access
+    # secret (scope @cuecrux, read+write). The token creates the package on
+    # first publish, so no manual workstation publish is needed.
     permissions:
       contents: read
-      id-token: write
     defaults:
       run:
         working-directory: sdks/typescript
@@ -25,8 +23,8 @@ jobs:
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
-      # npm OIDC trusted publishing needs npm >= 11.5
-      - run: npm install -g npm@11
       - run: npm install
       - run: npm run build
       - run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
