@@ -366,6 +366,20 @@ mod tests {
         assert_eq!(ledger_session_id("alice"), "ledger::alice");
     }
 
+    #[test]
+    fn record_truncation_increments_labelled_counter() {
+        let before = metrics()
+            .tool_response_truncated_total
+            .with_label_values(&["ledger-test-tool", "token_budget"])
+            .get();
+        record_truncation("ledger-test-tool", "token_budget");
+        let after = metrics()
+            .tool_response_truncated_total
+            .with_label_values(&["ledger-test-tool", "token_budget"])
+            .get();
+        assert!(after > before);
+    }
+
     #[tokio::test]
     async fn emit_without_base_url_is_a_counted_noop() {
         let before = metrics().emit_failures_total.with_label_values(&["no_loopback_url"]).get();

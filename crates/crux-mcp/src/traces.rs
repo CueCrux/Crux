@@ -28,8 +28,9 @@
 //!
 //! ## Feature flag
 //!
-//! Recording is gated by `CORECRUXD_FEATURE_TOOL_TRACES=1`; default OFF
-//! so legacy deploys see zero behavioural change.
+//! Recording is gated by `CORECRUXD_FEATURE_TOOL_TRACES`; **default ON**
+//! since action-ledger M4 (the durable ledger is the system of record;
+//! the ring is the cheap fast-path view). Set `=0` to opt out.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -42,7 +43,8 @@ use tokio::sync::Mutex;
 
 use crate::envelope::{is_reserved_entity, PredictedEffect};
 
-/// Environment variable that gates trace recording. Default off.
+/// Environment variable that gates trace recording. Default ON
+/// (action-ledger M4); set to `0`/`false`/`off`/`no` to disable.
 pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_TOOL_TRACES";
 
 /// Default sliding-window retention horizon (1 hour). Overridable via
@@ -60,13 +62,21 @@ pub const MAX_TRACES_PER_PASSPORT: usize = 5_000;
 pub const ANON_PASSPORT: &str = "__anon__";
 
 /// Return true if trace recording is enabled via the feature flag.
+///
+/// **Default ON** since action-ledger M4: with the durable
+/// `agent.tool_invocation.v1` ledger as the system of record, the ring
+/// is the cheap in-memory fast-path view and there is no reason to ship
+/// it dark. Operators can still opt out with
+/// `CORECRUXD_FEATURE_TOOL_TRACES=0`. An *empty* value also disables —
+/// preserved from the pre-M4 truthiness parser so `FOO=` keeps meaning
+/// "off" in env files that used it that way.
 pub fn traces_enabled() -> bool {
     match std::env::var(FEATURE_FLAG_ENV) {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !matches!(v.as_str(), "" | "0" | "false" | "off" | "no")
         }
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -275,10 +285,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn feature_flag_default_off() {
+    #[tokio::test]
+    async fn feature_flag_default_on_and_opt_out() {
+        let _g = test_env_lock().lock().await;
+        // action-ledger M4: ring records by default…
         std::env::remove_var(FEATURE_FLAG_ENV);
-        assert!(!traces_enabled());
+        assert!(traces_enabled());
+        // …and every disable spelling still works.
+        for off in ["0", "false", "off", "no", ""] {
+            std::env::set_var(FEATURE_FLAG_ENV, off);
+            assert!(!traces_enabled(), "{off:?} should disable");
+        }
+        std::env::set_var(FEATURE_FLAG_ENV, "1");
+        assert!(traces_enabled());
+        std::env::remove_var(FEATURE_FLAG_ENV);
     }
 
     #[test]
@@ -379,7 +399,7 @@ mod tests {
     #[tokio::test]
     async fn record_dispatch_is_noop_when_flag_off() {
         let _g = test_env_lock().lock().await;
-        std::env::remove_var(FEATURE_FLAG_ENV);
+        std::env::set_var(FEATURE_FLAG_ENV, "0");
         // Use a unique passport so the assertion is independent of other tests.
         let passport = "test-passport-noop-when-off";
         global().lock().await.clear_for_test(passport);

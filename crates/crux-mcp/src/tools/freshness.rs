@@ -150,6 +150,7 @@ pub async fn handle_memory_freshness(args: &Value, ctx: &McpContext) -> Result<V
         // emit, not the underlying fact's content size.
         used_tokens += crate::token_estimate::estimate_tokens(&row) as usize;
         if used_tokens > token_budget && !rows.is_empty() {
+            crate::ledger::record_truncation("memory_freshness", "token_budget");
             break;
         }
         rows.push(row);
@@ -248,6 +249,7 @@ pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> R
         });
         used_tokens += crate::token_estimate::estimate_tokens(&row) as usize;
         if used_tokens > token_budget && !rows.is_empty() {
+            crate::ledger::record_truncation("memory_sweep_candidates", "token_budget");
             break;
         }
         rows.push(row);
@@ -314,6 +316,7 @@ pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> R
             });
             used_tokens += crate::token_estimate::estimate_tokens(&row) as usize;
             if used_tokens > token_budget && !rows.is_empty() {
+                crate::ledger::record_truncation("memory_sweep_candidates", "token_budget");
                 break;
             }
             rows.push(row);

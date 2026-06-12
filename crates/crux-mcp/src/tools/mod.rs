@@ -2672,6 +2672,12 @@ mod tests {
     /// and the full set still far larger.
     #[tokio::test]
     async fn dynamic_listing_reshapes_by_declared_intent() {
+        // This test asserts the *intent-only* dynamic shape. The trace
+        // ring records by default since action-ledger M4, and other
+        // tests dispatching as __anon__ feed trace boosts into the
+        // surface — pin the flag off (env-lock per crate rules).
+        let _g = crate::test_env_lock().lock().await;
+        std::env::set_var(crate::traces::FEATURE_FLAG_ENV, "0");
         let pk = crate::traces::ANON_PASSPORT;
         surface::clear_intent_for_test(pk);
         surface::record_intent(pk, "audit_review");
@@ -2698,6 +2704,7 @@ mod tests {
         let json2 = list_tools_json_for_context_with_mode(&ctx, 0, surface::ToolSurfaceMode::Dynamic).await;
         let n2 = json2["tools"].as_array().expect("tools array").len();
         assert_eq!(n2, surface::CORE_FLOOR.len(), "no intent ⇒ floor only");
+        std::env::remove_var(crate::traces::FEATURE_FLAG_ENV);
     }
 
     #[test]

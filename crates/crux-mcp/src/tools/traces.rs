@@ -105,11 +105,14 @@ pub async fn handle_tool_trace_recent(args: &Value, ctx: &McpContext) -> Result<
     if let Some(turn) = filter_turn {
         entries.retain(|e| e.turn_id.as_deref() == Some(turn.as_str()));
     }
+    let requested = entries.len() as u64;
     let payload = trace_payload(entries, Some(token_budget));
-    let summary = format!(
-        "tool_trace_recent: {} entries for passport={passport}",
-        payload["count"].as_u64().unwrap_or(0)
-    );
+    let returned = payload["count"].as_u64().unwrap_or(0);
+    if returned < requested {
+        // action-ledger M4: surface budget truncation in metrics.
+        crate::ledger::record_truncation("tool_trace_recent", "token_budget");
+    }
+    let summary = format!("tool_trace_recent: {returned} entries for passport={passport}");
     let mut payload = payload;
     payload["content"] = json!([{"type": "text", "text": summary}]);
     Ok(payload)
@@ -144,7 +147,7 @@ mod tests {
     #[tokio::test]
     async fn returns_feature_disabled_when_flag_off() {
         let _g = trace_env_lock().lock().await;
-        std::env::remove_var(FEATURE_FLAG_ENV);
+        std::env::set_var(FEATURE_FLAG_ENV, "0");
         let ctx = ctx_with_agent(&unique_passport("disabled"));
         let res = handle_tool_trace_recent(&json!({}), &ctx).await.unwrap();
         assert_eq!(res["feature_disabled"], true);
