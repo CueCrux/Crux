@@ -34,12 +34,44 @@
 #
 # Safe for local use too — when sccache isn't present the first attempt
 # succeeds and the retry path is never taken.
+#
+# Note: the wrapper injects `--locked` into every invocation (see the
+# supply-chain guard below), so all CI cargo calls share one lockfile
+# policy choke point.
 
 set -eo pipefail
 
 if [ "$#" -eq 0 ]; then
   echo "usage: $0 <cargo-subcommand> [args...]" >&2
   exit 2
+fi
+
+# Supply-chain guard (ExecPlan crux-supply-chain-attestation-2026-06-11):
+# every cargo invocation routed through this wrapper runs with `--locked`,
+# so a Cargo.lock that drifts from the manifests fails loudly in CI instead
+# of being silently regenerated mid-build. Fix for a red run is to commit
+# the regenerated lock, not to remove the flag.
+#
+# The flag is injected AFTER the subcommand because cargo does not forward
+# pre-subcommand global flags to external subcommands (llvm-cov etc.).
+# Skipped when the caller already passed `--locked`, and overridable with
+# CI_CARGO_NO_LOCKED=1 for deliberate local runs against a drifted lock.
+SUBCOMMAND="$1"
+shift
+INJECT_LOCKED=1
+if [ "${CI_CARGO_NO_LOCKED:-0}" = "1" ]; then
+  INJECT_LOCKED=0
+fi
+for arg in "$@"; do
+  if [ "$arg" = "--locked" ]; then
+    INJECT_LOCKED=0
+    break
+  fi
+done
+if [ "$INJECT_LOCKED" -eq 1 ]; then
+  set -- "$SUBCOMMAND" --locked "$@"
+else
+  set -- "$SUBCOMMAND" "$@"
 fi
 
 LOG="$(mktemp -t ci-cargo-fallback.XXXXXX.log)"
