@@ -163,10 +163,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let handle = std::thread::spawn(move || {
-            use std::io::Read as _;
             let (mut stream, _) = listener.accept().expect("accept");
-            let mut req_buf = [0u8; 4096];
-            let _ = stream.read(&mut req_buf);
+            let _ = crate::test_support::read_full_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
                 bytes.len()
