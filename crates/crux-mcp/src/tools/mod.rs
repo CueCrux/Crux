@@ -2631,6 +2631,53 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    /// Read one full HTTP request (headers + `Content-Length` body) from an
+    /// accepted loopback-mock stream.
+    ///
+    /// Accepted sockets inherit `O_NONBLOCK` from a nonblocking listener on
+    /// BSD/macOS (not on Linux), so a bare `read()` can return `WouldBlock`
+    /// and look like an empty request; replying and closing at that point
+    /// races the client's in-flight request write and surfaces as EINVAL
+    /// (os error 22) on macOS arm64 — broke the `aarch64-apple-darwin`
+    /// release builds (incident 2026-06-12). Every loopback mock must read
+    /// through this helper rather than a single `read()`.
+    pub(crate) fn read_full_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        stream.set_nonblocking(false).ok();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+        let mut data = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break, // EOF or timeout
+                Ok(n) => {
+                    data.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..pos]);
+                        let content_len = headers
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    v.trim().parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if data.len() >= pos + 4 + content_len {
+                            break;
+                        }
+                    }
+                    if data.len() > (1 << 20) {
+                        break;
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&data).into_owned()
+    }
+
     pub(crate) fn clear_sync_env() {
         std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
         std::env::remove_var("CORECRUXD_SYNC_API_KEY");
