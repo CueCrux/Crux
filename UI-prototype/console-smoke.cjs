@@ -99,12 +99,12 @@ function makeFetch() {
   ok(env.getById('liveBadge').textContent === 'live', 'boot: badge shows "live"');
   ok((env.getById('scopeHeader').value || '').includes('read'), 'boot: scopeHeader seeded with default scopes');
   // M3 — Work
-  const workCall = f.calls.find(c => /\/v1\/work/.test(c.url));
+  const workCall = f.calls.find(c => /\/v1\/work\?/.test(c.url));
   ok(!!workCall && /^\/v1\//.test(workCall.url), 'M3 work: same-origin /v1/work fetch issued');
   ok(workCall && workCall.opts.headers && /read/.test(workCall.opts.headers['X-Corecrux-Scopes'] || ''), 'M3 work: X-Corecrux-Scopes header attached');
   await tile(env, 'panel', 'Work').fire('click'); await flush();
   ok(!!tile(env, 'execplan', 'agent-ux-best-in-class'), 'M3 work: live WorkItem → execplan tile');
-  ok(f.calls.filter(c => /\/v1\/work/.test(c.url)).length === 1, 'M3 work: cached (prefetch loaded it; click did not refetch)');
+  ok(f.calls.filter(c => /\/v1\/work\?/.test(c.url)).length === 1, 'M3 work: cached (prefetch loaded it; click did not refetch)');
   const chip = st => env.s.document.querySelectorAll('#workFilter .wf-chip').find(c => c.dataset.stage === st);
   const epLive = ofKind(env, 'execplan').length;
   await chip('done').fire('click'); await flush();
@@ -477,6 +477,41 @@ function makeFetch() {
   // overview tile badge (unit-level: applyUpdateBadge is also fed by the cx-overview loader)
   env7.s.applyUpdateBadge({ update: { state: 'behind', behind_by: 37 } });
   ok(JSON.stringify(env7.s.__cx.N['ov-node'].fields).includes('37 behind'), 'M5 update: ov-node tile carries the behind badge');
+
+  // ── P) M6 — work comments/transitions drill + gates approve/reject ──
+  f10.route(u => /\/v1\/work\?/.test(u), { ok: true, status: 200, body: { work: [{ id: 'gapwork', title: 'gap closure', state: 'in_progress' }] } });
+  f10.route(u => /\/v1\/work\/gapwork\/comments/.test(u), { ok: true, status: 200, body: { work_id: 'gapwork', comments: [
+    { id: 'c1', work_id: 'gapwork', author_passport: 'ce:4e6c4e2a:local', body: 'M1 held until the cutover merges', posted_at_unix_ms: 1765000000000 }] } });
+  f10.route(u => /\/v1\/work\/gapwork\/transitions/.test(u), { ok: true, status: 200, body: { work_id: 'gapwork', transitions: [
+    { id: 't1', work_id: 'gapwork', from_state: 'planned', to_state: 'in_progress', by_passport: 'ce:4e6c4e2a:local', gate_status: 'allowed', at_unix_ms: 1765000000000 }] } });
+  f10.route(u => /\/v1\/work\/gate\/pending/.test(u), { ok: true, status: 200, body: { count: 1, pending: [
+    { action_id: 'act_1', work_id: 'release-readiness', requested_by_passport: 'claude-work', requested_action: 'update_state', target_state: 'deployed', status: 'pending', requested_at_unix_ms: 1765000000000 }] } });
+  f10.route((u, o) => /\/v1\/work\/gate\/act_1\/approve/.test(u) && o.method === 'POST', { ok: true, status: 200, body: { id: 'release-readiness', state: 'deployed' } });
+  // drill: live work node fans out comments + transitions
+  await tile(env10, 'panel', 'Work').fire('click'); await flush(8);
+  const wNode = env10.s.__cx.N['work:gapwork'];
+  ok(!!wNode && wNode.__workId === 'gapwork', 'M6 thread: live work item carries __workId');
+  await env10.s.__cx.ensureLoaded(wNode); await flush(8);
+  ok((wNode.children || []).some(id => id.startsWith('wcm:')), 'M6 thread: drill merges comment children');
+  ok((wNode.children || []).some(id => id.startsWith('wtx:')), 'M6 thread: drill merges transition children');
+  ok(/planned → in_progress/.test((env10.s.__cx.N[(wNode.children || []).find(id => id.startsWith('wtx:'))] || {}).label || ''), 'M6 thread: transition label carries from → to');
+  // gates page: pending rows + attributed approve
+  env10.s.closePage(); env10.s.openPage('cx-gates'); await flush(10);
+  ok(env10.ALL.some(e => /update_state → deployed · requested by claude-work/.test(e._text || '')), 'M6 gates: pending gate row rendered');
+  env10.s.localStorage.setItem('crux-console-bound-passport', 'ce:4e6c4e2a:local');
+  const apBtn = lastBtn(env10, 'Approve act_1');
+  await apBtn.fire('click'); await flush(2);     // danger two-step: first click arms
+  await apBtn.fire('click'); await flush(8);     // second click fires
+  const apCall = f10.calls.find(c => /gate\/act_1\/approve/.test(c.url) && c.opts && c.opts.method === 'POST');
+  ok(!!apCall, 'M6 gates: Approve POSTs /v1/work/gate/{actionId}/approve');
+  ok(apCall && JSON.parse(apCall.opts.body).approver_passport === 'ce:4e6c4e2a:local', 'M6 gates: approval carries the bound passport (Art. 14)');
+  // unbound passport → refusal, no network
+  env10.s.localStorage.removeItem('crux-console-bound-passport');
+  env10.s.closePage(); env10.s.openPage('cx-gates'); await flush(8);
+  const rjBtn = lastBtn(env10, 'Reject act_1');
+  await rjBtn.fire('click'); await flush(2); await rjBtn.fire('click'); await flush(6);
+  ok(/bind a passport/.test(env10.getById('cxToast').textContent || ''), 'M6 gates: unbound passport refuses with attribution message');
+  ok(!f10.calls.some(c => /gate\/act_1\/reject/.test(c.url)), 'M6 gates: no reject call without attribution');
 
   console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

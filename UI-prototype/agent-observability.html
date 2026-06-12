@@ -1144,7 +1144,7 @@ const WSTATE = { planned:'planned', in_progress:'in_progress', blocked:'blocked'
 function txWork(json){   // M3 — kanban WorkItem[] → execplan nodes (status drives the stage filter)
   const items = json.work || json.items || (Array.isArray(json)? json : []);
   return items.map(w=>({
-    id: idFor('work', w.id), kind:'execplan',
+    id: idFor('work', w.id), kind:'execplan', __workId: w.id,
     label: w.title || w.id,
     sub: w.current_milestone || w.plan_path || w.state || '',
     status: WSTATE[w.state] || 'planned',
@@ -1247,6 +1247,32 @@ function txCoord(json){   // live board — sessions + client-side pairwise over
     fields:work.slice(0,8).map(w=>[w.id,(w.title||'')+' ('+(w.state||'')+')']), children:[],
     payload: JSON.stringify(work,null,2) }] : [];
   return warnNodes.concat(leaves).concat(workNodes);
+}
+function txWorkThread(json, node){   // gap-closure M6 — comments + gate transitions drill under a work item
+  const out=[], wid=(node&&node.__workId)||'';
+  (((json.com)||{}).comments||[]).forEach((c,i)=>out.push({
+    id: idFor('wcm', wid+'/'+(c.id||i)), kind:'comment',
+    label: c.author_passport||'comment', sub: String(c.body||'').slice(0,60),
+    status:'idle',
+    fields:[['author',c.author_passport],['posted',c.posted_at_unix_ms]].filter(([,v])=>v!=null),
+    children:[], doc:String(c.body||''), payload: JSON.stringify(c,null,2) }));
+  (((json.txn)||{}).transitions||[]).forEach((t,i)=>out.push({
+    id: idFor('wtx', wid+'/'+(t.id||i)), kind:'transition',
+    label:(t.from_state||'?')+' → '+(t.to_state||'?'),
+    sub:[t.by_passport, t.gate_status].filter(Boolean).join(' · '),
+    status: t.gate_status==='queued'?'blocked':(t.gate_status==='rejected'?'err':'ok'),
+    fields:[['by',t.by_passport],['gate',t.gate_status],['at',t.at_unix_ms]].filter(([,v])=>v!=null),
+    children:[], payload: JSON.stringify(t,null,2) }));
+  return out;
+}
+function txGates(json){   // gap-closure M6 — pending human gates panel
+  return (json.pending||[]).map(p=>({
+    id: idFor('gate', p.action_id), kind:'gate',
+    label: p.work_id+' · '+(p.target_state||p.requested_action||'update_state'),
+    sub:[p.status, 'by '+(p.requested_by_passport||'?')].filter(Boolean).join(' · '),
+    status: p.status==='pending'?'blocked':(p.status==='approved'||p.status==='auto_approved'?'ok':'idle'),
+    fields:[['action_id',p.action_id],['work',p.work_id],['action',p.requested_action],['target',p.target_state],['requested by',p.requested_by_passport],['status',p.status]].filter(([,v])=>v!=null),
+    children:[], payload: JSON.stringify(p,null,2) }));
 }
 function entityPrefix(e){ e=e||''; const i=e.indexOf(':'); return i>0? e.slice(0,i): (e||'other'); }
 function txFacts(json){   // M7 facts — group by entity prefix (single fetch yields groups + leaves)
@@ -1447,7 +1473,12 @@ function registerLoaders(){
   LOADERS['cx-passport']      = { endpoint:'/v1/passports',           noun:'passports',     transform: txPassports };      // M8
   // receipts: no daemon list endpoint — the panel projects this browser's lookup history (no network)
   LOADERS['cx-receipts']      = { fetch: async()=>({ recent: recentReceiptLookups() }), noun:'verified receipts yet — use ✓ Verify receipt (toolbar)', transform: txReceiptRecent };
-  // drill-down loaders (prefix match): orchestrator members + session audit chain + receipt verify
+  LOADERS['cx-gates']         = { endpoint:'/v1/work/gate/pending', noun:'pending gates', transform: txGates };            // M6
+  // drill-down loaders (prefix match): orchestrator members + session audit chain + receipt verify + work thread
+  LOADERS['__work_thread'] = { match:n=> n.kind==='execplan' && n.__workId, noun:'comments + transitions',
+    fetch: async n=>({ com: await api('/v1/work/'+encodeURIComponent(n.__workId)+'/comments').catch(()=>({comments:[]})),
+                       txn: await api('/v1/work/'+encodeURIComponent(n.__workId)+'/transitions').catch(()=>({transitions:[]})) }),
+    transform: txWorkThread };  // M6 drill
   LOADERS['__orc_members'] = { match:n=> n.kind==='orchestrator' && n.__orcId, endpoint:n=>'/v1/orchestrators/'+n.__orcId+'/work', noun:'members', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txOrcMembers };  // M5 drill
   LOADERS['__sess_audit']  = { match:n=> n.kind==='session' && n.__sessId, endpoint:n=>'/v1/observe/sessions/'+n.__sessId+'/audit', noun:'audit steps', flagHint:'Observe disabled — set CORECRUXD_OBSERVE=1', transform: txAudit };  // M9 drill
   LOADERS['__receipt_verify'] = { match:n=> n.kind==='receipt' && n.__rid, noun:'verification', flagHint:'Dataplane disabled — receipt streams unavailable (501)',
@@ -2871,7 +2902,7 @@ const PAGES={
    {t:'info',label:'wave1-orchestration',v:'MEDIUM · serialized security plans'},
    {t:'btn',label:'Approve wave1',danger:true},
    {t:'btn',label:'Withhold all',hint:'keeps gates pending'}],
-   doc:'GET /v1/work/gate/pending → POST /v1/work/{id}/transitions.\nApproval of one destructive action never extends to others;\ngates cannot auto-approve past timeout without a documented\nfallback policy.'}]},
+   doc:'GET /v1/work/gate/pending → POST /v1/work/gate/{actionId}/approve | /reject\n(approver_passport recorded on the transition). Approval of one destructive\naction never extends to others; gates cannot auto-approve past timeout\nwithout a documented fallback policy.'}]},
  'cx-mediation':{title:'Mediation & policy',sub:'the gateway plane — identity, capability ladder, foresight',sections:[
   {h:'Principal',controls:[
    {t:'info',label:'passport',v:'ce:4e6c4e2a:local · tier basic'},
@@ -3100,6 +3131,26 @@ const PAGE_WIRES={
       : [infoRow('—','sessions show here when save_session uses execplan:<slug> ids')];
   },
   set:{ win: ()=>{ if(openPageId==='cx-usage') openPage('cx-usage'); return null; } }},
+ 'cx-gates':{
+  load: async def=>{
+    const g=await api('/v1/work/gate/pending');
+    const pend=(g.pending||[]).filter(p=>(p.status||'pending')==='pending');
+    const rows=[];
+    pend.slice(0,8).forEach(p=>{
+      rows.push(infoRow(p.work_id,(p.requested_action||'update_state')+(p.target_state?' → '+p.target_state:'')+' · requested by '+(p.requested_by_passport||'?')));
+      rows.push({t:'btn',label:'Approve '+p.action_id,danger:true,hint:'records approving passport + timestamp'});
+      rows.push({t:'btn',label:'Reject '+p.action_id,danger:true});
+    });
+    def.sections[0].sub='/v1/work/gate/pending · '+pend.length+' pending';
+    def.sections[0].controls=rows.length? rows : [infoRow('none pending','gated transitions appear here when an agent requests a high-risk state change')];
+  },
+  actAny:(label,ctx)=>{
+    const m=label.match(/^(Approve|Reject) (.+)$/); if(!m) return null;
+    const pid=currentBoundPassportId();
+    if(!pid) return Promise.reject({status:'bind a passport first — approvals must be attributed (Art. 14)'});
+    return postApi('/v1/work/gate/'+encodeURIComponent(m[2])+'/'+(m[1]==='Approve'?'approve':'reject'),{approver_passport:pid})
+      .then(w=>{ ctx.reload(); return (m[1]==='Approve'?'approved':'rejected')+' · '+(w.id||m[2])+' · by '+pid; });
+  }},
  'ax-activity':{
   load: def=>{   // synchronous projection of the EVENTS ring buffer — onCruxEvent re-renders live
     const rows=EVENTS.slice(-14).reverse().map(e=>infoRow(e.type, [evtNote(e), e.at].filter(Boolean).join(' · ')));
@@ -3256,7 +3307,8 @@ function renderControl(pageId,c){
       if(c.action==='graph'){ closePage(); soloPanel(pageId,{graph:true}); return; }
       if(c.action==='open3d'){ closePage(); setView('3d'); return; }
       if(c.action==='rpc'){ sendRpc(pageId); return; }
-      const wire=PAGE_WIRES[pageId], h=wire&&wire.act&&wire.act[c.label];
+      const wire=PAGE_WIRES[pageId];
+      const h=(wire&&wire.act&&wire.act[c.label]) || (wire&&wire.actAny? (ctx=>wire.actAny(c.label,ctx)) : null);
       if(h && LIVE){   /* M1: wired button → real /v1 call; busy-guard + toast the outcome */
         b.disabled=true;
         const ctx={ reload:()=>{ if(openPageId===pageId) openPage(pageId); }, reopen:()=>{ if(openPageId===pageId) openPage(pageId,{__wired:true}); } };
