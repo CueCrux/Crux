@@ -6,7 +6,6 @@ one navigable clay-render world instead of twelve panels. Layout language borrow
 dolly, numbered chapter rail, glowing data beams, dotted ripple fields) and re-grounded
 in the daemon's actual object model.
 
-Tracks ExecPlan: `PlanCrux/.agent/execplans/crux-console-3d-substrate-concept-2026-06-11.md`
 Sibling: `../agent-observability.html` — the 2D Miller-columns prototype (now the shipped
 console playground); this concept reuses its dummy-data lineage and design tokens.
 

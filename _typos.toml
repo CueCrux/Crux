@@ -1,5 +1,11 @@
+[files]
+# Vendored three.js modules (minified upstream code; not ours to spell-check)
+extend-exclude = ["**/console-3d/vendor/"]
+
 [default.extend-words]
 # Domain-specific terms that aren't typos
+# three.js MeshStandardMaterial property (console-3d world renderer)
+metalness = "metalness"
 ccxi = "ccxi"
 ccxseg = "ccxseg"
 ccxs = "ccxs"
