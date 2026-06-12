@@ -43,7 +43,8 @@ export const THEMES = {
 /* status → block tint bucket (uniform block, colour carries the state) */
 const STATUS_TINT = { ok: 'done', run: 'in_progress', err: 'blocked', idle: 'planned' };
 
-const BLOCK = { foot: 5.4, plinth: 6.2, slabH: 1.5, msH: 0.95, msGap: 0.2 };
+/* ×1.5 footprint (operator request): wider/longer blocks, heights unchanged */
+const BLOCK = { foot: 8.1, plinth: 9.3, slabH: 1.5, msH: 0.95, msGap: 0.2 };
 
 /* ring platforms: nodes stand ON extruded annular bosses this tall */
 export const RING_H = 0.45;
@@ -274,21 +275,29 @@ export class World {
     const CW = canvas.width, CH = canvas.height, CX = CW / 2;
     g.clearRect(0, 0, CW, CH);
     g.textAlign = 'center'; g.textBaseline = 'middle';
-    /* corner badge: one big letter so the kind reads at any distance */
-    const ch = KIND_BADGE[n.kind] || (n.kind || '?')[0].toUpperCase();
+    /* corner badge: one big letter so the kind reads at any distance —
+       the daemon carries the arc-loop brand mark instead */
     const hue = '#' + new THREE.Color(KIND_HUE[n.kind] || 0x5e6ad2).getHexString();
-    g.globalAlpha = 0.16; g.fillStyle = hue;
-    g.beginPath(); g.roundRect(22, 22, 84, 84, 18); g.fill();
-    g.globalAlpha = 1;
-    g.strokeStyle = hue; g.lineWidth = 3;
-    g.beginPath(); g.roundRect(22, 22, 84, 84, 18); g.stroke();
-    g.fillStyle = hue;
-    g.font = '800 58px "JetBrains Mono", ui-monospace, monospace';
-    g.fillText(ch, 64, 66);
-    try { g.letterSpacing = '8px'; } catch (e) { /* older canvas */ }
+    if (n.kind === 'daemon') {
+      g.strokeStyle = hue; g.lineWidth = 10; g.lineCap = 'round';
+      g.beginPath(); g.arc(64, 64, 31, -0.5, 4.25); g.stroke();   /* open arc-loop */
+      g.fillStyle = hue;
+      g.beginPath(); g.arc(64, 64, 11, 0, 7); g.fill();           /* centre dot */
+    } else {
+      const ch = KIND_BADGE[n.kind] || (n.kind || '?')[0].toUpperCase();
+      g.globalAlpha = 0.16; g.fillStyle = hue;
+      g.beginPath(); g.roundRect(22, 22, 84, 84, 18); g.fill();
+      g.globalAlpha = 1;
+      g.strokeStyle = hue; g.lineWidth = 3;
+      g.beginPath(); g.roundRect(22, 22, 84, 84, 18); g.stroke();
+      g.fillStyle = hue;
+      g.font = '800 58px "JetBrains Mono", ui-monospace, monospace';
+      g.fillText(ch, 64, 66);
+    }
+    try { g.letterSpacing = '6px'; } catch (e) { /* older canvas */ }
     g.fillStyle = n.kind === 'daemon' ? th.accentCss : th.inkSubCss;
-    g.font = '600 24px "JetBrains Mono", ui-monospace, monospace';
-    g.fillText((KIND_LABELS[n.kind] || n.kind).toUpperCase(), CX + 42, 46);
+    g.font = '700 36px "JetBrains Mono", ui-monospace, monospace';
+    g.fillText((KIND_LABELS[n.kind] || n.kind).toUpperCase(), CX + 42, 48);
     try { g.letterSpacing = '0px'; } catch (e) { /* noop */ }
     g.fillStyle = th.inkCss;
     const lines = wrapLabel(n.label);
@@ -342,10 +351,10 @@ export class World {
 
       let topY;
       if (n.kind === 'daemon') {
-        this._mesh(new RoundedBoxGeometry(11, 0.6, 11, 2, 0.2), this._clay(true), 0, 0.3, 0, g);
-        this._mesh(new RoundedBoxGeometry(8.6, 3.1, 8.6, 3, 0.26), this._clay(), 0, 0.6 + 1.55, 0, g);
+        this._mesh(new RoundedBoxGeometry(16.5, 0.6, 16.5, 2, 0.2), this._clay(true), 0, 0.3, 0, g);
+        this._mesh(new RoundedBoxGeometry(12.9, 3.1, 12.9, 3, 0.26), this._clay(), 0, 0.6 + 1.55, 0, g);
         topY = 3.7;
-        this._topLabel(g, n, topY, 8.2, 4.1);
+        this._topLabel(g, n, topY, 12.3, 6.15);
       } else if (n.kind === 'execplan') {
         this._mesh(new RoundedBoxGeometry(BLOCK.plinth, 0.4, BLOCK.plinth, 2, 0.12), this._clay(true), 0, 0.2, 0, g);
         /* uniform footprint; slab HEIGHT scales with the milestone's tokens */
@@ -359,25 +368,25 @@ export class World {
           y += h / 2;
         }
         topY = y;
-        this._topLabel(g, n, topY, 5.15, 2.58);
+        this._topLabel(g, n, topY, 7.7, 3.85);
       } else {
         this._mesh(new RoundedBoxGeometry(BLOCK.plinth, 0.4, BLOCK.plinth, 2, 0.12), this._clay(true), 0, 0.2, 0, g);
         this._mesh(new RoundedBoxGeometry(BLOCK.foot, BLOCK.slabH, BLOCK.foot, 2, 0.14),
           this._tint(STATUS_TINT[n.status] || 'planned'), 0, 0.4 + BLOCK.slabH / 2, 0, g);
         topY = 0.4 + BLOCK.slabH;
-        this._topLabel(g, n, topY, 5.15, 2.58);
+        this._topLabel(g, n, topY, 7.7, 3.85);
       }
       g.userData.topY = topY;
 
       /* status lamp on the front-right corner of the top face */
-      const lampOff = n.kind === 'daemon' ? 3.7 : 2.2;
+      const lampOff = n.kind === 'daemon' ? 5.6 : 3.3;
       const lamp = this._mesh(new THREE.SphereGeometry(0.22, 18, 14),
         this._statusMat(n.status), lampOff, topY + 0.2, lampOff, g, false);
       this.lamps.push({ mesh: lamp, status: n.status, baseY: topY + 0.2 });
 
       /* invisible pick proxy — raycasting tests ONLY these 1-box-per-node
          meshes, never the full block geometry (mouse-move CPU guard) */
-      const pickW = n.kind === 'daemon' ? 11.2 : BLOCK.plinth + 0.2;
+      const pickW = n.kind === 'daemon' ? 16.7 : BLOCK.plinth + 0.2;
       const pick = new THREE.Mesh(
         new THREE.BoxGeometry(pickW, topY + 1.2, pickW),
         new THREE.MeshBasicMaterial({ visible: false }));
@@ -390,7 +399,7 @@ export class World {
       const halo = new THREE.Sprite(new THREE.SpriteMaterial({
         map: this.haloTex, color: 0x5e6ad2, transparent: true, opacity: 0,
         blending: THREE.AdditiveBlending, depthWrite: false }));
-      halo.scale.setScalar(n.kind === 'daemon' ? 15 : 10);
+      halo.scale.setScalar(n.kind === 'daemon' ? 22 : 14);
       halo.position.y = topY + 0.4;
       g.add(halo);
       this.halos.set(n.id, halo);
@@ -400,7 +409,25 @@ export class World {
     }
   }
 
-  /* ── edges — straight, single-level radial traces on the ground ───────── */
+  /* ── edges — polar traces that sweep around the rings, never through the
+     core: radius and bearing interpolate together, so a trace between two
+     rings spirals along the disc instead of cutting across the middle ───── */
+  _polarPoints(a, b, y) {
+    const SEG = 28;
+    const rA = Math.hypot(a.x, a.z), rB = Math.hypot(b.x, b.z);
+    const angB0 = rB < 1e-3 ? 0 : Math.atan2(b.z, b.x);
+    const angA = rA < 1e-3 ? angB0 : Math.atan2(a.z, a.x);
+    const angB = rB < 1e-3 ? angA : angB0;
+    let d = angB - angA;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    const pts = [];
+    for (let s = 0; s <= SEG; s++) {
+      const t = s / SEG, r = rA + (rB - rA) * t, an = angA + d * t;
+      pts.push(new THREE.Vector3(Math.cos(an) * r, y, Math.sin(an) * r));
+    }
+    return pts;
+  }
   _buildEdges() {
     /* rebuildable: traces re-route whenever nodes move (line-up / neighborhood) */
     if (!this.edgeGroup) { this.edgeGroup = new THREE.Group(); this.scene.add(this.edgeGroup); }
@@ -411,16 +438,15 @@ export class World {
       const a = this.nodeGroups.get(link.from).position;
       const b = this.nodeGroups.get(link.to).position;
       const y = TRACE_Y + (idx % 7) * 0.004;       /* hairline lift kills z-fighting only */
-      const dx = b.x - a.x, dz = b.z - a.z;
-      const len = Math.max(0.001, Math.hypot(dx, dz));
       const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true,
         opacity: 0.3, depthWrite: false });
-      const seg = new THREE.Mesh(new THREE.BoxGeometry(len, H, W), mat);
-      seg.position.set((a.x + b.x) / 2, y, (a.z + b.z) / 2);
-      seg.rotation.y = -Math.atan2(dz, dx);
+      /* flat ribbon: tube along the polar curve (built at y=0), squashed in Y */
+      const flat = new THREE.CatmullRomCurve3(this._polarPoints(a, b, 0));
+      const seg = new THREE.Mesh(new THREE.TubeGeometry(flat, 56, W / 2, 6, false), mat);
+      seg.scale.y = H / W;
+      seg.position.y = y;
       this.edgeGroup.add(seg);
-      const path = new THREE.CurvePath();
-      path.add(new THREE.LineCurve3(new THREE.Vector3(a.x, y, a.z), new THREE.Vector3(b.x, y, b.z)));
+      const path = new THREE.CatmullRomCurve3(this._polarPoints(a, b, y));   /* particle rail at trace height */
       this.edgeItems.push({ link, path, mats: [mat], key: link.from + '|' + link.to, mid: path.getPointAt(0.5) });
     });
     this.edgeByKey = new Map(this.edgeItems.map((e) => [e.key, e]));

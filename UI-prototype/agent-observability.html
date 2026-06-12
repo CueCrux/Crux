@@ -93,7 +93,7 @@
   .gnode[data-kind="unavailable"] .gstripe, .gnode[data-kind="empty"] .gstripe { background:var(--idle); }
   @keyframes cxpulse { 0%,100%{opacity:.4} 50%{opacity:1} }
   .wc-wordmark { font-size:1.6rem; line-height:1; font-weight:700; letter-spacing:.04em; color:var(--text-primary); }
-  .wc-wordmark .x { color:var(--ok); }   /* README-mockup wordmark: CRUX with the X in green */
+  .wc-wordmark .x { color:inherit; }   /* README-mockup wordmark, X in the same colour as the rest */
   .wc-centre-pills { display:flex; align-items:center; gap:4px; padding:3px; background:var(--surface-glass-muted); border-radius:var(--radius-full); border:1px solid var(--border-light); }
   .wc-centre-pill { padding:6px 16px; font-size:.82rem; font-weight:600; color:var(--text-secondary); border-radius:var(--radius-full); cursor:pointer; user-select:none; transition:color var(--transition-fast) ease, background var(--transition-fast) ease; }
   .wc-centre-pill small { font-weight:500; opacity:.7; margin-left:5px; font-size:.72rem; }
@@ -140,7 +140,10 @@
   .gnode { position:absolute; box-sizing:border-box; padding:9px 13px 9px 17px; background:var(--surface-glass-strong); border:1.4px solid var(--border-default); border-radius:13px; cursor:pointer; box-shadow:var(--shadow-card); overflow:hidden; user-select:none; transition:border-color .12s ease, box-shadow .15s ease, transform .12s ease; }
   .gnode:hover { border-color:var(--accent); transform:translateY(-2px); box-shadow:var(--shadow-card-hover); }
   .gnode.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent), 0 10px 26px rgba(94,106,210,.28); }
-  .gnode .gstripe { position:absolute; left:0; top:9px; bottom:9px; width:4px; border-radius:0 2px 2px 0; background:var(--idle); }
+  /* status stripe: full-height (clipped by the tile's rounded corners), with a vertical fade */
+  .gnode .gstripe { position:absolute; left:0; top:0; bottom:0; width:6px; background:var(--idle); }
+  .gnode .gstripe::after { content:''; position:absolute; inset:0;
+    background:linear-gradient(180deg, rgba(255,255,255,.35), rgba(255,255,255,0) 45%, rgba(0,0,0,.25)); }
   .gnode .ghead { display:flex; align-items:center; gap:6px; min-height:15px; }
   .gnode .gkind { font-size:9px; letter-spacing:.6px; text-transform:uppercase; color:var(--text-muted); }
   .gnode .ghead .gchip { margin-left:auto; }
@@ -440,6 +443,21 @@
   .sp-toggle.on { border-color:color-mix(in srgb, var(--ok) 55%, transparent);
     background:color-mix(in srgb, var(--ok) 22%, transparent); }
   .sp-toggle.on .sp-knob { left:21px; background:var(--ok); }
+  /* ── expandable list rows (Integrations / Extensions / Tenants / Memory) ── */
+  .sp-card.wide { grid-column:1 / -1; }
+  .sp-exp { border:1px solid var(--border-default); border-radius:11px; background:var(--surface-glass-strong); margin:6px 0; overflow:hidden; }
+  .sp-exphead { display:flex; align-items:center; gap:10px; padding:8px 12px; cursor:pointer; user-select:none; }
+  .sp-exphead:hover { background:var(--surface-glass-muted); }
+  .sp-expname { flex:1; min-width:0; }
+  .sp-expname b { display:block; font-size:12px; font-weight:650; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sp-expname small { display:block; font-family:var(--font-mono); font-size:9.5px; color:var(--text-muted); margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sp-expbadge { flex:none; font-family:var(--font-mono); font-size:9px; padding:1px 7px; border-radius:999px; border:1px solid var(--border-default); color:var(--text-muted); white-space:nowrap; }
+  .sp-expcaret { flex:none; color:var(--text-muted); font-size:13px; transition:transform .15s ease; }
+  .sp-exp.open .sp-expcaret { transform:rotate(90deg); }
+  .sp-expbody { display:none; padding:4px 12px 10px; border-top:1px solid var(--border-light); }
+  .sp-exp.open .sp-expbody { display:block; }
+  .sp-search { margin:2px 0 8px; }
+  .sp-search input { width:100%; box-sizing:border-box; }
   .sp-hint { font-family:var(--font-mono); font-size:9.5px; color:var(--text-muted); }
   #rpcOut { min-height:90px; }
   #cxToast { position:fixed; bottom:18px; left:50%; transform:translateX(-50%) translateY(8px); z-index:90;
@@ -850,9 +868,9 @@ const N = {
     children:['au-trail','sf-facts','sf-reasoning','sf-files','hk-agentux','ep-agentux','pp-main'],
     doc:'SAVED SESSION · execplan:agent-ux-best-in-class-master\nid 9c5a9271… · passport ce:4e6c4e2a:local\nsaved 2026-05-27T13:24Z via pre-compact hook\n42 turns · 312k in · 41k out · model opus-4.8\n\n── summary ───────────────────────────────\nResumed the agent-ux ExecPlan at M4. Built the work\naggregator (M1), /v1/work source merge (M2), header\ndecode (M3); started the reconciler (M4).\n\n── transcript (compacted) ────────────────\n[user]  resume M4, get the reconciler green\n[asst]  read http/work.rs + projection.rs; the read-\n        time projection is not stably sorted, so the\n        kanban merge drops live rows.\n[tool]  Read ×38 · grep EventBus · Edit projection.rs\n[asst]  wrote reconcile.rs; 4 diff tests still red —\n        needs a stable sort by updated_at before the\n        merge, plus a 3-stale-entry fixture.\n[user]  land loopback-auth first\n[asst]  deferred; logged session note 13:24.\n\n── decisions ─────────────────────────────\n· frontend = Leptos+Trunk WASM (no npm)\n· ingest via crux-claude-hooks subcommand\n· remote approval deferred (crate absent)\n\nOff this session → facts · reasoning · files ·\nhooks · execplan · passport.'},
   'sess-chaincrux':{kind:'session',label:'execplan:chaincrux-cascade-route-integration',sub:'ttl 3600s',status:'err',
-    fields:[['session_id','1af0b3e2…'],['ttl','3600s'],['tokens','110k in · 14k out'],['turns','18'],['model','opus-4.8'],['execplan','chaincrux-cascade-route-integration']],children:['ep-chaincrux','f-gate-cc3']},
+    fields:[['session_id','1af0b3e2…'],['ttl','3600s'],['tokens','110k in · 14k out'],['turns','18'],['model','opus-4.8'],['passport','ce:4e6c4e2a:local'],['execplan','chaincrux-cascade-route-integration']],children:['ep-chaincrux','f-gate-cc3','pp-main']},
   'sess-trait':{kind:'session',label:'execplan:corecrux-trait-expansion-global-default-on',sub:'ttl 3600s',status:'run',
-    fields:[['session_id','77be5510…'],['ttl','3600s'],['tokens','95k in · 12k out'],['turns','15'],['model','opus-4.8']],children:['ep-trait']},
+    fields:[['session_id','77be5510…'],['ttl','3600s'],['tokens','95k in · 12k out'],['turns','15'],['model','opus-4.8'],['passport','ce:4e6c4e2a:local']],children:['ep-trait','pp-main']},
 
   /* ── passports ── */
   'pp-main':{kind:'passport',label:'ce:4e6c4e2a:local',sub:'tier=local · anthropic',status:'ok',
@@ -1152,7 +1170,7 @@ function txWork(json){   // M3 — kanban WorkItem[] → execplan nodes (status 
   return items.map(w=>({
     id: idFor('work', w.id), kind:'execplan', __workId: w.id,
     label: w.title || w.id,
-    sub: w.current_milestone || w.plan_path || w.state || '',
+    sub: w.current_milestone || w.plan_path || '',   // state rides the chip — repeating it here printed in_progress twice
     status: WSTATE[w.state] || 'planned',
     fields: [['state',w.state],['risk_class',w.risk_class],['plan_path',w.plan_path],['milestone',w.current_milestone],['assignee',w.assignee_passport],['orchestrator',w.orchestrator_id],['linked_pr',w.linked_pr]].filter(([,v])=>v!=null && v!==''),
     children: [],
@@ -1183,12 +1201,20 @@ function txSessions(json){   // M4 — /v1/console/sessions returns {sessions:[i
     const id = isStr? s : (s.session_id || s.id || s.sid || '');
     const ep = isStr? '' : (s.execplan || s.plan_slug || s.label || '');
     const toks = isStr? null : (s.tokens || (s.tokens_in!=null? (Math.round((s.tokens_in||0)/1000)+'k in · '+Math.round((s.tokens_out||0)/1000)+'k out') : null));
+    const pass = isStr? null : (s.passport || s.passport_id || null);
+    let kids=[];
+    if(pass){   // attach the owning passport as a drillable node (registered directly; not a panel-level child)
+      const ppId=idFor('pp', pass);
+      if(!N[ppId]) N[ppId]={ id:ppId, kind:'passport', label:pass, sub:'session passport', status:'ok',
+        fields:[['passport',pass]], children:[] };
+      kids=[ppId];
+    }
     return { id: idFor('sess', id), kind:'session', __sessId:id,
       label: ep? ('execplan:'+ep) : (id||'session'),
       sub: isStr? 'session · open for audit chain →' : ([s.turns!=null? s.turns+' turns':null, toks, s.ttl? ('ttl '+s.ttl):null].filter(Boolean).join(' · ') || (s.saved||'')),
       status: isStr? 'idle' : st2(s.status || (s.active?'active':'idle')),
-      fields: isStr? [['session_id',id]] : [['session_id',id],['turns',s.turns],['tokens',toks],['model',s.model],['passport',s.passport||s.passport_id],['execplan',ep],['ttl',s.ttl]].filter(([,v])=>v!=null&&v!==''),
-      children:[], doc: isStr? '' : (s.summary||s.doc||''), payload: JSON.stringify(s,null,2) };
+      fields: isStr? [['session_id',id]] : [['session_id',id],['turns',s.turns],['tokens',toks],['model',s.model],['passport',pass],['execplan',ep],['ttl',s.ttl]].filter(([,v])=>v!=null&&v!==''),
+      children:kids, doc: isStr? '' : (s.summary||s.doc||''), payload: JSON.stringify(s,null,2) };
   });
 }
 function txOrchestrators(json){   // M5 read — members resolved on drill (shared work: ids → loop-guard safe)
@@ -2004,7 +2030,9 @@ function render(){
                + (node.status?`<span class="gchip">${chipText(node.status)}</span>`:'')
                + (kidsN?`<span class="gcount" title="${kidsN} linked">${kidsN}</span>`:'')
                + `</div>`;
-    const ffs = (node.fields||[]).slice(0, pr?1:2)
+    const ffs = (node.fields||[])
+      .filter(([k,v])=>!(node.status && ['state','status'].includes(String(k).toLowerCase()) && norm(String(v))===norm(node.status)))   // the chip already says it — don't repeat in_progress in the meta row
+      .slice(0, pr?1:2)
       .map(([k,v])=>`<span class="gf"><b>${esc(k)}</b>${esc(String(v))}</span>`).join('');
     const meta = (ffs||pr)
       ? `<div class="gmeta">${ffs}${pr?`<span class="gpct">${pr.done}/${pr.total} · ${pr.pct}%</span>`:''}</div>`
@@ -2640,7 +2668,61 @@ function sendRpc(pageId){
     .catch(()=>{ if(out) out.textContent+='\n← network error'; });
   toast('sent · '+m);
 }
+/* ── AMR lane catalog + tenant-row builders (Tenants / Memory pages) ──
+   AMR = Adaptive Manifest Routing: routes each query across retrieval lanes automatically.
+   Lane set mirrors the README lane stack; lexical is always-on (free, local). */
+const AMR_LANES=[
+ ['dense','Dense — semantic similarity over embeddings: meaning, not spelling. BYOE or managed.', false],
+ ['graph','Graph / topology — entity links walked at query time; facts that know each other.', false],
+ ['entity','Entity & trait — who/what-keyed recall: ask about a person, get their dossier.', false],
+ ['event','Event — time-anchored recall: what happened, when, in what order.', false],
+ ['nav','Navigational — summary-tree descent for corpora too large to scan.', false],
+ ['verbatim','Verbatim pointers — exact-quote recall without duplicating content into the index. Free, local.', true],
+];
+function amrLaneToggles(prefix){
+  return [{t:'toggle',k:prefix+'auto',label:'automatic — let AMR choose lanes',v:true,
+    desc:'Recommended. AMR reads the lane manifest and fuses the lanes that earn their tokens, per query — no manual lane picking. Turn off to pin lanes below.'},
+   {t:'info',label:'lexical (BM25)',v:'always on · free · local'}]
+   .concat(AMR_LANES.map(([k,d,on])=>({t:'toggle',k:prefix+k,label:k+' lane',v:on,desc:d})));
+}
+function tenantExpRow(id,sub,sys){
+  const p='tn_'+String(id).replace(/[^a-zA-Z0-9]/g,'_')+'_';
+  return {t:'exp',label:id,sub:sub||'tenant',badge:sys?'system':'tenant',sys:!!sys,hideIf:sys?'hidesys':null,
+   desc:sys? 'Reserved daemon-internal tenant ('+id+') — born private, never syncs.' : 'Click to expand this tenant\'s lane policy and sharing options.',
+   controls:[{t:'toggle',k:p+'inherit',label:'use AMR defaults',v:true,
+     desc:'Inherit the lane policy from the defaults panel above. Turn off to pin lanes for this tenant only.'}]
+    .concat(amrLaneToggles(p))
+    .concat([{t:'btn',label:'Collaborate with team',hint:'paid plan — teammates\' daemons can pull this tenant'}])};
+}
 const PAGES={
+ 'cx-tenants':{title:'Tenants',sub:'memory stores · AMR lane routing — defaults at the top, per-tenant overrides below',sections:[
+  {h:'AMR defaults — all tenants',sub:'Adaptive Manifest Routing picks lanes per query; set the default policy once — tenants inherit unless pinned',wide:true,controls:
+   [{t:'info',label:'subscription',v:'inactive — CoreCrux lanes activate with a subscription · lexical + verbatim stay free/local'}]
+   .concat(amrLaneToggles('amr_'))
+   .concat([{t:'btn',label:'Apply defaults to all tenants',hint:'resets per-tenant pins back to inherit'}])},
+  {h:'Tenants',sub:'click a tenant to expand its lane policy · system tenants hidden by default',wide:true,controls:[
+   {t:'search',ph:'Filter tenants…'},
+   {t:'toggle',k:'hidesys',label:'hide system tenants',v:true,rerender:true,
+    desc:'System tenants (__agent::, __ops::, __bootstrap__:: …) carry daemon internals — hidden by default.'},
+   tenantExpRow('default','fact store · local-first'),
+   tenantExpRow('lme-m','LongMemEval-M · ~253M frames'),
+   tenantExpRow('lme-s','LongMemEval-S · 6.6M chunks'),
+   tenantExpRow('personal','operator notes'),
+   tenantExpRow('__agent::anthropic','agent-private store',true),
+   tenantExpRow('__bootstrap__::patterns','boot playbooks',true),
+   {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+ 'cx-memory':{title:'Memory',sub:'recent facts per tenant — system tenants hidden by default',sections:[
+  {h:'Recent memory',sub:'click a tenant to expand its recent facts',wide:true,controls:[
+   {t:'search',ph:'Filter tenants…'},
+   {t:'toggle',k:'hidesys',label:'hide system tenants',v:true,rerender:true,
+    desc:'System tenants (__agent::, __ops::, __bootstrap__:: …) carry daemon internals — hidden by default.'},
+   {t:'exp',label:'default',sub:'fact store · 3 recent',badge:'tenant',controls:[
+    {t:'info',label:'decision:frontend',v:'execplan:crux-agent-observability · Leptos+Trunk WASM'},
+    {t:'info',label:'gate:M4',v:'execplan:agent-ux-best-in-class-master · in_progress'},
+    {t:'info',label:'bench:q500',v:'corpus LME-S · r@1 0.848'}]},
+   {t:'exp',label:'__agent::anthropic',sub:'agent-private store · 1 recent',badge:'system',sys:true,hideIf:'hidesys',controls:[
+    {t:'info',label:'session_binding',v:'passport ce:4e6c4e2a:local'}]},
+   {t:'btn',label:'Browse feed as graph',action:'graph'}]}]},
  'cx-settings':{title:'Console settings',sub:'persisted to data_dir/console/settings.json · auth + embedding apply on next restart',sections:[
   {h:'Access posture',sub:'who may call :14800',controls:[
    {t:'select',k:'auth_mode',label:'auth mode',options:['local_only','open','token','jwt_hs256 (strict)'],v:'local_only'},
@@ -2682,30 +2764,78 @@ const PAGES={
    {t:'info',label:'daemon',v:'ok (demo)'}]},
   {h:'Appearance',sub:'applies immediately',controls:[
    {t:'theme'},{t:'info',label:'canvas',v:'2D | 3D toolbar switch'}]}]},
- 'cx-integrations':{title:'Integrations',sub:'declarative packs — installed packs are inert until a passport grant exists',sections:[
-  {h:'Packs',sub:'enable per pack · grants are separate',controls:[
-   {t:'toggle',k:'pack_git',label:'git-pack · repo signals',v:true},
-   {t:'toggle',k:'pack_vault',label:'vault-pack · secret envelopes',v:true},
-   {t:'toggle',k:'pack_gateway',label:'gateway-pack · MCP mediation',v:true},
-   {t:'toggle',k:'pack_jobclaw',label:'jobclaw-pack · handoff queue',v:false},
-   {t:'toggle',k:'pack_fs',label:'fs-pack · file search',v:true}]},
-  {h:'GitHub source',controls:[
-   {t:'input',k:'gh_pat',label:'personal access token',ph:'ghp_…',mono:true,secret:true},
-   {t:'toggle',k:'gh_skiptls',label:'skip TLS verify (dev only)',v:false},
-   {t:'btn',label:'Verify connection'}]},
-  {h:'OpenAI · LLM pack',controls:[
-   {t:'select',k:'oa_model',label:'default model',options:['none','gpt-5.5','gpt-4o'],v:'none'},
-   {t:'input',k:'oa_key',label:'API key',ph:'sk-…',mono:true,secret:true},
-   {t:'input',k:'oa_org',label:'organisation',ph:'org-…',mono:true},
-   {t:'btn',label:'Test call'}]},
+ 'cx-integrations':{title:'Integrations',sub:'sources, packs & SDKs — click a row to expand its options · installs are inert until a passport grant exists',sections:[
+  {h:'Catalog',sub:'toggle = install / disable · grants are separate',wide:true,controls:[
+   {t:'search',ph:'Filter integrations…'},
+   {t:'exp',label:'GitHub',sub:'repos · PRs · issues → facts',badge:'source',
+    desc:'Sync GitHub repos, pull requests, issues and comments into the fact store. The PAT is held encrypted by the daemon — never in browser storage.',controls:[
+    {t:'info',label:'status',v:'not connected'},
+    {t:'input',k:'gh_pat',label:'personal access token',ph:'ghp_…',mono:true,secret:true},
+    {t:'toggle',k:'gh_skiptls',label:'skip TLS verify (dev only)',v:false,desc:'Development only — skip certificate verification for a self-hosted GitHub endpoint.'},
+    {t:'btn',label:'Verify connection'}]},
+   {t:'exp',label:'OpenAI-compatible LLM',sub:'embeddings · chat · model discovery',badge:'source',
+    desc:'Connect any OpenAI-compatible endpoint for embeddings and chat. The API key is held encrypted by the daemon.',controls:[
+    {t:'info',label:'status',v:'not connected'},
+    {t:'select',k:'oa_model',label:'default model',options:['none','gpt-5.5','gpt-4o'],v:'none'},
+    {t:'input',k:'oa_key',label:'API key',ph:'sk-…',mono:true,secret:true},
+    {t:'input',k:'oa_org',label:'organisation',ph:'org-…',mono:true},
+    {t:'btn',label:'Test call'}]},
+   {t:'exp',k:'pack_git',label:'git-pack',sub:'repo signals',badge:'pack',v:true,
+    desc:'Declarative pack: local repo signals (branches, commits, status) surfaced to agents.',controls:[
+    {t:'info',label:'kind',v:'builtin pack · inert until granted'}]},
+   {t:'exp',k:'pack_vault',label:'vault-pack',sub:'secret envelopes',badge:'pack',v:true,
+    desc:'Passport-scoped secret envelopes — secrets ride subprocess env, never chat output.',controls:[
+    {t:'info',label:'kind',v:'builtin pack · inert until granted'}]},
+   {t:'exp',k:'pack_gateway',label:'gateway-pack',sub:'MCP mediation',badge:'pack',v:true,
+    desc:'Routes third-party MCP servers through the gateway so every call is receipted and capability-checked.',controls:[
+    {t:'info',label:'kind',v:'builtin pack · inert until granted'}]},
+   {t:'exp',k:'pack_jobclaw',label:'jobclaw-pack',sub:'handoff queue',badge:'pack',v:false,
+    desc:'Cross-session task handoff queue (enqueue → claim → complete) for operator-in-the-loop workflows.',controls:[
+    {t:'info',label:'kind',v:'builtin pack · inert until granted'}]},
+   {t:'exp',k:'pack_fs',label:'fs-pack',sub:'file search',badge:'pack',v:true,
+    desc:'Workspace file search exposed as an integration tool.',controls:[
+    {t:'info',label:'kind',v:'builtin pack · inert until granted'}]},
+   {t:'exp',label:'Claude Desktop · MCP',sub:'mcp.claude-desktop — config generator',badge:'agent',
+    desc:'Generates the Claude Desktop mcp.json entry pointing at this daemon\'s MCP endpoint (:14801).',controls:[
+    {t:'info',label:'pack id',v:'mcp.claude-desktop'},
+    {t:'info',label:'capabilities',v:'integrations:read · passport:read'}]},
+   {t:'exp',label:'Cursor · MCP',sub:'mcp.cursor — config generator',badge:'agent',
+    desc:'Generates the .cursor/mcp.json entry pointing at this daemon\'s MCP endpoint (:14801).',controls:[
+    {t:'info',label:'pack id',v:'mcp.cursor'},
+    {t:'info',label:'capabilities',v:'integrations:read · passport:read'}]},
+   {t:'exp',label:'Claude Code hooks',sub:'crux-claude-hooks — SessionStart · PreCompact',badge:'agent',
+    desc:'Lifecycle hook runner: injects the boot banner at SessionStart and saves sessions pre-compaction.',controls:[
+    {t:'info',label:'binary',v:'crux-hook · crux-llm-shim'},
+    {t:'info',label:'source',v:'integrations/claude-code'}]},
+   {t:'exp',label:'Codex CLI hooks',sub:'MCP stdio shim + session tailer',badge:'agent',
+    desc:'Python hooks for Codex CLI: crux-mcp-stdio shim, session-start banner, transcript tailer.',controls:[
+    {t:'info',label:'source',v:'integrations/codex-cli'}]},
+   {t:'exp',label:'TypeScript SDK',sub:'@cuecrux/client — npm',badge:'sdk',
+    desc:'Typed client for the daemon HTTP surface (:14800): facts, sessions, event streaming.',
+    doc:'npm i @cuecrux/client',controls:[
+    {t:'info',label:'quickstart pack',v:'sdk.typescript.quickstart'}]},
+   {t:'exp',label:'Python SDK',sub:'corecrux-client — PyPI',badge:'sdk',
+    desc:'Python client for the daemon HTTP surface (:14800), httpx-based.',
+    doc:'pip install corecrux-client',controls:[
+    {t:'info',label:'package',v:'corecrux-client'}]},
+   {t:'exp',label:'VS Code extension',sub:'observations · KB search · receipt verify',badge:'editor',
+    desc:'Crux sidebar for VS Code: observations feed, knowledge-base search/capture, receipt verification.',controls:[
+    {t:'info',label:'publisher',v:'cuecrux · marketplace'}]}]},
   {h:'Grants',sub:'install alone never grants tool access',controls:[
    {t:'info',label:'active grants',v:'3 (agent-claude · trusted)'},
    {t:'btn',label:'Review grants'},
    {t:'btn',label:'Browse as graph',action:'graph'}]}]},
- 'cx-extensions':{title:'Extensions',sub:'signed third-party manifests · per-passport grants',sections:[
-  {h:'Installed',controls:[
-   {t:'toggle',k:'ext_hooks',label:'crux-claude-hooks · v0.4.2',v:true},
-   {t:'toggle',k:'ext_wizard',label:'crux-config-wizard · v3',v:true}]},
+ 'cx-extensions':{title:'Extensions',sub:'signed third-party manifests · per-passport grants — click a row to expand',sections:[
+  {h:'Installed',wide:true,controls:[
+   {t:'search',ph:'Filter extensions…'},
+   {t:'exp',k:'ext_hooks',label:'crux-claude-hooks',sub:'Claude Code lifecycle hooks',badge:'v0.4.2',v:true,
+    desc:'SessionStart boot banner + PreCompact session save, wired into Claude Code settings.',controls:[
+    {t:'info',label:'kind',v:'agent hooks'},
+    {t:'info',label:'signed by',v:'daemon-root · first_party'}]},
+   {t:'exp',k:'ext_wizard',label:'crux-config-wizard',sub:'managed CLAUDE.md sections',badge:'v3',v:true,
+    desc:'Regenerates managed profile sections in workspace CLAUDE.md files with a reviewable diff.',controls:[
+    {t:'info',label:'kind',v:'config tool'},
+    {t:'info',label:'signed by',v:'daemon-root · first_party'}]}]},
   {h:'Trusted signing keys',sub:'manifests verify against this keyring',controls:[
    {t:'info',label:'daemon-root',v:'fp:12345678 · tier partner'},
    {t:'input',k:'key_fpr',label:'passport fingerprint',ph:'fp:…',mono:true},
@@ -2986,7 +3116,8 @@ function closePage(){ openPageId=null; const el=document.getElementById('setting
      act{'Button label'} — real call behind a button; resolves to a toast message
    LIVE=false leaves every page on the concept demo; load failures degrade to demo values. */
 function pageCtrl(pageId,k){ const def=PAGES[pageId]; let out=null;
-  ((def&&def.sections)||[]).forEach(s=>(s.controls||[]).forEach(c=>{ if(c.k===k) out=c; })); return out; }
+  const walk=cs=>(cs||[]).forEach(c=>{ if(c.k===k) out=c; if(c.controls) walk(c.controls); });   // recurse: controls nest inside expandable rows
+  ((def&&def.sections)||[]).forEach(s=>walk(s.controls)); return out; }
 function pageVal(pageId,k){ const c=pageCtrl(pageId,k); return confGet(pageId+'.'+k, c?c.v:undefined); }
 function setCtrl(pageId,k,v){ const c=pageCtrl(pageId,k); if(c) c.v=v; confPut(pageId+'.'+k, v); }   // server truth wins on load
 const infoRow=(label,v)=>({t:'info',label,v});
@@ -3059,23 +3190,34 @@ const PAGE_WIRES={
       api('/v1/console/integrations').catch(e=>({_err:e})),
       api('/v1/integrations/github/status').catch(e=>({_err:e})),
       api('/v1/integrations/openai/status').catch(e=>({_err:e}))]);
+    const cat=def.sections[0].controls;
     if(!integ._err){
       const packs=integ.packs||[];
-      if(packs.length) def.sections[0].controls=packs.map(p=>({ t:'toggle', k:'pack_'+(p.id||p.name),
-        label:(p.id||p.name)+(p.version?' · v'+p.version:''), v:(p.status? p.status!=='disabled' : !!(p.installed||p.enabled)) }));
+      if(packs.length){   // live packs replace the concept pack rows; sources/SDK rows + search stay
+        const keep=cat.filter(c=>c.t==='search' || (c.t==='exp' && !(c.k&&/^pack_/.test(c.k))));
+        def.sections[0].controls=keep.concat(packs.map(p=>{ const id=p.id||p.name;
+          return { t:'exp', k:'pack_'+id, label:id, sub:p.description||p.kind||'integration pack',
+            badge:'pack'+(p.version?' · v'+p.version:''), v:(p.status? p.status!=='disabled' : !!(p.installed||p.enabled)),
+            desc:p.description||'', controls:[{t:'info',label:'status',v:p.status||(p.installed?'installed':'available')}]
+              .concat((p.capabilities&&p.capabilities.length)? [{t:'info',label:'capabilities',v:p.capabilities.join(' · ')}]:[]) };
+        }));
+      }
       def.sections[0].sub=(integ.enabled?'enabled':'disabled')+(integ.safe_mode?' · safe mode':'')+' · grants are separate';
-      const g=(def.sections[3]&&def.sections[3].controls||[]).find(c=>c.t==='info');
+      const g=(def.sections[1]&&def.sections[1].controls||[]).find(c=>c.t==='info');
       const n=Array.isArray(integ.grants)? integ.grants.length : (integ.grants&&integ.grants.count);
       if(g && n!=null) g.v=n+' active';
     }
-    if(!gh._err) def.sections[1].controls=[infoRow('status', gh.connected?('connected'+(gh.username?' · '+gh.username:'')):'not connected')]
-      .concat(def.sections[1].controls.filter(c=>c.t!=='info'));
+    const expRow=lb=>def.sections[0].controls.find(c=>c.t==='exp'&&c.label===lb);
+    if(!gh._err){ const r=expRow('GitHub');
+      if(r) r.controls=[infoRow('status', gh.connected?('connected'+(gh.username?' · '+gh.username:'')):'not connected')]
+        .concat(r.controls.filter(c=>c.t!=='info')); }
     if(!oa._err){
       const om=pageCtrl('cx-integrations','oa_model');
       if(om && Array.isArray(oa.available_models) && oa.available_models.length) om.options=['none'].concat(oa.available_models);
       if(oa.default_model){ if(om && om.options.indexOf(oa.default_model)<0) om.options=om.options.concat([oa.default_model]); setCtrl('cx-integrations','oa_model',oa.default_model); }
-      def.sections[2].controls=[infoRow('status', oa.connected?'connected':'not connected')]
-        .concat(def.sections[2].controls.filter(c=>c.t!=='info'));
+      const r=expRow('OpenAI-compatible LLM');
+      if(r) r.controls=[infoRow('status', oa.connected?'connected':'not connected')]
+        .concat(r.controls.filter(c=>c.t!=='info'));
     }
   },
   setAny:(k,v)=>{ if(!/^pack_/.test(k)) return null; const id=k.slice(5);
@@ -3111,8 +3253,14 @@ const PAGE_WIRES={
     const [ex,keys]=await Promise.all([api('/v1/extensions').catch(e=>({_err:e})), api('/v1/extensions/keys').catch(e=>({_err:e}))]);
     if(!ex._err){ const list=ex.extensions||[];
       def.sections[0].h='Installed · '+(ex.count!=null?ex.count:list.length);
-      def.sections[0].controls=list.length? list.map(x=>infoRow(x.id||x.name, [x.version,x.kind].filter(Boolean).join(' · ')||'installed'))
-        : [infoRow('none installed', ex.allow_unsigned_dev?'unsigned dev installs allowed':'—')]; }
+      const keep=def.sections[0].controls.filter(c=>c.t==='search');
+      def.sections[0].controls=keep.concat(list.length? list.map(x=>{ const id=x.id||x.name;
+        return { t:'exp', k:'ext_'+String(id).replace(/[^a-zA-Z0-9]/g,'_'), label:id,
+          sub:x.kind||'extension', badge:x.version? 'v'+x.version : 'installed', v:true, desc:x.description||'',
+          controls:[infoRow('kind', x.kind||'extension')]
+            .concat(x.capabilities&&x.capabilities.length? [infoRow('capabilities', x.capabilities.join(' · '))]:[]) };
+        })
+        : [infoRow('none installed', ex.allow_unsigned_dev?'unsigned dev installs allowed':'—')]); }
     if(!keys._err){ const ks=keys.keys||[];
       def.sections[1].controls=ks.map(k0=>infoRow(k0.passport_fpr||'key',[k0.trust_tier,k0.added_by?('by '+k0.added_by):null].filter(Boolean).join(' · ')))
         .concat(def.sections[1].controls.filter(c=>c.t!=='info')); }
@@ -3263,6 +3411,38 @@ const PAGE_WIRES={
     if(def.sections[0] && /^Tail/.test(def.sections[0].h)) def.sections[0]=sec; else def.sections.unshift(sec);
   },
   act:{ 'Clear': async()=>{ EVENTS.length=0; updateEvtTicker(); if(openPageId==='ax-activity') openPage('ax-activity'); return 'event tail cleared'; } }},
+ 'cx-tenants':{
+  load: async def=>{
+    const r=await api('/v1/console/tenants'); const ts=r.tenants||[];
+    if(!ts.length) return;
+    const keep=def.sections[1].controls.filter(c=>c.t==='search'||c.t==='toggle'||(c.t==='btn'&&c.action==='graph'));
+    const rows=ts.map(t=>{ const id=t.tenant_id||t.id; const sys=(t.category==='system')||/^__/.test(String(id));
+      return tenantExpRow(id, [t.category,t.source].filter(Boolean).join(' · ')||'tenant', sys); });
+    const gbtn=keep.filter(c=>c.t==='btn');
+    def.sections[1].controls=keep.filter(c=>c.t!=='btn').concat(rows).concat(gbtn);
+  },
+  act:{ 'Apply defaults to all tenants': async()=>{
+    /* local policy copy — per-tenant pins reset to inherit; lane keys themselves stay page-scoped */
+    Object.keys(CXCONF).forEach(k=>{ if(/^cx-tenants\.tn_.*_inherit$/.test(k)) CXCONF[k]=true; });
+    try{ localStorage.setItem('cxconf',JSON.stringify(CXCONF)); }catch(e){}
+    if(openPageId==='cx-tenants') openPage('cx-tenants',{__wired:true});
+    return 'defaults applied — all tenants inherit'; } }},
+ 'cx-memory':{
+  load: async def=>{
+    const r=await api('/v1/console/facts?top_k=50'); const fs=r.facts||[];
+    if(!fs.length) return;
+    const groups={};
+    fs.forEach(f=>{ const tn=f.tenant||f.tenant_id||(/^__/.test(String(f.entity||''))? String(f.entity).split('::')[0]+'::' : 'default');
+      (groups[tn]=groups[tn]||[]).push(f); });
+    const keep=def.sections[0].controls.filter(c=>c.t==='search'||c.t==='toggle'||(c.t==='btn'&&c.action==='graph'));
+    const rows=Object.entries(groups).map(([tn,list])=>{ const sys=/^__/.test(tn);
+      return { t:'exp', label:tn, sub:list.length+' recent fact'+(list.length===1?'':'s'), badge:sys?'system':'tenant',
+        sys, hideIf:sys?'hidesys':null,
+        desc:sys? 'Reserved daemon-internal tenant — born private, never syncs.' : 'Recent facts stored under this tenant.',
+        controls:list.slice(0,10).map(f=>infoRow(f.key||f.entity||'fact', [f.entity, f.stored_at].filter(Boolean).join(' · '))) }; });
+    const gbtn=keep.filter(c=>c.t==='btn');
+    def.sections[0].controls=keep.filter(c=>c.t!=='btn').concat(rows).concat(gbtn);
+  }},
  'cx-documents':{
   load: async def=>{
     const [tn,sb,qf]=await Promise.all([
@@ -3361,8 +3541,9 @@ function openPage(id, opts){
   const x=document.createElement('button'); x.id='sp-close'; x.title='Close (Esc)'; x.textContent='×'; x.onclick=closePage; head.appendChild(x);
   el.appendChild(head);
   const grid=document.createElement('div'); grid.className='sp-grid'; el.appendChild(grid);
+  EXP_ROWS[id]=[];   // expandable-row registry for this render — the search control filters over it
   def.sections.forEach(sec=>{
-    const card=document.createElement('div'); card.className='sp-card';
+    const card=document.createElement('div'); card.className='sp-card'+(sec.wide?' wide':'');
     const h=document.createElement('h2'); h.textContent=sec.h; card.appendChild(h);
     if(sec.sub){ const su=document.createElement('div'); su.className='sp-sub'; su.textContent=sec.sub; card.appendChild(su); }
     (sec.controls||[]).forEach(c=>card.appendChild(renderControl(id,c)));
@@ -3371,9 +3552,48 @@ function openPage(id, opts){
   });
   el.style.display='flex';
 }
+var EXP_ROWS={};   // pageId → [{el,text,sys}] — expandable rows registered per render, filtered by the search control
 function renderControl(pageId,c){
   const row=document.createElement('div'); row.className='sp-row';
   const key=c.k?pageId+'.'+c.k:null;
+  if(c.t==='search'){
+    const wrap=document.createElement('div'); wrap.className='sp-search';
+    const inp=document.createElement('input'); inp.className='sp-input mono'; inp.type='text';
+    inp.placeholder=c.ph||'Filter…'; inp.setAttribute('aria-label',c.ph||'Filter list');
+    inp.oninput=()=>{ const q=String(inp.value||'').toLowerCase();
+      (EXP_ROWS[pageId]||[]).forEach(r=>{ if(r.el.dataset.sysHidden==='1') return;   // hide-system wins over search
+        r.el.style.display = r.text.indexOf(q)>=0? '' : 'none'; }); };
+    wrap.appendChild(inp); return wrap;
+  }
+  if(c.t==='exp'){   /* full-width expandable list row: [toggle?] name/sub · badge · caret; click to expand options */
+    const wrap=document.createElement('div'); wrap.className='sp-exp'+(c.open?' open':'');
+    const head=document.createElement('div'); head.className='sp-exphead';
+    if(c.desc) head.title=c.desc;
+    if(c.k){   // leading switch rides the same conf/wire path as t:'toggle'
+      const tkey=pageId+'.'+c.k;
+      const b=document.createElement('button'); b.className='sp-toggle'; b.setAttribute('role','switch');
+      b.setAttribute('aria-label',c.label); if(c.desc) b.title=c.desc;
+      const knob=document.createElement('span'); knob.className='sp-knob'; b.appendChild(knob);
+      const setv=v=>{ b.classList.toggle('on',!!v); b.setAttribute('aria-checked',!!v); };
+      setv(confGet(tkey,c.v));
+      b.onclick=e=>{ if(e&&e.stopPropagation) e.stopPropagation(); const nv=!b.classList.contains('on'); setv(nv); confSet(tkey,nv); };
+      head.appendChild(b);
+    }
+    const nm=document.createElement('span'); nm.className='sp-expname';
+    const b1=document.createElement('b'); b1.textContent=c.label; nm.appendChild(b1);
+    if(c.sub){ const s1=document.createElement('small'); s1.textContent=c.sub; nm.appendChild(s1); }
+    head.appendChild(nm);
+    if(c.badge){ const bd=document.createElement('span'); bd.className='sp-expbadge'; bd.textContent=c.badge; head.appendChild(bd); }
+    const car=document.createElement('span'); car.className='sp-expcaret'; car.textContent='›'; head.appendChild(car);
+    const body=document.createElement('div'); body.className='sp-expbody';
+    (c.controls||[]).forEach(cc=>body.appendChild(renderControl(pageId,cc)));
+    if(c.doc){ const pre=document.createElement('pre'); pre.textContent=c.doc; body.appendChild(pre); }
+    head.onclick=()=>wrap.classList.toggle('open');
+    wrap.appendChild(head); wrap.appendChild(body);
+    if(c.hideIf && confGet(pageId+'.'+c.hideIf, true)){ wrap.style.display='none'; wrap.dataset.sysHidden='1'; }
+    (EXP_ROWS[pageId]=EXP_ROWS[pageId]||[]).push({el:wrap, text:(c.label+' '+(c.sub||'')+' '+(c.badge||'')).toLowerCase(), sys:!!c.sys});
+    return wrap;
+  }
   if(c.t==='info'){ row.className='frow';   /* createElement, not innerHTML — the smoke DOM stub has no innerHTML parser */
     const a=document.createElement('span'); a.className='fk'; a.textContent=c.label;
     const b=document.createElement('span'); b.className='fv'; b.textContent=c.v;
@@ -3427,15 +3647,17 @@ function renderControl(pageId,c){
   const cid=key?('spc-'+key.replace(/[^a-z0-9]/gi,'-')):null;
   const lab=document.createElement('label'); lab.className='sp-lab'; lab.textContent=c.label;
   if(cid) lab.htmlFor=cid;                          /* form-labels: explicit association */
+  if(c.desc){ lab.title=c.desc; row.title=c.desc; }  /* hover description for the whole row */
   row.appendChild(lab);
   if(c.t==='toggle'){
     const b=document.createElement('button'); b.className='sp-toggle'; b.setAttribute('role','switch');
     if(cid) b.id=cid;
-    b.setAttribute('aria-label',c.label);
+    b.setAttribute('aria-label',c.label); if(c.desc) b.title=c.desc;
     const knob=document.createElement('span'); knob.className='sp-knob'; b.appendChild(knob);
     const setv=(v)=>{ b.classList.toggle('on',!!v); b.setAttribute('aria-checked',!!v); };
     setv(confGet(key,c.v));
-    b.onclick=()=>{ const nv=!b.classList.contains('on'); setv(nv); confSet(key,nv); };
+    b.onclick=()=>{ const nv=!b.classList.contains('on'); setv(nv); confSet(key,nv);
+      if(c.rerender && openPageId===pageId) openPage(pageId,{__wired:true}); };  /* e.g. hide-system-tenants re-filters the list */
     row.appendChild(b);
   } else if(c.t==='select'){
     const sel=document.createElement('select'); sel.className='sp-input'; if(cid) sel.id=cid;
