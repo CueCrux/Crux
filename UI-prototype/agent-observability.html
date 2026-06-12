@@ -3241,8 +3241,29 @@ const PAGES={
    {t:'info',label:'endpoint',v:'POST /mcp · :14801'},
    {t:'input',k:'rpc_scopes',label:'X-Corecrux-Scopes',v:'read',mono:true},
    {t:'btn',label:'Browse recent calls as graph',action:'graph'}]}]},
- 'cx-projects':{title:'Projects',sub:'a project pairs repos to search, a planning repo for ExecPlans, passports and working tenants',sections:[
-  {h:'New project',wide:true,controls:[
+ 'cx-projects':{title:'Projects',sub:'a project pairs repos to track + search, a planning repo for ExecPlans, passports and working tenants',sections:[
+  {h:'Projects',sub:'click a project to expand & edit · ＋ adds a new one',wide:true,controls:[
+   {t:'search',ph:'Filter projects…'},
+   {t:'btn',label:'＋ New project',action:'showsec',key:'show_new'},
+   {t:'exp',label:'CueCrux',sub:'workspace · 12 repos · 3 sessions',badge:'active',open:true,controls:[
+    {t:'select',k:'pr_cuecrux_planrepo',label:'planning repo',options:['PlanCrux','Crux','AuditCrux','CruxEngine','(daemon-native)'],v:'PlanCrux',
+     desc:'Which tracked repo holds .agent/execplans — the Work board projects it read-time. (daemon-native) keeps plans as kanban work items only.'},
+    {t:'select',k:'pr_cuecrux_storage',label:'execplan storage',options:['planning repo (recommended)','daemon-native','hybrid — repo files + daemon kanban'],v:'hybrid — repo files + daemon kanban',
+     desc:'Repo: PR-reviewable markdown, survives daemon rebuilds, projects onto the Work board. Daemon-native: work items only. Hybrid: repo is source of truth, daemon overlays live state.'},
+    {t:'toggle',k:'pr_cuecrux_track_crux',label:'Crux · tracked',v:true,desc:'Actively tracked: workspace scans, code health and the Work board watch this repo.'},
+    {t:'toggle',k:'pr_cuecrux_search_crux',label:'Crux · searched',v:true,desc:'Included in project-scoped search. Only applies while the repo is tracked.'},
+    {t:'toggle',k:'pr_cuecrux_track_auditcrux',label:'AuditCrux · tracked',v:true,desc:'Actively tracked: workspace scans, code health and the Work board watch this repo.'},
+    {t:'toggle',k:'pr_cuecrux_search_auditcrux',label:'AuditCrux · searched',v:true,desc:'Included in project-scoped search. Only applies while the repo is tracked.'},
+    {t:'toggle',k:'pr_cuecrux_track_plancrux',label:'PlanCrux · tracked',v:true,desc:'Actively tracked: workspace scans, code health and the Work board watch this repo.'},
+    {t:'toggle',k:'pr_cuecrux_search_plancrux',label:'PlanCrux · searched',v:true,desc:'Included in project-scoped search. Only applies while the repo is tracked.'},
+    {t:'toggle',k:'pr_cuecrux_track_cruxengine',label:'CruxEngine · tracked',v:false,desc:'Actively tracked: workspace scans, code health and the Work board watch this repo.'},
+    {t:'toggle',k:'pr_cuecrux_search_cruxengine',label:'CruxEngine · searched',v:false,desc:'Included in project-scoped search. Only applies while the repo is tracked.'},
+    {t:'input',k:'pr_cuecrux_tenants',label:'working tenants',v:'default, lme-s',mono:true},
+    {t:'select',k:'pr_cuecrux_passport',label:'default passport',options:['ce:4e6c4e2a:local','ce:8821fa0d:local','ce:0c4419ab:remote'],v:'ce:4e6c4e2a:local'},
+    {t:'btn',label:'Save cuecrux',hint:'PATCH /v1/projects/cuecrux — kept locally until the daemon grows an update route'}]},
+   {t:'btn',label:'Browse as graph',action:'graph'}],
+   doc:'Track first, then search: a repo must be TRACKED (scans · code health ·\nWork board) before its SEARCH toggle applies. Both are stored locally —\nthe daemon project model carries no repo list yet (gap, noted).\nExecPlan storage: repo-first is recommended — plans live as markdown in\nthe planning repo (.agent/execplans), get PR review + history, and the\ndaemon projects them read-time; daemon-native suits repo-less tasks.'},
+  {h:'New project',wide:true,showIf:'show_new',controls:[
    {t:'input',k:'proj_name',label:'name',ph:'My project'},
    {t:'input',k:'proj_id',label:'id',ph:'proj-slug',mono:true},
    {t:'input',k:'proj_plan',label:'planning repo / target',ph:'github:owner/repo or tenant:…',mono:true,
@@ -3251,20 +3272,8 @@ const PAGES={
     desc:'Repo: plans are PR-reviewable markdown, survive daemon rebuilds, and project onto the Work board (source=all). Daemon-native: kanban work items only — quick tasks without a repo. Hybrid: repo is source of truth, daemon overlays live state.'},
    {t:'select',k:'proj_passport',label:'default passport',options:['ce:4e6c4e2a:local','ce:8821fa0d:local','ce:0c4419ab:remote'],v:'ce:4e6c4e2a:local'},
    {t:'input',k:'proj_tenants',label:'working tenants',ph:'default, lme-s',mono:true},
-   {t:'btn',label:'Create project'}]},
-  {h:'Tracked',sub:'click a project to expand repos · planning · tenants',wide:true,controls:[
-   {t:'search',ph:'Filter projects…'},
-   {t:'exp',label:'CueCrux',sub:'workspace · 12 repos · 3 sessions',badge:'active',open:true,controls:[
-    {t:'info',label:'planning repo',v:'PlanCrux — .agent/execplans · projected to the Work board (source=all)'},
-    {t:'info',label:'execplan storage',v:'hybrid — repo files are the source of truth, daemon kanban overlays state'},
-    {t:'toggle',k:'pr_cuecrux_crux',label:'search: Crux',v:true,desc:'Include this repo in project-scoped search and workspace scans.'},
-    {t:'toggle',k:'pr_cuecrux_auditcrux',label:'search: AuditCrux',v:true,desc:'Include this repo in project-scoped search and workspace scans.'},
-    {t:'toggle',k:'pr_cuecrux_plancrux',label:'search: PlanCrux',v:true,desc:'Include this repo in project-scoped search and workspace scans.'},
-    {t:'toggle',k:'pr_cuecrux_cruxengine',label:'search: CruxEngine',v:false,desc:'Include this repo in project-scoped search and workspace scans.'},
-    {t:'info',label:'working tenants',v:'default · lme-s'},
-    {t:'info',label:'default passport',v:'ce:4e6c4e2a:local'}]},
-   {t:'btn',label:'Browse as graph',action:'graph'}],
-   doc:'Repo-search toggles are project-scoped and stored locally — the daemon\nproject model carries no repo list yet (daemon gap, noted).\nExecPlan storage: repo-first is recommended. Plans live as markdown in\nthe planning repo (.agent/execplans), get PR review and history, and the\ndaemon projects them onto the Work board read-time; daemon-native work\nitems suit quick tasks that have no repo.'}]},
+   {t:'btn',label:'Create project'},
+   {t:'btn',label:'Cancel',action:'showsec',key:'show_new',value:false}]}]},
  'dx-articles':{title:'Articles',sub:'bundled docs + synced docs:: facts',sections:[
   {h:'Docs tenant override',sub:'load articles from facts under docs::<tenant>::*',controls:[
    {t:'input',k:'docs_tenant',label:'tenant id',ph:'cuecrux-docs',mono:true},
@@ -4018,23 +4027,39 @@ const PAGE_WIRES={
       const sel=pageCtrl('cx-projects','proj_passport');
       if(sel&&ids.length){ sel.options=ids; if(ids.indexOf(confGet('cx-projects.proj_passport',sel.v))<0) setCtrl('cx-projects','proj_passport',ids[0]); } }
     if(!pr._err){ const list=pr.projects||[];
-      def.sections[1].h='Tracked · '+list.length;
-      const head=def.sections[1].controls.filter(c=>c.t==='search');
-      const tail=def.sections[1].controls.filter(c=>c.t==='btn'&&c.action==='graph');
-      const storageOf=t=>{ t=String(t||''); return /^tenant:/.test(t)? 'daemon-native (kanban work items)'
-        : t? 'planning repo — '+t+' · projected to the Work board' : 'unset — defaults to daemon-native'; };
-      def.sections[1].controls=head.concat(list.length? list.map(p=>{
-          const pid=String(p.id||p.name).replace(/[^a-zA-Z0-9]/g,'_');
+      def.sections[0].h='Projects · '+list.length;
+      const head=def.sections[0].controls.filter(c=>c.t==='search'||(c.t==='btn'&&c.action==='showsec'));
+      const tail=def.sections[0].controls.filter(c=>c.t==='btn'&&c.action==='graph');
+      const storageDefault=t=>/^tenant:/.test(String(t||''))? 'daemon-native' : 'planning repo (recommended)';
+      def.sections[0].controls=head.concat(list.length? list.map(p=>{
+          const id=String(p.id||p.name), pid=id.replace(/[^a-zA-Z0-9]/g,'_');
           return {t:'exp',label:p.name||p.id,sub:[p.planning_target,(p.working_tenants||[]).join(', ')||null].filter(Boolean).join(' · ')||'project',
             badge:p.archived?'archived':'active',
             controls:[
-             {t:'info',label:'execplan storage',v:storageOf(p.planning_target)},
-             {t:'info',label:'working tenants',v:(p.working_tenants||[]).join(' · ')||'—'},
+             {t:'input',k:'pr_'+pid+'_planrepo',label:'planning repo / target',v:p.planning_target||'',mono:true,
+              desc:'Where .agent/execplans lives (github:owner/repo or a path); tenant:… = daemon-native.'},
+             {t:'select',k:'pr_'+pid+'_storage',label:'execplan storage',
+              options:['planning repo (recommended)','daemon-native','hybrid — repo files + daemon kanban'],v:storageDefault(p.planning_target),
+              desc:'Repo: PR-reviewable markdown projected onto the Work board. Daemon-native: work items only. Hybrid: repo source of truth + kanban overlay.'},
+             {t:'toggle',k:'pr_'+pid+'_track',label:'tracked',v:!p.archived,
+              desc:'Actively tracked: workspace scans, code health and the Work board watch this project.'},
+             {t:'toggle',k:'pr_'+pid+'_search',label:'included in search',v:true,
+              desc:'Project-scoped search inclusion. Only applies while tracked. Stored locally — the daemon project model carries no repo list yet.'},
+             {t:'input',k:'pr_'+pid+'_tenants',label:'working tenants',v:(p.working_tenants||[]).join(', '),mono:true},
              {t:'info',label:'default passport',v:p.default_passport_id||'—'},
-             {t:'toggle',k:'pr_'+pid+'_search',label:'include in project-scoped search',v:true,
-              desc:'Local setting — the daemon project model carries no repo list yet (noted gap).'}]};
+             {t:'btn',label:'Save '+id,hint:'PATCH /v1/projects/'+id+' — falls back to local if the route is absent'}]};
         })
-        : [infoRow('none yet','create one on the left')]).concat(tail); }
+        : [infoRow('none yet','＋ New project above')]).concat(tail); }
+  },
+  actAny:(label,ctx)=>{
+    const m=label.match(/^Save (.+)$/); if(!m) return null;
+    return (async()=>{
+      const id=m[1], pid=id.replace(/[^a-zA-Z0-9]/g,'_');
+      const body={ planning_target:confGet('cx-projects.pr_'+pid+'_planrepo',null)||null,
+        working_tenants:String(confGet('cx-projects.pr_'+pid+'_tenants','')||'').split(',').map(s=>s.trim()).filter(Boolean) };
+      try{ await patchApi('/v1/projects/'+encodeURIComponent(id), body); ctx.reload(); return 'project saved · '+id; }
+      catch(e){ if(e&&(e.status===404||e.status===405)) return 'saved locally — daemon has no project update route yet'; throw e; }
+    })();
   },
   act:{
     'Create project': async ctx=>{
@@ -4043,6 +4068,7 @@ const PAGE_WIRES={
         planning_target:pageVal('cx-projects','proj_plan')||null,
         default_passport_id:pageVal('cx-projects','proj_passport'),
         working_tenants:String(pageVal('cx-projects','proj_tenants')||'').split(',').map(s=>s.trim()).filter(Boolean) });
+      confPut('cx-projects.show_new', false);   /* fold the form back behind ＋ */
       ctx.reload(); return 'project created · '+id;
     },
   }},
@@ -4088,6 +4114,7 @@ function openPage(id, opts){
   def.sections.forEach(sec=>{
     const card=document.createElement('div'); card.className='sp-card'+((sec.wide||def.tabs)?' wide':'');
     if(def.tabs && sec.h!=='Results' && sec.h!==curTab) card.style.display='none';
+    if(sec.showIf && !confGet(id+'.'+sec.showIf,false)) card.style.display='none';   /* e.g. New project hides behind ＋ */
     const h=document.createElement('h2'); h.textContent=sec.h; card.appendChild(h);
     if(sec.sub){ const su=document.createElement('div'); su.className='sp-sub'; su.textContent=sec.sub; card.appendChild(su); }
     (sec.controls||[]).forEach(c=>card.appendChild(renderControl(id,c)));
@@ -4172,6 +4199,7 @@ function renderControl(pageId,c){
       if(c.action==='graph'){ closePage(); soloPanel(pageId,{graph:true}); return; }
       if(c.action==='open3d'){ closePage(); setView('3d'); return; }
       if(c.action==='rpc'){ sendRpc(pageId); return; }
+      if(c.action==='showsec'){ confPut(pageId+'.'+c.key, c.value!==undefined? c.value : true); openPage(pageId,{__wired:true}); return; }
       if(c.action==='folder'){   /* browser folder picker → derive the doc prefix from the selection */
         (async()=>{
           try{
