@@ -1,0 +1,1321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crux README — Redesign Mockup (2026-06-12)</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+:root{
+  --bg0:#0A0F1A; --bg1:#0F172A; --bg2:#141E33; --bg3:#1A2641;
+  --border:#223152; --border-soft:#1B2740;
+  --text:#E8EEF7; --muted:#92A6C3; --faint:#5E7290;
+  --green:#22C55E; --green-dim:#16A34A; --cyan:#38BDF8; --amber:#F5B041; --red:#F26D6D;
+  --note:#C7A6F5;
+  --radius:12px;
+  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+  --sans:'IBM Plex Sans',-apple-system,Segoe UI,Roboto,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion: reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
+body{background:var(--bg0);color:var(--text);font-family:var(--sans);font-size:16px;line-height:1.65;-webkit-font-smoothing:antialiased}
+a{color:var(--cyan);text-decoration:none;cursor:pointer}
+a:hover{text-decoration:underline}
+a:focus-visible,button:focus-visible{outline:2px solid var(--green);outline-offset:2px;border-radius:4px}
+code,pre,.mono{font-family:var(--mono)}
+h1,h2,h3,h4{font-family:var(--mono);letter-spacing:-0.01em}
+
+/* ============ MOCKUP TOOLBAR (not part of the README) ============ */
+.toolbar{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:14px;
+  padding:10px 20px;background:rgba(10,15,26,.92);backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--border)}
+.toolbar .tag{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--bg0);
+  background:var(--note);padding:3px 8px;border-radius:5px;letter-spacing:.06em}
+.toolbar .ttl{font-family:var(--mono);font-size:13px;color:var(--muted)}
+.toolbar .spacer{flex:1}
+.toolbar button{font-family:var(--mono);font-size:12px;font-weight:600;cursor:pointer;
+  color:var(--note);background:transparent;border:1px solid var(--note);
+  padding:6px 12px;border-radius:7px;transition:background .2s,color .2s}
+.toolbar button:hover{background:var(--note);color:var(--bg0)}
+.toolbar button.on{background:var(--note);color:var(--bg0)}
+
+/* ============ DESIGN NOTES ============ */
+.note{display:none;margin:18px 0;padding:14px 16px 14px 46px;position:relative;
+  background:rgba(199,166,245,.06);border:1px dashed rgba(199,166,245,.45);
+  border-radius:10px;font-size:13.5px;color:#D8C6F2;line-height:1.6}
+.note::before{content:attr(data-n);position:absolute;left:14px;top:13px;width:22px;height:22px;
+  display:flex;align-items:center;justify-content:center;font-family:var(--mono);
+  font-size:11px;font-weight:700;color:var(--bg0);background:var(--note);border-radius:50%}
+.note b{color:#EADDFB}
+.note .verify{display:inline-block;margin-top:6px;font-family:var(--mono);font-size:11px;
+  font-weight:700;color:var(--amber);border:1px solid var(--amber);border-radius:5px;padding:1px 7px;letter-spacing:.05em}
+body.notes .note{display:block}
+
+/* ============ GITHUB FRAME ============ */
+.gh-head{border-bottom:1px solid var(--border);background:var(--bg1)}
+.gh-head-inner{max-width:1060px;margin:0 auto;padding:14px 24px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.gh-repo{display:flex;align-items:center;gap:9px;font-size:18px}
+.gh-repo .org{color:var(--muted)}
+.gh-repo .name{font-weight:700;color:var(--text)}
+.gh-repo .pub{font-size:11px;font-family:var(--mono);color:var(--muted);border:1px solid var(--border);
+  border-radius:999px;padding:1px 9px}
+.gh-actions{margin-left:auto;display:flex;gap:8px}
+.gh-pill{display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:var(--text);
+  background:var(--bg2);border:1px solid var(--border);border-radius:7px;padding:4px 11px;cursor:pointer;
+  transition:border-color .2s}
+.gh-pill:hover{border-color:var(--faint)}
+.gh-pill .cnt{font-family:var(--mono);font-size:11.5px;color:var(--muted);border-left:1px solid var(--border);padding-left:7px}
+.gh-pill svg{width:15px;height:15px;stroke:var(--muted)}
+
+/* ============ README BODY ============ */
+.readme{max-width:1060px;margin:0 auto;padding:8px 24px 90px}
+.readme-frame{border:1px solid var(--border);border-radius:var(--radius);margin-top:20px;background:var(--bg1);overflow:hidden}
+.readme-tab{display:flex;align-items:center;gap:8px;padding:11px 18px;border-bottom:1px solid var(--border);
+  font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+.readme-tab svg{width:14px;height:14px;stroke:var(--muted)}
+.readme-inner{padding:34px clamp(18px,5vw,64px) 64px}
+
+section{margin-top:74px}
+section:first-of-type{margin-top:8px}
+.kicker{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;margin-bottom:10px}
+.k-green{color:var(--green)} .k-cyan{color:var(--cyan)} .k-amber{color:var(--amber)}
+h2.sec{font-size:clamp(22px,3vw,30px);font-weight:700;margin-bottom:14px}
+.lede{color:var(--muted);max-width:68ch;font-size:16.5px}
+
+/* ---- HERO ---- */
+.hero{text-align:center;padding-top:26px}
+.hero .logo{display:inline-flex;align-items:center;gap:14px;margin-bottom:18px}
+.hero .glyph{width:58px;height:58px}
+.hero h1{font-size:clamp(40px,7vw,64px);font-weight:700;letter-spacing:.04em}
+.hero h1 .x{color:var(--green)}
+.hero .tagline{font-size:clamp(18px,2.6vw,23px);font-weight:500;color:var(--text);max-width:34ch;margin:14px auto 0}
+.hero .tagline em{font-style:normal;color:var(--green)}
+.hero .sub{color:var(--muted);max-width:62ch;margin:14px auto 0;font-size:16px}
+.navlinks{display:flex;justify-content:center;gap:6px 22px;flex-wrap:wrap;margin-top:24px;
+  font-family:var(--mono);font-size:13.5px;font-weight:500}
+.navlinks a{color:var(--text)}
+.navlinks a:hover{color:var(--green);text-decoration:none}
+.navlinks span{color:var(--faint)}
+.badges{display:flex;justify-content:center;flex-wrap:wrap;gap:8px;margin-top:22px}
+.badge{display:inline-flex;font-family:var(--mono);font-size:11px;font-weight:600;border-radius:5px;overflow:hidden;border:1px solid var(--border)}
+.badge .l{background:var(--bg3);color:var(--muted);padding:3px 8px}
+.badge .r{background:var(--bg2);padding:3px 8px}
+.r-green{color:var(--green)} .r-cyan{color:var(--cyan)} .r-amber{color:var(--amber)} .r-text{color:var(--text)}
+
+/* ---- VIDEO SLOT ---- */
+.video{position:relative;margin-top:38px;border:1px solid var(--border);border-radius:var(--radius);
+  aspect-ratio:16/9;overflow:hidden;cursor:pointer;background:
+  radial-gradient(ellipse at 30% 20%,rgba(34,197,94,.13),transparent 55%),
+  radial-gradient(ellipse at 75% 80%,rgba(56,189,248,.11),transparent 55%),#141E33}
+.video:hover .play{transform:scale(1.06)}
+.video .term{position:absolute;inset:auto 8% 12% 8%;background:rgba(10,15,26,.85);border:1px solid var(--border);
+  border-radius:10px;padding:16px 20px;text-align:left;font-family:var(--mono);font-size:clamp(10px,1.4vw,13.5px);line-height:1.8;color:var(--muted)}
+.video .term .p{color:var(--green)}
+.video .term .c{color:var(--text)}
+.video .term .ok{color:var(--green)}
+.video .play{position:absolute;top:34%;left:50%;translate:-50% -50%;width:84px;height:84px;border-radius:50%;
+  background:rgba(34,197,94,.16);border:1.5px solid var(--green);display:flex;align-items:center;justify-content:center;
+  transition:transform .25s;backdrop-filter:blur(3px)}
+.video .play svg{width:30px;height:30px;fill:var(--green);margin-left:5px}
+.video .vlabel{position:absolute;top:14px;left:16px;font-family:var(--mono);font-size:11px;color:var(--faint);
+  background:rgba(10,15,26,.7);padding:3px 9px;border-radius:5px;border:1px solid var(--border)}
+.caption{margin-top:10px;text-align:center;font-size:13px;color:var(--faint)}
+
+/* ---- QUICKSTART ---- */
+.tabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:-1px;position:relative;z-index:1}
+.tab{font-family:var(--mono);font-size:12.5px;font-weight:600;color:var(--muted);cursor:pointer;
+  background:var(--bg1);border:1px solid var(--border);border-bottom:none;border-radius:9px 9px 0 0;
+  padding:8px 16px;transition:color .2s}
+.tab:hover{color:var(--text)}
+.tab.on{color:var(--green);background:var(--bg2)}
+.codebox{position:relative;background:var(--bg2);border:1px solid var(--border);border-radius:0 10px 10px 10px;padding:20px 22px;overflow-x:auto}
+.codebox pre{font-size:13.5px;line-height:1.85;color:var(--text)}
+.codebox .cm{color:var(--faint)}
+.codebox .pr{color:var(--green)}
+.codebox .st{color:var(--amber)}
+.copy{position:absolute;top:12px;right:12px;display:flex;align-items:center;gap:6px;cursor:pointer;
+  font-family:var(--mono);font-size:11px;font-weight:600;color:var(--muted);background:var(--bg3);
+  border:1px solid var(--border);border-radius:6px;padding:5px 10px;transition:color .2s,border-color .2s}
+.copy:hover{color:var(--green);border-color:var(--green)}
+.copy svg{width:13px;height:13px;stroke:currentColor}
+.pane{display:none}.pane.on{display:block}
+.qs-meta{display:flex;gap:10px 26px;flex-wrap:wrap;margin-top:16px;font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+.qs-meta b{color:var(--green);font-weight:600}
+
+/* ---- PILLARS ---- */
+.pillars{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px;margin-top:26px}
+.pillar{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:24px 22px;
+  transition:border-color .25s;position:relative;overflow:hidden}
+.pillar::before{content:"";position:absolute;top:0;left:0;right:0;height:2px}
+.pillar.pm::before{background:var(--green)} .pillar.pr::before{background:var(--cyan)} .pillar.pc::before{background:var(--amber)}
+.pillar:hover{border-color:var(--faint)}
+.pillar .ic{width:38px;height:38px;border-radius:9px;display:flex;align-items:center;justify-content:center;margin-bottom:14px}
+.pillar.pm .ic{background:rgba(34,197,94,.12)} .pillar.pr .ic{background:rgba(56,189,248,.12)} .pillar.pc .ic{background:rgba(245,176,65,.12)}
+.pillar .ic svg{width:20px;height:20px}
+.pillar.pm svg{stroke:var(--green)} .pillar.pr svg{stroke:var(--cyan)} .pillar.pc svg{stroke:var(--amber)}
+.pillar h3{font-size:16.5px;margin-bottom:8px}
+.pillar p{font-size:14px;color:var(--muted)}
+.pillar code{font-size:12px;color:var(--text);background:var(--bg3);padding:1px 6px;border-radius:4px}
+
+/* ---- TERMINAL (verify demo) ---- */
+.termwrap{background:#0B1322;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;margin-top:24px}
+.termbar{display:flex;align-items:center;gap:7px;padding:10px 16px;border-bottom:1px solid var(--border-soft);background:var(--bg2)}
+.dot{width:11px;height:11px;border-radius:50%}
+.d1{background:#F26D6D}.d2{background:#F5B041}.d3{background:#22C55E}
+.termbar .tt{margin-left:8px;font-family:var(--mono);font-size:11.5px;color:var(--faint)}
+.termbody{padding:20px 22px;font-family:var(--mono);font-size:13px;line-height:1.95;overflow-x:auto;white-space:pre}
+.termbody .p{color:var(--green)} .termbody .out{color:var(--muted)} .termbody .ok{color:var(--green);font-weight:600}
+.termbody .bad{color:var(--red);font-weight:600} .termbody .hl{color:var(--amber)}
+
+/* ---- STATS / CHARTS ---- */
+.stat-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin-top:26px}
+.stat{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:20px 20px 16px}
+.stat .v{font-family:var(--mono);font-size:clamp(24px,3vw,32px);font-weight:700}
+.stat .v small{font-size:.55em;font-weight:500;color:var(--muted)}
+.stat .l{font-size:13px;color:var(--muted);margin-top:4px}
+.chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:26px}
+@media(max-width:860px){.chart-grid{grid-template-columns:1fr}}
+.chart{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:22px}
+.chart h4{font-size:14px;margin-bottom:4px}
+.chart .sub{font-size:12.5px;color:var(--faint);margin-bottom:16px}
+.chart svg{width:100%;height:auto;display:block}
+.bar-label{font-family:var(--mono);font-size:11px;fill:var(--muted)}
+.bar-val{font-family:var(--mono);font-size:11px;font-weight:600}
+.fn{margin-top:14px;font-size:12px;color:var(--faint)}
+
+/* ---- CONSOLE BENTO ---- */
+.bento{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:26px}
+@media(max-width:860px){.bento{grid-template-columns:1fr}}
+.shot{border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;background:var(--bg2);transition:border-color .25s}
+.shot:hover{border-color:var(--faint)}
+.shot .bbar{display:flex;align-items:center;gap:7px;padding:8px 13px;background:var(--bg3);border-bottom:1px solid var(--border-soft)}
+.shot .url{flex:1;font-family:var(--mono);font-size:10.5px;color:var(--faint);background:var(--bg1);
+  border:1px solid var(--border-soft);border-radius:5px;padding:2px 9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.shot .body{padding:14px;font-size:11px;min-height:172px}
+.shot .cap{padding:11px 14px;border-top:1px solid var(--border-soft);font-size:12.5px;color:var(--muted)}
+.shot .cap b{color:var(--text);font-family:var(--mono);font-size:12px}
+/* mini kanban */
+.mini-kan{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.mini-kan .col h6{font-family:var(--mono);font-size:9.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px}
+.mini-card{background:var(--bg1);border:1px solid var(--border-soft);border-radius:6px;padding:6px 8px;margin-bottom:6px;
+  font-family:var(--mono);font-size:9.5px;color:var(--muted);line-height:1.5}
+.mini-card .st{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px}
+.s-g{background:var(--green)}.s-c{background:var(--cyan)}.s-a{background:var(--amber)}.s-r{background:var(--red)}
+/* mini facts table */
+.mini-tbl{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:9.5px}
+.mini-tbl td{padding:5px 6px;border-bottom:1px solid var(--border-soft);color:var(--muted);white-space:nowrap}
+.mini-tbl .e{color:var(--text)}
+.pill-s{font-size:8.5px;padding:1px 6px;border-radius:999px;font-weight:600}
+.pf{background:rgba(34,197,94,.13);color:var(--green)}
+.pa{background:rgba(245,176,65,.13);color:var(--amber)}
+/* mini coord */
+.mini-coord .row{display:flex;align-items:center;gap:8px;padding:5px 4px;border-bottom:1px solid var(--border-soft);
+  font-family:var(--mono);font-size:9.5px;color:var(--muted)}
+.mini-coord .led{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 6px rgba(34,197,94,.8)}
+.mini-coord .warn{color:var(--amber)}
+/* mini receipt */
+.mini-rcpt{font-family:var(--mono);font-size:10px;line-height:1.9;color:var(--muted)}
+.mini-rcpt .k{color:var(--faint)} .mini-rcpt .ok{color:var(--green);font-weight:700}
+.mini-rcpt .sha{color:var(--cyan);word-break:break-all}
+
+/* ---- DIAGRAMS ---- */
+.diagram{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:26px;margin-top:26px;overflow-x:auto}
+.diagram svg{width:100%;min-width:640px;height:auto;display:block}
+.dg-box{fill:var(--bg1);stroke:var(--border);rx:9}
+.dg-label{font-family:var(--mono);font-size:12.5px;font-weight:600;fill:var(--text)}
+.dg-sub{font-family:var(--mono);font-size:10px;fill:var(--muted)}
+.dg-tag{font-family:var(--mono);font-size:10px;font-weight:700}
+.dg-line{stroke:var(--faint);stroke-width:1.3;fill:none}
+.dg-line-g{stroke:var(--green);stroke-width:1.3;fill:none}
+.dg-line-a{stroke:var(--amber);stroke-width:1.3;fill:none;stroke-dasharray:5 4}
+
+/* ---- COMPARISON ---- */
+.cmp-wrap{overflow-x:auto;margin-top:26px;border:1px solid var(--border);border-radius:var(--radius)}
+table.cmp{width:100%;border-collapse:collapse;font-size:13.5px;min-width:680px}
+.cmp th,.cmp td{padding:12px 16px;text-align:left;border-bottom:1px solid var(--border-soft)}
+.cmp thead th{font-family:var(--mono);font-size:12px;color:var(--muted);background:var(--bg3);font-weight:600}
+.cmp thead th.us{color:var(--green)}
+.cmp tbody tr:hover{background:rgba(56,189,248,.03)}
+.cmp td.us{background:rgba(34,197,94,.05)}
+.cmp .feat{color:var(--text);font-weight:500}
+.cmp .feat small{display:block;font-weight:400;color:var(--faint);font-size:11.5px;margin-top:1px}
+.yes{color:var(--green);font-weight:700;font-family:var(--mono)}
+.no{color:var(--faint);font-family:var(--mono)}
+.part{color:var(--amber);font-family:var(--mono);font-size:12.5px}
+
+/* ---- TOOL CHIPS ---- */
+.toolgroups{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:14px;margin-top:26px}
+.tg{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:18px}
+.tg h4{font-size:13px;margin-bottom:11px;display:flex;align-items:center;gap:8px}
+.tg h4 .sw{width:9px;height:9px;border-radius:3px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{font-family:var(--mono);font-size:11px;color:var(--muted);background:var(--bg1);
+  border:1px solid var(--border-soft);border-radius:6px;padding:3px 9px}
+
+/* ---- COMMUNITY / FOOTER ---- */
+.cta-row{display:flex;gap:12px;flex-wrap:wrap;margin-top:26px}
+.btn{display:inline-flex;align-items:center;gap:9px;font-family:var(--mono);font-size:14px;font-weight:600;
+  border-radius:9px;padding:11px 20px;cursor:pointer;transition:background .2s,border-color .2s,color .2s;border:1px solid transparent}
+.btn svg{width:16px;height:16px}
+.btn-p{background:var(--green);color:#06130A}
+.btn-p:hover{background:#3BDA74;text-decoration:none}
+.btn-s{background:transparent;color:var(--text);border-color:var(--border)}
+.btn-s:hover{border-color:var(--faint);text-decoration:none}
+.starhist{margin-top:26px;border:1px dashed var(--border);border-radius:var(--radius);padding:22px;text-align:center;color:var(--faint);font-family:var(--mono);font-size:12px}
+footer.rm{margin-top:70px;padding-top:26px;border-top:1px solid var(--border);display:flex;justify-content:space-between;
+  gap:14px;flex-wrap:wrap;font-size:13px;color:var(--faint)}
+footer.rm .lic b{color:var(--muted)}
+
+/* ============ LIGHT THEME ============ */
+body.light{
+  --bg0:#F4F7FB; --bg1:#FFFFFF; --bg2:#F7FAFD; --bg3:#EDF2F9;
+  --border:#D8E1ED; --border-soft:#E6ECF5;
+  --text:#101A2C; --muted:#46546E; --faint:#8A97AC;
+  --green:#15803D; --cyan:#0369A1; --amber:#92610C; --red:#C73E3E;
+  --note:#6D3FB8;
+}
+body.light .toolbar{background:rgba(244,247,251,.92)}
+body.light .note{background:rgba(109,63,184,.06);border-color:rgba(109,63,184,.45);color:#4C2E84}
+body.light .note b{color:#3A2168}
+body.light .note::before{color:#fff}
+body.light .btn-p{color:#fff}
+body.light .btn-p:hover{background:#16A34A}
+body.light .pill-s.pf{background:rgba(21,128,61,.12)}
+body.light .pill-s.pa{background:rgba(146,97,12,.12)}
+/* dark-always islands: video, terminal, 3D — keep their text dark-tuned */
+body.light .video .term .c{color:#E8EEF7}
+body.light .video .term{color:#92A6C3}
+body.light .video .term .p,body.light .video .term .ok{color:#22C55E}
+body.light .video .vlabel{color:#8FA3BF}
+body.light .termwrap{background:#0B1322;border-color:#223152}
+body.light .termbar{background:#141E33;border-bottom-color:#1B2740}
+body.light .termbar .tt{color:#5E7290}
+body.light .termbody{color:#C7D4E8}
+body.light .termbody .p,body.light .termbody .ok{color:#22C55E}
+body.light .termbody .out{color:#92A6C3}
+body.light .termbody .bad{color:#F26D6D}
+body.light .termbody .hl{color:#F5B041}
+/* recolor inline-fill SVG accents for light-mode contrast */
+body.light svg [fill="#22C55E"]{fill:#15803D}
+body.light svg [fill="#38BDF8"]{fill:#0369A1}
+body.light svg [fill="#F5B041"]{fill:#92610C}
+body.light svg [fill="#92A6C3"]{fill:#46546E}
+body.light svg [fill="#5E7290"]{fill:#8A97AC}
+body.light svg [fill="#F26D6D"]{fill:#C73E3E}
+body.light svg [stroke="#22C55E"]{stroke:#15803D}
+body.light svg [stroke="#92A6C3"]{stroke:#46546E}
+body.light .gh-pill svg{stroke:#46546E}
+
+/* ---- HERO LOGO IMG ---- */
+.glyph-img{width:76px;height:76px;object-fit:contain;display:block}
+
+/* ---- 3D CHAIN ---- */
+.three-wrap{position:relative;margin-top:16px;border:1px solid #223152;border-radius:var(--radius);overflow:hidden;
+  background:radial-gradient(ellipse at 50% -10%,rgba(34,197,94,.1),transparent 60%),#0B1322}
+.three-wrap canvas{display:block;width:100%;height:360px;cursor:grab;touch-action:none}
+.three-wrap canvas:active{cursor:grabbing}
+.three-hud{position:absolute;left:14px;bottom:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+  font-family:var(--mono);font-size:11.5px;color:#8FA3BF;background:rgba(10,15,26,.78);
+  border:1px solid #223152;border-radius:7px;padding:6px 12px}
+.three-hud button{font-family:var(--mono);font-size:11px;font-weight:600;color:#22C55E;background:transparent;
+  border:1px solid #22C55E;border-radius:5px;padding:2px 10px;cursor:pointer;transition:background .2s,color .2s}
+.three-hud button:hover{background:#22C55E;color:#06130A}
+.chain-state{position:absolute;top:12px;left:14px;font-family:var(--mono);font-size:11.5px;font-weight:600;
+  color:#22C55E;background:rgba(10,15,26,.78);border:1px solid #223152;padding:4px 11px;border-radius:6px}
+
+/* ---- CAPABILITY MATRIX ---- */
+.cmp tr.grp td{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+  padding:9px 16px;background:var(--bg3)}
+.g-green{color:var(--green)} .g-cyan{color:var(--cyan)} .g-amber{color:var(--amber)} .g-faint{color:var(--muted)}
+.rcx-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin-top:18px}
+.tg p{font-size:13.5px;color:var(--muted);line-height:1.6}
+.tg p code{font-size:12px;color:var(--text);background:var(--bg1);padding:1px 6px;border-radius:4px;border:1px solid var(--border-soft)}
+
+/* ---- EU AI ACT ---- */
+.act-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:26px}
+.act{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:20px;transition:border-color .25s}
+.act:hover{border-color:var(--faint)}
+.act .art{display:inline-block;font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.08em;
+  color:var(--amber);border:1px solid rgba(245,176,65,.45);background:rgba(245,176,65,.08);border-radius:5px;
+  padding:2px 8px;margin-bottom:10px}
+.act .art.alt{color:var(--cyan);border-color:rgba(56,189,248,.45);background:rgba(56,189,248,.08)}
+.act h3{font-size:14.5px;margin-bottom:7px}
+.act p{font-size:13px;color:var(--muted);line-height:1.6}
+.act p code{font-size:11.5px;color:var(--text);background:var(--bg1);padding:1px 5px;border-radius:4px;border:1px solid var(--border-soft)}
+.act-banner{margin-top:18px;border:1px dashed var(--border);border-radius:10px;padding:15px 18px;font-size:13px;color:var(--muted);line-height:1.65}
+.act-banner b{color:var(--text)}
+body.light .act .art{background:rgba(146,97,12,.08);border-color:rgba(146,97,12,.4)}
+body.light .act .art.alt{background:rgba(3,105,161,.07);border-color:rgba(3,105,161,.4)}
+
+/* ---- CORECRUX FLOW / LANES / AMR ---- */
+.flow{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:10px;align-items:stretch;margin-top:26px}
+@media(max-width:860px){.flow{grid-template-columns:1fr}.flow .fa{transform:rotate(90deg);justify-self:center}}
+.fstep{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:18px}
+.fstep .fk{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;margin-bottom:9px}
+.fstep h3{font-size:14.5px;margin-bottom:6px}
+.fstep p{font-size:13px;color:var(--muted);line-height:1.6}
+.fstep p code{font-size:11.5px;color:var(--text);background:var(--bg1);padding:1px 5px;border-radius:4px;border:1px solid var(--border-soft)}
+.fa{display:flex;align-items:center;color:var(--faint)}
+.lanes{margin-top:26px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:22px}
+.lanes h4{font-size:14px;margin-bottom:4px}
+.lanes .lsub{font-size:12.5px;color:var(--faint);margin-bottom:12px}
+.lane{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--border-soft)}
+.lane:last-child{border-bottom:none}
+.lane .ln{font-family:var(--mono);font-size:12.5px;font-weight:600;min-width:150px}
+.lane .ld{flex:1;min-width:220px;font-size:13px;color:var(--muted)}
+.lt{font-family:var(--mono);font-size:10px;font-weight:600;border:1px solid;border-radius:4px;padding:1px 8px;white-space:nowrap}
+.lt-g{color:var(--green);border-color:rgba(34,197,94,.45)}
+.lt-c{color:var(--cyan);border-color:rgba(56,189,248,.45)}
+.lt-a{color:var(--amber);border-color:rgba(245,176,65,.45)}
+.lt-f{color:var(--faint);border-color:var(--border)}
+
+/* ---- PASSPORTS ---- */
+.pass-grid{display:grid;grid-template-columns:minmax(300px,430px) 1fr;gap:22px;margin-top:26px;align-items:start}
+@media(max-width:900px){.pass-grid{grid-template-columns:1fr}}
+.passport{background:linear-gradient(160deg,var(--bg3),var(--bg2));border:1px solid var(--border);border-radius:14px;
+  padding:22px;position:relative;overflow:hidden}
+.passport::after{content:"";position:absolute;right:-44px;top:-44px;width:180px;height:180px;border-radius:50%;
+  border:1.5px solid rgba(34,197,94,.18);pointer-events:none}
+.passport .ph{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.passport .ph .t{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.2em;color:var(--muted)}
+.passport .ph img{width:30px;height:30px;object-fit:contain}
+.passport .pid{font-family:var(--mono);font-size:17px;font-weight:700;color:var(--text);margin-bottom:14px}
+.passport .pid .tier{font-size:10.5px;font-weight:700;color:var(--green);border:1px solid rgba(34,197,94,.5);
+  border-radius:999px;padding:2px 10px;vertical-align:3px;margin-left:9px}
+.prow{display:flex;justify-content:space-between;gap:10px;font-family:var(--mono);font-size:11.5px;
+  padding:6px 0;border-bottom:1px solid var(--border-soft)}
+.prow .k{color:var(--faint)} .prow .v{color:var(--text)}
+.pcaps{display:flex;flex-wrap:wrap;gap:5px;margin-top:13px}
+.pfoot{margin-top:15px;font-family:var(--mono);font-size:10px;color:var(--faint);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.steps{display:flex;flex-direction:column;gap:12px}
+.step{display:flex;gap:14px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px}
+.step .n{flex:none;width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-family:var(--mono);font-size:12px;font-weight:700;color:#06130A;background:var(--green)}
+.step h3{font-size:14.5px;margin-bottom:4px}
+.step p{font-size:13px;color:var(--muted);line-height:1.6}
+.step p code{font-size:11.5px;background:var(--bg1);border:1px solid var(--border-soft);padding:1px 5px;border-radius:4px;color:var(--text)}
+body.light .step .n{color:#fff}
+body.light .passport::after{border-color:rgba(21,128,61,.2)}
+
+/* ---- ENGRAMS ---- */
+.engram-card{background:#0B1322;border:1px solid #223152;border-radius:var(--radius);padding:20px 22px;margin-top:26px;
+  font-family:var(--mono);font-size:12.5px;line-height:2;color:#92A6C3;overflow-x:auto;white-space:pre}
+.engram-card .ek{color:#5E7290}
+.engram-card .ev{color:#E8EEF7}
+.engram-card .eg{color:#22C55E}
+.engram-card .ea{color:#F5B041}
+.engram-card .ec{color:#38BDF8}
+
+/* reveal */
+.rv{opacity:0;transform:translateY(14px);transition:opacity .55s ease,transform .55s ease}
+.rv.in{opacity:1;transform:none}
+@media (prefers-reduced-motion: reduce){.rv{opacity:1;transform:none}}
+</style>
+</head>
+<body class="notes">
+
+<!-- ════════ MOCKUP TOOLBAR — not part of the proposed README ════════ -->
+<div class="toolbar">
+  <span class="tag">MOCKUP</span>
+  <span class="ttl">Crux daemon · README redesign · 2026-06-12 — rendered as it would appear on GitHub</span>
+  <span class="spacer"></span>
+  <button id="themeBtn" aria-pressed="false">theme: dark</button>
+  <button id="noteBtn" class="on" aria-pressed="true">design notes: ON</button>
+</div>
+
+<!-- ════════ GITHUB FRAME ════════ -->
+<div class="gh-head">
+  <div class="gh-head-inner">
+    <div class="gh-repo">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#92A6C3" stroke-width="1.6" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+      <span class="org">CueCrux&nbsp;/</span><span class="name">Crux</span>
+      <span class="pub">Public</span>
+    </div>
+    <div class="gh-actions">
+      <span class="gh-pill"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" aria-hidden="true"><path d="M12 17.3 6.2 20.4l1.1-6.5L2.6 9.2l6.5-.9L12 2.4l2.9 5.9 6.5.9-4.7 4.7 1.1 6.5z"/></svg>Star<span class="cnt">—</span></span>
+      <span class="gh-pill"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M6 8.5v2A3 3 0 0 0 9 13.5h6a3 3 0 0 0 3-3v-2M12 15.5v-2"/></svg>Fork<span class="cnt">—</span></span>
+    </div>
+  </div>
+</div>
+
+<div class="readme">
+  <div class="readme-frame">
+    <div class="readme-tab">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V4a2 2 0 0 0-2-2H6.5A2.5 2.5 0 0 0 4 4.5v15z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H20v-5"/></svg>
+      README.md
+    </div>
+    <div class="readme-inner">
+
+      <!-- ════════ 1 · HERO ════════ -->
+      <section class="hero" id="hero">
+        <div class="logo">
+          <img id="logoImg" class="glyph-img" src="assets/CueCrux-Arc-Loop-White.png" alt="CueCrux arc-loop mark">
+          <h1>CRU<span class="x">X</span></h1>
+        </div>
+        <p class="tagline">Memory your agents can <em>prove</em>.</p>
+        <p class="sub">Crux is a local-first memory daemon for AI agents — fact storage with deterministic
+        freshness decay, BM25 + graph retrieval under hard token budgets, and an Ed25519 receipt for every
+        write. One binary. No API keys. Nothing leaves your machine.</p>
+
+        <nav class="navlinks" aria-label="README navigation">
+          <a href="#quickstart">Quickstart</a><span>·</span>
+          <a href="#console">Console</a><span>·</span>
+          <a href="#how">How it works</a><span>·</span>
+          <a href="#compare">Capabilities</a><span>·</span>
+          <a href="#euaiact">EU AI Act</a><span>·</span>
+          <a href="#passports">Passports</a><span>·</span>
+          <a href="#community">Community</a>
+        </nav>
+
+        <div class="badges" aria-label="status badges">
+          <span class="badge"><span class="l">CI</span><span class="r r-green">passing</span></span>
+          <span class="badge"><span class="l">coverage</span><span class="r r-green">82%</span></span>
+          <span class="badge"><span class="l">release</span><span class="r r-text">v0.3.1</span></span>
+          <span class="badge"><span class="l">MSRV</span><span class="r r-text">1.88.0</span></span>
+          <span class="badge"><span class="l">MCP</span><span class="r r-cyan">native</span></span>
+          <span class="badge"><span class="l">LongMemEval</span><span class="r r-green">~91% strict · CoreCrux</span></span>
+          <span class="badge"><span class="l">licence</span><span class="r r-amber">CCL-1.0 → Apache-2.0</span></span>
+        </div>
+
+        <aside class="note" data-n="1"><b>Hero rationale.</b> Pattern from uv/Supabase: one-line category + differentiator, nav-link bar instead of a TOC, and a curated 6-badge row (all metric-bearing — research says 4–7 beats a badge wall). The tagline leads with <b>receipts</b> because neither mem0 nor Hindsight can say "prove": it's the uncontested word. "No API keys" directly attacks both competitors' quickstart (each needs an OpenAI key before anything works). Ship the wordmark as an SVG with <b>dark/light <code>&lt;picture&gt;</code> variants</b> — neither competitor does this.</aside>
+      </section>
+
+      <!-- ════════ 2 · VIDEO ════════ -->
+      <section class="rv" id="demo" style="margin-top:44px">
+        <div class="video" role="img" aria-label="Placeholder for 40-second demo video: store a fact, query it under a token budget, tamper with the store, watch verification fail">
+          <span class="vlabel">demo.mp4 · 0:40 · uploaded directly to README (GitHub renders inline)</span>
+          <div class="play"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4l14 8-14 8z"/></svg></div>
+          <div class="term">
+            <div><span class="p">$</span> <span class="c">docker compose up -d</span> <span class="ok">✓ crux ready on :14800</span></div>
+            <div><span class="p">$</span> <span class="c">crux fact store "prod deploys gate on receipt verify"</span> <span class="ok">✓ receipt e7a1…9c44</span></div>
+            <div><span class="p">$</span> <span class="c">crux query "deploy policy" --token-budget 500</span> <span class="ok">✓ 1 hit · 312 tokens</span></div>
+          </div>
+        </div>
+        <p class="caption">Script for the real asset: record with charm/VHS (reproducible, crisp) — store → query → tamper → <b>verification fails loudly</b>. 40s, no audio needed.</p>
+        <aside class="note" data-n="2"><b>The first-scroll weapon.</b> mem0 has <b>zero</b> motion media — text and one static PNG. GitHub renders uploaded ≤10MB mp4 inline, and almost nobody uses it (research: even PostHog still links a YouTube thumbnail). A 40s tamper-detection demo is the single highest-leverage asset on this page: it demonstrates the moat instead of claiming it. <span class="verify">ASSET NEEDED</span> record via VHS script so it's re-recordable every release.</aside>
+      </section>
+
+      <!-- ════════ 3 · QUICKSTART ════════ -->
+      <section class="rv" id="quickstart">
+        <p class="kicker k-green">Quickstart</p>
+        <h2 class="sec">Running in 60 seconds</h2>
+        <p class="lede">No signup. No OpenAI key. BM25 retrieval works out of the box — embeddings are optional and pluggable (Ollama, vLLM, TEI, llama.cpp) when you want them.</p>
+
+        <div style="margin-top:24px">
+          <div class="tabs" role="tablist" aria-label="install methods">
+            <button class="tab on" role="tab" aria-selected="true" data-pane="p-docker">docker</button>
+            <button class="tab" role="tab" aria-selected="false" data-pane="p-bin">binary</button>
+            <button class="tab" role="tab" aria-selected="false" data-pane="p-src">source</button>
+            <button class="tab" role="tab" aria-selected="false" data-pane="p-mcp">claude code / cursor</button>
+          </div>
+
+          <div class="pane on" id="p-docker">
+            <div class="codebox">
+              <button class="copy" aria-label="copy docker quickstart"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>copy</button>
+<pre><span class="cm"># one command — daemon on :14800, MCP on :14801, console embedded</span>
+<span class="pr">$</span> docker compose up -d
+<span class="pr">$</span> open http://127.0.0.1:14800/console   <span class="cm"># one-time setup wizard</span></pre>
+            </div>
+          </div>
+          <div class="pane" id="p-bin">
+            <div class="codebox">
+              <button class="copy" aria-label="copy binary quickstart"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>copy</button>
+<pre><span class="pr">$</span> curl -sSL https://github.com/CueCrux/Crux/releases/latest/download/crux-linux-amd64 -o crux
+<span class="pr">$</span> chmod +x crux
+<span class="pr">$</span> CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./crux
+<span class="cm"># releases are cosign-signed with SBOMs — see docs/verify-release.md</span></pre>
+            </div>
+          </div>
+          <div class="pane" id="p-src">
+            <div class="codebox">
+              <button class="copy" aria-label="copy source quickstart"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>copy</button>
+<pre><span class="pr">$</span> git clone https://github.com/CueCrux/Crux.git && cd Crux
+<span class="pr">$</span> cargo build --release          <span class="cm"># Rust ≥ 1.88, protobuf-compiler</span>
+<span class="pr">$</span> CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./target/release/corecruxd</pre>
+            </div>
+          </div>
+          <div class="pane" id="p-mcp">
+            <div class="codebox">
+              <button class="copy" aria-label="copy MCP config"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>copy</button>
+<pre><span class="cm">// .mcp.json — works with Claude Code, Claude Desktop, Cursor, any MCP client</span>
+{
+  <span class="st">"crux"</span>: { <span class="st">"url"</span>: <span class="st">"http://127.0.0.1:14801/mcp"</span> }
+}</pre>
+            </div>
+          </div>
+          <div class="qs-meta">
+            <span><b>0</b> API keys required</span>
+            <span><b>1</b> binary (+ ctl & wizard)</span>
+            <span><b>:14800</b> HTTP · <b>:14801</b> MCP</span>
+            <span><b>/data</b> is yours — append-only, portable</span>
+          </div>
+        </div>
+        <aside class="note" data-n="3"><b>Install before features</b> — uv, Bun, Dify and n8n all do this; the scroller is already sold, don't make them hunt. mem0's 4-command CLI quickstart is the bar; Docker-one-liner + embedded console wizard matches it while Hindsight requires Docker <b>plus</b> an OpenAI key. The tab pattern keeps alternates discoverable without burying the fast path. In real markdown this becomes 4 collapsed <code>&lt;details&gt;</code> blocks or sequential headed code fences.</aside>
+      </section>
+
+      <!-- ════════ 4 · PILLARS ════════ -->
+      <section class="rv" id="pillars">
+        <p class="kicker k-cyan">What you get</p>
+        <h2 class="sec">Three planes, one daemon</h2>
+        <div class="pillars">
+          <div class="pillar pm">
+            <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><ellipse cx="12" cy="5.5" rx="8" ry="3"/><path d="M4 5.5v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/><path d="M4 11.5v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg></div>
+            <h3>Memory that ages honestly</h3>
+            <p>Facts carry confidence, provenance and a <b>freshness horizon</b>. A deterministic decay engine
+            (volatile 24h · medium 35d · stable 365d) downranks stale claims instead of serving them as truth —
+            reversible via <code>memory_reverify</code>. Scoped forget for GDPR Art.&nbsp;17.</p>
+          </div>
+          <div class="pillar pr">
+            <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></div>
+            <h3>Retrieval on a token budget</h3>
+            <p><code>token_budget</code> is a required parameter, not a hope. BM25 + graph fusion returns metadata
+            and token counts first, content only inside budget — <b>60–80% fewer tokens</b> than naive top-K
+            context stuffing. Dense lanes optional, never required.</p>
+          </div>
+          <div class="pillar pc">
+            <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M12 2 4 5.5v5.6c0 4.9 3.4 9 8 10.4 4.6-1.4 8-5.5 8-10.4V5.5L12 2z"/><path d="m8.8 12 2.2 2.2 4.2-4.5"/></svg></div>
+            <h3>Receipts, not vibes</h3>
+            <p>Every write emits a <b>CROWN receipt</b>: Ed25519-signed, BLAKE3-chained, independently verifiable
+            offline with <code>corecruxctl verify-store</code>. Tamper with one byte and the chain fails loudly.
+            C2PA output attestation for EU AI Act Art.&nbsp;50.</p>
+          </div>
+        </div>
+        <aside class="note" data-n="4"><b>Three pillars, color-coded</b> (green/cyan/amber) — the same colors thread through the charts, diagrams and console shots below, so the README teaches its own legend. Quantified benefit bullets per the uv pattern ("60–80% fewer tokens", "24h/35d/365d") rather than a feature laundry list. Receipts get the strongest verbs; it's the column neither competitor can copy quickly.</aside>
+      </section>
+
+      <!-- ════════ 5 · VERIFY DEMO ════════ -->
+      <section class="rv" id="verify">
+        <p class="kicker k-amber">Trust, then verify</p>
+        <h2 class="sec">Don't believe this README</h2>
+        <p class="lede">Every claim about integrity is checkable on your own machine. This is the actual demo from the repo — flip one byte in the store and watch the chain break.</p>
+        <div class="termwrap">
+          <div class="termbar"><span class="dot d1"></span><span class="dot d2"></span><span class="dot d3"></span><span class="tt">corecruxctl — receipt verification</span></div>
+          <div class="termbody"><span class="p">$</span> corecruxctl verify-store --data-dir ./data
+<span class="out">  segments: 12 · receipts: 5,323 · chain: BLAKE3 · sig: Ed25519</span>
+<span class="ok">  ✓ VALID — every receipt verified, chain intact (412 ms)</span>
+
+<span class="p">$</span> printf '\x00' | dd of=./data/shards/seg-000007.crux bs=1 seek=1337 conv=notrunc
+<span class="p">$</span> corecruxctl verify-store --data-dir ./data
+<span class="bad">  ✗ TAMPER DETECTED — segment 7, frame 214: hash mismatch</span>
+<span class="out">  expected <span class="hl">b3:9f41…c2ae</span> · got <span class="hl">b3:0000…71d9</span> · chain broken at receipt 3,108</span></div>
+        </div>
+
+        <div class="three-wrap" id="threeWrap">
+          <canvas id="chain3d" aria-label="Interactive 3D model of the CROWN receipt chain. Drag to orbit. Click any block to simulate tampering with it — that block and every receipt downstream turns red because the BLAKE3 hash chain breaks."></canvas>
+          <span class="chain-state" id="chainState">chain: VALID — 14/14 receipts verify</span>
+          <div class="three-hud">
+            <span>drag to orbit · click a block to tamper it</span>
+            <button id="resetChain">reset chain</button>
+          </div>
+        </div>
+        <p class="caption">The receipt chain, literally. Each block is a CROWN receipt; each link is a BLAKE3 hash of the previous block. Break one, break everything after it.</p>
+
+        <aside class="note" data-n="5"><b>The signature move.</b> Hindsight's strongest play is third-party benchmark validation; Crux goes one better — <b>self-service verification</b>. "Don't believe this README" is a headline no memory competitor can write. This section exists in the current README ("Verify it yourself") but is buried below naming tables; promoted here to position #5, right after the pillars that make the claim. Terminal output shown is illustrative — <span class="verify">VERIFY</span> exact CLI output format against current <code>corecruxctl</code> before publishing. <b>The 3D chain below</b> is the interactive twin of the terminal demo: click a block, watch everything downstream fail. GitHub can't run three.js inside a README — so for the repo, export this as a 6-second looping mp4/GIF and link "play with it live" to the docs site / console, where the real interactive version lives. That's a "modern UI" element literally nobody in this category has.</aside>
+      </section>
+
+      <!-- ════════ 6 · TOKEN ECONOMICS ════════ -->
+      <section class="rv" id="tokens">
+        <p class="kicker k-cyan">Token economics</p>
+        <h2 class="sec">Your context window is the scarce resource</h2>
+        <p class="lede">Most memory layers measure recall. Crux also measures what recall <em>costs</em>: every retrieval call takes a hard <code>token_budget</code>, and the daemon trims to fit — metadata first, content only when it earns its tokens.</p>
+
+        <div class="chart-grid">
+          <div class="chart">
+            <h4>Tokens returned per query — naive top-K vs budgeted</h4>
+            <p class="sub">Illustrative shape · replace with a TokenBurn A/B run before publish</p>
+            <svg viewBox="0 0 440 190" role="img" aria-label="Bar chart comparing tokens returned: naive top-K about 18,400 tokens; token budget 4000 returns about 3,900; budget 2000 about 1,940; budget 500 about 480 tokens">
+              <g>
+                <text x="0" y="26" class="bar-label">top-K (no budget)</text>
+                <rect x="150" y="14" width="270" height="18" rx="4" fill="#F26D6D" opacity="0.85"/>
+                <text x="284" y="27" class="bar-val" fill="#0A0F1A" text-anchor="middle">~18,400 tk</text>
+                <text x="0" y="68" class="bar-label">budget = 4000</text>
+                <rect x="150" y="56" width="58" height="18" rx="4" fill="#38BDF8"/>
+                <text x="216" y="69" class="bar-val" fill="#38BDF8">3,900</text>
+                <text x="0" y="110" class="bar-label">budget = 2000</text>
+                <rect x="150" y="98" width="29" height="18" rx="4" fill="#38BDF8"/>
+                <text x="187" y="111" class="bar-val" fill="#38BDF8">1,940</text>
+                <text x="0" y="152" class="bar-label">budget = 500</text>
+                <rect x="150" y="140" width="8" height="18" rx="4" fill="#22C55E"/>
+                <text x="166" y="153" class="bar-val" fill="#22C55E">480</text>
+              </g>
+              <text x="150" y="182" class="bar-label" fill="#5E7290">budgets are enforced server-side — the model never sees the overflow</text>
+            </svg>
+          </div>
+          <div class="chart">
+            <h4>Retrieval latency — BM25 single segment (Criterion)</h4>
+            <p class="sub">Measured · docs/benchmarks.md · numbers in text, not locked in an image</p>
+            <svg viewBox="0 0 440 190" role="img" aria-label="Bar chart of BM25 median search latency: 100 docs 583 nanoseconds, 1000 docs 2.62 microseconds, 10000 docs 23.1 microseconds">
+              <g>
+                <text x="0" y="36" class="bar-label">100 docs</text>
+                <rect x="110" y="24" width="14" height="18" rx="4" fill="#22C55E"/>
+                <text x="132" y="37" class="bar-val" fill="#22C55E">583 ns</text>
+                <text x="0" y="88" class="bar-label">1,000 docs</text>
+                <rect x="110" y="76" width="52" height="18" rx="4" fill="#22C55E"/>
+                <text x="170" y="89" class="bar-val" fill="#22C55E">2.62 µs</text>
+                <text x="0" y="140" class="bar-label">10,000 docs</text>
+                <rect x="110" y="128" width="240" height="18" rx="4" fill="#38BDF8"/>
+                <text x="358" y="141" class="bar-val" fill="#38BDF8">23.1 µs</text>
+              </g>
+              <text x="110" y="182" class="bar-label" fill="#5E7290">microseconds, not milliseconds — memory lookups shouldn't need a GPU</text>
+            </svg>
+          </div>
+        </div>
+
+        <div class="stat-row">
+          <div class="stat"><div class="v" style="color:var(--green)">91.2<small>%</small></div><div class="l">LongMemEval — strict scoring, via <a href="#corecrux">CoreCrux lanes</a></div></div>
+          <div class="stat"><div class="v" style="color:var(--green)">25,422<small> ev/s</small></div><div class="l">append throughput (perf gate, p95 9.98 ms)</div></div>
+          <div class="stat"><div class="v" style="color:var(--cyan)">21,328<small> rd/s</small></div><div class="l">replay reads (p95 0.52 ms)</div></div>
+          <div class="stat"><div class="v" style="color:var(--amber)">60–80<small>%</small></div><div class="l">token reduction vs top-K context stuffing</div></div>
+          <div class="stat"><div class="v" style="color:var(--text)">82<small>%</small></div><div class="l">test coverage, enforced in CI</div></div>
+        </div>
+        <p class="fn">All performance numbers are reproducible from <code>docs/benchmarks.md</code> with pinned baselines — regression-gated in CI.</p>
+        <aside class="note" data-n="6"><b>Exploiting Hindsight's weakness directly:</b> their benchmark numbers live <b>only inside a chart image</b> — unquotable, invisible to search and LLMs. Crux puts every number in selectable text <i>and</i> charts, with the file path to reproduce. The left chart is labelled illustrative on purpose: <span class="verify">VERIFY</span> run TokenBurn A/B (AuditCrux/benchmarks/tokenburn) to replace with measured tokens-per-query before publish; the right chart + stat tiles are real repo numbers. Ship both charts as dark/light SVG via <code>&lt;picture&gt;</code> — the uv trick nobody in this category uses. The LongMemEval tile says <b>strict</b> scoring deliberately — mem0 self-reports 94.8 on its own harness; "91% strict, reproducible harness" beats "95% loose" on credibility. <span class="verify">VERIFY</span> exact LME number + run_id + corpus from the score tracker before publish, and footnote the scoring methodology.</aside>
+      </section>
+
+      <!-- ════════ 7 · CONSOLE ════════ -->
+      <section class="rv" id="console">
+        <p class="kicker k-green">Console</p>
+        <h2 class="sec">A cockpit, embedded — not a cloud dashboard</h2>
+        <p class="lede">The console ships inside the daemon. Facts, work board, live agent coordination and receipt verification — all served from <code>:14800/console</code>, all local.</p>
+
+        <div class="bento">
+          <div class="shot">
+            <div class="bbar"><span class="dot d1"></span><span class="dot d2"></span><span class="dot d3"></span><span class="url">crux.local:14800/console#/work</span></div>
+            <div class="body"><div class="mini-kan">
+              <div class="col"><h6>planned</h6>
+                <div class="mini-card"><span class="st s-c"></span>execplan: console-gap-closure</div>
+                <div class="mini-card"><span class="st s-c"></span>execplan: supply-chain-attest</div></div>
+              <div class="col"><h6>in progress</h6>
+                <div class="mini-card"><span class="st s-a"></span>execplan: turboquant · M2</div>
+                <div class="mini-card"><span class="st s-a"></span>execplan: wikicrux · M1</div></div>
+              <div class="col"><h6>done</h6>
+                <div class="mini-card"><span class="st s-g"></span>tenant-isolation · M6 ✓</div>
+                <div class="mini-card"><span class="st s-g"></span>coord-plane · shipped</div></div>
+            </div></div>
+            <div class="cap"><b>#/work</b> — kanban merged with a live projection over your ExecPlan files; agents resume where the last session stopped.</div>
+          </div>
+
+          <div class="shot">
+            <div class="bbar"><span class="dot d1"></span><span class="dot d2"></span><span class="dot d3"></span><span class="url">crux.local:14800/console#/facts</span></div>
+            <div class="body"><table class="mini-tbl">
+              <tr><td class="e">execplan:turboquant</td><td>decision:m0-representation</td><td><span class="pill-s pf">fresh</span></td></tr>
+              <tr><td class="e">bench:lme-s-r1</td><td>{metric, corpus, sha…}</td><td><span class="pill-s pf">fresh</span></td></tr>
+              <tr><td class="e">incident:2026-06-04</td><td>{symptom, cause, fix_sha}</td><td><span class="pill-s pa">aging · 35d</span></td></tr>
+              <tr><td class="e">design:config-audit</td><td>audit:verification</td><td><span class="pill-s pf">fresh</span></td></tr>
+              <tr><td class="e">deploy:gpu-1</td><td>state snapshot</td><td><span class="pill-s pa">re-verify</span></td></tr>
+            </table></div>
+            <div class="cap"><b>#/facts</b> — 5,000+ typed facts with per-fact freshness horizons; stale metrics decay instead of lying.</div>
+          </div>
+
+          <div class="shot">
+            <div class="bbar"><span class="dot d1"></span><span class="dot d2"></span><span class="dot d3"></span><span class="url">crux.local:14800/console#/coord</span></div>
+            <div class="body"><div class="mini-coord">
+              <div class="row"><span class="led"></span>a960e545 · claude-work · execplan:turboquant · M2 · <i>tree://crates/corecrux-index</i></div>
+              <div class="row"><span class="led"></span>03824212 · claude-personal · execplan:wikicrux · M1</div>
+              <div class="row"><span class="led"></span>8ccb7bf6 · cursor-agent · docs sweep</div>
+              <div class="row warn">⚠ overlap — two sessions announce paths under crates/corecrux-index/</div>
+              <div class="row"><span class="led" style="background:var(--faint);box-shadow:none"></span>2028bba0 · idle 14m · lease expiring</div>
+            </div></div>
+            <div class="cap"><b>#/coord</b> — live board of concurrent agent sessions: focus, path leases, collision warnings. Advisory by default.</div>
+          </div>
+
+          <div class="shot">
+            <div class="bbar"><span class="dot d1"></span><span class="dot d2"></span><span class="dot d3"></span><span class="url">crux.local:14800/console#/receipts</span></div>
+            <div class="body"><div class="mini-rcpt">
+              <div><span class="k">receipt</span>  crown:e7a1f30b…9c44</div>
+              <div><span class="k">actor</span>    passport ce:4e6c4e2a:local · tier=local</div>
+              <div><span class="k">action</span>   store_fact · execplan:turboquant · gate:M2</div>
+              <div><span class="k">chain</span>    <span class="sha">b3:9f41…c2ae → b3:77d0…18b2</span></div>
+              <div><span class="k">verify</span>   <span class="ok">✓ VALID</span> · Ed25519 · offline-checkable</div>
+            </div></div>
+            <div class="cap"><b>#/receipts</b> — pick any write, see who did it, under which capability, and verify the signature in-browser.</div>
+          </div>
+        </div>
+        <aside class="note" data-n="7"><b>Bento screenshot grid</b> (Supabase/n8n pattern: show outcome, not architecture). These four mini-mockups stand in for real screenshots — <span class="verify">ASSET NEEDED</span> capture the four real panels at 2x with seeded demo data, neutral background, dark + light variants. The panels chosen are the four no competitor has: work board, freshness-aware facts, live multi-agent coordination, receipt verify. mem0/Hindsight dashboards are hosted-cloud only; "embedded, local, yours" is the caption-level differentiator.</aside>
+      </section>
+
+      <!-- ════════ 8 · HOW IT WORKS ════════ -->
+      <section class="rv" id="how">
+        <p class="kicker k-cyan">How it works</p>
+        <h2 class="sec">One daemon, three planes, an append-only spine</h2>
+        <div class="diagram">
+          <svg viewBox="0 0 920 400" role="img" aria-label="Architecture diagram: agents connect over MCP port 14801 and HTTP port 14800 to the Crux daemon, which contains memory, retrieval and receipts planes over an append-only segment store; the embedded console reads from the same daemon">
+            <!-- agents -->
+            <rect x="20" y="24" width="180" height="76" class="dg-box"/>
+            <text x="110" y="49" text-anchor="middle" class="dg-label">Claude Code</text>
+            <text x="110" y="67" text-anchor="middle" class="dg-sub">or Cursor · Desktop</text>
+            <text x="110" y="82" text-anchor="middle" class="dg-sub">· any MCP client</text>
+            <rect x="20" y="130" width="180" height="64" class="dg-box"/>
+            <text x="110" y="157" text-anchor="middle" class="dg-label">Your services</text>
+            <text x="110" y="176" text-anchor="middle" class="dg-sub">HTTP / gRPC SDKs</text>
+            <rect x="20" y="230" width="180" height="64" class="dg-box"/>
+            <text x="110" y="257" text-anchor="middle" class="dg-label">Operator</text>
+            <text x="110" y="276" text-anchor="middle" class="dg-sub">browser → embedded console</text>
+            <!-- arrows in -->
+            <path d="M200 62 H 262" class="dg-line" marker-end="url(#arr)"/>
+            <text x="231" y="54" text-anchor="middle" class="dg-tag" fill="#38BDF8">:14801 MCP</text>
+            <path d="M200 162 H 262" class="dg-line" marker-end="url(#arr)"/>
+            <text x="231" y="154" text-anchor="middle" class="dg-tag" fill="#92A6C3">:14800 HTTP</text>
+            <path d="M200 262 H 262" class="dg-line" marker-end="url(#arr)"/>
+            <!-- daemon -->
+            <rect x="262" y="16" width="404" height="296" rx="12" fill="none" stroke="#22C55E" stroke-width="1.4"/>
+            <text x="282" y="44" class="dg-label" fill="#22C55E">corecruxd — one binary</text>
+            <text x="282" y="62" class="dg-sub">auth: off · dev_scopes · jwt — passports + capability ladder</text>
+            <rect x="282" y="78" width="364" height="50" class="dg-box"/>
+            <text x="300" y="100" class="dg-label" fill="#22C55E">memory plane</text>
+            <text x="300" y="117" class="dg-sub">facts · sessions · handoffs · freshness decay · scoped forget</text>
+            <rect x="282" y="138" width="364" height="50" class="dg-box"/>
+            <text x="300" y="160" class="dg-label" fill="#38BDF8">retrieval plane</text>
+            <text x="300" y="177" class="dg-sub">BM25 + graph fusion · token budgets · optional dense lanes</text>
+            <rect x="282" y="198" width="364" height="50" class="dg-box"/>
+            <text x="300" y="220" class="dg-label" fill="#F5B041">receipts plane</text>
+            <text x="300" y="237" class="dg-sub">CROWN: Ed25519 + BLAKE3 chain · C2PA output attestation</text>
+            <rect x="282" y="258" width="364" height="40" class="dg-box"/>
+            <text x="300" y="283" class="dg-sub">append-only segment store (.crux) · sealed segments · .ccxi indexes · projections</text>
+            <!-- right side -->
+            <rect x="710" y="78" width="190" height="64" class="dg-box"/>
+            <text x="805" y="105" text-anchor="middle" class="dg-label">/data</text>
+            <text x="805" y="124" text-anchor="middle" class="dg-sub">portable · verifiable offline</text>
+            <path d="M666 110 H 710" class="dg-line-g" marker-end="url(#arrg)"/>
+            <rect x="710" y="192" width="190" height="76" class="dg-box"/>
+            <text x="805" y="217" text-anchor="middle" class="dg-label">corecruxctl</text>
+            <text x="805" y="235" text-anchor="middle" class="dg-sub">verify-store · replay</text>
+            <text x="805" y="250" text-anchor="middle" class="dg-sub">receipts · offline</text>
+            <path d="M666 228 H 710" class="dg-line-a" marker-end="url(#arra)"/>
+            <text x="805" y="290" text-anchor="middle" class="dg-sub" fill="#5E7290">no cloud in this diagram — that's the point</text>
+            <defs>
+              <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8z" fill="#5E7290"/></marker>
+              <marker id="arrg" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8z" fill="#22C55E"/></marker>
+              <marker id="arra" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8z" fill="#F5B041"/></marker>
+            </defs>
+          </svg>
+        </div>
+        <aside class="note" data-n="8"><b>Architecture earns trust</b> (Supabase pattern; mem0's biggest gap — they have no internals story at all). The annotation "no cloud in this diagram — that's the point" turns an architecture figure into a sales line. In the real README this ships as a mermaid block (diff-able, native rendering — none of the 8 top projects surveyed use mermaid yet) <i>plus</i> this SVG as the pretty <code>&lt;picture&gt;</code> version.</aside>
+      </section>
+
+      <!-- ════════ 9 · PASSPORTS ════════ -->
+      <section class="rv" id="passports">
+        <p class="kicker k-green">Identity</p>
+        <h2 class="sec">Passports — identity agents earn</h2>
+        <p class="lede">API keys say <em>something with this string called us</em>. A passport says <em>this agent,
+        at this trust tier, with these grants, did this</em> — and the receipts prove it. Identity isn't configured
+        once; it's earned, write by verified write.</p>
+
+        <div class="pass-grid">
+          <div class="passport" role="img" aria-label="Example Crux agent passport: holder ce 4e6c local, tier local, group work, sponsor none, 76 verified receipts, with capability grants listed as chips">
+            <div class="ph"><span class="t">CRUX · AGENT PASSPORT</span><img id="passLogo" src="assets/CueCrux-Arc-Loop-White.png" alt=""></div>
+            <div class="pid">ce:4e6c…:local<span class="tier">TIER · LOCAL</span></div>
+            <div class="prow"><span class="k">group</span><span class="v">work</span></div>
+            <div class="prow"><span class="k">sponsor</span><span class="v">none</span></div>
+            <div class="prow"><span class="k">verified receipts</span><span class="v" style="color:var(--green)">76</span></div>
+            <div class="prow"><span class="k">session binding</span><span class="v">1bbe…beb4 · ttl 3600s</span></div>
+            <div class="pcaps">
+              <span class="chip">memory.readable_editable</span><span class="chip">output.verifiable_receipts</span>
+              <span class="chip">trace.source_linked</span><span class="chip">approval.risk_tiered</span>
+              <span class="chip">memory.scoped_forget</span><span class="chip">identity.continuity</span>
+              <span class="chip">+ 8 more</span>
+            </div>
+            <div class="pfoot"><span>signed · Ed25519</span><span>verify offline, like everything else</span></div>
+          </div>
+
+          <div class="steps">
+            <div class="step"><span class="n">1</span><div><h3>Bind</h3>
+              <p>The session handshake binds every connection to a passport. There are no anonymous writes —
+              unattributed calls get operator-tagged, never silently allowed.</p></div></div>
+            <div class="step"><span class="n">2</span><div><h3>Carry</h3>
+              <p>Every tool call rides the passport. RCX mints short-lived capability tokens against it —
+              scoped to tools, tenant and tier — so access expires instead of leaking.</p></div></div>
+            <div class="step"><span class="n">3</span><div><h3>Earn</h3>
+              <p>Verified receipts accrue to the passport as reputation. Tiers climb the capability ladder and
+              unlock more autonomy; a sponsor can vouch an agent up faster. Trust is a ledger, not a checkbox.</p></div></div>
+            <div class="step"><span class="n">4</span><div><h3>Answer</h3>
+              <p>Any receipt, any time later, resolves back to the passport that produced it: who acted, at what
+              tier, under which grants. That's the question auditors actually ask — pre-answered.</p></div></div>
+          </div>
+        </div>
+        <aside class="note" data-n="9"><b>The passport card is real data shape</b> — id format, tier, group, sponsor,
+        receipts count, session TTL and the capability strings all come from the live daemon's boot surface, lightly
+        redacted. Rendering identity as a physical passport document makes the abstract ("capability-scoped agent
+        identity") instantly legible — and it's a natural hero asset for social cards later. Earn-your-tier is the
+        emotional hook: nobody else treats agent trust as accruable. Moved ahead of the platform hub so "every arrow
+        carries a passport" and the RCX Environment node land with the concept already defined.
+        <span class="verify">VERIFY</span> the public names of the tier ladder rungs and the sponsorship semantics
+        before publish.</aside>
+      </section>
+
+      <!-- ════════ 10 · PLATFORM ════════ -->
+      <section class="rv" id="platform">
+        <p class="kicker k-green">Bigger picture</p>
+        <h2 class="sec">Standalone by design, platform by choice</h2>
+        <p class="lede">Crux is complete on its own. When you want more, it's the memory spine of the CueCrux platform — same receipts, same passports, every hop attributable.</p>
+        <div class="diagram">
+          <svg viewBox="0 0 920 332" role="img" aria-label="Hub diagram: Crux daemon at the center; CruxEngine provides frontier ingest, extraction and opt-in hosted sync; CoreCrux is the GPU database spine with AMR; ScoreCrux provides benchmarks and evals; RCX Environment exposes MCP as RCX graph tooling where every call rides a passport; a planning repo of your own provides ExecPlans and the work board">
+            <rect x="350" y="115" width="220" height="100" rx="14" fill="none" stroke="#22C55E" stroke-width="1.6"/>
+            <text x="460" y="153" text-anchor="middle" class="dg-label" style="font-size:17px" fill="#22C55E">Crux</text>
+            <text x="460" y="175" text-anchor="middle" class="dg-sub">memory · retrieval · receipts</text>
+            <text x="460" y="192" text-anchor="middle" class="dg-sub">runs on your machine</text>
+
+            <rect x="20" y="34" width="260" height="76" class="dg-box"/>
+            <text x="150" y="60" text-anchor="middle" class="dg-label">CruxEngine</text>
+            <text x="150" y="79" text-anchor="middle" class="dg-sub">frontier ingest · extraction</text>
+            <text x="150" y="94" text-anchor="middle" class="dg-sub">opt-in hosted sync &amp; RAG</text>
+            <path d="M280 88 C 322 96 334 110 354 122" class="dg-line-a" marker-end="url(#arra2)"/>
+            <text x="298" y="80" class="dg-tag" fill="#F5B041">sync: off by default</text>
+
+            <rect x="20" y="220" width="260" height="76" class="dg-box"/>
+            <text x="150" y="246" text-anchor="middle" class="dg-label">CoreCrux</text>
+            <text x="150" y="265" text-anchor="middle" class="dg-sub">GPU database spine</text>
+            <text x="150" y="280" text-anchor="middle" class="dg-sub">dense · graph · event lanes + AMR</text>
+            <path d="M280 242 C 322 234 334 220 354 208" class="dg-line"/>
+
+            <rect x="640" y="34" width="260" height="76" class="dg-box"/>
+            <text x="770" y="60" text-anchor="middle" class="dg-label">ScoreCrux</text>
+            <text x="770" y="79" text-anchor="middle" class="dg-sub">benchmarks · evals</text>
+            <text x="770" y="94" text-anchor="middle" class="dg-sub">score tracking</text>
+            <path d="M640 88 C 598 96 586 110 566 122" class="dg-line"/>
+
+            <rect x="640" y="127" width="260" height="76" class="dg-box"/>
+            <text x="770" y="153" text-anchor="middle" class="dg-label">RCX Environment</text>
+            <text x="770" y="172" text-anchor="middle" class="dg-sub">MCP → RCX graph tooling</text>
+            <text x="770" y="187" text-anchor="middle" class="dg-sub">every call rides a passport</text>
+            <path d="M570 165 H 632" class="dg-line-g" marker-end="url(#arrg2)"/>
+
+            <rect x="640" y="220" width="260" height="76" class="dg-box"/>
+            <text x="770" y="246" text-anchor="middle" class="dg-label">Planning repo</text>
+            <text x="770" y="265" text-anchor="middle" class="dg-sub">ExecPlans · work board</text>
+            <text x="770" y="280" text-anchor="middle" class="dg-sub">bring your own</text>
+            <path d="M640 242 C 598 234 586 220 566 208" class="dg-line"/>
+
+            <text x="460" y="322" text-anchor="middle" class="dg-sub" fill="#5E7290">every arrow carries a passport + receipt — the audit trail crosses the whole platform</text>
+            <defs>
+              <marker id="arra2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8z" fill="#F5B041"/></marker>
+              <marker id="arrg2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8z" fill="#22C55E"/></marker>
+            </defs>
+          </svg>
+        </div>
+        <aside class="note" data-n="10"><b>Platform link without platform lock-in.</b> Standalone-first headline, hub diagram second, sync arrow explicitly labelled <b>"off by default"</b> (matches the actual local-first data-residency posture). Names updated per operator: VaultCrux + Engine → <b>CruxEngine</b> (merge in flight), AuditCrux → <b>ScoreCrux</b>, PlanCrux generalised to <b>"bring your own planning repo"</b> (PlanCrux is operator-specific), and <b>CoreCrux</b> added as the GPU database spine. Caveat for the real README: this repo is CPU-only by design — CoreCrux GPU lanes live in the separate dataplane distribution, so phrase it as a companion product, not a feature of this binary. <span class="verify">VERIFY</span> public naming (CruxEngine / ScoreCrux) is announced before the README ships with them.</aside>
+      </section>
+
+      <!-- ════════ 11 · CORECRUX + AMR ════════ -->
+      <section class="rv" id="corecrux">
+        <p class="kicker k-cyan">CoreCrux + AMR</p>
+        <h2 class="sec">Frontier-grade recall. Zero custody.</h2>
+        <p class="lede">That 91.2% LongMemEval (strict) isn't the bare daemon flexing — it's <b>CoreCrux</b>, the
+        GPU retrieval substrate behind the paid tier. You can pay for frontier-model ingest and extraction over
+        your corpus. You cannot pay us to hold your data — there is no such product.</p>
+
+        <div class="flow">
+          <div class="fstep"><div class="fk" style="color:var(--green)">1 · your store</div>
+            <h3>Everything starts local</h3>
+            <p>Facts, documents and sessions live in your <code>/data</code> — append-only, receipt-chained, portable. This never changes.</p></div>
+          <div class="fa" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+          <div class="fstep"><div class="fk" style="color:var(--cyan)">2 · frontier ingest <span style="opacity:.7">(paid)</span></div>
+            <h3>Enriched in flight</h3>
+            <p>Frontier models extract entities, events, traits and summaries from your corpus — processed, never parked. Every hop carries a receipt.</p></div>
+          <div class="fa" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+          <div class="fstep"><div class="fk" style="color:var(--amber)">3 · returned & deleted</div>
+            <h3>Results come home</h3>
+            <p>Enrichment lands back in <i>your</i> store. Process, return, delete — we hold nothing, before or after.</p></div>
+        </div>
+        <p class="caption">Local-first isn't a pricing tier — it's the architecture. The paid lane rents compute, not custody.</p>
+
+        <div class="lanes">
+          <h4>The lane stack — the parts we can show</h4>
+          <p class="lsub">Each lane is a different way of remembering. You don't pick one per query; AMR does.</p>
+          <div class="lane"><span class="ln" style="color:var(--green)">lexical</span><span class="ld">exact words, BM25-class — always on, microseconds on CPU</span><span class="lt lt-g">free · local</span></div>
+          <div class="lane"><span class="ln" style="color:var(--cyan)">dense</span><span class="ld">semantic similarity — meaning, not spelling</span><span class="lt lt-c">BYOE / managed</span></div>
+          <div class="lane"><span class="ln" style="color:var(--cyan)">graph / topology</span><span class="ld">entity links walked at query time — facts that know each other</span><span class="lt lt-c">CoreCrux</span></div>
+          <div class="lane"><span class="ln" style="color:var(--cyan)">entity & trait</span><span class="ld">who/what-keyed recall — ask about a person, get their dossier</span><span class="lt lt-c">CoreCrux</span></div>
+          <div class="lane"><span class="ln" style="color:var(--cyan)">event</span><span class="ld">time-anchored recall — what happened, when, in what order</span><span class="lt lt-c">CoreCrux</span></div>
+          <div class="lane"><span class="ln" style="color:var(--cyan)">navigational</span><span class="ld">summary-tree descent for corpora too large to scan</span><span class="lt lt-c">CoreCrux</span></div>
+          <div class="lane"><span class="ln" style="color:var(--amber)">verbatim pointers</span><span class="ld">exact-quote recall without duplicating content into the index</span><span class="lt lt-a">free · local</span></div>
+          <div class="lane"><span class="ln" style="color:var(--faint)">+ several more</span><span class="ld" style="color:var(--faint)">the ones we don't blog about</span><span class="lt lt-f">IP</span></div>
+        </div>
+
+        <div class="rcx-grid">
+          <div class="tg">
+            <h4><span class="sw" style="background:var(--cyan)"></span>AMR — Adaptive Manifest Routing</h4>
+            <p>Every query is different, so AMR reads the lane manifest and routes each one automatically — fusing
+            the lanes that earn their tokens, skipping the ones that don't, learning from per-request outcomes.
+            No knobs, no lane config, no prompt engineering. <b>Automatic, and opt-in</b>: it switches on with
+            a subscription and stays off otherwise — like everything else in Crux.</p>
+          </div>
+          <div class="tg">
+            <h4><span class="sw" style="background:var(--green)"></span>Without a subscription</h4>
+            <p>You still run the full local daemon: lexical lane, graph fusion, token budgets, receipts. That's
+            not a demo — it's the same engine the paid lanes plug into. Upgrade when your corpus outgrows it,
+            not because a feature gate told you to.</p>
+          </div>
+        </div>
+        <aside class="note" data-n="11"><b>Corpus identity & custody honesty.</b> The LongMemEval number is now attributed
+        to CoreCrux everywhere it appears (hero badge, stat tile, here) — misattributing substrate results to the bare daemon
+        is exactly the benchmark sin this README criticises in others. Lane descriptions are deliberately capability-level
+        with zero mechanism names: upsell the silhouette, keep the IP — and the "ones we don't blog about" row turns the
+        omission itself into a flex. <span class="verify">VERIFY ×3</span> before publish: (1) the exact AMR subscription
+        / opt-in wording (expansion confirmed by operator: Adaptive <i>Manifest</i> Routing); (2) routing lifts are
+        per-corpus in internal evals — claim adaptivity, not a universal accuracy lift; (3) "process, return, delete —
+        we hold nothing" must be true end-to-end — close the known sync-path gaps before this sentence ships.</aside>
+      </section>
+
+      <!-- ════════ 12 · CAPABILITY MATRIX ════════ -->
+      <section class="rv" id="compare">
+        <p class="kicker k-amber">What's in the box</p>
+        <h2 class="sec">The capability matrix</h2>
+        <p class="lede">No tiers of vapor. The daemon you <code>docker compose up</code> today ships the full memory, retrieval, trust, identity and coordination planes. BYOE and hosted add reach — they don't unlock the basics.</p>
+        <div class="cmp-wrap">
+          <table class="cmp">
+            <thead><tr>
+              <th>Capability</th><th class="us">Local daemon</th><th>BYOE / self-host</th><th>Hosted</th>
+            </tr></thead>
+            <tbody>
+              <tr class="grp"><td colspan="4" class="g-green">Memory plane</td></tr>
+              <tr><td class="feat">Typed facts with provenance & confidence</td>
+                <td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+              <tr><td class="feat">Freshness decay + <code>memory_reverify</code><small>deterministic horizons: volatile 24h · medium 35d · stable 365d</small></td>
+                <td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+              <tr><td class="feat">Scoped forget + dry-run<small>GDPR Art. 17, auditable deletion</small></td>
+                <td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+              <tr class="grp"><td colspan="4" class="g-cyan">Retrieval plane</td></tr>
+              <tr><td class="feat">BM25 + graph fusion under hard token budgets</td>
+                <td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+              <tr><td class="feat">Dense / embedding lanes<small>Ollama · vLLM · TEI · llama.cpp</small></td>
+                <td class="us no">—</td><td class="yes">✓ bring your own</td><td class="yes">✓ managed</td></tr>
+              <tr><td class="feat">GPU lanes<small>CoreCrux dataplane distribution</small></td>
+                <td class="us no">—</td><td class="no">—</td><td class="yes">✓</td></tr>
+              <tr class="grp"><td colspan="4" class="g-amber">Trust plane</td></tr>
+              <tr><td class="feat">CROWN receipts on every write<small>Ed25519-signed, BLAKE3-chained</small></td>
+                <td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+              <tr><td class="feat">Offline verification<small><code>corecruxctl verify-store</code> — no daemon, no network</small></td>
+                <td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+              <tr><td class="feat">C2PA output attestation<small>EU AI Act Art. 50</small></td>
+                <td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+              <tr class="grp"><td colspan="4" class="g-faint">Identity & access — the RCX protocol</td></tr>
+              <tr><td class="feat">Agent passports + capability ladder<small>per-agent identity, tiered tool grants</small></td>
+                <td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+              <tr><td class="feat">RCX capability tokens<small>short-lived scoped JWTs, verifiable like everything else</small></td>
+                <td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+              <tr><td class="feat">Auth ladder<small>off → dev_scopes → JWT (HS256 / JWKS)</small></td>
+                <td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+              <tr class="grp"><td colspan="4" class="g-green">Coordination & observability</td></tr>
+              <tr><td class="feat">Live multi-session board + path leases</td>
+                <td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+              <tr><td class="feat">Cross-session handoffs</td>
+                <td class="us yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+              <tr><td class="feat">Agent action tracing<small>typed trace nodes + reasoning refs — never raw chain-of-thought</small></td>
+                <td class="us part">✓ opt-in</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+              <tr><td class="feat">Encrypted sync between machines</td>
+                <td class="us no">— (local only)</td><td class="yes">✓ self-host</td><td class="yes">✓ opt-in</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="rcx-grid">
+          <div class="tg">
+            <h4><span class="sw" style="background:var(--faint)"></span>The RCX protocol</h4>
+            <p>Every request resolves a principal: which agent, holding which passport, at which tier. The
+            <code>crux-router</code> policy layer walks the capability ladder and allows or denies per tool —
+            and the decision itself lands in the receipt, so "who could do what, when" is replayable forever.</p>
+          </div>
+          <div class="tg">
+            <h4><span class="sw" style="background:var(--amber)"></span>Capability tokens</h4>
+            <p>Access rides short-lived signed JWTs (<code>rcx-capability-token</code>) minted against a passport
+            and scoped to tools, tenant and tier — not a god-key in an env var. Tokens verify offline with the
+            same machinery as receipts. Lose one, it expires; mint another.</p>
+          </div>
+        </div>
+
+        <p class="fn">Tier columns mirror the daemon's existing local / BYOE / hosted split. Agent action tracing is gated behind <code>CORECRUXD_OBSERVE</code> (off by default — your traces are opt-in, like everything else).</p>
+        <aside class="note" data-n="12"><b>Reframed per operator decision:</b> sell the offer, not the feud — the competitor table is gone (research findings preserved in earlier notes). A tier matrix converts better here because every row is a ✓ in column one: the story is "the free local daemon is the whole product." RCX gets named because protocols are stickier than features. Grounding: <code>crux-router</code> and <code>rcx-capability-token</code> are real crates; action tracing is built (<code>crux-observe-api</code>: typed trace nodes, <code>ReasoningRef</code> as <code>fact:</code>/<code>blob:</code> pointers — raw chain-of-thought capture is <i>deliberately excluded</i> by policy R1 / AI Act Art. 10). <span class="verify">VERIFY</span> RCX wording against the crate docs, and the exact local/BYOE/hosted cell split against the current README's What-You-Get matrix before publish.</aside>
+      </section>
+
+      <!-- ════════ 13 · EU AI ACT ════════ -->
+      <section class="rv" id="euaiact">
+        <p class="kicker k-amber">EU AI Act</p>
+        <h2 class="sec">Compliance you can replay, not just claim</h2>
+        <p class="lede">The Act asks for risk management, logging, transparency and human oversight. Most stacks
+        will answer with PDFs. Crux answers with receipts — the compliance machinery is the same machinery
+        everything else runs on, not a bolt-on audit module.</p>
+
+        <div class="act-grid">
+          <div class="act"><span class="art">ART. 9 · RISK MANAGEMENT</span>
+            <h3>Risk classes on every plan</h3>
+            <p>Work items and plans declare <code>low | medium | high</code> risk. High-risk transitions demand a
+            passport-attributed human gate before they run — and the gate itself becomes a signed fact.</p></div>
+          <div class="act"><span class="art">ART. 10 · DATA GOVERNANCE</span>
+            <h3>PII is born private</h3>
+            <p>Private facts never leave the machine; reserved prefixes are private at ingest; observation capture
+            redacts; reasoning is stored as references — never raw chain-of-thought.</p></div>
+          <div class="act"><span class="art">ART. 12 · RECORD-KEEPING</span>
+            <h3>Logging you can't forget to do</h3>
+            <p>Every state mutation emits a signed CROWN receipt and a timeline row automatically. Retention:
+            90-day receipts, indefinite decision facts. The trail is hash-chained — gaps are detectable, not deniable.</p></div>
+          <div class="act"><span class="art">ART. 13 · TRANSPARENCY</span>
+            <h3>Every write has an author</h3>
+            <p>Agent passports attribute every mutation. AI-authored commits and PRs carry agent attribution;
+            end-user-facing output carries an AI-involvement notice.</p></div>
+          <div class="act"><span class="art">ART. 14 · HUMAN OVERSIGHT</span>
+            <h3>Gates that don't rubber-stamp</h3>
+            <p>Destructive actions need explicit, current consent. Gated transitions can't auto-approve past a
+            timeout. "Approved something similar yesterday" is not consent — by design, not by policy doc.</p></div>
+          <div class="act"><span class="art">ART. 15 · ACCURACY & ROBUSTNESS</span>
+            <h3>Look before the action</h3>
+            <p>Consequence enrichment predicts affected resources before high-risk operations. Benchmarks carry
+            corpus identity + commit_sha. The tamper-evident store catches silent drift.</p></div>
+          <div class="act"><span class="art">ART. 50 · OUTPUT TRANSPARENCY</span>
+            <h3>Machine-checkable provenance</h3>
+            <p>C2PA Content Credentials attached to agent outputs via <code>output_attest</code> — "an AI made this"
+            as a verifiable claim, not a footer nobody reads.</p></div>
+          <div class="act"><span class="art alt">GDPR ART. 17 · ERASURE</span>
+            <h3>The right to be forgotten, with receipts</h3>
+            <p><code>memory_forget</code> with a dry-run: see exactly what would be deleted, then delete it auditably.
+            Erasure that proves itself happened.</p></div>
+        </div>
+
+        <div class="act-banner"><b>Ship this banner too:</b> these are engineering controls aligned with the Act —
+        not a legal opinion, and conformity assessment for your deployment remains your responsibility. What Crux
+        gives you is the evidence layer: when the auditor asks, you answer with receipts, not screenshots.</div>
+
+        <aside class="note" data-n="13"><b>Nobody else in this category says a word about regulation</b> — neither
+        mem0 nor Hindsight mentions the AI Act, GDPR, or auditability once. For EU buyers this section alone can win
+        the eval, and it's unfakeable without receipts-grade infrastructure. The honesty banner is deliberate:
+        "aligned engineering controls, not legal advice" converts better with compliance officers than overclaiming.
+        Every card maps to real machinery (receipts, passports, gates, consequence enrichment, C2PA, scoped forget).
+        <span class="verify">VERIFY</span> which controls ship in the public daemon distro vs the wider platform
+        (gated transitions + enrichment ride the work/actions planes), and have counsel skim the final wording.</aside>
+      </section>
+
+      <!-- ════════ 14 · MCP SURFACE ════════ -->
+      <section class="rv" id="mcp">
+        <p class="kicker k-cyan">For agents</p>
+        <h2 class="sec">Built MCP-first, not MCP-wrapped</h2>
+        <p class="lede">The tool surface is designed for agents under context pressure: every retrieval tool takes a token budget, every mutation emits a receipt, identity rides a passport.</p>
+        <div class="toolgroups">
+          <div class="tg"><h4><span class="sw" style="background:var(--cyan)"></span>Retrieval</h4>
+            <div class="chips"><span class="chip">query</span><span class="chip">query_scan</span><span class="chip">query_expand</span><span class="chip">get_bootstrap</span></div></div>
+          <div class="tg"><h4><span class="sw" style="background:var(--green)"></span>Memory</h4>
+            <div class="chips"><span class="chip">store_fact</span><span class="chip">query_facts</span><span class="chip">memory_view</span><span class="chip">memory_pin</span><span class="chip">memory_freshness</span><span class="chip">memory_forget</span><span class="chip">memory_reverify</span></div></div>
+          <div class="tg"><h4><span class="sw" style="background:var(--amber)"></span>Receipts & identity</h4>
+            <div class="chips"><span class="chip">receipt_verify</span><span class="chip">output_attest</span><span class="chip">get_agent_identity</span><span class="chip">resolve_principal</span><span class="chip">autonomy_contract</span></div></div>
+          <div class="tg"><h4><span class="sw" style="background:var(--faint)"></span>Sessions & coordination</h4>
+            <div class="chips"><span class="chip">save_session</span><span class="chip">get_session</span><span class="chip">create_handoff</span><span class="chip">accept_handoff</span><span class="chip">coord_status</span><span class="chip">coord_announce</span></div></div>
+          <div class="tg"><h4><span class="sw" style="background:var(--red)"></span>Observability — the agent loop, logged</h4>
+            <div class="chips"><span class="chip">list_observations</span><span class="chip">get_observation</span><span class="chip">verify_observation</span><span class="chip">record_decision</span><span class="chip">audit_export</span><span class="chip">token_usage</span></div></div>
+        </div>
+        <aside class="note" data-n="14"><b>Grouped chips, not a 60-item list</b> — the current repo exposes far more tools (decisions, constraints, artefacts, observability…), but a README shows the silhouette, then links the full reference (<code>docs/mcp-system-prompt.md</code>). The four groups mirror the pillar colors again. "MCP-first, not MCP-wrapped" positions against both competitors, whose MCP support is an integration afterthought.</aside>
+      </section>
+
+      <!-- ════════ 15 · ENGRAMS ════════ -->
+      <section class="rv" id="engrams">
+        <p class="kicker k-cyan">Instinct</p>
+        <h2 class="sec">Engrams — memory that compiles</h2>
+        <p class="lede">Retrieval answers questions. Engrams skip them. When the same lesson keeps getting re-learned
+        from raw history, it's distilled into a named, versioned procedure that arrives <em>before</em> the agent
+        acts — instinct, not search.</p>
+
+        <div class="engram-card" aria-label="Example engram manifest: deploy-preflight version 3, matched on intent deploy to prod, distilled from 14 sessions and 6 incidents with source hashes attached, requires tier trusted or above, enabled"><span class="ek">engram</span>     <span class="ev">deploy-preflight</span> <span class="ec">@v3</span>
+<span class="ek">intent</span>     <span class="ev">"deploy to prod"</span>
+<span class="ek">distilled</span>  <span class="ev">14 sessions · 6 incidents</span>  <span class="ek">(source-chunk hashes attached)</span>
+<span class="ek">requires</span>   <span class="ea">tier ≥ trusted</span>
+<span class="ek">content</span>    <span class="ev">9-step preflight procedure</span>
+<span class="ek">status</span>     <span class="eg">enabled · policy-hashed · verifiable</span></div>
+
+        <div class="pillars" style="margin-top:18px">
+          <div class="pillar pm">
+            <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M6 3v12a3 3 0 0 0 3 3h9"/><path d="m14 14 4 4-4 4"/><path d="M6 3 3 6m3-3 3 3"/></svg></div>
+            <h3>Distilled, not retrieved</h3>
+            <p>Repeated patterns in your history compile into procedures with provenance — every engram carries
+            hashes back to the source chunks it was learned from. You can always audit <i>why</i> the instinct exists.</p>
+          </div>
+          <div class="pillar pr">
+            <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M13 2 4.5 12.5H11L9.5 22 19 10.5h-6.5L13 2z"/></svg></div>
+            <h3>Resolved by intent</h3>
+            <p>At session start the agent declares what it's about to do; matching engrams arrive before the first
+            action. No query needed — the pre-execution contract delivers the playbook up front.</p>
+          </div>
+          <div class="pillar pc">
+            <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></div>
+            <h3>Gated by tier</h3>
+            <p>Each engram carries capability-class bounds — an agent only inherits procedures its passport tier
+            allows. And it's local-first: a built-in catalog plus fact-backed overlays serve the same contract
+            with zero cloud dependency.</p>
+          </div>
+        </div>
+        <aside class="note" data-n="15"><b>Grounded in the real module</b> — <code>corecruxd/src/http/engrams.rs</code>:
+        versioned <code>LocalEngram</code> records with <code>intent_bucket</code>, <code>query_pattern</code>,
+        <code>capability_class_min/max</code>, <code>source_chunk_hashes</code> and <code>policy_hash</code>; the local
+        daemon serves a built-in catalog + <code>__engram__::*</code> fact overlays on the same contract as the hosted
+        plane. Passports are introduced back in §9, so the tier-gating here already has its referent.
+        The manifest figures ("14 sessions · 6 incidents") are illustrative. <span class="verify">VERIFY</span> the
+        public name of the hosted engram plane, and note the admin API currently disables one-way (no re-enable
+        endpoint) — fix before marketing engram lifecycle management.</aside>
+      </section>
+
+      <!-- ════════ 16 · COMMUNITY ════════ -->
+      <section class="rv" id="community">
+        <p class="kicker k-green">Community</p>
+        <h2 class="sec">Built in the open, verified in the open</h2>
+        <div class="cta-row">
+          <a class="btn btn-p" href="#quickstart"><svg viewBox="0 0 24 24" fill="none" stroke="#06130A" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg>Get started</a>
+          <a class="btn btn-s"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.3 9 9 0 0 1-3.8-.8L3 20l1.1-5A8 8 0 0 1 3.5 11.5 8.4 8.4 0 0 1 12 3.2a8.4 8.4 0 0 1 9 8.3z"/></svg>Discord</a>
+          <a class="btn btn-s"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V4a2 2 0 0 0-2-2H6.5A2.5 2.5 0 0 0 4 4.5v15zM4 19.5A2.5 2.5 0 0 0 6.5 22H20v-5"/></svg>Docs</a>
+          <a class="btn btn-s"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2v4m0 12v4M2 12h4m12 0h4"/><circle cx="12" cy="12" r="6"/></svg>Roadmap</a>
+        </div>
+        <div class="starhist">[ star-history.com chart — live-updating SVG ]&nbsp;&nbsp;+&nbsp;&nbsp;[ contrib.rocks contributor wall ]</div>
+        <aside class="note" data-n="16"><b>Open ground:</b> research found <i>neither</i> competitor has a roadmap link, newsletter, or contributor wall. Cheap wins. Add one personality moment near the footer (PostHog's hedgehog effect) — e.g. the receipt glyph "signing" the README itself with a real verifiable receipt ID. That's the kind of easter egg this product can do <i>literally</i>.</aside>
+
+        <footer class="rm">
+          <div class="lic"><b>Licence:</b> CueCrux Community Licence v1.0 — source-available, each release converts to Apache-2.0 after 3 years. <a>FAQ</a></div>
+          <div class="mono" style="font-size:11.5px">this README signed: <span style="color:var(--amber)">crown:e7a1…9c44</span> · <a>verify it</a></div>
+        </footer>
+      </section>
+
+    </div><!-- /readme-inner -->
+  </div><!-- /readme-frame -->
+</div><!-- /readme -->
+
+<script>
+// theme toggle (persisted) — flips the ENTIRE page incl. GitHub frame; terminal/video/3D stay dark by design
+const themeBtn = document.getElementById('themeBtn');
+const logoImg = document.getElementById('logoImg');
+function applyTheme(light){
+  document.body.classList.toggle('light', light);
+  themeBtn.textContent = 'theme: ' + (light ? 'light' : 'dark');
+  themeBtn.setAttribute('aria-pressed', String(light));
+  const src = light ? 'assets/CueCrux-Arc-Loop.png' : 'assets/CueCrux-Arc-Loop-White.png';
+  logoImg.src = src;
+  const passLogo = document.getElementById('passLogo');
+  if (passLogo) passLogo.src = src;
+}
+applyTheme(localStorage.getItem('crux-mock-theme') === 'light');
+themeBtn.addEventListener('click', () => {
+  const light = !document.body.classList.contains('light');
+  applyTheme(light);
+  localStorage.setItem('crux-mock-theme', light ? 'light' : 'dark');
+});
+// design-notes toggle (persisted)
+const btn = document.getElementById('noteBtn');
+const saved = localStorage.getItem('crux-mock-notes');
+if (saved === 'off') { document.body.classList.remove('notes'); btn.classList.remove('on'); btn.textContent = 'design notes: OFF'; btn.setAttribute('aria-pressed','false'); }
+btn.addEventListener('click', () => {
+  const on = document.body.classList.toggle('notes');
+  btn.classList.toggle('on', on);
+  btn.textContent = 'design notes: ' + (on ? 'ON' : 'OFF');
+  btn.setAttribute('aria-pressed', String(on));
+  localStorage.setItem('crux-mock-notes', on ? 'on' : 'off');
+});
+// quickstart tabs
+document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(x => { x.classList.remove('on'); x.setAttribute('aria-selected','false'); });
+  document.querySelectorAll('.pane').forEach(x => x.classList.remove('on'));
+  t.classList.add('on'); t.setAttribute('aria-selected','true');
+  document.getElementById(t.dataset.pane).classList.add('on');
+}));
+// copy buttons
+document.querySelectorAll('.copy').forEach(c => c.addEventListener('click', () => {
+  const pre = c.parentElement.querySelector('pre');
+  navigator.clipboard?.writeText(pre.innerText).then(() => {
+    const old = c.innerHTML; c.innerHTML = 'copied ✓';
+    setTimeout(() => c.innerHTML = old, 1400);
+  });
+}));
+// scroll reveal (respects prefers-reduced-motion via CSS)
+const io = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } }), { threshold: 0.08 });
+document.querySelectorAll('.rv').forEach(el => io.observe(el));
+</script>
+
+<script type="module">
+// 3D CROWN receipt chain — three.js from CDN; panel hides gracefully if offline / no WebGL
+const wrap = document.getElementById('threeWrap');
+try {
+  const THREE = await import('https://unpkg.com/three@0.160.0/build/three.module.js');
+  const canvas = document.getElementById('chain3d');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(40, 2, 0.1, 100);
+  camera.position.set(0, 1.6, 10.5);
+  camera.lookAt(0, 0, 0);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+  const key = new THREE.DirectionalLight(0xffffff, 1.2); key.position.set(4, 6, 6); scene.add(key);
+  const rim = new THREE.DirectionalLight(0x38bdf8, 0.5); rim.position.set(-6, -2, -4); scene.add(rim);
+
+  const group = new THREE.Group(); scene.add(group);
+  const N = 14, GREEN = 0x22c55e, RED = 0xf26d6d;
+  const blocks = [], links = [];
+  const geo = new THREE.BoxGeometry(0.6, 0.6, 0.6);
+  for (let i = 0; i < N; i++) {
+    const t = i / (N - 1);
+    const mat = new THREE.MeshStandardMaterial({ color: 0x101826, emissive: GREEN, emissiveIntensity: 0.55, metalness: 0.25, roughness: 0.35 });
+    const b = new THREE.Mesh(geo, mat);
+    b.position.set((t - 0.5) * 10, Math.sin(t * Math.PI * 2) * 0.9, Math.cos(t * Math.PI * 2) * 0.9);
+    b.userData.i = i; group.add(b); blocks.push(b);
+  }
+  const up = new THREE.Vector3(0, 1, 0);
+  for (let i = 0; i < N - 1; i++) {
+    const a = blocks[i].position, b = blocks[i + 1].position;
+    const dir = new THREE.Vector3().subVectors(b, a), len = dir.length();
+    const cyl = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.04, 0.04, Math.max(len - 0.6, 0.1), 8),
+      new THREE.MeshStandardMaterial({ color: 0x0b1322, emissive: GREEN, emissiveIntensity: 0.85 }));
+    cyl.position.copy(a).add(dir.clone().multiplyScalar(0.5));
+    cyl.quaternion.setFromUnitVectors(up, dir.normalize());
+    group.add(cyl); links.push(cyl);
+  }
+
+  let tampered = -1;
+  const state = document.getElementById('chainState');
+  const paint = () => {
+    blocks.forEach((b, i) => {
+      const bad = tampered >= 0 && i >= tampered;
+      b.material.emissive.setHex(bad ? RED : GREEN);
+      b.material.emissiveIntensity = bad ? 0.85 : 0.55;
+    });
+    links.forEach((l, i) => l.material.emissive.setHex(tampered >= 0 && i >= tampered ? RED : GREEN));
+    if (tampered < 0) { state.textContent = 'chain: VALID — 14/14 receipts verify'; state.style.color = '#22C55E'; }
+    else { state.textContent = 'chain: BROKEN at block ' + (tampered + 1) + ' — ' + (N - tampered) + ' receipts fail'; state.style.color = '#F26D6D'; }
+  };
+  paint();
+
+  let dragging = false, moved = 0, px = 0, py = 0, rotX = -0.1, rotY = 0.35;
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  canvas.addEventListener('pointerdown', e => { dragging = true; moved = 0; px = e.clientX; py = e.clientY; canvas.setPointerCapture(e.pointerId); });
+  canvas.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const dx = e.clientX - px, dy = e.clientY - py; moved += Math.abs(dx) + Math.abs(dy);
+    rotY += dx * 0.005; rotX = Math.max(-0.9, Math.min(0.9, rotX + dy * 0.004));
+    px = e.clientX; py = e.clientY;
+  });
+  canvas.addEventListener('pointerup', e => {
+    dragging = false;
+    if (moved < 6) {
+      const r = canvas.getBoundingClientRect();
+      const m = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+      const rc = new THREE.Raycaster(); rc.setFromCamera(m, camera);
+      const hit = rc.intersectObjects(blocks)[0];
+      if (hit) { tampered = tampered === hit.object.userData.i ? -1 : hit.object.userData.i; paint(); }
+    }
+  });
+  document.getElementById('resetChain').addEventListener('click', () => { tampered = -1; paint(); });
+
+  const resize = () => {
+    const w = wrap.clientWidth, h = 360;
+    renderer.setSize(w, h, false);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    camera.aspect = w / h; camera.updateProjectionMatrix();
+  };
+  new ResizeObserver(resize).observe(wrap); resize();
+  renderer.setAnimationLoop(() => {
+    if (!dragging && !reduced) rotY += 0.0018;
+    group.rotation.set(rotX, rotY, 0);
+    renderer.render(scene, camera);
+  });
+} catch (err) {
+  wrap.style.display = 'none';
+}
+</script>
+</body>
+</html>
