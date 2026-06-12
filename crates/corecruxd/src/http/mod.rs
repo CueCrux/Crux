@@ -9,6 +9,7 @@ mod admin;
 mod append;
 mod cloud;
 mod console;
+mod context_surface;
 mod coord;
 mod dataplane;
 mod dossier;
@@ -169,6 +170,9 @@ pub struct AppState {
     pub coord_enabled: bool,
     /// Liveness horizon for the coord active view, in seconds.
     pub coord_presence_ttl_secs: u64,
+    /// Provider-agnostic injection-bundle surface (`/v1/context`). Default
+    /// OFF (`CORECRUXD_CONTEXT_SURFACE=1`); when off, routes return 404.
+    pub context_surface_enabled: bool,
     pub integrations_enabled: bool,
     pub integrations_safe_mode: bool,
     pub integrations_allow_executable_helpers: bool,
@@ -545,6 +549,10 @@ pub fn router(state: AppState) -> Router {
         )
         // OpenAPI spec
         .route("/v1/openapi.json", get(self::openapi::openapi_json))
+        // Provider-agnostic injection-bundle surface (context_bundle/v1).
+        // Gated by CORECRUXD_CONTEXT_SURFACE (default OFF → 404).
+        .route("/v1/context", get(self::context_surface::get_context))
+        .route("/v1/context", axum::routing::post(self::context_surface::post_context))
         // Multi-agent coordination plane — presence-joined session board
         // (flag-gated by `CORECRUXD_COORD`; 404 when off).
         .route("/v1/coord/active", get(self::coord::get_coord_active))
