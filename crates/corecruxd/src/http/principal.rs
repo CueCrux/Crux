@@ -39,7 +39,18 @@ pub(super) async fn get_resolve_principal(
     let resolved = if let Some(sid) = query.session_id.as_deref().filter(|s| !s.is_empty()) {
         crate::principal::resolve_by_session(&store, sid)
     } else if let Some(pid) = query.passport_id.as_deref().filter(|s| !s.is_empty()) {
-        crate::principal::resolve_by_passport(&store, pid, None)
+        match crate::principal::resolve_by_passport(&store, pid, None) {
+            // G4b federation fallback (CORECRUXD_IDENTITY_LINKS): an unknown
+            // passport id may be a *linked* remote fingerprint. Resolution
+            // returns the linked local passport capped to memory.read;
+            // unlinked and revoked fingerprints fall through to the same
+            // 404 as before the feature.
+            Err(crate::principal::ResolveError::PassportNotFound(_)) if state.identity_links_enabled => {
+                let entities = state.entity_store.read().await;
+                crate::principal::resolve_by_linked_passport(&store, &entities, pid)
+            }
+            direct => direct,
+        }
     } else if let Some(pid) = ctx.passport_id.as_deref() {
         // "resolve me" — the caller's own bound passport.
         crate::principal::resolve_by_passport(&store, pid, None)

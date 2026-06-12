@@ -46,6 +46,7 @@ corecrux-segment = { path = "../corecrux-segment" }
 corecrux-storage = { path = "../corecrux-storage" }
 corecrux-types = { path = "../corecrux-types" }
 crux-integrations = { path = "../crux-integrations" }
+crux-session = { path = "../crux-session" }
 
 [features]
 default = []

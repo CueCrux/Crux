@@ -432,6 +432,16 @@ pub struct Config {
     // (`crate::http::openai_shim`). Default OFF.
     pub openai_shim_enabled: bool,
 
+    // `.cruxpack` import surface (`POST /v1/memory/import`,
+    // `crate::http::memory_import`). Default OFF (`CRUX_MEMORY_IMPORT=1`).
+    // Export needs no flag — it is read-only and lives in corecruxctl.
+    pub memory_import_enabled: bool,
+
+    // Identity-federation resolver extension + link CRUD
+    // (`/v1/identity/links*`, `crate::http::identity_links`). Default OFF
+    // (`CORECRUXD_IDENTITY_LINKS=1`).
+    pub identity_links_enabled: bool,
+
     // Embedded console + declarative integration library.
     pub integrations_enabled: bool,
     pub integrations_safe_mode: bool,
@@ -1056,6 +1066,8 @@ pub fn load_config() -> Config {
             .unwrap_or(crate::coord::DEFAULT_PRESENCE_TTL_SECS)
             .clamp(60, crate::coord::MAX_TTL_SECS),
         context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE").unwrap_or(false),
+        memory_import_enabled: env_bool("CRUX_MEMORY_IMPORT").unwrap_or(false),
+        identity_links_enabled: env_bool("CORECRUXD_IDENTITY_LINKS").unwrap_or(false),
         openai_shim_enabled: env_bool("CORECRUXD_OPENAI_SHIM").unwrap_or(false),
         integrations_enabled: std::env::var("CORECRUXD_INTEGRATIONS_ENABLED")
             .ok()

@@ -856,6 +856,7 @@ dependencies = [
  "corecrux-types",
  "crc32c",
  "crux-integrations",
+ "crux-session",
  "ed25519-dalek",
  "fs2",
  "hex",

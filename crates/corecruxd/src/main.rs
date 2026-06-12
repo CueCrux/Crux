@@ -48,6 +48,7 @@ mod extension_outbound;
 mod extension_registry;
 mod fact_helpers;
 mod fact_privacy;
+mod identity_links;
 mod integrations_github;
 mod integrations_github_sync;
 mod integrations_openai;
@@ -537,6 +538,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         coord_presence_ttl_secs: config.coord_presence_ttl_secs,
         context_surface_enabled: config.context_surface_enabled,
         openai_shim_enabled: config.openai_shim_enabled,
+        memory_import_enabled: config.memory_import_enabled,
+        identity_links_enabled: config.identity_links_enabled,
         mcp_context: None,
         integrations_enabled: config.integrations_enabled,
         integrations_safe_mode: config.integrations_safe_mode,
@@ -3888,6 +3891,8 @@ mod tests {
             coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
             context_surface_enabled: false,
             openai_shim_enabled: false,
+            memory_import_enabled: false,
+            identity_links_enabled: false,
             mcp_context: None,
             integrations_enabled: true,
             integrations_safe_mode: false,

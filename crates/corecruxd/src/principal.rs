@@ -110,6 +110,47 @@ pub fn resolve_by_passport(
     Ok(build(passport, tenant_id, category, agent_work_gate, "passport"))
 }
 
+/// The capability allowlist a federated (linked) passport may hold —
+/// read-only memory access, nothing else (Identity-Federation-v1 §4: a link
+/// grants `memory.read`, never write, never admin, never key custody).
+pub const MEMORY_READ_CAPABILITIES: &[&str] = &["tool:list", "tool:invoke:read"];
+
+/// Identity-federation fallback (G4b, behind `CORECRUXD_IDENTITY_LINKS`):
+/// resolve a passport fingerprint that is NOT local by following a live
+/// `identity_link` edge. The result is the *linked local* passport's
+/// identity, with capabilities intersected down to
+/// [`MEMORY_READ_CAPABILITIES`] and `resolved_via = "identity_link:<id>"`
+/// so receipts attribute the hop.
+///
+/// Unlinked → `PassportNotFound` (same denial as before the feature).
+/// Revoked links are invisible to `find_live_link_for_remote`, so a revoked
+/// remote is denied identically — checked at read time, no cache.
+pub fn resolve_by_linked_passport(
+    store: &FactStore,
+    entities: &corecrux_memory::EntityStore,
+    remote_fpr: &str,
+) -> Result<ResolvedPrincipal, ResolveError> {
+    let candidates = crate::identity_links::list_links(entities)
+        .into_iter()
+        .filter(|(_, p)| p.revoked_at.is_none() && p.remote_fpr == remote_fpr)
+        .count();
+    if candidates > 1 {
+        tracing::warn!(
+            remote_fpr,
+            candidates,
+            "multiple live identity links for one remote fpr — resolving via the oldest"
+        );
+    }
+    let (link_id, payload) = crate::identity_links::find_live_link_for_remote(entities, remote_fpr)
+        .ok_or_else(|| ResolveError::PassportNotFound(remote_fpr.to_string()))?;
+    let mut principal = resolve_by_passport(store, &payload.local_passport_id, None)?;
+    principal
+        .capabilities
+        .retain(|cap| MEMORY_READ_CAPABILITIES.contains(&cap.as_str()));
+    principal.resolved_via = format!("identity_link:{link_id}");
+    Ok(principal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +271,105 @@ mod tests {
         assert!(!p.capabilities.contains(&"tool:invoke:destructive".to_string()));
         assert!(p.agent_work_gate);
         assert_eq!(p.tenant_id, "work::ops");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── G4b: identity-link resolution (identity-memory-portability M5) ────
+
+    /// Seed defaults, promote `personal-default` to a high tier (so the
+    /// capability cap is observable), and create a live link to a synthetic
+    /// remote passport. Returns the remote fpr + link id.
+    fn seed_link(
+        dir: &std::path::Path,
+        store: &mut FactStore,
+        entities: &mut corecrux_memory::EntityStore,
+    ) -> (String, String) {
+        use ed25519_dalek::{Signer, SigningKey};
+        passports::seed_defaults_if_missing(dir, store, 1).expect("seed");
+        passports::update_passport(
+            store,
+            "personal-default",
+            passports::UpdatePassportInput {
+                agent_work_gate: None,
+                is_default_for_category: None,
+                sponsor_id: None,
+                reputation_tier: None,
+                receipt_count: Some(600), // trusted tier
+            },
+        )
+        .expect("promote");
+
+        let local = passports::get_passport(store, "personal-default").expect("local");
+        let local_key = crux_session::LocalPassportKey::from_path(&dir.join("passports").join("personal-default.key"))
+            .expect("local key");
+        let remote_key = SigningKey::from_bytes(&[42_u8; 32]);
+        let remote_pub = remote_key.verifying_key().to_bytes();
+        let remote_fpr = corecrux_memory::cruxpack::passport_fpr_from_public_key(&remote_pub);
+
+        let created_at = "2026-06-12T00:00:00Z";
+        let statement =
+            corecrux_memory::identity_link::LinkStatement::memory_read(&local.principal_id, &remote_fpr, created_at);
+        let hash = corecrux_memory::identity_link::statement_hash(&statement);
+        let (link_id, _) = crate::identity_links::create_link(
+            entities,
+            store,
+            &crate::identity_links::CreateLinkRequest {
+                local_passport_id: "personal-default".to_string(),
+                remote_fpr: remote_fpr.clone(),
+                remote_public_key_hex: hex::encode(remote_pub),
+                created_at: created_at.to_string(),
+                sig_local: hex::encode(local_key.sign_hash(&hash)),
+                sig_remote: hex::encode(remote_key.sign(&hash).to_bytes()),
+            },
+            "operator",
+        )
+        .expect("create link");
+        (remote_fpr, link_id)
+    }
+
+    #[test]
+    fn linked_passport_resolves_with_memory_read_caps_only() {
+        let dir = temp_dir("linked");
+        let mut store = FactStore::new();
+        let mut entities = corecrux_memory::EntityStore::new();
+        let (remote_fpr, link_id) = seed_link(&dir, &mut store, &mut entities);
+
+        let p = resolve_by_linked_passport(&store, &entities, &remote_fpr).expect("resolve via link");
+        assert_eq!(p.passport_id, "personal-default");
+        // Trusted tier would normally carry metered/side_effect — the link
+        // caps it to the memory.read allowlist, never key custody.
+        assert_eq!(
+            p.capabilities,
+            vec!["tool:list".to_string(), "tool:invoke:read".to_string()]
+        );
+        assert_eq!(p.resolved_via, format!("identity_link:{link_id}"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unlinked_passport_denied() {
+        let dir = temp_dir("unlinked");
+        let mut store = FactStore::new();
+        let mut entities = corecrux_memory::EntityStore::new();
+        let _ = seed_link(&dir, &mut store, &mut entities);
+
+        let err = resolve_by_linked_passport(&store, &entities, "p_00000000000000000000000000000bad")
+            .expect_err("unlinked must be denied");
+        assert!(matches!(err, ResolveError::PassportNotFound(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoked_link_denied() {
+        let dir = temp_dir("revoked-link");
+        let mut store = FactStore::new();
+        let mut entities = corecrux_memory::EntityStore::new();
+        let (remote_fpr, link_id) = seed_link(&dir, &mut store, &mut entities);
+
+        resolve_by_linked_passport(&store, &entities, &remote_fpr).expect("live link resolves");
+        crate::identity_links::revoke_link(&mut entities, &link_id, "operator").expect("revoke");
+        let err = resolve_by_linked_passport(&store, &entities, &remote_fpr).expect_err("revoked must be denied");
+        assert!(matches!(err, ResolveError::PassportNotFound(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

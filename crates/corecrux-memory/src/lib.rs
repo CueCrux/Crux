@@ -29,11 +29,13 @@
 
 pub mod action_enrichment;
 pub mod artefact_store;
+pub mod cruxpack;
 pub mod edge_store;
 pub mod embeddings;
 pub mod entity_store;
 pub mod events;
 pub mod fact_store;
+pub mod identity_link;
 pub mod kind_registry;
 pub mod replay;
 pub mod result_envelope;
@@ -42,6 +44,11 @@ pub mod session_store;
 pub mod sync;
 
 pub use artefact_store::{ArtefactError, ArtefactMetadata, ArtefactRecord, ArtefactStore, PutArtefact};
+pub use cruxpack::{
+    build_manifest, build_pack_sections, cruxpack_content_hash, plan_import, private_summary, sign_pack, verify_pack,
+    CruxPack, ExportOptions, ImportOptions, ImportPlan, PackCounts, PackManifest, PackSections, PackSignature,
+    PackVerifyError, PrivateSummary, CRUXPACK_RESERVED_PREFIXES, CRUXPACK_SCHEMA_V1,
+};
 pub use edge_store::{EdgeError, EdgeQuery, EdgeRecord, EdgeStore};
 pub use entity_store::{EntityError, EntityQuery, EntityRecord, EntityStore};
 pub use fact_store::{Fact, FactStore, HorizonClass};

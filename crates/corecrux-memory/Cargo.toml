@@ -10,7 +10,7 @@ llm = []
 
 [dependencies]
 blake3 = "1.8.5"
-ed25519-dalek = { version = "2.1.1", features = ["std"] }
+ed25519-dalek = { version = "2.2.0", features = ["std"] }
 hex = "0.4.3"
 utoipa = { version = "5", features = ["chrono"] }
 serde = { version = "1.0.218", features = ["derive"] }

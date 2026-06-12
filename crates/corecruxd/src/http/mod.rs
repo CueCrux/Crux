@@ -22,10 +22,12 @@ mod facts;
 mod features;
 mod gpu1;
 mod health;
+mod identity_links;
 pub mod ingress;
 mod integrations_github;
 mod integrations_openai;
 pub mod invocation;
+mod memory_import;
 pub(crate) mod observations;
 mod observe;
 mod observe_audit;
@@ -181,6 +183,13 @@ pub struct AppState {
     /// (`/v1/openai/tools.json` + `/v1/openai/invoke`). Default OFF
     /// (`CORECRUXD_OPENAI_SHIM=1`); when off, routes return 404.
     pub openai_shim_enabled: bool,
+    /// `.cruxpack` import surface (`POST /v1/memory/import`). Default OFF
+    /// (`CRUX_MEMORY_IMPORT=1`); when off, the route returns 404.
+    pub memory_import_enabled: bool,
+    /// Identity-federation links + resolver extension
+    /// (`/v1/identity/links*`; `/v1/principal/resolve` follows
+    /// `identity_link` edges). Default OFF (`CORECRUXD_IDENTITY_LINKS=1`).
+    pub identity_links_enabled: bool,
     /// Shared MCP dispatch context for the OpenAI shim — one source for the
     /// MCP server (:14801) and the shim (:14800). `None` when MCP disabled.
     pub mcp_context: Option<Arc<crux_mcp::dispatch::McpContext>>,
@@ -422,6 +431,16 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/facts", axum::routing::put(self::facts::put_fact))
         .route("/v1/facts", get(self::facts::query_facts))
         .route("/v1/facts/bulk", axum::routing::put(self::facts::put_facts_bulk))
+        .route("/v1/memory/import", axum::routing::post(self::memory_import::post_memory_import))
+        .route(
+            "/v1/identity/links",
+            axum::routing::post(self::identity_links::post_identity_link),
+        )
+        .route("/v1/identity/links", get(self::identity_links::get_identity_links))
+        .route(
+            "/v1/identity/links/{linkId}/revoke",
+            axum::routing::post(self::identity_links::post_identity_link_revoke),
+        )
         .route("/v1/facts/{factId}", get(self::facts::get_fact))
         .route("/v1/facts/{factId}", axum::routing::delete(self::facts::delete_fact))
         .route("/v1/facts/entity/{entity}", get(self::facts::get_facts_by_entity))
