@@ -50,6 +50,7 @@ mod result_envelope;
 mod routing;
 pub mod session;
 mod storybook;
+mod stream_receipts;
 mod sync;
 mod work;
 mod workbench;
@@ -179,6 +180,12 @@ pub struct AppState {
     /// Provider-agnostic injection-bundle surface (`/v1/context`). Default
     /// OFF (`CORECRUXD_CONTEXT_SURFACE=1`); when off, routes return 404.
     pub context_surface_enabled: bool,
+    /// G19 stream/context receipt wiring (`Streaming-Receipts-Spec` §5):
+    /// `/v1/mediation/receipts` lifts `context_injected` /
+    /// `stream_completed` / `stream_aborted` drafts into canonical signed
+    /// receipts, and SSE surfaces mint `stream_aborted` on disconnect.
+    /// Default OFF (`CORECRUXD_STREAM_RECEIPTS=1`).
+    pub stream_receipts_enabled: bool,
     /// OpenAI function-calling shim over the MCP tool surface
     /// (`/v1/openai/tools.json` + `/v1/openai/invoke`). Default OFF
     /// (`CORECRUXD_OPENAI_SHIM=1`); when off, routes return 404.

@@ -428,6 +428,10 @@ pub struct Config {
     // `crate::http::context_surface`). Default OFF.
     pub context_surface_enabled: bool,
 
+    // G19 stream/context receipt wiring (`crate::http::stream_receipts`).
+    // Default OFF.
+    pub stream_receipts_enabled: bool,
+
     // OpenAI function-calling shim over the MCP tool surface
     // (`crate::http::openai_shim`). Default OFF.
     pub openai_shim_enabled: bool,
@@ -1066,6 +1070,7 @@ pub fn load_config() -> Config {
             .unwrap_or(crate::coord::DEFAULT_PRESENCE_TTL_SECS)
             .clamp(60, crate::coord::MAX_TTL_SECS),
         context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE").unwrap_or(false),
+        stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS").unwrap_or(false),
         memory_import_enabled: env_bool("CRUX_MEMORY_IMPORT").unwrap_or(false),
         identity_links_enabled: env_bool("CORECRUXD_IDENTITY_LINKS").unwrap_or(false),
         openai_shim_enabled: env_bool("CORECRUXD_OPENAI_SHIM").unwrap_or(false),
