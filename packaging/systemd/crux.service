@@ -1,0 +1,37 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+#
+# System-wide unit, shipped in the .deb (packaging/deb/nfpm.yaml).
+# Per-user installs get a user unit from packaging/install.sh instead.
+#
+# Not enabled on package install — starting the daemon is your explicit
+# action: systemctl enable --now crux
+[Unit]
+Description=Crux daemon (local-first agent memory + receipts)
+Documentation=https://github.com/CueCrux/Crux/blob/main/docs/getting-started.md
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/corecruxd
+# DynamicUser: no dedicated system account to create/remove; state lives in
+# /var/lib/crux owned by the transient user via StateDirectory.
+DynamicUser=yes
+StateDirectory=crux
+StateDirectoryMode=0700
+Environment=CORECRUXD_DATA_DIR=/var/lib/crux
+Environment=CORECRUXD_AUTH_MODE=dev_scopes
+# Binary installs have no git checkout to compare against; keep the
+# no-phone-home posture explicit (see scripts/assert-no-phone-home.sh).
+Environment=CORECRUXD_UPDATE_CHECK_ENABLED=0
+Restart=on-failure
+RestartSec=2
+
+# Hardening (daemon binds loopback by default and touches only its data dir).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
