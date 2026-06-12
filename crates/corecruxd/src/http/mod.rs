@@ -20,6 +20,7 @@ mod facts;
 mod features;
 mod gpu1;
 mod health;
+pub mod ingress;
 mod integrations_github;
 mod integrations_openai;
 pub mod invocation;

@@ -932,13 +932,30 @@ impl CoreCruxExportV1 for ExportService {
     }
 }
 
+/// Serves the gRPC plane with transport-level hardening (ExecPlan
+/// `crux-http-ingress-hardening-2026-06-11` M4):
+///
+/// - HTTP/2 keep-alive pings reap dead peers instead of holding their
+///   connections open indefinitely (`CORECRUXD_GRPC_KEEPALIVE_INTERVAL_SECS`
+///   / `_TIMEOUT_SECS`; interval `0` = pings disabled).
+/// - A per-connection stream cap stops a single client from multiplexing
+///   unbounded streams over one connection
+///   (`CORECRUXD_GRPC_MAX_CONCURRENT_STREAMS`; `0` = unbounded). The
+///   per-tenant token-bucket throttle above remains the fairness layer —
+///   this is transport protection only.
+/// - `TCP_NODELAY`, matching the HTTP listeners (M1).
 pub async fn serve(
     addr: SocketAddr,
+    ingress: &crate::config::IngressConfig,
     svc: DataPlaneService,
     export_svc: ExportService,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tonic::transport::Server::builder()
+        .tcp_nodelay(true)
+        .http2_keepalive_interval(ingress.grpc_keepalive_interval())
+        .http2_keepalive_timeout(ingress.grpc_keepalive_timeout())
+        .max_concurrent_streams(ingress.grpc_max_streams())
         .add_service(CoreCruxDataPlaneV1Server::new(svc))
         .add_service(CoreCruxExportV1Server::new(export_svc))
         .serve_with_shutdown(addr, shutdown)
