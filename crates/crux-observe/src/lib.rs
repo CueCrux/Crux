@@ -14,4 +14,5 @@ pub mod config;
 pub mod metrics_sampler;
 pub mod ops_layer;
 pub mod redact;
+pub mod redact_writer;
 pub mod schema;

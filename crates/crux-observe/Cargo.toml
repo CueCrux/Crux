@@ -18,6 +18,7 @@ corecrux-memory = { path = "../corecrux-memory" }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["sync", "rt", "macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "json", "registry"] }
 
 [lints]
 workspace = true
