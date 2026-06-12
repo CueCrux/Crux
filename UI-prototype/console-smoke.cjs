@@ -17,6 +17,11 @@ ok(html.includes('console-assets/CueCrux-Arc-Loop.png'), 'logo path → console-
 ok(!/src="assets\//.test(html), 'no leftover assets/ logo src');
 ['<script src="http', '<link rel="stylesheet" href="http', '<iframe src="http', 'unpkg.com', 'jsdelivr', 'cdnjs']
   .forEach(b => ok(!html.includes(b), 'no external runtime dep: ' + b));
+// M9: the embedded 3D substrate must be offline-true as well (no @import fetch, no CDNs)
+const css3d = fs.readFileSync(__dirname + '/console-3d/css/console3d.css', 'utf8');
+ok(!/@import\s+url\(['"]?https?:/.test(css3d), 'console-3d: no external @import in css');
+['fonts.googleapis', 'unpkg.com', 'jsdelivr', 'cdnjs'].forEach(b =>
+  ok(!css3d.includes(b) && !fs.readFileSync(__dirname + '/console-3d/index.html', 'utf8').includes(b), 'console-3d: no external dep: ' + b));
 
 const code = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(x => x[1]).sort((a, b) => b.length - a.length)[0];
 try { new Function(code); } catch (e) { console.error('FAIL parse:', e.message); process.exit(1); }

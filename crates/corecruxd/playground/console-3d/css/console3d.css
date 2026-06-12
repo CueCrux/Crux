@@ -5,8 +5,8 @@
    default; html.dark mirrors the console dark theme.
    z-scale: stage 0 · labels 10 · hero 20 · chrome 30 · panel 40
    ════════════════════════════════════════════════════════════════════════ */
-@import url('https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
-
+/* No external font fetch — system stacks keep /console-3d offline-true like the 2D console.
+   ('Public Sans' / 'JetBrains Mono' still lead the stacks and apply when locally installed.) */
 :root {
   --font-sans: 'Public Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
