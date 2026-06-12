@@ -78,6 +78,7 @@ pub(super) fn is_known_admin_action(ty: &str) -> bool {
             | "parity-pack"
             | "runtime-knob-update"
             | "force-seal"
+            | "compact-facts"
     )
 }
 
@@ -980,6 +981,80 @@ pub(super) async fn execute_admin_action(
                     mutation_event_id: None,
                 })
             }
+        }
+        "compact-facts" => {
+            // Launch-gate 5.1 (GDPR erasure): hard-delete the content of
+            // soft-deleted facts from the on-disk `facts.jsonl` journal. This is
+            // a destructive, deliberately-invoked operation — gated behind an
+            // explicit `reason` exactly like `force-seal`.
+            let reason = read_param_str(params, "reason")
+                .ok_or_else(|| admin_action_error("reason is required for compact-facts"))?
+                .to_string();
+
+            // Optional retention sweep (W2.E2). Only runs when the operator
+            // passes `applyRetention: true` AND `CORECRUXD_RETENTION_DAYS` is
+            // set — retention never deletes implicitly.
+            let apply_retention = read_param_bool(params, "applyRetention")
+                .or_else(|| read_param_bool(params, "apply_retention"))
+                .unwrap_or(false);
+
+            let started = std::time::Instant::now();
+            let mut retention_marked: Vec<String> = Vec::new();
+            let mut retention_days_used: Option<u32> = None;
+
+            // Mark-then-compact under a single write lock so the on-disk journal
+            // reflects exactly the marks we just made.
+            let report = {
+                let mut store = state.fact_store.write().await;
+                if apply_retention {
+                    match state.retention_days {
+                        Some(days) => {
+                            let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+                            retention_marked = store.mark_retention_eligible(cutoff);
+                            retention_days_used = Some(days);
+                        }
+                        None => {
+                            return Err(admin_action_error(
+                                "applyRetention requested but CORECRUXD_RETENTION_DAYS is unset",
+                            ));
+                        }
+                    }
+                }
+                store
+                    .compact_journal()
+                    .map_err(|e| admin_action_error(format!("journal compaction failed: {e}")))?
+            };
+
+            let took_ms = started.elapsed().as_millis() as u64;
+
+            // Erasure receipt / audit-trail log line (T.4): records WHAT was
+            // removed and WHY, so the compaction is replayable from logs.
+            tracing::info!(
+                action_id = %action_id,
+                op = "erasure.compact_facts",
+                reason = %reason,
+                facts_dropped = report.facts_dropped,
+                facts_retained = report.facts_retained,
+                tombstones_kept = report.tombstones_kept,
+                retention_marked = retention_marked.len(),
+                retention_days = ?retention_days_used,
+                took_ms,
+                "erasure: fact-journal compaction removed deleted content"
+            );
+
+            Ok(AdminActionExecutionResult {
+                result: serde_json::json!({
+                    "ok": true,
+                    "reason": reason,
+                    "factsDropped": report.facts_dropped,
+                    "factsRetained": report.facts_retained,
+                    "tombstonesKept": report.tombstones_kept,
+                    "retentionMarked": retention_marked.len(),
+                    "retentionDays": retention_days_used,
+                    "tookMs": took_ms,
+                }),
+                mutation_event_id: None,
+            })
         }
         "parity-pack" => Err(admin_action_error(
             "parity-pack action is not implemented in corecruxd; run corecruxctl parity-pack",
@@ -2332,4 +2407,76 @@ pub(super) async fn post_restart_daemon(State(state): State<AppState>, headers: 
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod compact_facts_tests {
+    use super::*;
+    use corecrux_memory::fact_store::{FactStore, StoreFact};
+
+    fn store_fact(value: &str) -> StoreFact {
+        StoreFact {
+            entity: "e".into(),
+            key: format!("k-{value}"),
+            value: value.into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_facts_action_scrubs_deleted_content_from_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("facts.jsonl");
+
+        let mut state = crate::http::tests::test_app_state(4);
+        // Swap in a journal-backed fact store so compaction has a file to rewrite.
+        let mut fs = FactStore::with_persistence(dir.path()).unwrap();
+        let deleted = fs.store(store_fact("erase-this-pii"));
+        fs.store(store_fact("keep-this"));
+        fs.delete(&deleted.fact_id);
+        state.fact_store = std::sync::Arc::new(tokio::sync::RwLock::new(fs));
+
+        // Pre-condition: deleted value is still on disk (the soft-delete leak).
+        assert!(std::fs::read_to_string(&journal).unwrap().contains("erase-this-pii"));
+
+        let params = serde_json::json!({ "reason": "gdpr-erasure-test" });
+        let result = execute_admin_action(&state, "act-1", "compact-facts", Some(&params), None, None)
+            .await
+            .expect("compact-facts action succeeds");
+        assert_eq!(result.result["factsDropped"], 1);
+        assert_eq!(result.result["factsRetained"], 1);
+
+        // Post-condition: deleted value gone; live value survives.
+        let raw = std::fs::read_to_string(&journal).unwrap();
+        assert!(!raw.contains("erase-this-pii"), "deleted value still in journal");
+        assert!(raw.contains("keep-this"));
+    }
+
+    #[tokio::test]
+    async fn compact_facts_action_requires_reason() {
+        let state = crate::http::tests::test_app_state(4);
+        let err = execute_admin_action(&state, "act-2", "compact-facts", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("reason is required"));
+    }
+
+    #[tokio::test]
+    async fn apply_retention_without_config_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = crate::http::tests::test_app_state(4);
+        state.fact_store = std::sync::Arc::new(tokio::sync::RwLock::new(
+            FactStore::with_persistence(dir.path()).unwrap(),
+        ));
+        // retention_days is None on the test state.
+        let params = serde_json::json!({ "reason": "r", "applyRetention": true });
+        let err = execute_admin_action(&state, "act-3", "compact-facts", Some(&params), None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("CORECRUXD_RETENTION_DAYS is unset"));
+    }
 }

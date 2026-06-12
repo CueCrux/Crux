@@ -325,6 +325,13 @@ pub struct Config {
     // Admin force-seal: allows force-sealing head segments via admin actions.
     pub admin_force_seal_enabled: bool,
 
+    // Fact-store retention (launch-gate 5.1 / W2.E2). When `Some(n)`, the
+    // `compact-facts` admin action may mark facts older than `n` days as
+    // deletion-eligible before compacting. `None` (default, env unset) = off:
+    // retention never deletes anything; compaction still scrubs already
+    // soft-deleted facts. Sourced from `CORECRUXD_RETENTION_DAYS`.
+    pub retention_days: Option<u32>,
+
     // CoreCrux v5: build .ccxi companion indexes at seal time for BM25 retrieval.
     pub build_ccxi: bool,
 
@@ -752,6 +759,12 @@ pub fn load_config() -> Config {
         .ok()
         .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
 
+    // Fact-store retention window in days. Unset (or 0) = retention off.
+    let retention_days = std::env::var("CORECRUXD_RETENTION_DAYS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0);
+
     let receipts_verify_enabled = std::env::var("CORECRUXD_RECEIPTS_VERIFY_ENABLED")
         .ok()
         .is_none_or(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
@@ -926,6 +939,7 @@ pub fn load_config() -> Config {
         projections_tick_interval_ms,
 
         admin_force_seal_enabled,
+        retention_days,
 
         receipts_verify_enabled,
         receipts_recompute_candidate_digest,
@@ -1423,6 +1437,7 @@ mod tests {
         assert_eq!(cfg.projections_batch_frames, 1024);
         assert_eq!(cfg.projections_tick_interval_ms, 1000);
         assert!(!cfg.admin_force_seal_enabled);
+        assert_eq!(cfg.retention_days, None);
         assert!(cfg.receipts_verify_enabled);
         assert!(!cfg.receipts_recompute_candidate_digest);
         assert_eq!(cfg.receipts_keyring_path, None);
