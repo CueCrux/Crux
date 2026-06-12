@@ -8,17 +8,27 @@
 //! - M1: request-body size limit with RFC-7807 `413` responses.
 //! - M2: in-flight concurrency cap + load shed (`503` problem+json) and the
 //!   `corecrux_http_inflight` gauge.
+//! - M3: keyed rate limiting (passport → client-IP fallback) with `429` +
+//!   `Retry-After`, loopback exempt by default, and the
+//!   `corecrux_http_rate_limited_total{key_kind}` counter.
 //!
 //! Applied in `main.rs` to both the daemon API router and the MCP router so
 //! route-level tests exercise the un-hardened router unchanged.
 //!
 //! Layer ordering note: `Router::layer` wraps outside-in as calls accumulate,
 //! so layers added *later* run *earlier* on the request path. Final order:
-//! load-shed/concurrency gate → inflight gauge → 413 decorator → body limit
-//! → routes. Shedding happens before any body byte is read; the gauge counts
-//! only admitted requests.
+//! rate limiter → load-shed/concurrency gate → inflight gauge →
+//! 413 decorator → body limit → routes. A flood is 429'd before it can
+//! occupy an inflight slot, and shedding happens before any body byte is
+//! read; the gauge counts only admitted requests.
+
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::error_handling::HandleErrorLayer;
+use axum::extract::ConnectInfo;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
@@ -29,6 +39,16 @@ use tower_http::limit::RequestBodyLimitLayer;
 use crate::config::IngressConfig;
 use crate::metrics::Metrics;
 use crate::problem::ProblemResponse;
+
+/// Passport header reused as the rate-limit key when present (matches the
+/// presence middleware in `http/mod.rs`).
+const PASSPORT_HEADER: &str = "x-corecrux-passport-id";
+/// Bucket-map size that triggers an inline idle-entry sweep — bounds memory
+/// under spoofed-source floods.
+const BUCKET_SWEEP_THRESHOLD: usize = 10_000;
+/// Idle horizon for the sweep: an idle bucket is fully refilled anyway, so
+/// dropping it loses nothing.
+const BUCKET_IDLE_SECS: u64 = 60;
 
 /// Applies the ingress limits to a fully-built router.
 ///
@@ -80,7 +100,220 @@ pub fn apply_ingress_limits(router: Router, cfg: &IngressConfig, metrics: Option
         );
     }
 
+    // M3 — keyed rate limiting, outermost: a flood is rejected before it
+    // can occupy an inflight slot or read a body byte.
+    if cfg.rate_limit_rps > 0 {
+        let limiter = Arc::new(HttpRateLimiter::new(cfg, metrics.cloned()));
+        router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let limiter = limiter.clone();
+                async move {
+                    match limiter.check_request(&req) {
+                        Ok(()) => next.run(req).await,
+                        Err(denied) => denied.into_response(),
+                    }
+                }
+            },
+        ));
+    }
+
     router
+}
+
+/// Keyed token-bucket rate limiter for the HTTP planes.
+///
+/// Keying: per passport when `X-Corecrux-Passport-Id` is present, else per
+/// client IP (`ConnectInfo`). Client IPs inside an exempt CIDR (loopback by
+/// default — console SPA + local agents) bypass limiting entirely.
+///
+/// Deliberately in-crate rather than the `governor` crate: the daemon
+/// already ships a proven token-bucket (per-tenant gRPC throttle,
+/// `grpc.rs`), and supply-chain policy files (`deny.toml`) are owned by a
+/// concurrent workstream — no new dependency for ~100 lines of arithmetic.
+pub struct HttpRateLimiter {
+    rps: u64,
+    burst: u64,
+    exempt_cidrs: Vec<(IpAddr, u8)>,
+    buckets: Mutex<HashMap<String, RateBucket>>,
+    metrics: Option<Metrics>,
+}
+
+struct RateBucket {
+    tokens: f64,
+    last_touch: Instant,
+}
+
+/// A denied request: status 429 + `Retry-After`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RateLimited {
+    retry_after_secs: u64,
+    key_kind: &'static str,
+}
+
+impl IntoResponse for RateLimited {
+    fn into_response(self) -> Response {
+        let mut pd = ProblemDetails::new(
+            StatusCode::TOO_MANY_REQUESTS.as_u16(),
+            "https://errors.cuecrux.com/rate-limited",
+            "Too Many Requests",
+        );
+        pd.detail = Some(format!(
+            "request rate exceeds the per-{} limit (CORECRUXD_RATE_LIMIT_RPS); retry after {}s",
+            self.key_kind, self.retry_after_secs
+        ));
+        let mut resp = ProblemResponse(pd).into_response();
+        if let Ok(v) = HeaderValue::from_str(&self.retry_after_secs.to_string()) {
+            resp.headers_mut().insert(header::RETRY_AFTER, v);
+        }
+        resp
+    }
+}
+
+impl HttpRateLimiter {
+    pub fn new(cfg: &IngressConfig, metrics: Option<Metrics>) -> Self {
+        Self {
+            rps: cfg.rate_limit_rps,
+            burst: cfg.rate_limit_burst.max(cfg.rate_limit_rps).max(1),
+            exempt_cidrs: parse_cidrs(&cfg.rate_limit_exempt_cidrs),
+            buckets: Mutex::new(HashMap::new()),
+            metrics,
+        }
+    }
+
+    /// Derives the key from the request and consumes one token.
+    fn check_request(&self, req: &axum::extract::Request) -> Result<(), RateLimited> {
+        let passport = req
+            .headers()
+            .get(PASSPORT_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let client_ip = req
+            .extensions()
+            .get::<ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| normalize_ip(ci.0.ip()));
+        self.check(passport, client_ip, Instant::now())
+    }
+
+    /// Core decision, separated for deterministic tests. Exemption is by
+    /// client IP and wins over passport keying (a loopback console session
+    /// is never limited, passport or not). A request with neither passport
+    /// nor `ConnectInfo` fails open — that's a wiring bug, not an attack,
+    /// and limiting everything under one shared key would let any client
+    /// starve all others.
+    fn check(&self, passport: Option<&str>, client_ip: Option<IpAddr>, now: Instant) -> Result<(), RateLimited> {
+        if let Some(ip) = client_ip {
+            if self.exempt_cidrs.iter().any(|cidr| cidr_contains(cidr, ip)) {
+                return Ok(());
+            }
+        }
+        let (key_kind, key): (&'static str, String) = match (passport, client_ip) {
+            (Some(p), _) => ("passport", format!("p:{p}")),
+            (None, Some(ip)) => ("ip", format!("ip:{ip}")),
+            (None, None) => {
+                tracing::debug!("rate limiter saw a request with no passport and no ConnectInfo; failing open");
+                return Ok(());
+            }
+        };
+
+        // SAFETY-ish: a poisoned mutex here means another limiter call
+        // panicked mid-update; failing open is the availability-preserving
+        // choice for a guardrail.
+        let Ok(mut buckets) = self.buckets.lock() else {
+            return Ok(());
+        };
+
+        // Bound the map under spoofed-source floods: idle buckets are fully
+        // refilled anyway, so dropping them is lossless.
+        if buckets.len() >= BUCKET_SWEEP_THRESHOLD {
+            buckets.retain(|_, b| now.duration_since(b.last_touch).as_secs() < BUCKET_IDLE_SECS);
+        }
+
+        let burst = self.burst as f64;
+        let bucket = buckets.entry(key).or_insert(RateBucket {
+            tokens: burst,
+            last_touch: now,
+        });
+        let elapsed = now.duration_since(bucket.last_touch).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * self.rps as f64).min(burst);
+        bucket.last_touch = now;
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            return Ok(());
+        }
+
+        let deficit = 1.0 - bucket.tokens;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let retry_after_secs = (deficit / self.rps as f64).ceil().max(1.0) as u64;
+        drop(buckets);
+
+        if let Some(metrics) = &self.metrics {
+            metrics.inc_http_rate_limited(key_kind);
+        }
+        Err(RateLimited {
+            retry_after_secs,
+            key_kind,
+        })
+    }
+}
+
+/// Maps IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) back to IPv4 so
+/// dual-stack listeners match IPv4 CIDRs.
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// Parses `addr/prefix` strings; invalid entries are logged and skipped
+/// (a typo in the exempt list must not take rate limiting down with it).
+fn parse_cidrs(specs: &[String]) -> Vec<(IpAddr, u8)> {
+    specs
+        .iter()
+        .filter_map(|spec| {
+            let parsed = parse_cidr(spec);
+            if parsed.is_none() {
+                tracing::warn!(%spec, "ignoring invalid CIDR in CORECRUXD_RATE_LIMIT_EXEMPT_CIDRS");
+            }
+            parsed
+        })
+        .collect()
+}
+
+fn parse_cidr(spec: &str) -> Option<(IpAddr, u8)> {
+    let spec = spec.trim();
+    let (addr, prefix) = match spec.split_once('/') {
+        Some((addr, prefix)) => (addr, prefix.parse::<u8>().ok()?),
+        None => (spec, u8::MAX), // bare address = host route
+    };
+    let addr: IpAddr = addr.parse().ok()?;
+    let max = match addr {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    let prefix = if prefix == u8::MAX { max } else { prefix };
+    (prefix <= max).then_some((addr, prefix))
+}
+
+fn cidr_contains(cidr: &(IpAddr, u8), ip: IpAddr) -> bool {
+    let (net, prefix) = *cidr;
+    match (net, ip) {
+        (IpAddr::V4(net), IpAddr::V4(ip)) => {
+            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - u32::from(prefix)) };
+            (u32::from(net) & mask) == (u32::from(ip) & mask)
+        }
+        (IpAddr::V6(net), IpAddr::V6(ip)) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - u32::from(prefix))
+            };
+            (u128::from(net) & mask) == (u128::from(ip) & mask)
+        }
+        _ => false,
+    }
 }
 
 /// RAII guard so the inflight gauge stays correct even if the inner future
@@ -411,5 +644,216 @@ mod tests {
 
         release.notify_waiters();
         assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    // ── M3: keyed rate limiting ────────────────────────────────────────
+
+    use std::net::{IpAddr, SocketAddr};
+    use std::time::{Duration, Instant};
+
+    use axum::extract::ConnectInfo;
+
+    use super::{normalize_ip, parse_cidr, HttpRateLimiter};
+
+    fn rate_cfg(rps: u64, burst: u64) -> IngressConfig {
+        IngressConfig {
+            rate_limit_rps: rps,
+            rate_limit_burst: burst,
+            ..IngressConfig::default()
+        }
+    }
+
+    /// Builds a request carrying a synthetic peer address, mirroring what
+    /// `into_make_service_with_connect_info` injects in `main.rs`.
+    fn request_from(addr: &str, passport: Option<&str>) -> Request<Body> {
+        let mut builder = Request::post("/echo");
+        if let Some(p) = passport {
+            builder = builder.header("x-corecrux-passport-id", p);
+        }
+        let mut req = builder.body(Body::empty()).unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(addr.parse::<SocketAddr>().unwrap()));
+        req
+    }
+
+    #[tokio::test]
+    async fn passport_key_enforced_with_429_retry_after_and_metric() {
+        let metrics = test_metrics();
+        let app = apply_ingress_limits(test_router(), &rate_cfg(1, 1), Some(&metrics));
+
+        // First request consumes the single-token burst.
+        let ok = app
+            .clone()
+            .oneshot(request_from("203.0.113.7:5000", Some("passport-a")))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        // Second request on the same passport is limited.
+        let limited = app
+            .clone()
+            .oneshot(request_from("203.0.113.7:5000", Some("passport-a")))
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = limited
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .expect("429 must carry a numeric Retry-After");
+        assert!(retry_after >= 1);
+        let json = problem_json(limited).await;
+        assert_eq!(json["type"], "https://errors.cuecrux.com/rate-limited");
+        assert_eq!(json["status"], 429);
+
+        let rendered = metrics.render().unwrap();
+        assert!(
+            rendered.contains("corecrux_http_rate_limited_total{key_kind=\"passport\"} 1"),
+            "expected passport-keyed rate-limited counter, got: {}",
+            rendered
+                .lines()
+                .filter(|l| l.contains("rate_limited"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        // A different passport from the same IP has its own bucket.
+        let other = app
+            .clone()
+            .oneshot(request_from("203.0.113.7:5000", Some("passport-b")))
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ip_fallback_key_when_no_passport() {
+        let metrics = test_metrics();
+        let app = apply_ingress_limits(test_router(), &rate_cfg(1, 1), Some(&metrics));
+
+        let ok = app
+            .clone()
+            .oneshot(request_from("203.0.113.9:6000", None))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let limited = app
+            .clone()
+            .oneshot(request_from("203.0.113.9:6000", None))
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let rendered = metrics.render().unwrap();
+        assert!(rendered.contains("corecrux_http_rate_limited_total{key_kind=\"ip\"} 1"));
+
+        // A different source IP is an independent bucket.
+        let other = app
+            .clone()
+            .oneshot(request_from("203.0.113.10:6000", None))
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn loopback_is_exempt_by_default_even_with_passport() {
+        let app = apply_ingress_limits(test_router(), &rate_cfg(1, 1), None);
+        for _ in 0..20 {
+            let resp = app
+                .clone()
+                .oneshot(request_from("127.0.0.1:9000", Some("console-passport")))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "loopback must never be limited");
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_rps_disables_rate_limiting() {
+        let app = apply_ingress_limits(test_router(), &rate_cfg(0, 0), None);
+        for _ in 0..20 {
+            let resp = app
+                .clone()
+                .oneshot(request_from("203.0.113.20:7000", Some("p")))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+
+    #[test]
+    fn bucket_refills_at_rps_deterministically() {
+        let limiter = HttpRateLimiter::new(
+            &IngressConfig {
+                rate_limit_rps: 2,
+                rate_limit_burst: 2,
+                rate_limit_exempt_cidrs: vec![],
+                ..IngressConfig::default()
+            },
+            None,
+        );
+        let t0 = Instant::now();
+        let ip: Option<IpAddr> = Some("203.0.113.1".parse().unwrap());
+
+        // Burst of 2 admitted, third denied.
+        assert!(limiter.check(Some("p"), ip, t0).is_ok());
+        assert!(limiter.check(Some("p"), ip, t0).is_ok());
+        let denied = limiter.check(Some("p"), ip, t0).unwrap_err();
+        assert_eq!(denied.key_kind, "passport");
+        assert!(denied.retry_after_secs >= 1);
+
+        // After 1s at 2 rps, two tokens refill.
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(limiter.check(Some("p"), ip, t1).is_ok());
+        assert!(limiter.check(Some("p"), ip, t1).is_ok());
+        assert!(limiter.check(Some("p"), ip, t1).is_err());
+    }
+
+    #[test]
+    fn missing_passport_and_connect_info_fails_open() {
+        let limiter = HttpRateLimiter::new(&rate_cfg(1, 1), None);
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            assert!(limiter.check(None, None, t0).is_ok());
+        }
+    }
+
+    #[test]
+    fn cidr_parsing_and_matching() {
+        // Bare address = host route.
+        let host = parse_cidr("203.0.113.5").unwrap();
+        assert!(super::cidr_contains(&host, "203.0.113.5".parse().unwrap()));
+        assert!(!super::cidr_contains(&host, "203.0.113.6".parse().unwrap()));
+
+        let net = parse_cidr("10.0.0.0/8").unwrap();
+        assert!(super::cidr_contains(&net, "10.255.1.2".parse().unwrap()));
+        assert!(!super::cidr_contains(&net, "11.0.0.1".parse().unwrap()));
+
+        let v6 = parse_cidr("::1/128").unwrap();
+        assert!(super::cidr_contains(&v6, "::1".parse().unwrap()));
+        assert!(!super::cidr_contains(&v6, "::2".parse().unwrap()));
+
+        // Invalid specs are rejected, not panicking.
+        assert!(parse_cidr("not-an-ip").is_none());
+        assert!(parse_cidr("10.0.0.0/33").is_none());
+        assert!(parse_cidr("").is_none());
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_normalizes_to_v4_for_exemption() {
+        // Dual-stack listeners report loopback as ::ffff:127.0.0.1.
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert_eq!(normalize_ip(mapped), "127.0.0.1".parse::<IpAddr>().unwrap());
+
+        let limiter = HttpRateLimiter::new(&rate_cfg(1, 1), None);
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            assert!(limiter
+                .check(None, Some(normalize_ip(mapped)), t0)
+                .is_ok());
+        }
     }
 }

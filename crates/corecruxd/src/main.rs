@@ -1625,7 +1625,14 @@ async fn serve_http_listener(
         let _ = shutdown_rx.recv().await;
         let _ = drain_started_tx.send(());
     };
-    let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown);
+    // `into_make_service_with_connect_info` exposes the peer address as a
+    // `ConnectInfo<SocketAddr>` request extension — the rate limiter's
+    // per-IP fallback key (crux-http-ingress-hardening M3).
+    let serve = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown);
     match drain_cap {
         None => serve.await,
         Some(cap) => {
