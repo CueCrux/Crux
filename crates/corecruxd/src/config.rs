@@ -89,6 +89,65 @@ impl AppendLaneScope {
     }
 }
 
+/// HTTP/gRPC ingress-hardening knobs (ExecPlan
+/// `crux-http-ingress-hardening-2026-06-11`). All limits are env-tunable;
+/// `0` means "disabled / unbounded" so an emergency rollback never needs a
+/// redeploy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressConfig {
+    /// Maximum accepted HTTP request body, in bytes
+    /// (`CORECRUXD_MAX_REQUEST_BODY_BYTES`). `0` disables the limit.
+    pub max_request_body_bytes: usize,
+    /// Hard cap on the graceful-shutdown connection drain, in seconds
+    /// (`CORECRUXD_SHUTDOWN_DRAIN_SECS`). `0` means drain without bound
+    /// (pre-hardening behaviour).
+    pub shutdown_drain_secs: u64,
+}
+
+/// Default HTTP body limit: 256 MB. Sized for the largest legitimate
+/// payloads (multi-MB bulk-import bodies) with >10× headroom, while still
+/// closing the unbounded-body DoS door.
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
+/// Default graceful-shutdown drain cap: matches the router-wide 30s
+/// `TimeoutLayer`, so no request that can still complete is cut short.
+pub const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 30;
+
+impl Default for IngressConfig {
+    fn default() -> Self {
+        Self {
+            max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
+            shutdown_drain_secs: DEFAULT_SHUTDOWN_DRAIN_SECS,
+        }
+    }
+}
+
+impl IngressConfig {
+    /// Pure constructor shared by `from_env` and the unit tests:
+    /// missing or unparseable values fall back to the documented defaults.
+    fn from_values(max_request_body_bytes: Option<&str>, shutdown_drain_secs: Option<&str>) -> Self {
+        Self {
+            max_request_body_bytes: max_request_body_bytes
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(DEFAULT_MAX_REQUEST_BODY_BYTES),
+            shutdown_drain_secs: shutdown_drain_secs
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(DEFAULT_SHUTDOWN_DRAIN_SECS),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_values(
+            env_string("CORECRUXD_MAX_REQUEST_BODY_BYTES").as_deref(),
+            env_string("CORECRUXD_SHUTDOWN_DRAIN_SECS").as_deref(),
+        )
+    }
+
+    /// Drain cap as a `Duration`; `None` when unbounded (`0`).
+    pub fn shutdown_drain_cap(&self) -> Option<std::time::Duration> {
+        (self.shutdown_drain_secs > 0).then(|| std::time::Duration::from_secs(self.shutdown_drain_secs))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub loaded_config_path: Option<PathBuf>,
@@ -179,6 +238,9 @@ pub struct Config {
     pub capacity_critical_free_ratio: f64,
     pub capacity_emergency_free_ratio: f64,
     pub capacity_resume_free_ratio: f64,
+
+    // HTTP/gRPC ingress hardening (crux-http-ingress-hardening-2026-06-11).
+    pub ingress: IngressConfig,
 
     // Phase 4 ingest bounds / idempotency knobs.
     pub max_events_per_batch: usize,
@@ -851,12 +913,57 @@ pub fn load_config() -> Config {
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
         operating_mode,
         enabled_pro_services,
+        ingress: IngressConfig::from_env(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AppendLaneScope, CommitLevel, StoreLockStrategy};
+    use super::{
+        AppendLaneScope, CommitLevel, IngressConfig, StoreLockStrategy, DEFAULT_MAX_REQUEST_BODY_BYTES,
+        DEFAULT_SHUTDOWN_DRAIN_SECS,
+    };
+
+    #[test]
+    fn ingress_config_defaults_when_unset() {
+        let cfg = IngressConfig::from_values(None, None);
+        assert_eq!(cfg.max_request_body_bytes, DEFAULT_MAX_REQUEST_BODY_BYTES);
+        assert_eq!(cfg.shutdown_drain_secs, DEFAULT_SHUTDOWN_DRAIN_SECS);
+        assert_eq!(cfg, IngressConfig::default());
+    }
+
+    #[test]
+    fn ingress_config_parses_overrides() {
+        let cfg = IngressConfig::from_values(Some("1048576"), Some("5"));
+        assert_eq!(cfg.max_request_body_bytes, 1_048_576);
+        assert_eq!(cfg.shutdown_drain_secs, 5);
+        assert_eq!(
+            cfg.shutdown_drain_cap(),
+            Some(std::time::Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn ingress_config_zero_means_disabled() {
+        let cfg = IngressConfig::from_values(Some("0"), Some("0"));
+        assert_eq!(cfg.max_request_body_bytes, 0);
+        assert_eq!(cfg.shutdown_drain_secs, 0);
+        assert_eq!(cfg.shutdown_drain_cap(), None);
+    }
+
+    #[test]
+    fn ingress_config_invalid_values_fall_back_to_defaults() {
+        let cfg = IngressConfig::from_values(Some("not-a-number"), Some("-3"));
+        assert_eq!(cfg.max_request_body_bytes, DEFAULT_MAX_REQUEST_BODY_BYTES);
+        assert_eq!(cfg.shutdown_drain_secs, DEFAULT_SHUTDOWN_DRAIN_SECS);
+    }
+
+    #[test]
+    fn ingress_config_trims_whitespace() {
+        let cfg = IngressConfig::from_values(Some(" 2048 "), Some("\t60\n"));
+        assert_eq!(cfg.max_request_body_bytes, 2048);
+        assert_eq!(cfg.shutdown_drain_secs, 60);
+    }
 
     #[test]
     fn commit_level_parse_accepts_aliases() {
