@@ -102,6 +102,10 @@ pub struct IngressConfig {
     /// (`CORECRUXD_SHUTDOWN_DRAIN_SECS`). `0` means drain without bound
     /// (pre-hardening behaviour).
     pub shutdown_drain_secs: u64,
+    /// Maximum concurrently-admitted HTTP requests per listener
+    /// (`CORECRUXD_MAX_INFLIGHT`). Excess requests are load-shed with a
+    /// 503 problem+json. `0` disables the cap.
+    pub max_inflight: usize,
 }
 
 /// Default HTTP body limit: 256 MB. Sized for the largest legitimate
@@ -111,12 +115,16 @@ pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
 /// Default graceful-shutdown drain cap: matches the router-wide 30s
 /// `TimeoutLayer`, so no request that can still complete is cut short.
 pub const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 30;
+/// Default in-flight request cap: 4096 — far above observed prod
+/// concurrency, low enough to shed a connection flood before memory does.
+pub const DEFAULT_MAX_INFLIGHT: usize = 4096;
 
 impl Default for IngressConfig {
     fn default() -> Self {
         Self {
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             shutdown_drain_secs: DEFAULT_SHUTDOWN_DRAIN_SECS,
+            max_inflight: DEFAULT_MAX_INFLIGHT,
         }
     }
 }
@@ -124,7 +132,11 @@ impl Default for IngressConfig {
 impl IngressConfig {
     /// Pure constructor shared by `from_env` and the unit tests:
     /// missing or unparseable values fall back to the documented defaults.
-    fn from_values(max_request_body_bytes: Option<&str>, shutdown_drain_secs: Option<&str>) -> Self {
+    fn from_values(
+        max_request_body_bytes: Option<&str>,
+        shutdown_drain_secs: Option<&str>,
+        max_inflight: Option<&str>,
+    ) -> Self {
         Self {
             max_request_body_bytes: max_request_body_bytes
                 .and_then(|s| s.trim().parse().ok())
@@ -132,6 +144,9 @@ impl IngressConfig {
             shutdown_drain_secs: shutdown_drain_secs
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(DEFAULT_SHUTDOWN_DRAIN_SECS),
+            max_inflight: max_inflight
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(DEFAULT_MAX_INFLIGHT),
         }
     }
 
@@ -139,6 +154,7 @@ impl IngressConfig {
         Self::from_values(
             env_string("CORECRUXD_MAX_REQUEST_BODY_BYTES").as_deref(),
             env_string("CORECRUXD_SHUTDOWN_DRAIN_SECS").as_deref(),
+            env_string("CORECRUXD_MAX_INFLIGHT").as_deref(),
         )
     }
 
@@ -920,23 +936,25 @@ pub fn load_config() -> Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppendLaneScope, CommitLevel, IngressConfig, StoreLockStrategy, DEFAULT_MAX_REQUEST_BODY_BYTES,
-        DEFAULT_SHUTDOWN_DRAIN_SECS,
+        AppendLaneScope, CommitLevel, IngressConfig, StoreLockStrategy, DEFAULT_MAX_INFLIGHT,
+        DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_SHUTDOWN_DRAIN_SECS,
     };
 
     #[test]
     fn ingress_config_defaults_when_unset() {
-        let cfg = IngressConfig::from_values(None, None);
+        let cfg = IngressConfig::from_values(None, None, None);
         assert_eq!(cfg.max_request_body_bytes, DEFAULT_MAX_REQUEST_BODY_BYTES);
         assert_eq!(cfg.shutdown_drain_secs, DEFAULT_SHUTDOWN_DRAIN_SECS);
+        assert_eq!(cfg.max_inflight, DEFAULT_MAX_INFLIGHT);
         assert_eq!(cfg, IngressConfig::default());
     }
 
     #[test]
     fn ingress_config_parses_overrides() {
-        let cfg = IngressConfig::from_values(Some("1048576"), Some("5"));
+        let cfg = IngressConfig::from_values(Some("1048576"), Some("5"), Some("128"));
         assert_eq!(cfg.max_request_body_bytes, 1_048_576);
         assert_eq!(cfg.shutdown_drain_secs, 5);
+        assert_eq!(cfg.max_inflight, 128);
         assert_eq!(
             cfg.shutdown_drain_cap(),
             Some(std::time::Duration::from_secs(5))
@@ -945,24 +963,27 @@ mod tests {
 
     #[test]
     fn ingress_config_zero_means_disabled() {
-        let cfg = IngressConfig::from_values(Some("0"), Some("0"));
+        let cfg = IngressConfig::from_values(Some("0"), Some("0"), Some("0"));
         assert_eq!(cfg.max_request_body_bytes, 0);
         assert_eq!(cfg.shutdown_drain_secs, 0);
+        assert_eq!(cfg.max_inflight, 0);
         assert_eq!(cfg.shutdown_drain_cap(), None);
     }
 
     #[test]
     fn ingress_config_invalid_values_fall_back_to_defaults() {
-        let cfg = IngressConfig::from_values(Some("not-a-number"), Some("-3"));
+        let cfg = IngressConfig::from_values(Some("not-a-number"), Some("-3"), Some("4.5"));
         assert_eq!(cfg.max_request_body_bytes, DEFAULT_MAX_REQUEST_BODY_BYTES);
         assert_eq!(cfg.shutdown_drain_secs, DEFAULT_SHUTDOWN_DRAIN_SECS);
+        assert_eq!(cfg.max_inflight, DEFAULT_MAX_INFLIGHT);
     }
 
     #[test]
     fn ingress_config_trims_whitespace() {
-        let cfg = IngressConfig::from_values(Some(" 2048 "), Some("\t60\n"));
+        let cfg = IngressConfig::from_values(Some(" 2048 "), Some("\t60\n"), Some(" 512 "));
         assert_eq!(cfg.max_request_body_bytes, 2048);
         assert_eq!(cfg.shutdown_drain_secs, 60);
+        assert_eq!(cfg.max_inflight, 512);
     }
 
     #[test]

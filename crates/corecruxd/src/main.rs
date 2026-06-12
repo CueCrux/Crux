@@ -788,7 +788,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // limit + problem+json 413s, applied before TraceLayer so rejected
     // requests still show up in traces.
     let app: Router =
-        http::ingress::apply_ingress_limits(http::router(state), &config.ingress).layer(TraceLayer::new_for_http());
+        http::ingress::apply_ingress_limits(http::router(state), &config.ingress, Some(&metrics))
+            .layer(TraceLayer::new_for_http());
 
     // Session TTL reaper — runs every 60s, removes expired sessions.
     {
@@ -1018,7 +1019,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let rx = shutdown_tx.subscribe();
         let drain_cap = config.ingress.shutdown_drain_cap();
         // The MCP plane gets the same body limit as the API plane.
-        let mcp_app = http::ingress::apply_ingress_limits(mcp_app, &config.ingress);
+        let mcp_app = http::ingress::apply_ingress_limits(mcp_app, &config.ingress, Some(&metrics));
         tokio::spawn(async move { serve_http(mcp_addr, mcp_app, rx, drain_cap).await })
     });
 

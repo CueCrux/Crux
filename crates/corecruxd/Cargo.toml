@@ -42,6 +42,7 @@ tar = "0.4.44"
 tokio = { version = "1.52.3", features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
 tokio-stream = { version = "0.1.15", features = ["sync"] }
 tonic = "0.14.6"
+tower = { version = "0.5", features = ["limit", "load-shed", "util"] }
 tower-http = { version = "0.6.2", features = ["catch-panic", "cors", "limit", "timeout", "trace"] }
 thiserror = "2.0.12"
 tracing = "0.1.41"
@@ -81,7 +82,6 @@ sha2 = "0.11"
 corecrux-index = { path = "../corecrux-index" }
 serial_test = "3"
 tempfile = "3"
-tower = { version = "0.5", features = ["util"] }
 wat = "1"
 
 [build-dependencies]

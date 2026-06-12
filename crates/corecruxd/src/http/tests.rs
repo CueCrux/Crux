@@ -11403,7 +11403,7 @@ async fn sse_session_survives_30s_idle() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let state = test_app_state(1);
-    let app = super::ingress::apply_ingress_limits(router(state), &crate::config::IngressConfig::default());
+    let app = super::ingress::apply_ingress_limits(router(state), &crate::config::IngressConfig::default(), None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
