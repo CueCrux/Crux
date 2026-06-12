@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use corecruxctl::{
-    admin, audit_export, audit_pack, c2pa_x509, evidence, explain, extensions, fixture_digest, gaps, identity_cli,
-    inspect_receipt, memory, memory_pack, output_verify, parity, projections, receipts, reconcile, replay, shard,
-    shardmap, smoke, snapshot, stage1_import, storage, structured_log, tooling_env, verify_store,
+    admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, evidence, explain, extensions, fixture_digest,
+    gaps, identity_cli, inspect_receipt, memory, memory_pack, output_verify, parity, projections, receipts, reconcile,
+    replay, shard, shardmap, smoke, snapshot, stage1_import, storage, structured_log, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -346,6 +346,14 @@ enum Command {
         since: Option<String>,
     },
 
+    /// Code-intelligence harvester — ingest cargo-check / machete / grep /
+    /// ts-prune findings into normalized JSON (code-intelligence M1).
+    #[command(name = "code-health")]
+    CodeHealth {
+        #[command(subcommand)]
+        command: CodeHealthCommand,
+    },
+
     /// Interactive quickstart wizard for new users.
     Quickstart {
         /// CoreCrux HTTP base URL.
@@ -527,6 +535,57 @@ enum Command {
         /// Emit compact JSON instead of pretty JSON.
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CodeHealthCommand {
+    /// Harvest code-health findings from the tool battery over a repo and
+    /// emit normalized JSON (default) or a text summary. With `--push`, write
+    /// the findings to the daemon fact store instead (M2).
+    Harvest {
+        /// Repo root to harvest (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Output format: `json` (default) or `text`. Ignored with `--push`.
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Push findings to the daemon fact store (`codehealth:<repo>`),
+        /// retiring resolved findings and writing a `run:<date>` summary.
+        #[arg(long, default_value_t = false)]
+        push: bool,
+        /// Daemon HTTP base URL for `--push`.
+        #[arg(long, default_value = "http://127.0.0.1:14800")]
+        http: String,
+        /// Bearer token file for `--push` (defaults: $CRUX_AGENT_TOKEN, then
+        /// ~/.config/cuecrux/crux-tokens/anthropic.jwt).
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
+    /// Extract the endpoint→termination call chain for a route or function
+    /// (code-intelligence M4 — path-qualified syn walker).
+    Trace {
+        /// Repo root to analyze (default: current directory).
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Root to trace: an axum route path (`/v1/...`) or a function name.
+        #[arg(long)]
+        root: String,
+        /// Output format: `json` (default) or `text`. Ignored with `--push`.
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Maximum chain depth.
+        #[arg(long, default_value_t = 8)]
+        max_depth: usize,
+        /// Push the chain as a `codechain` entity instead of printing it.
+        #[arg(long, default_value_t = false)]
+        push: bool,
+        /// Daemon HTTP base URL for `--push`.
+        #[arg(long, default_value = "http://127.0.0.1:14800")]
+        http: String,
+        /// Bearer token file for `--push`.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
     },
 }
 
@@ -2123,6 +2182,35 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
 
+        Command::CodeHealth { command } => match command {
+            CodeHealthCommand::Harvest {
+                repo,
+                format,
+                push,
+                http,
+                token_file,
+            } => {
+                if push {
+                    code_health::run_push(&repo, &http, token_file.as_deref())?;
+                } else {
+                    code_health::run_harvest(&repo, &format)?;
+                }
+                Ok(())
+            }
+            CodeHealthCommand::Trace {
+                repo,
+                root,
+                format,
+                max_depth,
+                push,
+                http,
+                token_file,
+            } => {
+                code_chain::run_trace(&repo, &root, &format, max_depth, push, &http, token_file.as_deref())?;
+                Ok(())
+            }
+        },
+
         Command::Quickstart { http, non_interactive } => {
             corecruxctl::quickstart::run(&http, non_interactive)?;
             Ok(())
@@ -3527,6 +3615,21 @@ mod tests {
             Command::Gaps { data_dir, since } => {
                 assert!(data_dir.is_none());
                 assert_eq!(since, Some("2026-01-01".to_string()));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_code_health_harvest() {
+        let cli = Cli::try_parse_from(["corecruxctl", "code-health", "harvest", "--repo", "/tmp/x"]).unwrap();
+        match cli.command {
+            Command::CodeHealth {
+                command: CodeHealthCommand::Harvest { repo, format, push, .. },
+            } => {
+                assert_eq!(repo, std::path::PathBuf::from("/tmp/x"));
+                assert_eq!(format, "json");
+                assert!(!push);
             }
             other => panic!("unexpected command: {other:?}"),
         }

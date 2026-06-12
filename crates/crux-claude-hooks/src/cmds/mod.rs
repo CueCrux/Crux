@@ -6,6 +6,7 @@
 //! `anyhow::Result<()>`. The binary always exits 0 — errors are logged to
 //! stderr but never block tool execution.
 
+pub mod code_context;
 pub mod context_monitor;
 pub mod memory_ack_inline;
 pub mod observe_post;

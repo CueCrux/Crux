@@ -1,0 +1,3 @@
+sdks/typescript/src/client.ts:42 - LegacyClient
+sdks/typescript/src/index.ts:7 - deprecatedExport
+sdks/typescript/src/util.ts:15 - internalHelper (used in module)

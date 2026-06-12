@@ -1,0 +1,8 @@
+cargo-machete found the following unused dependencies in /home/myles/CueCrux/Crux:
+corecruxd -- crates/corecruxd/Cargo.toml:
+	regex
+	once_cell
+corecrux-types -- crates/corecrux-types/Cargo.toml:
+	once_cell
+
+If you believe cargo-machete has detected an unused dependency incorrectly, you can add the dependency to the list of dependencies to ignore in the `[package.metadata.cargo-machete]` section of the Cargo.toml.

@@ -29,6 +29,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// PreToolUse hook (code-intelligence M5): inject a `code:<repo>:<path>`
+    /// file-context fact as additionalContext when a file is Read. Default-OFF
+    /// behind `CRUX_HOOK_CODE_CONTEXT`. Always allows; never blocks.
+    CodeContext,
     /// PostToolUse hook: read-only operational anomaly warnings.
     ContextMonitor,
     /// PostToolUse hook (agent-ux-02): emit "Memory used: …" annotation
@@ -54,6 +58,7 @@ fn main() {
     let cli = Cli::parse();
     let stdin = std::io::stdin();
     let result = match cli.command {
+        Command::CodeContext => cmds::code_context::run(stdin.lock()),
         Command::ContextMonitor => cmds::context_monitor::run(stdin.lock()),
         Command::MemoryAckInline => cmds::memory_ack_inline::run(stdin.lock()),
         Command::ObservePre => cmds::observe_pre::run(stdin.lock()),
