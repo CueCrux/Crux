@@ -443,6 +443,19 @@ function makeFetch() {
   ok(f10.calls.some(c => /workspace\/scan/.test(c.url) && c.opts && c.opts.method === 'POST'), 'M3 scan: Scan path POSTs /v1/workspace/scan');
   ok(/17 modules/.test(env10.getById('cxToast').textContent || ''), 'M3 scan: toast carries scan stats');
 
+  // ── N) M4 — events stream: tail page + ticker (stub has no ReadableStream → graceful 'unsupported') ──
+  ok(f10.calls.some(c => /\/v1\/events\/stream/.test(c.url)), 'M4 events: boot subscribes to /v1/events/stream when live');
+  env10.s.onCruxEvent('fact.stored', JSON.stringify({ type: 'fact.stored', data: { fact_id: 'f1', entity: 'execplan:gap', key: 'gate:M4' } }));
+  env10.s.onCruxEvent('punchcard.changed', JSON.stringify({ type: 'punchcard.changed', data: { resource: 'tree://crates' } }));
+  env10.s.closePage(); env10.s.openPage('ax-activity'); await flush(8);
+  ok(env10.ALL.some(e => /execplan:gap · gate:M4/.test(e._text || '')), 'M4 events: tail row carries entity · key');
+  ok(env10.ALL.some(e => /punchcard\.changed/.test(e._text || '')), 'M4 events: newest event rendered in the tail');
+  env10.s.dashMode = true; env10.s.onCruxEvent('fact.stored', JSON.stringify({ type: 'fact.stored', data: { entity: 'bench:lme-s', key: 'r1' } }));
+  ok(/bench:lme-s/.test(env10.getById('evtTicker').textContent || ''), 'M4 events: dash ticker shows the latest event');
+  ok(/3 events/.test(env10.getById('evtTicker').textContent || ''), 'M4 events: ticker carries the buffer count');
+  await lastBtn(env10, 'Clear').fire('click'); await flush(6);
+  ok(env10.ALL.filter(e => /no events yet/.test(e._text || '')).length >= 1, 'M4 events: Clear empties the tail');
+
   console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

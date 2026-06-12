@@ -170,6 +170,8 @@
   .dash-num small { display:block; margin-top:7px; font-size:10.5px; font-weight:500; color:var(--text-muted); letter-spacing:0; }
   .dash-mid { margin:10px 0 2px; font-size:21px; font-weight:800; letter-spacing:-.015em; line-height:1.1; color:var(--text-primary); }
   .dash-mid small { display:block; margin-top:5px; font-size:10px; font-weight:500; color:var(--text-muted); font-family:var(--font-mono); }
+  #evtTicker { position:fixed; left:50%; transform:translateX(-50%); bottom:14px; z-index:60; padding:6px 14px; border-radius:var(--radius-full);
+    background:var(--surface-glass-strong); color:var(--text-muted); font:11px var(--font-mono); border:1px solid var(--border-default); display:none; pointer-events:none; }
   .dp-v.wide { width:84px; }
   .dash-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:13px; }
   .dash-chip { font-family:var(--font-mono); font-size:10px; padding:3px 9px; border:1px solid var(--border-default); border-radius:999px; color:var(--text-secondary); background:var(--surface-glass); white-space:nowrap; }
@@ -1377,6 +1379,52 @@ function applyStorageTile(sb){   // gap-closure M3: ov-storage dash tile ⇄ /v1
   n.payload=JSON.stringify({by_kind:ks},null,2);
 }
 function txOverviewPlus(json){ const kids=txOverview(json.sum||json); applyUsageTile(json.usage); applyStorageTile(json.storage); return kids; }
+/* ── live events stream (gap-closure M4): /v1/events/stream SSE → ring buffer →
+     Activity page tail + CX dash ticker. EventSource can't send the scopes header,
+     so this reads the stream via fetch; environments without ReadableStream
+     (the smoke DOM stub) degrade to EVT_STATE='unsupported'. ── */
+const EVENTS=[]; let EVT_STATE='idle', __evtRetries=0, __actRerender=0;
+function evtNote(e){ const d=e.data||{};
+  return [d.entity&&(d.entity+(d.key?' · '+d.key:'')), d.session_id, d.orchestrator_id, d.resource].filter(Boolean)[0]||''; }
+function updateEvtTicker(){
+  let t=document.getElementById('evtTicker');
+  if(!t){ t=document.createElement('div'); t.id='evtTicker'; document.body.appendChild(t); }
+  const on= LIVE && typeof dashMode!=='undefined' && dashMode && activeScope==='cx' && EVENTS.length>0;
+  t.style.display=on?'block':'none';
+  if(!on) return;
+  const e=EVENTS[EVENTS.length-1];
+  t.textContent='● '+e.type+(evtNote(e)?' · '+evtNote(e):'')+' · '+e.at+' · '+EVENTS.length+' events';
+}
+function onCruxEvent(type, dataStr){
+  let data={}; try{ const j=JSON.parse(dataStr); data=j.data||j; }catch(err){}
+  EVENTS.push({type, data, at:new Date().toISOString().slice(11,19)+'Z'});
+  if(EVENTS.length>200) EVENTS.shift();
+  updateEvtTicker();
+  if(openPageId==='ax-activity' && !confGet('ax-activity.act_pause',false)){
+    const now=Date.now();
+    if(now-__actRerender>600){ __actRerender=now;
+      Promise.resolve(PAGE_WIRES['ax-activity'].load(PAGES['ax-activity']))
+        .then(()=>{ if(openPageId==='ax-activity') openPage('ax-activity',{__wired:true}); }).catch(()=>{}); }
+  }
+}
+async function startEventStream(){
+  if(!LIVE || typeof fetch!=='function') return;
+  try{
+    const r=await fetch('/v1/events/stream',{headers:apiHeaders()});
+    if(!r.ok){ EVT_STATE=(r.status===401||r.status===403)?'unavailable':'error'; return; }
+    if(!r.body || !r.body.getReader || typeof TextDecoder==='undefined'){ EVT_STATE='unsupported'; return; }
+    EVT_STATE='open'; __evtRetries=0;
+    const rd=r.body.getReader(), dec=new TextDecoder(); let buf='';
+    for(;;){ const {done,value}=await rd.read(); if(done) break;
+      buf+=dec.decode(value,{stream:true});
+      let i; while((i=buf.indexOf('\n\n'))>=0){ const block=buf.slice(0,i); buf=buf.slice(i+2);
+        let ev='message', data='';
+        block.split('\n').forEach(l=>{ if(l.indexOf('event:')===0) ev=l.slice(6).trim(); else if(l.indexOf('data:')===0) data+=(data?'\n':'')+l.slice(5).trim(); });
+        if(data) onCruxEvent(ev, data); } }
+    EVT_STATE='closed';
+  }catch(err){ EVT_STATE='error'; }
+  if(LIVE && (EVT_STATE==='closed'||EVT_STATE==='error') && __evtRetries<5){ __evtRetries++; setTimeout(startEventStream, 2000*__evtRetries); }
+}
 function registerLoaders(){
   LOADERS['cx-overview']      = { noun:'tiles', transform: txOverviewPlus,                                                  // M2/M3
     fetch: async()=>({ sum: await api('/v1/console/summary'), usage: await usageRollup(7).catch(()=>null),
@@ -1408,7 +1456,7 @@ async function bootProbe(){
   if(el && !(el.value||'').trim()){ try{ el.value=localStorage.getItem('crux-console-scopes')||'admin:read,facts:read,console:read,receipts:read'; }catch{ el.value='admin:read,facts:read,console:read,receipts:read'; } }
   try{ const r=await fetch('/readyz',{cache:'no-store'}); LIVE=!!(r&&r.ok); }catch{ LIVE=false; }
   registerLoaders(); updateLiveBadge();
-  if(LIVE) prefetchScope(activeScope);
+  if(LIVE){ prefetchScope(activeScope); startEventStream(); }
 }
 // debug/test handle (used by the Node smoke harness; inert in prod)
 try{ globalThis.__cx = { get LIVE(){return LIVE;}, setLive:(v)=>{LIVE=v;}, N, LOADERS, loadState, ensureLoaded, mergeChildren, makeStatusNode, bootProbe, prefetchScope, api, idFor }; }catch{}
@@ -3005,6 +3053,18 @@ const PAGE_WIRES={
       : [infoRow('—','sessions show here when save_session uses execplan:<slug> ids')];
   },
   set:{ win: ()=>{ if(openPageId==='cx-usage') openPage('cx-usage'); return null; } }},
+ 'ax-activity':{
+  load: def=>{   // synchronous projection of the EVENTS ring buffer — onCruxEvent re-renders live
+    const rows=EVENTS.slice(-14).reverse().map(e=>infoRow(e.type, [evtNote(e), e.at].filter(Boolean).join(' · ')));
+    const sec={ h:'Tail · /v1/events/stream',
+      sub: EVT_STATE==='open'? (EVENTS.length+' events this session · live')
+         : EVT_STATE==='unavailable'? 'stream not authorised — needs query:read'
+         : EVT_STATE==='unsupported'? 'streaming unsupported in this environment'
+         : (EVENTS.length? EVENTS.length+' events buffered · stream '+EVT_STATE : 'waiting for store mutations…'),
+      controls: rows.length? rows : [infoRow('no events yet','fact / session / orchestrator / punchcard mutations appear here as they happen')] };
+    if(def.sections[0] && /^Tail/.test(def.sections[0].h)) def.sections[0]=sec; else def.sections.unshift(sec);
+  },
+  act:{ 'Clear': async()=>{ EVENTS.length=0; updateEvtTicker(); if(openPageId==='ax-activity') openPage('ax-activity'); return 'event tail cleared'; } }},
  'cx-documents':{
   load: async def=>{
     const [tn,sb,qf]=await Promise.all([
