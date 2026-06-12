@@ -11389,3 +11389,143 @@ async fn openapi_json_route_serves_valid_openapi_3_document() {
         "missing bearer_auth security scheme"
     );
 }
+
+// ── Agent usage rollup: /v1/agents/{passport}/usage (action-ledger M3) ────
+
+fn usage_query(window_hours: Option<u32>) -> axum::extract::Query<agent_usage::UsageQuery> {
+    axum::extract::Query(agent_usage::UsageQuery { window_hours })
+}
+
+fn seed_ledger_file(state: &AppState, passport: &str, payloads: &[serde_json::Value]) {
+    let obs_dir = state.data_dir.join("observations");
+    std::fs::create_dir_all(&obs_dir).expect("mkdir observations");
+    let body = payloads
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "kind": "agent.tool_invocation.v1",
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "session_id": format!("ledger::{passport}"),
+                "provider": "crux-mcp",
+                "principal": passport,
+                "payload": p,
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(obs_dir.join(format!("ledger__{passport}.jsonl")), body).expect("write ledger jsonl");
+}
+
+#[tokio::test]
+async fn agent_usage_unauthenticated_denied_401() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = agent_usage::get_agent_usage(
+        State(state),
+        HeaderMap::new(),
+        axum::extract::Path("alice".to_string()),
+        usage_query(None),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn agent_usage_insufficient_scope_denied_403() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = agent_usage::get_agent_usage(
+        State(state),
+        dev_scope_headers("facts:read"),
+        axum::extract::Path("alice".to_string()),
+        usage_query(None),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn agent_usage_other_passport_denied_403() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // bob (passport-bound, read scope) asks for alice's usage → 403,
+    // even though the scope would otherwise pass.
+    let resp = agent_usage::get_agent_usage(
+        State(state),
+        dev_scope_passport_headers("sessions:read", "bob"),
+        axum::extract::Path("alice".to_string()),
+        usage_query(None),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn agent_usage_own_passport_allowed_200() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_ledger_file(
+        &state,
+        "alice",
+        &[
+            serde_json::json!({"tool": "query_facts", "est_tokens_in": 10, "est_tokens_out": 90, "latency_ms": 4, "outcome": "ok"}),
+            serde_json::json!({"tool": "store_fact", "est_tokens_in": 20, "est_tokens_out": 30, "latency_ms": 2, "outcome": "error"}),
+        ],
+    );
+    let resp = agent_usage::get_agent_usage(
+        State(state),
+        dev_scope_passport_headers("sessions:read", "alice"),
+        axum::extract::Path("alice".to_string()),
+        usage_query(None),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["passport"], "alice");
+    assert_eq!(body["calls_total"], 2);
+    assert_eq!(body["tokens_total"], 150);
+    assert_eq!(body["errors_total"], 1);
+    assert_eq!(body["window"], "all");
+    assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn agent_usage_raw_admin_reads_others_200() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    seed_ledger_file(
+        &state,
+        "alice",
+        &[serde_json::json!({"tool": "query", "est_tokens_in": 5, "est_tokens_out": 5, "latency_ms": 1, "outcome": "ok"})],
+    );
+    // Raw admin (admin:read, NO passport binding) may read anyone's.
+    let resp = agent_usage::get_agent_usage(
+        State(state),
+        dev_scope_headers("admin:read"),
+        axum::extract::Path("alice".to_string()),
+        usage_query(Some(24)),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["calls_total"], 1);
+    assert_eq!(body["window"], "24h");
+}
+
+#[tokio::test]
+async fn agent_usage_empty_ledger_is_200_zeroes() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = agent_usage::get_agent_usage(
+        State(state),
+        dev_scope_passport_headers("sessions:read", "ghost"),
+        axum::extract::Path("ghost".to_string()),
+        usage_query(None),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["calls_total"], 0);
+    assert_eq!(body["error_rate"], 0.0);
+}
