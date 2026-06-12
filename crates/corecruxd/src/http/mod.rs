@@ -44,6 +44,7 @@ mod rcx_publish;
 mod receipts;
 mod relations;
 mod replay;
+mod result_envelope;
 mod routing;
 pub mod session;
 mod storybook;
@@ -478,6 +479,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/sync/tenants/{tenantId}/offboard",
             axum::routing::post(self::sync::post_tenant_offboard),
+        )
+        .route(
+            "/v1/result-envelope/import",
+            axum::routing::post(self::result_envelope::post_result_envelope_import),
         )
         .route("/v1/sessions/{sessionId}/state", axum::routing::put(self::facts::put_session_state))
         .route("/v1/sessions/{sessionId}/state", get(self::facts::get_session_state))
