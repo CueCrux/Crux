@@ -32,6 +32,8 @@
 //! `CORECRUXD_CONTEXT_SURFACE`, default-OFF). This module carries no
 //! runtime behavior change on its own.
 
+use std::fmt::Write as _;
+
 use crate::decay::{apply_at, DecayPolicy, Freshness, HorizonClass};
 use serde::{Deserialize, Serialize};
 
@@ -388,6 +390,10 @@ pub fn assemble(req: &BundleRequest, facts: Vec<FactInput>, aux: Vec<AuxSection>
 
 /// Canonical stable-region bytes: serde_json over the struct (field order
 /// fixed by struct definition; vectors pre-sorted by the assembler).
+// expect: serde_json over a plain derive(Serialize) struct (no maps with
+// non-string keys, no fallible custom impls) cannot fail; a default-empty
+// fallback would silently corrupt the stable hash, so assert instead.
+#[allow(clippy::expect_used)]
 pub fn stable_region_bytes(stable: &StableRegion) -> Vec<u8> {
     serde_json::to_vec(stable).expect("stable region serializes")
 }
@@ -407,8 +413,9 @@ pub fn hash_stable_region(stable: &StableRegion) -> String {
 /// (prompt prefix), volatile trailer last.
 pub fn render_markdown(bundle: &ContextBundle) -> String {
     let mut out = render_markdown_stable(&bundle.stable);
-    out.push_str(&format!(
-        "\n---\n_volatile: assembled_at_ms={} actor={} tenant={} session={} budget {}/{} (ceiling {}) hash={}_\n",
+    let _ = writeln!(
+        out,
+        "\n---\n_volatile: assembled_at_ms={} actor={} tenant={} session={} budget {}/{} (ceiling {}) hash={}_",
         bundle.assembled_at_ms,
         bundle.actor,
         bundle.tenant_id,
@@ -417,7 +424,7 @@ pub fn render_markdown(bundle: &ContextBundle) -> String {
         bundle.budget.requested,
         bundle.budget.ceiling,
         bundle.stable_hash,
-    ));
+    );
     out
 }
 
@@ -425,24 +432,25 @@ pub fn render_markdown(bundle: &ContextBundle) -> String {
 /// markdown and openai-messages renderers.
 pub fn render_markdown_stable(stable: &StableRegion) -> String {
     let mut out = String::new();
-    out.push_str(&format!("## Crux Context ({})\n", stable.bundle_version));
+    let _ = writeln!(out, "## Crux Context ({})", stable.bundle_version);
     for section in &stable.sections {
-        out.push_str(&format!("\n### {}\n", section.kind.as_str()));
+        let _ = writeln!(out, "\n### {}", section.kind.as_str());
         if !section.facts.is_empty() {
             out.push_str("| entity | key | value | conf | freshness |\n|---|---|---|---|---|\n");
             for f in &section.facts {
-                out.push_str(&format!(
-                    "| {} | {} | {} | {:.2} | {} |\n",
+                let _ = writeln!(
+                    out,
+                    "| {} | {} | {} | {:.2} | {} |",
                     md_cell(&f.entity),
                     md_cell(&f.key),
                     md_cell(&f.value),
                     f.confidence,
                     f.freshness.as_str(),
-                ));
+                );
             }
         }
         for item in &section.items {
-            out.push_str(&format!("- **{}** — {}\n", md_cell(&item.id), md_cell(&item.text)));
+            let _ = writeln!(out, "- **{}** — {}", md_cell(&item.id), md_cell(&item.text));
         }
     }
     out
@@ -453,6 +461,9 @@ fn md_cell(text: &str) -> String {
 }
 
 /// JSON renderer — the full bundle shape verbatim.
+// expect: same rationale as stable_region_bytes — plain derive(Serialize)
+// over the bundle cannot fail.
+#[allow(clippy::expect_used)]
 pub fn render_json(bundle: &ContextBundle) -> String {
     serde_json::to_string(bundle).expect("bundle serializes")
 }
