@@ -3544,6 +3544,10 @@ async fn post_query_graph_expand_uses_http_dataplane_fake() {
 
 // ── post_query_time_range (feature gate + validation) ───────────
 
+// Serialized: reads CORECRUXD_QUERY_TIME_RANGE (expects unset). Without this,
+// it can run concurrently with the #[serial] test that sets the flag and
+// observe a leaked value (process-global env), returning 501 not 404.
+#[serial_test::serial]
 #[tokio::test]
 async fn post_query_time_range_returns_not_found_when_disabled() {
     let state = test_app_state(16);
