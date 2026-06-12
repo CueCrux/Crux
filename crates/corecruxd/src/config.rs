@@ -89,6 +89,196 @@ impl AppendLaneScope {
     }
 }
 
+/// HTTP/gRPC ingress-hardening knobs (ExecPlan
+/// `crux-http-ingress-hardening-2026-06-11`). All limits are env-tunable;
+/// `0` means "disabled / unbounded" so an emergency rollback never needs a
+/// redeploy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressConfig {
+    /// Maximum accepted HTTP request body, in bytes
+    /// (`CORECRUXD_MAX_REQUEST_BODY_BYTES`). `0` disables the limit.
+    pub max_request_body_bytes: usize,
+    /// Hard cap on the graceful-shutdown connection drain, in seconds
+    /// (`CORECRUXD_SHUTDOWN_DRAIN_SECS`). `0` means drain without bound
+    /// (pre-hardening behaviour).
+    pub shutdown_drain_secs: u64,
+    /// Maximum concurrently-admitted HTTP requests per listener
+    /// (`CORECRUXD_MAX_INFLIGHT`). Excess requests are load-shed with a
+    /// 503 problem+json. `0` disables the cap.
+    pub max_inflight: usize,
+    /// Sustained per-key request rate (`CORECRUXD_RATE_LIMIT_RPS`).
+    /// Keyed per passport where `X-Corecrux-Passport-Id` is present,
+    /// falling back to per client IP. `0` disables rate limiting.
+    pub rate_limit_rps: u64,
+    /// Burst capacity per key (`CORECRUXD_RATE_LIMIT_BURST`). Clamped to
+    /// at least `rate_limit_rps`.
+    pub rate_limit_burst: u64,
+    /// CIDRs whose client IPs bypass rate limiting entirely
+    /// (`CORECRUXD_RATE_LIMIT_EXEMPT_CIDRS`, comma-separated). Defaults to
+    /// loopback (console/local agents).
+    pub rate_limit_exempt_cidrs: Vec<String>,
+    /// HTTP/2 keep-alive ping interval for the gRPC plane, in seconds
+    /// (`CORECRUXD_GRPC_KEEPALIVE_INTERVAL_SECS`). `0` disables server
+    /// keep-alive pings (pre-hardening behaviour: dead peers hold
+    /// connections open indefinitely).
+    pub grpc_keepalive_interval_secs: u64,
+    /// How long to wait for a keep-alive ping ack before closing the
+    /// connection, in seconds (`CORECRUXD_GRPC_KEEPALIVE_TIMEOUT_SECS`).
+    /// Only meaningful when the interval is non-zero.
+    pub grpc_keepalive_timeout_secs: u64,
+    /// Maximum concurrent HTTP/2 streams per gRPC connection
+    /// (`CORECRUXD_GRPC_MAX_CONCURRENT_STREAMS`). `0` leaves it unbounded.
+    pub grpc_max_concurrent_streams: u32,
+}
+
+/// Default HTTP body limit: 256 MB. Sized for the largest legitimate
+/// payloads (multi-MB bulk-import bodies) with >10× headroom, while still
+/// closing the unbounded-body DoS door.
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
+/// Default graceful-shutdown drain cap: matches the router-wide 30s
+/// `TimeoutLayer`, so no request that can still complete is cut short.
+pub const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 30;
+/// Default in-flight request cap: 4096 — far above observed prod
+/// concurrency, low enough to shed a connection flood before memory does.
+pub const DEFAULT_MAX_INFLIGHT: usize = 4096;
+/// Default sustained per-key request rate: 300 req/s — ≥10× the busiest
+/// observed single-agent traffic.
+pub const DEFAULT_RATE_LIMIT_RPS: u64 = 300;
+/// Default per-key burst capacity.
+pub const DEFAULT_RATE_LIMIT_BURST: u64 = 600;
+/// Default exempt CIDRs: loopback only (console SPA on the operator host
+/// and local agents).
+pub const DEFAULT_RATE_LIMIT_EXEMPT_CIDRS: &[&str] = &["127.0.0.0/8", "::1/128"];
+/// Default gRPC keep-alive ping interval: 30s — frequent enough to reap
+/// dead peers within a minute, far above any ping-flood concern.
+pub const DEFAULT_GRPC_KEEPALIVE_INTERVAL_SECS: u64 = 30;
+/// Default gRPC keep-alive ack timeout.
+pub const DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS: u64 = 10;
+/// Default per-connection HTTP/2 stream cap: 1024 — a single client
+/// cannot multiplex unbounded streams over one connection. The existing
+/// per-tenant token-bucket throttle (`grpc.rs`) stays the fairness layer.
+pub const DEFAULT_GRPC_MAX_CONCURRENT_STREAMS: u32 = 1024;
+
+impl Default for IngressConfig {
+    fn default() -> Self {
+        Self {
+            max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
+            shutdown_drain_secs: DEFAULT_SHUTDOWN_DRAIN_SECS,
+            max_inflight: DEFAULT_MAX_INFLIGHT,
+            rate_limit_rps: DEFAULT_RATE_LIMIT_RPS,
+            rate_limit_burst: DEFAULT_RATE_LIMIT_BURST,
+            rate_limit_exempt_cidrs: DEFAULT_RATE_LIMIT_EXEMPT_CIDRS
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            grpc_keepalive_interval_secs: DEFAULT_GRPC_KEEPALIVE_INTERVAL_SECS,
+            grpc_keepalive_timeout_secs: DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS,
+            grpc_max_concurrent_streams: DEFAULT_GRPC_MAX_CONCURRENT_STREAMS,
+        }
+    }
+}
+
+impl IngressConfig {
+    /// Pure constructor shared by `from_env` and the unit tests:
+    /// missing or unparseable values fall back to the documented defaults.
+    /// One positional arg per env var, in `from_env` order — a config
+    /// struct for a private 2-caller helper would be ceremony.
+    #[allow(clippy::too_many_arguments)]
+    fn from_values(
+        max_request_body_bytes: Option<&str>,
+        shutdown_drain_secs: Option<&str>,
+        max_inflight: Option<&str>,
+        rate_limit_rps: Option<&str>,
+        rate_limit_burst: Option<&str>,
+        rate_limit_exempt_cidrs: Option<&str>,
+        grpc_keepalive_interval_secs: Option<&str>,
+        grpc_keepalive_timeout_secs: Option<&str>,
+        grpc_max_concurrent_streams: Option<&str>,
+    ) -> Self {
+        let rate_limit_rps = rate_limit_rps
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(DEFAULT_RATE_LIMIT_RPS);
+        Self {
+            max_request_body_bytes: max_request_body_bytes
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(DEFAULT_MAX_REQUEST_BODY_BYTES),
+            shutdown_drain_secs: shutdown_drain_secs
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(DEFAULT_SHUTDOWN_DRAIN_SECS),
+            max_inflight: max_inflight
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(DEFAULT_MAX_INFLIGHT),
+            rate_limit_rps,
+            // Burst below the sustained rate makes no sense; clamp up.
+            rate_limit_burst: rate_limit_burst
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(DEFAULT_RATE_LIMIT_BURST)
+                .max(rate_limit_rps),
+            rate_limit_exempt_cidrs: rate_limit_exempt_cidrs.map_or_else(
+                || {
+                    DEFAULT_RATE_LIMIT_EXEMPT_CIDRS
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect()
+                },
+                |s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|part| !part.is_empty())
+                        .map(ToString::to_string)
+                        .collect()
+                },
+            ),
+            grpc_keepalive_interval_secs: grpc_keepalive_interval_secs
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(DEFAULT_GRPC_KEEPALIVE_INTERVAL_SECS),
+            grpc_keepalive_timeout_secs: grpc_keepalive_timeout_secs
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS),
+            grpc_max_concurrent_streams: grpc_max_concurrent_streams
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(DEFAULT_GRPC_MAX_CONCURRENT_STREAMS),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_values(
+            env_string("CORECRUXD_MAX_REQUEST_BODY_BYTES").as_deref(),
+            env_string("CORECRUXD_SHUTDOWN_DRAIN_SECS").as_deref(),
+            env_string("CORECRUXD_MAX_INFLIGHT").as_deref(),
+            env_string("CORECRUXD_RATE_LIMIT_RPS").as_deref(),
+            env_string("CORECRUXD_RATE_LIMIT_BURST").as_deref(),
+            env_string("CORECRUXD_RATE_LIMIT_EXEMPT_CIDRS").as_deref(),
+            env_string("CORECRUXD_GRPC_KEEPALIVE_INTERVAL_SECS").as_deref(),
+            env_string("CORECRUXD_GRPC_KEEPALIVE_TIMEOUT_SECS").as_deref(),
+            env_string("CORECRUXD_GRPC_MAX_CONCURRENT_STREAMS").as_deref(),
+        )
+    }
+
+    /// Drain cap as a `Duration`; `None` when unbounded (`0`).
+    pub fn shutdown_drain_cap(&self) -> Option<std::time::Duration> {
+        (self.shutdown_drain_secs > 0).then(|| std::time::Duration::from_secs(self.shutdown_drain_secs))
+    }
+
+    /// gRPC keep-alive ping interval; `None` when disabled (`0`).
+    pub fn grpc_keepalive_interval(&self) -> Option<std::time::Duration> {
+        (self.grpc_keepalive_interval_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.grpc_keepalive_interval_secs))
+    }
+
+    /// gRPC keep-alive ack timeout; `None` when keep-alive is disabled or
+    /// the timeout is `0` (tonic's own default applies).
+    pub fn grpc_keepalive_timeout(&self) -> Option<std::time::Duration> {
+        (self.grpc_keepalive_interval_secs > 0 && self.grpc_keepalive_timeout_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.grpc_keepalive_timeout_secs))
+    }
+
+    /// Per-connection HTTP/2 stream cap; `None` when unbounded (`0`).
+    pub fn grpc_max_streams(&self) -> Option<u32> {
+        (self.grpc_max_concurrent_streams > 0).then_some(self.grpc_max_concurrent_streams)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub loaded_config_path: Option<PathBuf>,
@@ -179,6 +369,9 @@ pub struct Config {
     pub capacity_critical_free_ratio: f64,
     pub capacity_emergency_free_ratio: f64,
     pub capacity_resume_free_ratio: f64,
+
+    // HTTP/gRPC ingress hardening (crux-http-ingress-hardening-2026-06-11).
+    pub ingress: IngressConfig,
 
     // Phase 4 ingest bounds / idempotency knobs.
     pub max_events_per_batch: usize,
@@ -851,12 +1044,139 @@ pub fn load_config() -> Config {
             .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")),
         operating_mode,
         enabled_pro_services,
+        ingress: IngressConfig::from_env(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AppendLaneScope, CommitLevel, StoreLockStrategy};
+    use super::{
+        AppendLaneScope, CommitLevel, IngressConfig, StoreLockStrategy, DEFAULT_GRPC_KEEPALIVE_INTERVAL_SECS,
+        DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS, DEFAULT_GRPC_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_INFLIGHT,
+        DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_RATE_LIMIT_BURST, DEFAULT_RATE_LIMIT_RPS, DEFAULT_SHUTDOWN_DRAIN_SECS,
+    };
+
+    #[test]
+    fn ingress_config_defaults_when_unset() {
+        let cfg = IngressConfig::from_values(None, None, None, None, None, None, None, None, None);
+        assert_eq!(cfg.max_request_body_bytes, DEFAULT_MAX_REQUEST_BODY_BYTES);
+        assert_eq!(cfg.shutdown_drain_secs, DEFAULT_SHUTDOWN_DRAIN_SECS);
+        assert_eq!(cfg.max_inflight, DEFAULT_MAX_INFLIGHT);
+        assert_eq!(cfg.rate_limit_rps, DEFAULT_RATE_LIMIT_RPS);
+        assert_eq!(cfg.rate_limit_burst, DEFAULT_RATE_LIMIT_BURST);
+        assert_eq!(cfg.rate_limit_exempt_cidrs, vec!["127.0.0.0/8", "::1/128"]);
+        assert_eq!(cfg.grpc_keepalive_interval_secs, DEFAULT_GRPC_KEEPALIVE_INTERVAL_SECS);
+        assert_eq!(cfg.grpc_keepalive_timeout_secs, DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS);
+        assert_eq!(cfg.grpc_max_concurrent_streams, DEFAULT_GRPC_MAX_CONCURRENT_STREAMS);
+        assert_eq!(cfg, IngressConfig::default());
+    }
+
+    #[test]
+    fn ingress_config_parses_overrides() {
+        let cfg = IngressConfig::from_values(
+            Some("1048576"),
+            Some("5"),
+            Some("128"),
+            Some("10"),
+            Some("20"),
+            Some("10.0.0.0/8, 192.168.1.1/32"),
+            Some("15"),
+            Some("5"),
+            Some("256"),
+        );
+        assert_eq!(cfg.max_request_body_bytes, 1_048_576);
+        assert_eq!(cfg.shutdown_drain_secs, 5);
+        assert_eq!(cfg.max_inflight, 128);
+        assert_eq!(cfg.rate_limit_rps, 10);
+        assert_eq!(cfg.rate_limit_burst, 20);
+        assert_eq!(cfg.rate_limit_exempt_cidrs, vec!["10.0.0.0/8", "192.168.1.1/32"]);
+        assert_eq!(cfg.shutdown_drain_cap(), Some(std::time::Duration::from_secs(5)));
+        assert_eq!(cfg.grpc_keepalive_interval(), Some(std::time::Duration::from_secs(15)));
+        assert_eq!(cfg.grpc_keepalive_timeout(), Some(std::time::Duration::from_secs(5)));
+        assert_eq!(cfg.grpc_max_streams(), Some(256));
+    }
+
+    #[test]
+    fn ingress_config_burst_clamps_up_to_rps() {
+        let cfg = IngressConfig::from_values(None, None, None, Some("500"), Some("100"), None, None, None, None);
+        assert_eq!(cfg.rate_limit_rps, 500);
+        assert_eq!(cfg.rate_limit_burst, 500, "burst below rps must clamp up");
+    }
+
+    #[test]
+    fn ingress_config_zero_means_disabled() {
+        let cfg = IngressConfig::from_values(
+            Some("0"),
+            Some("0"),
+            Some("0"),
+            Some("0"),
+            Some("0"),
+            Some(""),
+            Some("0"),
+            Some("0"),
+            Some("0"),
+        );
+        assert_eq!(cfg.max_request_body_bytes, 0);
+        assert_eq!(cfg.shutdown_drain_secs, 0);
+        assert_eq!(cfg.max_inflight, 0);
+        assert_eq!(cfg.rate_limit_rps, 0);
+        assert!(cfg.rate_limit_exempt_cidrs.is_empty(), "empty CIDR list stays empty");
+        assert_eq!(cfg.shutdown_drain_cap(), None);
+        assert_eq!(cfg.grpc_keepalive_interval(), None);
+        assert_eq!(cfg.grpc_keepalive_timeout(), None);
+        assert_eq!(cfg.grpc_max_streams(), None);
+    }
+
+    #[test]
+    fn ingress_config_keepalive_timeout_inert_when_interval_disabled() {
+        // Interval 0 disables keep-alive entirely; a configured timeout
+        // must not leak through on its own.
+        let cfg = IngressConfig::from_values(None, None, None, None, None, None, Some("0"), Some("10"), None);
+        assert_eq!(cfg.grpc_keepalive_interval(), None);
+        assert_eq!(cfg.grpc_keepalive_timeout(), None);
+    }
+
+    #[test]
+    fn ingress_config_invalid_values_fall_back_to_defaults() {
+        let cfg = IngressConfig::from_values(
+            Some("not-a-number"),
+            Some("-3"),
+            Some("4.5"),
+            Some("x"),
+            Some("y"),
+            None,
+            Some("z"),
+            Some("-1"),
+            Some("1.5"),
+        );
+        assert_eq!(cfg.max_request_body_bytes, DEFAULT_MAX_REQUEST_BODY_BYTES);
+        assert_eq!(cfg.shutdown_drain_secs, DEFAULT_SHUTDOWN_DRAIN_SECS);
+        assert_eq!(cfg.max_inflight, DEFAULT_MAX_INFLIGHT);
+        assert_eq!(cfg.grpc_keepalive_interval_secs, DEFAULT_GRPC_KEEPALIVE_INTERVAL_SECS);
+        assert_eq!(cfg.grpc_keepalive_timeout_secs, DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS);
+        assert_eq!(cfg.grpc_max_concurrent_streams, DEFAULT_GRPC_MAX_CONCURRENT_STREAMS);
+    }
+
+    #[test]
+    fn ingress_config_trims_whitespace() {
+        let cfg = IngressConfig::from_values(
+            Some(" 2048 "),
+            Some("\t60\n"),
+            Some(" 512 "),
+            Some(" 7 "),
+            Some(" 14 "),
+            None,
+            Some(" 45 "),
+            Some(" 9 "),
+            Some(" 64 "),
+        );
+        assert_eq!(cfg.max_request_body_bytes, 2048);
+        assert_eq!(cfg.shutdown_drain_secs, 60);
+        assert_eq!(cfg.max_inflight, 512);
+        assert_eq!(cfg.grpc_keepalive_interval_secs, 45);
+        assert_eq!(cfg.grpc_keepalive_timeout_secs, 9);
+        assert_eq!(cfg.grpc_max_concurrent_streams, 64);
+    }
 
     #[test]
     fn commit_level_parse_accepts_aliases() {

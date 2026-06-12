@@ -21,6 +21,8 @@ pub struct Metrics {
     registry: Arc<Registry>,
     io_backend: GaugeVec,
     valve_pause_ingest: Gauge,
+    http_inflight: Gauge,
+    http_rate_limited_total: CounterVec,
     valve_pause_compaction: Gauge,
     valve_throttle: Gauge,
     valve_read_only: Gauge,
@@ -256,6 +258,27 @@ impl Metrics {
         registry
             .register(Box::new(valve_pause_ingest.clone()))
             .expect("register corecrux_valve_pause_ingest");
+
+        let http_inflight = Gauge::new(
+            "corecrux_http_inflight",
+            "HTTP requests currently admitted past the ingress concurrency gate",
+        )
+        .expect("corecrux_http_inflight gauge");
+        registry
+            .register(Box::new(http_inflight.clone()))
+            .expect("register corecrux_http_inflight");
+
+        let http_rate_limited_total = CounterVec::new(
+            prometheus::Opts::new(
+                "corecrux_http_rate_limited_total",
+                "HTTP requests rejected by the keyed ingress rate limiter",
+            ),
+            &["key_kind"],
+        )
+        .expect("corecrux_http_rate_limited_total counter");
+        registry
+            .register(Box::new(http_rate_limited_total.clone()))
+            .expect("register corecrux_http_rate_limited_total");
 
         let valve_pause_compaction = Gauge::new(
             "corecrux_valve_pause_compaction",
@@ -1420,6 +1443,8 @@ impl Metrics {
             registry,
             io_backend,
             valve_pause_ingest,
+            http_inflight,
+            http_rate_limited_total,
             valve_pause_compaction,
             valve_throttle,
             valve_read_only,
@@ -1592,6 +1617,18 @@ impl Metrics {
 
     pub fn set_valve_pause_ingest(&self, enabled: bool) {
         self.valve_pause_ingest.set(if enabled { 1.0 } else { 0.0 });
+    }
+
+    /// Clone of the in-flight HTTP request gauge for the ingress middleware
+    /// (prometheus gauges share their inner atomic across clones).
+    pub fn http_inflight_gauge(&self) -> Gauge {
+        self.http_inflight.clone()
+    }
+
+    /// Counts a request rejected by the keyed ingress rate limiter.
+    /// `key_kind` is `"passport"` or `"ip"` (flat cardinality by design).
+    pub fn inc_http_rate_limited(&self, key_kind: &str) {
+        self.http_rate_limited_total.with_label_values(&[key_kind]).inc();
     }
 
     pub fn set_valve_pause_compaction(&self, enabled: bool) {

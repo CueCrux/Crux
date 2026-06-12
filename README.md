@@ -35,6 +35,11 @@ service.
 
 ## Verify it yourself
 
+Release artifacts are signed and attested end-to-end: cosign keyless
+signatures + CycloneDX SBOMs on every binary and container image, and SLSA
+provenance on every release. Copy-paste verification commands live in
+[`docs/verify-release.md`](docs/verify-release.md).
+
 A 60-second demo proves the central claim — verification catches tampering:
 
 ```bash

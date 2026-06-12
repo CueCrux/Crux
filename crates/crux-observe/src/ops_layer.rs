@@ -16,6 +16,7 @@ use tracing::Subscriber;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
+use crate::redact::Redactor;
 use crate::schema::{ops_entity, OpsErrorEvent, OpsWarningEvent, EVT_OPS_ERROR_V1, EVT_OPS_WARNING_V1};
 
 /// A `tracing_subscriber::Layer` that captures WARN and ERROR span events and
@@ -23,23 +24,49 @@ use crate::schema::{ops_entity, OpsErrorEvent, OpsWarningEvent, EVT_OPS_ERROR_V1
 ///
 /// The layer maintains a ring buffer of fact IDs so it can evict the oldest
 /// entries when the maximum is exceeded.
+///
+/// Captured field values become durable, queryable facts, so they are scrubbed
+/// through a [`Redactor`] before fact construction (ExecPlan
+/// `crux-log-redaction-2026-06-11` M3). This is defense in depth: it holds
+/// even for subscriber stacks where this layer is registered ahead of the
+/// sink-boundary `RedactMakeWriter`.
 pub struct OpsObserveLayer {
     fact_store: Arc<RwLock<FactStore>>,
     fact_ids: Arc<std::sync::Mutex<VecDeque<String>>>,
     node_id: String,
     max_facts: usize,
     enabled: bool,
+    redactor: Arc<Redactor>,
 }
 
 impl OpsObserveLayer {
-    /// Create a new layer.
+    /// Create a new layer scrubbing through the process-global [`Redactor`].
     pub fn new(fact_store: Arc<RwLock<FactStore>>, node_id: String, max_facts: usize, enabled: bool) -> Self {
+        Self::with_redactor(
+            fact_store,
+            node_id,
+            max_facts,
+            enabled,
+            Arc::clone(crate::redact::global()),
+        )
+    }
+
+    /// Create a new layer scrubbing through an explicit [`Redactor`] (tests,
+    /// or callers that manage their own instance).
+    pub fn with_redactor(
+        fact_store: Arc<RwLock<FactStore>>,
+        node_id: String,
+        max_facts: usize,
+        enabled: bool,
+        redactor: Arc<Redactor>,
+    ) -> Self {
         Self {
             fact_store,
             fact_ids: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             node_id,
             max_facts,
             enabled,
+            redactor,
         }
     }
 
@@ -113,7 +140,22 @@ where
         let mut visitor = FieldVisitor::default();
         event.record(&mut visitor);
 
+        // Scrub before fact construction — these values become durable,
+        // queryable facts, the highest-stakes sink of all. The message gets
+        // line-level scanning (kv pairs and bare secret shapes in free text);
+        // named fields get field-rule + value-rule treatment.
         let message = visitor.message.unwrap_or_default();
+        let message = match self.redactor.redact_line(&message) {
+            std::borrow::Cow::Borrowed(_) => message,
+            std::borrow::Cow::Owned(scrubbed) => scrubbed,
+        };
+        for (name, value) in &mut visitor.fields {
+            if let serde_json::Value::String(s) = value {
+                if let std::borrow::Cow::Owned(scrubbed) = self.redactor.redact_field(name, s) {
+                    *s = scrubbed;
+                }
+            }
+        }
         let target = event.metadata().target().to_string();
         let timestamp = Utc::now();
         let id = uuid::Uuid::new_v4().to_string();
