@@ -92,7 +92,8 @@
   .gnode[data-kind="error"] .gstripe { background:var(--err); } .gnode[data-kind="error"] { cursor:pointer; }
   .gnode[data-kind="unavailable"] .gstripe, .gnode[data-kind="empty"] .gstripe { background:var(--idle); }
   @keyframes cxpulse { 0%,100%{opacity:.4} 50%{opacity:1} }
-  .wc-wordmark { font-size:1.6rem; line-height:1; font-weight:700; letter-spacing:-.02em; color:var(--text-primary); }
+  .wc-wordmark { font-size:1.6rem; line-height:1; font-weight:700; letter-spacing:.04em; color:var(--text-primary); }
+  .wc-wordmark .x { color:var(--ok); }   /* README-mockup wordmark: CRUX with the X in green */
   .wc-centre-pills { display:flex; align-items:center; gap:4px; padding:3px; background:var(--surface-glass-muted); border-radius:var(--radius-full); border:1px solid var(--border-light); }
   .wc-centre-pill { padding:6px 16px; font-size:.82rem; font-weight:600; color:var(--text-secondary); border-radius:var(--radius-full); cursor:pointer; user-select:none; transition:color var(--transition-fast) ease, background var(--transition-fast) ease; }
   .wc-centre-pill small { font-weight:500; opacity:.7; margin-left:5px; font-size:.72rem; }
@@ -151,7 +152,7 @@
   .gnode .gf { font-family:var(--font-mono); font-size:9.5px; color:var(--text-secondary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .gnode .gf b { font-weight:600; color:var(--text-muted); margin-right:4px; }
   .gnode .gpct { margin-left:auto; flex:none; font-family:var(--font-mono); font-size:9.5px; color:var(--text-muted); }
-  .gnode .gbar { position:absolute; left:17px; right:13px; bottom:7px; height:3px; border-radius:999px; background:color-mix(in srgb, var(--accent) 15%, transparent); overflow:hidden; }
+  .gnode .gbar { position:absolute; left:17px; right:13px; bottom:9px; height:3px; border-radius:999px; background:color-mix(in srgb, var(--accent) 15%, transparent); overflow:hidden; }
   .gnode .gbar i { display:block; height:100%; border-radius:999px; background:var(--accent); }
   .gnode .gbar.hero { position:static; margin-top:8px; height:4px; }
   .gnode .gpct.hero { margin:4px 0 0; font-family:var(--font-mono); font-size:10px; color:var(--text-muted); }
@@ -430,11 +431,15 @@
     border:1px solid var(--border-default); background:var(--surface-glass-strong); color:var(--text-primary); }
   .sp-input.mono, textarea.sp-input { font-family:var(--font-mono); }
   .sp-input:focus { outline:none; border-color:var(--accent); box-shadow:var(--shadow-focus); }
-  .sp-toggle { width:54px; font-family:var(--font-mono); font-size:9.5px; letter-spacing:.06em; padding:3px 0;
-    border-radius:var(--radius-full); border:1px solid var(--border-default); background:var(--surface-glass-strong);
-    color:var(--text-muted); cursor:pointer; }
-  .sp-toggle.on { color:var(--ok); border-color:color-mix(in srgb, var(--ok) 50%, transparent);
-    background:color-mix(in srgb, var(--ok) 10%, transparent); }
+  /* switch-style toggle: sliding knob on a pill track (was an on/off text button) */
+  .sp-toggle { position:relative; flex:none; width:40px; height:22px; min-height:22px; padding:0;
+    border-radius:var(--radius-full); border:1px solid var(--border-strong); background:var(--surface-glass-strong);
+    cursor:pointer; }
+  .sp-toggle .sp-knob { position:absolute; top:50%; left:3px; transform:translateY(-50%); width:14px; height:14px;
+    border-radius:50%; background:var(--text-muted); transition:left .18s ease, background .18s ease; }
+  .sp-toggle.on { border-color:color-mix(in srgb, var(--ok) 55%, transparent);
+    background:color-mix(in srgb, var(--ok) 22%, transparent); }
+  .sp-toggle.on .sp-knob { left:21px; background:var(--ok); }
   .sp-hint { font-family:var(--font-mono); font-size:9.5px; color:var(--text-muted); }
   #rpcOut { min-height:90px; }
   #cxToast { position:fixed; bottom:18px; left:50%; transform:translateX(-50%) translateY(8px); z-index:90;
@@ -444,12 +449,13 @@
     opacity:0; pointer-events:none; transition:opacity .25s, transform .25s; }
   #cxToast.show { opacity:1; transform:translateX(-50%) translateY(0); }
   /* ── ui-ux-pro-max checklist: focus rings · transitions · touch · bars ── */
-  .sp-btn, .sp-toggle { min-height:30px; transition:color .18s ease, border-color .18s ease, background .18s ease; }
+  .sp-btn { min-height:30px; }
+  .sp-btn, .sp-toggle { transition:color .18s ease, border-color .18s ease, background .18s ease; }
   .sp-input { min-height:30px; transition:border-color .18s ease, box-shadow .18s ease; border-color:var(--border-strong); }
   .sp-btn:focus-visible, .sp-toggle:focus-visible, .sp-input:focus-visible, #sp-close:focus-visible {
     outline:2px solid var(--accent); outline-offset:2px; }
-  .sp-toggle:hover { border-color:var(--accent); color:var(--text-primary); }
-  .sp-toggle.on:hover { color:var(--ok); }
+  .sp-toggle:hover { border-color:var(--accent); }
+  .sp-toggle.on:hover { border-color:color-mix(in srgb, var(--ok) 80%, transparent); }
   .sp-btn[data-armed] { color:var(--err); border-color:var(--err); background:color-mix(in srgb, var(--err) 10%, transparent); }
   .sp-barrow { align-items:center; }
   .sp-barrow .sp-lab { flex:0 1 36%; min-width:88px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -479,14 +485,14 @@
         <img class="logo-light" src="console-assets/CueCrux-Arc-Loop.png" alt="CueCrux logo" onerror="brandFallback(this)" />
         <img class="logo-dark"  src="console-assets/CueCrux-Arc-Loop-White.png" alt="CueCrux logo" onerror="brandFallback(this)" />
         <svg class="wc-logo-fb" viewBox="0 0 32 32" width="34" height="34" aria-hidden="true"><path d="M25.8 9.2A12 12 0 1 0 28 16" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round"/><circle cx="16" cy="16" r="3.6" fill="currentColor"/></svg>
-        <span class="wc-wordmark">CueCrux</span>
+        <span class="wc-wordmark">CRU<span class="x">X</span></span>
       </a>
       <nav class="wc-centre-pills" id="scopePills"></nav>
       <div class="wc-right">
         <span id="liveBadge" class="live-badge" title="live = connected to the daemon · demo = sample data">demo</span>
         <button class="wc-icon-btn-sm" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">
-          <svg class="icon-moon" viewBox="0 0 24 24" fill="currentColor"><path fill-rule="evenodd" d="M17.293 13.293a8 8 0 11-6.586-6.586 6 6 0 106.586 6.586z" clip-rule="evenodd"/></svg>
-          <svg class="icon-sun" viewBox="0 0 24 24" fill="currentColor"><path fill-rule="evenodd" d="M12 2.25a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0V3a.75.75 0 01.75-.75zm0 15.75a3.75 3.75 0 100-7.5 3.75 3.75 0 000 7.5zM5.47 5.47a.75.75 0 011.06 0l1.59 1.59a.75.75 0 11-1.06 1.06L5.47 6.53a.75.75 0 010-1.06zm11.41 11.41a.75.75 0 011.06 0l1.59 1.59a.75.75 0 11-1.06 1.06l-1.59-1.59a.75.75 0 010-1.06zM2.25 12a.75.75 0 01.75-.75h2.25a.75.75 0 010 1.5H3a.75.75 0 01-.75-.75zM18.75 12a.75.75 0 01.75-.75h2.25a.75.75 0 010 1.5H19.5a.75.75 0 01-.75-.75zM5.47 18.53a.75.75 0 000 1.06l1.59 1.59a.75.75 0 001.06-1.06l-1.59-1.59a.75.75 0 00-1.06 0zM15.88 6.06a.75.75 0 001.06-1.06l-1.59-1.59a.75.75 0 10-1.06 1.06l1.59 1.59z" clip-rule="evenodd"/></svg>
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
         </button>
         <a class="wc-public-login" href="#">Sign in</a>
       </div>
@@ -1027,7 +1033,7 @@ const N = {
 Object.entries(N).forEach(([id,n])=>{ n.id=id; });
 
 /* ════════════ ENGINE ════════════ */
-const COL_W=256, COL_GAP=64, NODE_H=96, NODE_GAP=12, PAD_X=28, PAD_Y=22, GROUP_H=22;   // hero size is computed live in render()
+const COL_W=256, COL_GAP=64, NODE_H=110, NODE_GAP=12, PAD_X=28, PAD_Y=22, GROUP_H=22;   // hero size is computed live in render(); NODE_H leaves the bottom progress bar clear of the meta row
 const nodesEl=document.getElementById('nodes'), edgesEl=document.getElementById('edges');
 const norm = s => ({done:'ok',in_progress:'run',blocked:'err',planned:'idle',live:'run'}[s] || s || 'idle');
 const RAW = {in_progress:'in progress',done:'done',blocked:'blocked',planned:'planned',ok:'ok',run:'live',err:'error',idle:'idle',live:'live'};
@@ -2426,10 +2432,13 @@ const SB_ICONS={
 };
 function sbSvg(p){ return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${p}</svg>`; }
 function updateSidebarActive(){
+  /* an open full-card page (PAGES) owns the highlight; otherwise the solo graph panel does */
+  const pg=(typeof openPageId!=='undefined' && openPageId)?openPageId:null;
   document.querySelectorAll('#sidebar .sb-item').forEach(b=>{
     const on = (typeof viewMode!=='undefined' && viewMode==='3d')
       ? (b.dataset.panel ? b.dataset.panel===cx3dPanel : !cx3dPanel)
-      : (b.dataset.panel ? b.dataset.panel===soloPanelId : (!soloPanelId && activeScope==='cx'));
+      : (b.dataset.panel ? (pg ? b.dataset.panel===pg : b.dataset.panel===soloPanelId)
+                         : (!pg && !soloPanelId && activeScope==='cx'));
     b.classList.toggle('active', on);
   });
 }
@@ -2970,7 +2979,7 @@ const PAGES={
 };
 function openSettings(){ openPage('cx-settings'); }
 function closeSettings(){ closePage(); }
-function closePage(){ openPageId=null; const el=document.getElementById('settingsPage'); if(el) el.style.display='none'; }
+function closePage(){ openPageId=null; const el=document.getElementById('settingsPage'); if(el) el.style.display='none'; updateSidebarActive(); }
 /* ── M1: live operator pages. PAGE_WIRES[pageId] =
      load(def)  — async; pull /v1 state and mutate the page def's control values/options before re-render
      set{k}/setAny(k,v) — persist one control change to the daemon (called from confSet when LIVE)
@@ -3332,10 +3341,11 @@ const PAGE_WIRES={
     },
   }},
 };
-let openPageId=null;
+var openPageId=null;   // var (not let): updateSidebarActive typeof-guards it during boot
 function openPage(id, opts){
   const def=PAGES[id]; if(!def) return;
   openPageId=id;
+  updateSidebarActive();   // full-card pages highlight their rail icon, same as graph panels
   const wire=PAGE_WIRES[id];
   if(LIVE && wire && wire.load && !(opts&&opts.__wired))
     Promise.resolve(wire.load(def))
@@ -3422,7 +3432,8 @@ function renderControl(pageId,c){
     const b=document.createElement('button'); b.className='sp-toggle'; b.setAttribute('role','switch');
     if(cid) b.id=cid;
     b.setAttribute('aria-label',c.label);
-    const setv=(v)=>{ b.classList.toggle('on',!!v); b.setAttribute('aria-checked',!!v); b.textContent=v?'on':'off'; };
+    const knob=document.createElement('span'); knob.className='sp-knob'; b.appendChild(knob);
+    const setv=(v)=>{ b.classList.toggle('on',!!v); b.setAttribute('aria-checked',!!v); };
     setv(confGet(key,c.v));
     b.onclick=()=>{ const nv=!b.classList.contains('on'); setv(nv); confSet(key,nv); };
     row.appendChild(b);
