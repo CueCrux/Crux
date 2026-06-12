@@ -51,6 +51,7 @@ mod fact_privacy;
 mod integrations_github;
 mod integrations_github_sync;
 mod integrations_openai;
+mod mcp_stdio;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod metrics;
 mod onboarding;
@@ -143,6 +144,9 @@ enum CliAction {
     Version,
     /// Print usage note and exit 0.
     Help,
+    /// Run the bundled stdio⇄HTTP MCP bridge instead of the daemon
+    /// (provider-integration-surfaces M5; see `crate::mcp_stdio`).
+    McpStdio,
     /// No recognised flag — start the daemon normally.
     Run,
 }
@@ -155,6 +159,7 @@ fn parse_cli_arg(args: &[String]) -> CliAction {
     match args.first().map(String::as_str) {
         Some("--version" | "-V" | "version") => CliAction::Version,
         Some("--help" | "-h" | "help") => CliAction::Help,
+        Some("mcp-stdio") => CliAction::McpStdio,
         _ => CliAction::Run,
     }
 }
@@ -177,7 +182,10 @@ corecruxd is the Crux Daemon: an environment-configured, long-running process\n\
 all configuration is supplied via environment variables; see config.example.env.\n\
 The only recognised flags are:\n\
   --version, -V    print the version and git sha, then exit\n\
-  --help, -h       print this message, then exit\n",
+  --help, -h       print this message, then exit\n\
+  mcp-stdio        run the bundled stdio\u{21c4}HTTP MCP bridge (not the daemon);\n\
+                   env: CRUX_MCP_URL (default http://127.0.0.1:14801/mcp),\n\
+                   CRUX_AGENT_TOKEN (optional bearer)\n",
         line = version_line()
     )
 }
@@ -202,6 +210,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("{}", help_text());
             }
             return Ok(());
+        }
+        CliAction::McpStdio => {
+            std::process::exit(mcp_stdio::run());
         }
         CliAction::Run => {}
     }
