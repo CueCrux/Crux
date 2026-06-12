@@ -114,6 +114,14 @@ jobs:
           format: table
           severity: CRITICAL
           exit-code: "1"
+          # Gate only on vulnerabilities that have an available fix. Distro base
+          # images (Debian bookworm-slim → git → perl) ship unfixable CRITICALs
+          # (e.g. CVE-2026-8376, CVE-2026-42496 fix_deferred/affected with no
+          # fixed version), which would pin the gate permanently red without any
+          # action available to us. The SARIF report above stays comprehensive
+          # (all CRITICAL+HIGH, fixed or not) so the Security tab still tracks
+          # them; the merge gate fails only on actionable fixes we are skipping.
+          ignore-unfixed: true
           # Trivy was already installed (and its vuln DB cached) by the
           # SARIF step above — don't reinstall.
           skip-setup-trivy: true
