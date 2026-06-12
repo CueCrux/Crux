@@ -13,40 +13,32 @@
 //! `Context-Bundle-v1-Spec` (planning monorepo, shared plane; child plan E,
 //! `context-mediation-injection-2026-06-11`); this module owns the transport.
 //!
+//! Assembly is delegated to the canonical deterministic assembler,
+//! [`corecrux_projections::context_bundle::assemble`] (ExecPlan
+//! `context-mediation-injection-2026-06-11` M2) — this module fetches
+//! tenant-/passport-scoped inputs, maps them to the assembler's input
+//! types, and owns the HTTP wire shape. The interim mirror assembler this
+//! module shipped with has been deleted in favour of the canonical one.
+//!
 //! Gating: `CORECRUXD_CONTEXT_SURFACE=1`, default OFF. When off the routes
 //! return 404 so the surface is invisible rather than half-alive (same
 //! convention as the coord plane).
 //!
 //! Determinism: the *stable region* (`bundle_version` + ordered `sections`)
 //! is byte-stable for an unchanged fact-chain head and is hashed with blake3
-//! (`stable_hash`) so provider-side prompt caches hit on the injected prefix.
-//! Volatile material (`assembled_at`, `budget`, `receipt_ref`, identity
-//! echo) lives outside the stable region.
-//!
-//! TODO(context-mediation-injection-2026-06-11): replace [`assemble`] with
-//! `corecrux_projections::context_bundle::assemble` (commit `0664614` on
-//! branch `feat/context-mediation-injection-2026-06-11`, 13 unit tests) once
-//! that PR merges. The local types below deliberately mirror that crate's
-//! `BundleRequest` / `FactInput` / `StableRegion` API so the swap is a
-//! mechanical call-site change — do not grow divergent behaviour here.
+//! (`stable_hash`) so provider-side prompt caches hit on the injected
+//! prefix. Volatile material (`assembled_at`, `budget`, `receipt_ref`,
+//! identity echo) lives outside the stable region.
 
+use corecrux_projections::context_bundle::{
+    self as cb, render_markdown_stable, AuxItem, AuxSection, ContextBundle, SectionKind, BUNDLE_VERSION,
+    DEFAULT_REQUESTED_BUDGET, FREE_TIER_CEILING,
+};
 use corecrux_projections::decay;
 use serde_json::{json, Value};
 
 use super::observations::{append_one, PostObservationBody};
 use super::{problem_response, AppState, HeaderMap, IntoResponse, Json, Query, Response, State, StatusCode};
-
-/// Bundle schema version — the only field consumers may dispatch on.
-pub(super) const BUNDLE_VERSION: &str = "context_bundle/v1";
-
-/// Default `budget.requested` when the caller omits `token_budget`
-/// (free/local tier default per spec §5 — the house "scan" budget).
-const DEFAULT_REQUESTED_TOKENS: usize = 2000;
-
-/// Hard per-assembly ceiling for the free/local tier (spec §5). The
-/// anti-bloat backstop: the bundle must never become the token problem it
-/// solves.
-const FREE_TIER_CEILING_TOKENS: usize = 8000;
 
 /// Selection cap for the zero-hint default bundle (no `entity`, no `query`):
 /// top facts by effective confidence, before budget enforcement.
@@ -77,241 +69,48 @@ pub(super) struct ContextRequest {
     pub render: Option<String>,
 }
 
-// ── Bundle types (mirror corecrux_projections::context_bundle, see TODO) ──
-
-/// One fact row inside the stable region. Continuous values (`age_hours`,
-/// `effective_confidence`) are deliberately ABSENT: only the freshness
-/// *class* may appear, the one sanctioned source of stable-region change
-/// without a fact write (spec §3).
-#[derive(Debug, Clone, serde::Serialize)]
-pub(super) struct StableFactItem {
-    pub fact_id: String,
-    pub entity: String,
-    pub key: String,
-    pub value: String,
-    pub confidence: f32,
-    pub horizon_class: String,
-    pub freshness: String,
-    pub est_tokens: usize,
-}
-
-/// One section of the stable region. Order of sections and order of items
-/// within a section are normative (spec §2, §6).
-#[derive(Debug, Clone, serde::Serialize)]
-pub(super) struct StableSection {
-    pub kind: String,
-    pub items: Vec<Value>,
-    pub est_tokens: usize,
-}
-
-/// The hashed, byte-stable prefix: `bundle_version` + ordered sections.
-/// No timestamps, no receipt ids, no random ids (spec §6).
-#[derive(Debug, Clone, serde::Serialize)]
-pub(super) struct StableRegion {
-    pub bundle_version: String,
-    pub sections: Vec<StableSection>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub(super) struct DroppedReport {
-    pub kind: String,
-    pub count: usize,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub(super) struct BudgetReport {
-    pub requested: usize,
-    pub spent_est: usize,
-    pub ceiling: usize,
-    pub dropped: Vec<DroppedReport>,
-}
-
-/// Assembly inputs (mirrors the mediation assembler's `BundleRequest`).
-pub(super) struct BundleRequest {
-    pub requested_tokens: usize,
-    pub ceiling_tokens: usize,
-}
-
-/// A selected fact in *selection* order (addressed first, then effective-
-/// confidence rank). Presentation order is recomputed at render time.
-pub(super) struct FactInput {
-    pub item: StableFactItem,
-    /// True when this fact was resolved via a typed address (exact entity).
-    pub addressed: bool,
-    /// Recall-time effective confidence — used for SELECTION only; never
-    /// serialized into the stable region (volatile, spec §3).
-    pub effective_confidence: f64,
-}
-
-pub(super) struct AssembledBundle {
-    pub stable: StableRegion,
-    pub stable_hash: String,
-    pub budget: BudgetReport,
-    pub fact_ids: Vec<String>,
-}
-
-/// Deterministic serialization of the stable region. Struct field order is
-/// fixed by the type definitions; item order is enforced by [`assemble`].
-pub(super) fn stable_region_bytes(stable: &StableRegion) -> Vec<u8> {
-    serde_json::to_vec(stable).unwrap_or_default()
-}
-
-pub(super) fn hash_stable_region(stable: &StableRegion) -> String {
-    format!("blake3:{}", blake3::hash(&stable_region_bytes(stable)).to_hex())
-}
-
-/// Pure, deterministic interim assembler.
-///
-/// Selection: addressed facts first, then effective-confidence rank, walking
-/// the budget. Presentation: items re-sorted by `(entity, key, fact_id)` —
-/// never by retrieval-score ties (spec §6). Truncation is explicit via
-/// `dropped`, never silent.
-pub(super) fn assemble(
-    req: &BundleRequest,
-    mut facts: Vec<FactInput>,
-    session_state: Option<(Value, usize)>,
-) -> AssembledBundle {
-    let ceiling = req.ceiling_tokens;
-    let budget_limit = req.requested_tokens.min(ceiling);
-
-    // Selection order: addressed first, then effective confidence desc,
-    // tie-broken deterministically by (entity, key, fact_id).
-    facts.sort_by(|a, b| {
-        b.addressed
-            .cmp(&a.addressed)
-            .then_with(|| {
-                b.effective_confidence
-                    .partial_cmp(&a.effective_confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| {
-                (&a.item.entity, &a.item.key, &a.item.fact_id).cmp(&(&b.item.entity, &b.item.key, &b.item.fact_id))
-            })
-    });
-
-    let mut spent = 0usize;
-    let mut dropped: Vec<DroppedReport> = Vec::new();
-    let mut selected: Vec<StableFactItem> = Vec::new();
-    let mut dropped_facts = 0usize;
-    for f in facts {
-        if spent + f.item.est_tokens > budget_limit && !selected.is_empty() {
-            dropped_facts += 1;
-            continue;
-        }
-        if spent + f.item.est_tokens > budget_limit {
-            // First fact alone blows the budget: still drop it (explicitly).
-            dropped_facts += 1;
-            continue;
-        }
-        spent += f.item.est_tokens;
-        selected.push(f.item);
-    }
-    if dropped_facts > 0 {
-        dropped.push(DroppedReport {
-            kind: "facts".to_string(),
-            count: dropped_facts,
-            reason: "budget".to_string(),
-        });
-    }
-
-    // Presentation order (spec §6): (entity, key, fact_id).
-    selected.sort_by(|a, b| (&a.entity, &a.key, &a.fact_id).cmp(&(&b.entity, &b.key, &b.fact_id)));
-    let fact_ids: Vec<String> = selected.iter().map(|f| f.fact_id.clone()).collect();
-
-    let mut sections: Vec<StableSection> = Vec::new();
-    if !selected.is_empty() {
-        let est: usize = selected.iter().map(|f| f.est_tokens).sum();
-        sections.push(StableSection {
-            kind: "facts".to_string(),
-            items: selected
-                .into_iter()
-                .map(|f| serde_json::to_value(f).unwrap_or(Value::Null))
-                .collect(),
-            est_tokens: est,
-        });
-    }
-
-    // session_state rides after facts (spec §4 order: facts → dossier →
-    // session_state → work_table → coord; dossier/work_table/coord are
-    // TODO(context-mediation-injection-2026-06-11) — they ship with the
-    // mediation assembler swap).
-    if let Some((state_item, est_tokens)) = session_state {
-        if spent + est_tokens <= budget_limit {
-            spent += est_tokens;
-            sections.push(StableSection {
-                kind: "session_state".to_string(),
-                items: vec![state_item],
-                est_tokens,
-            });
-        } else {
-            dropped.push(DroppedReport {
-                kind: "session_state".to_string(),
-                count: 1,
-                reason: "budget".to_string(),
-            });
-        }
-    }
-
-    let stable = StableRegion {
-        bundle_version: BUNDLE_VERSION.to_string(),
-        sections,
-    };
-    let stable_hash = hash_stable_region(&stable);
-    AssembledBundle {
-        stable,
-        stable_hash,
-        budget: BudgetReport {
-            requested: req.requested_tokens,
-            spent_est: spent,
-            ceiling,
-            dropped,
-        },
-        fact_ids,
-    }
-}
-
 // ── Fact gathering (tenant/passport-scoped, supersession-aware) ──────────
 
 fn projection_class(class: corecrux_memory::fact_store::HorizonClass) -> decay::HorizonClass {
     decay::HorizonClass::parse(class.as_str()).unwrap_or(decay::HorizonClass::None)
 }
 
-fn fact_input(
-    fact: corecrux_memory::fact_store::Fact,
-    addressed: bool,
-    now: chrono::DateTime<chrono::Utc>,
-    policy: decay::DecayPolicy,
-) -> FactInput {
-    let class = projection_class(fact.horizon_class);
-    let fresh = decay::apply_at_chrono(class, fact.stored_at, fact.reverified_at, now, policy);
-    let effective = decay::effective_confidence(f64::from(fact.confidence), fresh);
-    FactInput {
-        item: StableFactItem {
-            fact_id: fact.fact_id,
-            entity: fact.entity,
-            key: fact.key,
-            value: fact.value,
-            confidence: fact.confidence,
-            horizon_class: class.as_str().to_string(),
-            // Class only — the one sanctioned stable-region freshness signal.
-            freshness: fresh.as_str().to_string(),
-            est_tokens: fact.tokens,
-        },
+/// Map a store fact to the canonical assembler's input row.
+///
+/// Visibility/tenancy scoping has already been enforced at fetch time by
+/// `query_visible_http_facts`; the assembler's private-owner re-check is
+/// defense in depth and therefore only engages when an owner is actually
+/// recorded (`actor`) — a private fact without a recorded owner relies on
+/// the fetch-time scope, exactly as before the canonical-assembler swap.
+fn fact_input(fact: corecrux_memory::fact_store::Fact, addressed: bool) -> cb::FactInput {
+    let written_ms = fact
+        .reverified_at
+        .unwrap_or(fact.stored_at)
+        .timestamp_millis();
+    cb::FactInput {
+        private: fact.private && fact.actor.is_some(),
+        owner: fact.actor,
+        fact_id: fact.fact_id,
+        entity: fact.entity,
+        key: fact.key,
+        value: fact.value,
+        confidence: f64::from(fact.confidence),
+        written_ms,
+        horizon_class: projection_class(fact.horizon_class),
+        version: fact.version,
+        superseded: fact.superseded_by.is_some(),
+        est_tokens: Some(fact.tokens.max(1)),
         addressed,
-        effective_confidence: effective,
     }
 }
 
 /// Gather candidate facts under the caller's scope. Superseded facts are
 /// excluded (spec §4 rule 2); stale facts are included with their `stale`
 /// annotation, never silently presented as current.
-async fn gather_facts(state: &AppState, ctx: &crate::auth::HttpScopeContext, req: &ContextRequest) -> Vec<FactInput> {
-    let now = chrono::Utc::now();
-    let policy = decay::DecayPolicy::from_env();
+async fn gather_facts(state: &AppState, ctx: &crate::auth::HttpScopeContext, req: &ContextRequest) -> Vec<cb::FactInput> {
     let store = state.fact_store.read().await;
 
-    let mut out: Vec<FactInput> = Vec::new();
+    let mut out: Vec<cb::FactInput> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // 1. Addressed recall first (spec §4 rule 1).
@@ -327,7 +126,7 @@ async fn gather_facts(state: &AppState, ctx: &crate::auth::HttpScopeContext, req
             if fact.superseded_by.is_some() || !seen.insert(fact.fact_id.clone()) {
                 continue;
             }
-            out.push(fact_input(fact, true, now, policy));
+            out.push(fact_input(fact, true));
         }
     }
 
@@ -350,37 +149,47 @@ async fn gather_facts(state: &AppState, ctx: &crate::auth::HttpScopeContext, req
             if fact.superseded_by.is_some() || !seen.insert(fact.fact_id.clone()) {
                 continue;
             }
-            out.push(fact_input(fact, false, now, policy));
+            out.push(fact_input(fact, false));
         }
     }
     out
 }
 
-/// Saved session state for the requested session, scoped to the caller.
-/// Stable item carries no timestamps (spec §6) — `updated_at` is excluded.
+/// Saved session state for the requested session, scoped to the caller,
+/// as a `session_state` aux section. Stable item carries no timestamps
+/// (spec §6) — `updated_at` is excluded; the state rides as canonical JSON
+/// text under the deterministic `id` sort key.
 async fn gather_session_state(
     state: &AppState,
     ctx: &crate::auth::HttpScopeContext,
     req: &ContextRequest,
-) -> Option<(Value, usize)> {
+) -> Option<AuxSection> {
     let session_id = req.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
     let scoped = super::facts::scoped_session_id_for_http(ctx, session_id);
     let store = state.session_store.read().await;
     let session = store.get(&scoped)?;
-    let est = session
-        .total_tokens
-        .max(serde_json::to_string(&session.state).map(|s| s.len() / 4).unwrap_or(0));
-    Some((
-        json!({
-            "session_id": session_id,
-            "state": session.state,
-            "est_tokens": est,
-        }),
-        est,
-    ))
+    let text = serde_json::to_string(&session.state).unwrap_or_default();
+    let est = session.total_tokens.max(text.len() / 4);
+    Some(AuxSection {
+        kind: SectionKind::SessionState,
+        items: vec![AuxItem {
+            id: session_id.to_string(),
+            text,
+            est_tokens: Some(est),
+        }],
+    })
 }
 
 // ── Receipting (spec §4 rule 7) ───────────────────────────────────────────
+
+fn bundle_fact_ids(bundle: &ContextBundle) -> Vec<String> {
+    bundle
+        .stable
+        .sections
+        .iter()
+        .flat_map(|s| s.facts.iter().map(|f| f.fact_id.clone()))
+        .collect()
+}
 
 /// Mint a mediation-class receipt for the assembled bundle through the
 /// signed-observation path. Best-effort: assembly is a read, and a node
@@ -390,13 +199,19 @@ fn mint_bundle_receipt(
     state: &AppState,
     principal: &str,
     session_id: Option<&str>,
-    bundle: &AssembledBundle,
+    bundle: &ContextBundle,
 ) -> Result<String, String> {
     let section_counts: Vec<Value> = bundle
         .stable
         .sections
         .iter()
-        .map(|s| json!({"kind": s.kind, "count": s.items.len(), "est_tokens": s.est_tokens}))
+        .map(|s| {
+            json!({
+                "kind": s.kind.as_str(),
+                "count": s.facts.len() + s.items.len(),
+                "est_tokens": s.est_tokens,
+            })
+        })
         .collect();
     let body = PostObservationBody {
         kind: "context.bundle.assembled.v1".to_string(),
@@ -407,7 +222,7 @@ fn mint_bundle_receipt(
             "stable_hash": bundle.stable_hash,
             "budget": bundle.budget,
             "section_counts": section_counts,
-            "fact_ids": bundle.fact_ids,
+            "fact_ids": bundle_fact_ids(bundle),
             "session_id": session_id,
         }),
     };
@@ -419,50 +234,12 @@ fn mint_bundle_receipt(
 
 // ── Renderers (spec §7) ───────────────────────────────────────────────────
 
-/// Markdown renderer — boot-banner shape. Stable region FIRST (the prompt
-/// prefix providers cache on), volatile trailer last.
-pub(super) fn render_markdown_stable(stable: &StableRegion) -> String {
+/// Markdown renderer — boot-banner shape. Canonical stable prefix FIRST
+/// (the prompt prefix providers cache on), this surface's volatile trailer
+/// (incl. `receipt_ref`) last.
+fn render_markdown(bundle_json: &Value, bundle: &ContextBundle) -> String {
     use std::fmt::Write as _;
-    let mut out = String::new();
-    let _ = writeln!(out, "# Crux Context Bundle ({})", stable.bundle_version);
-    for section in &stable.sections {
-        let _ = write!(out, "\n## {}\n\n", section.kind);
-        match section.kind.as_str() {
-            "facts" => {
-                out.push_str("| entity | key | value | confidence | freshness |\n");
-                out.push_str("|---|---|---|---|---|\n");
-                for item in &section.items {
-                    let _ = writeln!(
-                        out,
-                        "| {} | {} | {} | {:.2} | {} |",
-                        item.get("entity").and_then(Value::as_str).unwrap_or(""),
-                        item.get("key").and_then(Value::as_str).unwrap_or(""),
-                        item.get("value")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .replace('\n', " "),
-                        item.get("confidence").and_then(Value::as_f64).unwrap_or(0.0),
-                        item.get("freshness").and_then(Value::as_str).unwrap_or("unknown"),
-                    );
-                }
-            }
-            _ => {
-                for item in &section.items {
-                    let _ = writeln!(
-                        out,
-                        "```json\n{}\n```",
-                        serde_json::to_string_pretty(item).unwrap_or_default()
-                    );
-                }
-            }
-        }
-    }
-    out
-}
-
-fn render_markdown(bundle_json: &Value, stable: &StableRegion) -> String {
-    use std::fmt::Write as _;
-    let mut out = render_markdown_stable(stable);
+    let mut out = render_markdown_stable(&bundle.stable);
     out.push_str("\n---\n");
     let _ = writeln!(
         out,
@@ -477,13 +254,14 @@ fn render_markdown(bundle_json: &Value, stable: &StableRegion) -> String {
     out
 }
 
-/// OpenAI messages-array fragment: stable markdown as one system message,
-/// volatile metadata in a separate field (so the prefix stays cacheable).
-fn render_openai_messages(bundle_json: &Value, stable: &StableRegion) -> Value {
+/// OpenAI messages-array fragment: canonical stable markdown as one system
+/// message, volatile metadata in a separate field (so the prefix stays
+/// cacheable).
+fn render_openai_messages(bundle_json: &Value, bundle: &ContextBundle) -> Value {
     json!({
         "bundle_version": BUNDLE_VERSION,
         "messages": [
-            {"role": "system", "content": render_markdown_stable(stable)}
+            {"role": "system", "content": render_markdown_stable(&bundle.stable)}
         ],
         "metadata": {
             "stable_hash": bundle_json.get("stable_hash"),
@@ -515,20 +293,27 @@ async fn handle_context(state: AppState, headers: HeaderMap, req: ContextRequest
         Err(resp) => return resp,
     };
 
-    let requested = req.token_budget.unwrap_or(DEFAULT_REQUESTED_TOKENS);
-    let bundle_req = BundleRequest {
-        requested_tokens: requested,
-        ceiling_tokens: FREE_TIER_CEILING_TOKENS,
+    // Attribution: caller passport when bound, else the operator tag
+    // (anonymous writes are operator-tagged, not silently allowed —
+    // audit-hygiene profile).
+    let principal = ctx.passport_id.clone().unwrap_or_else(|| "operator".to_string());
+    let bundle_req = cb::BundleRequest {
+        actor: principal.clone(),
+        // Local daemon: single-tenant store; tenant identity rides the
+        // passport scoping already enforced at fetch time.
+        tenant_id: "local".to_string(),
+        session_id: req.session_id.clone(),
+        requested_budget: req.token_budget.unwrap_or(DEFAULT_REQUESTED_BUDGET),
+        ceiling: FREE_TIER_CEILING,
+        now_ms: chrono::Utc::now().timestamp_millis(),
+        policy: decay::DecayPolicy::from_env(),
     };
 
     let facts = gather_facts(&state, &ctx, &req).await;
-    let session_state = gather_session_state(&state, &ctx, &req).await;
-    let bundle = assemble(&bundle_req, facts, session_state);
+    let aux: Vec<AuxSection> = gather_session_state(&state, &ctx, &req).await.into_iter().collect();
+    let bundle = cb::assemble(&bundle_req, facts, aux);
 
-    // Receipt the assembly (spec §4 rule 7). Attribution: caller passport
-    // when bound, else the operator tag (anonymous writes are operator-
-    // tagged, not silently allowed — audit-hygiene profile).
-    let principal = ctx.passport_id.clone().unwrap_or_else(|| "operator".to_string());
+    // Receipt the assembly (spec §4 rule 7).
     let (receipt_ref, receipt_error) = match mint_bundle_receipt(&state, &principal, req.session_id.as_deref(), &bundle)
     {
         Ok(id) => (Some(id), None),
@@ -551,7 +336,7 @@ async fn handle_context(state: AppState, headers: HeaderMap, req: ContextRequest
 
     match req.render.as_deref().unwrap_or("json") {
         "markdown" => {
-            let md = render_markdown(&bundle_json, &bundle.stable);
+            let md = render_markdown(&bundle_json, &bundle);
             (
                 StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
@@ -561,7 +346,7 @@ async fn handle_context(state: AppState, headers: HeaderMap, req: ContextRequest
         }
         "openai_messages" => (
             StatusCode::OK,
-            Json(render_openai_messages(&bundle_json, &bundle.stable)),
+            Json(render_openai_messages(&bundle_json, &bundle)),
         )
             .into_response(),
         "json" => (StatusCode::OK, Json(bundle_json)).into_response(),
@@ -671,6 +456,17 @@ mod tests {
         state
     }
 
+    fn facts_items(bundle: &Value) -> &Vec<Value> {
+        bundle["sections"]
+            .as_array()
+            .expect("sections")
+            .iter()
+            .find(|s| s["kind"] == "facts")
+            .expect("facts section")["facts"]
+            .as_array()
+            .expect("facts items")
+    }
+
     #[tokio::test]
     async fn disabled_flag_returns_404() {
         let mut state = test_app_state(1);
@@ -718,9 +514,7 @@ mod tests {
         let bundle = get_bundle(&state, req(Some("execplan:demo"), None, Some(2000))).await;
         assert_eq!(bundle["bundle_version"], BUNDLE_VERSION);
         assert!(bundle["stable_hash"].as_str().unwrap_or("").starts_with("blake3:"));
-        let sections = bundle["sections"].as_array().expect("sections");
-        let facts = sections.iter().find(|s| s["kind"] == "facts").expect("facts section");
-        let items = facts["items"].as_array().expect("items");
+        let items = facts_items(&bundle);
         assert!(items
             .iter()
             .any(|i| i["entity"] == "execplan:demo" && i["key"] == "milestone:M1"));
@@ -769,7 +563,7 @@ mod tests {
             dropped.iter().any(|d| d["kind"] == "facts" && d["reason"] == "budget"),
             "truncation must be explicit: {dropped:?}"
         );
-        assert_eq!(bundle["budget"]["ceiling"], FREE_TIER_CEILING_TOKENS as u64);
+        assert_eq!(bundle["budget"]["ceiling"], FREE_TIER_CEILING as u64);
     }
 
     #[tokio::test]
@@ -779,7 +573,7 @@ mod tests {
         let bundle = get_bundle(&state, req(None, None, Some(1_000_000))).await;
         assert_eq!(bundle["budget"]["requested"], 1_000_000u64);
         let spent = bundle["budget"]["spent_est"].as_u64().expect("spent");
-        assert!(spent <= FREE_TIER_CEILING_TOKENS as u64);
+        assert!(spent <= FREE_TIER_CEILING as u64);
     }
 
     #[tokio::test]
@@ -792,7 +586,7 @@ mod tests {
             assert!(s.mark_superseded(&old.fact_id, &new.fact_id), "mark superseded");
         }
         let bundle = get_bundle(&state, req(Some("bench:lme-s"), None, Some(2000))).await;
-        let items = bundle["sections"][0]["items"].as_array().expect("items");
+        let items = facts_items(&bundle);
         assert!(
             !items.iter().any(|i| i["fact_id"] == old.fact_id.as_str()),
             "superseded fact must never appear"
@@ -843,6 +637,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_fact_with_recorded_owner_is_owner_only() {
+        // Defense-in-depth re-check inside the canonical assembler: a
+        // private fact whose `actor` is recorded only enters its owner's
+        // bundle (spec §4.6) — even if fetch-time visibility passes.
+        let state = enabled_state();
+        {
+            let mut s = state.fact_store.write().await;
+            let mut fact = new_fact("notes", "k", "owner-only secret", true);
+            fact.actor = Some("owner-agent".to_string());
+            s.try_store(fact).expect("store");
+        }
+        store_fact(&state, "public-entity", "k", "public note").await;
+
+        // Operator caller (no passport): the owned private fact is excluded.
+        let bundle = get_bundle(&state, req(None, Some("note secret"), Some(2000))).await;
+        let as_text = serde_json::to_string(&bundle["sections"]).expect("serialize");
+        assert!(!as_text.contains("owner-only secret"));
+    }
+
+    #[tokio::test]
     async fn session_state_section_included_when_requested() {
         let state = enabled_state();
         {
@@ -862,10 +676,12 @@ mod tests {
             .iter()
             .find(|s| s["kind"] == "session_state")
             .expect("session_state section");
-        assert_eq!(ss["items"][0]["session_id"], "sess-1");
-        assert_eq!(ss["items"][0]["state"]["next"], "M2");
+        // Canonical AuxItem shape: deterministic `id` + rendered `text`.
+        assert_eq!(ss["items"][0]["id"], "sess-1");
+        let text = ss["items"][0]["text"].as_str().expect("text");
+        assert!(text.contains("\"next\":\"M2\""), "state must ride in the item text: {text}");
         assert!(
-            ss["items"][0].get("updated_at").is_none(),
+            !text.contains("updated_at"),
             "no timestamps in stable region"
         );
     }
@@ -887,7 +703,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 1 << 22).await.expect("body");
         let md = String::from_utf8(bytes.to_vec()).expect("utf8");
-        assert!(md.starts_with("# Crux Context Bundle (context_bundle/v1)"));
+        assert!(md.starts_with("## Crux Context (context_bundle/v1)"));
         let stable_end = md.find("\n---\n").expect("volatile trailer present");
         let trailer = &md[stable_end..];
         assert!(
@@ -923,7 +739,7 @@ mod tests {
         assert!(bundle["messages"][0]["content"]
             .as_str()
             .expect("content")
-            .starts_with("# Crux Context Bundle"));
+            .starts_with("## Crux Context"));
         assert!(bundle["metadata"]["stable_hash"].as_str().is_some());
     }
 
@@ -941,36 +757,5 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn assemble_presentation_order_is_deterministic() {
-        let mk = |entity: &str, key: &str, id: &str, eff: f64| FactInput {
-            item: StableFactItem {
-                fact_id: id.to_string(),
-                entity: entity.to_string(),
-                key: key.to_string(),
-                value: "v".to_string(),
-                confidence: 1.0,
-                horizon_class: "none".to_string(),
-                freshness: "unknown".to_string(),
-                est_tokens: 1,
-            },
-            addressed: false,
-            effective_confidence: eff,
-        };
-        let req = BundleRequest {
-            requested_tokens: 100,
-            ceiling_tokens: 100,
-        };
-        // Same set, different input order + different scores: presentation
-        // must come out (entity, key, fact_id)-sorted both times.
-        let a = assemble(&req, vec![mk("b", "k", "f2", 0.9), mk("a", "k", "f1", 0.1)], None);
-        let b = assemble(&req, vec![mk("a", "k", "f1", 0.9), mk("b", "k", "f2", 0.1)], None);
-        assert_eq!(a.stable_hash, b.stable_hash);
-        assert_eq!(
-            a.stable.sections[0].items[0]["entity"], "a",
-            "items presented in (entity,key,fact_id) order"
-        );
     }
 }
