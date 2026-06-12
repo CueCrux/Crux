@@ -59,6 +59,11 @@ pub struct PreToolUseSpecificOutput {
     pub permission_decision: String,
     #[serde(rename = "permissionDecisionReason")]
     pub permission_decision_reason: String,
+    /// Optional context injected for the agent (code-intelligence M5 — a
+    /// `code:<repo>:<path>` file-context fact). Omitted when there is nothing
+    /// to inject; the harness surfaces it to the agent ahead of the tool call.
+    #[serde(rename = "additionalContext", skip_serializing_if = "Option::is_none")]
+    pub additional_context: Option<String>,
 }
 
 impl PreToolUseOutput {
@@ -68,6 +73,7 @@ impl PreToolUseOutput {
                 hook_event_name: "PreToolUse".to_string(),
                 permission_decision: decision.to_string(),
                 permission_decision_reason: reason.into(),
+                additional_context: None,
             },
         }
     }
@@ -75,6 +81,13 @@ impl PreToolUseOutput {
     /// Allow the tool call to proceed (the fail-open default).
     pub fn allow() -> Self {
         Self::new("allow", String::new())
+    }
+
+    /// Allow the tool call and inject `context` for the agent (M5 Read hook).
+    pub fn allow_with_context(context: impl Into<String>) -> Self {
+        let mut out = Self::new("allow", String::new());
+        out.hook_specific_output.additional_context = Some(context.into());
+        out
     }
 
     /// Deny the tool call, surfacing `reason` to the agent.

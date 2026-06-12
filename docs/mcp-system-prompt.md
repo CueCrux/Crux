@@ -71,6 +71,18 @@ Domain lens for the PlanCrux Feature Registry on top of the substrate. Capabilit
 - `feature_trigger_audit(id, status, auditor?, notes?)` — Record an audit on a capability. Status ∈ {audited, gap, waived, blocked}.
 - `feature_suggest_next(limit?)` — Suggest next-best capabilities to work on, derived from gap analysis + weakest-promise heuristic.
 
+## Code intelligence (M4–M6)
+Code health findings + context chains, ingested by `corecruxctl code-health` (ingest-not-analyze) — never re-read the codebase to re-derive these.
+- **Findings** live as facts under `entity="codehealth:<repo>"` (keys `dead:`/`unused-dep:`/`stub:`/`todo:`/`dark:<…>`, value `{class,file,line,message,tool,commit_sha}`; one `run:<date>` summary). Query current findings (resolved ones are retired, never returned):
+  - `query_facts(entity="codehealth:Crux", token_budget=500)` — all current findings + latest run summary for a repo.
+  - `query_facts(query="codehealth stub", token_budget=500)` — stub/`todo!()` findings across repos.
+- **Chains** live as `codechain` entities (id = slugified route/fn; payload `{root, steps:[{name,qualified,file,line,depth,kind}], terminations}`). Answer "what does this route touch?" without re-reading code:
+  - `entity_list(kind="codechain", limit=50)` — all extracted chains.
+  - `entity_get(kind="codechain", id="v1-work-gate-actionId-approve")` — one chain's steps + terminations.
+- **File context** lives as `code:<repo>:<path>` facts (key `context`); the `code-context` PreToolUse(Read) hook injects them automatically when enabled (`CRUX_HOOK_CODE_CONTEXT=1`). To read one directly: `query_facts(entity="code:Crux:crates/corecruxd/src/work.rs", token_budget=500)`.
+
+Always pass `token_budget` (500 default). Findings carry a `volatile` horizon — prefer a fresh query over a remembered count.
+
 ## Rules
 1. Always use `token_budget` to control context size.
 2. Store important findings as facts — don't rely on conversation memory.
