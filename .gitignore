@@ -38,6 +38,8 @@ __pycache__/
 /data/
 **/data/
 *.jsonl
+# code-intelligence harvester fixture (recorded cargo-check JSON) is intentionally tracked
+!crates/corecruxctl/tests/fixtures_code_health/cargo_check.jsonl
 crux-data/
 passport.key
 passports/
