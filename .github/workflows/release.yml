@@ -7,16 +7,27 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
+# Job-scoped permissions only (ExecPlan crux-supply-chain-attestation-2026-06-11):
+# id-token: write is confined to the jobs that actually sign (build) or
+# attest (provenance); only the release job can write contents.
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_SBOM_VERSION: "0.10.0"
 
 jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      # cosign keyless signing (OIDC identity token).
+      id-token: write
+    outputs:
+      hashes-linux-amd64: ${{ steps.hashes.outputs.hashes-linux-amd64 }}
+      hashes-darwin-arm64: ${{ steps.hashes.outputs.hashes-darwin-arm64 }}
+      hashes-darwin-amd64: ${{ steps.hashes.outputs.hashes-darwin-amd64 }}
     strategy:
       matrix:
         include:
@@ -49,8 +60,65 @@ jobs:
       - name: Build release
         run: cargo build --locked --release
 
+      # --- SBOM + keyless signing (ExecPlan crux-supply-chain-attestation-2026-06-11, M3) ---
+      # SBOM is generated into dist/ BEFORE packaging so the packaging
+      # script's RELEASE-MANIFEST sha256 list covers it.
+      - name: Generate SBOM (CycloneDX 1.6)
+        run: |
+          cargo install cargo-sbom --locked --version "$CARGO_SBOM_VERSION"
+          mkdir -p dist
+          cargo sbom --output-format cyclone_dx_json_1_6 \
+            > "dist/crux-daemon-${{ matrix.suffix }}.cdx.json"
+
       - name: Package binaries
         run: bash scripts/package-daemon-release.sh ${{ matrix.suffix }} dist
+
+      - name: Install cosign
+        # sigstore/cosign-installer v4.1.2 (pinned SHA — floating tags are a T.5 vector)
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+
+      - name: Sign artifacts (cosign keyless)
+        # Sign the per-suffix files only: the three binaries, the SBOM, and
+        # RELEASE-MANIFEST-<suffix>.txt (whose sha256 list covers the shared
+        # licence/docs files transitively). Shared files are NOT signed
+        # per-leg — their .sig names would collide across the matrix when
+        # artifacts are merged.
+        run: |
+          set -euo pipefail
+          for f in \
+            "dist/corecruxd-${{ matrix.suffix }}" \
+            "dist/crux-${{ matrix.suffix }}" \
+            "dist/corecruxctl-${{ matrix.suffix }}" \
+            "dist/crux-daemon-${{ matrix.suffix }}.cdx.json" \
+            "dist/RELEASE-MANIFEST-${{ matrix.suffix }}.txt"; do
+            test -f "$f"
+            cosign sign-blob --yes \
+              --output-signature "${f}.sig" \
+              --output-certificate "${f}.pem" \
+              "$f"
+          done
+
+      - name: Compute provenance subjects
+        id: hashes
+        # Subjects for the SLSA generator: the same per-suffix file set that
+        # was signed above. base64 -w0 is GNU-only; macOS base64 wraps off
+        # by default, so use openssl for portability across the matrix.
+        run: |
+          set -euo pipefail
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            SHA256="sha256sum"
+          else
+            SHA256="shasum -a 256"   # macOS runners
+          fi
+          subjects="$($SHA256 \
+            "corecruxd-${{ matrix.suffix }}" \
+            "crux-${{ matrix.suffix }}" \
+            "corecruxctl-${{ matrix.suffix }}" \
+            "crux-daemon-${{ matrix.suffix }}.cdx.json" \
+            "RELEASE-MANIFEST-${{ matrix.suffix }}.txt" \
+            | openssl base64 -A)"
+          echo "hashes-${{ matrix.suffix }}=${subjects}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
@@ -62,6 +130,8 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v8

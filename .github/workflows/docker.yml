@@ -29,6 +29,8 @@ permissions:
   packages: write
   # Trivy SARIF upload to the Security tab (code-scanning API).
   security-events: write
+  # cosign keyless signing/attestation of the pushed image (OIDC token).
+  id-token: write
 
 env:
   REGISTRY: ghcr.io
@@ -122,6 +124,7 @@ jobs:
 
       - name: Build and push
         if: github.event_name != 'pull_request'
+        id: push
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -132,3 +135,35 @@ jobs:
           # (the build context has no .git, so build.rs can't derive it).
           build-args: |
             GIT_SHA=${{ github.sha }}
+
+      # --- Image SBOM + keyless sign/attest (ExecPlan crux-supply-chain-attestation-2026-06-11, M3) ---
+      # syft generates the SBOM from the image as pushed (digest-addressed),
+      # so the published SBOM matches what actually ships; cosign signs the
+      # image and attaches the SBOM as a CycloneDX attestation.
+      - name: Generate image SBOM (syft)
+        if: github.event_name != 'pull_request'
+        # anchore/sbom-action v0.24.0 (pinned SHA)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          format: cyclonedx-json
+          output-file: crux-daemon-image.cdx.json
+          # Also attach the SBOM to the workflow run as an artifact.
+          artifact-name: crux-daemon-image.cdx.json
+
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        # sigstore/cosign-installer v4.1.2 (pinned SHA)
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+
+      - name: Sign image + attest SBOM (cosign keyless)
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_DIGEST_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$IMAGE_DIGEST_REF"
+          cosign attest --yes \
+            --type cyclonedx \
+            --predicate crux-daemon-image.cdx.json \
+            "$IMAGE_DIGEST_REF"
