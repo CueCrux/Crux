@@ -308,6 +308,8 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
         context_surface_enabled: true,
         openai_shim_enabled: false,
+        memory_import_enabled: true,
+        identity_links_enabled: true,
         mcp_context: None,
         integrations_enabled: true,
         integrations_safe_mode: false,
@@ -11595,4 +11597,203 @@ async fn sse_session_survives_30s_idle() {
         text.matches(':').count() >= 2,
         "expected SSE keep-alive frames over 35s idle, got: {text}"
     );
+}
+
+// ── /v1/memory/import — .cruxpack import (identity-memory-portability M4) ──
+
+fn cruxpack_test_signer() -> crux_session::LocalPassportKey {
+    crux_session::LocalPassportKey::from_seed([7_u8; 32]).expect("seed key")
+}
+
+/// Build a signed pack from a throwaway source store.
+fn build_test_pack(facts: Vec<(&str, &str, &str)>, tenant: &str) -> corecrux_memory::cruxpack::CruxPack {
+    use corecrux_memory::cruxpack as cp;
+    let mut source = corecrux_memory::FactStore::new();
+    for (entity, key, value) in facts {
+        source.store(corecrux_memory::fact_store::StoreFact {
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: Some("agent:source".to_string()),
+        });
+    }
+    let signer = cruxpack_test_signer();
+    let opts = cp::ExportOptions {
+        tenant_id: tenant.to_string(),
+        ..cp::ExportOptions::default()
+    };
+    let (sections, _) = cp::build_pack_sections(&source, None, &opts);
+    let manifest = cp::build_manifest(&sections, signer.passport_fpr(), signer.public_key_hex(), &opts);
+    cp::sign_pack(manifest, sections, |hash| signer.sign_hash(hash)).expect("sign pack")
+}
+
+fn import_request(
+    pack: corecrux_memory::cruxpack::CruxPack,
+    tenant: &str,
+    dry_run: bool,
+) -> Json<memory_import::MemoryImportRequest> {
+    Json(memory_import::MemoryImportRequest {
+        tenant_id: tenant.to_string(),
+        dry_run,
+        principal_map: std::collections::BTreeMap::new(),
+        pack,
+    })
+}
+
+#[tokio::test]
+async fn memory_import_round_trip_applies_pack() {
+    let state = test_app_state(16);
+    let pack = build_test_pack(vec![("project-alpha", "status", "phase 1 complete")], "local");
+    let resp = memory_import::post_memory_import(
+        State(state.clone()),
+        HeaderMap::new(),
+        import_request(pack, "local", false),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["imported_facts"], 1);
+    assert_eq!(body["collisions_superseded"], 0);
+
+    // The fact landed through the journaled path with pack provenance.
+    let store = state.fact_store.read().await;
+    let facts = store.get_by_entity("project-alpha");
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].value, "phase 1 complete");
+    assert!(facts[0]
+        .source_receipt
+        .as_deref()
+        .expect("provenance stamp")
+        .starts_with("cruxpack:blake3:"));
+}
+
+#[tokio::test]
+async fn memory_import_disabled_returns_404() {
+    let mut state = test_app_state(16);
+    state.memory_import_enabled = false;
+    let pack = build_test_pack(vec![("e", "k", "v")], "local");
+    let resp = memory_import::post_memory_import(State(state), HeaderMap::new(), import_request(pack, "local", false))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn memory_import_unauthenticated_denied_t3() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let pack = build_test_pack(vec![("e", "k", "v")], "local");
+    let resp = memory_import::post_memory_import(State(state), HeaderMap::new(), import_request(pack, "local", false))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn memory_import_tampered_pack_rejected() {
+    let state = test_app_state(16);
+    let mut pack = build_test_pack(vec![("e", "k", "honest-value")], "local");
+    pack.sections.facts[0].value = "tampered-value".to_string();
+    let resp = memory_import::post_memory_import(
+        State(state.clone()),
+        HeaderMap::new(),
+        import_request(pack, "local", false),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // Nothing was written.
+    assert_eq!(state.fact_store.read().await.count(), 0);
+}
+
+#[tokio::test]
+async fn memory_import_cross_tenant_pack_rejected_t1() {
+    let state = test_app_state(16);
+    let pack = build_test_pack(vec![("e", "k", "v")], "tenant-a");
+    let resp = memory_import::post_memory_import(
+        State(state.clone()),
+        HeaderMap::new(),
+        import_request(pack, "tenant-b", false),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(state.fact_store.read().await.count(), 0);
+}
+
+#[tokio::test]
+async fn memory_import_collision_supersedes_never_overwrites() {
+    let state = test_app_state(16);
+    {
+        let mut store = state.fact_store.write().await;
+        store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "shared".to_string(),
+            key: "k".to_string(),
+            value: "local-value".to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+    let pack = build_test_pack(vec![("shared", "k", "incoming-value")], "local");
+    let resp = memory_import::post_memory_import(
+        State(state.clone()),
+        HeaderMap::new(),
+        import_request(pack, "local", false),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["collisions_superseded"], 1);
+
+    let store = state.fact_store.read().await;
+    let history = store.fact_history("shared", "k");
+    assert_eq!(history.len(), 2, "local value retired, never destroyed");
+    assert_eq!(history[0].value, "local-value");
+    assert!(history[0].superseded_by.is_some());
+    assert_eq!(history[1].value, "incoming-value");
+}
+
+#[tokio::test]
+async fn memory_import_dry_run_writes_nothing() {
+    let state = test_app_state(16);
+    let pack = build_test_pack(vec![("e", "k", "v")], "local");
+    let resp = memory_import::post_memory_import(
+        State(state.clone()),
+        HeaderMap::new(),
+        import_request(pack, "local", true),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["dry_run"], true);
+    assert_eq!(body["imported_facts"], 1, "plan reports what WOULD be written");
+    assert_eq!(state.fact_store.read().await.count(), 0);
+}
+
+#[tokio::test]
+async fn memory_import_double_import_is_idempotent() {
+    let state = test_app_state(16);
+    let pack = build_test_pack(vec![("e", "k", "v")], "local");
+    for expected_imported in [1_i64, 0_i64] {
+        let resp = memory_import::post_memory_import(
+            State(state.clone()),
+            HeaderMap::new(),
+            import_request(pack.clone(), "local", false),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["imported_facts"], expected_imported);
+    }
+    assert_eq!(state.fact_store.read().await.count(), 1);
 }

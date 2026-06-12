@@ -110,7 +110,7 @@ pub fn passport_fpr_from_public_key(public_key: &[u8; 32]) -> String {
 
 /// Per-section record counts, embedded in the manifest so a human can audit
 /// "what's in this pack" without parsing the sections.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct PackCounts {
     pub facts: usize,
     pub sessions: usize,
@@ -120,7 +120,7 @@ pub struct PackCounts {
 
 /// The pack manifest: who exported, from which daemon, for which tenant,
 /// at which journal head.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct PackManifest {
     /// `blake3(install_uuid)` hex — never the raw install UUID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,7 +151,7 @@ pub struct PackManifest {
 /// exporters always write `[]` (entity records include born-local kinds like
 /// `identity_link` that must not travel; a receipts chain slice needs the
 /// CROWN slice API — both explicit follow-ups in the spec).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PackSections {
     pub facts: Vec<Fact>,
     #[serde(default)]
@@ -165,7 +165,7 @@ pub struct PackSections {
 /// The exporting passport's ed25519 signature over the decoded 32-byte
 /// content hash — the same hash-then-sign pattern as CROWN wipe receipts and
 /// the Result Envelope platform signature.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct PackSignature {
     /// Always `ed25519` in v1.
     pub alg: String,
@@ -176,7 +176,7 @@ pub struct PackSignature {
 }
 
 /// The full `.cruxpack` document (`crux.cruxpack.v1`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CruxPack {
     pub schema_version: String,
     pub manifest: PackManifest,
