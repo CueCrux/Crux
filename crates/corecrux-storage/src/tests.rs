@@ -2055,6 +2055,265 @@ mod tests {
         assert!(retry[0].location.is_some());
     }
 
+    // ── Crash-recovery matrix completion ─────────────────────────────────────
+    // ExecPlan crux-storage-fault-hardening-2026-06-11, M2. Together with the
+    // existing crash_* tests this covers every injected failpoint:
+    //   before seal        → after_seq_assignment        (new)
+    //   mid-seal           → after_write_tmp             (new)
+    //   sealed pre-manifest→ after_rename_before_manifest (existing)
+    //   mid/post-manifest  → after_manifest_commit        (existing ×2)
+    //   head pre-fence     → after_head_commit_frame_write_before_fence (new)
+    //   head post-fence    → after_head_commit_fence_before_ack (existing)
+    // All tests run against tempdirs only (open_test_storage), never real data dirs.
+
+    /// Crash before any bytes hit disk (sequence numbers assigned in memory
+    /// only). Recovery must show an empty shard; the retry is a fresh append
+    /// (seq 1, Appended), and exactly one frame replays afterwards.
+    #[test]
+    fn crash_after_seq_assignment_persists_nothing_and_retry_is_fresh_append() {
+        let _g = TEST_LOCK.lock().unwrap();
+
+        let opts = ShardStorageOptions {
+            idem_hot_capacity_entries: 4,
+            ..Default::default()
+        };
+        let (dir, mut storage) = open_test_storage(opts.clone());
+
+        let tenant_id = "t1";
+        let stream_type = "s";
+        let stream_id = "a";
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+
+        set_test_failpoint("after_seq_assignment");
+        let err = storage
+            .append_batch(
+                stream_hash,
+                0,
+                tenant_id,
+                stream_type,
+                stream_id,
+                "2026-02-06T00:00:01Z",
+                &[AppendEventInput {
+                    event_id: "e1",
+                    occurred_at: "2026-02-06T00:00:00Z",
+                    event_type: "t",
+                    content_type: "application/octet-stream",
+                    payload_bytes: b"x",
+                }],
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("after_seq_assignment"));
+        clear_test_failpoint();
+        drop(storage);
+
+        let mut reopened = ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
+
+        assert_eq!(reopened.segments_in_order.len(), 0);
+        let (frames, _) = reopened.replay_from(None, 0).unwrap();
+        let (total, _) = replay_digest(&frames);
+        assert_eq!(total, 0, "nothing must replay after a pre-write crash");
+
+        let retry = reopened
+            .append_batch(
+                stream_hash,
+                0,
+                tenant_id,
+                stream_type,
+                stream_id,
+                "2026-02-06T00:00:02Z",
+                &[AppendEventInput {
+                    event_id: "e1",
+                    occurred_at: "2026-02-06T00:00:00Z",
+                    event_type: "t",
+                    content_type: "application/octet-stream",
+                    payload_bytes: b"x",
+                }],
+            )
+            .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].status, AppendStatus::Appended);
+        assert_eq!(retry[0].seq, 1);
+
+        let (frames, _) = reopened.replay_from(None, 0).unwrap();
+        let (total, _) = replay_digest(&frames);
+        assert_eq!(total, 1);
+    }
+
+    /// Crash mid-seal: the segment bytes were written to `tmp/` but never
+    /// renamed into `segments/`. Recovery must not surface the partial file as
+    /// a segment, must not lose the sequence space, and a retry must succeed
+    /// with a stable replay digest.
+    #[test]
+    fn crash_after_write_tmp_ignores_partial_and_recovers_cleanly() {
+        let _g = TEST_LOCK.lock().unwrap();
+
+        let opts = ShardStorageOptions {
+            idem_hot_capacity_entries: 4,
+            ..Default::default()
+        };
+        let (dir, mut storage) = open_test_storage(opts.clone());
+
+        let tenant_id = "t1";
+        let stream_type = "s";
+        let stream_id = "a";
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+
+        set_test_failpoint("after_write_tmp");
+        let err = storage
+            .append_batch(
+                stream_hash,
+                0,
+                tenant_id,
+                stream_type,
+                stream_id,
+                "2026-02-06T00:00:01Z",
+                &[AppendEventInput {
+                    event_id: "e1",
+                    occurred_at: "2026-02-06T00:00:00Z",
+                    event_type: "t",
+                    content_type: "application/octet-stream",
+                    payload_bytes: b"x",
+                }],
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("after_write_tmp"));
+        clear_test_failpoint();
+
+        // The crash left a partial file in tmp/ and nothing in segments/.
+        let tmp_partials: Vec<_> = std::fs::read_dir(&storage.paths.tmp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(!tmp_partials.is_empty(), "expected a .partial leftover in tmp/");
+        let sealed: Vec<_> = std::fs::read_dir(&storage.paths.segments_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(sealed.is_empty(), "no sealed segment may exist after a mid-seal crash");
+        drop(storage);
+
+        let mut reopened = ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
+
+        // The partial must not be loaded as a segment.
+        assert_eq!(reopened.segments_in_order.len(), 0);
+        let (frames, _) = reopened.replay_from(None, 0).unwrap();
+        let (total, _) = replay_digest(&frames);
+        assert_eq!(total, 0);
+
+        let retry = reopened
+            .append_batch(
+                stream_hash,
+                0,
+                tenant_id,
+                stream_type,
+                stream_id,
+                "2026-02-06T00:00:02Z",
+                &[AppendEventInput {
+                    event_id: "e2",
+                    occurred_at: "2026-02-06T00:00:00Z",
+                    event_type: "t",
+                    content_type: "application/octet-stream",
+                    payload_bytes: b"y",
+                }],
+            )
+            .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].status, AppendStatus::Appended);
+        assert_eq!(reopened.segments_in_order.len(), 1);
+
+        // Replay digest stable across a further reopen (digest matrix column).
+        let (frames, _) = reopened.replay_from(None, 0).unwrap();
+        let (total_a, digest_a) = replay_digest(&frames);
+        assert_eq!(total_a, 1);
+        drop(reopened);
+        let reopened_again = ShardStorage::open(
+            dir.path(),
+            1,
+            1,
+            ShardStorageOptions {
+                idem_hot_capacity_entries: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (frames, _) = reopened_again.replay_from(None, 0).unwrap();
+        let (total_b, digest_b) = replay_digest(&frames);
+        assert_eq!(total_b, 1);
+        assert_eq!(digest_a, digest_b);
+    }
+
+    /// Head-mode crash after the commit frame is written+synced but before the
+    /// publish fence: the data is durable, the ack was lost. The retry must be
+    /// recognised as DuplicateCommitted (no double-append).
+    #[test]
+    fn crash_after_head_commit_frame_write_before_fence_is_idempotent_after_restart() {
+        let _g = TEST_LOCK.lock().unwrap();
+
+        let opts = ShardStorageOptions {
+            head_max_record_bytes: 1024 * 1024,
+            idem_hot_capacity_entries: 4,
+            ..Default::default()
+        };
+        let (dir, mut storage) = open_test_storage(opts.clone());
+
+        let tenant_id = "t1";
+        let stream_type = "s";
+        let stream_id = "a";
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+
+        set_test_failpoint("after_head_commit_frame_write_before_fence");
+        let err = storage
+            .append_batch(
+                stream_hash,
+                0,
+                tenant_id,
+                stream_type,
+                stream_id,
+                "2026-02-06T00:00:01Z",
+                &[AppendEventInput {
+                    event_id: "e1",
+                    occurred_at: "2026-02-06T00:00:00Z",
+                    event_type: "t",
+                    content_type: "application/octet-stream",
+                    payload_bytes: b"x",
+                }],
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("after_head_commit_frame_write_before_fence"));
+        clear_test_failpoint();
+        drop(storage);
+
+        let mut reopened = ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
+
+        let retry = reopened
+            .append_batch(
+                stream_hash,
+                0,
+                tenant_id,
+                stream_type,
+                stream_id,
+                "2026-02-06T00:00:02Z",
+                &[AppendEventInput {
+                    event_id: "e1",
+                    occurred_at: "2026-02-06T00:00:00Z",
+                    event_type: "t",
+                    content_type: "application/octet-stream",
+                    payload_bytes: b"x",
+                }],
+            )
+            .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].status, AppendStatus::DuplicateCommitted);
+        assert_eq!(retry[0].seq, 1);
+        assert!(retry[0].location.is_some());
+
+        let tail = reopened
+            .read_tail(tenant_id, stream_type, stream_id, stream_hash, 8)
+            .unwrap();
+        assert_eq!(tail.len(), 1, "exactly one durable copy of e1 after replayed ack");
+        assert_eq!(tail[0].event_id, "e1");
+    }
+
     #[test]
     fn read_tail_returns_last_n_across_segments() {
         let _g = TEST_LOCK.lock().unwrap();
