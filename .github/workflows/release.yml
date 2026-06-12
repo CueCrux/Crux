@@ -147,3 +147,53 @@ jobs:
             dist/content/*
             dist/docs/*
           generate_release_notes: true
+
+  # --- SLSA provenance (ExecPlan crux-supply-chain-attestation-2026-06-11, M4) ---
+  # The three matrix legs export per-suffix base64(sha256sum) subject blocks;
+  # this job concatenates them into the single base64-subjects input the
+  # generator expects.
+  combine-hashes:
+    name: Combine provenance subjects
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      hashes: ${{ steps.combine.outputs.hashes }}
+    steps:
+      - name: Combine per-target subject lists
+        id: combine
+        env:
+          H_LINUX_AMD64: ${{ needs.build.outputs.hashes-linux-amd64 }}
+          H_DARWIN_ARM64: ${{ needs.build.outputs.hashes-darwin-arm64 }}
+          H_DARWIN_AMD64: ${{ needs.build.outputs.hashes-darwin-amd64 }}
+        run: |
+          set -euo pipefail
+          for v in H_LINUX_AMD64 H_DARWIN_ARM64 H_DARWIN_AMD64; do
+            test -n "${!v}" || { echo "::error::missing subjects from $v leg"; exit 1; }
+          done
+          combined="$(
+            {
+              echo "$H_LINUX_AMD64" | base64 -d
+              echo "$H_DARWIN_ARM64" | base64 -d
+              echo "$H_DARWIN_AMD64" | base64 -d
+            } | base64 -w0
+          )"
+          echo "hashes=${combined}" >> "$GITHUB_OUTPUT"
+
+  provenance:
+    name: SLSA provenance
+    # needs release so upload-assets attaches to the already-created release
+    # instead of racing softprops/action-gh-release.
+    needs: [combine-hashes, release]
+    permissions:
+      actions: read # read the workflow run to record the builder identity
+      id-token: write # sign the provenance (Sigstore keyless)
+      contents: write # upload provenance to the release
+    # NOTE: referenced by TAG, not commit SHA — the slsa-github-generator
+    # explicitly requires tag refs for its reusable workflows (it verifies
+    # its own release integrity internally; SHA refs are unsupported).
+    # Documented exception to the pinned-SHA rule — see ExecPlan decision log.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.combine-hashes.outputs.hashes }}
+      upload-assets: true
