@@ -9,6 +9,7 @@
 //! routing/refusal decisions. Network refresh and revocation IO land in later phases.
 
 pub mod hosted;
+pub mod quota;
 
 use rcx_capability_token::{
     Backend, CreditRefill, Credits, DataEgressClass, FallbackAction, FallbackPolicy, Issuer, OverdraftPolicy,
