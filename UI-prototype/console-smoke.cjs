@@ -314,6 +314,75 @@ function makeFetch() {
   ok(!!tile(env2, 'coord-session', 'fa0a2f95'), 'coord demo: dummy live-session tile renders offline');
   ok(!!tile(env2, 'coord-overlap', 'Overlap'), 'coord demo: dummy overlap tile renders offline');
 
+  // ── K) M1 — operator pages live-wired (PAGE_WIRES: load / set / act + raw RPC) ──
+  const f7 = makeFetch();
+  f7.route(u => /\/v1\/console\/settings$/.test(u), { ok: true, status: 200, body: {
+    auth: { running_mode: 'local_only', chosen_mode: null, bind_is_loopback: true, supported_modes: ['local_only', 'open', 'token', 'jwt_hs256'] },
+    embedding: { enabled_intent: null, chosen_url: null, chosen_model: null, active_url: 'http://localhost:11434', active_model: 'bge-m3', active: true },
+    onboarding: { completed_at_unix_ms: 1 } } });
+  f7.route((u, o) => /\/v1\/console\/settings$/.test(u) && o.method === 'PUT', { ok: true, status: 200, body: { saved: {}, restart_required: true, restart_command: 'docker restart crux' } });
+  f7.route(u => /\/v1\/console\/embedding\/probe/.test(u), { ok: true, status: 200, body: { shape: 'ollama', models: ['bge-m3', 'nomic-embed-text'], resolved_url: 'http://localhost:11434' } });
+  f7.route(u => /\/v1\/projects$/.test(u), { ok: true, status: 200, body: { projects: [{ id: 'cuecrux', name: 'CueCrux', planning_target: 'github:CueCrux/Crux', working_tenants: ['default'] }] } });
+  f7.route((u, o) => /\/v1\/projects$/.test(u) && o.method === 'POST', { ok: true, status: 201, body: { id: 'newproj' } });
+  f7.route(u => /\/v1\/console\/passports/.test(u), { ok: true, status: 200, body: { passports: [{ id: 'ce:4e6c4e2a:local' }, { id: 'ce:8821fa0d:local' }] } });
+  f7.route(u => /\/v1\/mcp\/tools/.test(u), { ok: true, status: 200, body: { count: 2, tools: [{ name: 'query' }, { name: 'store_fact' }] } });
+  f7.route(u => /\/v1\/extensions$/.test(u), { ok: true, status: 200, body: { count: 1, extensions: [{ id: 'crux-claude-hooks', version: '0.4.2', kind: 'hooks' }], allow_unsigned_dev: false } });
+  f7.route(u => /\/v1\/extensions\/keys$/.test(u), { ok: true, status: 200, body: { count: 1, keys: [{ passport_fpr: 'fp:abc', trust_tier: 'first_party', added_by: 'root' }] } });
+  f7.route(u => /\/v1\/console\/integrations/.test(u), { ok: true, status: 200, body: { enabled: true, safe_mode: true, allow_executable_helpers: false, allowed_capabilities: [],
+    packs: [{ id: 'git-pack', version: '1.0', status: 'enabled' }, { id: 'fs-pack', version: '1.0', status: 'disabled' }], grants: [{}] } });
+  f7.route((u, o) => /\/v1\/console\/integrations\/fs-pack\/install/.test(u) && o.method === 'POST', { ok: true, status: 201, body: {} });
+  f7.route(u => /\/v1\/integrations\/github\/status/.test(u), { ok: true, status: 200, body: { connected: true, username: 'myles' } });
+  f7.route(u => /\/v1\/integrations\/openai\/status/.test(u), { ok: true, status: 200, body: { connected: false, available_models: ['gpt-4o'], default_model: null } });
+  const env7 = buildSandbox(f7); await flush();
+  const lastBtn = (env, label) => env.ALL.filter(e => e._text === label && e._listeners && e._listeners.click).pop();
+
+  // settings: load adopts daemon truth; control change PUTs; probe refreshes model options
+  env7.s.openPage('cx-settings'); await flush(10);
+  ok(f7.calls.some(c => /\/v1\/console\/settings$/.test(c.url) && (!c.opts || c.opts.method !== 'PUT')), 'M1 settings: open page GETs /v1/console/settings');
+  ok((env7.s.pageCtrl('cx-settings', 'auth_mode').options || []).includes('jwt_hs256'), 'M1 settings: auth-mode options replaced from supported_modes');
+  ok(env7.s.pageVal('cx-settings', 'embed_url') === 'http://localhost:11434', 'M1 settings: embedding url adopted from daemon');
+  const tog7 = env7.ALL.filter(e => e.classList && e.classList.contains('sp-toggle') && e.dataset['aria-label'] === 'enable embedding retrieval').pop();
+  await tog7.fire('click'); await flush(6);
+  const put7 = f7.calls.find(c => c.opts && c.opts.method === 'PUT' && /console\/settings/.test(c.url));
+  ok(!!put7, 'M1 settings: toggling embedding PUTs /v1/console/settings');
+  ok(put7 && JSON.parse(put7.opts.body).embedding_enabled !== undefined, 'M1 settings: PUT body carries embedding_enabled');
+  await lastBtn(env7, 'Probe endpoint').fire('click'); await flush(8);
+  ok(f7.calls.some(c => /embedding\/probe/.test(c.url) && c.opts.method === 'POST'), 'M1 settings: probe button POSTs /v1/console/embedding/probe');
+  ok((env7.s.pageCtrl('cx-settings', 'embed_model').options || []).includes('nomic-embed-text'), 'M1 settings: probe result repopulates model options');
+
+  // projects: passports populate the select; create POSTs the form
+  env7.s.closePage(); env7.s.openPage('cx-projects'); await flush(10);
+  ok((env7.s.pageCtrl('cx-projects', 'proj_passport').options || []).includes('ce:8821fa0d:local'), 'M1 projects: passport options from /v1/console/passports');
+  ok(env7.ALL.some(e => e._text === 'CueCrux'), 'M1 projects: tracked list rendered from /v1/projects');
+  env7.s.confSet('cx-projects.proj_id', 'newproj');
+  await lastBtn(env7, 'Create project').fire('click'); await flush(8);
+  const postP = f7.calls.find(c => /\/v1\/projects$/.test(c.url) && c.opts && c.opts.method === 'POST');
+  ok(!!postP, 'M1 projects: Create project POSTs /v1/projects');
+  ok(postP && JSON.parse(postP.opts.body).id === 'newproj', 'M1 projects: POST body carries the id');
+
+  // extensions + integrations: live lists replace the concept rows; pack toggle installs
+  env7.s.closePage(); env7.s.openPage('cx-extensions'); await flush(10);
+  ok(env7.ALL.some(e => e._text === 'crux-claude-hooks'), 'M1 extensions: installed list from /v1/extensions');
+  ok(env7.ALL.some(e => e._text === 'fp:abc'), 'M1 extensions: trusted keys from /v1/extensions/keys');
+  env7.s.closePage(); env7.s.openPage('cx-integrations'); await flush(10);
+  const pkTog = env7.ALL.filter(e => e.classList && e.classList.contains('sp-toggle') && /fs-pack/.test(e.dataset['aria-label'] || '')).pop();
+  ok(!!pkTog, 'M1 integrations: pack toggles rebuilt from live /v1/console/integrations');
+  ok(env7.ALL.some(e => /connected · myles/.test(e._text || '')), 'M1 integrations: github status row live');
+  await pkTog.fire('click'); await flush(6);
+  ok(f7.calls.some(c => /console\/integrations\/fs-pack\/install/.test(c.url) && c.opts.method === 'POST'), 'M1 integrations: pack toggle on POSTs install');
+
+  // raw RPC: tools/list rides the same-origin catalog proxy
+  env7.s.closePage(); env7.s.openPage('cx-raw'); await flush(6);
+  env7.s.sendRpc('cx-raw'); await flush(6);
+  ok(f7.calls.some(c => /\/v1\/mcp\/tools/.test(c.url)), 'M1 rpc: tools/list rides /v1/mcp/tools');
+  ok(/store_fact/.test(env7.getById('rpcOut').textContent), 'M1 rpc: tool names rendered into the output pane');
+
+  // demo mode: wired buttons refuse politely, no network
+  env2.s.openPage('cx-settings'); await flush(6);
+  await lastBtn(env2, 'Probe endpoint').fire('click'); await flush(6);
+  ok(/demo mode/.test(env2.getById('cxToast').textContent), 'M1 demo: wired button refuses politely in demo mode');
+  ok(!f2.calls.some(c => /embedding\/probe/.test(c.url)), 'M1 demo: no probe network call in demo mode');
+
   console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

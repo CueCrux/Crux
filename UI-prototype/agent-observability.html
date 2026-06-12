@@ -1083,6 +1083,12 @@ async function patchApi(path, body){
   const text=await r.text(); let data; try{ data=JSON.parse(text); }catch{ data={text}; }
   if(!r.ok) throw {status:r.status, data}; return data;
 }
+async function putApi(path, body){
+  const h=apiHeaders(); h['Content-Type']='application/json';
+  const r=await fetch(path,{method:'PUT',headers:h,body:JSON.stringify(body||{})});
+  const text=await r.text(); let data; try{ data=JSON.parse(text); }catch{ data={text}; }
+  if(!r.ok) throw {status:r.status, data}; return data;
+}
 async function deleteApi(path){
   const r=await fetch(path,{method:'DELETE',headers:apiHeaders()});
   if(!r.ok && r.status!==204){ const text=await r.text(); let data; try{ data=JSON.parse(text); }catch{ data={text}; } throw {status:r.status, data}; }
@@ -2434,7 +2440,14 @@ populatePassportFilter();
    override, create-forms. Controls persist to localStorage (concept). ── */
 var CXCONF={}; try{ CXCONF=JSON.parse(localStorage.getItem('cxconf')||'{}'); }catch(e){}
 function confGet(k,d){ return (k in CXCONF)?CXCONF[k]:d; }
-function confSet(k,v){ CXCONF[k]=v; try{ localStorage.setItem('cxconf',JSON.stringify(CXCONF)); }catch(e){} toast('saved · '+k); }
+function confPut(k,v){ CXCONF[k]=v; try{ localStorage.setItem('cxconf',JSON.stringify(CXCONF)); }catch(e){} }   // quiet write (no toast, no daemon)
+function confSet(k,v){ CXCONF[k]=v; try{ localStorage.setItem('cxconf',JSON.stringify(CXCONF)); }catch(e){} toast('saved · '+k);
+  /* M1 live seam: a wired control change persists to the daemon too */
+  const i=k.indexOf('.'); if(i<=0 || !LIVE) return;
+  const pid=k.slice(0,i), ck=k.slice(i+1), w=PAGE_WIRES[pid]; if(!w) return;
+  const h=(w.set&&w.set[ck]) || null, p = h? h(v) : (w.setAny? w.setAny(ck,v) : null);
+  if(p&&p.then) p.then(m=>{ if(m) toast(m); }).catch(e=>toast(ck+' · daemon rejected ('+((e&&e.status)||'network')+')'));
+}
 function toast(msg){
   let t=document.getElementById('cxToast');
   if(!t){ t=document.createElement('div'); t.id='cxToast'; document.body.appendChild(t); }
@@ -2447,6 +2460,35 @@ const RPC_SAMPLES={
  'tools/call · store_fact':'← { "result":{ "fact_id":"f_9fb33499…",\n    "receipt":"crn_d4e2…", "version":1 } }',
  'resources/list':'← { "result":{ "resources":[] } }',
 };
+/* M1: raw RPC page. tools/list rides the same-origin catalog proxy (/v1/mcp/tools);
+   tools/call POSTs /mcp on this origin — if no JSON-RPC bridge is mounted on :14800
+   the 404/405 renders a calm pointer at :14801 instead of a fake response. */
+function sendRpc(pageId){
+  const m=confGet(pageId+'.rpc_method','tools/list');
+  const out=document.getElementById('rpcOut');
+  if(!LIVE){ if(out) out.textContent='→ { "jsonrpc":"2.0", "method":"'+m+'" }\n'+(RPC_SAMPLES[m]||'← { "result":{} }'); toast('sent · '+m+' (demo)'); return; }
+  if(m==='tools/list'){
+    if(out) out.textContent='→ GET /v1/mcp/tools';
+    api('/v1/mcp/tools').then(j=>{ const ts=j.tools||[];
+      if(out) out.textContent='→ GET /v1/mcp/tools\n← '+(j.count!=null?j.count:ts.length)+' tools\n'+ts.slice(0,40).map(t=>' · '+t.name).join('\n')+(ts.length>40?'\n · …':'');
+      toast('tools/list · '+(j.count!=null?j.count:ts.length)); })
+     .catch(e=>{ if(out) out.textContent='→ GET /v1/mcp/tools\n← '+((e&&e.status)||'network')+' '+JSON.stringify((e&&e.data)||{}); });
+    return;
+  }
+  let params={}; const raw=confGet(pageId+'.rpc_params','{}')||'{}';
+  try{ params=JSON.parse(raw); }catch(err){ if(out) out.textContent='✗ params is not valid JSON — '+err.message; return; }
+  const name=(m.split('·')[1]||'').trim();
+  const body=name? {jsonrpc:'2.0',id:1,method:'tools/call',params:{name,arguments:params}} : {jsonrpc:'2.0',id:1,method:m,params};
+  if(out) out.textContent='→ POST /mcp '+JSON.stringify(body);
+  const scopes=confGet(pageId+'.rpc_scopes','read');
+  fetch('/mcp',{method:'POST',headers:Object.assign({'Content-Type':'application/json','Accept':'application/json, text/event-stream'},apiHeaders(),{'X-Corecrux-Scopes':scopes}),body:JSON.stringify(body)})
+    .then(async r=>{ const t=await r.text();
+      if(r.status===404||r.status===405){ if(out) out.textContent+='\n← '+r.status+' — no JSON-RPC bridge on :14800; the MCP server listens on :14801 /mcp'; return; }
+      let pretty=t; try{ pretty=JSON.stringify(JSON.parse(t.replace(/^data:\s*/gm,'').trim()),null,2); }catch{}
+      if(out) out.textContent+='\n← '+r.status+'\n'+pretty.slice(0,4000); })
+    .catch(()=>{ if(out) out.textContent+='\n← network error'; });
+  toast('sent · '+m);
+}
 const PAGES={
  'cx-settings':{title:'Console settings',sub:'persisted to data_dir/console/settings.json · auth + embedding apply on next restart',sections:[
   {h:'Access posture',sub:'who may call :14800',controls:[
@@ -2511,7 +2553,7 @@ const PAGES={
   {h:'Trusted signing keys',sub:'manifests verify against this keyring',controls:[
    {t:'info',label:'daemon-root',v:'fp:12345678 · tier partner'},
    {t:'input',k:'key_fpr',label:'passport fingerprint',ph:'fp:…',mono:true},
-   {t:'select',k:'key_tier',label:'trust tier',options:['community','verified','partner'],v:'community'},
+   {t:'select',k:'key_tier',label:'trust tier',options:['unknown','community_reviewed','locally_signed','first_party'],v:'community_reviewed'},
    {t:'input',k:'key_pub',label:'public key',ph:'ed25519:…',mono:true},
    {t:'btn',label:'Add key'}],
    doc:'Dev bypass: CORECRUXD_EXTENSIONS_ALLOW_UNSIGNED=1 lets unsigned manifests install for local testing only.'},
@@ -2768,9 +2810,157 @@ const PAGES={
 };
 function openSettings(){ openPage('cx-settings'); }
 function closeSettings(){ closePage(); }
-function closePage(){ const el=document.getElementById('settingsPage'); if(el) el.style.display='none'; }
-function openPage(id){
+function closePage(){ openPageId=null; const el=document.getElementById('settingsPage'); if(el) el.style.display='none'; }
+/* ── M1: live operator pages. PAGE_WIRES[pageId] =
+     load(def)  — async; pull /v1 state and mutate the page def's control values/options before re-render
+     set{k}/setAny(k,v) — persist one control change to the daemon (called from confSet when LIVE)
+     act{'Button label'} — real call behind a button; resolves to a toast message
+   LIVE=false leaves every page on the concept demo; load failures degrade to demo values. */
+function pageCtrl(pageId,k){ const def=PAGES[pageId]; let out=null;
+  ((def&&def.sections)||[]).forEach(s=>(s.controls||[]).forEach(c=>{ if(c.k===k) out=c; })); return out; }
+function pageVal(pageId,k){ const c=pageCtrl(pageId,k); return confGet(pageId+'.'+k, c?c.v:undefined); }
+function setCtrl(pageId,k,v){ const c=pageCtrl(pageId,k); if(c) c.v=v; confPut(pageId+'.'+k, v); }   // server truth wins on load
+const infoRow=(label,v)=>({t:'info',label,v});
+const PAGE_WIRES={
+ 'cx-settings':{
+  load: async()=>{
+    const s=await api('/v1/console/settings'); const a=s.auth||{}, e=s.embedding||{};
+    const am=pageCtrl('cx-settings','auth_mode');
+    if(am && Array.isArray(a.supported_modes) && a.supported_modes.length) am.options=a.supported_modes.slice();
+    if(a.chosen_mode||a.running_mode) setCtrl('cx-settings','auth_mode', a.chosen_mode||a.running_mode);
+    setCtrl('cx-settings','embed_on', e.enabled_intent!=null? !!e.enabled_intent : !!e.active);
+    setCtrl('cx-settings','embed_url', e.chosen_url||e.active_url||'');
+    const mm=pageCtrl('cx-settings','embed_model'), mv=e.chosen_model||e.active_model;
+    if(mm && mv && mm.options.indexOf(mv)<0) mm.options=mm.options.concat([mv]);
+    if(mv) setCtrl('cx-settings','embed_model', mv);
+  },
+  set:{
+    auth_mode: v=>putApi('/v1/console/settings',{auth_mode:v}).then(r=>r.restart_required?'saved · restart required':'saved to daemon'),
+    embed_on:  v=>putApi('/v1/console/settings',{embedding_enabled:!!v}).then(()=>'saved to daemon'),
+    embed_url: v=>putApi('/v1/console/settings',{embedding_url:v||null}).then(()=>'saved to daemon'),
+    embed_model: v=>(v&&v!=='—')? putApi('/v1/console/settings',{embedding_model:v}).then(()=>'saved to daemon') : null,
+  },
+  act:{
+    'Probe endpoint': async ctx=>{
+      const url=pageVal('cx-settings','embed_url'); if(!url) throw {status:'enter an endpoint URL first'};
+      const r=await postApi('/v1/console/embedding/probe',{url});
+      const mm=pageCtrl('cx-settings','embed_model'); if(mm) mm.options=['—'].concat(r.models||[]);
+      ctx.reopen(); return (r.shape||'endpoint')+' · '+((r.models||[]).length)+' models';
+    },
+    'Re-run onboarding': async()=>{ await postApi('/v1/console/onboarding/restart',{}); return 'onboarding shows on next load'; },
+  }},
+ 'cx-integrations':{
+  load: async def=>{
+    const [integ,gh,oa]=await Promise.all([
+      api('/v1/console/integrations').catch(e=>({_err:e})),
+      api('/v1/integrations/github/status').catch(e=>({_err:e})),
+      api('/v1/integrations/openai/status').catch(e=>({_err:e}))]);
+    if(!integ._err){
+      const packs=integ.packs||[];
+      if(packs.length) def.sections[0].controls=packs.map(p=>({ t:'toggle', k:'pack_'+(p.id||p.name),
+        label:(p.id||p.name)+(p.version?' · v'+p.version:''), v:(p.status? p.status!=='disabled' : !!(p.installed||p.enabled)) }));
+      def.sections[0].sub=(integ.enabled?'enabled':'disabled')+(integ.safe_mode?' · safe mode':'')+' · grants are separate';
+      const g=(def.sections[3]&&def.sections[3].controls||[]).find(c=>c.t==='info');
+      const n=Array.isArray(integ.grants)? integ.grants.length : (integ.grants&&integ.grants.count);
+      if(g && n!=null) g.v=n+' active';
+    }
+    if(!gh._err) def.sections[1].controls=[infoRow('status', gh.connected?('connected'+(gh.username?' · '+gh.username:'')):'not connected')]
+      .concat(def.sections[1].controls.filter(c=>c.t!=='info'));
+    if(!oa._err){
+      const om=pageCtrl('cx-integrations','oa_model');
+      if(om && Array.isArray(oa.available_models) && oa.available_models.length) om.options=['none'].concat(oa.available_models);
+      if(oa.default_model){ if(om && om.options.indexOf(oa.default_model)<0) om.options=om.options.concat([oa.default_model]); setCtrl('cx-integrations','oa_model',oa.default_model); }
+      def.sections[2].controls=[infoRow('status', oa.connected?'connected':'not connected')]
+        .concat(def.sections[2].controls.filter(c=>c.t!=='info'));
+    }
+  },
+  setAny:(k,v)=>{ if(!/^pack_/.test(k)) return null; const id=k.slice(5);
+    return v? postApi('/v1/console/integrations/'+encodeURIComponent(id)+'/install',{pack_id:id}).then(()=>id+' · installed')
+            : postApi('/v1/console/integrations/'+encodeURIComponent(id)+'/disable',{}).then(()=>id+' · disabled'); },
+  set:{
+    oa_model: v=>(v&&v!=='none')? patchApi('/v1/integrations/openai/settings',{default_model:v}).then(()=>'default model saved') : null,
+  },
+  act:{
+    'Verify connection': async ctx=>{
+      const pat=pageVal('cx-integrations','gh_pat'); if(!pat) throw {status:'paste a token first'};
+      const r=await postApi('/v1/integrations/github/connect',{pat, skip_verify:!!pageVal('cx-integrations','gh_skiptls')});
+      confPut('cx-integrations.gh_pat','');   // never keep the PAT in browser storage — the daemon holds it encrypted now
+      ctx.reload(); return 'github · connected'+(r.username?' as '+r.username:'');
+    },
+    'Test call': async ctx=>{
+      const key=pageVal('cx-integrations','oa_key');
+      if(key){ const m=pageVal('cx-integrations','oa_model');
+        const r=await postApi('/v1/integrations/openai/connect',{api_key:key, organization_id:pageVal('cx-integrations','oa_org')||null, default_model:(m&&m!=='none')?m:null});
+        confPut('cx-integrations.oa_key','');   // same rule as the PAT
+        ctx.reload(); return 'openai · connected'+(r.default_model?' · '+r.default_model:'');
+      }
+      const r=await postApi('/v1/integrations/openai/chat',{messages:[{role:'user',content:'Reply with the single word: pong'}],max_tokens:8});
+      const c=r.choices&&r.choices[0]&&r.choices[0].message&&r.choices[0].message.content;
+      return 'openai · '+(c?String(c).trim().slice(0,40):'ok');
+    },
+    'Review grants': async()=>{ const r=await api('/v1/console/integrations');
+      const n=Array.isArray(r.grants)? r.grants.length : ((r.grants&&r.grants.count)!=null? r.grants.count:'—');
+      return 'grants · '+n+' active'; },
+  }},
+ 'cx-extensions':{
+  load: async def=>{
+    const [ex,keys]=await Promise.all([api('/v1/extensions').catch(e=>({_err:e})), api('/v1/extensions/keys').catch(e=>({_err:e}))]);
+    if(!ex._err){ const list=ex.extensions||[];
+      def.sections[0].h='Installed · '+(ex.count!=null?ex.count:list.length);
+      def.sections[0].controls=list.length? list.map(x=>infoRow(x.id||x.name, [x.version,x.kind].filter(Boolean).join(' · ')||'installed'))
+        : [infoRow('none installed', ex.allow_unsigned_dev?'unsigned dev installs allowed':'—')]; }
+    if(!keys._err){ const ks=keys.keys||[];
+      def.sections[1].controls=ks.map(k0=>infoRow(k0.passport_fpr||'key',[k0.trust_tier,k0.added_by?('by '+k0.added_by):null].filter(Boolean).join(' · ')))
+        .concat(def.sections[1].controls.filter(c=>c.t!=='info')); }
+  },
+  act:{
+    'Add key': async ctx=>{
+      const fpr=pageVal('cx-extensions','key_fpr'), pub=pageVal('cx-extensions','key_pub');
+      if(!fpr||!pub) throw {status:'fingerprint + public key required'};
+      await postApi('/v1/extensions/keys',{passport_fpr:fpr, public_key_hex:String(pub).replace(/^ed25519:/,''), trust_tier:pageVal('cx-extensions','key_tier'), added_by:'console'});
+      ctx.reload(); return 'key added · '+fpr;
+    },
+    'Install': async ctx=>{
+      const src=pageVal('cx-extensions','manifest_url'); if(!src) throw {status:'enter a manifest URL or registry id'};
+      if(/^https?:\/\//.test(src)||/^\.?\//.test(src)){
+        const r=await fetch(src,{headers:apiHeaders()}); if(!r.ok) throw {status:r.status};
+        await postApi('/v1/extensions/register',{manifest:await r.json()});
+      } else await postApi('/v1/extensions/install-from-registry',{id:src});
+      ctx.reload(); return 'installed · '+src;
+    },
+  }},
+ 'cx-projects':{
+  load: async def=>{
+    const [pr,pp]=await Promise.all([api('/v1/projects').catch(e=>({_err:e})), api('/v1/console/passports').catch(e=>({_err:e}))]);
+    if(!pp._err){ const ids=(pp.passports||[]).map(p=>p.id).filter(Boolean);
+      const sel=pageCtrl('cx-projects','proj_passport');
+      if(sel&&ids.length){ sel.options=ids; if(ids.indexOf(confGet('cx-projects.proj_passport',sel.v))<0) setCtrl('cx-projects','proj_passport',ids[0]); } }
+    if(!pr._err){ const list=pr.projects||[];
+      def.sections[1].h='Tracked · '+list.length;
+      def.sections[1].controls=(list.length? list.map(p=>infoRow(p.name||p.id,
+          [p.planning_target,(p.working_tenants||[]).join(', ')||null,p.archived?'archived':null].filter(Boolean).join(' · ')||'—'))
+        : [infoRow('none yet','create one on the left')]).concat([{t:'btn',label:'Browse as graph',action:'graph'}]); }
+  },
+  act:{
+    'Create project': async ctx=>{
+      const id=pageVal('cx-projects','proj_id'); if(!id) throw {status:'id required'};
+      await postApi('/v1/projects',{ id, name:pageVal('cx-projects','proj_name')||id,
+        planning_target:pageVal('cx-projects','proj_plan')||null,
+        default_passport_id:pageVal('cx-projects','proj_passport'),
+        working_tenants:String(pageVal('cx-projects','proj_tenants')||'').split(',').map(s=>s.trim()).filter(Boolean) });
+      ctx.reload(); return 'project created · '+id;
+    },
+  }},
+};
+let openPageId=null;
+function openPage(id, opts){
   const def=PAGES[id]; if(!def) return;
+  openPageId=id;
+  const wire=PAGE_WIRES[id];
+  if(LIVE && wire && wire.load && !(opts&&opts.__wired))
+    Promise.resolve(wire.load(def))
+      .then(()=>{ if(openPageId===id) openPage(id,{__wired:true}); })
+      .catch(e=>{ announce('Live load failed for '+def.title+' ('+((e&&e.status)||'network')+') — concept data shown'); });
   let el=document.getElementById('settingsPage');
   if(!el){ el=document.createElement('div'); el.id='settingsPage'; (document.getElementById('canvas')||document.body).appendChild(el); }
   el.innerHTML='';
@@ -2794,9 +2984,10 @@ function openPage(id){
 function renderControl(pageId,c){
   const row=document.createElement('div'); row.className='sp-row';
   const key=c.k?pageId+'.'+c.k:null;
-  if(c.t==='info'){ row.className='frow';
-    row.innerHTML='<span class="fk"></span><span class="fv"></span>';
-    row.children[0].textContent=c.label; row.children[1].textContent=c.v; return row; }
+  if(c.t==='info'){ row.className='frow';   /* createElement, not innerHTML — the smoke DOM stub has no innerHTML parser */
+    const a=document.createElement('span'); a.className='fk'; a.textContent=c.label;
+    const b=document.createElement('span'); b.className='fv'; b.textContent=c.v;
+    row.appendChild(a); row.appendChild(b); return row; }
   if(c.t==='theme'){ row.className='frow';
     const a=document.createElement('span'); a.className='fk'; a.textContent='theme'; row.appendChild(a);
     const b=document.createElement('button'); b.className='sp-btn';
@@ -2826,11 +3017,17 @@ function renderControl(pageId,c){
       if(c.danger){ delete b.dataset.armed; b.textContent=c.label; }
       if(c.action==='graph'){ closePage(); soloPanel(pageId,{graph:true}); return; }
       if(c.action==='open3d'){ closePage(); setView('3d'); return; }
-      if(c.action==='rpc'){
-        const m=confGet(pageId+'.rpc_method','tools/list');
-        const out=document.getElementById('rpcOut'); if(out) out.textContent='→ { "jsonrpc":"2.0", "method":"'+m+'" }\n'+(RPC_SAMPLES[m]||'← { "result":{} }');
-        toast('sent · '+m); return;
+      if(c.action==='rpc'){ sendRpc(pageId); return; }
+      const wire=PAGE_WIRES[pageId], h=wire&&wire.act&&wire.act[c.label];
+      if(h && LIVE){   /* M1: wired button → real /v1 call; busy-guard + toast the outcome */
+        b.disabled=true;
+        const ctx={ reload:()=>{ if(openPageId===pageId) openPage(pageId); }, reopen:()=>{ if(openPageId===pageId) openPage(pageId,{__wired:true}); } };
+        Promise.resolve(h(ctx)).then(msg=>toast(msg||(c.label+' · done')))
+          .catch(e=>toast(c.label+' · failed ('+((e&&e.status)||'network')+')'))
+          .finally(()=>{ b.disabled=false; });
+        return;
       }
+      if(h){ toast(c.label+' · demo mode — start the daemon'); return; }
       toast(c.label+' · queued (concept)');
     };
     if(c.hint){ row.appendChild(b); const h=document.createElement('span'); h.className='sp-hint'; h.textContent=c.hint; row.appendChild(h); return row; }
