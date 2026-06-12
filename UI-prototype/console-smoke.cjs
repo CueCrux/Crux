@@ -124,6 +124,7 @@ function makeFetch() {
   // ── B) 501 → calm unavailable empty-state ──
   f.route(u => /\/v1\/punchcards/.test(u), { ok: false, status: 501, body: { error: 'disabled' } });
   env.s.__cx.LOADERS['cx-punchcards'] = { endpoint: '/v1/punchcards', noun: 'leases', flagHint: 'CORECRUXD_PUNCHCARD=off', transform: () => [] };
+  env.s.openScope('cx'); await flush();   // ExecPlans now solos into its kanban — return to the dash first
   await tile(env, 'panel', 'Punchcards').fire('click'); await flush();
   ok(ofKind(env, 'unavailable').length >= 1, '501: renders an "unavailable" empty-state, not a crash');
   ok((tile(env, 'unavailable', 'CORECRUXD_PUNCHCARD') || {}), '501: shows the flag hint');
@@ -131,7 +132,7 @@ function makeFetch() {
   // ── C) error → retry ──
   f.route(u => /\/v1\/console\/facts/.test(u), { ok: false, status: 500, body: { error: 'boom' } });
   env.s.__cx.LOADERS['cx-facts'] = { endpoint: '/v1/console/facts', noun: 'facts', transform: j => (j.facts || []).map((x, i) => ({ id: 'fact:' + i, kind: 'fact', label: x.key, children: [] })) };
-  await tile(env, 'panel', 'Facts').fire('click'); await flush();
+  await env.s.soloPanel('cx-facts', { graph: true }); await flush();   // facts is a list page now — drive the graph view directly
   ok(ofKind(env, 'error').length >= 1, 'error: 500 renders an error tile (not a crash)');
   // flip the route to success and retry by clicking the error tile
   f.route(u => /\/v1\/console\/facts/.test(u), { ok: true, status: 200, body: { facts: [{ key: 'gate:M1' }] } });

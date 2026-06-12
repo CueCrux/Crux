@@ -52,6 +52,9 @@
     --accent:#5E6AD2;
     --dot:rgba(148,163,184,.45); --edge:var(--border-strong);
     --ok:#16a34a; --run:#d97706; --err:#dc2626; --idle:#64748b; --code-bg:#f1f5f9;
+    --bar-grad:linear-gradient(90deg, #5E6AD2, #8b5cf6);
+    --bar-grad-ok:linear-gradient(90deg, #16a34a, #34d399);
+    --bar-grad-err:linear-gradient(90deg, #dc2626, #f87171);
   }
   html.dark {
     --bg-page:#020203; --surface-muted:#0a0a0c;
@@ -165,9 +168,9 @@
   .gnode .gf { font-family:var(--font-mono); font-size:9.5px; color:var(--text-secondary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .gnode .gf b { font-weight:600; color:var(--text-muted); margin-right:4px; }
   .gnode .gpct { margin-left:auto; flex:none; font-family:var(--font-mono); font-size:9.5px; color:var(--text-muted); }
-  .gnode .gbar { position:absolute; left:17px; right:13px; bottom:9px; height:3px; border-radius:999px; background:color-mix(in srgb, var(--accent) 15%, transparent); overflow:hidden; }
-  .gnode .gbar i { display:block; height:100%; border-radius:999px; background:var(--accent); }
-  .gnode .gbar.hero { position:static; margin-top:8px; height:4px; }
+  .gnode .gbar { position:absolute; left:17px; right:13px; bottom:8px; height:5px; border-radius:999px; background:color-mix(in srgb, var(--accent) 15%, transparent); overflow:hidden; }
+  .gnode .gbar i { display:block; height:100%; border-radius:999px; background:var(--bar-grad); }
+  .gnode .gbar.hero { position:static; margin-top:8px; height:6px; }
   .gnode .gpct.hero { margin:4px 0 0; font-family:var(--font-mono); font-size:10px; color:var(--text-muted); }
   .gnode .gchip { font-size:9.5px; font-weight:700; padding:1px 7px; border-radius:999px; white-space:nowrap; }
   .gnode .gcaret { position:absolute; right:9px; top:50%; transform:translateY(-50%); color:var(--text-muted); font-size:14px; }
@@ -193,14 +196,14 @@
   .dash-stages { display:flex; flex-wrap:wrap; gap:12px; margin-top:11px; }
   .dash-stages .st { font-family:var(--font-mono); font-size:10.5px; color:var(--text-secondary); }
   .dash-stages .st.ok{color:var(--ok)} .dash-stages .st.run{color:var(--run)} .dash-stages .st.err{color:var(--err)} .dash-stages .st.idle{color:var(--idle)}
-  .dbar { height:5px; margin-top:13px; border-radius:999px; background:color-mix(in srgb, var(--accent) 15%, transparent); overflow:hidden; }
-  .dbar i { display:block; height:100%; border-radius:999px; background:var(--accent); }
+  .dbar { height:7px; margin-top:13px; border-radius:999px; background:color-mix(in srgb, var(--accent) 15%, transparent); overflow:hidden; }
+  .dbar i { display:block; height:100%; border-radius:999px; background:var(--bar-grad); }
   .dash-pct { margin-top:5px; font-family:var(--font-mono); font-size:10px; color:var(--text-muted); }
   .dash-plans { display:flex; flex-direction:column; gap:6px; margin-top:11px; }
   .dp { display:flex; align-items:center; gap:9px; font-family:var(--font-mono); font-size:10.5px; color:var(--text-secondary); }
   .dp-n { flex:0 0 44%; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .dp-bar { flex:1; height:4px; border-radius:999px; background:color-mix(in srgb, var(--accent) 13%, transparent); overflow:hidden; }
-  .dp-bar i { display:block; height:100%; border-radius:999px; background:var(--accent); }
+  .dp-bar { flex:1; height:6px; border-radius:999px; background:color-mix(in srgb, var(--accent) 13%, transparent); overflow:hidden; }
+  .dp-bar i { display:block; height:100%; border-radius:999px; background:var(--bar-grad); }
   .dp-v { flex:none; width:36px; text-align:right; color:var(--text-muted); }
   .dash-g { display:flex; align-items:flex-start; gap:12px; margin-top:3px; }
   .dash-ico { flex:none; width:36px; height:36px; display:grid; place-items:center; border:1px solid color-mix(in srgb, var(--accent) 26%, transparent); border-radius:11px; color:var(--accent); background:color-mix(in srgb, var(--accent) 8%, transparent); }
@@ -233,8 +236,7 @@
   .dash-exprow { display:grid; grid-template-columns:130px 1fr; gap:10px; font-family:var(--font-mono); font-size:10.5px; padding:2.5px 0 2.5px 48px; }
   .dash-exprow b { color:var(--text-muted); font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .dash-exprow span { color:var(--text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .dash-expgo { margin-top:6px; padding-left:48px; font-family:var(--font-mono); font-size:10px; font-weight:700; color:var(--accent); cursor:pointer; }
-  .dash-expgo:hover { text-decoration:underline; }
+  .dash-exprow.dash-expsub span { color:var(--text-muted); font-size:9.5px; }
   /* GX bench donuts */
   .gx-donuts { display:flex; gap:26px; margin-top:12px; flex-wrap:wrap; }
   .gx-d { display:flex; flex-direction:column; align-items:center; gap:2px; }
@@ -531,10 +533,10 @@
   .sp-btn[data-armed] { color:var(--err); border-color:var(--err); background:color-mix(in srgb, var(--err) 10%, transparent); }
   .sp-barrow { align-items:center; }
   .sp-barrow .sp-lab { flex:0 1 36%; min-width:88px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .sp-bartrack { flex:1; height:8px; border-radius:999px; background:color-mix(in srgb, var(--accent) 13%, transparent); overflow:hidden; }
-  .sp-barfill { display:block; height:100%; border-radius:999px; background:var(--accent); transition:width .3s ease; }
-  .sp-barfill.ok { background:var(--ok); }
-  .sp-barfill.err { background:var(--err); }
+  .sp-bartrack { flex:1; height:10px; border-radius:999px; background:color-mix(in srgb, var(--accent) 13%, transparent); overflow:hidden; }
+  .sp-barfill { display:block; height:100%; border-radius:999px; background:var(--bar-grad); transition:width .3s ease; }
+  .sp-barfill.ok { background:var(--bar-grad-ok); }
+  .sp-barfill.err { background:var(--bar-grad-err); }
   .sp-barval { flex:0 0 86px; text-align:right; font-family:var(--font-mono); font-size:9.5px; color:var(--text-secondary); }
 
   .view-switch { display:inline-flex; margin-left:10px; border:1px solid var(--border-default); border-radius:var(--radius-full); overflow:hidden; background:var(--surface-glass); }
@@ -573,7 +575,7 @@
 
   <div class="toolbar">
     <div class="crumbs" id="breadcrumb"></div>
-    <button class="focus-exit" id="focusExit" style="display:none">↑ exit focus</button>
+    <button class="focus-exit" id="focusExit" style="display:none">← back</button>
     <button class="insp-toggle" id="orcNew" title="Create an orchestrator (group ExecPlans for a session)" style="display:none">＋ Orchestrator</button>
     <button class="insp-toggle" id="rcptVerify" title="Verify a CROWN receipt (GET /v1/receipts/{id}/verification + /signature)" style="display:none">✓ Verify receipt</button>
     <button class="active-toggle" id="activeToggle" title="Show only running sessions"><span class="led"></span> Active sessions only</button>
@@ -1053,10 +1055,44 @@ const N = {
     fields:[['nodes','669,658'],['lane','default-OFF'],['rebuild','merge-aware']]},
   'gr-frames':{kind:'tile',label:'frame offsets',sub:'entity → chunk bridge',status:'idle',
     fields:[['index','chunk_to_entity'],['coverage','LME-M']]},
+  /* graph panel: relationships as searchable nodes + a jump into the 3D substrate */
+  'gr-3d':{kind:'view',label:'Open 3D substrate',sub:'this graph, spatial — rings · traces · districts',status:'run',__open3d:true,
+    fields:[['view','Crux Substrate'],['filter','rail icons map to districts']],
+    doc:'Opens the 3D substrate view. The left rail drives both views —\nclicking a panel icon filters the matching 3D district.'},
+  'rel-binds':{kind:'relation',label:'binds — passport → session · daemon',sub:'identity attribution',status:'ok',
+    fields:[['rel','binds'],['from','passport'],['to','session · daemon'],['meaning','attributes every write to an identity']]},
+  'rel-drives':{kind:'relation',label:'drives — session → execplan',sub:'work execution',status:'ok',
+    fields:[['rel','drives'],['from','session'],['to','execplan'],['meaning','the session executing this plan']]},
+  'rel-gates':{kind:'relation',label:'gates — execplan → fact',sub:'milestone gates',status:'ok',
+    fields:[['rel','gates'],['from','execplan · milestone'],['to','fact'],['meaning','gate recorded as a replayable fact']]},
+  'rel-seals':{kind:'relation',label:'seals — mutation → receipt',sub:'CROWN proof',status:'ok',
+    fields:[['rel','seals'],['from','session · fact · punchcard'],['to','receipt'],['meaning','Ed25519-signed audit row']]},
+  'rel-chain':{kind:'relation',label:'chain — receipt → receipt',sub:'append-only sequence',status:'ok',
+    fields:[['rel','chain'],['from','receipt'],['to','receipt'],['meaning','tamper-evident ordering']]},
+  'rel-coord':{kind:'relation',label:'coord — session → live board',sub:'presence · leases',status:'ok',
+    fields:[['rel','coord'],['from','session'],['to','coord-session · punchcard'],['meaning','advisory presence, never a lock']]},
+  'rel-handoff':{kind:'relation',label:'handoff — session → session',sub:'cross-session transfer',status:'ok',
+    fields:[['rel','handoff'],['from','session'],['to','session'],['meaning','structured state + facts move, context does not']]},
+  /* storybook: a real catalog — one representative tile per kind + the patterns */
   'sb-nodes':{kind:'doc',label:'node kinds',sub:'20 catalogued',
     doc:'STORYBOOK · node kinds\n\npanel · tile · artefact · execplan · milestone ·\nfact · fact-group · session · passport · receipt ·\nverification · signature · orchestrator · punchcard\n· coord-session · hook · file · reasoning · step ·\ntenant'},
   'sb-panels':{kind:'doc',label:'panel patterns',sub:'hero · grid · columns',
-    doc:'STORYBOOK · panel patterns\n\nMiller columns (drill) · focus hero (document) ·\nartefact grid (live cards) · dashboard (landing) ·\nslide-out detail pane (3D-shared).'},
+    doc:'STORYBOOK · panel patterns\n\nMiller columns (drill) · focus hero (document) ·\nartefact grid (live cards) · dashboard (landing) ·\nslide-out detail pane (3D-shared) · kanban columns\n· list pages (search + expandable rows).'},
+  'sb-k-execplan':{kind:'execplan',label:'sample execplan tile',sub:'risk: medium · M2 in flight',status:'in_progress',
+    fields:[['slug','sample-plan'],['milestones','4']],children:['sb-k-milestone']},
+  'sb-k-milestone':{kind:'milestone',label:'M2 · sample milestone',status:'in_progress',fields:[['key','gate:M2'],['tests','3 passing']]},
+  'sb-k-session':{kind:'session',label:'sample session tile',sub:'ttl 3600s · 12 turns',status:'run',
+    fields:[['session_id','deadbeef…'],['tokens','42k in · 6k out']]},
+  'sb-k-fact':{kind:'fact',label:'sample fact tile',sub:'entity:key · receipted',status:'ok',
+    fields:[['entity','demo:storybook'],['key','sample']],payload:'{ "entity":"demo:storybook", "key":"sample" }'},
+  'sb-k-receipt':{kind:'receipt',label:'sample receipt tile',sub:'seq 1 · verified',status:'ok',
+    fields:[['receipt','crn_demo…'],['signature_valid','true']]},
+  'sb-k-passport':{kind:'passport',label:'sample passport tile',sub:'tier local',status:'ok',
+    fields:[['identity','demo'],['tier','local']]},
+  'sb-k-punchcard':{kind:'punchcard',label:'sample punchcard tile',sub:'held · modify',status:'run',
+    fields:[['resource','file://demo.rs'],['mode','modify']]},
+  'sb-k-tenant':{kind:'tenant',label:'sample tenant tile',sub:'work · 12 docs',status:'ok',
+    fields:[['tenant_id','demo'],['category','work']]},
 
   /* ── DX ── */
   'dx-articles':{kind:'panel',label:'Articles',sub:'bundled docs',children:['doc-mcp','doc-plans','doc-agent']},
@@ -1084,23 +1120,55 @@ const N = {
   'ax-snapshots':{kind:'panel',label:'Snapshots',sub:'session captures',children:['snap1']},
   'ax-tools':{kind:'panel',label:'Tools',sub:'MCP surface',children:['tool-query','tool-store','tool-handoff']},
   'ax-handoff':{kind:'panel',label:'Handoff',sub:'cross-session',children:['ho1']},
-  'ax-graph':{kind:'panel',label:'Graph',sub:'context graph',children:['gr-topology','gr-frames']},
-  'ax-storybook':{kind:'panel',label:'Storybook',sub:'tile catalog',children:['sb-nodes','sb-panels']},
-  'ax-dossiers':{kind:'panel',label:'Dossiers',sub:'subject cards',children:['dos1']},
-  'ax-story':{kind:'panel',label:'Story',sub:'call trees',children:['st-sess']},
+  'ax-graph':{kind:'panel',label:'Graph',sub:'context graph · searchable relationships',
+    children:['gr-3d','gr-topology','gr-frames','rel-binds','rel-drives','rel-gates','rel-seals','rel-chain','rel-coord','rel-handoff']},
+  'ax-storybook':{kind:'panel',label:'Storybook',sub:'tile + pattern catalog',
+    children:['sb-nodes','sb-panels','sb-k-execplan','sb-k-session','sb-k-fact','sb-k-receipt','sb-k-passport','sb-k-punchcard','sb-k-tenant']},
+  'ax-dossiers':{kind:'panel',label:'Dossiers',sub:'subject cards',children:['dos-operator','dos-crux','dos-corecrux','dos1']},
+  'ax-story':{kind:'panel',label:'Story',sub:'call trees',children:['st-sess','st-sess2']},
   'snap1':{kind:'snapshot',label:'pre-compact 13:24',sub:'session 9c5a92…',status:'ok'},
   'tool-query':{kind:'tool',label:'query',sub:'BM25 + graph',status:'ok'},
   'tool-store':{kind:'tool',label:'store_fact',sub:'deliberate',status:'ok'},
   'tool-handoff':{kind:'tool',label:'create_handoff',sub:'cross-session',status:'ok'},
   'ho1':{kind:'handoff',label:'opus → sonnet',sub:'M4 Q500 A/B',status:'run',fields:[['from','ce:4e6c4e2a'],['to','ce:8821fa0d'],['state','claimed']]},
-  'dos1':{kind:'dossier',label:'lme-m / __origin__',sub:'score 0.99',status:'ok'},
-  'st-sess':{kind:'session',label:'LME-M Q500 run',sub:'2 agents · 312k tok',status:'run',children:['st-orch','st-explore2']},
-  'st-orch':{kind:'agent',label:'orchestrator',sub:'2 subagents',status:'run',children:['st-explore','st-plan']},
-  'st-explore':{kind:'subagent',label:'Explore: map daemon',sub:'38 files',status:'ok',children:['st-read','st-grep']},
-  'st-plan':{kind:'subagent',label:'Plan: schema',sub:'running…',status:'run'},
-  'st-explore2':{kind:'agent',label:'explore',sub:'12 tool calls',status:'ok'},
-  'st-read':{kind:'tool',label:'38 × Read',sub:'1 error',status:'err'},
-  'st-grep':{kind:'tool',label:'grep · EventBus',sub:'4 matches',status:'ok'}
+  /* dossiers: subject cards aggregated from entity + trait extraction */
+  'dos1':{kind:'dossier',label:'lme-m / __origin__',sub:'score 0.99',status:'ok',
+    fields:[['subject','__origin__'],['tenant','lme-m'],['hit score','0.99 vs 0.88 state hits']],
+    doc:'DOSSIER · lme-m / __origin__\n\nAggregated subject card: traits, preferences and\nevents keyed to one subject, assembled from entity\nextraction. Dossier hits outrank raw state chunks\n(0.99 vs 0.88) on subject-shaped questions.'},
+  'dos-operator':{kind:'dossier',label:'operator / myles',sub:'7 traits · 3 active plans',status:'ok',
+    fields:[['subject','operator'],['traits','prefers concise output · self-funded · transparency-first'],
+            ['active plans','console gap-closure · release-readiness · wikicrux'],['last seen','today']],
+    doc:'DOSSIER · operator\n\nWho the work is for: standing preferences, active\nplans and decision history — recalled when an agent\nasks "what does the operator want here?"'},
+  'dos-crux':{kind:'dossier',label:'project / crux-daemon',sub:'17 crates · v0.4.9',status:'run',
+    fields:[['subject','Crux daemon'],['state','v0.4.9 cut · console PR open'],['ports',':14800 · :14801 · :4007'],
+            ['invariants','CPU-only · CCL licence · port fixed']],
+    doc:'DOSSIER · crux-daemon\n\nProject card: current version, open PRs, ports and\nthe invariants every session must respect.'},
+  'dos-corecrux':{kind:'dossier',label:'platform / corecrux',sub:'GPU lanes · AMR',status:'idle',
+    fields:[['subject','CoreCrux'],['role','paid retrieval substrate'],['lanes','dense · graph · entity · event · nav'],
+            ['routing','AMR — Adaptive Manifest Routing']],
+    doc:'DOSSIER · corecrux\n\nPlatform card: what activates with a subscription,\nwhich lanes exist and how AMR routes across them.'},
+  /* story: call trees — session → agents → tool calls, two real-shaped runs */
+  'st-sess':{kind:'session',label:'LME-M Q500 run',sub:'2 agents · 312k tok',status:'run',children:['st-orch','st-explore2'],
+    doc:'STORY · LME-M Q500 run\n\nCall tree: the orchestrator fans out subagents;\nevery tool call hangs off its agent. Drill right to\nwalk the tree; double-click a node to focus it.'},
+  'st-orch':{kind:'agent',label:'orchestrator',sub:'2 subagents · gated loop',status:'run',children:['st-explore','st-plan'],
+    fields:[['model','opus-4.8'],['pattern','retrieve → enumerate → submit'],['seal gate','lme500-aggregation@v1']]},
+  'st-explore':{kind:'subagent',label:'Explore: map daemon',sub:'38 files',status:'ok',children:['st-read','st-grep'],
+    fields:[['tools','Read ×38 · grep ×7'],['outcome','module map returned']]},
+  'st-plan':{kind:'subagent',label:'Plan: schema',sub:'running…',status:'run',children:['st-plan-read'],
+    fields:[['tools','Read ×6'],['outcome','pending']]},
+  'st-explore2':{kind:'agent',label:'explore',sub:'12 tool calls',status:'ok',children:['st-query']},
+  'st-read':{kind:'tool',label:'38 × Read',sub:'1 error',status:'err',
+    fields:[['error','EISDIR on crates/'],['retry','listed dir first']]},
+  'st-grep':{kind:'tool',label:'grep · EventBus',sub:'4 matches',status:'ok'},
+  'st-plan-read':{kind:'tool',label:'6 × Read',sub:'schema files',status:'ok'},
+  'st-query':{kind:'tool',label:'query ×4',sub:'token_budget 500',status:'ok',
+    fields:[['lane','BM25 + graph'],['budget','500 each']]},
+  'st-sess2':{kind:'session',label:'console gap-closure',sub:'1 agent · 4 rounds',status:'ok',children:['st2-agent'],
+    doc:'STORY · console gap-closure\n\nSingle-agent run: four operator-feedback rounds,\neach round = edit → smoke → playwright → commit.'},
+  'st2-agent':{kind:'agent',label:'claude-work',sub:'edit · test · commit loop',status:'ok',children:['st2-edit','st2-test'],
+    fields:[['rounds','4'],['gates','smoke 155/155 each round']]},
+  'st2-edit':{kind:'tool',label:'Edit ×60+',sub:'2 embedded files',status:'ok'},
+  'st2-test':{kind:'tool',label:'smoke + playwright',sub:'155/155 · visual sweeps',status:'ok'}
 };
 Object.entries(N).forEach(([id,n])=>{ n.id=id; });
 
@@ -1183,7 +1251,8 @@ function mergeChildren(node, kids){
   kids.forEach(k=>{ if(!Array.isArray(k.children)) k.children=[]; N[k.id]=k; });
   node.children = kids.map(k=>k.id);
 }
-function refreshOpenColumns(node){ columns.forEach(c=>{ if(c.parentId===node.id) c.nodes=childrenOf(node); }); }  // re-project an already-open column after a (re)load
+function refreshOpenColumns(node){ columns.forEach(c=>{ if(c.parentId===node.id)
+  c.nodes = c.kanban? childrenOf(node).filter(nn=>workStageOf(nn)===c.stage) : childrenOf(node); }); }  // re-project an already-open column after a (re)load (kanban keeps its stage slice)
 function loaderFor(node){
   if(!node) return null;
   if(LOADERS[node.id]) return LOADERS[node.id];
@@ -1634,7 +1703,7 @@ function focusNode(node, arg){
   const fromSearch=focusFromSearch; focusFromSearch=false;
   if(!fromSearch) searchHighlight='';   // (fix) don't leak a stale search highlight into a normally-focused doc
   // snapshot the tree the first time we enter focus, so the card "×" can return us
-  if(!focusMode) preFocus={columns:columns.map(c=>({parentId:c.parentId, nodes:c.nodes.slice()})), selectedId, scope:activeScope};
+  if(!focusMode) preFocus={columns:columns.map(c=>({...c, nodes:c.nodes.slice()})), selectedId, scope:activeScope};   /* spread keeps kanban/stage/title for the ← back restore */
   // build the FULL breadcrumb trail (scope › … › node) even though focus collapses columns
   let trail;
   if(Array.isArray(arg)) trail=arg;                                         // explicit (crumb click / inspector Linked)
@@ -1762,6 +1831,7 @@ function fOf(n,k){ const f=((n&&n.fields)||[]).find(x=>x[0]===k); return f?Strin
 async function dashOpen(id){
   const node=N[id]; if(!node) return;
   if(PAGES[id] && !prefersGraph(id)){ openPage(id); return; }
+  if(DUAL_VIEW[id] && prefersGraph(id)){ soloPanel(id,{graph:true}); return; }   /* kanban/graph flavour owns the layout */
   closePage();
   dashMode=false;
   closeInspector();
@@ -1809,7 +1879,8 @@ function renderDash(){
   const usageRows=by.slice(0,3).map(([name,v])=>
     `<div class="dp"><span class="dp-n">${esc(name)}</span><span class="dp-bar"><i style="width:${Math.round(100*(v.in||0)/maxIn)}%"></i></span><span class="dp-v wide">${k(v.in||0)}/${k(v.out||0)} · ${v.turns||0}t</span></div>`).join('');
   const usageTotal=usage&&usage.tokens?`${k(usage.tokens.in)} in · ${k(usage.tokens.out)} out`:(fOf(N['ov-usage'],'this week')||'—');
-  const u=mk(PAD, PAD, stack?W:halfW, H0, 'dash-usage',
+  /* row 1 (below the daemon/execplans row — operator request): usage + gateway */
+  const u=mk(PAD, stack? PAD+(H1+GAP)*2 : PAD+H1+GAP, stack?W:halfW, H0, 'dash-usage',
     `<div class="gstripe"></div>`+
     `<div class="ghead"><span class="gkind">token usage · per session</span><span class="gchip">${esc(fOf(N['ov-usage'],'sessions')||by.length||'')} live</span></div>`+
     `<div class="dash-mid">${esc(usageTotal)}<small>${esc(usage&&usage.window?usage.window:'this week · save_session / pre-compact hook')}</small></div>`+
@@ -1817,15 +1888,15 @@ function renderDash(){
     'cx-usage');
 
   const mcpA=N['af-mcp']||{};
-  const g2=mk(stack?PAD:PAD+halfW+GAP, stack?PAD+H0+GAP:PAD, stack?W:halfW, H0, 'dash-mcp s-run',
+  const g2=mk(stack?PAD:PAD+halfW+GAP, stack? PAD+(H1+GAP)*2+H0+GAP : PAD+H1+GAP, stack?W:halfW, H0, 'dash-mcp s-run',
     `<div class="gstripe"></div>`+
     `<div class="ghead"><span class="gkind">mcp gateway · :${esc(fOf(mcpA,'port')||'14801')}</span><span class="gchip">${esc(mcpA.sub||'listening')}</span></div>`+
     `<div class="dash-mid">MCP gateway<small>capability ladder loads at session bind · every tool call receipts</small></div>`+
     `<div class="dash-chips">${mchip('tools',fOf(mcpA,'tools'))}${mchip('endpoint','/mcp')}${mchip('transport','http + stdio shim')}${mchip('auth',fOf(ovn,'mode')||fOf(ovn,'auth_mode')||'local_only')}${mchip('agents',fOf(ovn,'sessions'))}</div>`,
     'cx-raw');
 
-  /* row 1: daemon hero + work totals */
-  const row1Y = stack ? PAD+(H0+GAP)*2 : PAD+H0+GAP;
+  /* row 0: daemon hero + execplan totals lead the dash */
+  const row1Y = PAD;
   const hero=mk(PAD, row1Y, stack?W:heroW, H1, 'dash-hero s-run',
     `<div class="gstripe"></div>`+
     `<div class="ghead"><span class="gkind">daemon · overview</span><span class="gchip">${typeof LIVE!=='undefined'&&LIVE?'live':'demo'}</span></div>`+
@@ -1850,7 +1921,7 @@ function renderDash(){
 
   /* panel grid: every other panel, general info */
   const ids=(SCOPES.find(s=>s.id==='cx')?.sections||[]).filter(id=>id!=='cx-overview'&&id!=='cx-work'&&N[id]);
-  const busY=Math.max(hero.y+hero.h, tasks.y+tasks.h)+34, gridTop=busY+26;
+  const busY=Math.max(u.y+u.h, g2.y+g2.h)+34, gridTop=busY+26;
   const cols=Math.max(2, Math.min(4, Math.floor((W+GAP)/(272+GAP))));
   const gw=(W-(cols-1)*GAP)/cols, gh=128;
   const cells=[];
@@ -1951,21 +2022,23 @@ function renderScopeDash(){
     }
     const key=activeScope+':'+id, open=!!window.__scopeOpen[key];
     const fieldRows=(n.fields||[]), kidRows=kids;
-    const bodyN=open? fieldRows.length+kidRows.length+1 : 0;
-    const h=60+(open? bodyN*21+18 : 0);
+    /* full detail lives IN the expansion — children carry their fields too */
+    const kidLines=kidRows.map(c=>({k:c.kind, v:c.label+(c.sub?' · '+c.sub:''),
+      extra:(c.fields||[]).slice(0,3).map(([fk,fv])=>fk+' '+fv).join(' · ')}));
+    const bodyN=open? fieldRows.length+kidLines.reduce((a,l)=>a+(l.extra?2:1),0) : 0;
+    const h=60+(open? bodyN*21+16 : 0);
     const body=open? `<div class="dash-exp">`+
         fieldRows.map(([k,v])=>`<div class="dash-exprow"><b>${esc(String(k))}</b><span>${esc(String(v))}</span></div>`).join('')+
-        kidRows.map(c=>`<div class="dash-exprow"><b>${esc(c.kind)}</b><span>${esc(c.label)}${c.sub?' · '+esc(c.sub):''}</span></div>`).join('')+
-        `<div class="dash-expgo">open full view ›</div></div>` : '';
+        kidLines.map(l=>`<div class="dash-exprow"><b>${esc(l.k)}</b><span>${esc(l.v)}</span></div>`+
+          (l.extra?`<div class="dash-exprow dash-expsub"><b></b><span>${esc(l.extra)}</span></div>`:'')).join('')+
+        `</div>` : '';
     const r=mk(PAD, y, W, h, 's-'+norm(n.status),
       `<div class="gstripe"></div>`+
       `<div class="dash-g"><span class="dash-ico">${sbSvg(SB_ICONS[id]||SB_ICONS.__dot)}</span>`+
       `<span class="dash-g-main"><span class="gtitle">${esc(n.label)}</span><span class="gsub">${esc(n.sub||'')}</span></span>`+
       `${kids.length?`<span class="gcount">${kids.length}</span>`:''}<span class="dash-caret">${open?'▾':'›'}</span></div>`+body,
       null);
-    r.el.addEventListener('click',e=>{
-      const t=e&&e.target;
-      if(t&&t.classList&&t.classList.contains('dash-expgo')){ dashOpen(id); return; }
+    r.el.addEventListener('click',()=>{
       window.__scopeOpen[key]=!open;
       if(!open && typeof ensureLoaded==='function') Promise.resolve(ensureLoaded(n)).then(()=>{ if(dashMode) render(); }).catch(()=>{});
       render();
@@ -2090,6 +2163,7 @@ function render(){
     const grouped = !(focusMode&&c===0) && !searchActive && n>5
       && new Set(colObj.nodes.map(nd=>nd.kind)).size>1;
     const items=[];
+    if(colObj.title) items.push({head:colObj.title, count:n});   /* kanban: stage header tops the column */
     for(let j=0;j<n;j++){
       const nd=colObj.nodes[j];
       if(grouped && (j===0 || nd.kind!==colObj.nodes[j-1].kind)){
@@ -2215,7 +2289,10 @@ function render(){
                  + (node.sub?`<div class="gsub">${esc(node.sub)}</div>`:'')
                  + meta + bar + `<span class="gcaret">›</span>`
                  + (isMember?`<button class="gdetach" title="Remove from orchestrator">×</button>`:'');
-    el.addEventListener('click', async ()=>{ if(searchActive){ openSearchResult(node); return; } if(node.__status){ if(node.kind==='error') retryLoad(node); return; } await ensureLoaded(node); expand(node, p.col); });
+    el.addEventListener('click', async ()=>{ if(searchActive){ openSearchResult(node); return; } if(node.__status){ if(node.kind==='error') retryLoad(node); return; }
+      if(node.__open3d){ setView('3d'); return; }   /* graph panel's jump into the substrate */
+      if(columns[p.col]&&columns[p.col].kanban){ await ensureLoaded(node); focusNode(node, p.col); return; }   /* kanban: click = focus this plan, hide the rest (← back resets) */
+      await ensureLoaded(node); expand(node, p.col); });
     el.addEventListener('dblclick', async e=>{ e.preventDefault(); if(node.__status) return; await ensureLoaded(node); focusNode(node, p.col); });
     if(isMember){ const db=el.querySelector('.gdetach'); if(db) db.addEventListener('click', e=>{ e.stopPropagation(); removeFromBuild(node.id); }); }
     if(node.kind==='orchestrator' && node.id===buildingId){   // (fix) only the orchestrator being built is a drop target
@@ -2645,8 +2722,9 @@ function updateSidebarActive(){
 /* panels with both views: does the operator prefer the graph/kanban for this id?
    story / storybook / graph are node-graph-first by design (operator request). */
 const GRAPH_FIRST={'ax-story':1,'ax-storybook':1,'ax-graph':1};
+const DUAL_VIEW={'cx-work':'Kanban','cx-receipts':'Graph'};   /* rail pull-out: graph-flavour label per panel */
 function prefersGraph(id){ if(GRAPH_FIRST[id]) return true;
-  return confGet(id+'.view', id==='cx-work'?'kanban':null)==='kanban'; }
+  return confGet(id+'.view', DUAL_VIEW[id]?'kanban':null)==='kanban'; }
 async function soloPanel(id, opts){
   const node=N[id]; if(!node) return;
   if(PAGES[id] && !(opts&&opts.graph) && !prefersGraph(id)){ openPage(id); return; }   // operator page first; graph on request
@@ -2661,14 +2739,24 @@ async function soloPanel(id, opts){
   closeInspector();
   /* rail click lands straight on the panel's CHILDREN — no primary node card
      (e.g. Work shows just the execplans). parentId carries the panel id so
-     stage filters + toolbar rules still recognise the column. */
-  columns=[{parentId:node.id, nodes:childrenOf(node)}];
+     stage filters + toolbar rules still recognise the column.
+     cx-work renders as a true KANBAN: one column per stage. */
+  const buildCols=()=>{
+    if(id==='cx-work'){
+      const eps=childrenOf(node);
+      const ks=WORK_STAGES.map(([s,h])=>({parentId:node.id, kanban:true, stage:s, title:h,
+        nodes:eps.filter(nn=>workStageOf(nn)===s)})).filter(co=>co.nodes.length);
+      if(ks.length) return ks;
+    }
+    return [{parentId:node.id, nodes:childrenOf(node)}];
+  };
+  columns=buildCols();
   document.querySelectorAll('.wc-centre-pill').forEach(p=>p.classList.toggle('wc-centre-pill--active', p.dataset.scope===activeScope));
   document.getElementById('focusExit').style.display='none';
   render();
   await ensureLoaded(node);
   if(soloPanelId!==id) return;          // user moved on while the panel was loading
-  columns=[{parentId:node.id, nodes:childrenOf(node)}];
+  columns=buildCols();
   render();
   updateSidebarActive();
 }
@@ -2684,7 +2772,7 @@ function showWorkFly(anchor,id){
     document.body.appendChild(workFly);
   }
   workFly.innerHTML='';
-  [['Kanban','kanban'],['List','list']].forEach(([lbl,view])=>{
+  [[DUAL_VIEW[id]||'Graph','kanban'],['List','list']].forEach(([lbl,view])=>{
     const x=document.createElement('button'); x.textContent=lbl;
     x.classList.toggle('on', confGet(id+'.view', 'kanban')===view);
     x.onclick=()=>{ confPut(id+'.view',view); hideWorkFly();
@@ -2713,7 +2801,7 @@ function buildSidebar(){
     b.title=n.label+(n.sub?' — '+n.sub:''); b.setAttribute('aria-label','Show only '+n.label);
     b.innerHTML=sbSvg(SB_ICONS[id]||SB_ICONS.__dot);
     b.onclick=()=>{ (typeof viewMode!=='undefined' && viewMode==='3d') ? filter3dPanel(id) : soloPanel(id); };
-    if(id==='cx-work'){   /* pull-out view switcher: kanban ⇄ list */
+    if(DUAL_VIEW[id]){   /* pull-out view switcher: kanban/graph ⇄ list */
       b.addEventListener('mouseenter',()=>showWorkFly(b,id));
       b.addEventListener('mouseleave',hideWorkFlySoon);
     }
@@ -2928,8 +3016,25 @@ function factsCascadeSections(){
         controls:((gp.children||[]).map(cid=>N[cid]).filter(Boolean)).map(factRow)})))
       .concat([{t:'btn',label:'Browse as graph',action:'graph'}])}];
 }
+/* ── CROWN receipts list view (graph stays the verify/drill surface) ── */
+function receiptExpRow(rc){
+  const subKids=(rc.children||[]).map(cid=>N[cid]).filter(Boolean);
+  return {t:'exp',label:rc.label,sub:rc.sub||'',badge:norm(rc.status)==='ok'?'verified':String(rc.status||'receipt'),
+    controls:(rc.fields||[]).map(([k,v])=>({t:'info',label:String(k),v:String(v)}))
+      .concat(subKids.map(s=>({t:'info',label:'↳ '+s.kind,v:s.label+(s.sub?' · '+s.sub:'')})))};
+}
+function receiptsListSections(){
+  const kids=((N['cx-receipts']||{}).children||[]).map(cid=>N[cid]).filter(Boolean);
+  return [{h:'CROWN receipts',sub:'browser-local lookup history — the daemon has no list endpoint; verify by id',wide:true,
+    controls:[{t:'search',ph:'Filter receipts…'},
+      {t:'input',k:'rcpt_id',label:'receipt id',ph:'crn_…',mono:true},
+      {t:'btn',label:'Verify receipt',hint:'opens the verify dock — GET /verification + /signature'}]
+     .concat(kids.map(receiptExpRow))
+     .concat([{t:'btn',label:'Browse as graph',action:'graph'}])}];
+}
 const PAGES={
  'cx-work':{title:'ExecPlans',sub:'list view · kanban available from the rail pull-out',sections:workListSections()},
+ 'cx-receipts':{title:'Receipts',sub:'CROWN · Ed25519 proofs — searchable list; graph from the rail pull-out',sections:receiptsListSections()},
  'cx-facts':{title:'Facts',sub:'the durable record — grouped by entity prefix, cascading into linked nodes',sections:factsCascadeSections()},
  'cx-tenants':{title:'Tenants',sub:'memory stores · AMR lane routing — defaults at the top, per-tenant overrides below',sections:[
   {h:'AMR defaults — all tenants',sub:'Adaptive Manifest Routing picks lanes per query; set the default policy once — tenants inherit unless pinned',wide:true,controls:
@@ -3642,6 +3747,19 @@ const PAGE_WIRES={
     })();
     return null;
   }},
+ 'cx-receipts':{
+  load: async def=>{
+    const n=N['cx-receipts']; await ensureLoaded(n);
+    const kids=childrenOf(n).filter(k=>!k.__status);
+    if(!kids.length) return;
+    const head=def.sections[0].controls.filter(c=>c.t==='search'||c.t==='input'||(c.t==='btn'&&c.action!=='graph'));
+    const tail=def.sections[0].controls.filter(c=>c.t==='btn'&&c.action==='graph');
+    def.sections[0].sub='browser-local lookup history · '+kids.length+' receipts';
+    def.sections[0].controls=head.concat(kids.map(receiptExpRow)).concat(tail);
+  },
+  act:{ 'Verify receipt': async()=>{ const rid=pageVal('cx-receipts','rcpt_id');
+    closePage(); soloPanel('cx-receipts',{graph:true}); openVerify(rid||undefined);
+    return 'verify dock opened'+(rid?' · '+rid:''); } }},
  'cx-facts':{
   load: async def=>{
     const r=await api('/v1/console/facts?top_k=100'); const fs=r.facts||[];
