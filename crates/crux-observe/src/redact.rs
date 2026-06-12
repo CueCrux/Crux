@@ -467,7 +467,11 @@ mod tests {
         assert_eq!(RedactMode::parse("on"), RedactMode::On);
         assert_eq!(RedactMode::parse("OFF"), RedactMode::Off);
         assert_eq!(RedactMode::parse("audit"), RedactMode::Audit);
-        assert_eq!(RedactMode::parse("bogus"), RedactMode::Audit, "unknown → audit, fail-safe");
+        assert_eq!(
+            RedactMode::parse("bogus"),
+            RedactMode::Audit,
+            "unknown → audit, fail-safe"
+        );
     }
 
     #[test]
@@ -518,7 +522,14 @@ mod tests {
     #[test]
     fn field_denylist_exact_and_compound() {
         let r = on();
-        for name in ["password", "PASSWORD", "db_password", "x_api_key", "client.secret", "session_token"] {
+        for name in [
+            "password",
+            "PASSWORD",
+            "db_password",
+            "x_api_key",
+            "client.secret",
+            "session_token",
+        ] {
             let out = r.redact_field(name, "fixture-hunter2-SYNTHETIC");
             assert!(out.starts_with("[REDACTED:fld."), "{name} → {out}");
             assert!(!out.contains("hunter2"), "{name} leaked: {out}");
@@ -597,7 +608,9 @@ mod tests {
     #[test]
     fn line_redaction_json_format() {
         let r = on();
-        let line = format!(r#"{{"level":"WARN","fields":{{"password":"fixture-pw-SYNTHETIC","attempt":3}},"jwt":"{FIX_JWT}"}}"#);
+        let line = format!(
+            r#"{{"level":"WARN","fields":{{"password":"fixture-pw-SYNTHETIC","attempt":3}},"jwt":"{FIX_JWT}"}}"#
+        );
         let out = r.redact_line(&line);
         assert!(!out.contains("fixture-pw-SYNTHETIC"), "got: {out}");
         assert!(!out.contains(FIX_JWT), "got: {out}");
@@ -618,7 +631,11 @@ mod tests {
     fn line_token_budget_telemetry_untouched() {
         let r = on();
         let line = "INFO query done token_budget=500 tokens=1234 auth_mode=jwt_hs256";
-        assert_eq!(r.redact_line(line), line, "allowlisted telemetry must survive line scan");
+        assert_eq!(
+            r.redact_line(line),
+            line,
+            "allowlisted telemetry must survive line scan"
+        );
     }
 
     #[test]
@@ -626,7 +643,10 @@ mod tests {
         let r = on();
         let line = "2026-06-11T00:00:00Z INFO corecruxd: segment seal complete frames=4096 duration_ms=18 tenant=lme-s shard=2";
         let out = r.redact_line(line);
-        assert!(matches!(out, Cow::Borrowed(_)), "non-matching line must be borrowed (zero-copy)");
+        assert!(
+            matches!(out, Cow::Borrowed(_)),
+            "non-matching line must be borrowed (zero-copy)"
+        );
         assert_eq!(out, line);
     }
 
@@ -642,7 +662,10 @@ mod tests {
     #[test]
     fn audit_mode_counts_without_redacting() {
         let r = Redactor::with_mode(RedactMode::Audit);
-        assert_eq!(r.redact_field("password", "fixture-pw-SYNTHETIC"), "fixture-pw-SYNTHETIC");
+        assert_eq!(
+            r.redact_field("password", "fixture-pw-SYNTHETIC"),
+            "fixture-pw-SYNTHETIC"
+        );
         assert_eq!(r.redact_value(FIX_JWT), FIX_JWT);
         let line = format!("api_key={FIX_SK}");
         assert_eq!(r.redact_line(&line), line);
@@ -690,7 +713,11 @@ mod tests {
         let err = format!("invalid type: string \"{FIX_SK}\" {long_tail}");
         let out = r.scrub_error_echo(&err);
         assert!(!out.contains(FIX_SK), "got: {out}");
-        assert!(out.chars().count() < 300, "must truncate: {} chars", out.chars().count());
+        assert!(
+            out.chars().count() < 300,
+            "must truncate: {} chars",
+            out.chars().count()
+        );
         assert!(out.contains("[truncated]"));
     }
 
@@ -701,7 +728,9 @@ mod tests {
     fn bench_redact_p99() {
         let r = on();
         let clean = "2026-06-11T00:00:00Z INFO corecruxd: append complete stream=projections frames=128 duration_ms=4 tenant=lme-s";
-        let hot = format!("2026-06-11T00:00:00Z WARN corecruxd: upstream auth failed api_key={FIX_SK} jwt={FIX_JWT} attempt=3");
+        let hot = format!(
+            "2026-06-11T00:00:00Z WARN corecruxd: upstream auth failed api_key={FIX_SK} jwt={FIX_JWT} attempt=3"
+        );
 
         let p99_of = |f: &dyn Fn()| -> (f64, f64) {
             const N: usize = 100_000;
