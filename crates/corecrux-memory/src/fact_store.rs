@@ -828,8 +828,8 @@ impl FactStore {
     /// Hard-delete the content of soft-deleted facts from the on-disk journal
     /// (launch-gate 5.1 — GDPR erasure).
     ///
-    /// Soft-delete only sets `deleted = true` and appends a [`JournalEvent::Delete`]
-    /// tombstone; the original [`JournalEvent::Store`] event — and the plaintext
+    /// Soft-delete only sets `deleted = true` and appends a `JournalEvent::Delete`
+    /// tombstone; the original `JournalEvent::Store` event — and the plaintext
     /// value inside it — remains in `facts.jsonl` forever and is replayed on every
     /// restart. Compaction rewrites the journal so that:
     ///
