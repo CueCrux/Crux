@@ -953,8 +953,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
         let svc = grpc::DataPlaneService::new(dataplane_pool, control.clone(), metrics.clone(), auth.clone(), svc_cfg);
         let export_svc = grpc::ExportService::new(export_pool, metrics.clone(), build.clone(), auth.clone());
+        let ingress = config.ingress.clone();
         tokio::spawn(async move {
-            grpc::serve(grpc_addr, svc, export_svc, async move {
+            grpc::serve(grpc_addr, &ingress, svc, export_svc, async move {
                 let _ = rx.recv().await;
             })
             .await
