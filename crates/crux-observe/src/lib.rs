@@ -13,4 +13,5 @@ pub mod cold_gate;
 pub mod config;
 pub mod metrics_sampler;
 pub mod ops_layer;
+pub mod redact;
 pub mod schema;
