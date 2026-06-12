@@ -383,6 +383,35 @@ function makeFetch() {
   ok(/demo mode/.test(env2.getById('cxToast').textContent), 'M1 demo: wired button refuses politely in demo mode');
   ok(!f2.calls.some(c => /embedding\/probe/.test(c.url)), 'M1 demo: no probe network call in demo mode');
 
+  // ── L) M2 — token usage live (page + ov-usage dash tile from /v1/observations/aggregate) ──
+  const f8 = makeFetch();
+  f8.route(u => /\/v1\/observations\/aggregate/.test(u), { ok: true, status: 200, body: { matched: 3, returned: 3, chains: {}, observations: [
+    { observation_id: 'o1', session_id: 'execplan:demo-plan', ts: '2026-06-12T08:00:00Z', provider: 'anthropic', principal: 'p', kind: 'model_response', payload: { usage: { input_tokens: 1000, output_tokens: 100 } } },
+    { observation_id: 'o2', session_id: 'execplan:demo-plan', ts: '2026-06-12T08:05:00Z', provider: 'anthropic', principal: 'p', kind: 'model_response', payload: { usage: { input_tokens: 2000, output_tokens: 200 } } },
+    { observation_id: 'o3', session_id: 'adhoc123', ts: '2026-06-12T08:06:00Z', provider: 'anthropic', principal: 'p', kind: 'model_response', payload: { usage: { input_tokens: 500, output_tokens: 50 } } }] } });
+  f8.route(u => /\/v1\/console\/summary/.test(u), { ok: true, status: 200, body: { daemon: { node_id: 'n1', auth_mode: 'local_only' }, stores: { facts: 7 } } });
+  const env8 = buildSandbox(f8); await flush(8);
+  ok(f8.calls.some(c => /observations\/aggregate/.test(c.url)), 'M2 usage: overview prefetch pulls /v1/observations/aggregate');
+  const ovU = env8.s.__cx.N['ov-usage'];
+  ok(/"in": ?3500/.test(ovU.payload || ''), 'M2 usage: dash tile payload carries the live total (3500 in)');
+  ok(/live/.test(ovU.sub || ''), 'M2 usage: dash tile flagged live');
+  ok((ovU.children || []).length === 0, 'M2 usage: dummy session children replaced by the live rollup');
+  env8.s.openPage('cx-usage'); await flush(10);
+  ok(env8.ALL.some(e => /execplan:demo-plan/.test(e._text || '')), 'M2 usage: per-execplan bar rendered from live sessions');
+  ok(env8.ALL.some(e => /standard session/.test(e._text || '')), 'M2 usage: savings bars computed from live in/out');
+  ok(env8.ALL.some(e => /3 model calls/.test(e._text || '')), 'M2 usage: window totals row shows live call count');
+  const aggBefore = f8.calls.filter(c => /observations\/aggregate/.test(c.url)).length;
+  env8.s.confSet('cx-usage.win', '30d'); await flush(10);
+  ok(f8.calls.filter(c => /observations\/aggregate/.test(c.url)).length > aggBefore, 'M2 usage: window change re-queries the aggregate');
+  // zero observations → calm explainer, demo dash tile untouched
+  const f9 = makeFetch();
+  f9.route(u => /\/v1\/observations\/aggregate/.test(u), { ok: true, status: 200, body: { matched: 0, returned: 0, chains: {}, observations: [] } });
+  f9.route(u => /\/v1\/console\/summary/.test(u), { ok: true, status: 200, body: { daemon: {}, stores: {} } });
+  const env9 = buildSandbox(f9); await flush(8);
+  ok(/517k/.test(JSON.stringify(env9.s.__cx.N['ov-usage'].fields)), 'M2 usage: zero observations keeps the demo dash tile');
+  env9.s.openPage('cx-usage'); await flush(10);
+  ok(env9.ALL.some(e => /CORECRUXD_OBSERVE/.test(e._text || '')), 'M2 usage: zero observations → explainer, not fake bars');
+
   console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

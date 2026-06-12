@@ -1339,8 +1339,39 @@ function txReceiptVerify(json, node){   // {ver: VerificationReportV1, sig: sign
   }
   return kids;
 }
+/* ── token-usage rollup (gap-closure M2): reduce /v1/observations/aggregate to the
+     {window, tokens:{in,out}, by_session} shape the usage page + dash card consume.
+     Token fields are redaction-allowlisted in crux-observe, so payloads carry real counts. ── */
+function fmtK(n){ n=Number(n)||0; return n>=1e6? (n/1e6).toFixed(2).replace(/\.?0+$/,'')+'M' : (n>=1000? Math.round(n/1000)+'k' : String(n)); }
+async function usageRollup(days){
+  const since=new Date(Date.now()-days*86400000).toISOString();
+  const r=await api('/v1/observations/aggregate?limit=1000&since='+encodeURIComponent(since));
+  const by={}; let tin=0,tout=0,turns=0;
+  (r.observations||[]).forEach(o=>{
+    const p=o.payload||{}, u=p.usage||p.tokens||p;
+    const i=Number(u.input_tokens||u.prompt_tokens||u.in)||0, ou=Number(u.output_tokens||u.completion_tokens||u.out)||0;
+    if(!i&&!ou) return;
+    const s=by[o.session_id]=by[o.session_id]||{in:0,out:0,turns:0};
+    s.in+=i; s.out+=ou; s.turns++; tin+=i; tout+=ou; turns++;
+  });
+  return { window:'last '+days+'d', days, tokens:{in:tin,out:tout}, by_session:by, turns,
+    sessions:Object.keys(by).length,
+    truncated:(r.matched!=null && r.returned!=null && r.matched>r.returned)? r.matched : null };
+}
+function applyUsageTile(u){   // refresh the ov-usage dash tile in place (txOverview-style)
+  const n=N['ov-usage']; if(!u || !u.turns || !n) return;   // zero observations → keep the demo tile
+  n.label='Token usage · '+u.window; n.sub=u.sessions+' sessions · live';
+  const top=Object.entries(u.by_session).sort((a,b)=>b[1].in-a[1].in)[0];
+  n.fields=[['this week',fmtK(u.tokens.in)+' in · '+fmtK(u.tokens.out)+' out'],['sessions',String(u.sessions)],
+    top?['busiest',top[0].slice(0,20)+' · '+fmtK(top[1].in)+'/'+fmtK(top[1].out)]:null,
+    ['daily avg','~'+fmtK(Math.round(u.tokens.in/(u.days||7)))+' in/day'],['source','/v1/observations/aggregate']].filter(Boolean);
+  n.payload=JSON.stringify({window:u.window,tokens:u.tokens,by_session:u.by_session},null,2);
+  n.children=[];   // live rollup replaces the dummy per-session children
+}
+function txOverviewPlus(json){ const kids=txOverview(json.sum||json); applyUsageTile(json.usage); return kids; }
 function registerLoaders(){
-  LOADERS['cx-overview']      = { endpoint:'/v1/console/summary',     noun:'tiles',         transform: txOverview };       // M2
+  LOADERS['cx-overview']      = { noun:'tiles', transform: txOverviewPlus,                                                  // M2
+    fetch: async()=>({ sum: await api('/v1/console/summary'), usage: await usageRollup(7).catch(()=>null) }) };
   LOADERS['cx-work']          = { endpoint:'/v1/work?source=all',     noun:'work items',    transform: txWork };           // M3
   LOADERS['cx-sessions']      = { endpoint:'/v1/console/sessions',    noun:'sessions',      transform: txSessions };       // M4
   LOADERS['cx-orchestrators'] = { endpoint:'/v1/orchestrators',       noun:'orchestrators', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txOrchestrators };  // M5
@@ -2929,6 +2960,42 @@ const PAGE_WIRES={
       ctx.reload(); return 'installed · '+src;
     },
   }},
+ 'cx-usage':{
+  load: async def=>{
+    const days={'7d':7,'30d':30,'90d':90}[pageVal('cx-usage','win')]||7;
+    const u=await usageRollup(days);
+    applyUsageTile(u);   // keep the dash card in step with the page window
+    const winSel=pageCtrl('cx-usage','win');
+    if(!u.turns){   // observe plane off or hooks not posting usage — say so, don't fake bars
+      def.sections[0].controls=[winSel,infoRow('no usage observations','enable CORECRUXD_OBSERVE=1 + the crux-claude-hooks usage hook')].filter(Boolean);
+      def.sections[1].controls=[infoRow('no data','savings are computed from live in/out once observations arrive')];
+      def.sections[2].controls=[]; def.sections[3].controls=[];
+      return;
+    }
+    def.sections[0].controls=[winSel,
+      infoRow('daily avg','~'+fmtK(Math.round(u.tokens.in/days))+' in · '+fmtK(Math.round(u.tokens.out/days))+' out'),
+      infoRow(u.window, fmtK(u.tokens.in)+' in · '+fmtK(u.tokens.out)+' out · '+u.turns+' model calls'),
+      infoRow('sessions', u.sessions+(u.truncated?' · latest 1000 of '+u.truncated+' records':''))].filter(Boolean);
+    /* savings: standard est = measured ÷ (1 − 0.31); the −31% factor is the TokenBurn
+       prefix-dedup measurement the method doc below explains — measured side is live */
+    const std=Math.round(u.tokens.in/0.69);
+    def.sections[1].controls=[
+      {t:'bar',label:'standard session (est.)',pct:100,v:fmtK(std)+' in',tone:'err'},
+      {t:'bar',label:'with Crux Daemon',pct:Math.max(2,Math.round(100*u.tokens.in/std)),v:fmtK(u.tokens.in)+' in',tone:'ok'},
+      infoRow('saved','≈'+fmtK(std-u.tokens.in)+' in tokens · −31% (estimate — method below)')];
+    const ses=Object.entries(u.by_session).sort((a,b)=>b[1].in-a[1].in);
+    const barsFor=list=>{ const max=list[0][1].in||1, avg=Math.round(list.reduce((a,[,v])=>a+v.in,0)/list.length)||1;
+      return list.slice(0,8).map(([sid,v])=>{ const d=Math.round(100*(v.in-avg)/avg);
+        return {t:'bar',label:sid.slice(0,28),pct:Math.max(2,Math.round(100*v.in/max)),
+          v:fmtK(v.in)+' · '+(d>=0?'+':'')+d+'%',tone:d>20?'err':(d<-20?'ok':undefined)}; }); };
+    def.sections[2].sub='avg '+fmtK(Math.round(u.tokens.in/u.sessions))+' in';
+    def.sections[2].controls=barsFor(ses);
+    const eps=ses.filter(([sid])=>/execplan:/.test(sid));
+    def.sections[3].sub=eps.length? ('avg '+fmtK(Math.round(eps.reduce((a,[,v])=>a+v.in,0)/eps.length))+' in per plan') : 'no execplan-attributed sessions in window';
+    def.sections[3].controls=eps.length? barsFor(eps)
+      : [infoRow('—','sessions show here when save_session uses execplan:<slug> ids')];
+  },
+  set:{ win: ()=>{ if(openPageId==='cx-usage') openPage('cx-usage'); return null; } }},
  'cx-projects':{
   load: async def=>{
     const [pr,pp]=await Promise.all([api('/v1/projects').catch(e=>({_err:e})), api('/v1/console/passports').catch(e=>({_err:e}))]);
