@@ -48,26 +48,45 @@ fn spawn_mock(response_body: &str, status_line: &str) -> (String, thread::JoinHa
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set_read_timeout");
 
-        // Read enough to capture headers + (optional) JSON body. ureq writes
-        // both in one chunk for POST, so a single buffered read is usually
-        // enough; loop to drain any straggler bytes within the timeout.
-        let mut buf = vec![0u8; 8192];
-        let mut total = 0;
+        // Read headers to "\r\n\r\n", then exactly Content-Length body bytes.
+        // The previous heuristic (stop once headers seen && total > 200) replied
+        // and closed before draining the body whenever the headers alone passed
+        // 200 bytes — i.e. precisely when an Authorization header was present —
+        // racing the client's in-flight request write (EINVAL on macOS arm64;
+        // broke the aarch64-apple-darwin release build since v0.4.8).
+        let mut buf = Vec::with_capacity(8192);
+        let mut tmp = [0u8; 4096];
+        let mut header_end = None;
         loop {
-            let n = match stream.read(&mut buf[total..]) {
-                Ok(0) | Err(_) => break, // EOF or timeout — we have what we need
-                Ok(n) => n,
-            };
-            total += n;
-            // Stop once headers + body fully drained, or buffer full.
-            if total >= 4 && buf[..total].windows(4).any(|w| w == b"\r\n\r\n") && total > 200 {
-                break;
-            }
-            if total == buf.len() {
-                break;
+            match stream.read(&mut tmp) {
+                Ok(0) | Err(_) => break, // EOF or timeout
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        break;
+                    }
+                    if buf.len() > 65536 {
+                        break;
+                    }
+                }
             }
         }
-        let captured = String::from_utf8_lossy(&buf[..total]).to_string();
+        if let Some(he) = header_end {
+            let headers = String::from_utf8_lossy(&buf[..he]).to_ascii_lowercase();
+            let body_len = headers
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while buf.len() < he + body_len {
+                match stream.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                }
+            }
+        }
+        let captured = String::from_utf8_lossy(&buf).to_string();
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
         captured
