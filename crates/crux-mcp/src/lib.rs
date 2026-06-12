@@ -31,6 +31,7 @@ pub mod crc_v1;
 pub mod dispatch;
 pub mod envelope;
 pub mod handoff;
+pub mod ledger;
 pub mod otel;
 pub mod protocol;
 pub mod scope;

@@ -41,19 +41,24 @@ impl std::io::Write for CountingWriter {
     }
 }
 
-/// Estimate the token cost of a JSON value: compact-serialized byte
-/// length / [`CHARS_PER_TOKEN`], floored at 1 (everything costs at
-/// least one token to emit).
-///
-/// Serialisation of a `serde_json::Value` is infallible in practice
-/// (object keys are always strings); should it ever fail we return the
-/// floor rather than propagating — estimation must never break a tool.
-pub fn estimate_tokens(value: &Value) -> u64 {
+/// Compact-serialized byte length of a JSON value, computed through a
+/// counting writer (no intermediate `String`). Returns 0 if
+/// serialisation fails (never happens for `Value` in practice — object
+/// keys are always strings).
+pub fn serialized_len(value: &Value) -> u64 {
     let mut sink = CountingWriter { bytes: 0 };
     if serde_json::to_writer(&mut sink, value).is_err() {
-        return 1;
+        return 0;
     }
-    (sink.bytes / CHARS_PER_TOKEN).max(1)
+    sink.bytes
+}
+
+/// Estimate the token cost of a JSON value: compact-serialized byte
+/// length / [`CHARS_PER_TOKEN`], floored at 1 (everything costs at
+/// least one token to emit). Estimation must never break a tool —
+/// serialisation failure yields the floor.
+pub fn estimate_tokens(value: &Value) -> u64 {
+    (serialized_len(value) / CHARS_PER_TOKEN).max(1)
 }
 
 /// Estimate the token cost of a raw string slice (no JSON quoting

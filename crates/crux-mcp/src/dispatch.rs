@@ -397,7 +397,9 @@ async fn dispatch_tool_call(
     // `opentelemetry` dep in crux-mcp) so the MCP crate stays sync-able.
     crate::otel::record_tool_span_start(name, ctx.agent.as_ref().map(|a| a.name.as_str()));
 
+    let started = std::time::Instant::now();
     let outcome = tools::call_tool(name, &args, ctx).await;
+    let latency = started.elapsed();
 
     // agent-ux-06 M2/M3: record into the per-passport trace ring.
     let trace_outcome = if outcome.is_ok() {
@@ -409,17 +411,46 @@ async fn dispatch_tool_call(
         .unwrap_or(crate::traces::ANON_PASSPORT)
         .to_string();
     let predicted = build_predicted_effects(name, &args);
-    crate::traces::record_dispatch(&passport, name, turn_id.as_deref(), predicted, trace_outcome).await;
 
     // action-ledger M1: per-passport token accounting. Estimates ride a
     // counting writer (no allocation) so this stays cheap on the hot path.
     let est_in = crate::token_estimate::estimate_tokens(&args);
-    let est_out = match &outcome {
-        Ok(v) => crate::token_estimate::estimate_tokens(v),
-        Err(e) => crate::token_estimate::estimate_tokens_str(&e.message),
+    let (est_out, result_bytes) = match &outcome {
+        Ok(v) => (crate::token_estimate::estimate_tokens(v), crate::token_estimate::serialized_len(v)),
+        Err(e) => (
+            crate::token_estimate::estimate_tokens_str(&e.message),
+            e.message.len() as u64,
+        ),
     };
     let declared_budget = args.get("token_budget").and_then(|v| v.as_u64());
     crate::token_accounting::record_usage(&passport, est_in, est_out, declared_budget).await;
+
+    // action-ledger M2: per-tool metrics (always on; tool label is
+    // cardinality-guarded — unresolved names collapse to "unknown") and
+    // the durable agent.tool_invocation.v1 ledger event (flag-gated,
+    // fire-and-forget on the observations stream).
+    let known_tool = !matches!(&outcome, Err(e) if e.code == crate::protocol::METHOD_NOT_FOUND);
+    let metric_tool = if known_tool { name } else { "unknown" };
+    crate::ledger::record_dispatch_metrics(metric_tool, outcome.is_ok(), latency, est_in + est_out);
+    if crate::ledger::ledger_enabled() {
+        let body = crate::ledger::build_event_body(&crate::ledger::InvocationRecord {
+            tool: metric_tool,
+            passport: &passport,
+            turn_id: turn_id.as_deref(),
+            args: &args,
+            est_tokens_in: est_in,
+            est_tokens_out: est_out,
+            result_bytes,
+            token_budget_in: declared_budget,
+            latency_ms: latency.as_millis() as u64,
+            outcome_ok: outcome.is_ok(),
+            request_id: id.as_ref(),
+            predicted_effects: &predicted,
+        });
+        crate::ledger::emit(ctx.daemon_base_url.clone(), &passport, body);
+    }
+
+    crate::traces::record_dispatch(&passport, name, turn_id.as_deref(), predicted, trace_outcome).await;
 
     match outcome {
         Ok(result) => {

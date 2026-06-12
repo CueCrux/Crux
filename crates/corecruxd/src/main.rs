@@ -606,6 +606,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // fails — tests are the expected consumer of the ephemeral
             // path. Either way, the route is live.
             let mcp_url = format!("http://{}/mcp", config.http_addr);
+            // action-ledger M2: per-tool MCP dispatch metrics scrape via /metrics.
+            crux_mcp::ledger::register_metrics(&metrics.registry());
             let session_metrics = Arc::new(crate::http::session_metrics::SessionMetrics::new(&metrics.registry()));
             match crate::http::session::SessionServices::local_durable(&config.data_dir, node_id.clone(), mcp_url) {
                 Ok(services) => Some(Arc::new(services.with_metrics(session_metrics))),
