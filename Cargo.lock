@@ -1315,6 +1315,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "jsonwebtoken",
+ "prometheus",
  "rand 0.10.1",
  "rcx-capability-token",
  "regex",
