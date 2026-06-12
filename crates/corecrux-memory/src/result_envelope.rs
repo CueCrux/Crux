@@ -169,15 +169,14 @@ pub enum EnvelopeVerifyError {
 /// Compute the canonical content hash over `payload` + `companion_artifacts`,
 /// returned as `blake3:<64-hex>`. Mirrors the `hash_json` convention used by
 /// the sync path (`sync.rs` `hash_json`): stable serde JSON serialization,
-/// then blake3. The platform emits a deterministic array order (§2 ordering
-/// rule); the importer hashes the bytes exactly as received.
+/// then blake3 (via the shared [`crate::signed_bundle`] idiom). The platform
+/// emits a deterministic array order (§2 ordering rule); the importer hashes
+/// the bytes exactly as received.
 pub fn result_envelope_content_hash(payload: &EnvelopePayload, companion_artifacts: &[CompanionArtifact]) -> String {
-    let canonical = serde_json::json!({
+    crate::signed_bundle::content_hash_json(&serde_json::json!({
         "payload": payload,
         "companion_artifacts": companion_artifacts,
-    });
-    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
-    format!("blake3:{}", blake3::hash(&bytes).to_hex())
+    }))
 }
 
 /// Verify a Result Envelope's integrity and platform signature.
@@ -196,7 +195,7 @@ pub fn verify_result_envelope(
     envelope: &ResultEnvelope,
     trusted_platform_keys: &[TrustedPlatformKey],
 ) -> Result<[u8; 32], EnvelopeVerifyError> {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use crate::signed_bundle;
 
     // 1) Schema gate.
     if envelope.schema_version != RESULT_ENVELOPE_SCHEMA_V1 {
@@ -213,19 +212,8 @@ pub fn verify_result_envelope(
     }
 
     // Decode the 32-byte hash that gets signed (strip the `blake3:` prefix).
-    let hex_hash = envelope
-        .blake3_content_hash
-        .strip_prefix("blake3:")
-        .unwrap_or(envelope.blake3_content_hash.as_str());
-    let decoded = hex::decode(hex_hash).map_err(|err| EnvelopeVerifyError::MalformedHash(err.to_string()))?;
-    if decoded.len() != 32 {
-        return Err(EnvelopeVerifyError::MalformedHash(format!(
-            "content hash is {} bytes, expected 32",
-            decoded.len()
-        )));
-    }
-    let mut hash = [0_u8; 32];
-    hash.copy_from_slice(&decoded);
+    let hash = signed_bundle::decode_content_hash(&envelope.blake3_content_hash)
+        .map_err(EnvelopeVerifyError::MalformedHash)?;
 
     // 3) Resolve the pinned signer.
     let key_id = &envelope.platform_signature.key_id;
@@ -234,33 +222,19 @@ pub fn verify_result_envelope(
         .find(|k| &k.key_id == key_id)
         .ok_or_else(|| EnvelopeVerifyError::UnknownSigner(key_id.clone()))?;
 
-    let pubkey_bytes = hex::decode(&trusted.public_key_hex).map_err(|err| EnvelopeVerifyError::MalformedPubkey {
+    let malformed_pubkey = |detail: String| EnvelopeVerifyError::MalformedPubkey {
         key_id: key_id.clone(),
-        detail: err.to_string(),
-    })?;
-    let pubkey_arr: [u8; 32] =
-        pubkey_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| EnvelopeVerifyError::MalformedPubkey {
-                key_id: key_id.clone(),
-                detail: format!("public key is {} bytes, expected 32", pubkey_bytes.len()),
-            })?;
-    let verifying_key = VerifyingKey::from_bytes(&pubkey_arr).map_err(|err| EnvelopeVerifyError::MalformedPubkey {
-        key_id: key_id.clone(),
-        detail: err.to_string(),
-    })?;
+        detail,
+    };
+    let pubkey_arr = signed_bundle::decode_public_key(&trusted.public_key_hex).map_err(malformed_pubkey)?;
+    let verifying_key = signed_bundle::parse_verifying_key(&pubkey_arr).map_err(malformed_pubkey)?;
 
     // 4) Verify the Ed25519 signature over the 32-byte hash.
-    let sig_bytes = hex::decode(&envelope.platform_signature.signature)
-        .map_err(|err| EnvelopeVerifyError::MalformedSignature(err.to_string()))?;
-    let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| {
-        EnvelopeVerifyError::MalformedSignature(format!("signature is {} bytes, expected 64", sig_bytes.len()))
-    })?;
-    let signature = Signature::from_bytes(&sig_arr);
-    verifying_key
-        .verify(&hash, &signature)
-        .map_err(|_| EnvelopeVerifyError::BadSignature(key_id.clone()))?;
+    let sig_arr = signed_bundle::decode_signature(&envelope.platform_signature.signature)
+        .map_err(EnvelopeVerifyError::MalformedSignature)?;
+    if !signed_bundle::verify_signature_over_hash(&verifying_key, &hash, &sig_arr) {
+        return Err(EnvelopeVerifyError::BadSignature(key_id.clone()));
+    }
 
     Ok(hash)
 }
