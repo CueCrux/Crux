@@ -10,6 +10,15 @@ description = "Claude Code lifecycle hooks for the Crux Daemon. Surfaces operati
 name = "crux-hook"
 path = "src/main.rs"
 
+# G17 local-LLM context-injection shim (ExecPlan
+# context-mediation-injection-2026-06-11, M4). Default-OFF via CRUX_LLM_SHIM=1;
+# upstream allowlist localhost/RFC1918 only. Lives in this crate (the
+# agent-harness surface crate) deliberately: zero new deps, zero Cargo.lock
+# delta while concurrent agents hold claims on corecruxd + the lockfile.
+[[bin]]
+name = "crux-llm-shim"
+path = "src/bin/crux_llm_shim.rs"
+
 [lib]
 name = "crux_claude_hooks"
 path = "src/lib.rs"

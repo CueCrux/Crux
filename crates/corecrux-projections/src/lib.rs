@@ -9,9 +9,11 @@
 //! - integer-only state (quantized confidence, unix micros)
 //! - stable encoding for snapshot/meta files
 
+pub mod assembly_cache;
 mod ccxs;
 mod codec_v1;
 mod cold_segment_v1;
+pub mod context_bundle;
 pub mod decay;
 mod events;
 pub mod extraction;
