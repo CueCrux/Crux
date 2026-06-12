@@ -261,7 +261,7 @@ pub async fn handle_github_comments_since(args: &Value, ctx: &McpContext) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::TcpListener;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -316,9 +316,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                let mut buf = [0u8; 4096];
-                let read = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..read]);
+                let req = crate::tools::test_support::read_full_request(&mut stream);
                 let path = req
                     .lines()
                     .next()

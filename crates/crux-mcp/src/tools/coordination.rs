@@ -483,7 +483,7 @@ fn urlencoding(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::TcpListener;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -509,9 +509,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                let mut buf = [0u8; 8192];
-                let read = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..read]);
+                let req = crate::tools::test_support::read_full_request(&mut stream);
                 let mut parts = req.lines().next().unwrap_or_default().split_whitespace();
                 let method = parts.next().unwrap_or_default();
                 let path = parts.next().unwrap_or_default();
@@ -695,9 +693,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                let mut buf = [0u8; 8192];
-                let read = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..read]);
+                let req = crate::tools::test_support::read_full_request(&mut stream);
                 let method = req
                     .lines()
                     .next()
@@ -737,9 +733,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                let mut buf = [0u8; 8192];
-                let read = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..read]);
+                let req = crate::tools::test_support::read_full_request(&mut stream);
                 let seen = req
                     .lines()
                     .find(|l| l.to_ascii_lowercase().starts_with("x-corecrux-passport-id:"))
@@ -822,8 +816,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                let mut buf = [0u8; 8192];
-                let _ = stream.read(&mut buf);
+                let _ = crate::tools::test_support::read_full_request(&mut stream);
                 let body = r#"{"type":"about:blank","title":"Not Found","status":404,"detail":"project not found"}"#;
                 let response = format!(
                     "HTTP/1.1 404 Not Found\r\nContent-Type: application/problem+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
