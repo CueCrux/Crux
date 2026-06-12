@@ -16,8 +16,9 @@
 //! trusted key: a Result Envelope is signed by a *pinned platform key*, a
 //! `.cruxpack` is signed by the exporting daemon's *own passport key* and is
 //! self-certifying to a fingerprint (`passport_fpr == blake3(pubkey)[..16]`).
-//! When #188 merges, the shared hash/verify plumbing should be unified into
-//! one helper — tracked as a follow-up in the ExecPlan.
+//! The shared hash/verify plumbing for both formats lives in
+//! [`crate::signed_bundle`] (the unification follow-up tracked in the
+//! ExecPlan once #188 merged first).
 //!
 //! Invariants (the two catastrophic-failure guards):
 //!
@@ -194,15 +195,14 @@ impl CruxPack {
 }
 
 /// Compute the canonical content hash over `manifest` + `sections`, returned
-/// as `blake3:<64-hex>`. Mirrors `result_envelope_content_hash` (PR #188):
-/// stable serde JSON serialization in fixed field order, then blake3.
+/// as `blake3:<64-hex>`. Same idiom as `result_envelope_content_hash`
+/// (PR #188) via the shared [`crate::signed_bundle`] helper: stable serde
+/// JSON serialization in fixed field order, then blake3.
 pub fn cruxpack_content_hash(manifest: &PackManifest, sections: &PackSections) -> String {
-    let canonical = serde_json::json!({
+    crate::signed_bundle::content_hash_json(&serde_json::json!({
         "manifest": manifest,
         "sections": sections,
-    });
-    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
-    format!("blake3:{}", blake3::hash(&bytes).to_hex())
+    }))
 }
 
 // ─── Export ────────────────────────────────────────────────────────────────
@@ -428,17 +428,7 @@ pub enum PackVerifyError {
 }
 
 fn decode_content_hash(stated: &str) -> Result<[u8; 32], PackVerifyError> {
-    let hex_hash = stated.strip_prefix("blake3:").unwrap_or(stated);
-    let decoded = hex::decode(hex_hash).map_err(|err| PackVerifyError::MalformedHash(err.to_string()))?;
-    if decoded.len() != 32 {
-        return Err(PackVerifyError::MalformedHash(format!(
-            "content hash is {} bytes, expected 32",
-            decoded.len()
-        )));
-    }
-    let mut hash = [0_u8; 32];
-    hash.copy_from_slice(&decoded);
-    Ok(hash)
+    crate::signed_bundle::decode_content_hash(stated).map_err(PackVerifyError::MalformedHash)
 }
 
 /// Verify a pack's integrity and signature. Steps, each a hard reject:
@@ -459,7 +449,7 @@ fn decode_content_hash(stated: &str) -> Result<[u8; 32], PackVerifyError> {
 /// fingerprint; whether to *trust* that fingerprint is the caller's decision
 /// (identity federation or operator confirmation).
 pub fn verify_pack(pack: &CruxPack) -> Result<[u8; 32], PackVerifyError> {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use crate::signed_bundle;
 
     // 1) Schema gate.
     if pack.schema_version != CRUXPACK_SCHEMA_V1 {
@@ -507,11 +497,8 @@ pub fn verify_pack(pack: &CruxPack) -> Result<[u8; 32], PackVerifyError> {
     let hash = decode_content_hash(&pack.blake3_content_hash)?;
 
     // 6) Self-certification.
-    let pubkey_bytes =
-        hex::decode(&pack.manifest.public_key_hex).map_err(|err| PackVerifyError::MalformedPubkey(err.to_string()))?;
-    let pubkey_arr: [u8; 32] = pubkey_bytes.as_slice().try_into().map_err(|_| {
-        PackVerifyError::MalformedPubkey(format!("public key is {} bytes, expected 32", pubkey_bytes.len()))
-    })?;
+    let pubkey_arr =
+        signed_bundle::decode_public_key(&pack.manifest.public_key_hex).map_err(PackVerifyError::MalformedPubkey)?;
     let derived_fpr = passport_fpr_from_public_key(&pubkey_arr);
     if derived_fpr != pack.manifest.passport_fpr {
         return Err(PackVerifyError::FingerprintMismatch {
@@ -533,17 +520,12 @@ pub fn verify_pack(pack: &CruxPack) -> Result<[u8; 32], PackVerifyError> {
     }
 
     // 7) Verify the ed25519 signature over the 32-byte hash.
-    let verifying_key =
-        VerifyingKey::from_bytes(&pubkey_arr).map_err(|err| PackVerifyError::MalformedPubkey(err.to_string()))?;
-    let sig_bytes = hex::decode(&pack.passport_signature.signature)
-        .map_err(|err| PackVerifyError::MalformedSignature(err.to_string()))?;
-    let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| {
-        PackVerifyError::MalformedSignature(format!("signature is {} bytes, expected 64", sig_bytes.len()))
-    })?;
-    let signature = Signature::from_bytes(&sig_arr);
-    verifying_key
-        .verify(&hash, &signature)
-        .map_err(|_| PackVerifyError::BadSignature(pack.manifest.passport_fpr.clone()))?;
+    let verifying_key = signed_bundle::parse_verifying_key(&pubkey_arr).map_err(PackVerifyError::MalformedPubkey)?;
+    let sig_arr = signed_bundle::decode_signature(&pack.passport_signature.signature)
+        .map_err(PackVerifyError::MalformedSignature)?;
+    if !signed_bundle::verify_signature_over_hash(&verifying_key, &hash, &sig_arr) {
+        return Err(PackVerifyError::BadSignature(pack.manifest.passport_fpr.clone()));
+    }
 
     Ok(hash)
 }

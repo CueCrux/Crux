@@ -41,6 +41,7 @@ pub mod replay;
 pub mod result_envelope;
 pub mod semantic;
 pub mod session_store;
+pub mod signed_bundle;
 pub mod sync;
 
 pub use artefact_store::{ArtefactError, ArtefactMetadata, ArtefactRecord, ArtefactStore, PutArtefact};
