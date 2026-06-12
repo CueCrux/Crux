@@ -11496,7 +11496,9 @@ async fn agent_usage_raw_admin_reads_others_200() {
     seed_ledger_file(
         &state,
         "alice",
-        &[serde_json::json!({"tool": "query", "est_tokens_in": 5, "est_tokens_out": 5, "latency_ms": 1, "outcome": "ok"})],
+        &[
+            serde_json::json!({"tool": "query", "est_tokens_in": 5, "est_tokens_out": 5, "latency_ms": 1, "outcome": "ok"}),
+        ],
     );
     // Raw admin (admin:read, NO passport binding) may read anyone's.
     let resp = agent_usage::get_agent_usage(

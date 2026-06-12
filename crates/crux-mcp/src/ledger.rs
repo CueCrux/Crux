@@ -155,10 +155,17 @@ pub fn build_event_body(rec: &InvocationRecord<'_>) -> Value {
 pub fn emit(daemon_base_url: Option<String>, passport: &str, body: Value) {
     let Some(base) = daemon_base_url else {
         debug!("tool ledger: no daemon_base_url; dropping event");
-        metrics().emit_failures_total.with_label_values(&["no_loopback_url"]).inc();
+        metrics()
+            .emit_failures_total
+            .with_label_values(&["no_loopback_url"])
+            .inc();
         return;
     };
-    let url = format!("{}/v1/sessions/{}/observations", base.trim_end_matches('/'), ledger_session_id(passport));
+    let url = format!(
+        "{}/v1/sessions/{}/observations",
+        base.trim_end_matches('/'),
+        ledger_session_id(passport)
+    );
     // spawn_blocking: ureq is a blocking client; the closure runs on the
     // blocking pool. The JoinHandle is dropped deliberately.
     drop(tokio::task::spawn_blocking(move || {
@@ -212,7 +219,9 @@ pub fn metrics() -> &'static LedgerMetrics {
                 "corecrux_tool_invocation_duration_seconds",
                 "MCP tools/call dispatch latency per tool and outcome.",
             )
-            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
             &["tool", "outcome"],
         )
         .expect("static histogram opts are valid"),
@@ -271,12 +280,17 @@ pub fn record_dispatch_metrics(tool: &str, outcome_ok: bool, latency: Duration, 
     m.tool_invocation_duration_seconds
         .with_label_values(&[tool, outcome])
         .observe(latency.as_secs_f64());
-    m.token_spend_total.with_label_values(&[tool]).inc_by(est_tokens_total as f64);
+    m.token_spend_total
+        .with_label_values(&[tool])
+        .inc_by(est_tokens_total as f64);
 }
 
 /// Bump the truncation counter from a budget-honouring path.
 pub fn record_truncation(tool: &str, reason: &str) {
-    metrics().tool_response_truncated_total.with_label_values(&[tool, reason]).inc();
+    metrics()
+        .tool_response_truncated_total
+        .with_label_values(&[tool, reason])
+        .inc();
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -382,9 +396,15 @@ mod tests {
 
     #[tokio::test]
     async fn emit_without_base_url_is_a_counted_noop() {
-        let before = metrics().emit_failures_total.with_label_values(&["no_loopback_url"]).get();
+        let before = metrics()
+            .emit_failures_total
+            .with_label_values(&["no_loopback_url"])
+            .get();
         emit(None, "alice", serde_json::json!({"kind": EVENT_KIND}));
-        let after = metrics().emit_failures_total.with_label_values(&["no_loopback_url"]).get();
+        let after = metrics()
+            .emit_failures_total
+            .with_label_values(&["no_loopback_url"])
+            .get();
         assert!(after > before);
     }
 

@@ -193,10 +193,7 @@ pub(super) async fn get_agent_usage(
     }
 
     let (since, window) = match params.window_hours {
-        Some(h) => (
-            Some(Utc::now() - ChronoDuration::hours(i64::from(h))),
-            format!("{h}h"),
-        ),
+        Some(h) => (Some(Utc::now() - ChronoDuration::hours(i64::from(h))), format!("{h}h")),
         None => (None, "all".to_string()),
     };
 
@@ -263,7 +260,10 @@ mod tests {
     #[test]
     fn ledger_file_path_sanitises_scoped_id() {
         let p = ledger_file_path(std::path::Path::new("/data"), "claude-work");
-        assert_eq!(p, std::path::PathBuf::from("/data/observations/ledger__claude-work.jsonl"));
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/data/observations/ledger__claude-work.jsonl")
+        );
     }
 
     #[test]

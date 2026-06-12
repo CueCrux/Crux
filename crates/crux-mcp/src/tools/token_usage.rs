@@ -48,9 +48,15 @@ pub async fn handle_session_token_usage(_args: &Value, ctx: &McpContext) -> Resu
 
     let summary = match (limit, pct) {
         (Some(l), Some(p)) => {
-            format!("session_token_usage: passport={passport} used≈{used} of {l} tokens ({p}%) across {} calls", usage.calls)
+            format!(
+                "session_token_usage: passport={passport} used≈{used} of {l} tokens ({p}%) across {} calls",
+                usage.calls
+            )
         }
-        _ => format!("session_token_usage: passport={passport} used≈{used} tokens (no limit set) across {} calls", usage.calls),
+        _ => format!(
+            "session_token_usage: passport={passport} used≈{used} tokens (no limit set) across {} calls",
+            usage.calls
+        ),
     };
 
     let mut payload = json!({

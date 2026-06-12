@@ -416,7 +416,10 @@ async fn dispatch_tool_call(
     // counting writer (no allocation) so this stays cheap on the hot path.
     let est_in = crate::token_estimate::estimate_tokens(&args);
     let (est_out, result_bytes) = match &outcome {
-        Ok(v) => (crate::token_estimate::estimate_tokens(v), crate::token_estimate::serialized_len(v)),
+        Ok(v) => (
+            crate::token_estimate::estimate_tokens(v),
+            crate::token_estimate::serialized_len(v),
+        ),
         Err(e) => (
             crate::token_estimate::estimate_tokens_str(&e.message),
             e.message.len() as u64,

@@ -73,7 +73,9 @@ fn ledger_flag_controls_tool_invocation_events() {
     let daemon_on = TestDaemon::start();
     std::env::remove_var(FLAG);
 
-    let resp = daemon_on.mcp_post_json(tool_call_body("ledger-on-1")).expect("MCP call");
+    let resp = daemon_on
+        .mcp_post_json(tool_call_body("ledger-on-1"))
+        .expect("MCP call");
     assert_eq!(resp.status().as_u16(), 200);
 
     // The append is fire-and-forget — poll for it.
@@ -100,7 +102,10 @@ fn ledger_flag_controls_tool_invocation_events() {
     let p = &event["payload"];
     assert_eq!(p["passport"], "__anon__", "anon sentinel attribution (QC.3)");
     assert_eq!(p["outcome"], "ok");
-    assert!(p["args_hash"].as_str().unwrap_or_default().starts_with("blake3:"), "args_hash: {p}");
+    assert!(
+        p["args_hash"].as_str().unwrap_or_default().starts_with("blake3:"),
+        "args_hash: {p}"
+    );
     assert!(p.get("args_raw").is_none(), "raw args must not be captured by default");
     assert!(p["est_tokens_in"].as_u64().unwrap_or(0) >= 1);
     assert!(p["est_tokens_out"].as_u64().unwrap_or(0) >= 1);
@@ -108,7 +113,10 @@ fn ledger_flag_controls_tool_invocation_events() {
     assert_eq!(p["token_budget_in"], 500);
     assert!(p["latency_ms"].as_u64().is_some());
     assert_eq!(p["request_id"], "ledger-on-1");
-    assert!(p["predicted_effects"].as_array().map(|a| !a.is_empty()).unwrap_or(false));
+    assert!(p["predicted_effects"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false));
 
     // Per-tool metrics are scrapeable on the same (CPU) build.
     let metrics_text = daemon_on
@@ -121,14 +129,19 @@ fn ledger_flag_controls_tool_invocation_events() {
         metrics_text.contains("corecrux_tool_invocation_duration_seconds"),
         "per-tool latency histogram registered"
     );
-    assert!(metrics_text.contains("corecrux_token_spend_total"), "token spend counter registered");
+    assert!(
+        metrics_text.contains("corecrux_token_spend_total"),
+        "token spend counter registered"
+    );
 
     drop(daemon_on);
 
     // ── Arm 2: flag OFF (default) ─────────────────────────────────────
     std::env::remove_var(FLAG);
     let daemon_off = TestDaemon::start();
-    let resp = daemon_off.mcp_post_json(tool_call_body("ledger-off-1")).expect("MCP call");
+    let resp = daemon_off
+        .mcp_post_json(tool_call_body("ledger-off-1"))
+        .expect("MCP call");
     assert_eq!(resp.status().as_u16(), 200);
     // Give a would-be fire-and-forget write ample time to land, then
     // assert nothing did.

@@ -80,7 +80,13 @@ pub async fn record_usage(passport: &str, tokens_in: u64, tokens_out: u64, decla
 /// Read back the accumulator for one passport (zeroed default when the
 /// passport has made no calls yet).
 pub async fn usage_for(passport: &str) -> PassportUsage {
-    global().lock().await.by_passport.get(passport).cloned().unwrap_or_default()
+    global()
+        .lock()
+        .await
+        .by_passport
+        .get(passport)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Configured session token budget limit, if any.
