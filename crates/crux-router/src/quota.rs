@@ -51,7 +51,10 @@ impl QuotaPolicy {
     /// Generous default for hosted surfaces: 120 burst, 60/min sustained.
     /// Protects the daemon from a runaway loop; an interactive agent never
     /// notices it.
-    pub const HOSTED_DEFAULT: QuotaPolicy = QuotaPolicy { capacity: 120, refill_per_minute: 60 };
+    pub const HOSTED_DEFAULT: QuotaPolicy = QuotaPolicy {
+        capacity: 120,
+        refill_per_minute: 60,
+    };
 
     /// Clamp degenerate configs (zero capacity/refill would deadlock a
     /// surface permanently — a misconfiguration, not a policy).
@@ -86,12 +89,18 @@ impl QuotaDecision {
     /// Unlimited surfaces emit no quota headers (nothing to back off from).
     pub fn headers(&self) -> Vec<(&'static str, String)> {
         match self {
-            QuotaDecision::Allowed { remaining: Some(remaining), limit: Some(limit) } => vec![
+            QuotaDecision::Allowed {
+                remaining: Some(remaining),
+                limit: Some(limit),
+            } => vec![
                 ("X-Crux-Quota-Limit", limit.to_string()),
                 ("X-Crux-Quota-Remaining", remaining.to_string()),
             ],
             QuotaDecision::Allowed { .. } => Vec::new(),
-            QuotaDecision::Denied { retry_after_secs, limit } => vec![
+            QuotaDecision::Denied {
+                retry_after_secs,
+                limit,
+            } => vec![
                 ("X-Crux-Quota-Limit", limit.to_string()),
                 ("X-Crux-Quota-Remaining", "0".to_string()),
                 ("Retry-After", retry_after_secs.to_string()),
@@ -182,15 +191,12 @@ impl QuotaLedger {
     ///
     /// `SurfaceClass::LocalCompute` is always admitted with no accounting —
     /// the free tier never limits the user's own compute (normative).
-    pub fn check(
-        &mut self,
-        passport: &str,
-        surface: &str,
-        class: SurfaceClass,
-        now_secs: u64,
-    ) -> QuotaDecision {
+    pub fn check(&mut self, passport: &str, surface: &str, class: SurfaceClass, now_secs: u64) -> QuotaDecision {
         if class == SurfaceClass::LocalCompute {
-            return QuotaDecision::Allowed { remaining: None, limit: None };
+            return QuotaDecision::Allowed {
+                remaining: None,
+                limit: None,
+            };
         }
         let policy = self.policy_for(surface);
         let key = (passport.to_string(), surface.to_string());
@@ -252,8 +258,17 @@ mod tests {
         let mut ledger = QuotaLedger::new();
         for i in 0..10_000u64 {
             let decision = ledger.check("p1", "mcp_local", SurfaceClass::LocalCompute, T0 + i / 100);
-            assert_eq!(decision, QuotaDecision::Allowed { remaining: None, limit: None });
-            assert!(decision.headers().is_empty(), "unlimited surfaces emit no quota headers");
+            assert_eq!(
+                decision,
+                QuotaDecision::Allowed {
+                    remaining: None,
+                    limit: None
+                }
+            );
+            assert!(
+                decision.headers().is_empty(),
+                "unlimited surfaces emit no quota headers"
+            );
         }
         // No bucket state is even created for local surfaces.
         assert!(ledger.buckets.is_empty());
@@ -262,17 +277,32 @@ mod tests {
     #[test]
     fn hosted_bucket_drains_to_429_with_retry_after() {
         let mut ledger = QuotaLedger::new();
-        ledger.set_policy("hosted_offload", QuotaPolicy { capacity: 3, refill_per_minute: 60 });
+        ledger.set_policy(
+            "hosted_offload",
+            QuotaPolicy {
+                capacity: 3,
+                refill_per_minute: 60,
+            },
+        );
         for expected_remaining in [2u64, 1, 0] {
             let decision = ledger.check("p1", "hosted_offload", SurfaceClass::Hosted, T0);
             assert_eq!(
                 decision,
-                QuotaDecision::Allowed { remaining: Some(expected_remaining), limit: Some(3) }
+                QuotaDecision::Allowed {
+                    remaining: Some(expected_remaining),
+                    limit: Some(3)
+                }
             );
         }
         let denied = ledger.check("p1", "hosted_offload", SurfaceClass::Hosted, T0);
         // 60/min = 1 token/sec → next token in 1s.
-        assert_eq!(denied, QuotaDecision::Denied { retry_after_secs: 1, limit: 3 });
+        assert_eq!(
+            denied,
+            QuotaDecision::Denied {
+                retry_after_secs: 1,
+                limit: 3
+            }
+        );
         let headers = denied.headers();
         assert!(headers.contains(&("Retry-After", "1".to_string())));
         assert!(headers.contains(&("X-Crux-Quota-Remaining", "0".to_string())));
@@ -281,32 +311,76 @@ mod tests {
     #[test]
     fn refill_restores_admission() {
         let mut ledger = QuotaLedger::new();
-        ledger.set_policy("hosted_offload", QuotaPolicy { capacity: 2, refill_per_minute: 30 });
-        assert!(ledger.check("p1", "hosted_offload", SurfaceClass::Hosted, T0).is_allowed());
-        assert!(ledger.check("p1", "hosted_offload", SurfaceClass::Hosted, T0).is_allowed());
-        assert!(!ledger.check("p1", "hosted_offload", SurfaceClass::Hosted, T0).is_allowed());
+        ledger.set_policy(
+            "hosted_offload",
+            QuotaPolicy {
+                capacity: 2,
+                refill_per_minute: 30,
+            },
+        );
+        assert!(ledger
+            .check("p1", "hosted_offload", SurfaceClass::Hosted, T0)
+            .is_allowed());
+        assert!(ledger
+            .check("p1", "hosted_offload", SurfaceClass::Hosted, T0)
+            .is_allowed());
+        assert!(!ledger
+            .check("p1", "hosted_offload", SurfaceClass::Hosted, T0)
+            .is_allowed());
         // 30/min = 1 token per 2s. At T0+2 exactly one token has refilled.
         let decision = ledger.check("p1", "hosted_offload", SurfaceClass::Hosted, T0 + 2);
-        assert_eq!(decision, QuotaDecision::Allowed { remaining: Some(0), limit: Some(2) });
+        assert_eq!(
+            decision,
+            QuotaDecision::Allowed {
+                remaining: Some(0),
+                limit: Some(2)
+            }
+        );
         // …and only one.
-        assert!(!ledger.check("p1", "hosted_offload", SurfaceClass::Hosted, T0 + 2).is_allowed());
+        assert!(!ledger
+            .check("p1", "hosted_offload", SurfaceClass::Hosted, T0 + 2)
+            .is_allowed());
     }
 
     #[test]
     fn refill_caps_at_capacity() {
         let mut ledger = QuotaLedger::new();
-        ledger.set_policy("s", QuotaPolicy { capacity: 5, refill_per_minute: 600 });
+        ledger.set_policy(
+            "s",
+            QuotaPolicy {
+                capacity: 5,
+                refill_per_minute: 600,
+            },
+        );
         assert!(ledger.check("p1", "s", SurfaceClass::Hosted, T0).is_allowed());
         // A year later the bucket holds capacity, not capacity + a year of refill.
         let decision = ledger.check("p1", "s", SurfaceClass::Hosted, T0 + 31_536_000);
-        assert_eq!(decision, QuotaDecision::Allowed { remaining: Some(4), limit: Some(5) });
+        assert_eq!(
+            decision,
+            QuotaDecision::Allowed {
+                remaining: Some(4),
+                limit: Some(5)
+            }
+        );
     }
 
     #[test]
     fn passports_and_surfaces_are_isolated() {
         let mut ledger = QuotaLedger::new();
-        ledger.set_policy("a", QuotaPolicy { capacity: 1, refill_per_minute: 1 });
-        ledger.set_policy("b", QuotaPolicy { capacity: 1, refill_per_minute: 1 });
+        ledger.set_policy(
+            "a",
+            QuotaPolicy {
+                capacity: 1,
+                refill_per_minute: 1,
+            },
+        );
+        ledger.set_policy(
+            "b",
+            QuotaPolicy {
+                capacity: 1,
+                refill_per_minute: 1,
+            },
+        );
         assert!(ledger.check("p1", "a", SurfaceClass::Hosted, T0).is_allowed());
         assert!(!ledger.check("p1", "a", SurfaceClass::Hosted, T0).is_allowed());
         // p2 on the same surface, and p1 on another surface, are unaffected.
@@ -318,7 +392,13 @@ mod tests {
     fn decisions_are_deterministic_for_identical_sequences() {
         let run = || {
             let mut ledger = QuotaLedger::new();
-            ledger.set_policy("s", QuotaPolicy { capacity: 4, refill_per_minute: 7 });
+            ledger.set_policy(
+                "s",
+                QuotaPolicy {
+                    capacity: 4,
+                    refill_per_minute: 7,
+                },
+            );
             let mut decisions = Vec::new();
             for i in 0..200u64 {
                 decisions.push(ledger.check("p", "s", SurfaceClass::Hosted, T0 + i * 3));
@@ -332,16 +412,34 @@ mod tests {
     fn retry_after_reflects_slow_refill() {
         let mut ledger = QuotaLedger::new();
         // 1/min: a full minute to the next token.
-        ledger.set_policy("slow", QuotaPolicy { capacity: 1, refill_per_minute: 1 });
+        ledger.set_policy(
+            "slow",
+            QuotaPolicy {
+                capacity: 1,
+                refill_per_minute: 1,
+            },
+        );
         assert!(ledger.check("p", "slow", SurfaceClass::Hosted, T0).is_allowed());
         let denied = ledger.check("p", "slow", SurfaceClass::Hosted, T0);
-        assert_eq!(denied, QuotaDecision::Denied { retry_after_secs: 60, limit: 1 });
+        assert_eq!(
+            denied,
+            QuotaDecision::Denied {
+                retry_after_secs: 60,
+                limit: 1
+            }
+        );
     }
 
     #[test]
     fn degenerate_policies_are_clamped_not_deadlocked() {
         let mut ledger = QuotaLedger::new();
-        ledger.set_policy("z", QuotaPolicy { capacity: 0, refill_per_minute: 0 });
+        ledger.set_policy(
+            "z",
+            QuotaPolicy {
+                capacity: 0,
+                refill_per_minute: 0,
+            },
+        );
         // Clamped to 1/1: one request admitted, then a bounded retry-after.
         assert!(ledger.check("p", "z", SurfaceClass::Hosted, T0).is_allowed());
         let denied = ledger.check("p", "z", SurfaceClass::Hosted, T0);
@@ -354,8 +452,20 @@ mod tests {
     #[test]
     fn snapshot_reports_per_surface_state() {
         let mut ledger = QuotaLedger::new();
-        ledger.set_policy("a", QuotaPolicy { capacity: 3, refill_per_minute: 60 });
-        ledger.set_policy("b", QuotaPolicy { capacity: 9, refill_per_minute: 60 });
+        ledger.set_policy(
+            "a",
+            QuotaPolicy {
+                capacity: 3,
+                refill_per_minute: 60,
+            },
+        );
+        ledger.set_policy(
+            "b",
+            QuotaPolicy {
+                capacity: 9,
+                refill_per_minute: 60,
+            },
+        );
         let _ = ledger.check("p", "a", SurfaceClass::Hosted, T0);
         let snap = ledger.snapshot("p", T0);
         assert_eq!(snap.len(), 2);
@@ -371,6 +481,12 @@ mod tests {
     fn unknown_surface_uses_generous_hosted_default() {
         let mut ledger = QuotaLedger::new();
         let decision = ledger.check("p", "new_surface", SurfaceClass::Hosted, T0);
-        assert_eq!(decision, QuotaDecision::Allowed { remaining: Some(119), limit: Some(120) });
+        assert_eq!(
+            decision,
+            QuotaDecision::Allowed {
+                remaining: Some(119),
+                limit: Some(120)
+            }
+        );
     }
 }

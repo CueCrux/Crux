@@ -77,8 +77,8 @@ pub use store_v1::{
 pub use stream_v1::{
     assert_context_injected_kind_v1, assert_stream_end_kind_v1, build_context_injected_body_v1,
     build_stream_end_body_v1, sign_stream_v1, stream_links_injection_v1, ContextInjectedBodyInputV1,
-    StreamEndBodyInputV1, StreamEndStateV1, CONTEXT_INJECTED_KIND_V1, STREAM_ABORTED_KIND_V1,
-    STREAM_BODY_SCHEMA_V1, STREAM_COMPLETED_KIND_V1,
+    StreamEndBodyInputV1, StreamEndStateV1, CONTEXT_INJECTED_KIND_V1, STREAM_ABORTED_KIND_V1, STREAM_BODY_SCHEMA_V1,
+    STREAM_COMPLETED_KIND_V1,
 };
 pub use subject_index_v1::{
     resolve_subject_receipt_id_v1, subject_index_path_v1, update_subject_index_v1, ReceiptSubjectIndexV1,

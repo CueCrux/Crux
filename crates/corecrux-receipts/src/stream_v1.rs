@@ -4,8 +4,8 @@
 
 //! v1 streaming + context-injection receipt classes (G19).
 //!
-//! ExecPlan `context-mediation-injection-2026-06-11` M3. Spec:
-//! `PlanCrux/docs/master-plan/shared/Streaming-Receipts-Spec.md`.
+//! ExecPlan `context-mediation-injection-2026-06-11` M3. Normative spec:
+//! `Streaming-Receipts-Spec` (planning monorepo, shared plane).
 //! Supersedes the receipts-relevant slice of Reasoning-Stream-Contract
 //! v0.1 (archived; its deterministic-replay invariants are retained —
 //! see `Shared-Consolidated-2026-05-31.md` §3).
@@ -174,12 +174,7 @@ pub fn build_context_injected_body_v1(input: &ContextInjectedBodyInputV1<'_>) ->
 
     let entries_arr = entries
         .iter()
-        .map(|e| {
-            CborValue::Map(vec![
-                text_entry("fact_id", &e.fact_id),
-                text_entry("entity", &e.entity),
-            ])
-        })
+        .map(|e| CborValue::Map(vec![text_entry("fact_id", &e.fact_id), text_entry("entity", &e.entity)]))
         .collect::<Vec<_>>();
     top.push((CborValue::Text("entries".to_string()), CborValue::Array(entries_arr)));
 
@@ -359,7 +354,10 @@ mod tests {
             },
         ];
         let (bytes, _) = build_context_injected_body_v1(&injected_input(&entries));
-        let text = format!("{:?}", ciborium::de::from_reader::<CborValue, _>(std::io::Cursor::new(&bytes)).unwrap());
+        let text = format!(
+            "{:?}",
+            ciborium::de::from_reader::<CborValue, _>(std::io::Cursor::new(&bytes)).unwrap()
+        );
         assert!(text.contains("f_pub"));
         assert!(!text.contains("f_secret"));
         assert!(!text.contains("__agent::"));

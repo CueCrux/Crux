@@ -87,9 +87,7 @@ fn spawn_stub(mode: StubMode, requests: usize) -> StubUpstream {
                 }
                 StubMode::Sse => {
                     stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-                        )
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
                         .unwrap();
                     for chunk in [
                         "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
@@ -120,9 +118,8 @@ fn shim_config(upstream: std::net::SocketAddr, spool: PathBuf, with_bundle: bool
     ShimConfig {
         upstream: format!("http://127.0.0.1:{}", upstream.port()),
         listen: "127.0.0.1:0".into(),
-        bundle: with_bundle.then(|| {
-            BundleSource::from_markdown(BUNDLE_MD.into(), Some("blake3:test".into()), "file:test".into())
-        }),
+        bundle: with_bundle
+            .then(|| BundleSource::from_markdown(BUNDLE_MD.into(), Some("blake3:test".into()), "file:test".into())),
         session_id: "shim-e2e".into(),
         receipts_spool: spool,
         daemon_receipts: false,
@@ -140,16 +137,13 @@ fn raw_post(addr: std::net::SocketAddr, path: &str, body: &str) -> (String, Vec<
     let mut response = Vec::new();
     stream.read_to_end(&mut response).unwrap();
     let text_head_end = find_head_end(&response);
-    let status = String::from_utf8_lossy(&response[..response.iter().position(|&b| b == b'\r').unwrap_or(0)])
-        .to_string();
+    let status =
+        String::from_utf8_lossy(&response[..response.iter().position(|&b| b == b'\r').unwrap_or(0)]).to_string();
     (status, response[text_head_end..].to_vec())
 }
 
 fn find_head_end(bytes: &[u8]) -> usize {
-    bytes
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map_or(0, |i| i + 4)
+    bytes.windows(4).position(|w| w == b"\r\n\r\n").map_or(0, |i| i + 4)
 }
 
 fn read_spool(path: &PathBuf) -> Vec<Value> {
@@ -185,8 +179,7 @@ fn injects_bundle_and_passes_request_through() {
     // What reached the upstream: bundle as NEW first system message, caller
     // fields value-identical.
     let upstream_body: Value =
-        serde_json::from_slice(&stub.received.recv_timeout(Duration::from_secs(5)).unwrap())
-            .unwrap();
+        serde_json::from_slice(&stub.received.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
     let messages = upstream_body["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[0]["role"], "system");
@@ -219,8 +212,7 @@ fn streams_sse_bytes_verbatim_and_mints_completed() {
     let spool = dir.path().join("receipts.jsonl");
     let shim = llm_shim::serve(shim_config(stub.addr, spool.clone(), true)).unwrap();
 
-    let request_body =
-        r#"{"model":"llama3.2","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let request_body = r#"{"model":"llama3.2","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
     let (status, body) = raw_post(shim.addr, "/v1/chat/completions", request_body);
     assert!(status.contains("200"), "got {status}");
     let text = String::from_utf8(body).unwrap();
@@ -244,11 +236,13 @@ fn upstream_truncation_mints_stream_aborted() {
     let spool = dir.path().join("receipts.jsonl");
     let shim = llm_shim::serve(shim_config(stub.addr, spool.clone(), true)).unwrap();
 
-    let request_body =
-        r#"{"model":"llama3.2","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let request_body = r#"{"model":"llama3.2","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
     let (_status, body) = raw_post(shim.addr, "/v1/chat/completions", request_body);
     let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("\"content\":\"a\""), "partial bytes should still reach the client");
+    assert!(
+        text.contains("\"content\":\"a\""),
+        "partial bytes should still reach the client"
+    );
     assert!(!text.contains("[DONE]"));
 
     let records = read_spool(&spool);
@@ -278,7 +272,11 @@ fn non_chat_paths_pass_through_unmodified_with_no_injection_receipt() {
     assert!(status.contains("200"), "got {status}");
 
     let upstream_body = stub.received.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(upstream_body, request_body.as_bytes(), "body must pass through byte-identical");
+    assert_eq!(
+        upstream_body,
+        request_body.as_bytes(),
+        "body must pass through byte-identical"
+    );
 
     // Only the end-state record — no context_injected for non-chat paths.
     let records = read_spool(&spool);
@@ -342,9 +340,7 @@ fn chunked_request_bodies_are_refused_with_411() {
 
     let mut stream = TcpStream::connect(shim.addr).unwrap();
     stream
-        .write_all(
-            b"POST /v1/chat/completions HTTP/1.1\r\nHost: shim\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
-        )
+        .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: shim\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
         .unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).unwrap();

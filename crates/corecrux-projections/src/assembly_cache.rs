@@ -77,7 +77,12 @@ pub struct AssemblyCache {
 impl AssemblyCache {
     /// `max_entries` is clamped to ≥1.
     pub fn new(max_entries: usize) -> Self {
-        Self { max_entries: max_entries.max(1), seq: 0, entries: BTreeMap::new(), stats: CacheStats::default() }
+        Self {
+            max_entries: max_entries.max(1),
+            seq: 0,
+            entries: BTreeMap::new(),
+            stats: CacheStats::default(),
+        }
     }
 
     pub fn stats(&self) -> CacheStats {
@@ -117,7 +122,13 @@ impl AssemblyCache {
             }
         }
         self.seq += 1;
-        self.entries.insert(key, AssemblyEntry { bundle, inserted_seq: self.seq });
+        self.entries.insert(
+            key,
+            AssemblyEntry {
+                bundle,
+                inserted_seq: self.seq,
+            },
+        );
     }
 
     /// Drop every entry for a passport regardless of chain head. Not needed
@@ -193,7 +204,12 @@ pub struct DedupCache {
 
 impl DedupCache {
     pub fn new(ttl_secs: u64, max_entries: usize) -> Self {
-        Self { ttl_secs, max_entries: max_entries.max(1), seq: 0, entries: BTreeMap::new() }
+        Self {
+            ttl_secs,
+            max_entries: max_entries.max(1),
+            seq: 0,
+            entries: BTreeMap::new(),
+        }
     }
 
     /// Fresh-entry lookup; expired entries are treated as absent (and
@@ -212,8 +228,11 @@ impl DedupCache {
 
     pub fn insert(&mut self, key: DedupKey, entry: DedupEntry) {
         if !self.entries.contains_key(&key) && self.entries.len() >= self.max_entries {
-            if let Some(oldest) =
-                self.entries.iter().min_by_key(|(_, (_, seq))| *seq).map(|(k, _)| k.clone())
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, seq))| *seq)
+                .map(|(k, _)| k.clone())
             {
                 self.entries.remove(&oldest);
             }
@@ -248,7 +267,11 @@ impl DedupCache {
         let (result, run_id) = execute();
         self.insert(
             key,
-            DedupEntry { result: result.clone(), origin_run_id: run_id.clone(), stored_at_secs: now_secs },
+            DedupEntry {
+                result: result.clone(),
+                origin_run_id: run_id.clone(),
+                stored_at_secs: now_secs,
+            },
         );
         ServeOutcome {
             result,

@@ -96,7 +96,12 @@ impl BundleSource {
     /// Build from rendered markdown, computing the transport digest.
     pub fn from_markdown(markdown: String, stable_hash: Option<String>, origin: String) -> Self {
         let bundle_digest = sha256_hex_prefixed(markdown.as_bytes());
-        Self { markdown, stable_hash, bundle_digest, origin }
+        Self {
+            markdown,
+            stable_hash,
+            bundle_digest,
+            origin,
+        }
     }
 }
 
@@ -129,10 +134,18 @@ pub fn ensure_enabled() -> anyhow::Result<()> {
 
 /// Load a bundle from a file path (markdown, injected verbatim).
 pub fn bundle_from_file(path: &std::path::Path) -> anyhow::Result<BundleSource> {
-    let markdown = std::fs::read_to_string(path)
-        .with_context(|| format!("reading --bundle-file {}", path.display()))?;
-    anyhow::ensure!(!markdown.trim().is_empty(), "--bundle-file is empty: {}", path.display());
-    Ok(BundleSource::from_markdown(markdown, None, format!("file:{}", path.display())))
+    let markdown =
+        std::fs::read_to_string(path).with_context(|| format!("reading --bundle-file {}", path.display()))?;
+    anyhow::ensure!(
+        !markdown.trim().is_empty(),
+        "--bundle-file is empty: {}",
+        path.display()
+    );
+    Ok(BundleSource::from_markdown(
+        markdown,
+        None,
+        format!("file:{}", path.display()),
+    ))
 }
 
 /// Fetch a bundle from a context endpoint (plan A's `/v1/context` transport).
@@ -171,7 +184,11 @@ pub fn bundle_from_endpoint(url: &str) -> anyhow::Result<BundleSource> {
         _ => (body, None),
     };
     anyhow::ensure!(!markdown.trim().is_empty(), "context endpoint returned an empty bundle");
-    Ok(BundleSource::from_markdown(markdown, stable_hash, format!("endpoint:{url}")))
+    Ok(BundleSource::from_markdown(
+        markdown,
+        stable_hash,
+        format!("endpoint:{url}"),
+    ))
 }
 
 /// Running shim handle — `addr` is the bound listen address; `shutdown`
@@ -208,8 +225,8 @@ impl Drop for ShimHandle {
 pub fn serve(config: ShimConfig) -> anyhow::Result<ShimHandle> {
     ensure_enabled()?;
     allowlist::validate_upstream(&config.upstream)?;
-    let listener = TcpListener::bind(&config.listen)
-        .with_context(|| format!("binding listen address {}", config.listen))?;
+    let listener =
+        TcpListener::bind(&config.listen).with_context(|| format!("binding listen address {}", config.listen))?;
     let addr = listener.local_addr().context("resolving bound listen address")?;
     anyhow::ensure!(
         addr.ip().is_loopback(),
@@ -230,7 +247,11 @@ pub fn serve(config: ShimConfig) -> anyhow::Result<ShimHandle> {
             });
         }
     });
-    Ok(ShimHandle { addr, stop, join: Some(join) })
+    Ok(ShimHandle {
+        addr,
+        stop,
+        join: Some(join),
+    })
 }
 
 #[cfg(test)]

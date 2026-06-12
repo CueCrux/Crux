@@ -52,7 +52,7 @@ struct Cli {
     #[arg(long)]
     context_endpoint: Option<String>,
 
-    /// Session id stamped on receipt records. Default: shim-<pid>-<epoch>.
+    /// Session id stamped on receipt records. Default: `shim-<pid>-<epoch>`.
     #[arg(long)]
     session_id: Option<String>,
 
@@ -120,8 +120,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         "crux-llm-shim (EXPERIMENTAL): {} -> {} | bundle: {} | receipts: {}{}",
         config.listen,
         config.upstream,
-        config.bundle.as_ref().map_or("none (passthrough)", |b| b.origin.as_str()),
-        if config.daemon_receipts { "daemon+spool " } else { "spool-only " },
+        config
+            .bundle
+            .as_ref()
+            .map_or("none (passthrough)", |b| b.origin.as_str()),
+        if config.daemon_receipts {
+            "daemon+spool "
+        } else {
+            "spool-only "
+        },
         config.receipts_spool.display()
     );
 

@@ -142,7 +142,10 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, RequestError> {
     let content_length = headers
         .iter()
         .find(|(n, _)| n == "content-length")
-        .map(|(_, v)| v.parse::<usize>().map_err(|_| RequestError::BadRequest("bad content-length".into())))
+        .map(|(_, v)| {
+            v.parse::<usize>()
+                .map_err(|_| RequestError::BadRequest("bad content-length".into()))
+        })
         .transpose()?
         .unwrap_or(0);
     if content_length > MAX_BODY_BYTES {
@@ -150,7 +153,12 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, RequestError> {
     }
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body).map_err(|_| RequestError::Io)?;
-    Ok(Request { method, target, headers, body })
+    Ok(Request {
+        method,
+        target,
+        headers,
+        body,
+    })
 }
 
 /// Request headers the proxy owns (everything else is forwarded verbatim).
@@ -180,10 +188,7 @@ fn forward(
     let url = format!("{}{}", config.upstream, request.target);
     // Pass upstream 4xx/5xx through as responses, not transport errors; no
     // global timeout — local generations are legitimately slow.
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .into();
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
 
     let Ok(method) = ureq::http::Method::from_bytes(request.method.as_bytes()) else {
         respond_error(writer, 501, "Not Implemented", "unsupported method");
@@ -238,8 +243,10 @@ fn forward(
     );
     for (name, value) in response.headers() {
         let n = name.as_str();
-        if matches!(n, "content-length" | "transfer-encoding" | "connection" | "content-encoding")
-        {
+        if matches!(
+            n,
+            "content-length" | "transfer-encoding" | "connection" | "content-encoding"
+        ) {
             continue;
         }
         if let Ok(v) = value.to_str() {
@@ -312,7 +319,12 @@ fn pump_body(upstream_reader: &mut impl Read, writer: &mut TcpStream) -> PumpOut
         }
         out
     });
-    PumpOutcome { end_state, abort_reason, first_byte_at, output_digest }
+    PumpOutcome {
+        end_state,
+        abort_reason,
+        first_byte_at,
+        output_digest,
+    }
 }
 
 fn respond_error(writer: &mut TcpStream, code: u16, reason: &str, message: &str) {

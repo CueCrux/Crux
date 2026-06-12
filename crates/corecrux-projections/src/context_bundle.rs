@@ -4,8 +4,8 @@
 
 //! Deterministic context-bundle assembler (`context_bundle/v1`).
 //!
-//! ExecPlan `context-mediation-injection-2026-06-11` M2 (G21a). Spec:
-//! `PlanCrux/docs/master-plan/shared/Context-Bundle-v1-Spec.md`.
+//! ExecPlan `context-mediation-injection-2026-06-11` M2 (G21a). Normative
+//! spec: `Context-Bundle-v1-Spec` (planning monorepo, shared plane).
 //!
 //! ## What this is
 //!
@@ -542,16 +542,8 @@ mod tests {
     #[test]
     fn presentation_order_independent_of_input_order() {
         let r = req(HOUR_MS, 2000);
-        let a = assemble(
-            &r,
-            vec![fact("f1", "b", "k", "v"), fact("f2", "a", "k", "v")],
-            vec![],
-        );
-        let b = assemble(
-            &r,
-            vec![fact("f2", "a", "k", "v"), fact("f1", "b", "k", "v")],
-            vec![],
-        );
+        let a = assemble(&r, vec![fact("f1", "b", "k", "v"), fact("f2", "a", "k", "v")], vec![]);
+        let b = assemble(&r, vec![fact("f2", "a", "k", "v"), fact("f1", "b", "k", "v")], vec![]);
         assert_eq!(a.stable_hash, b.stable_hash);
         let facts = &a.stable.sections[0].facts;
         assert_eq!(facts[0].entity, "a");
@@ -581,7 +573,11 @@ mod tests {
         r.ceiling = 50;
         let bundle = assemble(
             &r,
-            vec![fact("f1", "a", "k", "v"), fact("f2", "b", "k", "v"), fact("f3", "c", "k", "v")],
+            vec![
+                fact("f1", "a", "k", "v"),
+                fact("f2", "b", "k", "v"),
+                fact("f3", "c", "k", "v"),
+            ],
             vec![],
         );
         assert!(bundle.budget.spent_est <= 50);
@@ -615,7 +611,7 @@ mod tests {
         let mut old = fact("f1", "bench:x", "metric", "408/500");
         old.horizon_class = HorizonClass::Volatile;
         old.written_ms = HOUR_MS; // written_ms must be positive (<=0 means Unknown)
-        // Far past any volatile horizon.
+                                  // Far past any volatile horizon.
         let bundle = assemble(&req(HOUR_MS * 24 * 365, 2000), vec![old], vec![]);
         let facts = &bundle.stable.sections[0].facts;
         assert_eq!(facts.len(), 1);
@@ -656,11 +652,19 @@ mod tests {
         let aux = vec![
             AuxSection {
                 kind: SectionKind::Coord,
-                items: vec![AuxItem { id: "peer-1".into(), text: "editing crates/x".into(), est_tokens: Some(10) }],
+                items: vec![AuxItem {
+                    id: "peer-1".into(),
+                    text: "editing crates/x".into(),
+                    est_tokens: Some(10),
+                }],
             },
             AuxSection {
                 kind: SectionKind::SessionState,
-                items: vec![AuxItem { id: "s-1".into(), text: "resume at M2".into(), est_tokens: Some(10) }],
+                items: vec![AuxItem {
+                    id: "s-1".into(),
+                    text: "resume at M2".into(),
+                    est_tokens: Some(10),
+                }],
             },
         ];
         let bundle = assemble(&req(HOUR_MS, 2000), vec![fact("f1", "a", "k", "v")], aux);

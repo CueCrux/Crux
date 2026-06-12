@@ -49,21 +49,46 @@ pub fn inject_bundle(body: &[u8], bundle_markdown: Option<&str>) -> Injection {
         None => (false, None),
     };
     let Some(markdown) = bundle_markdown else {
-        return Injection { body: body.to_vec(), injected: false, stream, model };
+        return Injection {
+            body: body.to_vec(),
+            injected: false,
+            stream,
+            model,
+        };
     };
     let Some(mut v) = parsed else {
-        return Injection { body: body.to_vec(), injected: false, stream, model };
+        return Injection {
+            body: body.to_vec(),
+            injected: false,
+            stream,
+            model,
+        };
     };
     let Some(messages) = v.get_mut("messages").and_then(Value::as_array_mut) else {
-        return Injection { body: body.to_vec(), injected: false, stream, model };
+        return Injection {
+            body: body.to_vec(),
+            injected: false,
+            stream,
+            model,
+        };
     };
     let system = serde_json::json!({ "role": "system", "content": markdown });
     messages.insert(0, system);
     match serde_json::to_vec(&v) {
-        Ok(body) => Injection { body, injected: true, stream, model },
+        Ok(body) => Injection {
+            body,
+            injected: true,
+            stream,
+            model,
+        },
         // Re-serialization cannot realistically fail for a Value tree, but the
         // fallback keeps the never-break-a-request invariant lint-clean.
-        Err(_) => Injection { body: body.to_vec(), injected: false, stream, model },
+        Err(_) => Injection {
+            body: body.to_vec(),
+            injected: false,
+            stream,
+            model,
+        },
     }
 }
 

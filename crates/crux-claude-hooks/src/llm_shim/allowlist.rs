@@ -65,9 +65,10 @@ fn split_http_url(url: &str) -> anyhow::Result<(String, Option<u16>, String)> {
         };
         let host = &stripped[..end];
         let port = match stripped[end + 1..].strip_prefix(':') {
-            Some(p) => Some(p.parse::<u16>().map_err(|_| {
-                anyhow::anyhow!("invalid port in '{url}'")
-            })?),
+            Some(p) => Some(
+                p.parse::<u16>()
+                    .map_err(|_| anyhow::anyhow!("invalid port in '{url}'"))?,
+            ),
             None => None,
         };
         return Ok((host.to_string(), port, rest.to_string()));
@@ -75,7 +76,10 @@ fn split_http_url(url: &str) -> anyhow::Result<(String, Option<u16>, String)> {
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (
             h.to_string(),
-            Some(p.parse::<u16>().map_err(|_| anyhow::anyhow!("invalid port in '{url}'"))?),
+            Some(
+                p.parse::<u16>()
+                    .map_err(|_| anyhow::anyhow!("invalid port in '{url}'"))?,
+            ),
         ),
         None => (authority.to_string(), None),
     };
@@ -128,10 +132,10 @@ mod tests {
             "http://api.openai.com",
             "http://example.com:80",
             "http://8.8.8.8:80",
-            "http://172.32.0.1:80",   // just past RFC1918 172.16/12
-            "http://172.15.0.1:80",   // just before
+            "http://172.32.0.1:80",      // just past RFC1918 172.16/12
+            "http://172.15.0.1:80",      // just before
             "http://100.70.12.73:14800", // CGNAT/tailnet is NOT RFC1918
-            "https://127.0.0.1:11434", // TLS refused even on loopback
+            "https://127.0.0.1:11434",   // TLS refused even on loopback
             "ftp://127.0.0.1",
             "http://user@127.0.0.1:80",
             "http://my-local-box:11434", // non-localhost hostname: no DNS, refused

@@ -34,7 +34,10 @@ use super::{BundleSource, ShimConfig, BUNDLE_VERSION, SHIM_RECEIPT_SCHEMA};
 /// RFC3339 UTC timestamp (second precision — receipt ordering inside one
 /// second is carried by the spool append order).
 pub fn now_rfc3339() -> String {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     epoch_secs_to_rfc3339(secs)
 }
 
@@ -47,13 +50,16 @@ fn epoch_secs_to_rfc3339(secs: u64) -> String {
     let shifted = days + 719_468;
     let era = shifted.div_euclid(146_097);
     let day_of_era = shifted.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
     let mut year = year_of_era + era * 400;
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_part = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_part + 2) / 5 + 1;
-    let month = if month_part < 10 { month_part + 3 } else { month_part - 9 };
+    let month = if month_part < 10 {
+        month_part + 3
+    } else {
+        month_part - 9
+    };
     if month <= 2 {
         year += 1;
     }
@@ -61,12 +67,7 @@ fn epoch_secs_to_rfc3339(secs: u64) -> String {
 }
 
 /// Build the injected-side record for one mediated request.
-pub fn context_injected_record(
-    config: &ShimConfig,
-    bundle: &BundleSource,
-    receipt_id: &str,
-    path: &str,
-) -> Value {
+pub fn context_injected_record(config: &ShimConfig, bundle: &BundleSource, receipt_id: &str, path: &str) -> Value {
     json!({
         "schema": SHIM_RECEIPT_SCHEMA,
         "kind": "context_injected",
@@ -117,12 +118,7 @@ pub struct StreamEnd<'a> {
 }
 
 /// Build the emitted-side record for one request end-state.
-pub fn stream_end_record(
-    config: &ShimConfig,
-    end: &StreamEnd<'_>,
-    receipt_id: &str,
-    path: &str,
-) -> Value {
+pub fn stream_end_record(config: &ShimConfig, end: &StreamEnd<'_>, receipt_id: &str, path: &str) -> Value {
     json!({
         "schema": SHIM_RECEIPT_SCHEMA,
         "kind": end.end_state.kind(),
@@ -146,9 +142,7 @@ pub fn stream_end_record(
 /// Deliver a record: best-effort daemon POST, JSONL spool fallback. Never
 /// blocks or fails the mediated request.
 pub fn emit(config: &ShimConfig, record: &Value) {
-    if config.daemon_receipts
-        && crate::daemon_client::post_json("/v1/mediation/receipts", record).is_ok()
-    {
+    if config.daemon_receipts && crate::daemon_client::post_json("/v1/mediation/receipts", record).is_ok() {
         return;
     }
     if let Err(err) = append_jsonl(&config.receipts_spool, record) {
