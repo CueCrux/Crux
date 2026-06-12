@@ -28,6 +28,18 @@ const CONSOLE_DEV_PATH_ENV: &str = "CORECRUXD_CONSOLE_DEV_PATH";
 const ASSET_LOGO_DARK: &[u8] = include_bytes!("../playground/assets/CueCrux-Arc-Loop.png");
 const ASSET_LOGO_WHITE: &[u8] = include_bytes!("../playground/assets/CueCrux-Arc-Loop-White.png");
 
+// Embedded 3D substrate view (the `2D | 3D` toolbar switch in the console
+// loads `console-3d/index.html?embed=1` in an iframe). Same in-binary,
+// no-on-disk-dependency story as the console itself.
+const CONSOLE3D_HTML: &str = include_str!("../playground/console-3d/index.html");
+const CONSOLE3D_CSS: &str = include_str!("../playground/console-3d/css/console3d.css");
+const CONSOLE3D_JS_DATA: &str = include_str!("../playground/console-3d/js/data.js");
+const CONSOLE3D_JS_WORLD: &str = include_str!("../playground/console-3d/js/world.js");
+const CONSOLE3D_JS_MAIN: &str = include_str!("../playground/console-3d/js/main.js");
+const CONSOLE3D_VENDOR_THREE: &str = include_str!("../playground/console-3d/vendor/three.module.min.js");
+const CONSOLE3D_VENDOR_ORBIT: &str = include_str!("../playground/console-3d/vendor/OrbitControls.js");
+const CONSOLE3D_VENDOR_ROUNDED: &str = include_str!("../playground/console-3d/vendor/RoundedBoxGeometry.js");
+
 fn embedded_asset(name: &str) -> Option<&'static [u8]> {
     match name {
         "CueCrux-Arc-Loop.png" => Some(ASSET_LOGO_DARK),
@@ -99,6 +111,29 @@ fn asset_response(name: &str, bytes: Vec<u8>) -> Response {
         .into_response()
 }
 
+/// Embedded 3D substrate assets, keyed by their path under `/console-3d/`.
+async fn serve_console3d(AxumPath(path): AxumPath<String>) -> Response {
+    let (body, content_type): (&'static str, &'static str) = match path.as_str() {
+        "" | "index.html" => (CONSOLE3D_HTML, "text/html; charset=utf-8"),
+        "css/console3d.css" => (CONSOLE3D_CSS, "text/css; charset=utf-8"),
+        "js/data.js" => (CONSOLE3D_JS_DATA, "text/javascript; charset=utf-8"),
+        "js/world.js" => (CONSOLE3D_JS_WORLD, "text/javascript; charset=utf-8"),
+        "js/main.js" => (CONSOLE3D_JS_MAIN, "text/javascript; charset=utf-8"),
+        "vendor/three.module.min.js" => (CONSOLE3D_VENDOR_THREE, "text/javascript; charset=utf-8"),
+        "vendor/OrbitControls.js" => (CONSOLE3D_VENDOR_ORBIT, "text/javascript; charset=utf-8"),
+        "vendor/RoundedBoxGeometry.js" => (CONSOLE3D_VENDOR_ROUNDED, "text/javascript; charset=utf-8"),
+        _ => return (axum::http::StatusCode::NOT_FOUND, "no such console-3d asset").into_response(),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 pub fn routes(enabled: bool) -> Router {
     if !enabled {
         return Router::new();
@@ -110,6 +145,7 @@ pub fn routes(enabled: bool) -> Router {
         .route("/console-classic", get(serve_classic))
         .route("/playground", get(serve_console))
         .route("/console-assets/{name}", get(serve_console_asset))
+        .route("/console-3d/{*path}", get(serve_console3d))
         .layer(CorsLayer::permissive())
 }
 

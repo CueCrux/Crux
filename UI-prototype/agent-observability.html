@@ -45,6 +45,8 @@
     --text-primary:#0f172a; --text-secondary:rgba(71,85,105,.8); --text-muted:rgba(100,116,139,.6);
     --shadow-sm:0 1px 2px rgba(15,23,42,.06),0 0 0 1px rgba(15,23,42,.04);
     --shadow-lg:0 16px 40px rgba(15,23,42,.12),0 0 0 1px rgba(15,23,42,.03);
+    --shadow-card:0 2px 6px rgba(15,23,42,.07),0 12px 28px rgba(15,23,42,.07),0 0 0 1px rgba(15,23,42,.03);
+    --shadow-card-hover:0 6px 16px rgba(15,23,42,.12),0 18px 38px rgba(15,23,42,.10);
     --shadow-focus:0 0 0 2px rgba(94,106,210,.4);
     --backdrop-gradient:radial-gradient(circle at 20% 20%, rgba(94,106,210,.06), transparent 30%),radial-gradient(circle at 80% 10%, rgba(59,130,246,.08), transparent 26%),radial-gradient(circle at 50% 80%, rgba(139,92,246,.04), transparent 30%);
     --accent:#5E6AD2;
@@ -58,6 +60,8 @@
     --text-primary:#EDEDEF; --text-secondary:rgba(138,143,152,.9); --text-muted:rgba(138,143,152,.6);
     --shadow-sm:0 1px 2px rgba(0,0,0,.4),0 0 0 1px rgba(255,255,255,.04);
     --shadow-lg:0 20px 50px rgba(0,0,0,.6),0 0 0 1px rgba(255,255,255,.03);
+    --shadow-card:0 2px 6px rgba(0,0,0,.45),0 14px 30px rgba(0,0,0,.40),0 0 0 1px rgba(255,255,255,.04);
+    --shadow-card-hover:0 8px 20px rgba(0,0,0,.55),0 22px 44px rgba(0,0,0,.50);
     --shadow-focus:0 0 0 2px rgba(94,106,210,.5);
     --backdrop-gradient:radial-gradient(circle at 20% 20%, rgba(94,106,210,.08), transparent 30%),radial-gradient(circle at 80% 10%, rgba(59,130,246,.06), transparent 26%),radial-gradient(circle at 50% 80%, rgba(139,92,246,.05), transparent 30%);
     --dot:rgba(148,163,184,.14); --ok:#34d399; --run:#fbbf24; --err:#f87171; --idle:#6b7689; --code-bg:#0a0e16;
@@ -111,22 +115,85 @@
 
   /* canvas */
   main { flex:1; display:flex; min-height:0; }
+  /* ── left icon rail: solo-panel filter ── */
+  #sidebar { flex:0 0 50px; display:flex; flex-direction:column; align-items:center; gap:2px; padding:10px 0; overflow-y:auto; scrollbar-width:none; border-right:1px solid var(--border-light); background:var(--surface-glass-muted); backdrop-filter:blur(var(--blur-sm)); z-index:5; }
+  #sidebar::-webkit-scrollbar { display:none; }
+  #sidebar .sb-item { position:relative; display:flex; align-items:center; justify-content:center; width:36px; height:34px; flex:none; background:none; border:1px solid transparent; border-radius:10px; color:var(--text-muted); cursor:pointer; transition:color var(--transition-fast), background var(--transition-fast), border-color var(--transition-fast); }
+  #sidebar .sb-item svg { width:17px; height:17px; }
+  #sidebar .sb-item:hover { color:var(--text-primary); background:var(--surface-glass-strong); }
+  #sidebar .sb-item.active { color:var(--accent); border-color:color-mix(in srgb, var(--accent) 40%, transparent); background:color-mix(in srgb, var(--accent) 10%, transparent); }
+  #sidebar .sb-item:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  #sidebar .sb-sep { width:24px; height:1px; flex:none; margin:5px 0; background:var(--border-default); }
+  body.view3d #sidebar .sb-item[data-no3d] { opacity:.26; pointer-events:none; }
   .canvas-wrap { flex:1; position:relative; overflow:hidden; }
   /* inner scroller holds the graph; the build dock is a non-scrolling sibling so it stays pinned to the viewport, not the content */
-  #canvasScroll { position:absolute; inset:0; overflow:auto; background-image:radial-gradient(circle, var(--dot) 1px, transparent 1px); background-size:22px 22px; }
+  #canvasScroll { position:absolute; inset:0; overflow:auto;
+    background:
+      radial-gradient(1100px 620px at 8% -12%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 70%),
+      radial-gradient(950px 700px at 94% 0%, rgba(59,130,246,.08), transparent 72%),
+      radial-gradient(900px 720px at 50% 118%, rgba(139,92,246,.07), transparent 75%),
+      linear-gradient(180deg, transparent 55%, rgba(15,23,42,.03));
+  }
   #edges { position:absolute; left:0; top:0; pointer-events:none; } #nodes { position:absolute; left:0; top:0; }
 
-  .gnode { position:absolute; box-sizing:border-box; padding:8px 11px 8px 15px; background:var(--surface-glass-strong); border:1.4px solid var(--border-default); border-radius:11px; cursor:pointer; box-shadow:var(--shadow-sm); overflow:hidden; user-select:none; transition:border-color .12s ease, box-shadow .12s ease, transform .12s ease; }
-  .gnode:hover { border-color:var(--accent); transform:translateY(-1px); }
-  .gnode.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent), 0 0 13px rgba(94,106,210,.4); }
-  .gnode .gstripe { position:absolute; left:0; top:8px; bottom:8px; width:4px; border-radius:0 2px 2px 0; background:var(--idle); }
+  .gnode { position:absolute; box-sizing:border-box; padding:9px 13px 9px 17px; background:var(--surface-glass-strong); border:1.4px solid var(--border-default); border-radius:13px; cursor:pointer; box-shadow:var(--shadow-card); overflow:hidden; user-select:none; transition:border-color .12s ease, box-shadow .15s ease, transform .12s ease; }
+  .gnode:hover { border-color:var(--accent); transform:translateY(-2px); box-shadow:var(--shadow-card-hover); }
+  .gnode.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent), 0 10px 26px rgba(94,106,210,.28); }
+  .gnode .gstripe { position:absolute; left:0; top:9px; bottom:9px; width:4px; border-radius:0 2px 2px 0; background:var(--idle); }
+  .gnode .ghead { display:flex; align-items:center; gap:6px; min-height:15px; }
   .gnode .gkind { font-size:9px; letter-spacing:.6px; text-transform:uppercase; color:var(--text-muted); }
-  .gnode .gtitle { font-size:12.5px; font-weight:620; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .gnode .ghead .gchip { margin-left:auto; }
+  .gnode .gcount { font-family:var(--font-mono); font-size:9px; font-weight:700; color:var(--text-secondary); background:color-mix(in srgb, var(--accent) 10%, transparent); border:1px solid color-mix(in srgb, var(--accent) 26%, transparent); border-radius:999px; padding:0 6px; line-height:14px; }
+  .gnode .gtitle { margin-top:2px; font-size:12px; font-weight:640; line-height:1.28; color:var(--text-primary); display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; word-break:break-word; }
   .gnode .grow2 { display:flex; align-items:center; gap:6px; margin-top:2px; }
-  .gnode .gsub { font-size:10.5px; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .gnode .gsub { display:block; margin-top:2px; font-size:10.5px; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .gnode .gmeta { display:flex; align-items:center; gap:8px; margin-top:3px; overflow:hidden; }
+  .gnode .gf { font-family:var(--font-mono); font-size:9.5px; color:var(--text-secondary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .gnode .gf b { font-weight:600; color:var(--text-muted); margin-right:4px; }
+  .gnode .gpct { margin-left:auto; flex:none; font-family:var(--font-mono); font-size:9.5px; color:var(--text-muted); }
+  .gnode .gbar { position:absolute; left:17px; right:13px; bottom:7px; height:3px; border-radius:999px; background:color-mix(in srgb, var(--accent) 15%, transparent); overflow:hidden; }
+  .gnode .gbar i { display:block; height:100%; border-radius:999px; background:var(--accent); }
+  .gnode .gbar.hero { position:static; margin-top:8px; height:4px; }
+  .gnode .gpct.hero { margin:4px 0 0; font-family:var(--font-mono); font-size:10px; color:var(--text-muted); }
   .gnode .gchip { font-size:9.5px; font-weight:700; padding:1px 7px; border-radius:999px; white-space:nowrap; }
   .gnode .gcaret { position:absolute; right:9px; top:50%; transform:translateY(-50%); color:var(--text-muted); font-size:14px; }
   .gnode.leaf .gcaret { display:none; }
+  .ggroup { position:absolute; display:flex; align-items:center; gap:8px; padding-left:4px; box-sizing:border-box; pointer-events:none; }
+  .ggroup span { font-size:9px; letter-spacing:.14em; text-transform:uppercase; font-weight:700; color:var(--text-muted); }
+  .ggroup i { flex:1; height:1px; background:var(--border-default); }
+  .ggroup b { font-family:var(--font-mono); font-size:9.5px; font-weight:700; color:var(--text-secondary); background:var(--surface-glass-strong); border:1px solid var(--border-default); border-radius:999px; padding:0 7px; line-height:15px; }
+
+  /* ── overview dashboard (CX landing) ── */
+  .dash-card { padding:14px 18px 14px 22px; border-radius:15px; }
+  .dash-title { margin-top:7px; font-size:14.5px; font-weight:700; letter-spacing:-.01em; color:var(--text-primary); }
+  .dash-num { margin:16px 0 2px; font-size:44px; font-weight:800; letter-spacing:-.025em; line-height:1; color:var(--text-primary); }
+  .dash-num small { display:block; margin-top:7px; font-size:10.5px; font-weight:500; color:var(--text-muted); letter-spacing:0; }
+  .dash-mid { margin:10px 0 2px; font-size:21px; font-weight:800; letter-spacing:-.015em; line-height:1.1; color:var(--text-primary); }
+  .dash-mid small { display:block; margin-top:5px; font-size:10px; font-weight:500; color:var(--text-muted); font-family:var(--font-mono); }
+  .dp-v.wide { width:84px; }
+  .dash-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:13px; }
+  .dash-chip { font-family:var(--font-mono); font-size:10px; padding:3px 9px; border:1px solid var(--border-default); border-radius:999px; color:var(--text-secondary); background:var(--surface-glass); white-space:nowrap; }
+  .dash-chip b { color:var(--text-muted); font-weight:600; margin-right:5px; }
+  .dash-stages { display:flex; flex-wrap:wrap; gap:12px; margin-top:11px; }
+  .dash-stages .st { font-family:var(--font-mono); font-size:10.5px; color:var(--text-secondary); }
+  .dash-stages .st.ok{color:var(--ok)} .dash-stages .st.run{color:var(--run)} .dash-stages .st.err{color:var(--err)} .dash-stages .st.idle{color:var(--idle)}
+  .dbar { height:5px; margin-top:13px; border-radius:999px; background:color-mix(in srgb, var(--accent) 15%, transparent); overflow:hidden; }
+  .dbar i { display:block; height:100%; border-radius:999px; background:var(--accent); }
+  .dash-pct { margin-top:5px; font-family:var(--font-mono); font-size:10px; color:var(--text-muted); }
+  .dash-plans { display:flex; flex-direction:column; gap:6px; margin-top:11px; }
+  .dp { display:flex; align-items:center; gap:9px; font-family:var(--font-mono); font-size:10.5px; color:var(--text-secondary); }
+  .dp-n { flex:0 0 44%; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .dp-bar { flex:1; height:4px; border-radius:999px; background:color-mix(in srgb, var(--accent) 13%, transparent); overflow:hidden; }
+  .dp-bar i { display:block; height:100%; border-radius:999px; background:var(--accent); }
+  .dp-v { flex:none; width:36px; text-align:right; color:var(--text-muted); }
+  .dash-g { display:flex; align-items:flex-start; gap:12px; margin-top:3px; }
+  .dash-ico { flex:none; width:36px; height:36px; display:grid; place-items:center; border:1px solid color-mix(in srgb, var(--accent) 26%, transparent); border-radius:11px; color:var(--accent); background:color-mix(in srgb, var(--accent) 8%, transparent); }
+  .dash-ico svg { width:17px; height:17px; }
+  .dash-g-main { flex:1; min-width:0; display:block; }
+  .dash-g-main .gtitle { -webkit-line-clamp:1; margin-top:0; font-size:12.5px; }
+  .dash-g-main .gsub { margin-top:3px; }
+  .dash-g-main .gmeta { margin-top:6px; display:flex; gap:8px; overflow:hidden; }
+  .dash-g .gcount { flex:none; }
 
   /* focus hero card = expanded document panel */
   .gnode.hero { padding:14px 16px; cursor:default; display:flex; flex-direction:column; align-items:stretch; box-shadow:var(--shadow-lg); }
@@ -143,8 +210,11 @@
   .s-idle .gstripe{background:var(--idle)} .gnode.s-idle .gchip{color:var(--idle); background:color-mix(in srgb,var(--idle) 16%,transparent);}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 
-  .edge { fill:none; stroke:var(--edge); stroke-width:1.6; }
-  .edge.active { stroke:var(--accent); stroke-width:2; stroke-dasharray:5 6; animation:dash 1s linear infinite; } @keyframes dash{to{stroke-dashoffset:-22}}
+  .edge { fill:none; stroke:var(--edge); stroke-width:1.7; stroke-linecap:round; }
+  /* NOTE: the old `dash 1s linear infinite` stroke-dashoffset march forced a full
+     repaint of the (huge) edges SVG every frame, forever — a real-hardware
+     unresponsiveness source. Dashes are static now. */
+  .edge.active { stroke:var(--accent); stroke-width:2; stroke-dasharray:5 6; }
 
   /* file + hook nodes: monospace, smaller */
   .gnode[data-kind="file"] .gtitle, .gnode[data-kind="file-group"] .gtitle,
@@ -276,6 +346,121 @@
   .links { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:14px; }
   .links button { font-size:10.5px; color:var(--text-secondary); background:var(--surface-glass-muted); border:1px solid var(--border-default); border-radius:var(--radius-full); padding:2px 9px; cursor:pointer; }
   .links button:hover { border-color:var(--accent); color:var(--text-primary); }
+  /* ── inspector v3: slide-out detail pane (the original 3D panel pattern),
+        shared by 2D + 3D for every node; never shown on the All-Panels dash ── */
+  #inspector { position:fixed; top:110px; right:16px; bottom:44px; z-index:45;
+    width:min(400px, calc(100vw - 32px));
+    border:1px solid var(--border-default); border-radius:14px; border-left:1px solid var(--border-default);
+    box-shadow:var(--shadow-lg); background:var(--surface-glass-strong);
+    backdrop-filter:none; -webkit-backdrop-filter:none;   /* overlays the canvas — no per-frame blur readback */
+    transform:translateX(calc(100% + 44px));
+    transition:transform .35s cubic-bezier(.32,.72,.25,1); }
+  #inspector.open { transform:none; }
+  @media (prefers-reduced-motion: reduce) { #inspector { transition:none; } }
+  body.insp-hidden #inspector { display:block; }   /* legacy toggle class must not strand the slide-out */
+  .aside-resize, .insp-toggle { display:none !important; }
+  #i-close { margin-left:auto; width:26px; height:26px; flex:none; border-radius:8px;
+    border:1px solid var(--border-default); background:none; color:var(--text-secondary);
+    font-size:14px; line-height:1; cursor:pointer; }
+  #i-close:hover { color:var(--text-primary); border-color:var(--accent); }
+  .isrc { margin-left:0; }
+  .passport-filter { font-family:var(--font-mono); font-size:11px; color:var(--text-secondary);
+    background:var(--surface-glass-strong); border:1px solid var(--border-default);
+    border-radius:var(--radius-full); padding:4px 10px; margin-right:8px; cursor:pointer; }
+  .passport-filter:hover { border-color:var(--accent); color:var(--text-primary); }
+  .insp-head { display:flex; align-items:center; gap:7px; margin-bottom:10px; }
+  .ichip { font-family:var(--font-mono); font-size:10px; letter-spacing:.08em; text-transform:uppercase; padding:3px 10px; border-radius:var(--radius-full); color:var(--accent); background:color-mix(in srgb, var(--accent) 12%, transparent); border:1px solid color-mix(in srgb, var(--accent) 30%, transparent); }
+  .istatus { font-family:var(--font-mono); font-size:10px; letter-spacing:.06em; padding:3px 10px; border-radius:var(--radius-full); border:1px solid var(--border-default); color:var(--text-secondary); }
+  .istatus[data-s="ok"]  { color:var(--ok);  border-color:color-mix(in srgb, var(--ok) 45%, transparent); }
+  .istatus[data-s="run"] { color:var(--run); border-color:color-mix(in srgb, var(--run) 45%, transparent); }
+  .istatus[data-s="err"] { color:var(--err); border-color:color-mix(in srgb, var(--err) 45%, transparent); }
+  .isrc { margin-left:auto; font-family:var(--font-mono); font-size:9px; letter-spacing:.16em; color:var(--text-muted); }
+  #inspector .insp-title { font-family:var(--font-mono); font-size:15px; letter-spacing:-.01em; }
+  .insp-sub { font-family:var(--font-mono); font-size:10.5px; color:var(--text-muted); margin:2px 0 12px; word-break:break-word; }
+  #inspector .kv { display:flex; flex-direction:column; gap:1px; margin-bottom:14px; }
+  .kv .frow { display:grid; grid-template-columns:118px 1fr; gap:10px; padding:5px 8px; border-radius:8px; font-family:var(--font-mono); font-size:10.5px; }
+  .kv .frow:nth-child(odd) { background:var(--code-bg); }
+  .kv .frow .fk { color:var(--text-muted); }
+  .kv .frow .fv { color:var(--text-primary); word-break:break-word; }
+  .kv .frow .fv[data-st="done"]{color:var(--ok)} .kv .frow .fv[data-st="in_progress"]{color:var(--run)} .kv .frow .fv[data-st="blocked"]{color:var(--err)} .kv .frow .fv[data-st="planned"]{color:var(--idle)}
+  #inspector .links { display:flex; flex-direction:column; gap:6px; }
+  .links .ilink { display:flex; align-items:flex-start; gap:8px; text-align:left; padding:7px 10px; background:none; border:1px solid var(--border-default); border-radius:10px; cursor:pointer; color:var(--text-secondary); font-family:var(--font-mono); font-size:10.5px; transition:border-color .15s, color .15s, background .15s; }
+  .links .ilink:hover { color:var(--text-primary); border-color:var(--accent); background:var(--code-bg); }
+  .links .ilink i { width:8px; height:8px; border-radius:50%; flex:none; margin-top:3px; background:var(--accent); }
+  .links .ilink[data-k="fact"] i, .links .ilink[data-k="fact-group"] i, .links .ilink[data-k="gates"] i { background:var(--run); }
+  .links .ilink[data-k="receipt"] i, .links .ilink[data-k="verification"] i, .links .ilink[data-k="seals"] i, .links .ilink[data-k="chain"] i { background:var(--ok); }
+  .links .ilink[data-k="session"] i, .links .ilink[data-k="coord"] i, .links .ilink[data-k="coord-session"] i { background:#0891b2; }
+  .links .ilink[data-k="handoff"] i, .links .ilink[data-k="passport"] i { background:#8b5cf6; }
+  .links .ilink[data-k="drives"] i, .links .ilink[data-k="execplan"] i, .links .ilink[data-k="milestone"] i, .links .ilink[data-k="binds"] i { background:#3b82f6; }
+  .links .ilink .il-body { min-width:0; }
+  .links .ilink .il-main { display:block; word-break:break-word; }
+  .links .ilink small { display:block; margin-top:2px; font-family:var(--font-sans); font-size:9.5px; color:var(--text-muted); }
+  /* ── Settings: full-screen card ── */
+  #settingsPage { position:absolute; inset:10px; z-index:20; display:none; flex-direction:column;
+    background:#f4f7fb; border:1px solid var(--border-default); border-radius:16px;
+    box-shadow:var(--shadow-lg); padding:18px 22px; }
+  html.dark #settingsPage { background:#0e1118; }
+  .sp-head { display:flex; align-items:center; gap:12px; margin-bottom:16px; }
+  .sp-head h1 { margin:0; font-size:19px; font-weight:740; letter-spacing:-.01em; color:var(--text-primary); flex:1; }
+  #sp-close { width:30px; height:30px; border-radius:9px; border:1px solid var(--border-default);
+    background:none; color:var(--text-secondary); font-size:16px; line-height:1; cursor:pointer; }
+  #sp-close:hover { color:var(--text-primary); border-color:var(--accent); }
+  .sp-grid { flex:1; overflow:auto; display:grid; grid-template-columns:repeat(auto-fill,minmax(310px,1fr));
+    gap:14px; align-content:start; padding-bottom:8px; }
+  .sp-card { background:var(--surface-glass); border:1px solid var(--border-default); border-radius:13px;
+    padding:14px 16px; box-shadow:var(--shadow-sm); }
+  .sp-card h2 { margin:0 0 2px; font-size:13.5px; font-weight:700; letter-spacing:0; text-transform:none; color:var(--text-primary); }
+  .sp-sub { font-family:var(--font-mono); font-size:10px; color:var(--text-muted); margin-bottom:10px; }
+  .sp-card pre { margin-top:10px; }
+  .sp-btn { font-family:var(--font-mono); font-size:10.5px; padding:4px 12px; border-radius:var(--radius-full);
+    border:1px solid var(--border-default); background:var(--surface-glass-strong); color:var(--text-secondary); cursor:pointer; }
+  .sp-btn:hover { border-color:var(--accent); color:var(--text-primary); }
+  .sp-btn.danger { color:var(--err); border-color:color-mix(in srgb, var(--err) 45%, transparent); }
+  .sp-btn.danger:hover { border-color:var(--err); }
+  .sp-headsub { font-family:var(--font-mono); font-size:10px; color:var(--text-muted); margin-right:8px; max-width:46%; }
+  .sp-row { display:flex; align-items:center; gap:10px; padding:5px 0; }
+  .sp-card .frow { display:grid; grid-template-columns:168px 1fr; gap:10px; padding:5px 0;
+    font-family:var(--font-mono); font-size:10.5px; background:none; border-radius:0; }
+  .sp-card .frow .fk { color:var(--text-muted); }
+  .sp-card .frow .fv { color:var(--text-primary); word-break:break-word; }
+  .sp-lab { flex:0 0 168px; font-family:var(--font-mono); font-size:10.5px; color:var(--text-muted); }
+  .sp-input { flex:1; min-width:0; font-size:11.5px; padding:5px 10px; border-radius:9px;
+    border:1px solid var(--border-default); background:var(--surface-glass-strong); color:var(--text-primary); }
+  .sp-input.mono, textarea.sp-input { font-family:var(--font-mono); }
+  .sp-input:focus { outline:none; border-color:var(--accent); box-shadow:var(--shadow-focus); }
+  .sp-toggle { width:54px; font-family:var(--font-mono); font-size:9.5px; letter-spacing:.06em; padding:3px 0;
+    border-radius:var(--radius-full); border:1px solid var(--border-default); background:var(--surface-glass-strong);
+    color:var(--text-muted); cursor:pointer; }
+  .sp-toggle.on { color:var(--ok); border-color:color-mix(in srgb, var(--ok) 50%, transparent);
+    background:color-mix(in srgb, var(--ok) 10%, transparent); }
+  .sp-hint { font-family:var(--font-mono); font-size:9.5px; color:var(--text-muted); }
+  #rpcOut { min-height:90px; }
+  #cxToast { position:fixed; bottom:18px; left:50%; transform:translateX(-50%) translateY(8px); z-index:90;
+    padding:6px 16px; border-radius:var(--radius-full); background:var(--surface-glass-strong);
+    border:1px solid var(--border-default); box-shadow:var(--shadow-lg);
+    font-family:var(--font-mono); font-size:10.5px; color:var(--text-secondary);
+    opacity:0; pointer-events:none; transition:opacity .25s, transform .25s; }
+  #cxToast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+  /* ── ui-ux-pro-max checklist: focus rings · transitions · touch · bars ── */
+  .sp-btn, .sp-toggle { min-height:30px; transition:color .18s ease, border-color .18s ease, background .18s ease; }
+  .sp-input { min-height:30px; transition:border-color .18s ease, box-shadow .18s ease; border-color:var(--border-strong); }
+  .sp-btn:focus-visible, .sp-toggle:focus-visible, .sp-input:focus-visible, #sp-close:focus-visible {
+    outline:2px solid var(--accent); outline-offset:2px; }
+  .sp-toggle:hover { border-color:var(--accent); color:var(--text-primary); }
+  .sp-toggle.on:hover { color:var(--ok); }
+  .sp-btn[data-armed] { color:var(--err); border-color:var(--err); background:color-mix(in srgb, var(--err) 10%, transparent); }
+  .sp-barrow { align-items:center; }
+  .sp-barrow .sp-lab { flex:0 1 36%; min-width:88px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .sp-bartrack { flex:1; height:8px; border-radius:999px; background:color-mix(in srgb, var(--accent) 13%, transparent); overflow:hidden; }
+  .sp-barfill { display:block; height:100%; border-radius:999px; background:var(--accent); transition:width .3s ease; }
+  .sp-barfill.ok { background:var(--ok); }
+  .sp-barfill.err { background:var(--err); }
+  .sp-barval { flex:0 0 86px; text-align:right; font-family:var(--font-mono); font-size:9.5px; color:var(--text-secondary); }
+
+  .view-switch { display:inline-flex; margin-left:10px; border:1px solid var(--border-default); border-radius:var(--radius-full); overflow:hidden; background:var(--surface-glass); }
+  .view-switch button { font-size:11px; font-weight:600; font-family:var(--font-mono); color:var(--text-muted); background:none; border:0; padding:3px 12px; cursor:pointer; }
+  .view-switch button.on { color:var(--accent); background:color-mix(in srgb, var(--accent) 13%, transparent); }
+  #cx3dFrame { position:absolute; inset:0; width:100%; height:100%; border:0; display:none; }
   pre { background:var(--code-bg); border:1px solid var(--border-default); border-radius:8px; padding:10px; font-size:11px; color:var(--text-secondary); overflow:auto; margin:0 0 14px; font-family:var(--font-mono); white-space:pre-wrap; word-break:break-word; }
   .legend { display:flex; gap:14px; flex-wrap:wrap; color:var(--text-muted); font-size:11px; padding:8px 16px; border-top:1px solid var(--border-default); background:var(--surface-glass); }
   .legend i { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; vertical-align:middle; }
@@ -320,6 +505,9 @@
       <button class="wf-chip on s-ok" data-stage="done">Done</button>
     </div>
     <div class="grow"></div>
+    <select id="passportFilter" class="passport-filter" title="Filter tiles by the passport they're attached to" aria-label="Filter by passport">
+      <option value="all">All passports</option>
+    </select>
     <div class="search-wrap" id="searchWrap">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
       <input class="search-input" id="searchInput" type="text" placeholder="Search titles or data…" autocomplete="off" />
@@ -330,12 +518,19 @@
       </select>
       <button class="search-clear" id="searchClear" title="Clear search">×</button>
     </div>
+    <div class="view-switch" role="group" aria-label="Canvas view">
+      <button id="view2d" class="on" type="button" title="Classic 2D graph">2D</button><button id="view3d" type="button" title="Crux Substrate — 3D view">3D</button>
+    </div>
     <button class="insp-toggle" id="inspToggle" title="Show / hide inspector">⊟ Inspector</button>
   </div>
 
   <main>
+    <nav id="sidebar" aria-label="Panels — click an icon to show only that panel's nodes">
+      <!-- panel icons injected at boot (buildSidebar) -->
+    </nav>
     <div class="canvas-wrap" id="canvas">
       <div id="canvasScroll"><svg id="edges"></svg><div id="nodes"></div></div>
+      <iframe id="cx3dFrame" title="Crux Substrate — 3D view"></iframe>
       <!-- floating build dock pinned top-right: the "New Orchestrator" form card, with the candidate-card palette on the canvas directly beneath it -->
       <div id="buildDock">
         <div id="buildCard">
@@ -374,16 +569,16 @@
       </div>
     </div>
     <div class="aside-resize" id="asideResize" title="Drag to resize · double-click to hide"></div>
-    <aside id="inspector">
+    <aside id="inspector" aria-label="Node detail">
       <h2>Node inspector</h2>
+      <div class="insp-head"><span class="ichip" id="i-kindchip">node</span><span class="istatus" id="i-status" data-s="idle" style="display:none"></span><span class="isrc" id="i-src"></span><button id="i-close" title="Close (Esc)" aria-label="Close detail panel">×</button></div>
       <div class="insp-title" id="i-title">—</div>
-      <div class="insp-kind" id="i-kind">pick a node</div>
+      <div class="insp-sub" id="i-sub">pick a node</div>
       <div class="insp-actions" id="i-actions"></div>
       <div class="kv" id="i-kv"></div>
+      <pre id="i-payload" style="display:none">{ }</pre>
       <h2 id="i-links-h" style="display:none">Linked</h2>
       <div class="links" id="i-links"></div>
-      <h2>Payload</h2>
-      <pre id="i-payload">{ }</pre>
     </aside>
   </main>
 
@@ -400,7 +595,7 @@
 <script>
 /* ════════════ DUMMY GRAPH — flat node registry with id links (daemon-styled) ════════════ */
 const SCOPES = [
-  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-receipts','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-settings','cx-raw'] },
+  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-usage','cx-documents','cx-gates','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-receipts','cx-mediation','cx-workbench','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-settings','cx-raw'] },
   { id:'dx', label:'DX', tag:'Docs',         sections:['dx-articles','dx-readme','dx-sites'] },
   { id:'gx', label:'GX', tag:'Global',       sections:['gx-engrams','gx-bench','gx-sites','gx-factstore'] },
   { id:'ax', label:'AX', tag:'Agent',        sections:['ax-overview','ax-activity','ax-memory','ax-bulk','ax-snapshots','ax-tools','ax-handoff','ax-graph','ax-storybook','ax-dossiers','ax-story'] }
@@ -409,7 +604,7 @@ const SCOPES = [
 const N = {
   /* ── CX panels ── */
   'cx-overview':{kind:'panel',label:'Overview',sub:'daemon at a glance',fields:[['mode','local_only'],['facts','1,911'],['sessions','3 active']],children:['ov-node','ov-work','ov-usage','ov-storage','ov-integrations','ov-tenants']},
-  'cx-projects':{kind:'panel',label:'Projects',sub:'4 tracked',fields:[['count','4'],['active','CueCrux']]},
+  'cx-projects':{kind:'panel',label:'Projects',sub:'4 tracked',fields:[['count','4'],['active','CueCrux']],children:['proj-cuecrux','proj-crux','proj-audit','proj-plan']},
   'cx-work':{kind:'panel',label:'Work',sub:'kanban · /v1/work',children:['ep-agentux','ep-chaincrux','ep-trait','ep-cruxengine','ep-gemma','ep-plancrux','ep-verbatim']},
   'cx-sessions':{kind:'panel',label:'Sessions',sub:'active · execplan-scoped',fields:[['active','3'],['passport','ce:4e6c4e2a:local']],children:['sess-agentux','sess-chaincrux','sess-trait']},
   'cx-passport':{kind:'panel',label:'Passport',sub:'identities',children:['pp-main','pp-sonnet','pp-ops']},
@@ -429,12 +624,12 @@ const N = {
   'rcv-demo-sig':{kind:'signature',label:'Signature event',sub:'seq 2 · application/cbor',status:'ok',
     fields:[['seq','2'],['occurred','13:05:01Z'],['ingested','13:05:01Z'],['content_type','application/cbor'],['payload_hash','41c09be2…']],
     doc:'SIGNATURE EVENT (demo)\nGET /v1/receipts/crn_8f21…/signature\n\nThe detached Ed25519 signature over the canonical\nreceipt-body bytes, stored as its own event in the\nsame receipt stream (body seq 1, sig seq 2).'},
-  'cx-integrations':{kind:'panel',label:'Integrations',sub:'packs & sources',fields:[['connected','3'],['packs','5']]},
-  'cx-extensions':{kind:'panel',label:'Extensions',sub:'installed',fields:[['count','2']]},
+  'cx-integrations':{kind:'panel',label:'Integrations',sub:'packs & sources',fields:[['connected','3'],['packs','5']],children:['pack-git','pack-vault','pack-gateway','pack-jobclaw','pack-fs']},
+  'cx-extensions':{kind:'panel',label:'Extensions',sub:'installed',fields:[['count','2']],children:['ext-hooks','ext-wizard']},
   'cx-facts':{kind:'panel',label:'Facts',sub:'1,911 total',children:['fg-execplan','fg-bench','fg-incident','fg-design','fg-work']},
   'cx-memory':{kind:'panel',label:'Memory',sub:'recent feed',children:['mem1','mem2','mem3']},
   'cx-tenants':{kind:'panel',label:'Tenants',sub:'category + source',children:['t-lmem','t-lmes','t-personal']},
-  'cx-raw':{kind:'panel',label:'Raw',sub:'JSON-RPC console',fields:[['endpoint','/mcp'],['port','14801']]},
+  'cx-raw':{kind:'panel',label:'Raw',sub:'JSON-RPC console',fields:[['endpoint','/mcp'],['port','14801']],children:['rpc-tools','rpc-query','rpc-store']},
   'cx-settings':{kind:'panel',label:'Settings',sub:'console defaults',children:['set-auth','set-embed','set-onboard','set-daemon']},
   'cx-orchestrators':{kind:'panel',label:'Orchestrators',sub:'/v1/orchestrators · group plans for a session',fields:[['endpoint','/v1/orchestrators'],['flag','CORECRUXD_ORCHESTRATORS=on'],['mcp','create_orchestrator · attach · detach · list'],['active','1'],['build','＋ Orchestrator (toolbar)']],children:['orc-sprint1']},
 
@@ -714,9 +909,78 @@ const N = {
     fields:[['tenant','personal'],['private','true']],
     doc:'DOCUMENT  personal / note_01 (private — not synced)\n\nGrocery list and a dentist appointment on Tuesday.'},
 
+
+  'cx-documents':{kind:'panel',label:'Documents',sub:'ingested corpus · tenant browser',status:'ok',
+    fields:[['tenants','3'],['documents','6'],['chunks','25+'],['ingest','/v1/append · workspace/scan']],
+    children:['t-lmem','t-lmes','t-personal']},
+
+  /* ── gap-review additions: usage · gates · mediation · workbench ── */
+  'cx-usage':{kind:'panel',label:'Token usage',sub:'daily · weekly · monthly + savings',status:'run',
+    fields:[['this week','517k in · 67k out'],['daily avg','~83k in'],['source','/v1/observations/aggregate']]},
+  'cx-gates':{kind:'panel',label:'Pending gates',sub:'human approvals · /v1/work/gate/pending',status:'err',
+    fields:[['pending','2'],['policy','eu-ai-act · Art.14'],['endpoint','/v1/work/{id}/transitions']]},
+  'cx-mediation':{kind:'panel',label:'Mediation',sub:'principal · policy · enrich',status:'ok',
+    fields:[['endpoint','/v1/principal/resolve · /v1/policy/capabilities'],['receipts','/v1/mediation/receipts']]},
+  'cx-workbench':{kind:'panel',label:'Workbench',sub:'brief · preflight · policy sim · drift',status:'ok',
+    fields:[['endpoints','/v1/workbench/*'],['features','/v1/features/capabilities']]},
+
+  /* ── filled-in panels: projects · packs · extensions · raw RPC ── */
+  'proj-cuecrux':{kind:'project',label:'CueCrux',sub:'workspace · active',status:'run',
+    fields:[['path','/home/myles/CueCrux'],['repos','12'],['sessions','3 active'],['execplans','7 open']]},
+  'proj-crux':{kind:'project',label:'Crux daemon',sub:'source-available · CCL',status:'ok',
+    fields:[['path','CueCrux/Crux'],['crates','17'],['port','14800'],['tag','v0.4.2']]},
+  'proj-audit':{kind:'project',label:'AuditCrux',sub:'benchmarks + receipts',status:'ok',
+    fields:[['path','CueCrux/AuditCrux'],['runs','q500 · lme-s · agentq']]},
+  'proj-plan':{kind:'project',label:'PlanCrux',sub:'plans + feature registry',status:'idle',
+    fields:[['path','CueCrux/PlanCrux'],['execplans','.agent/execplans'],['api',':3334 → :14800 proxy']]},
+  'pack-git':{kind:'pack',label:'git-pack',sub:'enabled · repo signals',status:'ok',
+    fields:[['scopes','read'],['audit (24h)','5'],['source','builtin']]},
+  'pack-vault':{kind:'pack',label:'vault-pack',sub:'enabled · secret envelopes',status:'ok',
+    fields:[['scopes','read · mint'],['audit (24h)','2']]},
+  'pack-gateway':{kind:'pack',label:'gateway-pack',sub:'enabled · MCP mediation',status:'run',
+    fields:[['scopes','invoke'],['receipts','WAL'],['audit (24h)','12']]},
+  'pack-jobclaw':{kind:'pack',label:'jobclaw-pack',sub:'configured · handoff queue',status:'idle',
+    fields:[['queue','~/.jobclaw/queue'],['jobs','0 queued']]},
+  'pack-fs':{kind:'pack',label:'fs-pack',sub:'enabled · file search',status:'ok',
+    fields:[['scopes','read'],['roots','workspace']]},
+  'ext-hooks':{kind:'extension',label:'crux-claude-hooks',sub:'SessionStart · PreToolUse',status:'ok',
+    fields:[['events','boot banner · punchcard check'],['bin','crux-guardrail']],
+    doc:'EXTENSION crux-claude-hooks\n\nInjects the boot banner at SessionStart and\nenforces punchcard leases at PreToolUse. Ships as\npart of the daemon distribution.'},
+  'ext-wizard':{kind:'extension',label:'crux-config-wizard',sub:'profile regeneration',status:'ok',
+    fields:[['profiles','workspace · eu-ai-act'],['cmd','crux-config-wizard regenerate']]},
+  'rpc-tools':{kind:'rpc',label:'tools/list',sub:'93 tools · 12ms',status:'ok',
+    fields:[['method','tools/list'],['transport','/mcp :14801'],['wall','12ms']],
+    payload:'→ { "jsonrpc":"2.0", "id":1, "method":"tools/list" }\n← { "result":{ "tools":[ { "name":"query" },\n    { "name":"store_fact" }, … 93 ] } }'},
+  'rpc-query':{kind:'rpc',label:'tools/call · query',sub:'token_budget 500 · 48ms',status:'ok',
+    fields:[['tool','query'],['token_budget','500'],['hits','4'],['wall','48ms']],
+    payload:'→ { "method":"tools/call", "params":{ "name":"query",\n    "arguments":{ "query":"reconcile projection",\n    "token_budget":500 } } }\n← { "result":{ "hits":4, "chunks":[ … ] } }'},
+  'rpc-store':{kind:'rpc',label:'tools/call · store_fact',sub:'receipt crn_d4e2 · 9ms',status:'ok',
+    fields:[['tool','store_fact'],['entity','execplan:agent-ux…'],['receipt','crn_d4e2…']],
+    payload:'→ { "name":"store_fact", "arguments":{\n    "entity":"execplan:agent-ux…", "key":"gate:M4",\n    "value":{ "status":"in_progress" } } }\n← { "fact_id":"f_9fb3…", "receipt":"crn_d4e2…" }'},
+  'readme-build':{kind:'doc',label:'Build & test',sub:'cargo workspace',
+    doc:'# Build & Test\n\ncargo build --release   # CPU-only daemon\ncargo test --workspace\ncargo fmt --check\ncargo clippy --workspace -- -D warnings'},
+  'readme-arch':{kind:'doc',label:'Architecture',sub:'17 crates',
+    doc:'# Architecture\n\ncorecruxd — HTTP (axum :14800) + gRPC daemon\ncorecrux-retrieval — BM25 + graph fusion\ncorecrux-storage — append-only sealed segments\ncorecrux-receipts — Ed25519 CROWN signing'},
+  'readme-rules':{kind:'doc',label:'Key rules',sub:'do/don\u2019t',
+    doc:'# Key Rules\n\n· No GPU/CUDA code — daemon is CPU-only\n· Licence headers on every .rs (CCL v1.0)\n· Port 14800 is fixed\n· No proprietary crates in this repo'},
+  'gsite-corecrux':{kind:'site',label:'corecrux',sub:'62,114 entries',fields:[['kind','hypernym'],['depth','4']]},
+  'gsite-retrieval':{kind:'site',label:'retrieval-lanes',sub:'18,902 entries',fields:[['kind','hypernym'],['depth','3']]},
+  'bulk-import':{kind:'job',label:'bulk-import · corecrux',sub:'force_seal · 12k events',status:'ok',
+    fields:[['stream','projections'],['sealed','12,408'],['wall','4m12s']]},
+  'bulk-sweep':{kind:'job',label:'memory sweep',sub:'freshness horizons',status:'run',
+    fields:[['scanned','27'],['stale','0'],['policy','volatile 24h · medium 35d']]},
+  'gr-topology':{kind:'tile',label:'.ccxn topology',sub:'669,658 edges',status:'ok',
+    fields:[['nodes','669,658'],['lane','default-OFF'],['rebuild','merge-aware']]},
+  'gr-frames':{kind:'tile',label:'frame offsets',sub:'entity → chunk bridge',status:'idle',
+    fields:[['index','chunk_to_entity'],['coverage','LME-M']]},
+  'sb-nodes':{kind:'doc',label:'node kinds',sub:'20 catalogued',
+    doc:'STORYBOOK · node kinds\n\npanel · tile · artefact · execplan · milestone ·\nfact · fact-group · session · passport · receipt ·\nverification · signature · orchestrator · punchcard\n· coord-session · hook · file · reasoning · step ·\ntenant'},
+  'sb-panels':{kind:'doc',label:'panel patterns',sub:'hero · grid · columns',
+    doc:'STORYBOOK · panel patterns\n\nMiller columns (drill) · focus hero (document) ·\nartefact grid (live cards) · dashboard (landing) ·\nslide-out detail pane (3D-shared).'},
+
   /* ── DX ── */
   'dx-articles':{kind:'panel',label:'Articles',sub:'bundled docs',children:['doc-mcp','doc-plans','doc-agent']},
-  'dx-readme':{kind:'panel',label:'README',sub:'corecruxd',fields:[['crates','17'],['port','14800']]},
+  'dx-readme':{kind:'panel',label:'README',sub:'corecruxd',fields:[['crates','17'],['port','14800']],children:['readme-build','readme-arch','readme-rules']},
   'dx-sites':{kind:'panel',label:'External docs',sub:'links',children:['site-cc','site-signals']},
   'doc-mcp':{kind:'doc',label:'mcp-system-prompt.md',sub:'tool surface ref'},
   'doc-plans':{kind:'doc',label:'PLANS.md',sub:'ExecPlan format',doc:'# PLANS.md\n\nRequired sections: Purpose, Non-goals, Context,\nConstraints, Proposed design, Milestones, Test\nplan, Rollout/rollback, Risks, Progress, Decision\nlog.\n\nQC.1 commit_sha on decisions · QC.2 token_budget\n· QC.5 file:line for existence claims.'},
@@ -727,21 +991,21 @@ const N = {
   /* ── GX ── */
   'gx-engrams':{kind:'panel',label:'Engrams',sub:'shared memory',children:['eng1','eng2']},
   'gx-bench':{kind:'panel',label:'Bench',sub:'ScoreCrux board',children:['bench-q500','bench-lmem']},
-  'gx-sites':{kind:'panel',label:'Sites',sub:'hypernym surface',fields:[['entries','170,987']]},
-  'gx-factstore':{kind:'panel',label:'Fact store',sub:'online',fields:[['mode','local_only'],['facts','1,911']]},
+  'gx-sites':{kind:'panel',label:'Sites',sub:'hypernym surface',fields:[['entries','170,987']],children:['gsite-corecrux','gsite-retrieval']},
+  'gx-factstore':{kind:'panel',label:'Fact store',sub:'online',fields:[['mode','local_only'],['facts','1,911']],children:['fg-execplan','fg-bench','fg-incident']},
   'eng1':{kind:'engram',label:'retrieval-playbook',sub:'pinned',status:'ok'},
   'eng2':{kind:'engram',label:'deploy-gate-checklist',sub:'pinned',status:'ok'},
 
   /* ── AX ── */
   'ax-overview':{kind:'panel',label:'Overview',sub:'agent cockpit',fields:[['active agents','2'],['handoffs','1 open']],children:['st-sess','ho1']},
-  'ax-activity':{kind:'panel',label:'Activity',sub:'live tool stream',status:'run',fields:[['events/min','~40']]},
-  'ax-memory':{kind:'panel',label:'Memory',sub:'agent recall',fields:[['acks today','12']]},
-  'ax-bulk':{kind:'panel',label:'Bulk',sub:'batch ops'},
+  'ax-activity':{kind:'panel',label:'Activity',sub:'live tool stream',status:'run',fields:[['events/min','~40']],children:['hk-agentux','hk5']},
+  'ax-memory':{kind:'panel',label:'Memory',sub:'agent recall',fields:[['acks today','12']],children:['mem1','mem2','mem3']},
+  'ax-bulk':{kind:'panel',label:'Bulk',sub:'batch ops',children:['bulk-import','bulk-sweep']},
   'ax-snapshots':{kind:'panel',label:'Snapshots',sub:'session captures',children:['snap1']},
   'ax-tools':{kind:'panel',label:'Tools',sub:'MCP surface',children:['tool-query','tool-store','tool-handoff']},
   'ax-handoff':{kind:'panel',label:'Handoff',sub:'cross-session',children:['ho1']},
-  'ax-graph':{kind:'panel',label:'Graph',sub:'context graph'},
-  'ax-storybook':{kind:'panel',label:'Storybook',sub:'tile catalog'},
+  'ax-graph':{kind:'panel',label:'Graph',sub:'context graph',children:['gr-topology','gr-frames']},
+  'ax-storybook':{kind:'panel',label:'Storybook',sub:'tile catalog',children:['sb-nodes','sb-panels']},
   'ax-dossiers':{kind:'panel',label:'Dossiers',sub:'subject cards',children:['dos1']},
   'ax-story':{kind:'panel',label:'Story',sub:'call trees',children:['st-sess']},
   'snap1':{kind:'snapshot',label:'pre-compact 13:24',sub:'session 9c5a92…',status:'ok'},
@@ -761,12 +1025,26 @@ const N = {
 Object.entries(N).forEach(([id,n])=>{ n.id=id; });
 
 /* ════════════ ENGINE ════════════ */
-const COL_W=188, COL_GAP=60, NODE_H=64, NODE_GAP=14, PAD_X=28, PAD_Y=22;   // hero size is computed live in render()
+const COL_W=256, COL_GAP=64, NODE_H=96, NODE_GAP=12, PAD_X=28, PAD_Y=22, GROUP_H=22;   // hero size is computed live in render()
 const nodesEl=document.getElementById('nodes'), edgesEl=document.getElementById('edges');
 const norm = s => ({done:'ok',in_progress:'run',blocked:'err',planned:'idle',live:'run'}[s] || s || 'idle');
 const RAW = {in_progress:'in progress',done:'done',blocked:'blocked',planned:'planned',ok:'ok',run:'live',err:'error',idle:'idle',live:'live'};
 const chipText = s => RAW[s] || s;
 const childrenOf = node => (node.children||[]).map(id=>N[id]).filter(Boolean);
+/* tile title: drop a leading "<kind>:" prefix — the kind tag already says it (no more "execplan execplan:…") */
+const displayTitle = n => { const l=n.label||'', p=(n.kind||'')+':'; return l.toLowerCase().startsWith(p.toLowerCase()) ? l.slice(p.length) : l; };
+/* milestone completion: execplans count their milestone children; sessions inherit their
+   execplan's; Work panel / overview tile / orchestrators aggregate across members */
+const msStats = n => { const ms=childrenOf(n).filter(c=>c.kind==='milestone'); if(!ms.length) return null;
+  return { done: ms.filter(m=>norm(m.status)==='ok').length, total: ms.length }; };
+function progressOf(node){
+  let agg=null; const add=s=>{ if(s){ agg=agg||{done:0,total:0}; agg.done+=s.done; agg.total+=s.total; } };
+  if(node.kind==='execplan') add(msStats(node));
+  else if(node.kind==='session') childrenOf(node).filter(c=>c.kind==='execplan').slice(0,1).forEach(c=>add(msStats(c)));
+  else if(node.kind==='orchestrator' || node.id==='cx-work' || node.id==='ov-work')
+    childrenOf(node).filter(c=>c.kind==='execplan').forEach(c=>add(msStats(c)));
+  return (agg && agg.total) ? { ...agg, pct: Math.round(100*agg.done/agg.total) } : null;
+}
 const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 
 let activeScope='cx', columns=[], selectedId=null, focusMode=false, positions={}, activeOnly=false, heroUserW=null, focusTrail=[], preFocus=null;
@@ -1089,9 +1367,11 @@ async function bootProbe(){
 // debug/test handle (used by the Node smoke harness; inert in prod)
 try{ globalThis.__cx = { get LIVE(){return LIVE;}, setLive:(v)=>{LIVE=v;}, N, LOADERS, loadState, ensureLoaded, mergeChildren, makeStatusNode, bootProbe, prefetchScope, api, idFor }; }catch{}
 
+var dashMode=false;   // CX landing renders as the overview dashboard (see renderDash)
 function openScope(id){
   if(buildingId) teardownBuild();   // (fix) leaving the build canvas must tear down build mode, not leak it across scopes
   activeScope=id; focusMode=false; selectedId=null; heroUserW=null; focusTrail=[]; preFocus=null;
+  soloPanelId=null; buildSidebar();   // rail re-renders for THIS scope; home lights up
   searchActive=false; searchHighlight=''; searchReturn=null; focusFromSearch=false;
   Object.keys(workStages).forEach(k=>workStages[k]=true);   // fresh scope → fresh stage filter (don't carry a hidden filter across scopes)
   document.querySelectorAll('#workFilter .wf-chip').forEach(ch=>ch.classList.add('on'));
@@ -1099,14 +1379,16 @@ function openScope(id){
   const secs=scope.sections.map(x=>N[x]).filter(Boolean);
   columns=[{parentId:null, nodes:secs}];
   // default landing: auto-expand the scope's first tile (Overview) so its tiles show
-  const def=secs[0], defKids=def?childrenOf(def):[];
-  if(defKids.length){ columns.push({parentId:def.id, nodes:defKids}); selectedId=def.id; inspect(def); }
+  dashMode = true;               // every scope lands on a card dashboard — no primary tiles
+  closeInspector();              // the dashboard never shows the detail pane
+  closePage();                   // leaving for a dashboard closes any operator page
   document.querySelectorAll('.wc-centre-pill').forEach(p=>p.classList.toggle('wc-centre-pill--active', p.dataset.scope===id));
   document.getElementById('focusExit').style.display='none';
   render();
   if(LIVE) prefetchScope(id);   // lazy-load every panel in this scope so search/drill see live data
 }
 function expand(node, col){
+  dashMode=false;                 // any drill leaves the overview dashboard
   selectedId=node.id;
   columns=columns.slice(0, col+1);
   const path=columns.map(c=>c.parentId).filter(Boolean); path.push(node.id);   // ancestors already on the spine
@@ -1143,49 +1425,88 @@ function exitFocus(){
   if(preFocus && preFocus.scope===activeScope){ columns=preFocus.columns; selectedId=preFocus.selectedId; preFocus=null; render(); }
   else { preFocus=null; openScope(activeScope); }
 }
-function inspect(node){
-  document.getElementById('i-title').textContent=node.label;
-  document.getElementById('i-kind').textContent=node.kind + (node.status?` · ${chipText(node.status)}`:'');
+/* inspector v2 — the 3D detail-pane design, fed by 2D nodes AND the 3D iframe */
+const KIND_EXPLAIN={ execplan:'plan of record — milestones gate on facts', milestone:'milestone — gates on a stored fact',
+  fact:'stored fact — replayable audit row', 'fact-group':'facts grouped by entity prefix',
+  session:'execplan-scoped live session', passport:'identity — writes are attributed to it',
+  receipt:'CROWN receipt — Ed25519 proof', verification:'offline-replayable verdict', signature:'detached signature event',
+  orchestrator:'groups plans for a session', punchcard:'resource lease — PreToolUse enforced',
+  'punchcard-group':'leases grouped by holder session', 'coord-session':'live presence on the board',
+  'coord-overlap':'advisory overlap — never a lock', tile:'overview tile', artefact:'live health card',
+  panel:'console panel', file:'file touched this session', 'file-group':'files changed',
+  hook:'tool-use hook event', note:'session note', reasoning:'captured reasoning step', step:'audit-trail step',
+  tenant:'tenant store', setting:'console setting' };
+function renderInspector(d){
+  document.getElementById('i-kindchip').textContent=d.kind||'node';
+  const st=document.getElementById('i-status');
+  st.textContent=d.state||d.status||''; st.dataset.s=norm(d.status||'idle');
+  st.style.display=(d.state||d.status)?'':'none';
+  document.getElementById('i-src').textContent=d.src||'';
+  document.getElementById('i-title').textContent=d.label||'—';
+  document.getElementById('i-sub').textContent=d.sub||'';
   const kv=document.getElementById('i-kv'); kv.innerHTML='';
-  (node.fields||[]).forEach(([k,v])=>{
-    const a=document.createElement('div'); a.className='k'; a.textContent=k;
-    const b=document.createElement('div'); b.className='v'; b.textContent=v;
-    kv.appendChild(a); kv.appendChild(b);
+  (d.fields||[]).forEach(([k,v])=>{
+    const r=document.createElement('div'); r.className='frow';
+    const a=document.createElement('span'); a.className='fk'; a.textContent=k;
+    const b=document.createElement('span'); b.className='fv'; b.textContent=String(v);
+    if(['done','in_progress','blocked','planned'].includes(String(v))) b.dataset.st=String(v);
+    r.appendChild(a); r.appendChild(b); kv.appendChild(r);
   });
+  const pl=document.getElementById('i-payload');
+  pl.textContent=d.doc||''; pl.style.display=d.doc?'':'none';
   const lk=document.getElementById('i-links'), lkh=document.getElementById('i-links-h'); lk.innerHTML='';
+  lkh.style.display=(d.links&&d.links.length)?'':'none';
+  (d.links||[]).forEach(L=>{
+    const btn=document.createElement('button'); btn.className='ilink'; btn.dataset.k=L.kind||L.rel||''; btn.title=L.title||'';
+    const dot=document.createElement('i');
+    const body=document.createElement('span'); body.className='il-body';
+    const main=document.createElement('span'); main.className='il-main';
+    main.textContent=`${L.dir||'→'} ${L.rel?L.rel+' · ':''}${L.label}`;
+    const sm=document.createElement('small'); sm.textContent=L.explain||'';
+    body.appendChild(main); body.appendChild(sm);
+    btn.appendChild(dot); btn.appendChild(body);
+    btn.onclick=L.onclick;
+    lk.appendChild(btn);
+  });
+  const acts=document.getElementById('i-actions'); acts.innerHTML='';
+  (d.actions||[]).forEach(A=>{ const b=document.createElement('button'); b.textContent=A.label; b.title=A.title||''; b.onclick=A.onclick; acts.appendChild(b); });
+  openInspector();
+}
+function openInspector(){ document.getElementById('inspector').classList.add('open'); }
+function closeInspector(){ document.getElementById('inspector').classList.remove('open'); }
+var quietInspect=false;   // navigation paths fill columns without popping the panel
+function inspect(node){
+  if(quietInspect) return;
   const path=(focusMode?focusTrail:columns.map(c=>c.parentId).filter(Boolean)).filter(id=>id!==node.id);
   const kids=childrenOf(node).filter(c=>!path.includes(c.id));   // loop guard: don't offer a Linked jump back to an ancestor
-  lkh.style.display = kids.length? '' : 'none';
-  kids.forEach(c=>{ const btn=document.createElement('button'); btn.textContent=c.label; btn.title=`expand ${c.kind}`;
+  const links=kids.map(c=>({ kind:c.kind, label:c.label, dir:'→', explain:KIND_EXPLAIN[c.kind]||c.kind, title:`open ${c.kind}`,
     // pass the FULL ancestry trail (path = ancestors of `node`, + node, + c) so a Linked jump from Miller mode breadcrumbs the same as a dblclick
-    btn.onclick=async ()=>{ await ensureLoaded(c); focusMode ? focusNode(c) : focusNode(c, path.concat(node.id, c.id)); };
-    lk.appendChild(btn); });
-  document.getElementById('i-payload').textContent=node.payload || (node.doc? node.doc : '{ }');
-  const acts=document.getElementById('i-actions'); acts.innerHTML='';
-  if(node.kind==='orchestrator' && node.id!==buildingId){   // edit entry point (not while it's already the build target)
-    const eb=document.createElement('button'); eb.textContent='✎ Edit orchestrator';
-    eb.title='Open this orchestrator in the builder to rename, reassign, add or remove members';
-    eb.onclick=()=>editOrc(node.id);
-    acts.appendChild(eb);
-  }
-  if(node.id==='cx-receipts'){
-    const vb=document.createElement('button'); vb.textContent='✓ Verify a receipt…';
-    vb.title='Fetch /verification + /signature for a receipt id and watch it verify';
-    vb.onclick=()=>openVerify();
-    acts.appendChild(vb);
-  }
-  if(node.kind==='receipt' && node.__rid){
-    const vb=document.createElement('button'); vb.textContent='✓ Re-verify receipt';
-    vb.title='Open the verifier prefilled with this receipt id';
-    vb.onclick=()=>openVerify(node.__rid);
-    acts.appendChild(vb);
-  }
+    onclick:async ()=>{ await ensureLoaded(c); focusMode ? focusNode(c) : focusNode(c, path.concat(node.id, c.id)); } }));
+  const actions=[];
+  if(node.kind==='orchestrator' && node.id!==buildingId)   // edit entry point (not while it's already the build target)
+    actions.push({label:'✎ Edit orchestrator', title:'Open this orchestrator in the builder to rename, reassign, add or remove members', onclick:()=>editOrc(node.id)});
+  if(node.id==='cx-receipts')
+    actions.push({label:'✓ Verify a receipt…', title:'Fetch /verification + /signature for a receipt id and watch it verify', onclick:()=>openVerify()});
+  if(node.kind==='receipt' && node.__rid)
+    actions.push({label:'✓ Re-verify receipt', title:'Open the verifier prefilled with this receipt id', onclick:()=>openVerify(node.__rid)});
+  renderInspector({ src:'', kind:node.kind, status:node.status, state:node.state,
+    label:displayTitle(node), sub:node.sub||'', fields:node.fields||[],
+    doc:node.payload || node.doc || '', links, actions });
 }
 
+// passport filter: a tile is "attached" to the first ce:… passport ref in its
+// label/fields; tiles with no passport ref are neutral and always show
+var passportFilter='all';
+function passOf(n){
+  const m=(n.label||'').match(/ce:[0-9a-f]{4,}[a-z0-9:_-]*/i); if(n.kind==='passport'&&m) return m[0];
+  for(const f of (n.fields||[])){ const mm=String(f[1]).match(/ce:[0-9a-f]{4,}[a-z0-9:_-]*/i); if(mm) return mm[0]; }
+  return null;
+}
 // active-session filter: hide non-running sessions when activeOnly is on
 const filt = (ns, parentId) => {
   let out = activeOnly ? ns.filter(n => n.kind!=='session' || norm(n.status)==='run') : ns;
   if(parentId==='cx-work') out = out.filter(n => n.kind!=='execplan' || workStages[n.status]!==false);   // stage filter, scoped to the Work panel column
+  if(passportFilter!=='all') out = out.filter(n => { const p=passOf(n); return !p || p===passportFilter; });
   return out;
 };
 // if a filter (stage / active-only) hides a node we had drilled INTO, drop its now-orphaned descendant columns so the breadcrumb + selection stay truthful
@@ -1199,7 +1520,204 @@ function pruneOrphanColumns(){
   }
 }
 
+/* ── overview dashboard: the CX landing — daemon live metrics, task totals
+   with progress, and a node-connected grid of panel cards ── */
+function fOf(n,k){ const f=((n&&n.fields)||[]).find(x=>x[0]===k); return f?String(f[1]):null; }
+/* dash card click → classic drill: restore the full panels column, then expand
+   the chosen panel (keeps Miller navigation + sibling panels reachable) */
+async function dashOpen(id){
+  const node=N[id]; if(!node) return;
+  if(PAGES[id]){ openPage(id); return; }
+  closePage();
+  dashMode=false;
+  closeInspector();
+  const scope=SCOPES.find(s=>s.id==='cx');
+  columns=[{parentId:null, nodes:scope.sections.map(x=>N[x]).filter(Boolean)}];
+  selectedId=id; render();
+  await ensureLoaded(node);
+  quietInspect=true;                       // navigation: drill without popping the pane
+  try{ expand(node, 0); } finally { quietInspect=false; }
+}
+function renderDash(){
+  if(activeScope!=='cx'){ renderScopeDash(); return; }
+  const canvasEl=document.getElementById('canvas');
+  const cw=canvasEl.clientWidth||1100;
+  const PAD=30, GAP=18, W=Math.max(700, cw-PAD*2);
+  const ovn=N['ov-node']||{}, wk=N['cx-work']||{};
+  const eps=childrenOf(wk).filter(n=>n.kind==='execplan');
+  const stateOf=n=>{ const s=(n.state||n.status||'').toLowerCase(); return s==='complete'?'done':(s||'planned'); };
+  const counts={planned:0,in_progress:0,blocked:0,done:0};
+  eps.forEach(n=>{ const s=stateOf(n); if(counts[s]!=null) counts[s]++; });
+  const pr=progressOf(wk) || (eps.length?{done:counts.done,total:eps.length,pct:Math.round(100*counts.done/eps.length)}:null);
+  const mchip=(k,v)=>v?`<span class="dash-chip"><b>${esc(k)}</b>${esc(v)}</span>`:'';
+  const aChip=id=>{ const a=N[id]; return a?mchip(a.label.replace(/^GET /,'').toLowerCase(), a.sub||''):''; };
+
+  nodesEl.innerHTML='';
+  const mk=(x,y,w,h,cls,inner,openId)=>{
+    const el=document.createElement('div');
+    el.className=`gnode dash-card ${cls||''}`; el.dataset.kind='panel';
+    el.style.left=x+'px'; el.style.top=y+'px'; el.style.width=w+'px'; el.style.height=h+'px';
+    el.innerHTML=inner;
+    if(openId) el.addEventListener('click', ()=>dashOpen(openId));
+    nodesEl.appendChild(el);
+    return {x,y,w,h};
+  };
+
+  /* row 0: token usage per session + the MCP gateway */
+  const H0=174, H1=240;
+  const heroW=Math.min(560, Math.round(W*0.48));
+  const stack = (W-heroW) < 360;                  /* narrow → single column */
+  const halfW=(W-GAP)/2;
+  const k=v=>v>=1000?Math.round(v/1000)+'k':String(v);
+  let usage=null; try{ usage=JSON.parse((N['ov-usage']||{}).payload||''); }catch(e){ /* live shape may differ */ }
+  const by=usage&&usage.by_session?Object.entries(usage.by_session):[];
+  const maxIn=by.reduce((a,[,v])=>Math.max(a,v.in||0),1);
+  const usageRows=by.slice(0,3).map(([name,v])=>
+    `<div class="dp"><span class="dp-n">${esc(name)}</span><span class="dp-bar"><i style="width:${Math.round(100*(v.in||0)/maxIn)}%"></i></span><span class="dp-v wide">${k(v.in||0)}/${k(v.out||0)} · ${v.turns||0}t</span></div>`).join('');
+  const usageTotal=usage&&usage.tokens?`${k(usage.tokens.in)} in · ${k(usage.tokens.out)} out`:(fOf(N['ov-usage'],'this week')||'—');
+  const u=mk(PAD, PAD, stack?W:halfW, H0, 'dash-usage',
+    `<div class="gstripe"></div>`+
+    `<div class="ghead"><span class="gkind">token usage · per session</span><span class="gchip">${esc(fOf(N['ov-usage'],'sessions')||by.length||'')} live</span></div>`+
+    `<div class="dash-mid">${esc(usageTotal)}<small>${esc(usage&&usage.window?usage.window:'this week · save_session / pre-compact hook')}</small></div>`+
+    `<div class="dash-plans">${usageRows||`<div class="dash-chips">${mchip('busiest',fOf(N['ov-usage'],'busiest'))}${mchip('daily avg',fOf(N['ov-usage'],'daily avg'))}</div>`}</div>`,
+    'cx-usage');
+
+  const mcpA=N['af-mcp']||{};
+  const g2=mk(stack?PAD:PAD+halfW+GAP, stack?PAD+H0+GAP:PAD, stack?W:halfW, H0, 'dash-mcp s-run',
+    `<div class="gstripe"></div>`+
+    `<div class="ghead"><span class="gkind">mcp gateway · :${esc(fOf(mcpA,'port')||'14801')}</span><span class="gchip">${esc(mcpA.sub||'listening')}</span></div>`+
+    `<div class="dash-mid">MCP gateway<small>capability ladder loads at session bind · every tool call receipts</small></div>`+
+    `<div class="dash-chips">${mchip('tools',fOf(mcpA,'tools'))}${mchip('endpoint','/mcp')}${mchip('transport','http + stdio shim')}${mchip('auth',fOf(ovn,'mode')||fOf(ovn,'auth_mode')||'local_only')}${mchip('agents',fOf(ovn,'sessions'))}</div>`,
+    'cx-raw');
+
+  /* row 1: daemon hero + work totals */
+  const row1Y = stack ? PAD+(H0+GAP)*2 : PAD+H0+GAP;
+  const hero=mk(PAD, row1Y, stack?W:heroW, H1, 'dash-hero s-run',
+    `<div class="gstripe"></div>`+
+    `<div class="ghead"><span class="gkind">daemon · overview</span><span class="gchip">${typeof LIVE!=='undefined'&&LIVE?'live':'demo'}</span></div>`+
+    `<div class="dash-title">${esc(fOf(ovn,'mode')||fOf(ovn,'auth_mode')||'local_only')} · ${esc(ovn.sub||'ce:4e6c4e2a:local')}</div>`+
+    `<div class="dash-num">${esc(fOf(ovn,'facts')||'—')}<small>facts in the local store</small></div>`+
+    `<div class="dash-chips">${mchip('sessions',fOf(ovn,'sessions'))}${mchip('bg sync',fOf(ovn,'bg sync'))}${mchip('degraded',fOf(ovn,'degraded'))}${aChip('af-heap')}${aChip('af-uptime')}${aChip('af-build')}${aChip('af-mcp')}</div>`,
+    'cx-overview');
+
+  /* tasks: totals + aggregate progress + top plans */
+  const tx=stack?PAD:PAD+heroW+GAP, ty=stack?row1Y+H1+GAP:row1Y, tw=stack?W:W-heroW-GAP;
+  const plans=eps.slice().sort((a,b)=>(stateOf(a)==='in_progress'?-1:1)-(stateOf(b)==='in_progress'?-1:1)).slice(0,3)
+    .map(p=>{ const ms=msStats(p); const pct=ms?Math.round(100*ms.done/ms.total):(stateOf(p)==='done'?100:0);
+      return `<div class="dp"><span class="dp-n">${esc(displayTitle(p))}</span><span class="dp-bar"><i style="width:${pct}%"></i></span><span class="dp-v">${pct}%</span></div>`; }).join('');
+  const tasks=mk(tx, ty, tw, H1, 'dash-tasks',
+    `<div class="gstripe"></div>`+
+    `<div class="ghead"><span class="gkind">work · kanban</span>${eps.length?`<span class="gcount">${eps.length}</span>`:''}</div>`+
+    `<div class="dash-title">Work — task totals</div>`+
+    `<div class="dash-stages"><span class="st idle">● ${counts.planned} planned</span><span class="st run">● ${counts.in_progress} in progress</span><span class="st err">● ${counts.blocked} blocked</span><span class="st ok">● ${counts.done} done</span></div>`+
+    (pr?`<div class="dbar"><i style="width:${pr.pct}%"></i></div><div class="dash-pct">${pr.done}/${pr.total} milestone gates passed · ${pr.pct}%</div>`:'')+
+    `<div class="dash-plans">${plans}</div>`,
+    'cx-work');
+
+  /* panel grid: every other panel, general info */
+  const ids=(SCOPES.find(s=>s.id==='cx')?.sections||[]).filter(id=>id!=='cx-overview'&&id!=='cx-work'&&N[id]);
+  const busY=Math.max(hero.y+hero.h, tasks.y+tasks.h)+34, gridTop=busY+26;
+  const cols=Math.max(2, Math.min(4, Math.floor((W+GAP)/(272+GAP))));
+  const gw=(W-(cols-1)*GAP)/cols, gh=128;
+  const cells=[];
+  ids.forEach((id,i)=>{
+    const n=N[id], r=Math.floor(i/cols), c=i%cols;
+    const kids=childrenOf(n).length;
+    const ffs=(n.fields||[]).slice(0,2).map(([k,v])=>`<span class="gf"><b>${esc(k)}</b>${esc(String(v))}</span>`).join('');
+    const cell=mk(PAD+c*(gw+GAP), gridTop+r*(gh+GAP), gw, gh, 's-'+norm(n.status),
+      `<div class="gstripe"></div>`+
+      `<div class="dash-g"><span class="dash-ico">${sbSvg(SB_ICONS[id]||SB_ICONS.__dot)}</span>`+
+      `<span class="dash-g-main"><span class="gtitle">${esc(n.label)}</span><span class="gsub">${esc(n.sub||'')}</span>`+
+      `<span class="gmeta">${ffs}</span></span>${kids?`<span class="gcount">${kids}</span>`:''}</div>`,
+      id);
+    cells.push(cell);
+  });
+
+  /* node connectors: hero → tasks, hero → bus → every panel card */
+  let paths='';
+  if(!stack){
+    paths+=`<path class="edge active" d="M ${hero.x+hero.w} ${hero.y+H1/2} L ${tasks.x} ${tasks.y+H1/2}"/>`;
+    /* row 0 feeds row 1: usage → daemon, gateway → work */
+    paths+=`<path class="edge active" d="M ${u.x+u.w/2} ${u.y+u.h} L ${u.x+u.w/2} ${hero.y}"/>`;
+    paths+=`<path class="edge" d="M ${g2.x+g2.w/2} ${g2.y+g2.h} L ${g2.x+g2.w/2} ${tasks.y}"/>`;
+  }
+  const hx=hero.x+hero.w/2;
+  paths+=`<path class="edge active" d="M ${hx} ${hero.y+hero.h} L ${hx} ${busY}"/>`;
+  if(cells.length){
+    const first=cells[0].x+gw/2, last=cells[Math.min(cols-1,cells.length-1)].x+gw/2;
+    paths+=`<path class="edge active" d="M ${Math.min(hx,first)} ${busY} L ${Math.max(hx,last)} ${busY}"/>`;
+    cells.slice(0,cols).forEach(c0=>{ paths+=`<path class="edge" d="M ${c0.x+gw/2} ${busY} L ${c0.x+gw/2} ${c0.y}"/>`; });
+    cells.slice(cols).forEach(c0=>{ paths+=`<path class="edge" d="M ${c0.x+gw/2} ${c0.y-GAP} L ${c0.x+gw/2} ${c0.y}"/>`; });
+  }
+  const Wt=W+PAD*2, Ht=(cells.length?cells[cells.length-1].y+gh:busY)+PAD;
+  edgesEl.setAttribute('width',Wt); edgesEl.setAttribute('height',Ht); edgesEl.setAttribute('viewBox',`0 0 ${Wt} ${Ht}`);
+  edgesEl.style.width=Wt+'px'; edgesEl.style.height=Ht+'px'; edgesEl.innerHTML=paths;
+  nodesEl.style.width=Wt+'px'; nodesEl.style.height=Ht+'px';
+  document.getElementById('orcNew').style.display='none';
+  document.getElementById('rcptVerify').style.display='none';
+  document.getElementById('workFilter').style.display='none';
+  renderCrumbs();
+}
+
+function renderScopeDash(){
+  const canvasEl=document.getElementById('canvas');
+  const cw=canvasEl.clientWidth||1100;
+  const PAD=30, GAP=18, W=Math.max(700, cw-PAD*2);
+  nodesEl.innerHTML='';
+  const scope=SCOPES.find(sc=>sc.id===activeScope)||SCOPES[0];
+  const mk=(x,y,w,h,cls,inner,openId)=>{
+    const el=document.createElement('div');
+    el.className=`gnode dash-card ${cls||''}`; el.dataset.kind='panel';
+    el.style.left=x+'px'; el.style.top=y+'px'; el.style.width=w+'px'; el.style.height=h+'px';
+    el.innerHTML=inner;
+    if(openId) el.addEventListener('click', ()=>{ PAGES[openId]?openPage(openId):dashOpen(openId); });
+    nodesEl.appendChild(el);
+    return {x,y,w,h};
+  };
+  const ids=(scope.sections||[]).filter(id=>N[id]);
+  const hero=mk(PAD, PAD, W, 84, 'dash-hero s-run',
+    `<div class="gstripe"></div>`+
+    `<div class="ghead"><span class="gkind">${esc(scope.label)} · ${esc(scope.tag)}</span><span class="gcount">${ids.length}</span></div>`+
+    `<div class="dash-title">${esc(scope.tag)}</div>`+
+    `<div class="gsub">every card is an operator page — click to configure</div>`, null);
+  const busY=PAD+84+30, gridTop=busY+26;
+  const cols=Math.max(2, Math.min(4, Math.floor((W+GAP)/(272+GAP))));
+  const gw=(W-(cols-1)*GAP)/cols, gh=128;
+  const cells=[];
+  ids.forEach((id,i)=>{
+    const n=N[id], r=Math.floor(i/cols), c=i%cols;
+    const kids=childrenOf(n).length;
+    const ffs=(n.fields||[]).slice(0,2).map(([k,v])=>`<span class="gf"><b>${esc(k)}</b>${esc(String(v))}</span>`).join('');
+    const cell=mk(PAD+c*(gw+GAP), gridTop+r*(gh+GAP), gw, gh, 's-'+norm(n.status),
+      `<div class="gstripe"></div>`+
+      `<div class="dash-g"><span class="dash-ico">${sbSvg(SB_ICONS[id]||SB_ICONS.__dot)}</span>`+
+      `<span class="dash-g-main"><span class="gtitle">${esc(n.label)}</span><span class="gsub">${esc(n.sub||'')}</span>`+
+      `<span class="gmeta">${ffs}</span></span>${kids?`<span class="gcount">${kids}</span>`:''}</div>`,
+      id);
+    cells.push(cell);
+  });
+  let paths='';
+  const hx=hero.x+hero.w/2;
+  paths+=`<path class="edge active" d="M ${hx} ${hero.y+hero.h} L ${hx} ${busY}"/>`;
+  if(cells.length){
+    const first=cells[0].x+gw/2, last=cells[Math.min(cols-1,cells.length-1)].x+gw/2;
+    paths+=`<path class="edge active" d="M ${Math.min(hx,first)} ${busY} L ${Math.max(hx,last)} ${busY}"/>`;
+    cells.slice(0,cols).forEach(c0=>{ paths+=`<path class="edge" d="M ${c0.x+gw/2} ${busY} L ${c0.x+gw/2} ${c0.y}"/>`; });
+    cells.slice(cols).forEach(c0=>{ paths+=`<path class="edge" d="M ${c0.x+gw/2} ${c0.y-GAP} L ${c0.x+gw/2} ${c0.y}"/>`; });
+  }
+  const Wt=W+PAD*2, Ht=(cells.length?cells[cells.length-1].y+gh:busY)+PAD;
+  edgesEl.setAttribute('width',Wt); edgesEl.setAttribute('height',Ht); edgesEl.setAttribute('viewBox',`0 0 ${Wt} ${Ht}`);
+  edgesEl.style.width=Wt+'px'; edgesEl.style.height=Ht+'px'; edgesEl.innerHTML=paths;
+  nodesEl.style.width=Wt+'px'; nodesEl.style.height=Ht+'px';
+  document.getElementById('orcNew').style.display='none';
+  document.getElementById('rcptVerify').style.display='none';
+  document.getElementById('workFilter').style.display='none';
+  renderCrumbs();
+}
+
 function render(){
+  populatePassportFilter();   /* options track whatever passports the loaded data mentions */
+  if(dashMode && !searchActive && !focusMode){ renderDash(); return; }
   positions={}; let maxBottom=0;
   const canvasEl=document.getElementById('canvas');
   const cw=canvasEl.clientWidth||1000, chh=canvasEl.clientHeight||640;
@@ -1212,15 +1730,35 @@ function render(){
 
   const colX=[]; let x=PAD_X;
   for(let c=0;c<view.length;c++){ colX[c]=x; x += ((focusMode&&c===0)?hw:COL_W) + COL_GAP; }
+  const groupHeads=[];
   view.forEach((colObj,c)=>{
     const w=(focusMode&&c===0)?hw:COL_W, h=(focusMode&&c===0)?heroH:NODE_H, n=colObj.nodes.length;
+    /* long mixed-kind columns get contiguous-run section headers so big child
+       lists read as clusters, not one wall */
+    const grouped = !(focusMode&&c===0) && !searchActive && n>5
+      && new Set(colObj.nodes.map(nd=>nd.kind)).size>1;
+    const items=[];
+    for(let j=0;j<n;j++){
+      const nd=colObj.nodes[j];
+      if(grouped && (j===0 || nd.kind!==colObj.nodes[j-1].kind)){
+        let run=j; while(run<n && colObj.nodes[run].kind===nd.kind) run++;
+        items.push({head:nd.kind, count:run-j});
+      }
+      items.push({node:nd});
+    }
+    const totalH=items.reduce((a,it)=>a+(it.node?h:GROUP_H)+NODE_GAP,0)-NODE_GAP;
     let startY;
     if(c===0) startY=PAD_Y;
-    else { const pp=positions[`${c-1}:${colObj.parentId}`]; const H=n*NODE_H+(n-1)*NODE_GAP; const pc=pp?pp.y+pp.h/2:PAD_Y+H/2; startY=Math.max(PAD_Y, pc-H/2); }
-    colObj.nodes.forEach((node,j)=>{
-      const y=startY + j*(NODE_H+NODE_GAP);
-      positions[`${c}:${node.id}`]={x:colX[c],y,w,h,node,col:c};
-      maxBottom=Math.max(maxBottom, y+h);
+    else { const pp=positions[`${c-1}:${colObj.parentId}`]; const pc=pp?pp.y+pp.h/2:PAD_Y+totalH/2; startY=Math.max(PAD_Y, pc-totalH/2); }
+    let yy=startY;
+    items.forEach(it=>{
+      if(it.node){
+        positions[`${c}:${it.node.id}`]={x:colX[c],y:yy,w,h,node:it.node,col:c};
+        maxBottom=Math.max(maxBottom, yy+h); yy+=h+NODE_GAP;
+      } else {
+        groupHeads.push({x:colX[c],y:yy,w,label:it.head,count:it.count});
+        maxBottom=Math.max(maxBottom, yy+GROUP_H); yy+=GROUP_H+NODE_GAP;
+      }
     });
   });
   // ── artefact grid: artefacts render alongside their parent (focus hero, OR any node in the
@@ -1278,13 +1816,15 @@ function render(){
     el.dataset.kind=node.kind;
     el.style.left=p.x+'px'; el.style.top=p.y+'px'; el.style.width=p.w+'px'; el.style.height=p.h+'px';
     if(isHero){
-      const ff=(node.fields||[]).slice(0,6).map(([k,v])=>`<span class="k">${esc(k)}</span><span class="v">${esc(v)}</span>`).join('');
+      const ff=(node.fields||[]).slice(0,8).map(([k,v])=>`<span class="k">${esc(k)}</span><span class="v">${esc(v)}</span>`).join('');
       let body = node.doc ? esc(node.doc) : (node.payload? esc(node.payload) : '');
       if(searchHighlight && body) body=hl(body, searchHighlight);
       const seg=(node.seglinks||[]).map(([lbl,ref])=>`<span class="sl" data-ref="${esc(ref)}">${esc(lbl)}</span>`).join('');
+      const hpr=progressOf(node);
       el.innerHTML=`<button class="hero-x" title="Exit focus">×</button>`+
-                   `<div class="gstripe"></div><div class="gkind">${esc(node.kind)}</div>`+
-                   `<div class="gtitle">${esc(node.label)}</div>`+
+                   `<div class="gstripe"></div><div class="gkind">${esc(node.kind)}${node.status?` · ${chipText(node.status)}`:''}</div>`+
+                   `<div class="gtitle">${esc(displayTitle(node))}</div>`+
+                   (hpr?`<div class="gbar hero"><i style="width:${hpr.pct}%"></i></div><div class="gpct hero">${hpr.done}/${hpr.total} milestones · ${hpr.pct}%</div>`:'')+
                    (ff?`<div class="herofields">${ff}</div>`:'')+
                    (body?`<div class="gdoc">${body}</div>`:'')+
                    (seg?`<div class="seglinks">${seg}</div>`:'')+
@@ -1304,11 +1844,22 @@ function render(){
       });
       return; // hero is the focused root: no click/dblclick so the doc stays selectable
     }
-    const row2 = node.status
-      ? `<div class="grow2"><span class="gchip">${chipText(node.status)}</span>${node.sub?`<span class="gsub">${esc(node.sub)}</span>`:''}</div>`
-      : (node.sub?`<div class="grow2"><span class="gsub">${esc(node.sub)}</span></div>`:'');
+    const kidsN = childrenOf(node).length + (node.artefacts?node.artefacts.length:0);
+    const pr = progressOf(node);
+    const head = `<div class="ghead"><span class="gkind">${esc(node.kind)}</span>`
+               + (node.status?`<span class="gchip">${chipText(node.status)}</span>`:'')
+               + (kidsN?`<span class="gcount" title="${kidsN} linked">${kidsN}</span>`:'')
+               + `</div>`;
+    const ffs = (node.fields||[]).slice(0, pr?1:2)
+      .map(([k,v])=>`<span class="gf"><b>${esc(k)}</b>${esc(String(v))}</span>`).join('');
+    const meta = (ffs||pr)
+      ? `<div class="gmeta">${ffs}${pr?`<span class="gpct">${pr.done}/${pr.total} · ${pr.pct}%</span>`:''}</div>`
+      : '';
+    const bar = pr?`<div class="gbar"><i style="width:${pr.pct}%"></i></div>`:'';
     const isMember = buildingId && p.col>0 && (N[buildingId].children||[]).includes(node.id);   // attached to the orchestrator being built/edited
-    el.innerHTML=`<div class="gstripe"></div><div class="gkind">${esc(node.kind)}</div><div class="gtitle">${esc(node.label)}</div>${row2}<span class="gcaret">›</span>`
+    el.innerHTML=`<div class="gstripe"></div>${head}<div class="gtitle">${esc(displayTitle(node))}</div>`
+                 + (node.sub?`<div class="gsub">${esc(node.sub)}</div>`:'')
+                 + meta + bar + `<span class="gcaret">›</span>`
                  + (isMember?`<button class="gdetach" title="Remove from orchestrator">×</button>`:'');
     el.addEventListener('click', async ()=>{ if(searchActive){ openSearchResult(node); return; } if(node.__status){ if(node.kind==='error') retryLoad(node); return; } await ensureLoaded(node); expand(node, p.col); });
     el.addEventListener('dblclick', async e=>{ e.preventDefault(); if(node.__status) return; await ensureLoaded(node); focusNode(node, p.col); });
@@ -1318,6 +1869,13 @@ function render(){
       el.addEventListener('dragleave', ()=>el.classList.remove('dragover'));
       el.addEventListener('drop', e=>{ e.preventDefault(); el.classList.remove('dragover'); const id=e.dataTransfer.getData('text/plain'); if(id) dropOntoOrc(node, id); });
     }
+    nodesEl.appendChild(el);
+  });
+  // kind-run section headers for long mixed columns
+  groupHeads.forEach(g=>{
+    const el=document.createElement('div'); el.className='ggroup';
+    el.style.left=g.x+'px'; el.style.top=g.y+'px'; el.style.width=g.w+'px'; el.style.height=GROUP_H+'px';
+    el.innerHTML=`<span>${esc(g.label)}</span><i></i><b>${g.count}</b>`;
     nodesEl.appendChild(el);
   });
   // artefact cards
@@ -1362,6 +1920,12 @@ function renderCrumbs(){
     });
     return;
   }
+  if(columns[0] && columns[0].parentId){   // solo mode: the rail panel is the root crumb
+    const sep=document.createElement('span'); sep.className='sep'; sep.textContent='›'; bc.appendChild(sep);
+    const rn=N[columns[0].parentId];
+    const seg=document.createElement('span'); seg.className='c head'; seg.textContent=(rn&&rn.label)||columns[0].parentId;
+    seg.onclick=()=>{ if(rn) soloPanel(rn.id); }; bc.appendChild(seg);
+  }
   for(let c=1;c<columns.length;c++){
     const sep=document.createElement('span'); sep.className='sep'; sep.textContent='›'; bc.appendChild(sep);
     const node=N[columns[c].parentId];
@@ -1374,7 +1938,10 @@ function renderCrumbs(){
 const pillsEl=document.getElementById('scopePills');
 SCOPES.forEach(s=>{ const b=document.createElement('span'); b.className='wc-centre-pill'; b.dataset.scope=s.id; b.innerHTML=`${s.label}<small>${s.tag}</small>`; b.addEventListener('click',()=>openScope(s.id)); pillsEl.appendChild(b); });
 document.getElementById('focusExit').addEventListener('click', ()=>exitFocus());
-document.getElementById('themeBtn').addEventListener('click', ()=>{ const d=document.documentElement.classList.toggle('dark'); try{ localStorage.setItem('cx-theme', d?'dark':'light'); }catch(e){} });
+document.getElementById('themeBtn').addEventListener('click', ()=>{ const d=document.documentElement.classList.toggle('dark'); try{ localStorage.setItem('cx-theme', d?'dark':'light'); }catch(e){}
+  const fr=document.getElementById('cx3dFrame');   // keep the embedded 3D in step
+  if(fr && fr.dataset.booted && fr.contentWindow) fr.contentWindow.postMessage({type:'cx3d:theme', theme:d?'dark':'light'}, location.origin);
+});
 
 /* inspector: drag-resize (left/right) + hide toggle */
 const aside=document.getElementById('inspector'), asideResize=document.getElementById('asideResize');
@@ -1662,6 +2229,656 @@ async function coordDeepLink(){
   const p=N['cx-coord'];
   if(p){ await ensureLoaded(p); expand(p, 0); }
 }
+
+/* ── left icon rail: click a panel icon → show ONLY that panel's nodes ──
+   (home icon restores the full panels column; openScope clears solo mode) */
+var soloPanelId=null;
+const SB_ICONS={
+  __home:'<rect x="4" y="4" width="7" height="7" rx="1.5"/><rect x="13" y="4" width="7" height="7" rx="1.5"/><rect x="4" y="13" width="7" height="7" rx="1.5"/><rect x="13" y="13" width="7" height="7" rx="1.5"/>',
+  __dot:'<circle cx="12" cy="12" r="3"/>',
+  'cx-overview':'<path d="M5.5 19a9 9 0 1 1 13 0"/><path d="m12 13 3.5-3.5"/>',
+  'cx-projects':'<path d="M3.5 6.5a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>',
+  'cx-work':'<rect x="4" y="4" width="4.4" height="11" rx="1.4"/><rect x="9.8" y="4" width="4.4" height="16" rx="1.4"/><rect x="15.6" y="4" width="4.4" height="8" rx="1.4"/>',
+  'cx-coord':'<circle cx="12" cy="12" r="2.2"/><path d="M7.4 16.6a6.5 6.5 0 0 1 0-9.2M16.6 7.4a6.5 6.5 0 0 1 0 9.2M4.6 19.4a10.5 10.5 0 0 1 0-14.8M19.4 4.6a10.5 10.5 0 0 1 0 14.8"/>',
+  'cx-sessions':'<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7 9 3 3-3 3M12.5 15H17"/>',
+  'cx-orchestrators':'<circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="8" r="2.4"/><path d="M6 8.4v7.2M18 10.4c0 3-2.5 4.6-5.5 4.6H8.4"/>',
+  'cx-punchcards':'<path d="M4 8a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2a2 2 0 0 0 0 4v2a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-2a2 2 0 0 0 0-4z"/><path d="M13.5 6v2.2M13.5 11v2M13.5 15.8V18"/>',
+  'cx-passport':'<rect x="4" y="4" width="16" height="16" rx="2.5"/><circle cx="12" cy="10" r="2.6"/><path d="M7.5 17c.9-2 2.6-3 4.5-3s3.6 1 4.5 3"/>',
+  'cx-receipts':'<circle cx="12" cy="12" r="8.5"/><path d="m8.5 12.2 2.4 2.4 4.6-4.8"/>',
+  'cx-integrations':'<path d="M9 3v4.5M15 3v4.5M7 7.5h10V11a5 5 0 0 1-10 0zM12 16v5"/>',
+  'cx-extensions':'<path d="M10 4h4v3.2a1.8 1.8 0 1 0 3.6 0V7H20v4h-2.8a1.8 1.8 0 1 0 0 3.6H20V20H4v-4h2.8a1.8 1.8 0 1 0 0-3.6H4V8h6z"/>',
+  'cx-facts':'<ellipse cx="12" cy="5.5" rx="7.5" ry="2.8"/><path d="M4.5 5.5v13c0 1.6 3.4 2.8 7.5 2.8s7.5-1.2 7.5-2.8v-13M4.5 12c0 1.6 3.4 2.8 7.5 2.8s7.5-1.2 7.5-2.8"/>',
+  'cx-memory':'<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
+  'cx-tenants':'<rect x="5" y="3.5" width="14" height="17" rx="1.5"/><path d="M9 7.5h2M13 7.5h2M9 11h2M13 11h2M9 14.5h2M13 14.5h2M10.5 20.5v-3h3v3"/>',
+  'cx-settings':'<path d="M4 7h8M16 7h4M4 12h2M10 12h10M4 17h11M19 17h1"/><circle cx="14" cy="7" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="17" cy="17" r="2"/>',
+  'cx-raw':'<path d="m8.5 8-4 4 4 4M15.5 8l4 4-4 4"/>',
+  'cx-usage':'<path d="M5 19V9.5M10 19V4.5M15 19v-7M20 19v-11M3 21h18"/>',
+  'cx-documents':'<path d="M7 3.5h7l4 4V17a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5.5a2 2 0 0 1 2-2z"/><path d="M14 3.5V8h4M3.5 20.5h13"/>',
+  'cx-gates':'<path d="M12 3.5 19 6v5c0 4.6-3 7.9-7 9.5-4-1.6-7-4.9-7-9.5V6z"/><path d="m9 11.5 2 2 4-4"/>',
+  'cx-mediation':'<path d="M4 7h4l8 10h4M4 17h4M16 7h4M20 7l-2-2M20 7l-2 2M20 17l-2-2M20 17l-2 2"/>',
+  'cx-workbench':'<rect x="3.5" y="8" width="17" height="12" rx="2"/><path d="M9 8V6a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M3.5 13.5h17"/>',
+  'dx-articles':'<path d="M6 3.5h8l4.5 4.5V19a1.5 1.5 0 0 1-1.5 1.5H6A1.5 1.5 0 0 1 4.5 19V5A1.5 1.5 0 0 1 6 3.5z"/><path d="M14 3.5V8h4.5M8 12.5h8M8 16h8"/>',
+  'dx-readme':'<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15.5H6.5A2.5 2.5 0 0 0 4 21z"/><path d="M4 18.5A2.5 2.5 0 0 1 6.5 16H20M8 7.5h8"/>',
+  'dx-sites':'<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.7 2.6 2.7 14.4 0 17-2.7-2.6-2.7-14.4 0-17z"/>',
+  'gx-engrams':'<circle cx="6.5" cy="7" r="2.4"/><circle cx="17.5" cy="7" r="2.4"/><circle cx="12" cy="17" r="2.4"/><path d="M8.4 8.4 10.7 15M15.6 8.4 13.3 15M8.9 7h6.2"/>',
+  'gx-bench':'<path d="M5.5 19a9 9 0 1 1 13 0"/><path d="m12 13 3.5-3.5"/>',
+  'gx-sites':'<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.7 2.6 2.7 14.4 0 17-2.7-2.6-2.7-14.4 0-17z"/>',
+  'gx-factstore':'<ellipse cx="12" cy="5.5" rx="7.5" ry="2.8"/><path d="M4.5 5.5v13c0 1.6 3.4 2.8 7.5 2.8s7.5-1.2 7.5-2.8v-13M4.5 12c0 1.6 3.4 2.8 7.5 2.8s7.5-1.2 7.5-2.8"/>',
+  'ax-overview':'<path d="M5.5 19a9 9 0 1 1 13 0"/><path d="m12 13 3.5-3.5"/>',
+  'ax-activity':'<path d="M3 12h4l3-7 4 14 3-7h4"/>',
+  'ax-memory':'<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
+  'ax-bulk':'<path d="m12 3 9 5-9 5-9-5z"/><path d="m3 13 9 5 9-5M3 17l9 5 9-5"/>',
+  'ax-snapshots':'<rect x="3.5" y="6" width="17" height="14" rx="2.5"/><path d="M8 6 9.5 3.5h5L16 6"/><circle cx="12" cy="13" r="3.4"/>',
+  'ax-tools':'<path d="M4 7h8M16 7h4M4 12h2M10 12h10M4 17h11M19 17h1"/><circle cx="14" cy="7" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="17" cy="17" r="2"/>',
+  'ax-handoff':'<path d="M7 7.5h10M17 7.5 14 4.5M17 7.5l-3 3M17 16.5H7M7 16.5l3-3M7 16.5l3 3"/>',
+  'ax-graph':'<circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="8" r="2.4"/><path d="M6 8.4v7.2M18 10.4c0 3-2.5 4.6-5.5 4.6H8.4"/>',
+  'ax-storybook':'<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15.5H6.5A2.5 2.5 0 0 0 4 21z"/><path d="M4 18.5A2.5 2.5 0 0 1 6.5 16H20"/>',
+  'ax-dossiers':'<path d="M3.5 6.5a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>',
+  'ax-story':'<path d="M8 5.5v13l11-6.5z"/>',
+};
+function sbSvg(p){ return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${p}</svg>`; }
+function updateSidebarActive(){
+  document.querySelectorAll('#sidebar .sb-item').forEach(b=>{
+    const on = (typeof viewMode!=='undefined' && viewMode==='3d')
+      ? (b.dataset.panel ? b.dataset.panel===cx3dPanel : !cx3dPanel)
+      : (b.dataset.panel ? b.dataset.panel===soloPanelId : (!soloPanelId && activeScope==='cx'));
+    b.classList.toggle('active', on);
+  });
+}
+async function soloPanel(id, opts){
+  const node=N[id]; if(!node) return;
+  if(PAGES[id] && !(opts&&opts.graph)){ openPage(id); return; }   // operator page first; graph on request
+  closePage();
+  if(buildingId) teardownBuild();
+  activeScope=(SCOPES.find(sc=>sc.sections.includes(id))||{id:'cx'}).id;
+  focusMode=false; heroUserW=null; focusTrail=[]; preFocus=null;
+  searchActive=false; searchHighlight=''; searchReturn=null; focusFromSearch=false;
+  Object.keys(workStages).forEach(k=>workStages[k]=true);
+  document.querySelectorAll('#workFilter .wf-chip').forEach(ch=>ch.classList.add('on'));
+  soloPanelId=id; selectedId=id; dashMode=false;
+  closeInspector();
+  /* rail click lands straight on the panel's CHILDREN — no primary node card
+     (e.g. Work shows just the execplans). parentId carries the panel id so
+     stage filters + toolbar rules still recognise the column. */
+  columns=[{parentId:node.id, nodes:childrenOf(node)}];
+  document.querySelectorAll('.wc-centre-pill').forEach(p=>p.classList.toggle('wc-centre-pill--active', p.dataset.scope===activeScope));
+  document.getElementById('focusExit').style.display='none';
+  render();
+  await ensureLoaded(node);
+  if(soloPanelId!==id) return;          // user moved on while the panel was loading
+  columns=[{parentId:node.id, nodes:childrenOf(node)}];
+  render();
+  updateSidebarActive();
+}
+function buildSidebar(){
+  const sb=document.getElementById('sidebar'); if(!sb) return;
+  sb.innerHTML='';
+  const scopeId=(typeof activeScope!=='undefined'&&activeScope)||'cx';
+  const home=document.createElement('button'); home.className='sb-item'; home.title='All panels';
+  home.setAttribute('aria-label','Show all panels'); home.innerHTML=sbSvg(SB_ICONS.__home);
+  home.onclick=()=>{ (typeof viewMode!=='undefined' && viewMode==='3d') ? filter3dPanel(null) : openScope(scopeId); };
+  sb.appendChild(home);
+  const sep=document.createElement('div'); sep.className='sb-sep'; sb.appendChild(sep);
+  (SCOPES.find(s=>s.id===scopeId)?.sections||[]).filter(id=>id!=='cx-overview').forEach(id=>{
+    /* overview lives on the home dashboard now — no rail icon needed */
+    const n=N[id]; if(!n) return;
+    const b=document.createElement('button'); b.className='sb-item'; b.dataset.panel=id;
+    if(!PANEL_TO_DISTRICT[id]) b.dataset.no3d='1';   // dimmed while the 3D view is up
+    b.title=n.label+(n.sub?' — '+n.sub:''); b.setAttribute('aria-label','Show only '+n.label);
+    b.innerHTML=sbSvg(SB_ICONS[id]||SB_ICONS.__dot);
+    b.onclick=()=>{ (typeof viewMode!=='undefined' && viewMode==='3d') ? filter3dPanel(id) : soloPanel(id); };
+    sb.appendChild(b);
+  });
+  updateSidebarActive();
+}
+/* ── 2D ⇄ 3D view switch: the canvas swaps to the Crux Substrate iframe; the
+   inspector (3D-style detail pane) is shared — focus round-trips postMessage ── */
+var viewMode='2d';
+/* the ONE left rail drives both views — panel → 3D district mapping */
+var PANEL_TO_DISTRICT={ 'cx-work':'work', 'cx-sessions':'sessions', 'cx-passport':'passport',
+  'cx-receipts':'receipts', 'cx-facts':'memory', 'cx-memory':'memory',
+  'cx-coord':'coord', 'cx-punchcards':'coord', 'cx-raw':'core' };
+var cx3dPanel=null;
+function filter3dPanel(id){
+  cx3dPanel=id;
+  const fr=document.getElementById('cx3dFrame');
+  if(fr && fr.dataset.booted && fr.contentWindow)
+    fr.contentWindow.postMessage({type:'cx3d:filter', district:id?PANEL_TO_DISTRICT[id]||null:null}, location.origin);
+  closeInspector();
+  updateSidebarActive();
+}
+function setView(v){
+  viewMode=v; try{ localStorage.setItem('cx-view', v); }catch(e){}
+  document.getElementById('view2d').classList.toggle('on', v==='2d');
+  document.getElementById('view3d').classList.toggle('on', v==='3d');
+  document.getElementById('canvasScroll').style.display = v==='3d'?'none':'';
+  document.body.classList.toggle('view3d', v==='3d');   // the shared rail stays; unmapped icons dim
+  const fr=document.getElementById('cx3dFrame');
+  if(v==='3d'){
+    if(!fr.dataset.booted){
+      const th=document.documentElement.classList.contains('dark')?'dark':'light';
+      fr.src='console-3d/index.html?embed=1&theme='+th;
+      fr.dataset.booted='1';
+    }
+    fr.style.display='block';
+    if(fr.contentWindow) fr.contentWindow.postMessage({type:'cx3d:resume'}, location.origin);
+    closeInspector();
+  } else {
+    fr.style.display='none';
+    /* hidden iframe must stop its render loop — don't burn GPU behind the 2D view */
+    if(fr.dataset.booted && fr.contentWindow) fr.contentWindow.postMessage({type:'cx3d:pause'}, location.origin);
+  }
+  updateSidebarActive();
+}
+document.getElementById('view2d').addEventListener('click', ()=>setView('2d'));
+document.getElementById('view3d').addEventListener('click', ()=>setView('3d'));
+window.addEventListener('message', e=>{
+  if(!e.data || !String(e.data.type||'').startsWith('cx3d:')) return;
+  if(e.origin!==location.origin) return;
+  const fr=document.getElementById('cx3dFrame');
+  if(e.data.type==='cx3d:focus' && e.data.node){
+    const n=e.data.node;
+    renderInspector({ src:'3D', kind:n.kind, status:n.status, state:n.state, label:n.label, sub:n.sub||'',
+      fields:n.fields||[], doc:n.doc||'',
+      links:(n.links||[]).map(L=>({ kind:L.rel, rel:L.rel, dir:L.dir, label:L.other, explain:L.explain,
+        title:'focus in 3D', onclick:()=>{ if(fr.contentWindow) fr.contentWindow.postMessage({type:'cx3d:focusId', id:L.id}, location.origin); } })) });
+  }
+  if(e.data.type==='cx3d:unfocus') closeInspector();
+});
+document.getElementById('i-close').addEventListener('click', ()=>{
+  closeInspector();
+  const fr=document.getElementById('cx3dFrame');   // closing the pane also clears the 3D focus
+  if(viewMode==='3d' && fr.dataset.booted && fr.contentWindow)
+    fr.contentWindow.postMessage({type:'cx3d:unfocus'}, location.origin);
+});
+document.addEventListener('keydown', e=>{
+  if(e.key!=='Escape') return;
+  const sp=document.getElementById('settingsPage');
+  if(sp && sp.style.display!=='none' && sp.style.display!==''){ closeSettings(); return; }
+  closeInspector();
+  const fr=document.getElementById('cx3dFrame');   // Esc also clears the 3D focus/mode
+  if(typeof viewMode!=='undefined' && viewMode==='3d' && fr.dataset.booted && fr.contentWindow)
+    fr.contentWindow.postMessage({type:'cx3d:unfocus'}, location.origin);
+});
+/* 2D parity with 3D: clicking the empty substrate (background) hides the pane */
+document.getElementById('canvasScroll').addEventListener('click', e=>{
+  if(e.target && e.target.closest && e.target.closest('.gnode')) return;
+  closeInspector();
+});
+/* passport filter (left of search): rebuild options when the known set changes */
+let __ppSig='';
+function populatePassportFilter(){
+  const sel=document.getElementById('passportFilter'); if(!sel) return;
+  const set=new Set();
+  Object.values(N).forEach(n=>{ const p=passOf(n); if(p) set.add(p); });
+  const list=[...set].sort();
+  const sig=list.join('|');
+  if(sig===__ppSig) return;
+  __ppSig=sig;
+  const cur=passportFilter;
+  sel.innerHTML='';
+  const all=document.createElement('option'); all.value='all'; all.textContent='All passports'; sel.appendChild(all);
+  list.forEach(p=>{ const o=document.createElement('option'); o.value=p; o.textContent=p; sel.appendChild(o); });
+  sel.value=list.includes(cur)?cur:'all';
+  if(sel.value==='all') passportFilter='all';
+}
+document.getElementById('passportFilter').addEventListener('change', e=>{
+  passportFilter=e.target.value||'all';
+  render();
+});
+populatePassportFilter();
+
+/* ── Full-page cards: every config-flavoured panel gets an operator page.
+   Grounded in the legacy console (index.classic.html): auth/embedding/probe,
+   pack grants + GitHub/OpenAI config, trusted signing keys, docs tenant
+   override, create-forms. Controls persist to localStorage (concept). ── */
+var CXCONF={}; try{ CXCONF=JSON.parse(localStorage.getItem('cxconf')||'{}'); }catch(e){}
+function confGet(k,d){ return (k in CXCONF)?CXCONF[k]:d; }
+function confSet(k,v){ CXCONF[k]=v; try{ localStorage.setItem('cxconf',JSON.stringify(CXCONF)); }catch(e){} toast('saved · '+k); }
+function toast(msg){
+  let t=document.getElementById('cxToast');
+  if(!t){ t=document.createElement('div'); t.id='cxToast'; document.body.appendChild(t); }
+  t.textContent=msg; t.classList.add('show');
+  clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),1600);
+}
+const RPC_SAMPLES={
+ 'tools/list':'← { "result":{ "tools":[ {"name":"query"}, {"name":"query_facts"},\n    {"name":"store_fact"}, {"name":"save_session"}, {"name":"create_handoff"},\n    {"name":"punch_in"}, {"name":"coord_announce"}, … 93 total ] } }',
+ 'tools/call · query':'← { "result":{ "hits":4, "token_budget_used":412,\n    "chunks":[ {"chunkId":"ccxi:0:226200","score":0.91}, … ] } }',
+ 'tools/call · store_fact':'← { "result":{ "fact_id":"f_9fb33499…",\n    "receipt":"crn_d4e2…", "version":1 } }',
+ 'resources/list':'← { "result":{ "resources":[] } }',
+};
+const PAGES={
+ 'cx-settings':{title:'Console settings',sub:'persisted to data_dir/console/settings.json · auth + embedding apply on next restart',sections:[
+  {h:'Access posture',sub:'who may call :14800',controls:[
+   {t:'select',k:'auth_mode',label:'auth mode',options:['local_only','open','token','jwt_hs256 (strict)'],v:'local_only'},
+   {t:'toggle',k:'require_bind',label:'require passport binding',v:true},
+   {t:'info',label:'node id',v:'ce:4e6c4e2a:local'}]},
+  {h:'Embedding (semantic retrieval)',sub:'Crux ships no embedding model — point at your endpoint',controls:[
+   {t:'toggle',k:'embed_on',label:'enable embedding retrieval',v:false},
+   {t:'input',k:'embed_url',label:'endpoint URL',ph:'http://localhost:11434',mono:true},
+   {t:'btn',label:'Probe endpoint',hint:'fetches available models'},
+   {t:'select',k:'embed_model',label:'model',options:['—','bge-m3','nomic-embed-text','e5-large-v2'],v:'—'}],
+   doc:'Examples: http://localhost:11434 (Ollama) · http://localhost:8080 (TEI) · http://vllm:8000 (vLLM)'},
+  {h:'Sync',sub:'background sync is off by default — local-first',controls:[
+   {t:'toggle',k:'sync_on',label:'background sync',v:false},
+   {t:'input',k:'sync_remote',label:'remote',ph:'https://crux.cuecrux.com',mono:true},
+   {t:'select',k:'sync_cadence',label:'cadence',options:['manual','15m','1h','6h'],v:'manual'},
+   {t:'info',label:'pulls / pushes',v:'0 / 0'}]},
+  {h:'Memory & freshness',sub:'decay engine horizons',controls:[
+   {t:'toggle',k:'decay_on',label:'decay engine',v:true},
+   {t:'select',k:'h_volatile',label:'volatile horizon',options:['12h','24h','48h'],v:'24h'},
+   {t:'select',k:'h_medium',label:'medium horizon',options:['7d','35d','90d'],v:'35d'},
+   {t:'select',k:'h_stable',label:'stable horizon',options:['180d','365d'],v:'365d'},
+   {t:'btn',label:'Run sweep now',hint:'memory_sweep_candidates'}]},
+  {h:'Coordination & leases',controls:[
+   {t:'select',k:'punchcards',label:'punchcards',options:['off','advisory','enforce'],v:'advisory'},
+   {t:'toggle',k:'coord_on',label:'coordination plane (CORECRUXD_COORD)',v:true},
+   {t:'toggle',k:'observe_on',label:'observe / audit trail (CORECRUXD_OBSERVE)',v:false}]},
+  {h:'Retention',controls:[
+   {t:'input',k:'receipt_days',label:'receipts (days)',v:'90',mono:true},
+   {t:'info',label:'execplan facts',v:'indefinite — operator delete only'},
+   {t:'btn',label:'Export audit bundle',hint:'audit_export_bundle'}]},
+  {h:'Onboarding',controls:[{t:'btn',label:'Re-run onboarding',hint:'first-run wizard shows on next load'}]},
+  {h:'Daemon',controls:[
+   {t:'info',label:'build',v:'7417c9f · v0.4.2 · :14800'},
+   {t:'btn',label:'Restart daemon',hint:'needs restart: unless-stopped policy',danger:true}]},
+  {h:'Appearance',sub:'applies immediately',controls:[
+   {t:'theme'},{t:'info',label:'canvas',v:'2D | 3D toolbar switch'}]}]},
+ 'cx-integrations':{title:'Integrations',sub:'declarative packs — installed packs are inert until a passport grant exists',sections:[
+  {h:'Packs',sub:'enable per pack · grants are separate',controls:[
+   {t:'toggle',k:'pack_git',label:'git-pack · repo signals',v:true},
+   {t:'toggle',k:'pack_vault',label:'vault-pack · secret envelopes',v:true},
+   {t:'toggle',k:'pack_gateway',label:'gateway-pack · MCP mediation',v:true},
+   {t:'toggle',k:'pack_jobclaw',label:'jobclaw-pack · handoff queue',v:false},
+   {t:'toggle',k:'pack_fs',label:'fs-pack · file search',v:true}]},
+  {h:'GitHub source',controls:[
+   {t:'input',k:'gh_pat',label:'personal access token',ph:'ghp_…',mono:true,secret:true},
+   {t:'toggle',k:'gh_skiptls',label:'skip TLS verify (dev only)',v:false},
+   {t:'btn',label:'Verify connection'}]},
+  {h:'OpenAI · LLM pack',controls:[
+   {t:'select',k:'oa_model',label:'default model',options:['none','gpt-5.5','gpt-4o'],v:'none'},
+   {t:'input',k:'oa_key',label:'API key',ph:'sk-…',mono:true,secret:true},
+   {t:'input',k:'oa_org',label:'organisation',ph:'org-…',mono:true},
+   {t:'btn',label:'Test call'}]},
+  {h:'Grants',sub:'install alone never grants tool access',controls:[
+   {t:'info',label:'active grants',v:'3 (agent-claude · trusted)'},
+   {t:'btn',label:'Review grants'},
+   {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+ 'cx-extensions':{title:'Extensions',sub:'signed third-party manifests · per-passport grants',sections:[
+  {h:'Installed',controls:[
+   {t:'toggle',k:'ext_hooks',label:'crux-claude-hooks · v0.4.2',v:true},
+   {t:'toggle',k:'ext_wizard',label:'crux-config-wizard · v3',v:true}]},
+  {h:'Trusted signing keys',sub:'manifests verify against this keyring',controls:[
+   {t:'info',label:'daemon-root',v:'fp:12345678 · tier partner'},
+   {t:'input',k:'key_fpr',label:'passport fingerprint',ph:'fp:…',mono:true},
+   {t:'select',k:'key_tier',label:'trust tier',options:['community','verified','partner'],v:'community'},
+   {t:'input',k:'key_pub',label:'public key',ph:'ed25519:…',mono:true},
+   {t:'btn',label:'Add key'}],
+   doc:'Dev bypass: CORECRUXD_EXTENSIONS_ALLOW_UNSIGNED=1 lets unsigned manifests install for local testing only.'},
+  {h:'Install manifest',controls:[
+   {t:'input',k:'manifest_url',label:'manifest URL / path',ph:'https://… or ./ext.json',mono:true},
+   {t:'btn',label:'Install'}]}]},
+ 'cx-raw':{title:'Raw · JSON-RPC console',sub:'/mcp on :14801 · scopes header attaches automatically',sections:[
+  {h:'Request',controls:[
+   {t:'select',k:'rpc_method',label:'method',options:['tools/list','tools/call · query','tools/call · store_fact','resources/list'],v:'tools/list'},
+   {t:'textarea',k:'rpc_params',label:'params',v:'{ "token_budget": 500 }',rows:4},
+   {t:'btn',label:'Send',action:'rpc'}]},
+  {h:'Response',controls:[{t:'rpcout'}]},
+  {h:'Transport',controls:[
+   {t:'info',label:'endpoint',v:'POST /mcp · :14801'},
+   {t:'input',k:'rpc_scopes',label:'X-Corecrux-Scopes',v:'read',mono:true},
+   {t:'btn',label:'Browse recent calls as graph',action:'graph'}]}]},
+ 'cx-projects':{title:'Projects',sub:'each project pairs a planning target with allowed passports + working tenants',sections:[
+  {h:'New project',controls:[
+   {t:'input',k:'proj_name',label:'name',ph:'My project'},
+   {t:'input',k:'proj_id',label:'id',ph:'proj-slug',mono:true},
+   {t:'input',k:'proj_plan',label:'planning target',ph:'tenant:… or github:owner/repo',mono:true},
+   {t:'select',k:'proj_passport',label:'default passport',options:['ce:4e6c4e2a:local','ce:8821fa0d:local','ce:0c4419ab:remote'],v:'ce:4e6c4e2a:local'},
+   {t:'input',k:'proj_tenants',label:'working tenants',ph:'default, lme-s',mono:true},
+   {t:'btn',label:'Create project'}]},
+  {h:'Tracked',controls:[
+   {t:'info',label:'CueCrux',v:'active · 12 repos · 3 sessions'},
+   {t:'info',label:'Crux daemon · AuditCrux · PlanCrux',v:'see graph for detail'},
+   {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+ 'dx-articles':{title:'Articles',sub:'bundled docs + synced docs:: facts',sections:[
+  {h:'Docs tenant override',sub:'load articles from facts under docs::<tenant>::*',controls:[
+   {t:'input',k:'docs_tenant',label:'tenant id',ph:'cuecrux-docs',mono:true},
+   {t:'btn',label:'Save'},{t:'btn',label:'Reload'}]},
+  {h:'Bundled',controls:[
+   {t:'info',label:'mcp-system-prompt.md',v:'tool surface reference'},
+   {t:'info',label:'PLANS.md',v:'ExecPlan format'},
+   {t:'info',label:'agent-guide.md',v:'QC / threat refs'},
+   {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+ 'dx-readme':{title:'README · corecruxd',sub:'17 crates · port 14800',sections:[
+  {h:'Build & test',doc:'cargo build --release   # CPU-only daemon\ncargo test --workspace\ncargo fmt --check\ncargo clippy --workspace -- -D warnings',controls:[]},
+  {h:'Key rules',doc:'· No GPU/CUDA code — daemon is CPU-only\n· Licence headers on every .rs (CCL v1.0)\n· Port 14800 is fixed\n· No proprietary crates in this repo',controls:[
+   {t:'btn',label:'Browse sections as graph',action:'graph'}]}]},
+ 'dx-sites':{title:'External docs',sub:'linked surfaces',sections:[
+  {h:'Links',controls:[
+   {t:'info',label:'cuecrux.com',v:'marketing'},
+   {t:'info',label:'signals.cuecrux.com',v:'status'},
+   {t:'input',k:'site_label',label:'add · label',ph:'My link'},
+   {t:'input',k:'site_url',label:'add · url',ph:'https://…',mono:true},
+   {t:'btn',label:'Add link'}]}]},
+ 'gx-engrams':{title:'Engrams',sub:'shared playbooks pinned into every boot',sections:[
+  {h:'Pinned',controls:[
+   {t:'toggle',k:'eng_retrieval',label:'retrieval-playbook',v:true},
+   {t:'toggle',k:'eng_deploy',label:'deploy-gate-checklist',v:true},
+   {t:'btn',label:'Sync from remote'}],
+   doc:'WARNING — the engram admin API has no enable endpoint: disabling is one-way from the console. Re-enable requires operator surgery.'}]},
+ 'gx-bench':{title:'Bench · ScoreCrux',sub:'corpus identity is mandatory on every reported number',sections:[
+  {h:'Filters',controls:[
+   {t:'select',k:'bench_corpus',label:'corpus',options:['LME-S','LME-M','Q500'],v:'LME-S'},
+   {t:'input',k:'bench_flags',label:'lane flags',ph:'LME_INJECT_FACTS+DOSSIERS',mono:true}]},
+  {h:'Latest',controls:[
+   {t:'info',label:'LME-S gated',v:'91.7% · LME_INJECT_FACTS+DOSSIERS'},
+   {t:'info',label:'Q500 baseline',v:'87.4% · 437/500'},
+   {t:'btn',label:'Browse runs as graph',action:'graph'}],
+   doc:'Misattributing an LME-S lift to LME-M is the flagged failure mode — every row carries corpus + commit_sha + run_id.'}]},
+ 'gx-sites':{title:'Sites · hypernym surface',sub:'170,987 entries',sections:[
+  {h:'Surface',controls:[
+   {t:'select',k:'hyp_depth',label:'depth',options:['3','4','5'],v:'4'},
+   {t:'toggle',k:'hyp_auto',label:'auto-refresh on ingest',v:false},
+   {t:'btn',label:'Rebuild surface'},
+   {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+ 'gx-factstore':{title:'Fact store',sub:'local_only · 1,911 facts',sections:[
+  {h:'Store',controls:[
+   {t:'info',label:'mode',v:'local_only · tenant manifest present'},
+   {t:'toggle',k:'fs_decay',label:'decay engine',v:true},
+   {t:'input',k:'fs_topk',label:'default top_k',v:'100',mono:true},
+   {t:'btn',label:'Sweep candidates'}],
+   doc:'Reserved prefixes are born private at ingest: __agent::* · __ops::* · __bootstrap__::* — never push to a remote.'},
+  {h:'Browse',controls:[{t:'btn',label:'Browse fact groups as graph',action:'graph'}]}]},
+ 'ax-overview':{title:'Agent cockpit',sub:'2 active agents · 1 open handoff',sections:[
+  {h:'Defaults',controls:[
+   {t:'toggle',k:'ax_autocoord',label:'auto-enroll coord on session bind',v:true},
+   {t:'input',k:'ax_budget',label:'default token_budget',v:'500',mono:true},
+   {t:'btn',label:'Browse cockpit as graph',action:'graph'}]}]},
+ 'ax-activity':{title:'Activity · live tool stream',sub:'~40 events/min',sections:[
+  {h:'Stream',controls:[
+   {t:'toggle',k:'act_pause',label:'pause stream',v:false},
+   {t:'toggle',k:'act_reads',label:'show Read events',v:false},
+   {t:'toggle',k:'act_group',label:'group repeats (Read ×38)',v:true},
+   {t:'select',k:'act_level',label:'level',options:['all','warnings','errors'],v:'all'},
+   {t:'btn',label:'Clear'},
+   {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+ 'ax-memory':{title:'Agent memory',sub:'recall behaviour',sections:[
+  {h:'Recall',controls:[
+   {t:'select',k:'mem_budget',label:'token_budget default',options:['500','2000','4000'],v:'500'},
+   {t:'toggle',k:'mem_private',label:'include private facts',v:true},
+   {t:'toggle',k:'mem_fresh',label:'prefer live probe over stale metrics',v:true},
+   {t:'btn',label:'Browse recent memories as graph',action:'graph'}]}]},
+ 'ax-bulk':{title:'Bulk operations',sub:'batch ingest / export / sweep',sections:[
+  {h:'Import',controls:[
+   {t:'input',k:'bulk_tenant',label:'tenant',ph:'default',mono:true},
+   {t:'select',k:'bulk_stream',label:'stream',options:['projections','observations'],v:'projections'},
+   {t:'toggle',k:'bulk_seal',label:'force_seal',v:true},
+   {t:'btn',label:'Run import'}],
+   doc:'Gotcha (esi_v2): facts read corecruxd, not pg — surface via CoreCrux bulk-import with force_seal:true.'},
+  {h:'Export / sweep',controls:[
+   {t:'input',k:'bulk_prefix',label:'entity prefix',ph:'execplan:',mono:true},
+   {t:'btn',label:'Export JSONL'},
+   {t:'btn',label:'Run freshness sweep'}]}]},
+ 'ax-snapshots':{title:'Snapshots',sub:'session captures',sections:[
+  {h:'Capture',controls:[
+   {t:'btn',label:'Capture snapshot now'},
+   {t:'toggle',k:'snap_auto',label:'auto-capture pre-compact',v:true},
+   {t:'select',k:'snap_keep',label:'retention',options:['10','50','all'],v:'50'},
+   {t:'info',label:'latest',v:'pre-compact 13:24 · session 9c5a92…'},
+   {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+ 'ax-tools':{title:'Tools · MCP surface',sub:'93 tools exposed on :14801',sections:[
+  {h:'Surface',controls:[
+   {t:'toggle',k:'tool_query',label:'query / query_facts / query_scan',v:true},
+   {t:'toggle',k:'tool_store',label:'store_fact / save_session',v:true},
+   {t:'toggle',k:'tool_handoff',label:'create_handoff / accept_handoff',v:true},
+   {t:'toggle',k:'tool_punch',label:'punch_in / punch_out / check_punchcard',v:true},
+   {t:'toggle',k:'tool_coord',label:'coord_status / coord_announce',v:true},
+   {t:'btn',label:'Browse as graph',action:'graph'}],
+   doc:'The dynamic tool surface collapses per-session via cuecrux_session — tools outside the capability plan stay deferred.'}]},
+ 'ax-handoff':{title:'Handoff',sub:'cross-session, structured state',sections:[
+  {h:'Create',controls:[
+   {t:'select',k:'ho_to',label:'to passport',options:['ce:8821fa0d:local','ce:0c4419ab:remote'],v:'ce:8821fa0d:local'},
+   {t:'textarea',k:'ho_payload',label:'payload (facts bundle)',v:'{ "work_ids": ["agentux"] }',rows:3},
+   {t:'input',k:'ho_ttl',label:'ttl (hours)',v:'24',mono:true},
+   {t:'btn',label:'Create handoff'}]},
+  {h:'Open',controls:[
+   {t:'info',label:'opus → sonnet',v:'M4 Q500 A/B · claimed'},
+   {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+ 'ax-graph':{title:'Graph · retrieval lanes',sub:'context graph + lane flags',sections:[
+  {h:'Lanes',controls:[
+   {t:'toggle',k:'lane_topology',label:'.ccxn topology (669,658 edges)',v:false},
+   {t:'toggle',k:'lane_navtree',label:'.ccxst navtree (RAPTOR)',v:false},
+   {t:'toggle',k:'lane_frames',label:'.ccxf frame substrate',v:false},
+   {t:'input',k:'lane_allow',label:'event-lane allowlist',ph:'22 tenants',mono:true}],
+   doc:'PARK verdicts on record: topology net 0/+1-of-500 on LME-S (noise floor) · navtree 3 nulls — do not re-attempt without a new corpus.'}]},
+ 'ax-storybook':{title:'Storybook',sub:'tile + pattern catalog',sections:[
+  {h:'Catalog',controls:[
+   {t:'info',label:'node kinds',v:'20 catalogued'},
+   {t:'info',label:'panel patterns',v:'columns · hero · grid · dashboard · slide-out'},
+   {t:'btn',label:'Open 3D concept',action:'open3d'},
+   {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+ 'ax-dossiers':{title:'Dossiers',sub:'subject cards',sections:[
+  {h:'Index',controls:[
+   {t:'input',k:'dos_filter',label:'subject filter',ph:'__origin__',mono:true},
+   {t:'info',label:'lme-m / __origin__',v:'score 0.99'},
+   {t:'btn',label:'Rebuild dossiers'},
+   {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+ 'ax-story':{title:'Story · call trees',sub:'session → agents → tools',sections:[
+  {h:'Viewer',controls:[
+   {t:'select',k:'story_session',label:'session',options:['LME-M Q500 run','9c5a9271 · agent-ux'],v:'LME-M Q500 run'},
+   {t:'select',k:'story_depth',label:'depth',options:['2','3','all'],v:'all'},
+   {t:'toggle',k:'story_reads',label:'include Read calls',v:false},
+   {t:'btn',label:'Browse call tree as graph',action:'graph'}]}]},
+ 'cx-usage':{title:'Token usage',sub:'derived from save_session / pre-compact hooks · /v1/observations/aggregate',sections:[
+  {h:'Periods',sub:'input · output tokens',controls:[
+   {t:'select',k:'win',label:'window',options:['7d','30d','90d'],v:'7d'},
+   {t:'info',label:'daily avg',v:'~83k in · 11k out'},
+   {t:'info',label:'this week',v:'517k in · 67k out · 75 turns'},
+   {t:'info',label:'this month',v:'2.22M in · 288k out · 13 sessions'}]},
+  {h:'Savings vs standard session',sub:'estimate — boot banner + injected facts replace context re-reads',controls:[
+   {t:'bar',label:'standard session (est.)',pct:100,v:'750k in/wk',tone:'err'},
+   {t:'bar',label:'with Crux Daemon',pct:69,v:'517k in/wk',tone:'ok'},
+   {t:'info',label:'saved',v:'≈233k in tokens/week · −31%'}],
+   doc:'Method: without the daemon each session re-reads plans, prior\ndecisions and repo state. With Crux, the boot banner + query_facts\ninject just the deltas. TokenBurn measured prefix context at 54.8%\nof carried tokens; cache reads run 369× output volume.'},
+  {h:'Sessions vs average',sub:'avg 172k in',controls:[
+   {t:'bar',label:'agent-ux · 9c5a9271',pct:100,v:'312k · +81%',tone:'err'},
+   {t:'bar',label:'chaincrux · b17c277d',pct:35,v:'110k · −36%',tone:'ok'},
+   {t:'bar',label:'trait · f3d09a44',pct:30,v:'95k · −45%',tone:'ok'}]},
+  {h:'ExecPlans vs average',sub:'avg 86k in per plan',controls:[
+   {t:'bar',label:'agent-ux-best-in-class',pct:100,v:'271k · +214%',tone:'err'},
+   {t:'bar',label:'chaincrux-cascade-route',pct:41,v:'110k · +27%'},
+   {t:'bar',label:'trait-expansion',pct:35,v:'95k · +10%'},
+   {t:'bar',label:'plancrux-retirement',pct:24,v:'64k · −26%',tone:'ok'},
+   {t:'bar',label:'cheap-tier-llm-ab',pct:15,v:'41k · −52%',tone:'ok'},
+   {t:'bar',label:'verbatim-closeout',pct:7,v:'18k · −79%',tone:'ok'},
+   {t:'bar',label:'cruxengine-carry-all',pct:2,v:'5k · −94%',tone:'ok'}]}]},
+ 'cx-documents':{title:'Documents · ingest',sub:'what the daemon has read, per tenant — and how to feed it more',sections:[
+  {h:'Tenant browser',sub:'/v1/console/tenants · storage per corpus',controls:[
+   {t:'select',k:'doc_tenant',label:'tenant',options:['lme-s','lme-m','personal','default'],v:'lme-s'},
+   {t:'info',label:'lme-s',v:'3 docs · 25 chunks · work · ingested 2026-05-16'},
+   {t:'info',label:'lme-m',v:'2 docs · long-form streams · work'},
+   {t:'info',label:'personal',v:'1 doc · private — never syncs'},
+   {t:'btn',label:'Browse documents as graph',action:'graph'}]},
+  {h:'Ingested documents',sub:'knowledge.document.ingested.v1 events',controls:[
+   {t:'info',label:'lme-s / sess_7f3a · travel',v:'12 chunks · 2026-05-16'},
+   {t:'info',label:'lme-s / sess_91be · hotels',v:'8 chunks · 2026-05-16'},
+   {t:'info',label:'lme-s / sess_c401 · diet',v:'5 chunks'},
+   {t:'info',label:'lme-m / strm_4413 · org',v:'long-form'},
+   {t:'info',label:'lme-m / strm_77be · prefs',v:'long-form'},
+   {t:'info',label:'personal / note_01',v:'private'}]},
+  {h:'Add documents',sub:'point the agent at a path — ingest is receipted like any other write',controls:[
+   {t:'input',k:'ing_path',label:'source path / glob',ph:'~/docs/**/*.md or /srv/corpus/',mono:true},
+   {t:'select',k:'ing_tenant',label:'target tenant',options:['default','lme-s','lme-m','personal','new tenant…'],v:'default'},
+   {t:'select',k:'ing_chunking',label:'chunking profile',options:['default · 512 tok','markdown-aware','code-aware'],v:'default · 512 tok'},
+   {t:'toggle',k:'ing_watch',label:'watch folder for changes',v:false},
+   {t:'toggle',k:'ing_ner',label:'extract entities (NER)',v:true},
+   {t:'toggle',k:'ing_dossiers',label:'build dossiers',v:false},
+   {t:'btn',label:'Scan path',hint:'/v1/workspace/scan — counts candidates first'},
+   {t:'btn',label:'Queue ingest',hint:'stores ingest:queue fact — the agent picks it up'}],
+   doc:'Agent flow: the queued path is stored as a fact\n(entity ingest:queue) with chunking + tenant opts.\nThe next bound session sees it in the boot banner,\nruns the backfill (/v1/append per chunk), and seals\na CROWN receipt per document. Nothing ingests\nwithout an attributed actor.'},
+  {h:'Pipeline',sub:'storage + extraction state',controls:[
+   {t:'info',label:'queue',v:'0 pending'},
+   {t:'info',label:'last ingest',v:'2026-05-16 · lme-s · 25 chunks · receipt crn_91b2…'},
+   {t:'info',label:'storage by kind',v:'.ccxe 5.26 GiB · .ccxs 280 MB · bm25 153M postings'},
+   {t:'btn',label:'Open storage breakdown',action:'graph'}],
+   doc:'Three-place wiring rule: a new on-disk artifact\nkind must be added to the storage allowlist, the\nprojection registry, AND load-at-startup — missing\none quarantines it on restart.'}]},
+ 'cx-gates':{title:'Pending gates',sub:'human approvals — destructive / high-risk transitions wait here (Art. 14)',sections:[
+  {h:'Awaiting approval',controls:[
+   {t:'info',label:'release-readiness M1',v:'HIGH · prod cutover · withheld'},
+   {t:'btn',label:'Approve M1 cutover',danger:true,hint:'records approving passport + timestamp'},
+   {t:'info',label:'wave1-orchestration',v:'MEDIUM · serialized security plans'},
+   {t:'btn',label:'Approve wave1',danger:true},
+   {t:'btn',label:'Withhold all',hint:'keeps gates pending'}],
+   doc:'GET /v1/work/gate/pending → POST /v1/work/{id}/transitions.\nApproval of one destructive action never extends to others;\ngates cannot auto-approve past timeout without a documented\nfallback policy.'}]},
+ 'cx-mediation':{title:'Mediation & policy',sub:'the gateway plane — identity, capability ladder, foresight',sections:[
+  {h:'Principal',controls:[
+   {t:'info',label:'passport',v:'ce:4e6c4e2a:local · tier basic'},
+   {t:'info',label:'capabilities',v:'14 loaded at session bind'},
+   {t:'btn',label:'Resolve principal',hint:'GET /v1/principal/resolve'}]},
+  {h:'Capability ladder',controls:[
+   {t:'info',label:'session_context · journal_append',v:'free tier'},
+   {t:'info',label:'proof_verify · memory.freshness',v:'free tier'},
+   {t:'info',label:'approval.risk_tiered',v:'gated · Art.14'},
+   {t:'btn',label:'View full ladder',hint:'GET /v1/policy/capabilities'}]},
+  {h:'Foresight (Art. 15)',controls:[
+   {t:'input',k:'enrich_action',label:'action to preview',ph:'delete tenant lme-s',mono:true},
+   {t:'btn',label:'Preview consequences',hint:'POST /v1/actions/enrich'}],
+   doc:'Enrich returns predicted consequences + affected principals and\nresources BEFORE a high-risk action runs. Surprises here mean\nstop and re-confirm with the operator.'},
+  {h:'Receipts',controls:[
+   {t:'info',label:'mediation receipts',v:'WAL · 12 in 24h'},
+   {t:'btn',label:'Open receipts panel',action:'graph'}]}]},
+ 'cx-workbench':{title:'Workbench',sub:'operator tooling over /v1/workbench/*',sections:[
+  {h:'Briefing',controls:[
+   {t:'btn',label:'Generate brief',hint:'/v1/workbench/brief'},
+   {t:'btn',label:'Build context pack',hint:'/v1/workbench/context-pack'},
+   {t:'info',label:'command ledger',v:'48 commands · 0 failures today'}]},
+  {h:'Preflight',controls:[
+   {t:'input',k:'wb_target',label:'impact target',ph:'crates/corecruxd/src/http',mono:true},
+   {t:'btn',label:'Run impact preflight',hint:'/v1/workbench/impact-preflight'},
+   {t:'select',k:'wb_policy',label:'policy profile',options:['eu-ai-act','workspace','none'],v:'eu-ai-act'},
+   {t:'btn',label:'Simulate policy',hint:'/v1/workbench/policy-simulation'}]},
+  {h:'Drift & timeline',controls:[
+   {t:'info',label:'api drift',v:'0 breaking · 2 additive since v0.4.2'},
+   {t:'info',label:'reasoning timeline',v:'/v1/workbench/reasoning-timeline'},
+   {t:'btn',label:'Probe route',hint:'/v1/workbench/route-probe'}]},
+  {h:'Feature registry',sub:'/v1/features/capabilities (post-M5 cutover)',controls:[
+   {t:'info',label:'gap analysis',v:'2 critical · 5 high'},
+   {t:'info',label:'promise coverage',v:'78% audited'},
+   {t:'btn',label:'Record capability audit',hint:'POST …/capabilities/{id}/audit'}]}]},
+};
+function openSettings(){ openPage('cx-settings'); }
+function closeSettings(){ closePage(); }
+function closePage(){ const el=document.getElementById('settingsPage'); if(el) el.style.display='none'; }
+function openPage(id){
+  const def=PAGES[id]; if(!def) return;
+  let el=document.getElementById('settingsPage');
+  if(!el){ el=document.createElement('div'); el.id='settingsPage'; (document.getElementById('canvas')||document.body).appendChild(el); }
+  el.innerHTML='';
+  const head=document.createElement('div'); head.className='sp-head';
+  const chip=document.createElement('span'); chip.className='ichip'; chip.textContent=(N[id]&&N[id].kind)||'panel'; head.appendChild(chip);
+  const h1=document.createElement('h1'); h1.textContent=def.title; head.appendChild(h1);
+  if(def.sub){ const sb=document.createElement('span'); sb.className='sp-headsub'; sb.textContent=def.sub; head.appendChild(sb); }
+  const x=document.createElement('button'); x.id='sp-close'; x.title='Close (Esc)'; x.textContent='×'; x.onclick=closePage; head.appendChild(x);
+  el.appendChild(head);
+  const grid=document.createElement('div'); grid.className='sp-grid'; el.appendChild(grid);
+  def.sections.forEach(sec=>{
+    const card=document.createElement('div'); card.className='sp-card';
+    const h=document.createElement('h2'); h.textContent=sec.h; card.appendChild(h);
+    if(sec.sub){ const su=document.createElement('div'); su.className='sp-sub'; su.textContent=sec.sub; card.appendChild(su); }
+    (sec.controls||[]).forEach(c=>card.appendChild(renderControl(id,c)));
+    if(sec.doc){ const pre=document.createElement('pre'); pre.textContent=sec.doc; card.appendChild(pre); }
+    grid.appendChild(card);
+  });
+  el.style.display='flex';
+}
+function renderControl(pageId,c){
+  const row=document.createElement('div'); row.className='sp-row';
+  const key=c.k?pageId+'.'+c.k:null;
+  if(c.t==='info'){ row.className='frow';
+    row.innerHTML='<span class="fk"></span><span class="fv"></span>';
+    row.children[0].textContent=c.label; row.children[1].textContent=c.v; return row; }
+  if(c.t==='theme'){ row.className='frow';
+    const a=document.createElement('span'); a.className='fk'; a.textContent='theme'; row.appendChild(a);
+    const b=document.createElement('button'); b.className='sp-btn';
+    const lab=()=>document.documentElement.classList.contains('dark')?'dark — switch to light':'light — switch to dark';
+    b.textContent=lab();
+    b.onclick=()=>{ const tb=document.getElementById('themeBtn'); if(tb&&typeof Event!=='undefined') tb.dispatchEvent(new Event('click')); b.textContent=lab(); };
+    row.appendChild(b); return row; }
+  if(c.t==='rpcout'){ const pre=document.createElement('pre'); pre.id='rpcOut'; pre.textContent='— send a request —'; return pre; }
+  if(c.t==='bar'){
+    row.className='sp-row sp-barrow';
+    const a=document.createElement('span'); a.className='sp-lab'; a.textContent=c.label; row.appendChild(a);
+    const tr=document.createElement('span'); tr.className='sp-bartrack';
+    const f=document.createElement('i'); f.className='sp-barfill'+(c.tone?' '+c.tone:'');
+    f.style.width=Math.max(2,Math.min(100,c.pct||0))+'%';
+    tr.appendChild(f); row.appendChild(tr);
+    const v=document.createElement('span'); v.className='sp-barval'; v.textContent=c.v||''; row.appendChild(v);
+    return row;
+  }
+  if(c.t==='btn'){
+    const b=document.createElement('button'); b.className='sp-btn'+(c.danger?' danger':''); b.textContent=c.label;
+    b.onclick=()=>{
+      if(c.danger && !b.dataset.armed){            /* two-step danger affordance */
+        b.dataset.armed='1'; const orig=b.textContent; b.textContent='confirm: '+orig+'?';
+        setTimeout(()=>{ delete b.dataset.armed; b.textContent=orig; },2600);
+        return;
+      }
+      if(c.danger){ delete b.dataset.armed; b.textContent=c.label; }
+      if(c.action==='graph'){ closePage(); soloPanel(pageId,{graph:true}); return; }
+      if(c.action==='open3d'){ closePage(); setView('3d'); return; }
+      if(c.action==='rpc'){
+        const m=confGet(pageId+'.rpc_method','tools/list');
+        const out=document.getElementById('rpcOut'); if(out) out.textContent='→ { "jsonrpc":"2.0", "method":"'+m+'" }\n'+(RPC_SAMPLES[m]||'← { "result":{} }');
+        toast('sent · '+m); return;
+      }
+      toast(c.label+' · queued (concept)');
+    };
+    if(c.hint){ row.appendChild(b); const h=document.createElement('span'); h.className='sp-hint'; h.textContent=c.hint; row.appendChild(h); return row; }
+    return b;
+  }
+  const cid=key?('spc-'+key.replace(/[^a-z0-9]/gi,'-')):null;
+  const lab=document.createElement('label'); lab.className='sp-lab'; lab.textContent=c.label;
+  if(cid) lab.htmlFor=cid;                          /* form-labels: explicit association */
+  row.appendChild(lab);
+  if(c.t==='toggle'){
+    const b=document.createElement('button'); b.className='sp-toggle'; b.setAttribute('role','switch');
+    if(cid) b.id=cid;
+    b.setAttribute('aria-label',c.label);
+    const setv=(v)=>{ b.classList.toggle('on',!!v); b.setAttribute('aria-checked',!!v); b.textContent=v?'on':'off'; };
+    setv(confGet(key,c.v));
+    b.onclick=()=>{ const nv=!b.classList.contains('on'); setv(nv); confSet(key,nv); };
+    row.appendChild(b);
+  } else if(c.t==='select'){
+    const sel=document.createElement('select'); sel.className='sp-input'; if(cid) sel.id=cid;
+    (c.options||[]).forEach(o=>{ const op=document.createElement('option'); op.value=o; op.textContent=o; sel.appendChild(op); });
+    sel.value=confGet(key,c.v);
+    sel.onchange=()=>confSet(key,sel.value);
+    row.appendChild(sel);
+  } else if(c.t==='textarea'){
+    const ta=document.createElement('textarea'); ta.className='sp-input mono'; ta.rows=c.rows||3; if(cid) ta.id=cid;
+    ta.value=confGet(key,c.v||''); ta.onchange=()=>confSet(key,ta.value);
+    row.appendChild(ta);
+  } else {
+    const inp=document.createElement('input'); inp.className='sp-input'+(c.mono?' mono':''); if(cid) inp.id=cid;
+    inp.type=c.secret?'password':'text'; inp.placeholder=c.ph||''; inp.value=confGet(key,c.v||'');
+    inp.onchange=()=>confSet(key,inp.value);
+    row.appendChild(inp);
+  }
+  return row;
+}
+
+/* perf watchdog: surfaces main-thread stalls in the console; __cxStats() for quick checks */
+if(typeof performance!=='undefined' && typeof setInterval==='function'){
+  let __beat=performance.now();
+  setInterval(()=>{ const now=performance.now(), gap=now-__beat-1000;
+    if(gap>400) console.warn(`[cx2d] main-thread stall ≈${Math.round(gap)}ms`);
+    __beat=now; },1000);
+}
+window.__cxStats=()=>({ heapMB:(typeof performance!=='undefined'&&performance.memory)?Math.round(performance.memory.usedJSHeapSize/1048576):null,
+  domNodes:document.getElementsByTagName('*').length, view:viewMode });
+
+buildSidebar();    // after PANEL_TO_DISTRICT exists — rail icons carry their 3D mapping
+try{ if(localStorage.getItem('cx-view')==='3d') setView('3d'); }catch(e){}
 
 openScope('cx');   // immediate render with dummy data
 bootProbe().then(()=>{ receiptsDeepLink(); coordDeepLink(); });   // probe /readyz; if live, lazy-replace panels with real /v1 data; then honour #/receipts · #/coord deep links

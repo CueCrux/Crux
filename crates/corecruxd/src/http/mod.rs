@@ -6,6 +6,7 @@
 
 mod actions;
 mod admin;
+mod agent_usage;
 mod append;
 mod cloud;
 mod console;
@@ -21,6 +22,7 @@ mod facts;
 mod features;
 mod gpu1;
 mod health;
+pub mod ingress;
 mod integrations_github;
 mod integrations_openai;
 pub mod invocation;
@@ -492,6 +494,8 @@ pub fn router(state: AppState) -> Router {
             "/v1/observations/aggregate",
             get(self::observations::get_observations_aggregate),
         )
+        // Per-passport tool-usage rollup over the action ledger (action-ledger M3).
+        .route("/v1/agents/{passport}/usage", get(self::agent_usage::get_agent_usage))
         // Real-time event stream (SSE)
         .route("/v1/events/stream", get(self::events::event_stream))
         // Self-observation (crux-observe)

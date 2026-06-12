@@ -1,0 +1,56 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+#
+# Crux daemon — pull-only quickstart (no source checkout, no local build).
+#
+#   docker compose up -d
+#   curl -sf http://127.0.0.1:14800/readyz
+#
+# Before first use, verify the image signature + SBOM attestation:
+# docs/verify-release.md §4 (cosign keyless, verify by digest, never by tag).
+#
+# Tag policy: `:latest` tracks the newest RELEASE TAG, not main. Pin a version
+# for anything you care about:
+#   CRUX_VERSION=0.5.0 docker compose up -d
+services:
+  crux:
+    image: ghcr.io/cuecrux/crux-daemon:${CRUX_VERSION:-latest}
+    restart: unless-stopped
+    # Runs as uid 65532 (non-root). The named volume below inherits correct
+    # ownership from the image automatically. If you switch to a bind mount,
+    # chown the host dir first: sudo chown -R 65532:65532 ./crux-data
+    ports:
+      # Loopback-only by design: the daemon is a local-first, single-host
+      # service. Front it with a reverse proxy + TLS if you must expose it
+      # (see docs/ops-guide.md).
+      - "127.0.0.1:14800:14800" # HTTP API + embedded console
+      - "127.0.0.1:14801:14801" # MCP (streamable HTTP)
+    volumes:
+      - crux-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:14800/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    environment:
+      - CORECRUXD_DATA_DIR=/data
+      # dev_scopes is the local-development posture. For anything shared,
+      # switch to jwt_hs256 / jwt_jwks — see docs/getting-started.md.
+      - CORECRUXD_AUTH_MODE=dev_scopes
+      - CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND=1
+      - CORECRUXD_HTTP_HOST=0.0.0.0
+      - CORECRUXD_GRPC_HOST=0.0.0.0
+      - CORECRUXD_MCP_HOST=0.0.0.0
+      - CORECRUXD_MCP_PORT=14801
+      - CORECRUXD_BUILD_CCXI=1
+      - CORECRUX_LOG_FORMAT=json
+      # The container has no git checkout; disable the repo-drift probe so
+      # update posture is explicit, not "unavailable".
+      - CORECRUXD_UPDATE_CHECK_ENABLED=0
+
+volumes:
+  crux-data:

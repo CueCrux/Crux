@@ -1,0 +1,51 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+#
+# nfpm (https://nfpm.goreleaser.com) config for the crux-daemon .deb.
+# Build locally with packaging/deb/build-deb.sh after staging release
+# binaries into dist/ (see that script's header). The .deb is attached to
+# GitHub Releases and installed with explicit signature verification first —
+# never from a pipe. See docs/getting-started.md → "Debian / Ubuntu".
+#
+# Why no apt repo (v1): a repo adds key-distribution + hosting surface for
+# marginal UX gain at current scale; the signed-release + dpkg -i path keeps
+# T.5 verification explicit. Revisit post-revenue (ExecPlan decision log).
+name: crux-daemon
+arch: amd64
+platform: linux
+version: ${CRUX_VERSION} # injected by build-deb.sh, e.g. 0.5.0
+section: utils
+priority: optional
+maintainer: CueCrux Ltd <security@cuecrux.com>
+description: |
+  Crux daemon — local-first agent memory, retrieval, and signed-receipts
+  backend. Single binary, embedded console, no phone-home.
+vendor: CueCrux Ltd
+homepage: https://github.com/CueCrux/Crux
+license: CCL-1.0
+
+contents:
+  - src: dist/crux-linux-amd64
+    dst: /usr/bin/crux
+    file_info:
+      mode: 0755
+  - src: dist/corecruxctl-linux-amd64
+    dst: /usr/bin/corecruxctl
+    file_info:
+      mode: 0755
+  # Same daemon binary under the service-manager name.
+  - src: /usr/bin/crux
+    dst: /usr/bin/corecruxd
+    type: symlink
+  - src: packaging/systemd/crux.service
+    dst: /usr/lib/systemd/system/crux.service
+    file_info:
+      mode: 0644
+  - src: LICENCE.md
+    dst: /usr/share/doc/crux-daemon/LICENCE.md
+  - src: TRUST-CONTRACT.md
+    dst: /usr/share/doc/crux-daemon/TRUST-CONTRACT.md
+
+scripts:
+  postinstall: packaging/deb/postinstall.sh
+  postremove: packaging/deb/postremove.sh

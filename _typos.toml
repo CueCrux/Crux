@@ -1,5 +1,11 @@
+[files]
+# Vendored three.js modules (minified upstream code; not ours to spell-check)
+extend-exclude = ["**/console-3d/vendor/"]
+
 [default.extend-words]
 # Domain-specific terms that aren't typos
+# three.js MeshStandardMaterial property (console-3d world renderer)
+metalness = "metalness"
 ccxi = "ccxi"
 ccxseg = "ccxseg"
 ccxs = "ccxs"
@@ -27,6 +33,8 @@ mch = "mch"
 pn = "pn"
 # Hetzner Helsinki datacentre code in the bare-metal runner hostname runner-hel1
 hel = "hel"
+# in-toto attestation format — SLSA provenance files are *.intoto.jsonl
+intoto = "intoto"
 
 [default.extend-identifiers]
 # Acceptable variant spelling (used in struct fields and function names)

@@ -146,8 +146,11 @@ pub async fn handle_memory_freshness(args: &Value, ctx: &McpContext) -> Result<V
             "stored_at": f.stored_at.to_rfc3339(),
             "reverified_at": f.reverified_at.map(|d| d.to_rfc3339()),
         });
-        used_tokens += f.tokens.max(8); // floor — even tiny rows cost ~8 tok
+        // Shared estimator (action-ledger M1): cost the row we actually
+        // emit, not the underlying fact's content size.
+        used_tokens += crate::token_estimate::estimate_tokens(&row) as usize;
         if used_tokens > token_budget && !rows.is_empty() {
+            crate::ledger::record_truncation("memory_freshness", "token_budget");
             break;
         }
         rows.push(row);
@@ -244,8 +247,9 @@ pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> R
             "superseded_by": f.superseded_by,
             "stored_at": f.stored_at.to_rfc3339(),
         });
-        used_tokens += f.tokens.max(8);
+        used_tokens += crate::token_estimate::estimate_tokens(&row) as usize;
         if used_tokens > token_budget && !rows.is_empty() {
+            crate::ledger::record_truncation("memory_sweep_candidates", "token_budget");
             break;
         }
         rows.push(row);
@@ -310,8 +314,9 @@ pub async fn handle_memory_sweep_candidates(args: &Value, ctx: &McpContext) -> R
                 "superseded_by": f.superseded_by,
                 "stored_at": f.stored_at.to_rfc3339(),
             });
-            used_tokens += f.tokens.max(8);
+            used_tokens += crate::token_estimate::estimate_tokens(&row) as usize;
             if used_tokens > token_budget && !rows.is_empty() {
+                crate::ledger::record_truncation("memory_sweep_candidates", "token_budget");
                 break;
             }
             rows.push(row);

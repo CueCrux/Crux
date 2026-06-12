@@ -1,0 +1,68 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+#
+# Supply-chain egress probe (ExecPlan crux-supply-chain-attestation-2026-06-11, M1).
+#
+# The Trivy scan (docker.yml) and cosign/SLSA signing (release.yml) need
+# network egress to the Trivy vulnerability DB registries and the Sigstore
+# public-good endpoints. GitHub-hosted runners always have this; the
+# self-hosted `[self-hosted, ci]` pool may not. This probe verifies
+# reachability from the self-hosted pool so a blocked endpoint surfaces as
+# a 2-minute red probe instead of a mid-release signing failure.
+#
+# Expected status codes (anything that returns an HTTP status reached the
+# endpoint — 401 from ghcr.io is auth-required, not blocked-egress):
+#   fulcio.sigstore.dev        200
+#   rekor.sigstore.dev         200
+#   tuf-repo-cdn.sigstore.dev  200
+#   ghcr.io (trivy-db)         200 or 401
+#   mirror.gcr.io (trivy-db)   200
+#
+# Not a required check. Runs when workflow/script supply-chain files change
+# and on manual dispatch.
+
+name: Supply-chain egress probe
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - "scripts/ci-cargo-with-fallback.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Probe Sigstore + Trivy egress (self-hosted)
+    runs-on: [self-hosted, ci]
+    timeout-minutes: 5
+    steps:
+      - name: Probe endpoints
+        run: |
+          set -uo pipefail
+          probe() {
+            local label="$1" url="$2" allowed="$3"
+            local code
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$url" || echo "000")
+            if echo "$allowed" | grep -qw "$code"; then
+              echo "OK   $label -> $code"
+            else
+              echo "::error::Egress probe failed: $label returned $code (allowed: $allowed). Supply-chain jobs (Trivy/cosign/SLSA) will not work from this runner pool — fall back to github-hosted runners for those steps."
+              FAILED=1
+            fi
+          }
+          FAILED=0
+          probe "fulcio.sigstore.dev (keyless signing CA)" \
+            "https://fulcio.sigstore.dev/api/v2/trustBundle" "200"
+          probe "rekor.sigstore.dev (transparency log)" \
+            "https://rekor.sigstore.dev/api/v1/log" "200"
+          probe "tuf-repo-cdn.sigstore.dev (TUF root)" \
+            "https://tuf-repo-cdn.sigstore.dev/1.root.json" "200"
+          probe "ghcr.io trivy-db (vuln DB, 401=reachable)" \
+            "https://ghcr.io/v2/aquasecurity/trivy-db/tags/list" "200 401"
+          probe "mirror.gcr.io trivy-db (vuln DB mirror)" \
+            "https://mirror.gcr.io/v2/aquasec/trivy-db/tags/list" "200"
+          exit "$FAILED"

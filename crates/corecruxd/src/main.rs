@@ -69,6 +69,7 @@ mod product;
 mod project_repo_links;
 mod projects;
 mod protocol_posture;
+mod redaction;
 mod relations;
 mod session_bindings;
 mod shard_map;
@@ -375,6 +376,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     let metrics = Metrics::new(&build, &config.service_name);
+    crate::redaction::register_metrics(&metrics.registry());
     metrics.set_peer_cache_bytes(0);
     {
         let c = control.read().await.clone();
@@ -620,6 +622,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // fails — tests are the expected consumer of the ephemeral
             // path. Either way, the route is live.
             let mcp_url = format!("http://{}/mcp", config.http_addr);
+            // action-ledger M2: per-tool MCP dispatch metrics scrape via /metrics.
+            crux_mcp::ledger::register_metrics(&metrics.registry());
             let session_metrics = Arc::new(crate::http::session_metrics::SessionMetrics::new(&metrics.registry()));
             match crate::http::session::SessionServices::local_durable(&config.data_dir, node_id.clone(), mcp_url) {
                 Ok(services) => Some(Arc::new(services.with_metrics(session_metrics))),
@@ -804,7 +808,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut state = state;
     state.mcp_context = mcp_context.map(std::sync::Arc::new);
-    let app: Router = http::router(state).layer(TraceLayer::new_for_http());
+    // Ingress hardening (crux-http-ingress-hardening-2026-06-11 M1): body
+    // limit + problem+json 413s, applied before TraceLayer so rejected
+    // requests still show up in traces.
+    let app: Router = http::ingress::apply_ingress_limits(http::router(state), &config.ingress, Some(&metrics))
+        .layer(TraceLayer::new_for_http());
 
     // Session TTL reaper — runs every 60s, removes expired sessions.
     {
@@ -945,13 +953,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     let http_task = {
-        let mut rx = shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            serve_http(http_addr, app, async move {
-                let _ = rx.recv().await;
-            })
-            .await
-        })
+        let rx = shutdown_tx.subscribe();
+        let drain_cap = config.ingress.shutdown_drain_cap();
+        tokio::spawn(async move { serve_http(http_addr, app, rx, drain_cap).await })
     };
 
     let grpc_task = {
@@ -972,8 +976,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
         let svc = grpc::DataPlaneService::new(dataplane_pool, control.clone(), metrics.clone(), auth.clone(), svc_cfg);
         let export_svc = grpc::ExportService::new(export_pool, metrics.clone(), build.clone(), auth.clone());
+        let ingress = config.ingress.clone();
         tokio::spawn(async move {
-            grpc::serve(grpc_addr, svc, export_svc, async move {
+            grpc::serve(grpc_addr, &ingress, svc, export_svc, async move {
                 let _ = rx.recv().await;
             })
             .await
@@ -1035,13 +1040,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let mcp_task = mcp_app.map(|mcp_app| {
-        let mut rx = shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            serve_http(mcp_addr, mcp_app, async move {
-                let _ = rx.recv().await;
-            })
-            .await
-        })
+        let rx = shutdown_tx.subscribe();
+        let drain_cap = config.ingress.shutdown_drain_cap();
+        // The MCP plane gets the same body limit as the API plane.
+        let mcp_app = http::ingress::apply_ingress_limits(mcp_app, &config.ingress, Some(&metrics));
+        tokio::spawn(async move { serve_http(mcp_addr, mcp_app, rx, drain_cap).await })
     });
 
     let http_runner = wait_for_http_task("http", http_task);
@@ -1482,6 +1485,13 @@ fn init_tracing(level: &str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
     let log_format = std::env::var("LOG_FORMAT").unwrap_or_default();
+    // Sink-boundary redaction (ExecPlan crux-log-redaction-2026-06-11 M2):
+    // every formatted event is scrubbed before reaching stdout. Mode is
+    // CORECRUXD_REDACT=on|off|audit (default audit: count, don't mutate).
+    let redacting_writer = crux_observe::redact_writer::RedactMakeWriter::new(
+        std::io::stdout as fn() -> std::io::Stdout,
+        crate::redaction::redactor(),
+    );
 
     #[cfg(feature = "otel")]
     {
@@ -1515,9 +1525,14 @@ fn init_tracing(level: &str) {
                 let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(provider.tracer("corecruxd"));
 
                 let fmt_layer = if log_format.eq_ignore_ascii_case("json") {
-                    tracing_subscriber::fmt::layer().json().boxed()
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(redacting_writer.clone())
+                        .boxed()
                 } else {
-                    tracing_subscriber::fmt::layer().boxed()
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(redacting_writer.clone())
+                        .boxed()
                 };
 
                 tracing_subscriber::registry()
@@ -1531,9 +1546,16 @@ fn init_tracing(level: &str) {
     }
 
     if log_format.eq_ignore_ascii_case("json") {
-        tracing_subscriber::fmt().json().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .with_writer(redacting_writer)
+            .init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(redacting_writer)
+            .init();
     }
 }
 
@@ -1608,11 +1630,67 @@ fn observe_shard_map_metrics(metrics: &Metrics, table: &RoutingTable, node_id: &
 async fn serve_http(
     addr: SocketAddr,
     app: Router,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    shutdown_rx: broadcast::Receiver<()>,
+    drain_cap: Option<std::time::Duration>,
 ) -> Result<(), std::io::Error> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).with_graceful_shutdown(shutdown).await?;
-    Ok(())
+    serve_http_listener(listener, app, shutdown_rx, drain_cap).await
+}
+
+/// Serves `app` on a pre-bound listener with TCP_NODELAY on every accepted
+/// connection and a bounded graceful-shutdown drain
+/// (crux-http-ingress-hardening-2026-06-11 M1).
+///
+/// On shutdown signal the server stops accepting and drains in-flight
+/// connections; if `drain_cap` elapses first the serve future is dropped so
+/// the daemon can finish exiting (logged as a warning). Connection tasks
+/// already spawned by axum keep running until process exit closes their
+/// sockets — the cap bounds how long shutdown blocks, which is the DoS door
+/// (unbounded drain) this closes. `drain_cap: None` preserves the old
+/// unbounded-drain behaviour.
+async fn serve_http_listener(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    mut shutdown_rx: broadcast::Receiver<()>,
+    drain_cap: Option<std::time::Duration>,
+) -> Result<(), std::io::Error> {
+    use axum::serve::ListenerExt as _;
+
+    let listener = listener.tap_io(|stream| {
+        if let Err(err) = stream.set_nodelay(true) {
+            tracing::trace!(%err, "failed to set TCP_NODELAY on incoming connection");
+        }
+    });
+    // Fan the broadcast shutdown signal out to (a) axum's graceful shutdown
+    // and (b) the drain-cap timer, which must only start once draining began.
+    let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown = async move {
+        let _ = shutdown_rx.recv().await;
+        let _ = drain_started_tx.send(());
+    };
+    // `into_make_service_with_connect_info` exposes the peer address as a
+    // `ConnectInfo<SocketAddr>` request extension — the rate limiter's
+    // per-IP fallback key (crux-http-ingress-hardening M3).
+    let serve =
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown);
+    match drain_cap {
+        None => serve.await,
+        Some(cap) => {
+            tokio::select! {
+                result = serve => result,
+                _ = async {
+                    let _ = drain_started_rx.await;
+                    tokio::time::sleep(cap).await;
+                } => {
+                    tracing::warn!(
+                        drain_cap_secs = cap.as_secs(),
+                        "graceful-shutdown drain cap exceeded; abandoning remaining connections to process exit"
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -4102,5 +4180,123 @@ mod tests {
     fn capacity_free_ratio_exceeds_total() {
         // In theory shouldn't happen, but test the arithmetic
         assert!((capacity_free_ratio(100, 200) - 2.0).abs() < f64::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod serve_http_tests {
+    use std::time::Duration;
+
+    use axum::routing::get;
+    use axum::Router;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::sync::broadcast;
+
+    use super::serve_http_listener;
+
+    async fn bind_local() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+        #[allow(clippy::unwrap_used)]
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        #[allow(clippy::unwrap_used)]
+        let addr = listener.local_addr().unwrap();
+        (listener, addr)
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_with_no_inflight_returns_promptly() {
+        let (listener, _addr) = bind_local().await;
+        let app = Router::new().route("/", get(|| async { "ok" }));
+        let (tx, rx) = broadcast::channel::<()>(1);
+        let server = tokio::spawn(serve_http_listener(listener, app, rx, Some(Duration::from_secs(30))));
+
+        // Let the accept loop start, then signal shutdown with nothing in flight.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = tx.send(());
+        let joined = tokio::time::timeout(Duration::from_secs(3), server).await;
+        #[allow(clippy::unwrap_used)]
+        let result = joined.expect("server did not stop within 3s of shutdown").unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn drain_cap_force_closes_stuck_connections() {
+        let (listener, addr) = bind_local().await;
+        // Handler that outlives any reasonable drain: 60s sleep.
+        let app = Router::new().route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                "done"
+            }),
+        );
+        let (tx, rx) = broadcast::channel::<()>(1);
+        let server = tokio::spawn(serve_http_listener(listener, app, rx, Some(Duration::from_millis(300))));
+
+        // Park one request inside the slow handler.
+        #[allow(clippy::unwrap_used)]
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        #[allow(clippy::unwrap_used)]
+        conn.write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let started = std::time::Instant::now();
+        let _ = tx.send(());
+        // Without the cap this would block ~60s on the parked request; with
+        // the cap the serve future must return within the 300ms window
+        // (plus scheduling slack), unblocking process shutdown.
+        let joined = tokio::time::timeout(Duration::from_secs(5), server).await;
+        #[allow(clippy::unwrap_used)]
+        let result = joined.expect("drain cap did not unblock shutdown within 5s").unwrap();
+        assert!(result.is_ok());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "drain cap fired before it elapsed: {elapsed:?}"
+        );
+        // Keep the parked connection alive until here so the drain genuinely
+        // had something in flight (it is closed at process/test exit, which
+        // mirrors prod behaviour: abandoned connections die with the process).
+        drop(conn);
+    }
+
+    #[tokio::test]
+    async fn unbounded_drain_waits_for_inflight_requests() {
+        let (listener, addr) = bind_local().await;
+        let app = Router::new().route(
+            "/short",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                "done"
+            }),
+        );
+        let (tx, rx) = broadcast::channel::<()>(1);
+        let server = tokio::spawn(serve_http_listener(listener, app, rx, None));
+
+        #[allow(clippy::unwrap_used)]
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        #[allow(clippy::unwrap_used)]
+        conn.write_all(b"GET /short HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = tx.send(());
+
+        // The in-flight request must still complete (200 with body "done").
+        let mut buf = Vec::new();
+        #[allow(clippy::unwrap_used)]
+        tokio::time::timeout(Duration::from_secs(3), conn.read_to_end(&mut buf))
+            .await
+            .expect("response not received before timeout")
+            .unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with("HTTP/1.1 200"), "unexpected response: {text}");
+        assert!(text.ends_with("done"), "unexpected body: {text}");
+
+        let joined = tokio::time::timeout(Duration::from_secs(3), server).await;
+        #[allow(clippy::unwrap_used)]
+        let result = joined.expect("server did not stop after drain").unwrap();
+        assert!(result.is_ok());
     }
 }

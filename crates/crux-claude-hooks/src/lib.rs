@@ -23,6 +23,7 @@ pub mod config_audit;
 pub mod daemon_client;
 pub mod hook_input;
 pub mod hook_output;
+pub mod llm_shim;
 pub mod mcp_client;
 pub mod observe_capture;
 pub mod state;

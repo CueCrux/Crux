@@ -12,6 +12,7 @@ base64 = "0.22.1"
 ed25519-dalek = { version = "2.2.0", features = ["std"] }
 hex = "0.4.3"
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+prometheus = { version = "0.13.4", default-features = false }
 rand = "0.10.1"
 regex = "1.11"
 serde = { version = "1.0.218", features = ["derive"] }
