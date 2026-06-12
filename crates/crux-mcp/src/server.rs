@@ -98,8 +98,12 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
     let req: JsonRpcRequest = match serde_json::from_str(&body) {
         Ok(r) => r,
         Err(e) => {
-            warn!(error = %e, "failed to parse JSON-RPC request");
-            let resp = JsonRpcResponse::error(None, PARSE_ERROR, format!("invalid JSON: {e}"));
+            // serde_json errors can echo request-body fragments; truncate and
+            // redact before logging or returning them (ExecPlan
+            // crux-log-redaction-2026-06-11 M3).
+            let scrubbed = crux_observe::redact::global().scrub_error_echo(&e.to_string());
+            warn!(error = %scrubbed, "failed to parse JSON-RPC request");
+            let resp = JsonRpcResponse::error(None, PARSE_ERROR, format!("invalid JSON: {scrubbed}"));
             return (StatusCode::OK, Json(resp)).into_response();
         }
     };

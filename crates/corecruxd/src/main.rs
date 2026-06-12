@@ -68,6 +68,7 @@ mod product;
 mod project_repo_links;
 mod projects;
 mod protocol_posture;
+mod redaction;
 mod relations;
 mod session_bindings;
 mod shard_map;
@@ -364,6 +365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     let metrics = Metrics::new(&build, &config.service_name);
+    crate::redaction::register_metrics(&metrics.registry());
     metrics.set_peer_cache_bytes(0);
     {
         let c = control.read().await.clone();
@@ -1461,6 +1463,13 @@ fn init_tracing(level: &str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
     let log_format = std::env::var("LOG_FORMAT").unwrap_or_default();
+    // Sink-boundary redaction (ExecPlan crux-log-redaction-2026-06-11 M2):
+    // every formatted event is scrubbed before reaching stdout. Mode is
+    // CORECRUXD_REDACT=on|off|audit (default audit: count, don't mutate).
+    let redacting_writer = crux_observe::redact_writer::RedactMakeWriter::new(
+        std::io::stdout as fn() -> std::io::Stdout,
+        crate::redaction::redactor(),
+    );
 
     #[cfg(feature = "otel")]
     {
@@ -1494,9 +1503,14 @@ fn init_tracing(level: &str) {
                 let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(provider.tracer("corecruxd"));
 
                 let fmt_layer = if log_format.eq_ignore_ascii_case("json") {
-                    tracing_subscriber::fmt::layer().json().boxed()
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(redacting_writer.clone())
+                        .boxed()
                 } else {
-                    tracing_subscriber::fmt::layer().boxed()
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(redacting_writer.clone())
+                        .boxed()
                 };
 
                 tracing_subscriber::registry()
@@ -1510,9 +1524,16 @@ fn init_tracing(level: &str) {
     }
 
     if log_format.eq_ignore_ascii_case("json") {
-        tracing_subscriber::fmt().json().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .with_writer(redacting_writer)
+            .init();
     } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(redacting_writer)
+            .init();
     }
 }
 
