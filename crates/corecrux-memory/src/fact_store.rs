@@ -768,15 +768,26 @@ impl FactStore {
         self.facts.values()
     }
 
-    /// Paginated export of ALL facts (including deleted tombstones) for sync.
+    /// Paginated export of facts for the sync push path.
     ///
     /// Facts are sorted by `(stored_at, fact_id)` ascending. If `since` is set,
     /// only facts with `stored_at >= since` are included. If `cursor` is set,
     /// items are skipped until the fact with `fact_id == cursor` is found, then
     /// the export starts from the next item. Returns at most `limit` facts.
+    ///
+    /// ERASURE (launch-gate 5.1): soft-deleted (tombstoned) facts are EXCLUDED
+    /// from export. A deleted fact's value must never leave this node — including
+    /// its plaintext in the sync push is a GDPR erasure failure (the deleted
+    /// content reaches a remote and persists there). Deletion *propagation* does
+    /// not depend on this path: the structured tenant-sync mechanism carries a
+    /// separate, value-redacted `__sync_tombstone__::` record (only a
+    /// `value_hash`, marked `private: true`) so a remote still learns the fact_id
+    /// was retired without ever seeing the original content
+    /// (see `sync::offboard_tenant_mirror`).
     pub fn export(&self, since: Option<DateTime<Utc>>, cursor: Option<&str>, limit: usize) -> FactExportResult {
-        // 1. Collect all facts EXCEPT private ones (private facts never leave this node).
-        let mut all: Vec<&Fact> = self.facts.values().filter(|f| !f.private).collect();
+        // 1. Collect facts, excluding private ones (never leave this node) AND
+        //    deleted ones (their content must not leave the box — erasure).
+        let mut all: Vec<&Fact> = self.facts.values().filter(|f| !f.private && !f.deleted).collect();
 
         // 2. Sort by (stored_at, fact_id) ascending.
         all.sort_by(|a, b| a.stored_at.cmp(&b.stored_at).then_with(|| a.fact_id.cmp(&b.fact_id)));
@@ -812,6 +823,148 @@ impl FactStore {
             next_cursor,
             has_more,
         }
+    }
+
+    /// Hard-delete the content of soft-deleted facts from the on-disk journal
+    /// (launch-gate 5.1 — GDPR erasure).
+    ///
+    /// Soft-delete only sets `deleted = true` and appends a `JournalEvent::Delete`
+    /// tombstone; the original `JournalEvent::Store` event — and the plaintext
+    /// value inside it — remains in `facts.jsonl` forever and is replayed on every
+    /// restart. Compaction rewrites the journal so that:
+    ///
+    /// * each **live** (non-deleted) fact is re-emitted as a single `Store` event
+    ///   carrying its current identity, value and version, plus a `Supersede`
+    ///   marker if it is cross-entity-retired (`superseded_by`);
+    /// * each **deleted** fact_id is re-emitted as a `Delete` tombstone ONLY — the
+    ///   original `Store` event (and its value) is dropped. Replay still learns
+    ///   the fact_id was deleted, but the value is gone from disk.
+    ///
+    /// Crash-safe: the new journal is written to a sibling temp file, fsynced,
+    /// then atomically renamed over `facts.jsonl` — never truncated in place. A
+    /// crash before the rename leaves the original journal intact; a crash after
+    /// it leaves the fully-written replacement. The in-memory state is the source
+    /// of truth and is left untouched.
+    ///
+    /// Returns a [`CompactionReport`] describing what was removed. No-op (returns
+    /// a zeroed report) when the store has no journal (pure in-memory mode).
+    pub fn compact_journal(&self) -> std::io::Result<CompactionReport> {
+        let Some(path) = self.journal_path.clone() else {
+            return Ok(CompactionReport::default());
+        };
+
+        // Gather deleted fact_ids and live facts from in-memory state.
+        let mut deleted_ids: Vec<&String> = Vec::new();
+        let mut live: Vec<&Fact> = Vec::new();
+        for fact in self.facts.values() {
+            if fact.deleted {
+                deleted_ids.push(&fact.fact_id);
+            } else {
+                live.push(fact);
+            }
+        }
+        // Deterministic ordering keeps the rewritten journal stable across runs
+        // and makes the compaction reproducible/auditable.
+        live.sort_by(|a, b| a.stored_at.cmp(&b.stored_at).then_with(|| a.fact_id.cmp(&b.fact_id)));
+        deleted_ids.sort();
+
+        let report = CompactionReport {
+            facts_dropped: deleted_ids.len(),
+            facts_retained: live.len(),
+            tombstones_kept: deleted_ids.len(),
+        };
+
+        // Write the replacement journal to a temp file in the same directory so
+        // the final rename is atomic (same filesystem).
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let tmp_path = parent.join(format!(
+            "facts.jsonl.compact-{}.tmp",
+            uuid::Uuid::new_v4().to_string().replace('-', "")
+        ));
+
+        {
+            let tmp_file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            let mut writer = std::io::BufWriter::new(tmp_file);
+
+            for fact in &live {
+                let event = JournalEvent::Store { fact: (*fact).clone() };
+                let line = serde_json::to_string(&event).map_err(std::io::Error::other)?;
+                writeln!(writer, "{}", line)?;
+                // Preserve cross-entity supersession state for live facts so a
+                // replay of the compacted journal re-derives `superseded_by`.
+                if let Some(by) = &fact.superseded_by {
+                    let sup = JournalEvent::Supersede {
+                        fact_id: fact.fact_id.clone(),
+                        by_fact_id: by.clone(),
+                        superseded_at: Utc::now().to_rfc3339(),
+                    };
+                    let line = serde_json::to_string(&sup).map_err(std::io::Error::other)?;
+                    writeln!(writer, "{}", line)?;
+                }
+            }
+
+            // Value-free tombstones: replay still marks these fact_ids deleted,
+            // but the original value never touches the rewritten journal. The
+            // `Delete` arm is a no-op on replay if the fact_id is unknown, which
+            // is exactly right — the content Store event is gone.
+            for fact_id in &deleted_ids {
+                let event = JournalEvent::Delete {
+                    fact_id: (*fact_id).clone(),
+                    deleted_at: Utc::now().to_rfc3339(),
+                };
+                let line = serde_json::to_string(&event).map_err(std::io::Error::other)?;
+                writeln!(writer, "{}", line)?;
+            }
+
+            writer.flush()?;
+            // fsync the file contents before the rename so a crash can't leave a
+            // half-written replacement that the rename then publishes.
+            writer.get_ref().sync_all()?;
+        }
+
+        // Atomic publish.
+        std::fs::rename(&tmp_path, &path)?;
+        // Best-effort fsync of the directory so the rename itself is durable.
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+
+        tracing::info!(
+            facts_dropped = report.facts_dropped,
+            facts_retained = report.facts_retained,
+            tombstones_kept = report.tombstones_kept,
+            journal = %path.display(),
+            "fact-journal-compacted"
+        );
+
+        Ok(report)
+    }
+
+    /// Mark facts whose `stored_at` is older than `cutoff` as deletion-eligible
+    /// (retention sweep — W2.E2). Soft-deletes each matching live fact via the
+    /// journaled [`Self::delete`] path (so the deletion survives a restart and a
+    /// later [`Self::compact_journal`] pass removes the content). Private facts
+    /// and the structured `__sync_tombstone__::` records are left alone.
+    ///
+    /// Returns the fact_ids that were newly marked deleted. This only *marks*;
+    /// the content is not removed from disk until `compact_journal` runs, which
+    /// the caller invokes explicitly.
+    pub fn mark_retention_eligible(&mut self, cutoff: DateTime<Utc>) -> Vec<String> {
+        let to_delete: Vec<String> = self
+            .facts
+            .values()
+            .filter(|f| !f.deleted && !f.private && f.stored_at < cutoff)
+            .filter(|f| !f.entity.starts_with("__sync_tombstone__::"))
+            .map(|f| f.fact_id.clone())
+            .collect();
+        for fact_id in &to_delete {
+            self.delete(fact_id);
+        }
+        to_delete
     }
 
     /// Insert a fact directly with its original identity (fact_id, version,
@@ -856,7 +1009,21 @@ pub struct FactQueryResult {
     pub total_tokens: usize,
 }
 
-/// Result of a paginated fact export (includes deleted facts for sync tombstones).
+/// Outcome of a [`FactStore::compact_journal`] pass (launch-gate 5.1 erasure).
+#[derive(Debug, Default, Clone, Serialize, utoipa::ToSchema)]
+pub struct CompactionReport {
+    /// Number of soft-deleted facts whose original content (the `Store` event)
+    /// was dropped from the on-disk journal.
+    pub facts_dropped: usize,
+    /// Number of live (non-deleted) facts re-emitted into the compacted journal.
+    pub facts_retained: usize,
+    /// Number of value-free `Delete` tombstones kept so replay still excludes
+    /// the dropped fact_ids.
+    pub tombstones_kept: usize,
+}
+
+/// Result of a paginated fact export. Excludes private and soft-deleted facts
+/// (erasure: a tombstoned fact's content must not leave the node).
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct FactExportResult {
     pub facts: Vec<Fact>,
@@ -1466,6 +1633,154 @@ mod tests {
     }
 
     #[test]
+    fn test_compaction_removes_deleted_value_keeps_live() {
+        // Launch-gate 5.1: after compaction (a) the deleted fact's value is gone
+        // from the on-disk journal, (b) replay still excludes it, (c) non-deleted
+        // facts survive intact with correct values and versions.
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("facts.jsonl");
+        let deleted_id: String;
+        let live_id: String;
+
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let to_delete = store.store(StoreFact {
+                entity: "e".into(),
+                key: "erase-me".into(),
+                value: "highly-sensitive-erased-value".into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+            let to_keep = store.store(StoreFact {
+                entity: "e".into(),
+                key: "keep-me".into(),
+                value: "surviving-value".into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+            deleted_id = to_delete.fact_id;
+            live_id = to_keep.fact_id;
+            store.delete(&deleted_id);
+
+            // Pre-compaction: the deleted value IS still on disk (the leak).
+            let raw = std::fs::read_to_string(&journal).unwrap();
+            assert!(raw.contains("highly-sensitive-erased-value"));
+
+            let report = store.compact_journal().unwrap();
+            assert_eq!(report.facts_dropped, 1);
+            assert_eq!(report.facts_retained, 1);
+            assert_eq!(report.tombstones_kept, 1);
+        }
+
+        // (a) Deleted value is gone from the journal; live value survives.
+        let raw = std::fs::read_to_string(&journal).unwrap();
+        assert!(
+            !raw.contains("highly-sensitive-erased-value"),
+            "deleted fact value still present in compacted journal"
+        );
+        assert!(raw.contains("surviving-value"));
+
+        // (b)+(c) Replay still excludes the deleted fact and preserves the live one.
+        {
+            let store = FactStore::with_persistence(dir.path()).unwrap();
+            assert_eq!(store.count(), 1);
+            assert!(store.get(&deleted_id).is_none());
+            // Tombstone preserved: the deleted fact_id is still known + flagged.
+            assert!(store.facts.get(&deleted_id).map(|f| f.deleted).unwrap_or(true));
+            let live = store.get(&live_id).expect("live fact survived replay");
+            assert_eq!(live.value, "surviving-value");
+            assert_eq!(live.version, 1);
+        }
+    }
+
+    #[test]
+    fn test_compaction_preserves_version_chain() {
+        // A re-stored (entity, key) leaves the prior version live-but-superseded;
+        // compaction must retain BOTH the current value and the version chain.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            store.store(StoreFact {
+                entity: "proj".into(),
+                key: "status".into(),
+                value: "v1".into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+            store.store(StoreFact {
+                entity: "proj".into(),
+                key: "status".into(),
+                value: "v2".into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            });
+            store.compact_journal().unwrap();
+        }
+        {
+            let store = FactStore::with_persistence(dir.path()).unwrap();
+            let history = store.fact_history("proj", "status");
+            assert_eq!(history.len(), 2, "version chain lost after compaction");
+            assert_eq!(history[0].version, 1);
+            assert_eq!(history[1].version, 2);
+            // Latest-wins recall returns the current value.
+            let latest = store
+                .get_by_entity("proj")
+                .into_iter()
+                .max_by_key(|f| f.version)
+                .unwrap();
+            assert_eq!(latest.value, "v2");
+        }
+    }
+
+    #[test]
+    fn test_retention_marks_old_facts() {
+        // W2.E2: facts older than the cutoff are marked deletion-eligible; a
+        // following compaction removes their content. Fresh facts survive.
+        let mut store = FactStore::new();
+        let mut old = store.store(StoreFact {
+            entity: "e".into(),
+            key: "old".into(),
+            value: "old-value".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        store.store(StoreFact {
+            entity: "e".into(),
+            key: "new".into(),
+            value: "new-value".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        // Backdate the first fact well past the cutoff.
+        old.stored_at = Utc::now() - chrono::Duration::days(120);
+        store.facts.get_mut(&old.fact_id).unwrap().stored_at = old.stored_at;
+
+        let cutoff = Utc::now() - chrono::Duration::days(90);
+        let marked = store.mark_retention_eligible(cutoff);
+        assert_eq!(marked, vec![old.fact_id.clone()]);
+        assert!(store.get(&old.fact_id).is_none());
+        assert_eq!(store.count(), 1); // only the fresh fact remains live
+    }
+
+    #[test]
     fn test_persistence_versioning() {
         let dir = tempfile::tempdir().unwrap();
 
@@ -1707,20 +2022,24 @@ mod tests {
     }
 
     #[test]
-    fn test_export_includes_deleted() {
+    fn test_export_excludes_deleted_facts() {
+        // ERASURE (launch-gate 5.1): a soft-deleted fact — and crucially its
+        // plaintext value — must NOT appear in the sync export. Including a
+        // deleted fact's content in the push path lets erased data leave the
+        // box, which is a GDPR erasure failure.
         let mut store = FactStore::new();
 
         let f1 = store.store(StoreFact {
             entity: "e".into(),
             key: "k1".into(),
-            value: "v1".into(),
+            value: "secret-pii-value".into(),
             source_receipt: None,
             confidence: 1.0,
             private: false,
             horizon_class: None,
             actor: None,
         });
-        store.store(StoreFact {
+        let f2 = store.store(StoreFact {
             entity: "e".into(),
             key: "k2".into(),
             value: "v2".into(),
@@ -1733,15 +2052,19 @@ mod tests {
 
         store.delete(&f1.fact_id);
 
-        // Export should include the deleted fact as a tombstone
         let result = store.export(None, None, 100);
-        assert_eq!(result.facts.len(), 2);
 
-        let deleted_fact = result.facts.iter().find(|f| f.fact_id == f1.fact_id).unwrap();
-        assert!(deleted_fact.deleted);
+        // Only the live fact is exported; the tombstoned fact is absent.
+        assert_eq!(result.facts.len(), 1);
+        assert_eq!(result.facts[0].fact_id, f2.fact_id);
+        assert!(result.facts.iter().all(|f| f.fact_id != f1.fact_id));
 
-        let live_fact = result.facts.iter().find(|f| f.fact_id != f1.fact_id).unwrap();
-        assert!(!live_fact.deleted);
+        // The deleted value never appears anywhere in the serialised export.
+        let serialised = serde_json::to_string(&result.facts).unwrap();
+        assert!(
+            !serialised.contains("secret-pii-value"),
+            "deleted fact value leaked into export output"
+        );
     }
 
     // ── M6: cross-entity supersession ───────────────────────────────
