@@ -411,6 +411,16 @@ async fn dispatch_tool_call(
     let predicted = build_predicted_effects(name, &args);
     crate::traces::record_dispatch(&passport, name, turn_id.as_deref(), predicted, trace_outcome).await;
 
+    // action-ledger M1: per-passport token accounting. Estimates ride a
+    // counting writer (no allocation) so this stays cheap on the hot path.
+    let est_in = crate::token_estimate::estimate_tokens(&args);
+    let est_out = match &outcome {
+        Ok(v) => crate::token_estimate::estimate_tokens(v),
+        Err(e) => crate::token_estimate::estimate_tokens_str(&e.message),
+    };
+    let declared_budget = args.get("token_budget").and_then(|v| v.as_u64());
+    crate::token_accounting::record_usage(&passport, est_in, est_out, declared_budget).await;
+
     match outcome {
         Ok(result) => {
             let result = maybe_wrap_with_envelope(name, &args, ctx, result).await;

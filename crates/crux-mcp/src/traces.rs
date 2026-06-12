@@ -222,15 +222,29 @@ pub async fn record_dispatch(
 
 /// Render the `tool_trace_recent` payload directly to JSON.
 ///
-/// `token_budget` is honoured loosely: each [`TraceEntry`] is roughly
-/// 200 chars of JSON; we cap returned entries at `token_budget / 50` so
-/// a 500-token budget surfaces ~10 entries. This is the same cheap
-/// heuristic used elsewhere in the codebase (master plan §"Two
-/// structural rules — token_budget is mandatory").
+/// `token_budget` is honoured via the shared estimator
+/// ([`crate::token_estimate::estimate_tokens`], ~4 chars/token):
+/// entries are included while the running estimate stays within
+/// budget, and at least one entry is always returned so a tight budget
+/// can't blank the response. This replaced the older `token_budget / 50`
+/// fixed-cap heuristic (action-ledger M1) so every budget check in the
+/// crate uses the same yardstick.
 pub fn trace_payload(entries: Vec<TraceEntry>, token_budget: Option<usize>) -> Value {
     let trimmed = if let Some(budget) = token_budget {
-        let cap = (budget / 50).max(1);
-        entries.into_iter().take(cap).collect::<Vec<_>>()
+        let budget = budget as u64;
+        let mut used: u64 = 0;
+        let mut kept = Vec::new();
+        for entry in entries {
+            let cost = serde_json::to_value(&entry)
+                .map(|v| crate::token_estimate::estimate_tokens(&v))
+                .unwrap_or(1);
+            if !kept.is_empty() && used.saturating_add(cost) > budget {
+                break;
+            }
+            used = used.saturating_add(cost);
+            kept.push(entry);
+        }
+        kept
     } else {
         entries
     };
@@ -343,9 +357,23 @@ mod tests {
             entries.push(entry(&format!("t{i}"), vec![]));
         }
         let payload = trace_payload(entries, Some(500));
-        // 500 / 50 = 10 entries
-        assert_eq!(payload["count"], 10);
-        assert_eq!(payload["traces"].as_array().unwrap().len(), 10);
+        let returned = payload["traces"].as_array().unwrap();
+        // Budget must truncate (30 entries ≈ 600+ estimated tokens) but
+        // never blank the response.
+        assert!(!returned.is_empty());
+        assert!(returned.len() < 30, "budget should truncate, got {}", returned.len());
+        // Estimator invariant: total estimated cost of what we returned
+        // stays within the budget.
+        let total: u64 = returned.iter().map(crate::token_estimate::estimate_tokens).sum();
+        assert!(total <= 500, "estimated cost {total} exceeds budget 500");
+        assert_eq!(payload["count"].as_u64().unwrap() as usize, returned.len());
+    }
+
+    #[test]
+    fn trace_payload_tiny_budget_returns_at_least_one() {
+        let entries = vec![entry("t0", vec![]), entry("t1", vec![])];
+        let payload = trace_payload(entries, Some(1));
+        assert_eq!(payload["count"], 1);
     }
 
     #[tokio::test]

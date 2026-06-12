@@ -46,6 +46,7 @@ pub mod sessions;
 pub mod storyline;
 pub mod surface;
 pub mod sync;
+pub mod token_usage;
 pub mod traces;
 pub mod update;
 
@@ -1885,6 +1886,12 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
             description: traces::TOOL_DESCRIPTION.to_string(),
             input_schema: traces::tool_input_schema(),
         },
+        // ── Token accounting (action-ledger M1) ──────────────────────────
+        ToolDefinition {
+            name: "session_token_usage".to_string(),
+            description: token_usage::TOOL_DESCRIPTION.to_string(),
+            input_schema: token_usage::tool_input_schema(),
+        },
         // ── Risk-tiered HITL (agent-ux-05) ───────────────────────
         ToolDefinition {
             name: "approval_request".to_string(),
@@ -2458,6 +2465,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "feature_trigger_audit",   "output": "{ content: [...], capability: <updated payload>, version }" },
         { "tool": "feature_suggest_next",    "output": "{ content: [...], suggestions: [{kind, capability_id?, gap_type?, severity?, promise?, rationale}], count }" },
         { "tool": "tool_trace_recent",       "output": "{ content: [...], traces: [{tool, ts_us, turn_id?, predicted_effects: [{kind, entity, key, ts_us?}], outcome}], count, feature_disabled? } — per-passport; reserved-prefix effects stripped." },
+        { "tool": "session_token_usage",     "output": "{ content: [...], passport, used, tokens_in, tokens_out, declared_budget_in, calls, estimator, limit?, pct? } — per-passport estimated token spend (~4 chars/token); limit/pct only when CORECRUXD_SESSION_TOKEN_BUDGET is set." },
         { "tool": "approval_request",        "output": "{ content: [...], request_id, status: 'pending'|'feature_disabled', risk_tier, tenant_id, feature_enabled } — pending entries also visible via list_work(state='pending_approval')." },
         { "tool": "approval_decide",         "output": "{ content: [...], ok, request_id, status: 'approved'|'rejected', reviewer_passport, decided_at, receipt_id, receipt_body_hash_hex, tenant_id, risk_tier } — non-operator callers receive a 403-style JSON-RPC error with `why_denied`." },
         { "tool": "create_orchestrator",      "output": "Orchestrator record { id, name, assignee_passport, created_by_passport, tenant_id, state, members[], created_at_unix_ms, updated_at_unix_ms }. (Package S scaffold: daemon endpoint stubbed → 501 until the orchestrators plan ships.)" },
@@ -2607,6 +2615,8 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "feature_suggest_next" => features::handle_feature_suggest_next(args, ctx).await,
         // Typed action traces (agent-ux-06).
         "tool_trace_recent" => traces::handle_tool_trace_recent(args, ctx).await,
+        // Token accounting (action-ledger M1).
+        "session_token_usage" => token_usage::handle_session_token_usage(args, ctx).await,
         // Risk-tiered HITL (agent-ux-05).
         "approval_request" => approvals::handle_approval_request(args, ctx).await,
         "approval_decide" => approvals::handle_approval_decide(args, ctx).await,
@@ -2650,7 +2660,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 103; // main 93 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard).
+    const TOOL_COUNT: usize = 104; // main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
