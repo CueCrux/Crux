@@ -170,6 +170,8 @@
   .dash-num small { display:block; margin-top:7px; font-size:10.5px; font-weight:500; color:var(--text-muted); letter-spacing:0; }
   .dash-mid { margin:10px 0 2px; font-size:21px; font-weight:800; letter-spacing:-.015em; line-height:1.1; color:var(--text-primary); }
   .dash-mid small { display:block; margin-top:5px; font-size:10px; font-weight:500; color:var(--text-muted); font-family:var(--font-mono); }
+  #evtTicker { position:fixed; left:50%; transform:translateX(-50%); bottom:14px; z-index:60; padding:6px 14px; border-radius:var(--radius-full);
+    background:var(--surface-glass-strong); color:var(--text-muted); font:11px var(--font-mono); border:1px solid var(--border-default); display:none; pointer-events:none; }
   .dp-v.wide { width:84px; }
   .dash-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:13px; }
   .dash-chip { font-family:var(--font-mono); font-size:10px; padding:3px 9px; border:1px solid var(--border-default); border-radius:999px; color:var(--text-secondary); background:var(--surface-glass); white-space:nowrap; }
@@ -1083,6 +1085,12 @@ async function patchApi(path, body){
   const text=await r.text(); let data; try{ data=JSON.parse(text); }catch{ data={text}; }
   if(!r.ok) throw {status:r.status, data}; return data;
 }
+async function putApi(path, body){
+  const h=apiHeaders(); h['Content-Type']='application/json';
+  const r=await fetch(path,{method:'PUT',headers:h,body:JSON.stringify(body||{})});
+  const text=await r.text(); let data; try{ data=JSON.parse(text); }catch{ data={text}; }
+  if(!r.ok) throw {status:r.status, data}; return data;
+}
 async function deleteApi(path){
   const r=await fetch(path,{method:'DELETE',headers:apiHeaders()});
   if(!r.ok && r.status!==204){ const text=await r.text(); let data; try{ data=JSON.parse(text); }catch{ data={text}; } throw {status:r.status, data}; }
@@ -1136,7 +1144,7 @@ const WSTATE = { planned:'planned', in_progress:'in_progress', blocked:'blocked'
 function txWork(json){   // M3 — kanban WorkItem[] → execplan nodes (status drives the stage filter)
   const items = json.work || json.items || (Array.isArray(json)? json : []);
   return items.map(w=>({
-    id: idFor('work', w.id), kind:'execplan',
+    id: idFor('work', w.id), kind:'execplan', __workId: w.id,
     label: w.title || w.id,
     sub: w.current_milestone || w.plan_path || w.state || '',
     status: WSTATE[w.state] || 'planned',
@@ -1240,6 +1248,32 @@ function txCoord(json){   // live board — sessions + client-side pairwise over
     payload: JSON.stringify(work,null,2) }] : [];
   return warnNodes.concat(leaves).concat(workNodes);
 }
+function txWorkThread(json, node){   // gap-closure M6 — comments + gate transitions drill under a work item
+  const out=[], wid=(node&&node.__workId)||'';
+  (((json.com)||{}).comments||[]).forEach((c,i)=>out.push({
+    id: idFor('wcm', wid+'/'+(c.id||i)), kind:'comment',
+    label: c.author_passport||'comment', sub: String(c.body||'').slice(0,60),
+    status:'idle',
+    fields:[['author',c.author_passport],['posted',c.posted_at_unix_ms]].filter(([,v])=>v!=null),
+    children:[], doc:String(c.body||''), payload: JSON.stringify(c,null,2) }));
+  (((json.txn)||{}).transitions||[]).forEach((t,i)=>out.push({
+    id: idFor('wtx', wid+'/'+(t.id||i)), kind:'transition',
+    label:(t.from_state||'?')+' → '+(t.to_state||'?'),
+    sub:[t.by_passport, t.gate_status].filter(Boolean).join(' · '),
+    status: t.gate_status==='queued'?'blocked':(t.gate_status==='rejected'?'err':'ok'),
+    fields:[['by',t.by_passport],['gate',t.gate_status],['at',t.at_unix_ms]].filter(([,v])=>v!=null),
+    children:[], payload: JSON.stringify(t,null,2) }));
+  return out;
+}
+function txGates(json){   // gap-closure M6 — pending human gates panel
+  return (json.pending||[]).map(p=>({
+    id: idFor('gate', p.action_id), kind:'gate',
+    label: p.work_id+' · '+(p.target_state||p.requested_action||'update_state'),
+    sub:[p.status, 'by '+(p.requested_by_passport||'?')].filter(Boolean).join(' · '),
+    status: p.status==='pending'?'blocked':(p.status==='approved'||p.status==='auto_approved'?'ok':'idle'),
+    fields:[['action_id',p.action_id],['work',p.work_id],['action',p.requested_action],['target',p.target_state],['requested by',p.requested_by_passport],['status',p.status]].filter(([,v])=>v!=null),
+    children:[], payload: JSON.stringify(p,null,2) }));
+}
 function entityPrefix(e){ e=e||''; const i=e.indexOf(':'); return i>0? e.slice(0,i): (e||'other'); }
 function txFacts(json){   // M7 facts — group by entity prefix (single fetch yields groups + leaves)
   const facts = json.facts || (Array.isArray(json)? json : []);
@@ -1272,6 +1306,21 @@ function txPassports(json){   // M8
     sub:[p.category,p.reputation_tier].filter(Boolean).join(' · '), status:'ok',
     fields:[['id',p.id],['category',p.category],['tier',p.reputation_tier],['receipts',p.receipt_count],['gate',p.agent_work_gate]].filter(([,v])=>v!=null),
     children:[], payload: JSON.stringify(p,null,2) }));
+}
+function txPassportsPresence(json){   // gap-closure M7 — join /v1/passports/presence onto the passport panel
+  const base=txPassports(json.pp||{});
+  const pres=((json.pr||{}).presence)||[];
+  const ago=ms=>{ const s=Math.max(0,Math.round((Date.now()-ms)/1000)); return s<60? s+'s ago' : (s<3600? Math.round(s/60)+'m ago' : Math.round(s/3600)+'h ago'); };
+  pres.forEach(p=>{
+    const n=base.find(b=>b.id===idFor('pp',p.passport_id));
+    if(n){ n.status='run'; n.sub=(n.sub?n.sub+' · ':'')+'seen '+ago(p.last_seen_at_unix_ms);
+      n.fields=(n.fields||[]).concat([['last seen',ago(p.last_seen_at_unix_ms)],['last route',p.last_method+' '+p.last_route],['calls',p.call_count]]); }
+    else base.push({ id:idFor('ppx',p.passport_id), kind:'presence', label:p.passport_id,
+      sub:'seen '+ago(p.last_seen_at_unix_ms)+' · '+p.call_count+' calls', status:'run',
+      fields:[['passport',p.passport_id],['last route',p.last_method+' '+p.last_route],['calls',p.call_count]],
+      children:[], payload:JSON.stringify(p,null,2) });
+  });
+  return base;
 }
 function txAudit(json){   // M9 — session audit chain → step nodes
   const steps = json.steps || (Array.isArray(json)? json : []);
@@ -1333,8 +1382,101 @@ function txReceiptVerify(json, node){   // {ver: VerificationReportV1, sig: sign
   }
   return kids;
 }
+/* ── token-usage rollup (gap-closure M2): reduce /v1/observations/aggregate to the
+     {window, tokens:{in,out}, by_session} shape the usage page + dash card consume.
+     Token fields are redaction-allowlisted in crux-observe, so payloads carry real counts. ── */
+function fmtK(n){ n=Number(n)||0; return n>=1e6? (n/1e6).toFixed(2).replace(/\.?0+$/,'')+'M' : (n>=1000? Math.round(n/1000)+'k' : String(n)); }
+async function usageRollup(days){
+  const since=new Date(Date.now()-days*86400000).toISOString();
+  const r=await api('/v1/observations/aggregate?limit=1000&since='+encodeURIComponent(since));
+  const by={}; let tin=0,tout=0,turns=0;
+  (r.observations||[]).forEach(o=>{
+    const p=o.payload||{}, u=p.usage||p.tokens||p;
+    const i=Number(u.input_tokens||u.prompt_tokens||u.in)||0, ou=Number(u.output_tokens||u.completion_tokens||u.out)||0;
+    if(!i&&!ou) return;
+    const s=by[o.session_id]=by[o.session_id]||{in:0,out:0,turns:0};
+    s.in+=i; s.out+=ou; s.turns++; tin+=i; tout+=ou; turns++;
+  });
+  return { window:'last '+days+'d', days, tokens:{in:tin,out:tout}, by_session:by, turns,
+    sessions:Object.keys(by).length,
+    truncated:(r.matched!=null && r.returned!=null && r.matched>r.returned)? r.matched : null };
+}
+function applyUsageTile(u){   // refresh the ov-usage dash tile in place (txOverview-style)
+  const n=N['ov-usage']; if(!u || !u.turns || !n) return;   // zero observations → keep the demo tile
+  n.label='Token usage · '+u.window; n.sub=u.sessions+' sessions · live';
+  const top=Object.entries(u.by_session).sort((a,b)=>b[1].in-a[1].in)[0];
+  n.fields=[['this week',fmtK(u.tokens.in)+' in · '+fmtK(u.tokens.out)+' out'],['sessions',String(u.sessions)],
+    top?['busiest',top[0].slice(0,20)+' · '+fmtK(top[1].in)+'/'+fmtK(top[1].out)]:null,
+    ['daily avg','~'+fmtK(Math.round(u.tokens.in/(u.days||7)))+' in/day'],['source','/v1/observations/aggregate']].filter(Boolean);
+  n.payload=JSON.stringify({window:u.window,tokens:u.tokens,by_session:u.by_session},null,2);
+  n.children=[];   // live rollup replaces the dummy per-session children
+}
+function applyStorageTile(sb){   // gap-closure M3: ov-storage dash tile ⇄ /v1/console/storage-breakdown
+  const n=N['ov-storage']; const ks=(sb&&sb.kinds)||[];
+  if(!n || !ks.length || !ks.some(k0=>k0.available)) return;   // nothing indexed → keep the demo tile
+  const gib=b=>{ b=Number(b)||0; return b>=1073741824? (b/1073741824).toFixed(2)+' GiB' : (b>=1048576? Math.round(b/1048576)+' MiB' : (b? Math.round(b/1024)+' KiB':'')); };
+  n.sub='live · '+ks.filter(k0=>k0.available).length+' of '+ks.length+' kinds populated';
+  n.fields=ks.map(k0=>[k0.label||k0.kind, [(k0.available?'':'empty'), k0.chunks? fmtK(k0.chunks)+' rows':null, k0.bytes? gib(k0.bytes):null].filter(Boolean).join(' · ')||'—']);
+  n.payload=JSON.stringify({by_kind:ks},null,2);
+}
+function applyUpdateBadge(ver){   // gap-closure M5: git-behind state on the overview tile, not just the boot banner
+  const n=N['ov-node'], up=ver&&ver.update; if(!n||!up||!up.state||up.state==='disabled') return;
+  n.fields=(n.fields||[]).filter(([k])=>k!=='update')
+    .concat([['update',(up.state||'?')+(up.behind_by?' · '+up.behind_by+' behind':'')+(up.comparison_stale?' (unverified)':'')]]);
+  if(up.state==='diverged'||up.state==='ahead') n.status='blocked'; else if(up.state==='behind') n.status='run';
+}
+function txOverviewPlus(json){ const kids=txOverview(json.sum||json); applyUsageTile(json.usage); applyStorageTile(json.storage); applyUpdateBadge(json.ver); return kids; }
+/* ── live events stream (gap-closure M4): /v1/events/stream SSE → ring buffer →
+     Activity page tail + CX dash ticker. EventSource can't send the scopes header,
+     so this reads the stream via fetch; environments without ReadableStream
+     (the smoke DOM stub) degrade to EVT_STATE='unsupported'. ── */
+const EVENTS=[]; let EVT_STATE='idle', __evtRetries=0, __actRerender=0;
+function evtNote(e){ const d=e.data||{};
+  return [d.entity&&(d.entity+(d.key?' · '+d.key:'')), d.session_id, d.orchestrator_id, d.resource].filter(Boolean)[0]||''; }
+function updateEvtTicker(){
+  let t=document.getElementById('evtTicker');
+  if(!t){ t=document.createElement('div'); t.id='evtTicker'; document.body.appendChild(t); }
+  const on= LIVE && typeof dashMode!=='undefined' && dashMode && activeScope==='cx' && EVENTS.length>0;
+  t.style.display=on?'block':'none';
+  if(!on) return;
+  const e=EVENTS[EVENTS.length-1];
+  t.textContent='● '+e.type+(evtNote(e)?' · '+evtNote(e):'')+' · '+e.at+' · '+EVENTS.length+' events';
+}
+function onCruxEvent(type, dataStr){
+  let data={}; try{ const j=JSON.parse(dataStr); data=j.data||j; }catch(err){}
+  EVENTS.push({type, data, at:new Date().toISOString().slice(11,19)+'Z'});
+  if(EVENTS.length>200) EVENTS.shift();
+  updateEvtTicker();
+  if(openPageId==='ax-activity' && !confGet('ax-activity.act_pause',false)){
+    const now=Date.now();
+    if(now-__actRerender>600){ __actRerender=now;
+      Promise.resolve(PAGE_WIRES['ax-activity'].load(PAGES['ax-activity']))
+        .then(()=>{ if(openPageId==='ax-activity') openPage('ax-activity',{__wired:true}); }).catch(()=>{}); }
+  }
+}
+async function startEventStream(){
+  if(!LIVE || typeof fetch!=='function') return;
+  try{
+    const r=await fetch('/v1/events/stream',{headers:apiHeaders()});
+    if(!r.ok){ EVT_STATE=(r.status===401||r.status===403)?'unavailable':'error'; return; }
+    if(!r.body || !r.body.getReader || typeof TextDecoder==='undefined'){ EVT_STATE='unsupported'; return; }
+    EVT_STATE='open'; __evtRetries=0;
+    const rd=r.body.getReader(), dec=new TextDecoder(); let buf='';
+    for(;;){ const {done,value}=await rd.read(); if(done) break;
+      buf+=dec.decode(value,{stream:true});
+      let i; while((i=buf.indexOf('\n\n'))>=0){ const block=buf.slice(0,i); buf=buf.slice(i+2);
+        let ev='message', data='';
+        block.split('\n').forEach(l=>{ if(l.indexOf('event:')===0) ev=l.slice(6).trim(); else if(l.indexOf('data:')===0) data+=(data?'\n':'')+l.slice(5).trim(); });
+        if(data) onCruxEvent(ev, data); } }
+    EVT_STATE='closed';
+  }catch(err){ EVT_STATE='error'; }
+  if(LIVE && (EVT_STATE==='closed'||EVT_STATE==='error') && __evtRetries<5){ __evtRetries++; setTimeout(startEventStream, 2000*__evtRetries); }
+}
 function registerLoaders(){
-  LOADERS['cx-overview']      = { endpoint:'/v1/console/summary',     noun:'tiles',         transform: txOverview };       // M2
+  LOADERS['cx-overview']      = { noun:'tiles', transform: txOverviewPlus,                                                  // M2/M3
+    fetch: async()=>({ sum: await api('/v1/console/summary'), usage: await usageRollup(7).catch(()=>null),
+                       storage: await api('/v1/console/storage-breakdown').catch(()=>null),
+                       ver: await api('/v1/version').catch(()=>null) }) };
   LOADERS['cx-work']          = { endpoint:'/v1/work?source=all',     noun:'work items',    transform: txWork };           // M3
   LOADERS['cx-sessions']      = { endpoint:'/v1/console/sessions',    noun:'sessions',      transform: txSessions };       // M4
   LOADERS['cx-orchestrators'] = { endpoint:'/v1/orchestrators',       noun:'orchestrators', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txOrchestrators };  // M5
@@ -1343,10 +1485,16 @@ function registerLoaders(){
   LOADERS['cx-facts']         = { endpoint:'/v1/console/facts?top_k=100', noun:'facts',     transform: txFacts };          // M7
   LOADERS['cx-memory']        = { endpoint:'/v1/console/facts?top_k=20',  noun:'memories',  transform: txMemory };         // M7
   LOADERS['cx-tenants']       = { endpoint:'/v1/console/tenants',     noun:'tenants',       transform: txTenants };        // M8
-  LOADERS['cx-passport']      = { endpoint:'/v1/passports',           noun:'passports',     transform: txPassports };      // M8
+  LOADERS['cx-passport']      = { noun:'passports', transform: txPassportsPresence,                                        // M8 + gap-closure M7 presence
+    fetch: async()=>({ pp: await api('/v1/passports'), pr: await api('/v1/passports/presence').catch(()=>null) }) };
   // receipts: no daemon list endpoint — the panel projects this browser's lookup history (no network)
   LOADERS['cx-receipts']      = { fetch: async()=>({ recent: recentReceiptLookups() }), noun:'verified receipts yet — use ✓ Verify receipt (toolbar)', transform: txReceiptRecent };
-  // drill-down loaders (prefix match): orchestrator members + session audit chain + receipt verify
+  LOADERS['cx-gates']         = { endpoint:'/v1/work/gate/pending', noun:'pending gates', transform: txGates };            // M6
+  // drill-down loaders (prefix match): orchestrator members + session audit chain + receipt verify + work thread
+  LOADERS['__work_thread'] = { match:n=> n.kind==='execplan' && n.__workId, noun:'comments + transitions',
+    fetch: async n=>({ com: await api('/v1/work/'+encodeURIComponent(n.__workId)+'/comments').catch(()=>({comments:[]})),
+                       txn: await api('/v1/work/'+encodeURIComponent(n.__workId)+'/transitions').catch(()=>({transitions:[]})) }),
+    transform: txWorkThread };  // M6 drill
   LOADERS['__orc_members'] = { match:n=> n.kind==='orchestrator' && n.__orcId, endpoint:n=>'/v1/orchestrators/'+n.__orcId+'/work', noun:'members', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txOrcMembers };  // M5 drill
   LOADERS['__sess_audit']  = { match:n=> n.kind==='session' && n.__sessId, endpoint:n=>'/v1/observe/sessions/'+n.__sessId+'/audit', noun:'audit steps', flagHint:'Observe disabled — set CORECRUXD_OBSERVE=1', transform: txAudit };  // M9 drill
   LOADERS['__receipt_verify'] = { match:n=> n.kind==='receipt' && n.__rid, noun:'verification', flagHint:'Dataplane disabled — receipt streams unavailable (501)',
@@ -1362,7 +1510,7 @@ async function bootProbe(){
   if(el && !(el.value||'').trim()){ try{ el.value=localStorage.getItem('crux-console-scopes')||'admin:read,facts:read,console:read,receipts:read'; }catch{ el.value='admin:read,facts:read,console:read,receipts:read'; } }
   try{ const r=await fetch('/readyz',{cache:'no-store'}); LIVE=!!(r&&r.ok); }catch{ LIVE=false; }
   registerLoaders(); updateLiveBadge();
-  if(LIVE) prefetchScope(activeScope);
+  if(LIVE){ prefetchScope(activeScope); startEventStream(); }
 }
 // debug/test handle (used by the Node smoke harness; inert in prod)
 try{ globalThis.__cx = { get LIVE(){return LIVE;}, setLive:(v)=>{LIVE=v;}, N, LOADERS, loadState, ensureLoaded, mergeChildren, makeStatusNode, bootProbe, prefetchScope, api, idFor }; }catch{}
@@ -2434,7 +2582,14 @@ populatePassportFilter();
    override, create-forms. Controls persist to localStorage (concept). ── */
 var CXCONF={}; try{ CXCONF=JSON.parse(localStorage.getItem('cxconf')||'{}'); }catch(e){}
 function confGet(k,d){ return (k in CXCONF)?CXCONF[k]:d; }
-function confSet(k,v){ CXCONF[k]=v; try{ localStorage.setItem('cxconf',JSON.stringify(CXCONF)); }catch(e){} toast('saved · '+k); }
+function confPut(k,v){ CXCONF[k]=v; try{ localStorage.setItem('cxconf',JSON.stringify(CXCONF)); }catch(e){} }   // quiet write (no toast, no daemon)
+function confSet(k,v){ CXCONF[k]=v; try{ localStorage.setItem('cxconf',JSON.stringify(CXCONF)); }catch(e){} toast('saved · '+k);
+  /* M1 live seam: a wired control change persists to the daemon too */
+  const i=k.indexOf('.'); if(i<=0 || !LIVE) return;
+  const pid=k.slice(0,i), ck=k.slice(i+1), w=PAGE_WIRES[pid]; if(!w) return;
+  const h=(w.set&&w.set[ck]) || null, p = h? h(v) : (w.setAny? w.setAny(ck,v) : null);
+  if(p&&p.then) p.then(m=>{ if(m) toast(m); }).catch(e=>toast(ck+' · daemon rejected ('+((e&&e.status)||'network')+')'));
+}
 function toast(msg){
   let t=document.getElementById('cxToast');
   if(!t){ t=document.createElement('div'); t.id='cxToast'; document.body.appendChild(t); }
@@ -2447,6 +2602,35 @@ const RPC_SAMPLES={
  'tools/call · store_fact':'← { "result":{ "fact_id":"f_9fb33499…",\n    "receipt":"crn_d4e2…", "version":1 } }',
  'resources/list':'← { "result":{ "resources":[] } }',
 };
+/* M1: raw RPC page. tools/list rides the same-origin catalog proxy (/v1/mcp/tools);
+   tools/call POSTs /mcp on this origin — if no JSON-RPC bridge is mounted on :14800
+   the 404/405 renders a calm pointer at :14801 instead of a fake response. */
+function sendRpc(pageId){
+  const m=confGet(pageId+'.rpc_method','tools/list');
+  const out=document.getElementById('rpcOut');
+  if(!LIVE){ if(out) out.textContent='→ { "jsonrpc":"2.0", "method":"'+m+'" }\n'+(RPC_SAMPLES[m]||'← { "result":{} }'); toast('sent · '+m+' (demo)'); return; }
+  if(m==='tools/list'){
+    if(out) out.textContent='→ GET /v1/mcp/tools';
+    api('/v1/mcp/tools').then(j=>{ const ts=j.tools||[];
+      if(out) out.textContent='→ GET /v1/mcp/tools\n← '+(j.count!=null?j.count:ts.length)+' tools\n'+ts.slice(0,40).map(t=>' · '+t.name).join('\n')+(ts.length>40?'\n · …':'');
+      toast('tools/list · '+(j.count!=null?j.count:ts.length)); })
+     .catch(e=>{ if(out) out.textContent='→ GET /v1/mcp/tools\n← '+((e&&e.status)||'network')+' '+JSON.stringify((e&&e.data)||{}); });
+    return;
+  }
+  let params={}; const raw=confGet(pageId+'.rpc_params','{}')||'{}';
+  try{ params=JSON.parse(raw); }catch(err){ if(out) out.textContent='✗ params is not valid JSON — '+err.message; return; }
+  const name=(m.split('·')[1]||'').trim();
+  const body=name? {jsonrpc:'2.0',id:1,method:'tools/call',params:{name,arguments:params}} : {jsonrpc:'2.0',id:1,method:m,params};
+  if(out) out.textContent='→ POST /mcp '+JSON.stringify(body);
+  const scopes=confGet(pageId+'.rpc_scopes','read');
+  fetch('/mcp',{method:'POST',headers:Object.assign({'Content-Type':'application/json','Accept':'application/json, text/event-stream'},apiHeaders(),{'X-Corecrux-Scopes':scopes}),body:JSON.stringify(body)})
+    .then(async r=>{ const t=await r.text();
+      if(r.status===404||r.status===405){ if(out) out.textContent+='\n← '+r.status+' — no JSON-RPC bridge on :14800; the MCP server listens on :14801 /mcp'; return; }
+      let pretty=t; try{ pretty=JSON.stringify(JSON.parse(t.replace(/^data:\s*/gm,'').trim()),null,2); }catch{}
+      if(out) out.textContent+='\n← '+r.status+'\n'+pretty.slice(0,4000); })
+    .catch(()=>{ if(out) out.textContent+='\n← network error'; });
+  toast('sent · '+m);
+}
 const PAGES={
  'cx-settings':{title:'Console settings',sub:'persisted to data_dir/console/settings.json · auth + embedding apply on next restart',sections:[
   {h:'Access posture',sub:'who may call :14800',controls:[
@@ -2482,6 +2666,11 @@ const PAGES={
   {h:'Daemon',controls:[
    {t:'info',label:'build',v:'7417c9f · v0.4.2 · :14800'},
    {t:'btn',label:'Restart daemon',hint:'needs restart: unless-stopped policy',danger:true}]},
+  {h:'Update & bootstrap',sub:'/v1/version · /v1/bootstrap/status',controls:[
+   {t:'info',label:'update state',v:'behind · 37 commits behind (demo)'},
+   {t:'info',label:'bootstrap',v:'seeded · 8 patterns (demo)'}]},
+  {h:'Ops health',sub:'__ops__ facts · /v1/ops/{health,errors} · needs CORECRUXD_OBSERVE=1',controls:[
+   {t:'info',label:'daemon',v:'ok (demo)'}]},
   {h:'Appearance',sub:'applies immediately',controls:[
    {t:'theme'},{t:'info',label:'canvas',v:'2D | 3D toolbar switch'}]}]},
  'cx-integrations':{title:'Integrations',sub:'declarative packs — installed packs are inert until a passport grant exists',sections:[
@@ -2511,7 +2700,7 @@ const PAGES={
   {h:'Trusted signing keys',sub:'manifests verify against this keyring',controls:[
    {t:'info',label:'daemon-root',v:'fp:12345678 · tier partner'},
    {t:'input',k:'key_fpr',label:'passport fingerprint',ph:'fp:…',mono:true},
-   {t:'select',k:'key_tier',label:'trust tier',options:['community','verified','partner'],v:'community'},
+   {t:'select',k:'key_tier',label:'trust tier',options:['unknown','community_reviewed','locally_signed','first_party'],v:'community_reviewed'},
    {t:'input',k:'key_pub',label:'public key',ph:'ed25519:…',mono:true},
    {t:'btn',label:'Add key'}],
    doc:'Dev bypass: CORECRUXD_EXTENSIONS_ALLOW_UNSIGNED=1 lets unsigned manifests install for local testing only.'},
@@ -2729,7 +2918,7 @@ const PAGES={
    {t:'info',label:'wave1-orchestration',v:'MEDIUM · serialized security plans'},
    {t:'btn',label:'Approve wave1',danger:true},
    {t:'btn',label:'Withhold all',hint:'keeps gates pending'}],
-   doc:'GET /v1/work/gate/pending → POST /v1/work/{id}/transitions.\nApproval of one destructive action never extends to others;\ngates cannot auto-approve past timeout without a documented\nfallback policy.'}]},
+   doc:'GET /v1/work/gate/pending → POST /v1/work/gate/{actionId}/approve | /reject\n(approver_passport recorded on the transition). Approval of one destructive\naction never extends to others; gates cannot auto-approve past timeout\nwithout a documented fallback policy.'}]},
  'cx-mediation':{title:'Mediation & policy',sub:'the gateway plane — identity, capability ladder, foresight',sections:[
   {h:'Principal',controls:[
    {t:'info',label:'passport',v:'ce:4e6c4e2a:local · tier basic'},
@@ -2764,13 +2953,394 @@ const PAGES={
   {h:'Feature registry',sub:'/v1/features/capabilities (post-M5 cutover)',controls:[
    {t:'info',label:'gap analysis',v:'2 critical · 5 high'},
    {t:'info',label:'promise coverage',v:'78% audited'},
-   {t:'btn',label:'Record capability audit',hint:'POST …/capabilities/{id}/audit'}]}]},
+   {t:'btn',label:'Record capability audit',hint:'POST …/capabilities/{id}/audit'}]},
+  {h:'Query workbench',sub:'/v1/query/* · dataplane lanes (text-search · graph-expand · time-range)',controls:[
+   {t:'input',k:'wbq_tenant',label:'tenant',v:'default',mono:true},
+   {t:'input',k:'wbq_query',label:'text search',ph:'retrieval cascade',mono:true},
+   {t:'btn',label:'Run text search'},
+   {t:'input',k:'wbq_seeds',label:'graph seeds · artifact ids',ph:'12, 44',mono:true},
+   {t:'btn',label:'Graph expand'},
+   {t:'select',k:'wbq_window',label:'time window',options:['24h','7d','30d'],v:'24h'},
+   {t:'btn',label:'Time range'},
+   {t:'btn',label:'Browse results as graph',action:'graph'}]},
+  {h:'Entities',sub:'/v1/entities/{kind}/{id} + /history',controls:[
+   {t:'select',k:'wbe_kind',label:'kind',options:['capability'],v:'capability'},
+   {t:'input',k:'wbe_id',label:'id',ph:'entity id',mono:true},
+   {t:'btn',label:'Load entity'}]}]},
 };
 function openSettings(){ openPage('cx-settings'); }
 function closeSettings(){ closePage(); }
-function closePage(){ const el=document.getElementById('settingsPage'); if(el) el.style.display='none'; }
-function openPage(id){
+function closePage(){ openPageId=null; const el=document.getElementById('settingsPage'); if(el) el.style.display='none'; }
+/* ── M1: live operator pages. PAGE_WIRES[pageId] =
+     load(def)  — async; pull /v1 state and mutate the page def's control values/options before re-render
+     set{k}/setAny(k,v) — persist one control change to the daemon (called from confSet when LIVE)
+     act{'Button label'} — real call behind a button; resolves to a toast message
+   LIVE=false leaves every page on the concept demo; load failures degrade to demo values. */
+function pageCtrl(pageId,k){ const def=PAGES[pageId]; let out=null;
+  ((def&&def.sections)||[]).forEach(s=>(s.controls||[]).forEach(c=>{ if(c.k===k) out=c; })); return out; }
+function pageVal(pageId,k){ const c=pageCtrl(pageId,k); return confGet(pageId+'.'+k, c?c.v:undefined); }
+function setCtrl(pageId,k,v){ const c=pageCtrl(pageId,k); if(c) c.v=v; confPut(pageId+'.'+k, v); }   // server truth wins on load
+const infoRow=(label,v)=>({t:'info',label,v});
+const PAGE_WIRES={
+ 'cx-settings':{
+  load: async def=>{
+    const s=await api('/v1/console/settings'); const a=s.auth||{}, e=s.embedding||{};
+    const am=pageCtrl('cx-settings','auth_mode');
+    if(am && Array.isArray(a.supported_modes) && a.supported_modes.length) am.options=a.supported_modes.slice();
+    if(a.chosen_mode||a.running_mode) setCtrl('cx-settings','auth_mode', a.chosen_mode||a.running_mode);
+    setCtrl('cx-settings','embed_on', e.enabled_intent!=null? !!e.enabled_intent : !!e.active);
+    setCtrl('cx-settings','embed_url', e.chosen_url||e.active_url||'');
+    const mm=pageCtrl('cx-settings','embed_model'), mv=e.chosen_model||e.active_model;
+    if(mm && mv && mm.options.indexOf(mv)<0) mm.options=mm.options.concat([mv]);
+    if(mv) setCtrl('cx-settings','embed_model', mv);
+    /* gap-closure M5: ops + update surfaces — version is public; ops/bootstrap 501 when observe is off */
+    const [ver,oh,oe,bs]=await Promise.all([
+      api('/v1/version').catch(()=>null),
+      api('/v1/ops/health').catch(err=>({_err:err})),
+      api('/v1/ops/errors?top_k=8').catch(err=>({_err:err})),
+      api('/v1/bootstrap/status').catch(err=>({_err:err}))]);
+    const secByH=h=>def.sections.find(s0=>s0.h===h);
+    const factLine=f=>(typeof f.value==='string'? f.value : JSON.stringify(f.value)).slice(0,70)+(f.stored_at?' · '+String(f.stored_at).slice(0,16):'');
+    const comp=en=>String(en||'').replace(/^__ops__::(health|error)(::)?/,'')||'daemon';
+    if(ver){
+      const d=secByH('Daemon');
+      if(d) d.controls=[infoRow('build',[(ver.version||''),((ver.commit||ver.build_sha||(ver.update&&ver.update.current_commit)||'')+'').slice(0,9),':14800'].filter(Boolean).join(' · ')||'—')]
+        .concat(d.controls.filter(c=>c.t!=='info'));
+    }
+    const us=secByH('Update & bootstrap');
+    if(us){ const rows=[];
+      if(ver&&ver.update){ const up=ver.update;
+        rows.push(infoRow('update state',(up.state||'unknown')+(up.behind_by?' · '+up.behind_by+' commits behind':'')+(up.ahead_by?' · '+up.ahead_by+' ahead':'')+(up.comparison_stale?' · drift unverified':'')));
+        if(up.tracking_ref) rows.push(infoRow('tracking', up.tracking_ref+(up.checked_at?' · checked '+String(up.checked_at).slice(0,16):'')));
+        if(up.state==='behind'&&up.upgrade_hint) rows.push(infoRow('upgrade', up.upgrade_hint)); }
+      if(!bs._err) rows.push(infoRow('bootstrap',(bs.seeded?'seeded':'not seeded')+(bs.fact_count!=null?' · '+bs.fact_count+' facts':'')+((bs.categories&&bs.categories.length)?' · '+bs.categories.length+' categories':'')));
+      else if(bs._err.status===501) rows.push(infoRow('bootstrap','observe plane off — set CORECRUXD_OBSERVE=1'));
+      if(rows.length) us.controls=rows;
+    }
+    const ohSec=secByH('Ops health');
+    if(ohSec){
+      if(!oh._err){ const hs=oh.health||[];
+        ohSec.controls=hs.length? hs.map(f=>infoRow(comp(f.entity), factLine(f)))
+          : [infoRow('no health facts','components report via __ops__::health::*')];
+      } else ohSec.controls=[infoRow(oh._err.status===501?'observe plane off':'unavailable',
+          oh._err.status===501? 'set CORECRUXD_OBSERVE=1 to collect __ops__ facts' : ('/v1/ops/health → '+(oh._err.status||'network')))];
+      if(!oe._err){ const es=oe.facts||[];
+        ohSec.sub='/v1/ops/{health,errors} · '+es.length+' recent errors';
+        ohSec.controls=ohSec.controls.concat(es.slice(0,6).map(f=>infoRow('⚠ '+comp(f.entity), factLine(f)))); }
+    }
+  },
+  set:{
+    auth_mode: v=>putApi('/v1/console/settings',{auth_mode:v}).then(r=>r.restart_required?'saved · restart required':'saved to daemon'),
+    embed_on:  v=>putApi('/v1/console/settings',{embedding_enabled:!!v}).then(()=>'saved to daemon'),
+    embed_url: v=>putApi('/v1/console/settings',{embedding_url:v||null}).then(()=>'saved to daemon'),
+    embed_model: v=>(v&&v!=='—')? putApi('/v1/console/settings',{embedding_model:v}).then(()=>'saved to daemon') : null,
+  },
+  act:{
+    'Probe endpoint': async ctx=>{
+      const url=pageVal('cx-settings','embed_url'); if(!url) throw {status:'enter an endpoint URL first'};
+      const r=await postApi('/v1/console/embedding/probe',{url});
+      const mm=pageCtrl('cx-settings','embed_model'); if(mm) mm.options=['—'].concat(r.models||[]);
+      ctx.reopen(); return (r.shape||'endpoint')+' · '+((r.models||[]).length)+' models';
+    },
+    'Re-run onboarding': async()=>{ await postApi('/v1/console/onboarding/restart',{}); return 'onboarding shows on next load'; },
+  }},
+ 'cx-integrations':{
+  load: async def=>{
+    const [integ,gh,oa]=await Promise.all([
+      api('/v1/console/integrations').catch(e=>({_err:e})),
+      api('/v1/integrations/github/status').catch(e=>({_err:e})),
+      api('/v1/integrations/openai/status').catch(e=>({_err:e}))]);
+    if(!integ._err){
+      const packs=integ.packs||[];
+      if(packs.length) def.sections[0].controls=packs.map(p=>({ t:'toggle', k:'pack_'+(p.id||p.name),
+        label:(p.id||p.name)+(p.version?' · v'+p.version:''), v:(p.status? p.status!=='disabled' : !!(p.installed||p.enabled)) }));
+      def.sections[0].sub=(integ.enabled?'enabled':'disabled')+(integ.safe_mode?' · safe mode':'')+' · grants are separate';
+      const g=(def.sections[3]&&def.sections[3].controls||[]).find(c=>c.t==='info');
+      const n=Array.isArray(integ.grants)? integ.grants.length : (integ.grants&&integ.grants.count);
+      if(g && n!=null) g.v=n+' active';
+    }
+    if(!gh._err) def.sections[1].controls=[infoRow('status', gh.connected?('connected'+(gh.username?' · '+gh.username:'')):'not connected')]
+      .concat(def.sections[1].controls.filter(c=>c.t!=='info'));
+    if(!oa._err){
+      const om=pageCtrl('cx-integrations','oa_model');
+      if(om && Array.isArray(oa.available_models) && oa.available_models.length) om.options=['none'].concat(oa.available_models);
+      if(oa.default_model){ if(om && om.options.indexOf(oa.default_model)<0) om.options=om.options.concat([oa.default_model]); setCtrl('cx-integrations','oa_model',oa.default_model); }
+      def.sections[2].controls=[infoRow('status', oa.connected?'connected':'not connected')]
+        .concat(def.sections[2].controls.filter(c=>c.t!=='info'));
+    }
+  },
+  setAny:(k,v)=>{ if(!/^pack_/.test(k)) return null; const id=k.slice(5);
+    return v? postApi('/v1/console/integrations/'+encodeURIComponent(id)+'/install',{pack_id:id}).then(()=>id+' · installed')
+            : postApi('/v1/console/integrations/'+encodeURIComponent(id)+'/disable',{}).then(()=>id+' · disabled'); },
+  set:{
+    oa_model: v=>(v&&v!=='none')? patchApi('/v1/integrations/openai/settings',{default_model:v}).then(()=>'default model saved') : null,
+  },
+  act:{
+    'Verify connection': async ctx=>{
+      const pat=pageVal('cx-integrations','gh_pat'); if(!pat) throw {status:'paste a token first'};
+      const r=await postApi('/v1/integrations/github/connect',{pat, skip_verify:!!pageVal('cx-integrations','gh_skiptls')});
+      confPut('cx-integrations.gh_pat','');   // never keep the PAT in browser storage — the daemon holds it encrypted now
+      ctx.reload(); return 'github · connected'+(r.username?' as '+r.username:'');
+    },
+    'Test call': async ctx=>{
+      const key=pageVal('cx-integrations','oa_key');
+      if(key){ const m=pageVal('cx-integrations','oa_model');
+        const r=await postApi('/v1/integrations/openai/connect',{api_key:key, organization_id:pageVal('cx-integrations','oa_org')||null, default_model:(m&&m!=='none')?m:null});
+        confPut('cx-integrations.oa_key','');   // same rule as the PAT
+        ctx.reload(); return 'openai · connected'+(r.default_model?' · '+r.default_model:'');
+      }
+      const r=await postApi('/v1/integrations/openai/chat',{messages:[{role:'user',content:'Reply with the single word: pong'}],max_tokens:8});
+      const c=r.choices&&r.choices[0]&&r.choices[0].message&&r.choices[0].message.content;
+      return 'openai · '+(c?String(c).trim().slice(0,40):'ok');
+    },
+    'Review grants': async()=>{ const r=await api('/v1/console/integrations');
+      const n=Array.isArray(r.grants)? r.grants.length : ((r.grants&&r.grants.count)!=null? r.grants.count:'—');
+      return 'grants · '+n+' active'; },
+  }},
+ 'cx-extensions':{
+  load: async def=>{
+    const [ex,keys]=await Promise.all([api('/v1/extensions').catch(e=>({_err:e})), api('/v1/extensions/keys').catch(e=>({_err:e}))]);
+    if(!ex._err){ const list=ex.extensions||[];
+      def.sections[0].h='Installed · '+(ex.count!=null?ex.count:list.length);
+      def.sections[0].controls=list.length? list.map(x=>infoRow(x.id||x.name, [x.version,x.kind].filter(Boolean).join(' · ')||'installed'))
+        : [infoRow('none installed', ex.allow_unsigned_dev?'unsigned dev installs allowed':'—')]; }
+    if(!keys._err){ const ks=keys.keys||[];
+      def.sections[1].controls=ks.map(k0=>infoRow(k0.passport_fpr||'key',[k0.trust_tier,k0.added_by?('by '+k0.added_by):null].filter(Boolean).join(' · ')))
+        .concat(def.sections[1].controls.filter(c=>c.t!=='info')); }
+  },
+  act:{
+    'Add key': async ctx=>{
+      const fpr=pageVal('cx-extensions','key_fpr'), pub=pageVal('cx-extensions','key_pub');
+      if(!fpr||!pub) throw {status:'fingerprint + public key required'};
+      await postApi('/v1/extensions/keys',{passport_fpr:fpr, public_key_hex:String(pub).replace(/^ed25519:/,''), trust_tier:pageVal('cx-extensions','key_tier'), added_by:'console'});
+      ctx.reload(); return 'key added · '+fpr;
+    },
+    'Install': async ctx=>{
+      const src=pageVal('cx-extensions','manifest_url'); if(!src) throw {status:'enter a manifest URL or registry id'};
+      if(/^https?:\/\//.test(src)||/^\.?\//.test(src)){
+        const r=await fetch(src,{headers:apiHeaders()}); if(!r.ok) throw {status:r.status};
+        await postApi('/v1/extensions/register',{manifest:await r.json()});
+      } else await postApi('/v1/extensions/install-from-registry',{id:src});
+      ctx.reload(); return 'installed · '+src;
+    },
+  }},
+ 'cx-usage':{
+  load: async def=>{
+    const days={'7d':7,'30d':30,'90d':90}[pageVal('cx-usage','win')]||7;
+    const u=await usageRollup(days);
+    applyUsageTile(u);   // keep the dash card in step with the page window
+    const winSel=pageCtrl('cx-usage','win');
+    if(!u.turns){   // observe plane off or hooks not posting usage — say so, don't fake bars
+      def.sections[0].controls=[winSel,infoRow('no usage observations','enable CORECRUXD_OBSERVE=1 + the crux-claude-hooks usage hook')].filter(Boolean);
+      def.sections[1].controls=[infoRow('no data','savings are computed from live in/out once observations arrive')];
+      def.sections[2].controls=[]; def.sections[3].controls=[];
+      return;
+    }
+    def.sections[0].controls=[winSel,
+      infoRow('daily avg','~'+fmtK(Math.round(u.tokens.in/days))+' in · '+fmtK(Math.round(u.tokens.out/days))+' out'),
+      infoRow(u.window, fmtK(u.tokens.in)+' in · '+fmtK(u.tokens.out)+' out · '+u.turns+' model calls'),
+      infoRow('sessions', u.sessions+(u.truncated?' · latest 1000 of '+u.truncated+' records':''))].filter(Boolean);
+    /* savings: standard est = measured ÷ (1 − 0.31); the −31% factor is the TokenBurn
+       prefix-dedup measurement the method doc below explains — measured side is live */
+    const std=Math.round(u.tokens.in/0.69);
+    def.sections[1].controls=[
+      {t:'bar',label:'standard session (est.)',pct:100,v:fmtK(std)+' in',tone:'err'},
+      {t:'bar',label:'with Crux Daemon',pct:Math.max(2,Math.round(100*u.tokens.in/std)),v:fmtK(u.tokens.in)+' in',tone:'ok'},
+      infoRow('saved','≈'+fmtK(std-u.tokens.in)+' in tokens · −31% (estimate — method below)')];
+    const ses=Object.entries(u.by_session).sort((a,b)=>b[1].in-a[1].in);
+    const barsFor=list=>{ const max=list[0][1].in||1, avg=Math.round(list.reduce((a,[,v])=>a+v.in,0)/list.length)||1;
+      return list.slice(0,8).map(([sid,v])=>{ const d=Math.round(100*(v.in-avg)/avg);
+        return {t:'bar',label:sid.slice(0,28),pct:Math.max(2,Math.round(100*v.in/max)),
+          v:fmtK(v.in)+' · '+(d>=0?'+':'')+d+'%',tone:d>20?'err':(d<-20?'ok':undefined)}; }); };
+    def.sections[2].sub='avg '+fmtK(Math.round(u.tokens.in/u.sessions))+' in';
+    def.sections[2].controls=barsFor(ses);
+    const eps=ses.filter(([sid])=>/execplan:/.test(sid));
+    def.sections[3].sub=eps.length? ('avg '+fmtK(Math.round(eps.reduce((a,[,v])=>a+v.in,0)/eps.length))+' in per plan') : 'no execplan-attributed sessions in window';
+    def.sections[3].controls=eps.length? barsFor(eps)
+      : [infoRow('—','sessions show here when save_session uses execplan:<slug> ids')];
+  },
+  set:{ win: ()=>{ if(openPageId==='cx-usage') openPage('cx-usage'); return null; } }},
+ 'cx-workbench':{
+  load: async def=>{   // gap-closure M7: kinds feed the entities browser; everything else is action-driven
+    const ks=await api('/v1/kinds').catch(()=>null);
+    const sel=pageCtrl('cx-workbench','wbe_kind');
+    const names=ks? (ks.kinds||[]).map(k0=>k0.kind||k0.name||k0.id).filter(Boolean) : [];
+    if(sel&&names.length){ sel.options=names; if(names.indexOf(confGet('cx-workbench.wbe_kind',sel.v))<0) setCtrl('cx-workbench','wbe_kind',names[0]); }
+  },
+  actAny:(label,ctx)=>{
+    const def=PAGES['cx-workbench'];
+    const setResults=(rows,sub)=>{ const sec={h:'Results',sub:sub||'',controls:rows.length?rows:[infoRow('none','no matches')]}
+      ; const i=def.sections.findIndex(s0=>s0.h==='Results'); if(i>=0) def.sections[i]=sec; else def.sections.push(sec); ctx.reopen(); };
+    const mergeGraph=nodes=>{ const wb=N['cx-workbench']; if(wb&&nodes.length) mergeChildren(wb,nodes); };
+    const flagged=(e,flag)=>{ if(e&&(e.status===404||e.status===400)) throw {status:'dataplane lane off — '+flag}; throw e; };
+    if(label==='Run text search') return (async()=>{
+      const q=pageVal('cx-workbench','wbq_query'); if(!q) throw {status:'enter a query'};
+      const r=await postApi('/v1/query/text-search',{tenant_id:pageVal('cx-workbench','wbq_tenant')||'default', query:q, limit:10})
+        .catch(e=>flagged(e,'BM25 index (.ccxi) not built or dataplane disabled'));
+      const res=r.results||[];
+      setResults(res.map(x=>infoRow('#'+x.rank+' · doc '+x.doc_id,'score '+(x.score!=null?x.score.toFixed(3):'—')+' · seg '+x.segment_index+' · '+(x.token_count||0)+' tok')),
+        'text-search · '+res.length+' hits · '+((r.meta&&r.meta.took_ms)!=null?r.meta.took_ms+'ms':'')+(r.coverage&&r.coverage.score!=null?' · coverage '+r.coverage.score.toFixed(2):''));
+      mergeGraph(res.map(x=>({ id:idFor('wbres',x.result_id||x.segment_index+':'+x.doc_id), kind:'chunk',
+        label:'#'+x.rank+' · doc '+x.doc_id, sub:'score '+(x.score!=null?x.score.toFixed(3):'—'),
+        status:'ok', fields:[['result_id',x.result_id],['segment',x.segment_index],['score',x.score],['tokens',x.token_count]].filter(([,v])=>v!=null),
+        children:[], payload:JSON.stringify(x,null,2) })));
+      return 'text-search · '+res.length+' hits';
+    })();
+    if(label==='Graph expand') return (async()=>{
+      const seeds=String(pageVal('cx-workbench','wbq_seeds')||'').split(',').map(s=>parseInt(s.trim(),10)).filter(n=>!isNaN(n));
+      if(!seeds.length) throw {status:'enter seed artifact ids'};
+      const r=await postApi('/v1/query/graph-expand',{tenant_id:pageVal('cx-workbench','wbq_tenant')||'default', seed_artifact_ids:seeds, max_hops:2, budget:50})
+        .catch(e=>flagged(e,'set CORECRUXD_QUERY_GRAPH_EXPAND=1'));
+      const arts=r.artifacts||[];
+      setResults(arts.map(a=>infoRow('artifact '+a.artifact_id,'hop '+a.hop_distance+' · score '+(a.score!=null?a.score.toFixed(3):'—')+(a.edge_types_used&&a.edge_types_used.length?' · '+a.edge_types_used.join(','):''))),
+        'graph-expand · '+arts.length+' artifacts · '+((r.traversal_stats||{}).nodes_visited||0)+' visited');
+      return 'graph-expand · '+arts.length+' artifacts';
+    })();
+    if(label==='Time range') return (async()=>{
+      const days={'24h':1,'7d':7,'30d':30}[pageVal('cx-workbench','wbq_window')]||1;
+      const end=Date.now()*1000, start=end-days*86400000000;
+      const r=await postApi('/v1/query/time-range',{tenant_id:pageVal('cx-workbench','wbq_tenant')||'default', start_micros:start, end_micros:end, limit:50})
+        .catch(e=>flagged(e,'set CORECRUXD_QUERY_TIME_RANGE=1'));
+      const ch=r.artifacts_changed||[];
+      setResults(ch.map(a=>infoRow('artifact '+a.artifact_id,(a.living_status||'')+' · conf '+(a.confidence!=null?a.confidence.toFixed(2):'—')+(a.relation_change_count?' · '+a.relation_change_count+' relation changes':''))),
+        'time-range · '+ch.length+' changed · '+((r.scan_stats||{}).artifacts_scanned||0)+' scanned');
+      return 'time-range · '+ch.length+' changed';
+    })();
+    if(label==='Load entity') return (async()=>{
+      const kind=pageVal('cx-workbench','wbe_kind'), id=pageVal('cx-workbench','wbe_id');
+      if(!id) throw {status:'enter an entity id'};
+      const base='/v1/entities/'+encodeURIComponent(kind)+'/'+encodeURIComponent(id);
+      const [er,hr]=await Promise.all([api(base), api(base+'/history').catch(()=>null)]);
+      const ent=er.entity||er;
+      const rows=[infoRow(kind+'/'+id, JSON.stringify(ent).slice(0,80))]
+        .concat(hr? [infoRow('history',(hr.count!=null?hr.count:(hr.versions||[]).length)+' versions')] : []);
+      setResults(rows,'entity · '+kind+'/'+id);
+      mergeGraph([{ id:idFor('wbent',kind+'/'+id), kind:'entity', label:kind+'/'+id,
+        sub:(hr&&hr.count!=null? hr.count+' versions':''), status:'ok', fields:[['kind',kind],['id',id]],
+        children:[], payload:JSON.stringify({entity:ent,history:hr},null,2) }]);
+      return 'entity loaded · '+kind+'/'+id;
+    })();
+    return null;
+  }},
+ 'cx-gates':{
+  load: async def=>{
+    const g=await api('/v1/work/gate/pending');
+    const pend=(g.pending||[]).filter(p=>(p.status||'pending')==='pending');
+    const rows=[];
+    pend.slice(0,8).forEach(p=>{
+      rows.push(infoRow(p.work_id,(p.requested_action||'update_state')+(p.target_state?' → '+p.target_state:'')+' · requested by '+(p.requested_by_passport||'?')));
+      rows.push({t:'btn',label:'Approve '+p.action_id,danger:true,hint:'records approving passport + timestamp'});
+      rows.push({t:'btn',label:'Reject '+p.action_id,danger:true});
+    });
+    def.sections[0].sub='/v1/work/gate/pending · '+pend.length+' pending';
+    def.sections[0].controls=rows.length? rows : [infoRow('none pending','gated transitions appear here when an agent requests a high-risk state change')];
+  },
+  actAny:(label,ctx)=>{
+    const m=label.match(/^(Approve|Reject) (.+)$/); if(!m) return null;
+    const pid=currentBoundPassportId();
+    if(!pid) return Promise.reject({status:'bind a passport first — approvals must be attributed (Art. 14)'});
+    return postApi('/v1/work/gate/'+encodeURIComponent(m[2])+'/'+(m[1]==='Approve'?'approve':'reject'),{approver_passport:pid})
+      .then(w=>{ ctx.reload(); return (m[1]==='Approve'?'approved':'rejected')+' · '+(w.id||m[2])+' · by '+pid; });
+  }},
+ 'ax-activity':{
+  load: def=>{   // synchronous projection of the EVENTS ring buffer — onCruxEvent re-renders live
+    const rows=EVENTS.slice(-14).reverse().map(e=>infoRow(e.type, [evtNote(e), e.at].filter(Boolean).join(' · ')));
+    const sec={ h:'Tail · /v1/events/stream',
+      sub: EVT_STATE==='open'? (EVENTS.length+' events this session · live')
+         : EVT_STATE==='unavailable'? 'stream not authorised — needs query:read'
+         : EVT_STATE==='unsupported'? 'streaming unsupported in this environment'
+         : (EVENTS.length? EVENTS.length+' events buffered · stream '+EVT_STATE : 'waiting for store mutations…'),
+      controls: rows.length? rows : [infoRow('no events yet','fact / session / orchestrator / punchcard mutations appear here as they happen')] };
+    if(def.sections[0] && /^Tail/.test(def.sections[0].h)) def.sections[0]=sec; else def.sections.unshift(sec);
+  },
+  act:{ 'Clear': async()=>{ EVENTS.length=0; updateEvtTicker(); if(openPageId==='ax-activity') openPage('ax-activity'); return 'event tail cleared'; } }},
+ 'cx-documents':{
+  load: async def=>{
+    const [tn,sb,qf]=await Promise.all([
+      api('/v1/console/tenants').catch(e=>({_err:e})),
+      api('/v1/console/storage-breakdown').catch(e=>({_err:e})),
+      api('/v1/console/facts?q='+encodeURIComponent('ingest:queue')+'&top_k=20').catch(e=>({_err:e}))]);
+    if(!tn._err){
+      const ts=tn.tenants||[], ids=ts.map(t=>t.tenant_id);
+      const sel=pageCtrl('cx-documents','doc_tenant');
+      if(sel&&ids.length){ sel.options=ids; if(ids.indexOf(confGet('cx-documents.doc_tenant',sel.v))<0) setCtrl('cx-documents','doc_tenant',ids[0]); }
+      const ingSel=pageCtrl('cx-documents','ing_tenant'); if(ingSel&&ids.length) ingSel.options=ids.concat(['new tenant…']);
+      def.sections[0].sub='/v1/console/tenants · '+ts.length+' tenants'+(tn.dataplane_enabled===false?' · dataplane off (metadata only)':'');
+      def.sections[0].controls=[sel].filter(Boolean)
+        .concat(ts.slice(0,8).map(t=>infoRow(t.tenant_id,[t.category,t.override?('override '+t.override):null].filter(Boolean).join(' · ')||'—')))
+        .concat([{t:'btn',label:'Browse documents as graph',action:'graph'}]);
+    }
+    const cur=pageVal('cx-documents','doc_tenant');
+    if(cur){
+      try{
+        const ch=await api('/v1/console/tenants/'+encodeURIComponent(cur)+'/chunks?limit=12');
+        const rows=(ch.chunks||[]).map(c=>infoRow((c.stream_type||'stream')+' / '+String(c.stream_id||'').slice(0,20),
+          [c.event_type, c.payload_bytes? Math.max(1,Math.round(c.payload_bytes/1024))+' KiB':null, (c.occurred_at||'').slice(0,10)].filter(Boolean).join(' · ')));
+        def.sections[1].sub=cur+' · '+(ch.chunks||[]).length+' chunks shown'+((ch.page&&ch.page.next_cursor)?' · more available':'');
+        def.sections[1].controls=rows.length? rows : [infoRow('no chunks','tenant has no indexed chunk metadata yet')];
+      }catch(e){
+        def.sections[1].sub=cur+' · chunks unavailable ('+((e&&e.status)||'network')+')';
+        def.sections[1].controls=[infoRow(e&&e.status===403?'not authorised':'unavailable',
+          e&&e.status===403? ('needs tenant:chunks:read scope for '+cur) : 'chunk index not readable')];
+      }
+    }
+    if(!sb._err || !qf._err){
+      const px=def.sections[3].controls.filter(c=>c.t==='btn');
+      const rows=[];
+      if(!qf._err){ const qn=(qf.facts||[]).filter(f=>f.entity==='ingest:queue').length; rows.push(infoRow('queue', qn+' pending')); }
+      if(!sb._err) (sb.kinds||[]).forEach(k0=>rows.push(infoRow(k0.label||k0.kind,
+        [(k0.available?null:'empty'), k0.chunks? fmtK(k0.chunks)+' rows':null, k0.bytes? (k0.bytes/1073741824).toFixed(2)+' GiB':null].filter(Boolean).join(' · ')||'available')));
+      def.sections[3].controls=rows.concat(px);
+      applyStorageTile(sb._err? null : sb);
+    }
+  },
+  set:{ doc_tenant: ()=>{ if(openPageId==='cx-documents') openPage('cx-documents'); return null; } },
+  act:{
+    'Scan path': async()=>{   /* daemon scans CORECRUXD_WORKSPACE_PATH — the typed path rides the queue fact, not this call */
+      try{ const r=await postApi('/v1/workspace/scan',{});
+        const st=r.stats||{}; return 'scan '+(r.scan_id||'done')+(st.modules!=null?' · '+st.modules+' modules':'')+(r.duration_ms!=null?' · '+r.duration_ms+'ms':'');
+      }catch(e){ if(e&&e.status===412) throw {status:'CORECRUXD_WORKSPACE_PATH not configured'}; throw e; } },
+    'Queue ingest': async()=>{
+      const path=pageVal('cx-documents','ing_path'); if(!path) throw {status:'enter a source path first'};
+      const tenant=pageVal('cx-documents','ing_tenant');
+      await postApi('/v1/console/facts/add',{ entity:'ingest:queue', key:'path:'+path,
+        value: JSON.stringify({ path, tenant, chunking:pageVal('cx-documents','ing_chunking'),
+          watch:!!pageVal('cx-documents','ing_watch'), ner:!!pageVal('cx-documents','ing_ner'),
+          dossiers:!!pageVal('cx-documents','ing_dossiers'), queued_at:new Date().toISOString(), status:'queued' }) });
+      return 'queued · ingest:queue fact stored for '+tenant; },
+  }},
+ 'cx-projects':{
+  load: async def=>{
+    const [pr,pp]=await Promise.all([api('/v1/projects').catch(e=>({_err:e})), api('/v1/console/passports').catch(e=>({_err:e}))]);
+    if(!pp._err){ const ids=(pp.passports||[]).map(p=>p.id).filter(Boolean);
+      const sel=pageCtrl('cx-projects','proj_passport');
+      if(sel&&ids.length){ sel.options=ids; if(ids.indexOf(confGet('cx-projects.proj_passport',sel.v))<0) setCtrl('cx-projects','proj_passport',ids[0]); } }
+    if(!pr._err){ const list=pr.projects||[];
+      def.sections[1].h='Tracked · '+list.length;
+      def.sections[1].controls=(list.length? list.map(p=>infoRow(p.name||p.id,
+          [p.planning_target,(p.working_tenants||[]).join(', ')||null,p.archived?'archived':null].filter(Boolean).join(' · ')||'—'))
+        : [infoRow('none yet','create one on the left')]).concat([{t:'btn',label:'Browse as graph',action:'graph'}]); }
+  },
+  act:{
+    'Create project': async ctx=>{
+      const id=pageVal('cx-projects','proj_id'); if(!id) throw {status:'id required'};
+      await postApi('/v1/projects',{ id, name:pageVal('cx-projects','proj_name')||id,
+        planning_target:pageVal('cx-projects','proj_plan')||null,
+        default_passport_id:pageVal('cx-projects','proj_passport'),
+        working_tenants:String(pageVal('cx-projects','proj_tenants')||'').split(',').map(s=>s.trim()).filter(Boolean) });
+      ctx.reload(); return 'project created · '+id;
+    },
+  }},
+};
+let openPageId=null;
+function openPage(id, opts){
   const def=PAGES[id]; if(!def) return;
+  openPageId=id;
+  const wire=PAGE_WIRES[id];
+  if(LIVE && wire && wire.load && !(opts&&opts.__wired))
+    Promise.resolve(wire.load(def))
+      .then(()=>{ if(openPageId===id) openPage(id,{__wired:true}); })
+      .catch(e=>{ announce('Live load failed for '+def.title+' ('+((e&&e.status)||'network')+') — concept data shown'); });
   let el=document.getElementById('settingsPage');
   if(!el){ el=document.createElement('div'); el.id='settingsPage'; (document.getElementById('canvas')||document.body).appendChild(el); }
   el.innerHTML='';
@@ -2794,9 +3364,10 @@ function openPage(id){
 function renderControl(pageId,c){
   const row=document.createElement('div'); row.className='sp-row';
   const key=c.k?pageId+'.'+c.k:null;
-  if(c.t==='info'){ row.className='frow';
-    row.innerHTML='<span class="fk"></span><span class="fv"></span>';
-    row.children[0].textContent=c.label; row.children[1].textContent=c.v; return row; }
+  if(c.t==='info'){ row.className='frow';   /* createElement, not innerHTML — the smoke DOM stub has no innerHTML parser */
+    const a=document.createElement('span'); a.className='fk'; a.textContent=c.label;
+    const b=document.createElement('span'); b.className='fv'; b.textContent=c.v;
+    row.appendChild(a); row.appendChild(b); return row; }
   if(c.t==='theme'){ row.className='frow';
     const a=document.createElement('span'); a.className='fk'; a.textContent='theme'; row.appendChild(a);
     const b=document.createElement('button'); b.className='sp-btn';
@@ -2826,11 +3397,18 @@ function renderControl(pageId,c){
       if(c.danger){ delete b.dataset.armed; b.textContent=c.label; }
       if(c.action==='graph'){ closePage(); soloPanel(pageId,{graph:true}); return; }
       if(c.action==='open3d'){ closePage(); setView('3d'); return; }
-      if(c.action==='rpc'){
-        const m=confGet(pageId+'.rpc_method','tools/list');
-        const out=document.getElementById('rpcOut'); if(out) out.textContent='→ { "jsonrpc":"2.0", "method":"'+m+'" }\n'+(RPC_SAMPLES[m]||'← { "result":{} }');
-        toast('sent · '+m); return;
+      if(c.action==='rpc'){ sendRpc(pageId); return; }
+      const wire=PAGE_WIRES[pageId];
+      const h=(wire&&wire.act&&wire.act[c.label]) || (wire&&wire.actAny? (ctx=>wire.actAny(c.label,ctx)) : null);
+      if(h && LIVE){   /* M1: wired button → real /v1 call; busy-guard + toast the outcome */
+        b.disabled=true;
+        const ctx={ reload:()=>{ if(openPageId===pageId) openPage(pageId); }, reopen:()=>{ if(openPageId===pageId) openPage(pageId,{__wired:true}); } };
+        Promise.resolve(h(ctx)).then(msg=>toast(msg||(c.label+' · done')))
+          .catch(e=>toast(c.label+' · failed ('+((e&&e.status)||'network')+')'))
+          .finally(()=>{ b.disabled=false; });
+        return;
       }
+      if(h){ toast(c.label+' · demo mode — start the daemon'); return; }
       toast(c.label+' · queued (concept)');
     };
     if(c.hint){ row.appendChild(b); const h=document.createElement('span'); h.className='sp-hint'; h.textContent=c.hint; row.appendChild(h); return row; }
