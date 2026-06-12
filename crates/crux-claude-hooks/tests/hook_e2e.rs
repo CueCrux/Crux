@@ -74,12 +74,12 @@ fn spawn_mock(response_body: &str, status_line: &str) -> (String, thread::JoinHa
         }
         if let Some(he) = header_end {
             let headers = String::from_utf8_lossy(&buf[..he]).to_ascii_lowercase();
-            let clen = headers
+            let body_len = headers
                 .lines()
                 .find_map(|l| l.strip_prefix("content-length:"))
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .unwrap_or(0);
-            while buf.len() < he + clen {
+            while buf.len() < he + body_len {
                 match stream.read(&mut tmp) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => buf.extend_from_slice(&tmp[..n]),
