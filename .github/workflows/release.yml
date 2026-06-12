@@ -44,10 +44,10 @@ jobs:
         run: |
           bash scripts/assert-daemon-release-boundary.sh
           bash scripts/assert-hosted-bridge-contract.sh
-          cargo test --workspace
+          cargo test --locked --workspace
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Package binaries
         run: bash scripts/package-daemon-release.sh ${{ matrix.suffix }} dist
