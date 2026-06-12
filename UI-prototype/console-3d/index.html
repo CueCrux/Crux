@@ -1,0 +1,99 @@
+<!doctype html>
+<!--
+  Crux Substrate — 3D console concept
+  Home: Crux/UI-prototype/console-3d/
+  Tracks ExecPlan: PlanCrux/.agent/execplans/crux-console-3d-substrate-concept-2026-06-11.md
+
+  A design-first reimagining of /console as a spatial substrate (vectrfl.com-
+  style soft clay world): execplans are milestone towers, sessions are
+  capsules, facts are cubes, CROWN receipts are a sealed chain, passports are
+  rings, the coord plane is a beacon field. Scroll plays the story; the end
+  state IS the console — click any node to walk the graph.
+
+  Local-only: vendored three.js r165, no build step, dummy data (data.js is
+  the live-wire swap point). Serve:  ./serve.sh  →  http://localhost:8321/
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Crux Substrate · console concept</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="css/console3d.css" />
+<script>
+  (function () {
+    try {
+      if ((localStorage.getItem('cx3d-theme') || 'light') === 'dark')
+        document.documentElement.classList.add('dark');
+    } catch (e) { /* default light */ }
+  })();
+</script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.min.js",
+    "three/addons/controls/OrbitControls.js": "./vendor/OrbitControls.js",
+    "three/addons/geometries/RoundedBoxGeometry.js": "./vendor/RoundedBoxGeometry.js"
+  }
+}
+</script>
+</head>
+<body>
+
+<canvas id="stage" aria-label="Crux substrate — 3D graph of execplans, sessions, facts, receipts and coordination. Use the chapter list or the search box to navigate."></canvas>
+<div id="labels" aria-hidden="true"></div>
+
+<header id="bar">
+  <div class="brand">
+    <img src="../assets/CueCrux-Arc-Loop.png" alt="" onerror="this.style.display='none'" />
+    <b>crux</b><span>substrate · console concept</span>
+  </div>
+  <div class="spacer"></div>
+  <span class="pill"><span class="dot"></span><span id="stat-mode">local_only</span></span>
+  <span class="pill" id="stat-facts">3,823 facts</span>
+  <input id="search" list="node-list" placeholder="jump to node…" aria-label="Jump to node" />
+  <datalist id="node-list"></datalist>
+  <button class="pill btn" id="theme" aria-label="Toggle light/dark theme">◐ theme</button>
+  <a class="pill" href="../agent-observability.html" title="The 2D graph-navigator prototype this concept reimagines">classic ↗</a>
+</header>
+
+<nav id="crumbs" aria-label="Focus trail"></nav>
+<!-- district nav removed: the host (classic console) left rail is the one menu;
+     it drives this view over postMessage (cx3d:filter) -->
+
+<section id="hero">
+  <div class="mono">memory · retrieval · receipts</div>
+  <h1>The daemon,<br/>as a place.</h1>
+  <p>Every execplan, session, fact and receipt in the Crux substrate —
+     one navigable world instead of twelve panels.</p>
+  <div class="scroll-hint">scroll to walk the substrate</div>
+</section>
+
+<nav id="rail" aria-label="Story chapters">
+  <!-- chapter items injected by main.js -->
+</nav>
+<button id="skip" type="button">skip intro — explore ↗</button>
+
+<aside id="panel" aria-label="Node detail">
+  <div class="p-head">
+    <span class="chip" id="p-kind">node</span>
+    <span id="p-status" data-s="idle"></span>
+    <button id="p-close" aria-label="Close detail panel (Esc)">✕</button>
+  </div>
+  <h2 id="p-title"></h2>
+  <div id="p-sub"></div>
+  <div class="p-scroll">
+    <div id="p-fields"></div>
+    <pre id="p-doc"></pre>
+    <h3 class="p-links-h">linked</h3>
+    <div id="p-links"></div>
+  </div>
+</aside>
+
+<div id="explore-hint">drag orbit · scroll zoom · click a node · esc overview</div>
+
+<div id="scroll-spacer"></div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
