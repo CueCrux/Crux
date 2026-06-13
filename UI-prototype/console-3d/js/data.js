@@ -327,17 +327,44 @@ export const HERO_CAM    = { pos: [-16, 40, 100], look: [0, 0, 0] };
 export const EXPLORE_CAM = { pos: [0, 130, 98], look: [0, 0, -14] };
 
 
-/* ring platforms — real geometry; uniform dark grey for now. radii spaced
-   so adjacent washers (band ±4.6) never intersect. solid = centre podium. */
-export const RINGS = [
-  { r: 9,  solid: true },   /* daemon podium */
-  { r: 18 },                /* passports */
-  { r: 32 },                /* sessions */
-  { r: 44 },                /* coord (front) */
-  { r: 56 },                /* execplans */
-  { r: 68 },                /* receipts */
-  { r: 80 },                /* memory */
-];
+/* ── dynamic radial layout ────────────────────────────────────────────────
+   Ring radii derive from content instead of fixed slots: each ring takes the
+   smallest radius that (a) clears the washer inside it and (b) gives the
+   blocks on it enough chord clearance for the ×1.5 footprint. Bearings are
+   preserved; every node is projected exactly onto its ring. Districts and
+   their labels scale with their ring so the overlays stay attached. */
+const RING_BAND = 4.6;     /* half-width of a washer (world.js BAND) */
+const RING_GAP  = 1.6;     /* clearance between adjacent washers — compact */
+const MIN_CHORD = 10.3;    /* min centre-to-centre spacing on a ring (plinth 9.3 + air) */
+const PODIUM_R  = 10;      /* solid daemon podium (covers the ×1.5 daemon slab) */
+const RING_ORDER = ['passport', 'sessions', 'coord', 'work', 'receipts', 'memory'];
+const OLD_R = { passport: 18, sessions: 32, coord: 44, work: 56, receipts: 68, memory: 80 };
+
+function computeRings() {
+  const rings = [{ r: PODIUM_R, solid: true }];
+  let prevOuter = PODIUM_R;                      /* outer edge of the ring inside us */
+  for (const district of RING_ORDER) {
+    const members = NODES.filter((n) => n.district === district);
+    const angs = members.map((n) => Math.atan2(n.pos[1], n.pos[0])).sort((x, y) => x - y);
+    let minSep = Math.PI * 2;
+    for (let i = 1; i < angs.length; i++) minSep = Math.min(minSep, angs[i] - angs[i - 1]);
+    const chordR = (members.length > 1 && minSep > 1e-4) ? MIN_CHORD / minSep : 0;
+    const r = Math.max(prevOuter + RING_GAP + RING_BAND, chordR);
+    rings.push({ r });
+    prevOuter = r + RING_BAND;
+    const ratio = r / OLD_R[district];
+    for (const n of members) {                   /* project onto the ring, bearing preserved */
+      const a = Math.atan2(n.pos[1], n.pos[0]);
+      n.pos = [Math.cos(a) * r, Math.sin(a) * r];
+    }
+    const d = DISTRICTS.find((x) => x.id === district);
+    if (d) { d.pos = [d.pos[0] * ratio, d.pos[1] * ratio];
+             d.labelPos = [d.labelPos[0] * ratio, d.labelPos[1] * ratio]; }
+  }
+  return rings;
+}
+
+export const RINGS = computeRings();
 
 
 export const KIND_LABELS = {

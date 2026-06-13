@@ -107,7 +107,7 @@ function makeFetch() {
   const workCall = f.calls.find(c => /\/v1\/work\?/.test(c.url));
   ok(!!workCall && /^\/v1\//.test(workCall.url), 'M3 work: same-origin /v1/work fetch issued');
   ok(workCall && workCall.opts.headers && /read/.test(workCall.opts.headers['X-Corecrux-Scopes'] || ''), 'M3 work: X-Corecrux-Scopes header attached');
-  await tile(env, 'panel', 'Work').fire('click'); await flush();
+  await tile(env, 'panel', 'ExecPlans').fire('click'); await flush();
   ok(!!tile(env, 'execplan', 'agent-ux-best-in-class'), 'M3 work: live WorkItem → execplan tile');
   ok(f.calls.filter(c => /\/v1\/work\?/.test(c.url)).length === 1, 'M3 work: cached (prefetch loaded it; click did not refetch)');
   const chip = st => env.s.document.querySelectorAll('#workFilter .wf-chip').find(c => c.dataset.stage === st);
@@ -124,6 +124,7 @@ function makeFetch() {
   // ── B) 501 → calm unavailable empty-state ──
   f.route(u => /\/v1\/punchcards/.test(u), { ok: false, status: 501, body: { error: 'disabled' } });
   env.s.__cx.LOADERS['cx-punchcards'] = { endpoint: '/v1/punchcards', noun: 'leases', flagHint: 'CORECRUXD_PUNCHCARD=off', transform: () => [] };
+  env.s.openScope('cx'); await flush();   // ExecPlans now solos into its kanban — return to the dash first
   await tile(env, 'panel', 'Punchcards').fire('click'); await flush();
   ok(ofKind(env, 'unavailable').length >= 1, '501: renders an "unavailable" empty-state, not a crash');
   ok((tile(env, 'unavailable', 'CORECRUXD_PUNCHCARD') || {}), '501: shows the flag hint');
@@ -131,7 +132,7 @@ function makeFetch() {
   // ── C) error → retry ──
   f.route(u => /\/v1\/console\/facts/.test(u), { ok: false, status: 500, body: { error: 'boom' } });
   env.s.__cx.LOADERS['cx-facts'] = { endpoint: '/v1/console/facts', noun: 'facts', transform: j => (j.facts || []).map((x, i) => ({ id: 'fact:' + i, kind: 'fact', label: x.key, children: [] })) };
-  await tile(env, 'panel', 'Facts').fire('click'); await flush();
+  await env.s.soloPanel('cx-facts', { graph: true }); await flush();   // facts is a list page now — drive the graph view directly
   ok(ofKind(env, 'error').length >= 1, 'error: 500 renders an error tile (not a crash)');
   // flip the route to success and retry by clicking the error tile
   f.route(u => /\/v1\/console\/facts/.test(u), { ok: true, status: 200, body: { facts: [{ key: 'gate:M1' }] } });
@@ -148,7 +149,7 @@ function makeFetch() {
   const env2 = buildSandbox(f2); await flush();
   ok(env2.s.__cx.LIVE === false, 'demo: /readyz fail → LIVE false');
   ok(env2.getById('liveBadge').textContent === 'demo', 'demo: badge shows "demo"');
-  await tile(env2, 'panel', 'Work').fire('click'); await flush();
+  await tile(env2, 'panel', 'ExecPlans').fire('click'); await flush();
   ok(ofKind(env2, 'execplan').length >= 1, 'demo: dummy execplans still render (offline still demos)');
 
   // ── F) demo-mode regression: the async click/dblclick wrappers don't break existing UX ──
@@ -191,6 +192,7 @@ function makeFetch() {
 
   await tile(env3, 'panel', 'Sessions').fire('click'); await flush();
   ok(!!tile(env3, 'session', '9c5a9271'), 'M4 sessions: live session id tile (ids-only shape)');
+  cxp(); await flush();   // sessions now solos into its graph — return to the dash
   await tile(env3, 'panel', 'Orchestrators').fire('click'); await flush();
   ok(!!tile(env3, 'orchestrator', 'Sprint 1'), 'M5 orchestrators: live orchestrator tile');
   await tile(env3, 'orchestrator', 'Sprint 1').fire('dblclick'); await flush();
@@ -206,7 +208,7 @@ function makeFetch() {
   ok(!!tile(env3, 'passport', 'ce:4e6c4e2a'), 'M8 passport: live passport tile');
 
   // M5 live write: build an orchestrator → Done POSTs create + member
-  await tile(env3, 'panel', 'Work').fire('click'); await flush();   // populate work:agentux as a candidate
+  await tile(env3, 'panel', 'ExecPlans').fire('click'); await flush();   // populate work:agentux as a candidate
   cxp(); await flush();
   env3.getById('orcNew').fire('click'); await flush();
   env3.s.addToBuild('work:agentux'); await flush();
@@ -337,6 +339,9 @@ function makeFetch() {
     packs: [{ id: 'git-pack', version: '1.0', status: 'enabled' }, { id: 'fs-pack', version: '1.0', status: 'disabled' }], grants: [{}] } });
   f7.route((u, o) => /\/v1\/console\/integrations\/fs-pack\/install/.test(u) && o.method === 'POST', { ok: true, status: 201, body: {} });
   f7.route(u => /\/v1\/integrations\/github\/status/.test(u), { ok: true, status: 200, body: { connected: true, username: 'myles' } });
+  f7.route(u => /\/v1\/integrations\/github\/repos\/accessible/.test(u), { ok: true, status: 200, body: { repos: [{ full_name: 'CueCrux/Crux' }, { full_name: 'CueCrux/AuditCrux' }] } });
+  f7.route(u => /\/v1\/integrations\/github\/repos$/.test(u), { ok: true, status: 200, body: { repos: [{ full_name: 'CueCrux/Crux' }] } });
+  f7.route((u, o) => /\/v1\/integrations\/github\/repos\/CueCrux\/AuditCrux\/select/.test(u) && o.method === 'POST', { ok: true, status: 200, body: {} });
   f7.route(u => /\/v1\/integrations\/openai\/status/.test(u), { ok: true, status: 200, body: { connected: false, available_models: ['gpt-4o'], default_model: null } });
   const env7 = buildSandbox(f7); await flush();
   const lastBtn = (env, label) => env.ALL.filter(e => e._text === label && e._listeners && e._listeners.click).pop();
@@ -359,6 +364,12 @@ function makeFetch() {
   env7.s.closePage(); env7.s.openPage('cx-projects'); await flush(10);
   ok((env7.s.pageCtrl('cx-projects', 'proj_passport').options || []).includes('ce:8821fa0d:local'), 'M1 projects: passport options from /v1/console/passports');
   ok(env7.ALL.some(e => e._text === 'CueCrux'), 'M1 projects: tracked list rendered from /v1/projects');
+  // GitHub-connected repo picker: accessible repos populate the select; Add repo POSTs /select
+  ok((env7.s.pageCtrl('cx-projects', 'gh_addrepo').options || []).includes('CueCrux/AuditCrux'), 'M1 projects: accessible repos populate the picker when GitHub is connected');
+  ok(env7.ALL.some(e => /CueCrux\/Crux · tracked/.test(e.dataset && e.dataset['aria-label'] || '')), 'M1 projects: added GitHub repo surfaces as a tracked toggle');
+  env7.s.confSet('cx-projects.gh_addrepo', 'CueCrux/AuditCrux');
+  await lastBtn(env7, 'Add repo').fire('click'); await flush(8);
+  ok(f7.calls.some(c => /github\/repos\/CueCrux\/AuditCrux\/select/.test(c.url) && c.opts && c.opts.method === 'POST'), 'M1 projects: Add repo POSTs repos/{owner}/{repo}/select');
   env7.s.confSet('cx-projects.proj_id', 'newproj');
   await lastBtn(env7, 'Create project').fire('click'); await flush(8);
   const postP = f7.calls.find(c => /\/v1\/projects$/.test(c.url) && c.opts && c.opts.method === 'POST');
@@ -434,9 +445,9 @@ function makeFetch() {
   const env10 = buildSandbox(f10); await flush(8);
   ok(/live · 1 of 2/.test(env10.s.__cx.N['ov-storage'].sub || ''), 'M3 storage: ov-storage dash tile live from storage-breakdown');
   env10.s.openPage('cx-documents'); await flush(12);
-  ok((env10.s.pageCtrl('cx-documents', 'doc_tenant').options || []).join(',') === 'lme-s,personal', 'M3 documents: tenant select from /v1/console/tenants');
-  ok(env10.ALL.some(e => /documents \/ sess_7f3a_travel/.test(e._text || '')), 'M3 documents: chunk metadata rows from /chunks');
-  ok(env10.ALL.some(e => /more available/.test(e._text || '')), 'M3 documents: next_cursor surfaces as "more available"');
+  ok(env10.ALL.some(e => e._text === 'lme-s') && env10.ALL.some(e => e._text === 'personal'), 'M3 documents: tenants render as expandable rows from /v1/console/tenants');
+  ok(env10.ALL.some(e => /documents \/ sess_7f3a_travel/.test(e._text || '')), 'M3 documents: chunk metadata rows from /chunks inside the tenant row');
+  ok(env10.ALL.some(e => /2 tenants/.test(e._text || '')), 'M3 documents: tenant count surfaces in the section sub');
   ok(env10.ALL.some(e => /1 pending/.test(e._text || '')), 'M3 documents: pipeline queue counts ingest:queue facts');
   env10.s.confSet('cx-documents.ing_path', '~/corpus/**/*.md');
   await lastBtn(env10, 'Queue ingest').fire('click'); await flush(8);
@@ -493,7 +504,7 @@ function makeFetch() {
     { action_id: 'act_1', work_id: 'release-readiness', requested_by_passport: 'claude-work', requested_action: 'update_state', target_state: 'deployed', status: 'pending', requested_at_unix_ms: 1765000000000 }] } });
   f10.route((u, o) => /\/v1\/work\/gate\/act_1\/approve/.test(u) && o.method === 'POST', { ok: true, status: 200, body: { id: 'release-readiness', state: 'deployed' } });
   // drill: live work node fans out comments + transitions
-  await tile(env10, 'panel', 'Work').fire('click'); await flush(8);
+  await tile(env10, 'panel', 'ExecPlans').fire('click'); await flush(8);
   const wNode = env10.s.__cx.N['work:gapwork'];
   ok(!!wNode && wNode.__workId === 'gapwork', 'M6 thread: live work item carries __workId');
   await env10.s.__cx.ensureLoaded(wNode); await flush(8);
