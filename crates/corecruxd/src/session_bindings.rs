@@ -110,6 +110,39 @@ pub fn list_bindings(store: &FactStore) -> Vec<SessionBinding> {
     out
 }
 
+/// Uncapped total of live session bindings with a per-passport breakdown.
+///
+/// Unlike [`list_bindings`] (which caps at `top_k: 200`) this is O(n) over the
+/// whole fact store and does not truncate — use it for leak / observability
+/// (e.g. spotting a churning client minting one binding per MCP `initialize`),
+/// not for listing. Deduplicates by entity (session id) and skips tombstones.
+pub fn count_bindings(store: &FactStore) -> BindingCounts {
+    let prefix = format!("{SESSION_BINDING_ENTITY_PREFIX}::");
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut by_passport: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut total = 0u64;
+    for fact in store.all_facts() {
+        if fact.deleted || fact.key != SESSION_BINDING_RECORD_KEY || !fact.entity.starts_with(&prefix) {
+            continue;
+        }
+        if !seen.insert(fact.entity.as_str()) {
+            continue;
+        }
+        total += 1;
+        if let Ok(b) = serde_json::from_str::<SessionBinding>(&fact.value) {
+            *by_passport.entry(b.passport_id).or_default() += 1;
+        }
+    }
+    BindingCounts { total, by_passport }
+}
+
+/// Result of [`count_bindings`].
+#[derive(Debug, Clone, Serialize)]
+pub struct BindingCounts {
+    pub total: u64,
+    pub by_passport: std::collections::BTreeMap<String, u64>,
+}
+
 /// Point lookup of the binding for a single session id (hex). Returns the
 /// latest `record` fact under `__session_binding__::{session_id_hex}`, or
 /// `None` if no binding exists. Cheaper than [`list_bindings`] when the caller

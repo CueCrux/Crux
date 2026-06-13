@@ -21,20 +21,30 @@
 //!
 //! Gated by `CORECRUXD_EPHEMERAL_GC=1` (default OFF;
 //! [`crate::config::Config::ephemeral_gc_enabled`]). The GC NEVER touches
-//! non-reserved or private user facts, and only ever the two ephemeral
-//! prefixes above — enforced by
-//! [`crux_mcp::envelope::is_ephemeral_reserved_entity`] and re-checked
-//! per-fact in [`select_ephemeral_candidates`].
+//! non-reserved user facts (private or not), and only ever the two ephemeral
+//! prefixes above — each branch of [`select_ephemeral_candidates`] matches its
+//! reserved prefix by name.
 //!
 //! ## Selection rule (safety-critical)
 //!
 //! - `__reverify_receipts__::*` — delete if `stored_at` is older than
 //!   `retain` (default 30 days). Recent receipts are kept.
-//! - `__session_binding__::<hex>` — KEEP the newest binding per entity
-//!   (per `session_id_hex`). An older binding is deletable ONLY if it is
-//!   past `retain` AND it is NOT the newest `stored_at` for its entity.
-//!   The single live binding for a session is therefore never selected,
-//!   even when it is old; only superseded churn is collected.
+//! - `__session_binding__::<hex>` — bindings are minted one-per-MCP-session
+//!   with a *unique* `session_id_hex`, so a churning client (e.g. a stateless
+//!   bridge that re-`initialize`s every poll) accumulates unbounded durable
+//!   facts. "Newest per entity" never reclaims this, because every binding is
+//!   the sole record for its own entity. Instead: keep the newest
+//!   [`SESSION_BINDING_KEEP_N`] bindings **per passport** (by `stored_at`); an
+//!   older one is deletable ONLY if it is past the cap AND older than
+//!   [`SESSION_BINDING_MIN_AGE_HOURS`] (a safety floor well above the coord
+//!   presence TTL, so an active session's just-minted binding is never
+//!   orphaned). Caps the durable population at ~`KEEP_N × #passports`.
+//!
+//! NOTE: these bookkeeping facts are stored `private = true` by
+//! `fact_privacy::enforce_global`. The selector therefore does NOT skip
+//! private facts wholesale — it scopes eligibility to the two reserved
+//! prefixes *by name*, so churned-but-private bindings are reclaimable while
+//! non-reserved user facts (private or not) are still never touched.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,10 +54,21 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::{broadcast, RwLock};
 
 use corecrux_memory::{Fact, FactStore};
-use crux_mcp::envelope::is_ephemeral_reserved_entity;
+
+use crate::session_bindings::{SessionBinding, SESSION_BINDING_RECORD_KEY};
 
 /// Default retain window for ephemeral facts: 30 days.
 pub const DEFAULT_RETAIN_DAYS: i64 = 30;
+
+/// Keep at most this many of the most-recently-stored session bindings per
+/// passport. Beyond this, older bindings are reclaimable.
+pub const SESSION_BINDING_KEEP_N: usize = 32;
+
+/// Safety floor for session-binding collection: never collect a binding
+/// younger than this even when it is beyond the per-passport cap. Set well
+/// above the coordination-plane presence TTL (15 min) so that a live
+/// session's just-minted binding is never orphaned.
+pub const SESSION_BINDING_MIN_AGE_HOURS: i64 = 1;
 
 /// Default GC tick interval: hourly.
 const GC_INTERVAL_SECS: u64 = 3600;
@@ -58,52 +79,54 @@ const GC_INTERVAL_SECS: u64 = 3600;
 ///
 /// Safety invariants (all enforced here, independent of caller):
 /// - Only `__session_binding__::*` and `__reverify_receipts__::*` entities
-///   are ever eligible (via [`is_ephemeral_reserved_entity`]).
-/// - `private` facts are NEVER selected.
+///   are ever eligible — scoped by prefix, so non-reserved user facts
+///   (including private ones) are never selected.
 /// - Already-deleted facts are skipped (idempotent across ticks).
-/// - For session bindings, the newest version per entity is always kept.
+/// - The newest [`SESSION_BINDING_KEEP_N`] bindings per passport, and any
+///   binding younger than the [`SESSION_BINDING_MIN_AGE_HOURS`] floor, are
+///   always kept.
 pub fn select_ephemeral_candidates(facts: &[Fact], now: DateTime<Utc>, retain: Duration) -> Vec<String> {
-    // Newest stored_at per session-binding entity — the live binding we
-    // must never collect.
-    let mut newest_binding_at: HashMap<&str, DateTime<Utc>> = HashMap::new();
+    let mut out = Vec::new();
+
+    // `__reverify_receipts__::*` — age-based: any fact past `retain`.
     for f in facts {
         if f.deleted {
             continue;
         }
-        if f.entity.starts_with("__session_binding__::") {
-            let e = newest_binding_at.entry(f.entity.as_str()).or_insert(f.stored_at);
-            if f.stored_at > *e {
-                *e = f.stored_at;
-            }
+        if f.entity.starts_with("__reverify_receipts__::") && (now - f.stored_at) > retain {
+            out.push(f.fact_id.clone());
         }
     }
 
-    let mut out = Vec::new();
+    // `__session_binding__::*` — per-passport population cap. Each MCP session
+    // mints a unique-id binding, so keep the newest KEEP_N per passport and
+    // collect the rest once they age past the safety floor.
+    let min_age = Duration::hours(SESSION_BINDING_MIN_AGE_HOURS);
+    let mut by_passport: HashMap<String, Vec<(DateTime<Utc>, String)>> = HashMap::new();
     for f in facts {
-        // Never touch deleted, private, or non-ephemeral-reserved facts.
-        if f.deleted || f.private {
+        if f.deleted || !f.entity.starts_with("__session_binding__::") {
             continue;
         }
-        if !is_ephemeral_reserved_entity(&f.entity) {
+        if f.key != SESSION_BINDING_RECORD_KEY {
             continue;
         }
-        let past_retain = (now - f.stored_at) > retain;
-        if !past_retain {
+        // Attribute each binding to its passport; unparseable records are kept
+        // (conservative — never collect something we cannot classify).
+        let Ok(binding) = serde_json::from_str::<SessionBinding>(&f.value) else {
             continue;
-        }
-        if f.entity.starts_with("__session_binding__::") {
-            // Keep the newest binding for each session; only superseded
-            // (older) versions past retain are deletable.
-            let is_newest = newest_binding_at
-                .get(f.entity.as_str())
-                .is_none_or(|newest| f.stored_at >= *newest);
-            if is_newest {
-                continue;
+        };
+        by_passport
+            .entry(binding.passport_id)
+            .or_default()
+            .push((f.stored_at, f.fact_id.clone()));
+    }
+    for (_passport, mut rows) in by_passport {
+        // Newest first; protect the leading KEEP_N, collect aged-out remainder.
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        for (stored_at, fact_id) in rows.into_iter().skip(SESSION_BINDING_KEEP_N) {
+            if (now - stored_at) > min_age {
+                out.push(fact_id);
             }
-            out.push(f.fact_id.clone());
-        } else {
-            // __reverify_receipts__::* — any fact past retain.
-            out.push(f.fact_id.clone());
         }
     }
     out
@@ -210,49 +233,111 @@ mod tests {
         }
     }
 
-    #[test]
-    fn selects_backdated_facts_for_both_prefixes() {
-        let now = Utc::now();
-        let old = now - Duration::days(45);
-        let facts = vec![
-            // A reverify receipt past retain → selected.
-            fact("__reverify_receipts__::f1", "r1", old, false),
-            // Two bindings for the same session: old + recent. The recent
-            // one is newest → kept; the old one is superseded → selected.
-            fact("__session_binding__::aaaa", "b_old", old, false),
-            fact("__session_binding__::aaaa", "b_new", now, false),
-        ];
-        let retain = Duration::days(DEFAULT_RETAIN_DAYS);
-        let selected = select_ephemeral_candidates(&facts, now, retain);
-        assert!(selected.contains(&"r1".to_string()), "old reverify receipt selected");
-        assert!(
-            selected.contains(&"b_old".to_string()),
-            "superseded old binding selected"
+    /// A session-binding fact carrying a real JSON `SessionBinding` value
+    /// (the selector parses it for the passport). Stored `private = true` to
+    /// mirror prod, where `fact_privacy::enforce_global` forces it.
+    fn binding_fact(session_hex: &str, fact_id: &str, passport: &str, stored_at: DateTime<Utc>) -> Fact {
+        let value = format!(
+            r#"{{"session_id_hex":"{session_hex}","project_id":null,"tenant_id":"personal","passport_id":"{passport}","passport_category":"personal","agent_work_gate":false,"bound_at_unix_ms":0}}"#
         );
-        assert!(!selected.contains(&"b_new".to_string()), "newest binding kept");
-        assert_eq!(selected.len(), 2);
+        Fact {
+            fact_id: fact_id.to_string(),
+            entity: format!("__session_binding__::{session_hex}"),
+            key: "record".to_string(),
+            value,
+            source_receipt: None,
+            confidence: 1.0,
+            stored_at,
+            tokens: 8,
+            deleted: false,
+            version: 1,
+            supersedes: None,
+            private: true,
+            horizon_class: Default::default(),
+            reverified_at: None,
+            superseded_by: None,
+            actor: None,
+        }
     }
 
     #[test]
-    fn never_selects_recent_private_or_nonreserved() {
+    fn caps_bindings_per_passport_and_ages_out_private_receipts() {
         let now = Utc::now();
         let old = now - Duration::days(45);
-        let facts = vec![
-            // Recent single session binding → kept (newest for its entity).
-            fact("__session_binding__::bbbb", "recent_binding", now, false),
-            // Old single session binding, but it is the ONLY (newest) one
-            // for its entity → kept (never orphan a live session).
-            fact("__session_binding__::cccc", "lone_old_binding", old, false),
-            // A non-reserved user fact, old → NEVER selected.
+        // A reverify receipt that is PRIVATE and past retain. Regression for
+        // the prod gap where the selector skipped all private facts and so
+        // never collected anything.
+        let mut facts = vec![fact("__reverify_receipts__::f1", "r1", old, true)];
+        // 40 aged bindings (all > the 1h safety floor) for one passport.
+        // Newest 32 kept; oldest 8 collected. i ascending = newest → oldest.
+        for i in 0..40 {
+            let ts = now - Duration::hours(2) - Duration::minutes(i as i64);
+            facts.push(binding_fact(
+                &format!("sess{i:02}"),
+                &format!("b{i:02}"),
+                "personal-default",
+                ts,
+            ));
+        }
+        let selected = select_ephemeral_candidates(&facts, now, Duration::days(DEFAULT_RETAIN_DAYS));
+        assert!(
+            selected.contains(&"r1".to_string()),
+            "private receipt past retain collected"
+        );
+        let binding_hits: Vec<_> = selected.iter().filter(|id| id.starts_with('b')).cloned().collect();
+        assert_eq!(
+            binding_hits.len(),
+            8,
+            "8 oldest bindings beyond the cap collected: {binding_hits:?}"
+        );
+        assert!(!selected.contains(&"b00".to_string()), "newest binding kept");
+    }
+
+    #[test]
+    fn keeps_recent_bindings_and_never_touches_nonreserved() {
+        let now = Utc::now();
+        let old = now - Duration::days(45);
+        let mut facts = vec![
+            // Non-reserved facts, old → NEVER selected (even the private one).
             fact("user::notes", "u1", old, false),
-            // A private fact under an ephemeral prefix, old → NEVER selected.
-            fact("__reverify_receipts__::secret", "p1", old, true),
-            // execplan fact, old → NEVER selected.
             fact("execplan:foo", "e1", old, false),
+            fact("secret::pii", "p1", old, true),
         ];
-        let retain = Duration::days(DEFAULT_RETAIN_DAYS);
-        let selected = select_ephemeral_candidates(&facts, now, retain);
+        // 50 RECENT bindings (younger than the 1h floor) for one passport:
+        // beyond the cap, but none may be collected yet.
+        for i in 0..50 {
+            let ts = now - Duration::minutes(i as i64);
+            facts.push(binding_fact(
+                &format!("r{i:02}"),
+                &format!("rb{i:02}"),
+                "personal-default",
+                ts,
+            ));
+        }
+        let selected = select_ephemeral_candidates(&facts, now, Duration::days(DEFAULT_RETAIN_DAYS));
         assert!(selected.is_empty(), "no candidates expected, got {selected:?}");
+    }
+
+    #[test]
+    fn cap_is_per_passport_not_global() {
+        let now = Utc::now();
+        // 40 aged bindings each for two passports. The cap is per-passport, so
+        // each contributes 8 collectable (40 - 32), never starving one passport
+        // because another is busy.
+        let mut facts = Vec::new();
+        for (p, prefix) in [("personal-default", "a"), ("work-default", "c")] {
+            for i in 0..40 {
+                let ts = now - Duration::hours(2) - Duration::minutes(i as i64);
+                facts.push(binding_fact(
+                    &format!("{prefix}{i:02}"),
+                    &format!("{prefix}{i:02}"),
+                    p,
+                    ts,
+                ));
+            }
+        }
+        let selected = select_ephemeral_candidates(&facts, now, Duration::days(DEFAULT_RETAIN_DAYS));
+        assert_eq!(selected.len(), 16, "8 per passport × 2 passports");
     }
 
     #[tokio::test]
@@ -261,65 +346,39 @@ mod tests {
         let now = Utc::now();
         let retain = Duration::days(DEFAULT_RETAIN_DAYS);
 
-        // Seed facts; then patch stored_at directly on the in-memory copies
-        // so we can exercise the real try_delete path.
-        let (receipt_id, old_binding_id, new_binding_id, user_id) = {
+        // Seed a PRIVATE reverify receipt (mirrors prod privacy) + a user fact.
+        let (receipt_id, user_id) = {
             let mut g = store.write().await;
-            let receipt = store_fact(&mut g, "__reverify_receipts__::f1", "r1", false);
-            let old_binding = store_fact(&mut g, "__session_binding__::aaaa", "b_old", false);
-            let new_binding = store_fact(&mut g, "__session_binding__::aaaa", "b_new", false);
+            let receipt = store_fact(&mut g, "__reverify_receipts__::f1", "r1", true);
             let user = store_fact(&mut g, "user::notes", "u1", false);
-            (receipt.fact_id, old_binding.fact_id, new_binding.fact_id, user.fact_id)
+            (receipt.fact_id, user.fact_id)
         };
 
-        // Backdate everything except the newest binding to 45 days ago via
-        // a fresh slice fed to the pure selector — verify selection first.
+        // Backdate via a hand-built slice fed to the pure selector → only the
+        // aged ephemeral receipt qualifies (the user fact never does).
         let backdated = vec![
-            fact(
-                "__reverify_receipts__::f1",
-                &receipt_id,
-                now - Duration::days(45),
-                false,
-            ),
-            fact(
-                "__session_binding__::aaaa",
-                &old_binding_id,
-                now - Duration::days(45),
-                false,
-            ),
-            fact("__session_binding__::aaaa", &new_binding_id, now, false),
+            fact("__reverify_receipts__::f1", &receipt_id, now - Duration::days(45), true),
             fact("user::notes", &user_id, now - Duration::days(45), false),
         ];
         let selected = select_ephemeral_candidates(&backdated, now, retain);
-        assert_eq!(selected.len(), 2);
+        assert_eq!(selected, vec![receipt_id.clone()], "only the aged ephemeral receipt");
 
-        // Drive the real journaled delete path on exactly those ids.
-        let mut deleted = 0usize;
+        // Drive the real journaled delete path.
         {
             let mut g = store.write().await;
-            for id in &selected {
-                if g.try_delete(id).expect("journaled delete") {
-                    deleted += 1;
-                }
-            }
+            assert!(g.try_delete(&receipt_id).expect("journaled delete"));
         }
-        assert_eq!(deleted, 2, "two ephemeral facts soft-deleted");
 
         let g = store.read().await;
-        // Soft-deleted facts are hidden from get()...
+        // Soft-deleted fact is hidden from get(), user fact retained.
         assert!(g.get(&receipt_id).is_none(), "deleted receipt hidden from get");
-        assert!(g.get(&old_binding_id).is_none(), "deleted old binding hidden from get");
-        // ...but the newest binding and the user fact remain visible.
-        assert!(g.get(&new_binding_id).is_some(), "newest binding retained");
         assert!(g.get(&user_id).is_some(), "user fact retained");
-        // Reversibility: the tombstone still exists in all_facts() (not
-        // physically gone) with deleted = true.
+        // Reversibility: the tombstone still exists in all_facts() with deleted = true.
         let tombstone = g
             .all_facts()
             .find(|f| f.fact_id == receipt_id)
             .expect("tombstone present in all_facts");
         assert!(tombstone.deleted, "soft-deleted fact is a tombstone, not erased");
-        // The user fact is never a tombstone.
         let user_fact = g.all_facts().find(|f| f.fact_id == user_id).expect("user fact present");
         assert!(!user_fact.deleted, "user fact untouched");
     }
@@ -331,10 +390,20 @@ mod tests {
         let retain = Duration::days(DEFAULT_RETAIN_DAYS);
         // No facts → zero deletions.
         assert_eq!(run_sweep_once(&store, now, retain).await, 0);
-        // Only recent ephemeral facts → still zero (nothing past retain).
+        // A single recent, valid binding → kept (under the cap, younger than
+        // the safety floor).
         {
             let mut g = store.write().await;
-            let _ = store_fact(&mut g, "__session_binding__::z", "rec", false);
+            g.store(StoreFact {
+                entity: "__session_binding__::z".to_string(),
+                key: "record".to_string(),
+                value: r#"{"session_id_hex":"z","project_id":null,"tenant_id":"personal","passport_id":"personal-default","passport_category":"personal","agent_work_gate":false,"bound_at_unix_ms":0}"#.to_string(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: true,
+                horizon_class: None,
+                actor: None,
+            });
         }
         assert_eq!(run_sweep_once(&store, now, retain).await, 0);
     }

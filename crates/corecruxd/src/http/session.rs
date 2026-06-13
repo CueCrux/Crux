@@ -222,11 +222,16 @@ pub async fn get_active_sessions(State(state): State<AppState>, headers: HeaderM
     }
     let store = state.fact_store.read().await;
     let bindings = crate::session_bindings::list_bindings(&store);
+    // Uncapped totals — `bindings`/`count` are truncated at top_k: 200, which
+    // historically hid a binding-churn leak; surface the real figures.
+    let counts = crate::session_bindings::count_bindings(&store);
     drop(store);
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "count": bindings.len(),
+            "total_bindings": counts.total,
+            "bindings_by_passport": counts.by_passport,
             "sessions": bindings,
         })),
     )
