@@ -151,7 +151,13 @@ impl McpToolCapability {
 pub struct RcxRouter {
     token: RcxCapabilityToken,
     trusted_issuer_pubkey: Option<[u8; 32]>,
-    runtime_credit_balance: Option<Option<u64>>,
+    runtime_credit_balance: RuntimeCreditBalance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeCreditBalance {
+    FromToken,
+    Override(Option<u64>),
 }
 
 impl RcxRouter {
@@ -159,7 +165,7 @@ impl RcxRouter {
         Self {
             token,
             trusted_issuer_pubkey: None,
-            runtime_credit_balance: None,
+            runtime_credit_balance: RuntimeCreditBalance::FromToken,
         }
     }
 
@@ -167,12 +173,12 @@ impl RcxRouter {
         Self {
             token,
             trusted_issuer_pubkey: Some(trusted_issuer_pubkey),
-            runtime_credit_balance: None,
+            runtime_credit_balance: RuntimeCreditBalance::FromToken,
         }
     }
 
     pub fn with_runtime_credit_balance(mut self, balance: Option<u64>) -> Self {
-        self.runtime_credit_balance = Some(balance);
+        self.runtime_credit_balance = RuntimeCreditBalance::Override(balance);
         self
     }
 
@@ -316,10 +322,11 @@ impl RcxRouter {
         if estimated_credit_cost == 0 {
             return true;
         }
-        let balance = self
-            .runtime_credit_balance
-            .unwrap_or(self.token.credits.balance)
-            .unwrap_or(0);
+        let balance = match self.runtime_credit_balance {
+            RuntimeCreditBalance::FromToken => self.token.credits.balance,
+            RuntimeCreditBalance::Override(balance) => balance,
+        }
+        .unwrap_or(0);
         if balance >= estimated_credit_cost {
             return true;
         }

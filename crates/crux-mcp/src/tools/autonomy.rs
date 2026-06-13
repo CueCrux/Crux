@@ -331,6 +331,7 @@ mod tests {
     use crate::dispatch::McpContext;
     use crate::tools::list_tools;
     use crux_router::{mint_free_local_token, RcxRouter};
+    use ed25519_dalek::{Signer, SigningKey};
     use rcx_capability_token::{
         Backend, CreditCost, CreditCostUnit, CreditRefill, Credits, FallbackAction, FallbackPolicy, OverdraftPolicy,
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
@@ -357,6 +358,7 @@ mod tests {
     }
 
     fn pro_hosted_router(passport: &str) -> RcxRouter {
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
         let mut token = mint_free_local_token(
             passport,
             "daemon_01HV0000000000000000000000",
@@ -402,7 +404,8 @@ mod tests {
                 })
                 .collect(),
         });
-        RcxRouter::new(token)
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes())
     }
 
     #[tokio::test]

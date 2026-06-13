@@ -213,6 +213,8 @@ impl TestDaemon {
             .env("CORECRUXD_QUERY_TIME_RANGE", "1")
             .env("CORECRUXD_BUILD_CCXI", "1")
             .env("CORECRUXD_UPDATE_CHECK_ENABLED", "0")
+            .env_remove("CRUX_AGENT_TOKEN")
+            .env_remove("CRUX_AGENT_TOKENS")
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_log));
 
