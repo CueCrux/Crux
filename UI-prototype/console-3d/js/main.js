@@ -178,7 +178,7 @@ function applyDistrictFilter(id) {
   const d = DISTRICTS.find((x) => x.id === id);
   if (!d) return;
   const members = districtMembers(id);
-  const S = 11, c = d.pos;
+  const S = 14, c = d.pos;   /* line-up pitch clears the ×1.5 block footprint */
   members.forEach((n, i) => world.setNodeTarget(n.id, c[0] + (i - (members.length - 1) / 2) * S, c[1]));
   linedUp = id;
   activeBeams = new Set();
@@ -241,7 +241,7 @@ function enterNeighborhood(id) {
   const g0 = world.nodeGroups.get(id);
   const cx = g0.position.x, cz = g0.position.z;
   const others = [...nbr].filter((x) => x !== id);
-  const R = Math.max(11.5, others.length * 2.1);   /* tight orbit */
+  const R = Math.max(16, others.length * 2.9);   /* tight orbit, scaled for the ×1.5 blocks */
   const moved = new Set();
   others.forEach((nid, i) => {
     const a = (i / others.length) * Math.PI * 2 - Math.PI / 2;

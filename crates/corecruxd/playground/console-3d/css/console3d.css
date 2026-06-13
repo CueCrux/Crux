@@ -45,7 +45,7 @@ body {
   color: var(--ink);
   background: #dde6f2;
 }
-html.dark body { background: #06070b; }
+html.dark body { background: #12151d; }
 
 #stage { position: fixed; inset: 0; z-index: 0; display: block; cursor: default; }
 #scroll-spacer { position: relative; z-index: 1; pointer-events: none; }
