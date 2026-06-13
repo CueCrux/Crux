@@ -27,6 +27,10 @@ pub enum CruxEvent {
     SessionStored { session_id: String },
     #[serde(rename = "session.deleted")]
     SessionDeleted { session_id: String },
+    /// A session was archived (`archived: true`) or restored (`archived: false`).
+    /// Archive is a soft, reversible state — the session state is preserved.
+    #[serde(rename = "session.archived")]
+    SessionArchived { session_id: String, archived: bool },
     /// Agent-graph: a new audit step was appended to a session's trace chain.
     #[serde(rename = "observe.audit_step")]
     AuditStep {

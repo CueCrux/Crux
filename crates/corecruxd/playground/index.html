@@ -1322,14 +1322,16 @@ function st2(s){ s=(s||'').toLowerCase();
   if(['blocked','error','expired','force_released','err','cancelled'].includes(s)) return 'err';
   return 'idle';
 }
-function txSessions(json){   // M4 — /v1/console/sessions returns {sessions:[id-string]} (ids only, by design); detail via the audit drill
-  const ss = json.sessions || json.active || (Array.isArray(json)? json : []);
-  return ss.map(s=>{
-    const isStr = typeof s==='string';
-    const id = isStr? s : (s.session_id || s.id || s.sid || '');
-    const ep = isStr? '' : (s.execplan || s.plan_slug || s.label || '');
-    const toks = isStr? null : (s.tokens || (s.tokens_in!=null? (Math.round((s.tokens_in||0)/1000)+'k in · '+Math.round((s.tokens_out||0)/1000)+'k out') : null));
-    const pass = isStr? null : (s.passport || s.passport_id || null);
+function txSessions(json){   // /v1/console/sessions → {session_rows:[{session_id(friendly), agent, raw_key, archived, archived_at}], sessions:[friendly-string] (compat)}
+  // Prefer the structured rows; fall back to the flat string list for older daemons.
+  const rows = Array.isArray(json.session_rows) ? json.session_rows
+             : (json.sessions || json.active || (Array.isArray(json)? json : [])).map(s=> typeof s==='string'? {session_id:s, raw_key:s} : s);
+  return rows.map(s=>{
+    const raw = s.raw_key || s.session_id || s.id || '';   // raw scoped key — used for archive/restore calls
+    const title = s.session_id || raw;                      // friendly title (prefix already stripped server-side)
+    const agent = s.agent || null;
+    const archived = !!s.archived;
+    const pass = s.passport || s.passport_id || null;
     let kids=[];
     if(pass){   // attach the owning passport as a drillable node (registered directly; not a panel-level child)
       const ppId=idFor('pp', pass);
@@ -1337,12 +1339,14 @@ function txSessions(json){   // M4 — /v1/console/sessions returns {sessions:[i
         fields:[['passport',pass]], children:[] };
       kids=[ppId];
     }
-    return { id: idFor('sess', id), kind:'session', __sessId:id,
-      label: ep? ('execplan:'+ep) : (id||'session'),
-      sub: isStr? 'session · open for audit chain →' : ([s.turns!=null? s.turns+' turns':null, toks, s.ttl? ('ttl '+s.ttl):null].filter(Boolean).join(' · ') || (s.saved||'')),
-      status: isStr? 'idle' : st2(s.status || (s.active?'active':'idle')),
-      fields: isStr? [['session_id',id]] : [['session_id',id],['turns',s.turns],['tokens',toks],['model',s.model],['passport',pass],['execplan',ep],['ttl',s.ttl]].filter(([,v])=>v!=null&&v!==''),
-      children:kids, doc: isStr? '' : (s.summary||s.doc||''), payload: JSON.stringify(s,null,2) };
+    return { id: idFor('sess', raw), kind:'session', __sessId:title, __raw:raw, __archived:archived, __title:title,
+      label: title || 'session',
+      sub: [agent? ('agent '+agent):null, archived? 'archived':null, s.archived_at? ('· '+String(s.archived_at).slice(0,10)):null]
+             .filter(Boolean).join(' · ') || 'session · open for audit chain →',
+      status: archived? 'idle' : st2(s.status || (s.active?'active':'idle')),
+      fields: [['session_id',title],['agent',agent],['archived',archived?'yes':null],['archived_at',s.archived_at],['raw_key',raw]]
+               .filter(([,v])=>v!=null&&v!==''),
+      children:kids, doc:(s.summary||s.doc||''), payload: JSON.stringify(s,null,2) };
   });
 }
 function txOrchestrators(json){   // M5 read — members resolved on drill (shared work: ids → loop-guard safe)
@@ -1638,7 +1642,7 @@ function registerLoaders(){
                        storage: await api('/v1/console/storage-breakdown').catch(()=>null),
                        ver: await api('/v1/version').catch(()=>null) }) };
   LOADERS['cx-work']          = { endpoint:'/v1/work?source=all',     noun:'work items',    transform: txWork };           // M3
-  LOADERS['cx-sessions']      = { endpoint:'/v1/console/sessions',    noun:'sessions',      transform: txSessions };       // M4
+  LOADERS['cx-sessions']      = { endpoint:'/v1/console/sessions?include_archived=true', noun:'sessions', transform: txSessions };  // M4 — fetch all; the 'Show archived' toggle filters client-side
   LOADERS['cx-orchestrators'] = { endpoint:'/v1/orchestrators',       noun:'orchestrators', flagHint:'Orchestrators disabled — set CORECRUXD_ORCHESTRATORS=1', transform: txOrchestrators };  // M5
   LOADERS['cx-punchcards']    = { endpoint:'/v1/punchcards',          noun:'leases',        flagHint:'Punchcards disabled — set CORECRUXD_PUNCHCARD=advisory|enforce', transform: txPunchcards };  // M6
   LOADERS['cx-coord']         = { endpoint:'/v1/coord/active',        noun:'live sessions', flagHint:'Coordination plane disabled — set CORECRUXD_COORD=1', treat404AsDisabled:true, transform: txCoord };  // live board (coord plane returns 404 when off)
@@ -3065,9 +3069,14 @@ function receiptsListSections(){
 /* ── sessions list view ── */
 function sessionExpRow(s){
   const links=(s.children||[]).map(cid=>N[cid]).filter(Boolean);
-  return {t:'exp',label:s.label,sub:s.sub||'',badge:RAW[norm(s.status)]||'session',
+  // Archive (or Restore, when already archived) — preserves the session, just hides/shows it.
+  const archBtn = s.__raw ? [{t:'btn', label: s.__archived?'Restore':'Archive', action:'session_archive',
+      raw:s.__raw, archived:!!s.__archived, title:s.__title||s.label,
+      hint: s.__archived?'return to the default list':'preserve & hide from the default list'}] : [];
+  return {t:'exp',label:s.label,sub:s.sub||'',badge: s.__archived?'archived':(RAW[norm(s.status)]||'session'),
     controls:(s.fields||[]).map(([k,v])=>({t:'info',label:String(k),v:String(v)}))
-      .concat(links.map(l=>({t:'info',label:'↳ '+l.kind,v:l.label+(l.sub?' · '+l.sub:'')})))};
+      .concat(links.map(l=>({t:'info',label:'↳ '+l.kind,v:l.label+(l.sub?' · '+l.sub:'')})))
+      .concat(archBtn)};
 }
 function sessionsListSections(){
   const kids=((N['cx-sessions']||{}).children||[]).map(cid=>N[cid]).filter(Boolean);
@@ -3826,8 +3835,14 @@ const PAGE_WIRES={
     if(!kids.length) return;
     const head=def.sections[0].controls.filter(c=>c.t==='search');
     const tail=def.sections[0].controls.filter(c=>c.t==='btn'&&c.action==='graph');
-    def.sections[0].sub=kids.length+' sessions · /v1/console/sessions';
-    def.sections[0].controls=head.concat(kids.map(sessionExpRow)).concat(tail);
+    const showArch=confGet('cx-sessions.show_archived',false);
+    const archived=kids.filter(k=>k.__archived);
+    const visible=showArch? kids : kids.filter(k=>!k.__archived);
+    const toggle={t:'toggle', k:'show_archived', v:false, rerender:true,
+      label:'Show archived'+(archived.length?(' ('+archived.length+')'):''),
+      desc:'Archived sessions are preserved but hidden from this list by default.'};
+    def.sections[0].sub=visible.length+' sessions'+(archived.length?(' · '+archived.length+' archived'):'')+' · /v1/console/sessions';
+    def.sections[0].controls=head.concat([toggle]).concat(visible.map(sessionExpRow)).concat(tail);
   }},
  'cx-receipts':{
   load: async def=>{
@@ -4254,6 +4269,18 @@ function renderControl(pageId,c){
         return;
       }
       if(c.danger){ delete b.dataset.armed; b.textContent=c.label; }
+      if(c.action==='session_archive'){
+        if(!LIVE){ toast('archive · start the daemon'); return; }
+        b.disabled=true;
+        const path='/v1/sessions/'+encodeURIComponent(c.raw)+(c.archived?'/unarchive':'/archive');
+        postApi(path, c.archived? {} : {reason:'archived from console'})
+          .then(()=>{ toast((c.archived?'restored':'archived')+' · '+(c.title||''));
+            loadState['cx-sessions']=null; const sn=N['cx-sessions']; if(sn) sn.children=[];   // invalidate cache → refetch fresh archive state
+            if(openPageId===pageId) openPage(pageId); })
+          .catch(e=>toast((c.archived?'restore':'archive')+' · failed ('+((e&&e.status)||'network')+')'))
+          .finally(()=>{ b.disabled=false; });
+        return;
+      }
       if(c.action==='graph'){ closePage(); soloPanel(pageId,{graph:true}); return; }
       if(c.action==='open3d'){ closePage(); setView('3d'); return; }
       if(c.action==='rpc'){ sendRpc(pageId); return; }

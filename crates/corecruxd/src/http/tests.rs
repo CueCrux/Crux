@@ -1175,15 +1175,113 @@ async fn console_redacts_private_facts_and_session_state() {
     let facts_text = serde_json::to_string(&facts_body).expect("facts json");
     assert!(!facts_text.contains("secret-token-123"));
 
-    let sessions_resp = console::get_console_sessions(State(state), dev_scope_headers("admin:read"))
-        .await
-        .into_response();
+    let sessions_resp = console::get_console_sessions(
+        State(state),
+        dev_scope_headers("admin:read"),
+        axum::extract::Query(console::ConsoleSessionsQuery {
+            include_archived: false,
+        }),
+    )
+    .await
+    .into_response();
     assert_eq!(sessions_resp.status(), StatusCode::OK);
     let sessions_body = json_body(sessions_resp).await;
     assert_eq!(sessions_body["raw_state_exposed"], false);
     assert_eq!(sessions_body["sessions"][0], "sess-secret");
     let sessions_text = serde_json::to_string(&sessions_body).expect("sessions json");
     assert!(!sessions_text.contains("secret-session-token"));
+}
+
+#[tokio::test]
+async fn console_sessions_friendly_titles_and_archive_filter() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    // A scoped session (agent-prefixed) and a plain one.
+    let scoped = "__agent_session::anthropic::demo-memoryhook:mh-p0";
+    state
+        .session_store
+        .write()
+        .await
+        .put(scoped, serde_json::json!({"v": 1}), None);
+    state
+        .session_store
+        .write()
+        .await
+        .put("plain-session", serde_json::json!({"v": 2}), None);
+
+    let fetch = |st: AppState, include: bool| async move {
+        let resp = console::get_console_sessions(
+            State(st),
+            dev_scope_headers("admin:read"),
+            axum::extract::Query(console::ConsoleSessionsQuery {
+                include_archived: include,
+            }),
+        )
+        .await
+        .into_response();
+        json_body(resp).await
+    };
+
+    // Friendly title strips the `__agent_session::<agent>::` prefix; agent surfaced separately.
+    let body = fetch(state.clone(), false).await;
+    let rows = body["session_rows"].as_array().expect("rows");
+    let demo = rows
+        .iter()
+        .find(|r| r["raw_key"] == scoped)
+        .expect("scoped row present");
+    assert_eq!(demo["session_id"], "demo-memoryhook:mh-p0");
+    assert_eq!(demo["agent"], "anthropic");
+    assert_eq!(demo["archived"], false);
+
+    // Archive it via the HTTP endpoint (raw admin:write → raw key).
+    let arch = super::facts::archive_session(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        axum::extract::Path(scoped.to_string()),
+        None,
+    )
+    .await
+    .into_response();
+    assert_eq!(arch.status(), StatusCode::OK);
+
+    // Hidden from the default listing...
+    let body = fetch(state.clone(), false).await;
+    assert!(
+        !body["session_rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["raw_key"] == scoped),
+        "archived session must be hidden by default"
+    );
+    assert_eq!(body["archived_count"], 1);
+    // ...but present with include_archived=true.
+    let body = fetch(state.clone(), true).await;
+    let demo = body["session_rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["raw_key"] == scoped)
+        .expect("archived row visible with include_archived");
+    assert_eq!(demo["archived"], true);
+
+    // Unarchive restores it to the default listing.
+    let un = super::facts::unarchive_session(
+        State(state.clone()),
+        dev_scope_headers("admin:write"),
+        axum::extract::Path(scoped.to_string()),
+    )
+    .await
+    .into_response();
+    assert_eq!(un.status(), StatusCode::OK);
+    let body = fetch(state.clone(), false).await;
+    assert!(
+        body["session_rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["raw_key"] == scoped),
+        "unarchived session must reappear in the default listing"
+    );
 }
 
 #[tokio::test]

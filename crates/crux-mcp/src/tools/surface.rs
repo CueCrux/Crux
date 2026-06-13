@@ -208,6 +208,8 @@ pub fn tool_affinity(tool: &str) -> &'static str {
         | "get_session"
         | "list_sessions"
         | "delete_session"
+        | "archive_session"
+        | "unarchive_session"
         | "cuecrux_session"
         | "create_handoff"
         | "accept_handoff"

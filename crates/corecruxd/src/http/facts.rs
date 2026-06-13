@@ -559,3 +559,97 @@ pub(super) async fn get_session_state(
         None => problem_response(StatusCode::NOT_FOUND, format!("session '{}' not found", session_id)),
     }
 }
+
+/// Resolve the stored session key for a write/lifecycle mutation, mirroring the
+/// read-path resolution in [`get_session_state`]: passport callers are scoped to
+/// their own namespace; a raw `admin:write` caller (or an already-unscoped id)
+/// operates on the raw key directly. Returns `None` when a scoped caller targets
+/// someone else's key (surfaced as 404 by the caller).
+fn resolve_session_key_for_write(ctx: &crate::auth::HttpScopeContext, session_id: &str) -> Option<String> {
+    if ctx.passport_id.is_some() {
+        Some(scoped_session_id_for_http(ctx, session_id))
+    } else if raw_admin_write(ctx) || crux_mcp::scope::split_scoped_session_id(session_id).is_none() {
+        Some(session_id.to_string())
+    } else {
+        None
+    }
+}
+
+/// Optional JSON body for the archive endpoint: `{ "reason": "..." }`.
+#[derive(Debug, Default, serde::Deserialize, utoipa::ToSchema)]
+pub(super) struct ArchiveSessionBody {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+async fn set_session_archived(
+    state: AppState,
+    headers: HeaderMap,
+    session_id: String,
+    archived: bool,
+    reason: Option<String>,
+) -> Response {
+    let ctx = match require_session_write_ctx(&state, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    let Some(stored_session_id) = resolve_session_key_for_write(&ctx, &session_id) else {
+        return problem_response(StatusCode::NOT_FOUND, format!("session '{}' not found", session_id));
+    };
+    let result = state
+        .session_store
+        .write()
+        .await
+        .try_set_archived(&stored_session_id, archived, reason);
+    match result {
+        Ok(Some(session)) => match render_session_for_http(&session, &ctx) {
+            Some(session) => (StatusCode::OK, axum::Json(serde_json::json!(session))).into_response(),
+            None => problem_response(StatusCode::NOT_FOUND, format!("session '{}' not found", session_id)),
+        },
+        Ok(None) => problem_response(StatusCode::NOT_FOUND, format!("session '{}' not found", session_id)),
+        Err(err) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/sessions/{sessionId}/archive",
+    tag = "Sessions",
+    params(("sessionId" = String, Path, description = "Session identifier")),
+    request_body(content = ArchiveSessionBody, description = "Optional archive reason"),
+    responses(
+        (status = 200, description = "Session archived", body = corecrux_memory::session_store::SessionState),
+        (status = 404, description = "Session not found"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(super) async fn archive_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    body: Option<Json<ArchiveSessionBody>>,
+) -> impl IntoResponse {
+    let reason = body.and_then(|Json(b)| b.reason);
+    set_session_archived(state, headers, session_id, true, reason).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/sessions/{sessionId}/unarchive",
+    tag = "Sessions",
+    params(("sessionId" = String, Path, description = "Session identifier")),
+    responses(
+        (status = 200, description = "Session restored", body = corecrux_memory::session_store::SessionState),
+        (status = 404, description = "Session not found"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(super) async fn unarchive_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    set_session_archived(state, headers, session_id, false, None).await
+}

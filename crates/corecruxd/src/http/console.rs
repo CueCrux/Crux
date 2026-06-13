@@ -738,23 +738,68 @@ pub(super) async fn get_console_passports(State(state): State<AppState>, headers
         .into_response()
 }
 
-pub(super) async fn get_console_sessions(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ConsoleSessionsQuery {
+    /// When true, archived sessions are included in the listing. Default false —
+    /// archived sessions are preserved but hidden from the default view.
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+pub(super) async fn get_console_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleSessionsQuery>,
+) -> impl IntoResponse {
     if let Err(problem) = require_console_read(&state, &headers) {
         return problem.into_response();
     }
 
     let store = state.session_store.read().await;
-    let mut session_ids: Vec<String> = store.list().into_iter().map(str::to_string).collect();
-    session_ids.sort();
-    if session_ids.len() > 50 {
-        session_ids.truncate(50);
+
+    // Build structured rows: friendly title (scoped prefix stripped), owning
+    // agent, the raw key (needed by the console to issue archive calls), and the
+    // archive flag. Archived rows are hidden unless `include_archived=true`.
+    let mut rows: Vec<serde_json::Value> = store
+        .list_filtered(query.include_archived)
+        .into_iter()
+        .filter_map(|raw_key| store.get(raw_key).map(|session| (raw_key.to_string(), session)))
+        .map(|(raw_key, session)| {
+            let (agent, title) = match crux_mcp::scope::split_scoped_session_id(&raw_key) {
+                Some((owner, logical)) => (Some(owner.to_string()), logical.to_string()),
+                None => (None, raw_key.clone()),
+            };
+            serde_json::json!({
+                "session_id": title,
+                "agent": agent,
+                "raw_key": raw_key,
+                "archived": session.archived,
+                "archived_at": session.archived_at,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| a["session_id"].as_str().cmp(&b["session_id"].as_str()));
+    if rows.len() > 50 {
+        rows.truncate(50);
     }
+
+    // Backward-compatible flat list of friendly ids (consumed by the classic
+    // console and any older caller). Mirrors `session_rows` post-filter/sort.
+    let session_ids: Vec<&str> = rows.iter().filter_map(|r| r["session_id"].as_str()).collect();
+    let archived_count = store
+        .list_filtered(true)
+        .len()
+        .saturating_sub(store.list_filtered(false).len());
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "count": store.count(),
+            "count": rows.len(),
+            "total_count": store.count(),
+            "archived_count": archived_count,
+            "include_archived": query.include_archived,
             "sessions": session_ids,
+            "session_rows": rows,
             "state_preview": "ids_only",
             "raw_state_exposed": false
         })),

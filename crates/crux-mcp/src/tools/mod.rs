@@ -756,20 +756,51 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
         },
         ToolDefinition {
             name: "list_sessions".to_string(),
-            description: "List active session IDs visible to you. Returns a sorted list.".to_string(),
+            description: "List active session IDs visible to you. Returns a sorted list. Archived sessions are hidden unless include_archived=true.".to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {},
-                "examples": [{}]
+                "properties": {
+                    "include_archived": { "type": "boolean", "description": "Include archived sessions in the listing (default false)" }
+                },
+                "examples": [{}, { "include_archived": true }]
             }),
         },
         ToolDefinition {
             name: "delete_session".to_string(),
-            description: "Delete one of your sessions by ID. Returns confirmation or not-found.".to_string(),
+            description: "Delete one of your sessions by ID. Returns confirmation or not-found. Destructive — prefer archive_session to preserve the session for reference.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string", "description": "Session identifier to delete" }
+                },
+                "required": ["session_id"],
+                "examples": [
+                    { "session_id": "session-42" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "archive_session".to_string(),
+            description: "Archive one of your sessions by ID — preserves its state in full but hides it from the default list_sessions view. Reversible via unarchive_session.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session identifier to archive" },
+                    "reason":     { "type": "string", "description": "Optional reason for archiving (e.g. 'shipped', 'parked')" }
+                },
+                "required": ["session_id"],
+                "examples": [
+                    { "session_id": "session-42", "reason": "shipped" }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "unarchive_session".to_string(),
+            description: "Restore a previously archived session by ID — returns it to the default list_sessions view.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session identifier to restore" }
                 },
                 "required": ["session_id"],
                 "examples": [
@@ -2403,8 +2434,10 @@ pub fn tool_output_docs() -> Value {
         { "tool": "get_session",        "output": "{ session_id, state, updated_at, total_tokens }" },
         { "tool": "save_session",       "output": "{ session_id, updated_at }" },
         { "tool": "session_checkpoint", "output": "{ content: [...], structuredContent: { session_id, updated_at, total_tokens } } — stores a compact crux.session_checkpoint.v1 state (objective, current_milestone, decisions, open_questions, files_touched, commands_run, test_status, next_action) scoped to the calling agent; requires token_budget>0." },
-        { "tool": "list_sessions",      "output": "{ sessions: [string] }" },
+        { "tool": "list_sessions",      "output": "{ sessions: [string] } — archived sessions hidden unless include_archived=true." },
         { "tool": "delete_session",     "output": "{ deleted: bool, session_id }" },
+        { "tool": "archive_session",    "output": "{ content: [{type:'text', text}] } — archives the session (soft, reversible; state preserved, hidden from default list_sessions). Confirms archived or not-found." },
+        { "tool": "unarchive_session",  "output": "{ content: [{type:'text', text}] } — restores an archived session to the default listing." },
         { "tool": "route_access_matrix", "output": "{ content: [...], structuredContent: { routes: [{route, required_any_scope: [string], passport_binding, tenant_binding, notes}] } } — static high-risk HTTP route gate matrix used by agent hardening checks." },
         { "tool": "execplan_gate",       "output": "{ content: [...], structuredContent: { fact_id, entity, key, commit_sha, status } } — records a milestone gate as a stable fact under execplan:<slug> key gate:<milestone>; status one of passed|failed|blocked|skipped; requires token_budget>0." },
         { "tool": "auth_posture_audit",  "output": "{ content: [...], structuredContent: { schema: 'crux.auth_posture_audit.v1', checked_at, mcp_agent, daemon_loopback_configured: bool, rcx_router_configured: bool, agent_passports_enabled: bool, data_dir_configured: bool, notes: [string], recommended_checks: [string] } } — local auth-posture checklist; HTTP auth mode is not exposed through MCP." },
@@ -2535,6 +2568,8 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "session_checkpoint" => sessions::handle_session_checkpoint(args, ctx).await,
         "list_sessions" => sessions::handle_list_sessions(args, ctx).await,
         "delete_session" => sessions::handle_delete_session(args, ctx).await,
+        "archive_session" => sessions::handle_archive_session(args, ctx).await,
+        "unarchive_session" => sessions::handle_unarchive_session(args, ctx).await,
         "route_access_matrix" => hardening::handle_route_access_matrix(args, ctx).await,
         "execplan_gate" => hardening::handle_execplan_gate(args, ctx).await,
         "auth_posture_audit" => hardening::handle_auth_posture_audit(args, ctx).await,
@@ -2708,7 +2743,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 104; // main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard).
+    const TOOL_COUNT: usize = 106; // main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
