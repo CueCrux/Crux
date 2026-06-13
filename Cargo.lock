@@ -3450,6 +3450,7 @@ version = "0.3.1"
 dependencies = [
  "blake3",
  "crux-session",
+ "ed25519-dalek",
  "hex",
 ]
 

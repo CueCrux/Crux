@@ -5,10 +5,12 @@
 //! RCX Capability Token v1.0 schema-lock crate.
 //!
 //! Phase 1 intentionally keeps this crate pure: it defines the token model,
-//! deterministic CBOR/JSON mirror, token hash input, and non-cryptographic
-//! structural validation result used by the daemon router and hosted issuer.
+//! deterministic CBOR/JSON mirror, token hash input, structural validation, and
+//! strict Ed25519 verification helpers used by the daemon router and hosted
+//! issuer.
 
 use crux_session::canonical::{to_canonical_json, CborValue};
+use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey};
 
 pub const RCX_CT_SPEC_VERSION: &str = "rcx-ct/1.0";
 pub const RCX_CT_SIGNATURE_LEN: usize = 64;
@@ -404,6 +406,12 @@ impl RcxCapabilityToken {
         if self.token_id.trim().is_empty() {
             issues.push(TokenValidationIssue::new("missing_token_id", "token_id is required"));
         }
+        if self.issued_at > now_unix_seconds {
+            issues.push(TokenValidationIssue::new(
+                "token_not_yet_valid",
+                "issued_at must be at or before the validation time",
+            ));
+        }
         if self.expires_at <= now_unix_seconds {
             issues.push(TokenValidationIssue::new("token_expired", "token has expired"));
         }
@@ -553,6 +561,37 @@ pub struct TokenValidationResult {
     pub valid: bool,
     pub issues: Vec<TokenValidationIssue>,
     pub token_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyOutcome {
+    Verified,
+    StructuralFailure(Vec<String>),
+    BadSignature,
+    BadTrustRoot,
+}
+
+pub fn verify_token(token: &RcxCapabilityToken, trust_root_pubkey: &[u8], now_unix_seconds: u64) -> VerifyOutcome {
+    let basic = token.validate_basic(now_unix_seconds);
+    if !basic.valid {
+        return VerifyOutcome::StructuralFailure(basic.issues.into_iter().map(|issue| issue.code).collect());
+    }
+
+    let key_bytes: [u8; 32] = match trust_root_pubkey.try_into() {
+        Ok(bytes) => bytes,
+        Err(_) => return VerifyOutcome::BadTrustRoot,
+    };
+    let verifying_key = match VerifyingKey::from_bytes(&key_bytes) {
+        Ok(key) => key,
+        Err(_) => return VerifyOutcome::BadTrustRoot,
+    };
+
+    let signature = Ed25519Signature::from_bytes(&token.signature.sig);
+    let message = token.token_hash();
+    match verifying_key.verify_strict(&message, &signature) {
+        Ok(()) => VerifyOutcome::Verified,
+        Err(_) => VerifyOutcome::BadSignature,
+    }
 }
 
 pub fn free_local_verified_fixture() -> RcxCapabilityToken {
@@ -834,6 +873,13 @@ fn opt_u64_to_cbor(value: Option<u64>) -> CborValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn sign_fixture(signing: &SigningKey) -> RcxCapabilityToken {
+        let mut token = free_local_verified_fixture();
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        token
+    }
 
     const FREE_LOCAL_VERIFIED_CBOR_HEX: &str = "af6474696572646672656566697373756572a26a6973737565725f6f7267656c6f63616c6c70617373706f72745f6b69647822705f30313233343536373839616263646566303132333435363738396162636465666763726564697473a466726566696c6ca266616d6f756e74f666706572696f64646e6f6e656762616c616e6365f6696f766572647261667466666f726269646f6f76657264726166745f6c696d6974f6677375626a656374a26c70617373706f72745f6670727822705f3031323334353637383961626364656630313233343536373839616263646566726461656d6f6e5f696e7374616e63655f696478216461656d6f6e5f3031485630303030303030303030303030303030303030303030686261636b656e647381a46a6261636b656e645f6964656c6f63616c6c656e64706f696e745f75726cf66e74727573745f726f6f745f6b69647822705f3031323334353637383961626364656630313233343536373839616263646566767065726d69747465645f6361706162696c697469657381a46a6361706162696c69747974636f7265637275782e71756572792e6c6f63616c6b6372656469745f636f7374f673646174615f6567726573735f636c617373657381646e6f6e657572657175697265645f6174746573746174696f6e73806866616c6c6261636ba4696f6e5f657870697279667265667573657171756575655f74746c5f7365636f6e6473f6746f6e5f637265646974735f65786861757374656466726566757365766f6e5f6261636b656e645f756e726561636861626c656672656675736568746f6b656e5f6964782372637863745f667265655f303132333435363738396162636465665f64656661756c74696973737565645f61741a69eab5a0697369676e6174757265a363616c676765643235353139636b69647822705f3031323334353637383961626364656630313233343536373839616263646566637369675840111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111116a657870697265735f61741a6a1ad4606a7265766f636174696f6ea26763726c5f75726cf66c707573685f6368616e6e656cf66c737065635f76657273696f6e6a7263782d63742f312e306c74656e616e745f73636f7065a26974656e616e745f69646764656661756c746c646973706c61795f6e616d65654c6f63616c6d726563656970745f636c6173736876657269666965646f726566726573685f68696e745f61741a6a1ac650";
     const FREE_LOCAL_VERIFIED_TOKEN_HASH: &str = "fec9ac825cd4f1f2ccbb3c4cf95495d61416e867818413153e86cc4539b3cee9";
@@ -882,7 +928,74 @@ mod tests {
         token.expires_at = 1;
         let expired = token.validate_basic(2);
         assert!(!expired.valid);
-        assert_eq!(expired.issues[0].code, "token_expired");
+        assert!(expired.issues.iter().any(|issue| issue.code == "token_expired"));
+    }
+
+    #[test]
+    fn basic_validation_rejects_future_issued_token() {
+        let mut token = free_local_verified_fixture();
+        token.issued_at = 1_776_989_700;
+        let validation = token.validate_basic(1_776_989_601);
+        assert!(!validation.valid);
+        assert!(validation
+            .issues
+            .iter()
+            .any(|issue| issue.code == "token_not_yet_valid"));
+    }
+
+    #[test]
+    fn strict_verify_accepts_signed_token() {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let token = sign_fixture(&signing);
+        let pubkey = signing.verifying_key().to_bytes();
+        assert_eq!(verify_token(&token, &pubkey, 1_776_989_601), VerifyOutcome::Verified);
+    }
+
+    #[test]
+    fn strict_verify_rejects_tampered_token() {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut token = sign_fixture(&signing);
+        token.backends[0].permitted_capabilities[0].capability = "corecrux.query.tampered".to_string();
+        let pubkey = signing.verifying_key().to_bytes();
+        assert_eq!(
+            verify_token(&token, &pubkey, 1_776_989_601),
+            VerifyOutcome::BadSignature
+        );
+    }
+
+    #[test]
+    fn strict_verify_rejects_wrong_trust_root() {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let token = sign_fixture(&signing);
+        let wrong_pubkey = SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
+        assert_eq!(
+            verify_token(&token, &wrong_pubkey, 1_776_989_601),
+            VerifyOutcome::BadSignature
+        );
+    }
+
+    #[test]
+    fn strict_verify_rejects_malformed_trust_root() {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let token = sign_fixture(&signing);
+        assert_eq!(
+            verify_token(&token, &[0u8; 5], 1_776_989_601),
+            VerifyOutcome::BadTrustRoot
+        );
+    }
+
+    #[test]
+    fn strict_verify_reports_future_issued_token_structurally() {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut token = sign_fixture(&signing);
+        token.issued_at = 1_776_989_700;
+        let pubkey = signing.verifying_key().to_bytes();
+        match verify_token(&token, &pubkey, 1_776_989_601) {
+            VerifyOutcome::StructuralFailure(codes) => {
+                assert!(codes.iter().any(|code| code == "token_not_yet_valid"));
+            }
+            other => panic!("expected structural failure, got {other:?}"),
+        }
     }
 
     #[test]

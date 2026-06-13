@@ -167,6 +167,9 @@ enum Command {
         /// Sample rate for sampled mode (0.0..1.0).
         #[arg(long, default_value_t = 0.25)]
         sample_rate: f64,
+        /// Recompute sealed-segment BLAKE3 hashes and cross-check the manifest.
+        #[arg(long, default_value_t = false)]
+        strict: bool,
     },
 
     /// .ccxi companion index tooling (v5 retrieval).
@@ -1432,6 +1435,7 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             scope,
             mode,
             sample_rate,
+            strict,
         } => {
             let started = std::time::Instant::now();
             let scope = verify_store::VerifyScope::parse(&scope)
@@ -1447,6 +1451,7 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 scope,
                 mode,
                 sample_rate,
+                strict,
                 budget_bytes: 8 * 1024 * 1024,
                 device_index: 0,
             })?;
@@ -2856,12 +2861,14 @@ mod tests {
                 scope,
                 mode,
                 sample_rate,
+                strict,
             } => {
                 assert_eq!(data_dir, Some(PathBuf::from("/tmp/test")));
                 assert!(shard.is_none());
                 assert_eq!(scope, "recent");
                 assert_eq!(mode, "sampled");
                 assert!((sample_rate - 0.25).abs() < f64::EPSILON);
+                assert!(!strict);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -2882,6 +2889,7 @@ mod tests {
             "full",
             "--sample-rate",
             "0.5",
+            "--strict",
         ])
         .unwrap();
         match cli.command {
@@ -2890,12 +2898,14 @@ mod tests {
                 scope,
                 mode,
                 sample_rate,
+                strict,
                 ..
             } => {
                 assert_eq!(shard, Some(3));
                 assert_eq!(scope, "all");
                 assert_eq!(mode, "full");
                 assert!((sample_rate - 0.5).abs() < f64::EPSILON);
+                assert!(strict);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -4184,6 +4194,7 @@ mod tests {
             scope: verify_store::VerifyScope::Recent,
             mode: verify_store::VerifyMode::Sampled,
             sample_rate: 0.25,
+            strict: false,
             budget_bytes: 8 * 1024 * 1024,
             device_index: 0,
         })
@@ -4639,6 +4650,7 @@ mod tests {
             scope: verify_store::VerifyScope::All,
             mode: verify_store::VerifyMode::Full,
             sample_rate: 1.0,
+            strict: false,
             budget_bytes: 8 * 1024 * 1024,
             device_index: 0,
         })
@@ -4858,6 +4870,7 @@ mod tests {
             scope: verify_store::VerifyScope::Recent,
             mode: verify_store::VerifyMode::Sampled,
             sample_rate: 0.25,
+            strict: false,
             budget_bytes: 8 * 1024 * 1024,
             device_index: 0,
         })
@@ -4879,6 +4892,7 @@ mod tests {
             scope: verify_store::VerifyScope::All,
             mode: verify_store::VerifyMode::Full,
             sample_rate: 1.0,
+            strict: false,
             budget_bytes: 8 * 1024 * 1024,
             device_index: 0,
         })
@@ -4899,6 +4913,7 @@ mod tests {
             scope: verify_store::VerifyScope::All,
             mode: verify_store::VerifyMode::Full,
             sample_rate: 1.0,
+            strict: false,
             budget_bytes: 8 * 1024 * 1024,
             device_index: 0,
         })
@@ -5204,6 +5219,7 @@ mod tests {
             scope: verify_store::VerifyScope::Recent,
             mode: verify_store::VerifyMode::Sampled,
             sample_rate: 0.25,
+            strict: false,
             budget_bytes: 8 * 1024 * 1024,
             device_index: 0,
         })
@@ -5323,6 +5339,7 @@ mod tests {
             scope: verify_store::VerifyScope::All,
             mode: verify_store::VerifyMode::Full,
             sample_rate: 1.0,
+            strict: false,
             budget_bytes: 8 * 1024 * 1024,
             device_index: 0,
         })
@@ -5344,6 +5361,7 @@ mod tests {
             scope: verify_store::VerifyScope::All,
             mode: verify_store::VerifyMode::Full,
             sample_rate: 1.0,
+            strict: false,
             budget_bytes: 8 * 1024 * 1024,
             device_index: 0,
         })
@@ -5672,6 +5690,7 @@ mod tests {
             scope: verify_store::VerifyScope::All,
             mode: verify_store::VerifyMode::Full,
             sample_rate: 1.0,
+            strict: false,
             budget_bytes: 8 * 1024 * 1024,
             device_index: 0,
         })

@@ -171,10 +171,12 @@ image: ghcr.io/cuecrux/crux-daemon:latest
 ### SEGMENT_CORRUPT
 
 ```
-Run: corecruxctl verify-store --data-dir ./data --scope recent
+Run: corecruxctl verify-store --data-dir ./data --scope all --mode full --strict
 ```
 
-This checks BLAKE3 hashes and CROWN receipt chains. If corruption is confirmed, the affected segment is quarantined.
+This checks manifest/frame structure and, with `--strict`, sealed-segment BLAKE3 hashes. CROWN
+receipt signatures are verified by the receipt verifier/API, not by `verify-store`. If corruption
+is confirmed, quarantine or restore the affected segment from a known-good snapshot.
 
 ### EPOCH_MISMATCH
 
@@ -182,7 +184,7 @@ This checks BLAKE3 hashes and CROWN receipt chains. If corruption is confirmed, 
 
 **Fix:** Usually safe to ignore if you're running a single node. If persists:
 ```bash
-corecruxctl verify-store --data-dir ./data --scope full
+corecruxctl verify-store --data-dir ./data --scope all --mode full --strict
 ```
 
 ## Quick diagnostic commands
@@ -192,5 +194,6 @@ corecruxctl verify-store --data-dir ./data --scope full
 | Is the daemon alive? | `curl http://localhost:14800/healthz` |
 | Is it ready for traffic? | `curl http://localhost:14800/readyz` |
 | How many metrics? | `curl http://localhost:14800/metrics \| wc -l` |
-| Verify data integrity | `corecruxctl verify-store --data-dir ./data` |
+| Verify data integrity | `corecruxctl verify-store --data-dir ./data --scope recent` |
+| Verify sealed segment hashes | `corecruxctl verify-store --data-dir ./data --scope all --mode full --strict` |
 | Check MCP tools | `curl -X POST http://localhost:14801/mcp -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'` |

@@ -114,7 +114,7 @@ cargo bench -p corecrux-retrieval --bench bm25_bench
 CORECRUXD_DATA_DIR=./data cargo run --release --bin corecruxctl -- replay --scope full
 
 # Verify-store integrity benchmark
-CORECRUXD_DATA_DIR=./data cargo run --release --bin corecruxctl -- verify-store --scope full
+CORECRUXD_DATA_DIR=./data cargo run --release --bin corecruxctl -- verify-store --scope all --mode full --strict
 ```
 
 ## Adding a New Benchmark

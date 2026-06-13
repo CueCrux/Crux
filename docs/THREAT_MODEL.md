@@ -52,8 +52,8 @@ for the Crux Daemon.
 - The signing key is loaded from `CORECRUXD_RECEIPTS_KEYRING_PATH` or
   `CORECRUXD_RECEIPTS_KEYRING_JSON`.
 - Key material is held in process memory. Compromise of the daemon process exposes the key.
-- Receipt verification is performed by `corecruxctl verify-store` and the `/v1/receipts/`
-  API endpoints.
+- Store verification is performed by `corecruxctl verify-store`; CROWN receipt signature
+  verification is performed by the receipt verifier and the `/v1/receipts/` API endpoints.
 
 ## Adversary Model
 

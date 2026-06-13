@@ -12,9 +12,9 @@ pub mod hosted;
 pub mod quota;
 
 use rcx_capability_token::{
-    Backend, CreditRefill, Credits, DataEgressClass, FallbackAction, FallbackPolicy, Issuer, OverdraftPolicy,
-    PermittedCapability, RcxCapabilityToken, RcxTier, ReceiptClass, Revocation, Signature, Subject, TenantScope,
-    TokenValidationIssue, RCX_CT_SIGNATURE_LEN, RCX_CT_SPEC_VERSION,
+    verify_token, Backend, CreditRefill, Credits, DataEgressClass, FallbackAction, FallbackPolicy, Issuer,
+    OverdraftPolicy, PermittedCapability, RcxCapabilityToken, RcxTier, ReceiptClass, Revocation, Signature, Subject,
+    TenantScope, TokenValidationIssue, VerifyOutcome, RCX_CT_SIGNATURE_LEN, RCX_CT_SPEC_VERSION,
 };
 
 pub const RCX_MODE_HEADER: &str = "X-Crux-Mode";
@@ -150,11 +150,36 @@ impl McpToolCapability {
 #[derive(Debug, Clone)]
 pub struct RcxRouter {
     token: RcxCapabilityToken,
+    trusted_issuer_pubkey: Option<[u8; 32]>,
+    runtime_credit_balance: RuntimeCreditBalance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeCreditBalance {
+    FromToken,
+    Override(Option<u64>),
 }
 
 impl RcxRouter {
     pub fn new(token: RcxCapabilityToken) -> Self {
-        Self { token }
+        Self {
+            token,
+            trusted_issuer_pubkey: None,
+            runtime_credit_balance: RuntimeCreditBalance::FromToken,
+        }
+    }
+
+    pub fn new_with_trusted_issuer_pubkey(token: RcxCapabilityToken, trusted_issuer_pubkey: [u8; 32]) -> Self {
+        Self {
+            token,
+            trusted_issuer_pubkey: Some(trusted_issuer_pubkey),
+            runtime_credit_balance: RuntimeCreditBalance::FromToken,
+        }
+    }
+
+    pub fn with_runtime_credit_balance(mut self, balance: Option<u64>) -> Self {
+        self.runtime_credit_balance = RuntimeCreditBalance::Override(balance);
+        self
     }
 
     pub fn token(&self) -> &RcxCapabilityToken {
@@ -177,6 +202,10 @@ impl RcxRouter {
         let Some(backend) = backend else {
             return self.refuse(call, DenialReason::CapabilityNotPermitted);
         };
+
+        if !self.token_signature_permits_backend(backend, now_unix_seconds) {
+            return self.refuse(call, DenialReason::TokenInvalid);
+        }
 
         if !call.backend_reachable && backend.backend_id != "local" {
             return self.apply_fallback_action(
@@ -220,7 +249,7 @@ impl RcxRouter {
         if self.token.receipt_class == ReceiptClass::Replay && debitable {
             return self.refuse(call, DenialReason::ReceiptClassSideEffectDenied);
         }
-        if debitable && !has_credit(&self.token, credit_cost) {
+        if debitable && !self.has_credit(credit_cost) {
             return self.apply_fallback_action(
                 call,
                 &self.token.fallback.on_credits_exhausted,
@@ -277,6 +306,36 @@ impl RcxRouter {
                     .iter()
                     .any(|capability| capability.capability == call.capability)
         })
+    }
+
+    fn token_signature_permits_backend(&self, backend: &Backend, now_unix_seconds: u64) -> bool {
+        if backend.backend_id == "local" {
+            return true;
+        }
+        let Some(trusted_issuer_pubkey) = self.trusted_issuer_pubkey.as_ref() else {
+            return false;
+        };
+        verify_token(&self.token, trusted_issuer_pubkey, now_unix_seconds) == VerifyOutcome::Verified
+    }
+
+    fn has_credit(&self, estimated_credit_cost: u64) -> bool {
+        if estimated_credit_cost == 0 {
+            return true;
+        }
+        let balance = match self.runtime_credit_balance {
+            RuntimeCreditBalance::FromToken => self.token.credits.balance,
+            RuntimeCreditBalance::Override(balance) => balance,
+        }
+        .unwrap_or(0);
+        if balance >= estimated_credit_cost {
+            return true;
+        }
+        match self.token.credits.overdraft {
+            OverdraftPolicy::Forbid => false,
+            OverdraftPolicy::Warn | OverdraftPolicy::AllowToLimit => {
+                balance.saturating_add(self.token.credits.overdraft_limit.unwrap_or(0)) >= estimated_credit_cost
+            }
+        }
     }
 
     fn apply_expiry_fallback(&self, call: &CallContext, reason: DenialReason) -> RouterDecision {
@@ -650,25 +709,10 @@ fn first_validation_reason(issues: &[TokenValidationIssue]) -> DenialReason {
     }
 }
 
-fn has_credit(token: &RcxCapabilityToken, estimated_credit_cost: u64) -> bool {
-    if estimated_credit_cost == 0 {
-        return true;
-    }
-    let balance = token.credits.balance.unwrap_or(0);
-    if balance >= estimated_credit_cost {
-        return true;
-    }
-    match token.credits.overdraft {
-        OverdraftPolicy::Forbid => false,
-        OverdraftPolicy::Warn | OverdraftPolicy::AllowToLimit => {
-            balance.saturating_add(token.credits.overdraft_limit.unwrap_or(0)) >= estimated_credit_cost
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
     use std::time::Instant;
 
     fn router() -> RcxRouter {
@@ -687,13 +731,13 @@ mod tests {
         ))
     }
 
-    fn hosted_router(
+    fn hosted_token(
         fallback_on_backend_unreachable: FallbackAction,
         fallback_on_credits_exhausted: FallbackAction,
         fallback_on_expiry: FallbackAction,
         queue_ttl_seconds: Option<u64>,
         balance: Option<u64>,
-    ) -> RcxRouter {
+    ) -> RcxCapabilityToken {
         let mut token = mint_free_local_token(
             "p_0123456789abcdef0123456789abcdef",
             "daemon_01HV0000000000000000000000",
@@ -725,7 +769,26 @@ mod tests {
             on_expiry: fallback_on_expiry,
             queue_ttl_seconds,
         };
-        RcxRouter::new(token)
+        token
+    }
+
+    fn hosted_router(
+        fallback_on_backend_unreachable: FallbackAction,
+        fallback_on_credits_exhausted: FallbackAction,
+        fallback_on_expiry: FallbackAction,
+        queue_ttl_seconds: Option<u64>,
+        balance: Option<u64>,
+    ) -> RcxRouter {
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = hosted_token(
+            fallback_on_backend_unreachable,
+            fallback_on_credits_exhausted,
+            fallback_on_expiry,
+            queue_ttl_seconds,
+            balance,
+        );
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes())
     }
 
     fn hosted_retrieve_call(estimated_credit_cost: u64, backend_reachable: bool) -> CallContext {
@@ -737,6 +800,58 @@ mod tests {
             estimated_credit_cost,
             backend_reachable,
         }
+    }
+
+    #[test]
+    fn refuses_hosted_without_trusted_issuer_key() {
+        let token = hosted_token(
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            None,
+            Some(10),
+        );
+        let decision = RcxRouter::new(token).decide(&hosted_retrieve_call(1, true), 1_776_989_601);
+        assert!(!decision.authorised);
+        assert_eq!(decision.reason_code.as_deref(), Some("denied:token_invalid"));
+    }
+
+    #[test]
+    fn refuses_hosted_with_wrong_trust_root() {
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let wrong = SigningKey::from_bytes(&[43u8; 32]);
+        let mut token = hosted_token(
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            None,
+            Some(10),
+        );
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+
+        let decision = RcxRouter::new_with_trusted_issuer_pubkey(token, wrong.verifying_key().to_bytes())
+            .decide(&hosted_retrieve_call(1, true), 1_776_989_601);
+        assert!(!decision.authorised);
+        assert_eq!(decision.reason_code.as_deref(), Some("denied:token_invalid"));
+    }
+
+    #[test]
+    fn refuses_hosted_when_signed_payload_is_tampered() {
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        let mut token = hosted_token(
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            None,
+            Some(10),
+        );
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        token.credits.balance = Some(0);
+
+        let decision = RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes())
+            .decide(&hosted_retrieve_call(1, true), 1_776_989_601);
+        assert!(!decision.authorised);
+        assert_eq!(decision.reason_code.as_deref(), Some("denied:token_invalid"));
     }
 
     #[test]

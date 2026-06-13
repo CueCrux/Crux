@@ -288,7 +288,7 @@ pub fn stream_links_injection_v1(injected_body: &[u8], stream_body: &[u8]) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Verifier as _, VerifyingKey};
+    use ed25519_dalek::VerifyingKey;
 
     fn injected_input<'a>(entries: &'a [MemoryUseEntryV1]) -> ContextInjectedBodyInputV1<'a> {
         ContextInjectedBodyInputV1 {
@@ -433,13 +433,13 @@ mod tests {
         assert_eq!(sig.signed_payload_hash, hash.to_vec());
         let vk: VerifyingKey = signing_key.verifying_key();
         let sig_bytes: [u8; 64] = sig.signature.as_slice().try_into().unwrap();
-        vk.verify(&bytes, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
+        vk.verify_strict(&bytes, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
             .expect("signature verifies over canonical body bytes");
         // Tamper → fails.
         let mut tampered = bytes.clone();
         tampered[0] ^= 0xFF;
         assert!(vk
-            .verify(&tampered, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
+            .verify_strict(&tampered, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
             .is_err());
     }
 }

@@ -17,9 +17,9 @@ use super::{
     parse_head_record_len, parse_segment_seq_from_filename, push_head_stream_tail_index, rejected_outcome,
     select_stream_tail_from_trailer_sorted, write_at_file, write_new_file_host, AppendEventInput, AppendOutcome,
     AppendStatsV1, AppendStatus, ColdBatchLookup, ColdBatchMatch, DirExtentV1, DirRunKey, DirRunMeta, FrameLocation,
-    HeadFrameMeta, HeadSegment, IdemEntry, IdemKey, NewFrameMeta, Result, SealResultV1, SegmentMeta, ShardStorage,
-    StorageError, StreamSegmentRef, WriteConfirmationMaterialV1, COMMIT_FRAME_LEN_V1, COMMIT_FRAME_MAGIC_CCMT,
-    STREAM_TAIL_LOCATOR_MAX_EVENTS,
+    HeadFrameMeta, HeadSegment, IdemEntry, IdemKey, NewFrameMeta, Result, SealResultV1, SegmentMeta,
+    SegmentSealMaterialV1, ShardStorage, StorageError, StreamSegmentRef, WriteConfirmationMaterialV1,
+    COMMIT_FRAME_LEN_V1, COMMIT_FRAME_MAGIC_CCMT, STREAM_TAIL_LOCATOR_MAX_EVENTS,
 };
 use corecrux_frame::{
     canonical_header_bytes_v1, compute_header_hash, compute_payload_hash, decode_canonical_header_bytes_v1,
@@ -294,6 +294,7 @@ impl ShardStorage {
                 segment_seq: None,
                 frame_count: None,
                 seal_duration_secs: 0.0,
+                seal_receipt: None,
             });
         };
 
@@ -406,6 +407,7 @@ impl ShardStorage {
             max_seq: seg.footer.max_seq,
             segment_hash: seg.footer.segment_hash,
         };
+        let seal_receipt = self.segment_seal_material_v1(&seg_meta, seal_frame_count);
 
         self.append_manifest_add_segment(&seg_meta)?;
 
@@ -490,6 +492,7 @@ impl ShardStorage {
             segment_seq: Some(segment_seq),
             frame_count: Some(seal_frame_count),
             seal_duration_secs: seal_elapsed.as_secs_f64(),
+            seal_receipt: Some(seal_receipt),
         })
     }
 
@@ -1279,6 +1282,7 @@ impl ShardStorage {
         self.segment_files_by_seq.insert(segment_seq, seg_file);
         self.segments_in_order.push(seg_meta.clone());
         self.segments_in_order.sort_by_key(|s| s.segment_seq);
+        stats.seal_receipt = Some(self.segment_seal_material_v1(&seg_meta, entries.len() as u64));
         stats.write_confirmation = Some(WriteConfirmationMaterialV1 {
             commit_seq: seg.footer.max_seq,
             segment_id: segment_seq,
@@ -1288,6 +1292,25 @@ impl ShardStorage {
         stats.total_nanos = total_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
 
         Ok((outcomes, stats))
+    }
+
+    fn segment_seal_material_v1(&self, seg: &SegmentMeta, frame_count: u64) -> SegmentSealMaterialV1 {
+        let previous = self
+            .segments_in_order
+            .iter()
+            .filter(|candidate| candidate.segment_seq < seg.segment_seq)
+            .max_by_key(|candidate| candidate.segment_seq);
+        SegmentSealMaterialV1 {
+            shard_id: seg.shard_id,
+            epoch: seg.epoch,
+            segment_seq: seg.segment_seq,
+            segment_id: seg.segment_id,
+            segment_hash: seg.segment_hash,
+            previous_segment_seq: previous.map(|candidate| candidate.segment_seq),
+            previous_segment_hash: previous.map(|candidate| candidate.segment_hash),
+            sealed_at_unix_ns: seg.sealed_at_unix_ns,
+            frame_count,
+        }
     }
 
     pub(crate) fn lookup_duplicate_hot(&self, key: &IdemKey, event_id: &str) -> Result<Option<AppendOutcome>> {

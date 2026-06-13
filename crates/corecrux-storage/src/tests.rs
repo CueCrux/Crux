@@ -402,6 +402,7 @@ mod tests {
             segment_seq: Some(42),
             frame_count: Some(100),
             seal_duration_secs: 0.5,
+            seal_receipt: None,
         };
         assert!(r.sealed);
         assert_eq!(r.segment_seq, Some(42));
@@ -411,6 +412,7 @@ mod tests {
             segment_seq: None,
             frame_count: None,
             seal_duration_secs: 0.0,
+            seal_receipt: None,
         };
         assert!(!not_sealed.sealed);
     }
@@ -766,6 +768,50 @@ mod tests {
         match err {
             StorageError::ManifestRecordInvalid { msg } => {
                 assert!(msg.contains("segment hash mismatch for segment_seq 92"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn strict_scan_verifies_segment_hashes_and_detects_manifest_mismatch() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+
+        let tenant_id = "tenant-a";
+        let stream_type = "artifact";
+        let stream_id = "strict-segment";
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+        storage
+            .append_batch(
+                stream_hash,
+                0,
+                tenant_id,
+                stream_type,
+                stream_id,
+                "2026-02-06T00:00:01Z",
+                &[AppendEventInput {
+                    event_id: "e1",
+                    occurred_at: "2026-02-06T00:00:00Z",
+                    event_type: "t",
+                    content_type: "application/octet-stream",
+                    payload_bytes: b"payload",
+                }],
+            )
+            .expect("append sealed segment");
+
+        let stats = storage.verify_segment_hashes_all().expect("strict scan");
+        assert_eq!(stats.verified_segments, 1);
+        assert_eq!(stats.verified_frames, 1);
+        assert_eq!(stats.skipped_head_segments, 0);
+
+        storage.segments_in_order[0].segment_hash = [0u8; 32];
+        let err = storage
+            .verify_segment_hashes_all()
+            .expect_err("strict scan should catch manifest hash mismatch");
+        match err {
+            StorageError::ManifestRecordInvalid { msg } => {
+                assert!(msg.contains("strict segment_hash mismatch for segment_seq"));
             }
             other => panic!("unexpected error: {other}"),
         }
@@ -1331,6 +1377,7 @@ mod tests {
             )
             .unwrap();
         let confirmation = stats.write_confirmation.expect("write confirmation");
+        let seal_receipt = stats.seal_receipt.expect("seal receipt material");
 
         let mut hasher = blake3::Hasher::new();
         for outcome in &outcomes {
@@ -1350,6 +1397,66 @@ mod tests {
                 .expect("segment id")
         );
         assert_eq!(confirmation.receipt_hash, *hasher.finalize().as_bytes());
+        let seg = storage.segments_in_order.last().expect("sealed segment");
+        assert_eq!(seal_receipt.segment_seq, seg.segment_seq);
+        assert_eq!(seal_receipt.segment_hash, seg.segment_hash);
+        assert_eq!(seal_receipt.previous_segment_seq, None);
+        assert_eq!(seal_receipt.previous_segment_hash, None);
+        assert_eq!(seal_receipt.frame_count, outcomes.len() as u64);
+        assert_ne!(seal_receipt.material_hash(), [0u8; 32]);
+    }
+
+    #[test]
+    fn append_batch_seal_receipt_links_previous_segment_hash() {
+        let _g = TEST_LOCK.lock().unwrap();
+
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+        let tenant_id = "t1";
+        let stream_type = "s";
+        let stream_id = "a";
+        let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+
+        let (_, first_stats) = storage
+            .append_batch_with_stats(
+                stream_hash,
+                0,
+                tenant_id,
+                stream_type,
+                stream_id,
+                "2026-02-06T00:00:00Z",
+                &[AppendEventInput {
+                    event_id: "e1",
+                    occurred_at: "2026-02-06T00:00:00Z",
+                    event_type: "t",
+                    content_type: "application/octet-stream",
+                    payload_bytes: b"hello",
+                }],
+            )
+            .unwrap();
+        let first = first_stats.seal_receipt.expect("first seal receipt");
+
+        let (_, second_stats) = storage
+            .append_batch_with_stats(
+                stream_hash,
+                2,
+                tenant_id,
+                stream_type,
+                stream_id,
+                "2026-02-06T00:00:01Z",
+                &[AppendEventInput {
+                    event_id: "e2",
+                    occurred_at: "2026-02-06T00:00:01Z",
+                    event_type: "t",
+                    content_type: "application/octet-stream",
+                    payload_bytes: b"world",
+                }],
+            )
+            .unwrap();
+        let second = second_stats.seal_receipt.expect("second seal receipt");
+
+        assert_eq!(second.previous_segment_seq, Some(first.segment_seq));
+        assert_eq!(second.previous_segment_hash, Some(first.segment_hash));
+        assert_ne!(second.material_hash(), first.material_hash());
     }
 
     #[test]
