@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use corecrux_storage::{ReplayScanStats, ShardStorage, ShardStorageOptions};
+use corecrux_storage::{ReplayScanStats, ShardStorage, ShardStorageOptions, StrictScanStats};
 
 #[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -50,6 +50,7 @@ pub struct VerifyStoreOptions {
     pub scope: VerifyScope,
     pub mode: VerifyMode,
     pub sample_rate: f64,
+    pub strict: bool,
     pub budget_bytes: usize,
     pub device_index: i32,
 }
@@ -76,6 +77,26 @@ impl From<ReplayScanStats> for VerifyStoreStats {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct VerifyStoreStrictStats {
+    #[serde(rename = "verifiedSegments")]
+    pub verified_segments: u64,
+    #[serde(rename = "verifiedFrames")]
+    pub verified_frames: u64,
+    #[serde(rename = "skippedHeadSegments")]
+    pub skipped_head_segments: u64,
+}
+
+impl From<StrictScanStats> for VerifyStoreStrictStats {
+    fn from(v: StrictScanStats) -> Self {
+        Self {
+            verified_segments: v.verified_segments,
+            verified_frames: v.verified_frames,
+            skipped_head_segments: v.skipped_head_segments,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct VerifyStoreShardReport {
     #[serde(rename = "shardId")]
     pub shard_id: u32,
@@ -90,6 +111,9 @@ pub struct VerifyStoreShardReport {
     pub elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<VerifyStoreStats>,
+    #[serde(rename = "strictStats")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict_stats: Option<VerifyStoreStrictStats>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -101,6 +125,7 @@ pub struct VerifyStoreReport {
     pub shards_root: String,
     pub scope: VerifyScope,
     pub mode: VerifyMode,
+    pub strict: bool,
     #[serde(rename = "sampleRate")]
     pub sample_rate: f64,
     #[serde(rename = "scannedShards")]
@@ -166,6 +191,9 @@ fn sampled_in(mode: VerifyMode, sample_rate: f64, shard_id: u32) -> bool {
 
 fn classify_corruption_reason(err: &str) -> String {
     let lower = err.to_ascii_lowercase();
+    if lower.contains("segment_hash") || lower.contains("segment hash") {
+        return "SEGMENT_HASH_MISMATCH".to_string();
+    }
     if lower.contains("trailer") && lower.contains("hash") {
         return "TRAILER_HASH_MISMATCH".to_string();
     }
@@ -220,7 +248,7 @@ pub fn verify_store(opts: &VerifyStoreOptions) -> Result<VerifyStoreReport, Box<
     let mut scanned = 0u64;
 
     for shard_id in shard_ids {
-        let include = sampled_in(opts.mode, opts.sample_rate, shard_id);
+        let include = opts.strict || sampled_in(opts.mode, opts.sample_rate, shard_id);
         let manifest = shard_root.join(format!("shard-{shard_id:04}")).join("MANIFEST");
         let epoch = match parse_manifest_epoch(&manifest) {
             Ok(v) => v,
@@ -235,6 +263,7 @@ pub fn verify_store(opts: &VerifyStoreOptions) -> Result<VerifyStoreReport, Box<
                     error: Some(err.to_string()),
                     elapsed_ms: 0,
                     stats: None,
+                    strict_stats: None,
                 });
                 continue;
             }
@@ -250,6 +279,7 @@ pub fn verify_store(opts: &VerifyStoreOptions) -> Result<VerifyStoreReport, Box<
                 error: None,
                 elapsed_ms: 0,
                 stats: None,
+                strict_stats: None,
             });
             continue;
         }
@@ -260,6 +290,29 @@ pub fn verify_store(opts: &VerifyStoreOptions) -> Result<VerifyStoreReport, Box<
         match storage {
             Ok(storage) => match storage.integrity_scan_stats_all(opts.budget_bytes) {
                 Ok(stats) => {
+                    let strict_stats = if opts.strict {
+                        match storage.verify_segment_hashes_all() {
+                            Ok(strict_stats) => Some(strict_stats.into()),
+                            Err(err) => {
+                                failed = failed.saturating_add(1);
+                                let es = err.to_string();
+                                out.push(VerifyStoreShardReport {
+                                    shard_id,
+                                    epoch,
+                                    scanned: true,
+                                    ok: false,
+                                    reason: Some(classify_corruption_reason(&es)),
+                                    error: Some(es),
+                                    elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                                    stats: Some(stats.into()),
+                                    strict_stats: None,
+                                });
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     out.push(VerifyStoreShardReport {
                         shard_id,
                         epoch,
@@ -269,6 +322,7 @@ pub fn verify_store(opts: &VerifyStoreOptions) -> Result<VerifyStoreReport, Box<
                         error: None,
                         elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                         stats: Some(stats.into()),
+                        strict_stats,
                     });
                 }
                 Err(err) => {
@@ -283,6 +337,7 @@ pub fn verify_store(opts: &VerifyStoreOptions) -> Result<VerifyStoreReport, Box<
                         error: Some(es),
                         elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                         stats: None,
+                        strict_stats: None,
                     });
                 }
             },
@@ -298,6 +353,7 @@ pub fn verify_store(opts: &VerifyStoreOptions) -> Result<VerifyStoreReport, Box<
                     error: Some(es),
                     elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                     stats: None,
+                    strict_stats: None,
                 });
             }
         }
@@ -309,6 +365,7 @@ pub fn verify_store(opts: &VerifyStoreOptions) -> Result<VerifyStoreReport, Box<
         shards_root: shard_root.display().to_string(),
         scope: opts.scope,
         mode: opts.mode,
+        strict: opts.strict,
         sample_rate: opts.sample_rate,
         scanned_shards: scanned,
         failed_shards: failed,
@@ -437,6 +494,14 @@ mod tests {
     }
 
     #[test]
+    fn classify_segment_hash() {
+        assert_eq!(
+            classify_corruption_reason("strict segment_hash mismatch for segment_seq 7"),
+            "SEGMENT_HASH_MISMATCH"
+        );
+    }
+
+    #[test]
     fn classify_payload_hash() {
         assert_eq!(
             classify_corruption_reason("PayloadHash verification failed"),
@@ -559,6 +624,7 @@ mod tests {
             shards_root: "/data/shards".to_string(),
             scope: VerifyScope::All,
             mode: VerifyMode::Full,
+            strict: true,
             sample_rate: 1.0,
             scanned_shards: 2,
             failed_shards: 0,
@@ -570,6 +636,7 @@ mod tests {
         assert_eq!(json["shardsRoot"], "/data/shards");
         assert_eq!(json["scope"], "all");
         assert_eq!(json["mode"], "full");
+        assert_eq!(json["strict"], true);
     }
 
     #[test]
@@ -583,11 +650,13 @@ mod tests {
             error: None,
             elapsed_ms: 0,
             stats: None,
+            strict_stats: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("reason"));
         assert!(!json.contains("error"));
         assert!(!json.contains("stats"));
+        assert!(!json.contains("strictStats"));
     }
 
     // ── verify_store with missing shards dir ─────────────────────────
@@ -601,6 +670,7 @@ mod tests {
             scope: VerifyScope::All,
             mode: VerifyMode::Full,
             sample_rate: 1.0,
+            strict: false,
             budget_bytes: 1024 * 1024,
             device_index: 0,
         };
@@ -622,6 +692,7 @@ mod tests {
             scope: VerifyScope::All,
             mode: VerifyMode::Full,
             sample_rate: 1.0,
+            strict: false,
             budget_bytes: 1024 * 1024,
             device_index: 0,
         };
@@ -646,6 +717,7 @@ mod tests {
             scope: VerifyScope::All,
             mode: VerifyMode::Full,
             sample_rate: 1.0,
+            strict: false,
             budget_bytes: 1024 * 1024,
             device_index: 0,
         };
@@ -671,6 +743,7 @@ mod tests {
             scope: VerifyScope::All,
             mode: VerifyMode::Full,
             sample_rate: 1.0,
+            strict: false,
             budget_bytes: 1024 * 1024,
             device_index: 0,
         };
@@ -699,6 +772,7 @@ mod tests {
             scope: VerifyScope::All,
             mode: VerifyMode::Sampled,
             sample_rate: 0.0, // 0% sampling = skip all
+            strict: false,
             budget_bytes: 1024 * 1024,
             device_index: 0,
         };
@@ -707,6 +781,30 @@ mod tests {
         // All shards should be present but none scanned
         assert_eq!(report.scanned_shards, 0);
         assert!(report.shards.iter().all(|s| !s.scanned));
+    }
+
+    #[test]
+    fn verify_store_strict_ignores_sample_rate() {
+        let tmp = TempDir::new().unwrap();
+        let shard_dir = tmp.path().join("shards").join("shard-0000");
+        fs::create_dir_all(&shard_dir).unwrap();
+        let mut data = vec![0u8; 32];
+        data[16..24].copy_from_slice(&(1u64).to_le_bytes());
+        fs::write(shard_dir.join("MANIFEST"), &data).unwrap();
+
+        let opts = VerifyStoreOptions {
+            data_dir: tmp.path().to_path_buf(),
+            shard: None,
+            scope: VerifyScope::All,
+            mode: VerifyMode::Sampled,
+            sample_rate: 0.0,
+            strict: true,
+            budget_bytes: 1024 * 1024,
+            device_index: 0,
+        };
+        let report = verify_store(&opts).unwrap();
+        assert!(!report.ok);
+        assert_eq!(report.scanned_shards, 1);
     }
 
     #[test]
@@ -742,6 +840,7 @@ mod tests {
                 total_compressed_bytes: 2048,
                 total_uncompressed_bytes: 4096,
             }),
+            strict_stats: None,
         };
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["elapsedMs"], 42);
@@ -767,6 +866,7 @@ mod tests {
             scope: VerifyScope::Recent,
             mode: VerifyMode::Full,
             sample_rate: 1.0,
+            strict: false,
             budget_bytes: 1024 * 1024,
             device_index: 0,
         };

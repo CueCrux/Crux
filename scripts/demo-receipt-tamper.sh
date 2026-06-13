@@ -9,9 +9,9 @@
 #   1. Seed a minimal CROWN receipt into a fresh tmp data dir.
 #      (`corecruxctl receipts seed-minimal` uses a fixed dev signing key for
 #      repeatable local seeding — see crates/corecruxctl/src/receipts.rs.)
-#   2. Run `corecruxctl verify-store --mode full` — assert OK.
+#   2. Run `corecruxctl verify-store --mode full --strict` — assert OK.
 #   3. Flip one byte deep inside the segment file holding the receipt body.
-#   4. Re-run verify-store — assert NOT OK, with a payload-hash mismatch reason.
+#   4. Re-run verify-store — assert NOT OK, with a segment or frame integrity reason.
 #   5. Clean up the tmp dir on exit.
 #
 # Requirements: bash, jq, a built `corecruxctl` binary (default lookup:
@@ -87,7 +87,8 @@ VR1="$("${CTL}" verify-store \
   --data-dir "${DATA_DIR}" \
   --shard "${SHARD}" \
   --scope all \
-  --mode full)"
+  --mode full \
+  --strict)"
 
 OK1="$(echo "${VR1}" | jq -r '.ok')"
 if [[ "${OK1}" != "true" ]]; then
@@ -141,7 +142,8 @@ VR2="$("${CTL}" verify-store \
   --data-dir "${DATA_DIR}" \
   --shard "${SHARD}" \
   --scope all \
-  --mode full 2>/dev/null)"
+  --mode full \
+  --strict 2>/dev/null)"
 VR2_RC=$?
 set -e
 
@@ -163,7 +165,7 @@ if [[ "${OK2}" == "false" ]] && {
    }; then
   echo "   ok=false reason=${REASON} error=\"${ERROR_MSG}\" ✓"
   echo
-  echo "Tamper caught. The on-disk byte flip was detected by verify-store."
+  echo "Tamper caught. The on-disk byte flip was detected by verify-store --strict."
   echo "(Exact classification depends on which integrity layer fires first;"
   echo "the receipt-level verifier surfaces BODY_HASH_MISMATCH / SIG_INVALID"
   echo "at the corecrux-receipts API — see crates/corecrux-receipts/src/tests.rs"

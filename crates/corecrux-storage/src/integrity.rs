@@ -4,7 +4,10 @@
 
 //! Phase 5 integrity helpers — physical-order block reads + optional CUDA "touch" to ensure device-visible bytes.
 
-use super::{io_err, read_blocks_cpu, scan_frames_v1_block_bytes, ReplayScanStats, Result, ShardStorage, StorageError};
+use super::{
+    io_err, read_blocks_cpu, scan_frames_v1_block_bytes, ReplayScanStats, Result, ShardStorage, StorageError,
+    StrictScanStats,
+};
 use std::fs::File;
 
 impl ShardStorage {
@@ -282,6 +285,35 @@ impl ShardStorage {
                 });
             }
             stats.total_frames = stats.total_frames.saturating_add(scanned);
+        }
+
+        Ok(stats)
+    }
+
+    /// Strict sealed-segment verification: re-decode each manifest-committed segment, which
+    /// recomputes the BLAKE3 header/record/TOC/segment hashes, then cross-checks the decoded
+    /// footer hash against the manifest entry.
+    pub fn verify_segment_hashes_all(&self) -> Result<StrictScanStats> {
+        let mut stats = StrictScanStats::default();
+
+        for seg in &self.segments_in_order {
+            let seg_path = self.paths.shard_dir.join(&seg.relative_path);
+            let bytes = std::fs::read(&seg_path).map_err(io_err)?;
+            let (_header, _toc_header, entries, footer) = corecrux_segment::decode_segment_v1(&bytes)?;
+            if footer.segment_hash != seg.segment_hash {
+                return Err(StorageError::ManifestRecordInvalid {
+                    msg: format!(
+                        "strict segment_hash mismatch for segment_seq {}: manifest differs from decoded footer",
+                        seg.segment_seq
+                    ),
+                });
+            }
+            stats.verified_segments = stats.verified_segments.saturating_add(1);
+            stats.verified_frames = stats.verified_frames.saturating_add(entries.len() as u64);
+        }
+
+        if self.head.is_some() {
+            stats.skipped_head_segments = 1;
         }
 
         Ok(stats)

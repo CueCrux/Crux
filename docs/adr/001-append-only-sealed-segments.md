@@ -15,7 +15,7 @@ Key properties:
 - **Append path:** New events are written to the head (unsealed) segment. Commit markers record durable write boundaries.
 - **Seal path:** When the head segment exceeds `segment_target_bytes`, it is sealed and a new head segment is created.
 - **Crash recovery:** On startup, the daemon replays from the last commit marker. Partially-written frames after the marker are discarded.
-- **Integrity:** `corecruxctl verify-store` walks sealed segments and recomputes BLAKE3 hashes. Any mismatch is flagged.
+- **Integrity:** `corecruxctl verify-store` checks manifest/frame structure; `--strict` walks sealed segments and recomputes BLAKE3 hashes. Any mismatch is flagged.
 
 ## Consequences
 

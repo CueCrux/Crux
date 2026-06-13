@@ -7,9 +7,9 @@
 | IO_READ_FAILED | 503 | UNAVAILABLE | Yes | Segment read failed | Check disk health, permissions |
 | IO_WRITE_FAILED | 503 | UNAVAILABLE | Yes | Segment write failed | Check disk space, permissions |
 | IO_FSYNC_FAILED | 503 | UNAVAILABLE | Yes | fsync failed | Check filesystem health |
-| SEGMENT_CORRUPT | 500 | INTERNAL | No | BLAKE3 hash mismatch | Run `corecruxctl verify-store` |
+| SEGMENT_CORRUPT | 500 | INTERNAL | No | BLAKE3 hash mismatch | Run `corecruxctl verify-store --mode full --strict` |
 | INVALID_FRAME | 500 | INTERNAL | No | Frame header hash mismatch | Usually auto-recovered on restart |
-| INVALID_TOC | 500 | INTERNAL | No | Table of contents invalid | Run verify-store --mode full |
+| INVALID_TOC | 500 | INTERNAL | No | Table of contents invalid | Run `verify-store --mode full` |
 | SHARD_NOT_OWNER | 412 | FAILED_PRECONDITION | Yes | Wrong shard for this stream | Re-fetch shard map, retry |
 | EPOCH_MISMATCH | 412 | FAILED_PRECONDITION | Yes | Shard epoch changed | Retry with updated epoch |
 | BACKPRESSURE | 429 | RESOURCE_EXHAUSTED | Yes | System under load | Wait, retry with backoff |
@@ -42,7 +42,7 @@ For `BACKPRESSURE` (429), respect the `Retry-After` header if present.
 
 | Error | Diagnostic |
 |---|---|
-| SEGMENT_CORRUPT | `corecruxctl verify-store --mode full` |
-| IO_READ_FAILED | `corecruxctl verify-store --mode quick` |
+| SEGMENT_CORRUPT | `corecruxctl verify-store --scope all --mode full --strict` |
+| IO_READ_FAILED | `corecruxctl verify-store --scope recent` |
 | SHARD_NOT_OWNER | `corecruxctl shard-map` |
 | EPOCH_MISMATCH | `corecruxctl shard-map --show-epochs` |
