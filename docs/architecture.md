@@ -57,7 +57,9 @@ graph TD
 3. Events encoded as frames (`corecrux-frame`) and appended to shard (`corecrux-storage`).
 4. When segment fills, it is sealed with BLAKE3 integrity hash.
 5. `.ccxi` companion index built at seal time (`corecrux-index`).
-6. CROWN receipt generated for every event (`corecrux-receipts`).
+6. AppendBatch returns write-confirmation material. If a segment is sealed, the response also includes
+   a segment-seal receipt signed over the current segment hash and previous sealed segment hash.
+   Stored receipt streams use `corecrux-receipts` for Ed25519-signed CROWN bodies/signatures.
 
 In the default Crux Daemon runtime, the dataplane is disabled, so append
 requires a dataplane-enabled deployment.
@@ -96,13 +98,13 @@ requires a dataplane-enabled deployment.
 ### Application Layer
 
 - **corecrux-memory** -- In-memory fact store and session store. Facts are key-value pairs with entity, confidence, and timestamps. BM25 keyword search over fact values with token budgets.
-- **corecrux-receipts** -- CROWN receipt generation and verification. Ed25519-signed receipts with BLAKE3 chain linking. Every append and query operation produces a verifiable receipt.
+- **corecrux-receipts** -- CROWN receipt generation and verification for receipt-bearing streams. Ed25519-signed receipts bind receipt IDs to payload hashes.
 - **corecrux-proto** -- gRPC protocol buffer definitions for the `AppendBatch`, `ReadStream`, and query RPCs.
 
 ### Server Layer
 
 - **corecruxd** -- HTTP (axum, port 14800), gRPC (tonic, port 4007), and built-in MCP (port 14801 by default) daemon. Manages shard lifecycle, routes requests, serves Prometheus metrics at `/metrics`, and provides health/readiness endpoints.
-- **corecruxctl** -- CLI tool with subcommands: `verify-store` (cryptographic integrity check), `replay` (deterministic replay with drift classification), `receipts` (receipt tooling and export), `ccxi` (companion index inspection), `projections` (projection state management).
+- **corecruxctl** -- CLI tool with subcommands: `verify-store` (structural integrity, plus sealed-segment BLAKE3 with `--strict`), `replay` (deterministic replay with drift classification), `receipts` (receipt tooling and export), `ccxi` (companion index inspection), `projections` (projection state management).
 
 ### Agent And Extension Layer
 

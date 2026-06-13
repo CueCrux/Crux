@@ -2702,6 +2702,7 @@ mod tests {
     use crate::dispatch::McpContext;
     use crate::tools::test_support::{clear_sync_env, sync_env_lock};
     use crux_router::{mint_free_local_token, RcxRouter};
+    use ed25519_dalek::{Signer, SigningKey};
     use rcx_capability_token::{
         Backend, CreditCost, CreditCostUnit, CreditRefill, Credits, FallbackAction, FallbackPolicy, OverdraftPolicy,
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
@@ -3081,7 +3082,11 @@ mod tests {
                 .collect(),
         });
 
-        let names: Vec<String> = list_tools_for_rcx_token(&token, 1_776_989_601)
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        let router = RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes());
+
+        let names: Vec<String> = list_tools_for_rcx_router(&router, 1_776_989_601)
             .into_iter()
             .map(|tool| tool.name)
             .collect();

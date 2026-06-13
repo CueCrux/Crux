@@ -126,10 +126,11 @@ CoreCrux uses append-only sealed segments with BLAKE3 integrity hashes.
 ### Detection
 
 ```bash
-corecruxctl verify-store --data-dir ./data --scope full
+corecruxctl verify-store --data-dir ./data --scope all --mode full --strict
 ```
 
-Reports any segment with mismatched BLAKE3 hashes, truncated frames, or missing trailer indexes.
+Reports structural/CRC failures and, with `--strict`, sealed segments whose decoded BLAKE3 hash
+does not match the manifest.
 
 ### Recovery
 
@@ -145,13 +146,13 @@ Reports any segment with mismatched BLAKE3 hashes, truncated frames, or missing 
 
 3. **Verify integrity after restart**:
    ```bash
-   corecruxctl verify-store --data-dir ./data --scope recent
+   corecruxctl verify-store --data-dir ./data --scope all --mode full --strict
    ```
 
 ### Prevention
 
 - Use filesystem-level snapshots (ZFS, LVM) for point-in-time recovery
-- Run `verify-store --scope recent` as a cron job (daily)
+- Run `verify-store --scope recent` as a daily cron job and schedule `--scope all --mode full --strict` during maintenance windows
 - Monitor the `corecrux_segment_corrupt_total` Prometheus metric
 - Enable capacity guards (`CORECRUXD_CAPACITY_GUARD_ENABLED=1`) to prevent writes when disk is low
 
@@ -160,7 +161,7 @@ Reports any segment with mismatched BLAKE3 hashes, truncated frames, or missing 
 - Check `/v1/version` or the MCP `update_status` tool before changing a running node.
 - If the update state is `behind`, take a snapshot of `CORECRUXD_DATA_DIR` or an equivalent volume backup before pulling and rebuilding.
 - If the update state is `ahead` or `diverged`, do not blind-pull. Review local commits first and use a human-approved merge or rebase flow.
-- After the upgrade, rerun `corecruxctl verify-store --data-dir ./data --scope recent` and confirm the update state has moved to `current` or the expected tracked position.
+- After the upgrade, rerun `corecruxctl verify-store --data-dir ./data --scope recent`; run the strict full scan when the maintenance window allows, and confirm the update state has moved to `current` or the expected tracked position.
 
 ### What data is lost
 

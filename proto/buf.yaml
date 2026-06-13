@@ -5,6 +5,12 @@ modules:
 lint:
   use:
     - MINIMAL
+  except:
+    # Crux keeps v1 protos in a flat `proto/` directory for compatibility with
+    # existing generated paths. Revisit when the proto tree is reorganised.
+    - DIRECTORY_SAME_PACKAGE
+    - PACKAGE_DIRECTORY_MATCH
+    - PACKAGE_SAME_DIRECTORY
 breaking:
   use:
     - FILE

@@ -53,6 +53,29 @@ message WriteConfirmation {
   bytes vault_signature = 4;
   string key_id = 5;
   bool unsigned = 6;
+  // Present when this append sealed a segment. The signature covers the
+  // deterministic segment-seal material bytes, including segment_hash and the
+  // previous sealed segment hash when one exists.
+  SegmentSealReceipt segment_seal_receipt = 7;
+}
+
+message SegmentSealReceipt {
+  uint32 shard_id = 1;
+  uint64 epoch = 2;
+  uint64 segment_seq = 3;
+  bytes segment_id = 4;
+  bytes segment_hash = 5;
+  bool previous_segment_present = 6;
+  uint64 previous_segment_seq = 7;
+  bytes previous_segment_hash = 8;
+  uint64 sealed_at_unix_ns = 9;
+  uint64 frame_count = 10;
+  bytes material_hash = 11;
+  // Ed25519 signature over the deterministic segment-seal material bytes.
+  // Empty when signing is unavailable; check unsigned/key_id.
+  bytes vault_signature = 12;
+  string key_id = 13;
+  bool unsigned = 14;
 }
 
 message AppendResult {

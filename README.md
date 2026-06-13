@@ -98,10 +98,10 @@ reversible via `memory_reverify`. Scoped forget with dry-run for GDPR Art. 17.
 BM25 + graph fusion returns metadata and token counts first, content only inside budget —
 **60–80% fewer tokens** than naive top-K context stuffing. Dense lanes optional, never required.
 
-**🟠 Receipts, not vibes.** Every write emits a **CROWN receipt**: Ed25519-signed,
-hash-bound, independently verifiable offline with `corecruxctl verify-store`. Tamper with one
-byte and verification fails loudly — `BODY_HASH_MISMATCH` vs `SIG_INVALID`, because operators
-need to know *why*.
+**🟠 Receipts, not vibes.** Receipt streams use **CROWN receipts**: Ed25519-signed,
+hash-bound, and independently verifiable by the receipt verifier. Store integrity is checked
+separately: `corecruxctl verify-store` checks manifest/frame structure, and `--strict`
+also recomputes sealed-segment BLAKE3 hashes against the manifest.
 
 ## Don't believe this README
 
@@ -113,9 +113,10 @@ cargo build --release --bin corecruxctl
 bash scripts/demo-receipt-tamper.sh
 ```
 
-The script seeds a CROWN receipt into a tmp data dir, runs `corecruxctl verify-store --mode full`
-(expects `ok: true`), **flips one byte on disk**, re-runs verification, and asserts the failure is
-detected. Read the script first — it's ~150 lines of bash using only documented subcommands.
+The script seeds a CROWN receipt into a tmp data dir, runs `corecruxctl verify-store --mode full
+--strict` (expects `ok: true`), **flips one byte on disk**, re-runs verification, and asserts the
+failure is detected. Read the script first — it's ~150 lines of bash using only documented
+subcommands.
 
 The verifier is ~1,250 lines of Rust at
 [`crates/corecrux-receipts/src/verify_v1.rs`](crates/corecrux-receipts/src/verify_v1.rs):
@@ -404,6 +405,7 @@ Verify store integrity:
 
 ```bash
 docker exec crux-crux-1 corecruxctl verify-store --data-dir /data --scope recent
+docker exec crux-crux-1 corecruxctl verify-store --data-dir /data --scope all --mode full --strict
 ```
 
 Common endpoints:
@@ -443,7 +445,8 @@ matching and confidence ranking only.
 `receipts` (inspect/export), `ccxi` (companion indexes), `projections` (projection state).
 
 Before upgrading: stop cleanly → snapshot `CORECRUXD_DATA_DIR` → `corecruxctl verify-store
---scope recent` → keep the previous binary until the new one passes `/readyz`. Rollback = restore
+--scope recent` plus `corecruxctl verify-store --scope all --mode full --strict` when the window
+allows → keep the previous binary until the new one passes `/readyz`. Rollback = restore
 the snapshot, restart the previous binary. Never delete live shard data by hand.
 
 | Symptom | Check |

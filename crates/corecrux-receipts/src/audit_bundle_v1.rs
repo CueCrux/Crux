@@ -30,7 +30,7 @@ use std::io::{Read, Write};
 
 use base64::Engine as _;
 use ciborium::{de::from_reader as cbor_from_reader, ser::into_writer as cbor_into_writer};
-use ed25519_dalek::{Signer as _, SigningKey, Verifier as _, VerifyingKey};
+use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -378,7 +378,7 @@ pub fn verify_bundle_v1(tar_zst_bytes: &[u8]) -> Result<VerifyReportV1, AuditBun
     let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
 
     let signing_bytes = manifest.canonical_signing_bytes()?;
-    let sig_ok = verifying.verify(&signing_bytes, &signature).is_ok();
+    let sig_ok = verifying.verify_strict(&signing_bytes, &signature).is_ok();
     if !sig_ok {
         return Ok(VerifyReportV1 {
             ok: false,

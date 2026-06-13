@@ -16,7 +16,7 @@
 //! The storage engine provides:
 //! - Append with backpressure (rejects writes when behind)
 //! - Deterministic replay (re-read all events in commit order)
-//! - Integrity verification (`verify-store` walks all segments and checks BLAKE3 hashes)
+//! - Integrity verification (`verify-store --strict` walks sealed segments and checks BLAKE3 hashes)
 //! - Epoch-based shard ownership for safe rebalancing
 
 #![deny(clippy::unwrap_used)]
@@ -241,6 +241,7 @@ pub struct SealResultV1 {
     pub frame_count: Option<u64>,
     /// Seal duration in seconds (0.0 if not sealed).
     pub seal_duration_secs: f64,
+    pub seal_receipt: Option<SegmentSealMaterialV1>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -670,6 +671,13 @@ pub struct ReplayScanStats {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StrictScanStats {
+    pub verified_segments: u64,
+    pub verified_frames: u64,
+    pub skipped_head_segments: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadStatsV1 {
     pub segments_touched: u32,
     pub blocks_touched: u32,
@@ -717,6 +725,50 @@ pub struct WriteConfirmationMaterialV1 {
     pub receipt_hash: [u8; 32],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentSealMaterialV1 {
+    pub shard_id: u32,
+    pub epoch: u64,
+    pub segment_seq: u64,
+    pub segment_id: SegmentId,
+    pub segment_hash: [u8; 32],
+    pub previous_segment_seq: Option<u64>,
+    pub previous_segment_hash: Option<[u8; 32]>,
+    pub sealed_at_unix_ns: u64,
+    pub frame_count: u64,
+}
+
+impl SegmentSealMaterialV1 {
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        out.extend_from_slice(b"corecrux.segment_seal.material.v1\0");
+        out.extend_from_slice(&self.shard_id.to_be_bytes());
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.extend_from_slice(&self.segment_seq.to_be_bytes());
+        out.extend_from_slice(&self.segment_id.0);
+        out.extend_from_slice(&self.segment_hash);
+        match (self.previous_segment_seq, self.previous_segment_hash) {
+            (Some(seq), Some(hash)) => {
+                out.push(1);
+                out.extend_from_slice(&seq.to_be_bytes());
+                out.extend_from_slice(&hash);
+            }
+            _ => {
+                out.push(0);
+                out.extend_from_slice(&0u64.to_be_bytes());
+                out.extend_from_slice(&[0u8; 32]);
+            }
+        }
+        out.extend_from_slice(&self.sealed_at_unix_ns.to_be_bytes());
+        out.extend_from_slice(&self.frame_count.to_be_bytes());
+        out
+    }
+
+    pub fn material_hash(&self) -> [u8; 32] {
+        *blake3::hash(&self.signing_bytes()).as_bytes()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AppendStatsV1 {
     pub idempotency_check_nanos: u64,
@@ -727,6 +779,7 @@ pub struct AppendStatsV1 {
     pub fence_nanos: u64,
     pub total_nanos: u64,
     pub write_confirmation: Option<WriteConfirmationMaterialV1>,
+    pub seal_receipt: Option<SegmentSealMaterialV1>,
 }
 
 impl AppendStatsV1 {

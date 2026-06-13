@@ -66,7 +66,7 @@
 
 use base64::Engine as _;
 use ciborium::value::Value as CborValue;
-use ed25519_dalek::{Signer as _, SigningKey, Verifier as _, VerifyingKey};
+use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use thiserror::Error;
 
 /// Schema string written into the canonical body.
@@ -730,7 +730,7 @@ pub fn verify_c2pa_manifest_v1(
         let mut arr = [0u8; 64];
         arr.copy_from_slice(&parsed.signature);
         let sig = ed25519_dalek::Signature::from_bytes(&arr);
-        verifying_key.verify(&parsed.canonical_body_bytes, &sig).is_ok()
+        verifying_key.verify_strict(&parsed.canonical_body_bytes, &sig).is_ok()
     } else {
         // Non-64-byte signature → not the legacy Ed25519 envelope.
         // verify_c2pa_manifest_v1 only handles Ed25519; X.509 chain

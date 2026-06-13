@@ -21,7 +21,8 @@ use corecrux_proto::dataplane_v1::{
     AppendBatchRequest, AppendBatchResponse, ExportChunk, ExportReceiptBundleRequest, ReadFramesBatchRawResponse,
     ReadFramesRequest, ReadFramesResponse, ReadManyBatchedRequest, ReadManyBatchedResponse,
     ReadManyFramesBatchedRequest, ReadManyFramesBatchedResponse, ReadStreamBatchResponse, ReadStreamBatchedRequest,
-    ReadStreamRequest, ReadStreamResponse, ReplaySessionRequest, ReplaySessionResponse, WriteConfirmation,
+    ReadStreamRequest, ReadStreamResponse, ReplaySessionRequest, ReplaySessionResponse, SegmentSealReceipt,
+    WriteConfirmation,
 };
 
 use tokio::sync::{Mutex, RwLock};
@@ -404,6 +405,7 @@ impl DataPlaneService {
     }
 
     fn build_write_confirmation(&self, append_stats: AppendStats, outcomes: &[AppendOutcome]) -> WriteConfirmation {
+        let segment_seal_receipt = append_stats.seal_receipt.map(build_segment_seal_receipt);
         let material = append_stats
             .write_confirmation
             .unwrap_or_else(|| fallback_write_confirmation_material(outcomes));
@@ -418,6 +420,7 @@ impl DataPlaneService {
             vault_signature: Vec::new(),
             key_id: signing.key_id.clone(),
             unsigned: true,
+            segment_seal_receipt,
         };
 
         match signing.signature {
@@ -430,7 +433,7 @@ impl DataPlaneService {
                 self.drain_unsigned_write_confirmation_queue();
             }
             None => {
-                self.queue_unsigned_write_confirmation(material);
+                let _queued = self.queue_unsigned_write_confirmation(material);
                 self.metrics.inc_write_confirmation(false);
                 if sign_elapsed_ms > 0.0 {
                     self.metrics
@@ -442,7 +445,7 @@ impl DataPlaneService {
         confirmation
     }
 
-    fn queue_unsigned_write_confirmation(&self, material: corecrux_storage::WriteConfirmationMaterialV1) {
+    fn queue_unsigned_write_confirmation(&self, material: corecrux_storage::WriteConfirmationMaterialV1) -> bool {
         // SAFETY: Mutex poisoning is process-fatal by design.
         #[allow(clippy::expect_used)]
         let mut queue = self
@@ -450,7 +453,17 @@ impl DataPlaneService {
             .lock()
             .expect("unsigned write confirmation queue mutex");
         if queue.len() >= WRITE_CONFIRMATION_UNSIGNED_QUEUE_CAPACITY {
-            queue.pop_front();
+            let depth = queue.len();
+            self.metrics.set_write_confirmation_unsigned_queue_depth(depth as u64);
+            self.metrics.inc_write_reject("unsigned_confirmation_queue_full");
+            tracing::error!(
+                depth,
+                capacity = WRITE_CONFIRMATION_UNSIGNED_QUEUE_CAPACITY,
+                commit_seq = material.commit_seq,
+                segment_id = material.segment_id,
+                "write confirmation signing unavailable and unsigned queue is full; refusing to evict queued confirmations; current confirmation was not retained"
+            );
+            return false;
         }
         queue.push_back(PendingWriteConfirmation {
             commit_seq: material.commit_seq,
@@ -465,6 +478,7 @@ impl DataPlaneService {
                 "write confirmation signing unavailable; unsigned queue depth above warning threshold"
             );
         }
+        true
     }
 
     fn drain_unsigned_write_confirmation_queue(&self) {
@@ -1048,6 +1062,48 @@ fn sign_write_confirmation_material(
     }
 }
 
+fn sign_segment_seal_material(material: corecrux_storage::SegmentSealMaterialV1) -> WriteConfirmationSigningResult {
+    let key_id = load_write_confirmation_key_id();
+    let Some(signing_key) = load_write_confirmation_signing_key() else {
+        return WriteConfirmationSigningResult {
+            signature: None,
+            key_id,
+        };
+    };
+
+    let signature = signing_key.sign(&material.signing_bytes());
+    WriteConfirmationSigningResult {
+        signature: Some(signature.to_bytes().to_vec()),
+        key_id,
+    }
+}
+
+fn build_segment_seal_receipt(material: corecrux_storage::SegmentSealMaterialV1) -> SegmentSealReceipt {
+    let signing = sign_segment_seal_material(material);
+    let previous_segment_present = material.previous_segment_seq.is_some() && material.previous_segment_hash.is_some();
+    let mut receipt = SegmentSealReceipt {
+        shard_id: material.shard_id,
+        epoch: material.epoch,
+        segment_seq: material.segment_seq,
+        segment_id: material.segment_id.0.to_vec(),
+        segment_hash: material.segment_hash.to_vec(),
+        previous_segment_present,
+        previous_segment_seq: material.previous_segment_seq.unwrap_or_default(),
+        previous_segment_hash: material.previous_segment_hash.unwrap_or([0u8; 32]).to_vec(),
+        sealed_at_unix_ns: material.sealed_at_unix_ns,
+        frame_count: material.frame_count,
+        material_hash: material.material_hash().to_vec(),
+        vault_signature: Vec::new(),
+        key_id: signing.key_id,
+        unsigned: true,
+    };
+    if let Some(signature) = signing.signature {
+        receipt.vault_signature = signature;
+        receipt.unsigned = false;
+    }
+    receipt
+}
+
 fn map_append_error(err: AppendError) -> Status {
     match err {
         AppendError::InvalidArgument(msg) => Status::invalid_argument(msg),
@@ -1093,10 +1149,10 @@ mod tests {
     use ed25519_dalek::Signer as _;
 
     use super::{
-        build_read_stream_batch_single, build_read_stream_batches, fallback_write_confirmation_material,
-        load_write_confirmation_signing_key, map_append_error, replication_auth_bearer_value,
-        sign_write_confirmation_material, stored_event_to_read_stream_response, DataPlaneService,
-        DataPlaneServiceConfig, WRITE_CONFIRMATION_KEY_ID_ENV, WRITE_CONFIRMATION_SIGNING_KEY_ENV,
+        build_read_stream_batch_single, build_read_stream_batches, build_segment_seal_receipt,
+        fallback_write_confirmation_material, load_write_confirmation_signing_key, map_append_error,
+        replication_auth_bearer_value, sign_write_confirmation_material, stored_event_to_read_stream_response,
+        DataPlaneService, DataPlaneServiceConfig, WRITE_CONFIRMATION_KEY_ID_ENV, WRITE_CONFIRMATION_SIGNING_KEY_ENV,
     };
     use crate::auth::{AuthMode, Authz};
     use crate::config::{AppendLaneScope, CommitLevel, StoreLockStrategy};
@@ -1663,6 +1719,58 @@ mod tests {
 
         assert_eq!(signed.key_id, "test-key-1");
         assert_eq!(signed.signature, Some(expected.to_bytes().to_vec()));
+
+        std::env::remove_var(WRITE_CONFIRMATION_SIGNING_KEY_ENV);
+        std::env::remove_var(WRITE_CONFIRMATION_KEY_ID_ENV);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn segment_seal_receipt_signing_commits_to_segment_chain() {
+        let _guard = WRITE_CONFIRMATION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(WRITE_CONFIRMATION_SIGNING_KEY_ENV);
+        std::env::remove_var(WRITE_CONFIRMATION_KEY_ID_ENV);
+
+        let material = corecrux_storage::SegmentSealMaterialV1 {
+            shard_id: 7,
+            epoch: 3,
+            segment_seq: 42,
+            segment_id: corecrux_segment::SegmentId([0x21; 16]),
+            segment_hash: [0x44; 32],
+            previous_segment_seq: Some(41),
+            previous_segment_hash: Some([0x33; 32]),
+            sealed_at_unix_ns: 123_456_789,
+            frame_count: 9,
+        };
+        let unsigned = build_segment_seal_receipt(material);
+        assert!(unsigned.unsigned);
+        assert!(unsigned.vault_signature.is_empty());
+        assert_eq!(unsigned.material_hash, material.material_hash().to_vec());
+
+        let secret = [0x55u8; 32];
+        std::env::set_var(
+            WRITE_CONFIRMATION_SIGNING_KEY_ENV,
+            base64::engine::general_purpose::STANDARD.encode(secret),
+        );
+        std::env::set_var(WRITE_CONFIRMATION_KEY_ID_ENV, "seal-key");
+
+        let signing_key = load_write_confirmation_signing_key().expect("signing key");
+        let signed = build_segment_seal_receipt(material);
+        let signature = ed25519_dalek::Signature::try_from(signed.vault_signature.as_slice()).expect("signature");
+        signing_key
+            .verifying_key()
+            .verify_strict(&material.signing_bytes(), &signature)
+            .expect("seal signature verifies");
+
+        assert!(!signed.unsigned);
+        assert_eq!(signed.key_id, "seal-key");
+        assert_eq!(signed.shard_id, material.shard_id);
+        assert_eq!(signed.segment_seq, material.segment_seq);
+        assert_eq!(signed.segment_id, material.segment_id.0.to_vec());
+        assert_eq!(signed.segment_hash, material.segment_hash.to_vec());
+        assert!(signed.previous_segment_present);
+        assert_eq!(signed.previous_segment_seq, 41);
+        assert_eq!(signed.previous_segment_hash, [0x33; 32].to_vec());
 
         std::env::remove_var(WRITE_CONFIRMATION_SIGNING_KEY_ENV);
         std::env::remove_var(WRITE_CONFIRMATION_KEY_ID_ENV);
@@ -3363,16 +3471,17 @@ mod tests {
     fn queue_unsigned_write_confirmation_caps_at_capacity() {
         let svc = test_service_with_auth("node-a", AuthMode::Off);
         for i in 0..super::WRITE_CONFIRMATION_UNSIGNED_QUEUE_CAPACITY + 10 {
-            svc.queue_unsigned_write_confirmation(corecrux_storage::WriteConfirmationMaterialV1 {
+            let queued = svc.queue_unsigned_write_confirmation(corecrux_storage::WriteConfirmationMaterialV1 {
                 commit_seq: i as u64,
                 segment_id: 1,
                 receipt_hash: [0x11; 32],
             });
+            assert_eq!(queued, i < super::WRITE_CONFIRMATION_UNSIGNED_QUEUE_CAPACITY);
         }
         let queue = svc.unsigned_write_confirmation_queue.lock().expect("lock");
         assert_eq!(queue.len(), super::WRITE_CONFIRMATION_UNSIGNED_QUEUE_CAPACITY);
-        // Oldest entries should have been evicted
-        assert_eq!(queue.front().unwrap().commit_seq, 10);
+        // Preserve FIFO backlog; overflow is reported, not silently evicted.
+        assert_eq!(queue.front().unwrap().commit_seq, 0);
     }
 
     // ── read_many_batched_unary auth paths ───────────────────────────

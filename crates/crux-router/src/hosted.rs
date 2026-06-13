@@ -196,9 +196,8 @@ impl<C: HostedBackendClient> HostedBridge<C> {
             call.backend_reachable = self.client.is_reachable(backend_id);
         }
 
-        let mut token = router.token().clone();
-        token.credits.balance = self.ledger.balance();
-        let decision = RcxRouter::new(token).decide(&call, now_unix_seconds);
+        let decision_router = router.clone().with_runtime_credit_balance(self.ledger.balance());
+        let decision = decision_router.decide(&call, now_unix_seconds);
         if !matches!(&decision.mode, RouterMode::Hosted | RouterMode::CustomerHosted) {
             return HostedBridgeOutcome {
                 decision,
@@ -272,6 +271,7 @@ fn hosted_credit_cost(token: &RcxCapabilityToken, call: &CallContext) -> u64 {
 mod tests {
     use super::*;
     use crate::mint_free_local_token;
+    use ed25519_dalek::{Signer, SigningKey};
     use rcx_capability_token::{
         Backend, CreditCost, CreditCostUnit, Credits, DataEgressClass, FallbackAction, FallbackPolicy, OverdraftPolicy,
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN, RCX_HOSTED_BACKEND_ID, RCX_HOSTED_RETRIEVE_CAPABILITY,
@@ -338,7 +338,9 @@ mod tests {
             on_expiry: FallbackAction::Refuse,
             queue_ttl_seconds: Some(120),
         };
-        RcxRouter::new(token)
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        token.signature.sig = signing.sign(&token.token_hash()).to_bytes();
+        RcxRouter::new_with_trusted_issuer_pubkey(token, signing.verifying_key().to_bytes())
     }
 
     fn hosted_call(cost: u64) -> CallContext {
