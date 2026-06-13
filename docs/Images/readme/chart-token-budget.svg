@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 200" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">
+  <text x="0" y="14" font-size="12" font-weight="600" fill="#8b949e">Tokens returned per query — naive top-K vs token_budget</text>
+  <g font-size="11">
+    <text x="0" y="46" fill="#8b949e">top-K (no budget)</text>
+    <rect x="150" y="34" width="270" height="18" rx="4" fill="#f85149" opacity="0.85"/>
+    <text x="284" y="47" font-weight="600" fill="#0d1117" text-anchor="middle">~18,400 tk</text>
+    <text x="0" y="86" fill="#8b949e">budget = 4000</text>
+    <rect x="150" y="74" width="58" height="18" rx="4" fill="#58a6ff"/>
+    <text x="216" y="87" font-weight="600" fill="#58a6ff">3,900</text>
+    <text x="0" y="126" fill="#8b949e">budget = 2000</text>
+    <rect x="150" y="114" width="29" height="18" rx="4" fill="#58a6ff"/>
+    <text x="187" y="127" font-weight="600" fill="#58a6ff">1,940</text>
+    <text x="0" y="166" fill="#8b949e">budget = 500</text>
+    <rect x="150" y="154" width="8" height="18" rx="4" fill="#3fb950"/>
+    <text x="166" y="167" font-weight="600" fill="#3fb950">480</text>
+  </g>
+  <text x="150" y="192" font-size="10" fill="#6e7681">budgets are enforced server-side — the model never sees the overflow (illustrative shape)</text>
+</svg>
