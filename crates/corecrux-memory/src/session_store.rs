@@ -33,6 +33,16 @@ pub struct SessionState {
     pub total_tokens: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    /// Soft, reversible archive flag. Archived sessions are preserved in full
+    /// but hidden from the default session listings (MCP `list_sessions` and the
+    /// console Sessions panel). `#[serde(default)]` keeps pre-archive journal
+    /// lines replay-safe (they deserialize as `archived = false`).
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_reason: Option<String>,
 }
 
 /// In-memory session store with optional JSONL persistence.
@@ -156,6 +166,9 @@ impl SessionStore {
             updated_at: Utc::now(),
             total_tokens: tokens,
             expires_at,
+            archived: false,
+            archived_at: None,
+            archive_reason: None,
         }
     }
 
@@ -209,9 +222,84 @@ impl SessionStore {
         Ok(removed)
     }
 
-    /// List all session IDs.
+    /// Set (or clear) the archive flag on a session, preserving its `state`.
+    ///
+    /// Unlike [`delete`](Self::delete), archiving is non-destructive and
+    /// reversible: the session is retained in full but hidden from the default
+    /// listings. Returns the updated session, or `None` if the id is unknown.
+    /// The mutation is journalled as a `Store` event so it survives replay.
+    pub fn set_archived(&mut self, session_id: &str, archived: bool, reason: Option<String>) -> Option<SessionState> {
+        let session = self.apply_archive(session_id, archived, reason)?;
+        if let Err(err) = self.append_journal(&SessionJournalEvent::Store {
+            session: session.clone(),
+        }) {
+            tracing::warn!(?err, "session-journal-append-failed");
+        }
+        self.emit_session_archived(&session);
+        Some(session)
+    }
+
+    /// Archive/restore a session only after its journal event has been durably appended.
+    pub fn try_set_archived(
+        &mut self,
+        session_id: &str,
+        archived: bool,
+        reason: Option<String>,
+    ) -> std::io::Result<Option<SessionState>> {
+        // Build the mutated session without committing it to memory first, so a
+        // failed journal append leaves the in-memory state untouched.
+        let Some(mut session) = self.sessions.get(session_id).cloned() else {
+            return Ok(None);
+        };
+        session.archived = archived;
+        session.archived_at = archived.then(Utc::now);
+        session.archive_reason = if archived { reason } else { None };
+        session.updated_at = Utc::now();
+        self.append_journal(&SessionJournalEvent::Store {
+            session: session.clone(),
+        })?;
+        self.sessions.insert(session_id.to_string(), session.clone());
+        self.emit_session_archived(&session);
+        Ok(Some(session))
+    }
+
+    /// Apply the archive mutation in memory and return the updated session.
+    fn apply_archive(&mut self, session_id: &str, archived: bool, reason: Option<String>) -> Option<SessionState> {
+        let session = self.sessions.get_mut(session_id)?;
+        session.archived = archived;
+        session.archived_at = archived.then(Utc::now);
+        session.archive_reason = if archived { reason } else { None };
+        session.updated_at = Utc::now();
+        Some(session.clone())
+    }
+
+    fn emit_session_archived(&self, session: &SessionState) {
+        if let Some(bus) = &self.event_bus {
+            bus.emit(crate::events::CruxEvent::SessionArchived {
+                session_id: session.session_id.clone(),
+                archived: session.archived,
+            });
+        }
+    }
+
+    /// List all session IDs (including archived).
     pub fn list(&self) -> Vec<&str> {
         self.sessions.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// List session IDs, optionally including archived ones. When
+    /// `include_archived` is false, archived sessions are omitted.
+    pub fn list_filtered(&self, include_archived: bool) -> Vec<&str> {
+        self.sessions
+            .iter()
+            .filter(|(_, s)| include_archived || !s.archived)
+            .map(|(id, _)| id.as_str())
+            .collect()
+    }
+
+    /// True if the session exists and is currently archived.
+    pub fn is_archived(&self, session_id: &str) -> bool {
+        self.sessions.get(session_id).is_some_and(|s| s.archived)
     }
 
     /// Total number of active sessions.
@@ -530,6 +618,107 @@ mod tests {
             assert_eq!(s.state["step"], 2);
             assert_eq!(s.state["done"], true);
         }
+    }
+
+    // ── Archive tests ──────────────────────────────────────────────
+
+    #[test]
+    fn new_session_is_not_archived() {
+        let mut store = SessionStore::new();
+        let s = store.put("s1", json!({"x": 1}), None);
+        assert!(!s.archived);
+        assert!(s.archived_at.is_none());
+        assert!(s.archive_reason.is_none());
+    }
+
+    #[test]
+    fn archive_preserves_state_and_sets_metadata() {
+        let mut store = SessionStore::new();
+        store.put("s1", json!({"keep": "this"}), None);
+
+        let archived = store.set_archived("s1", true, Some("done".to_string())).unwrap();
+        assert!(archived.archived);
+        assert!(archived.archived_at.is_some());
+        assert_eq!(archived.archive_reason.as_deref(), Some("done"));
+        // State is preserved, not destroyed (unlike delete).
+        assert_eq!(archived.state, json!({"keep": "this"}));
+        assert!(store.get("s1").is_some());
+        assert!(store.is_archived("s1"));
+    }
+
+    #[test]
+    fn unarchive_clears_metadata() {
+        let mut store = SessionStore::new();
+        store.put("s1", json!({}), None);
+        store.set_archived("s1", true, Some("done".to_string()));
+
+        let restored = store.set_archived("s1", false, None).unwrap();
+        assert!(!restored.archived);
+        assert!(restored.archived_at.is_none());
+        assert!(restored.archive_reason.is_none());
+        assert!(!store.is_archived("s1"));
+    }
+
+    #[test]
+    fn set_archived_unknown_session_returns_none() {
+        let mut store = SessionStore::new();
+        assert!(store.set_archived("nope", true, None).is_none());
+    }
+
+    #[test]
+    fn list_filtered_hides_archived_by_default() {
+        let mut store = SessionStore::new();
+        store.put("active", json!({}), None);
+        store.put("done", json!({}), None);
+        store.set_archived("done", true, None);
+
+        let mut active = store.list_filtered(false);
+        active.sort_unstable();
+        assert_eq!(active, vec!["active"]);
+
+        let mut all = store.list_filtered(true);
+        all.sort_unstable();
+        assert_eq!(all, vec!["active", "done"]);
+
+        // count() and list() remain whole-store.
+        assert_eq!(store.count(), 2);
+        assert_eq!(store.list().len(), 2);
+    }
+
+    #[test]
+    fn archive_survives_journal_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = SessionStore::with_persistence(dir.path()).unwrap();
+            store.try_put("s1", json!({"v": 1}), None).unwrap();
+            store.try_set_archived("s1", true, Some("shipped".to_string())).unwrap();
+        }
+        {
+            let store = SessionStore::with_persistence(dir.path()).unwrap();
+            let s = store.get("s1").unwrap();
+            assert!(s.archived);
+            assert_eq!(s.archive_reason.as_deref(), Some("shipped"));
+            assert_eq!(s.state, json!({"v": 1}));
+            assert!(store.list_filtered(false).is_empty());
+        }
+    }
+
+    #[test]
+    fn pre_archive_journal_line_replays_as_not_archived() {
+        // A journal line written before the archive fields existed has no
+        // `archived`/`archived_at`/`archive_reason` keys. `#[serde(default)]`
+        // must let it replay as `archived = false`.
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("sessions.jsonl");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let legacy = r#"{"op":"store","session":{"session_id":"legacy","state":{"a":1},"updated_at":"2026-01-01T00:00:00Z","total_tokens":3}}"#;
+        std::fs::write(&journal, format!("{legacy}\n")).unwrap();
+
+        let store = SessionStore::with_persistence(dir.path()).unwrap();
+        let s = store.get("legacy").expect("legacy session replays");
+        assert!(!s.archived);
+        assert!(s.archived_at.is_none());
+        assert_eq!(s.state, json!({"a": 1}));
     }
 
     #[test]

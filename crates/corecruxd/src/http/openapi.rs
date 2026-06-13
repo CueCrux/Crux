@@ -32,6 +32,8 @@ use utoipa::OpenApi;
         // Sessions
         super::facts::put_session_state,
         super::facts::get_session_state,
+        super::facts::archive_session,
+        super::facts::unarchive_session,
         // Events
         super::events::event_stream,
         // Query

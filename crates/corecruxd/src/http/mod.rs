@@ -534,6 +534,15 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/sessions/{sessionId}/state", axum::routing::put(self::facts::put_session_state))
         .route("/v1/sessions/{sessionId}/state", get(self::facts::get_session_state))
+        // Session archive lifecycle (soft, reversible — preserves state, hides from default listings).
+        .route(
+            "/v1/sessions/{sessionId}/archive",
+            axum::routing::post(self::facts::archive_session),
+        )
+        .route(
+            "/v1/sessions/{sessionId}/unarchive",
+            axum::routing::post(self::facts::unarchive_session),
+        )
         // Session observations (multi-provider capture, ExecPlan 2026-05-13).
         .route(
             "/v1/sessions/{sessionId}/observations",

@@ -114,11 +114,13 @@ pub async fn handle_session_checkpoint(args: &Value, ctx: &McpContext) -> Result
     }))
 }
 
-/// `list_sessions` — list all session IDs.
-pub async fn handle_list_sessions(_args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+/// `list_sessions` — list session IDs. Archived sessions are hidden unless
+/// `include_archived` is true.
+pub async fn handle_list_sessions(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let include_archived = args.get("include_archived").and_then(Value::as_bool).unwrap_or(false);
     let store = ctx.session_store.read().await;
     let mut ids = store
-        .list()
+        .list_filtered(include_archived)
         .into_iter()
         .filter_map(|session_id| scope::visible_session_for_agent(session_id, scope::agent_name(ctx.agent.as_ref())))
         .collect::<Vec<_>>();
@@ -163,6 +165,48 @@ pub async fn handle_delete_session(args: &Value, ctx: &McpContext) -> Result<Val
             }],
             "isError": false
         }))
+    }
+}
+
+/// `archive_session` — archive a session by ID (soft, reversible; preserves state).
+pub async fn handle_archive_session(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    set_session_archived(args, ctx, true).await
+}
+
+/// `unarchive_session` — restore a previously archived session by ID.
+pub async fn handle_unarchive_session(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    set_session_archived(args, ctx, false).await
+}
+
+async fn set_session_archived(args: &Value, ctx: &McpContext, archived: bool) -> Result<Value, JsonRpcError> {
+    let session_id = require_str(args, "session_id")?;
+    let reason = args.get("reason").and_then(Value::as_str).map(str::to_string);
+    let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
+
+    let mut store = ctx.session_store.write().await;
+    let result = store
+        .try_set_archived(&stored_session_id, archived, reason)
+        .map_err(|err| JsonRpcError {
+            code: INTERNAL_ERROR,
+            message: "session journal append failed".to_string(),
+            data: Some(json!({"error": err.to_string()})),
+        })?;
+
+    let verb = if archived { "archived" } else { "restored" };
+    match result {
+        Some(_) => Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": format!("{verb} session {session_id}")
+            }]
+        })),
+        None => Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": format!("session not found: {session_id}")
+            }],
+            "isError": false
+        })),
     }
 }
 
@@ -367,6 +411,69 @@ mod tests {
             .unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("session not found"));
+    }
+
+    // ── archive_session tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn archive_hides_from_list_but_keeps_state() {
+        let ctx = test_ctx();
+        handle_save_session(&json!({"session_id": "s1", "state": {"keep": 1}}), &ctx)
+            .await
+            .unwrap();
+
+        let result = handle_archive_session(&json!({"session_id": "s1", "reason": "shipped"}), &ctx)
+            .await
+            .unwrap();
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("archived session s1"));
+
+        // Hidden from default list_sessions...
+        let listed = handle_list_sessions(&json!({}), &ctx).await.unwrap();
+        assert_eq!(listed["content"][0]["text"].as_str().unwrap(), "no sessions");
+        // ...but visible with include_archived...
+        let listed_all = handle_list_sessions(&json!({"include_archived": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(listed_all["content"][0]["text"].as_str().unwrap().contains("s1"));
+        // ...and state is preserved (not destroyed like delete).
+        let got = handle_get_session(&json!({"session_id": "s1"}), &ctx).await.unwrap();
+        assert!(got["content"][0]["text"].as_str().unwrap().contains("\"keep\": 1"));
+    }
+
+    #[tokio::test]
+    async fn unarchive_restores_to_default_list() {
+        let ctx = test_ctx();
+        handle_save_session(&json!({"session_id": "s1", "state": {}}), &ctx)
+            .await
+            .unwrap();
+        handle_archive_session(&json!({"session_id": "s1"}), &ctx)
+            .await
+            .unwrap();
+
+        let result = handle_unarchive_session(&json!({"session_id": "s1"}), &ctx)
+            .await
+            .unwrap();
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("restored session s1"));
+        let listed = handle_list_sessions(&json!({}), &ctx).await.unwrap();
+        assert!(listed["content"][0]["text"].as_str().unwrap().contains("s1"));
+    }
+
+    #[tokio::test]
+    async fn archive_nonexistent_returns_not_found() {
+        let ctx = test_ctx();
+        let result = handle_archive_session(&json!({"session_id": "nope"}), &ctx)
+            .await
+            .unwrap();
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("session not found"));
     }
 
     #[tokio::test]

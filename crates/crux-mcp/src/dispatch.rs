@@ -485,7 +485,7 @@ fn build_predicted_effects(name: &str, args: &serde_json::Value) -> Vec<crate::e
     let entity = args.get("entity").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
     match name {
-        "store_fact" | "entity_upsert" | "edge_upsert" | "save_session" => {
+        "store_fact" | "entity_upsert" | "edge_upsert" | "save_session" | "archive_session" | "unarchive_session" => {
             vec![PredictedEffect::now("fact_write", entity, key)]
         }
         "delete_fact" | "entity_delete" | "edge_delete" | "delete_session" => {
@@ -2159,7 +2159,9 @@ mod tests {
             "memory_freshness" => json!({"query": "v", "token_budget": 1000}),
             "artefact_put" => json!({"content_bytes_base64": "AAAA", "mime_type": "text/plain"}),
             "artefact_get" => json!({"artefact_id": "a_stub"}),
-            "get_session" | "list_observations" | "delete_session" => json!({"session_id": "s_stub"}),
+            "get_session" | "list_observations" | "delete_session" | "archive_session" | "unarchive_session" => {
+                json!({"session_id": "s_stub"})
+            }
             "save_session" => json!({"session_id": "s_stub", "state": {}}),
             "get_observation" | "verify_observation" => {
                 json!({"session_id": "s_stub", "observation_id": "o_stub"})
