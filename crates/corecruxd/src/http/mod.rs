@@ -1096,6 +1096,11 @@ pub fn router(state: AppState) -> Router {
                 .patch(self::console::patch_console_tenant_category),
         )
         .route(
+            "/v1/console/tenants/{tenantId}/lane-weights",
+            get(self::console::get_console_tenant_lane_weights)
+                .patch(self::console::patch_console_tenant_lane_weights),
+        )
+        .route(
             "/v1/console/tenants/{tenantId}/chunks",
             get(self::console::get_console_tenant_chunks),
         )

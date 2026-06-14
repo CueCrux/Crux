@@ -48,6 +48,8 @@ pub(super) struct CompleteOnboardingBody {
 }
 
 const SUPPORTED_ONBOARDING_AUTH_MODES: &[&str] = &["off", "dev_scopes", "jwt_hs256", "jwt_jwks"];
+const CORECRUX_ADMIN_BASE_URL_ENV: &str = "CORECRUXD_CORECRUX_ADMIN_BASE_URL";
+const CORECRUX_ADMIN_TOKEN_ENV: &str = "CORECRUXD_CORECRUX_ADMIN_TOKEN";
 
 pub(super) async fn get_console_onboarding(State(state): State<AppState>) -> impl IntoResponse {
     let onboarding = state.onboarding.read().await;
@@ -1168,6 +1170,159 @@ pub(super) async fn patch_console_tenant_category(
     let override_ = crate::tenant_metadata::get_tenant_category_override(&store, &tenant_id);
     let resp = tenant_category_response(&tenant_id, override_);
     (StatusCode::OK, Json(resp)).into_response()
+}
+
+pub(super) async fn get_console_tenant_lane_weights(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    if tenant_id.is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "tenant_id must not be empty".to_string());
+    }
+    match proxy_corecrux_lane_weights(CorecruxAdminMethod::Get, tenant_id, None).await {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err((status, detail)) => problem_response(status, detail),
+    }
+}
+
+pub(super) async fn patch_console_tenant_lane_weights(
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(mut body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_write(&state, &headers) {
+        return problem.into_response();
+    }
+    if tenant_id.is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "tenant_id must not be empty".to_string());
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return problem_response(StatusCode::BAD_REQUEST, "lane weights body must be a JSON object");
+    };
+    if !obj.contains_key("actor") {
+        if let Some(actor) = console_actor_from_headers(&headers) {
+            obj.insert("actor".to_string(), serde_json::Value::String(actor));
+        }
+    }
+    match proxy_corecrux_lane_weights(CorecruxAdminMethod::Patch, tenant_id, Some(body)).await {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err((status, detail)) => problem_response(status, detail),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CorecruxAdminMethod {
+    Get,
+    Patch,
+}
+
+async fn proxy_corecrux_lane_weights(
+    method: CorecruxAdminMethod,
+    tenant_id: String,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    tokio::task::spawn_blocking(move || proxy_corecrux_lane_weights_blocking(method, &tenant_id, body))
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("CoreCrux admin proxy join failed: {err}"),
+            )
+        })?
+}
+
+fn proxy_corecrux_lane_weights_blocking(
+    method: CorecruxAdminMethod,
+    tenant_id: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let base_url = corecrux_admin_base_url()?;
+    let url = format!(
+        "{}/v1/admin/lane-weights/{}",
+        base_url.trim_end_matches('/'),
+        encode_path_segment(tenant_id)
+    );
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(8)))
+        .build()
+        .into();
+    let response = match method {
+        CorecruxAdminMethod::Get => {
+            let mut request = agent.get(&url).header("Accept", "application/json");
+            if let Some(token) = corecrux_admin_token() {
+                request = request.header("Authorization", &format!("Bearer {token}"));
+            }
+            request.call()
+        }
+        CorecruxAdminMethod::Patch => {
+            let mut request = agent
+                .patch(&url)
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json");
+            if let Some(token) = corecrux_admin_token() {
+                request = request.header("Authorization", &format!("Bearer {token}"));
+            }
+            request.send_json(body.unwrap_or_else(|| serde_json::json!({})))
+        }
+    };
+    let mut response = response.map_err(|err| match err {
+        ureq::Error::StatusCode(code) => (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
+            format!("CoreCrux admin returned HTTP {code}"),
+        ),
+        other => (StatusCode::BAD_GATEWAY, format!("CoreCrux admin proxy failed: {other}")),
+    })?;
+    response.body_mut().read_json::<serde_json::Value>().map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("CoreCrux admin response decode failed: {err}"),
+        )
+    })
+}
+
+fn corecrux_admin_base_url() -> Result<String, (StatusCode, String)> {
+    std::env::var(CORECRUX_ADMIN_BASE_URL_ENV)
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                format!("{CORECRUX_ADMIN_BASE_URL_ENV} is not configured"),
+            )
+        })
+}
+
+fn corecrux_admin_token() -> Option<String> {
+    std::env::var(CORECRUX_ADMIN_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn console_actor_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-corecrux-passport-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+pub(super) fn encode_path_segment(raw: &str) -> String {
+    let mut out = String::new();
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 fn validation_policy(state: &AppState) -> crux_integrations::ValidationPolicy {

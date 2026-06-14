@@ -682,7 +682,7 @@
 <script>
 /* ════════════ DUMMY GRAPH — flat node registry with id links (daemon-styled) ════════════ */
 const SCOPES = [
-  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-usage','cx-documents','cx-gates','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-receipts','cx-mediation','cx-workbench','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-settings','cx-raw'] },
+  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-usage','cx-documents','cx-gates','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-receipts','cx-mediation','cx-workbench','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-lanes','cx-settings','cx-raw'] },
   { id:'dx', label:'DX', tag:'Docs',         sections:['dx-articles','dx-readme','dx-sites'] },
   { id:'gx', label:'GX', tag:'Global',       sections:['gx-engrams','gx-bench','gx-sites','gx-factstore'] },
   { id:'ax', label:'AX', tag:'Agent',        sections:['ax-overview','ax-activity','ax-memory','ax-bulk','ax-snapshots','ax-tools','ax-handoff','ax-graph','ax-storybook','ax-dossiers','ax-story'] }
@@ -716,6 +716,7 @@ const N = {
   'cx-facts':{kind:'panel',label:'Facts',sub:'1,911 total',children:['fg-execplan','fg-bench','fg-incident','fg-design','fg-work']},
   'cx-memory':{kind:'panel',label:'Memory',sub:'recent feed',children:['mem1','mem2','mem3']},
   'cx-tenants':{kind:'panel',label:'Tenants',sub:'category + source',children:['t-lmem','t-lmes','t-personal']},
+  'cx-lanes':{kind:'panel',label:'Lanes',sub:'CoreCrux RRF weights',children:['t-lmem','t-lmes','t-personal']},
   'cx-raw':{kind:'panel',label:'Raw',sub:'JSON-RPC console',fields:[['endpoint','/mcp'],['port','14801']],children:['rpc-tools','rpc-query','rpc-store']},
   'cx-settings':{kind:'panel',label:'Settings',sub:'console defaults',children:['set-auth','set-embed','set-onboard','set-daemon']},
   'cx-orchestrators':{kind:'panel',label:'Orchestrators',sub:'/v1/orchestrators · group plans for a session',fields:[['endpoint','/v1/orchestrators'],['flag','CORECRUXD_ORCHESTRATORS=on'],['mcp','create_orchestrator · attach · detach · list'],['active','1'],['build','＋ Orchestrator (toolbar)']],children:['orc-sprint1']},
@@ -2695,6 +2696,17 @@ async function coordDeepLink(){
   if(p){ await ensureLoaded(p); expand(p, 0); }
 }
 
+/* boot-time deep link: #/lanes opens the CoreCrux lane-weight editor; #/lanes/<tenant> preselects a tenant */
+async function lanesDeepLink(){
+  let h=''; try{ h=(typeof location!=='undefined' && location.hash)||''; }catch{ h=''; }
+  const m=h.match(/^#\/lanes(?:\/([^/?#]+))?(?:\?tenant=([^#]+))?$/);
+  if(!m) return;
+  openScope('cx');
+  const tenant=m[1]||m[2];
+  if(tenant) setCtrl('cx-lanes','tenant',decodeURIComponent(tenant));
+  openPage('cx-lanes');
+}
+
 /* ── left icon rail: click a panel icon → show ONLY that panel's nodes ──
    (home icon restores the full panels column; openScope clears solo mode) */
 var soloPanelId=null;
@@ -2715,6 +2727,7 @@ const SB_ICONS={
   'cx-facts':'<ellipse cx="12" cy="5.5" rx="7.5" ry="2.8"/><path d="M4.5 5.5v13c0 1.6 3.4 2.8 7.5 2.8s7.5-1.2 7.5-2.8v-13M4.5 12c0 1.6 3.4 2.8 7.5 2.8s7.5-1.2 7.5-2.8"/>',
   'cx-memory':'<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
   'cx-tenants':'<rect x="5" y="3.5" width="14" height="17" rx="1.5"/><path d="M9 7.5h2M13 7.5h2M9 11h2M13 11h2M9 14.5h2M13 14.5h2M10.5 20.5v-3h3v3"/>',
+  'cx-lanes':'<path d="M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="17" r="2"/>',
   'cx-settings':'<path d="M4 7h8M16 7h4M4 12h2M10 12h10M4 17h11M19 17h1"/><circle cx="14" cy="7" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="17" cy="17" r="2"/>',
   'cx-raw':'<path d="m8.5 8-4 4 4 4M15.5 8l4 4-4 4"/>',
   'cx-usage':'<path d="M5 19V9.5M10 19V4.5M15 19v-7M20 19v-11M3 21h18"/>',
@@ -3006,6 +3019,21 @@ const AMR_LANES=[
  ['nav','Navigational — summary-tree descent for corpora too large to scan.', false],
  ['verbatim','Verbatim pointers — exact-quote recall without duplicating content into the index. Free, local.', true],
 ];
+const CORECRUX_RRF_LANES=[
+ ['bm25','BM25','Lexical exact-match lane.'],
+ ['cosine','Cosine','CoreCrux vector similarity lane.'],
+ ['sparse','Sparse','Sparse semantic lane.'],
+ ['hyde','HyDE','Generated-query expansion lane.'],
+ ['topology','Topology','Graph-neighbour lane.'],
+ ['vernacular','Vernacular','Local phrasing and vocabulary lane.'],
+ ['indexing','Indexing','CCXDI indexing lane.'],
+ ['topology_trait_expansion','Trait expansion','Topology trait-expansion lane.'],
+ ['navtree','Navtree','Summary-tree navigation lane.'],
+ ['events','Events','Time/event lane.'],
+];
+function laneWeightControls(){
+  return CORECRUX_RRF_LANES.map(([k,label,desc])=>({t:'input',k:'lw_'+k,label,ph:'0.0 - 10.0',v:'',desc}));
+}
 function amrLaneToggles(prefix){
   return [{t:'toggle',k:prefix+'auto',label:'automatic — let AMR choose lanes',v:true,
     desc:'Recommended. AMR reads the lane manifest and fuses the lanes that earn their tokens, per query — no manual lane picking. Turn off to pin lanes below.'},
@@ -3019,7 +3047,8 @@ function tenantExpRow(id,sub,sys){
    controls:[{t:'toggle',k:p+'inherit',label:'use AMR defaults',v:true,
      desc:'Inherit the lane policy from the defaults panel above. Turn off to pin lanes for this tenant only.'}]
     .concat(amrLaneToggles(p))
-    .concat([{t:'btn',label:'Collaborate with team',hint:'paid plan — teammates\' daemons can pull this tenant'}])};
+    .concat([{t:'btn',label:'Tune lane weights',action:'lanes',tenant:id,hint:'opens the CoreCrux RRF editor for this tenant'},
+             {t:'btn',label:'Collaborate with team',hint:'paid plan — teammates\' daemons can pull this tenant'}])};
 }
 /* ── ExecPlans list view (the kanban's sibling — rail pull-out switches) ── */
 const WORK_STAGES=[['in_progress','In progress'],['blocked','Blocked'],['planned','Planned'],['done','Done']];
@@ -3105,6 +3134,23 @@ const PAGES={
    tenantExpRow('__agent::anthropic','agent-private store',true),
    tenantExpRow('__bootstrap__::patterns','boot playbooks',true),
    {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+ 'cx-lanes':{title:'Lane weights',sub:'CoreCrux RRF fusion · tenant-scoped console control',sections:[
+  {h:'Target',sub:'Same-origin Crux proxy: /v1/console/tenants/{tenant}/lane-weights',wide:true,controls:[
+   {t:'select',k:'tenant',label:'tenant',options:['default','personal','lme-s','lme-m'],v:'default'},
+   {t:'info',k:'status',label:'status',v:'not loaded'},
+   {t:'info',k:'source',label:'source',v:'CoreCrux admin proxy'},
+   {t:'toggle',k:'enabled',label:'enable RRF fusion',v:false,desc:'Turns FEATURE_FUSION_RRF on for this tenant.'},
+   {t:'input',k:'k',label:'RRF k',ph:'60',v:'60',desc:'RRF smoothing constant. Must be 1 or greater.'},
+   {t:'input',k:'reason',label:'change reason',ph:'operator tune via console',v:'operator tune via console'}]},
+  {h:'Weights',sub:'0 disables a lane contribution; higher values increase its fused rank contribution; max 10',wide:true,controls:laneWeightControls()},
+  {h:'Actions',sub:'Presets only stage values locally until Apply lane weights is pressed',wide:true,controls:[
+   {t:'btn',label:'Load tenant'},
+   {t:'btn',label:'Balanced preset'},
+   {t:'btn',label:'Lexical preset'},
+   {t:'btn',label:'Semantic preset'},
+   {t:'btn',label:'Graph preset'},
+   {t:'btn',label:'Apply lane weights'},
+   {t:'btn',label:'Reset tenant override',danger:true,hint:'clears only the CoreCrux RRF override keys for this tenant'}]}]},
  'cx-memory':{title:'Memory',sub:'recent facts per tenant — system tenants hidden by default',sections:[
   {h:'Recent memory',sub:'click a tenant to expand its recent facts',wide:true,controls:[
    {t:'search',ph:'Filter tenants…'},
@@ -3568,6 +3614,62 @@ function pageCtrl(pageId,k){ const def=PAGES[pageId]; let out=null;
 function pageVal(pageId,k){ const c=pageCtrl(pageId,k); return confGet(pageId+'.'+k, c?c.v:undefined); }
 function setCtrl(pageId,k,v){ const c=pageCtrl(pageId,k); if(c) c.v=v; confPut(pageId+'.'+k, v); }   // server truth wins on load
 const infoRow=(label,v)=>({t:'info',label,v});
+const LANE_WEIGHT_PRESETS={
+ 'Balanced preset':{enabled:true,k:60,weights:{bm25:1,cosine:1,sparse:1,hyde:1,topology:0,vernacular:0,indexing:0,topology_trait_expansion:0,navtree:0,events:0}},
+ 'Lexical preset':{enabled:true,k:60,weights:{bm25:2,cosine:0.6,sparse:1.2,hyde:0.5,topology:0,vernacular:0.6,indexing:0,topology_trait_expansion:0,navtree:0,events:0}},
+ 'Semantic preset':{enabled:true,k:60,weights:{bm25:0.8,cosine:2,sparse:1.2,hyde:1.2,topology:0,vernacular:0.4,indexing:0,topology_trait_expansion:0,navtree:0,events:0}},
+ 'Graph preset':{enabled:true,k:60,weights:{bm25:1,cosine:1,sparse:0.8,hyde:0.6,topology:1.6,vernacular:0.4,indexing:0.6,topology_trait_expansion:1.2,navtree:0.9,events:0.7}},
+};
+function laneTenant(){ const v=String(pageVal('cx-lanes','tenant')||'default').trim(); return v||'default'; }
+function laneWeightsUrl(tenant){ return '/v1/console/tenants/'+encodeURIComponent(tenant||laneTenant())+'/lane-weights'; }
+function fmtLaneNumber(v){
+  const n=Number(v);
+  if(!Number.isFinite(n)) return v==null?'':String(v);
+  const r=Math.round(n*1000)/1000;
+  return String(r);
+}
+function laneReadNumber(k,label,min,max){
+  const raw=String(pageVal('cx-lanes',k)||'').trim();
+  const n=Number(raw);
+  if(!raw || !Number.isFinite(n)) throw {status:label+' must be numeric'};
+  if(min!=null && n<min) throw {status:label+' must be >= '+min};
+  if(max!=null && n>max) throw {status:label+' must be <= '+max};
+  return n;
+}
+function lanePayload(){
+  const weights={};
+  CORECRUX_RRF_LANES.forEach(([k,label])=>{ weights[k]=laneReadNumber('lw_'+k,label,0,10); });
+  return {
+    fusion_rrf_enabled: !!pageVal('cx-lanes','enabled'),
+    fusion_rrf_k: laneReadNumber('k','RRF k',1,null),
+    rrf_lane_weights: weights,
+    reason: String(pageVal('cx-lanes','reason')||'operator tune via console').trim()||'operator tune via console',
+  };
+}
+function laneOverlaySource(resp){
+  const overlay=(resp&&resp.tenant_overlay)||{};
+  const names=['FEATURE_FUSION_RRF','FUSION_RRF_K','FUSION_RRF_LANE_WEIGHTS']
+    .filter(k=>Object.prototype.hasOwnProperty.call(overlay,k));
+  return names.length? ('tenant override · '+names.join(', ')) : 'inherited defaults';
+}
+function applyLaneSnapshot(resp,msg){
+  const snap=(resp&&resp.after)||resp||{};
+  const weights=snap.weights||{};
+  if(snap.tenant_id) setCtrl('cx-lanes','tenant',snap.tenant_id);
+  setCtrl('cx-lanes','enabled',!!snap.fusion_rrf_enabled);
+  setCtrl('cx-lanes','k',fmtLaneNumber(snap.fusion_rrf_k!=null?snap.fusion_rrf_k:60));
+  CORECRUX_RRF_LANES.forEach(([k])=>setCtrl('cx-lanes','lw_'+k,fmtLaneNumber(weights[k])));
+  setCtrl('cx-lanes','status',msg||('loaded · '+(snap.tenant_id||laneTenant())));
+  setCtrl('cx-lanes','source',(resp&&resp.changed_keys)?('changed '+resp.changed_keys.length+' keys') : laneOverlaySource(resp));
+}
+function applyLanePreset(label){
+  const preset=LANE_WEIGHT_PRESETS[label]; if(!preset) return false;
+  setCtrl('cx-lanes','enabled',!!preset.enabled);
+  setCtrl('cx-lanes','k',fmtLaneNumber(preset.k));
+  CORECRUX_RRF_LANES.forEach(([k])=>setCtrl('cx-lanes','lw_'+k,fmtLaneNumber(preset.weights[k])));
+  setCtrl('cx-lanes','status',label.replace(' preset','')+' preset staged');
+  return true;
+}
 const PAGE_WIRES={
  'cx-settings':{
   load: async def=>{
@@ -3872,6 +3974,46 @@ const PAGE_WIRES={
           controls:[{t:'info',label:'stored',v:String(f.stored_at||'—')},
             {t:'info',label:'value',v:(typeof f.value==='string'?f.value:JSON.stringify(f.value||'')).slice(0,140)}]}))})))
       .concat(keep.filter(c=>c.t==='btn'));
+  }},
+ 'cx-lanes':{
+  load: async def=>{
+    const tenant=laneTenant();
+    const tenants=await api('/v1/console/tenants').catch(e=>({_err:e}));
+    const sel=pageCtrl('cx-lanes','tenant');
+    if(sel && !tenants._err){
+      const opts=[tenant].concat((tenants.tenants||[]).map(t=>t.tenant_id||t.id).filter(Boolean));
+      sel.options=Array.from(new Set(opts));
+    }
+    const snap=await api(laneWeightsUrl(tenant)).catch(e=>{
+      const st=(e&&e.status)||'network';
+      setCtrl('cx-lanes','status',st===501?'CoreCrux admin proxy not configured':'unavailable · '+st);
+      setCtrl('cx-lanes','source',st===403?'needs admin:write for apply; admin:read for load':'CoreCrux admin proxy');
+      return null;
+    });
+    if(snap) applyLaneSnapshot(snap);
+    const target=def.sections[0];
+    if(target) target.sub='tenant '+laneTenant()+' · same-origin Crux proxy keeps CoreCrux admin token server-side';
+  },
+  set:{ tenant: ()=>{ if(openPageId==='cx-lanes') openPage('cx-lanes'); return null; } },
+  act:{
+    'Load tenant': async ctx=>{ await PAGE_WIRES['cx-lanes'].load(PAGES['cx-lanes']); ctx.reopen(); return 'loaded · '+laneTenant(); },
+    'Balanced preset': async ctx=>{ applyLanePreset('Balanced preset'); ctx.reopen(); return 'balanced preset staged'; },
+    'Lexical preset': async ctx=>{ applyLanePreset('Lexical preset'); ctx.reopen(); return 'lexical preset staged'; },
+    'Semantic preset': async ctx=>{ applyLanePreset('Semantic preset'); ctx.reopen(); return 'semantic preset staged'; },
+    'Graph preset': async ctx=>{ applyLanePreset('Graph preset'); ctx.reopen(); return 'graph preset staged'; },
+    'Apply lane weights': async ctx=>{
+      const r=await patchApi(laneWeightsUrl(laneTenant()),lanePayload());
+      applyLaneSnapshot(r,'saved · '+laneTenant());
+      ctx.reopen(); return 'lane weights saved · '+laneTenant();
+    },
+    'Reset tenant override': async ctx=>{
+      const r=await patchApi(laneWeightsUrl(laneTenant()),{
+        reset:true,
+        reason:String(pageVal('cx-lanes','reason')||'console reset lane weights').trim()||'console reset lane weights',
+      });
+      applyLaneSnapshot(r,'reset · '+laneTenant());
+      ctx.reopen(); return 'tenant override reset · '+laneTenant();
+    },
   }},
  'cx-mediation':{
   actAny:(label,ctx)=>{
@@ -4286,6 +4428,7 @@ function renderControl(pageId,c){
       if(c.action==='rpc'){ sendRpc(pageId); return; }
       if(c.action==='showsec'){ confPut(pageId+'.'+c.key, c.value!==undefined? c.value : true); openPage(pageId,{__wired:true}); return; }
       if(c.action==='openpage'){ openPage(c.page); return; }
+      if(c.action==='lanes'){ setCtrl('cx-lanes','tenant',c.tenant||c.raw||'default'); openPage('cx-lanes'); return; }
       if(c.action==='folder'){   /* browser folder picker → derive the doc prefix from the selection */
         (async()=>{
           try{
@@ -4365,7 +4508,7 @@ buildSidebar();    // after PANEL_TO_DISTRICT exists — rail icons carry their 
 try{ if(localStorage.getItem('cx-view')==='3d') setView('3d'); }catch(e){}
 
 openScope('cx');   // immediate render with dummy data
-bootProbe().then(()=>{ receiptsDeepLink(); coordDeepLink(); });   // probe /readyz; if live, lazy-replace panels with real /v1 data; then honour #/receipts · #/coord deep links
+bootProbe().then(()=>{ receiptsDeepLink(); coordDeepLink(); lanesDeepLink(); });   // probe /readyz; if live, lazy-replace panels with real /v1 data; then honour console deep links
 </script>
 </body>
 </html>

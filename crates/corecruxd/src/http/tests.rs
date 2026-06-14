@@ -7692,6 +7692,89 @@ async fn console_tenants_classify_by_prefix_and_filter() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+struct EnvRestore {
+    key: &'static str,
+    original: Option<String>,
+}
+
+impl EnvRestore {
+    fn remove(key: &'static str) -> Self {
+        let original = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        if let Some(value) = &self.original {
+            std::env::set_var(self.key, value);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+// ── ExecPlan crux-daemon-console-lane-weights-2026-06-13 M3 ──────────────
+// Console bridge for CoreCrux lane weights. Missing CoreCrux target must be
+// explicit, not a silent local no-op.
+
+#[tokio::test]
+async fn console_lane_weights_get_requires_corecrux_admin_target() {
+    let _base = EnvRestore::remove("CORECRUXD_CORECRUX_ADMIN_BASE_URL");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::get_console_tenant_lane_weights(
+        State(state),
+        axum::extract::Path("tenant-a".to_string()),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let body = json_body(resp).await;
+    assert!(body["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("CORECRUXD_CORECRUX_ADMIN_BASE_URL"));
+}
+
+#[tokio::test]
+async fn console_lane_weights_patch_requires_write_scope_before_proxy() {
+    let _base = EnvRestore::remove("CORECRUXD_CORECRUX_ADMIN_BASE_URL");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::patch_console_tenant_lane_weights(
+        State(state),
+        axum::extract::Path("tenant-a".to_string()),
+        dev_scope_headers("admin:read"),
+        Json(serde_json::json!({"fusion_rrf_enabled": true})),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn console_lane_weights_patch_rejects_non_object_body() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::patch_console_tenant_lane_weights(
+        State(state),
+        axum::extract::Path("tenant-a".to_string()),
+        dev_scope_headers("admin:write"),
+        Json(serde_json::json!(["not", "object"])),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn console_lane_weights_encode_tenant_path_segment() {
+    assert_eq!(console::encode_path_segment("tenant/a b"), "tenant%2Fa%20b");
+}
+
 // ── ExecPlan crux-tenant-category-model-2026-05-22 M2 ────────────────────
 // GET/PATCH /v1/console/tenants/:tenant/category — override layer for the
 // derived classification. System category not user-settable; system-prefix
