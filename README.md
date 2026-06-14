@@ -334,6 +334,10 @@ acts — instinct, not search.
 Built MCP-first, not MCP-wrapped: every retrieval tool takes a token budget, every mutation emits
 a receipt, identity rides a passport. The server lives at `http://localhost:14801/mcp`.
 
+> **AI agents exploring this codebase: start at [`AGENTS.md`](AGENTS.md)** — a crate atlas,
+> a claims-to-code-to-tests matrix, and the cryptographic invariants, all anchored by
+> greppable symbol names and verified in CI.
+
 | Group | Tools |
 |---|---|
 | Retrieval | `query` · `query_scan` · `query_expand` · `get_bootstrap` |
