@@ -11,14 +11,35 @@
 //! network access.
 
 use ciborium::value::Value as CborValue;
+use cms::cert::x509::der::{Decode, Encode, Tag as CmsTag, Tagged};
+use cms::{
+    cert::{
+        x509::{ext::pkix::SubjectKeyIdentifier, Certificate as CmsCertificate},
+        CertificateChoices,
+    },
+    content_info::ContentInfo,
+    signed_data::{SignedData, SignerIdentifier, SignerInfo},
+};
+use const_oid::{
+    db::{rfc5911, rfc5912},
+    ObjectIdentifier,
+};
 use ed25519_dalek::{Signer as _, SigningKey};
-use sha2::{Digest as _, Sha256};
+use ring::signature;
+use sha2::{Digest as _, Sha256, Sha384, Sha512};
+use x509_cert::{der::Encode as X509Cert02Encode, Certificate as PemCertificate};
+use x509_parser::der_parser::{
+    ber::{BerObjectContent, Tag as DerTag},
+    der::parse_der_sequence,
+};
+use x509_parser::{certificate::X509Certificate, prelude::FromDer};
 
 use crate::verify_v1::ReceiptSigV1;
 
 pub const WITNESS_BODY_SCHEMA_V1: &str = "cuecrux.receipt.body.v1";
 pub const EXTERNAL_ANCHOR_KIND_V1: &str = "external_anchor";
 pub const RFC3161_TIMESTAMP_KIND_V1: &str = "rfc3161_timestamp";
+const ID_CT_TST_INFO: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
 
 #[derive(Debug, Clone)]
 pub struct ExternalAnchorBodyInputV1<'a> {
@@ -276,6 +297,648 @@ pub fn verify_rfc3161_timestamp_token_binding_v1(
     true
 }
 
+#[derive(Debug, Clone)]
+pub struct Rfc3161StrictValidationOptionsV1<'a> {
+    pub expected_message_imprint_hash: Option<&'a str>,
+    pub expected_policy_oid: Option<&'a str>,
+    /// Optional nonce bytes as the unsigned integer value, not DER encoded.
+    pub expected_nonce: Option<&'a [u8]>,
+    /// DER-encoded trusted TSA roots. At least one is required for strict mode.
+    pub trusted_root_certs_der: &'a [&'a [u8]],
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Rfc3161StrictValidationReportV1 {
+    pub ok: bool,
+    pub token_hash_ok: bool,
+    pub cms_structure_ok: bool,
+    pub content_type_ok: bool,
+    pub signed_attrs_ok: bool,
+    pub message_imprint_ok: bool,
+    pub policy_ok: bool,
+    pub nonce_ok: bool,
+    pub gen_time_ok: bool,
+    pub cms_signature_ok: bool,
+    pub tsa_eku_ok: bool,
+    pub cert_chain_ok: bool,
+    pub tsa_policy_oid: Option<String>,
+    pub gen_time: Option<String>,
+    pub signer_subject: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
+impl Rfc3161StrictValidationReportV1 {
+    fn new() -> Self {
+        Self {
+            ok: false,
+            token_hash_ok: false,
+            cms_structure_ok: false,
+            content_type_ok: false,
+            signed_attrs_ok: false,
+            message_imprint_ok: false,
+            policy_ok: false,
+            nonce_ok: false,
+            gen_time_ok: false,
+            cms_signature_ok: false,
+            tsa_eku_ok: false,
+            cert_chain_ok: false,
+            tsa_policy_oid: None,
+            gen_time: None,
+            signer_subject: None,
+            failure_reason: None,
+        }
+    }
+
+    fn fail(mut self, reason: impl Into<String>) -> Self {
+        self.failure_reason = Some(reason.into());
+        self
+    }
+
+    fn pass(mut self) -> Self {
+        self.ok = true;
+        self.failure_reason = None;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedTstInfoV1 {
+    version: u64,
+    policy_oid: String,
+    message_imprint_alg_oid: String,
+    message_imprint_hash: Vec<u8>,
+    gen_time: x509_parser::time::ASN1Time,
+    gen_time_rfc3339: String,
+    nonce: Option<Vec<u8>>,
+}
+
+pub fn verify_rfc3161_timestamp_token_strict_v1(
+    body_bytes: &[u8],
+    opts: &Rfc3161StrictValidationOptionsV1<'_>,
+) -> Rfc3161StrictValidationReportV1 {
+    let mut report = Rfc3161StrictValidationReportV1::new();
+    if opts.trusted_root_certs_der.is_empty() {
+        return report.fail("strict RFC3161 validation requires at least one trusted TSA root certificate");
+    }
+
+    let Some(fields) = parse_body_fields(body_bytes) else {
+        return report.fail("receipt body is not valid CBOR");
+    };
+    if fields.text("kind").as_deref() != Some(RFC3161_TIMESTAMP_KIND_V1) {
+        return report.fail("body is not an rfc3161_timestamp receipt body");
+    }
+    let (Some(token), Some(token_hash), Some(body_imprint_alg), Some(body_imprint_hash)) = (
+        fields.bytes("timestamp_token_der"),
+        fields.text("timestamp_token_sha256"),
+        fields.text("message_imprint_alg"),
+        fields.text("message_imprint_hash"),
+    ) else {
+        return report.fail("rfc3161_timestamp body is missing token, token hash, or message imprint fields");
+    };
+    report.token_hash_ok = hex_eq(&sha256_hex(&token), &token_hash);
+    if !report.token_hash_ok {
+        return report.fail("timestamp_token_sha256 does not match timestamp_token_der");
+    }
+    if let Some(expected) = opts.expected_message_imprint_hash {
+        if !digest_hex_eq(expected, &body_imprint_hash, digest_len_for_alg(&body_imprint_alg)) {
+            return report.fail("expected message imprint does not match receipt body message_imprint_hash");
+        }
+    }
+
+    let token_ci = match ContentInfo::from_der(&token) {
+        Ok(v) => v,
+        Err(err) => return report.fail(format!("TimeStampToken ContentInfo parse failed: {err}")),
+    };
+    if token_ci.content_type != rfc5911::ID_SIGNED_DATA {
+        return report.fail("TimeStampToken ContentInfo contentType is not id-signedData");
+    }
+    let signed_data = match token_ci.content.decode_as::<SignedData>() {
+        Ok(v) => v,
+        Err(err) => return report.fail(format!("SignedData parse failed: {err}")),
+    };
+    if signed_data.encap_content_info.econtent_type != ID_CT_TST_INFO {
+        return report.fail("SignedData encapContentInfo eContentType is not id-ct-TSTInfo");
+    }
+    let Some(econtent) = signed_data.encap_content_info.econtent.as_ref() else {
+        return report.fail("SignedData is missing encapsulated TSTInfo content");
+    };
+    let tst_info_der = econtent.value();
+    let tst_info = match parse_tst_info_v1(tst_info_der) {
+        Ok(v) => v,
+        Err(err) => return report.fail(format!("TSTInfo parse failed: {err}")),
+    };
+    report.cms_structure_ok = true;
+    report.content_type_ok = true;
+    report.tsa_policy_oid = Some(tst_info.policy_oid.clone());
+    report.gen_time = Some(tst_info.gen_time_rfc3339.clone());
+
+    if tst_info.version != 1 {
+        return report.fail(format!("unsupported TSTInfo version: {}", tst_info.version));
+    }
+    if alg_name_for_digest_oid_str(&tst_info.message_imprint_alg_oid) != Some(body_imprint_alg.as_str()) {
+        return report.fail("TSTInfo messageImprint hashAlgorithm does not match receipt body message_imprint_alg");
+    }
+    let Some(expected_imprint) = parse_digest_hex(&body_imprint_hash, tst_info.message_imprint_hash.len()) else {
+        return report.fail("receipt body message_imprint_hash is not valid hex for the TSTInfo hash algorithm");
+    };
+    report.message_imprint_ok = tst_info.message_imprint_hash.as_slice() == expected_imprint.as_slice();
+    if !report.message_imprint_ok {
+        return report.fail("TSTInfo messageImprint hashedMessage does not match receipt body");
+    }
+
+    report.policy_ok = fields
+        .text("tsa_policy_oid")
+        .is_none_or(|receipt_policy| receipt_policy == tst_info.policy_oid)
+        && opts
+            .expected_policy_oid
+            .is_none_or(|expected_policy| expected_policy == tst_info.policy_oid);
+    if !report.policy_ok {
+        return report.fail("TSTInfo policy does not match expected or receipt body TSA policy");
+    }
+
+    report.nonce_ok = match opts.expected_nonce {
+        Some(expected_nonce) => tst_info
+            .nonce
+            .as_ref()
+            .is_some_and(|nonce| nonce.as_slice() == trim_unsigned_integer(expected_nonce)),
+        None => true,
+    };
+    if !report.nonce_ok {
+        return report.fail("TSTInfo nonce does not match expected nonce");
+    }
+
+    let signer_info = match single_signer_info(&signed_data) {
+        Ok(v) => v,
+        Err(reason) => return report.fail(reason),
+    };
+    let cert_ders = match certificate_der_set(&signed_data) {
+        Ok(v) => v,
+        Err(reason) => return report.fail(reason),
+    };
+    let (signer_cert_der, signer_cert) = match find_signer_cert_der(&cert_ders, signer_info) {
+        Some(v) => v,
+        None => return report.fail("no certificate in SignedData matches SignerInfo sid"),
+    };
+    report.signer_subject = Some(signer_cert.subject().to_string());
+
+    let content_digest = match digest_for_oid(signer_info.digest_alg.oid, tst_info_der) {
+        Some(v) => v,
+        None => return report.fail("SignerInfo digestAlgorithm is unsupported"),
+    };
+    report.signed_attrs_ok = verify_signed_attrs_v1(
+        signer_info,
+        signed_data.encap_content_info.econtent_type,
+        &content_digest,
+    )
+    .is_ok();
+    if !report.signed_attrs_ok {
+        return report.fail("SignerInfo signedAttrs contentType/messageDigest verification failed");
+    }
+
+    report.cms_signature_ok = verify_cms_signature_v1(signer_info, &signer_cert).is_ok();
+    if !report.cms_signature_ok {
+        return report.fail("SignerInfo signature verification failed");
+    }
+
+    let gen_time = tst_info.gen_time;
+    report.gen_time_ok = signer_cert.validity().is_valid_at(gen_time);
+    if !report.gen_time_ok {
+        return report.fail("TSA signer certificate was not valid at TSTInfo genTime");
+    }
+
+    report.tsa_eku_ok = signer_has_timestamping_eku(&signer_cert);
+    if !report.tsa_eku_ok {
+        return report.fail("TSA signer certificate lacks id-kp-timeStamping EKU");
+    }
+
+    let root_ders = opts
+        .trusted_root_certs_der
+        .iter()
+        .map(|cert| cert.to_vec())
+        .collect::<Vec<_>>();
+    report.cert_chain_ok = validate_tsa_chain_v1(signer_cert_der, &cert_ders, &root_ders, gen_time).is_ok();
+    if !report.cert_chain_ok {
+        return report.fail("TSA signer certificate does not chain to a trusted root");
+    }
+
+    report.pass()
+}
+
+pub fn parse_x509_certs_der_or_pem_v1(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    if bytes.starts_with(b"-----BEGIN") {
+        PemCertificate::load_pem_chain(bytes)
+            .map_err(|err| format!("PEM certificate parse failed: {err}"))?
+            .into_iter()
+            .map(|cert| {
+                cert.to_der()
+                    .map_err(|err| format!("certificate DER encoding failed: {err}"))
+            })
+            .collect()
+    } else {
+        X509Certificate::from_der(bytes).map_err(|err| format!("DER certificate parse failed: {err}"))?;
+        Ok(vec![bytes.to_vec()])
+    }
+}
+
+fn parse_tst_info_v1(bytes: &[u8]) -> Result<ParsedTstInfoV1, String> {
+    let (rem, seq) = parse_der_sequence(bytes).map_err(|err| format!("{err:?}"))?;
+    if !rem.is_empty() {
+        return Err("TSTInfo has trailing bytes".to_string());
+    }
+    let fields = seq.as_sequence().map_err(|err| format!("{err:?}"))?;
+    if fields.len() < 5 {
+        return Err("TSTInfo is missing required fields".to_string());
+    }
+
+    let version = fields[0]
+        .as_u64()
+        .map_err(|err| format!("version parse failed: {err:?}"))?;
+    let policy_oid = fields[1]
+        .as_oid()
+        .map_err(|err| format!("policy OID parse failed: {err:?}"))?
+        .to_id_string();
+    let imprint_fields = fields[2]
+        .as_sequence()
+        .map_err(|err| format!("messageImprint parse failed: {err:?}"))?;
+    if imprint_fields.len() < 2 {
+        return Err("messageImprint is missing hashAlgorithm or hashedMessage".to_string());
+    }
+    let alg_fields = imprint_fields[0]
+        .as_sequence()
+        .map_err(|err| format!("messageImprint hashAlgorithm parse failed: {err:?}"))?;
+    let Some(alg_oid_obj) = alg_fields.first() else {
+        return Err("messageImprint hashAlgorithm is missing algorithm OID".to_string());
+    };
+    let message_imprint_alg_oid = alg_oid_obj
+        .as_oid()
+        .map_err(|err| format!("messageImprint algorithm OID parse failed: {err:?}"))?
+        .to_id_string();
+    let message_imprint_hash = imprint_fields[1]
+        .as_slice()
+        .map_err(|err| format!("messageImprint hashedMessage parse failed: {err:?}"))?
+        .to_vec();
+
+    fields[3]
+        .as_biguint()
+        .map_err(|err| format!("serialNumber parse failed: {err:?}"))?;
+    let gen_time_raw = match &fields[4].content {
+        BerObjectContent::GeneralizedTime(dt) => dt.to_string(),
+        _ => return Err("genTime is not DER GeneralizedTime".to_string()),
+    };
+    let gen_time_content = gen_time_raw.as_bytes();
+    let gen_time_der = wrap_generalized_time_der(gen_time_content)?;
+    let (_, gen_time) = x509_parser::time::ASN1Time::from_der(&gen_time_der)
+        .map_err(|err| format!("genTime validation failed: {err:?}"))?;
+    let gen_time_rfc3339 = generalized_time_to_rfc3339(gen_time_content);
+
+    let nonce = fields
+        .iter()
+        .skip(5)
+        .find(|field| field.header.tag() == DerTag::Integer)
+        .map(|field| {
+            field
+                .as_biguint()
+                .map(|value| trim_unsigned_integer(&value.to_bytes_be()).to_vec())
+                .map_err(|err| format!("nonce parse failed: {err:?}"))
+        })
+        .transpose()?;
+
+    Ok(ParsedTstInfoV1 {
+        version,
+        policy_oid,
+        message_imprint_alg_oid,
+        message_imprint_hash,
+        gen_time,
+        gen_time_rfc3339,
+        nonce,
+    })
+}
+
+fn wrap_generalized_time_der(content: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = vec![0x18];
+    if content.len() < 128 {
+        out.push(content.len() as u8);
+    } else if content.len() <= 255 {
+        out.extend_from_slice(&[0x81, content.len() as u8]);
+    } else {
+        return Err("GeneralizedTime is too long".to_string());
+    }
+    out.extend_from_slice(content);
+    Ok(out)
+}
+
+fn generalized_time_to_rfc3339(content: &[u8]) -> String {
+    if content.len() == 15 && content[14] == b'Z' {
+        let s = String::from_utf8_lossy(content);
+        format!(
+            "{}-{}-{}T{}:{}:{}Z",
+            &s[0..4],
+            &s[4..6],
+            &s[6..8],
+            &s[8..10],
+            &s[10..12],
+            &s[12..14]
+        )
+    } else {
+        String::from_utf8_lossy(content).to_string()
+    }
+}
+
+fn single_signer_info(signed_data: &SignedData) -> Result<&SignerInfo, String> {
+    let mut iter = signed_data.signer_infos.0.iter();
+    let Some(first) = iter.next() else {
+        return Err("SignedData does not contain a SignerInfo".to_string());
+    };
+    if iter.next().is_some() {
+        return Err("strict RFC3161 validation requires exactly one SignerInfo".to_string());
+    }
+    Ok(first)
+}
+
+fn certificate_der_set(signed_data: &SignedData) -> Result<Vec<Vec<u8>>, String> {
+    let Some(certs) = signed_data.certificates.as_ref() else {
+        return Err("SignedData does not include TSA certificates".to_string());
+    };
+    let mut out = Vec::new();
+    for cert in certs.0.iter() {
+        if let CertificateChoices::Certificate(cert) = cert {
+            out.push(
+                cert.to_der()
+                    .map_err(|err| format!("certificate DER encoding failed: {err}"))?,
+            );
+        }
+    }
+    if out.is_empty() {
+        return Err("SignedData certificate set has no X.509 certificates".to_string());
+    }
+    Ok(out)
+}
+
+fn find_signer_cert_der<'a>(
+    cert_ders: &'a [Vec<u8>],
+    signer_info: &SignerInfo,
+) -> Option<(&'a [u8], X509Certificate<'a>)> {
+    for cert_der in cert_ders {
+        let owned = CmsCertificate::from_der(cert_der).ok()?;
+        if !cert_matches_signer_v1(&owned, &signer_info.sid) {
+            continue;
+        }
+        let (_, parsed) = X509Certificate::from_der(cert_der).ok()?;
+        return Some((cert_der.as_slice(), parsed));
+    }
+    None
+}
+
+fn cert_matches_signer_v1(cert: &CmsCertificate, sid: &SignerIdentifier) -> bool {
+    match sid {
+        SignerIdentifier::IssuerAndSerialNumber(isn) => {
+            cert.tbs_certificate().issuer() == &isn.issuer
+                && cert.tbs_certificate().serial_number() == &isn.serial_number
+        }
+        SignerIdentifier::SubjectKeyIdentifier(ski) => cert
+            .tbs_certificate()
+            .get_extension::<SubjectKeyIdentifier>()
+            .ok()
+            .flatten()
+            .is_some_and(|(_, cert_ski)| cert_ski.0.as_bytes() == ski.0.as_bytes()),
+    }
+}
+
+fn verify_signed_attrs_v1(
+    signer_info: &SignerInfo,
+    expected_content_type: ObjectIdentifier,
+    expected_content_digest: &[u8],
+) -> Result<(), String> {
+    let Some(attrs) = signer_info.signed_attrs.as_ref() else {
+        return Err("SignerInfo has no signedAttrs".to_string());
+    };
+    let content_type = signed_attr_oid_value(attrs, rfc5911::ID_CONTENT_TYPE)?;
+    if content_type != expected_content_type {
+        return Err("signedAttrs contentType does not match TSTInfo eContentType".to_string());
+    }
+    let message_digest = signed_attr_octets_value(attrs, rfc5911::ID_MESSAGE_DIGEST)?;
+    if message_digest != expected_content_digest {
+        return Err("signedAttrs messageDigest does not match TSTInfo digest".to_string());
+    }
+    Ok(())
+}
+
+fn signed_attr_oid_value(
+    attrs: &cms::cert::x509::attr::Attributes,
+    oid: ObjectIdentifier,
+) -> Result<ObjectIdentifier, String> {
+    let attr = single_attr(attrs, oid)?;
+    let value = attr
+        .values
+        .get(0)
+        .ok_or_else(|| "signed attribute has no values".to_string())?;
+    value
+        .decode_as::<ObjectIdentifier>()
+        .map_err(|err| format!("signed attribute OID decode failed: {err}"))
+}
+
+fn signed_attr_octets_value(
+    attrs: &cms::cert::x509::attr::Attributes,
+    oid: ObjectIdentifier,
+) -> Result<Vec<u8>, String> {
+    let attr = single_attr(attrs, oid)?;
+    let value = attr
+        .values
+        .get(0)
+        .ok_or_else(|| "signed attribute has no values".to_string())?;
+    if value.tag() != CmsTag::OctetString {
+        return Err("signed attribute value is not an OCTET STRING".to_string());
+    }
+    Ok(value.value().to_vec())
+}
+
+fn single_attr(
+    attrs: &cms::cert::x509::attr::Attributes,
+    oid: ObjectIdentifier,
+) -> Result<&cms::cert::x509::attr::Attribute, String> {
+    let mut matches = attrs.iter().filter(|attr| attr.oid == oid);
+    let Some(first) = matches.next() else {
+        return Err(format!("missing signed attribute {oid}"));
+    };
+    if first.values.len() != 1 {
+        return Err(format!("signed attribute {oid} must have exactly one value"));
+    }
+    if matches.next().is_some() {
+        return Err(format!("duplicate signed attribute {oid}"));
+    }
+    Ok(first)
+}
+
+fn verify_cms_signature_v1(signer_info: &SignerInfo, signer_cert: &X509Certificate<'_>) -> Result<(), String> {
+    let Some(attrs) = signer_info.signed_attrs.as_ref() else {
+        return Err("SignerInfo has no signedAttrs".to_string());
+    };
+    let signed_attrs_der = attrs
+        .to_der()
+        .map_err(|err| format!("signedAttrs DER encoding failed: {err}"))?;
+    let verification_alg = ring_alg_for_signature_v1(signer_info.signature_algorithm.oid, signer_cert)?;
+    let public_key = signer_cert.public_key();
+    let key = signature::UnparsedPublicKey::new(verification_alg, &public_key.subject_public_key.data);
+    key.verify(&signed_attrs_der, signer_info.signature.as_bytes())
+        .map_err(|_| "CMS signature verification failed".to_string())
+}
+
+fn ring_alg_for_signature_v1(
+    signature_oid: ObjectIdentifier,
+    signer_cert: &X509Certificate<'_>,
+) -> Result<&'static dyn signature::VerificationAlgorithm, String> {
+    let key_len = signer_cert.public_key().subject_public_key.data.len();
+    match signature_oid.to_string().as_str() {
+        "1.2.840.10045.4.3.2" => {
+            if key_len > 80 {
+                Ok(&signature::ECDSA_P384_SHA256_ASN1)
+            } else {
+                Ok(&signature::ECDSA_P256_SHA256_ASN1)
+            }
+        }
+        "1.2.840.10045.4.3.3" => {
+            if key_len > 80 {
+                Ok(&signature::ECDSA_P384_SHA384_ASN1)
+            } else {
+                Ok(&signature::ECDSA_P256_SHA384_ASN1)
+            }
+        }
+        "1.2.840.113549.1.1.11" => Ok(&signature::RSA_PKCS1_2048_8192_SHA256),
+        "1.2.840.113549.1.1.12" => Ok(&signature::RSA_PKCS1_2048_8192_SHA384),
+        "1.2.840.113549.1.1.13" => Ok(&signature::RSA_PKCS1_2048_8192_SHA512),
+        "1.3.101.112" => Ok(&signature::ED25519),
+        other => Err(format!("unsupported CMS signature algorithm OID: {other}")),
+    }
+}
+
+fn signer_has_timestamping_eku(cert: &X509Certificate<'_>) -> bool {
+    cert.extended_key_usage()
+        .ok()
+        .flatten()
+        .is_some_and(|eku| eku.value.time_stamping)
+}
+
+fn validate_tsa_chain_v1(
+    signer_cert_der: &[u8],
+    cert_ders: &[Vec<u8>],
+    trusted_root_ders: &[Vec<u8>],
+    gen_time: x509_parser::time::ASN1Time,
+) -> Result<(), String> {
+    let mut current_der = signer_cert_der.to_vec();
+    let mut seen_hashes = Vec::<[u8; 32]>::new();
+    let mut candidates = cert_ders.to_vec();
+    candidates.extend_from_slice(trusted_root_ders);
+
+    for _ in 0..=candidates.len() {
+        let current_hash = Sha256::digest(&current_der).into();
+        if seen_hashes.contains(&current_hash) {
+            return Err("certificate chain loop detected".to_string());
+        }
+        seen_hashes.push(current_hash);
+
+        let (_, current) = X509Certificate::from_der(&current_der)
+            .map_err(|err| format!("certificate parse failed during chain validation: {err}"))?;
+        if !current.validity().is_valid_at(gen_time) {
+            return Err("certificate in TSA chain was not valid at genTime".to_string());
+        }
+        if trusted_root_ders
+            .iter()
+            .any(|root| root.as_slice() == current_der.as_slice())
+        {
+            current
+                .verify_signature(None)
+                .map_err(|_| "trusted TSA root self-signature verification failed".to_string())?;
+            return Ok(());
+        }
+
+        let mut next_der = None;
+        for candidate_der in &candidates {
+            if candidate_der.as_slice() == current_der.as_slice() {
+                continue;
+            }
+            let Ok((_, issuer)) = X509Certificate::from_der(candidate_der) else {
+                continue;
+            };
+            if current.issuer() == issuer.subject() && current.verify_signature(Some(issuer.public_key())).is_ok() {
+                next_der = Some(candidate_der.clone());
+                break;
+            }
+        }
+        let Some(found) = next_der else {
+            return Err("no issuer found for certificate in TSA chain".to_string());
+        };
+        current_der = found;
+    }
+    Err("certificate chain exceeded candidate length".to_string())
+}
+
+fn digest_for_oid(oid: ObjectIdentifier, bytes: &[u8]) -> Option<Vec<u8>> {
+    if oid == rfc5912::ID_SHA_256 {
+        Some(Sha256::digest(bytes).to_vec())
+    } else if oid == rfc5912::ID_SHA_384 {
+        Some(Sha384::digest(bytes).to_vec())
+    } else if oid == rfc5912::ID_SHA_512 {
+        Some(Sha512::digest(bytes).to_vec())
+    } else {
+        None
+    }
+}
+
+fn alg_name_for_digest_oid_str(oid: &str) -> Option<&'static str> {
+    match oid {
+        "2.16.840.1.101.3.4.2.1" => Some("sha256"),
+        "2.16.840.1.101.3.4.2.2" => Some("sha384"),
+        "2.16.840.1.101.3.4.2.3" => Some("sha512"),
+        _ => None,
+    }
+}
+
+fn digest_len_for_alg(alg: &str) -> Option<usize> {
+    match alg.to_ascii_lowercase().as_str() {
+        "sha256" => Some(32),
+        "sha384" => Some(48),
+        "sha512" => Some(64),
+        _ => None,
+    }
+}
+
+fn digest_hex_eq(a: &str, b: &str, expected_len: Option<usize>) -> bool {
+    let Some(expected_len) = expected_len else {
+        return false;
+    };
+    let Some(aa) = parse_digest_hex(a, expected_len) else {
+        return false;
+    };
+    let Some(bb) = parse_digest_hex(b, expected_len) else {
+        return false;
+    };
+    aa == bb
+}
+
+fn parse_digest_hex(s: &str, expected_len: usize) -> Option<Vec<u8>> {
+    let raw = s.strip_prefix("sha256:").unwrap_or(s);
+    let raw = raw.strip_prefix("sha384:").unwrap_or(raw);
+    let raw = raw.strip_prefix("sha512:").unwrap_or(raw);
+    if raw.len() != expected_len * 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(expected_len);
+    for chunk in raw.as_bytes().chunks_exact(2) {
+        let hi = hex_val(chunk[0])?;
+        let lo = hex_val(chunk[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+fn trim_unsigned_integer(bytes: &[u8]) -> &[u8] {
+    let mut out = bytes;
+    while out.len() > 1 && out[0] == 0 {
+        out = &out[1..];
+    }
+    out
+}
+
 pub fn assert_external_anchor_kind_v1(body_bytes: &[u8]) -> bool {
     parse_body_fields(body_bytes)
         .and_then(|fields| fields.text("kind"))
@@ -415,6 +1078,32 @@ mod tests {
     use super::*;
     use ed25519_dalek::VerifyingKey;
 
+    const OPENSSL_TSA_ROOT_DER_HEX: &str = concat!(
+        "308201a63082014ba00302010202146357e286ac744b2644b9a1944bc53332ce452aeb300a06082a8648ce3d0403023020311e301c06035504030c15437565437275782054534120526f6f742054455354301e170d3236303631343130323332",
+        "385a170d3336303631313130323332385a3020311e301c06035504030c15437565437275782054534120526f6f7420544553543059301306072a8648ce3d020106082a8648ce3d03010703420004c8c194328268f50786a22f5418e0e799b96e",
+        "9a3408e6664eaef4fe55187b9d9f85f8ed06493f9384f556afc8e63d7d720d7f3e4728c8215620db479155426327a3633061301d0603551d0e0416041420a6b0cc0760ce03e42a1abe8dc28dd7f3588d77301f0603551d2304183016801420a6",
+        "b0cc0760ce03e42a1abe8dc28dd7f3588d77300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300a06082a8648ce3d04030203490030460221009d2f57cbfeb2f962585b84a4ec824df010a3b8e32c50a25b9a",
+        "0ab3824a5c8752022100ac9ae04621d06d2a5687bbbb3aaa8d08648f875d49712b0d04ebf7d5582542ec",
+    );
+
+    const OPENSSL_TSA_TOKEN_DER_HEX: &str = concat!(
+        "3082055206092a864886f70d010702a08205433082053f020103310f300d06096086480165030402010500306d060b2a864886f70d0109100104a05e045c305a02010106032a03043031300d06096086480165030402010500042080a7a77c0c",
+        "d501aec2d7694dcc7fdf4cf50a4cab83579fb290924fc8520ba680020102180f32303236303631343130323332385a020900c23a5af413e2a2cfa0820368308201ba30820160a0030201020214437244843a279eb992604133c83183abb6a90e",
+        "bc300a06082a8648ce3d0403023020311e301c06035504030c15437565437275782054534120526f6f742054455354301e170d3236303631343130323332385a170d3237303631343130323332385a3020311e301c06035504030c1543756543",
+        "72757820545341204c65616620544553543059301306072a8648ce3d020106082a8648ce3d03010703420004d21bb325d01bd4c057c7021a73aff34d0c14bf6c5785206dc916e9416f742f0087918d532fdb601dfcdf0cbdd0ff0536f189565f",
+        "72519eeebef4c0bede05a02fa3783076300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030160603551d250101ff040c300a06082b06010505070308301d0603551d0e041604147425117c29124793460e9b439f6e0a",
+        "12015af4a1301f0603551d2304183016801420a6b0cc0760ce03e42a1abe8dc28dd7f3588d77300a06082a8648ce3d0403020348003045022100ba128d57fb0ef7f2d27ce152ae15317f65f42f634403400e6c3c3b65af18d6b3022047c2767d",
+        "28e4e7098d4fb30e7a0d43efdbe9a8984a2a18dbb2d5420cda0be816308201a63082014ba00302010202146357e286ac744b2644b9a1944bc53332ce452aeb300a06082a8648ce3d0403023020311e301c06035504030c154375654372757820",
+        "54534120526f6f742054455354301e170d3236303631343130323332385a170d3336303631313130323332385a3020311e301c06035504030c15437565437275782054534120526f6f7420544553543059301306072a8648ce3d020106082a86",
+        "48ce3d03010703420004c8c194328268f50786a22f5418e0e799b96e9a3408e6664eaef4fe55187b9d9f85f8ed06493f9384f556afc8e63d7d720d7f3e4728c8215620db479155426327a3633061301d0603551d0e0416041420a6b0cc0760ce",
+        "03e42a1abe8dc28dd7f3588d77301f0603551d2304183016801420a6b0cc0760ce03e42a1abe8dc28dd7f3588d77300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300a06082a8648ce3d0403020349003046",
+        "0221009d2f57cbfeb2f962585b84a4ec824df010a3b8e32c50a25b9a0ab3824a5c8752022100ac9ae04621d06d2a5687bbbb3aaa8d08648f875d49712b0d04ebf7d5582542ec3182014c3082014802010130383020311e301c06035504030c15",
+        "437565437275782054534120526f6f7420544553540214437244843a279eb992604133c83183abb6a90ebc300d06096086480165030402010500a081a4301a06092a864886f70d010903310d060b2a864886f70d0109100104301c06092a8648",
+        "86f70d010905310f170d3236303631343130323332385a302f06092a864886f70d01090431220420a154fa93da08b28749c6997f1141c4d99df70a3e2413752bc57fca13a96807933037060b2a864886f70d010910022f312830263024302204",
+        "20a40d8b814db0a06bcdada9d081a75c5e9325878aee771f8219744111c9dca9fb300a06082a8648ce3d04030204473045022100f59034d403430bb434427cdf47dbc58365f92d60756980a26a5418624ecff2e402206489558c4bd929accf38",
+        "91a22b4435a12ad9aa0723534bec33449b8acc2db3bf",
+    );
+
     fn two_leaf_tree() -> ([u8; 32], [u8; 32], [u8; 32]) {
         let leaf0 = rfc6962_leaf_hash(b"leaf-0");
         let leaf1 = rfc6962_leaf_hash(b"leaf-1");
@@ -457,6 +1146,17 @@ mod tests {
             gen_time: "2026-06-14T10:00:00Z",
             created_at: "2026-06-14T10:00:01Z",
         }
+    }
+
+    fn hex_bytes(raw: &str) -> Vec<u8> {
+        raw.as_bytes()
+            .chunks_exact(2)
+            .map(|chunk| {
+                let hi = hex_val(chunk[0]).unwrap();
+                let lo = hex_val(chunk[1]).unwrap();
+                (hi << 4) | lo
+            })
+            .collect()
     }
 
     #[test]
@@ -507,6 +1207,56 @@ mod tests {
             &body,
             Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
         ));
+    }
+
+    #[test]
+    fn rfc3161_strict_validation_accepts_openssl_time_stamp_token() {
+        let token = hex_bytes(OPENSSL_TSA_TOKEN_DER_HEX);
+        let imprint_hash = "sha256:80a7a77c0cd501aec2d7694dcc7fdf4cf50a4cab83579fb290924fc8520ba680";
+        let input = Rfc3161TimestampBodyInputV1 {
+            tenant_id: "tenant-a",
+            receipt_id: "tsa_fixture",
+            timestamp_id: "timestamp-fixture",
+            actor_passport: "passport:operator",
+            tsa_url: "https://tsa.example",
+            tsa_policy_oid: Some("1.2.3.4"),
+            message_imprint_alg: "sha256",
+            message_imprint_hash: imprint_hash,
+            timestamp_token_der: &token,
+            serial_number: Some("02"),
+            gen_time: "2026-06-14T10:23:28Z",
+            created_at: "2026-06-14T10:23:29Z",
+        };
+        let (body, _) = build_rfc3161_timestamp_body_v1(&input);
+        let root = hex_bytes(OPENSSL_TSA_ROOT_DER_HEX);
+        let root_refs = vec![root.as_slice()];
+        let nonce = hex_bytes("C23A5AF413E2A2CF");
+
+        let report = verify_rfc3161_timestamp_token_strict_v1(
+            &body,
+            &Rfc3161StrictValidationOptionsV1 {
+                expected_message_imprint_hash: Some(imprint_hash),
+                expected_policy_oid: Some("1.2.3.4"),
+                expected_nonce: Some(&nonce),
+                trusted_root_certs_der: &root_refs,
+            },
+        );
+
+        assert!(report.ok, "{report:?}");
+        assert!(report.token_hash_ok);
+        assert!(report.cms_structure_ok);
+        assert!(report.content_type_ok);
+        assert!(report.signed_attrs_ok);
+        assert!(report.message_imprint_ok);
+        assert!(report.policy_ok);
+        assert!(report.nonce_ok);
+        assert!(report.gen_time_ok);
+        assert!(report.cms_signature_ok);
+        assert!(report.tsa_eku_ok);
+        assert!(report.cert_chain_ok);
+        assert_eq!(report.tsa_policy_oid.as_deref(), Some("1.2.3.4"));
+        assert_eq!(report.gen_time.as_deref(), Some("2026-06-14T10:23:28Z"));
+        assert_eq!(report.signer_subject.as_deref(), Some("CN=CueCrux TSA Leaf TEST"));
     }
 
     #[test]

@@ -1303,6 +1303,15 @@ enum ReceiptsCommand {
         /// Optional expected SHA-256 message imprint hash (hex, `sha256:` prefix accepted).
         #[arg(long)]
         expected_imprint_hash: Option<String>,
+        /// Trusted TSA root certificate for strict RFC3161 validation. May be repeated; accepts DER or PEM.
+        #[arg(long = "tsa-root-cert")]
+        tsa_root_cert: Vec<PathBuf>,
+        /// Optional expected RFC3161 policy OID for strict validation.
+        #[arg(long)]
+        expected_policy_oid: Option<String>,
+        /// Optional expected RFC3161 nonce as hex bytes for strict validation.
+        #[arg(long)]
+        expected_nonce_hex: Option<String>,
     },
 
     /// Build an external_anchor receipt body from a transparency-log inclusion proof.
@@ -2403,8 +2412,23 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ReceiptsCommand::VerifyRfc3161Timestamp {
                 body,
                 expected_imprint_hash,
+                tsa_root_cert,
+                expected_policy_oid,
+                expected_nonce_hex,
             } => {
-                let report = receipts::verify_rfc3161_timestamp_body_file_v1(&body, expected_imprint_hash.as_deref())?;
+                let expected_nonce = expected_nonce_hex
+                    .as_deref()
+                    .map(receipts::parse_hex_bytes_v1)
+                    .transpose()?;
+                let report = receipts::verify_rfc3161_timestamp_body_file_with_options_v1(
+                    &body,
+                    &receipts::Rfc3161TimestampVerifyOptionsV1 {
+                        expected_message_imprint_hash: expected_imprint_hash.as_deref(),
+                        expected_policy_oid: expected_policy_oid.as_deref(),
+                        expected_nonce: expected_nonce.as_deref(),
+                        trusted_root_cert_paths: &tsa_root_cert,
+                    },
+                )?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 if report.ok {
                     Ok(())
@@ -4144,6 +4168,12 @@ mod tests {
             "/tmp/body.cbor",
             "--expected-imprint-hash",
             "sha256:abc",
+            "--tsa-root-cert",
+            "/tmp/root.pem",
+            "--expected-policy-oid",
+            "1.2.3.4",
+            "--expected-nonce-hex",
+            "0001",
         ])
         .unwrap();
         match cli.command {
@@ -4152,10 +4182,16 @@ mod tests {
                     ReceiptsCommand::VerifyRfc3161Timestamp {
                         body,
                         expected_imprint_hash,
+                        tsa_root_cert,
+                        expected_policy_oid,
+                        expected_nonce_hex,
                     },
             } => {
                 assert_eq!(body, PathBuf::from("/tmp/body.cbor"));
                 assert_eq!(expected_imprint_hash.as_deref(), Some("sha256:abc"));
+                assert_eq!(tsa_root_cert, vec![PathBuf::from("/tmp/root.pem")]);
+                assert_eq!(expected_policy_oid.as_deref(), Some("1.2.3.4"));
+                assert_eq!(expected_nonce_hex.as_deref(), Some("0001"));
             }
             other => panic!("unexpected command: {other:?}"),
         }

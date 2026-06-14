@@ -9,6 +9,8 @@ base64 = "0.22.1"
 blake3 = "1.8.5"
 ciborium = "0.2.2"
 chacha20poly1305 = "0.10.1"
+cms = { version = "0.3.0-pre.2", features = ["std"] }
+const-oid = "0.10.2"
 ed25519-dalek = { version = "2.1.1", features = ["std"] }
 serde = { version = "1.0.218", features = ["derive"] }
 serde_bytes = "0.11.14"
@@ -31,12 +33,14 @@ zip = "8.6.0"
 p256 = { version = "0.13.2", default-features = false, features = ["std", "ecdsa", "pem"] }
 rcgen = { version = "0.14.8", features = ["x509-parser"] }
 x509-cert = { version = "0.2.5", default-features = false, features = ["std", "pem"] }
+x509-parser = { version = "0.18.1", features = ["verify"] }
 der = { version = "0.7.10", default-features = false, features = ["std", "pem"] }
 ureq = { version = "2.12.1", default-features = false, features = ["tls", "json"] }
 url = "2.5.4"
 parking_lot = "0.12.3"
 # rand_core 0.6 matches p256 0.13's CryptoRng trait. We only use OsRng.
 rand_core = { version = "0.6.4", features = ["std", "getrandom"] }
+ring = "0.17.14"
 
 corecrux-types = { path = "../corecrux-types" }
 

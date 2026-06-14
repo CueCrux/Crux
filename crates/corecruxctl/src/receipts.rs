@@ -4,7 +4,7 @@
 
 //! Receipt-tooling — sign receipts with an Ed25519 key, encode + decode CROWN bodies, base64 IO.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer as _, SigningKey};
@@ -13,9 +13,10 @@ use corecrux_frame::{decode_canonical_header_bytes_v1, stream_hash_xxhash64};
 use corecrux_receipts::{
     assert_external_anchor_kind_v1, assert_rfc3161_timestamp_kind_v1, seal_crypto_shred_payload_v1,
     update_subject_index_v1, verify_chain_reanchor_body_v1, verify_external_anchor_body_v1,
-    verify_rfc3161_timestamp_token_binding_v1, ChainReanchorBodyInputV1, CoverageAttestationBodyInputV1,
-    CryptoShredSealInputV1, Ed25519KeyEntryV1, Ed25519KeyRingV1, ExternalAnchorBodyInputV1, ReceiptSigV1,
-    RedactionReceiptBodyInputV1, Rfc3161TimestampBodyInputV1, CONTENT_TYPE_RECEIPT_BODY_V1,
+    verify_rfc3161_timestamp_token_binding_v1, verify_rfc3161_timestamp_token_strict_v1, ChainReanchorBodyInputV1,
+    CoverageAttestationBodyInputV1, CryptoShredSealInputV1, Ed25519KeyEntryV1, Ed25519KeyRingV1,
+    ExternalAnchorBodyInputV1, ReceiptSigV1, RedactionReceiptBodyInputV1, Rfc3161StrictValidationOptionsV1,
+    Rfc3161StrictValidationReportV1, Rfc3161TimestampBodyInputV1, CONTENT_TYPE_RECEIPT_BODY_V1,
     CONTENT_TYPE_RECEIPT_SIG_V1, EVT_RECEIPT_BODY_V1, EVT_RECEIPT_SIG_V1, STREAM_TYPE_RECEIPT,
 };
 use corecrux_segment::decode_frame_v1;
@@ -91,6 +92,7 @@ pub struct WitnessVerifyReportV1 {
     pub kind: String,
     pub ok: bool,
     pub failure_reason: Option<String>,
+    pub strict_validation: Option<Rfc3161StrictValidationReportV1>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -192,6 +194,14 @@ pub struct Rfc3161TimestampAttestOptionsV1<'a> {
     pub serial_number: Option<&'a str>,
     pub gen_time: &'a str,
     pub created_at: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct Rfc3161TimestampVerifyOptionsV1<'a> {
+    pub expected_message_imprint_hash: Option<&'a str>,
+    pub expected_policy_oid: Option<&'a str>,
+    pub expected_nonce: Option<&'a [u8]>,
+    pub trusted_root_cert_paths: &'a [PathBuf],
 }
 
 #[derive(Debug, Clone)]
@@ -658,6 +668,7 @@ pub fn verify_external_anchor_body_file_v1(
         } else {
             Some("body is not an external_anchor receipt body".to_string())
         },
+        strict_validation: None,
     })
 }
 
@@ -665,21 +676,86 @@ pub fn verify_rfc3161_timestamp_body_file_v1(
     body_path: &Path,
     expected_message_imprint_hash: Option<&str>,
 ) -> Result<WitnessVerifyReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let trusted_root_cert_paths = Vec::new();
+    verify_rfc3161_timestamp_body_file_with_options_v1(
+        body_path,
+        &Rfc3161TimestampVerifyOptionsV1 {
+            expected_message_imprint_hash,
+            expected_policy_oid: None,
+            expected_nonce: None,
+            trusted_root_cert_paths: &trusted_root_cert_paths,
+        },
+    )
+}
+
+pub fn verify_rfc3161_timestamp_body_file_with_options_v1(
+    body_path: &Path,
+    opts: &Rfc3161TimestampVerifyOptionsV1<'_>,
+) -> Result<WitnessVerifyReportV1, Box<dyn std::error::Error + Send + Sync>> {
     let body = std::fs::read(body_path)?;
     let kind_ok = assert_rfc3161_timestamp_kind_v1(&body);
-    let binding_ok = kind_ok && verify_rfc3161_timestamp_token_binding_v1(&body, expected_message_imprint_hash);
+    let binding_ok = kind_ok && verify_rfc3161_timestamp_token_binding_v1(&body, opts.expected_message_imprint_hash);
+
+    let mut trusted_root_certs_der = Vec::new();
+    for path in opts.trusted_root_cert_paths {
+        let cert_bytes = std::fs::read(path)?;
+        let mut certs = corecrux_receipts::parse_x509_certs_der_or_pem_v1(&cert_bytes)
+            .map_err(|err| format!("failed to parse trusted TSA root {}: {err}", path.display()))?;
+        trusted_root_certs_der.append(&mut certs);
+    }
+    let trusted_root_refs = trusted_root_certs_der.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let strict_validation = if trusted_root_refs.is_empty() {
+        None
+    } else {
+        Some(verify_rfc3161_timestamp_token_strict_v1(
+            &body,
+            &Rfc3161StrictValidationOptionsV1 {
+                expected_message_imprint_hash: opts.expected_message_imprint_hash,
+                expected_policy_oid: opts.expected_policy_oid,
+                expected_nonce: opts.expected_nonce,
+                trusted_root_certs_der: &trusted_root_refs,
+            },
+        ))
+    };
+    let ok = strict_validation.as_ref().map_or(binding_ok, |report| report.ok);
     Ok(WitnessVerifyReportV1 {
         body_path: body_path.display().to_string(),
         kind: "rfc3161_timestamp".to_string(),
-        ok: binding_ok,
-        failure_reason: if binding_ok {
+        ok,
+        failure_reason: if ok {
             None
+        } else if let Some(report) = &strict_validation {
+            report.failure_reason.clone()
         } else if kind_ok {
             Some("timestamp token hash or expected message imprint binding mismatch".to_string())
         } else {
             Some("body is not an rfc3161_timestamp receipt body".to_string())
         },
+        strict_validation,
     })
+}
+
+pub fn parse_hex_bytes_v1(raw: &str) -> Result<Vec<u8>, String> {
+    let raw = raw.strip_prefix("0x").unwrap_or(raw);
+    if raw.is_empty() || raw.len() % 2 != 0 {
+        return Err("hex value must contain an even number of digits".to_string());
+    }
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    for chunk in raw.as_bytes().chunks_exact(2) {
+        let hi = hex_val_v1(chunk[0])?;
+        let lo = hex_val_v1(chunk[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_val_v1(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err("hex value contains a non-hex digit".to_string()),
+    }
 }
 
 pub fn seed_minimal_receipt_v1(
@@ -1290,6 +1366,7 @@ mod tests {
             kind: "external_anchor".to_string(),
             ok: false,
             failure_reason: Some("bad proof".to_string()),
+            strict_validation: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"kind\":\"external_anchor\""));
@@ -1377,6 +1454,68 @@ mod tests {
         .unwrap();
         assert!(!bad.ok);
         assert!(bad.failure_reason.as_deref().unwrap_or("").contains("message imprint"));
+    }
+
+    #[test]
+    fn verify_rfc3161_timestamp_with_root_enables_strict_cms_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body_path = tmp.path().join("tsa.cbor");
+        let root_path = tmp.path().join("tsa-root.pem");
+
+        let mut root_params = rcgen::CertificateParams::new(vec!["CueCrux TSA Root TEST".to_string()]).unwrap();
+        root_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "CueCrux TSA Root TEST");
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let root_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        std::fs::write(&root_path, root_cert.pem()).unwrap();
+
+        let input = corecrux_receipts::Rfc3161TimestampBodyInputV1 {
+            tenant_id: "tenant-a",
+            receipt_id: "tsa_1",
+            timestamp_id: "tsa-1",
+            actor_passport: "passport:operator",
+            tsa_url: "https://tsa.example",
+            tsa_policy_oid: Some("1.2.3.4"),
+            message_imprint_alg: "sha256",
+            message_imprint_hash: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            timestamp_token_der: b"fake-token",
+            serial_number: None,
+            gen_time: "2026-06-14T10:00:00Z",
+            created_at: "2026-06-14T10:00:01Z",
+        };
+        let (body, _) = corecrux_receipts::build_rfc3161_timestamp_body_v1(&input);
+        std::fs::write(&body_path, body).unwrap();
+        let root_paths = vec![root_path];
+
+        let report = verify_rfc3161_timestamp_body_file_with_options_v1(
+            &body_path,
+            &Rfc3161TimestampVerifyOptionsV1 {
+                expected_message_imprint_hash: Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                expected_policy_oid: Some("1.2.3.4"),
+                expected_nonce: None,
+                trusted_root_cert_paths: &root_paths,
+            },
+        )
+        .unwrap();
+
+        assert!(!report.ok);
+        let strict = report.strict_validation.expect("strict report is emitted");
+        assert!(!strict.ok);
+        assert!(strict.token_hash_ok);
+        assert!(strict
+            .failure_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("ContentInfo parse failed"));
+    }
+
+    #[test]
+    fn parse_hex_bytes_accepts_nonce_hex() {
+        assert_eq!(parse_hex_bytes_v1("0x0001").unwrap(), vec![0, 1]);
+        assert_eq!(parse_hex_bytes_v1("0A").unwrap(), vec![10]);
+        assert!(parse_hex_bytes_v1("abc").is_err());
     }
 
     #[test]

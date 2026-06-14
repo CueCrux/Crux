@@ -50,6 +50,7 @@ Offline witness verification:
 |---|---|
 | `corecruxctl receipts verify-external-anchor --body <body.cbor>` | Recomputes RFC6962 inclusion path against the stored leaf hash, log index, tree size, and root hash. |
 | `corecruxctl receipts verify-rfc3161-timestamp --body <body.cbor> [--expected-imprint-hash <sha256>]` | Recomputes the stored timestamp-token SHA-256 and optionally checks the expected message imprint hash. |
+| `corecruxctl receipts verify-rfc3161-timestamp --body <body.cbor> --tsa-root-cert <root.pem> [--expected-policy-oid <oid>] [--expected-nonce-hex <hex>]` | Enables strict RFC3161 validation: parses the TimeStampToken CMS, checks TSTInfo content type, signed attributes, message imprint, policy, nonce, CMS signature, TSA time-stamping EKU, signer validity at `genTime`, and a certificate chain to the supplied TSA trust anchor. |
 | `corecruxctl receipts verify-chain-reanchor --body <body.cbor>` | Checks a `chain_reanchor` body has the expected kind, non-empty old/new chain heads, distinct heads, supported algorithm labels, non-zero receipt count, and non-empty linked receipt IDs. |
 
 Migration attestation:
