@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn console_lane_weights_has_deeplink_dropdown_presets_and_reset_guard() {
+    fn console_lane_weights_has_deeplink_dropdown_presets_and_scoped_reset() {
         for required in [
             "function laneWeightsDeepLink()",
             "#/lane-weights",
@@ -257,8 +257,8 @@ mod tests {
             "Stage preset",
             "Baseline defaults",
             "Graph/topology trial",
-            "scoped reset",
-            "blocked: current Crux proxy has no lane-key clear route",
+            "Reset lane weights",
+            "deleteApi(path)",
             "putApi('/v1/console/corecrux/lane-weights'",
         ] {
             assert!(

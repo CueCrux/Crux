@@ -3262,7 +3262,7 @@ const PAGES={
    {t:'select',k:'preset',label:'preset',options:laneWeightPresetOptions(),v:'',
     desc:'Local operator presets only. Selecting one does not change CoreCrux until Apply lane weights.'},
    {t:'btn',label:'Stage preset',hint:'fills the weights form only; Apply lane weights performs the write'},
-   {t:'info',label:'scoped reset',v:'blocked: current Crux proxy has no lane-key clear route'}]},
+   {t:'btn',label:'Reset lane weights',danger:true,hint:'clears only the lane-weight overlay keys for this scope; other boost overlay keys are untouched'}]},
   {h:'Weights',sub:'non-negative RRF lane multipliers; dense vectors live in CoreCrux',wide:true,controls:laneWeightControls()}]},
  'cx-memory':{title:'Memory',sub:'recent facts per tenant — system tenants hidden by default',sections:[
   {h:'Recent memory',sub:'click a tenant to expand its recent facts',wide:true,controls:[
@@ -4210,6 +4210,16 @@ const PAGE_WIRES={
       });
       setLaneWeightControls(r.weights||{});
       ctx.reopen(); return 'CoreCrux lane weights saved · '+(tenant||'global');
+    },
+    'Reset lane weights': async ctx=>{
+      const tenant=laneWeightTenantValue();
+      const scope=tenant||'global';
+      if(!confirm('Clear the lane-weight overlay keys for '+scope+'? This returns lane weights to inherited/default values. Other boost overlay keys are left untouched.')) return 'reset cancelled';
+      const path='/v1/console/corecrux/lane-weights'+(tenant?('?tenant_id='+encodeURIComponent(tenant)):'');
+      const r=await deleteApi(path);
+      setLaneWeightControls(r.weights||{});
+      setCtrl('cx-lane-weights','fusion_rrf', !!r.fusion_rrf_enabled);
+      ctx.reopen(); return 'lane weights reset · '+scope+' · now '+(r.source||'default');
     },
   }},
  'cx-memory':{

@@ -8378,6 +8378,107 @@ async fn console_corecrux_lane_weights_put_tenant_proxies_boost_overlay() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn console_corecrux_lane_weights_delete_clears_only_lane_keys() {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut buf).expect("read request");
+            bytes.extend_from_slice(&buf[..n]);
+            if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header_end = bytes
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|p| p + 4)
+            .expect("headers end");
+        let header = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+        let content_len = header
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length:")
+                    .or_else(|| line.strip_prefix("content-length:"))
+            })
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_len {
+            let n = stream.read(&mut buf).expect("read body");
+            bytes.extend_from_slice(&buf[..n]);
+        }
+        (header, bytes[header_end..header_end + content_len].to_vec())
+    }
+
+    fn write_json(stream: &mut std::net::TcpStream, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write mock response");
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock CoreCrux");
+    let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for i in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept mock request");
+            let (header, body) = read_request(&mut stream);
+            if i == 0 {
+                // The scoped reset: POST the clear of only the lane-weight keys.
+                assert!(header.starts_with("POST /v1/admin/boost-config "));
+                tx.send(body).expect("send captured post body");
+                write_json(&mut stream, r#"{"ok":true,"overlay_size":1,"overlay":{}}"#);
+            } else {
+                // Re-read: lane keys gone, an unrelated key survives.
+                assert!(header.starts_with("GET /v1/admin/boost-config "));
+                write_json(
+                    &mut stream,
+                    r#"{"overlay":{"FEATURE_VERNACULAR_LANE":"true"},"overlay_size":1}"#,
+                );
+            }
+        }
+    });
+
+    std::env::set_var("CORECRUXD_CORECRUX_BASE_URL", &base_url);
+    std::env::remove_var("CORECRUXD_CORECRUX_URL");
+    std::env::remove_var("CORECRUX_BASE_URL");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::delete_console_corecrux_lane_weights(
+        State(state),
+        dev_scope_headers("admin:write"),
+        Query(console::CoreCruxLaneWeightsQuery { tenant_id: None }),
+    )
+    .await
+    .into_response();
+    std::env::remove_var("CORECRUXD_CORECRUX_BASE_URL");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["reset"], true);
+    assert_eq!(body["scope"], "global");
+    // Post-reset weights fall back to defaults (no overlay lane keys remain).
+    assert_eq!(body["source"], "default");
+    assert_eq!(body["weights"]["bm25"], 1.0);
+
+    let posted = rx.recv().expect("captured CoreCrux POST");
+    let posted: serde_json::Value = serde_json::from_slice(&posted).expect("posted json");
+    let cleared = posted["clear"].as_array().expect("clear array");
+    assert!(cleared.iter().any(|v| v == "FUSION_RRF_LANE_WEIGHTS"));
+    assert!(cleared.iter().any(|v| v == "FEATURE_FUSION_RRF"));
+    // Scoped reset must not send a `set` payload or a whole-overlay reset.
+    assert!(posted.get("set").is_none());
+    assert!(posted.get("reset").is_none());
+}
+
+#[tokio::test]
 async fn console_review_contradictions_returns_factstore_candidates() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let (first_id, second_id) = {
