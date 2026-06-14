@@ -8223,6 +8223,7 @@ async fn console_settings_put_rejects_off_on_non_loopback() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn console_corecrux_lane_weights_get_requires_corecrux_base_url() {
     std::env::remove_var("CORECRUXD_CORECRUX_BASE_URL");
     std::env::remove_var("CORECRUXD_CORECRUX_URL");
@@ -8260,6 +8261,7 @@ async fn console_corecrux_lane_weights_put_validates_lanes_before_proxy() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn console_corecrux_lane_weights_put_tenant_proxies_boost_overlay() {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
