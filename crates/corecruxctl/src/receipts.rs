@@ -21,6 +21,8 @@ use corecrux_receipts::{
 use corecrux_segment::decode_frame_v1;
 use corecrux_storage::{AppendEventInput, ShardStorage, ShardStorageOptions};
 
+type ReceiptSignerV1 = fn(&str, &[u8], [u8; 32], &SigningKey, &str, &str) -> ReceiptSigV1;
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReceiptsSeedReportV1 {
     pub data_dir: String,
@@ -271,16 +273,16 @@ pub fn write_external_anchor_attestation_v1(
         return Err("external_anchor body failed inclusion-proof verification".into());
     }
     write_parented(opts.out_body, &body)?;
-    let sig_path = write_optional_sig_v1(
-        opts.out_sig,
-        opts.signing_key_b64,
-        opts.receipt_id,
-        &body,
+    let sig_path = write_optional_sig_v1(OptionalSigWriteV1 {
+        out_sig: opts.out_sig,
+        signing_key_b64: opts.signing_key_b64,
+        receipt_id: opts.receipt_id,
+        body: &body,
         body_hash,
-        opts.key_id,
-        opts.signed_at,
-        corecrux_receipts::sign_external_anchor_v1,
-    )?;
+        key_id: opts.key_id,
+        signed_at: opts.signed_at,
+        signer: corecrux_receipts::sign_external_anchor_v1,
+    })?;
     Ok(WitnessAttestReportV1 {
         body_path: opts.out_body.display().to_string(),
         sig_path,
@@ -315,16 +317,16 @@ pub fn write_rfc3161_timestamp_attestation_v1(
         return Err("rfc3161_timestamp body failed token/imprint binding verification".into());
     }
     write_parented(opts.out_body, &body)?;
-    let sig_path = write_optional_sig_v1(
-        opts.out_sig,
-        opts.signing_key_b64,
-        opts.receipt_id,
-        &body,
+    let sig_path = write_optional_sig_v1(OptionalSigWriteV1 {
+        out_sig: opts.out_sig,
+        signing_key_b64: opts.signing_key_b64,
+        receipt_id: opts.receipt_id,
+        body: &body,
         body_hash,
-        opts.key_id,
-        opts.signed_at,
-        corecrux_receipts::sign_rfc3161_timestamp_v1,
-    )?;
+        key_id: opts.key_id,
+        signed_at: opts.signed_at,
+        signer: corecrux_receipts::sign_rfc3161_timestamp_v1,
+    })?;
     Ok(WitnessAttestReportV1 {
         body_path: opts.out_body.display().to_string(),
         sig_path,
@@ -335,23 +337,36 @@ pub fn write_rfc3161_timestamp_attestation_v1(
     })
 }
 
-fn write_optional_sig_v1(
-    out_sig: Option<&Path>,
-    signing_key_b64: Option<&str>,
-    receipt_id: &str,
-    body: &[u8],
+struct OptionalSigWriteV1<'a> {
+    out_sig: Option<&'a Path>,
+    signing_key_b64: Option<&'a str>,
+    receipt_id: &'a str,
+    body: &'a [u8],
     body_hash: [u8; 32],
-    key_id: &str,
-    signed_at: &str,
-    signer: fn(&str, &[u8], [u8; 32], &SigningKey, &str, &str) -> ReceiptSigV1,
+    key_id: &'a str,
+    signed_at: &'a str,
+    signer: ReceiptSignerV1,
+}
+
+fn write_optional_sig_v1(
+    opts: OptionalSigWriteV1<'_>,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(sig_path) = out_sig else {
+    let Some(sig_path) = opts.out_sig else {
         return Ok(None);
     };
-    let signing_key_b64 = signing_key_b64.ok_or("signing-key-b64 is required when out-sig is set")?;
+    let signing_key_b64 = opts
+        .signing_key_b64
+        .ok_or("signing-key-b64 is required when out-sig is set")?;
     let key_bytes = decode_fixed_32_b64("signing-key-b64", signing_key_b64)?;
     let signing_key = SigningKey::from_bytes(&key_bytes);
-    let sig = signer(receipt_id, body, body_hash, &signing_key, key_id, signed_at);
+    let sig = (opts.signer)(
+        opts.receipt_id,
+        opts.body,
+        opts.body_hash,
+        &signing_key,
+        opts.key_id,
+        opts.signed_at,
+    );
     let mut sig_bytes = Vec::new();
     ciborium::ser::into_writer(&sig, &mut sig_bytes)?;
     write_parented(sig_path, &sig_bytes)?;
