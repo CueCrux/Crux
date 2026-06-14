@@ -396,6 +396,41 @@ pub(super) async fn put_console_corecrux_lane_weights(
     }
 }
 
+/// `DELETE /v1/console/corecrux/lane-weights[?tenant_id=...]` — scoped reset.
+///
+/// Clears **only** the two lane-weight overlay keys (`FUSION_RRF_LANE_WEIGHTS`,
+/// `FEATURE_FUSION_RRF`) from the global or per-tenant CoreCrux boost overlay,
+/// returning that scope to its process-env / inherited defaults. Other boost
+/// overlay keys are left untouched — this is intentionally narrower than
+/// CoreCrux's whole-overlay `DELETE /v1/admin/boost-config/tenant`.
+pub(super) async fn delete_console_corecrux_lane_weights(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CoreCruxLaneWeightsQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_write(&state, &headers) {
+        return problem.into_response();
+    }
+    let base_url = match corecrux_base_url_from_env() {
+        Ok(url) => url,
+        Err(err) => return problem_response(StatusCode::SERVICE_UNAVAILABLE, err),
+    };
+    let tenant_id = normalize_optional_tenant(query.tenant_id);
+    let result = tokio::task::spawn_blocking(move || reset_corecrux_lane_weights(&base_url, tenant_id))
+        .await
+        .map_err(|err| {
+            CoreCruxProxyError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("CoreCrux proxy join failed: {err}"),
+            )
+        });
+
+    match result {
+        Ok(Ok(body)) => (StatusCode::OK, Json(body)).into_response(),
+        Ok(Err(err)) | Err(err) => problem_response(err.status, err.detail),
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct ConsoleReviewQuery {
     pub limit: Option<usize>,
@@ -824,6 +859,49 @@ fn put_corecrux_lane_weights(
         "upstream_overlay_size": upstream.get("overlay_size").and_then(|v| v.as_u64()),
         "actor": actor,
         "reason": reason,
+    }))
+}
+
+/// Clear only the lane-weight overlay keys for the global or tenant scope, then
+/// re-read so the caller sees the post-reset (inherited / default) weights.
+fn reset_corecrux_lane_weights(
+    base_url: &str,
+    tenant_id: Option<String>,
+) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let agent = corecrux_agent();
+    let clear = vec![
+        CORECRUX_LANE_WEIGHTS_KEY.to_string(),
+        CORECRUX_FUSION_RRF_KEY.to_string(),
+    ];
+    let (target, body) = if let Some(tenant_id) = &tenant_id {
+        (
+            format!("{base_url}/v1/admin/boost-config/tenant"),
+            serde_json::json!({ "tenant_id": tenant_id, "clear": clear }),
+        )
+    } else {
+        (
+            format!("{base_url}/v1/admin/boost-config"),
+            serde_json::json!({ "clear": clear }),
+        )
+    };
+    corecrux_post_json(&agent, &target, "admin:write", &body)?;
+
+    // Re-read so the response reflects the now-inherited weights and scope.
+    let (global_overlay, tenant_overlay) = fetch_corecrux_overlays(&agent, base_url, tenant_id.as_deref())?;
+    let (weights, source, raw) = resolved_lane_weights(&global_overlay, &tenant_overlay);
+    Ok(serde_json::json!({
+        "ok": true,
+        "reset": true,
+        "scope": if tenant_id.is_some() { "tenant" } else { "global" },
+        "tenant_id": tenant_id,
+        "source": source,
+        "cleared_keys": [CORECRUX_LANE_WEIGHTS_KEY, CORECRUX_FUSION_RRF_KEY],
+        "fusion_rrf_enabled": overlay_bool(&tenant_overlay, &global_overlay, CORECRUX_FUSION_RRF_KEY),
+        "lanes": CORECRUX_LANE_KEYS,
+        "weights": weights,
+        "raw_lane_weights": raw,
+        "global_overlay_size": global_overlay.len(),
+        "tenant_overlay_size": tenant_overlay.len(),
     }))
 }
 

@@ -1,0 +1,30 @@
+# Crux
+
+> Local-first, tamper-evident retrieval + memory engine for AI agents. Sealed segments are
+> BLAKE3 hash-chained; every receipt-bearing operation produces a signed, replayable CROWN
+> receipt that verifies offline.
+
+## Agent docs
+- [AGENTS.md](AGENTS.md): entry point — reading order, trust-core tour, verify commands
+- [CODEMAP](docs/agent/CODEMAP.md): crate atlas (27 crates → purpose, symbols, deps)
+- [CLAIMS](docs/agent/CLAIMS.md): product claim → enforcing symbol → proving test
+- [INVARIANTS](docs/agent/INVARIANTS.md): cryptographic + data guarantees I1–I4
+- [GLOSSARY](docs/agent/GLOSSARY.md): CROWN, CCXI, CRC-v1, cruxpack, lane, passport
+- [repo-manifest.yaml](docs/agent/repo-manifest.yaml): machine-readable index + CI assertions
+
+## Specs & trust
+- [THREAT_MODEL](docs/THREAT_MODEL.md): trust boundaries and stated limitations
+- [receipt-v1 spec](docs/spec/receipt-v1.md): on-the-wire receipt format
+- [audit-bundle-v1 spec](docs/spec/audit-bundle-v1.md): BYO audit-trail export bundle
+- [ADRs](docs/adr/): 001 append-only sealed segments, 002 CROWN receipts, 003 CPU-only daemon
+
+## Verify
+- `cargo test --workspace`
+- `corecruxctl verify-store --strict` — per-segment BLAKE3 + chain walk
+- `corecruxctl replay --strict` — recompute + compare
+- conformance vectors: crates/corecrux-receipts/vectors/
+- fuzz: fuzz/fuzz_targets/ (segment_decode, storage_scan_frames, receipt_verify_cbor, rcx_canonical_token)
+
+## Optional
+- [README](README.md): product overview
+- [CHANGELOG](CHANGELOG.md)

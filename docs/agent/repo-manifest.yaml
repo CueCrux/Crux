@@ -1,0 +1,172 @@
+schema: crux-agent-manifest/v1
+# Machine-readable index of the Crux workspace. No prose interpretation required.
+# The `ci_assertions` block at the bottom is verified against the tree by
+# scripts/check-agent-docs.sh — every symbol/test/crate/fuzz-target named there must
+# still exist, or CI fails. Anchor by symbol name, never line number.
+
+summary: Local-first, tamper-evident retrieval + memory engine with signed, replayable receipts.
+msrv: "1.88.0"
+edition: "2021"
+workspace_version: "0.3.1"
+
+verify_commands:
+  - cargo test --workspace
+  - corecruxctl verify-store --strict   # per-segment BLAKE3 + chain walk
+  - corecruxctl replay --strict         # recompute + compare
+  - cargo fuzz run segment_decode       # (nightly; one of 4 targets)
+
+docs:
+  reading_order:
+    - docs/agent/CODEMAP.md
+    - docs/agent/CLAIMS.md
+    - docs/agent/INVARIANTS.md
+    - docs/THREAT_MODEL.md
+    - docs/spec/receipt-v1.md
+  glossary: docs/agent/GLOSSARY.md
+  conformance_vectors: crates/corecrux-receipts/vectors/
+
+crates:
+  - name: corecrux-segment
+    purpose: sealed segment format (.ccxseg) — build/seal/decode + hash binding
+    entry_symbols: [build_segment_v1, seal_segment_v1_from_record_area, decode_segment_v1]
+  - name: corecrux-storage
+    purpose: append-only shard store, integrity scan, seal material
+    entry_symbols: [integrity_scan_stats_all, verify_segment_hashes_all, SegmentSealMaterialV1]
+  - name: corecrux-receipts
+    purpose: receipt formats, signing, strict verification, witness anchoring
+    entry_symbols: [verify_receipt_v1, verify_c2pa_manifest_v1, verify_bundle_v1, verify_rfc6962_inclusion_proof_v1]
+  - name: corecrux-memory
+    purpose: versioned fact store, decay, supersession, CROWN receipts
+    entry_symbols: [Fact, mark_superseded, ContradictionCandidateV1, ConsolidationReceiptV1]
+  - name: corecrux-index
+    purpose: companion inverted index (.ccxi) — seal-time, powers BM25
+    entry_symbols: [CcxiBuilder, CcxiReader]
+  - name: corecrux-retrieval
+    purpose: fused retrieval — BM25 + graph-signal fusion
+    entry_symbols: [fused_retrieve, FusionWeights]
+  - name: crux-lens-features
+    purpose: feature-registry coverage / gap reporting
+    entry_symbols: [compute_coverage_report, compute_gaps, compute_promise_coverage]
+  - name: rcx-capability-token
+    purpose: RCX capability token v1.0 (schema-lock + validation)
+    entry_symbols: [RcxCapabilityToken, validate_basic]
+  - name: crux-router
+    purpose: RCX router primitives (capability / credit / egress)
+    entry_symbols: [RcxRouter]
+
+claims:
+  - claim: receipt signatures are strongly unforgeable
+    symbol: verify_receipt_v1
+    test: tampering_with_signature_breaks_signature_check
+  - claim: sealed-segment content matches its footer hashes
+    symbol: decode_segment_v1
+    test: detects_footer_corruption
+  - claim: verify-store does cryptographic (BLAKE3) checks
+    symbol: verify_segment_hashes_all
+    test: strict_scan_verifies_segment_hashes_and_detects_manifest_mismatch
+  - claim: each sealed segment is signed and chained
+    symbol: sign_segment_seal_material
+    test: segment_seal_receipt_signing_commits_to_segment_chain
+  - claim: chain heads can be externally witnessed
+    symbol: verify_rfc6962_inclusion_proof_v1
+    test: rfc6962_inclusion_proof_verifies_two_leaf_tree
+  - claim: capability tokens verified against trusted issuer
+    symbol: validate_basic
+    test: strict_verify_rejects_tampered_token
+  - claim: memory updates non-destructive and versioned
+    symbol: mark_superseded
+    test: store_same_key_auto_supersedes_prior_version_in_recall
+  - claim: coverage is provable (no silent gaps)
+    symbol: compute_gaps
+    test: gaps_identifies_critical_no_tests_for_shipped
+
+invariants:
+  - id: I1
+    statement: segment_hash = BLAKE3(header_hash || record_hash || toc_payload_hash)
+    checked_by: verify_segment_hashes_all
+  - id: I2
+    statement: seal(N).previous_segment_hash == seal(N-1).segment_hash within a shard
+    checked_by: append_batch_seal_receipt_links_previous_segment_hash
+  - id: I3
+    statement: report.ok iff canonical_hash_match && signature_valid && content_hash_match
+    checked_by: verify_c2pa_manifest_v1
+  - id: I4
+    statement: new (entity,key) value supersedes prior; history retained
+    checked_by: consolidate_facts_v1_supersedes_targets_without_deleting_history
+
+fuzz_targets: [segment_decode, storage_scan_frames, receipt_verify_cbor, rcx_canonical_token]
+
+# ---------------------------------------------------------------------------
+# CI ASSERTIONS — scripts/check-agent-docs.sh greps the tree for each of these.
+# This is the canonical machine-checked superset of every name cited across the
+# docs/agent/ set. A rename that orphans a reference here fails the build.
+# ---------------------------------------------------------------------------
+ci_assertions:
+  crate_dirs:
+    - corecrux-segment
+    - corecrux-storage
+    - corecrux-receipts
+    - corecrux-memory
+    - corecrux-index
+    - corecrux-retrieval
+    - corecrux-projections
+    - corecrux-frame
+    - crux-lens-features
+    - rcx-capability-token
+    - crux-router
+    - crux-session
+    - crux-mcp
+    - corecruxd
+    - corecruxctl
+  symbols:
+    - verify_receipt_v1
+    - verify_c2pa_manifest_v1
+    - build_c2pa_manifest_v1
+    - verify_bundle_v1
+    - build_bundle_v1
+    - verify_rfc6962_inclusion_proof_v1
+    - build_external_anchor_body_v1
+    - decode_segment_v1
+    - build_segment_v1
+    - seal_segment_v1_from_record_area
+    - verify_segment_hashes_all
+    - integrity_scan_stats_all
+    - SegmentSealMaterialV1
+    - sign_segment_seal_material
+    - build_segment_seal_receipt
+    - Fact
+    - mark_superseded
+    - ContradictionCandidateV1
+    - ConsolidationReceiptV1
+    - compute_coverage_report
+    - compute_gaps
+    - compute_promise_coverage
+    - fused_retrieve
+    - RcxCapabilityToken
+    - validate_basic
+    - RcxRouter
+    - CcxiBuilder
+    - CcxiReader
+  tests:
+    - tampering_with_signature_breaks_signature_check
+    - wrong_verifying_key_fails
+    - verify_receipt_sig_payload_hash_mismatch
+    - tamper_with_signature_breaks_verification
+    - detects_footer_corruption
+    - strict_scan_verifies_segment_hashes_and_detects_manifest_mismatch
+    - segment_seal_receipt_signing_commits_to_segment_chain
+    - append_batch_seal_receipt_links_previous_segment_hash
+    - rfc6962_inclusion_proof_verifies_two_leaf_tree
+    - external_anchor_body_binds_inclusion_proof
+    - rfc3161_timestamp_body_binds_token_hash_and_imprint
+    - strict_verify_rejects_tampered_token
+    - strict_verify_rejects_wrong_trust_root
+    - store_same_key_auto_supersedes_prior_version_in_recall
+    - consolidate_facts_v1_supersedes_targets_without_deleting_history
+    - gaps_identifies_critical_no_tests_for_shipped
+    - coverage_report_tallies_per_system
+  fuzz_targets:
+    - segment_decode
+    - storage_scan_frames
+    - receipt_verify_cbor
+    - rcx_canonical_token

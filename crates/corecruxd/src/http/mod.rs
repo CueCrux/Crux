@@ -1056,7 +1056,8 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/console/corecrux/lane-weights",
             get(self::console::get_console_corecrux_lane_weights)
-                .put(self::console::put_console_corecrux_lane_weights),
+                .put(self::console::put_console_corecrux_lane_weights)
+                .delete(self::console::delete_console_corecrux_lane_weights),
         )
         .route(
             "/v1/console/review/contradictions",
