@@ -1167,7 +1167,7 @@ mod tests {
             key_id: "external-anchor",
             signed_at: "2026-06-14T10:00:00Z",
             tenant_id: "tenant-a",
-            receipt_id: "anc_1",
+            receipt_id: "anchor_receipt_1",
             anchor_id: "anchor-1",
             actor_passport: "passport:operator",
             transparency_log: "rekor",

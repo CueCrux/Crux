@@ -4173,7 +4173,7 @@ mod tests {
             "--tenant-id",
             "t1",
             "--receipt-id",
-            "anc_1",
+            "anchor_receipt_1",
             "--log-url",
             "https://rekor.example",
             "--leaf-hash",
@@ -4201,7 +4201,7 @@ mod tests {
                     },
             } => {
                 assert_eq!(out_body, PathBuf::from("/tmp/anchor.cbor"));
-                assert_eq!(receipt_id, "anc_1");
+                assert_eq!(receipt_id, "anchor_receipt_1");
                 assert_eq!(tree_size, 1);
             }
             other => panic!("unexpected command: {other:?}"),
