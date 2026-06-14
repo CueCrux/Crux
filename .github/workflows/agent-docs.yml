@@ -1,0 +1,29 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+#
+# Keeps the agent-facing doc set (AGENTS.md, docs/agent/*) provably current: every
+# symbol, test, crate, and fuzz target it references must still exist in the tree.
+# Runs on every PR (incl. docs-only — deliberately NOT gated on the code-scope filter).
+name: Agent docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Verify agent-doc references resolve
+    runs-on: [self-hosted, ci]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check agent docs
+        run: bash scripts/check-agent-docs.sh
