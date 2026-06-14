@@ -8376,6 +8376,162 @@ async fn console_corecrux_lane_weights_put_tenant_proxies_boost_overlay() {
 }
 
 #[tokio::test]
+async fn console_review_contradictions_returns_factstore_candidates() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let (first_id, second_id) = {
+        let mut store = state.fact_store.write().await;
+        let first = store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "service:api".to_string(),
+            key: "enabled".to_string(),
+            value: "enabled".to_string(),
+            source_receipt: None,
+            confidence: 0.7,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let second = store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "service:api".to_string(),
+            key: "enabled".to_string(),
+            value: "disabled".to_string(),
+            source_receipt: None,
+            confidence: 0.7,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        assert!(store.clear_superseded(&first.fact_id));
+        (first.fact_id, second.fact_id)
+    };
+
+    let resp = console::get_console_review_contradictions(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Query(console::ConsoleReviewQuery { limit: Some(10) }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.console.review.contradictions.v1");
+    assert_eq!(body["count"], 1);
+    let ids = body["candidates"][0]["fact_ids"].as_array().expect("fact ids");
+    assert!(ids.iter().any(|id| id.as_str() == Some(first_id.as_str())));
+    assert!(ids.iter().any(|id| id.as_str() == Some(second_id.as_str())));
+}
+
+#[tokio::test]
+async fn console_review_consolidation_supersedes_targets_with_actor() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let (old_id, newer_id) = {
+        let mut store = state.fact_store.write().await;
+        let old = store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "blocked".to_string(),
+            source_receipt: None,
+            confidence: 0.4,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let newer = store.store(corecrux_memory::fact_store::StoreFact {
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "active".to_string(),
+            source_receipt: None,
+            confidence: 0.5,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        assert!(store.clear_superseded(&old.fact_id));
+        (old.fact_id, newer.fact_id)
+    };
+
+    let resp = console::post_console_review_consolidation(
+        State(state.clone()),
+        dev_scope_passport_headers("admin:write", "passport:reviewer"),
+        Json(corecrux_memory::fact_store::ConsolidationRequestV1 {
+            consolidation_id: "con-http-1".to_string(),
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            canonical_value: "active".to_string(),
+            target_fact_ids: vec![old_id.clone(), newer_id.clone()],
+            protected_fact_ids: vec![],
+            confidence: 0.8,
+            source_receipt: None,
+            actor: None,
+            horizon_class: Some(corecrux_memory::fact_store::HorizonClass::Stable),
+            protected_confidence_floor: 0.99,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["schema"], "crux.console.review.consolidation.v1");
+    let canonical_id = body["receipt"]["canonical_fact_id"]
+        .as_str()
+        .expect("canonical fact id")
+        .to_string();
+    let store = state.fact_store.read().await;
+    assert_eq!(
+        store.get(&old_id).unwrap().superseded_by.as_deref(),
+        Some(canonical_id.as_str())
+    );
+    assert_eq!(
+        store.get(&newer_id).unwrap().superseded_by.as_deref(),
+        Some(canonical_id.as_str())
+    );
+    assert_eq!(
+        store.get(&canonical_id).unwrap().actor.as_deref(),
+        Some("passport:reviewer")
+    );
+}
+
+#[tokio::test]
+async fn console_review_consolidation_rejects_receipt_linked_targets() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let target_id = {
+        let mut store = state.fact_store.write().await;
+        store
+            .store(corecrux_memory::fact_store::StoreFact {
+                entity: "proj".to_string(),
+                key: "decision".to_string(),
+                value: "approved".to_string(),
+                source_receipt: Some("receipt:r1".to_string()),
+                confidence: 0.5,
+                private: false,
+                horizon_class: None,
+                actor: None,
+            })
+            .fact_id
+    };
+
+    let resp = console::post_console_review_consolidation(
+        State(state),
+        dev_scope_headers("admin:write"),
+        Json(corecrux_memory::fact_store::ConsolidationRequestV1 {
+            consolidation_id: "con-http-guard".to_string(),
+            entity: "proj".to_string(),
+            key: "decision".to_string(),
+            canonical_value: "approved".to_string(),
+            target_fact_ids: vec![target_id],
+            protected_fact_ids: vec![],
+            confidence: 0.8,
+            source_receipt: None,
+            actor: None,
+            horizon_class: None,
+            protected_confidence_floor: 0.99,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
 async fn console_storage_breakdown_returns_four_kinds_with_empty_defaults() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = console::get_console_storage_breakdown(State(state), dev_scope_headers("admin:read"))

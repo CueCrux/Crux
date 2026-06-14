@@ -392,6 +392,93 @@ pub(super) async fn put_console_corecrux_lane_weights(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ConsoleReviewQuery {
+    pub limit: Option<usize>,
+}
+
+pub(super) async fn get_console_review_contradictions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleReviewQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    let limit = query.limit.unwrap_or(50).min(250);
+    let candidates = {
+        let store = state.fact_store.read().await;
+        store.contradiction_candidates_v1(limit)
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "schema": "crux.console.review.contradictions.v1",
+            "limit": limit,
+            "count": candidates.len(),
+            "candidates": candidates,
+        })),
+    )
+        .into_response()
+}
+
+pub(super) async fn post_console_review_consolidation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<corecrux_memory::fact_store::ConsolidationRequestV1>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_write(&state, &headers) {
+        return problem.into_response();
+    }
+    if body.consolidation_id.trim().is_empty() {
+        body.consolidation_id = format!("console-{}", uuid::Uuid::new_v4());
+    }
+    if body.actor.as_deref().unwrap_or_default().trim().is_empty() {
+        body.actor = Some(console_actor_from_headers(&headers));
+    }
+    let report = {
+        let mut store = state.fact_store.write().await;
+        store.consolidate_facts_v1(body)
+    };
+    match report {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "schema": "crux.console.review.consolidation.v1",
+                "status": report.status,
+                "receipt": report.receipt,
+            })),
+        )
+            .into_response(),
+        Err(err) => consolidation_problem(err),
+    }
+}
+
+fn console_actor_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get("x-corecrux-passport-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("console")
+        .to_string()
+}
+
+fn consolidation_problem(err: corecrux_memory::fact_store::ConsolidationErrorV1) -> axum::response::Response {
+    use corecrux_memory::fact_store::ConsolidationErrorV1;
+    let status = match &err {
+        ConsolidationErrorV1::NoTargets | ConsolidationErrorV1::TargetOutsideEntityKey(_) => StatusCode::BAD_REQUEST,
+        ConsolidationErrorV1::TargetNotFound(_) => StatusCode::NOT_FOUND,
+        ConsolidationErrorV1::TargetDeleted(_)
+        | ConsolidationErrorV1::TargetPinned(_)
+        | ConsolidationErrorV1::TargetPrivate(_)
+        | ConsolidationErrorV1::TargetReceiptLinked(_)
+        | ConsolidationErrorV1::TargetHighConfidence { .. } => StatusCode::CONFLICT,
+        ConsolidationErrorV1::Journal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    problem_response(status, err.to_string())
+}
+
 fn corecrux_base_url_from_env() -> Result<String, String> {
     for key in [
         "CORECRUXD_CORECRUX_BASE_URL",

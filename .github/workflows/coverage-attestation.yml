@@ -1,0 +1,72 @@
+name: Coverage Attestation
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "45 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage-attestation:
+    name: Coverage attestation
+    runs-on: [self-hosted, ci]
+    env:
+      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
+      COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/main\.rs|.*/corecruxd/src/http/admin\.rs|.*/corecruxd/src/http/append\.rs|.*/corecruxd/src/http/query\.rs|.*/corecruxd/src/http/projections\.rs|.*/corecruxd/src/http/receipts\.rs|.*/corecruxctl/src/main\.rs|.*/corecruxctl/src/audit_pack\.rs)$'
+      CORECRUX_COVERAGE_ATTEST_SIGNING_KEY_B64: ${{ secrets.CORECRUX_COVERAGE_ATTEST_SIGNING_KEY_B64 }}
+      CORECRUX_COVERAGE_ATTEST_KEY_ID: ${{ vars.CORECRUX_COVERAGE_ATTEST_KEY_ID || 'coverage-attest' }}
+    steps:
+      - name: Seed per-job CARGO_HOME from shared toolchain
+        run: |
+          mkdir -p "$CARGO_HOME/bin"
+          for tool in /home/gha-runner/.cargo/bin/*; do
+            [ -e "$tool" ] || continue
+            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
+          done
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v6
+
+      - name: Preflight self-hosted runner
+        run: |
+          set +e
+          MISSING=""
+          if ! command -v cc >/dev/null 2>&1; then MISSING="$MISSING cc"; fi
+          if ! sudo -n true 2>/dev/null; then MISSING="$MISSING passwordless-sudo"; fi
+          if [ -n "$MISSING" ]; then
+            echo "::error::Self-hosted runner is missing required tooling:$MISSING"
+            echo "::error::Run scripts/provision-self-hosted-runner.sh on the runner host (or add ci:fallback label)."
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Generate coverage reports
+        run: |
+          set -euo pipefail
+          bash scripts/ci-cargo-with-fallback.sh llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --lcov --output-path lcov.info
+          cargo llvm-cov report --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --summary-only | tee coverage-summary.txt
+
+      - name: Build coverage attestation
+        run: bash scripts/coverage-attest-ci.sh
+
+      - name: Upload coverage attestation
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-attestation-${{ github.run_id }}
+          path: |
+            coverage-summary.txt
+            lcov.info
+            coverage-attestation/

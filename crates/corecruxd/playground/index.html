@@ -682,7 +682,7 @@
 <script>
 /* ════════════ DUMMY GRAPH — flat node registry with id links (daemon-styled) ════════════ */
 const SCOPES = [
-  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-usage','cx-documents','cx-gates','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-receipts','cx-mediation','cx-workbench','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-lane-weights','cx-settings','cx-raw'] },
+  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-usage','cx-documents','cx-gates','cx-review','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-receipts','cx-mediation','cx-workbench','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-lane-weights','cx-settings','cx-raw'] },
   { id:'dx', label:'DX', tag:'Docs',         sections:['dx-articles','dx-readme','dx-sites'] },
   { id:'gx', label:'GX', tag:'Global',       sections:['gx-engrams','gx-bench','gx-sites','gx-factstore'] },
   { id:'ax', label:'AX', tag:'Agent',        sections:['ax-overview','ax-activity','ax-memory','ax-bulk','ax-snapshots','ax-tools','ax-handoff','ax-graph','ax-storybook','ax-dossiers','ax-story'] }
@@ -695,6 +695,7 @@ const N = {
   'cx-work':{kind:'panel',label:'ExecPlans',sub:'kanban · /v1/work',children:['ep-agentux','ep-chaincrux','ep-trait','ep-cruxengine','ep-gemma','ep-plancrux','ep-verbatim']},
   'cx-sessions':{kind:'panel',label:'Sessions',sub:'active · execplan-scoped',fields:[['active','3'],['passport','ce:4e6c4e2a:local']],children:['sess-agentux','sess-chaincrux','sess-trait']},
   'cx-passport':{kind:'panel',label:'Passport',sub:'identities',children:['pp-main','pp-sonnet','pp-ops']},
+  'cx-review':{kind:'panel',label:'Review',sub:'contradictions + consolidation',children:[]},
 
   /* ── Receipts (CROWN proof verifier) — kind=receipt/verification/signature · /v1/receipts/{id} ── */
   'cx-receipts':{kind:'panel',label:'Receipts',sub:'CROWN · verify Ed25519 proofs',
@@ -2722,6 +2723,7 @@ const SB_ICONS={
   'cx-usage':'<path d="M5 19V9.5M10 19V4.5M15 19v-7M20 19v-11M3 21h18"/>',
   'cx-documents':'<path d="M7 3.5h7l4 4V17a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5.5a2 2 0 0 1 2-2z"/><path d="M14 3.5V8h4M3.5 20.5h13"/>',
   'cx-gates':'<path d="M12 3.5 19 6v5c0 4.6-3 7.9-7 9.5-4-1.6-7-4.9-7-9.5V6z"/><path d="m9 11.5 2 2 4-4"/>',
+  'cx-review':'<path d="M5 5h14v14H5z"/><path d="m8 9 2 2 4-4M8 15h8"/>',
   'cx-mediation':'<path d="M4 7h4l8 10h4M4 17h4M16 7h4M20 7l-2-2M20 7l-2 2M20 17l-2-2M20 17l-2 2"/>',
   'cx-workbench':'<rect x="3.5" y="8" width="17" height="12" rx="2"/><path d="M9 8V6a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M3.5 13.5h17"/>',
   'dx-articles':'<path d="M6 3.5h8l4.5 4.5V19a1.5 1.5 0 0 1-1.5 1.5H6A1.5 1.5 0 0 1 4.5 19V5A1.5 1.5 0 0 1 6 3.5z"/><path d="M14 3.5V8h4.5M8 12.5h8M8 16h8"/>',
@@ -3044,6 +3046,18 @@ function setLaneWeightControls(weights){
     if(weights&&weights[k]!=null) setCtrl('cx-lane-weights','w_'+k,String(weights[k]));
   });
 }
+function reviewContradictionRow(c,i){
+  const ids=(c.fact_ids||[]).join(', ');
+  const vals=(c.values||[]).map(v=>String(v).slice(0,120)).join(' | ');
+  return {t:'exp',label:(c.entity||'entity')+' · '+(c.key||'key'),
+    sub:(c.reason||'candidate')+' · '+(c.polarity_a||'?')+' vs '+(c.polarity_b||'?'),
+    badge:'candidate '+(i+1),
+    controls:[infoRow('fact ids',ids||'—'),infoRow('values',vals||'—'),
+      infoRow('draft','copy fact ids into the consolidation form after choosing a canonical value')]};
+}
+function csvList(v){
+  return String(v||'').split(/[,\n]/).map(s=>s.trim()).filter(Boolean);
+}
 function tenantExpRow(id,sub,sys){
   const p='tn_'+String(id).replace(/[^a-zA-Z0-9]/g,'_')+'_';
   return {t:'exp',label:id,sub:sub||'tenant',badge:sys?'system':'tenant',sys:!!sys,hideIf:sys?'hidesys':null,
@@ -3137,6 +3151,20 @@ const PAGES={
    tenantExpRow('__agent::anthropic','agent-private store',true),
    tenantExpRow('__bootstrap__::patterns','boot playbooks',true),
    {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+ 'cx-review':{title:'Review',sub:'contradiction candidates · guarded fact consolidation',sections:[
+  {h:'Contradictions',sub:'read-only candidates from active facts with opposite polarity',wide:true,controls:[
+   {t:'search',ph:'Filter candidates…'},
+   {t:'info',label:'candidates',v:'not loaded'},
+   {t:'btn',label:'Load contradictions',hint:'GET /v1/console/review/contradictions'}]},
+  {h:'Consolidation',sub:'creates one canonical fact and supersedes selected targets; protected facts are rejected',wide:true,controls:[
+   {t:'input',k:'cr_entity',label:'entity',ph:'service:api',mono:true},
+   {t:'input',k:'cr_key',label:'key',ph:'enabled',mono:true},
+   {t:'textarea',k:'cr_value',label:'canonical value',rows:3,ph:'the value to keep'},
+   {t:'textarea',k:'cr_targets',label:'target fact ids',rows:3,ph:'f_... , f_...',mono:true},
+   {t:'textarea',k:'cr_protected',label:'protected fact ids',rows:2,ph:'optional pinned ids',mono:true},
+   {t:'input',k:'cr_conf',label:'confidence',v:'0.8',mono:true},
+   {t:'input',k:'cr_floor',label:'protect floor',v:'0.99',mono:true},
+   {t:'btn',label:'Consolidate facts',danger:true,hint:'writes a canonical fact and supersedes selected target facts'}]}]},
  'cx-lane-weights':{title:'Lane weights',sub:'CoreCrux RRF overlay · same-origin console proxy',sections:[
   {h:'Scope',sub:'leave tenant blank for global defaults; tenant values shadow global overlay',wide:true,controls:[
    {t:'input',k:'tenant_id',label:'tenant id',ph:'optional tenant id',mono:true},
@@ -4013,6 +4041,42 @@ const PAGE_WIRES={
     try{ localStorage.setItem('cxconf',JSON.stringify(CXCONF)); }catch(e){}
     if(openPageId==='cx-tenants') openPage('cx-tenants',{__wired:true});
     return 'defaults applied — all tenants inherit'; } }},
+ 'cx-review':{
+  load: async def=>{
+    const r=await api('/v1/console/review/contradictions?limit=50');
+    const keep=def.sections[0].controls.filter(c=>c.t==='search'||c.t==='btn');
+    const rows=(r.candidates||[]).map(reviewContradictionRow);
+    def.sections[0].sub='read-only candidates · '+(r.count||0)+' found';
+    def.sections[0].controls=keep.filter(c=>c.t==='search')
+      .concat([infoRow('candidates',String(r.count||0))])
+      .concat(rows.length? rows : [infoRow('none','no active opposite-polarity fact pairs')])
+      .concat(keep.filter(c=>c.t==='btn'));
+  },
+  act:{
+    'Load contradictions': async ctx=>{
+      await PAGE_WIRES['cx-review'].load(PAGES['cx-review']);
+      ctx.reopen(); return 'contradictions loaded';
+    },
+    'Consolidate facts': async ctx=>{
+      const entity=pageVal('cx-review','cr_entity'), key=pageVal('cx-review','cr_key');
+      const canonical_value=pageVal('cx-review','cr_value');
+      const target_fact_ids=csvList(pageVal('cx-review','cr_targets'));
+      if(!entity||!key||!canonical_value||!target_fact_ids.length) throw {status:'entity, key, canonical value, and target ids required'};
+      const confidence=Number(pageVal('cx-review','cr_conf')||0.8);
+      const protected_confidence_floor=Number(pageVal('cx-review','cr_floor')||0.99);
+      if(!Number.isFinite(confidence)||confidence<0||confidence>1) throw {status:'confidence must be 0..1'};
+      if(!Number.isFinite(protected_confidence_floor)||protected_confidence_floor<0||protected_confidence_floor>1) throw {status:'protect floor must be 0..1'};
+      const r=await postApi('/v1/console/review/consolidations',{
+        consolidation_id:'console-'+Date.now(),
+        entity,key,canonical_value,target_fact_ids,
+        protected_fact_ids:csvList(pageVal('cx-review','cr_protected')),
+        confidence,protected_confidence_floor,
+        actor:currentBoundPassportId()||'console',
+      });
+      await PAGE_WIRES['cx-review'].load(PAGES['cx-review']);
+      ctx.reopen(); return 'consolidated · '+((r.receipt&&r.receipt.canonical_fact_id)||'canonical fact');
+    },
+  }},
  'cx-lane-weights':{
   load: async def=>{
     const tenant=String(pageVal('cx-lane-weights','tenant_id')||'').trim();
