@@ -5,12 +5,16 @@
 //! Aggregation and guarded mutation endpoints for the embedded Crux Console.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
     problem_response, require_http_scopes, require_http_scopes_for_tenant, AppState, HeaderMap, IntoResponse, Json,
     Path, Query, State, StatusCode,
 };
+
+type BoostOverlay = BTreeMap<String, String>;
+type BoostOverlayPair = (BoostOverlay, BoostOverlay);
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct InstallIntegrationBody {
@@ -560,12 +564,11 @@ fn parse_overlay_map(body: &serde_json::Value) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-fn overlay_bool(tenant: &BTreeMap<String, String>, global: &BTreeMap<String, String>, key: &str) -> bool {
+fn overlay_bool(tenant: &BoostOverlay, global: &BoostOverlay, key: &str) -> bool {
     tenant
         .get(key)
         .or_else(|| global.get(key))
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 fn parse_lane_weights_raw(raw: &str) -> BTreeMap<String, f64> {
@@ -718,7 +721,7 @@ fn fetch_corecrux_overlays(
     agent: &ureq::Agent,
     base_url: &str,
     tenant_id: Option<&str>,
-) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>), CoreCruxProxyError> {
+) -> Result<BoostOverlayPair, CoreCruxProxyError> {
     let global = corecrux_get_json(agent, &format!("{base_url}/v1/admin/boost-config"), "admin:read")?;
     let global_overlay = parse_overlay_map(&global);
     let tenant_overlay = if let Some(tenant_id) = tenant_id {
@@ -741,7 +744,7 @@ fn encode_query_component(raw: &str) -> String {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
             out.push(char::from(b));
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            let _ = write!(out, "%{b:02X}");
         }
     }
     out
