@@ -10,8 +10,12 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import io
 import json
+import shutil
+import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
@@ -41,7 +45,42 @@ def fail(manifest: dict | None, reason: str, *, events_match: bool = False, rece
     }
 
 
-def verify_vector_dir(path: Path) -> dict:
+REQUIRED_MEMBERS = ("manifest.json", "events.jsonl", "receipts.cbor")
+
+
+def read_archive_members(path: Path) -> tuple[dict, bytes, bytes]:
+    try:
+        import zstandard as zstd  # type: ignore[import-not-found]
+    except Exception:
+        zstd = None
+
+    if zstd is not None:
+        with path.open("rb") as fh:
+            with zstd.ZstdDecompressor().stream_reader(fh) as reader:
+                tar_bytes = reader.read()
+    elif shutil.which("zstd"):
+        tar_bytes = subprocess.check_output(["zstd", "-dc", str(path)])
+    else:
+        raise RuntimeError("verifying .tar.zst vectors requires python zstandard or zstd CLI")
+
+    members: dict[str, bytes] = {}
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
+        for member in archive.getmembers():
+            if member.name not in REQUIRED_MEMBERS:
+                continue
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                continue
+            members[member.name] = extracted.read()
+
+    missing = [name for name in REQUIRED_MEMBERS if name not in members]
+    if missing:
+        raise RuntimeError(f"archive missing required member(s): {', '.join(missing)}")
+    manifest = json.loads(members["manifest.json"].decode("utf-8"))
+    return manifest, members["events.jsonl"], members["receipts.cbor"]
+
+
+def read_unpacked_members(path: Path) -> tuple[dict, bytes, bytes] | dict:
     manifest_path = path / "manifest.json"
     events_path = path / "events.jsonl"
     receipts_path = path / "receipts.cbor"
@@ -57,8 +96,29 @@ def verify_vector_dir(path: Path) -> dict:
     if not receipts_path.exists():
         return fail(manifest, "missing receipts.cbor")
 
-    events = events_path.read_bytes()
-    receipts = receipts_path.read_bytes()
+    return manifest, events_path.read_bytes(), receipts_path.read_bytes()
+
+
+def verify_vector(path: Path) -> dict:
+    try:
+        if path.is_dir():
+            loaded = read_unpacked_members(path)
+            expected_path = path / "expected.json"
+        elif path.name.endswith(".tar.zst"):
+            loaded = read_archive_members(path)
+            expected_path = path.parent / "expected.json"
+        else:
+            return fail(None, "expected unpacked vector directory or .tar.zst archive")
+    except Exception as exc:
+        return fail(None, str(exc))
+
+    if isinstance(loaded, dict):
+        return loaded
+    manifest, events, receipts = loaded
+
+    if manifest.get("bundle_format_version") != SUPPORTED_VERSION:
+        return fail(manifest, f"unsupported bundle_format_version: {manifest.get('bundle_format_version')}")
+
     events_hash = hashlib.sha256(events).hexdigest()
     receipts_hash = hashlib.sha256(receipts).hexdigest()
     events_match = events_hash == manifest.get("events_jsonl_sha256")
@@ -127,18 +187,19 @@ def compare_expected(report: dict, expected_path: Path) -> tuple[bool, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("vector_dir", type=Path)
+    parser.add_argument("vector", type=Path, help="unpacked vector directory or audit-bundle.tar.zst")
     parser.add_argument("--json", action="store_true", help="print report JSON")
     args = parser.parse_args()
 
-    report = verify_vector_dir(args.vector_dir)
-    matches, mismatch = compare_expected(report, args.vector_dir / "expected.json")
+    report = verify_vector(args.vector)
+    expected_path = args.vector / "expected.json" if args.vector.is_dir() else args.vector.parent / "expected.json"
+    matches, mismatch = compare_expected(report, expected_path)
     if args.json or not matches:
         print(json.dumps(report, indent=2, sort_keys=True))
     if not matches:
         print(mismatch, file=sys.stderr)
         return 1
-    return 0 if report["ok"] or (args.vector_dir / "expected.json").exists() else 1
+    return 0 if report["ok"] or expected_path.exists() else 1
 
 
 if __name__ == "__main__":

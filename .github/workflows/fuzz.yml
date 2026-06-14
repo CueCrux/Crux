@@ -1,0 +1,79 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+
+name: Scheduled Fuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "libFuzzer runs per target"
+        required: false
+        default: "512"
+  schedule:
+    - cron: "30 3 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_FUZZ_VERSION: 0.13.2
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: [self-hosted, ci]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - segment_decode
+          - storage_scan_frames
+          - receipt_verify_cbor
+          - rcx_canonical_token
+    env:
+      CARGO_HOME: /home/gha-runner/.cargo-fuzz-${{ matrix.target }}-${{ github.run_id }}
+      FUZZ_RUNS: ${{ github.event.inputs.runs || '512' }}
+    steps:
+      - name: Seed per-job CARGO_HOME from shared toolchain
+        run: |
+          mkdir -p "$CARGO_HOME/bin"
+          for tool in /home/gha-runner/.cargo/bin/*; do
+            [ -e "$tool" ] || continue
+            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
+          done
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Ensure cargo-fuzz
+        run: |
+          set -euo pipefail
+          mkdir -p "$CARGO_HOME/bin"
+          (
+            flock 9
+            if ! cargo fuzz --version 2>/dev/null | grep -q "cargo-fuzz $CARGO_FUZZ_VERSION"; then
+              cargo install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION"
+            fi
+          ) 9>/tmp/cargo-fuzz-install.lock
+          cargo fuzz --version
+      - name: Compile fuzz targets
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins
+      - name: Run bounded fuzz target
+        run: cargo fuzz run "${{ matrix.target }}" -- -runs="$FUZZ_RUNS"
+      - name: Upload fuzz artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}
+            fuzz/corpus/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 14
