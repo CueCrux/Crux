@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Generate Audit Bundle v1 conformance vectors.
+"""Generate Audit Bundle v1 unpacked conformance vectors.
 
 The vectors are intentionally small and deterministic. They are unpacked bundle
 directories so git can review the JSON members directly; `receipts.cbor` is
-generated as the raw CBOR empty-array byte.
+generated as the raw CBOR empty-array byte. To regenerate the committed
+archive-level `audit-bundle.tar.zst` fixtures, run:
+
+    cargo run -p corecrux-receipts --example gen_audit_bundle_archive_vectors
 """
 
 from __future__ import annotations

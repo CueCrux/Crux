@@ -1303,6 +1303,47 @@ enum ReceiptsCommand {
         /// Optional expected SHA-256 message imprint hash (hex, `sha256:` prefix accepted).
         #[arg(long)]
         expected_imprint_hash: Option<String>,
+        /// Trusted TSA root certificate for strict RFC3161 validation. May be repeated; accepts DER or PEM.
+        #[arg(long = "tsa-root-cert")]
+        tsa_root_cert: Vec<PathBuf>,
+        /// Optional expected RFC3161 policy OID for strict validation.
+        #[arg(long)]
+        expected_policy_oid: Option<String>,
+        /// Optional expected RFC3161 nonce as hex bytes for strict validation.
+        #[arg(long)]
+        expected_nonce_hex: Option<String>,
+    },
+
+    /// Smoke-check witness/TSA configuration locally without network submission.
+    #[command(name = "witness-smoke")]
+    WitnessSmoke {
+        /// Enable Rekor witness checks in the local smoke report.
+        #[arg(long, default_value_t = false)]
+        witness_enabled: bool,
+        /// Witness provider label. Only `rekor` is supported by this scaffold.
+        #[arg(long, default_value = "disabled")]
+        witness_provider: String,
+        /// Witness timeout budget in milliseconds.
+        #[arg(long, default_value_t = 5000)]
+        witness_timeout_ms: u64,
+        /// Rekor base URL required when --witness-enabled is set.
+        #[arg(long)]
+        rekor_url: Option<String>,
+        /// Optional Rekor public key path checked for readability.
+        #[arg(long)]
+        rekor_public_key_path: Option<PathBuf>,
+        /// Enable TSA checks in the local smoke report.
+        #[arg(long, default_value_t = false)]
+        tsa_enabled: bool,
+        /// TSA URL required when --tsa-enabled is set.
+        #[arg(long)]
+        tsa_url: Option<String>,
+        /// Trusted TSA root certificate path. May be repeated; accepts DER or PEM.
+        #[arg(long = "tsa-root-cert")]
+        tsa_root_cert: Vec<PathBuf>,
+        /// Optional TSA policy OID expected by later strict verification.
+        #[arg(long)]
+        tsa_policy_oid: Option<String>,
     },
 
     /// Build an external_anchor receipt body from a transparency-log inclusion proof.
@@ -1553,6 +1594,59 @@ enum ReceiptsCommand {
         /// Base64 24-byte XChaCha20 nonce for deterministic staging/replay.
         #[arg(long)]
         nonce_b64: Option<String>,
+    },
+
+    /// Build a non-destructive crypto-shred CEK destroy marker.
+    #[command(name = "crypto-shred-destroy-marker")]
+    CryptoShredDestroyMarker {
+        /// Output path for the crypto-shred destroy marker JSON.
+        #[arg(long)]
+        out_marker: PathBuf,
+        /// Marker ID.
+        #[arg(long)]
+        marker_id: String,
+        /// Tenant ID.
+        #[arg(long)]
+        tenant_id: String,
+        /// Subject type, e.g. fact, stream, document.
+        #[arg(long)]
+        subject_type: String,
+        /// Subject identifier.
+        #[arg(long)]
+        subject_id: String,
+        /// Subject CEK id.
+        #[arg(long)]
+        subject_cek_id: String,
+        /// Subject CEK commitment.
+        #[arg(long)]
+        subject_cek_commitment: String,
+        /// Redaction receipt linked to this CEK lifecycle marker.
+        #[arg(long)]
+        redaction_receipt_id: String,
+        /// Actor/passport creating the marker.
+        #[arg(long, default_value = "corecruxctl")]
+        actor_passport: String,
+        /// Idempotency key for repeated destroy requests.
+        #[arg(long)]
+        idempotency_key: String,
+        /// Marker request timestamp.
+        #[arg(long)]
+        requested_at: String,
+        /// CEK destruction timestamp. Requires --human-gate-receipt.
+        #[arg(long)]
+        destroyed_at: Option<String>,
+        /// Passport-attributed approval receipt for actual CEK destruction.
+        #[arg(long)]
+        human_gate_receipt: Option<String>,
+        /// Wrapped CEK registry reference, never key material.
+        #[arg(long)]
+        wrapped_key_ref: Option<String>,
+        /// Operator-visible reason for the lifecycle marker.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Linked receipt id; repeat for multiple ids.
+        #[arg(long = "linked-receipt")]
+        linked_receipts: Vec<String>,
     },
 
     /// Build a coverage_attestation receipt body from a reproducible report file.
@@ -2403,8 +2497,23 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ReceiptsCommand::VerifyRfc3161Timestamp {
                 body,
                 expected_imprint_hash,
+                tsa_root_cert,
+                expected_policy_oid,
+                expected_nonce_hex,
             } => {
-                let report = receipts::verify_rfc3161_timestamp_body_file_v1(&body, expected_imprint_hash.as_deref())?;
+                let expected_nonce = expected_nonce_hex
+                    .as_deref()
+                    .map(receipts::parse_hex_bytes_v1)
+                    .transpose()?;
+                let report = receipts::verify_rfc3161_timestamp_body_file_with_options_v1(
+                    &body,
+                    &receipts::Rfc3161TimestampVerifyOptionsV1 {
+                        expected_message_imprint_hash: expected_imprint_hash.as_deref(),
+                        expected_policy_oid: expected_policy_oid.as_deref(),
+                        expected_nonce: expected_nonce.as_deref(),
+                        trusted_root_cert_paths: &tsa_root_cert,
+                    },
+                )?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 if report.ok {
                     Ok(())
@@ -2413,6 +2522,35 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .failure_reason
                         .unwrap_or_else(|| "RFC3161 timestamp verification failed".to_string())
                         .into())
+                }
+            }
+            ReceiptsCommand::WitnessSmoke {
+                witness_enabled,
+                witness_provider,
+                witness_timeout_ms,
+                rekor_url,
+                rekor_public_key_path,
+                tsa_enabled,
+                tsa_url,
+                tsa_root_cert,
+                tsa_policy_oid,
+            } => {
+                let report = receipts::witness_smoke_v1(&receipts::WitnessSmokeOptionsV1 {
+                    witness_enabled,
+                    witness_provider: &witness_provider,
+                    witness_timeout_ms,
+                    rekor_url: rekor_url.as_deref(),
+                    rekor_public_key_path: rekor_public_key_path.as_deref(),
+                    tsa_enabled,
+                    tsa_url: tsa_url.as_deref(),
+                    tsa_root_cert_paths: &tsa_root_cert,
+                    tsa_policy_oid: tsa_policy_oid.as_deref(),
+                });
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.ok {
+                    Ok(())
+                } else {
+                    Err("witness/TSA smoke check failed".into())
                 }
             }
             ReceiptsCommand::ExternalAnchorAttest {
@@ -2629,6 +2767,47 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     cek_b64: cek_b64.as_deref(),
                     nonce_b64: nonce_b64.as_deref(),
                 })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            ReceiptsCommand::CryptoShredDestroyMarker {
+                out_marker,
+                marker_id,
+                tenant_id,
+                subject_type,
+                subject_id,
+                subject_cek_id,
+                subject_cek_commitment,
+                redaction_receipt_id,
+                actor_passport,
+                idempotency_key,
+                requested_at,
+                destroyed_at,
+                human_gate_receipt,
+                wrapped_key_ref,
+                reason,
+                linked_receipts,
+            } => {
+                let linked_receipt_refs: Vec<&str> = linked_receipts.iter().map(String::as_str).collect();
+                let report =
+                    receipts::write_crypto_shred_destroy_marker_v1(&receipts::CryptoShredDestroyMarkerOptionsV1 {
+                        out_marker: &out_marker,
+                        marker_id: &marker_id,
+                        tenant_id: &tenant_id,
+                        subject_type: &subject_type,
+                        subject_id: &subject_id,
+                        subject_cek_id: &subject_cek_id,
+                        subject_cek_commitment: &subject_cek_commitment,
+                        redaction_receipt_id: &redaction_receipt_id,
+                        actor_passport: &actor_passport,
+                        idempotency_key: &idempotency_key,
+                        requested_at: &requested_at,
+                        destroyed_at: destroyed_at.as_deref(),
+                        human_gate_receipt: human_gate_receipt.as_deref(),
+                        wrapped_key_ref: wrapped_key_ref.as_deref(),
+                        reason: reason.as_deref(),
+                        linked_receipts: &linked_receipt_refs,
+                    })?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
@@ -4144,6 +4323,12 @@ mod tests {
             "/tmp/body.cbor",
             "--expected-imprint-hash",
             "sha256:abc",
+            "--tsa-root-cert",
+            "/tmp/root.pem",
+            "--expected-policy-oid",
+            "1.2.3.4",
+            "--expected-nonce-hex",
+            "0001",
         ])
         .unwrap();
         match cli.command {
@@ -4152,10 +4337,69 @@ mod tests {
                     ReceiptsCommand::VerifyRfc3161Timestamp {
                         body,
                         expected_imprint_hash,
+                        tsa_root_cert,
+                        expected_policy_oid,
+                        expected_nonce_hex,
                     },
             } => {
                 assert_eq!(body, PathBuf::from("/tmp/body.cbor"));
                 assert_eq!(expected_imprint_hash.as_deref(), Some("sha256:abc"));
+                assert_eq!(tsa_root_cert, vec![PathBuf::from("/tmp/root.pem")]);
+                assert_eq!(expected_policy_oid.as_deref(), Some("1.2.3.4"));
+                assert_eq!(expected_nonce_hex.as_deref(), Some("0001"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_witness_smoke() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "witness-smoke",
+            "--witness-enabled",
+            "--witness-provider",
+            "rekor",
+            "--witness-timeout-ms",
+            "7500",
+            "--rekor-url",
+            "https://rekor.example",
+            "--rekor-public-key-path",
+            "/tmp/rekor.pub",
+            "--tsa-enabled",
+            "--tsa-url",
+            "https://tsa.example",
+            "--tsa-root-cert",
+            "/tmp/tsa-root.pem",
+            "--tsa-policy-oid",
+            "1.2.3.4",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command:
+                    ReceiptsCommand::WitnessSmoke {
+                        witness_enabled,
+                        witness_provider,
+                        witness_timeout_ms,
+                        rekor_url,
+                        rekor_public_key_path,
+                        tsa_enabled,
+                        tsa_url,
+                        tsa_root_cert,
+                        tsa_policy_oid,
+                    },
+            } => {
+                assert!(witness_enabled);
+                assert_eq!(witness_provider, "rekor");
+                assert_eq!(witness_timeout_ms, 7500);
+                assert_eq!(rekor_url.as_deref(), Some("https://rekor.example"));
+                assert_eq!(rekor_public_key_path, Some(PathBuf::from("/tmp/rekor.pub")));
+                assert!(tsa_enabled);
+                assert_eq!(tsa_url.as_deref(), Some("https://tsa.example"));
+                assert_eq!(tsa_root_cert, vec![PathBuf::from("/tmp/tsa-root.pem")]);
+                assert_eq!(tsa_policy_oid.as_deref(), Some("1.2.3.4"));
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -4371,6 +4615,64 @@ mod tests {
                 assert_eq!(subject_id, "f_1");
                 assert_eq!(linked_receipts, vec!["forget_1"]);
                 assert!(!crypto_shred_staged);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_crypto_shred_destroy_marker() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "crypto-shred-destroy-marker",
+            "--out-marker",
+            "/tmp/destroy-marker.json",
+            "--marker-id",
+            "destroy_1",
+            "--tenant-id",
+            "t1",
+            "--subject-type",
+            "fact",
+            "--subject-id",
+            "f_1",
+            "--subject-cek-id",
+            "cek:t1:fact:f_1:v1",
+            "--subject-cek-commitment",
+            "blake3:abc",
+            "--redaction-receipt-id",
+            "red_1",
+            "--idempotency-key",
+            "destroy:f_1:v1",
+            "--requested-at",
+            "2026-06-14T10:00:00Z",
+            "--wrapped-key-ref",
+            "vault://t1/cek/f_1/v1",
+            "--linked-receipt",
+            "forget_1",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command:
+                    ReceiptsCommand::CryptoShredDestroyMarker {
+                        out_marker,
+                        marker_id,
+                        tenant_id,
+                        subject_cek_id,
+                        redaction_receipt_id,
+                        wrapped_key_ref,
+                        linked_receipts,
+                        ..
+                    },
+            } => {
+                assert_eq!(out_marker, PathBuf::from("/tmp/destroy-marker.json"));
+                assert_eq!(marker_id, "destroy_1");
+                assert_eq!(tenant_id, "t1");
+                assert_eq!(subject_cek_id, "cek:t1:fact:f_1:v1");
+                assert_eq!(redaction_receipt_id, "red_1");
+                assert_eq!(wrapped_key_ref.as_deref(), Some("vault://t1/cek/f_1/v1"));
+                assert_eq!(linked_receipts, vec!["forget_1"]);
             }
             other => panic!("unexpected command: {other:?}"),
         }

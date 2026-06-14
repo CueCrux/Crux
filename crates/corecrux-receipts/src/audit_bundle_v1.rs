@@ -653,4 +653,28 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn packaged_valid_minimal_vector_verifies() {
+        let bytes = include_bytes!("../vectors/audit-bundle-v1/valid-minimal/audit-bundle.tar.zst");
+        let report = verify_bundle_v1(bytes).expect("verify packaged valid vector");
+        assert!(report.ok, "valid archive vector failed: {report:?}");
+        assert_eq!(report.bundle_id, "vector-valid-minimal");
+        assert_eq!(report.fact_count, 1);
+        assert_eq!(report.receipt_count, 0);
+        assert!(report.signature_valid);
+    }
+
+    #[test]
+    fn packaged_invalid_events_hash_vector_fails() {
+        let bytes = include_bytes!("../vectors/audit-bundle-v1/invalid-events-hash/audit-bundle.tar.zst");
+        let report = verify_bundle_v1(bytes).expect("verify packaged invalid vector");
+        assert!(!report.ok, "invalid archive vector should fail");
+        assert!(!report.events_jsonl_sha256_match);
+        assert!(report
+            .failure_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("events.jsonl sha256 mismatch"));
+    }
 }

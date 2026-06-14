@@ -50,6 +50,8 @@ Offline witness verification:
 |---|---|
 | `corecruxctl receipts verify-external-anchor --body <body.cbor>` | Recomputes RFC6962 inclusion path against the stored leaf hash, log index, tree size, and root hash. |
 | `corecruxctl receipts verify-rfc3161-timestamp --body <body.cbor> [--expected-imprint-hash <sha256>]` | Recomputes the stored timestamp-token SHA-256 and optionally checks the expected message imprint hash. |
+| `corecruxctl receipts verify-rfc3161-timestamp --body <body.cbor> --tsa-root-cert <root.pem> [--expected-policy-oid <oid>] [--expected-nonce-hex <hex>]` | Enables strict RFC3161 validation: parses the TimeStampToken CMS, checks TSTInfo content type, signed attributes, message imprint, policy, nonce, CMS signature, TSA time-stamping EKU, signer validity at `genTime`, and a certificate chain to the supplied TSA trust anchor. |
+| `corecruxctl receipts witness-smoke [--witness-enabled --witness-provider rekor --rekor-url <url>] [--tsa-enabled --tsa-url <url> --tsa-root-cert <root.pem>]` | Local-only preflight for default-off live witness/TSA rollout. It does not submit to Rekor or a TSA; it checks required settings, readable Rekor public key paths when provided, and DER/PEM TSA trust roots. |
 | `corecruxctl receipts verify-chain-reanchor --body <body.cbor>` | Checks a `chain_reanchor` body has the expected kind, non-empty old/new chain heads, distinct heads, supported algorithm labels, non-zero receipt count, and non-empty linked receipt IDs. |
 
 Migration attestation:
@@ -71,6 +73,7 @@ Daemon live witness submission is controlled by default-off env knobs:
 `CORECRUXD_REKOR_PUBLIC_KEY_PATH`, `CORECRUXD_TSA_ENABLED`,
 `CORECRUXD_TSA_URL`, `CORECRUXD_TSA_ROOT_CERT_PATH`, and
 `CORECRUXD_TSA_POLICY_OID`.
+The daemon exposes the same local-only preflight at `GET /v1/witness/smoke`.
 
 Staged crypto-shred support:
 
@@ -78,12 +81,20 @@ Staged crypto-shred support:
 |---|---|---|
 | Crypto-shred envelope | `cuecrux.crypto_shred.envelope.v1` / `xchacha20poly1305-subject-cek-v1` | Non-destructive staging artifact. The envelope stores ciphertext, nonce, AAD hash, plaintext/ciphertext hashes, and a CEK commitment. It never stores CEK bytes. |
 | Redaction receipt | `kind = "redaction"` | Hash-only receipt body that records subject scope, `subject_cek_id`, `subject_cek_commitment`, optional `cek_destroyed_at`, and linked forget/redaction receipts. |
+| Destroy marker | `cuecrux.crypto_shred.destroy_marker.v1` | Non-destructive CEK lifecycle artifact. It links a redaction receipt, subject CEK id/commitment, idempotency key, actor passport, optional wrapped-key registry reference, and optional human-gated destruction attestation. It never stores CEK bytes and never deletes keys by itself. |
 
 `corecruxctl receipts redaction-attest` can build a redaction receipt body.
 When called with `--crypto-shred-staged`, it can also seal a local plaintext
 fixture into a crypto-shred envelope so tests can prove retained ciphertext is
 unreadable without the per-subject CEK. Production CEK destruction is not part
 of this command and remains a separately gated operation.
+
+`corecruxctl receipts crypto-shred-destroy-marker` writes a JSON destroy marker
+for migration dry-runs and cutover evidence. With no `--destroyed-at`, the
+marker state is `destroy_requested` and reports that a human gate is still
+required before any destructive CEK action. With `--destroyed-at`, callers must
+also provide `--human-gate-receipt`; the marker state becomes
+`destroy_attested`, but the command still performs no CEK deletion.
 
 ## Signature Event
 

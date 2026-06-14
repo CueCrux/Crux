@@ -4,13 +4,17 @@
 
 //! Aggregation and guarded mutation endpoints for the embedded Crux Console.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
     problem_response, require_http_scopes, require_http_scopes_for_tenant, AppState, HeaderMap, IntoResponse, Json,
     Path, Query, State, StatusCode,
 };
+
+type BoostOverlay = BTreeMap<String, String>;
+type BoostOverlayPair = (BoostOverlay, BoostOverlay);
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct InstallIntegrationBody {
@@ -268,6 +272,559 @@ pub(super) async fn post_console_embedding_probe(
         Ok(Err(err)) => problem_response(StatusCode::BAD_GATEWAY, err),
         Err(err) => problem_response(StatusCode::INTERNAL_SERVER_ERROR, format!("probe join failed: {err}")),
     }
+}
+
+const CORECRUX_LANE_WEIGHTS_KEY: &str = "FUSION_RRF_LANE_WEIGHTS";
+const CORECRUX_FUSION_RRF_KEY: &str = "FEATURE_FUSION_RRF";
+const CORECRUX_LANE_KEYS: &[&str] = &[
+    "bm25",
+    "cosine",
+    "sparse",
+    "hyde",
+    "topology",
+    "vernacular",
+    "indexing",
+    "topology_trait_expansion",
+    "navtree",
+    "events",
+];
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct CoreCruxLaneWeightsQuery {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct UpdateCoreCruxLaneWeightsBody {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub weights: BTreeMap<String, f64>,
+    #[serde(default = "default_true")]
+    pub fusion_rrf_enabled: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug)]
+struct CoreCruxProxyError {
+    status: StatusCode,
+    detail: String,
+}
+
+impl CoreCruxProxyError {
+    fn new(status: StatusCode, detail: impl Into<String>) -> Self {
+        Self {
+            status,
+            detail: detail.into(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+pub(super) async fn get_console_corecrux_lane_weights(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CoreCruxLaneWeightsQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    let base_url = match corecrux_base_url_from_env() {
+        Ok(url) => url,
+        Err(err) => return problem_response(StatusCode::SERVICE_UNAVAILABLE, err),
+    };
+    let tenant_id = normalize_optional_tenant(query.tenant_id);
+    let result = tokio::task::spawn_blocking(move || fetch_corecrux_lane_weights(&base_url, tenant_id))
+        .await
+        .map_err(|err| {
+            CoreCruxProxyError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("CoreCrux proxy join failed: {err}"),
+            )
+        });
+
+    match result {
+        Ok(Ok(body)) => (StatusCode::OK, Json(body)).into_response(),
+        Ok(Err(err)) | Err(err) => problem_response(err.status, err.detail),
+    }
+}
+
+pub(super) async fn put_console_corecrux_lane_weights(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateCoreCruxLaneWeightsBody>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_write(&state, &headers) {
+        return problem.into_response();
+    }
+    if body.weights.is_empty() {
+        return problem_response(StatusCode::BAD_REQUEST, "weights must include at least one lane");
+    }
+    let updates = match normalize_lane_weights(&body.weights) {
+        Ok(weights) => weights,
+        Err(err) => return problem_response(StatusCode::BAD_REQUEST, err),
+    };
+    let base_url = match corecrux_base_url_from_env() {
+        Ok(url) => url,
+        Err(err) => return problem_response(StatusCode::SERVICE_UNAVAILABLE, err),
+    };
+    let tenant_id = normalize_optional_tenant(body.tenant_id);
+    let fusion_rrf_enabled = body.fusion_rrf_enabled;
+    let actor = body.actor;
+    let reason = body.reason;
+    let result = tokio::task::spawn_blocking(move || {
+        put_corecrux_lane_weights(&base_url, tenant_id, updates, fusion_rrf_enabled, actor, reason)
+    })
+    .await
+    .map_err(|err| {
+        CoreCruxProxyError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("CoreCrux proxy join failed: {err}"),
+        )
+    });
+
+    match result {
+        Ok(Ok(body)) => (StatusCode::OK, Json(body)).into_response(),
+        Ok(Err(err)) | Err(err) => problem_response(err.status, err.detail),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ConsoleReviewQuery {
+    pub limit: Option<usize>,
+}
+
+pub(super) async fn get_console_review_contradictions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleReviewQuery>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_read(&state, &headers) {
+        return problem.into_response();
+    }
+    let limit = query.limit.unwrap_or(50).min(250);
+    let candidates = {
+        let store = state.fact_store.read().await;
+        store.contradiction_candidates_v1(limit)
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "schema": "crux.console.review.contradictions.v1",
+            "limit": limit,
+            "count": candidates.len(),
+            "candidates": candidates,
+        })),
+    )
+        .into_response()
+}
+
+pub(super) async fn post_console_review_consolidation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<corecrux_memory::fact_store::ConsolidationRequestV1>,
+) -> impl IntoResponse {
+    if let Err(problem) = require_console_write(&state, &headers) {
+        return problem.into_response();
+    }
+    if body.consolidation_id.trim().is_empty() {
+        body.consolidation_id = format!("console-{}", uuid::Uuid::new_v4());
+    }
+    if body.actor.as_deref().unwrap_or_default().trim().is_empty() {
+        body.actor = Some(console_actor_from_headers(&headers));
+    }
+    let report = {
+        let mut store = state.fact_store.write().await;
+        store.consolidate_facts_v1(body)
+    };
+    match report {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "schema": "crux.console.review.consolidation.v1",
+                "status": report.status,
+                "receipt": report.receipt,
+            })),
+        )
+            .into_response(),
+        Err(err) => consolidation_problem(err),
+    }
+}
+
+fn console_actor_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get("x-corecrux-passport-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("console")
+        .to_string()
+}
+
+fn consolidation_problem(err: corecrux_memory::fact_store::ConsolidationErrorV1) -> axum::response::Response {
+    use corecrux_memory::fact_store::ConsolidationErrorV1;
+    let status = match &err {
+        ConsolidationErrorV1::NoTargets | ConsolidationErrorV1::TargetOutsideEntityKey(_) => StatusCode::BAD_REQUEST,
+        ConsolidationErrorV1::TargetNotFound(_) => StatusCode::NOT_FOUND,
+        ConsolidationErrorV1::TargetDeleted(_)
+        | ConsolidationErrorV1::TargetPinned(_)
+        | ConsolidationErrorV1::TargetPrivate(_)
+        | ConsolidationErrorV1::TargetReceiptLinked(_)
+        | ConsolidationErrorV1::TargetHighConfidence { .. } => StatusCode::CONFLICT,
+        ConsolidationErrorV1::Journal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    problem_response(status, err.to_string())
+}
+
+fn corecrux_base_url_from_env() -> Result<String, String> {
+    for key in [
+        "CORECRUXD_CORECRUX_BASE_URL",
+        "CORECRUXD_CORECRUX_URL",
+        "CORECRUX_BASE_URL",
+    ] {
+        if let Ok(raw) = std::env::var(key) {
+            let trimmed = raw.trim().trim_end_matches('/').to_string();
+            if !trimmed.is_empty() {
+                return Ok(trimmed);
+            }
+        }
+    }
+    Err("CoreCrux base URL is not configured; set CORECRUXD_CORECRUX_BASE_URL on the Crux daemon".to_string())
+}
+
+fn normalize_optional_tenant(raw: Option<String>) -> Option<String> {
+    raw.map(|tenant| tenant.trim().to_string())
+        .filter(|tenant| !tenant.is_empty())
+}
+
+fn default_lane_weights() -> BTreeMap<String, f64> {
+    [
+        ("bm25", 1.0),
+        ("cosine", 1.0),
+        ("sparse", 1.0),
+        ("hyde", 1.0),
+        ("topology", 0.0),
+        ("vernacular", 0.0),
+        ("indexing", 0.0),
+        ("topology_trait_expansion", 0.0),
+        ("navtree", 0.0),
+        ("events", 0.0),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
+fn canonical_lane_key(name: &str) -> Option<&'static str> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "bm25" => Some("bm25"),
+        "cosine" | "dense" | "vec" | "vector" => Some("cosine"),
+        "sparse" | "splade" => Some("sparse"),
+        "hyde" => Some("hyde"),
+        "topology" => Some("topology"),
+        "vernacular" => Some("vernacular"),
+        "indexing" | "ccxdi" => Some("indexing"),
+        "topology_trait_expansion" | "trait_expansion" | "ccxse_expansion" => Some("topology_trait_expansion"),
+        "navtree" | "nav" | "ccxst" => Some("navtree"),
+        "events" | "event" | "ccxev" => Some("events"),
+        _ => None,
+    }
+}
+
+fn normalize_lane_weights(raw: &BTreeMap<String, f64>) -> Result<BTreeMap<String, f64>, String> {
+    let mut out = BTreeMap::new();
+    for (name, value) in raw {
+        let Some(key) = canonical_lane_key(name) else {
+            return Err(format!("unknown lane '{name}'"));
+        };
+        if !value.is_finite() || *value < 0.0 {
+            return Err(format!("lane '{name}' must be a non-negative finite number"));
+        }
+        out.insert(key.to_string(), *value);
+    }
+    Ok(out)
+}
+
+fn parse_overlay_map(body: &serde_json::Value) -> BTreeMap<String, String> {
+    body.get("overlay")
+        .and_then(|overlay| overlay.as_object())
+        .map(|overlay| {
+            overlay
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn overlay_bool(tenant: &BoostOverlay, global: &BoostOverlay, key: &str) -> bool {
+    tenant
+        .get(key)
+        .or_else(|| global.get(key))
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+fn parse_lane_weights_raw(raw: &str) -> BTreeMap<String, f64> {
+    let mut weights = default_lane_weights();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return weights;
+    }
+    if trimmed.starts_with('{') {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(obj) = json.as_object() {
+                for (name, value) in obj {
+                    if let (Some(key), Some(weight)) = (canonical_lane_key(name), value.as_f64()) {
+                        if weight.is_finite() && weight >= 0.0 {
+                            weights.insert(key.to_string(), weight);
+                        }
+                    }
+                }
+            }
+        }
+        return weights;
+    }
+    for part in trimmed.split(',') {
+        let Some((name, value)) = part.split_once('=').or_else(|| part.split_once(':')) else {
+            continue;
+        };
+        let Ok(weight) = value.trim().parse::<f64>() else {
+            continue;
+        };
+        if let Some(key) = canonical_lane_key(name) {
+            if weight.is_finite() && weight >= 0.0 {
+                weights.insert(key.to_string(), weight);
+            }
+        }
+    }
+    weights
+}
+
+fn resolved_lane_weights(
+    global_overlay: &BTreeMap<String, String>,
+    tenant_overlay: &BTreeMap<String, String>,
+) -> (BTreeMap<String, f64>, &'static str, Option<String>) {
+    if let Some(raw) = tenant_overlay.get(CORECRUX_LANE_WEIGHTS_KEY) {
+        return (parse_lane_weights_raw(raw), "tenant", Some(raw.clone()));
+    }
+    if let Some(raw) = global_overlay.get(CORECRUX_LANE_WEIGHTS_KEY) {
+        return (parse_lane_weights_raw(raw), "global", Some(raw.clone()));
+    }
+    (default_lane_weights(), "default", None)
+}
+
+fn lane_weights_to_overlay_json(weights: &BTreeMap<String, f64>) -> Result<String, CoreCruxProxyError> {
+    let mut body = serde_json::Map::new();
+    for key in CORECRUX_LANE_KEYS {
+        let value = weights
+            .get(*key)
+            .copied()
+            .unwrap_or_else(|| default_lane_weights()[*key]);
+        body.insert((*key).to_string(), serde_json::json!(value));
+    }
+    serde_json::to_string(&serde_json::Value::Object(body)).map_err(|err| {
+        CoreCruxProxyError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize CoreCrux lane weights: {err}"),
+        )
+    })
+}
+
+fn corecrux_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(8)))
+        .build()
+        .into()
+}
+
+fn bearer_token_from_env() -> Option<String> {
+    std::env::var("CORECRUXD_CORECRUX_ADMIN_TOKEN")
+        .or_else(|_| std::env::var("CORECRUX_ADMIN_TOKEN"))
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn passport_id_from_env() -> Option<String> {
+    std::env::var("CORECRUXD_CORECRUX_PASSPORT_ID")
+        .or_else(|_| std::env::var("CORECRUX_PASSPORT_ID"))
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn apply_corecrux_headers<S>(mut req: ureq::RequestBuilder<S>, scopes: &str) -> ureq::RequestBuilder<S> {
+    req = req
+        .header("Accept", "application/json")
+        .header("X-Corecrux-Scopes", scopes);
+    if let Some(token) = bearer_token_from_env() {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    if let Some(passport_id) = passport_id_from_env() {
+        req = req.header("X-Corecrux-Passport-Id", passport_id);
+    }
+    req
+}
+
+fn read_corecrux_json(mut response: ureq::http::Response<ureq::Body>) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let status = response.status().as_u16();
+    let text = response.body_mut().read_to_string().map_err(|err| {
+        CoreCruxProxyError::new(StatusCode::BAD_GATEWAY, format!("CoreCrux response read failed: {err}"))
+    })?;
+    let body = if text.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str::<serde_json::Value>(&text).map_err(|err| {
+            CoreCruxProxyError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("CoreCrux returned non-JSON response ({status}): {err}"),
+            )
+        })?
+    };
+    if !(200..300).contains(&status) {
+        return Err(CoreCruxProxyError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("CoreCrux admin endpoint returned {status}"),
+        ));
+    }
+    Ok(body)
+}
+
+fn corecrux_get_json(agent: &ureq::Agent, url: &str, scopes: &str) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let response = apply_corecrux_headers(agent.get(url), scopes)
+        .call()
+        .map_err(|err| CoreCruxProxyError::new(StatusCode::BAD_GATEWAY, format!("CoreCrux request failed: {err}")))?;
+    read_corecrux_json(response)
+}
+
+fn corecrux_post_json(
+    agent: &ureq::Agent,
+    url: &str,
+    scopes: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let response = apply_corecrux_headers(agent.post(url), scopes)
+        .send_json(body)
+        .map_err(|err| CoreCruxProxyError::new(StatusCode::BAD_GATEWAY, format!("CoreCrux request failed: {err}")))?;
+    read_corecrux_json(response)
+}
+
+fn fetch_corecrux_overlays(
+    agent: &ureq::Agent,
+    base_url: &str,
+    tenant_id: Option<&str>,
+) -> Result<BoostOverlayPair, CoreCruxProxyError> {
+    let global = corecrux_get_json(agent, &format!("{base_url}/v1/admin/boost-config"), "admin:read")?;
+    let global_overlay = parse_overlay_map(&global);
+    let tenant_overlay = if let Some(tenant_id) = tenant_id {
+        let encoded = encode_query_component(tenant_id);
+        let tenant = corecrux_get_json(
+            agent,
+            &format!("{base_url}/v1/admin/boost-config/tenant?tenant_id={encoded}"),
+            "admin:read",
+        )?;
+        parse_overlay_map(&tenant)
+    } else {
+        BTreeMap::new()
+    };
+    Ok((global_overlay, tenant_overlay))
+}
+
+fn encode_query_component(raw: &str) -> String {
+    let mut out = String::new();
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+fn fetch_corecrux_lane_weights(
+    base_url: &str,
+    tenant_id: Option<String>,
+) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let agent = corecrux_agent();
+    let (global_overlay, tenant_overlay) = fetch_corecrux_overlays(&agent, base_url, tenant_id.as_deref())?;
+    let (weights, source, raw) = resolved_lane_weights(&global_overlay, &tenant_overlay);
+    Ok(serde_json::json!({
+        "ok": true,
+        "configured": true,
+        "scope": if tenant_id.is_some() { "tenant" } else { "global" },
+        "tenant_id": tenant_id,
+        "source": source,
+        "fusion_rrf_enabled": overlay_bool(&tenant_overlay, &global_overlay, CORECRUX_FUSION_RRF_KEY),
+        "lanes": CORECRUX_LANE_KEYS,
+        "weights": weights,
+        "raw_lane_weights": raw,
+        "global_overlay_size": global_overlay.len(),
+        "tenant_overlay_size": tenant_overlay.len(),
+    }))
+}
+
+fn put_corecrux_lane_weights(
+    base_url: &str,
+    tenant_id: Option<String>,
+    updates: BTreeMap<String, f64>,
+    fusion_rrf_enabled: bool,
+    actor: Option<String>,
+    reason: Option<String>,
+) -> Result<serde_json::Value, CoreCruxProxyError> {
+    let agent = corecrux_agent();
+    let (global_overlay, tenant_overlay) = fetch_corecrux_overlays(&agent, base_url, tenant_id.as_deref())?;
+    let (mut weights, _, _) = resolved_lane_weights(&global_overlay, &tenant_overlay);
+    for (key, value) in updates {
+        weights.insert(key, value);
+    }
+
+    let mut set = HashMap::new();
+    set.insert(
+        CORECRUX_FUSION_RRF_KEY.to_string(),
+        if fusion_rrf_enabled { "true" } else { "false" }.to_string(),
+    );
+    set.insert(
+        CORECRUX_LANE_WEIGHTS_KEY.to_string(),
+        lane_weights_to_overlay_json(&weights)?,
+    );
+
+    let target = if tenant_id.is_some() {
+        format!("{base_url}/v1/admin/boost-config/tenant")
+    } else {
+        format!("{base_url}/v1/admin/boost-config")
+    };
+    let body = if let Some(tenant_id) = &tenant_id {
+        serde_json::json!({
+            "tenant_id": tenant_id,
+            "set": set,
+        })
+    } else {
+        serde_json::json!({
+            "set": set,
+        })
+    };
+    let upstream = corecrux_post_json(&agent, &target, "admin:write", &body)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "scope": if tenant_id.is_some() { "tenant" } else { "global" },
+        "tenant_id": tenant_id,
+        "source": if tenant_id.is_some() { "tenant" } else { "global" },
+        "fusion_rrf_enabled": fusion_rrf_enabled,
+        "lanes": CORECRUX_LANE_KEYS,
+        "weights": weights,
+        "upstream_overlay_size": upstream.get("overlay_size").and_then(|v| v.as_u64()),
+        "actor": actor,
+        "reason": reason,
+    }))
 }
 
 #[derive(Debug, serde::Serialize)]

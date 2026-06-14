@@ -4,18 +4,20 @@
 
 //! Receipt-tooling — sign receipts with an Ed25519 key, encode + decode CROWN bodies, base64 IO.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer as _, SigningKey};
 
 use corecrux_frame::{decode_canonical_header_bytes_v1, stream_hash_xxhash64};
 use corecrux_receipts::{
-    assert_external_anchor_kind_v1, assert_rfc3161_timestamp_kind_v1, seal_crypto_shred_payload_v1,
-    update_subject_index_v1, verify_chain_reanchor_body_v1, verify_external_anchor_body_v1,
-    verify_rfc3161_timestamp_token_binding_v1, ChainReanchorBodyInputV1, CoverageAttestationBodyInputV1,
-    CryptoShredSealInputV1, Ed25519KeyEntryV1, Ed25519KeyRingV1, ExternalAnchorBodyInputV1, ReceiptSigV1,
-    RedactionReceiptBodyInputV1, Rfc3161TimestampBodyInputV1, CONTENT_TYPE_RECEIPT_BODY_V1,
+    assert_external_anchor_kind_v1, assert_rfc3161_timestamp_kind_v1, build_crypto_shred_destroy_marker_v1,
+    seal_crypto_shred_payload_v1, update_subject_index_v1, verify_chain_reanchor_body_v1,
+    verify_external_anchor_body_v1, verify_rfc3161_timestamp_token_binding_v1,
+    verify_rfc3161_timestamp_token_strict_v1, ChainReanchorBodyInputV1, CoverageAttestationBodyInputV1,
+    CryptoShredDestroyMarkerInputV1, CryptoShredSealInputV1, Ed25519KeyEntryV1, Ed25519KeyRingV1,
+    ExternalAnchorBodyInputV1, ReceiptSigV1, RedactionReceiptBodyInputV1, Rfc3161StrictValidationOptionsV1,
+    Rfc3161StrictValidationReportV1, Rfc3161TimestampBodyInputV1, CONTENT_TYPE_RECEIPT_BODY_V1,
     CONTENT_TYPE_RECEIPT_SIG_V1, EVT_RECEIPT_BODY_V1, EVT_RECEIPT_SIG_V1, STREAM_TYPE_RECEIPT,
 };
 use corecrux_segment::decode_frame_v1;
@@ -91,6 +93,40 @@ pub struct WitnessVerifyReportV1 {
     pub kind: String,
     pub ok: bool,
     pub failure_reason: Option<String>,
+    pub strict_validation: Option<Rfc3161StrictValidationReportV1>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WitnessSmokeReportV1 {
+    pub ok: bool,
+    pub mode: &'static str,
+    pub witness: WitnessProviderSmokeReportV1,
+    pub tsa: TsaProviderSmokeReportV1,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WitnessProviderSmokeReportV1 {
+    pub enabled: bool,
+    pub provider: String,
+    pub timeout_ms: u64,
+    pub configured: bool,
+    pub ok: bool,
+    pub rekor_url: Option<String>,
+    pub rekor_public_key_path: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TsaProviderSmokeReportV1 {
+    pub enabled: bool,
+    pub configured: bool,
+    pub ok: bool,
+    pub tsa_url: Option<String>,
+    pub tsa_root_cert_paths: Vec<String>,
+    pub tsa_root_cert_count: usize,
+    pub tsa_policy_oid: Option<String>,
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -149,6 +185,21 @@ pub struct RedactionAttestReportV1 {
     pub crypto_shred_staged: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CryptoShredDestroyMarkerReportV1 {
+    pub marker_path: String,
+    pub marker_id: String,
+    pub tenant_id: String,
+    pub subject_type: String,
+    pub subject_id: String,
+    pub subject_cek_id: String,
+    pub redaction_receipt_id: String,
+    pub state: String,
+    pub linked_receipts_count: usize,
+    pub human_gate_required: bool,
+    pub destructive_action_performed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExternalAnchorAttestOptionsV1<'a> {
     pub out_body: &'a Path,
@@ -192,6 +243,27 @@ pub struct Rfc3161TimestampAttestOptionsV1<'a> {
     pub serial_number: Option<&'a str>,
     pub gen_time: &'a str,
     pub created_at: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct Rfc3161TimestampVerifyOptionsV1<'a> {
+    pub expected_message_imprint_hash: Option<&'a str>,
+    pub expected_policy_oid: Option<&'a str>,
+    pub expected_nonce: Option<&'a [u8]>,
+    pub trusted_root_cert_paths: &'a [PathBuf],
+}
+
+#[derive(Debug, Clone)]
+pub struct WitnessSmokeOptionsV1<'a> {
+    pub witness_enabled: bool,
+    pub witness_provider: &'a str,
+    pub witness_timeout_ms: u64,
+    pub rekor_url: Option<&'a str>,
+    pub rekor_public_key_path: Option<&'a Path>,
+    pub tsa_enabled: bool,
+    pub tsa_url: Option<&'a str>,
+    pub tsa_root_cert_paths: &'a [PathBuf],
+    pub tsa_policy_oid: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +317,26 @@ pub struct RedactionAttestOptionsV1<'a> {
     pub out_envelope: Option<&'a Path>,
     pub cek_b64: Option<&'a str>,
     pub nonce_b64: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CryptoShredDestroyMarkerOptionsV1<'a> {
+    pub out_marker: &'a Path,
+    pub marker_id: &'a str,
+    pub tenant_id: &'a str,
+    pub subject_type: &'a str,
+    pub subject_id: &'a str,
+    pub subject_cek_id: &'a str,
+    pub subject_cek_commitment: &'a str,
+    pub redaction_receipt_id: &'a str,
+    pub actor_passport: &'a str,
+    pub idempotency_key: &'a str,
+    pub requested_at: &'a str,
+    pub destroyed_at: Option<&'a str>,
+    pub human_gate_receipt: Option<&'a str>,
+    pub wrapped_key_ref: Option<&'a str>,
+    pub reason: Option<&'a str>,
+    pub linked_receipts: &'a [&'a str],
 }
 
 pub fn write_external_anchor_attestation_v1(
@@ -557,6 +649,44 @@ pub fn write_redaction_attestation_v1(
     })
 }
 
+pub fn write_crypto_shred_destroy_marker_v1(
+    opts: &CryptoShredDestroyMarkerOptionsV1<'_>,
+) -> Result<CryptoShredDestroyMarkerReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let marker = build_crypto_shred_destroy_marker_v1(&CryptoShredDestroyMarkerInputV1 {
+        marker_id: opts.marker_id,
+        tenant_id: opts.tenant_id,
+        subject_type: opts.subject_type,
+        subject_id: opts.subject_id,
+        subject_cek_id: opts.subject_cek_id,
+        subject_cek_commitment: opts.subject_cek_commitment,
+        redaction_receipt_id: opts.redaction_receipt_id,
+        actor_passport: opts.actor_passport,
+        idempotency_key: opts.idempotency_key,
+        requested_at: opts.requested_at,
+        destroyed_at: opts.destroyed_at,
+        human_gate_receipt: opts.human_gate_receipt,
+        wrapped_key_ref: opts.wrapped_key_ref,
+        reason: opts.reason,
+        linked_receipts: opts.linked_receipts,
+    })?;
+    let marker_bytes = serde_json::to_vec_pretty(&marker)?;
+    write_parented(opts.out_marker, &marker_bytes)?;
+
+    Ok(CryptoShredDestroyMarkerReportV1 {
+        marker_path: opts.out_marker.display().to_string(),
+        marker_id: marker.marker_id,
+        tenant_id: marker.tenant_id,
+        subject_type: marker.subject_type,
+        subject_id: marker.subject_id,
+        subject_cek_id: marker.subject_cek_id,
+        redaction_receipt_id: marker.redaction_receipt_id,
+        state: marker.state,
+        linked_receipts_count: marker.linked_receipts.len(),
+        human_gate_required: marker.destroyed_at.is_none(),
+        destructive_action_performed: false,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn write_coverage_attestation_v1(
     out_body: &Path,
@@ -658,6 +788,7 @@ pub fn verify_external_anchor_body_file_v1(
         } else {
             Some("body is not an external_anchor receipt body".to_string())
         },
+        strict_validation: None,
     })
 }
 
@@ -665,21 +796,256 @@ pub fn verify_rfc3161_timestamp_body_file_v1(
     body_path: &Path,
     expected_message_imprint_hash: Option<&str>,
 ) -> Result<WitnessVerifyReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let trusted_root_cert_paths = Vec::new();
+    verify_rfc3161_timestamp_body_file_with_options_v1(
+        body_path,
+        &Rfc3161TimestampVerifyOptionsV1 {
+            expected_message_imprint_hash,
+            expected_policy_oid: None,
+            expected_nonce: None,
+            trusted_root_cert_paths: &trusted_root_cert_paths,
+        },
+    )
+}
+
+pub fn verify_rfc3161_timestamp_body_file_with_options_v1(
+    body_path: &Path,
+    opts: &Rfc3161TimestampVerifyOptionsV1<'_>,
+) -> Result<WitnessVerifyReportV1, Box<dyn std::error::Error + Send + Sync>> {
     let body = std::fs::read(body_path)?;
     let kind_ok = assert_rfc3161_timestamp_kind_v1(&body);
-    let binding_ok = kind_ok && verify_rfc3161_timestamp_token_binding_v1(&body, expected_message_imprint_hash);
+    let binding_ok = kind_ok && verify_rfc3161_timestamp_token_binding_v1(&body, opts.expected_message_imprint_hash);
+
+    let mut trusted_root_certs_der = Vec::new();
+    for path in opts.trusted_root_cert_paths {
+        let cert_bytes = std::fs::read(path)?;
+        let mut certs = corecrux_receipts::parse_x509_certs_der_or_pem_v1(&cert_bytes)
+            .map_err(|err| format!("failed to parse trusted TSA root {}: {err}", path.display()))?;
+        trusted_root_certs_der.append(&mut certs);
+    }
+    let trusted_root_refs = trusted_root_certs_der.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let strict_validation = if trusted_root_refs.is_empty() {
+        None
+    } else {
+        Some(verify_rfc3161_timestamp_token_strict_v1(
+            &body,
+            &Rfc3161StrictValidationOptionsV1 {
+                expected_message_imprint_hash: opts.expected_message_imprint_hash,
+                expected_policy_oid: opts.expected_policy_oid,
+                expected_nonce: opts.expected_nonce,
+                trusted_root_certs_der: &trusted_root_refs,
+            },
+        ))
+    };
+    let ok = strict_validation.as_ref().map_or(binding_ok, |report| report.ok);
     Ok(WitnessVerifyReportV1 {
         body_path: body_path.display().to_string(),
         kind: "rfc3161_timestamp".to_string(),
-        ok: binding_ok,
-        failure_reason: if binding_ok {
+        ok,
+        failure_reason: if ok {
             None
+        } else if let Some(report) = &strict_validation {
+            report.failure_reason.clone()
         } else if kind_ok {
             Some("timestamp token hash or expected message imprint binding mismatch".to_string())
         } else {
             Some("body is not an rfc3161_timestamp receipt body".to_string())
         },
+        strict_validation,
     })
+}
+
+pub fn witness_smoke_v1(opts: &WitnessSmokeOptionsV1<'_>) -> WitnessSmokeReportV1 {
+    let mut warnings = Vec::new();
+    let witness = witness_provider_smoke_v1(opts, &mut warnings);
+    let tsa = tsa_provider_smoke_v1(opts);
+    WitnessSmokeReportV1 {
+        ok: witness.ok && tsa.ok,
+        mode: "local_config_only",
+        witness,
+        tsa,
+        warnings,
+    }
+}
+
+fn witness_provider_smoke_v1(
+    opts: &WitnessSmokeOptionsV1<'_>,
+    warnings: &mut Vec<String>,
+) -> WitnessProviderSmokeReportV1 {
+    if !opts.witness_enabled {
+        return WitnessProviderSmokeReportV1 {
+            enabled: false,
+            provider: opts.witness_provider.to_string(),
+            timeout_ms: opts.witness_timeout_ms,
+            configured: false,
+            ok: true,
+            rekor_url: opts.rekor_url.map(str::to_string),
+            rekor_public_key_path: opts.rekor_public_key_path.map(|p| p.display().to_string()),
+            failure_reason: None,
+        };
+    }
+
+    if !opts.witness_provider.trim().eq_ignore_ascii_case("rekor") {
+        return WitnessProviderSmokeReportV1 {
+            enabled: true,
+            provider: opts.witness_provider.to_string(),
+            timeout_ms: opts.witness_timeout_ms,
+            configured: false,
+            ok: false,
+            rekor_url: opts.rekor_url.map(str::to_string),
+            rekor_public_key_path: opts.rekor_public_key_path.map(|p| p.display().to_string()),
+            failure_reason: Some(format!("unsupported witness provider: {}", opts.witness_provider)),
+        };
+    }
+    if opts.rekor_url.is_none_or(str::is_empty) {
+        return WitnessProviderSmokeReportV1 {
+            enabled: true,
+            provider: opts.witness_provider.to_string(),
+            timeout_ms: opts.witness_timeout_ms,
+            configured: false,
+            ok: false,
+            rekor_url: opts.rekor_url.map(str::to_string),
+            rekor_public_key_path: opts.rekor_public_key_path.map(|p| p.display().to_string()),
+            failure_reason: Some("--rekor-url is required when --witness-enabled is set".to_string()),
+        };
+    }
+    if let Some(path) = opts.rekor_public_key_path {
+        if !path.is_file() {
+            return WitnessProviderSmokeReportV1 {
+                enabled: true,
+                provider: opts.witness_provider.to_string(),
+                timeout_ms: opts.witness_timeout_ms,
+                configured: false,
+                ok: false,
+                rekor_url: opts.rekor_url.map(str::to_string),
+                rekor_public_key_path: Some(path.display().to_string()),
+                failure_reason: Some(format!("Rekor public key path is not readable: {}", path.display())),
+            };
+        }
+    } else {
+        warnings.push("Rekor witness is enabled without --rekor-public-key-path".to_string());
+    }
+
+    WitnessProviderSmokeReportV1 {
+        enabled: true,
+        provider: opts.witness_provider.to_string(),
+        timeout_ms: opts.witness_timeout_ms,
+        configured: true,
+        ok: true,
+        rekor_url: opts.rekor_url.map(str::to_string),
+        rekor_public_key_path: opts.rekor_public_key_path.map(|p| p.display().to_string()),
+        failure_reason: None,
+    }
+}
+
+fn tsa_provider_smoke_v1(opts: &WitnessSmokeOptionsV1<'_>) -> TsaProviderSmokeReportV1 {
+    let root_paths = opts
+        .tsa_root_cert_paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>();
+    if !opts.tsa_enabled {
+        return TsaProviderSmokeReportV1 {
+            enabled: false,
+            configured: false,
+            ok: true,
+            tsa_url: opts.tsa_url.map(str::to_string),
+            tsa_root_cert_paths: root_paths,
+            tsa_root_cert_count: 0,
+            tsa_policy_oid: opts.tsa_policy_oid.map(str::to_string),
+            failure_reason: None,
+        };
+    }
+    if opts.tsa_url.is_none_or(str::is_empty) {
+        return tsa_smoke_fail_v1(opts, root_paths, 0, "--tsa-url is required when --tsa-enabled is set");
+    }
+    if opts.tsa_root_cert_paths.is_empty() {
+        return tsa_smoke_fail_v1(
+            opts,
+            root_paths,
+            0,
+            "--tsa-root-cert is required at least once when --tsa-enabled is set",
+        );
+    }
+
+    let mut cert_count = 0usize;
+    for path in opts.tsa_root_cert_paths {
+        let cert_bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return tsa_smoke_fail_v1(
+                    opts,
+                    root_paths,
+                    cert_count,
+                    &format!("failed to read TSA root certificate {}: {err}", path.display()),
+                )
+            }
+        };
+        let certs = match corecrux_receipts::parse_x509_certs_der_or_pem_v1(&cert_bytes) {
+            Ok(certs) => certs,
+            Err(err) => {
+                return tsa_smoke_fail_v1(
+                    opts,
+                    root_paths,
+                    cert_count,
+                    &format!("failed to parse TSA root certificate {}: {err}", path.display()),
+                )
+            }
+        };
+        cert_count += certs.len();
+    }
+
+    TsaProviderSmokeReportV1 {
+        enabled: true,
+        configured: true,
+        ok: true,
+        tsa_url: opts.tsa_url.map(str::to_string),
+        tsa_root_cert_paths: root_paths,
+        tsa_root_cert_count: cert_count,
+        tsa_policy_oid: opts.tsa_policy_oid.map(str::to_string),
+        failure_reason: None,
+    }
+}
+
+fn tsa_smoke_fail_v1(
+    opts: &WitnessSmokeOptionsV1<'_>,
+    root_paths: Vec<String>,
+    tsa_root_cert_count: usize,
+    reason: &str,
+) -> TsaProviderSmokeReportV1 {
+    TsaProviderSmokeReportV1 {
+        enabled: true,
+        configured: false,
+        ok: false,
+        tsa_url: opts.tsa_url.map(str::to_string),
+        tsa_root_cert_paths: root_paths,
+        tsa_root_cert_count,
+        tsa_policy_oid: opts.tsa_policy_oid.map(str::to_string),
+        failure_reason: Some(reason.to_string()),
+    }
+}
+
+pub fn parse_hex_bytes_v1(raw: &str) -> Result<Vec<u8>, String> {
+    let raw = raw.strip_prefix("0x").unwrap_or(raw);
+    if raw.is_empty() || raw.len() % 2 != 0 {
+        return Err("hex value must contain an even number of digits".to_string());
+    }
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    for chunk in raw.as_bytes().chunks_exact(2) {
+        let hi = hex_val_v1(chunk[0])?;
+        let lo = hex_val_v1(chunk[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_val_v1(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err("hex value contains a non-hex digit".to_string()),
+    }
 }
 
 pub fn seed_minimal_receipt_v1(
@@ -1136,6 +1502,70 @@ mod tests {
     }
 
     #[test]
+    fn crypto_shred_destroy_marker_writes_non_destructive_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("destroy-marker.json");
+        let report = write_crypto_shred_destroy_marker_v1(&CryptoShredDestroyMarkerOptionsV1 {
+            out_marker: &marker_path,
+            marker_id: "destroy_1",
+            tenant_id: "tenant-a",
+            subject_type: "fact",
+            subject_id: "f_1",
+            subject_cek_id: "cek:tenant-a:fact:f_1:v1",
+            subject_cek_commitment: "blake3:commitment",
+            redaction_receipt_id: "red_1",
+            actor_passport: "passport:operator",
+            idempotency_key: "destroy:f_1:v1",
+            requested_at: "2026-06-14T10:00:00Z",
+            destroyed_at: None,
+            human_gate_receipt: None,
+            wrapped_key_ref: Some("vault://tenant-a/cek/f_1/v1"),
+            reason: Some("subject erasure request"),
+            linked_receipts: &["forget_1", "red_1"],
+        })
+        .unwrap();
+
+        assert!(marker_path.exists());
+        assert_eq!(report.marker_id, "destroy_1");
+        assert_eq!(report.state, "destroy_requested");
+        assert_eq!(report.linked_receipts_count, 2);
+        assert!(report.human_gate_required);
+        assert!(!report.destructive_action_performed);
+        let marker_json = std::fs::read_to_string(marker_path).unwrap();
+        assert!(marker_json.contains("\"schema\": \"cuecrux.crypto_shred.destroy_marker.v1\""));
+        assert!(marker_json.contains("\"red_1\""));
+        assert!(!marker_json.contains("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="));
+    }
+
+    #[test]
+    fn crypto_shred_destroy_marker_rejects_destroyed_without_human_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("destroy-marker.json");
+        let err = write_crypto_shred_destroy_marker_v1(&CryptoShredDestroyMarkerOptionsV1 {
+            out_marker: &marker_path,
+            marker_id: "destroy_1",
+            tenant_id: "tenant-a",
+            subject_type: "fact",
+            subject_id: "f_1",
+            subject_cek_id: "cek:tenant-a:fact:f_1:v1",
+            subject_cek_commitment: "blake3:commitment",
+            redaction_receipt_id: "red_1",
+            actor_passport: "passport:operator",
+            idempotency_key: "destroy:f_1:v1",
+            requested_at: "2026-06-14T10:00:00Z",
+            destroyed_at: Some("2026-06-14T10:05:00Z"),
+            human_gate_receipt: None,
+            wrapped_key_ref: None,
+            reason: None,
+            linked_receipts: &[],
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("human gate receipt"));
+        assert!(!marker_path.exists());
+    }
+
+    #[test]
     fn chain_reanchor_attest_writes_body_that_verifies() {
         let dir = tempfile::tempdir().unwrap();
         let body_path = dir.path().join("chain.cbor");
@@ -1290,6 +1720,7 @@ mod tests {
             kind: "external_anchor".to_string(),
             ok: false,
             failure_reason: Some("bad proof".to_string()),
+            strict_validation: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"kind\":\"external_anchor\""));
@@ -1377,6 +1808,145 @@ mod tests {
         .unwrap();
         assert!(!bad.ok);
         assert!(bad.failure_reason.as_deref().unwrap_or("").contains("message imprint"));
+    }
+
+    #[test]
+    fn verify_rfc3161_timestamp_with_root_enables_strict_cms_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body_path = tmp.path().join("tsa.cbor");
+        let root_path = tmp.path().join("tsa-root.pem");
+
+        let mut root_params = rcgen::CertificateParams::new(vec!["CueCrux TSA Root TEST".to_string()]).unwrap();
+        root_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "CueCrux TSA Root TEST");
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let root_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        std::fs::write(&root_path, root_cert.pem()).unwrap();
+
+        let input = corecrux_receipts::Rfc3161TimestampBodyInputV1 {
+            tenant_id: "tenant-a",
+            receipt_id: "tsa_1",
+            timestamp_id: "tsa-1",
+            actor_passport: "passport:operator",
+            tsa_url: "https://tsa.example",
+            tsa_policy_oid: Some("1.2.3.4"),
+            message_imprint_alg: "sha256",
+            message_imprint_hash: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            timestamp_token_der: b"fake-token",
+            serial_number: None,
+            gen_time: "2026-06-14T10:00:00Z",
+            created_at: "2026-06-14T10:00:01Z",
+        };
+        let (body, _) = corecrux_receipts::build_rfc3161_timestamp_body_v1(&input);
+        std::fs::write(&body_path, body).unwrap();
+        let root_paths = vec![root_path];
+
+        let report = verify_rfc3161_timestamp_body_file_with_options_v1(
+            &body_path,
+            &Rfc3161TimestampVerifyOptionsV1 {
+                expected_message_imprint_hash: Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                expected_policy_oid: Some("1.2.3.4"),
+                expected_nonce: None,
+                trusted_root_cert_paths: &root_paths,
+            },
+        )
+        .unwrap();
+
+        assert!(!report.ok);
+        let strict = report.strict_validation.expect("strict report is emitted");
+        assert!(!strict.ok);
+        assert!(strict.token_hash_ok);
+        assert!(strict
+            .failure_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("ContentInfo parse failed"));
+    }
+
+    #[test]
+    fn parse_hex_bytes_accepts_nonce_hex() {
+        assert_eq!(parse_hex_bytes_v1("0x0001").unwrap(), vec![0, 1]);
+        assert_eq!(parse_hex_bytes_v1("0A").unwrap(), vec![10]);
+        assert!(parse_hex_bytes_v1("abc").is_err());
+    }
+
+    #[test]
+    fn witness_smoke_disabled_is_ok() {
+        let report = witness_smoke_v1(&WitnessSmokeOptionsV1 {
+            witness_enabled: false,
+            witness_provider: "disabled",
+            witness_timeout_ms: 5000,
+            rekor_url: None,
+            rekor_public_key_path: None,
+            tsa_enabled: false,
+            tsa_url: None,
+            tsa_root_cert_paths: &[],
+            tsa_policy_oid: None,
+        });
+        assert!(report.ok);
+        assert!(!report.witness.enabled);
+        assert!(!report.tsa.enabled);
+    }
+
+    #[test]
+    fn witness_smoke_validates_tsa_root_cert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("tsa-root.pem");
+        let mut root_params = rcgen::CertificateParams::new(vec!["CueCrux TSA Root TEST".to_string()]).unwrap();
+        root_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "CueCrux TSA Root TEST");
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let root_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        std::fs::write(&root_path, root_cert.pem()).unwrap();
+        let root_paths = vec![root_path];
+
+        let report = witness_smoke_v1(&WitnessSmokeOptionsV1 {
+            witness_enabled: true,
+            witness_provider: "rekor",
+            witness_timeout_ms: 7500,
+            rekor_url: Some("https://rekor.example"),
+            rekor_public_key_path: None,
+            tsa_enabled: true,
+            tsa_url: Some("https://tsa.example"),
+            tsa_root_cert_paths: &root_paths,
+            tsa_policy_oid: Some("1.2.3.4"),
+        });
+
+        assert!(report.ok, "{report:?}");
+        assert!(report.witness.ok);
+        assert!(report.tsa.ok);
+        assert_eq!(report.tsa.tsa_root_cert_count, 1);
+        assert_eq!(report.tsa.tsa_policy_oid.as_deref(), Some("1.2.3.4"));
+        assert_eq!(
+            report.warnings,
+            vec!["Rekor witness is enabled without --rekor-public-key-path".to_string()]
+        );
+    }
+
+    #[test]
+    fn witness_smoke_fails_when_enabled_tsa_lacks_root() {
+        let report = witness_smoke_v1(&WitnessSmokeOptionsV1 {
+            witness_enabled: false,
+            witness_provider: "disabled",
+            witness_timeout_ms: 5000,
+            rekor_url: None,
+            rekor_public_key_path: None,
+            tsa_enabled: true,
+            tsa_url: Some("https://tsa.example"),
+            tsa_root_cert_paths: &[],
+            tsa_policy_oid: None,
+        });
+        assert!(!report.ok);
+        assert!(report
+            .tsa
+            .failure_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("--tsa-root-cert"));
     }
 
     #[test]

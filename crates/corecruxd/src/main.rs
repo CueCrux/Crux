@@ -82,6 +82,7 @@ mod update;
 mod wasm_dispatcher;
 #[cfg(feature = "wasm-extensions")]
 mod wasm_host;
+mod witness;
 mod work;
 mod work_execplans;
 mod workspace_scan;
@@ -546,6 +547,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         auth: auth.clone(),
         rcx_router: Some(rcx_router.clone()),
         data_dir: config.data_dir.clone(),
+        witness: crate::witness::WitnessRuntimeConfigV1::from_config(&config),
         mcp_enabled: config.mcp_enabled,
         console_enabled: config.console_enabled,
         coord_enabled: config.coord_enabled,
@@ -3908,6 +3910,7 @@ mod tests {
             auth,
             rcx_router: None,
             data_dir: tmp.path().to_path_buf(),
+            witness: crate::witness::WitnessRuntimeConfigV1::disabled(),
             mcp_enabled: true,
             console_enabled: true,
             coord_enabled: false,

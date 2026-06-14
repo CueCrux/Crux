@@ -45,6 +45,7 @@ use utoipa::OpenApi;
         super::receipts::get_receipt_body_v1,
         super::receipts::get_receipt_signature_v1,
         super::receipts::get_receipt_verification_v1,
+        super::witness::get_witness_smoke,
     ),
     components(schemas(
         corecrux_memory::fact_store::Fact,
