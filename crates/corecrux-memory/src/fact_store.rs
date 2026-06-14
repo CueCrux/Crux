@@ -8,12 +8,13 @@
 //! a source receipt reference and confidence score. The store supports BM25-style
 //! keyword search over fact values and soft-delete via tombstone events.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Journal event for fact persistence.
 #[derive(Serialize, Deserialize)]
@@ -191,6 +192,78 @@ pub struct StoreFact {
     /// path) write `actor = None` — byte-for-byte the pre-M1 behaviour.
     #[serde(default)]
     pub actor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ContradictionCandidateV1 {
+    pub entity: String,
+    pub key: String,
+    pub reason: String,
+    pub polarity_a: String,
+    pub polarity_b: String,
+    pub fact_ids: Vec<String>,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ConsolidationRequestV1 {
+    pub consolidation_id: String,
+    pub entity: String,
+    pub key: String,
+    pub canonical_value: String,
+    pub target_fact_ids: Vec<String>,
+    #[serde(default)]
+    pub protected_fact_ids: Vec<String>,
+    #[serde(default = "default_confidence")]
+    pub confidence: f32,
+    #[serde(default)]
+    pub source_receipt: Option<String>,
+    #[serde(default)]
+    pub actor: Option<String>,
+    #[serde(default)]
+    pub horizon_class: Option<HorizonClass>,
+    #[serde(default = "default_consolidation_protected_confidence_floor")]
+    pub protected_confidence_floor: f32,
+}
+
+fn default_consolidation_protected_confidence_floor() -> f32 {
+    0.99
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ConsolidationReceiptV1 {
+    pub consolidation_id: String,
+    pub canonical_fact_id: String,
+    pub superseded_fact_ids: Vec<String>,
+    pub source_fact_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ConsolidationPassReportV1 {
+    pub status: String,
+    pub receipt: ConsolidationReceiptV1,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ConsolidationErrorV1 {
+    #[error("consolidation requires at least one target fact")]
+    NoTargets,
+    #[error("target fact not found: {0}")]
+    TargetNotFound(String),
+    #[error("target fact is deleted: {0}")]
+    TargetDeleted(String),
+    #[error("target fact is protected by caller: {0}")]
+    TargetPinned(String),
+    #[error("target fact is private: {0}")]
+    TargetPrivate(String),
+    #[error("target fact is receipt-linked: {0}")]
+    TargetReceiptLinked(String),
+    #[error("target fact confidence is protected: {fact_id} confidence={confidence}")]
+    TargetHighConfidence { fact_id: String, confidence: String },
+    #[error("target fact is outside requested entity/key: {0}")]
+    TargetOutsideEntityKey(String),
+    #[error("fact journal append failed: {0}")]
+    Journal(String),
 }
 
 fn default_confidence() -> f32 {
@@ -1000,6 +1073,138 @@ impl FactStore {
             None => Vec::new(),
         }
     }
+
+    /// Read-only contradiction-candidate pass (Audit II M1).
+    ///
+    /// This intentionally emits candidates, not decisions. It only flags
+    /// active, non-superseded facts that share `(entity, key)` and carry
+    /// opposite deterministic polarity classes (`true` vs `false`,
+    /// `active` vs `inactive`, etc.). The pass never mutates memory.
+    pub fn contradiction_candidates_v1(&self, limit: usize) -> Vec<ContradictionCandidateV1> {
+        let mut groups: BTreeMap<(String, String), Vec<&Fact>> = BTreeMap::new();
+        for fact in self.facts.values() {
+            if fact.deleted || fact.superseded_by.is_some() {
+                continue;
+            }
+            if polarity_class_v1(&fact.value).is_none() {
+                continue;
+            }
+            groups
+                .entry((fact.entity.clone(), fact.key.clone()))
+                .or_default()
+                .push(fact);
+        }
+
+        let mut out = Vec::new();
+        for ((entity, key), facts) in groups {
+            let mut by_polarity: BTreeMap<String, Vec<&Fact>> = BTreeMap::new();
+            for fact in facts {
+                if let Some(pol) = polarity_class_v1(&fact.value) {
+                    by_polarity.entry(pol.to_string()).or_default().push(fact);
+                }
+            }
+            if by_polarity.len() < 2 {
+                continue;
+            }
+            let polarities = by_polarity.keys().cloned().collect::<Vec<_>>();
+            let fact_ids = by_polarity
+                .values()
+                .flat_map(|facts| facts.iter().map(|f| f.fact_id.clone()))
+                .collect::<Vec<_>>();
+            let values = by_polarity
+                .values()
+                .flat_map(|facts| facts.iter().map(|f| f.value.clone()))
+                .collect::<Vec<_>>();
+            out.push(ContradictionCandidateV1 {
+                entity,
+                key,
+                reason: "opposite_polarity_same_entity_key".to_string(),
+                polarity_a: polarities.first().cloned().unwrap_or_default(),
+                polarity_b: polarities.get(1).cloned().unwrap_or_default(),
+                fact_ids,
+                values,
+            });
+            if limit > 0 && out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Safe consolidation pass (Audit II M2).
+    ///
+    /// Creates a new canonical fact and explicitly supersedes every target
+    /// fact, but only after rejecting protected inputs. It never hard-deletes
+    /// history; `fact_history` and `all_facts` remain replayable.
+    pub fn consolidate_facts_v1(
+        &mut self,
+        req: ConsolidationRequestV1,
+    ) -> Result<ConsolidationPassReportV1, ConsolidationErrorV1> {
+        if req.target_fact_ids.is_empty() {
+            return Err(ConsolidationErrorV1::NoTargets);
+        }
+
+        for fact_id in &req.target_fact_ids {
+            let fact = self
+                .facts
+                .get(fact_id)
+                .ok_or_else(|| ConsolidationErrorV1::TargetNotFound(fact_id.clone()))?;
+            if fact.deleted {
+                return Err(ConsolidationErrorV1::TargetDeleted(fact_id.clone()));
+            }
+            if req.protected_fact_ids.iter().any(|id| id == fact_id) {
+                return Err(ConsolidationErrorV1::TargetPinned(fact_id.clone()));
+            }
+            if fact.private {
+                return Err(ConsolidationErrorV1::TargetPrivate(fact_id.clone()));
+            }
+            if fact.source_receipt.is_some() {
+                return Err(ConsolidationErrorV1::TargetReceiptLinked(fact_id.clone()));
+            }
+            if fact.confidence >= req.protected_confidence_floor {
+                return Err(ConsolidationErrorV1::TargetHighConfidence {
+                    fact_id: fact_id.clone(),
+                    confidence: format!("{:.3}", fact.confidence),
+                });
+            }
+            if fact.entity != req.entity || fact.key != req.key {
+                return Err(ConsolidationErrorV1::TargetOutsideEntityKey(fact_id.clone()));
+            }
+        }
+
+        let canonical = self
+            .try_store(StoreFact {
+                entity: req.entity.clone(),
+                key: req.key.clone(),
+                value: req.canonical_value,
+                source_receipt: req.source_receipt.clone().or_else(|| {
+                    if req.consolidation_id.trim().is_empty() {
+                        None
+                    } else {
+                        Some(format!("consolidation:{}", req.consolidation_id))
+                    }
+                }),
+                confidence: req.confidence,
+                private: false,
+                horizon_class: req.horizon_class,
+                actor: req.actor,
+            })
+            .map_err(|err| ConsolidationErrorV1::Journal(err.to_string()))?;
+
+        for fact_id in &req.target_fact_ids {
+            self.mark_superseded(fact_id, &canonical.fact_id);
+        }
+
+        Ok(ConsolidationPassReportV1 {
+            status: "consolidated".to_string(),
+            receipt: ConsolidationReceiptV1 {
+                consolidation_id: req.consolidation_id,
+                canonical_fact_id: canonical.fact_id,
+                superseded_fact_ids: req.target_fact_ids.clone(),
+                source_fact_ids: req.target_fact_ids,
+            },
+        })
+    }
 }
 
 /// Result of a fact query.
@@ -1034,6 +1239,20 @@ pub struct FactExportResult {
 /// Estimate token count from text (bytes / 4 approximation).
 fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
+}
+
+fn polarity_class_v1(value: &str) -> Option<&'static str> {
+    let v = value
+        .trim()
+        .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+        .to_ascii_lowercase();
+    match v.as_str() {
+        "true" | "yes" | "y" | "on" | "enabled" | "enable" | "active" | "complete" | "completed" | "passed"
+        | "pass" | "approved" | "approve" | "present" => Some("positive"),
+        "false" | "no" | "n" | "off" | "disabled" | "disable" | "inactive" | "blocked" | "failed" | "fail"
+        | "rejected" | "reject" | "absent" => Some("negative"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1125,6 +1344,135 @@ mod tests {
 
         assert_eq!(result.facts.len(), 1);
         assert_eq!(result.facts[0].entity, "deployment");
+    }
+
+    #[test]
+    fn contradiction_candidates_v1_flags_active_opposite_polarity() {
+        let mut store = FactStore::new();
+
+        let first = store.store(StoreFact {
+            entity: "service:api".to_string(),
+            key: "enabled".to_string(),
+            value: "enabled".to_string(),
+            source_receipt: None,
+            confidence: 0.7,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let second = store.store(StoreFact {
+            entity: "service:api".to_string(),
+            key: "enabled".to_string(),
+            value: "disabled".to_string(),
+            source_receipt: None,
+            confidence: 0.7,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        assert!(
+            store.clear_superseded(&first.fact_id),
+            "simulate unresolved remote conflict"
+        );
+
+        let candidates = store.contradiction_candidates_v1(10);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].entity, "service:api");
+        assert_eq!(candidates[0].key, "enabled");
+        assert!(candidates[0].fact_ids.contains(&first.fact_id));
+        assert!(candidates[0].fact_ids.contains(&second.fact_id));
+        assert_eq!(candidates[0].reason, "opposite_polarity_same_entity_key");
+    }
+
+    #[test]
+    fn consolidate_facts_v1_supersedes_targets_without_deleting_history() {
+        let mut store = FactStore::new();
+
+        let old = store.store(StoreFact {
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "blocked".to_string(),
+            source_receipt: None,
+            confidence: 0.4,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        let newer = store.store(StoreFact {
+            entity: "proj".to_string(),
+            key: "status".to_string(),
+            value: "active".to_string(),
+            source_receipt: None,
+            confidence: 0.5,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+        assert!(store.clear_superseded(&old.fact_id), "make both targets active");
+
+        let report = store
+            .consolidate_facts_v1(ConsolidationRequestV1 {
+                consolidation_id: "con-1".to_string(),
+                entity: "proj".to_string(),
+                key: "status".to_string(),
+                canonical_value: "active".to_string(),
+                target_fact_ids: vec![old.fact_id.clone(), newer.fact_id.clone()],
+                protected_fact_ids: vec![],
+                confidence: 0.8,
+                source_receipt: None,
+                actor: Some("agent:codex".to_string()),
+                horizon_class: Some(HorizonClass::Stable),
+                protected_confidence_floor: 0.99,
+            })
+            .expect("consolidate");
+
+        let canonical_id = report.receipt.canonical_fact_id;
+        assert_eq!(
+            store.get(&old.fact_id).unwrap().superseded_by.as_deref(),
+            Some(canonical_id.as_str())
+        );
+        assert_eq!(
+            store.get(&newer.fact_id).unwrap().superseded_by.as_deref(),
+            Some(canonical_id.as_str())
+        );
+        let history = store.fact_history("proj", "status");
+        assert_eq!(history.len(), 3, "consolidation must preserve version history");
+        assert!(history.iter().any(|f| f.fact_id == old.fact_id));
+        assert!(history.iter().any(|f| f.fact_id == newer.fact_id));
+        assert!(history.iter().any(|f| f.fact_id == canonical_id));
+    }
+
+    #[test]
+    fn consolidate_facts_v1_rejects_protected_targets() {
+        let mut store = FactStore::new();
+        let linked = store.store(StoreFact {
+            entity: "proj".to_string(),
+            key: "decision".to_string(),
+            value: "approved".to_string(),
+            source_receipt: Some("receipt:r1".to_string()),
+            confidence: 0.5,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+
+        let err = store
+            .consolidate_facts_v1(ConsolidationRequestV1 {
+                consolidation_id: "con-guard".to_string(),
+                entity: "proj".to_string(),
+                key: "decision".to_string(),
+                canonical_value: "approved".to_string(),
+                target_fact_ids: vec![linked.fact_id.clone()],
+                protected_fact_ids: vec![],
+                confidence: 0.8,
+                source_receipt: None,
+                actor: None,
+                horizon_class: None,
+                protected_confidence_floor: 0.99,
+            })
+            .expect_err("receipt-linked targets are protected");
+        assert_eq!(err, ConsolidationErrorV1::TargetReceiptLinked(linked.fact_id.clone()));
+        assert!(store.get(&linked.fact_id).unwrap().superseded_by.is_none());
     }
 
     #[test]

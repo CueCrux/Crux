@@ -1,0 +1,4 @@
+{
+  "ok": false,
+  "failure_reason_contains": "events.jsonl sha256 mismatch"
+}

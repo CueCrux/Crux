@@ -11,9 +11,11 @@
 
 mod approval_decision_v1;
 mod audit_bundle_v1;
+mod audit_gap_v1;
 mod body_v1;
 mod c2pa_manifest_v1;
 mod candidate_digest_v1;
+mod crypto_shred_v1;
 mod export_v1;
 mod forget_v1;
 mod identity_v1;
@@ -24,6 +26,7 @@ mod stream_v1;
 mod subject_index_v1;
 pub mod vault_pki_x509_signer;
 mod verify_v1;
+mod witness_v1;
 
 pub use approval_decision_v1::{
     assert_approval_decision_kind_v1, build_approval_decision_body_v1, sign_approval_decision_v1,
@@ -35,6 +38,16 @@ pub use audit_bundle_v1::{
     AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1, BuiltBundleV1, VerifyReportV1,
     BUNDLE_FORMAT_VERSION, EVENTS_FILENAME, MANIFEST_FILENAME, RECEIPTS_FILENAME,
 };
+pub use audit_gap_v1::{
+    assert_chain_reanchor_kind_v1, assert_consolidation_kind_v1, assert_coverage_attestation_kind_v1,
+    assert_model_invocation_kind_v1, assert_redaction_receipt_kind_v1, build_chain_reanchor_body_v1,
+    build_consolidation_body_v1, build_coverage_attestation_body_v1, build_model_invocation_body_v1,
+    build_redaction_receipt_body_v1, sign_chain_reanchor_v1, sign_consolidation_v1, sign_coverage_attestation_v1,
+    sign_model_invocation_v1, sign_redaction_receipt_v1, verify_chain_reanchor_body_v1, ChainReanchorBodyInputV1,
+    ConsolidationBodyInputV1, CoverageAttestationBodyInputV1, ModelInvocationBodyInputV1, RedactionReceiptBodyInputV1,
+    AUDIT_GAP_BODY_SCHEMA_V1, CHAIN_REANCHOR_KIND_V1, CONSOLIDATION_KIND_V1, COVERAGE_ATTESTATION_KIND_V1,
+    MODEL_INVOCATION_KIND_V1, REDACTION_RECEIPT_KIND_V1,
+};
 pub use body_v1::{extract_body_index_v1, extract_linked_receipts_v1, ReceiptBodyIndexV1};
 pub use c2pa_manifest_v1::{
     assert_crown_receipt_id_v1, build_c2pa_manifest_v1, canonical_body_bytes_v1, ed25519_signer, parse_jumbf_base64,
@@ -42,6 +55,10 @@ pub use c2pa_manifest_v1::{
     C2paManifestInputV1, C2paManifestV1, C2paSignedManifestV1, C2paSigner, C2paVerificationReportV1,
     SignedManifestParts, C2PA_ACTION_CREATED, C2PA_MANIFEST_SCHEMA_V1, C2PA_SPEC_VERSION, CUECRUX_CROWN_RECEIPT_LABEL,
     DIGITAL_SOURCE_TYPE_AI, SOFTWARE_AGENT_DEFAULT,
+};
+pub use crypto_shred_v1::{
+    open_crypto_shred_payload_v1, seal_crypto_shred_payload_v1, subject_cek_commitment_v1, CryptoShredEnvelopeV1,
+    CryptoShredError, CryptoShredSealInputV1, CRYPTO_SHRED_ENVELOPE_SCHEMA_V1, CRYPTO_SHRED_METHOD_V1,
 };
 pub use export_v1::{
     build_receipt_export_v1, BuildReceiptExportInput, ExportError, ExportFileV1, ExportFormatV1, ExportRedactionV1,
@@ -85,6 +102,13 @@ pub use subject_index_v1::{
     ReceiptSubjectLatestV1, SubjectResolveModeV1,
 };
 pub use verify_v1::{verify_receipt_v1, ReceiptSigV1, VerificationReportV1, VerifyErrorCodeV1, VerifyReceiptInput};
+pub use witness_v1::{
+    assert_external_anchor_kind_v1, assert_rfc3161_timestamp_kind_v1, build_external_anchor_body_v1,
+    build_rfc3161_timestamp_body_v1, sign_external_anchor_v1, sign_rfc3161_timestamp_v1,
+    verify_external_anchor_body_v1, verify_rfc3161_timestamp_token_binding_v1, verify_rfc6962_inclusion_proof_v1,
+    ExternalAnchorBodyInputV1, Rfc3161TimestampBodyInputV1, EXTERNAL_ANCHOR_KIND_V1, RFC3161_TIMESTAMP_KIND_V1,
+    WITNESS_BODY_SCHEMA_V1,
+};
 
 pub const STREAM_TYPE_RECEIPT: &str = "receipt";
 pub const EVT_RECEIPT_BODY_V1: &str = "receipt.body.v1";

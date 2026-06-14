@@ -1,0 +1,49 @@
+[package]
+name = "corecrux-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+blake3 = "1.8.5"
+libfuzzer-sys = "0.4"
+
+corecrux-receipts = { path = "../crates/corecrux-receipts" }
+corecrux-segment = { path = "../crates/corecrux-segment" }
+corecrux-storage = { path = "../crates/corecrux-storage", features = ["fuzzing"] }
+corecrux-types = { path = "../crates/corecrux-types" }
+crux-session = { path = "../crates/crux-session" }
+rcx-capability-token = { path = "../crates/rcx-capability-token" }
+
+[[bin]]
+name = "segment_decode"
+path = "fuzz_targets/segment_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "storage_scan_frames"
+path = "fuzz_targets/storage_scan_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "receipt_verify_cbor"
+path = "fuzz_targets/receipt_verify_cbor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rcx_canonical_token"
+path = "fuzz_targets/rcx_canonical_token.rs"
+test = false
+doc = false
+bench = false

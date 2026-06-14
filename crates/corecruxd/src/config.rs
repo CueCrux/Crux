@@ -345,6 +345,15 @@ pub struct Config {
     pub receipts_recompute_candidate_digest: bool,
     pub receipts_keyring_path: Option<PathBuf>,
     pub receipts_keyring_json: Option<String>,
+    pub witness_enabled: bool,
+    pub witness_provider: String,
+    pub witness_timeout_ms: u64,
+    pub rekor_url: Option<String>,
+    pub rekor_public_key_path: Option<PathBuf>,
+    pub tsa_enabled: bool,
+    pub tsa_url: Option<String>,
+    pub tsa_root_cert_path: Option<PathBuf>,
+    pub tsa_policy_oid: Option<String>,
 
     // Replay/batching path configuration.
     pub replay_batch_max_events: u32,
@@ -796,6 +805,19 @@ pub fn load_config() -> Config {
         .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let receipts_keyring_path = std::env::var("CORECRUXD_RECEIPTS_KEYRING_PATH").ok().map(PathBuf::from);
     let receipts_keyring_json = std::env::var("CORECRUXD_RECEIPTS_KEYRING_JSON").ok();
+    let witness_enabled = env_bool("CORECRUXD_WITNESS_ENABLED").unwrap_or(false);
+    let witness_provider = env_string("CORECRUXD_WITNESS_PROVIDER").unwrap_or_else(|| "disabled".to_string());
+    let witness_timeout_ms = std::env::var("CORECRUXD_WITNESS_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5_000)
+        .clamp(100, 120_000);
+    let rekor_url = env_string("CORECRUXD_REKOR_URL");
+    let rekor_public_key_path = env_string("CORECRUXD_REKOR_PUBLIC_KEY_PATH").map(PathBuf::from);
+    let tsa_enabled = env_bool("CORECRUXD_TSA_ENABLED").unwrap_or(false);
+    let tsa_url = env_string("CORECRUXD_TSA_URL");
+    let tsa_root_cert_path = env_string("CORECRUXD_TSA_ROOT_CERT_PATH").map(PathBuf::from);
+    let tsa_policy_oid = env_string("CORECRUXD_TSA_POLICY_OID");
     let replay_batch_max_events = std::env::var("CORECRUXD_REPLAY_BATCH_MAX_EVENTS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -968,6 +990,15 @@ pub fn load_config() -> Config {
         receipts_recompute_candidate_digest,
         receipts_keyring_path,
         receipts_keyring_json,
+        witness_enabled,
+        witness_provider,
+        witness_timeout_ms,
+        rekor_url,
+        rekor_public_key_path,
+        tsa_enabled,
+        tsa_url,
+        tsa_root_cert_path,
+        tsa_policy_oid,
         replay_batch_max_events,
         replay_batch_max_bytes,
         replay_many_max_reads,
@@ -1480,6 +1511,15 @@ mod tests {
         assert!(!cfg.receipts_recompute_candidate_digest);
         assert_eq!(cfg.receipts_keyring_path, None);
         assert_eq!(cfg.receipts_keyring_json, None);
+        assert!(!cfg.witness_enabled);
+        assert_eq!(cfg.witness_provider, "disabled");
+        assert_eq!(cfg.witness_timeout_ms, 5_000);
+        assert_eq!(cfg.rekor_url, None);
+        assert_eq!(cfg.rekor_public_key_path, None);
+        assert!(!cfg.tsa_enabled);
+        assert_eq!(cfg.tsa_url, None);
+        assert_eq!(cfg.tsa_root_cert_path, None);
+        assert_eq!(cfg.tsa_policy_oid, None);
         assert_eq!(cfg.replay_batch_max_events, 64);
         assert_eq!(cfg.replay_batch_max_bytes, 262_144);
         assert_eq!(cfg.replay_many_max_reads, 64);
@@ -1582,6 +1622,15 @@ mod tests {
         std::env::set_var("CORECRUXD_ADMIN_FORCE_SEAL", "yes");
         std::env::set_var("CORECRUXD_RECEIPTS_VERIFY_ENABLED", "false");
         std::env::set_var("CORECRUXD_RECEIPTS_RECOMPUTE_CANDIDATE_DIGEST", "true");
+        std::env::set_var("CORECRUXD_WITNESS_ENABLED", "true");
+        std::env::set_var("CORECRUXD_WITNESS_PROVIDER", "rekor");
+        std::env::set_var("CORECRUXD_WITNESS_TIMEOUT_MS", "7500");
+        std::env::set_var("CORECRUXD_REKOR_URL", "https://rekor.example");
+        std::env::set_var("CORECRUXD_REKOR_PUBLIC_KEY_PATH", "/tmp/rekor.pub");
+        std::env::set_var("CORECRUXD_TSA_ENABLED", "true");
+        std::env::set_var("CORECRUXD_TSA_URL", "https://tsa.example");
+        std::env::set_var("CORECRUXD_TSA_ROOT_CERT_PATH", "/tmp/tsa-root.pem");
+        std::env::set_var("CORECRUXD_TSA_POLICY_OID", "1.2.3.4");
         std::env::set_var("CORECRUXD_STORE_LOCK_STRATEGY", "rwlock");
         std::env::set_var("CORECRUXD_APPEND_LANE_ENABLED", "false");
         std::env::set_var("CORECRUXD_APPEND_LANE_SCOPE", "shard");
@@ -1651,6 +1700,21 @@ mod tests {
         assert!(cfg.admin_force_seal_enabled);
         assert!(!cfg.receipts_verify_enabled);
         assert!(cfg.receipts_recompute_candidate_digest);
+        assert!(cfg.witness_enabled);
+        assert_eq!(cfg.witness_provider, "rekor");
+        assert_eq!(cfg.witness_timeout_ms, 7_500);
+        assert_eq!(cfg.rekor_url.as_deref(), Some("https://rekor.example"));
+        assert_eq!(
+            cfg.rekor_public_key_path.as_ref().unwrap().to_str().unwrap(),
+            "/tmp/rekor.pub"
+        );
+        assert!(cfg.tsa_enabled);
+        assert_eq!(cfg.tsa_url.as_deref(), Some("https://tsa.example"));
+        assert_eq!(
+            cfg.tsa_root_cert_path.as_ref().unwrap().to_str().unwrap(),
+            "/tmp/tsa-root.pem"
+        );
+        assert_eq!(cfg.tsa_policy_oid.as_deref(), Some("1.2.3.4"));
         assert_eq!(cfg.store_lock_strategy, StoreLockStrategy::RwLock);
         assert!(!cfg.append_lane_enabled);
         assert_eq!(cfg.append_lane_scope, AppendLaneScope::Shard);

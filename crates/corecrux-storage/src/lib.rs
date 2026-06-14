@@ -2293,6 +2293,11 @@ fn scan_frames_v1_block_bytes(block: &[u8]) -> Result<u32> {
     Ok(frames)
 }
 
+#[cfg(any(test, feature = "fuzzing"))]
+pub fn fuzz_scan_frames_v1_block_bytes(block: &[u8]) -> Result<u32> {
+    scan_frames_v1_block_bytes(block)
+}
+
 fn decode_blocks_from_plan_parts(
     out: &mut [Option<Vec<u8>>],
     blocks: &[BlockMetaV1],
