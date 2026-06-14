@@ -13,11 +13,10 @@
 //!
 //! ## Dense vector lane decision (ADR-CORECRUX-0001, 2026-04-03)
 //!
-//! CoreCrux v5 launches with BM25 + graph fusion only. The `dense` weight exists in
-//! `FusionWeights` but `dense_score` is hardcoded to 0.0. Dense vector retrieval
-//! uses pgvector in the Engine retrieval path as a parallel lane.
-//! If conceptual/paraphrased queries prove to need in-CoreCrux dense support, that's
-//! a future milestone — the FusionWeights plumbing is ready for it.
+//! This legacy Crux crate does not own vector search. Native dense retrieval
+//! lives in CoreCrux `.ccxe` companions; this path keeps the request field for
+//! wire compatibility but reports the dense lane inactive rather than pretending
+//! a local vector score was computed.
 
 use serde::{Deserialize, Serialize};
 
@@ -209,13 +208,15 @@ pub fn fused_retrieve(
                 (0.0, 0)
             };
 
-            // Dense cosine (future: accept pre-computed doc embeddings)
-            let dense_score = 0.0f32;
+            // Dense vectors are CoreCrux-owned. This legacy Crux path keeps
+            // the response field for compatibility and reports the lane
+            // inactive in `RetrievalStats`.
+            let dense_component = 0.0f32;
 
             // Fused score
             let score = effective_weights.bm25 * bm25_normalized
                 + effective_weights.graph * graph_score
-                + effective_weights.dense * dense_score
+                + effective_weights.dense * dense_component
                 + effective_weights.sparse * 0.0; // future: learned sparse
 
             FusedHit {
@@ -226,7 +227,7 @@ pub fn fused_retrieve(
                 score_breakdown: ScoreBreakdown {
                     bm25: bm25_normalized,
                     graph: graph_score,
-                    dense: dense_score,
+                    dense: dense_component,
                     sparse: 0.0,
                 },
                 hop_distance: hop_dist,
@@ -244,7 +245,7 @@ pub fn fused_retrieve(
             docs_scanned: index_mgr.total_docs(),
             postings_decoded: bm25_hits.len(),
             graph_nodes_expanded: graph_expanded,
-            dense_lane_active: req.query_embedding.is_some(),
+            dense_lane_active: false,
         },
     })
 }
@@ -410,6 +411,33 @@ mod tests {
         assert!(!resp.results.is_empty());
         // Terraform drift doc should be top result
         assert_eq!(resp.results[0].doc_id, 0);
+    }
+
+    #[test]
+    fn legacy_crux_path_reports_dense_lane_inactive() {
+        let (mgr, _) = build_test_index_manager();
+
+        let req = FusedRetrieveRequest {
+            tenant_id: "test-tenant".to_string(),
+            query: "terraform drift detection".to_string(),
+            query_embedding: Some(vec![0.0, 1.0, 0.0]),
+            top_k: 5,
+            weights: FusionWeights {
+                bm25: 1.0,
+                graph: 0.0,
+                dense: 1.0,
+                sparse: 0.0,
+            },
+            graph_hops: 0,
+            min_confidence: 0.0,
+            include_state: false,
+            graph_node_count: 0,
+            graph_cold_start_threshold: 100,
+        };
+
+        let resp = fused_retrieve(&mgr, &req, None).unwrap();
+        assert!(!resp.stats.dense_lane_active);
+        assert!(resp.results.iter().all(|hit| hit.score_breakdown.dense == 0.0));
     }
 
     #[test]

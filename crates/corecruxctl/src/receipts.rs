@@ -11,11 +11,17 @@ use ed25519_dalek::{Signer as _, SigningKey};
 
 use corecrux_frame::{decode_canonical_header_bytes_v1, stream_hash_xxhash64};
 use corecrux_receipts::{
-    update_subject_index_v1, Ed25519KeyEntryV1, Ed25519KeyRingV1, ReceiptSigV1, CONTENT_TYPE_RECEIPT_BODY_V1,
+    assert_external_anchor_kind_v1, assert_rfc3161_timestamp_kind_v1, seal_crypto_shred_payload_v1,
+    update_subject_index_v1, verify_chain_reanchor_body_v1, verify_external_anchor_body_v1,
+    verify_rfc3161_timestamp_token_binding_v1, ChainReanchorBodyInputV1, CoverageAttestationBodyInputV1,
+    CryptoShredSealInputV1, Ed25519KeyEntryV1, Ed25519KeyRingV1, ExternalAnchorBodyInputV1, ReceiptSigV1,
+    RedactionReceiptBodyInputV1, Rfc3161TimestampBodyInputV1, CONTENT_TYPE_RECEIPT_BODY_V1,
     CONTENT_TYPE_RECEIPT_SIG_V1, EVT_RECEIPT_BODY_V1, EVT_RECEIPT_SIG_V1, STREAM_TYPE_RECEIPT,
 };
 use corecrux_segment::decode_frame_v1;
 use corecrux_storage::{AppendEventInput, ShardStorage, ShardStorageOptions};
+
+type ReceiptSignerV1 = fn(&str, &[u8], [u8; 32], &SigningKey, &str, &str) -> ReceiptSigV1;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReceiptsSeedReportV1 {
@@ -77,6 +83,603 @@ pub struct BackfillTotalsV1 {
     pub skipped_no_subject: u64,
     pub skipped_kind_other: u64,
     pub parse_failed: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WitnessVerifyReportV1 {
+    pub body_path: String,
+    pub kind: String,
+    pub ok: bool,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CoverageAttestReportV1 {
+    pub body_path: String,
+    pub sig_path: Option<String>,
+    pub receipt_id: String,
+    pub attestation_id: String,
+    pub report_hash: String,
+    pub signed: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WitnessAttestReportV1 {
+    pub body_path: String,
+    pub sig_path: Option<String>,
+    pub receipt_id: String,
+    pub kind: String,
+    pub verified: bool,
+    pub signed: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChainReanchorVerifyReportV1 {
+    pub body_path: String,
+    pub ok: bool,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChainReanchorAttestReportV1 {
+    pub body_path: String,
+    pub sig_path: Option<String>,
+    pub receipt_id: String,
+    pub migration_id: String,
+    pub old_chain_head: String,
+    pub new_chain_head: String,
+    pub receipt_count: u64,
+    pub linked_receipts_count: usize,
+    pub verified: bool,
+    pub signed: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RedactionAttestReportV1 {
+    pub body_path: String,
+    pub sig_path: Option<String>,
+    pub envelope_path: Option<String>,
+    pub receipt_id: String,
+    pub redaction_id: String,
+    pub subject_cek_id: String,
+    pub subject_cek_commitment: String,
+    pub prior_content_hash: Option<String>,
+    pub redacted_content_hash: Option<String>,
+    pub signed: bool,
+    pub crypto_shred_staged: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalAnchorAttestOptionsV1<'a> {
+    pub out_body: &'a Path,
+    pub out_sig: Option<&'a Path>,
+    pub signing_key_b64: Option<&'a str>,
+    pub key_id: &'a str,
+    pub signed_at: &'a str,
+    pub tenant_id: &'a str,
+    pub receipt_id: &'a str,
+    pub anchor_id: &'a str,
+    pub actor_passport: &'a str,
+    pub transparency_log: &'a str,
+    pub log_url: &'a str,
+    pub rekor_uuid: Option<&'a str>,
+    pub leaf_hash: &'a str,
+    pub log_index: u64,
+    pub tree_size: u64,
+    pub root_hash: &'a str,
+    pub inclusion_proof: &'a [&'a str],
+    pub checkpoint: Option<&'a str>,
+    pub integrated_time: &'a str,
+    pub created_at: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct Rfc3161TimestampAttestOptionsV1<'a> {
+    pub out_body: &'a Path,
+    pub out_sig: Option<&'a Path>,
+    pub signing_key_b64: Option<&'a str>,
+    pub key_id: &'a str,
+    pub signed_at: &'a str,
+    pub tenant_id: &'a str,
+    pub receipt_id: &'a str,
+    pub timestamp_id: &'a str,
+    pub actor_passport: &'a str,
+    pub tsa_url: &'a str,
+    pub tsa_policy_oid: Option<&'a str>,
+    pub message_imprint_alg: &'a str,
+    pub message_imprint_hash: &'a str,
+    pub timestamp_token_der: &'a Path,
+    pub serial_number: Option<&'a str>,
+    pub gen_time: &'a str,
+    pub created_at: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChainReanchorAttestOptionsV1<'a> {
+    pub out_body: &'a Path,
+    pub out_sig: Option<&'a Path>,
+    pub signing_key_b64: Option<&'a str>,
+    pub key_id: &'a str,
+    pub signed_at: &'a str,
+    pub tenant_id: &'a str,
+    pub receipt_id: &'a str,
+    pub migration_id: &'a str,
+    pub actor_passport: &'a str,
+    pub old_chain_head: &'a str,
+    pub new_chain_head: &'a str,
+    pub old_hash_alg: &'a str,
+    pub new_hash_alg: &'a str,
+    pub first_receipt_id: &'a str,
+    pub last_receipt_id: &'a str,
+    pub receipt_count: u64,
+    pub reason: &'a str,
+    pub linked_receipts: &'a [&'a str],
+    pub created_at: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct RedactionAttestOptionsV1<'a> {
+    pub out_body: &'a Path,
+    pub out_sig: Option<&'a Path>,
+    pub signing_key_b64: Option<&'a str>,
+    pub key_id: &'a str,
+    pub signed_at: &'a str,
+    pub tenant_id: &'a str,
+    pub receipt_id: &'a str,
+    pub redaction_id: &'a str,
+    pub actor_passport: &'a str,
+    pub subject_type: &'a str,
+    pub subject_id: &'a str,
+    pub request_id: &'a str,
+    pub scope: &'a str,
+    pub method: &'a str,
+    pub subject_cek_id: &'a str,
+    pub subject_cek_commitment: Option<&'a str>,
+    pub cek_destroyed_at: Option<&'a str>,
+    pub prior_content_hash: Option<&'a str>,
+    pub redacted_content_hash: Option<&'a str>,
+    pub linked_receipts: &'a [&'a str],
+    pub created_at: &'a str,
+    pub crypto_shred_staged: bool,
+    pub seal_plaintext: Option<&'a Path>,
+    pub out_envelope: Option<&'a Path>,
+    pub cek_b64: Option<&'a str>,
+    pub nonce_b64: Option<&'a str>,
+}
+
+pub fn write_external_anchor_attestation_v1(
+    opts: &ExternalAnchorAttestOptionsV1<'_>,
+) -> Result<WitnessAttestReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let input = ExternalAnchorBodyInputV1 {
+        tenant_id: opts.tenant_id,
+        receipt_id: opts.receipt_id,
+        anchor_id: opts.anchor_id,
+        actor_passport: opts.actor_passport,
+        transparency_log: opts.transparency_log,
+        log_url: opts.log_url,
+        rekor_uuid: opts.rekor_uuid,
+        leaf_hash: opts.leaf_hash,
+        log_index: opts.log_index,
+        tree_size: opts.tree_size,
+        root_hash: opts.root_hash,
+        inclusion_proof: opts.inclusion_proof,
+        checkpoint: opts.checkpoint,
+        integrated_time: opts.integrated_time,
+        created_at: opts.created_at,
+    };
+    let (body, body_hash) = corecrux_receipts::build_external_anchor_body_v1(&input);
+    let verified = verify_external_anchor_body_v1(&body);
+    if !verified {
+        return Err("external_anchor body failed inclusion-proof verification".into());
+    }
+    write_parented(opts.out_body, &body)?;
+    let sig_path = write_optional_sig_v1(OptionalSigWriteV1 {
+        out_sig: opts.out_sig,
+        signing_key_b64: opts.signing_key_b64,
+        receipt_id: opts.receipt_id,
+        body: &body,
+        body_hash,
+        key_id: opts.key_id,
+        signed_at: opts.signed_at,
+        signer: corecrux_receipts::sign_external_anchor_v1,
+    })?;
+    Ok(WitnessAttestReportV1 {
+        body_path: opts.out_body.display().to_string(),
+        sig_path,
+        receipt_id: opts.receipt_id.to_string(),
+        kind: "external_anchor".to_string(),
+        verified,
+        signed: opts.out_sig.is_some(),
+    })
+}
+
+pub fn write_rfc3161_timestamp_attestation_v1(
+    opts: &Rfc3161TimestampAttestOptionsV1<'_>,
+) -> Result<WitnessAttestReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let token = std::fs::read(opts.timestamp_token_der)?;
+    let input = Rfc3161TimestampBodyInputV1 {
+        tenant_id: opts.tenant_id,
+        receipt_id: opts.receipt_id,
+        timestamp_id: opts.timestamp_id,
+        actor_passport: opts.actor_passport,
+        tsa_url: opts.tsa_url,
+        tsa_policy_oid: opts.tsa_policy_oid,
+        message_imprint_alg: opts.message_imprint_alg,
+        message_imprint_hash: opts.message_imprint_hash,
+        timestamp_token_der: &token,
+        serial_number: opts.serial_number,
+        gen_time: opts.gen_time,
+        created_at: opts.created_at,
+    };
+    let (body, body_hash) = corecrux_receipts::build_rfc3161_timestamp_body_v1(&input);
+    let verified = verify_rfc3161_timestamp_token_binding_v1(&body, Some(opts.message_imprint_hash));
+    if !verified {
+        return Err("rfc3161_timestamp body failed token/imprint binding verification".into());
+    }
+    write_parented(opts.out_body, &body)?;
+    let sig_path = write_optional_sig_v1(OptionalSigWriteV1 {
+        out_sig: opts.out_sig,
+        signing_key_b64: opts.signing_key_b64,
+        receipt_id: opts.receipt_id,
+        body: &body,
+        body_hash,
+        key_id: opts.key_id,
+        signed_at: opts.signed_at,
+        signer: corecrux_receipts::sign_rfc3161_timestamp_v1,
+    })?;
+    Ok(WitnessAttestReportV1 {
+        body_path: opts.out_body.display().to_string(),
+        sig_path,
+        receipt_id: opts.receipt_id.to_string(),
+        kind: "rfc3161_timestamp".to_string(),
+        verified,
+        signed: opts.out_sig.is_some(),
+    })
+}
+
+struct OptionalSigWriteV1<'a> {
+    out_sig: Option<&'a Path>,
+    signing_key_b64: Option<&'a str>,
+    receipt_id: &'a str,
+    body: &'a [u8],
+    body_hash: [u8; 32],
+    key_id: &'a str,
+    signed_at: &'a str,
+    signer: ReceiptSignerV1,
+}
+
+fn write_optional_sig_v1(
+    opts: OptionalSigWriteV1<'_>,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(sig_path) = opts.out_sig else {
+        return Ok(None);
+    };
+    let signing_key_b64 = opts
+        .signing_key_b64
+        .ok_or("signing-key-b64 is required when out-sig is set")?;
+    let key_bytes = decode_fixed_32_b64("signing-key-b64", signing_key_b64)?;
+    let signing_key = SigningKey::from_bytes(&key_bytes);
+    let sig = (opts.signer)(
+        opts.receipt_id,
+        opts.body,
+        opts.body_hash,
+        &signing_key,
+        opts.key_id,
+        opts.signed_at,
+    );
+    let mut sig_bytes = Vec::new();
+    ciborium::ser::into_writer(&sig, &mut sig_bytes)?;
+    write_parented(sig_path, &sig_bytes)?;
+    Ok(Some(sig_path.display().to_string()))
+}
+
+pub fn write_chain_reanchor_attestation_v1(
+    opts: &ChainReanchorAttestOptionsV1<'_>,
+) -> Result<ChainReanchorAttestReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let input = ChainReanchorBodyInputV1 {
+        tenant_id: opts.tenant_id,
+        receipt_id: opts.receipt_id,
+        migration_id: opts.migration_id,
+        actor_passport: opts.actor_passport,
+        old_chain_head: opts.old_chain_head,
+        new_chain_head: opts.new_chain_head,
+        old_hash_alg: opts.old_hash_alg,
+        new_hash_alg: opts.new_hash_alg,
+        first_receipt_id: opts.first_receipt_id,
+        last_receipt_id: opts.last_receipt_id,
+        receipt_count: opts.receipt_count,
+        reason: opts.reason,
+        linked_receipts: opts.linked_receipts,
+        created_at: opts.created_at,
+    };
+    let (body, body_hash) = corecrux_receipts::build_chain_reanchor_body_v1(&input);
+    let verified = verify_chain_reanchor_body_v1(&body);
+    if !verified {
+        return Err("chain_reanchor body failed structural verification".into());
+    }
+    write_parented(opts.out_body, &body)?;
+
+    let mut sig_path_out = None;
+    if let Some(sig_path) = opts.out_sig {
+        let signing_key_b64 = opts
+            .signing_key_b64
+            .ok_or("signing-key-b64 is required when out-sig is set")?;
+        let key_bytes = decode_fixed_32_b64("signing-key-b64", signing_key_b64)?;
+        let signing_key = SigningKey::from_bytes(&key_bytes);
+        let sig = corecrux_receipts::sign_chain_reanchor_v1(
+            opts.receipt_id,
+            &body,
+            body_hash,
+            &signing_key,
+            opts.key_id,
+            opts.signed_at,
+        );
+        let mut sig_bytes = Vec::new();
+        ciborium::ser::into_writer(&sig, &mut sig_bytes)?;
+        write_parented(sig_path, &sig_bytes)?;
+        sig_path_out = Some(sig_path.display().to_string());
+    }
+
+    Ok(ChainReanchorAttestReportV1 {
+        body_path: opts.out_body.display().to_string(),
+        sig_path: sig_path_out,
+        receipt_id: opts.receipt_id.to_string(),
+        migration_id: opts.migration_id.to_string(),
+        old_chain_head: opts.old_chain_head.to_string(),
+        new_chain_head: opts.new_chain_head.to_string(),
+        receipt_count: opts.receipt_count,
+        linked_receipts_count: opts.linked_receipts.len(),
+        verified,
+        signed: opts.out_sig.is_some(),
+    })
+}
+
+pub fn verify_chain_reanchor_body_file_v1(
+    body_path: &Path,
+) -> Result<ChainReanchorVerifyReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let body = std::fs::read(body_path)?;
+    let ok = verify_chain_reanchor_body_v1(&body);
+    Ok(ChainReanchorVerifyReportV1 {
+        body_path: body_path.display().to_string(),
+        ok,
+        failure_reason: if ok {
+            None
+        } else {
+            Some(
+                "body is not a structurally valid chain_reanchor receipt body; check kind, heads, algorithms, receipt_count, and linked_receipts"
+                    .to_string(),
+            )
+        },
+    })
+}
+
+pub fn write_redaction_attestation_v1(
+    opts: &RedactionAttestOptionsV1<'_>,
+) -> Result<RedactionAttestReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let mut envelope_path_out = None;
+    let mut derived_subject_cek_commitment = opts.subject_cek_commitment.map(str::to_string);
+    let mut derived_prior_content_hash = opts.prior_content_hash.map(str::to_string);
+    let mut derived_redacted_content_hash = opts.redacted_content_hash.map(str::to_string);
+
+    if opts.crypto_shred_staged {
+        let seal_plaintext = opts
+            .seal_plaintext
+            .ok_or("--seal-plaintext is required with --crypto-shred-staged")?;
+        let out_envelope = opts
+            .out_envelope
+            .ok_or("--out-envelope is required with --crypto-shred-staged")?;
+        let cek_b64 = opts.cek_b64.ok_or("--cek-b64 is required with --crypto-shred-staged")?;
+        let nonce_b64 = opts
+            .nonce_b64
+            .ok_or("--nonce-b64 is required with --crypto-shred-staged")?;
+        let cek = decode_fixed_32_b64("cek-b64", cek_b64)?;
+        let nonce = decode_fixed_24_b64("nonce-b64", nonce_b64)?;
+        let plaintext = std::fs::read(seal_plaintext)?;
+        let seal_input = CryptoShredSealInputV1 {
+            tenant_id: opts.tenant_id,
+            subject_type: opts.subject_type,
+            subject_id: opts.subject_id,
+            subject_cek_id: opts.subject_cek_id,
+            created_at: opts.created_at,
+        };
+        let envelope = seal_crypto_shred_payload_v1(&seal_input, &plaintext, &cek, &nonce)?;
+        derived_subject_cek_commitment = Some(envelope.subject_cek_commitment.clone());
+        derived_prior_content_hash.get_or_insert_with(|| envelope.plaintext_hash.clone());
+        derived_redacted_content_hash.get_or_insert_with(|| envelope.ciphertext_hash.clone());
+        let envelope_bytes = serde_json::to_vec_pretty(&envelope)?;
+        write_parented(out_envelope, &envelope_bytes)?;
+        envelope_path_out = Some(out_envelope.display().to_string());
+    } else if opts.seal_plaintext.is_some()
+        || opts.out_envelope.is_some()
+        || opts.cek_b64.is_some()
+        || opts.nonce_b64.is_some()
+    {
+        return Err("envelope options require --crypto-shred-staged".into());
+    }
+
+    let subject_cek_commitment = derived_subject_cek_commitment
+        .as_deref()
+        .ok_or("--subject-cek-commitment is required unless --crypto-shred-staged derives it")?;
+    let input = RedactionReceiptBodyInputV1 {
+        tenant_id: opts.tenant_id,
+        receipt_id: opts.receipt_id,
+        redaction_id: opts.redaction_id,
+        actor_passport: opts.actor_passport,
+        subject_type: opts.subject_type,
+        subject_id: opts.subject_id,
+        request_id: opts.request_id,
+        scope: opts.scope,
+        method: opts.method,
+        subject_cek_id: opts.subject_cek_id,
+        subject_cek_commitment,
+        cek_destroyed_at: opts.cek_destroyed_at,
+        prior_content_hash: derived_prior_content_hash.as_deref(),
+        redacted_content_hash: derived_redacted_content_hash.as_deref(),
+        linked_receipts: opts.linked_receipts,
+        created_at: opts.created_at,
+    };
+    let (body, body_hash) = corecrux_receipts::build_redaction_receipt_body_v1(&input);
+    write_parented(opts.out_body, &body)?;
+
+    let mut sig_path_out = None;
+    if let Some(sig_path) = opts.out_sig {
+        let signing_key_b64 = opts
+            .signing_key_b64
+            .ok_or("signing-key-b64 is required when out-sig is set")?;
+        let key_bytes = decode_fixed_32_b64("signing-key-b64", signing_key_b64)?;
+        let signing_key = SigningKey::from_bytes(&key_bytes);
+        let sig = corecrux_receipts::sign_redaction_receipt_v1(
+            opts.receipt_id,
+            &body,
+            body_hash,
+            &signing_key,
+            opts.key_id,
+            opts.signed_at,
+        );
+        let mut sig_bytes = Vec::new();
+        ciborium::ser::into_writer(&sig, &mut sig_bytes)?;
+        write_parented(sig_path, &sig_bytes)?;
+        sig_path_out = Some(sig_path.display().to_string());
+    }
+
+    Ok(RedactionAttestReportV1 {
+        body_path: opts.out_body.display().to_string(),
+        sig_path: sig_path_out,
+        envelope_path: envelope_path_out,
+        receipt_id: opts.receipt_id.to_string(),
+        redaction_id: opts.redaction_id.to_string(),
+        subject_cek_id: opts.subject_cek_id.to_string(),
+        subject_cek_commitment: subject_cek_commitment.to_string(),
+        prior_content_hash: derived_prior_content_hash,
+        redacted_content_hash: derived_redacted_content_hash,
+        signed: opts.out_sig.is_some(),
+        crypto_shred_staged: opts.crypto_shred_staged,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_coverage_attestation_v1(
+    out_body: &Path,
+    out_sig: Option<&Path>,
+    signing_key_b64: Option<&str>,
+    key_id: &str,
+    signed_at: &str,
+    tenant_id: &str,
+    receipt_id: &str,
+    attestation_id: &str,
+    actor_passport: &str,
+    subject: &str,
+    corpus: &str,
+    run_id: &str,
+    commit_sha: &str,
+    lane_flags: &str,
+    metric: &str,
+    score: f64,
+    floor: Option<f64>,
+    below_floor: u64,
+    capability_count: Option<u64>,
+    covered_count: Option<u64>,
+    gaps_hash: Option<&str>,
+    report_path: &Path,
+    created_at: &str,
+) -> Result<CoverageAttestReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let report_bytes = std::fs::read(report_path)?;
+    let report_hash = format!("blake3:{}", hex32(blake3::hash(&report_bytes).as_bytes()));
+    let input = CoverageAttestationBodyInputV1 {
+        tenant_id,
+        receipt_id,
+        attestation_id,
+        actor_passport,
+        subject,
+        corpus,
+        run_id,
+        commit_sha,
+        lane_flags,
+        metric,
+        score,
+        floor,
+        below_floor,
+        capability_count,
+        covered_count,
+        gaps_hash,
+        report_hash: &report_hash,
+        created_at,
+    };
+    let (body, body_hash) = corecrux_receipts::build_coverage_attestation_body_v1(&input);
+    write_parented(out_body, &body)?;
+
+    let mut sig_path_out = None;
+    if let Some(sig_path) = out_sig {
+        let signing_key_b64 = signing_key_b64.ok_or("signing-key-b64 is required when out-sig is set")?;
+        let key_bytes = base64::engine::general_purpose::STANDARD.decode(signing_key_b64)?;
+        let key_bytes: [u8; 32] = key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "signing-key-b64 must decode to a 32-byte Ed25519 signing key")?;
+        let signing_key = SigningKey::from_bytes(&key_bytes);
+        let sig = corecrux_receipts::sign_coverage_attestation_v1(
+            receipt_id,
+            &body,
+            body_hash,
+            &signing_key,
+            key_id,
+            signed_at,
+        );
+        let mut sig_bytes = Vec::new();
+        ciborium::ser::into_writer(&sig, &mut sig_bytes)?;
+        write_parented(sig_path, &sig_bytes)?;
+        sig_path_out = Some(sig_path.display().to_string());
+    }
+
+    Ok(CoverageAttestReportV1 {
+        body_path: out_body.display().to_string(),
+        sig_path: sig_path_out,
+        receipt_id: receipt_id.to_string(),
+        attestation_id: attestation_id.to_string(),
+        report_hash,
+        signed: out_sig.is_some(),
+    })
+}
+
+pub fn verify_external_anchor_body_file_v1(
+    body_path: &Path,
+) -> Result<WitnessVerifyReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let body = std::fs::read(body_path)?;
+    let kind_ok = assert_external_anchor_kind_v1(&body);
+    let proof_ok = kind_ok && verify_external_anchor_body_v1(&body);
+    Ok(WitnessVerifyReportV1 {
+        body_path: body_path.display().to_string(),
+        kind: "external_anchor".to_string(),
+        ok: proof_ok,
+        failure_reason: if proof_ok {
+            None
+        } else if kind_ok {
+            Some("RFC6962 inclusion proof does not match leaf/root/tree metadata".to_string())
+        } else {
+            Some("body is not an external_anchor receipt body".to_string())
+        },
+    })
+}
+
+pub fn verify_rfc3161_timestamp_body_file_v1(
+    body_path: &Path,
+    expected_message_imprint_hash: Option<&str>,
+) -> Result<WitnessVerifyReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let body = std::fs::read(body_path)?;
+    let kind_ok = assert_rfc3161_timestamp_kind_v1(&body);
+    let binding_ok = kind_ok && verify_rfc3161_timestamp_token_binding_v1(&body, expected_message_imprint_hash);
+    Ok(WitnessVerifyReportV1 {
+        body_path: body_path.display().to_string(),
+        kind: "rfc3161_timestamp".to_string(),
+        ok: binding_ok,
+        failure_reason: if binding_ok {
+            None
+        } else if kind_ok {
+            Some("timestamp token hash or expected message imprint binding mismatch".to_string())
+        } else {
+            Some("body is not an rfc3161_timestamp receipt body".to_string())
+        },
+    })
 }
 
 pub fn seed_minimal_receipt_v1(
@@ -363,6 +966,26 @@ pub fn backfill_subject_index_v1(
     })
 }
 
+fn decode_fixed_32_b64(field: &'static str, value: &str) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|err| format!("{field} is not valid base64: {err}"))?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("{field} must decode to 32 bytes").into())
+}
+
+fn decode_fixed_24_b64(field: &'static str, value: &str) -> Result<[u8; 24], Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|err| format!("{field} is not valid base64: {err}"))?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("{field} must decode to 24 bytes").into())
+}
+
 fn hex32(bytes: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = [0u8; 64];
@@ -371,6 +994,16 @@ fn hex32(bytes: &[u8; 32]) -> String {
         out[i * 2 + 1] = HEX[(b & 0x0f) as usize];
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+fn write_parented(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, bytes)?;
+    Ok(())
 }
 
 fn list_shards(shard_root: &Path) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
@@ -454,6 +1087,161 @@ mod tests {
     }
 
     #[test]
+    fn redaction_attest_stages_crypto_shred_envelope_without_key_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("plain.txt");
+        let body_path = dir.path().join("redaction.cbor");
+        let envelope_path = dir.path().join("envelope.json");
+        std::fs::write(&plaintext_path, b"erase me").unwrap();
+
+        let report = write_redaction_attestation_v1(&RedactionAttestOptionsV1 {
+            out_body: &body_path,
+            out_sig: None,
+            signing_key_b64: None,
+            key_id: "redaction-attest",
+            signed_at: "2026-06-14T10:00:00Z",
+            tenant_id: "tenant-a",
+            receipt_id: "red_1",
+            redaction_id: "red_1",
+            actor_passport: "passport:operator",
+            subject_type: "fact",
+            subject_id: "f_1",
+            request_id: "forget_1",
+            scope: "subject",
+            method: "crypto_shred",
+            subject_cek_id: "cek:tenant-a:fact:f_1:v1",
+            subject_cek_commitment: None,
+            cek_destroyed_at: None,
+            prior_content_hash: None,
+            redacted_content_hash: None,
+            linked_receipts: &["forget_1"],
+            created_at: "2026-06-14T10:00:00Z",
+            crypto_shred_staged: true,
+            seal_plaintext: Some(&plaintext_path),
+            out_envelope: Some(&envelope_path),
+            cek_b64: Some("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="),
+            nonce_b64: Some("CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJ"),
+        })
+        .unwrap();
+
+        assert!(body_path.exists());
+        assert!(envelope_path.exists());
+        assert!(report.crypto_shred_staged);
+        assert!(report.prior_content_hash.as_deref().unwrap().starts_with("blake3:"));
+        assert!(report.redacted_content_hash.as_deref().unwrap().starts_with("blake3:"));
+        let envelope_json = std::fs::read_to_string(&envelope_path).unwrap();
+        assert!(envelope_json.contains("\"ciphertext_b64\""));
+        assert!(!envelope_json.contains("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="));
+        assert!(!envelope_json.contains("erase me"));
+    }
+
+    #[test]
+    fn chain_reanchor_attest_writes_body_that_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let body_path = dir.path().join("chain.cbor");
+        let report = write_chain_reanchor_attestation_v1(&ChainReanchorAttestOptionsV1 {
+            out_body: &body_path,
+            out_sig: None,
+            signing_key_b64: None,
+            key_id: "chain-reanchor",
+            signed_at: "2026-06-14T10:00:00Z",
+            tenant_id: "tenant-a",
+            receipt_id: "cr_1",
+            migration_id: "migration-1",
+            actor_passport: "passport:operator",
+            old_chain_head: "blake3:old",
+            new_chain_head: "blake3:new",
+            old_hash_alg: "blake3",
+            new_hash_alg: "blake3+external-anchor",
+            first_receipt_id: "r_1",
+            last_receipt_id: "r_2",
+            receipt_count: 2,
+            reason: "external-anchor-upgrade",
+            linked_receipts: &["anchor_1"],
+            created_at: "2026-06-14T10:00:00Z",
+        })
+        .unwrap();
+        assert!(body_path.exists());
+        assert!(report.verified);
+        assert_eq!(report.linked_receipts_count, 1);
+
+        let verify = verify_chain_reanchor_body_file_v1(&body_path).unwrap();
+        assert!(verify.ok);
+        assert!(verify.failure_reason.is_none());
+    }
+
+    #[test]
+    fn external_anchor_attest_writes_body_that_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let body_path = dir.path().join("anchor.cbor");
+        let leaf = "00".repeat(32);
+        let report = write_external_anchor_attestation_v1(&ExternalAnchorAttestOptionsV1 {
+            out_body: &body_path,
+            out_sig: None,
+            signing_key_b64: None,
+            key_id: "external-anchor",
+            signed_at: "2026-06-14T10:00:00Z",
+            tenant_id: "tenant-a",
+            receipt_id: "anchor_receipt_1",
+            anchor_id: "anchor-1",
+            actor_passport: "passport:operator",
+            transparency_log: "rekor",
+            log_url: "https://rekor.example",
+            rekor_uuid: Some("uuid-1"),
+            leaf_hash: &leaf,
+            log_index: 0,
+            tree_size: 1,
+            root_hash: &leaf,
+            inclusion_proof: &[],
+            checkpoint: None,
+            integrated_time: "2026-06-14T10:00:00Z",
+            created_at: "2026-06-14T10:00:00Z",
+        })
+        .unwrap();
+        assert!(body_path.exists());
+        assert_eq!(report.kind, "external_anchor");
+        assert!(report.verified);
+
+        let verify = verify_external_anchor_body_file_v1(&body_path).unwrap();
+        assert!(verify.ok);
+    }
+
+    #[test]
+    fn rfc3161_timestamp_attest_writes_body_that_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let body_path = dir.path().join("tsa.cbor");
+        let token_path = dir.path().join("token.der");
+        std::fs::write(&token_path, b"fixture-token").unwrap();
+        let imprint = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let report = write_rfc3161_timestamp_attestation_v1(&Rfc3161TimestampAttestOptionsV1 {
+            out_body: &body_path,
+            out_sig: None,
+            signing_key_b64: None,
+            key_id: "rfc3161-timestamp",
+            signed_at: "2026-06-14T10:00:00Z",
+            tenant_id: "tenant-a",
+            receipt_id: "tsa_1",
+            timestamp_id: "timestamp-1",
+            actor_passport: "passport:operator",
+            tsa_url: "https://tsa.example",
+            tsa_policy_oid: Some("1.2.3.4"),
+            message_imprint_alg: "sha256",
+            message_imprint_hash: imprint,
+            timestamp_token_der: &token_path,
+            serial_number: Some("01"),
+            gen_time: "2026-06-14T10:00:00Z",
+            created_at: "2026-06-14T10:00:00Z",
+        })
+        .unwrap();
+        assert!(body_path.exists());
+        assert_eq!(report.kind, "rfc3161_timestamp");
+        assert!(report.verified);
+
+        let verify = verify_rfc3161_timestamp_body_file_v1(&body_path, Some(imprint)).unwrap();
+        assert!(verify.ok);
+    }
+
+    #[test]
     fn backfill_totals_default_is_zero() {
         let t = BackfillTotalsV1::default();
         assert_eq!(t.shards, 0);
@@ -493,6 +1281,102 @@ mod tests {
         let json = serde_json::to_string(&report).expect("serialize");
         assert!(json.contains("\"dry_run\":true"));
         assert!(json.contains("\"scanned_frames\":100"));
+    }
+
+    #[test]
+    fn witness_verify_report_serializes() {
+        let report = WitnessVerifyReportV1 {
+            body_path: "/tmp/body.cbor".to_string(),
+            kind: "external_anchor".to_string(),
+            ok: false,
+            failure_reason: Some("bad proof".to_string()),
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"kind\":\"external_anchor\""));
+        assert!(json.contains("\"ok\":false"));
+        assert!(json.contains("bad proof"));
+    }
+
+    #[test]
+    fn coverage_attest_writes_body_and_signature() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report_path = tmp.path().join("coverage.json");
+        std::fs::write(&report_path, br#"{"coverage":0.92}"#).unwrap();
+        let body_path = tmp.path().join("out/body.cbor");
+        let sig_path = tmp.path().join("out/body.sig.cbor");
+        let signing_key = SigningKey::from_bytes(&[99u8; 32]);
+        let signing_key_b64 = base64::engine::general_purpose::STANDARD.encode(signing_key.to_bytes());
+
+        let report = write_coverage_attestation_v1(
+            &body_path,
+            Some(&sig_path),
+            Some(&signing_key_b64),
+            "coverage-key",
+            "2026-06-14T10:00:01Z",
+            "tenant-a",
+            "cov_1",
+            "coverage-1",
+            "passport:agent",
+            "feature_registry",
+            "LME-S",
+            "run-1",
+            "deadbeef",
+            "dense=on,sparse=on",
+            "capability_coverage",
+            0.92,
+            Some(0.9),
+            0,
+            Some(100),
+            Some(92),
+            Some("blake3:gaps"),
+            &report_path,
+            "2026-06-14T10:00:00Z",
+        )
+        .unwrap();
+
+        assert!(body_path.exists());
+        assert!(sig_path.exists());
+        assert!(report.signed);
+        assert!(report.report_hash.starts_with("blake3:"));
+        let body = std::fs::read(body_path).unwrap();
+        assert!(corecrux_receipts::assert_coverage_attestation_kind_v1(&body));
+    }
+
+    #[test]
+    fn verify_rfc3161_timestamp_body_file_checks_expected_imprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body_path = tmp.path().join("tsa.cbor");
+        let input = corecrux_receipts::Rfc3161TimestampBodyInputV1 {
+            tenant_id: "tenant-a",
+            receipt_id: "tsa_1",
+            timestamp_id: "tsa-1",
+            actor_passport: "passport:operator",
+            tsa_url: "https://tsa.example",
+            tsa_policy_oid: None,
+            message_imprint_alg: "sha256",
+            message_imprint_hash: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            timestamp_token_der: b"fake-token",
+            serial_number: None,
+            gen_time: "2026-06-14T10:00:00Z",
+            created_at: "2026-06-14T10:00:01Z",
+        };
+        let (body, _) = corecrux_receipts::build_rfc3161_timestamp_body_v1(&input);
+        std::fs::write(&body_path, body).unwrap();
+
+        let ok = verify_rfc3161_timestamp_body_file_v1(
+            &body_path,
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+        assert!(ok.ok);
+
+        let bad = verify_rfc3161_timestamp_body_file_v1(
+            &body_path,
+            Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+        )
+        .unwrap();
+        assert!(!bad.ok);
+        assert!(bad.failure_reason.as_deref().unwrap_or("").contains("message imprint"));
     }
 
     #[test]

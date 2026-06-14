@@ -33,9 +33,10 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use corecrux_receipts::{
-    build_context_injected_body_v1, build_stream_end_body_v1, sign_stream_v1, ContextInjectedBodyInputV1,
-    MemoryUseEntryV1, StreamEndBodyInputV1, StreamEndStateV1, CONTEXT_INJECTED_KIND_V1, STREAM_ABORTED_KIND_V1,
-    STREAM_BODY_SCHEMA_V1, STREAM_COMPLETED_KIND_V1,
+    build_context_injected_body_v1, build_model_invocation_body_v1, build_stream_end_body_v1, sign_model_invocation_v1,
+    sign_stream_v1, ContextInjectedBodyInputV1, MemoryUseEntryV1, ModelInvocationBodyInputV1, StreamEndBodyInputV1,
+    StreamEndStateV1, AUDIT_GAP_BODY_SCHEMA_V1, CONTEXT_INJECTED_KIND_V1, MODEL_INVOCATION_KIND_V1,
+    STREAM_ABORTED_KIND_V1, STREAM_BODY_SCHEMA_V1, STREAM_COMPLETED_KIND_V1,
 };
 use ed25519_dalek::SigningKey;
 use serde::Deserialize;
@@ -44,11 +45,11 @@ use serde_json::{json, Value};
 use super::observations::{append_one, PostObservationBody};
 use super::{problem_response, AppState, HeaderMap};
 
-/// Is `kind` one of the G19 stream/context receipt kinds this module lifts?
+/// Is `kind` one of the mediation receipt draft kinds this module lifts?
 pub(super) fn is_stream_receipt_kind(kind: &str) -> bool {
     matches!(
         kind,
-        CONTEXT_INJECTED_KIND_V1 | STREAM_COMPLETED_KIND_V1 | STREAM_ABORTED_KIND_V1
+        CONTEXT_INJECTED_KIND_V1 | STREAM_COMPLETED_KIND_V1 | STREAM_ABORTED_KIND_V1 | MODEL_INVOCATION_KIND_V1
     )
 }
 
@@ -102,6 +103,33 @@ pub(super) struct StreamReceiptDraft {
     pub output_digest: Option<String>,
     #[serde(default)]
     pub injected_stable_hash: Option<String>,
+    // ── model invocation provenance ──
+    #[serde(default)]
+    pub invocation_id: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub model_version: Option<String>,
+    #[serde(default)]
+    pub provider_request_id: Option<String>,
+    #[serde(default)]
+    pub prompt_hash: Option<String>,
+    #[serde(default)]
+    pub retrieval_set_hash: Option<String>,
+    #[serde(default)]
+    pub output_hash: Option<String>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub seed: Option<i64>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
     #[serde(default)]
     pub created_at: Option<String>,
 }
@@ -214,6 +242,42 @@ pub(super) fn mint_stream_receipt(
                 created_at: &created_at,
             })
         }
+        MODEL_INVOCATION_KIND_V1 => {
+            let invocation_id = draft.invocation_id.as_deref().filter(|s| !s.trim().is_empty()).ok_or((
+                StatusCode::BAD_REQUEST,
+                "model_invocation draft requires invocation_id".to_string(),
+            ))?;
+            let prompt_hash = draft.prompt_hash.as_deref().filter(|s| !s.trim().is_empty()).ok_or((
+                StatusCode::BAD_REQUEST,
+                "model_invocation draft requires prompt_hash".to_string(),
+            ))?;
+            let started_at = draft.started_at.as_deref().unwrap_or(&created_at);
+            let completed_at = draft.completed_at.as_deref().or(draft.ended_at.as_deref());
+            build_model_invocation_body_v1(&ModelInvocationBodyInputV1 {
+                tenant_id,
+                receipt_id: &receipt_id,
+                invocation_id,
+                actor_passport: actor,
+                provider: draft.provider.as_deref().unwrap_or("unknown"),
+                model_id: draft
+                    .model_id
+                    .as_deref()
+                    .or(draft.model.as_deref())
+                    .unwrap_or("unknown"),
+                model_version: draft.model_version.as_deref(),
+                provider_request_id: draft.provider_request_id.as_deref(),
+                prompt_hash,
+                retrieval_set_hash: draft.retrieval_set_hash.as_deref(),
+                output_hash: draft.output_hash.as_deref().or(draft.output_digest.as_deref()),
+                temperature: draft.temperature,
+                top_p: draft.top_p,
+                seed: draft.seed,
+                max_tokens: draft.max_tokens,
+                started_at,
+                completed_at,
+                created_at: &created_at,
+            })
+        }
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -229,14 +293,30 @@ pub(super) fn mint_stream_receipt(
     }
 
     let signing_key = load_signing_key(state).map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
-    let sig = sign_stream_v1(
-        &receipt_id,
-        &body_bytes,
-        body_hash,
-        &signing_key,
-        &state.passport_fpr,
-        &now,
-    );
+    let sig = if draft.kind == MODEL_INVOCATION_KIND_V1 {
+        sign_model_invocation_v1(
+            &receipt_id,
+            &body_bytes,
+            body_hash,
+            &signing_key,
+            &state.passport_fpr,
+            &now,
+        )
+    } else {
+        sign_stream_v1(
+            &receipt_id,
+            &body_bytes,
+            body_hash,
+            &signing_key,
+            &state.passport_fpr,
+            &now,
+        )
+    };
+    let body_schema = if draft.kind == MODEL_INVOCATION_KIND_V1 {
+        AUDIT_GAP_BODY_SCHEMA_V1
+    } else {
+        STREAM_BODY_SCHEMA_V1
+    };
 
     // T.4: record through the signed-observation path — same per-group log
     // the tool-mediation receipts ride (`mediation::<group>`).
@@ -251,7 +331,7 @@ pub(super) fn mint_stream_receipt(
         payload: json!({
             "receipt_id": receipt_id,
             "kind": draft.kind,
-            "body_schema": STREAM_BODY_SCHEMA_V1,
+            "body_schema": body_schema,
             "body_cbor_hex": hex::encode(&body_bytes),
             "body_hash": format!("blake3:{}", hex::encode(body_hash)),
             "sig": {
@@ -264,6 +344,10 @@ pub(super) fn mint_stream_receipt(
             "session_id": session_id,
             "stable_hash": draft.stable_hash,
             "injected_stable_hash": draft.injected_stable_hash,
+            "invocation_id": draft.invocation_id,
+            "prompt_hash": draft.prompt_hash,
+            "retrieval_set_hash": draft.retrieval_set_hash,
+            "output_hash": draft.output_hash,
         }),
     };
     let (resp, _tip) = append_one(state, &scoped, actor, obs_body, None)?;
@@ -475,6 +559,48 @@ mod tests {
     }
 
     #[test]
+    fn model_invocation_draft_lifts_with_prompt_retrieval_and_output_hashes() {
+        let state = signing_state();
+        let draft = StreamReceiptDraft {
+            kind: MODEL_INVOCATION_KIND_V1.to_string(),
+            session_id: Some("s-model".to_string()),
+            invocation_id: Some("inv-1".to_string()),
+            provider: Some("openai".to_string()),
+            model_id: Some("gpt-5.4".to_string()),
+            model_version: Some("2026-06-01".to_string()),
+            provider_request_id: Some("req_123".to_string()),
+            prompt_hash: Some("blake3:prompt".to_string()),
+            retrieval_set_hash: Some("blake3:retrieval".to_string()),
+            output_hash: Some("blake3:output".to_string()),
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            seed: Some(42),
+            max_tokens: Some(2048),
+            started_at: Some("2026-06-14T10:00:00Z".to_string()),
+            completed_at: Some("2026-06-14T10:00:02Z".to_string()),
+            ..StreamReceiptDraft::default()
+        };
+        let minted = mint_stream_receipt(&state, "operator", &draft).expect("mint model invocation");
+        assert_eq!(minted.kind, MODEL_INVOCATION_KIND_V1);
+
+        let records = read_mediation_records(&state, "s-model");
+        assert_eq!(records.len(), 1);
+        let payload = &records[0].payload;
+        assert_eq!(payload["kind"], MODEL_INVOCATION_KIND_V1);
+        assert_eq!(payload["invocation_id"], "inv-1");
+        assert_eq!(payload["prompt_hash"], "blake3:prompt");
+        assert_eq!(payload["retrieval_set_hash"], "blake3:retrieval");
+        assert_eq!(payload["output_hash"], "blake3:output");
+
+        let body = hex::decode(payload["body_cbor_hex"].as_str().expect("cbor hex")).expect("hex");
+        assert!(corecrux_receipts::assert_model_invocation_kind_v1(&body));
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(body_text.contains("blake3:prompt"));
+        assert!(body_text.contains("blake3:retrieval"));
+        assert!(body_text.contains("blake3:output"));
+    }
+
+    #[test]
     fn injected_draft_without_stable_hash_is_rejected() {
         let state = signing_state();
         let mut draft = injected_draft();
@@ -511,12 +637,16 @@ mod tests {
         use axum::extract::State;
 
         let draft = serde_json::json!({
-            "kind": "stream_completed",
+            "kind": "model_invocation",
             "session_id": "s-route",
             "provider": "llm_shim",
             "model": "llama3:8b",
-            "ended_at": "2026-06-12T00:00:09Z",
-            "output_digest": "sha256:00",
+            "invocation_id": "inv-route",
+            "prompt_hash": "blake3:prompt",
+            "retrieval_set_hash": "blake3:retrieval",
+            "output_hash": "blake3:output",
+            "started_at": "2026-06-12T00:00:01Z",
+            "completed_at": "2026-06-12T00:00:09Z",
         });
 
         // Flag ON → draft is lifted into a signed receipt (201).
@@ -550,10 +680,11 @@ mod tests {
     }
 
     #[test]
-    fn kind_predicate_matches_exactly_the_three_kinds() {
+    fn kind_predicate_matches_supported_draft_kinds() {
         assert!(is_stream_receipt_kind("context_injected"));
         assert!(is_stream_receipt_kind("stream_completed"));
         assert!(is_stream_receipt_kind("stream_aborted"));
+        assert!(is_stream_receipt_kind("model_invocation"));
         assert!(!is_stream_receipt_kind("tool_mediation"));
         assert!(!is_stream_receipt_kind(""));
     }

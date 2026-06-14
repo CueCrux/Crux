@@ -1285,6 +1285,349 @@ enum ReceiptsCommand {
         #[arg(long, default_value_t = 8192)]
         batch_frames: u32,
     },
+
+    /// Verify an external-anchor receipt body inclusion proof offline.
+    #[command(name = "verify-external-anchor")]
+    VerifyExternalAnchor {
+        /// Path to the raw receipt.body.v1 CBOR bytes.
+        #[arg(long)]
+        body: PathBuf,
+    },
+
+    /// Verify an RFC3161 timestamp receipt body token binding offline.
+    #[command(name = "verify-rfc3161-timestamp")]
+    VerifyRfc3161Timestamp {
+        /// Path to the raw receipt.body.v1 CBOR bytes.
+        #[arg(long)]
+        body: PathBuf,
+        /// Optional expected SHA-256 message imprint hash (hex, `sha256:` prefix accepted).
+        #[arg(long)]
+        expected_imprint_hash: Option<String>,
+    },
+
+    /// Build an external_anchor receipt body from a transparency-log inclusion proof.
+    #[command(name = "external-anchor-attest")]
+    ExternalAnchorAttest {
+        /// Output path for the raw receipt.body.v1 CBOR bytes.
+        #[arg(long)]
+        out_body: PathBuf,
+        /// Optional output path for detached receipt.sig.v1 CBOR bytes.
+        #[arg(long)]
+        out_sig: Option<PathBuf>,
+        /// Base64 32-byte Ed25519 signing key. Required when --out-sig is set.
+        #[arg(long)]
+        signing_key_b64: Option<String>,
+        /// Signature key identifier.
+        #[arg(long, default_value = "external-anchor")]
+        key_id: String,
+        /// Signature timestamp; defaults to --created-at when omitted.
+        #[arg(long)]
+        signed_at: Option<String>,
+        #[arg(long)]
+        tenant_id: String,
+        #[arg(long)]
+        receipt_id: String,
+        /// Anchor ID. Defaults to --receipt-id when omitted.
+        #[arg(long)]
+        anchor_id: Option<String>,
+        #[arg(long, default_value = "corecruxctl")]
+        actor_passport: String,
+        #[arg(long, default_value = "rekor")]
+        transparency_log: String,
+        #[arg(long)]
+        log_url: String,
+        #[arg(long)]
+        rekor_uuid: Option<String>,
+        #[arg(long)]
+        leaf_hash: String,
+        #[arg(long)]
+        log_index: u64,
+        #[arg(long)]
+        tree_size: u64,
+        #[arg(long)]
+        root_hash: String,
+        #[arg(long = "inclusion-proof")]
+        inclusion_proof: Vec<String>,
+        #[arg(long)]
+        checkpoint: Option<String>,
+        #[arg(long)]
+        integrated_time: String,
+        #[arg(long)]
+        created_at: String,
+    },
+
+    /// Build an rfc3161_timestamp receipt body from a TSA token file.
+    #[command(name = "rfc3161-timestamp-attest")]
+    Rfc3161TimestampAttest {
+        /// Output path for the raw receipt.body.v1 CBOR bytes.
+        #[arg(long)]
+        out_body: PathBuf,
+        /// Optional output path for detached receipt.sig.v1 CBOR bytes.
+        #[arg(long)]
+        out_sig: Option<PathBuf>,
+        /// Base64 32-byte Ed25519 signing key. Required when --out-sig is set.
+        #[arg(long)]
+        signing_key_b64: Option<String>,
+        /// Signature key identifier.
+        #[arg(long, default_value = "rfc3161-timestamp")]
+        key_id: String,
+        /// Signature timestamp; defaults to --created-at when omitted.
+        #[arg(long)]
+        signed_at: Option<String>,
+        #[arg(long)]
+        tenant_id: String,
+        #[arg(long)]
+        receipt_id: String,
+        /// Timestamp ID. Defaults to --receipt-id when omitted.
+        #[arg(long)]
+        timestamp_id: Option<String>,
+        #[arg(long, default_value = "corecruxctl")]
+        actor_passport: String,
+        #[arg(long)]
+        tsa_url: String,
+        #[arg(long)]
+        tsa_policy_oid: Option<String>,
+        #[arg(long, default_value = "sha256")]
+        message_imprint_alg: String,
+        #[arg(long)]
+        message_imprint_hash: String,
+        /// DER-encoded RFC3161 TimeStampToken returned by the TSA.
+        #[arg(long)]
+        timestamp_token_der: PathBuf,
+        #[arg(long)]
+        serial_number: Option<String>,
+        #[arg(long)]
+        gen_time: String,
+        #[arg(long)]
+        created_at: String,
+    },
+
+    /// Verify a chain_reanchor receipt body offline.
+    #[command(name = "verify-chain-reanchor")]
+    VerifyChainReanchor {
+        /// Path to the raw receipt.body.v1 CBOR bytes.
+        #[arg(long)]
+        body: PathBuf,
+    },
+
+    /// Build a chain_reanchor receipt body for crypto/signature migration.
+    #[command(name = "chain-reanchor-attest")]
+    ChainReanchorAttest {
+        /// Output path for the raw receipt.body.v1 CBOR bytes.
+        #[arg(long)]
+        out_body: PathBuf,
+        /// Optional output path for detached receipt.sig.v1 CBOR bytes.
+        #[arg(long)]
+        out_sig: Option<PathBuf>,
+        /// Base64 32-byte Ed25519 signing key. Required when --out-sig is set.
+        #[arg(long)]
+        signing_key_b64: Option<String>,
+        /// Signature key identifier.
+        #[arg(long, default_value = "chain-reanchor")]
+        key_id: String,
+        /// Signature timestamp; defaults to --created-at when omitted.
+        #[arg(long)]
+        signed_at: Option<String>,
+        /// Tenant ID.
+        #[arg(long)]
+        tenant_id: String,
+        /// Receipt ID.
+        #[arg(long)]
+        receipt_id: String,
+        /// Migration ID. Defaults to --receipt-id when omitted.
+        #[arg(long)]
+        migration_id: Option<String>,
+        /// Actor/passport creating the reanchor attestation.
+        #[arg(long, default_value = "corecruxctl")]
+        actor_passport: String,
+        /// Old chain head hash.
+        #[arg(long)]
+        old_chain_head: String,
+        /// New chain head hash.
+        #[arg(long)]
+        new_chain_head: String,
+        /// Old hash/signature/anchor algorithm label.
+        #[arg(long, default_value = "blake3")]
+        old_hash_alg: String,
+        /// New hash/signature/anchor algorithm label.
+        #[arg(long, default_value = "blake3+external-anchor")]
+        new_hash_alg: String,
+        /// First receipt id covered by this migration.
+        #[arg(long)]
+        first_receipt_id: String,
+        /// Last receipt id covered by this migration.
+        #[arg(long)]
+        last_receipt_id: String,
+        /// Count of receipts covered by this migration.
+        #[arg(long)]
+        receipt_count: u64,
+        /// Migration reason.
+        #[arg(long)]
+        reason: String,
+        /// Linked receipt id; repeat for multiple ids.
+        #[arg(long = "linked-receipt")]
+        linked_receipts: Vec<String>,
+        /// Receipt creation timestamp.
+        #[arg(long)]
+        created_at: String,
+    },
+
+    /// Build a redaction receipt body, optionally with a staged crypto-shred envelope.
+    #[command(name = "redaction-attest")]
+    RedactionAttest {
+        /// Output path for the raw receipt.body.v1 CBOR bytes.
+        #[arg(long)]
+        out_body: PathBuf,
+        /// Optional output path for detached receipt.sig.v1 CBOR bytes.
+        #[arg(long)]
+        out_sig: Option<PathBuf>,
+        /// Base64 32-byte Ed25519 signing key. Required when --out-sig is set.
+        #[arg(long)]
+        signing_key_b64: Option<String>,
+        /// Signature key identifier.
+        #[arg(long, default_value = "redaction-attest")]
+        key_id: String,
+        /// Signature timestamp; defaults to --created-at when omitted.
+        #[arg(long)]
+        signed_at: Option<String>,
+        /// Tenant ID.
+        #[arg(long)]
+        tenant_id: String,
+        /// Receipt ID.
+        #[arg(long)]
+        receipt_id: String,
+        /// Redaction ID. Defaults to --receipt-id when omitted.
+        #[arg(long)]
+        redaction_id: Option<String>,
+        /// Actor/passport creating the attestation.
+        #[arg(long, default_value = "corecruxctl")]
+        actor_passport: String,
+        /// Subject type, e.g. fact, stream, document.
+        #[arg(long)]
+        subject_type: String,
+        /// Subject identifier.
+        #[arg(long)]
+        subject_id: String,
+        /// Source forget/DSAR/request identifier.
+        #[arg(long)]
+        request_id: String,
+        /// Redaction scope label.
+        #[arg(long, default_value = "subject")]
+        scope: String,
+        /// Redaction method.
+        #[arg(long, default_value = "crypto_shred")]
+        method: String,
+        /// Subject CEK id.
+        #[arg(long)]
+        subject_cek_id: String,
+        /// Subject CEK commitment. Derived when --crypto-shred-staged is used.
+        #[arg(long)]
+        subject_cek_commitment: Option<String>,
+        /// CEK destruction timestamp. Omit for non-destructive staged receipts.
+        #[arg(long)]
+        cek_destroyed_at: Option<String>,
+        /// Prior content hash. Derived from --seal-plaintext when omitted.
+        #[arg(long)]
+        prior_content_hash: Option<String>,
+        /// Redacted content hash. Derived from staged ciphertext when omitted.
+        #[arg(long)]
+        redacted_content_hash: Option<String>,
+        /// Linked receipt id; repeat for multiple ids.
+        #[arg(long = "linked-receipt")]
+        linked_receipts: Vec<String>,
+        /// Receipt creation timestamp.
+        #[arg(long)]
+        created_at: String,
+        /// Explicitly permit writing a non-destructive local crypto-shred envelope.
+        #[arg(long, default_value_t = false)]
+        crypto_shred_staged: bool,
+        /// Plaintext path to seal into an envelope. Requires --crypto-shred-staged.
+        #[arg(long)]
+        seal_plaintext: Option<PathBuf>,
+        /// Output path for the staged crypto-shred JSON envelope.
+        #[arg(long)]
+        out_envelope: Option<PathBuf>,
+        /// Base64 32-byte subject CEK. Consumed to write the envelope; never written.
+        #[arg(long)]
+        cek_b64: Option<String>,
+        /// Base64 24-byte XChaCha20 nonce for deterministic staging/replay.
+        #[arg(long)]
+        nonce_b64: Option<String>,
+    },
+
+    /// Build a coverage_attestation receipt body from a reproducible report file.
+    #[command(name = "coverage-attest")]
+    CoverageAttest {
+        /// Output path for the raw receipt.body.v1 CBOR bytes.
+        #[arg(long)]
+        out_body: PathBuf,
+        /// Optional output path for detached receipt.sig.v1 CBOR bytes.
+        #[arg(long)]
+        out_sig: Option<PathBuf>,
+        /// Base64 32-byte Ed25519 signing key. Required when --out-sig is set.
+        #[arg(long)]
+        signing_key_b64: Option<String>,
+        /// Signature key identifier.
+        #[arg(long, default_value = "coverage-attest")]
+        key_id: String,
+        /// Signature timestamp; defaults to --created-at when omitted.
+        #[arg(long)]
+        signed_at: Option<String>,
+        /// Tenant ID.
+        #[arg(long)]
+        tenant_id: String,
+        /// Receipt ID.
+        #[arg(long)]
+        receipt_id: String,
+        /// Attestation ID. Defaults to --receipt-id when omitted.
+        #[arg(long)]
+        attestation_id: Option<String>,
+        /// Actor/passport creating the attestation.
+        #[arg(long, default_value = "corecruxctl")]
+        actor_passport: String,
+        /// Attested subject.
+        #[arg(long, default_value = "feature_registry")]
+        subject: String,
+        /// Corpus identity, e.g. LME-S, LME-M, LME-500.
+        #[arg(long)]
+        corpus: String,
+        /// Reproducible run identifier.
+        #[arg(long)]
+        run_id: String,
+        /// Source commit SHA for the run.
+        #[arg(long)]
+        commit_sha: String,
+        /// Lane flags used during the run.
+        #[arg(long, default_value = "")]
+        lane_flags: String,
+        /// Metric name.
+        #[arg(long, default_value = "coverage")]
+        metric: String,
+        /// Metric value.
+        #[arg(long)]
+        score: f64,
+        /// Optional floor for the metric.
+        #[arg(long)]
+        floor: Option<f64>,
+        /// Count below floor.
+        #[arg(long, default_value_t = 0)]
+        below_floor: u64,
+        /// Optional capability count.
+        #[arg(long)]
+        capability_count: Option<u64>,
+        /// Optional covered count.
+        #[arg(long)]
+        covered_count: Option<u64>,
+        /// Optional hash of a gaps payload.
+        #[arg(long)]
+        gaps_hash: Option<String>,
+        /// Path to the underlying report file whose BLAKE3 hash is bound.
+        #[arg(long)]
+        report: PathBuf,
+        /// Receipt creation timestamp.
+        #[arg(long)]
+        created_at: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2042,6 +2385,305 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             } => {
                 let report =
                     receipts::backfill_subject_index_v1(&data_dir, shard, dry_run, device_index, batch_frames)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            ReceiptsCommand::VerifyExternalAnchor { body } => {
+                let report = receipts::verify_external_anchor_body_file_v1(&body)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.ok {
+                    Ok(())
+                } else {
+                    Err(report
+                        .failure_reason
+                        .unwrap_or_else(|| "external anchor verification failed".to_string())
+                        .into())
+                }
+            }
+            ReceiptsCommand::VerifyRfc3161Timestamp {
+                body,
+                expected_imprint_hash,
+            } => {
+                let report = receipts::verify_rfc3161_timestamp_body_file_v1(&body, expected_imprint_hash.as_deref())?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.ok {
+                    Ok(())
+                } else {
+                    Err(report
+                        .failure_reason
+                        .unwrap_or_else(|| "RFC3161 timestamp verification failed".to_string())
+                        .into())
+                }
+            }
+            ReceiptsCommand::ExternalAnchorAttest {
+                out_body,
+                out_sig,
+                signing_key_b64,
+                key_id,
+                signed_at,
+                tenant_id,
+                receipt_id,
+                anchor_id,
+                actor_passport,
+                transparency_log,
+                log_url,
+                rekor_uuid,
+                leaf_hash,
+                log_index,
+                tree_size,
+                root_hash,
+                inclusion_proof,
+                checkpoint,
+                integrated_time,
+                created_at,
+            } => {
+                let anchor_id = anchor_id.unwrap_or_else(|| receipt_id.clone());
+                let signed_at = signed_at.unwrap_or_else(|| created_at.clone());
+                let proof_refs: Vec<&str> = inclusion_proof.iter().map(String::as_str).collect();
+                let report =
+                    receipts::write_external_anchor_attestation_v1(&receipts::ExternalAnchorAttestOptionsV1 {
+                        out_body: &out_body,
+                        out_sig: out_sig.as_deref(),
+                        signing_key_b64: signing_key_b64.as_deref(),
+                        key_id: &key_id,
+                        signed_at: &signed_at,
+                        tenant_id: &tenant_id,
+                        receipt_id: &receipt_id,
+                        anchor_id: &anchor_id,
+                        actor_passport: &actor_passport,
+                        transparency_log: &transparency_log,
+                        log_url: &log_url,
+                        rekor_uuid: rekor_uuid.as_deref(),
+                        leaf_hash: &leaf_hash,
+                        log_index,
+                        tree_size,
+                        root_hash: &root_hash,
+                        inclusion_proof: &proof_refs,
+                        checkpoint: checkpoint.as_deref(),
+                        integrated_time: &integrated_time,
+                        created_at: &created_at,
+                    })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            ReceiptsCommand::Rfc3161TimestampAttest {
+                out_body,
+                out_sig,
+                signing_key_b64,
+                key_id,
+                signed_at,
+                tenant_id,
+                receipt_id,
+                timestamp_id,
+                actor_passport,
+                tsa_url,
+                tsa_policy_oid,
+                message_imprint_alg,
+                message_imprint_hash,
+                timestamp_token_der,
+                serial_number,
+                gen_time,
+                created_at,
+            } => {
+                let timestamp_id = timestamp_id.unwrap_or_else(|| receipt_id.clone());
+                let signed_at = signed_at.unwrap_or_else(|| created_at.clone());
+                let report =
+                    receipts::write_rfc3161_timestamp_attestation_v1(&receipts::Rfc3161TimestampAttestOptionsV1 {
+                        out_body: &out_body,
+                        out_sig: out_sig.as_deref(),
+                        signing_key_b64: signing_key_b64.as_deref(),
+                        key_id: &key_id,
+                        signed_at: &signed_at,
+                        tenant_id: &tenant_id,
+                        receipt_id: &receipt_id,
+                        timestamp_id: &timestamp_id,
+                        actor_passport: &actor_passport,
+                        tsa_url: &tsa_url,
+                        tsa_policy_oid: tsa_policy_oid.as_deref(),
+                        message_imprint_alg: &message_imprint_alg,
+                        message_imprint_hash: &message_imprint_hash,
+                        timestamp_token_der: &timestamp_token_der,
+                        serial_number: serial_number.as_deref(),
+                        gen_time: &gen_time,
+                        created_at: &created_at,
+                    })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            ReceiptsCommand::VerifyChainReanchor { body } => {
+                let report = receipts::verify_chain_reanchor_body_file_v1(&body)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.ok {
+                    Ok(())
+                } else {
+                    Err(report
+                        .failure_reason
+                        .unwrap_or_else(|| "chain reanchor verification failed".to_string())
+                        .into())
+                }
+            }
+            ReceiptsCommand::ChainReanchorAttest {
+                out_body,
+                out_sig,
+                signing_key_b64,
+                key_id,
+                signed_at,
+                tenant_id,
+                receipt_id,
+                migration_id,
+                actor_passport,
+                old_chain_head,
+                new_chain_head,
+                old_hash_alg,
+                new_hash_alg,
+                first_receipt_id,
+                last_receipt_id,
+                receipt_count,
+                reason,
+                linked_receipts,
+                created_at,
+            } => {
+                let migration_id = migration_id.unwrap_or_else(|| receipt_id.clone());
+                let signed_at = signed_at.unwrap_or_else(|| created_at.clone());
+                let linked_receipt_refs: Vec<&str> = linked_receipts.iter().map(String::as_str).collect();
+                let report = receipts::write_chain_reanchor_attestation_v1(&receipts::ChainReanchorAttestOptionsV1 {
+                    out_body: &out_body,
+                    out_sig: out_sig.as_deref(),
+                    signing_key_b64: signing_key_b64.as_deref(),
+                    key_id: &key_id,
+                    signed_at: &signed_at,
+                    tenant_id: &tenant_id,
+                    receipt_id: &receipt_id,
+                    migration_id: &migration_id,
+                    actor_passport: &actor_passport,
+                    old_chain_head: &old_chain_head,
+                    new_chain_head: &new_chain_head,
+                    old_hash_alg: &old_hash_alg,
+                    new_hash_alg: &new_hash_alg,
+                    first_receipt_id: &first_receipt_id,
+                    last_receipt_id: &last_receipt_id,
+                    receipt_count,
+                    reason: &reason,
+                    linked_receipts: &linked_receipt_refs,
+                    created_at: &created_at,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            ReceiptsCommand::RedactionAttest {
+                out_body,
+                out_sig,
+                signing_key_b64,
+                key_id,
+                signed_at,
+                tenant_id,
+                receipt_id,
+                redaction_id,
+                actor_passport,
+                subject_type,
+                subject_id,
+                request_id,
+                scope,
+                method,
+                subject_cek_id,
+                subject_cek_commitment,
+                cek_destroyed_at,
+                prior_content_hash,
+                redacted_content_hash,
+                linked_receipts,
+                created_at,
+                crypto_shred_staged,
+                seal_plaintext,
+                out_envelope,
+                cek_b64,
+                nonce_b64,
+            } => {
+                let redaction_id = redaction_id.unwrap_or_else(|| receipt_id.clone());
+                let signed_at = signed_at.unwrap_or_else(|| created_at.clone());
+                let linked_receipt_refs: Vec<&str> = linked_receipts.iter().map(String::as_str).collect();
+                let report = receipts::write_redaction_attestation_v1(&receipts::RedactionAttestOptionsV1 {
+                    out_body: &out_body,
+                    out_sig: out_sig.as_deref(),
+                    signing_key_b64: signing_key_b64.as_deref(),
+                    key_id: &key_id,
+                    signed_at: &signed_at,
+                    tenant_id: &tenant_id,
+                    receipt_id: &receipt_id,
+                    redaction_id: &redaction_id,
+                    actor_passport: &actor_passport,
+                    subject_type: &subject_type,
+                    subject_id: &subject_id,
+                    request_id: &request_id,
+                    scope: &scope,
+                    method: &method,
+                    subject_cek_id: &subject_cek_id,
+                    subject_cek_commitment: subject_cek_commitment.as_deref(),
+                    cek_destroyed_at: cek_destroyed_at.as_deref(),
+                    prior_content_hash: prior_content_hash.as_deref(),
+                    redacted_content_hash: redacted_content_hash.as_deref(),
+                    linked_receipts: &linked_receipt_refs,
+                    created_at: &created_at,
+                    crypto_shred_staged,
+                    seal_plaintext: seal_plaintext.as_deref(),
+                    out_envelope: out_envelope.as_deref(),
+                    cek_b64: cek_b64.as_deref(),
+                    nonce_b64: nonce_b64.as_deref(),
+                })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            ReceiptsCommand::CoverageAttest {
+                out_body,
+                out_sig,
+                signing_key_b64,
+                key_id,
+                signed_at,
+                tenant_id,
+                receipt_id,
+                attestation_id,
+                actor_passport,
+                subject,
+                corpus,
+                run_id,
+                commit_sha,
+                lane_flags,
+                metric,
+                score,
+                floor,
+                below_floor,
+                capability_count,
+                covered_count,
+                gaps_hash,
+                report,
+                created_at,
+            } => {
+                let attestation_id = attestation_id.unwrap_or_else(|| receipt_id.clone());
+                let signed_at = signed_at.unwrap_or_else(|| created_at.clone());
+                let report = receipts::write_coverage_attestation_v1(
+                    &out_body,
+                    out_sig.as_deref(),
+                    signing_key_b64.as_deref(),
+                    &key_id,
+                    &signed_at,
+                    &tenant_id,
+                    &receipt_id,
+                    &attestation_id,
+                    &actor_passport,
+                    &subject,
+                    &corpus,
+                    &run_id,
+                    &commit_sha,
+                    &lane_flags,
+                    &metric,
+                    score,
+                    floor,
+                    below_floor,
+                    capability_count,
+                    covered_count,
+                    gaps_hash.as_deref(),
+                    &report,
+                    &created_at,
+                )?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
@@ -3467,6 +4109,316 @@ mod tests {
                 assert_eq!(tenant_id, "t1");
                 assert_eq!(receipt_id, "abc-123");
                 assert_eq!(shard, 1);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_verify_external_anchor() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "verify-external-anchor",
+            "--body",
+            "/tmp/body.cbor",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command: ReceiptsCommand::VerifyExternalAnchor { body },
+            } => {
+                assert_eq!(body, PathBuf::from("/tmp/body.cbor"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_verify_rfc3161_timestamp() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "verify-rfc3161-timestamp",
+            "--body",
+            "/tmp/body.cbor",
+            "--expected-imprint-hash",
+            "sha256:abc",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command:
+                    ReceiptsCommand::VerifyRfc3161Timestamp {
+                        body,
+                        expected_imprint_hash,
+                    },
+            } => {
+                assert_eq!(body, PathBuf::from("/tmp/body.cbor"));
+                assert_eq!(expected_imprint_hash.as_deref(), Some("sha256:abc"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_external_anchor_attest() {
+        let leaf = "00".repeat(32);
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "external-anchor-attest",
+            "--out-body",
+            "/tmp/anchor.cbor",
+            "--tenant-id",
+            "t1",
+            "--receipt-id",
+            "anchor_receipt_1",
+            "--log-url",
+            "https://rekor.example",
+            "--leaf-hash",
+            &leaf,
+            "--log-index",
+            "0",
+            "--tree-size",
+            "1",
+            "--root-hash",
+            &leaf,
+            "--integrated-time",
+            "2026-06-14T10:00:00Z",
+            "--created-at",
+            "2026-06-14T10:00:00Z",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command:
+                    ReceiptsCommand::ExternalAnchorAttest {
+                        out_body,
+                        receipt_id,
+                        tree_size,
+                        ..
+                    },
+            } => {
+                assert_eq!(out_body, PathBuf::from("/tmp/anchor.cbor"));
+                assert_eq!(receipt_id, "anchor_receipt_1");
+                assert_eq!(tree_size, 1);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_rfc3161_timestamp_attest() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "rfc3161-timestamp-attest",
+            "--out-body",
+            "/tmp/tsa.cbor",
+            "--tenant-id",
+            "t1",
+            "--receipt-id",
+            "tsa_1",
+            "--tsa-url",
+            "https://tsa.example",
+            "--message-imprint-hash",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--timestamp-token-der",
+            "/tmp/token.der",
+            "--gen-time",
+            "2026-06-14T10:00:00Z",
+            "--created-at",
+            "2026-06-14T10:00:00Z",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command:
+                    ReceiptsCommand::Rfc3161TimestampAttest {
+                        out_body,
+                        receipt_id,
+                        timestamp_token_der,
+                        ..
+                    },
+            } => {
+                assert_eq!(out_body, PathBuf::from("/tmp/tsa.cbor"));
+                assert_eq!(receipt_id, "tsa_1");
+                assert_eq!(timestamp_token_der, PathBuf::from("/tmp/token.der"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_chain_reanchor_attest() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "chain-reanchor-attest",
+            "--out-body",
+            "/tmp/chain.cbor",
+            "--tenant-id",
+            "t1",
+            "--receipt-id",
+            "cr_1",
+            "--old-chain-head",
+            "blake3:old",
+            "--new-chain-head",
+            "blake3:new",
+            "--first-receipt-id",
+            "r_1",
+            "--last-receipt-id",
+            "r_2",
+            "--receipt-count",
+            "2",
+            "--reason",
+            "external-anchor-upgrade",
+            "--linked-receipt",
+            "anchor_1",
+            "--created-at",
+            "2026-06-14T10:00:00Z",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command:
+                    ReceiptsCommand::ChainReanchorAttest {
+                        out_body,
+                        tenant_id,
+                        receipt_id,
+                        receipt_count,
+                        linked_receipts,
+                        ..
+                    },
+            } => {
+                assert_eq!(out_body, PathBuf::from("/tmp/chain.cbor"));
+                assert_eq!(tenant_id, "t1");
+                assert_eq!(receipt_id, "cr_1");
+                assert_eq!(receipt_count, 2);
+                assert_eq!(linked_receipts, vec!["anchor_1"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_verify_chain_reanchor() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "verify-chain-reanchor",
+            "--body",
+            "/tmp/chain.cbor",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command: ReceiptsCommand::VerifyChainReanchor { body },
+            } => {
+                assert_eq!(body, PathBuf::from("/tmp/chain.cbor"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_redaction_attest() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "redaction-attest",
+            "--out-body",
+            "/tmp/redaction.cbor",
+            "--tenant-id",
+            "t1",
+            "--receipt-id",
+            "red_1",
+            "--subject-type",
+            "fact",
+            "--subject-id",
+            "f_1",
+            "--request-id",
+            "forget_1",
+            "--subject-cek-id",
+            "cek:t1:fact:f_1:v1",
+            "--subject-cek-commitment",
+            "blake3:abc",
+            "--linked-receipt",
+            "forget_1",
+            "--created-at",
+            "2026-06-14T10:00:00Z",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command:
+                    ReceiptsCommand::RedactionAttest {
+                        out_body,
+                        tenant_id,
+                        receipt_id,
+                        subject_type,
+                        subject_id,
+                        linked_receipts,
+                        crypto_shred_staged,
+                        ..
+                    },
+            } => {
+                assert_eq!(out_body, PathBuf::from("/tmp/redaction.cbor"));
+                assert_eq!(tenant_id, "t1");
+                assert_eq!(receipt_id, "red_1");
+                assert_eq!(subject_type, "fact");
+                assert_eq!(subject_id, "f_1");
+                assert_eq!(linked_receipts, vec!["forget_1"]);
+                assert!(!crypto_shred_staged);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_coverage_attest() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "coverage-attest",
+            "--out-body",
+            "/tmp/body.cbor",
+            "--tenant-id",
+            "t1",
+            "--receipt-id",
+            "cov_1",
+            "--corpus",
+            "LME-S",
+            "--run-id",
+            "run-1",
+            "--commit-sha",
+            "deadbeef",
+            "--score",
+            "0.92",
+            "--report",
+            "/tmp/report.json",
+            "--created-at",
+            "2026-06-14T10:00:00Z",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command:
+                    ReceiptsCommand::CoverageAttest {
+                        out_body,
+                        tenant_id,
+                        receipt_id,
+                        corpus,
+                        score,
+                        ..
+                    },
+            } => {
+                assert_eq!(out_body, PathBuf::from("/tmp/body.cbor"));
+                assert_eq!(tenant_id, "t1");
+                assert_eq!(receipt_id, "cov_1");
+                assert_eq!(corpus, "LME-S");
+                assert_eq!(score, 0.92);
             }
             other => panic!("unexpected command: {other:?}"),
         }

@@ -1,0 +1,17 @@
+{
+  "bundle_format_version": 1,
+  "bundle_id": "vector-valid-minimal",
+  "since": "2026-06-14T00:00:00Z",
+  "until": "2026-06-14T00:01:00Z",
+  "generated_at": "2026-06-14T00:01:00Z",
+  "scope": {
+    "include_reserved": false
+  },
+  "fact_count": 1,
+  "receipt_count": 0,
+  "events_jsonl_sha256": "48149caacbbc9b8b6e4b93298fca263428dfb410e70d0fa8ca24a92cf83e672d",
+  "receipts_cbor_sha256": "76be8b528d0075f7aae98d6fa57a6d3c83ae480a8469e668d7b0af968995ac71",
+  "signer_public_key_b64": "IVL40Zt5HSRFMkLhXy6rbLfP+ntqXtMAl5YOBpiB2xI=",
+  "signer_key_id": "vector-ed25519-42",
+  "signature_b64": "7hUBM1ce75RX+oiwevmcKHVvKn+2oa41q+Xp/i7sizGBKpCKWtdI4o/Ao31rv9tcQdZlqeYnQuDQdzQivMBSBw=="
+}

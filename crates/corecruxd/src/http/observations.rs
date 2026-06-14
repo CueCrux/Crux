@@ -749,9 +749,10 @@ fn mediation_observation(body: &PostMediationReceiptBody) -> (String, PostObserv
 ///   never a raw store write.
 ///
 /// G19 (`Streaming-Receipts-Spec` §5): when `CORECRUXD_STREAM_RECEIPTS=1`,
-/// the route also accepts stream/context receipt *drafts* (`kind` one of
-/// `context_injected` / `stream_completed` / `stream_aborted`) and lifts
-/// them into canonical signed `stream_v1` receipts — see
+/// the route also accepts stream/context/model-provenance receipt *drafts*
+/// (`kind` one of `context_injected` / `stream_completed` /
+/// `stream_aborted` / `model_invocation`) and lifts them into canonical
+/// signed receipt bodies — see
 /// [`super::stream_receipts`]. With the flag off (default) those drafts hit
 /// the legacy tool-mediation parse and are rejected, exactly as before.
 pub(super) async fn post_mediation_receipt(
