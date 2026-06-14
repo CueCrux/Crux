@@ -1053,6 +1053,11 @@ pub fn router(state: AppState) -> Router {
             "/v1/console/embedding/probe",
             axum::routing::post(self::console::post_console_embedding_probe),
         )
+        .route(
+            "/v1/console/corecrux/lane-weights",
+            get(self::console::get_console_corecrux_lane_weights)
+                .put(self::console::put_console_corecrux_lane_weights),
+        )
         // First-run onboarding state for the embedded console.
         .route("/v1/console/onboarding", get(self::console::get_console_onboarding))
         .route(

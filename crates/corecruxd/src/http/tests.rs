@@ -8223,6 +8223,159 @@ async fn console_settings_put_rejects_off_on_non_loopback() {
 }
 
 #[tokio::test]
+async fn console_corecrux_lane_weights_get_requires_corecrux_base_url() {
+    std::env::remove_var("CORECRUXD_CORECRUX_BASE_URL");
+    std::env::remove_var("CORECRUXD_CORECRUX_URL");
+    std::env::remove_var("CORECRUX_BASE_URL");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::get_console_corecrux_lane_weights(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Query(console::CoreCruxLaneWeightsQuery { tenant_id: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn console_corecrux_lane_weights_put_validates_lanes_before_proxy() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::put_console_corecrux_lane_weights(
+        State(state),
+        dev_scope_headers("admin:write"),
+        Json(console::UpdateCoreCruxLaneWeightsBody {
+            tenant_id: None,
+            weights: [("pgvector".to_string(), 1.0)].into_iter().collect(),
+            fusion_rrf_enabled: true,
+            reason: None,
+            actor: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp).await;
+    assert!(body["detail"].as_str().unwrap_or_default().contains("unknown lane"));
+}
+
+#[tokio::test]
+async fn console_corecrux_lane_weights_put_tenant_proxies_boost_overlay() {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut buf).expect("read request");
+            bytes.extend_from_slice(&buf[..n]);
+            if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header_end = bytes
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|p| p + 4)
+            .expect("headers end");
+        let header = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+        let content_len = header
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length:")
+                    .or_else(|| line.strip_prefix("content-length:"))
+            })
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_len {
+            let n = stream.read(&mut buf).expect("read body");
+            bytes.extend_from_slice(&buf[..n]);
+        }
+        (header, bytes[header_end..header_end + content_len].to_vec())
+    }
+
+    fn write_json(stream: &mut std::net::TcpStream, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write mock response");
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock CoreCrux");
+    let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for i in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept mock request");
+            let (header, body) = read_request(&mut stream);
+            if i == 0 {
+                assert!(header.starts_with("GET /v1/admin/boost-config "));
+                write_json(
+                    &mut stream,
+                    r#"{"overlay":{"FEATURE_FUSION_RRF":"true","FUSION_RRF_LANE_WEIGHTS":"{\"bm25\":0.9,\"cosine\":1.2}"},"overlay_size":2}"#,
+                );
+            } else if i == 1 {
+                assert!(header.starts_with("GET /v1/admin/boost-config/tenant?tenant_id=business%3A%3Aacme "));
+                write_json(
+                    &mut stream,
+                    r#"{"ok":true,"tenant_id":"business::acme","overlay":{},"overlay_size":0}"#,
+                );
+            } else {
+                assert!(header.starts_with("POST /v1/admin/boost-config/tenant "));
+                tx.send(body).expect("send captured post body");
+                write_json(
+                    &mut stream,
+                    r#"{"ok":true,"tenant_id":"business::acme","overlay_size":2,"overlay":{}}"#,
+                );
+            }
+        }
+    });
+
+    std::env::set_var("CORECRUXD_CORECRUX_BASE_URL", &base_url);
+    std::env::remove_var("CORECRUXD_CORECRUX_URL");
+    std::env::remove_var("CORECRUX_BASE_URL");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::put_console_corecrux_lane_weights(
+        State(state),
+        dev_scope_headers("admin:write"),
+        Json(console::UpdateCoreCruxLaneWeightsBody {
+            tenant_id: Some("business::acme".to_string()),
+            weights: [("cosine".to_string(), 2.0)].into_iter().collect(),
+            fusion_rrf_enabled: true,
+            reason: Some("audit ii m7 test".to_string()),
+            actor: Some("test-console".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    std::env::remove_var("CORECRUXD_CORECRUX_BASE_URL");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["tenant_id"], "business::acme");
+    assert_eq!(body["weights"]["bm25"], 0.9);
+    assert_eq!(body["weights"]["cosine"], 2.0);
+
+    let posted = rx.recv().expect("captured CoreCrux POST");
+    let posted: serde_json::Value = serde_json::from_slice(&posted).expect("posted json");
+    assert_eq!(posted["tenant_id"], "business::acme");
+    assert_eq!(posted["set"]["FEATURE_FUSION_RRF"], "true");
+    let weights: serde_json::Value = serde_json::from_str(
+        posted["set"]["FUSION_RRF_LANE_WEIGHTS"]
+            .as_str()
+            .expect("weights string"),
+    )
+    .expect("weights json");
+    assert_eq!(weights["bm25"], 0.9);
+    assert_eq!(weights["cosine"], 2.0);
+    assert!(weights["navtree"].is_number());
+}
+
+#[tokio::test]
 async fn console_storage_breakdown_returns_four_kinds_with_empty_defaults() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = console::get_console_storage_breakdown(State(state), dev_scope_headers("admin:read"))

@@ -374,6 +374,9 @@ Config via environment variables or YAML (`config.example.env`, `config.example.
 | `CORECRUXD_BUILD_CCXI` | `0` | Build `.ccxi` indexes at seal time. |
 | `CORECRUXD_EMBEDDING_URL` | unset | Enables dense fact retrieval. |
 | `CORECRUXD_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model name. |
+| `CORECRUXD_CORECRUX_BASE_URL` | unset | CoreCrux admin base URL for `/console` lane-weight controls. |
+| `CORECRUXD_CORECRUX_ADMIN_TOKEN` | unset | Optional bearer token forwarded to CoreCrux admin endpoints. |
+| `CORECRUXD_CORECRUX_PASSPORT_ID` | unset | Optional passport id forwarded to CoreCrux admin endpoints. |
 
 Security defaults: loopback binds are safe for local development; non-loopback HTTP binds require
 a real auth mode; non-loopback MCP binds should set `CRUX_AGENT_TOKEN(S)`; set

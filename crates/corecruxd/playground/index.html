@@ -682,7 +682,7 @@
 <script>
 /* ════════════ DUMMY GRAPH — flat node registry with id links (daemon-styled) ════════════ */
 const SCOPES = [
-  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-usage','cx-documents','cx-gates','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-receipts','cx-mediation','cx-workbench','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-settings','cx-raw'] },
+  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-usage','cx-documents','cx-gates','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-receipts','cx-mediation','cx-workbench','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-lane-weights','cx-settings','cx-raw'] },
   { id:'dx', label:'DX', tag:'Docs',         sections:['dx-articles','dx-readme','dx-sites'] },
   { id:'gx', label:'GX', tag:'Global',       sections:['gx-engrams','gx-bench','gx-sites','gx-factstore'] },
   { id:'ax', label:'AX', tag:'Agent',        sections:['ax-overview','ax-activity','ax-memory','ax-bulk','ax-snapshots','ax-tools','ax-handoff','ax-graph','ax-storybook','ax-dossiers','ax-story'] }
@@ -716,6 +716,7 @@ const N = {
   'cx-facts':{kind:'panel',label:'Facts',sub:'1,911 total',children:['fg-execplan','fg-bench','fg-incident','fg-design','fg-work']},
   'cx-memory':{kind:'panel',label:'Memory',sub:'recent feed',children:['mem1','mem2','mem3']},
   'cx-tenants':{kind:'panel',label:'Tenants',sub:'category + source',children:['t-lmem','t-lmes','t-personal']},
+  'cx-lane-weights':{kind:'panel',label:'Lane weights',sub:'CoreCrux RRF overlay',children:[]},
   'cx-raw':{kind:'panel',label:'Raw',sub:'JSON-RPC console',fields:[['endpoint','/mcp'],['port','14801']],children:['rpc-tools','rpc-query','rpc-store']},
   'cx-settings':{kind:'panel',label:'Settings',sub:'console defaults',children:['set-auth','set-embed','set-onboard','set-daemon']},
   'cx-orchestrators':{kind:'panel',label:'Orchestrators',sub:'/v1/orchestrators · group plans for a session',fields:[['endpoint','/v1/orchestrators'],['flag','CORECRUXD_ORCHESTRATORS=on'],['mcp','create_orchestrator · attach · detach · list'],['active','1'],['build','＋ Orchestrator (toolbar)']],children:['orc-sprint1']},
@@ -2715,6 +2716,7 @@ const SB_ICONS={
   'cx-facts':'<ellipse cx="12" cy="5.5" rx="7.5" ry="2.8"/><path d="M4.5 5.5v13c0 1.6 3.4 2.8 7.5 2.8s7.5-1.2 7.5-2.8v-13M4.5 12c0 1.6 3.4 2.8 7.5 2.8s7.5-1.2 7.5-2.8"/>',
   'cx-memory':'<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
   'cx-tenants':'<rect x="5" y="3.5" width="14" height="17" rx="1.5"/><path d="M9 7.5h2M13 7.5h2M9 11h2M13 11h2M9 14.5h2M13 14.5h2M10.5 20.5v-3h3v3"/>',
+  'cx-lane-weights':'<path d="M4 18h16M6 14l3-5 4 3 4-7"/><circle cx="9" cy="9" r="1.7"/><circle cx="13" cy="12" r="1.7"/><circle cx="17" cy="5" r="1.7"/>',
   'cx-settings':'<path d="M4 7h8M16 7h4M4 12h2M10 12h10M4 17h11M19 17h1"/><circle cx="14" cy="7" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="17" cy="17" r="2"/>',
   'cx-raw':'<path d="m8.5 8-4 4 4 4M15.5 8l4 4-4 4"/>',
   'cx-usage':'<path d="M5 19V9.5M10 19V4.5M15 19v-7M20 19v-11M3 21h18"/>',
@@ -3012,6 +3014,36 @@ function amrLaneToggles(prefix){
    {t:'info',label:'lexical (BM25)',v:'always on · free · local'}]
    .concat(AMR_LANES.map(([k,d,on])=>({t:'toggle',k:prefix+k,label:k+' lane',v:on,desc:d})));
 }
+const CORECRUX_RRF_LANES=[
+ ['bm25','BM25 lexical','Keyword recall over the CoreCrux text index.'],
+ ['cosine','Dense / cosine','Semantic vector recall owned by CoreCrux.'],
+ ['sparse','Sparse','Sparse semantic recall when the sparse lane is enabled.'],
+ ['hyde','HyDE','Hypothetical-answer dense recall.'],
+ ['topology','Topology','Graph/topology structural scoring.'],
+ ['vernacular','Vernacular','Predicate/entity pattern recall.'],
+ ['indexing','Indexing','Document-index pointer lane.'],
+ ['topology_trait_expansion','Trait expansion','Trait-embedding candidate expansion.'],
+ ['navtree','Navtree','Summary-tree navigation.'],
+ ['events','Events','Event-lane control signal.'],
+];
+function laneWeightControls(){
+  return CORECRUX_RRF_LANES.map(([k,label,desc])=>({t:'input',k:'w_'+k,label,ph:'0.0',v:(k==='bm25'||k==='cosine'||k==='sparse'||k==='hyde')?'1':'0',desc,mono:true}));
+}
+function laneWeightsFromControls(){
+  const out={};
+  CORECRUX_RRF_LANES.forEach(([k])=>{
+    const raw=String(pageVal('cx-lane-weights','w_'+k)||'').trim();
+    const n=raw===''?0:Number(raw);
+    if(!Number.isFinite(n)||n<0) throw {status:k+' must be a non-negative number'};
+    out[k]=n;
+  });
+  return out;
+}
+function setLaneWeightControls(weights){
+  CORECRUX_RRF_LANES.forEach(([k])=>{
+    if(weights&&weights[k]!=null) setCtrl('cx-lane-weights','w_'+k,String(weights[k]));
+  });
+}
 function tenantExpRow(id,sub,sys){
   const p='tn_'+String(id).replace(/[^a-zA-Z0-9]/g,'_')+'_';
   return {t:'exp',label:id,sub:sub||'tenant',badge:sys?'system':'tenant',sys:!!sys,hideIf:sys?'hidesys':null,
@@ -3105,6 +3137,16 @@ const PAGES={
    tenantExpRow('__agent::anthropic','agent-private store',true),
    tenantExpRow('__bootstrap__::patterns','boot playbooks',true),
    {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+ 'cx-lane-weights':{title:'Lane weights',sub:'CoreCrux RRF overlay · same-origin console proxy',sections:[
+  {h:'Scope',sub:'leave tenant blank for global defaults; tenant values shadow global overlay',wide:true,controls:[
+   {t:'input',k:'tenant_id',label:'tenant id',ph:'optional tenant id',mono:true},
+   {t:'toggle',k:'fusion_rrf',label:'enable RRF fusion',v:true,
+    desc:'Writes FEATURE_FUSION_RRF alongside FUSION_RRF_LANE_WEIGHTS in CoreCrux boost config.'},
+   {t:'input',k:'reason',label:'reason',ph:'operator note for this change'},
+   {t:'info',label:'CoreCrux',v:'not loaded'},
+   {t:'btn',label:'Load lane weights',hint:'reads CoreCrux global/tenant boost overlay'},
+   {t:'btn',label:'Apply lane weights',hint:'writes FUSION_RRF_LANE_WEIGHTS through the daemon to CoreCrux'}]},
+  {h:'Weights',sub:'non-negative RRF lane multipliers; dense vectors live in CoreCrux',wide:true,controls:laneWeightControls()}]},
  'cx-memory':{title:'Memory',sub:'recent facts per tenant — system tenants hidden by default',sections:[
   {h:'Recent memory',sub:'click a tenant to expand its recent facts',wide:true,controls:[
    {t:'search',ph:'Filter tenants…'},
@@ -3971,6 +4013,35 @@ const PAGE_WIRES={
     try{ localStorage.setItem('cxconf',JSON.stringify(CXCONF)); }catch(e){}
     if(openPageId==='cx-tenants') openPage('cx-tenants',{__wired:true});
     return 'defaults applied — all tenants inherit'; } }},
+ 'cx-lane-weights':{
+  load: async def=>{
+    const tenant=String(pageVal('cx-lane-weights','tenant_id')||'').trim();
+    const path='/v1/console/corecrux/lane-weights'+(tenant?('?tenant_id='+encodeURIComponent(tenant)):'');
+    const r=await api(path);
+    setLaneWeightControls(r.weights||{});
+    setCtrl('cx-lane-weights','fusion_rrf', !!r.fusion_rrf_enabled);
+    const row=def.sections[0].controls.find(c=>c.t==='info'&&c.label==='CoreCrux');
+    if(row) row.v=[r.scope||'global', r.source?('source '+r.source):null, r.fusion_rrf_enabled?'RRF on':'RRF off'].filter(Boolean).join(' · ');
+    def.sections[1].sub='resolved from '+(r.source||'default')+' overlay · '+(tenant||'global');
+  },
+  act:{
+    'Load lane weights': async ctx=>{
+      await PAGE_WIRES['cx-lane-weights'].load(PAGES['cx-lane-weights']);
+      ctx.reopen(); return 'lane weights loaded';
+    },
+    'Apply lane weights': async ctx=>{
+      const tenant=String(pageVal('cx-lane-weights','tenant_id')||'').trim();
+      const r=await putApi('/v1/console/corecrux/lane-weights',{
+        tenant_id: tenant||null,
+        fusion_rrf_enabled: !!pageVal('cx-lane-weights','fusion_rrf'),
+        weights: laneWeightsFromControls(),
+        reason: pageVal('cx-lane-weights','reason')||null,
+        actor: currentBoundPassportId()||'console',
+      });
+      setLaneWeightControls(r.weights||{});
+      ctx.reopen(); return 'CoreCrux lane weights saved · '+(tenant||'global');
+    },
+  }},
  'cx-memory':{
   load: async def=>{
     const r=await api('/v1/console/facts?top_k=50'); const fs=r.facts||[];
