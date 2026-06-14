@@ -302,6 +302,7 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         auth,
         rcx_router: None,
         data_dir: root.clone(),
+        witness: crate::witness::WitnessRuntimeConfigV1::disabled(),
         mcp_enabled: true,
         console_enabled: true,
         coord_enabled: true,
@@ -435,6 +436,18 @@ fn dev_scope_passport_headers(scopes: &str, passport_id: &str) -> HeaderMap {
 async fn json_body(resp: Response) -> serde_json::Value {
     let bytes = to_bytes(resp.into_body(), 1_048_576).await.expect("read body");
     serde_json::from_slice(&bytes).expect("json body")
+}
+
+#[tokio::test]
+async fn witness_smoke_route_reports_default_off_ok() {
+    let state = test_app_state(1);
+    let response = super::witness::get_witness_smoke(State(state)).await.into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["mode"], "local_config_only");
+    assert_eq!(body["witness"]["enabled"], false);
+    assert_eq!(body["tsa"]["enabled"], false);
 }
 
 async fn mark_ready_except_control(state: &AppState) {

@@ -51,6 +51,7 @@ Offline witness verification:
 | `corecruxctl receipts verify-external-anchor --body <body.cbor>` | Recomputes RFC6962 inclusion path against the stored leaf hash, log index, tree size, and root hash. |
 | `corecruxctl receipts verify-rfc3161-timestamp --body <body.cbor> [--expected-imprint-hash <sha256>]` | Recomputes the stored timestamp-token SHA-256 and optionally checks the expected message imprint hash. |
 | `corecruxctl receipts verify-rfc3161-timestamp --body <body.cbor> --tsa-root-cert <root.pem> [--expected-policy-oid <oid>] [--expected-nonce-hex <hex>]` | Enables strict RFC3161 validation: parses the TimeStampToken CMS, checks TSTInfo content type, signed attributes, message imprint, policy, nonce, CMS signature, TSA time-stamping EKU, signer validity at `genTime`, and a certificate chain to the supplied TSA trust anchor. |
+| `corecruxctl receipts witness-smoke [--witness-enabled --witness-provider rekor --rekor-url <url>] [--tsa-enabled --tsa-url <url> --tsa-root-cert <root.pem>]` | Local-only preflight for default-off live witness/TSA rollout. It does not submit to Rekor or a TSA; it checks required settings, readable Rekor public key paths when provided, and DER/PEM TSA trust roots. |
 | `corecruxctl receipts verify-chain-reanchor --body <body.cbor>` | Checks a `chain_reanchor` body has the expected kind, non-empty old/new chain heads, distinct heads, supported algorithm labels, non-zero receipt count, and non-empty linked receipt IDs. |
 
 Migration attestation:
@@ -72,6 +73,7 @@ Daemon live witness submission is controlled by default-off env knobs:
 `CORECRUXD_REKOR_PUBLIC_KEY_PATH`, `CORECRUXD_TSA_ENABLED`,
 `CORECRUXD_TSA_URL`, `CORECRUXD_TSA_ROOT_CERT_PATH`, and
 `CORECRUXD_TSA_POLICY_OID`.
+The daemon exposes the same local-only preflight at `GET /v1/witness/smoke`.
 
 Staged crypto-shred support:
 

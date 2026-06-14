@@ -53,6 +53,7 @@ pub mod session;
 mod storybook;
 mod stream_receipts;
 mod sync;
+mod witness;
 mod work;
 mod workbench;
 mod workspace;
@@ -171,6 +172,7 @@ pub struct AppState {
     pub auth: Authz,
     pub rcx_router: Option<Arc<crux_router::RcxRouter>>,
     pub data_dir: PathBuf,
+    pub witness: crate::witness::WitnessRuntimeConfigV1,
     pub mcp_enabled: bool,
     pub console_enabled: bool,
     /// Multi-agent coordination plane (`/v1/coord/*`). Default OFF
@@ -347,6 +349,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/receipts/{receiptId}/verification",
             get(self::receipts::get_receipt_verification_v1),
         )
+        .route("/v1/witness/smoke", get(self::witness::get_witness_smoke))
         .route(
             "/v1/replay/exports/receipts/{receiptId}",
             get(self::receipts::get_receipt_export_v1),

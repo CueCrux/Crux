@@ -1314,6 +1314,38 @@ enum ReceiptsCommand {
         expected_nonce_hex: Option<String>,
     },
 
+    /// Smoke-check witness/TSA configuration locally without network submission.
+    #[command(name = "witness-smoke")]
+    WitnessSmoke {
+        /// Enable Rekor witness checks in the local smoke report.
+        #[arg(long, default_value_t = false)]
+        witness_enabled: bool,
+        /// Witness provider label. Only `rekor` is supported by this scaffold.
+        #[arg(long, default_value = "disabled")]
+        witness_provider: String,
+        /// Witness timeout budget in milliseconds.
+        #[arg(long, default_value_t = 5000)]
+        witness_timeout_ms: u64,
+        /// Rekor base URL required when --witness-enabled is set.
+        #[arg(long)]
+        rekor_url: Option<String>,
+        /// Optional Rekor public key path checked for readability.
+        #[arg(long)]
+        rekor_public_key_path: Option<PathBuf>,
+        /// Enable TSA checks in the local smoke report.
+        #[arg(long, default_value_t = false)]
+        tsa_enabled: bool,
+        /// TSA URL required when --tsa-enabled is set.
+        #[arg(long)]
+        tsa_url: Option<String>,
+        /// Trusted TSA root certificate path. May be repeated; accepts DER or PEM.
+        #[arg(long = "tsa-root-cert")]
+        tsa_root_cert: Vec<PathBuf>,
+        /// Optional TSA policy OID expected by later strict verification.
+        #[arg(long)]
+        tsa_policy_oid: Option<String>,
+    },
+
     /// Build an external_anchor receipt body from a transparency-log inclusion proof.
     #[command(name = "external-anchor-attest")]
     ExternalAnchorAttest {
@@ -2437,6 +2469,35 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .failure_reason
                         .unwrap_or_else(|| "RFC3161 timestamp verification failed".to_string())
                         .into())
+                }
+            }
+            ReceiptsCommand::WitnessSmoke {
+                witness_enabled,
+                witness_provider,
+                witness_timeout_ms,
+                rekor_url,
+                rekor_public_key_path,
+                tsa_enabled,
+                tsa_url,
+                tsa_root_cert,
+                tsa_policy_oid,
+            } => {
+                let report = receipts::witness_smoke_v1(&receipts::WitnessSmokeOptionsV1 {
+                    witness_enabled,
+                    witness_provider: &witness_provider,
+                    witness_timeout_ms,
+                    rekor_url: rekor_url.as_deref(),
+                    rekor_public_key_path: rekor_public_key_path.as_deref(),
+                    tsa_enabled,
+                    tsa_url: tsa_url.as_deref(),
+                    tsa_root_cert_paths: &tsa_root_cert,
+                    tsa_policy_oid: tsa_policy_oid.as_deref(),
+                });
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.ok {
+                    Ok(())
+                } else {
+                    Err("witness/TSA smoke check failed".into())
                 }
             }
             ReceiptsCommand::ExternalAnchorAttest {
@@ -4192,6 +4253,59 @@ mod tests {
                 assert_eq!(tsa_root_cert, vec![PathBuf::from("/tmp/root.pem")]);
                 assert_eq!(expected_policy_oid.as_deref(), Some("1.2.3.4"));
                 assert_eq!(expected_nonce_hex.as_deref(), Some("0001"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_witness_smoke() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "witness-smoke",
+            "--witness-enabled",
+            "--witness-provider",
+            "rekor",
+            "--witness-timeout-ms",
+            "7500",
+            "--rekor-url",
+            "https://rekor.example",
+            "--rekor-public-key-path",
+            "/tmp/rekor.pub",
+            "--tsa-enabled",
+            "--tsa-url",
+            "https://tsa.example",
+            "--tsa-root-cert",
+            "/tmp/tsa-root.pem",
+            "--tsa-policy-oid",
+            "1.2.3.4",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command:
+                    ReceiptsCommand::WitnessSmoke {
+                        witness_enabled,
+                        witness_provider,
+                        witness_timeout_ms,
+                        rekor_url,
+                        rekor_public_key_path,
+                        tsa_enabled,
+                        tsa_url,
+                        tsa_root_cert,
+                        tsa_policy_oid,
+                    },
+            } => {
+                assert!(witness_enabled);
+                assert_eq!(witness_provider, "rekor");
+                assert_eq!(witness_timeout_ms, 7500);
+                assert_eq!(rekor_url.as_deref(), Some("https://rekor.example"));
+                assert_eq!(rekor_public_key_path, Some(PathBuf::from("/tmp/rekor.pub")));
+                assert!(tsa_enabled);
+                assert_eq!(tsa_url.as_deref(), Some("https://tsa.example"));
+                assert_eq!(tsa_root_cert, vec![PathBuf::from("/tmp/tsa-root.pem")]);
+                assert_eq!(tsa_policy_oid.as_deref(), Some("1.2.3.4"));
             }
             other => panic!("unexpected command: {other:?}"),
         }

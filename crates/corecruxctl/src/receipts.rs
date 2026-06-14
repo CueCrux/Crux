@@ -96,6 +96,39 @@ pub struct WitnessVerifyReportV1 {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct WitnessSmokeReportV1 {
+    pub ok: bool,
+    pub mode: &'static str,
+    pub witness: WitnessProviderSmokeReportV1,
+    pub tsa: TsaProviderSmokeReportV1,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WitnessProviderSmokeReportV1 {
+    pub enabled: bool,
+    pub provider: String,
+    pub timeout_ms: u64,
+    pub configured: bool,
+    pub ok: bool,
+    pub rekor_url: Option<String>,
+    pub rekor_public_key_path: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TsaProviderSmokeReportV1 {
+    pub enabled: bool,
+    pub configured: bool,
+    pub ok: bool,
+    pub tsa_url: Option<String>,
+    pub tsa_root_cert_paths: Vec<String>,
+    pub tsa_root_cert_count: usize,
+    pub tsa_policy_oid: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CoverageAttestReportV1 {
     pub body_path: String,
     pub sig_path: Option<String>,
@@ -202,6 +235,19 @@ pub struct Rfc3161TimestampVerifyOptionsV1<'a> {
     pub expected_policy_oid: Option<&'a str>,
     pub expected_nonce: Option<&'a [u8]>,
     pub trusted_root_cert_paths: &'a [PathBuf],
+}
+
+#[derive(Debug, Clone)]
+pub struct WitnessSmokeOptionsV1<'a> {
+    pub witness_enabled: bool,
+    pub witness_provider: &'a str,
+    pub witness_timeout_ms: u64,
+    pub rekor_url: Option<&'a str>,
+    pub rekor_public_key_path: Option<&'a Path>,
+    pub tsa_enabled: bool,
+    pub tsa_url: Option<&'a str>,
+    pub tsa_root_cert_paths: &'a [PathBuf],
+    pub tsa_policy_oid: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -733,6 +779,176 @@ pub fn verify_rfc3161_timestamp_body_file_with_options_v1(
         },
         strict_validation,
     })
+}
+
+pub fn witness_smoke_v1(opts: &WitnessSmokeOptionsV1<'_>) -> WitnessSmokeReportV1 {
+    let mut warnings = Vec::new();
+    let witness = witness_provider_smoke_v1(opts, &mut warnings);
+    let tsa = tsa_provider_smoke_v1(opts);
+    WitnessSmokeReportV1 {
+        ok: witness.ok && tsa.ok,
+        mode: "local_config_only",
+        witness,
+        tsa,
+        warnings,
+    }
+}
+
+fn witness_provider_smoke_v1(
+    opts: &WitnessSmokeOptionsV1<'_>,
+    warnings: &mut Vec<String>,
+) -> WitnessProviderSmokeReportV1 {
+    if !opts.witness_enabled {
+        return WitnessProviderSmokeReportV1 {
+            enabled: false,
+            provider: opts.witness_provider.to_string(),
+            timeout_ms: opts.witness_timeout_ms,
+            configured: false,
+            ok: true,
+            rekor_url: opts.rekor_url.map(str::to_string),
+            rekor_public_key_path: opts.rekor_public_key_path.map(|p| p.display().to_string()),
+            failure_reason: None,
+        };
+    }
+
+    if !opts.witness_provider.trim().eq_ignore_ascii_case("rekor") {
+        return WitnessProviderSmokeReportV1 {
+            enabled: true,
+            provider: opts.witness_provider.to_string(),
+            timeout_ms: opts.witness_timeout_ms,
+            configured: false,
+            ok: false,
+            rekor_url: opts.rekor_url.map(str::to_string),
+            rekor_public_key_path: opts.rekor_public_key_path.map(|p| p.display().to_string()),
+            failure_reason: Some(format!("unsupported witness provider: {}", opts.witness_provider)),
+        };
+    }
+    if opts.rekor_url.is_none_or(str::is_empty) {
+        return WitnessProviderSmokeReportV1 {
+            enabled: true,
+            provider: opts.witness_provider.to_string(),
+            timeout_ms: opts.witness_timeout_ms,
+            configured: false,
+            ok: false,
+            rekor_url: opts.rekor_url.map(str::to_string),
+            rekor_public_key_path: opts.rekor_public_key_path.map(|p| p.display().to_string()),
+            failure_reason: Some("--rekor-url is required when --witness-enabled is set".to_string()),
+        };
+    }
+    if let Some(path) = opts.rekor_public_key_path {
+        if !path.is_file() {
+            return WitnessProviderSmokeReportV1 {
+                enabled: true,
+                provider: opts.witness_provider.to_string(),
+                timeout_ms: opts.witness_timeout_ms,
+                configured: false,
+                ok: false,
+                rekor_url: opts.rekor_url.map(str::to_string),
+                rekor_public_key_path: Some(path.display().to_string()),
+                failure_reason: Some(format!("Rekor public key path is not readable: {}", path.display())),
+            };
+        }
+    } else {
+        warnings.push("Rekor witness is enabled without --rekor-public-key-path".to_string());
+    }
+
+    WitnessProviderSmokeReportV1 {
+        enabled: true,
+        provider: opts.witness_provider.to_string(),
+        timeout_ms: opts.witness_timeout_ms,
+        configured: true,
+        ok: true,
+        rekor_url: opts.rekor_url.map(str::to_string),
+        rekor_public_key_path: opts.rekor_public_key_path.map(|p| p.display().to_string()),
+        failure_reason: None,
+    }
+}
+
+fn tsa_provider_smoke_v1(opts: &WitnessSmokeOptionsV1<'_>) -> TsaProviderSmokeReportV1 {
+    let root_paths = opts
+        .tsa_root_cert_paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>();
+    if !opts.tsa_enabled {
+        return TsaProviderSmokeReportV1 {
+            enabled: false,
+            configured: false,
+            ok: true,
+            tsa_url: opts.tsa_url.map(str::to_string),
+            tsa_root_cert_paths: root_paths,
+            tsa_root_cert_count: 0,
+            tsa_policy_oid: opts.tsa_policy_oid.map(str::to_string),
+            failure_reason: None,
+        };
+    }
+    if opts.tsa_url.is_none_or(str::is_empty) {
+        return tsa_smoke_fail_v1(opts, root_paths, 0, "--tsa-url is required when --tsa-enabled is set");
+    }
+    if opts.tsa_root_cert_paths.is_empty() {
+        return tsa_smoke_fail_v1(
+            opts,
+            root_paths,
+            0,
+            "--tsa-root-cert is required at least once when --tsa-enabled is set",
+        );
+    }
+
+    let mut cert_count = 0usize;
+    for path in opts.tsa_root_cert_paths {
+        let cert_bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return tsa_smoke_fail_v1(
+                    opts,
+                    root_paths,
+                    cert_count,
+                    &format!("failed to read TSA root certificate {}: {err}", path.display()),
+                )
+            }
+        };
+        let certs = match corecrux_receipts::parse_x509_certs_der_or_pem_v1(&cert_bytes) {
+            Ok(certs) => certs,
+            Err(err) => {
+                return tsa_smoke_fail_v1(
+                    opts,
+                    root_paths,
+                    cert_count,
+                    &format!("failed to parse TSA root certificate {}: {err}", path.display()),
+                )
+            }
+        };
+        cert_count += certs.len();
+    }
+
+    TsaProviderSmokeReportV1 {
+        enabled: true,
+        configured: true,
+        ok: true,
+        tsa_url: opts.tsa_url.map(str::to_string),
+        tsa_root_cert_paths: root_paths,
+        tsa_root_cert_count: cert_count,
+        tsa_policy_oid: opts.tsa_policy_oid.map(str::to_string),
+        failure_reason: None,
+    }
+}
+
+fn tsa_smoke_fail_v1(
+    opts: &WitnessSmokeOptionsV1<'_>,
+    root_paths: Vec<String>,
+    tsa_root_cert_count: usize,
+    reason: &str,
+) -> TsaProviderSmokeReportV1 {
+    TsaProviderSmokeReportV1 {
+        enabled: true,
+        configured: false,
+        ok: false,
+        tsa_url: opts.tsa_url.map(str::to_string),
+        tsa_root_cert_paths: root_paths,
+        tsa_root_cert_count,
+        tsa_policy_oid: opts.tsa_policy_oid.map(str::to_string),
+        failure_reason: Some(reason.to_string()),
+    }
 }
 
 pub fn parse_hex_bytes_v1(raw: &str) -> Result<Vec<u8>, String> {
@@ -1516,6 +1732,83 @@ mod tests {
         assert_eq!(parse_hex_bytes_v1("0x0001").unwrap(), vec![0, 1]);
         assert_eq!(parse_hex_bytes_v1("0A").unwrap(), vec![10]);
         assert!(parse_hex_bytes_v1("abc").is_err());
+    }
+
+    #[test]
+    fn witness_smoke_disabled_is_ok() {
+        let report = witness_smoke_v1(&WitnessSmokeOptionsV1 {
+            witness_enabled: false,
+            witness_provider: "disabled",
+            witness_timeout_ms: 5000,
+            rekor_url: None,
+            rekor_public_key_path: None,
+            tsa_enabled: false,
+            tsa_url: None,
+            tsa_root_cert_paths: &[],
+            tsa_policy_oid: None,
+        });
+        assert!(report.ok);
+        assert!(!report.witness.enabled);
+        assert!(!report.tsa.enabled);
+    }
+
+    #[test]
+    fn witness_smoke_validates_tsa_root_cert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("tsa-root.pem");
+        let mut root_params = rcgen::CertificateParams::new(vec!["CueCrux TSA Root TEST".to_string()]).unwrap();
+        root_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "CueCrux TSA Root TEST");
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let root_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+        std::fs::write(&root_path, root_cert.pem()).unwrap();
+        let root_paths = vec![root_path];
+
+        let report = witness_smoke_v1(&WitnessSmokeOptionsV1 {
+            witness_enabled: true,
+            witness_provider: "rekor",
+            witness_timeout_ms: 7500,
+            rekor_url: Some("https://rekor.example"),
+            rekor_public_key_path: None,
+            tsa_enabled: true,
+            tsa_url: Some("https://tsa.example"),
+            tsa_root_cert_paths: &root_paths,
+            tsa_policy_oid: Some("1.2.3.4"),
+        });
+
+        assert!(report.ok, "{report:?}");
+        assert!(report.witness.ok);
+        assert!(report.tsa.ok);
+        assert_eq!(report.tsa.tsa_root_cert_count, 1);
+        assert_eq!(report.tsa.tsa_policy_oid.as_deref(), Some("1.2.3.4"));
+        assert_eq!(
+            report.warnings,
+            vec!["Rekor witness is enabled without --rekor-public-key-path".to_string()]
+        );
+    }
+
+    #[test]
+    fn witness_smoke_fails_when_enabled_tsa_lacks_root() {
+        let report = witness_smoke_v1(&WitnessSmokeOptionsV1 {
+            witness_enabled: false,
+            witness_provider: "disabled",
+            witness_timeout_ms: 5000,
+            rekor_url: None,
+            rekor_public_key_path: None,
+            tsa_enabled: true,
+            tsa_url: Some("https://tsa.example"),
+            tsa_root_cert_paths: &[],
+            tsa_policy_oid: None,
+        });
+        assert!(!report.ok);
+        assert!(report
+            .tsa
+            .failure_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("--tsa-root-cert"));
     }
 
     #[test]
