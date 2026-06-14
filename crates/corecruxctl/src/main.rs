@@ -1596,6 +1596,59 @@ enum ReceiptsCommand {
         nonce_b64: Option<String>,
     },
 
+    /// Build a non-destructive crypto-shred CEK destroy marker.
+    #[command(name = "crypto-shred-destroy-marker")]
+    CryptoShredDestroyMarker {
+        /// Output path for the crypto-shred destroy marker JSON.
+        #[arg(long)]
+        out_marker: PathBuf,
+        /// Marker ID.
+        #[arg(long)]
+        marker_id: String,
+        /// Tenant ID.
+        #[arg(long)]
+        tenant_id: String,
+        /// Subject type, e.g. fact, stream, document.
+        #[arg(long)]
+        subject_type: String,
+        /// Subject identifier.
+        #[arg(long)]
+        subject_id: String,
+        /// Subject CEK id.
+        #[arg(long)]
+        subject_cek_id: String,
+        /// Subject CEK commitment.
+        #[arg(long)]
+        subject_cek_commitment: String,
+        /// Redaction receipt linked to this CEK lifecycle marker.
+        #[arg(long)]
+        redaction_receipt_id: String,
+        /// Actor/passport creating the marker.
+        #[arg(long, default_value = "corecruxctl")]
+        actor_passport: String,
+        /// Idempotency key for repeated destroy requests.
+        #[arg(long)]
+        idempotency_key: String,
+        /// Marker request timestamp.
+        #[arg(long)]
+        requested_at: String,
+        /// CEK destruction timestamp. Requires --human-gate-receipt.
+        #[arg(long)]
+        destroyed_at: Option<String>,
+        /// Passport-attributed approval receipt for actual CEK destruction.
+        #[arg(long)]
+        human_gate_receipt: Option<String>,
+        /// Wrapped CEK registry reference, never key material.
+        #[arg(long)]
+        wrapped_key_ref: Option<String>,
+        /// Operator-visible reason for the lifecycle marker.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Linked receipt id; repeat for multiple ids.
+        #[arg(long = "linked-receipt")]
+        linked_receipts: Vec<String>,
+    },
+
     /// Build a coverage_attestation receipt body from a reproducible report file.
     #[command(name = "coverage-attest")]
     CoverageAttest {
@@ -2714,6 +2767,47 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     cek_b64: cek_b64.as_deref(),
                     nonce_b64: nonce_b64.as_deref(),
                 })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
+            ReceiptsCommand::CryptoShredDestroyMarker {
+                out_marker,
+                marker_id,
+                tenant_id,
+                subject_type,
+                subject_id,
+                subject_cek_id,
+                subject_cek_commitment,
+                redaction_receipt_id,
+                actor_passport,
+                idempotency_key,
+                requested_at,
+                destroyed_at,
+                human_gate_receipt,
+                wrapped_key_ref,
+                reason,
+                linked_receipts,
+            } => {
+                let linked_receipt_refs: Vec<&str> = linked_receipts.iter().map(String::as_str).collect();
+                let report =
+                    receipts::write_crypto_shred_destroy_marker_v1(&receipts::CryptoShredDestroyMarkerOptionsV1 {
+                        out_marker: &out_marker,
+                        marker_id: &marker_id,
+                        tenant_id: &tenant_id,
+                        subject_type: &subject_type,
+                        subject_id: &subject_id,
+                        subject_cek_id: &subject_cek_id,
+                        subject_cek_commitment: &subject_cek_commitment,
+                        redaction_receipt_id: &redaction_receipt_id,
+                        actor_passport: &actor_passport,
+                        idempotency_key: &idempotency_key,
+                        requested_at: &requested_at,
+                        destroyed_at: destroyed_at.as_deref(),
+                        human_gate_receipt: human_gate_receipt.as_deref(),
+                        wrapped_key_ref: wrapped_key_ref.as_deref(),
+                        reason: reason.as_deref(),
+                        linked_receipts: &linked_receipt_refs,
+                    })?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
@@ -4521,6 +4615,64 @@ mod tests {
                 assert_eq!(subject_id, "f_1");
                 assert_eq!(linked_receipts, vec!["forget_1"]);
                 assert!(!crypto_shred_staged);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receipts_crypto_shred_destroy_marker() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "receipts",
+            "crypto-shred-destroy-marker",
+            "--out-marker",
+            "/tmp/destroy-marker.json",
+            "--marker-id",
+            "destroy_1",
+            "--tenant-id",
+            "t1",
+            "--subject-type",
+            "fact",
+            "--subject-id",
+            "f_1",
+            "--subject-cek-id",
+            "cek:t1:fact:f_1:v1",
+            "--subject-cek-commitment",
+            "blake3:abc",
+            "--redaction-receipt-id",
+            "red_1",
+            "--idempotency-key",
+            "destroy:f_1:v1",
+            "--requested-at",
+            "2026-06-14T10:00:00Z",
+            "--wrapped-key-ref",
+            "vault://t1/cek/f_1/v1",
+            "--linked-receipt",
+            "forget_1",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Receipts {
+                command:
+                    ReceiptsCommand::CryptoShredDestroyMarker {
+                        out_marker,
+                        marker_id,
+                        tenant_id,
+                        subject_cek_id,
+                        redaction_receipt_id,
+                        wrapped_key_ref,
+                        linked_receipts,
+                        ..
+                    },
+            } => {
+                assert_eq!(out_marker, PathBuf::from("/tmp/destroy-marker.json"));
+                assert_eq!(marker_id, "destroy_1");
+                assert_eq!(tenant_id, "t1");
+                assert_eq!(subject_cek_id, "cek:t1:fact:f_1:v1");
+                assert_eq!(redaction_receipt_id, "red_1");
+                assert_eq!(wrapped_key_ref.as_deref(), Some("vault://t1/cek/f_1/v1"));
+                assert_eq!(linked_receipts, vec!["forget_1"]);
             }
             other => panic!("unexpected command: {other:?}"),
         }

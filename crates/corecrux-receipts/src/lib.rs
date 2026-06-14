@@ -57,8 +57,11 @@ pub use c2pa_manifest_v1::{
     DIGITAL_SOURCE_TYPE_AI, SOFTWARE_AGENT_DEFAULT,
 };
 pub use crypto_shred_v1::{
-    open_crypto_shred_payload_v1, seal_crypto_shred_payload_v1, subject_cek_commitment_v1, CryptoShredEnvelopeV1,
-    CryptoShredError, CryptoShredSealInputV1, CRYPTO_SHRED_ENVELOPE_SCHEMA_V1, CRYPTO_SHRED_METHOD_V1,
+    build_crypto_shred_destroy_marker_v1, open_crypto_shred_payload_v1, seal_crypto_shred_payload_v1,
+    subject_cek_commitment_v1, CryptoShredDestroyMarkerInputV1, CryptoShredDestroyMarkerV1, CryptoShredEnvelopeV1,
+    CryptoShredError, CryptoShredSealInputV1, CRYPTO_SHRED_DESTROY_ATTESTED_STATE_V1,
+    CRYPTO_SHRED_DESTROY_MARKER_SCHEMA_V1, CRYPTO_SHRED_DESTROY_REQUESTED_STATE_V1, CRYPTO_SHRED_ENVELOPE_SCHEMA_V1,
+    CRYPTO_SHRED_METHOD_V1,
 };
 pub use export_v1::{
     build_receipt_export_v1, BuildReceiptExportInput, ExportError, ExportFileV1, ExportFormatV1, ExportRedactionV1,

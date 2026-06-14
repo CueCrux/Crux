@@ -19,6 +19,9 @@ use thiserror::Error;
 
 pub const CRYPTO_SHRED_ENVELOPE_SCHEMA_V1: &str = "cuecrux.crypto_shred.envelope.v1";
 pub const CRYPTO_SHRED_METHOD_V1: &str = "xchacha20poly1305-subject-cek-v1";
+pub const CRYPTO_SHRED_DESTROY_MARKER_SCHEMA_V1: &str = "cuecrux.crypto_shred.destroy_marker.v1";
+pub const CRYPTO_SHRED_DESTROY_REQUESTED_STATE_V1: &str = "destroy_requested";
+pub const CRYPTO_SHRED_DESTROY_ATTESTED_STATE_V1: &str = "destroy_attested";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CryptoShredEnvelopeV1 {
@@ -46,6 +49,46 @@ pub struct CryptoShredSealInputV1<'a> {
     pub created_at: &'a str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CryptoShredDestroyMarkerV1 {
+    pub schema: String,
+    pub marker_id: String,
+    pub tenant_id: String,
+    pub subject_type: String,
+    pub subject_id: String,
+    pub subject_cek_id: String,
+    pub subject_cek_commitment: String,
+    pub redaction_receipt_id: String,
+    pub actor_passport: String,
+    pub idempotency_key: String,
+    pub state: String,
+    pub requested_at: String,
+    pub destroyed_at: Option<String>,
+    pub human_gate_receipt: Option<String>,
+    pub wrapped_key_ref: Option<String>,
+    pub reason: Option<String>,
+    pub linked_receipts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CryptoShredDestroyMarkerInputV1<'a> {
+    pub marker_id: &'a str,
+    pub tenant_id: &'a str,
+    pub subject_type: &'a str,
+    pub subject_id: &'a str,
+    pub subject_cek_id: &'a str,
+    pub subject_cek_commitment: &'a str,
+    pub redaction_receipt_id: &'a str,
+    pub actor_passport: &'a str,
+    pub idempotency_key: &'a str,
+    pub requested_at: &'a str,
+    pub destroyed_at: Option<&'a str>,
+    pub human_gate_receipt: Option<&'a str>,
+    pub wrapped_key_ref: Option<&'a str>,
+    pub reason: Option<&'a str>,
+    pub linked_receipts: &'a [&'a str],
+}
+
 #[derive(Debug, Error)]
 pub enum CryptoShredError {
     #[error("invalid schema or method")]
@@ -62,6 +105,10 @@ pub enum CryptoShredError {
     EncryptFailed,
     #[error("aad encode failed: {0}")]
     AadEncode(String),
+    #[error("destroy marker missing required field {0}")]
+    DestroyMarkerMissing(&'static str),
+    #[error("destroy marker with destroyed_at requires a human gate receipt")]
+    DestroyMarkerMissingHumanGate,
 }
 
 pub fn subject_cek_commitment_v1(cek: &[u8; 32], subject_cek_id: &str) -> String {
@@ -104,6 +151,63 @@ pub fn seal_crypto_shred_payload_v1(
         ciphertext_hash: format!("blake3:{}", blake3::hash(&ciphertext).to_hex()),
         ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(ciphertext),
         created_at: input.created_at.to_string(),
+    })
+}
+
+pub fn build_crypto_shred_destroy_marker_v1(
+    input: &CryptoShredDestroyMarkerInputV1<'_>,
+) -> Result<CryptoShredDestroyMarkerV1, CryptoShredError> {
+    require_non_empty("marker_id", input.marker_id)?;
+    require_non_empty("tenant_id", input.tenant_id)?;
+    require_non_empty("subject_type", input.subject_type)?;
+    require_non_empty("subject_id", input.subject_id)?;
+    require_non_empty("subject_cek_id", input.subject_cek_id)?;
+    require_non_empty("subject_cek_commitment", input.subject_cek_commitment)?;
+    require_non_empty("redaction_receipt_id", input.redaction_receipt_id)?;
+    require_non_empty("actor_passport", input.actor_passport)?;
+    require_non_empty("idempotency_key", input.idempotency_key)?;
+    require_non_empty("requested_at", input.requested_at)?;
+    require_optional_non_empty("destroyed_at", input.destroyed_at)?;
+    require_optional_non_empty("human_gate_receipt", input.human_gate_receipt)?;
+    require_optional_non_empty("wrapped_key_ref", input.wrapped_key_ref)?;
+    require_optional_non_empty("reason", input.reason)?;
+    if input.destroyed_at.is_some() && input.human_gate_receipt.is_none() {
+        return Err(CryptoShredError::DestroyMarkerMissingHumanGate);
+    }
+
+    let mut linked_receipts = Vec::new();
+    for linked_receipt in input.linked_receipts {
+        if !linked_receipt.trim().is_empty() {
+            push_unique(&mut linked_receipts, linked_receipt);
+        }
+    }
+    push_unique(&mut linked_receipts, input.redaction_receipt_id);
+    if let Some(human_gate_receipt) = input.human_gate_receipt {
+        push_unique(&mut linked_receipts, human_gate_receipt);
+    }
+
+    Ok(CryptoShredDestroyMarkerV1 {
+        schema: CRYPTO_SHRED_DESTROY_MARKER_SCHEMA_V1.to_string(),
+        marker_id: input.marker_id.to_string(),
+        tenant_id: input.tenant_id.to_string(),
+        subject_type: input.subject_type.to_string(),
+        subject_id: input.subject_id.to_string(),
+        subject_cek_id: input.subject_cek_id.to_string(),
+        subject_cek_commitment: input.subject_cek_commitment.to_string(),
+        redaction_receipt_id: input.redaction_receipt_id.to_string(),
+        actor_passport: input.actor_passport.to_string(),
+        idempotency_key: input.idempotency_key.to_string(),
+        state: if input.destroyed_at.is_some() {
+            CRYPTO_SHRED_DESTROY_ATTESTED_STATE_V1.to_string()
+        } else {
+            CRYPTO_SHRED_DESTROY_REQUESTED_STATE_V1.to_string()
+        },
+        requested_at: input.requested_at.to_string(),
+        destroyed_at: input.destroyed_at.map(str::to_string),
+        human_gate_receipt: input.human_gate_receipt.map(str::to_string),
+        wrapped_key_ref: input.wrapped_key_ref.map(str::to_string),
+        reason: input.reason.map(str::to_string),
+        linked_receipts,
     })
 }
 
@@ -187,6 +291,27 @@ fn aad_bytes(input: &CryptoShredSealInputV1<'_>) -> Result<Vec<u8>, CryptoShredE
     .map_err(|err| CryptoShredError::AadEncode(err.to_string()))
 }
 
+fn require_non_empty(field: &'static str, value: &str) -> Result<(), CryptoShredError> {
+    if value.trim().is_empty() {
+        Err(CryptoShredError::DestroyMarkerMissing(field))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_optional_non_empty(field: &'static str, value: Option<&str>) -> Result<(), CryptoShredError> {
+    if let Some(value) = value {
+        require_non_empty(field, value)?;
+    }
+    Ok(())
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|v| v == value) {
+        values.push(value.to_string());
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -233,5 +358,58 @@ mod tests {
         envelope.subject_id = "f_tampered".to_string();
         let err = open_crypto_shred_payload_v1(&envelope, &cek).unwrap_err();
         assert!(matches!(err, CryptoShredError::DecryptFailed));
+    }
+
+    #[test]
+    fn destroy_marker_links_redaction_receipt_without_key_material() {
+        let marker = build_crypto_shred_destroy_marker_v1(&CryptoShredDestroyMarkerInputV1 {
+            marker_id: "destroy-marker-1",
+            tenant_id: "tenant-a",
+            subject_type: "fact",
+            subject_id: "f_123",
+            subject_cek_id: "cek:tenant-a:fact:f_123:v1",
+            subject_cek_commitment: "blake3:commitment",
+            redaction_receipt_id: "red_123",
+            actor_passport: "passport:operator",
+            idempotency_key: "destroy:f_123:v1",
+            requested_at: "2026-06-14T12:00:00Z",
+            destroyed_at: None,
+            human_gate_receipt: None,
+            wrapped_key_ref: Some("vault://tenant-a/cek/f_123/v1"),
+            reason: Some("subject erasure request"),
+            linked_receipts: &["forget_123"],
+        })
+        .unwrap();
+
+        assert_eq!(marker.schema, CRYPTO_SHRED_DESTROY_MARKER_SCHEMA_V1);
+        assert_eq!(marker.state, CRYPTO_SHRED_DESTROY_REQUESTED_STATE_V1);
+        assert!(marker.destroyed_at.is_none());
+        assert!(marker.human_gate_receipt.is_none());
+        assert_eq!(marker.linked_receipts, vec!["forget_123", "red_123"]);
+        let json = serde_json::to_string(&marker).unwrap();
+        assert!(!json.contains("BwcHBwc"));
+    }
+
+    #[test]
+    fn destroy_attestation_requires_human_gate_receipt() {
+        let err = build_crypto_shred_destroy_marker_v1(&CryptoShredDestroyMarkerInputV1 {
+            marker_id: "destroy-marker-1",
+            tenant_id: "tenant-a",
+            subject_type: "fact",
+            subject_id: "f_123",
+            subject_cek_id: "cek:tenant-a:fact:f_123:v1",
+            subject_cek_commitment: "blake3:commitment",
+            redaction_receipt_id: "red_123",
+            actor_passport: "passport:operator",
+            idempotency_key: "destroy:f_123:v1",
+            requested_at: "2026-06-14T12:00:00Z",
+            destroyed_at: Some("2026-06-14T12:05:00Z"),
+            human_gate_receipt: None,
+            wrapped_key_ref: None,
+            reason: None,
+            linked_receipts: &[],
+        })
+        .unwrap_err();
+        assert!(matches!(err, CryptoShredError::DestroyMarkerMissingHumanGate));
     }
 }

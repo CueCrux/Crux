@@ -81,12 +81,20 @@ Staged crypto-shred support:
 |---|---|---|
 | Crypto-shred envelope | `cuecrux.crypto_shred.envelope.v1` / `xchacha20poly1305-subject-cek-v1` | Non-destructive staging artifact. The envelope stores ciphertext, nonce, AAD hash, plaintext/ciphertext hashes, and a CEK commitment. It never stores CEK bytes. |
 | Redaction receipt | `kind = "redaction"` | Hash-only receipt body that records subject scope, `subject_cek_id`, `subject_cek_commitment`, optional `cek_destroyed_at`, and linked forget/redaction receipts. |
+| Destroy marker | `cuecrux.crypto_shred.destroy_marker.v1` | Non-destructive CEK lifecycle artifact. It links a redaction receipt, subject CEK id/commitment, idempotency key, actor passport, optional wrapped-key registry reference, and optional human-gated destruction attestation. It never stores CEK bytes and never deletes keys by itself. |
 
 `corecruxctl receipts redaction-attest` can build a redaction receipt body.
 When called with `--crypto-shred-staged`, it can also seal a local plaintext
 fixture into a crypto-shred envelope so tests can prove retained ciphertext is
 unreadable without the per-subject CEK. Production CEK destruction is not part
 of this command and remains a separately gated operation.
+
+`corecruxctl receipts crypto-shred-destroy-marker` writes a JSON destroy marker
+for migration dry-runs and cutover evidence. With no `--destroyed-at`, the
+marker state is `destroy_requested` and reports that a human gate is still
+required before any destructive CEK action. With `--destroyed-at`, callers must
+also provide `--human-gate-receipt`; the marker state becomes
+`destroy_attested`, but the command still performs no CEK deletion.
 
 ## Signature Event
 

@@ -11,10 +11,11 @@ use ed25519_dalek::{Signer as _, SigningKey};
 
 use corecrux_frame::{decode_canonical_header_bytes_v1, stream_hash_xxhash64};
 use corecrux_receipts::{
-    assert_external_anchor_kind_v1, assert_rfc3161_timestamp_kind_v1, seal_crypto_shred_payload_v1,
-    update_subject_index_v1, verify_chain_reanchor_body_v1, verify_external_anchor_body_v1,
-    verify_rfc3161_timestamp_token_binding_v1, verify_rfc3161_timestamp_token_strict_v1, ChainReanchorBodyInputV1,
-    CoverageAttestationBodyInputV1, CryptoShredSealInputV1, Ed25519KeyEntryV1, Ed25519KeyRingV1,
+    assert_external_anchor_kind_v1, assert_rfc3161_timestamp_kind_v1, build_crypto_shred_destroy_marker_v1,
+    seal_crypto_shred_payload_v1, update_subject_index_v1, verify_chain_reanchor_body_v1,
+    verify_external_anchor_body_v1, verify_rfc3161_timestamp_token_binding_v1,
+    verify_rfc3161_timestamp_token_strict_v1, ChainReanchorBodyInputV1, CoverageAttestationBodyInputV1,
+    CryptoShredDestroyMarkerInputV1, CryptoShredSealInputV1, Ed25519KeyEntryV1, Ed25519KeyRingV1,
     ExternalAnchorBodyInputV1, ReceiptSigV1, RedactionReceiptBodyInputV1, Rfc3161StrictValidationOptionsV1,
     Rfc3161StrictValidationReportV1, Rfc3161TimestampBodyInputV1, CONTENT_TYPE_RECEIPT_BODY_V1,
     CONTENT_TYPE_RECEIPT_SIG_V1, EVT_RECEIPT_BODY_V1, EVT_RECEIPT_SIG_V1, STREAM_TYPE_RECEIPT,
@@ -184,6 +185,21 @@ pub struct RedactionAttestReportV1 {
     pub crypto_shred_staged: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CryptoShredDestroyMarkerReportV1 {
+    pub marker_path: String,
+    pub marker_id: String,
+    pub tenant_id: String,
+    pub subject_type: String,
+    pub subject_id: String,
+    pub subject_cek_id: String,
+    pub redaction_receipt_id: String,
+    pub state: String,
+    pub linked_receipts_count: usize,
+    pub human_gate_required: bool,
+    pub destructive_action_performed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExternalAnchorAttestOptionsV1<'a> {
     pub out_body: &'a Path,
@@ -301,6 +317,26 @@ pub struct RedactionAttestOptionsV1<'a> {
     pub out_envelope: Option<&'a Path>,
     pub cek_b64: Option<&'a str>,
     pub nonce_b64: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CryptoShredDestroyMarkerOptionsV1<'a> {
+    pub out_marker: &'a Path,
+    pub marker_id: &'a str,
+    pub tenant_id: &'a str,
+    pub subject_type: &'a str,
+    pub subject_id: &'a str,
+    pub subject_cek_id: &'a str,
+    pub subject_cek_commitment: &'a str,
+    pub redaction_receipt_id: &'a str,
+    pub actor_passport: &'a str,
+    pub idempotency_key: &'a str,
+    pub requested_at: &'a str,
+    pub destroyed_at: Option<&'a str>,
+    pub human_gate_receipt: Option<&'a str>,
+    pub wrapped_key_ref: Option<&'a str>,
+    pub reason: Option<&'a str>,
+    pub linked_receipts: &'a [&'a str],
 }
 
 pub fn write_external_anchor_attestation_v1(
@@ -610,6 +646,44 @@ pub fn write_redaction_attestation_v1(
         redacted_content_hash: derived_redacted_content_hash,
         signed: opts.out_sig.is_some(),
         crypto_shred_staged: opts.crypto_shred_staged,
+    })
+}
+
+pub fn write_crypto_shred_destroy_marker_v1(
+    opts: &CryptoShredDestroyMarkerOptionsV1<'_>,
+) -> Result<CryptoShredDestroyMarkerReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let marker = build_crypto_shred_destroy_marker_v1(&CryptoShredDestroyMarkerInputV1 {
+        marker_id: opts.marker_id,
+        tenant_id: opts.tenant_id,
+        subject_type: opts.subject_type,
+        subject_id: opts.subject_id,
+        subject_cek_id: opts.subject_cek_id,
+        subject_cek_commitment: opts.subject_cek_commitment,
+        redaction_receipt_id: opts.redaction_receipt_id,
+        actor_passport: opts.actor_passport,
+        idempotency_key: opts.idempotency_key,
+        requested_at: opts.requested_at,
+        destroyed_at: opts.destroyed_at,
+        human_gate_receipt: opts.human_gate_receipt,
+        wrapped_key_ref: opts.wrapped_key_ref,
+        reason: opts.reason,
+        linked_receipts: opts.linked_receipts,
+    })?;
+    let marker_bytes = serde_json::to_vec_pretty(&marker)?;
+    write_parented(opts.out_marker, &marker_bytes)?;
+
+    Ok(CryptoShredDestroyMarkerReportV1 {
+        marker_path: opts.out_marker.display().to_string(),
+        marker_id: marker.marker_id,
+        tenant_id: marker.tenant_id,
+        subject_type: marker.subject_type,
+        subject_id: marker.subject_id,
+        subject_cek_id: marker.subject_cek_id,
+        redaction_receipt_id: marker.redaction_receipt_id,
+        state: marker.state,
+        linked_receipts_count: marker.linked_receipts.len(),
+        human_gate_required: marker.destroyed_at.is_none(),
+        destructive_action_performed: false,
     })
 }
 
@@ -1425,6 +1499,70 @@ mod tests {
         assert!(envelope_json.contains("\"ciphertext_b64\""));
         assert!(!envelope_json.contains("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="));
         assert!(!envelope_json.contains("erase me"));
+    }
+
+    #[test]
+    fn crypto_shred_destroy_marker_writes_non_destructive_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("destroy-marker.json");
+        let report = write_crypto_shred_destroy_marker_v1(&CryptoShredDestroyMarkerOptionsV1 {
+            out_marker: &marker_path,
+            marker_id: "destroy_1",
+            tenant_id: "tenant-a",
+            subject_type: "fact",
+            subject_id: "f_1",
+            subject_cek_id: "cek:tenant-a:fact:f_1:v1",
+            subject_cek_commitment: "blake3:commitment",
+            redaction_receipt_id: "red_1",
+            actor_passport: "passport:operator",
+            idempotency_key: "destroy:f_1:v1",
+            requested_at: "2026-06-14T10:00:00Z",
+            destroyed_at: None,
+            human_gate_receipt: None,
+            wrapped_key_ref: Some("vault://tenant-a/cek/f_1/v1"),
+            reason: Some("subject erasure request"),
+            linked_receipts: &["forget_1", "red_1"],
+        })
+        .unwrap();
+
+        assert!(marker_path.exists());
+        assert_eq!(report.marker_id, "destroy_1");
+        assert_eq!(report.state, "destroy_requested");
+        assert_eq!(report.linked_receipts_count, 2);
+        assert!(report.human_gate_required);
+        assert!(!report.destructive_action_performed);
+        let marker_json = std::fs::read_to_string(marker_path).unwrap();
+        assert!(marker_json.contains("\"schema\": \"cuecrux.crypto_shred.destroy_marker.v1\""));
+        assert!(marker_json.contains("\"red_1\""));
+        assert!(!marker_json.contains("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="));
+    }
+
+    #[test]
+    fn crypto_shred_destroy_marker_rejects_destroyed_without_human_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("destroy-marker.json");
+        let err = write_crypto_shred_destroy_marker_v1(&CryptoShredDestroyMarkerOptionsV1 {
+            out_marker: &marker_path,
+            marker_id: "destroy_1",
+            tenant_id: "tenant-a",
+            subject_type: "fact",
+            subject_id: "f_1",
+            subject_cek_id: "cek:tenant-a:fact:f_1:v1",
+            subject_cek_commitment: "blake3:commitment",
+            redaction_receipt_id: "red_1",
+            actor_passport: "passport:operator",
+            idempotency_key: "destroy:f_1:v1",
+            requested_at: "2026-06-14T10:00:00Z",
+            destroyed_at: Some("2026-06-14T10:05:00Z"),
+            human_gate_receipt: None,
+            wrapped_key_ref: None,
+            reason: None,
+            linked_receipts: &[],
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("human gate receipt"));
+        assert!(!marker_path.exists());
     }
 
     #[test]
