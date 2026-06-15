@@ -14,6 +14,7 @@ use corecrux_memory::candidate_link::{
     CANDIDATE_LINK_KIND, CANDIDATE_LINK_SCHEMA_V1,
 };
 use corecrux_memory::{EntityQuery, EntityStore, FactStore};
+use std::collections::BTreeSet;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CandidateLinkError {
@@ -37,6 +38,34 @@ pub struct CreateCandidateInput {
     pub confidence: f32,
     pub evidence_refs: Vec<String>,
     pub proposed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateObservation {
+    pub local_passport_fpr: String,
+    pub observed_subject: String,
+    pub tenant_id: String,
+    pub project_id: Option<String>,
+    pub observed_at_unix_ms: u64,
+    pub evidence_ref: String,
+    pub cruxpack_source_receipt: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProposerConfig {
+    pub temporal_window_ms: u64,
+    pub project_window_ms: u64,
+    pub min_confidence: f32,
+}
+
+impl Default for ProposerConfig {
+    fn default() -> Self {
+        Self {
+            temporal_window_ms: 10 * 60 * 1000,
+            project_window_ms: 24 * 60 * 60 * 1000,
+            min_confidence: 0.75,
+        }
+    }
 }
 
 fn ensure_local_passport_fpr(facts: &FactStore, fpr: &str) -> Result<(), CandidateLinkError> {
@@ -126,6 +155,136 @@ pub fn update_candidate_status(
         .upsert(CANDIDATE_LINK_KIND, candidate_id, value, actor, None)
         .map_err(|e| CandidateLinkError::Store(e.to_string()))?;
     Ok(payload)
+}
+
+pub fn observations_from_session_bindings(facts: &FactStore) -> Vec<CandidateObservation> {
+    crate::session_bindings::list_bindings(facts)
+        .into_iter()
+        .filter_map(|binding| {
+            let passport = crate::passports::get_passport(facts, &binding.passport_id)?;
+            Some(CandidateObservation {
+                local_passport_fpr: passport.principal_id.clone(),
+                observed_subject: passport.principal_id,
+                tenant_id: binding.tenant_id,
+                project_id: binding.project_id,
+                observed_at_unix_ms: binding.bound_at_unix_ms,
+                evidence_ref: format!("session_binding:{}", binding.session_id_hex),
+                cruxpack_source_receipt: None,
+            })
+        })
+        .collect()
+}
+
+pub fn propose_from_session_bindings(
+    entities: &mut EntityStore,
+    facts: &FactStore,
+    actor: &str,
+    config: &ProposerConfig,
+) -> Result<Vec<(String, CandidateLinkPayload)>, CandidateLinkError> {
+    let observations = observations_from_session_bindings(facts);
+    propose_from_observations(entities, facts, &observations, actor, config)
+}
+
+pub fn propose_from_observations(
+    entities: &mut EntityStore,
+    facts: &FactStore,
+    observations: &[CandidateObservation],
+    actor: &str,
+    config: &ProposerConfig,
+) -> Result<Vec<(String, CandidateLinkPayload)>, CandidateLinkError> {
+    let mut created = Vec::new();
+    let mut sorted = observations.to_vec();
+    sorted.sort_by(|a, b| {
+        a.observed_at_unix_ms
+            .cmp(&b.observed_at_unix_ms)
+            .then_with(|| a.evidence_ref.cmp(&b.evidence_ref))
+    });
+
+    for i in 0..sorted.len() {
+        for j in (i + 1)..sorted.len() {
+            let a = &sorted[i];
+            let b = &sorted[j];
+            let Some(input) = proposal_input_for_pair(a, b, config) else {
+                continue;
+            };
+            match create_candidate(entities, facts, input, actor) {
+                Ok(candidate) => created.push(candidate),
+                Err(CandidateLinkError::AlreadyExists(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    Ok(created)
+}
+
+fn proposal_input_for_pair(
+    a: &CandidateObservation,
+    b: &CandidateObservation,
+    config: &ProposerConfig,
+) -> Option<CreateCandidateInput> {
+    if a.tenant_id != b.tenant_id || a.observed_subject == b.observed_subject {
+        return None;
+    }
+
+    let delta = a.observed_at_unix_ms.abs_diff(b.observed_at_unix_ms);
+    let same_project = match (&a.project_id, &b.project_id) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    };
+    let same_cruxpack = match (&a.cruxpack_source_receipt, &b.cruxpack_source_receipt) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    };
+
+    let mut signals = Vec::new();
+    if same_project && delta <= config.temporal_window_ms {
+        signals.push(CandidateLinkSignal {
+            kind: "temporal_adjacency".to_string(),
+            confidence: 0.82,
+            evidence_ref: Some(format!("{}|{}", a.evidence_ref, b.evidence_ref)),
+        });
+    }
+    if same_project && delta <= config.project_window_ms {
+        signals.push(CandidateLinkSignal {
+            kind: "tenant_project_overlap".to_string(),
+            confidence: 0.74,
+            evidence_ref: Some(format!("{}|{}", a.evidence_ref, b.evidence_ref)),
+        });
+    }
+    if same_cruxpack {
+        signals.push(CandidateLinkSignal {
+            kind: "cruxpack_provenance_match".to_string(),
+            confidence: 0.86,
+            evidence_ref: a.cruxpack_source_receipt.clone(),
+        });
+    }
+    if signals.is_empty() {
+        return None;
+    }
+
+    let confidence = signals.iter().map(|signal| signal.confidence).sum::<f32>() / signals.len() as f32;
+    if confidence < config.min_confidence {
+        return None;
+    }
+
+    let mut evidence_refs = BTreeSet::new();
+    evidence_refs.insert(a.evidence_ref.clone());
+    evidence_refs.insert(b.evidence_ref.clone());
+    if let Some(receipt) = &a.cruxpack_source_receipt {
+        evidence_refs.insert(receipt.clone());
+    }
+    if let Some(receipt) = &b.cruxpack_source_receipt {
+        evidence_refs.insert(receipt.clone());
+    }
+
+    Some(CreateCandidateInput {
+        local_passport_fpr: a.local_passport_fpr.clone(),
+        observed_subject: b.observed_subject.clone(),
+        signals,
+        confidence,
+        evidence_refs: evidence_refs.into_iter().collect(),
+        proposed_at: None,
+    })
 }
 
 #[cfg(test)]
@@ -231,6 +390,162 @@ mod tests {
             create_candidate(&mut entities, &facts, input("p_unknown".to_string()), "operator"),
             Err(CandidateLinkError::LocalPassportNotFound(_))
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_binding_proposer_emits_temporal_project_candidate() {
+        let (dir, mut facts, mut entities, _) = seeded();
+        let b1 = crate::session_bindings::resolve(
+            &facts,
+            crate::session_bindings::ResolveInput {
+                session_id_hex: "sess-a",
+                project_id: Some("alpha".to_string()),
+                tenant_id: Some("work::team".to_string()),
+                passport_id: Some("personal-default".to_string()),
+                now_unix_ms: 1_000,
+            },
+        )
+        .expect("binding 1");
+        let b2 = crate::session_bindings::resolve(
+            &facts,
+            crate::session_bindings::ResolveInput {
+                session_id_hex: "sess-b",
+                project_id: Some("alpha".to_string()),
+                tenant_id: Some("work::team".to_string()),
+                passport_id: Some("work-default".to_string()),
+                now_unix_ms: 2_000,
+            },
+        )
+        .expect("binding 2");
+        crate::session_bindings::write_binding(&mut facts, &b1).expect("write 1");
+        crate::session_bindings::write_binding(&mut facts, &b2).expect("write 2");
+
+        let created = propose_from_session_bindings(&mut entities, &facts, "operator", &ProposerConfig::default())
+            .expect("propose");
+        assert_eq!(created.len(), 1);
+        let signals: Vec<String> = created[0].1.signals.iter().map(|signal| signal.kind.clone()).collect();
+        assert!(signals.contains(&"temporal_adjacency".to_string()));
+        assert!(signals.contains(&"tenant_project_overlap".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proposer_holds_decoy_with_different_tenant() {
+        let (dir, facts, mut entities, local_fpr) = seeded();
+        let observations = vec![
+            CandidateObservation {
+                local_passport_fpr: local_fpr.clone(),
+                observed_subject: "p_remote_a".to_string(),
+                tenant_id: "work::team-a".to_string(),
+                project_id: Some("alpha".to_string()),
+                observed_at_unix_ms: 1_000,
+                evidence_ref: "session_binding:a".to_string(),
+                cruxpack_source_receipt: None,
+            },
+            CandidateObservation {
+                local_passport_fpr: local_fpr,
+                observed_subject: "p_remote_b".to_string(),
+                tenant_id: "work::team-b".to_string(),
+                project_id: Some("alpha".to_string()),
+                observed_at_unix_ms: 1_100,
+                evidence_ref: "session_binding:b".to_string(),
+                cruxpack_source_receipt: None,
+            },
+        ];
+
+        let created = propose_from_observations(
+            &mut entities,
+            &facts,
+            &observations,
+            "operator",
+            &ProposerConfig::default(),
+        )
+        .expect("propose");
+        assert!(created.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cruxpack_provenance_proposer_emits_candidate() {
+        let (dir, facts, mut entities, local_fpr) = seeded();
+        let observations = vec![
+            CandidateObservation {
+                local_passport_fpr: local_fpr.clone(),
+                observed_subject: "p_remote_a".to_string(),
+                tenant_id: "personal".to_string(),
+                project_id: None,
+                observed_at_unix_ms: 1_000,
+                evidence_ref: "fact:f1".to_string(),
+                cruxpack_source_receipt: Some("cruxpack:blake3:abc".to_string()),
+            },
+            CandidateObservation {
+                local_passport_fpr: local_fpr,
+                observed_subject: "p_remote_b".to_string(),
+                tenant_id: "personal".to_string(),
+                project_id: None,
+                observed_at_unix_ms: 86_400_000,
+                evidence_ref: "fact:f2".to_string(),
+                cruxpack_source_receipt: Some("cruxpack:blake3:abc".to_string()),
+            },
+        ];
+
+        let created = propose_from_observations(
+            &mut entities,
+            &facts,
+            &observations,
+            "operator",
+            &ProposerConfig::default(),
+        )
+        .expect("propose");
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].1.signals[0].kind, "cruxpack_provenance_match");
+        assert!(created[0].1.evidence_refs.contains(&"cruxpack:blake3:abc".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proposer_skips_duplicate_candidates() {
+        let (dir, facts, mut entities, local_fpr) = seeded();
+        let observations = vec![
+            CandidateObservation {
+                local_passport_fpr: local_fpr.clone(),
+                observed_subject: "p_remote_a".to_string(),
+                tenant_id: "personal".to_string(),
+                project_id: Some("alpha".to_string()),
+                observed_at_unix_ms: 1_000,
+                evidence_ref: "session_binding:a".to_string(),
+                cruxpack_source_receipt: None,
+            },
+            CandidateObservation {
+                local_passport_fpr: local_fpr,
+                observed_subject: "p_remote_b".to_string(),
+                tenant_id: "personal".to_string(),
+                project_id: Some("alpha".to_string()),
+                observed_at_unix_ms: 2_000,
+                evidence_ref: "session_binding:b".to_string(),
+                cruxpack_source_receipt: None,
+            },
+        ];
+
+        let first = propose_from_observations(
+            &mut entities,
+            &facts,
+            &observations,
+            "operator",
+            &ProposerConfig::default(),
+        )
+        .expect("first");
+        let second = propose_from_observations(
+            &mut entities,
+            &facts,
+            &observations,
+            "operator",
+            &ProposerConfig::default(),
+        )
+        .expect("second");
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
