@@ -146,7 +146,7 @@ pub fn resolve_by_linked_passport(
         .ok_or_else(|| ResolveError::PassportNotFound(remote_fpr.to_string()))?;
     let mut principal = resolve_by_passport(store, &payload.local_passport_id, None)?;
     let grant = crate::policy::federation_read_grant();
-    principal.capabilities = grant.allowed_capabilities.clone();
+    principal.capabilities.clone_from(&grant.allowed_capabilities);
     principal.federation_grant = Some(grant);
     principal.resolved_via = format!("identity_link:{link_id}");
     Ok(principal)

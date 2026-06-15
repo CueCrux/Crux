@@ -37,8 +37,9 @@ mod dataplane_store;
 #[allow(dead_code)]
 mod grpc;
 mod http;
-// metrics: Prometheus register!() macros use expect() at init — safe, panics
-// only on duplicate registration (programmer error caught in tests).
+// Candidate proposers are staged behind the identity-candidates rollout path; tests
+// exercise creation/proposal before daemon startup wires automatic proposer runs.
+#[allow(dead_code)]
 mod candidate_links;
 mod context_graph;
 mod dossier;
@@ -54,6 +55,8 @@ mod integrations_github;
 mod integrations_github_sync;
 mod integrations_openai;
 mod mcp_stdio;
+// metrics: Prometheus register!() macros use expect() at init — safe, panics
+// only on duplicate registration (programmer error caught in tests).
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod metrics;
 mod onboarding;

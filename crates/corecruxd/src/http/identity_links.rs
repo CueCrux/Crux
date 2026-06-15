@@ -67,17 +67,15 @@ pub(super) struct ListIdentityCandidatesQuery {
     pub status: Option<String>,
 }
 
-fn parse_candidate_status(raw: Option<&str>) -> Result<Option<CandidateLinkStatus>, Response> {
+fn parse_candidate_status(raw: Option<&str>) -> Result<Option<CandidateLinkStatus>, String> {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
         None | Some("all") => Ok(None),
         Some("proposed") => Ok(Some(CandidateLinkStatus::Proposed)),
         Some("confirmed") => Ok(Some(CandidateLinkStatus::Confirmed)),
         Some("rejected") => Ok(Some(CandidateLinkStatus::Rejected)),
-        Some(other) => Err(problem_response(
-            StatusCode::BAD_REQUEST,
-            format!("status must be proposed, confirmed, rejected, or all; got '{other}'"),
-        )
-        .into_response()),
+        Some(other) => Err(format!(
+            "status must be proposed, confirmed, rejected, or all; got '{other}'"
+        )),
     }
 }
 
@@ -158,7 +156,7 @@ pub(super) async fn get_identity_candidates(
     }
     let status = match parse_candidate_status(query.status.as_deref()) {
         Ok(status) => status,
-        Err(response) => return response,
+        Err(message) => return problem_response(StatusCode::BAD_REQUEST, message).into_response(),
     };
     let entities = state.entity_store.read().await;
     let mut candidates: Vec<serde_json::Value> = candidate_links::list_candidates(&entities, status)

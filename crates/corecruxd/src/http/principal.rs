@@ -161,8 +161,7 @@ fn query_include_candidates(query: &ResolvePrincipalQuery) -> bool {
         .include_candidates
         .as_deref()
         .map(str::trim)
-        .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+        .is_some_and(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 fn candidate_suggestions_for_query(
