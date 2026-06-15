@@ -328,6 +328,8 @@ mod tests {
     use rcx_capability_token::RCX_CT_SIGNATURE_LEN;
     use tower::ServiceExt;
 
+    const TEST_AGENT_TOKEN: &str = "crux_at_0123456789abcdef01234567";
+
     fn test_app() -> axum::Router {
         router(McpContext::new_default("test-node"))
     }
@@ -461,7 +463,7 @@ mod tests {
     #[tokio::test]
     async fn sse_requires_bearer_when_registry_configured() {
         let mut ctx = McpContext::new_default("test-node");
-        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token("secret-token");
+        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token(TEST_AGENT_TOKEN);
         let app = test_app_with_ctx(ctx);
         let req = Request::builder()
             .method("GET")
@@ -479,13 +481,13 @@ mod tests {
     #[tokio::test]
     async fn sse_accepts_bearer_when_registry_configured() {
         let mut ctx = McpContext::new_default("test-node");
-        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token("secret-token");
+        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token(TEST_AGENT_TOKEN);
         let app = test_app_with_ctx(ctx);
         let req = Request::builder()
             .method("GET")
             .uri("/mcp")
             .header("accept", "text/event-stream")
-            .header("authorization", "Bearer secret-token")
+            .header("authorization", format!("Bearer {TEST_AGENT_TOKEN}"))
             .header("mcp-session-id", "test-auth-sse-session-ok")
             .body(Body::empty())
             .unwrap();
@@ -553,7 +555,7 @@ mod tests {
     #[tokio::test]
     async fn post_requires_auth_when_registry_configured() {
         let mut ctx = McpContext::new_default("test-node");
-        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token("secret-token");
+        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token(TEST_AGENT_TOKEN);
         let app = test_app_with_ctx(ctx);
         let body = serde_json::to_string(&json!({
             "jsonrpc": "2.0",
@@ -577,7 +579,7 @@ mod tests {
     #[tokio::test]
     async fn post_accepts_valid_token_when_registry_configured() {
         let mut ctx = McpContext::new_default("test-node");
-        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token("secret-token");
+        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token(TEST_AGENT_TOKEN);
         let app = test_app_with_ctx(ctx);
         let body = serde_json::to_string(&json!({
             "jsonrpc": "2.0",
@@ -591,7 +593,7 @@ mod tests {
             .method("POST")
             .uri("/mcp")
             .header("content-type", "application/json")
-            .header("authorization", "Bearer secret-token")
+            .header("authorization", format!("Bearer {TEST_AGENT_TOKEN}"))
             .body(Body::from(body))
             .unwrap();
 

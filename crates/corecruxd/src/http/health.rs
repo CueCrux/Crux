@@ -7,8 +7,8 @@
 use corecrux_types::{HealthzResponse, ProblemDetails};
 
 use super::{
-    is_query_feature_enabled, problem_response, to_valve_info, AppState, CommitLevel, HeaderMap, IntoResponse, Json,
-    Response, RoutingInfo, RoutingTable, State, StatusCode, ValvesInfo,
+    is_query_feature_enabled, problem_response, require_http_scopes, to_valve_info, AppState, CommitLevel, HeaderMap,
+    IntoResponse, Json, Response, RoutingInfo, RoutingTable, State, StatusCode, ValvesInfo,
 };
 
 #[utoipa::path(
@@ -353,6 +353,57 @@ pub(super) fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Resp
 )]
 pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoResponse {
     let sync_status = sync_runtime_status();
+    let product = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services);
+    let cloud = crate::product::CloudPosture::from_sync(&sync_status);
+    let cloud_access =
+        crate::product::CloudAccessContract::new(state.operating_mode, &state.enabled_pro_services, &cloud);
+    let agent_workbench = super::workbench::workbench_posture(&state);
+    let (embeddings_enabled, semantic_profile) = {
+        let store = state.fact_store.read().await;
+        (store.embeddings_enabled(), store.semantic_profile())
+    };
+    let retrieval_segment_count = state.retrieval_index.read().await.segment_count();
+    let protocol_contracts =
+        crate::protocol_posture::ProtocolPosture::from_runtime(retrieval_segment_count, semantic_profile.as_ref());
+    Json(serde_json::json!({
+        "version": state.build.version,
+        "msrv": "1.88.0",
+        "product": product,
+        "cloud_access": {
+            "schema": cloud_access.schema,
+            "contract_path": "/v1/cloud/access-contract",
+            "cloud_only_entitled": cloud_access.cloud_only_entitled,
+            "cloud_only_active": cloud_access.cloud_only_active,
+            "local_daemon_required_for_current_mode": cloud_access.local_daemon_required_for_current_mode,
+            "mode_switching_supported": cloud_access.mode_switching_supported,
+        },
+        "agent_workbench": agent_workbench,
+        "features": {
+            "text_search": is_query_feature_enabled("CORECRUXD_QUERY_TEXT_SEARCH"),
+            "graph_expand": is_query_feature_enabled("CORECRUXD_QUERY_GRAPH_EXPAND"),
+            "self_observe": crux_observe::config::self_observe_enabled(),
+            "mcp": state.mcp_enabled,
+            "embeddings": embeddings_enabled,
+        },
+        "semantic_profile": semantic_profile,
+        "protocol_contracts": protocol_contracts,
+        "sync": {
+            "mode": sync_status.mode,
+            "configured": sync_status.configured,
+            "background_sync_enabled": sync_status.background_sync_enabled,
+            "degraded": sync_status.degraded,
+            "degraded_reason": sync_status.degraded_reason,
+            "remote_url_redacted": !sync_status.remote_url.is_empty(),
+            "api_key_configured": sync_status.api_key_configured,
+        }
+    }))
+}
+
+pub(super) async fn get_admin_version(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    let sync_status = sync_runtime_status();
     let update_status = state.update_status.read().await.public_view();
     let product = crate::product::ProductPosture::new(state.operating_mode, &state.enabled_pro_services);
     let cloud = crate::product::CloudPosture::from_sync(&sync_status);
@@ -422,6 +473,7 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
         },
         "update": update_status
     }))
+    .into_response()
 }
 
 pub(super) fn sync_runtime_status() -> corecrux_memory::sync::SyncRuntimeStatus {

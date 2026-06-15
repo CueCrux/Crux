@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
@@ -267,18 +268,16 @@ pub(super) async fn post_console_embedding_probe(
     headers: HeaderMap,
     Json(body): Json<ProbeEmbeddingBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_console_read(&state, &headers) {
+    if let Err(problem) = require_console_write(&state, &headers) {
         return problem.into_response();
     }
     let url = body.url.trim().trim_end_matches('/').to_string();
-    if url.is_empty() {
-        return problem_response(StatusCode::BAD_REQUEST, "url must not be empty");
-    }
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return problem_response(StatusCode::BAD_REQUEST, "url must start with http:// or https://");
-    }
+    let policy = match validate_embedding_probe_url(&url) {
+        Ok(policy) => policy,
+        Err(err) => return problem_response(StatusCode::BAD_REQUEST, err),
+    };
 
-    let result = tokio::task::spawn_blocking(move || probe_embedding_url(&url))
+    let result = tokio::task::spawn_blocking(move || probe_embedding_url(&policy))
         .await
         .map_err(|e| e.to_string());
     match result {
@@ -930,13 +929,19 @@ struct EmbeddingProbeResult {
     resolved_url: String,
 }
 
-fn probe_embedding_url(url: &str) -> Result<EmbeddingProbeResult, String> {
+#[derive(Debug, Clone)]
+struct EmbeddingProbePolicy {
+    base_url: String,
+    allow_private_targets: bool,
+}
+
+fn probe_embedding_url(policy: &EmbeddingProbePolicy) -> Result<EmbeddingProbeResult, String> {
     // Inside a Docker container, `localhost`/`127.0.0.1` from the daemon's
     // perspective resolves to the daemon itself, NOT the user's host or a
     // sibling container. We try the URL the operator gave us first; if that
     // fails AND the URL points at localhost, we transparently retry with
     // common Docker-aware fallbacks before giving up.
-    let candidates = build_probe_candidates(url);
+    let candidates = build_probe_candidates(&policy.base_url);
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(6)))
         .build()
@@ -946,6 +951,10 @@ fn probe_embedding_url(url: &str) -> Result<EmbeddingProbeResult, String> {
     let mut last_error = String::new();
 
     for candidate in &candidates {
+        if let Err(err) = ensure_embedding_probe_candidate_allowed(candidate, policy.allow_private_targets) {
+            last_error = err;
+            continue;
+        }
         for (shape, path) in probe_endpoints {
             let probe_url = format!("{candidate}{path}");
             match agent.get(&probe_url).header("Accept", "application/json").call() {
@@ -1006,6 +1015,104 @@ fn probe_embedding_url(url: &str) -> Result<EmbeddingProbeResult, String> {
     ))
 }
 
+fn validate_embedding_probe_url(url: &str) -> Result<EmbeddingProbePolicy, String> {
+    if url.is_empty() {
+        return Err("url must not be empty".to_string());
+    }
+    let parsed = parse_embedding_probe_url(url)?;
+    let allow_private_targets = embedding_probe_private_targets_allowed(&parsed);
+    ensure_embedding_probe_addr_allowed(&parsed, allow_private_targets)?;
+    Ok(EmbeddingProbePolicy {
+        base_url: url.trim().trim_end_matches('/').to_string(),
+        allow_private_targets,
+    })
+}
+
+fn parse_embedding_probe_url(url: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid url: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("url must start with http:// or https://".to_string());
+    }
+    if parsed.host_str().is_none() {
+        return Err("url must include a host".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("url must not include credentials".to_string());
+    }
+    Ok(parsed)
+}
+
+fn ensure_embedding_probe_candidate_allowed(candidate: &str, allow_private_targets: bool) -> Result<(), String> {
+    let parsed = parse_embedding_probe_url(candidate)?;
+    ensure_embedding_probe_addr_allowed(&parsed, allow_private_targets)
+}
+
+fn ensure_embedding_probe_addr_allowed(parsed: &url::Url, allow_private_targets: bool) -> Result<(), String> {
+    let host = parsed.host_str().ok_or_else(|| "url must include a host".to_string())?;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return ensure_embedding_ip_allowed(ip, allow_private_targets);
+    }
+    for addr in (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("could not resolve embedding probe host '{host}': {e}"))?
+    {
+        ensure_embedding_ip_allowed(addr.ip(), allow_private_targets)?;
+    }
+    Ok(())
+}
+
+fn ensure_embedding_ip_allowed(ip: IpAddr, allow_private_targets: bool) -> Result<(), String> {
+    if allow_private_targets || !is_private_probe_ip(ip) {
+        return Ok(());
+    }
+    Err(format!(
+        "embedding probe target {ip} is private, loopback, link-local, metadata, multicast, or unspecified; configure CORECRUXD_EMBEDDING_URL or CORECRUXD_EMBEDDING_PROBE_ALLOW_LOCAL=1 for local endpoints"
+    ))
+}
+
+fn is_private_probe_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+        }
+    }
+}
+
+fn embedding_probe_private_targets_allowed(parsed: &url::Url) -> bool {
+    if std::env::var("CORECRUXD_EMBEDDING_PROBE_ALLOW_LOCAL")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    {
+        return true;
+    }
+    let Some(configured) = std::env::var("CORECRUXD_EMBEDDING_URL")
+        .ok()
+        .and_then(|value| url::Url::parse(value.trim()).ok())
+    else {
+        return false;
+    };
+    same_probe_origin(parsed, &configured)
+}
+
+fn same_probe_origin(left: &url::Url, right: &url::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str().map(str::to_ascii_lowercase) == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
 /// Given a user-supplied embedding URL, build the ordered list of hostnames
 /// to actually probe. The operator's URL is always first. When the URL points
 /// at localhost, we append `host.docker.internal` (Docker Desktop bridge) and
@@ -1014,7 +1121,7 @@ fn probe_embedding_url(url: &str) -> Result<EmbeddingProbeResult, String> {
 /// profile) so the operator's "obvious" URL Just Works from inside the daemon.
 #[cfg(test)]
 mod probe_candidate_tests {
-    use super::build_probe_candidates;
+    use super::{build_probe_candidates, validate_embedding_probe_url};
 
     #[test]
     fn non_localhost_url_returns_only_itself() {
@@ -1047,6 +1154,34 @@ mod probe_candidate_tests {
         let c = build_probe_candidates("http://host.docker.internal:11434");
         // Not localhost, so no rewrite.
         assert_eq!(c, vec!["http://host.docker.internal:11434".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embedding_probe_blocks_metadata_ip() {
+        std::env::remove_var("CORECRUXD_EMBEDDING_URL");
+        std::env::remove_var("CORECRUXD_EMBEDDING_PROBE_ALLOW_LOCAL");
+        let err = validate_embedding_probe_url("http://169.254.169.254/latest").unwrap_err();
+        assert!(err.contains("private"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embedding_probe_blocks_private_cidr_by_default() {
+        std::env::remove_var("CORECRUXD_EMBEDDING_URL");
+        std::env::remove_var("CORECRUXD_EMBEDDING_PROBE_ALLOW_LOCAL");
+        let err = validate_embedding_probe_url("http://10.0.0.5:11434").unwrap_err();
+        assert!(err.contains("private"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn embedding_probe_allows_configured_local_endpoint() {
+        std::env::set_var("CORECRUXD_EMBEDDING_URL", "http://127.0.0.1:11434");
+        std::env::remove_var("CORECRUXD_EMBEDDING_PROBE_ALLOW_LOCAL");
+        let policy = validate_embedding_probe_url("http://127.0.0.1:11434").expect("configured local endpoint");
+        assert!(policy.allow_private_targets);
+        std::env::remove_var("CORECRUXD_EMBEDDING_URL");
     }
 }
 

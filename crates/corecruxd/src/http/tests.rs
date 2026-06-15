@@ -1066,8 +1066,9 @@ async fn mediation_receipt_unauthenticated_denied_t3() {
 #[serial_test::serial]
 async fn resolve_principal_cross_tenant_denied_t1() {
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    const TEST_HS256_SECRET: &str = "0123456789abcdef0123456789abcdef";
 
-    std::env::set_var("CORECRUXD_JWT_HS256_SECRET", "secret");
+    std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
     std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
     std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
 
@@ -1097,7 +1098,7 @@ async fn resolve_principal_cross_tenant_denied_t1() {
         let token = encode(
             &Header::new(Algorithm::HS256),
             &claims,
-            &EncodingKey::from_secret(b"secret"),
+            &EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
         )
         .expect("jwt");
         let mut headers = HeaderMap::new();
@@ -4319,7 +4320,25 @@ async fn post_admin_action_too_long_id_returns_400() {
         .into_response();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = json_body(resp).await;
-    assert!(body["detail"].as_str().unwrap_or_default().contains("128 characters"));
+    assert!(body["detail"].as_str().unwrap_or_default().contains("1..=128"));
+}
+
+#[tokio::test]
+async fn admin_action_id_rejects_unsafe_chars() {
+    let state = test_app_state(16);
+    let req = admin::PostAdminActionRequest {
+        action_id: Some("act:bad/../id".to_string()),
+        action_type: "runtime-knob-update".to_string(),
+        actor: None,
+        reason: None,
+        params: None,
+    };
+    let resp = admin::post_admin_action(State(state), HeaderMap::new(), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp).await;
+    assert!(body["detail"].as_str().unwrap_or_default().contains("[A-Za-z0-9._-]"));
 }
 
 // ── to_valve_info ───────────────────────────────────────────────
@@ -5960,7 +5979,7 @@ async fn panic_handler_handles_string_panic() {
 
 #[serial_test::serial]
 #[tokio::test]
-async fn version_endpoint_returns_build_info_and_features() {
+async fn version_public_view_is_redacted() {
     std::env::remove_var("CORECRUXD_SYNC_ENABLED");
     std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
     std::env::remove_var("CORECRUXD_SYNC_API_KEY");
@@ -5985,11 +6004,18 @@ async fn version_endpoint_returns_build_info_and_features() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
     assert_eq!(body["version"], "test");
-    assert_eq!(body["commit"], "test");
     assert_eq!(body["msrv"], "1.88.0");
+    assert!(body["commit"].is_null());
+    assert!(body["passport"].is_null());
+    assert!(body["cloud"].is_null());
+    assert!(body["action_enrichment"].is_null());
+    assert!(body["gpu1_compute"].is_null());
+    assert!(body["update"].is_null());
     assert_eq!(body["product"]["mode"], "free_local");
     assert_eq!(body["product"]["tier"], "free");
     assert_eq!(body["product"]["free_safety_baseline_active"], true);
+    assert_eq!(body["cloud_access"]["contract_path"], "/v1/cloud/access-contract");
+    assert_eq!(body["agent_workbench"]["contract_path"], "/v1/workbench/contract");
     assert!(body["product"]["enabled_capability_claims"]
         .as_array()
         .unwrap()
@@ -6005,37 +6031,6 @@ async fn version_endpoint_returns_build_info_and_features() {
         .unwrap()
         .iter()
         .any(|claim| claim == "gpu1:answer"));
-    assert_eq!(body["cloud"]["tenant_connectivity"], "not_configured");
-    assert_eq!(body["cloud"]["local_mirror_state"], "disabled");
-    assert_eq!(
-        body["cloud_access"]["schema"],
-        crate::product::CLOUD_ACCESS_CONTRACT_SCHEMA
-    );
-    assert_eq!(body["cloud_access"]["contract_path"], "/v1/cloud/access-contract");
-    assert_eq!(body["cloud_access"]["cloud_only_entitled"], false);
-    assert_eq!(
-        body["action_enrichment"]["schema"],
-        corecrux_memory::action_enrichment::ACTION_ENRICHMENT_SCHEMA
-    );
-    assert_eq!(body["action_enrichment"]["contract_path"], "/v1/actions/enrich");
-    assert_eq!(body["action_enrichment"]["basic_available"], true);
-    assert_eq!(body["action_enrichment"]["first_party_enabled"], false);
-    assert_eq!(
-        body["agent_workbench"]["schema"],
-        super::workbench::WORKBENCH_CONTRACT_SCHEMA
-    );
-    assert_eq!(body["agent_workbench"]["contract_path"], "/v1/workbench/contract");
-    assert!(body["agent_workbench"]["surfaces"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|surface| surface["capability"] == "agent_brief:pro" && surface["status"] == "pro_required"));
-    assert_eq!(
-        body["gpu1_compute"]["schema"],
-        super::gpu1::GPU1_COMPUTE_CONTRACT_SCHEMA
-    );
-    assert_eq!(body["gpu1_compute"]["contract_path"], "/v1/gpu1/contract");
-    assert_eq!(body["gpu1_compute"]["remote_memory_sync_required"], false);
     assert!(body["semantic_profile"].is_null());
     assert_eq!(body["protocol_contracts"]["session_plan_contract"]["status"], "current");
     assert_eq!(
@@ -6070,6 +6065,46 @@ async fn version_endpoint_returns_build_info_and_features() {
     assert!(body["features"]["mcp"].is_boolean());
     assert_eq!(body["sync"]["mode"], "local_only");
     assert_eq!(body["sync"]["configured"], false);
+    assert_eq!(body["sync"]["remote_url_redacted"], false);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn version_admin_view_includes_operational_details() {
+    std::env::remove_var("CORECRUXD_SYNC_ENABLED");
+    std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
+    std::env::remove_var("CORECRUXD_SYNC_API_KEY");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    *state.update_status.write().await = corecrux_types::UpdateStatus {
+        enabled: true,
+        state: corecrux_types::UpdateCheckState::Current,
+        remote: "origin".to_string(),
+        ref_name: "main".to_string(),
+        tracking_ref: "origin/main".to_string(),
+        repo_dir: Some("/tmp/crux".to_string()),
+        current_commit: Some("abc123".to_string()),
+        latest_commit: Some("abc123".to_string()),
+        ahead_by: 0,
+        behind_by: 0,
+        checked_at: Some("2026-04-09T12:00:00Z".to_string()),
+        error: None,
+        comparison_stale: false,
+        upgrade_hint: "current".to_string(),
+    };
+
+    let resp = get_admin_version(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["version"], "test");
+    assert_eq!(body["commit"], "test");
+    assert_eq!(body["passport"]["alg"], "ed25519");
+    assert_eq!(body["cloud"]["tenant_connectivity"], "not_configured");
+    assert_eq!(body["cloud_access"]["contract_path"], "/v1/cloud/access-contract");
+    assert_eq!(body["action_enrichment"]["contract_path"], "/v1/actions/enrich");
+    assert_eq!(body["agent_workbench"]["contract_path"], "/v1/workbench/contract");
+    assert_eq!(body["gpu1_compute"]["contract_path"], "/v1/gpu1/contract");
     assert_eq!(body["update"]["state"], "current");
     assert_eq!(body["update"]["tracking_ref"], "origin/main");
     assert_eq!(body["update"]["current_commit"], "abc123");
@@ -6091,7 +6126,8 @@ async fn version_endpoint_reports_degraded_sync_when_remote_is_incomplete() {
     assert_eq!(body["sync"]["mode"], "degraded");
     assert_eq!(body["sync"]["configured"], false);
     assert_eq!(body["sync"]["background_sync_enabled"], true);
-    assert_eq!(body["sync"]["remote_url"], "http://example.test:14800");
+    assert!(body["sync"]["remote_url"].is_null());
+    assert_eq!(body["sync"]["remote_url_redacted"], true);
     assert_eq!(body["sync"]["api_key_configured"], false);
     assert!(body["sync"]["degraded_reason"]
         .as_str()
@@ -6486,7 +6522,9 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
 #[serial_test::serial]
 #[tokio::test]
 async fn workbench_context_pack_honors_jwt_tenant_binding() {
-    std::env::set_var("CORECRUXD_JWT_HS256_SECRET", "secret");
+    const TEST_HS256_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+    std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
     std::env::remove_var("CORECRUXD_JWT_ISS");
     std::env::remove_var("CORECRUXD_JWT_AUD");
     let mut state = test_app_state_with_auth(16, AuthMode::JwtHs256);
@@ -6505,7 +6543,7 @@ async fn workbench_context_pack_honors_jwt_tenant_binding() {
             "tenant_id": "business::other",
             "exp": exp,
         }),
-        &jsonwebtoken::EncodingKey::from_secret(b"secret"),
+        &jsonwebtoken::EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
     )
     .expect("jwt");
     let mut headers = HeaderMap::new();
@@ -10501,7 +10539,7 @@ async fn embedding_probe_rejects_empty_url() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = console::post_console_embedding_probe(
         State(state),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(console::ProbeEmbeddingBody { url: "".to_string() }),
     )
     .await
@@ -10514,7 +10552,7 @@ async fn embedding_probe_rejects_non_http_url() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = console::post_console_embedding_probe(
         State(state),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(console::ProbeEmbeddingBody {
             url: "ftp://example.com".to_string(),
         }),
@@ -10525,7 +10563,7 @@ async fn embedding_probe_rejects_non_http_url() {
 }
 
 #[tokio::test]
-async fn embedding_probe_requires_admin_read() {
+async fn embedding_probe_requires_admin_write() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = console::post_console_embedding_probe(
         State(state),
@@ -10537,6 +10575,21 @@ async fn embedding_probe_requires_admin_read() {
     .await
     .into_response();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn embedding_probe_rejects_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::post_console_embedding_probe(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Json(console::ProbeEmbeddingBody {
+            url: "http://example.com".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 // ── Coverage-lift batch (PR #66) ───────────────────────────────────────────

@@ -82,6 +82,14 @@ pub(super) fn is_known_admin_action(ty: &str) -> bool {
     )
 }
 
+fn is_safe_admin_action_id(action_id: &str) -> bool {
+    !action_id.is_empty()
+        && action_id.len() <= 128
+        && action_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 pub(super) fn read_param_str<'a>(params: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
     params
         .and_then(|v| v.get(key))
@@ -1257,8 +1265,11 @@ pub(super) async fn post_admin_action(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map_or_else(|| format!("act_{}", uuid::Uuid::new_v4()), ToOwned::to_owned);
-    if action_id.len() > 128 {
-        return problem_response(StatusCode::BAD_REQUEST, "actionId must be <= 128 characters");
+    if !is_safe_admin_action_id(&action_id) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "actionId must be 1..=128 ASCII chars from [A-Za-z0-9._-]",
+        );
     }
 
     let mut actions = state.admin_actions.write().await;

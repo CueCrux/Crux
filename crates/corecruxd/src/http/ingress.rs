@@ -29,12 +29,11 @@ use std::time::Instant;
 
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::ConnectInfo;
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use corecrux_types::ProblemDetails;
 use tower::ServiceBuilder;
-use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::config::IngressConfig;
 use crate::metrics::Metrics;
@@ -51,6 +50,13 @@ const BUCKET_SWEEP_THRESHOLD: usize = 10_000;
 /// Idle horizon for the sweep: an idle bucket is fully refilled anyway, so
 /// dropping it loses nothing.
 const BUCKET_IDLE_SECS: u64 = 60;
+const LARGE_ROUTE_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const LARGE_BODY_ROUTES: &[&str] = &[
+    "/v1/append",
+    "/v1/admin/append",
+    "/v1/memory/import",
+    "/v1/result-envelope/import",
+];
 
 /// Applies the ingress limits to a fully-built router.
 ///
@@ -62,12 +68,19 @@ pub fn apply_ingress_limits(router: Router, cfg: &IngressConfig, metrics: Option
 
     // M1 — request body limit + problem+json 413s.
     if cfg.max_request_body_bytes > 0 {
-        let limit = cfg.max_request_body_bytes;
-        router = router
-            .layer(RequestBodyLimitLayer::new(limit))
-            .layer(axum::middleware::map_response(move |resp: Response| async move {
-                decorate_payload_too_large(resp, limit)
-            }));
+        let default_limit = cfg.max_request_body_bytes;
+        router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                let limit = request_body_limit_for_path(req.uri().path(), default_limit);
+                if content_length_exceeds(req.headers(), limit) {
+                    return payload_too_large_response(limit);
+                }
+                let (parts, body) = req.into_parts();
+                let limited = http_body_util::Limited::new(body, limit);
+                let req = Request::from_parts(parts, axum::body::Body::new(limited));
+                decorate_payload_too_large(next.run(req).await, limit)
+            },
+        ));
     }
 
     // M2 — inflight gauge (admitted requests only, so added before = inside
@@ -526,6 +539,10 @@ fn decorate_payload_too_large(resp: Response, limit: usize) -> Response {
     if already_problem {
         return resp;
     }
+    payload_too_large_response(limit)
+}
+
+fn payload_too_large_response(limit: usize) -> Response {
     let mut pd = ProblemDetails::new(
         StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
         "https://errors.cuecrux.com/payload-too-large",
@@ -535,6 +552,22 @@ fn decorate_payload_too_large(resp: Response, limit: usize) -> Response {
         "request body exceeds the configured limit of {limit} bytes (CORECRUXD_MAX_REQUEST_BODY_BYTES)"
     ));
     ProblemResponse(pd).into_response()
+}
+
+fn request_body_limit_for_path(path: &str, default_limit: usize) -> usize {
+    if LARGE_BODY_ROUTES.contains(&path) {
+        default_limit.max(LARGE_ROUTE_BODY_LIMIT_BYTES)
+    } else {
+        default_limit
+    }
+}
+
+fn content_length_exceeds(headers: &HeaderMap, limit: usize) -> bool {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|len| len > limit)
 }
 
 #[cfg(test)]
@@ -549,10 +582,11 @@ mod tests {
     use crate::config::IngressConfig;
 
     fn test_router() -> Router {
-        Router::new().route(
-            "/echo",
-            post(|body: Bytes| async move { format!("{} bytes", body.len()) }),
-        )
+        let echo = post(|body: Bytes| async move { format!("{} bytes", body.len()) });
+        Router::new()
+            .route("/echo", echo.clone())
+            .route("/v1/admin/append", echo.clone())
+            .route("/v1/admin/actions", echo)
     }
 
     fn cfg(limit: usize) -> IngressConfig {
@@ -617,6 +651,40 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"512 bytes");
+    }
+
+    #[tokio::test]
+    async fn route_specific_body_limits() {
+        let app = apply_ingress_limits(test_router(), &cfg(1024), None);
+        let resp = app
+            .oneshot(
+                Request::post("/v1/admin/append")
+                    .header("content-length", "2048")
+                    .body(Body::from(vec![0u8; 2048]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"2048 bytes");
+    }
+
+    #[tokio::test]
+    async fn admin_routes_reject_large_bodies() {
+        let app = apply_ingress_limits(test_router(), &cfg(1024), None);
+        let resp = app
+            .oneshot(
+                Request::post("/v1/admin/actions")
+                    .header("content-length", "2048")
+                    .body(Body::from(vec![0u8; 2048]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let json = problem_json(resp).await;
+        assert!(json["detail"].as_str().unwrap().contains("1024"));
     }
 
     #[tokio::test]

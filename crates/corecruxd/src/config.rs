@@ -134,16 +134,16 @@ pub struct IngressConfig {
     pub grpc_max_concurrent_streams: u32,
 }
 
-/// Default HTTP body limit: 256 MB. Sized for the largest legitimate
-/// payloads (multi-MB bulk-import bodies) with >10× headroom, while still
-/// closing the unbounded-body DoS door.
-pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
+/// Default HTTP body limit: 16 MB. Bulk/import routes get explicit higher
+/// caps in the ingress layer; ordinary admin/query/console writes should not
+/// need multi-hundred-MB bodies.
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Default graceful-shutdown drain cap: matches the router-wide 30s
 /// `TimeoutLayer`, so no request that can still complete is cut short.
 pub const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 30;
-/// Default in-flight request cap: 4096 — far above observed prod
+/// Default in-flight request cap: 1024 — far above observed prod
 /// concurrency, low enough to shed a connection flood before memory does.
-pub const DEFAULT_MAX_INFLIGHT: usize = 4096;
+pub const DEFAULT_MAX_INFLIGHT: usize = 1024;
 /// Default sustained per-key request rate: 300 req/s — ≥10× the busiest
 /// observed single-agent traffic.
 pub const DEFAULT_RATE_LIMIT_RPS: u64 = 300;
