@@ -12597,12 +12597,15 @@ async fn identity_link_lifecycle_create_resolve_revoke_deny() {
         .iter()
         .map(|v| v.as_str().unwrap_or_default().to_string())
         .collect();
-    for cap in &caps {
-        assert!(
-            crate::principal::MEMORY_READ_CAPABILITIES.contains(&cap.as_str()),
-            "linked passport must never hold non-memory.read capability {cap}"
-        );
-    }
+    assert_eq!(caps, crate::policy::federation_read_allowed_capabilities());
+    assert_eq!(
+        principal["federation_grant"]["capability"],
+        crate::policy::FEDERATION_READ_CAPABILITY
+    );
+    assert_eq!(
+        principal["federation_grant"]["scope"],
+        crate::policy::FEDERATION_READ_SCOPE
+    );
 
     // List shows it.
     let resp = identity_links::get_identity_links(State(state.clone()), HeaderMap::new())
@@ -12627,6 +12630,62 @@ async fn identity_link_lifecycle_create_resolve_revoke_deny() {
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "revoked link must be denied");
+}
+
+#[tokio::test]
+async fn identity_link_resolution_consumes_rcx_federation_read_grant() {
+    let mut state = test_app_state(16);
+    state.rcx_router = Some(test_rcx_router(vec![crate::policy::FEDERATION_READ_CAPABILITY]));
+    let (req, remote_fpr) = signed_link_request(&state).await;
+
+    let resp = identity_links::post_identity_link(State(state.clone()), HeaderMap::new(), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = principal::get_resolve_principal(State(state), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-crux-mode").unwrap(), "local");
+    let principal = json_body(resp).await;
+    assert_eq!(
+        principal["federation_grant"]["capability"],
+        crate::policy::FEDERATION_READ_CAPABILITY
+    );
+}
+
+#[tokio::test]
+async fn identity_link_resolution_denied_when_rcx_federation_read_missing() {
+    let mut state = test_app_state(16);
+    state.rcx_router = Some(test_rcx_router(vec!["corecrux.query.local"]));
+    let (req, remote_fpr) = signed_link_request(&state).await;
+
+    let resp = principal::get_resolve_principal(State(state.clone()), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "unlinked passport stays 404 before RCX"
+    );
+
+    let resp = identity_links::post_identity_link(State(state.clone()), HeaderMap::new(), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = principal::get_resolve_principal(State(state), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.headers().get("x-crux-mode").unwrap(), "refused");
+    let body = json_body(resp).await;
+    assert_eq!(body["error"], "rcx_capability_denied");
+    assert_eq!(
+        body["refusal_receipt"]["capability"],
+        crate::policy::FEDERATION_READ_CAPABILITY
+    );
 }
 
 #[tokio::test]

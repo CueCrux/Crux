@@ -42,6 +42,11 @@ pub struct ResolvedPrincipal {
     pub agent_work_gate: bool,
     /// `"session"` (joined via a session binding) or `"passport"` (direct).
     pub resolved_via: String,
+    /// Present only for identity-federation fallback resolution. The grant is
+    /// explicit so mediators can distinguish a tier-derived read capability
+    /// from a confirmed cross-passport memory-read edge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub federation_grant: Option<crate::policy::FederationReadGrant>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -73,6 +78,7 @@ fn build(
         tenant_id,
         agent_work_gate,
         resolved_via: resolved_via.to_string(),
+        federation_grant: None,
     }
 }
 
@@ -110,17 +116,12 @@ pub fn resolve_by_passport(
     Ok(build(passport, tenant_id, category, agent_work_gate, "passport"))
 }
 
-/// The capability allowlist a federated (linked) passport may hold —
-/// read-only memory access, nothing else (Identity-Federation-v1 §4: a link
-/// grants `memory.read`, never write, never admin, never key custody).
-pub const MEMORY_READ_CAPABILITIES: &[&str] = &["tool:list", "tool:invoke:read"];
-
 /// Identity-federation fallback (G4b, behind `CORECRUXD_IDENTITY_LINKS`):
 /// resolve a passport fingerprint that is NOT local by following a live
 /// `identity_link` edge. The result is the *linked local* passport's
-/// identity, with capabilities intersected down to
-/// [`MEMORY_READ_CAPABILITIES`] and `resolved_via = "identity_link:<id>"`
-/// so receipts attribute the hop.
+/// identity, with capabilities stamped from the policy-owned
+/// `federation.read` grant and `resolved_via = "identity_link:<id>"` so
+/// receipts attribute the hop.
 ///
 /// Unlinked → `PassportNotFound` (same denial as before the feature).
 /// Revoked links are invisible to `find_live_link_for_remote`, so a revoked
@@ -144,9 +145,9 @@ pub fn resolve_by_linked_passport(
     let (link_id, payload) = crate::identity_links::find_live_link_for_remote(entities, remote_fpr)
         .ok_or_else(|| ResolveError::PassportNotFound(remote_fpr.to_string()))?;
     let mut principal = resolve_by_passport(store, &payload.local_passport_id, None)?;
-    principal
-        .capabilities
-        .retain(|cap| MEMORY_READ_CAPABILITIES.contains(&cap.as_str()));
+    let grant = crate::policy::federation_read_grant();
+    principal.capabilities = grant.allowed_capabilities.clone();
+    principal.federation_grant = Some(grant);
     principal.resolved_via = format!("identity_link:{link_id}");
     Ok(principal)
 }
@@ -338,10 +339,10 @@ mod tests {
         assert_eq!(p.passport_id, "personal-default");
         // Trusted tier would normally carry metered/side_effect — the link
         // caps it to the memory.read allowlist, never key custody.
-        assert_eq!(
-            p.capabilities,
-            vec!["tool:list".to_string(), "tool:invoke:read".to_string()]
-        );
+        assert_eq!(p.capabilities, crate::policy::federation_read_allowed_capabilities());
+        let grant = p.federation_grant.expect("federation grant stamped");
+        assert_eq!(grant.capability, crate::policy::FEDERATION_READ_CAPABILITY);
+        assert_eq!(grant.scope, crate::policy::FEDERATION_READ_SCOPE);
         assert_eq!(p.resolved_via, format!("identity_link:{link_id}"));
         let _ = std::fs::remove_dir_all(&dir);
     }

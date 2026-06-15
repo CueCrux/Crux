@@ -46,6 +46,40 @@ pub fn capabilities_for_tier(tier: &str) -> Vec<String> {
     caps
 }
 
+/// RCX capability class for read-only identity-federation hops. This is not a
+/// reputation-tier capability; it is granted by an explicit `identity_link`
+/// and enforced through the RCX router when that fallback is used.
+pub const FEDERATION_READ_CAPABILITY: &str = crux_router::FEDERATION_READ_CAPABILITY;
+
+/// The link scope that backs [`FEDERATION_READ_CAPABILITY`].
+pub const FEDERATION_READ_SCOPE: &str = corecrux_memory::identity_link::IDENTITY_LINK_SCOPE_MEMORY_READ;
+
+/// The mediator capabilities unlocked by a confirmed federation read grant.
+/// Keep this as the single allowlist for linked-passport resolution.
+pub const FEDERATION_READ_ALLOWED_CAPABILITIES: &[&str] = &["tool:list", "tool:invoke:read"];
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct FederationReadGrant {
+    pub capability: String,
+    pub scope: String,
+    pub allowed_capabilities: Vec<String>,
+}
+
+pub fn federation_read_allowed_capabilities() -> Vec<String> {
+    FEDERATION_READ_ALLOWED_CAPABILITIES
+        .iter()
+        .map(|capability| (*capability).to_string())
+        .collect()
+}
+
+pub fn federation_read_grant() -> FederationReadGrant {
+    FederationReadGrant {
+        capability: FEDERATION_READ_CAPABILITY.to_string(),
+        scope: FEDERATION_READ_SCOPE.to_string(),
+        allowed_capabilities: federation_read_allowed_capabilities(),
+    }
+}
+
 // ── Per-tool risk → required capability (B3: the single source) ───────────
 
 /// Risk classes for a proxied tool, lowest → highest privilege. Each maps to
@@ -125,6 +159,9 @@ pub fn policy_document() -> serde_json::Value {
         "risk_required_capability": risk_required,
         "min_tier_for_capability": min_tier_for_cap,
         "gateway_min_tier_required_capability": gateway_map,
+        "federation_grants": {
+            (FEDERATION_READ_CAPABILITY): federation_read_grant(),
+        },
     })
 }
 
@@ -176,7 +213,19 @@ mod tests {
         assert_eq!(min_tier_for_capability("tool:invoke:side_effect"), Some("established"));
         assert_eq!(min_tier_for_capability("tool:invoke:metered"), Some("trusted"));
         assert_eq!(min_tier_for_capability("tool:invoke:destructive"), Some("elite"));
+        assert_eq!(min_tier_for_capability(FEDERATION_READ_CAPABILITY), None);
         assert_eq!(min_tier_for_capability("tool:invoke:nope"), None);
+    }
+
+    #[test]
+    fn federation_read_grant_is_read_only_and_explicit() {
+        let grant = federation_read_grant();
+        assert_eq!(grant.capability, FEDERATION_READ_CAPABILITY);
+        assert_eq!(grant.scope, FEDERATION_READ_SCOPE);
+        assert_eq!(
+            grant.allowed_capabilities,
+            vec!["tool:list".to_string(), "tool:invoke:read".to_string()]
+        );
     }
 
     #[test]
