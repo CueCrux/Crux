@@ -99,6 +99,27 @@ for the Crux Daemon.
 5. Public `/v1/version` is redacted. Full operational version details live at
    `/v1/admin/version` behind `admin:read`.
 
+## Capability Token Trust and Revocation
+
+- **Local-token trust invariant.** The capability router (`crux-router`) skips
+  signature verification for the `local` backend. This is sound only because the
+  token reaching the router is daemon-minted (self-minted local token in
+  `corecruxd` startup) and never client-injected — the local token does not
+  cross a trust boundary. Hosted/customer backends are always signature-verified
+  against a configured trusted issuer key; the local short-circuit cannot be
+  leveraged to authorise a hosted lane. A future change that routes a
+  client-supplied token through the router must construct it with a trusted
+  issuer pubkey. This is pinned by the
+  `local_signature_bypass_does_not_extend_to_hosted_backend` regression test.
+- **Revocation is modelled but not yet enforced.** Tokens carry `crl_url` and
+  `push_channel` revocation hints, but the router does not yet consult them, so a
+  revoked-but-unexpired token is still authorised within its validity window.
+  To avoid misleading downstream auditors, the router mode stamp carries
+  `revocation_checked: false`; an authorised decision does **not** imply the
+  token was checked against a CRL or revocation timestamp. Mitigation today:
+  keep token lifetimes short. Revocation IO (CRL/timestamp consult) is a planned
+  later phase.
+
 ## Error Response Policy
 
 Error responses for shard routing errors (`SHARD_UNAVAILABLE`, `WRONG_SHARD`,
@@ -143,3 +164,18 @@ tests pin representative scope contracts and high-risk HTTP boundary routes.
 - Parser/verifier fuzz targets run on the scheduled workflow and as bounded PR
   runs when fuzz, frame, receipt, router, or lockfile paths change. Crash and
   corpus artifacts are uploaded for follow-up.
+- `cargo deny`'s `wildcards` policy is `deny`: no workspace crate may declare a
+  `"*"` version. `multiple-versions` remains `warn` because two RustCrypto
+  generations coexist (the stable `digest 0.10` / `der 0.7` stack from
+  `ed25519-dalek` and `p256`/`ecdsa`, and the `digest 0.11` / `der 0.8` stack
+  from `cms`, `x509-cert`, and `zip`). This duplication is tracked, not silently
+  accepted; the crypto subset will move to a targeted `deny` once upstreams
+  converge.
+- **Pre-release crypto in witness verification.** `corecrux-receipts` depends on
+  `cms 0.3.0-pre.2` and `x509-cert 0.3.0-rc.4`. These parse RFC3161 timestamp
+  tokens for the optional witness/co-signature path only — they are not in the
+  core CROWN Ed25519 receipt signing/verification path, which uses stable
+  `ed25519-dalek 2.x`. `cms` is the only Rust CMS/PKCS#7 parser and is still
+  pre-release upstream, so it cannot be replaced with a stable equivalent today.
+  Treat witness-timestamp parsing as a defence-in-depth signal, not a primary
+  trust anchor, until these crates reach a stable release.
