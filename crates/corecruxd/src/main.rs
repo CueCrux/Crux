@@ -39,6 +39,7 @@ mod grpc;
 mod http;
 // metrics: Prometheus register!() macros use expect() at init — safe, panics
 // only on duplicate registration (programmer error caught in tests).
+mod candidate_links;
 mod context_graph;
 mod dossier;
 mod encrypted_secrets;

@@ -361,6 +361,40 @@ mod tests {
     }
 
     #[test]
+    fn candidate_link_is_not_a_resolving_edge() {
+        let dir = temp_dir("candidate-is-not-link");
+        let mut store = FactStore::new();
+        let mut entities = corecrux_memory::EntityStore::new();
+        passports::seed_defaults_if_missing(&dir, &mut store, 1).expect("seed");
+        let local = passports::get_passport(&store, "personal-default").expect("local");
+        let observed_subject = "p_candidate000000000000000000000000".to_string();
+        let (candidate_id, _) = crate::candidate_links::create_candidate(
+            &mut entities,
+            &store,
+            crate::candidate_links::CreateCandidateInput {
+                local_passport_fpr: local.principal_id,
+                observed_subject: observed_subject.clone(),
+                signals: vec![corecrux_memory::candidate_link::CandidateLinkSignal {
+                    kind: "temporal_adjacency".to_string(),
+                    confidence: 0.7,
+                    evidence_ref: Some("evidence:test".to_string()),
+                }],
+                confidence: 0.7,
+                evidence_refs: vec!["evidence:test".to_string()],
+                proposed_at: Some("2026-06-15T00:00:00Z".to_string()),
+            },
+            "operator",
+        )
+        .expect("candidate");
+
+        assert!(crate::candidate_links::get_candidate(&entities, &candidate_id).is_some());
+        let err =
+            resolve_by_linked_passport(&store, &entities, &observed_subject).expect_err("candidate must not resolve");
+        assert!(matches!(err, ResolveError::PassportNotFound(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn revoked_link_denied() {
         let dir = temp_dir("revoked-link");
         let mut store = FactStore::new();

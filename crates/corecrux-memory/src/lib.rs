@@ -29,6 +29,7 @@
 
 pub mod action_enrichment;
 pub mod artefact_store;
+pub mod candidate_link;
 pub mod cruxpack;
 pub mod edge_store;
 pub mod embeddings;

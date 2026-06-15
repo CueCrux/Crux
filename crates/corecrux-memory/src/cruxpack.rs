@@ -150,8 +150,8 @@ pub struct PackManifest {
 
 /// The pack payload. `entities` and `receipts` are schema-reserved: v1
 /// exporters always write `[]` (entity records include born-local kinds like
-/// `identity_link` that must not travel; a receipts chain slice needs the
-/// CROWN slice API — both explicit follow-ups in the spec).
+/// `identity_link` and `candidate_link` that must not travel; a receipts chain
+/// slice needs the CROWN slice API — both explicit follow-ups in the spec).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PackSections {
     pub facts: Vec<Fact>,
