@@ -94,8 +94,10 @@ for the Crux Daemon.
    (`CORECRUXD_REPLICATION_AUTH_BEARER`).
 3. Prometheus metrics (`/metrics`) and health endpoints (`/healthz`, `/readyz`) are
    unauthenticated. Restrict access at the network level if exposing beyond localhost.
-4. The `/debug/healthz` endpoint is gated behind the `debug:read` scope and includes
-   internal topology information. It should not be exposed to untrusted clients.
+4. MCP Streamable HTTP server-info discovery can remain public, but SSE stream
+   creation requires configured bearer auth when agent tokens are present.
+5. Public `/v1/version` is redacted. Full operational version details live at
+   `/v1/admin/version` behind `admin:read`.
 
 ## Error Response Policy
 
@@ -112,8 +114,32 @@ route-specific resource protection. `X-Corecrux-Passport-Id` is not trusted as
 a pre-auth rate-limit key; unauthenticated callers cannot rotate it to obtain
 independent buckets.
 
+Global request bodies default to 16 MiB. Bulk/import endpoints that need a
+larger envelope have explicit route-specific limits. The console embedding
+probe is an authenticated admin write operation and rejects metadata,
+link-local, private, multicast, unspecified, and DNS-rebound targets by default
+unless the target matches the configured embedding endpoint or an explicit
+local-probe override is set.
+
+## Route Authorization Proof
+
+The CI test gate `route_auth_matrix_is_complete` parses the live Axum router
+source and fails when a route lacks one of these classes: public, read, write,
+admin read, admin write, internal replication, or feature-gated. Companion
+tests pin representative scope contracts and high-risk HTTP boundary routes.
+
 ## Dependency Security
 
-- `cargo deny check` is run in CI to detect known advisories and licence violations.
-- `cargo audit` is run in CI as a secondary advisory check.
-- Known ignores are documented in `deny.toml` with remediation deadlines.
+- `cargo deny check` is run in CI to detect known advisories, bans, licence
+  drift, and source-policy violations.
+- `cargo audit` is run in CI as a secondary RustSec advisory check. It
+  currently surfaces the yanked `aes 0.9.0` warning through `zip 8.6.0`; this
+  is visible but non-blocking until the upstream dependency path can move.
+- Known RustSec ignores in `deny.toml` must carry owner and expiry comments; CI
+  enforces this metadata.
+- Container images are scanned with Trivy before push. Emergency skips require
+  a structured waiver with owner, expiry, reason, commit SHA, run ID, and image
+  reference, uploaded as a 90-day artifact.
+- Parser/verifier fuzz targets run on the scheduled workflow and as bounded PR
+  runs when fuzz, frame, receipt, router, or lockfile paths change. Crash and
+  corpus artifacts are uploaded for follow-up.

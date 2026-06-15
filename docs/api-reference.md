@@ -119,13 +119,14 @@ visibility are MCP-only features.
 |--------|------|-------------|------------|
 | POST | `/v1/admin/shard-map` | Update shard map | `admin:write` |
 | GET | `/v1/admin/control` | Current control state | `admin:read` |
+| POST | `/v1/admin/restart` | Request daemon process restart | `admin:write` |
 | GET | `/v1/admin/ops-log` | Structured operations log | `admin:read` |
 | POST | `/v1/admin/valves` | Set valve states (throttle, pause, emergency brake) | `admin:write` |
 | GET | `/v1/admin/replication/status` | Replication topology status | `admin:read` * |
 | POST | `/v1/admin/actions` | Submit admin action (seal, scrub, verify, rebalance) | `admin:write` |
 | GET | `/v1/admin/actions/{actionId}` | Get admin action status | `admin:read` |
 | POST | `/v1/admin/stream-meta` | Update stream metadata | `admin:write` * |
-| POST | `/v1/internal/replication/segments` | Receive replicated segments | `admin:write` * |
+| POST | `/v1/internal/replication/segments` | Receive replicated segments | `replication:write` * |
 
 \* Requires a dataplane-enabled deployment. Returns 501 in Crux Daemon.
 
