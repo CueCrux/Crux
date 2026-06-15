@@ -877,7 +877,11 @@ fn substrate_kinds_list() {
 
 #[test]
 fn mcp_requires_auth_when_agent_token_configured() {
-    let daemon = TestDaemon::start_with_agent_token("secret-token");
+    // Must satisfy the agent-token strength policy (>= 32 bytes, safe charset);
+    // a weaker token is rejected at registry build and would leave MCP in
+    // no-auth mode. See crux_mcp::agent::is_safe_agent_token.
+    let token = "crux_at_int_test_0123456789abcdef";
+    let daemon = TestDaemon::start_with_agent_token(token);
 
     match daemon.mcp_post_json(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})) {
         Err(ureq::Error::StatusCode(401)) => {}
@@ -892,7 +896,7 @@ fn mcp_requires_auth_when_agent_token_configured() {
                 "method":"tools/call",
                 "params":{"name":"get_agent_identity","arguments":{}}
             }),
-            "secret-token",
+            token,
         )
         .unwrap()
         .into_body()
