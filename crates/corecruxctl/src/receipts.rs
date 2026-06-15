@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer as _, SigningKey};
+use sha2::{Digest as _, Sha256};
 
 use corecrux_frame::{decode_canonical_header_bytes_v1, stream_hash_xxhash64};
 use corecrux_receipts::{
@@ -124,6 +125,7 @@ pub struct TsaProviderSmokeReportV1 {
     pub ok: bool,
     pub tsa_url: Option<String>,
     pub tsa_root_cert_paths: Vec<String>,
+    pub tsa_root_cert_sha256_fingerprints: Vec<String>,
     pub tsa_root_cert_count: usize,
     pub tsa_policy_oid: Option<String>,
     pub failure_reason: Option<String>,
@@ -858,7 +860,7 @@ pub fn verify_rfc3161_timestamp_body_file_with_options_v1(
 pub fn witness_smoke_v1(opts: &WitnessSmokeOptionsV1<'_>) -> WitnessSmokeReportV1 {
     let mut warnings = Vec::new();
     let witness = witness_provider_smoke_v1(opts, &mut warnings);
-    let tsa = tsa_provider_smoke_v1(opts);
+    let tsa = tsa_provider_smoke_v1(opts, &mut warnings);
     WitnessSmokeReportV1 {
         ok: witness.ok && tsa.ok,
         mode: "local_config_only",
@@ -885,6 +887,19 @@ fn witness_provider_smoke_v1(
         };
     }
 
+    if opts.witness_timeout_ms == 0 {
+        return WitnessProviderSmokeReportV1 {
+            enabled: true,
+            provider: opts.witness_provider.to_string(),
+            timeout_ms: opts.witness_timeout_ms,
+            configured: false,
+            ok: false,
+            rekor_url: opts.rekor_url.map(str::to_string),
+            rekor_public_key_path: opts.rekor_public_key_path.map(|p| p.display().to_string()),
+            failure_reason: Some("--witness-timeout-ms must be greater than zero".to_string()),
+        };
+    }
+
     if !opts.witness_provider.trim().eq_ignore_ascii_case("rekor") {
         return WitnessProviderSmokeReportV1 {
             enabled: true,
@@ -908,6 +923,9 @@ fn witness_provider_smoke_v1(
             rekor_public_key_path: opts.rekor_public_key_path.map(|p| p.display().to_string()),
             failure_reason: Some("--rekor-url is required when --witness-enabled is set".to_string()),
         };
+    }
+    if opts.rekor_url.is_some_and(|url| !looks_https_url(url)) {
+        warnings.push("Rekor witness URL is not HTTPS; use only for local/non-prod mocks".to_string());
     }
     if let Some(path) = opts.rekor_public_key_path {
         if !path.is_file() {
@@ -938,7 +956,7 @@ fn witness_provider_smoke_v1(
     }
 }
 
-fn tsa_provider_smoke_v1(opts: &WitnessSmokeOptionsV1<'_>) -> TsaProviderSmokeReportV1 {
+fn tsa_provider_smoke_v1(opts: &WitnessSmokeOptionsV1<'_>, warnings: &mut Vec<String>) -> TsaProviderSmokeReportV1 {
     let root_paths = opts
         .tsa_root_cert_paths
         .iter()
@@ -951,24 +969,47 @@ fn tsa_provider_smoke_v1(opts: &WitnessSmokeOptionsV1<'_>) -> TsaProviderSmokeRe
             ok: true,
             tsa_url: opts.tsa_url.map(str::to_string),
             tsa_root_cert_paths: root_paths,
+            tsa_root_cert_sha256_fingerprints: Vec::new(),
             tsa_root_cert_count: 0,
             tsa_policy_oid: opts.tsa_policy_oid.map(str::to_string),
             failure_reason: None,
         };
     }
     if opts.tsa_url.is_none_or(str::is_empty) {
-        return tsa_smoke_fail_v1(opts, root_paths, 0, "--tsa-url is required when --tsa-enabled is set");
+        return tsa_smoke_fail_v1(
+            opts,
+            root_paths,
+            Vec::new(),
+            0,
+            "--tsa-url is required when --tsa-enabled is set",
+        );
+    }
+    if opts.tsa_url.is_some_and(|url| !looks_https_url(url)) {
+        warnings.push("TSA URL is not HTTPS; use only for local/non-prod mocks".to_string());
+    }
+    if let Some(policy_oid) = opts.tsa_policy_oid {
+        if !corecrux_receipts::is_valid_object_identifier_text_v1(policy_oid) {
+            return tsa_smoke_fail_v1(
+                opts,
+                root_paths,
+                Vec::new(),
+                0,
+                "--tsa-policy-oid must be a valid dotted object identifier",
+            );
+        }
     }
     if opts.tsa_root_cert_paths.is_empty() {
         return tsa_smoke_fail_v1(
             opts,
             root_paths,
+            Vec::new(),
             0,
             "--tsa-root-cert is required at least once when --tsa-enabled is set",
         );
     }
 
     let mut cert_count = 0usize;
+    let mut fingerprints = Vec::new();
     for path in opts.tsa_root_cert_paths {
         let cert_bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
@@ -976,6 +1017,7 @@ fn tsa_provider_smoke_v1(opts: &WitnessSmokeOptionsV1<'_>) -> TsaProviderSmokeRe
                 return tsa_smoke_fail_v1(
                     opts,
                     root_paths,
+                    fingerprints,
                     cert_count,
                     &format!("failed to read TSA root certificate {}: {err}", path.display()),
                 )
@@ -987,11 +1029,13 @@ fn tsa_provider_smoke_v1(opts: &WitnessSmokeOptionsV1<'_>) -> TsaProviderSmokeRe
                 return tsa_smoke_fail_v1(
                     opts,
                     root_paths,
+                    fingerprints,
                     cert_count,
                     &format!("failed to parse TSA root certificate {}: {err}", path.display()),
                 )
             }
         };
+        fingerprints.extend(certs.iter().map(|cert| format!("sha256:{}", sha256_hex(cert))));
         cert_count += certs.len();
     }
 
@@ -1001,6 +1045,7 @@ fn tsa_provider_smoke_v1(opts: &WitnessSmokeOptionsV1<'_>) -> TsaProviderSmokeRe
         ok: true,
         tsa_url: opts.tsa_url.map(str::to_string),
         tsa_root_cert_paths: root_paths,
+        tsa_root_cert_sha256_fingerprints: fingerprints,
         tsa_root_cert_count: cert_count,
         tsa_policy_oid: opts.tsa_policy_oid.map(str::to_string),
         failure_reason: None,
@@ -1010,6 +1055,7 @@ fn tsa_provider_smoke_v1(opts: &WitnessSmokeOptionsV1<'_>) -> TsaProviderSmokeRe
 fn tsa_smoke_fail_v1(
     opts: &WitnessSmokeOptionsV1<'_>,
     root_paths: Vec<String>,
+    tsa_root_cert_sha256_fingerprints: Vec<String>,
     tsa_root_cert_count: usize,
     reason: &str,
 ) -> TsaProviderSmokeReportV1 {
@@ -1019,6 +1065,7 @@ fn tsa_smoke_fail_v1(
         ok: false,
         tsa_url: opts.tsa_url.map(str::to_string),
         tsa_root_cert_paths: root_paths,
+        tsa_root_cert_sha256_fingerprints,
         tsa_root_cert_count,
         tsa_policy_oid: opts.tsa_policy_oid.map(str::to_string),
         failure_reason: Some(reason.to_string()),
@@ -1037,6 +1084,20 @@ pub fn parse_hex_bytes_v1(raw: &str) -> Result<Vec<u8>, String> {
         out.push((hi << 4) | lo);
     }
     Ok(out)
+}
+
+fn looks_https_url(url: &str) -> bool {
+    url.trim_start().starts_with("https://")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 fn hex_val_v1(b: u8) -> Result<u8, String> {
@@ -1920,6 +1981,12 @@ mod tests {
         assert!(report.witness.ok);
         assert!(report.tsa.ok);
         assert_eq!(report.tsa.tsa_root_cert_count, 1);
+        assert_eq!(report.tsa.tsa_root_cert_sha256_fingerprints.len(), 1);
+        assert!(report.tsa.tsa_root_cert_sha256_fingerprints[0].starts_with("sha256:"));
+        assert_eq!(
+            report.tsa.tsa_root_cert_sha256_fingerprints[0].len(),
+            "sha256:".len() + 64
+        );
         assert_eq!(report.tsa.tsa_policy_oid.as_deref(), Some("1.2.3.4"));
         assert_eq!(
             report.warnings,
@@ -1947,6 +2014,69 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("--tsa-root-cert"));
+    }
+
+    #[test]
+    fn witness_smoke_fails_when_enabled_witness_timeout_is_zero() {
+        let report = witness_smoke_v1(&WitnessSmokeOptionsV1 {
+            witness_enabled: true,
+            witness_provider: "rekor",
+            witness_timeout_ms: 0,
+            rekor_url: Some("https://rekor.example"),
+            rekor_public_key_path: None,
+            tsa_enabled: false,
+            tsa_url: None,
+            tsa_root_cert_paths: &[],
+            tsa_policy_oid: None,
+        });
+        assert!(!report.ok);
+        assert_eq!(
+            report.witness.failure_reason.as_deref(),
+            Some("--witness-timeout-ms must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn witness_smoke_rejects_malformed_tsa_policy_oid_before_root_read() {
+        let report = witness_smoke_v1(&WitnessSmokeOptionsV1 {
+            witness_enabled: false,
+            witness_provider: "disabled",
+            witness_timeout_ms: 5000,
+            rekor_url: None,
+            rekor_public_key_path: None,
+            tsa_enabled: true,
+            tsa_url: Some("https://tsa.example"),
+            tsa_root_cert_paths: &[PathBuf::from("/tmp/missing-root.pem")],
+            tsa_policy_oid: Some("not-an-oid"),
+        });
+        assert!(!report.ok);
+        assert_eq!(
+            report.tsa.failure_reason.as_deref(),
+            Some("--tsa-policy-oid must be a valid dotted object identifier")
+        );
+        assert!(report.tsa.tsa_root_cert_sha256_fingerprints.is_empty());
+    }
+
+    #[test]
+    fn witness_smoke_warns_on_non_https_provider_urls() {
+        let report = witness_smoke_v1(&WitnessSmokeOptionsV1 {
+            witness_enabled: true,
+            witness_provider: "rekor",
+            witness_timeout_ms: 5000,
+            rekor_url: Some("http://127.0.0.1:3000"),
+            rekor_public_key_path: None,
+            tsa_enabled: true,
+            tsa_url: Some("http://127.0.0.1:3001"),
+            tsa_root_cert_paths: &[PathBuf::from("/tmp/missing-root.pem")],
+            tsa_policy_oid: Some("1.2.3.4"),
+        });
+        assert!(!report.ok);
+        assert!(report
+            .warnings
+            .contains(&"Rekor witness URL is not HTTPS; use only for local/non-prod mocks".to_string()));
+        assert!(report
+            .warnings
+            .contains(&"TSA URL is not HTTPS; use only for local/non-prod mocks".to_string()));
     }
 
     #[test]
