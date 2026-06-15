@@ -625,4 +625,90 @@ mod tests {
         assert!(second.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn synthetic_candidate_proposer_precision_recall_m6() {
+        fn obs(
+            local_fpr: &str,
+            subject: &str,
+            tenant: &str,
+            project: Option<&str>,
+            at: u64,
+            receipt: Option<&str>,
+        ) -> CandidateObservation {
+            CandidateObservation {
+                local_passport_fpr: local_fpr.to_string(),
+                observed_subject: subject.to_string(),
+                tenant_id: tenant.to_string(),
+                project_id: project.map(ToString::to_string),
+                observed_at_unix_ms: at,
+                evidence_ref: format!("synthetic:{subject}:{at}"),
+                cruxpack_source_receipt: receipt.map(ToString::to_string),
+            }
+        }
+
+        let local = "p_synthetic_local";
+        let config = ProposerConfig::default();
+        let corpus = [
+            (
+                obs(local, "p_alpha_known", "work::team", Some("alpha"), 1_000, None),
+                obs(local, "p_alpha_laptop", "work::team", Some("alpha"), 2_000, None),
+                true,
+            ),
+            (
+                obs(
+                    local,
+                    "p_beta_export",
+                    "personal",
+                    None,
+                    1_000,
+                    Some("cruxpack:blake3:beta"),
+                ),
+                obs(
+                    local,
+                    "p_beta_import",
+                    "personal",
+                    None,
+                    90_000_000,
+                    Some("cruxpack:blake3:beta"),
+                ),
+                true,
+            ),
+            (
+                obs(local, "p_decoy_a", "work::team-a", Some("alpha"), 1_000, None),
+                obs(local, "p_decoy_b", "work::team-b", Some("alpha"), 1_100, None),
+                false,
+            ),
+            (
+                obs(local, "p_far_a", "work::team", Some("alpha"), 1_000, None),
+                obs(local, "p_far_b", "work::team", Some("alpha"), 200_000_000, None),
+                false,
+            ),
+            (
+                obs(local, "p_same", "work::team", Some("alpha"), 1_000, None),
+                obs(local, "p_same", "work::team", Some("alpha"), 1_100, None),
+                false,
+            ),
+        ];
+
+        let mut tp = 0;
+        let mut fp = 0;
+        let mut fn_ = 0;
+        let mut tn = 0;
+        for (left, right, label) in corpus {
+            let proposed = proposal_input_for_pair(&left, &right, &config).is_some();
+            match (proposed, label) {
+                (true, true) => tp += 1,
+                (true, false) => fp += 1,
+                (false, true) => fn_ += 1,
+                (false, false) => tn += 1,
+            }
+        }
+
+        assert_eq!((tp, fp, fn_, tn), (2, 0, 0, 3));
+        let precision = tp as f32 / (tp + fp) as f32;
+        let recall = tp as f32 / (tp + fn_) as f32;
+        assert!((precision - 1.0).abs() < f32::EPSILON);
+        assert!((recall - 1.0).abs() < f32::EPSILON);
+    }
 }

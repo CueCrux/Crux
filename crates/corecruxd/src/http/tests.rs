@@ -12786,6 +12786,112 @@ async fn resolve_principal_include_candidates_surfaces_suggestions_without_resol
 }
 
 #[tokio::test]
+async fn synthetic_anonymous_session_resolution_demo_m6() {
+    let state = test_app_state(16);
+    let (req, remote_fpr) = signed_link_request(&state).await;
+    let local_fpr = {
+        let facts = state.fact_store.read().await;
+        crate::passports::get_passport(&facts, "personal-default")
+            .expect("local passport")
+            .principal_id
+    };
+
+    let observations = vec![
+        crate::candidate_links::CandidateObservation {
+            local_passport_fpr: local_fpr.clone(),
+            observed_subject: local_fpr,
+            tenant_id: "work::team".to_string(),
+            project_id: Some("alpha".to_string()),
+            observed_at_unix_ms: 1_000,
+            evidence_ref: "synthetic:session-a".to_string(),
+            cruxpack_source_receipt: None,
+        },
+        crate::candidate_links::CandidateObservation {
+            local_passport_fpr: {
+                let facts = state.fact_store.read().await;
+                crate::passports::get_passport(&facts, "personal-default")
+                    .expect("local passport")
+                    .principal_id
+            },
+            observed_subject: remote_fpr.clone(),
+            tenant_id: "work::team".to_string(),
+            project_id: Some("alpha".to_string()),
+            observed_at_unix_ms: 2_000,
+            evidence_ref: "synthetic:session-b".to_string(),
+            cruxpack_source_receipt: None,
+        },
+        crate::candidate_links::CandidateObservation {
+            local_passport_fpr: {
+                let facts = state.fact_store.read().await;
+                crate::passports::get_passport(&facts, "personal-default")
+                    .expect("local passport")
+                    .principal_id
+            },
+            observed_subject: "p_decoy_remote".to_string(),
+            tenant_id: "work::other-team".to_string(),
+            project_id: Some("alpha".to_string()),
+            observed_at_unix_ms: 2_100,
+            evidence_ref: "synthetic:decoy".to_string(),
+            cruxpack_source_receipt: None,
+        },
+    ];
+
+    let created = {
+        let facts = state.fact_store.read().await;
+        let mut entities = state.entity_store.write().await;
+        crate::candidate_links::propose_from_observations(
+            &mut entities,
+            &facts,
+            &observations,
+            "m6-demo",
+            &crate::candidate_links::ProposerConfig::default(),
+        )
+        .expect("propose")
+    };
+    assert_eq!(created.len(), 1, "decoy pair must not emit a candidate");
+    let candidate_id = created[0].0.clone();
+    assert_eq!(created[0].1.observed_subject, remote_fpr);
+
+    let resp = principal::get_resolve_principal(
+        State(state.clone()),
+        resolve_query_with_candidates(&remote_fpr),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "candidate is a suggestion only");
+    let body = json_body(resp).await;
+    assert_eq!(body["candidates"][0]["candidate_id"], candidate_id);
+    assert_eq!(body["candidates_resolve"], false);
+
+    let resp = identity_links::post_identity_candidate_confirm(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(candidate_id),
+        Json(req),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = principal::get_resolve_principal(State(state.clone()), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let principal = json_body(resp).await;
+    assert_eq!(principal["passport_id"], "personal-default");
+    assert!(principal["resolved_via"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("identity_link:"));
+
+    let resp = principal::get_resolve_principal(State(state), resolve_query("p_decoy_remote"), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "decoy never resolves");
+}
+
+#[tokio::test]
 async fn identity_link_lifecycle_create_resolve_revoke_deny() {
     let state = test_app_state(16);
     let (req, remote_fpr) = signed_link_request(&state).await;
