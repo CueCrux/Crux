@@ -86,8 +86,10 @@ for the Crux Daemon.
 
 ## Network Assumptions
 
-1. The daemon assumes the network between reverse proxy and daemon is trusted (loopback or
-   private network).
+1. The daemon assumes the network between reverse proxy and daemon is trusted
+   (loopback or private network). It only consumes `Forwarded` /
+   `X-Forwarded-For` for rate-limit keying from peers listed in
+   `CORECRUXD_TRUSTED_PROXY_CIDRS`.
 2. gRPC replication between nodes should use authenticated channels
    (`CORECRUXD_REPLICATION_AUTH_BEARER`).
 3. Prometheus metrics (`/metrics`) and health endpoints (`/healthz`, `/readyz`) are
@@ -104,8 +106,11 @@ to include full details for debugging.
 
 ## Rate Limiting
 
-The Crux Daemon does not implement application-level rate limiting. Use your reverse
-proxy (Caddy `rate_limit`, nginx `limit_req`, etc.) to protect against resource exhaustion.
+The Crux Daemon implements coarse client-IP rate limiting and request caps.
+Use your reverse proxy (Caddy `rate_limit`, nginx `limit_req`, etc.) for
+route-specific resource protection. `X-Corecrux-Passport-Id` is not trusted as
+a pre-auth rate-limit key; unauthenticated callers cannot rotate it to obtain
+independent buckets.
 
 ## Dependency Security
 

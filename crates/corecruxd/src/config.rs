@@ -106,9 +106,8 @@ pub struct IngressConfig {
     /// (`CORECRUXD_MAX_INFLIGHT`). Excess requests are load-shed with a
     /// 503 problem+json. `0` disables the cap.
     pub max_inflight: usize,
-    /// Sustained per-key request rate (`CORECRUXD_RATE_LIMIT_RPS`).
-    /// Keyed per passport where `X-Corecrux-Passport-Id` is present,
-    /// falling back to per client IP. `0` disables rate limiting.
+    /// Sustained per-client-IP request rate (`CORECRUXD_RATE_LIMIT_RPS`).
+    /// `0` disables rate limiting.
     pub rate_limit_rps: u64,
     /// Burst capacity per key (`CORECRUXD_RATE_LIMIT_BURST`). Clamped to
     /// at least `rate_limit_rps`.
@@ -117,6 +116,10 @@ pub struct IngressConfig {
     /// (`CORECRUXD_RATE_LIMIT_EXEMPT_CIDRS`, comma-separated). Defaults to
     /// loopback (console/local agents).
     pub rate_limit_exempt_cidrs: Vec<String>,
+    /// CIDRs for reverse proxies whose `Forwarded` / `X-Forwarded-For`
+    /// headers may be used to derive the effective client IP
+    /// (`CORECRUXD_TRUSTED_PROXY_CIDRS`, comma-separated). Defaults empty.
+    pub trusted_proxy_cidrs: Vec<String>,
     /// HTTP/2 keep-alive ping interval for the gRPC plane, in seconds
     /// (`CORECRUXD_GRPC_KEEPALIVE_INTERVAL_SECS`). `0` disables server
     /// keep-alive pings (pre-hardening behaviour: dead peers hold
@@ -149,6 +152,9 @@ pub const DEFAULT_RATE_LIMIT_BURST: u64 = 600;
 /// Default exempt CIDRs: loopback only (console SPA on the operator host
 /// and local agents).
 pub const DEFAULT_RATE_LIMIT_EXEMPT_CIDRS: &[&str] = &["127.0.0.0/8", "::1/128"];
+/// Default trusted proxy CIDRs: none. Operators must opt in before forwarded
+/// headers affect rate-limit keys.
+pub const DEFAULT_TRUSTED_PROXY_CIDRS: &[&str] = &[];
 /// Default gRPC keep-alive ping interval: 30s — frequent enough to reap
 /// dead peers within a minute, far above any ping-flood concern.
 pub const DEFAULT_GRPC_KEEPALIVE_INTERVAL_SECS: u64 = 30;
@@ -171,6 +177,7 @@ impl Default for IngressConfig {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            trusted_proxy_cidrs: DEFAULT_TRUSTED_PROXY_CIDRS.iter().map(ToString::to_string).collect(),
             grpc_keepalive_interval_secs: DEFAULT_GRPC_KEEPALIVE_INTERVAL_SECS,
             grpc_keepalive_timeout_secs: DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS,
             grpc_max_concurrent_streams: DEFAULT_GRPC_MAX_CONCURRENT_STREAMS,
@@ -191,6 +198,7 @@ impl IngressConfig {
         rate_limit_rps: Option<&str>,
         rate_limit_burst: Option<&str>,
         rate_limit_exempt_cidrs: Option<&str>,
+        trusted_proxy_cidrs: Option<&str>,
         grpc_keepalive_interval_secs: Option<&str>,
         grpc_keepalive_timeout_secs: Option<&str>,
         grpc_max_concurrent_streams: Option<&str>,
@@ -229,6 +237,16 @@ impl IngressConfig {
                         .collect()
                 },
             ),
+            trusted_proxy_cidrs: trusted_proxy_cidrs.map_or_else(
+                || DEFAULT_TRUSTED_PROXY_CIDRS.iter().map(ToString::to_string).collect(),
+                |s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|part| !part.is_empty())
+                        .map(ToString::to_string)
+                        .collect()
+                },
+            ),
             grpc_keepalive_interval_secs: grpc_keepalive_interval_secs
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(DEFAULT_GRPC_KEEPALIVE_INTERVAL_SECS),
@@ -249,6 +267,7 @@ impl IngressConfig {
             env_string("CORECRUXD_RATE_LIMIT_RPS").as_deref(),
             env_string("CORECRUXD_RATE_LIMIT_BURST").as_deref(),
             env_string("CORECRUXD_RATE_LIMIT_EXEMPT_CIDRS").as_deref(),
+            env_string("CORECRUXD_TRUSTED_PROXY_CIDRS").as_deref(),
             env_string("CORECRUXD_GRPC_KEEPALIVE_INTERVAL_SECS").as_deref(),
             env_string("CORECRUXD_GRPC_KEEPALIVE_TIMEOUT_SECS").as_deref(),
             env_string("CORECRUXD_GRPC_MAX_CONCURRENT_STREAMS").as_deref(),
@@ -1151,13 +1170,14 @@ mod tests {
 
     #[test]
     fn ingress_config_defaults_when_unset() {
-        let cfg = IngressConfig::from_values(None, None, None, None, None, None, None, None, None);
+        let cfg = IngressConfig::from_values(None, None, None, None, None, None, None, None, None, None);
         assert_eq!(cfg.max_request_body_bytes, DEFAULT_MAX_REQUEST_BODY_BYTES);
         assert_eq!(cfg.shutdown_drain_secs, DEFAULT_SHUTDOWN_DRAIN_SECS);
         assert_eq!(cfg.max_inflight, DEFAULT_MAX_INFLIGHT);
         assert_eq!(cfg.rate_limit_rps, DEFAULT_RATE_LIMIT_RPS);
         assert_eq!(cfg.rate_limit_burst, DEFAULT_RATE_LIMIT_BURST);
         assert_eq!(cfg.rate_limit_exempt_cidrs, vec!["127.0.0.0/8", "::1/128"]);
+        assert!(cfg.trusted_proxy_cidrs.is_empty());
         assert_eq!(cfg.grpc_keepalive_interval_secs, DEFAULT_GRPC_KEEPALIVE_INTERVAL_SECS);
         assert_eq!(cfg.grpc_keepalive_timeout_secs, DEFAULT_GRPC_KEEPALIVE_TIMEOUT_SECS);
         assert_eq!(cfg.grpc_max_concurrent_streams, DEFAULT_GRPC_MAX_CONCURRENT_STREAMS);
@@ -1173,6 +1193,7 @@ mod tests {
             Some("10"),
             Some("20"),
             Some("10.0.0.0/8, 192.168.1.1/32"),
+            Some("127.0.0.1/32, ::1/128"),
             Some("15"),
             Some("5"),
             Some("256"),
@@ -1183,6 +1204,7 @@ mod tests {
         assert_eq!(cfg.rate_limit_rps, 10);
         assert_eq!(cfg.rate_limit_burst, 20);
         assert_eq!(cfg.rate_limit_exempt_cidrs, vec!["10.0.0.0/8", "192.168.1.1/32"]);
+        assert_eq!(cfg.trusted_proxy_cidrs, vec!["127.0.0.1/32", "::1/128"]);
         assert_eq!(cfg.shutdown_drain_cap(), Some(std::time::Duration::from_secs(5)));
         assert_eq!(cfg.grpc_keepalive_interval(), Some(std::time::Duration::from_secs(15)));
         assert_eq!(cfg.grpc_keepalive_timeout(), Some(std::time::Duration::from_secs(5)));
@@ -1191,7 +1213,7 @@ mod tests {
 
     #[test]
     fn ingress_config_burst_clamps_up_to_rps() {
-        let cfg = IngressConfig::from_values(None, None, None, Some("500"), Some("100"), None, None, None, None);
+        let cfg = IngressConfig::from_values(None, None, None, Some("500"), Some("100"), None, None, None, None, None);
         assert_eq!(cfg.rate_limit_rps, 500);
         assert_eq!(cfg.rate_limit_burst, 500, "burst below rps must clamp up");
     }
@@ -1205,6 +1227,7 @@ mod tests {
             Some("0"),
             Some("0"),
             Some(""),
+            Some(""),
             Some("0"),
             Some("0"),
             Some("0"),
@@ -1214,6 +1237,10 @@ mod tests {
         assert_eq!(cfg.max_inflight, 0);
         assert_eq!(cfg.rate_limit_rps, 0);
         assert!(cfg.rate_limit_exempt_cidrs.is_empty(), "empty CIDR list stays empty");
+        assert!(
+            cfg.trusted_proxy_cidrs.is_empty(),
+            "empty trusted proxy list stays empty"
+        );
         assert_eq!(cfg.shutdown_drain_cap(), None);
         assert_eq!(cfg.grpc_keepalive_interval(), None);
         assert_eq!(cfg.grpc_keepalive_timeout(), None);
@@ -1224,7 +1251,7 @@ mod tests {
     fn ingress_config_keepalive_timeout_inert_when_interval_disabled() {
         // Interval 0 disables keep-alive entirely; a configured timeout
         // must not leak through on its own.
-        let cfg = IngressConfig::from_values(None, None, None, None, None, None, Some("0"), Some("10"), None);
+        let cfg = IngressConfig::from_values(None, None, None, None, None, None, None, Some("0"), Some("10"), None);
         assert_eq!(cfg.grpc_keepalive_interval(), None);
         assert_eq!(cfg.grpc_keepalive_timeout(), None);
     }
@@ -1237,6 +1264,7 @@ mod tests {
             Some("4.5"),
             Some("x"),
             Some("y"),
+            None,
             None,
             Some("z"),
             Some("-1"),
@@ -1259,6 +1287,7 @@ mod tests {
             Some(" 7 "),
             Some(" 14 "),
             None,
+            Some(" 127.0.0.1/32, 10.0.0.0/8 "),
             Some(" 45 "),
             Some(" 9 "),
             Some(" 64 "),
@@ -1266,6 +1295,7 @@ mod tests {
         assert_eq!(cfg.max_request_body_bytes, 2048);
         assert_eq!(cfg.shutdown_drain_secs, 60);
         assert_eq!(cfg.max_inflight, 512);
+        assert_eq!(cfg.trusted_proxy_cidrs, vec!["127.0.0.1/32", "10.0.0.0/8"]);
         assert_eq!(cfg.grpc_keepalive_interval_secs, 45);
         assert_eq!(cfg.grpc_keepalive_timeout_secs, 9);
         assert_eq!(cfg.grpc_max_concurrent_streams, 64);

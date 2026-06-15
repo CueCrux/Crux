@@ -8,8 +8,8 @@
 //! - M1: request-body size limit with RFC-7807 `413` responses.
 //! - M2: in-flight concurrency cap + load shed (`503` problem+json) and the
 //!   `corecrux_http_inflight` gauge.
-//! - M3: keyed rate limiting (passport → client-IP fallback) with `429` +
-//!   `Retry-After`, loopback exempt by default, and the
+//! - M3: client-IP keyed rate limiting with `429` + `Retry-After`, loopback
+//!   exempt by default, trusted-proxy forwarded-header handling, and the
 //!   `corecrux_http_rate_limited_total{key_kind}` counter.
 //!
 //! Applied in `main.rs` to both the daemon API router and the MCP router so
@@ -17,10 +17,10 @@
 //!
 //! Layer ordering note: `Router::layer` wraps outside-in as calls accumulate,
 //! so layers added *later* run *earlier* on the request path. Final order:
-//! rate limiter → load-shed/concurrency gate → inflight gauge →
-//! 413 decorator → body limit → routes. A flood is 429'd before it can
-//! occupy an inflight slot, and shedding happens before any body byte is
-//! read; the gauge counts only admitted requests.
+//! passport-header validator → rate limiter → load-shed/concurrency gate →
+//! inflight gauge → 413 decorator → body limit → routes. A flood is 429'd
+//! before it can occupy an inflight slot, and shedding happens before any body
+//! byte is read; the gauge counts only admitted requests.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -29,7 +29,7 @@ use std::time::Instant;
 
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::ConnectInfo;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use corecrux_types::ProblemDetails;
@@ -40,9 +40,11 @@ use crate::config::IngressConfig;
 use crate::metrics::Metrics;
 use crate::problem::ProblemResponse;
 
-/// Passport header reused as the rate-limit key when present (matches the
-/// presence middleware in `http/mod.rs`).
+/// Passport header validated at ingress before route-level auth binds it.
 const PASSPORT_HEADER: &str = "x-corecrux-passport-id";
+const X_FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+const FORWARDED_HEADER: &str = "forwarded";
+const PASSPORT_HEADER_MAX_LEN: usize = 128;
 /// Bucket-map size that triggers an inline idle-entry sweep — bounds memory
 /// under spoofed-source floods.
 const BUCKET_SWEEP_THRESHOLD: usize = 10_000;
@@ -100,7 +102,7 @@ pub fn apply_ingress_limits(router: Router, cfg: &IngressConfig, metrics: Option
         );
     }
 
-    // M3 — keyed rate limiting, outermost: a flood is rejected before it
+    // M3 — keyed rate limiting: a flood is rejected before it
     // can occupy an inflight slot or read a body byte.
     if cfg.rate_limit_rps > 0 {
         let limiter = Arc::new(HttpRateLimiter::new(cfg, metrics.cloned()));
@@ -117,14 +119,28 @@ pub fn apply_ingress_limits(router: Router, cfg: &IngressConfig, metrics: Option
         ));
     }
 
+    // Validate caller-supplied passport shape at ingress regardless of
+    // whether rate limiting is enabled; route-level auth still proves
+    // ownership before handlers trust the value.
+    router = router.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| async move {
+            match validate_passport_header(req.headers()) {
+                Ok(()) => next.run(req).await,
+                Err(problem) => problem.into_response(),
+            }
+        },
+    ));
+
     router
 }
 
 /// Keyed token-bucket rate limiter for the HTTP planes.
 ///
-/// Keying: per passport when `X-Corecrux-Passport-Id` is present, else per
-/// client IP (`ConnectInfo`). Client IPs inside an exempt CIDR (loopback by
-/// default — console SPA + local agents) bypass limiting entirely.
+/// Keying: per effective client IP. `X-Corecrux-Passport-Id` is only validated
+/// here; route-level auth must prove passport ownership before any handler
+/// trusts it. Direct client IPs inside an exempt CIDR (loopback by default —
+/// console SPA + local agents) bypass limiting entirely unless untrusted
+/// forwarded headers are present.
 ///
 /// Deliberately in-crate rather than the `governor` crate: the daemon
 /// already ships a proven token-bucket (per-tenant gRPC throttle,
@@ -134,6 +150,7 @@ pub struct HttpRateLimiter {
     rps: u64,
     burst: u64,
     exempt_cidrs: Vec<(IpAddr, u8)>,
+    trusted_proxy_cidrs: Vec<(IpAddr, u8)>,
     buckets: Mutex<HashMap<String, RateBucket>>,
     metrics: Option<Metrics>,
 }
@@ -169,12 +186,36 @@ impl IntoResponse for RateLimited {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct InvalidPassportHeader;
+
+impl IntoResponse for InvalidPassportHeader {
+    fn into_response(self) -> Response {
+        let mut pd = ProblemDetails::new(
+            StatusCode::BAD_REQUEST.as_u16(),
+            "https://errors.cuecrux.com/invalid-passport-header",
+            "Invalid X-Corecrux-Passport-Id",
+        );
+        pd.detail = Some(format!(
+            "X-Corecrux-Passport-Id must be 1..={PASSPORT_HEADER_MAX_LEN} ASCII chars from [A-Za-z0-9._:-]"
+        ));
+        ProblemResponse(pd).into_response()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientIpDecision {
+    key_ip: Option<IpAddr>,
+    exempt_ip: Option<IpAddr>,
+}
+
 impl HttpRateLimiter {
     pub fn new(cfg: &IngressConfig, metrics: Option<Metrics>) -> Self {
         Self {
             rps: cfg.rate_limit_rps,
             burst: cfg.rate_limit_burst.max(cfg.rate_limit_rps).max(1),
             exempt_cidrs: parse_cidrs(&cfg.rate_limit_exempt_cidrs),
+            trusted_proxy_cidrs: parse_cidrs_with_label(&cfg.trusted_proxy_cidrs, "CORECRUXD_TRUSTED_PROXY_CIDRS"),
             buckets: Mutex::new(HashMap::new()),
             metrics,
         }
@@ -182,36 +223,29 @@ impl HttpRateLimiter {
 
     /// Derives the key from the request and consumes one token.
     fn check_request(&self, req: &axum::extract::Request) -> Result<(), RateLimited> {
-        let passport = req
-            .headers()
-            .get(PASSPORT_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
         let client_ip = req
             .extensions()
             .get::<ConnectInfo<std::net::SocketAddr>>()
             .map(|ci| normalize_ip(ci.0.ip()));
-        self.check(passport, client_ip, Instant::now())
+        let decision = self.client_ip_decision(req.headers(), client_ip);
+        self.check(decision.key_ip, decision.exempt_ip, Instant::now())
     }
 
-    /// Core decision, separated for deterministic tests. Exemption is by
-    /// client IP and wins over passport keying (a loopback console session
-    /// is never limited, passport or not). A request with neither passport
-    /// nor `ConnectInfo` fails open — that's a wiring bug, not an attack,
+    /// Core decision, separated for deterministic tests. Exemption is applied
+    /// only to the effective client IP. A request with no `ConnectInfo` fails
+    /// open — that's a wiring bug, not an attack,
     /// and limiting everything under one shared key would let any client
     /// starve all others.
-    fn check(&self, passport: Option<&str>, client_ip: Option<IpAddr>, now: Instant) -> Result<(), RateLimited> {
-        if let Some(ip) = client_ip {
+    fn check(&self, key_ip: Option<IpAddr>, exempt_ip: Option<IpAddr>, now: Instant) -> Result<(), RateLimited> {
+        if let Some(ip) = exempt_ip {
             if self.exempt_cidrs.iter().any(|cidr| cidr_contains(cidr, ip)) {
                 return Ok(());
             }
         }
-        let (key_kind, key): (&'static str, String) = match (passport, client_ip) {
-            (Some(p), _) => ("passport", format!("p:{p}")),
-            (None, Some(ip)) => ("ip", format!("ip:{ip}")),
-            (None, None) => {
-                tracing::debug!("rate limiter saw a request with no passport and no ConnectInfo; failing open");
+        let (key_kind, key): (&'static str, String) = match key_ip {
+            Some(ip) => ("ip", format!("ip:{ip}")),
+            None => {
+                tracing::debug!("rate limiter saw a request with no ConnectInfo; failing open");
                 return Ok(());
             }
         };
@@ -256,6 +290,115 @@ impl HttpRateLimiter {
             key_kind,
         })
     }
+
+    fn client_ip_decision(&self, headers: &HeaderMap, peer_ip: Option<IpAddr>) -> ClientIpDecision {
+        let Some(peer_ip) = peer_ip else {
+            return ClientIpDecision {
+                key_ip: None,
+                exempt_ip: None,
+            };
+        };
+        let peer_is_trusted_proxy = self.trusted_proxy_cidrs.iter().any(|cidr| cidr_contains(cidr, peer_ip));
+        let forwarded_present = has_forwarded_headers(headers);
+
+        if peer_is_trusted_proxy {
+            if let Some(client_ip) = forwarded_client_ip(headers) {
+                return ClientIpDecision {
+                    key_ip: Some(client_ip),
+                    exempt_ip: Some(client_ip),
+                };
+            }
+            return ClientIpDecision {
+                key_ip: Some(peer_ip),
+                // A configured proxy with absent/malformed forwarded headers is
+                // bucketed by proxy IP, but the proxy IP itself is not exempted.
+                exempt_ip: None,
+            };
+        }
+
+        ClientIpDecision {
+            key_ip: Some(peer_ip),
+            // Forwarded headers from untrusted peers are ignored and also
+            // suppress loopback/private exemptions. A same-host reverse proxy
+            // that is not in CORECRUXD_TRUSTED_PROXY_CIDRS gets one shared
+            // bucket instead of an unlimited loopback bypass.
+            exempt_ip: (!forwarded_present).then_some(peer_ip),
+        }
+    }
+}
+
+fn validate_passport_header(headers: &HeaderMap) -> Result<(), InvalidPassportHeader> {
+    for value in headers.get_all(PASSPORT_HEADER) {
+        let raw = value.to_str().map_err(|_| InvalidPassportHeader)?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.len() > PASSPORT_HEADER_MAX_LEN || !trimmed.bytes().all(is_safe_passport_byte)
+        {
+            return Err(InvalidPassportHeader);
+        }
+    }
+    Ok(())
+}
+
+fn is_safe_passport_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+}
+
+fn has_forwarded_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key(FORWARDED_HEADER) || headers.contains_key(X_FORWARDED_FOR_HEADER)
+}
+
+fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    headers
+        .get(FORWARDED_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_forwarded_header)
+        .or_else(|| {
+            headers
+                .get(X_FORWARDED_FOR_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_x_forwarded_for)
+        })
+        .map(normalize_ip)
+}
+
+fn parse_forwarded_header(value: &str) -> Option<IpAddr> {
+    for element in value.split(',') {
+        for part in element.split(';') {
+            let Some((name, value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("for") {
+                if let Some(ip) = parse_forwarded_ip(value.trim()) {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_x_forwarded_for(value: &str) -> Option<IpAddr> {
+    value.split(',').find_map(|part| parse_forwarded_ip(part.trim()))
+}
+
+fn parse_forwarded_ip(raw: &str) -> Option<IpAddr> {
+    let raw = raw.trim().trim_matches('"');
+    if raw.is_empty() || raw.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    if let Ok(ip) = raw.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if let Some(rest) = raw.strip_prefix('[') {
+        let (inside, _) = rest.split_once(']')?;
+        return inside.parse::<IpAddr>().ok();
+    }
+    let colon_count = raw.bytes().filter(|b| *b == b':').count();
+    if colon_count == 1 {
+        let (host, _) = raw.rsplit_once(':')?;
+        return host.parse::<IpAddr>().ok();
+    }
+    None
 }
 
 /// Maps IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) back to IPv4 so
@@ -270,12 +413,16 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
 /// Parses `addr/prefix` strings; invalid entries are logged and skipped
 /// (a typo in the exempt list must not take rate limiting down with it).
 fn parse_cidrs(specs: &[String]) -> Vec<(IpAddr, u8)> {
+    parse_cidrs_with_label(specs, "CORECRUXD_RATE_LIMIT_EXEMPT_CIDRS")
+}
+
+fn parse_cidrs_with_label(specs: &[String], env_name: &'static str) -> Vec<(IpAddr, u8)> {
     specs
         .iter()
         .filter_map(|spec| {
             let parsed = parse_cidr(spec);
             if parsed.is_none() {
-                tracing::warn!(%spec, "ignoring invalid CIDR in CORECRUXD_RATE_LIMIT_EXEMPT_CIDRS");
+                tracing::warn!(%spec, env_name, "ignoring invalid CIDR in ingress config");
             }
             parsed
         })
@@ -681,7 +828,9 @@ mod tests {
 
     use axum::extract::ConnectInfo;
 
-    use super::{normalize_ip, parse_cidr, HttpRateLimiter};
+    use super::{
+        normalize_ip, parse_cidr, parse_forwarded_header, parse_forwarded_ip, parse_x_forwarded_for, HttpRateLimiter,
+    };
 
     fn rate_cfg(rps: u64, burst: u64) -> IngressConfig {
         IngressConfig {
@@ -691,12 +840,28 @@ mod tests {
         }
     }
 
+    fn rate_cfg_with_trusted_proxy(rps: u64, burst: u64, trusted_proxy_cidrs: Vec<String>) -> IngressConfig {
+        IngressConfig {
+            rate_limit_rps: rps,
+            rate_limit_burst: burst,
+            trusted_proxy_cidrs,
+            ..IngressConfig::default()
+        }
+    }
+
     /// Builds a request carrying a synthetic peer address, mirroring what
     /// `into_make_service_with_connect_info` injects in `main.rs`.
     fn request_from(addr: &str, passport: Option<&str>) -> Request<Body> {
+        request_from_with_headers(addr, passport, &[])
+    }
+
+    fn request_from_with_headers(addr: &str, passport: Option<&str>, headers: &[(&str, &str)]) -> Request<Body> {
         let mut builder = Request::post("/echo");
         if let Some(p) = passport {
             builder = builder.header("x-corecrux-passport-id", p);
+        }
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
         }
         let mut req = builder.body(Body::empty()).unwrap();
         req.extensions_mut()
@@ -705,7 +870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passport_key_enforced_with_429_retry_after_and_metric() {
+    async fn unauthenticated_rotating_passports_rate_limit_by_ip() {
         let metrics = test_metrics();
         let app = apply_ingress_limits(test_router(), &rate_cfg(1, 1), Some(&metrics));
 
@@ -717,10 +882,11 @@ mod tests {
             .unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
 
-        // Second request on the same passport is limited.
+        // Rotating unauthenticated passport IDs from the same IP still hits
+        // the IP bucket.
         let limited = app
             .clone()
-            .oneshot(request_from("203.0.113.7:5000", Some("passport-a")))
+            .oneshot(request_from("203.0.113.7:5000", Some("passport-b")))
             .await
             .unwrap();
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -737,8 +903,8 @@ mod tests {
 
         let rendered = metrics.render().unwrap();
         assert!(
-            rendered.contains("corecrux_http_rate_limited_total{key_kind=\"passport\"} 1"),
-            "expected passport-keyed rate-limited counter, got: {}",
+            rendered.contains("corecrux_http_rate_limited_total{key_kind=\"ip\"} 1"),
+            "expected ip-keyed rate-limited counter, got: {}",
             rendered
                 .lines()
                 .filter(|l| l.contains("rate_limited"))
@@ -746,13 +912,33 @@ mod tests {
                 .join("\n")
         );
 
-        // A different passport from the same IP has its own bucket.
+        // A different source IP has its own bucket.
         let other = app
             .clone()
-            .oneshot(request_from("203.0.113.7:5000", Some("passport-b")))
+            .oneshot(request_from("203.0.113.8:5000", Some("passport-c")))
             .await
             .unwrap();
         assert_eq!(other.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn passport_header_rejects_unsafe_values() {
+        let app = apply_ingress_limits(test_router(), &rate_cfg(1, 1), None);
+        let resp = app
+            .oneshot(request_from("203.0.113.7:5000", Some("bad/passport")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn passport_header_rejected_when_rate_limiting_disabled() {
+        let app = apply_ingress_limits(test_router(), &rate_cfg(0, 0), None);
+        let resp = app
+            .oneshot(request_from("203.0.113.7:5000", Some("bad/passport")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -800,6 +986,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trusted_proxy_rate_limit_keying() {
+        let metrics = test_metrics();
+        let cfg = rate_cfg_with_trusted_proxy(1, 1, vec!["127.0.0.1/32".to_string()]);
+        let app = apply_ingress_limits(test_router(), &cfg, Some(&metrics));
+
+        let ok = app
+            .clone()
+            .oneshot(request_from_with_headers(
+                "127.0.0.1:9000",
+                None,
+                &[("x-forwarded-for", "203.0.113.30")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let limited = app
+            .clone()
+            .oneshot(request_from_with_headers(
+                "127.0.0.1:9000",
+                None,
+                &[("x-forwarded-for", "203.0.113.30")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let other = app
+            .clone()
+            .oneshot(request_from_with_headers(
+                "127.0.0.1:9000",
+                None,
+                &[("x-forwarded-for", "203.0.113.31")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn untrusted_forwarded_for_is_ignored() {
+        let app = apply_ingress_limits(test_router(), &rate_cfg(1, 1), None);
+
+        let ok = app
+            .clone()
+            .oneshot(request_from_with_headers(
+                "198.51.100.9:9000",
+                None,
+                &[("x-forwarded-for", "203.0.113.40")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let limited = app
+            .clone()
+            .oneshot(request_from_with_headers(
+                "198.51.100.9:9000",
+                None,
+                &[("x-forwarded-for", "203.0.113.41")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn untrusted_loopback_forwarded_for_is_not_exempt() {
+        let app = apply_ingress_limits(test_router(), &rate_cfg(1, 1), None);
+
+        let ok = app
+            .clone()
+            .oneshot(request_from_with_headers(
+                "127.0.0.1:9000",
+                None,
+                &[("x-forwarded-for", "203.0.113.50")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let limited = app
+            .clone()
+            .oneshot(request_from_with_headers(
+                "127.0.0.1:9000",
+                None,
+                &[("x-forwarded-for", "203.0.113.51")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
     async fn zero_rps_disables_rate_limiting() {
         let app = apply_ingress_limits(test_router(), &rate_cfg(0, 0), None);
         for _ in 0..20 {
@@ -827,17 +1107,17 @@ mod tests {
         let ip: Option<IpAddr> = Some("203.0.113.1".parse().unwrap());
 
         // Burst of 2 admitted, third denied.
-        assert!(limiter.check(Some("p"), ip, t0).is_ok());
-        assert!(limiter.check(Some("p"), ip, t0).is_ok());
-        let denied = limiter.check(Some("p"), ip, t0).unwrap_err();
-        assert_eq!(denied.key_kind, "passport");
+        assert!(limiter.check(ip, ip, t0).is_ok());
+        assert!(limiter.check(ip, ip, t0).is_ok());
+        let denied = limiter.check(ip, ip, t0).unwrap_err();
+        assert_eq!(denied.key_kind, "ip");
         assert!(denied.retry_after_secs >= 1);
 
         // After 1s at 2 rps, two tokens refill.
         let t1 = t0 + Duration::from_secs(1);
-        assert!(limiter.check(Some("p"), ip, t1).is_ok());
-        assert!(limiter.check(Some("p"), ip, t1).is_ok());
-        assert!(limiter.check(Some("p"), ip, t1).is_err());
+        assert!(limiter.check(ip, ip, t1).is_ok());
+        assert!(limiter.check(ip, ip, t1).is_ok());
+        assert!(limiter.check(ip, ip, t1).is_err());
     }
 
     #[test]
@@ -879,7 +1159,29 @@ mod tests {
         let limiter = HttpRateLimiter::new(&rate_cfg(1, 1), None);
         let t0 = Instant::now();
         for _ in 0..5 {
-            assert!(limiter.check(None, Some(normalize_ip(mapped)), t0).is_ok());
+            let ip = Some(normalize_ip(mapped));
+            assert!(limiter.check(ip, ip, t0).is_ok());
         }
+    }
+
+    #[test]
+    fn forwarded_header_parsing() {
+        assert_eq!(
+            parse_forwarded_header(r"for=203.0.113.60;proto=https;by=127.0.0.1"),
+            Some("203.0.113.60".parse().unwrap())
+        );
+        assert_eq!(
+            parse_forwarded_header(r#"for="[2001:db8::1]:443";proto=https"#),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(parse_forwarded_header("for=unknown"), None);
+        assert_eq!(
+            parse_x_forwarded_for("203.0.113.70, 198.51.100.1"),
+            Some("203.0.113.70".parse().unwrap())
+        );
+        assert_eq!(
+            parse_forwarded_ip("203.0.113.71:1234"),
+            Some("203.0.113.71".parse().unwrap())
+        );
     }
 }

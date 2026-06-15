@@ -480,9 +480,13 @@ curl -s -X POST http://localhost:14801/mcp \
 
 ## Rate Limiting
 
-In standalone mode, Crux has no built-in HTTP rate limiting. For production deployments,
-place Crux behind a reverse proxy (Caddy, nginx) with rate limiting configured.
-The gRPC append path has built-in per-tenant throttling via `CRUX_TENANT_THROTTLE_*` env vars.
+Crux has coarse built-in HTTP request caps and client-IP rate limiting. For
+production deployments, place Crux behind a reverse proxy (Caddy, nginx) with
+route-specific rate limiting configured. Set `CORECRUXD_TRUSTED_PROXY_CIDRS`
+only for proxy peers that strip inbound `Forwarded` / `X-Forwarded-For` and
+rewrite them from the real client address.
+The gRPC append path has built-in per-tenant throttling via
+`CRUX_TENANT_THROTTLE_*` env vars.
 
 Every HTTP endpoint has a **30-second request timeout** enforced by Tower middleware.
 Requests exceeding the deadline receive a `408 Request Timeout` response.
