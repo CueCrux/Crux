@@ -506,8 +506,15 @@ pub(super) async fn get_proj_artifact_pressure_events(
 
 pub(super) async fn get_entity_count(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
+        if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+            return problem.into_response();
+        }
+    }
+
     let tenant_id = params.get("tenant_id").cloned().unwrap_or_default();
     let entity_type = params.get("entity_type").cloned().unwrap_or_default();
     let predicate = params.get("predicate").cloned().unwrap_or_default();
@@ -537,8 +544,15 @@ pub(super) async fn get_entity_count(
 
 pub(super) async fn get_entity_timeline(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
+        if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+            return problem.into_response();
+        }
+    }
+
     let tenant_id = params.get("tenant_id").cloned().unwrap_or_default();
     let entity_type = params.get("entity_type").cloned().unwrap_or_default();
     let predicate = params.get("predicate").cloned().unwrap_or_default();
@@ -580,8 +594,15 @@ pub(super) async fn get_entity_timeline(
 
 pub(super) async fn get_entity_current_state(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    if require_http_scopes(&state.auth, &headers, &["query:read"]).is_err() {
+        if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+            return problem.into_response();
+        }
+    }
+
     let tenant_id = params.get("tenant_id").cloned().unwrap_or_default();
     let entity_name = params.get("entity_name").cloned().unwrap_or_default();
     let predicate = params.get("predicate").cloned().unwrap_or_default();

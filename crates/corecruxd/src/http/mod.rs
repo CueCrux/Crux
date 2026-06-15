@@ -48,6 +48,8 @@ mod receipts;
 mod relations;
 mod replay;
 mod result_envelope;
+#[cfg(test)]
+mod route_auth;
 mod routing;
 pub mod session;
 mod storybook;

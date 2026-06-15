@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   advisories:
-    name: Advisory audit
+    name: Cargo deny policy
     runs-on: [self-hosted, ci]
     env:
       CARGO_HOME: /home/gha-runner/.cargo
@@ -34,8 +34,36 @@ jobs:
           "$CARGO_HOME/bin/cargo-deny" --version
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Check advisories
-        run: cargo deny check advisories
+      - name: Check advisory ignore metadata
+        run: bash scripts/check-deny-advisory-ignores.sh
+
+      - name: Check cargo-deny policy
+        run: cargo deny check
+
+  cargo-audit:
+    name: Cargo audit
+    runs-on: [self-hosted, ci]
+    env:
+      CARGO_HOME: /home/gha-runner/.cargo
+      CARGO_AUDIT_VERSION: 0.22.1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Ensure cargo-audit
+        run: |
+          set -euo pipefail
+          mkdir -p "$CARGO_HOME/bin"
+          (
+            flock 9
+            if ! "$CARGO_HOME/bin/cargo-audit" --version | grep -q "$CARGO_AUDIT_VERSION"; then
+              cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
+            fi
+          ) 9>/tmp/cargo-audit-install.lock
+          "$CARGO_HOME/bin/cargo-audit" --version
+      - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Check RustSec advisories
+        run: cargo audit
 
   licenses:
     name: Licence check

@@ -867,6 +867,21 @@ async fn get_control_returns_knowledge_authority() {
 }
 
 #[tokio::test]
+async fn admin_restart_requires_admin_write() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let missing = admin::post_restart_daemon(State(state.clone()), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let read_only = admin::post_restart_daemon(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(read_only.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn admin_action_submit_is_idempotent_by_action_id() {
     let state = test_app_state(16);
     let req_a = admin::PostAdminActionRequest {
@@ -3883,7 +3898,7 @@ async fn get_entity_count_returns_501_without_dataplane() {
     let mut params = std::collections::HashMap::new();
     params.insert("tenant_id".to_string(), "tenant-a".to_string());
     params.insert("entity_type".to_string(), "server".to_string());
-    let resp = get_entity_count(State(state), axum::extract::Query(params))
+    let resp = get_entity_count(State(state), HeaderMap::new(), axum::extract::Query(params))
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
@@ -3894,7 +3909,7 @@ async fn get_entity_timeline_returns_501_without_dataplane() {
     let state = test_app_state(16);
     let mut params = std::collections::HashMap::new();
     params.insert("tenant_id".to_string(), "tenant-a".to_string());
-    let resp = get_entity_timeline(State(state), axum::extract::Query(params))
+    let resp = get_entity_timeline(State(state), HeaderMap::new(), axum::extract::Query(params))
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
@@ -3906,10 +3921,45 @@ async fn get_entity_current_state_returns_501_without_dataplane() {
     let mut params = std::collections::HashMap::new();
     params.insert("tenant_id".to_string(), "tenant-a".to_string());
     params.insert("entity_name".to_string(), "server-1".to_string());
-    let resp = get_entity_current_state(State(state), axum::extract::Query(params))
+    let resp = get_entity_current_state(State(state), HeaderMap::new(), axum::extract::Query(params))
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn entity_projection_routes_require_query_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let mut params = std::collections::HashMap::new();
+    params.insert("tenant_id".to_string(), "tenant-a".to_string());
+    params.insert("entity_type".to_string(), "server".to_string());
+
+    let missing = get_entity_count(
+        State(state.clone()),
+        HeaderMap::new(),
+        axum::extract::Query(params.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong_scope = get_entity_count(
+        State(state.clone()),
+        dev_scope_headers("facts:write"),
+        axum::extract::Query(params.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(wrong_scope.status(), StatusCode::FORBIDDEN);
+
+    let allowed = get_entity_count(
+        State(state),
+        dev_scope_headers("query:read"),
+        axum::extract::Query(params),
+    )
+    .await
+    .into_response();
+    assert_eq!(allowed.status(), StatusCode::NOT_IMPLEMENTED);
 }
 
 // ── get_replication_status ──────────────────────────────────────
@@ -5344,7 +5394,7 @@ async fn post_valves_sets_pause_compaction() {
 async fn get_entity_count_missing_tenant_id_returns_501() {
     let state = test_app_state(16);
     let params = std::collections::HashMap::new();
-    let resp = get_entity_count(State(state), axum::extract::Query(params))
+    let resp = get_entity_count(State(state), HeaderMap::new(), axum::extract::Query(params))
         .await
         .into_response();
     // Missing tenant_id should still reach no-dataplane path -> 501

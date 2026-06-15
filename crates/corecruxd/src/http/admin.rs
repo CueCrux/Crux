@@ -2401,7 +2401,7 @@ pub(super) async fn post_sharing_backfill(
 /// manually. We schedule the exit on a background task so the HTTP response
 /// has time to flush before the process disappears.
 pub(super) async fn post_restart_daemon(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:write"]) {
         return problem.into_response();
     }
     tracing::warn!(target: "corecruxd::admin", "restart requested via /v1/admin/restart");

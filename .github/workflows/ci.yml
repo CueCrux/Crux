@@ -146,6 +146,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: bash scripts/ci-cargo-with-fallback.sh build --workspace
+      - name: HTTP auth boundary contracts
+        run: bash scripts/ci-cargo-with-fallback.sh test -p corecruxd route_auth
+      - name: HTTP boundary smoke contracts
+        run: bash scripts/ci-cargo-with-fallback.sh test -p corecruxd http_boundary_contracts
       # `cargo test --workspace` (next step) already covers
       # `crux-integrations::community_packs`; the explicit invocation here
       # was duplicating that target's execution. Drop it.
