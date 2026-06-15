@@ -111,6 +111,13 @@ jobs:
       - run: typos
       - run: bash scripts/assert-daemon-release-boundary.sh
       - run: bash scripts/ci-cargo-with-fallback.sh clippy --workspace -- -D warnings
+      - name: Reclaim per-job CARGO_HOME
+        if: always()
+        # The per-job CARGO_HOME lives on the self-hosted runner's data disk and
+        # is unique per run; nothing reuses it afterwards. Without this it leaks
+        # a cache dir every run until the disk fills and the runner listeners
+        # crash-loop (incident 2026-06-15: 263 orphan dirs, 118 GiB, md3 100%).
+        run: rm -rf "$CARGO_HOME"
 
   # ── Test, MSRV, Coverage: self-hosted ────────────────────────────────
   test:
@@ -214,6 +221,9 @@ jobs:
             | jq -r '.result.tools | length')
           echo "MCP tools/list returned: $TOOL_COUNT tools"
           [ "$TOOL_COUNT" -gt 0 ]
+      - name: Reclaim per-job CARGO_HOME
+        if: always()
+        run: rm -rf "$CARGO_HOME"  # see lint job — prevents data-disk leak
 
   msrv:
     name: MSRV (1.88.0)
@@ -247,6 +257,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - run: bash scripts/ci-cargo-with-fallback.sh build --workspace
+      - name: Reclaim per-job CARGO_HOME
+        if: always()
+        run: rm -rf "$CARGO_HOME"  # see lint job — prevents data-disk leak
 
   coverage:
     name: Coverage
@@ -332,3 +345,6 @@ jobs:
         with:
           name: coverage-report
           path: lcov.info
+      - name: Reclaim per-job CARGO_HOME
+        if: always()
+        run: rm -rf "$CARGO_HOME"  # see lint job — prevents data-disk leak
