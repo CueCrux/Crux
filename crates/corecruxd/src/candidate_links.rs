@@ -26,6 +26,8 @@ pub enum CandidateLinkError {
     NotFound(String),
     #[error("invalid candidate: {0}")]
     Invalid(String),
+    #[error(transparent)]
+    Link(#[from] crate::identity_links::LinkError),
     #[error("entity store error: {0}")]
     Store(String),
 }
@@ -155,6 +157,70 @@ pub fn update_candidate_status(
         .upsert(CANDIDATE_LINK_KIND, candidate_id, value, actor, None)
         .map_err(|e| CandidateLinkError::Store(e.to_string()))?;
     Ok(payload)
+}
+
+pub fn confirm_candidate_with_link(
+    entities: &mut EntityStore,
+    facts: &FactStore,
+    candidate_id: &str,
+    req: &crate::identity_links::CreateLinkRequest,
+    actor: &str,
+) -> Result<
+    (
+        String,
+        corecrux_memory::identity_link::IdentityLinkPayload,
+        CandidateLinkPayload,
+    ),
+    CandidateLinkError,
+> {
+    let candidate =
+        get_candidate(entities, candidate_id).ok_or_else(|| CandidateLinkError::NotFound(candidate_id.to_string()))?;
+    if candidate.status != CandidateLinkStatus::Proposed {
+        return Err(CandidateLinkError::Invalid(format!(
+            "candidate '{candidate_id}' is not proposed"
+        )));
+    }
+
+    let local = crate::passports::get_passport(facts, &req.local_passport_id)
+        .ok_or_else(|| CandidateLinkError::LocalPassportNotFound(req.local_passport_id.clone()))?;
+    if candidate.local_passport_fpr != local.principal_id {
+        return Err(CandidateLinkError::Invalid(
+            "candidate local_passport_fpr does not match link local passport".to_string(),
+        ));
+    }
+    if candidate.observed_subject != req.remote_fpr {
+        return Err(CandidateLinkError::Invalid(
+            "candidate observed_subject does not match link remote_fpr".to_string(),
+        ));
+    }
+
+    let (link_id, link_payload) = crate::identity_links::create_link(entities, facts, req, actor)?;
+    let candidate = update_candidate_status(
+        entities,
+        candidate_id,
+        CandidateLinkStatus::Confirmed,
+        Some(link_id.clone()),
+        actor,
+    )?;
+    Ok((link_id, link_payload, candidate))
+}
+
+pub fn reject_candidate(
+    entities: &mut EntityStore,
+    candidate_id: &str,
+    actor: &str,
+) -> Result<CandidateLinkPayload, CandidateLinkError> {
+    let candidate =
+        get_candidate(entities, candidate_id).ok_or_else(|| CandidateLinkError::NotFound(candidate_id.to_string()))?;
+    match candidate.status {
+        CandidateLinkStatus::Confirmed => Err(CandidateLinkError::Invalid(format!(
+            "confirmed candidate '{candidate_id}' cannot be rejected"
+        ))),
+        CandidateLinkStatus::Rejected => Ok(candidate),
+        CandidateLinkStatus::Proposed => {
+            update_candidate_status(entities, candidate_id, CandidateLinkStatus::Rejected, None, actor)
+        }
+    }
 }
 
 pub fn observations_from_session_bindings(facts: &FactStore) -> Vec<CandidateObservation> {

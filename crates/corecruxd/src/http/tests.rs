@@ -12533,6 +12533,34 @@ async fn signed_link_request(state: &AppState) -> (crate::identity_links::Create
     )
 }
 
+async fn candidate_for_signed_request(state: &AppState, remote_fpr: &str) -> String {
+    let facts = state.fact_store.read().await;
+    let local = crate::passports::get_passport(&facts, "personal-default").expect("local passport");
+    let mut entities = state.entity_store.write().await;
+    let (candidate_id, _) = crate::candidate_links::create_candidate(
+        &mut entities,
+        &facts,
+        crate::candidate_links::CreateCandidateInput {
+            local_passport_fpr: local.principal_id,
+            observed_subject: remote_fpr.to_string(),
+            signals: vec![corecrux_memory::candidate_link::CandidateLinkSignal {
+                kind: "temporal_adjacency".to_string(),
+                confidence: 0.82,
+                evidence_ref: Some("session_binding:test-a|session_binding:test-b".to_string()),
+            }],
+            confidence: 0.82,
+            evidence_refs: vec![
+                "session_binding:test-a".to_string(),
+                "session_binding:test-b".to_string(),
+            ],
+            proposed_at: Some("2026-06-15T00:00:00Z".to_string()),
+        },
+        "operator",
+    )
+    .expect("candidate");
+    candidate_id
+}
+
 #[tokio::test]
 async fn identity_links_disabled_returns_404() {
     let mut state = test_app_state(16);
@@ -12562,6 +12590,93 @@ async fn identity_link_create_requires_admin_write_t3() {
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn identity_candidate_confirm_promotes_to_resolving_link() {
+    let state = test_app_state(16);
+    let (req, remote_fpr) = signed_link_request(&state).await;
+    let candidate_id = candidate_for_signed_request(&state, &remote_fpr).await;
+
+    let resp = identity_links::post_identity_candidate_confirm(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(candidate_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp).await;
+    let link_id = body["link_id"].as_str().expect("link id").to_string();
+    assert_eq!(body["candidate"]["status"], "confirmed");
+    assert_eq!(body["candidate"]["resolved_link_id"], link_id);
+
+    {
+        let entities = state.entity_store.read().await;
+        let candidate_history = entities.history(corecrux_memory::candidate_link::CANDIDATE_LINK_KIND, &candidate_id);
+        assert_eq!(candidate_history.len(), 2, "proposal + confirmation are versioned");
+        let link_history = entities.history(corecrux_memory::identity_link::IDENTITY_LINK_KIND, &link_id);
+        assert_eq!(link_history.len(), 1);
+    }
+
+    let resp = principal::get_resolve_principal(State(state), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn identity_candidate_confirm_rejects_mismatched_remote_fpr() {
+    let state = test_app_state(16);
+    let (req, remote_fpr) = signed_link_request(&state).await;
+    let candidate_id = candidate_for_signed_request(&state, "p_observed-but-not-signed").await;
+
+    let resp = identity_links::post_identity_candidate_confirm(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(candidate_id),
+        Json(req),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let entities = state.entity_store.read().await;
+    assert!(
+        crate::identity_links::find_live_link_for_remote(&entities, &remote_fpr).is_none(),
+        "mismatched candidate must not create a resolving edge"
+    );
+}
+
+#[tokio::test]
+async fn identity_candidate_reject_is_versioned_and_non_resolving() {
+    let state = test_app_state(16);
+    let (_req, remote_fpr) = signed_link_request(&state).await;
+    let candidate_id = candidate_for_signed_request(&state, &remote_fpr).await;
+
+    let resp = identity_links::post_identity_candidate_reject(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(candidate_id.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["candidate"]["status"], "rejected");
+    assert!(body["candidate"]["resolved_link_id"].is_null());
+
+    {
+        let entities = state.entity_store.read().await;
+        let candidate_history = entities.history(corecrux_memory::candidate_link::CANDIDATE_LINK_KIND, &candidate_id);
+        assert_eq!(candidate_history.len(), 2, "proposal + rejection are versioned");
+        assert!(crate::identity_links::find_live_link_for_remote(&entities, &remote_fpr).is_none());
+    }
+
+    let resp = principal::get_resolve_principal(State(state), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
