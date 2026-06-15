@@ -111,7 +111,10 @@ tokens, send `Authorization: Bearer <token>` on HTTP requests.
 
 If the server has no MCP agent tokens configured, MCP requests may run as
 `anonymous`. If the server sets `CRUX_AGENT_TOKEN` or `CRUX_AGENT_TOKENS`,
-every `POST /mcp` request must include the matching bearer token.
+every `POST /mcp` request and authenticated SSE stream must include the
+matching bearer token. Streamable HTTP SSE sessions are capped globally and per
+agent or client IP via `CRUX_MCP_SSE_MAX_SESSIONS` and
+`CRUX_MCP_SSE_MAX_SESSIONS_PER_OWNER`.
 
 ```bash
 export CRUX_AGENT_TOKEN="your-token-here"

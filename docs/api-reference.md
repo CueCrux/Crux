@@ -180,6 +180,10 @@ Endpoint: `GET/POST http://<host>:14801/mcp`
   `tools/call`.
 - If `CRUX_AGENT_TOKEN` or `CRUX_AGENT_TOKENS` is configured, MCP requests
   must include `Authorization: Bearer <token>`.
+- `Accept: text/event-stream` opens a Streamable HTTP SSE stream. SSE streams
+  use the same bearer-token rule, validate `Mcp-Session-Id`, and are capped by
+  `CRUX_MCP_SSE_MAX_SESSIONS` and
+  `CRUX_MCP_SSE_MAX_SESSIONS_PER_OWNER`.
 - Private facts, agent-scoped sessions, and handoff workflows are available
   through MCP tools, not the HTTP `/v1/facts` surface.
 - `sync_status` tells agents whether the node is local-only, sync-enabled, or

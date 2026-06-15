@@ -4,9 +4,10 @@
 
 //! axum HTTP server for the MCP Streamable HTTP endpoint.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -17,11 +18,14 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 use tracing::{info, warn};
 
+use crate::agent::AgentIdentity;
 use crate::dispatch::{self, McpContext, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, PARSE_ERROR};
+use crate::sse::{RegisterError, Registration};
 
 /// MCP Streamable HTTP session-correlation header.
 const MCP_SESSION_HEADER: &str = "mcp-session-id";
+const MCP_SESSION_ID_MAX_LEN: usize = 128;
 
 /// True when the request is a `tools/call` for `cuecrux_session` carrying a
 /// non-empty `intent` — the trigger that reshapes the `dynamic` surface and so
@@ -50,23 +54,14 @@ pub fn router(ctx: McpContext) -> axum::Router {
 
 /// `POST /mcp` — JSON-RPC 2.0 endpoint (MCP Streamable HTTP).
 async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap, body: String) -> Response {
-    // Extract optional bearer token for agent lookup.
-    let agent = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|auth| auth.strip_prefix("Bearer "))
-        .and_then(|token| ctx.agent_registry.lookup(token).cloned());
-
-    if !ctx.agent_registry.is_empty() && agent.is_none() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": "unauthorized",
-                "hint": "set Authorization: Bearer <CRUX_AGENT_TOKEN>"
-            })),
-        )
-            .into_response();
-    }
+    let agent = match authenticate_agent(&ctx, &headers) {
+        Ok(agent) => agent,
+        Err(problem) => return problem.into_response(),
+    };
+    let incoming_session = match mcp_session_id_from_headers(&headers) {
+        Ok(session_id) => session_id,
+        Err(problem) => return problem.into_response(),
+    };
 
     // Build a per-request context with the agent identity attached (if any).
     let req_ctx = if let Some(identity) = agent {
@@ -116,10 +111,6 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
     // triggers a `tools/list_changed` push to that session's stream (if open).
     let is_initialize = req.method == "initialize";
     let push_list_changed = is_cuecrux_session_with_intent(&req);
-    let incoming_session = headers
-        .get(MCP_SESSION_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
 
     let resp = dispatch::dispatch(req, &req_ctx, None).await;
 
@@ -149,7 +140,9 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
 /// - `Accept: text/event-stream` → open a server→client SSE stream for
 ///   notifications (M3.5: `tools/list_changed`), keyed by `Mcp-Session-Id`.
 /// - otherwise → static server-info discovery (unchanged).
-async fn handle_mcp_get(State(_ctx): State<Arc<McpContext>>, headers: HeaderMap) -> Response {
+async fn handle_mcp_get(State(ctx): State<Arc<McpContext>>, req: axum::extract::Request) -> Response {
+    let headers = req.headers();
+    let peer_ip = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ci| ci.0.ip());
     let wants_sse = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -166,14 +159,28 @@ async fn handle_mcp_get(State(_ctx): State<Arc<McpContext>>, headers: HeaderMap)
         .into_response();
     }
 
-    let session_id = headers
-        .get(MCP_SESSION_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map_or_else(|| uuid::Uuid::new_v4().simple().to_string(), str::to_string);
+    let agent = match authenticate_agent(&ctx, headers) {
+        Ok(agent) => agent,
+        Err(problem) => return problem.into_response(),
+    };
+    let session_id = match mcp_session_id_from_headers(headers) {
+        Ok(Some(session_id)) => session_id,
+        Ok(None) => uuid::Uuid::new_v4().simple().to_string(),
+        Err(problem) => return problem.into_response(),
+    };
+    let owner_key = sse_owner_key(agent.as_ref(), peer_ip);
 
-    let rx = crate::sse::register(&session_id);
-    let stream =
-        UnboundedReceiverStream::new(rx).map(|data| Ok::<Event, std::convert::Infallible>(Event::default().data(data)));
+    let registered = match crate::sse::register(&session_id, &owner_key) {
+        Ok(registered) => registered,
+        Err(err) => return sse_register_error_response(err),
+    };
+    let registration = registered.registration();
+    let rx = registered.into_receiver();
+    let cleanup = SseCleanupGuard(registration);
+    let stream = UnboundedReceiverStream::new(rx).map(move |data| {
+        let _cleanup = &cleanup;
+        Ok::<Event, std::convert::Infallible>(Event::default().data(data))
+    });
 
     let mut response = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
     if let Ok(value) = HeaderValue::from_str(&session_id) {
@@ -182,6 +189,112 @@ async fn handle_mcp_get(State(_ctx): State<Arc<McpContext>>, headers: HeaderMap)
             .insert(HeaderName::from_static(MCP_SESSION_HEADER), value);
     }
     response
+}
+
+struct SseCleanupGuard(Registration);
+
+impl Drop for SseCleanupGuard {
+    fn drop(&mut self) {
+        crate::sse::unregister_registration(&self.0);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InvalidMcpSessionId;
+
+impl IntoResponse for InvalidMcpSessionId {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_mcp_session_id",
+                "hint": format!("Mcp-Session-Id must be 1..={MCP_SESSION_ID_MAX_LEN} ASCII chars from [A-Za-z0-9._:-]")
+            })),
+        )
+            .into_response()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct UnauthorizedAgent;
+
+impl IntoResponse for UnauthorizedAgent {
+    fn into_response(self) -> Response {
+        unauthorized_response()
+    }
+}
+
+fn authenticate_agent(ctx: &McpContext, headers: &HeaderMap) -> Result<Option<AgentIdentity>, UnauthorizedAgent> {
+    let agent = bearer_token(headers).and_then(|token| ctx.agent_registry.lookup(token).cloned());
+    if !ctx.agent_registry.is_empty() && agent.is_none() {
+        Err(UnauthorizedAgent)
+    } else {
+        Ok(agent)
+    }
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|auth| auth.strip_prefix("Bearer "))
+}
+
+fn unauthorized_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "unauthorized",
+            "hint": "set Authorization: Bearer <CRUX_AGENT_TOKEN>"
+        })),
+    )
+        .into_response()
+}
+
+fn mcp_session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, InvalidMcpSessionId> {
+    let mut values = headers.get_all(MCP_SESSION_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(InvalidMcpSessionId);
+    }
+    let raw = value.to_str().map_err(|_| InvalidMcpSessionId)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > MCP_SESSION_ID_MAX_LEN || !trimmed.bytes().all(is_safe_session_id_byte) {
+        return Err(InvalidMcpSessionId);
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn is_safe_session_id_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+}
+
+fn sse_owner_key(agent: Option<&AgentIdentity>, peer_ip: Option<IpAddr>) -> String {
+    if let Some(agent) = agent {
+        format!("agent:{}", agent.name)
+    } else if let Some(ip) = peer_ip {
+        format!("ip:{ip}")
+    } else {
+        "anonymous".to_string()
+    }
+}
+
+fn sse_register_error_response(err: RegisterError) -> Response {
+    let (scope, limit) = match err {
+        RegisterError::GlobalLimit { max } => ("global", max),
+        RegisterError::OwnerLimit { max } => ("owner", max),
+    };
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({
+            "error": "sse_session_limit",
+            "scope": scope,
+            "limit": limit
+        })),
+    )
+        .into_response()
 }
 
 fn json_rpc_response_with_crux_mode(resp: JsonRpcResponse) -> Response {
@@ -343,6 +456,98 @@ mod tests {
         // Do NOT read the long-lived body. Clean up the registry entry.
         drop(resp);
         crate::sse::unregister("test-sse-session");
+    }
+
+    #[tokio::test]
+    async fn sse_requires_bearer_when_registry_configured() {
+        let mut ctx = McpContext::new_default("test-node");
+        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token("secret-token");
+        let app = test_app_with_ctx(ctx);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header("accept", "text/event-stream")
+            .header("mcp-session-id", "test-auth-sse-session")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(!crate::sse::is_registered("test-auth-sse-session"));
+    }
+
+    #[tokio::test]
+    async fn sse_accepts_bearer_when_registry_configured() {
+        let mut ctx = McpContext::new_default("test-node");
+        ctx.agent_registry = crate::agent::AgentRegistry::from_single_token("secret-token");
+        let app = test_app_with_ctx(ctx);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header("accept", "text/event-stream")
+            .header("authorization", "Bearer secret-token")
+            .header("mcp-session-id", "test-auth-sse-session-ok")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(crate::sse::is_registered("test-auth-sse-session-ok"));
+        drop(resp);
+        tokio::task::yield_now().await;
+        assert!(!crate::sse::is_registered("test-auth-sse-session-ok"));
+    }
+
+    #[tokio::test]
+    async fn sse_unregisters_on_stream_end() {
+        let app = test_app();
+        let session_id = "test-sse-cleanup-session";
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header("accept", "text/event-stream")
+            .header("mcp-session-id", session_id)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(crate::sse::is_registered(session_id));
+        drop(resp);
+        tokio::task::yield_now().await;
+        assert!(!crate::sse::is_registered(session_id));
+    }
+
+    #[tokio::test]
+    async fn sse_session_id_limits() {
+        let app = test_app();
+        let too_long = "a".repeat(MCP_SESSION_ID_MAX_LEN + 1);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header("accept", "text/event-stream")
+            .header("mcp-session-id", too_long)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        }))
+        .unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("mcp-session-id", "bad/session")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
