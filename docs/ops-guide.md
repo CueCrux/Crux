@@ -2,8 +2,27 @@
 
 ## Rate Limiting
 
-Crux Daemon does not include application-level rate limiting.
-Deploy behind a reverse proxy (nginx, Caddy, Envoy) with rate limits configured.
+Crux Daemon includes a transport-level global request cap and a coarse
+client-IP rate limiter. Production deployments should still put a TLS
+reverse proxy (nginx, Caddy, Envoy) in front and configure route-specific rate
+limits there.
+
+Daemon-side rate limiting keys by effective client IP. `X-Corecrux-Passport-Id`
+is validated at ingress but is not trusted as a pre-auth rate-limit key.
+Forwarded client IP headers are ignored unless the proxy peer is listed in
+`CORECRUXD_TRUSTED_PROXY_CIDRS`.
+
+For same-host proxies, either:
+
+- keep proxy-side rate limits authoritative; or
+- set `CORECRUXD_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128` and configure the
+  proxy to strip inbound `Forwarded` / `X-Forwarded-For` before setting them
+  from the real client address.
+
+When forwarded headers arrive from an untrusted peer, the daemon ignores them
+and suppresses loopback exemption for that request. This gives an unconfigured
+same-host proxy one shared daemon bucket rather than an unlimited loopback
+bypass.
 
 ### Recommended Limits
 

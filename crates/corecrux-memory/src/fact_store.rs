@@ -1001,10 +1001,13 @@ impl FactStore {
 
         // Atomic publish.
         std::fs::rename(&tmp_path, &path)?;
-        // Best-effort fsync of the directory so the rename itself is durable.
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
+        // Fence the directory fsync so the rename is durable before we log the
+        // compaction as successful. Propagated (not swallowed) to match the
+        // hard dir-fsync discipline in storage/append.rs: a crash right after a
+        // silently-failed dir fsync could lose the rename while the success log
+        // below claimed the compaction landed.
+        let dir = std::fs::File::open(parent)?;
+        dir.sync_all()?;
 
         tracing::info!(
             facts_dropped = report.facts_dropped,

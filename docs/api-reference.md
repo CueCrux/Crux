@@ -119,13 +119,14 @@ visibility are MCP-only features.
 |--------|------|-------------|------------|
 | POST | `/v1/admin/shard-map` | Update shard map | `admin:write` |
 | GET | `/v1/admin/control` | Current control state | `admin:read` |
+| POST | `/v1/admin/restart` | Request daemon process restart | `admin:write` |
 | GET | `/v1/admin/ops-log` | Structured operations log | `admin:read` |
 | POST | `/v1/admin/valves` | Set valve states (throttle, pause, emergency brake) | `admin:write` |
 | GET | `/v1/admin/replication/status` | Replication topology status | `admin:read` * |
 | POST | `/v1/admin/actions` | Submit admin action (seal, scrub, verify, rebalance) | `admin:write` |
 | GET | `/v1/admin/actions/{actionId}` | Get admin action status | `admin:read` |
 | POST | `/v1/admin/stream-meta` | Update stream metadata | `admin:write` * |
-| POST | `/v1/internal/replication/segments` | Receive replicated segments | `admin:write` * |
+| POST | `/v1/internal/replication/segments` | Receive replicated segments | `replication:write` * |
 
 \* Requires a dataplane-enabled deployment. Returns 501 in Crux Daemon.
 
@@ -180,6 +181,10 @@ Endpoint: `GET/POST http://<host>:14801/mcp`
   `tools/call`.
 - If `CRUX_AGENT_TOKEN` or `CRUX_AGENT_TOKENS` is configured, MCP requests
   must include `Authorization: Bearer <token>`.
+- `Accept: text/event-stream` opens a Streamable HTTP SSE stream. SSE streams
+  use the same bearer-token rule, validate `Mcp-Session-Id`, and are capped by
+  `CRUX_MCP_SSE_MAX_SESSIONS` and
+  `CRUX_MCP_SSE_MAX_SESSIONS_PER_OWNER`.
 - Private facts, agent-scoped sessions, and handoff workflows are available
   through MCP tools, not the HTTP `/v1/facts` surface.
 - `sync_status` tells agents whether the node is local-only, sync-enabled, or

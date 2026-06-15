@@ -231,6 +231,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let auth = crate::auth::Authz::from_env(config.auth_mode)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let mcp_agent_registry = crux_mcp::agent::AgentRegistry::from_env();
+    // Security: an agent-token env var set to a value that fails the strength
+    // policy (>= 32 bytes, charset [A-Za-z0-9._~-]) yields an empty registry,
+    // and MCP then falls open to no-auth. Warn loudly so a misconfigured weak
+    // token is never mistaken for enforced auth.
+    if mcp_agent_registry.is_empty()
+        && (std::env::var_os("CRUX_AGENT_TOKEN").is_some() || std::env::var_os("CRUX_AGENT_TOKENS").is_some())
+    {
+        tracing::warn!(
+            "CRUX_AGENT_TOKEN(S) is set but no valid agent token was parsed (need >= 32 bytes, \
+             charset [A-Za-z0-9._~-]); MCP auth is NOT enforced. Fix the token to enable auth."
+        );
+    }
     validate_network_auth_posture(
         config.auth_mode,
         config.http_addr,

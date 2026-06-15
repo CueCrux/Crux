@@ -600,21 +600,9 @@ pub(super) async fn post_query_text_search(
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             });
             let json = serde_json::to_string(&event).unwrap_or_default();
-            let entity = crux_observe::schema::ops_entity("coverage", &uuid::Uuid::new_v4().to_string());
             let mut store = fs.write().await;
             {
-                let mut sf = corecrux_memory::fact_store::StoreFact {
-                    entity,
-                    key: crux_observe::schema::EVT_OPS_QUERY_COVERAGE_V1.to_string(),
-                    value: json,
-                    source_receipt: None,
-                    confidence: score,
-                    private: false,
-                    horizon_class: None,
-                    actor: None,
-                };
-                crate::fact_privacy::enforce_global(&mut sf);
-                store.store(sf);
+                store.store(query_coverage_store_fact(json, score));
             };
         });
     }
@@ -786,6 +774,32 @@ pub(super) async fn post_query_text_search_expand(
         })),
     )
         .into_response()
+}
+
+fn query_coverage_store_fact(value: String, score: f32) -> corecrux_memory::fact_store::StoreFact {
+    let entity = crux_observe::schema::ops_entity("coverage", &uuid::Uuid::new_v4().to_string());
+    let mut sf = corecrux_memory::fact_store::StoreFact {
+        entity,
+        key: crux_observe::schema::EVT_OPS_QUERY_COVERAGE_V1.to_string(),
+        value,
+        source_receipt: None,
+        confidence: score,
+        private: true,
+        horizon_class: None,
+        actor: None,
+    };
+    crate::fact_privacy::enforce_global(&mut sf);
+    sf
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn self_observe_query_coverage_facts_private() {
+        let fact = super::query_coverage_store_fact("{}".to_string(), 0.1);
+        assert!(fact.entity.starts_with("__ops__::coverage:"));
+        assert!(fact.private);
+    }
 }
 
 // ── Fact Store API (Phase 1.5) ──────────────────────────────────────

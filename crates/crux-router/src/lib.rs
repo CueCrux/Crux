@@ -112,6 +112,13 @@ pub struct CruxModeStamp {
     pub token_id: String,
     pub token_hash: String,
     pub queue_ttl_seconds: Option<u64>,
+    /// Whether the router consulted token revocation state (CRL / push channel)
+    /// before authorising. Currently always `false`: revocation is modelled on
+    /// the token (`crl_url`, `push_channel`) but `decide()` does not yet consult
+    /// it, so a revoked-but-unexpired token is still authorised. Surfaced here so
+    /// downstream auditors do not read an authorised decision as implying the
+    /// token was checked for revocation. See `docs/THREAT_MODEL.md`.
+    pub revocation_checked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +315,21 @@ impl RcxRouter {
         })
     }
 
+    /// Whether the token's signature authorises routing to `backend`.
+    ///
+    /// INVARIANT: the `local` backend skips signature verification. This is sound
+    /// only because the token reaching `decide()` is always daemon-minted (see
+    /// `RcxRouter::new`, fed a self-minted local token in `corecruxd::main`) and
+    /// never a client-injected `RcxCapabilityToken`. The local token never crosses
+    /// a trust boundary, so there is no signer to verify against.
+    ///
+    /// Any future wiring that routes a client-supplied token through `decide()`
+    /// MUST construct the router via `new_with_trusted_issuer_pubkey` so non-local
+    /// backends are signature-checked; the local short-circuit must not be relied
+    /// on to authorise a hosted backend. The negative test
+    /// `local_signature_bypass_does_not_extend_to_hosted_backend` pins this: a
+    /// router built with `new()` (no trusted issuer) authorises a local capability
+    /// but refuses any hosted backend with `TokenInvalid`.
     fn token_signature_permits_backend(&self, backend: &Backend, now_unix_seconds: u64) -> bool {
         if backend.backend_id == "local" {
             return true;
@@ -445,6 +467,9 @@ impl RcxRouter {
             token_id: self.token.token_id.clone(),
             token_hash: self.token.token_hash_hex(),
             queue_ttl_seconds,
+            // Revocation IO is not yet wired into decide(); never claim it was
+            // checked. Flip this to `true` only once a CRL/timestamp consult runs.
+            revocation_checked: false,
         }
     }
 }
@@ -814,6 +839,61 @@ mod tests {
         let decision = RcxRouter::new(token).decide(&hosted_retrieve_call(1, true), 1_776_989_601);
         assert!(!decision.authorised);
         assert_eq!(decision.reason_code.as_deref(), Some("denied:token_invalid"));
+    }
+
+    #[test]
+    fn mode_stamp_reports_revocation_unchecked() {
+        // Revocation IO is not wired into decide(); an authorised decision must
+        // never claim the token was checked for revocation.
+        let decision = router().decide(&CallContext::local("corecrux.query.local"), 1_776_989_601);
+        assert!(decision.authorised);
+        assert!(
+            !decision.stamp.revocation_checked,
+            "stamp must report revocation_checked=false until a CRL/timestamp consult is wired"
+        );
+    }
+
+    #[test]
+    fn local_signature_bypass_does_not_extend_to_hosted_backend() {
+        // A router built via new() (no trusted issuer pubkey) models the
+        // daemon-minted-local-token case. The local signature bypass authorises a
+        // local capability, but the SAME router must refuse a hosted backend with
+        // TokenInvalid — the bypass cannot be leveraged to reach a hosted lane.
+        let token = hosted_token(
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            FallbackAction::Refuse,
+            None,
+            Some(10),
+        );
+        // Grant the same token a local capability so we can prove local is allowed.
+        let mut token = token;
+        token.backends.push(Backend {
+            backend_id: "local".to_string(),
+            trust_root_kid: "p_0123456789abcdef0123456789abcdef".to_string(),
+            endpoint_url: None,
+            permitted_capabilities: vec![PermittedCapability {
+                capability: "corecrux.query.local".to_string(),
+                data_egress_classes: vec![DataEgressClass::None],
+                required_attestations: vec![],
+                credit_cost: None,
+            }],
+        });
+        let router = RcxRouter::new(token);
+
+        let local = router.decide(&CallContext::local("corecrux.query.local"), 1_776_989_601);
+        assert!(
+            local.authorised,
+            "local capability must be authorised via the local bypass"
+        );
+        assert_eq!(local.backend_id.as_deref(), Some("local"));
+
+        let hosted = router.decide(&hosted_retrieve_call(1, true), 1_776_989_601);
+        assert!(
+            !hosted.authorised,
+            "hosted backend must not ride the local signature bypass"
+        );
+        assert_eq!(hosted.reason_code.as_deref(), Some("denied:token_invalid"));
     }
 
     #[test]
