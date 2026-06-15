@@ -10,11 +10,12 @@
 //! `admin:read`.
 
 use super::{
-    http_scope_context, problem_response, require_http_any_scope, AppState, HeaderMap, IntoResponse, Json, Path,
+    http_scope_context, problem_response, require_http_any_scope, AppState, HeaderMap, IntoResponse, Json, Path, Query,
     Response, State, StatusCode,
 };
 use crate::candidate_links::{self, CandidateLinkError};
 use crate::identity_links::{self, CreateLinkRequest, LinkError};
+use corecrux_memory::candidate_link::CandidateLinkStatus;
 use corecrux_memory::identity_link::LinkVerifyError;
 
 fn links_disabled() -> Response {
@@ -57,6 +58,27 @@ fn candidate_error_response(err: &CandidateLinkError) -> Response {
 /// writes).
 fn actor_for(ctx: &crate::auth::HttpScopeContext) -> String {
     ctx.passport_id.clone().unwrap_or_else(|| "operator:admin".to_string())
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct ListIdentityCandidatesQuery {
+    /// `proposed`, `confirmed`, `rejected`, or `all` (default).
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+fn parse_candidate_status(raw: Option<&str>) -> Result<Option<CandidateLinkStatus>, Response> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None | Some("all") => Ok(None),
+        Some("proposed") => Ok(Some(CandidateLinkStatus::Proposed)),
+        Some("confirmed") => Ok(Some(CandidateLinkStatus::Confirmed)),
+        Some("rejected") => Ok(Some(CandidateLinkStatus::Rejected)),
+        Some(other) => Err(problem_response(
+            StatusCode::BAD_REQUEST,
+            format!("status must be proposed, confirmed, rejected, or all; got '{other}'"),
+        )
+        .into_response()),
+    }
 }
 
 #[utoipa::path(
@@ -107,6 +129,55 @@ pub(super) async fn post_identity_link(
         }
         Err(err) => link_error_response(&err),
     }
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/identity/candidates",
+    tag = "Identity",
+    params(("status" = Option<String>, Query, description = "Candidate status filter: proposed, confirmed, rejected, or all")),
+    responses(
+        (status = 200, description = "Candidate records, non-resolving unless confirmed as identity links"),
+        (status = 400, description = "Invalid status filter"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Missing admin read scope"),
+        (status = 404, description = "Disabled"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(super) async fn get_identity_candidates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListIdentityCandidatesQuery>,
+) -> Response {
+    if !state.identity_links_enabled {
+        return links_disabled();
+    }
+    if let Err(problem) = require_http_any_scope(&state.auth, &headers, &["admin:read", "admin:write"]) {
+        return problem.into_response();
+    }
+    let status = match parse_candidate_status(query.status.as_deref()) {
+        Ok(status) => status,
+        Err(response) => return response,
+    };
+    let entities = state.entity_store.read().await;
+    let mut candidates: Vec<serde_json::Value> = candidate_links::list_candidates(&entities, status)
+        .into_iter()
+        .map(|(candidate_id, candidate)| serde_json::json!({"candidate_id": candidate_id, "candidate": candidate}))
+        .collect();
+    candidates.sort_by(|a, b| {
+        a["candidate"]["proposed_at"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["candidate"]["proposed_at"].as_str().unwrap_or_default())
+            .then_with(|| {
+                a["candidate_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(b["candidate_id"].as_str().unwrap_or_default())
+            })
+    });
+    (StatusCode::OK, Json(serde_json::json!({"candidates": candidates}))).into_response()
 }
 
 #[utoipa::path(

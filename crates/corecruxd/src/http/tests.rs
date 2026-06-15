@@ -1025,6 +1025,15 @@ fn resolve_query(passport_id: &str) -> axum::extract::Query<principal::ResolvePr
     axum::extract::Query(principal::ResolvePrincipalQuery {
         session_id: None,
         passport_id: Some(passport_id.to_string()),
+        include_candidates: None,
+    })
+}
+
+fn resolve_query_with_candidates(passport_id: &str) -> axum::extract::Query<principal::ResolvePrincipalQuery> {
+    axum::extract::Query(principal::ResolvePrincipalQuery {
+        session_id: None,
+        passport_id: Some(passport_id.to_string()),
+        include_candidates: Some("1".to_string()),
     })
 }
 
@@ -12677,6 +12686,103 @@ async fn identity_candidate_reject_is_versioned_and_non_resolving() {
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn identity_candidates_list_requires_admin_read_and_filters() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let (_req, remote_fpr) = signed_link_request(&state).await;
+    let candidate_id = candidate_for_signed_request(&state, &remote_fpr).await;
+
+    let resp = identity_links::get_identity_candidates(
+        State(state.clone()),
+        HeaderMap::new(),
+        Query(identity_links::ListIdentityCandidatesQuery { status: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = identity_links::get_identity_candidates(
+        State(state.clone()),
+        dev_scope_headers("facts:read"),
+        Query(identity_links::ListIdentityCandidatesQuery { status: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = identity_links::get_identity_candidates(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(identity_links::ListIdentityCandidatesQuery {
+            status: Some("proposed".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let candidates = body["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["candidate_id"], candidate_id);
+
+    let resp = identity_links::get_identity_candidates(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(identity_links::ListIdentityCandidatesQuery {
+            status: Some("rejected".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(json_body(resp).await["candidates"]
+        .as_array()
+        .expect("candidates")
+        .is_empty());
+
+    let resp = identity_links::get_identity_candidates(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Query(identity_links::ListIdentityCandidatesQuery {
+            status: Some("bogus".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn resolve_principal_include_candidates_surfaces_suggestions_without_resolving() {
+    let state = test_app_state(16);
+    let (_req, remote_fpr) = signed_link_request(&state).await;
+    let candidate_id = candidate_for_signed_request(&state, &remote_fpr).await;
+
+    let resp = principal::get_resolve_principal(
+        State(state.clone()),
+        resolve_query_with_candidates(&remote_fpr),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = json_body(resp).await;
+    assert_eq!(body["candidates_resolve"], false);
+    let candidates = body["candidates"].as_array().expect("candidate suggestions");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["candidate_id"], candidate_id);
+    assert_eq!(candidates[0]["resolving"], false);
+
+    let resp = principal::get_resolve_principal(State(state), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "candidate remains non-resolving without confirmation"
+    );
 }
 
 #[tokio::test]

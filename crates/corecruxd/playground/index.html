@@ -682,7 +682,7 @@
 <script>
 /* ════════════ DUMMY GRAPH — flat node registry with id links (daemon-styled) ════════════ */
 const SCOPES = [
-  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-usage','cx-documents','cx-gates','cx-review','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-receipts','cx-mediation','cx-workbench','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-lane-weights','cx-settings','cx-raw'] },
+  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-usage','cx-documents','cx-gates','cx-review','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-identity','cx-receipts','cx-mediation','cx-workbench','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-lane-weights','cx-settings','cx-raw'] },
   { id:'dx', label:'DX', tag:'Docs',         sections:['dx-articles','dx-readme','dx-sites'] },
   { id:'gx', label:'GX', tag:'Global',       sections:['gx-engrams','gx-bench','gx-sites','gx-factstore'] },
   { id:'ax', label:'AX', tag:'Agent',        sections:['ax-overview','ax-activity','ax-memory','ax-bulk','ax-snapshots','ax-tools','ax-handoff','ax-graph','ax-storybook','ax-dossiers','ax-story'] }
@@ -695,6 +695,7 @@ const N = {
   'cx-work':{kind:'panel',label:'ExecPlans',sub:'kanban · /v1/work',children:['ep-agentux','ep-chaincrux','ep-trait','ep-cruxengine','ep-gemma','ep-plancrux','ep-verbatim']},
   'cx-sessions':{kind:'panel',label:'Sessions',sub:'active · execplan-scoped',fields:[['active','3'],['passport','ce:4e6c4e2a:local']],children:['sess-agentux','sess-chaincrux','sess-trait']},
   'cx-passport':{kind:'panel',label:'Passport',sub:'identities',children:['pp-main','pp-sonnet','pp-ops']},
+  'cx-identity':{kind:'panel',label:'Identity',sub:'candidate links',children:[]},
   'cx-review':{kind:'panel',label:'Review',sub:'contradictions + consolidation',children:[]},
 
   /* ── Receipts (CROWN proof verifier) — kind=receipt/verification/signature · /v1/receipts/{id} ── */
@@ -1488,6 +1489,27 @@ function txPassportsPresence(json){   // gap-closure M7 — join /v1/passports/p
   });
   return base;
 }
+function identityCandidateRecords(json){
+  return json.candidates || (Array.isArray(json)? json : []);
+}
+function identityCandidateId(row){
+  return row.candidate_id || row.id || (row.candidate && row.candidate.id) || '';
+}
+function identityCandidatePayload(row){
+  return row.candidate || row.payload || row;
+}
+function txIdentityCandidates(json){
+  const rows=identityCandidateRecords(json);
+  return rows.map((row,i)=>{
+    const c=identityCandidatePayload(row), id=identityCandidateId(row)||('candidate-'+i);
+    const status=String(c.status||'proposed');
+    return { id:idFor('icl',id), kind:'identity-candidate', __candidateId:id,
+      label:id, sub:[c.local_passport_fpr,c.observed_subject].filter(Boolean).join(' → '),
+      status: status==='confirmed'?'ok':(status==='rejected'?'idle':'planned'),
+      fields:[['status',status],['confidence',c.confidence],['local',c.local_passport_fpr],['observed',c.observed_subject],['resolved_link',c.resolved_link_id],['proposed',c.proposed_at]].filter(([,v])=>v!=null),
+      children:[], payload:JSON.stringify(row,null,2) };
+  });
+}
 function txAudit(json){   // M9 — session audit chain → step nodes
   const steps = json.steps || (Array.isArray(json)? json : []);
   return steps.map((s,i)=>({ id: idFor('step', (s.node_id||s.session_id||'')+'/'+(s.seq!=null?s.seq:i)), kind:'step',
@@ -1653,6 +1675,7 @@ function registerLoaders(){
   LOADERS['cx-tenants']       = { endpoint:'/v1/console/tenants',     noun:'tenants',       transform: txTenants };        // M8
   LOADERS['cx-passport']      = { noun:'passports', transform: txPassportsPresence,                                        // M8 + gap-closure M7 presence
     fetch: async()=>({ pp: await api('/v1/passports'), pr: await api('/v1/passports/presence').catch(()=>null) }) };
+  LOADERS['cx-identity']      = { endpoint:'/v1/identity/candidates', noun:'identity candidates', flagHint:'Identity candidates disabled — set CORECRUXD_IDENTITY_LINKS=1', treat404AsDisabled:true, transform: txIdentityCandidates };
   // receipts: no daemon list endpoint — the panel projects this browser's lookup history (no network)
   LOADERS['cx-receipts']      = { fetch: async()=>({ recent: recentReceiptLookups() }), noun:'verified receipts yet — use ✓ Verify receipt (toolbar)', transform: txReceiptRecent };
   LOADERS['cx-gates']         = { endpoint:'/v1/work/gate/pending', noun:'pending gates', transform: txGates };            // M6
@@ -2872,7 +2895,7 @@ function buildSidebar(){
    inspector (3D-style detail pane) is shared — focus round-trips postMessage ── */
 var viewMode='2d';
 /* the ONE left rail drives both views — panel → 3D district mapping */
-var PANEL_TO_DISTRICT={ 'cx-work':'work', 'cx-sessions':'sessions', 'cx-passport':'passport',
+var PANEL_TO_DISTRICT={ 'cx-work':'work', 'cx-sessions':'sessions', 'cx-passport':'passport', 'cx-identity':'passport',
   'cx-receipts':'receipts', 'cx-facts':'memory', 'cx-memory':'memory',
   'cx-coord':'coord', 'cx-punchcards':'coord', 'cx-raw':'core' };
 var cx3dPanel=null;
@@ -3210,9 +3233,43 @@ function sessionsListSections(){
     controls:[{t:'search',ph:'Filter sessions…'}].concat(kids.map(sessionExpRow))
       .concat([{t:'btn',label:'Browse as graph',action:'graph'}])}];
 }
+function identityCandidateRowData(n){
+  try{ return JSON.parse(n.payload||'{}'); }catch(e){ return {}; }
+}
+function identityCandidateExpRow(n){
+  const row=identityCandidateRowData(n), c=identityCandidatePayload(row), id=identityCandidateId(row)||n.__candidateId||n.label;
+  const status=String(c.status||'proposed');
+  const fields=(n.fields||[]).map(([k,v])=>infoRow(String(k),String(v)));
+  const actions=status==='proposed'
+    ? [{t:'btn',label:'Stage confirm '+id,hint:'fills the proof form below with candidate ids'},
+       {t:'btn',label:'Reject '+id,danger:true,hint:'sets status=rejected; the candidate remains in the audit trail'}]
+    : [];
+  return {t:'exp',label:id,sub:n.sub||'',badge:status,
+    controls:fields
+      .concat((c.signals||[]).map(s=>infoRow('signal '+(s.kind||''),[(s.confidence!=null?s.confidence:''),s.evidence_ref].filter(Boolean).join(' · '))))
+      .concat(actions)};
+}
+function identityCandidateSections(){
+  const kids=((N['cx-identity']||{}).children||[]).map(cid=>N[cid]).filter(Boolean);
+  return [
+    {h:'Candidates',sub:'proposals only — candidates never resolve until confirmed as identity links',wide:true,
+      controls:[{t:'search',ph:'Filter identity candidates…'}]
+        .concat(kids.map(identityCandidateExpRow))
+        .concat([{t:'btn',label:'Browse as graph',action:'graph'}])},
+    {h:'Confirmation proof',sub:'paste the existing cross-signature ceremony output',wide:true,controls:[
+      {t:'input',k:'ic_candidate_id',label:'candidate id',ph:'cl_…',mono:true},
+      {t:'input',k:'ic_local_passport_id',label:'local passport id',v:'personal-default',mono:true},
+      {t:'input',k:'ic_remote_fpr',label:'remote fingerprint',ph:'p_…',mono:true},
+      {t:'input',k:'ic_remote_public_key_hex',label:'remote public key hex',ph:'64 hex chars',mono:true},
+      {t:'input',k:'ic_created_at',label:'created at',ph:'2026-06-15T00:00:00Z',mono:true},
+      {t:'input',k:'ic_sig_local',label:'sig local',ph:'128 hex chars',mono:true},
+      {t:'input',k:'ic_sig_remote',label:'sig remote',ph:'128 hex chars',mono:true},
+      {t:'btn',label:'Confirm candidate',danger:true,hint:'creates the resolving identity_link only after both signatures verify'}]}];
+}
 const PAGES={
  'cx-work':{title:'ExecPlans',sub:'list view · kanban available from the rail pull-out',sections:workListSections()},
  'cx-sessions':{title:'Sessions',sub:'execplan-scoped sessions — searchable list; graph from the rail pull-out',sections:sessionsListSections()},
+ 'cx-identity':{title:'Identity',sub:'candidate links — inference proposes, consent disposes',sections:identityCandidateSections()},
  'cx-receipts':{title:'Receipts',sub:'CROWN · Ed25519 proofs — searchable list; graph from the rail pull-out',sections:receiptsListSections()},
  'cx-facts':{title:'Facts',sub:'the durable record — grouped by entity prefix, cascading into linked nodes',sections:factsCascadeSections()},
  'cx-tenants':{title:'Tenants',sub:'memory stores · AMR lane routing — defaults at the top, per-tenant overrides below',sections:[
@@ -4079,6 +4136,44 @@ const PAGE_WIRES={
         .concat([{t:'btn',label:'Open in kanban',action:'graph'}])});
     def.sections=[def.sections[0]]
       .concat(WORK_STAGES.map(([s,h])=>({h,wide:true,controls:items.filter(w=>workStageOf(w)===s).map(mk)})));
+  }},
+ 'cx-identity':{
+  load: async def=>{
+    const n=N['cx-identity']; await ensureLoaded(n);
+    const kids=childrenOf(n).filter(k=>!k.__status);
+    def.sections=identityCandidateSections();
+    def.sections[0].sub=kids.length+' candidates · /v1/identity/candidates';
+  },
+  actAny:(label,ctx)=>{
+    const reset=()=>{ loadState['cx-identity']=null; const n=N['cx-identity']; if(n) n.children=[]; };
+    const stage=label.match(/^Stage confirm (.+)$/);
+    if(stage) return (async()=>{
+      const id=stage[1], node=N[idFor('icl',id)], row=node? identityCandidateRowData(node) : {};
+      const c=identityCandidatePayload(row);
+      setCtrl('cx-identity','ic_candidate_id',id);
+      if(c.observed_subject) setCtrl('cx-identity','ic_remote_fpr',c.observed_subject);
+      if(!pageVal('cx-identity','ic_created_at')) setCtrl('cx-identity','ic_created_at',new Date().toISOString());
+      ctx.reopen(); return 'staged confirmation · '+id;
+    })();
+    const reject=label.match(/^Reject (.+)$/);
+    if(reject) return postApi('/v1/identity/candidates/'+encodeURIComponent(reject[1])+'/reject',{})
+      .then(()=>{ reset(); ctx.reload(); return 'rejected · '+reject[1]; });
+    if(label==='Confirm candidate') return (async()=>{
+      const id=String(pageVal('cx-identity','ic_candidate_id')||'').trim();
+      const body={
+        local_passport_id:String(pageVal('cx-identity','ic_local_passport_id')||'').trim(),
+        remote_fpr:String(pageVal('cx-identity','ic_remote_fpr')||'').trim(),
+        remote_public_key_hex:String(pageVal('cx-identity','ic_remote_public_key_hex')||'').trim(),
+        created_at:String(pageVal('cx-identity','ic_created_at')||'').trim(),
+        sig_local:String(pageVal('cx-identity','ic_sig_local')||'').trim(),
+        sig_remote:String(pageVal('cx-identity','ic_sig_remote')||'').trim(),
+      };
+      const missing=Object.entries(Object.assign({candidate_id:id},body)).filter(([,v])=>!v).map(([k])=>k);
+      if(missing.length) throw {status:'missing '+missing.join(', ')};
+      const r=await postApi('/v1/identity/candidates/'+encodeURIComponent(id)+'/confirm',body);
+      reset(); ctx.reload(); return 'confirmed · '+(r.link_id||id);
+    })();
+    return null;
   }},
  'cx-gates':{
   load: async def=>{

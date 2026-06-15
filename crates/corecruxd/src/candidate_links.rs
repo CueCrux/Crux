@@ -137,6 +137,17 @@ pub fn list_candidates(
         .collect()
 }
 
+pub fn list_candidates_for_subject(
+    entities: &EntityStore,
+    subject: &str,
+    status: Option<CandidateLinkStatus>,
+) -> Vec<(String, CandidateLinkPayload)> {
+    list_candidates(entities, status)
+        .into_iter()
+        .filter(|(_, payload)| payload.local_passport_fpr == subject || payload.observed_subject == subject)
+        .collect()
+}
+
 pub fn update_candidate_status(
     entities: &mut EntityStore,
     candidate_id: &str,

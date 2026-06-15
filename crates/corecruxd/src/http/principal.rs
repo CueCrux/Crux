@@ -7,14 +7,18 @@
 //! caller may only resolve a principal whose tenant it is allowed.
 
 use super::{
-    http_scope_context, problem_response, require_http_any_scope_for_tenant, AppState, HeaderMap, HeaderName,
-    HeaderValue, IntoResponse, Json, Query, Response, State, StatusCode,
+    http_scope_context, problem_response, require_http_any_scope, require_http_any_scope_for_tenant, AppState,
+    HeaderMap, HeaderName, HeaderValue, IntoResponse, Json, Query, Response, State, StatusCode,
 };
+use corecrux_memory::candidate_link::CandidateLinkStatus;
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct ResolvePrincipalQuery {
     pub session_id: Option<String>,
     pub passport_id: Option<String>,
+    /// Accepts `1`, `true`, `yes`, or `on`. Suggestions are read-only and
+    /// never make a `candidate_link` resolving.
+    pub include_candidates: Option<String>,
 }
 
 /// Resolve the principal for a `session_id` or `passport_id`, or — when neither
@@ -89,18 +93,115 @@ pub(super) async fn get_resolve_principal(
             ) {
                 return problem.into_response();
             }
-            response_with_rcx_mode(
-                (StatusCode::OK, Json(principal)).into_response(),
-                federation_decision.as_ref(),
-            )
+            let response = if query_include_candidates(&query) && state.identity_links_enabled {
+                let mut body = match serde_json::to_value(&principal) {
+                    Ok(body) => body,
+                    Err(err) => return problem_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+                };
+                let entities = state.entity_store.read().await;
+                let candidates = candidate_suggestions_for_query(&entities, &query);
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("candidates".to_string(), serde_json::Value::Array(candidates));
+                    obj.insert("candidates_resolve".to_string(), serde_json::Value::Bool(false));
+                }
+                (StatusCode::OK, Json(body)).into_response()
+            } else {
+                (StatusCode::OK, Json(principal)).into_response()
+            };
+            response_with_rcx_mode(response, federation_decision.as_ref())
         }
         Err(crate::principal::ResolveError::BindingNotFound(_)) => {
-            problem_response(StatusCode::NOT_FOUND, "no session binding for that session id")
+            unresolved_with_candidate_suggestions(
+                &state,
+                &headers,
+                &query,
+                "binding_not_found",
+                "no session binding for that session id",
+            )
+            .await
         }
         Err(crate::principal::ResolveError::PassportNotFound(_)) => {
-            problem_response(StatusCode::NOT_FOUND, "passport not found")
+            unresolved_with_candidate_suggestions(&state, &headers, &query, "passport_not_found", "passport not found")
+                .await
         }
     }
+}
+
+async fn unresolved_with_candidate_suggestions(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &ResolvePrincipalQuery,
+    error: &str,
+    detail: &str,
+) -> Response {
+    if query_include_candidates(query) && state.identity_links_enabled {
+        if let Err(problem) = require_http_any_scope(&state.auth, headers, &["admin:read"]) {
+            return problem.into_response();
+        }
+        let entities = state.entity_store.read().await;
+        let candidates = candidate_suggestions_for_query(&entities, query);
+        if !candidates.is_empty() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": error,
+                    "detail": detail,
+                    "candidates": candidates,
+                    "candidates_resolve": false,
+                })),
+            )
+                .into_response();
+        }
+    }
+    problem_response(StatusCode::NOT_FOUND, detail)
+}
+
+fn query_include_candidates(query: &ResolvePrincipalQuery) -> bool {
+    query
+        .include_candidates
+        .as_deref()
+        .map(str::trim)
+        .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn candidate_suggestions_for_query(
+    entities: &corecrux_memory::EntityStore,
+    query: &ResolvePrincipalQuery,
+) -> Vec<serde_json::Value> {
+    let subject = query
+        .passport_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| query.session_id.as_deref().filter(|s| !s.is_empty()));
+    let Some(subject) = subject else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<serde_json::Value> =
+        crate::candidate_links::list_candidates_for_subject(entities, subject, Some(CandidateLinkStatus::Proposed))
+            .into_iter()
+            .map(|(candidate_id, candidate)| {
+                serde_json::json!({
+                    "candidate_id": candidate_id,
+                    "candidate": candidate,
+                    "action_required": "confirm_candidate",
+                    "resolving": false,
+                })
+            })
+            .collect();
+    candidates.sort_by(|a, b| {
+        a["candidate"]["proposed_at"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["candidate"]["proposed_at"].as_str().unwrap_or_default())
+            .then_with(|| {
+                a["candidate_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(b["candidate_id"].as_str().unwrap_or_default())
+            })
+    });
+    candidates
 }
 
 fn federation_read_decision(state: &AppState) -> Option<crux_router::RouterDecision> {
