@@ -247,6 +247,28 @@ mod tests {
     }
 
     #[test]
+    fn console_lane_weights_has_deeplink_dropdown_presets_and_scoped_reset() {
+        for required in [
+            "function laneWeightsDeepLink()",
+            "#/lane-weights",
+            "tenant_id",
+            "tenant_pick",
+            "api('/v1/console/tenants')",
+            "Stage preset",
+            "Baseline defaults",
+            "Graph/topology trial",
+            "Reset lane weights",
+            "deleteApi(path)",
+            "putApi('/v1/console/corecrux/lane-weights'",
+        ] {
+            assert!(
+                PLAYGROUND_HTML.contains(required),
+                "missing lane-weight console marker: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn dev_override_unset_returns_embedded_html() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var(CONSOLE_DEV_PATH_ENV);

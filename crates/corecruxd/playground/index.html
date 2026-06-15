@@ -2688,6 +2688,27 @@ async function receiptsDeepLink(){
   if(m[1]){ openVerify(decodeURIComponent(m[1])); if(LIVE) await runVerifyLookup(); }
 }
 
+function safeHashDecode(value){ try{ return decodeURIComponent(value||''); }catch(e){ return value||''; } }
+function laneWeightsHashState(hash){
+  const m=String(hash||'').match(/^#\/(?:corecrux\/)?lane-weights(?:\/([^?#]+))?(?:\?([^#]*))?$/);
+  if(!m) return null;
+  const params=new URLSearchParams(m[2]||'');
+  return {
+    tenant: (params.get('tenant_id')||params.get('tenant')||safeHashDecode(m[1]||'')).trim(),
+    preset: (params.get('preset')||'').trim(),
+  };
+}
+/* boot-time deep link: #/lane-weights opens the CoreCrux RRF page; ?tenant_id= preselects scope */
+async function laneWeightsDeepLink(){
+  let h=''; try{ h=(typeof location!=='undefined' && location.hash)||''; }catch{ h=''; }
+  const state=laneWeightsHashState(h);
+  if(!state) return;
+  openScope('cx');
+  laneWeightSetTenant(state.tenant);
+  if(state.preset){ setCtrl('cx-lane-weights','preset',state.preset); stageLaneWeightPreset(state.preset); }
+  openPage('cx-lane-weights');
+}
+
 /* boot-time deep link: #/coord opens the Live board panel */
 async function coordDeepLink(){
   let h=''; try{ h=(typeof location!=='undefined' && location.hash)||''; }catch{ h=''; }
@@ -3028,8 +3049,67 @@ const CORECRUX_RRF_LANES=[
  ['navtree','Navtree','Summary-tree navigation.'],
  ['events','Events','Event-lane control signal.'],
 ];
+const CORECRUX_RRF_DEFAULT_WEIGHTS=Object.freeze({bm25:1,cosine:1,sparse:1,hyde:1,topology:0,vernacular:0,indexing:0,topology_trait_expansion:0,navtree:0,events:0});
+const LANE_WEIGHT_GLOBAL_OPTION={value:'',label:'global defaults'};
+const LANE_WEIGHT_PRESETS=[
+ {id:'baseline',label:'Baseline defaults',fusion:true,weights:CORECRUX_RRF_DEFAULT_WEIGHTS},
+ {id:'lexical',label:'Lexical-only diagnostic',fusion:true,weights:{bm25:1,cosine:0,sparse:0,hyde:0,topology:0,vernacular:0,indexing:0,topology_trait_expansion:0,navtree:0,events:0}},
+ {id:'dense',label:'Dense recall trial',fusion:true,weights:{bm25:.8,cosine:1.4,sparse:1,hyde:1,topology:0,vernacular:0,indexing:0,topology_trait_expansion:0,navtree:0,events:0}},
+ {id:'graph',label:'Graph/topology trial',fusion:true,weights:{bm25:1,cosine:1,sparse:1,hyde:1,topology:.3,vernacular:.2,indexing:.1,topology_trait_expansion:.2,navtree:.2,events:.1}},
+];
+function laneWeightTenantValue(){
+  const custom=String(confGet('cx-lane-weights.tenant_id','')||'').trim();
+  if(custom) return custom;
+  return String(confGet('cx-lane-weights.tenant_pick','')||'').trim();
+}
+function laneWeightSelectOptions(values){
+  const seen=new Set(['']);
+  const out=[LANE_WEIGHT_GLOBAL_OPTION];
+  (values||[]).forEach(v=>{ const id=String(v||'').trim(); if(id&&!seen.has(id)){ seen.add(id); out.push(id); } });
+  return out;
+}
+function laneWeightOptionValue(option){
+  return option&&typeof option==='object' ? String(option.value||'') : String(option||'');
+}
+function laneWeightSetTenant(tenant){
+  const id=String(tenant||'').trim(), pick=pageCtrl('cx-lane-weights','tenant_pick');
+  const values=(pick&&pick.options||[]).map(laneWeightOptionValue);
+  if(!id){ setCtrl('cx-lane-weights','tenant_pick',''); setCtrl('cx-lane-weights','tenant_id',''); return; }
+  if(values.includes(id)){ setCtrl('cx-lane-weights','tenant_pick',id); setCtrl('cx-lane-weights','tenant_id',''); }
+  else { setCtrl('cx-lane-weights','tenant_pick',''); setCtrl('cx-lane-weights','tenant_id',id); }
+}
+function laneWeightPresetOptions(){
+  return [{value:'',label:'select a local preset'}].concat(LANE_WEIGHT_PRESETS.map(p=>({value:p.id,label:p.label})));
+}
+function laneWeightPreset(id){ return LANE_WEIGHT_PRESETS.find(p=>p.id===id); }
+function stageLaneWeightPreset(id){
+  const preset=laneWeightPreset(id);
+  if(!preset) return null;
+  setCtrl('cx-lane-weights','fusion_rrf',!!preset.fusion);
+  setLaneWeightControls(preset.weights);
+  return preset;
+}
+function laneWeightsLinkFor(tenant,preset){
+  const params=[];
+  if(tenant) params.push('tenant_id='+encodeURIComponent(tenant));
+  if(preset) params.push('preset='+encodeURIComponent(preset));
+  return '#/lane-weights'+(params.length?('?'+params.join('&')):'');
+}
+function setLaneWeightsDeepLinkRow(def){
+  const row=def.sections[0].controls.find(c=>c.t==='info'&&c.label==='deep link');
+  if(row) row.v=laneWeightsLinkFor(laneWeightTenantValue(), confGet('cx-lane-weights.preset',''));
+}
+function updateLaneWeightTenantOptions(def, tenants){
+  const selected=laneWeightTenantValue();
+  const ids=(tenants||[]).map(t=>t&&(t.tenant_id||t.id)).filter(Boolean);
+  if(selected && !ids.includes(selected)) ids.unshift(selected);
+  const pick=pageCtrl('cx-lane-weights','tenant_pick');
+  if(pick) pick.options=laneWeightSelectOptions(ids);
+  laneWeightSetTenant(selected);
+  if(def&&def.sections&&def.sections[0]) def.sections[0].sub='global defaults or tenant overlay · '+ids.length+' tenants available';
+}
 function laneWeightControls(){
-  return CORECRUX_RRF_LANES.map(([k,label,desc])=>({t:'input',k:'w_'+k,label,ph:'0.0',v:(k==='bm25'||k==='cosine'||k==='sparse'||k==='hyde')?'1':'0',desc,mono:true}));
+  return CORECRUX_RRF_LANES.map(([k,label,desc])=>({t:'input',k:'w_'+k,label,ph:'0.0',v:String(CORECRUX_RRF_DEFAULT_WEIGHTS[k]||0),desc,mono:true}));
 }
 function laneWeightsFromControls(){
   const out={};
@@ -3166,14 +3246,23 @@ const PAGES={
    {t:'input',k:'cr_floor',label:'protect floor',v:'0.99',mono:true},
    {t:'btn',label:'Consolidate facts',danger:true,hint:'writes a canonical fact and supersedes selected target facts'}]}]},
  'cx-lane-weights':{title:'Lane weights',sub:'CoreCrux RRF overlay · same-origin console proxy',sections:[
-  {h:'Scope',sub:'leave tenant blank for global defaults; tenant values shadow global overlay',wide:true,controls:[
-   {t:'input',k:'tenant_id',label:'tenant id',ph:'optional tenant id',mono:true},
+  {h:'Scope',sub:'global defaults or tenant overlay',wide:true,controls:[
+   {t:'select',k:'tenant_pick',label:'tenant',options:laneWeightSelectOptions(['default','lme-m','lme-s','personal']),v:'',
+    clear:['tenant_id'],rerender:true,desc:'Pick global defaults or a tenant discovered from /v1/console/tenants.'},
+   {t:'input',k:'tenant_id',label:'custom tenant',ph:'optional tenant id',mono:true,
+    desc:'Overrides the dropdown when a tenant is not in the manifest yet.'},
    {t:'toggle',k:'fusion_rrf',label:'enable RRF fusion',v:true,
     desc:'Writes FEATURE_FUSION_RRF alongside FUSION_RRF_LANE_WEIGHTS in CoreCrux boost config.'},
    {t:'input',k:'reason',label:'reason',ph:'operator note for this change'},
    {t:'info',label:'CoreCrux',v:'not loaded'},
+   {t:'info',label:'deep link',v:'#/lane-weights'},
    {t:'btn',label:'Load lane weights',hint:'reads CoreCrux global/tenant boost overlay'},
    {t:'btn',label:'Apply lane weights',hint:'writes FUSION_RRF_LANE_WEIGHTS through the daemon to CoreCrux'}]},
+  {h:'Presets',sub:'staged locally only; review the form before applying',wide:true,controls:[
+   {t:'select',k:'preset',label:'preset',options:laneWeightPresetOptions(),v:'',
+    desc:'Local operator presets only. Selecting one does not change CoreCrux until Apply lane weights.'},
+   {t:'btn',label:'Stage preset',hint:'fills the weights form only; Apply lane weights performs the write'},
+   {t:'btn',label:'Reset lane weights',danger:true,hint:'clears only the lane-weight overlay keys for this scope; other boost overlay keys are untouched'}]},
   {h:'Weights',sub:'non-negative RRF lane multipliers; dense vectors live in CoreCrux',wide:true,controls:laneWeightControls()}]},
  'cx-memory':{title:'Memory',sub:'recent facts per tenant — system tenants hidden by default',sections:[
   {h:'Recent memory',sub:'click a tenant to expand its recent facts',wide:true,controls:[
@@ -4079,22 +4168,39 @@ const PAGE_WIRES={
   }},
  'cx-lane-weights':{
   load: async def=>{
-    const tenant=String(pageVal('cx-lane-weights','tenant_id')||'').trim();
+    const tenant=laneWeightTenantValue();
     const path='/v1/console/corecrux/lane-weights'+(tenant?('?tenant_id='+encodeURIComponent(tenant)):'');
-    const r=await api(path);
+    const [r,tn]=await Promise.all([
+      api(path).catch(e=>({_err:e})),
+      api('/v1/console/tenants').catch(e=>({_err:e})),
+    ]);
+    if(!tn._err) updateLaneWeightTenantOptions(def, tn.tenants||[]);
+    setLaneWeightsDeepLinkRow(def);
+    if(r._err){
+      const row=def.sections[0].controls.find(c=>c.t==='info'&&c.label==='CoreCrux');
+      if(row) row.v='unavailable · '+((r._err&&r._err.status)||'network');
+      def.sections[2].sub='not loaded · '+(tenant||'global');
+      return;
+    }
     setLaneWeightControls(r.weights||{});
     setCtrl('cx-lane-weights','fusion_rrf', !!r.fusion_rrf_enabled);
     const row=def.sections[0].controls.find(c=>c.t==='info'&&c.label==='CoreCrux');
     if(row) row.v=[r.scope||'global', r.source?('source '+r.source):null, r.fusion_rrf_enabled?'RRF on':'RRF off'].filter(Boolean).join(' · ');
-    def.sections[1].sub='resolved from '+(r.source||'default')+' overlay · '+(tenant||'global');
+    def.sections[2].sub='resolved from '+(r.source||'default')+' overlay · '+(tenant||'global');
   },
   act:{
     'Load lane weights': async ctx=>{
       await PAGE_WIRES['cx-lane-weights'].load(PAGES['cx-lane-weights']);
       ctx.reopen(); return 'lane weights loaded';
     },
+    'Stage preset': async ctx=>{
+      const preset=stageLaneWeightPreset(pageVal('cx-lane-weights','preset'));
+      if(!preset) throw {status:'select a preset first'};
+      setLaneWeightsDeepLinkRow(PAGES['cx-lane-weights']);
+      ctx.reopen(); return 'staged preset · '+preset.label+' (not written)';
+    },
     'Apply lane weights': async ctx=>{
-      const tenant=String(pageVal('cx-lane-weights','tenant_id')||'').trim();
+      const tenant=laneWeightTenantValue();
       const r=await putApi('/v1/console/corecrux/lane-weights',{
         tenant_id: tenant||null,
         fusion_rrf_enabled: !!pageVal('cx-lane-weights','fusion_rrf'),
@@ -4104,6 +4210,16 @@ const PAGE_WIRES={
       });
       setLaneWeightControls(r.weights||{});
       ctx.reopen(); return 'CoreCrux lane weights saved · '+(tenant||'global');
+    },
+    'Reset lane weights': async ctx=>{
+      const tenant=laneWeightTenantValue();
+      const scope=tenant||'global';
+      if(!confirm('Clear the lane-weight overlay keys for '+scope+'? This returns lane weights to inherited/default values. Other boost overlay keys are left untouched.')) return 'reset cancelled';
+      const path='/v1/console/corecrux/lane-weights'+(tenant?('?tenant_id='+encodeURIComponent(tenant)):'');
+      const r=await deleteApi(path);
+      setLaneWeightControls(r.weights||{});
+      setCtrl('cx-lane-weights','fusion_rrf', !!r.fusion_rrf_enabled);
+      ctx.reopen(); return 'lane weights reset · '+scope+' · now '+(r.source||'default');
     },
   }},
  'cx-memory':{
@@ -4469,9 +4585,12 @@ function renderControl(pageId,c){
     row.appendChild(b);
   } else if(c.t==='select'){
     const sel=document.createElement('select'); sel.className='sp-input'; if(cid) sel.id=cid;
-    (c.options||[]).forEach(o=>{ const op=document.createElement('option'); op.value=o; op.textContent=o; sel.appendChild(op); });
+    (c.options||[]).forEach(o=>{ const op=document.createElement('option');
+      op.value=o&&typeof o==='object'? String(o.value||'') : String(o);
+      op.textContent=o&&typeof o==='object'? String(o.label||o.value||'') : String(o);
+      sel.appendChild(op); });
     sel.value=confGet(key,c.v);
-    sel.onchange=()=>confSet(key,sel.value);
+    sel.onchange=()=>{ confSet(key,sel.value); (c.clear||[]).forEach(k2=>confPut(pageId+'.'+k2,'')); if(c.rerender&&openPageId===pageId) openPage(pageId,{__wired:true}); };
     row.appendChild(sel);
   } else if(c.t==='textarea'){
     const ta=document.createElement('textarea'); ta.className='sp-input mono'; ta.rows=c.rows||3; if(cid) ta.id=cid;
@@ -4500,7 +4619,7 @@ buildSidebar();    // after PANEL_TO_DISTRICT exists — rail icons carry their 
 try{ if(localStorage.getItem('cx-view')==='3d') setView('3d'); }catch(e){}
 
 openScope('cx');   // immediate render with dummy data
-bootProbe().then(()=>{ receiptsDeepLink(); coordDeepLink(); });   // probe /readyz; if live, lazy-replace panels with real /v1 data; then honour #/receipts · #/coord deep links
+bootProbe().then(()=>{ receiptsDeepLink(); coordDeepLink(); laneWeightsDeepLink(); });   // probe /readyz; if live, lazy-replace panels with real /v1 data; then honour stable hash deep links
 </script>
 </body>
 </html>
