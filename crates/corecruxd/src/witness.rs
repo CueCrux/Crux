@@ -10,6 +10,8 @@
 
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest as _, Sha256};
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WitnessRuntimeStatusV1 {
     pub ok: bool,
@@ -38,6 +40,7 @@ pub struct TsaProviderStatusV1 {
     pub ok: bool,
     pub tsa_url: Option<String>,
     pub tsa_root_cert_path: Option<String>,
+    pub tsa_root_cert_sha256_fingerprints: Vec<String>,
     pub tsa_root_cert_count: usize,
     pub tsa_policy_oid: Option<String>,
     pub failure_reason: Option<String>,
@@ -89,7 +92,7 @@ impl WitnessRuntimeConfigV1 {
     pub fn smoke_report(&self) -> WitnessRuntimeStatusV1 {
         let mut warnings = Vec::new();
         let witness = self.witness_status(&mut warnings);
-        let tsa = self.tsa_status();
+        let tsa = self.tsa_status(&mut warnings);
         WitnessRuntimeStatusV1 {
             ok: witness.ok && tsa.ok,
             mode: "local_config_only",
@@ -110,6 +113,19 @@ impl WitnessRuntimeConfigV1 {
                 rekor_url: self.rekor_url.clone(),
                 rekor_public_key_path: path_string(self.rekor_public_key_path.as_deref()),
                 failure_reason: None,
+            };
+        }
+
+        if self.witness_timeout_ms == 0 {
+            return WitnessProviderStatusV1 {
+                enabled: true,
+                provider: self.witness_provider.clone(),
+                timeout_ms: self.witness_timeout_ms,
+                configured: false,
+                ok: false,
+                rekor_url: self.rekor_url.clone(),
+                rekor_public_key_path: path_string(self.rekor_public_key_path.as_deref()),
+                failure_reason: Some("CORECRUXD_WITNESS_TIMEOUT_MS must be greater than zero".to_string()),
             };
         }
 
@@ -136,6 +152,9 @@ impl WitnessRuntimeConfigV1 {
                 rekor_public_key_path: path_string(self.rekor_public_key_path.as_deref()),
                 failure_reason: Some("CORECRUXD_REKOR_URL is required when Rekor witness is enabled".to_string()),
             };
+        }
+        if self.rekor_url.as_deref().is_some_and(|url| !looks_https_url(url)) {
+            warnings.push("Rekor witness URL is not HTTPS; use only for local/non-prod mocks".to_string());
         }
         if let Some(path) = &self.rekor_public_key_path {
             if !path.is_file() {
@@ -166,7 +185,7 @@ impl WitnessRuntimeConfigV1 {
         }
     }
 
-    fn tsa_status(&self) -> TsaProviderStatusV1 {
+    fn tsa_status(&self, warnings: &mut Vec<String>) -> TsaProviderStatusV1 {
         if !self.tsa_enabled {
             return TsaProviderStatusV1 {
                 enabled: false,
@@ -174,6 +193,7 @@ impl WitnessRuntimeConfigV1 {
                 ok: true,
                 tsa_url: self.tsa_url.clone(),
                 tsa_root_cert_path: path_string(self.tsa_root_cert_path.as_deref()),
+                tsa_root_cert_sha256_fingerprints: Vec::new(),
                 tsa_root_cert_count: 0,
                 tsa_policy_oid: self.tsa_policy_oid.clone(),
                 failure_reason: None,
@@ -181,6 +201,14 @@ impl WitnessRuntimeConfigV1 {
         }
         if self.tsa_url.as_deref().is_none_or(str::is_empty) {
             return self.tsa_fail("CORECRUXD_TSA_URL is required when TSA is enabled", 0);
+        }
+        if self.tsa_url.as_deref().is_some_and(|url| !looks_https_url(url)) {
+            warnings.push("TSA URL is not HTTPS; use only for local/non-prod mocks".to_string());
+        }
+        if let Some(policy_oid) = &self.tsa_policy_oid {
+            if !corecrux_receipts::is_valid_object_identifier_text_v1(policy_oid) {
+                return self.tsa_fail("CORECRUXD_TSA_POLICY_OID must be a valid dotted object identifier", 0);
+            }
         }
         let Some(root_path) = self.tsa_root_cert_path.as_ref() else {
             return self.tsa_fail("CORECRUXD_TSA_ROOT_CERT_PATH is required when TSA is enabled", 0);
@@ -203,12 +231,17 @@ impl WitnessRuntimeConfigV1 {
                 )
             }
         };
+        let fingerprints = certs
+            .iter()
+            .map(|cert| format!("sha256:{}", sha256_hex(cert)))
+            .collect::<Vec<_>>();
         TsaProviderStatusV1 {
             enabled: true,
             configured: true,
             ok: true,
             tsa_url: self.tsa_url.clone(),
             tsa_root_cert_path: path_string(Some(root_path)),
+            tsa_root_cert_sha256_fingerprints: fingerprints,
             tsa_root_cert_count: certs.len(),
             tsa_policy_oid: self.tsa_policy_oid.clone(),
             failure_reason: None,
@@ -222,6 +255,7 @@ impl WitnessRuntimeConfigV1 {
             ok: false,
             tsa_url: self.tsa_url.clone(),
             tsa_root_cert_path: path_string(self.tsa_root_cert_path.as_deref()),
+            tsa_root_cert_sha256_fingerprints: Vec::new(),
             tsa_root_cert_count,
             tsa_policy_oid: self.tsa_policy_oid.clone(),
             failure_reason: Some(reason.to_string()),
@@ -231,6 +265,20 @@ impl WitnessRuntimeConfigV1 {
 
 fn path_string(path: Option<&Path>) -> Option<String> {
     path.map(|p| p.display().to_string())
+}
+
+fn looks_https_url(url: &str) -> bool {
+    url.trim_start().starts_with("https://")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -260,5 +308,61 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("CORECRUXD_TSA_ROOT_CERT_PATH"));
+    }
+
+    #[test]
+    fn enabled_witness_requires_positive_timeout() {
+        let cfg = WitnessRuntimeConfigV1 {
+            witness_enabled: true,
+            witness_provider: "rekor".to_string(),
+            witness_timeout_ms: 0,
+            rekor_url: Some("https://rekor.example".to_string()),
+            ..WitnessRuntimeConfigV1::disabled()
+        };
+        let report = cfg.smoke_report();
+        assert!(!report.ok);
+        assert_eq!(
+            report.witness.failure_reason.as_deref(),
+            Some("CORECRUXD_WITNESS_TIMEOUT_MS must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn enabled_tsa_rejects_malformed_policy_oid() {
+        let cfg = WitnessRuntimeConfigV1 {
+            tsa_enabled: true,
+            tsa_url: Some("https://tsa.example".to_string()),
+            tsa_root_cert_path: Some(PathBuf::from("/tmp/tsa-root.pem")),
+            tsa_policy_oid: Some("not-an-oid".to_string()),
+            ..WitnessRuntimeConfigV1::disabled()
+        };
+        let report = cfg.smoke_report();
+        assert!(!report.ok);
+        assert_eq!(
+            report.tsa.failure_reason.as_deref(),
+            Some("CORECRUXD_TSA_POLICY_OID must be a valid dotted object identifier")
+        );
+        assert!(report.tsa.tsa_root_cert_sha256_fingerprints.is_empty());
+    }
+
+    #[test]
+    fn enabled_non_https_provider_urls_are_warnings_only() {
+        let cfg = WitnessRuntimeConfigV1 {
+            witness_enabled: true,
+            witness_provider: "rekor".to_string(),
+            rekor_url: Some("http://127.0.0.1:3000".to_string()),
+            tsa_enabled: true,
+            tsa_url: Some("http://127.0.0.1:3001".to_string()),
+            tsa_policy_oid: Some("not-an-oid".to_string()),
+            ..WitnessRuntimeConfigV1::disabled()
+        };
+        let report = cfg.smoke_report();
+        assert!(!report.ok);
+        assert!(report
+            .warnings
+            .contains(&"Rekor witness URL is not HTTPS; use only for local/non-prod mocks".to_string()));
+        assert!(report
+            .warnings
+            .contains(&"TSA URL is not HTTPS; use only for local/non-prod mocks".to_string()));
     }
 }

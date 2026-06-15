@@ -540,6 +540,11 @@ pub fn parse_x509_certs_der_or_pem_v1(bytes: &[u8]) -> Result<Vec<Vec<u8>>, Stri
     }
 }
 
+pub fn is_valid_object_identifier_text_v1(oid: &str) -> bool {
+    let oid = oid.trim();
+    oid.split('.').count() >= 3 && ObjectIdentifier::new(oid).is_ok()
+}
+
 fn parse_tst_info_v1(bytes: &[u8]) -> Result<ParsedTstInfoV1, String> {
     let (rem, seq) = parse_der_sequence(bytes).map_err(|err| format!("{err:?}"))?;
     if !rem.is_empty() {
@@ -1257,6 +1262,69 @@ mod tests {
         assert_eq!(report.tsa_policy_oid.as_deref(), Some("1.2.3.4"));
         assert_eq!(report.gen_time.as_deref(), Some("2026-06-14T10:23:28Z"));
         assert_eq!(report.signer_subject.as_deref(), Some("CN=CueCrux TSA Leaf TEST"));
+    }
+
+    #[test]
+    fn rfc3161_strict_validation_rejects_wrong_policy_and_nonce() {
+        let token = hex_bytes(OPENSSL_TSA_TOKEN_DER_HEX);
+        let imprint_hash = "sha256:80a7a77c0cd501aec2d7694dcc7fdf4cf50a4cab83579fb290924fc8520ba680";
+        let input = Rfc3161TimestampBodyInputV1 {
+            tenant_id: "tenant-a",
+            receipt_id: "tsa_fixture",
+            timestamp_id: "timestamp-fixture",
+            actor_passport: "passport:operator",
+            tsa_url: "https://tsa.example",
+            tsa_policy_oid: Some("1.2.3.4"),
+            message_imprint_alg: "sha256",
+            message_imprint_hash: imprint_hash,
+            timestamp_token_der: &token,
+            serial_number: Some("02"),
+            gen_time: "2026-06-14T10:23:28Z",
+            created_at: "2026-06-14T10:23:29Z",
+        };
+        let (body, _) = build_rfc3161_timestamp_body_v1(&input);
+        let root = hex_bytes(OPENSSL_TSA_ROOT_DER_HEX);
+        let root_refs = vec![root.as_slice()];
+
+        let wrong_policy = verify_rfc3161_timestamp_token_strict_v1(
+            &body,
+            &Rfc3161StrictValidationOptionsV1 {
+                expected_message_imprint_hash: Some(imprint_hash),
+                expected_policy_oid: Some("1.2.3.5"),
+                expected_nonce: Some(&hex_bytes("C23A5AF413E2A2CF")),
+                trusted_root_certs_der: &root_refs,
+            },
+        );
+        assert!(!wrong_policy.ok);
+        assert_eq!(
+            wrong_policy.failure_reason.as_deref(),
+            Some("TSTInfo policy does not match expected or receipt body TSA policy")
+        );
+
+        let wrong_nonce = verify_rfc3161_timestamp_token_strict_v1(
+            &body,
+            &Rfc3161StrictValidationOptionsV1 {
+                expected_message_imprint_hash: Some(imprint_hash),
+                expected_policy_oid: Some("1.2.3.4"),
+                expected_nonce: Some(&hex_bytes("01")),
+                trusted_root_certs_der: &root_refs,
+            },
+        );
+        assert!(!wrong_nonce.ok);
+        assert_eq!(
+            wrong_nonce.failure_reason.as_deref(),
+            Some("TSTInfo nonce does not match expected nonce")
+        );
+    }
+
+    #[test]
+    fn object_identifier_text_validation_rejects_malformed_policy_oid() {
+        assert!(is_valid_object_identifier_text_v1("1.2.3.4"));
+        assert!(is_valid_object_identifier_text_v1(" 1.2.840.113549.1.9.16.1.4 "));
+        assert!(!is_valid_object_identifier_text_v1(""));
+        assert!(!is_valid_object_identifier_text_v1("1.2"));
+        assert!(!is_valid_object_identifier_text_v1("1.2.bad"));
+        assert!(!is_valid_object_identifier_text_v1("3.1.1"));
     }
 
     #[test]
