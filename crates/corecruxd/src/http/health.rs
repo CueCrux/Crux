@@ -365,11 +365,21 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
     let retrieval_segment_count = state.retrieval_index.read().await.segment_count();
     let protocol_contracts =
         crate::protocol_posture::ProtocolPosture::from_runtime(retrieval_segment_count, semantic_profile.as_ref());
-    // Update/upgrade status is product-facing (is a newer build available, and
-    // the upgrade hint) and is the same redaction-safe `public_view()` the admin
-    // endpoint serves — keep it public. Operational internals (commit, passport,
-    // node identity, raw remote URLs) remain admin-only on /v1/admin/version.
-    let update_status = state.update_status.read().await.public_view();
+    // Update/upgrade *status* is product-facing (is a newer build available, and
+    // the upgrade hint) and is part of the public /v1/version contract (the
+    // daemon's own smoke probe and integration tests assert it). Expose only the
+    // status-shaped subset; operational internals (commit SHAs, repo dir, remote
+    // and tracking refs) stay admin-only on /v1/admin/version, consistent with
+    // the top-level `commit` redaction.
+    let update = state.update_status.read().await.clone();
+    let update_public = serde_json::json!({
+        "enabled": update.enabled,
+        "state": update.state,
+        "ahead_by": update.ahead_by,
+        "behind_by": update.behind_by,
+        "comparison_stale": update.comparison_stale,
+        "upgrade_hint": update.upgrade_hint,
+    });
     Json(serde_json::json!({
         "version": state.build.version,
         "msrv": "1.88.0",
@@ -401,7 +411,7 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
             "remote_url_redacted": !sync_status.remote_url.is_empty(),
             "api_key_configured": sync_status.api_key_configured,
         },
-        "update": update_status
+        "update": update_public
     }))
 }
 

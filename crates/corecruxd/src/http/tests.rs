@@ -6060,7 +6060,15 @@ async fn version_public_view_is_redacted() {
     assert!(body["cloud"].is_null());
     assert!(body["action_enrichment"].is_null());
     assert!(body["gpu1_compute"].is_null());
-    assert!(body["update"].is_null());
+    // Update *status* is public (product-facing), but commit SHAs and repo
+    // internals are not — consistent with the top-level `commit` redaction.
+    assert!(body["update"]["state"].is_string());
+    assert!(body["update"]["upgrade_hint"].is_string());
+    assert!(body["update"]["current_commit"].is_null());
+    assert!(body["update"]["latest_commit"].is_null());
+    assert!(body["update"]["repo_dir"].is_null());
+    assert!(body["update"]["remote"].is_null());
+    assert!(body["update"]["tracking_ref"].is_null());
     assert_eq!(body["product"]["mode"], "free_local");
     assert_eq!(body["product"]["tier"], "free");
     assert_eq!(body["product"]["free_safety_baseline_active"], true);
