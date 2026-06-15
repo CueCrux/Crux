@@ -34,8 +34,20 @@ pub fn build_commons_query_body(query: &str, top_k: usize) -> serde_json::Value 
 }
 
 /// Build the API URL for a given path.
+///
+/// Normalises the single seam between `endpoint` and `path` so a
+/// trailing slash on the configured endpoint (e.g. `https://host/`) cannot
+/// combine with a leading-slash path to produce a `//` in the request URL.
 pub fn api_url(endpoint: &str, path: &str) -> String {
-    format!("{}{}", endpoint, path)
+    let endpoint = endpoint.trim_end_matches('/');
+    if path.is_empty() {
+        return endpoint.to_string();
+    }
+    if path.starts_with('/') {
+        format!("{}{}", endpoint, path)
+    } else {
+        format!("{}/{}", endpoint, path)
+    }
 }
 
 /// Push contributions to VaultCrux.
@@ -168,6 +180,19 @@ mod tests {
     fn api_url_no_trailing_slash() {
         let url = api_url("http://localhost:14333", "/api/v1/community/contributions");
         assert_eq!(url, "http://localhost:14333/api/v1/community/contributions");
+    }
+
+    #[test]
+    fn api_url_normalises_double_slash() {
+        // Trailing slash on the endpoint must not produce `//` at the seam.
+        let url = api_url("https://vaultcrux.com/", "/api/v1/community/auth");
+        assert_eq!(url, "https://vaultcrux.com/api/v1/community/auth");
+        // A path without a leading slash still yields exactly one separator.
+        let url = api_url("https://vaultcrux.com", "api/v1/community/auth");
+        assert_eq!(url, "https://vaultcrux.com/api/v1/community/auth");
+        // Multiple trailing slashes collapse too.
+        let url = api_url("https://vaultcrux.com///", "/x");
+        assert_eq!(url, "https://vaultcrux.com/x");
     }
 
     #[test]
