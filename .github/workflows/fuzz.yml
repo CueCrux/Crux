@@ -4,6 +4,14 @@
 name: Scheduled Fuzz
 
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "fuzz/**"
+      - "crates/corecrux-frame/**"
+      - "crates/corecrux-receipts/**"
+      - "crates/crux-router/**"
+      - "Cargo.lock"
   workflow_dispatch:
     inputs:
       runs:
@@ -40,7 +48,13 @@ jobs:
           - rcx_canonical_token
     env:
       CARGO_HOME: /home/gha-runner/.cargo-fuzz-${{ matrix.target }}-${{ github.run_id }}
-      FUZZ_RUNS: ${{ github.event.inputs.runs || '512' }}
+      FUZZ_RUNS: ${{ github.event.inputs.runs || (github.event_name == 'pull_request' && '64' || '512') }}
+      # cargo-fuzz (and its deps, e.g. cargo-platform >= 0.3.3) require a newer
+      # rustc than the repo's pinned stable toolchain, and libFuzzer needs
+      # nightly anyway. Override rust-toolchain.toml for every cargo call in this
+      # job so `cargo install cargo-fuzz` and `cargo fuzz` use the nightly that
+      # dtolnay/rust-toolchain@nightly installs below.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - name: Seed per-job CARGO_HOME from shared toolchain
         run: |
@@ -77,3 +91,11 @@ jobs:
             fuzz/corpus/${{ matrix.target }}
           if-no-files-found: ignore
           retention-days: 14
+      - name: Reclaim per-job CARGO_HOME
+        if: always()
+        # The per-run CARGO_HOME lives on the self-hosted runner's data disk and
+        # is not reused across runs. Without this, every fuzz run leaks a
+        # multi-hundred-MB cache dir and eventually fills the disk, crash-looping
+        # the runner listeners. Artifacts above are uploaded from the workspace,
+        # not CARGO_HOME, so this is safe to remove unconditionally.
+        run: rm -rf "$CARGO_HOME"

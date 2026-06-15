@@ -8,10 +8,11 @@
 //! payloads remain in the dataplane stream log and are not copied into the
 //! console index.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use corecrux_proto::dataplane_v1::AppendEvent;
+use fs2::FileExt;
 
 const CONSOLE_CHUNK_INDEX_SCHEMA_V1: &str = "crux.console.chunk-index.v1";
 const MAX_INDEXED_CHUNKS: usize = 10_000;
@@ -83,21 +84,23 @@ pub fn record_appended_events(
     events: &[AppendEvent],
     now_unix_ms: u64,
 ) -> Result<(), ConsoleIndexError> {
-    let mut index = read_index(data_dir)?;
-    for (offset, event) in events.iter().enumerate() {
-        let seq = expected_next_seq.saturating_add(offset as u64);
-        let chunk = metadata_from_append(tenant_id, stream_type, stream_id, seq, event);
-        index
-            .chunks
-            .retain(|existing| existing.chunk_digest != chunk.chunk_digest);
-        index.chunks.push(chunk);
-    }
-    if index.chunks.len() > MAX_INDEXED_CHUNKS {
-        let drop_count = index.chunks.len() - MAX_INDEXED_CHUNKS;
-        index.chunks.drain(0..drop_count);
-    }
-    index.updated_at_unix_ms = now_unix_ms;
-    write_index(data_dir, &index)
+    with_index_lock(data_dir, || {
+        let mut index = read_index(data_dir)?;
+        for (offset, event) in events.iter().enumerate() {
+            let seq = expected_next_seq.saturating_add(offset as u64);
+            let chunk = metadata_from_append(tenant_id, stream_type, stream_id, seq, event);
+            index
+                .chunks
+                .retain(|existing| existing.chunk_digest != chunk.chunk_digest);
+            index.chunks.push(chunk);
+        }
+        if index.chunks.len() > MAX_INDEXED_CHUNKS {
+            let drop_count = index.chunks.len() - MAX_INDEXED_CHUNKS;
+            index.chunks.drain(0..drop_count);
+        }
+        index.updated_at_unix_ms = now_unix_ms;
+        write_index(data_dir, &index)
+    })
 }
 
 pub fn list_tenants(data_dir: &Path) -> Result<Vec<String>, ConsoleIndexError> {
@@ -267,6 +270,26 @@ fn index_path(data_dir: &Path) -> PathBuf {
     data_dir.join("console").join("chunks-index.json")
 }
 
+fn with_index_lock<T>(
+    data_dir: &Path,
+    f: impl FnOnce() -> Result<T, ConsoleIndexError>,
+) -> Result<T, ConsoleIndexError> {
+    let lock_path = data_dir.join("console").join("chunks-index.lock");
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    lock.lock_exclusive()?;
+    let result = f();
+    FileExt::unlock(&lock)?;
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +324,38 @@ mod tests {
         );
         let page_text = serde_json::to_string(&page).expect("page json");
         assert!(!page_text.contains(r#""token":"secret""#));
+        Ok(())
+    }
+
+    #[test]
+    fn console_index_concurrent_appends_preserve_all_chunks() -> Result<(), ConsoleIndexError> {
+        let root = temp_data_dir("concurrent");
+        let handles: Vec<_> = (0..16)
+            .map(|idx| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let events = vec![AppendEvent {
+                        event_id: format!("evt-{idx}"),
+                        occurred_at: "2026-05-01T12:00:00Z".to_string(),
+                        event_type: "test.event".to_string(),
+                        content_type: "application/json".to_string(),
+                        payload: format!(r#"{{"value":{idx}}}"#).into_bytes(),
+                    }];
+                    record_appended_events(&root, "tenant-a", "artifact", "stream-a", idx, &events, 1_000 + idx)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("thread join")?;
+        }
+        let page = list_chunks(&root, "tenant-a", 32, None)?;
+        assert_eq!(page.chunks.len(), 16);
+        let mut ids: Vec<_> = page.chunks.into_iter().map(|chunk| chunk.event_id).collect();
+        ids.sort();
+        assert_eq!(ids.first().map(String::as_str), Some("evt-0"));
+        assert_eq!(ids.last().map(String::as_str), Some("evt-9"));
+        assert!(ids.contains(&"evt-15".to_string()));
         Ok(())
     }
 }

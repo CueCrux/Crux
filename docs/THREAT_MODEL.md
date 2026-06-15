@@ -86,14 +86,39 @@ for the Crux Daemon.
 
 ## Network Assumptions
 
-1. The daemon assumes the network between reverse proxy and daemon is trusted (loopback or
-   private network).
+1. The daemon assumes the network between reverse proxy and daemon is trusted
+   (loopback or private network). It only consumes `Forwarded` /
+   `X-Forwarded-For` for rate-limit keying from peers listed in
+   `CORECRUXD_TRUSTED_PROXY_CIDRS`.
 2. gRPC replication between nodes should use authenticated channels
    (`CORECRUXD_REPLICATION_AUTH_BEARER`).
 3. Prometheus metrics (`/metrics`) and health endpoints (`/healthz`, `/readyz`) are
    unauthenticated. Restrict access at the network level if exposing beyond localhost.
-4. The `/debug/healthz` endpoint is gated behind the `debug:read` scope and includes
-   internal topology information. It should not be exposed to untrusted clients.
+4. MCP Streamable HTTP server-info discovery can remain public, but SSE stream
+   creation requires configured bearer auth when agent tokens are present.
+5. Public `/v1/version` is redacted. Full operational version details live at
+   `/v1/admin/version` behind `admin:read`.
+
+## Capability Token Trust and Revocation
+
+- **Local-token trust invariant.** The capability router (`crux-router`) skips
+  signature verification for the `local` backend. This is sound only because the
+  token reaching the router is daemon-minted (self-minted local token in
+  `corecruxd` startup) and never client-injected — the local token does not
+  cross a trust boundary. Hosted/customer backends are always signature-verified
+  against a configured trusted issuer key; the local short-circuit cannot be
+  leveraged to authorise a hosted lane. A future change that routes a
+  client-supplied token through the router must construct it with a trusted
+  issuer pubkey. This is pinned by the
+  `local_signature_bypass_does_not_extend_to_hosted_backend` regression test.
+- **Revocation is modelled but not yet enforced.** Tokens carry `crl_url` and
+  `push_channel` revocation hints, but the router does not yet consult them, so a
+  revoked-but-unexpired token is still authorised within its validity window.
+  To avoid misleading downstream auditors, the router mode stamp carries
+  `revocation_checked: false`; an authorised decision does **not** imply the
+  token was checked against a CRL or revocation timestamp. Mitigation today:
+  keep token lifetimes short. Revocation IO (CRL/timestamp consult) is a planned
+  later phase.
 
 ## Error Response Policy
 
@@ -104,11 +129,53 @@ to include full details for debugging.
 
 ## Rate Limiting
 
-The Crux Daemon does not implement application-level rate limiting. Use your reverse
-proxy (Caddy `rate_limit`, nginx `limit_req`, etc.) to protect against resource exhaustion.
+The Crux Daemon implements coarse client-IP rate limiting and request caps.
+Use your reverse proxy (Caddy `rate_limit`, nginx `limit_req`, etc.) for
+route-specific resource protection. `X-Corecrux-Passport-Id` is not trusted as
+a pre-auth rate-limit key; unauthenticated callers cannot rotate it to obtain
+independent buckets.
+
+Global request bodies default to 16 MiB. Bulk/import endpoints that need a
+larger envelope have explicit route-specific limits. The console embedding
+probe is an authenticated admin write operation and rejects metadata,
+link-local, private, multicast, unspecified, and DNS-rebound targets by default
+unless the target matches the configured embedding endpoint or an explicit
+local-probe override is set.
+
+## Route Authorization Proof
+
+The CI test gate `route_auth_matrix_is_complete` parses the live Axum router
+source and fails when a route lacks one of these classes: public, read, write,
+admin read, admin write, internal replication, or feature-gated. Companion
+tests pin representative scope contracts and high-risk HTTP boundary routes.
 
 ## Dependency Security
 
-- `cargo deny check` is run in CI to detect known advisories and licence violations.
-- `cargo audit` is run in CI as a secondary advisory check.
-- Known ignores are documented in `deny.toml` with remediation deadlines.
+- `cargo deny check` is run in CI to detect known advisories, bans, licence
+  drift, and source-policy violations.
+- `cargo audit` is run in CI as a secondary RustSec advisory check. It
+  currently surfaces the yanked `aes 0.9.0` warning through `zip 8.6.0`; this
+  is visible but non-blocking until the upstream dependency path can move.
+- Known RustSec ignores in `deny.toml` must carry owner and expiry comments; CI
+  enforces this metadata.
+- Container images are scanned with Trivy before push. Emergency skips require
+  a structured waiver with owner, expiry, reason, commit SHA, run ID, and image
+  reference, uploaded as a 90-day artifact.
+- Parser/verifier fuzz targets run on the scheduled workflow and as bounded PR
+  runs when fuzz, frame, receipt, router, or lockfile paths change. Crash and
+  corpus artifacts are uploaded for follow-up.
+- `cargo deny`'s `wildcards` policy is `deny`: no workspace crate may declare a
+  `"*"` version. `multiple-versions` remains `warn` because two RustCrypto
+  generations coexist (the stable `digest 0.10` / `der 0.7` stack from
+  `ed25519-dalek` and `p256`/`ecdsa`, and the `digest 0.11` / `der 0.8` stack
+  from `cms`, `x509-cert`, and `zip`). This duplication is tracked, not silently
+  accepted; the crypto subset will move to a targeted `deny` once upstreams
+  converge.
+- **Pre-release crypto in witness verification.** `corecrux-receipts` depends on
+  `cms 0.3.0-pre.2` and `x509-cert 0.3.0-rc.4`. These parse RFC3161 timestamp
+  tokens for the optional witness/co-signature path only — they are not in the
+  core CROWN Ed25519 receipt signing/verification path, which uses stable
+  `ed25519-dalek 2.x`. `cms` is the only Rust CMS/PKCS#7 parser and is still
+  pre-release upstream, so it cannot be replaced with a stable equivalent today.
+  Treat witness-timestamp parsing as a defence-in-depth signal, not a primary
+  trust anchor, until these crates reach a stable release.

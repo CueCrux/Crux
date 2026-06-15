@@ -111,7 +111,10 @@ tokens, send `Authorization: Bearer <token>` on HTTP requests.
 
 If the server has no MCP agent tokens configured, MCP requests may run as
 `anonymous`. If the server sets `CRUX_AGENT_TOKEN` or `CRUX_AGENT_TOKENS`,
-every `POST /mcp` request must include the matching bearer token.
+every `POST /mcp` request and authenticated SSE stream must include the
+matching bearer token. Streamable HTTP SSE sessions are capped globally and per
+agent or client IP via `CRUX_MCP_SSE_MAX_SESSIONS` and
+`CRUX_MCP_SSE_MAX_SESSIONS_PER_OWNER`.
 
 ```bash
 export CRUX_AGENT_TOKEN="your-token-here"
@@ -480,9 +483,13 @@ curl -s -X POST http://localhost:14801/mcp \
 
 ## Rate Limiting
 
-In standalone mode, Crux has no built-in HTTP rate limiting. For production deployments,
-place Crux behind a reverse proxy (Caddy, nginx) with rate limiting configured.
-The gRPC append path has built-in per-tenant throttling via `CRUX_TENANT_THROTTLE_*` env vars.
+Crux has coarse built-in HTTP request caps and client-IP rate limiting. For
+production deployments, place Crux behind a reverse proxy (Caddy, nginx) with
+route-specific rate limiting configured. Set `CORECRUXD_TRUSTED_PROXY_CIDRS`
+only for proxy peers that strip inbound `Forwarded` / `X-Forwarded-For` and
+rewrite them from the real client address.
+The gRPC append path has built-in per-tenant throttling via
+`CRUX_TENANT_THROTTLE_*` env vars.
 
 Every HTTP endpoint has a **30-second request timeout** enforced by Tower middleware.
 Requests exceeding the deadline receive a `408 Request Timeout` response.

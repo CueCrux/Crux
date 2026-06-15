@@ -17,7 +17,7 @@ One binary. No API keys. Nothing leaves your machine.
 [Capabilities](#what-you-get) · [EU AI Act](#eu-ai-act) · [Licence](#licence)
 
 [![CI](https://github.com/CueCrux/Crux/actions/workflows/ci.yml/badge.svg)](https://github.com/CueCrux/Crux/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-82%25-green)](https://github.com/CueCrux/Crux)
+[![Coverage](https://img.shields.io/badge/coverage-CI%20gated-green)](https://github.com/CueCrux/Crux/actions/workflows/coverage-attestation.yml)
 [![MCP](https://img.shields.io/badge/MCP-native-blue)](#mcp-server-for-agents)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88.0-orange)](rust-toolchain.toml)
 [![Licence: CCL-1.0 (source-available)](https://img.shields.io/badge/licence-CCL--1.0_(source--available)-blue)](LICENCE.md)
@@ -88,6 +88,11 @@ CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 Ready-made connector configs live in [`examples/mcp-configs/`](examples/mcp-configs/).
 `CORECRUXD_AUTH_MODE` is required; use `off` only for local development.
 
+**Local storage boundary:** Crux receipts and BLAKE3 chains prove integrity,
+not confidentiality. The daemon data directory is not encrypted by Crux; use
+filesystem encryption such as LUKS, dm-crypt, FileVault, or BitLocker when the
+machine, volume, or backup location is outside your trusted boundary.
+
 ## Three planes, one daemon
 
 **🟢 Memory that ages honestly.** Facts carry confidence, provenance and a freshness horizon.
@@ -145,14 +150,16 @@ earns its tokens.
 | **25,422 ev/s** | append throughput (CI perf gate, p95 9.98 ms) |
 | **21,328 rd/s** | replay reads (p95 0.52 ms) |
 | **60–80%** | token reduction vs top-K context stuffing |
-| **~91%** | LongMemEval, **strict** scoring¹ |
+| **~91%** | preliminary hosted retrieval eval, strict scoring¹ |
 
 All daemon performance numbers are reproducible from [`docs/benchmarks.md`](docs/benchmarks.md)
 with pinned baselines, regression-gated in CI.
 
-<sub>¹ Internal runs via the CoreCrux retrieval substrate (paid tier — see
-[below](#corecrux--amr-frontier-grade-recall-zero-custody)), not the bare local daemon. Strict
-scoring, no partial credit. Run details to be published with the public benchmark page.</sub>
+<sub>¹ Internal runs via the CoreCrux retrieval substrate (paid tier; see the
+[CoreCrux / AMR section](#corecrux--amr-frontier-grade-recall-zero-custody)),
+not the bare local daemon. Strict scoring, no partial credit. Treat this as
+preliminary until a public evidence pack with corpus, run ID, lane flags, and
+commit SHA is published.</sub>
 
 ## How it works
 
@@ -307,7 +314,7 @@ everything else runs on.
 | **Art. 12** — record-keeping | automatic logging | every state mutation emits a signed CROWN receipt + timeline row; hash-chained, so gaps are detectable, not deniable |
 | **Art. 13** — transparency | attributable outputs | agent passports attribute every mutation; AI-authored commits and PRs carry agent attribution |
 | **Art. 14** — human oversight | meaningful gates | destructive actions need explicit, current consent; gated transitions can't auto-approve past a timeout |
-| **Art. 15** — accuracy & robustness | foresight + integrity | consequence enrichment before high-risk operations; benchmarks carry corpus + commit; tamper-evident store |
+| **Art. 15** — accuracy & robustness | foresight + integrity | consequence enrichment before high-risk operations; published benchmark packs carry corpus + commit; tamper-evident store |
 | **Art. 50** — output transparency | "an AI made this" | C2PA Content Credentials via `output_attest` — a verifiable claim, not a footer |
 | *GDPR Art. 17* — erasure | right to be forgotten | `memory_forget` with dry-run: see what would be deleted, then delete it auditably |
 

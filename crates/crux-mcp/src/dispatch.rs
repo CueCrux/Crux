@@ -589,6 +589,7 @@ fn enforce_rcx_tool_capability(id: Option<serde_json::Value>, name: &str, ctx: &
                 "token_id": &decision.stamp.token_id,
                 "token_hash": &decision.stamp.token_hash,
                 "queue_ttl_seconds": &decision.stamp.queue_ttl_seconds,
+                "revocation_checked": decision.stamp.revocation_checked,
             },
             "refusal_receipt": refusal_receipt,
         }),

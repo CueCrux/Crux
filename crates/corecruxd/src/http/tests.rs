@@ -867,6 +867,21 @@ async fn get_control_returns_knowledge_authority() {
 }
 
 #[tokio::test]
+async fn admin_restart_requires_admin_write() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+
+    let missing = admin::post_restart_daemon(State(state.clone()), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let read_only = admin::post_restart_daemon(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(read_only.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn admin_action_submit_is_idempotent_by_action_id() {
     let state = test_app_state(16);
     let req_a = admin::PostAdminActionRequest {
@@ -1066,8 +1081,9 @@ async fn mediation_receipt_unauthenticated_denied_t3() {
 #[serial_test::serial]
 async fn resolve_principal_cross_tenant_denied_t1() {
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    const TEST_HS256_SECRET: &str = "0123456789abcdef0123456789abcdef";
 
-    std::env::set_var("CORECRUXD_JWT_HS256_SECRET", "secret");
+    std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
     std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
     std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
 
@@ -1097,7 +1113,7 @@ async fn resolve_principal_cross_tenant_denied_t1() {
         let token = encode(
             &Header::new(Algorithm::HS256),
             &claims,
-            &EncodingKey::from_secret(b"secret"),
+            &EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
         )
         .expect("jwt");
         let mut headers = HeaderMap::new();
@@ -3882,7 +3898,7 @@ async fn get_entity_count_returns_501_without_dataplane() {
     let mut params = std::collections::HashMap::new();
     params.insert("tenant_id".to_string(), "tenant-a".to_string());
     params.insert("entity_type".to_string(), "server".to_string());
-    let resp = get_entity_count(State(state), axum::extract::Query(params))
+    let resp = get_entity_count(State(state), HeaderMap::new(), axum::extract::Query(params))
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
@@ -3893,7 +3909,7 @@ async fn get_entity_timeline_returns_501_without_dataplane() {
     let state = test_app_state(16);
     let mut params = std::collections::HashMap::new();
     params.insert("tenant_id".to_string(), "tenant-a".to_string());
-    let resp = get_entity_timeline(State(state), axum::extract::Query(params))
+    let resp = get_entity_timeline(State(state), HeaderMap::new(), axum::extract::Query(params))
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
@@ -3905,10 +3921,45 @@ async fn get_entity_current_state_returns_501_without_dataplane() {
     let mut params = std::collections::HashMap::new();
     params.insert("tenant_id".to_string(), "tenant-a".to_string());
     params.insert("entity_name".to_string(), "server-1".to_string());
-    let resp = get_entity_current_state(State(state), axum::extract::Query(params))
+    let resp = get_entity_current_state(State(state), HeaderMap::new(), axum::extract::Query(params))
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn entity_projection_routes_require_query_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let mut params = std::collections::HashMap::new();
+    params.insert("tenant_id".to_string(), "tenant-a".to_string());
+    params.insert("entity_type".to_string(), "server".to_string());
+
+    let missing = get_entity_count(
+        State(state.clone()),
+        HeaderMap::new(),
+        axum::extract::Query(params.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong_scope = get_entity_count(
+        State(state.clone()),
+        dev_scope_headers("facts:write"),
+        axum::extract::Query(params.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(wrong_scope.status(), StatusCode::FORBIDDEN);
+
+    let allowed = get_entity_count(
+        State(state),
+        dev_scope_headers("query:read"),
+        axum::extract::Query(params),
+    )
+    .await
+    .into_response();
+    assert_eq!(allowed.status(), StatusCode::NOT_IMPLEMENTED);
 }
 
 // ── get_replication_status ──────────────────────────────────────
@@ -4319,7 +4370,25 @@ async fn post_admin_action_too_long_id_returns_400() {
         .into_response();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = json_body(resp).await;
-    assert!(body["detail"].as_str().unwrap_or_default().contains("128 characters"));
+    assert!(body["detail"].as_str().unwrap_or_default().contains("1..=128"));
+}
+
+#[tokio::test]
+async fn admin_action_id_rejects_unsafe_chars() {
+    let state = test_app_state(16);
+    let req = admin::PostAdminActionRequest {
+        action_id: Some("act:bad/../id".to_string()),
+        action_type: "runtime-knob-update".to_string(),
+        actor: None,
+        reason: None,
+        params: None,
+    };
+    let resp = admin::post_admin_action(State(state), HeaderMap::new(), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp).await;
+    assert!(body["detail"].as_str().unwrap_or_default().contains("[A-Za-z0-9._-]"));
 }
 
 // ── to_valve_info ───────────────────────────────────────────────
@@ -5325,7 +5394,7 @@ async fn post_valves_sets_pause_compaction() {
 async fn get_entity_count_missing_tenant_id_returns_501() {
     let state = test_app_state(16);
     let params = std::collections::HashMap::new();
-    let resp = get_entity_count(State(state), axum::extract::Query(params))
+    let resp = get_entity_count(State(state), HeaderMap::new(), axum::extract::Query(params))
         .await
         .into_response();
     // Missing tenant_id should still reach no-dataplane path -> 501
@@ -5960,7 +6029,7 @@ async fn panic_handler_handles_string_panic() {
 
 #[serial_test::serial]
 #[tokio::test]
-async fn version_endpoint_returns_build_info_and_features() {
+async fn version_public_view_is_redacted() {
     std::env::remove_var("CORECRUXD_SYNC_ENABLED");
     std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
     std::env::remove_var("CORECRUXD_SYNC_API_KEY");
@@ -5985,11 +6054,26 @@ async fn version_endpoint_returns_build_info_and_features() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
     assert_eq!(body["version"], "test");
-    assert_eq!(body["commit"], "test");
     assert_eq!(body["msrv"], "1.88.0");
+    assert!(body["commit"].is_null());
+    assert!(body["passport"].is_null());
+    assert!(body["cloud"].is_null());
+    assert!(body["action_enrichment"].is_null());
+    assert!(body["gpu1_compute"].is_null());
+    // Update *status* is public (product-facing), but commit SHAs and repo
+    // internals are not — consistent with the top-level `commit` redaction.
+    assert!(body["update"]["state"].is_string());
+    assert!(body["update"]["upgrade_hint"].is_string());
+    assert!(body["update"]["current_commit"].is_null());
+    assert!(body["update"]["latest_commit"].is_null());
+    assert!(body["update"]["repo_dir"].is_null());
+    assert!(body["update"]["remote"].is_null());
+    assert!(body["update"]["tracking_ref"].is_null());
     assert_eq!(body["product"]["mode"], "free_local");
     assert_eq!(body["product"]["tier"], "free");
     assert_eq!(body["product"]["free_safety_baseline_active"], true);
+    assert_eq!(body["cloud_access"]["contract_path"], "/v1/cloud/access-contract");
+    assert_eq!(body["agent_workbench"]["contract_path"], "/v1/workbench/contract");
     assert!(body["product"]["enabled_capability_claims"]
         .as_array()
         .unwrap()
@@ -6005,37 +6089,6 @@ async fn version_endpoint_returns_build_info_and_features() {
         .unwrap()
         .iter()
         .any(|claim| claim == "gpu1:answer"));
-    assert_eq!(body["cloud"]["tenant_connectivity"], "not_configured");
-    assert_eq!(body["cloud"]["local_mirror_state"], "disabled");
-    assert_eq!(
-        body["cloud_access"]["schema"],
-        crate::product::CLOUD_ACCESS_CONTRACT_SCHEMA
-    );
-    assert_eq!(body["cloud_access"]["contract_path"], "/v1/cloud/access-contract");
-    assert_eq!(body["cloud_access"]["cloud_only_entitled"], false);
-    assert_eq!(
-        body["action_enrichment"]["schema"],
-        corecrux_memory::action_enrichment::ACTION_ENRICHMENT_SCHEMA
-    );
-    assert_eq!(body["action_enrichment"]["contract_path"], "/v1/actions/enrich");
-    assert_eq!(body["action_enrichment"]["basic_available"], true);
-    assert_eq!(body["action_enrichment"]["first_party_enabled"], false);
-    assert_eq!(
-        body["agent_workbench"]["schema"],
-        super::workbench::WORKBENCH_CONTRACT_SCHEMA
-    );
-    assert_eq!(body["agent_workbench"]["contract_path"], "/v1/workbench/contract");
-    assert!(body["agent_workbench"]["surfaces"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|surface| surface["capability"] == "agent_brief:pro" && surface["status"] == "pro_required"));
-    assert_eq!(
-        body["gpu1_compute"]["schema"],
-        super::gpu1::GPU1_COMPUTE_CONTRACT_SCHEMA
-    );
-    assert_eq!(body["gpu1_compute"]["contract_path"], "/v1/gpu1/contract");
-    assert_eq!(body["gpu1_compute"]["remote_memory_sync_required"], false);
     assert!(body["semantic_profile"].is_null());
     assert_eq!(body["protocol_contracts"]["session_plan_contract"]["status"], "current");
     assert_eq!(
@@ -6070,6 +6123,46 @@ async fn version_endpoint_returns_build_info_and_features() {
     assert!(body["features"]["mcp"].is_boolean());
     assert_eq!(body["sync"]["mode"], "local_only");
     assert_eq!(body["sync"]["configured"], false);
+    assert_eq!(body["sync"]["remote_url_redacted"], false);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn version_admin_view_includes_operational_details() {
+    std::env::remove_var("CORECRUXD_SYNC_ENABLED");
+    std::env::remove_var("CORECRUXD_SYNC_REMOTE_URL");
+    std::env::remove_var("CORECRUXD_SYNC_API_KEY");
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    *state.update_status.write().await = corecrux_types::UpdateStatus {
+        enabled: true,
+        state: corecrux_types::UpdateCheckState::Current,
+        remote: "origin".to_string(),
+        ref_name: "main".to_string(),
+        tracking_ref: "origin/main".to_string(),
+        repo_dir: Some("/tmp/crux".to_string()),
+        current_commit: Some("abc123".to_string()),
+        latest_commit: Some("abc123".to_string()),
+        ahead_by: 0,
+        behind_by: 0,
+        checked_at: Some("2026-04-09T12:00:00Z".to_string()),
+        error: None,
+        comparison_stale: false,
+        upgrade_hint: "current".to_string(),
+    };
+
+    let resp = get_admin_version(State(state), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["version"], "test");
+    assert_eq!(body["commit"], "test");
+    assert_eq!(body["passport"]["alg"], "ed25519");
+    assert_eq!(body["cloud"]["tenant_connectivity"], "not_configured");
+    assert_eq!(body["cloud_access"]["contract_path"], "/v1/cloud/access-contract");
+    assert_eq!(body["action_enrichment"]["contract_path"], "/v1/actions/enrich");
+    assert_eq!(body["agent_workbench"]["contract_path"], "/v1/workbench/contract");
+    assert_eq!(body["gpu1_compute"]["contract_path"], "/v1/gpu1/contract");
     assert_eq!(body["update"]["state"], "current");
     assert_eq!(body["update"]["tracking_ref"], "origin/main");
     assert_eq!(body["update"]["current_commit"], "abc123");
@@ -6091,7 +6184,8 @@ async fn version_endpoint_reports_degraded_sync_when_remote_is_incomplete() {
     assert_eq!(body["sync"]["mode"], "degraded");
     assert_eq!(body["sync"]["configured"], false);
     assert_eq!(body["sync"]["background_sync_enabled"], true);
-    assert_eq!(body["sync"]["remote_url"], "http://example.test:14800");
+    assert!(body["sync"]["remote_url"].is_null());
+    assert_eq!(body["sync"]["remote_url_redacted"], true);
     assert_eq!(body["sync"]["api_key_configured"], false);
     assert!(body["sync"]["degraded_reason"]
         .as_str()
@@ -6486,7 +6580,9 @@ async fn workbench_context_pack_and_command_ledger_store_private_receipts() {
 #[serial_test::serial]
 #[tokio::test]
 async fn workbench_context_pack_honors_jwt_tenant_binding() {
-    std::env::set_var("CORECRUXD_JWT_HS256_SECRET", "secret");
+    const TEST_HS256_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+    std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
     std::env::remove_var("CORECRUXD_JWT_ISS");
     std::env::remove_var("CORECRUXD_JWT_AUD");
     let mut state = test_app_state_with_auth(16, AuthMode::JwtHs256);
@@ -6505,7 +6601,7 @@ async fn workbench_context_pack_honors_jwt_tenant_binding() {
             "tenant_id": "business::other",
             "exp": exp,
         }),
-        &jsonwebtoken::EncodingKey::from_secret(b"secret"),
+        &jsonwebtoken::EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
     )
     .expect("jwt");
     let mut headers = HeaderMap::new();
@@ -7455,6 +7551,7 @@ async fn console_onboarding_complete_persists_and_marks_restart_required() {
     let state = test_app_state(16);
     let resp = console::post_console_onboarding_complete(
         State(state.clone()),
+        HeaderMap::new(),
         Json(console::CompleteOnboardingBody {
             auth_mode: "dev_scopes".to_string(),
             hide_onboarding: true,
@@ -7479,6 +7576,7 @@ async fn console_onboarding_complete_rejects_unknown_auth_mode() {
     let state = test_app_state(16);
     let resp = console::post_console_onboarding_complete(
         State(state),
+        HeaderMap::new(),
         Json(console::CompleteOnboardingBody {
             auth_mode: "magical".to_string(),
             hide_onboarding: false,
@@ -7496,6 +7594,7 @@ async fn console_onboarding_complete_refuses_off_on_non_loopback() {
     state.allow_insecure_dev_auth_bind = false;
     let resp = console::post_console_onboarding_complete(
         State(state),
+        HeaderMap::new(),
         Json(console::CompleteOnboardingBody {
             auth_mode: "off".to_string(),
             hide_onboarding: true,
@@ -7508,11 +7607,12 @@ async fn console_onboarding_complete_refuses_off_on_non_loopback() {
 
 #[tokio::test]
 async fn console_onboarding_complete_allows_off_when_insecure_bind_overridden() {
-    let mut state = test_app_state(16);
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
     state.http_bind_loopback = false;
     state.allow_insecure_dev_auth_bind = true;
     let resp = console::post_console_onboarding_complete(
         State(state),
+        dev_scope_headers("admin:write"),
         Json(console::CompleteOnboardingBody {
             auth_mode: "off".to_string(),
             hide_onboarding: false,
@@ -7521,6 +7621,31 @@ async fn console_onboarding_complete_allows_off_when_insecure_bind_overridden() 
     .await
     .into_response();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn onboarding_complete_is_first_run_only_without_admin_write() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut current = state.onboarding.write().await;
+        current.completed_at_unix_ms = Some(123);
+        current.chosen_auth_mode = Some("dev_scopes".to_string());
+        crate::onboarding::write_state(&state.data_dir, &current).expect("seed write");
+    }
+    let resp = console::post_console_onboarding_complete(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Json(console::CompleteOnboardingBody {
+            auth_mode: "jwt_hs256".to_string(),
+            hide_onboarding: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let reloaded = crate::onboarding::read_state(&state.data_dir).expect("reload settings");
+    assert_eq!(reloaded.chosen_auth_mode.as_deref(), Some("dev_scopes"));
+    assert_eq!(reloaded.completed_at_unix_ms, Some(123));
 }
 
 #[tokio::test]
@@ -8180,7 +8305,7 @@ async fn console_settings_put_persists_choices_and_flags_restart() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = console::put_console_settings(
         State(state.clone()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(console::UpdateSettingsBody {
             auth_mode: Some("jwt_hs256".to_string()),
             embedding_enabled: Some(true),
@@ -8203,13 +8328,31 @@ async fn console_settings_put_persists_choices_and_flags_restart() {
 }
 
 #[tokio::test]
+async fn console_settings_requires_admin_write() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::put_console_settings(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Json(console::UpdateSettingsBody {
+            auth_mode: Some("jwt_hs256".to_string()),
+            embedding_enabled: None,
+            embedding_url: None,
+            embedding_model: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn console_settings_put_rejects_off_on_non_loopback() {
     let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
     state.http_bind_loopback = false;
     state.allow_insecure_dev_auth_bind = false;
     let resp = console::put_console_settings(
         State(state),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(console::UpdateSettingsBody {
             auth_mode: Some("off".to_string()),
             embedding_enabled: None,
@@ -8841,13 +8984,30 @@ async fn console_onboarding_restart_clears_completed_marker() {
         current.chosen_auth_mode = Some("dev_scopes".to_string());
         crate::onboarding::write_state(&state.data_dir, &current).expect("seed write");
     }
-    let resp = console::post_console_onboarding_restart(State(state.clone()), dev_scope_headers("admin:read"))
+    let resp = console::post_console_onboarding_restart(State(state.clone()), dev_scope_headers("admin:write"))
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::OK);
     let reloaded = crate::onboarding::read_state(&state.data_dir).expect("reload");
     assert!(reloaded.completed_at_unix_ms.is_none());
     assert_eq!(reloaded.chosen_auth_mode.as_deref(), Some("dev_scopes"));
+}
+
+#[tokio::test]
+async fn onboarding_restart_requires_admin_write() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut current = state.onboarding.write().await;
+        current.completed_at_unix_ms = Some(123);
+        current.chosen_auth_mode = Some("dev_scopes".to_string());
+        crate::onboarding::write_state(&state.data_dir, &current).expect("seed write");
+    }
+    let resp = console::post_console_onboarding_restart(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let reloaded = crate::onboarding::read_state(&state.data_dir).expect("reload");
+    assert_eq!(reloaded.completed_at_unix_ms, Some(123));
 }
 
 #[tokio::test]
@@ -10437,7 +10597,7 @@ async fn embedding_probe_rejects_empty_url() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = console::post_console_embedding_probe(
         State(state),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(console::ProbeEmbeddingBody { url: "".to_string() }),
     )
     .await
@@ -10450,7 +10610,7 @@ async fn embedding_probe_rejects_non_http_url() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = console::post_console_embedding_probe(
         State(state),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(console::ProbeEmbeddingBody {
             url: "ftp://example.com".to_string(),
         }),
@@ -10461,7 +10621,7 @@ async fn embedding_probe_rejects_non_http_url() {
 }
 
 #[tokio::test]
-async fn embedding_probe_requires_admin_read() {
+async fn embedding_probe_requires_admin_write() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = console::post_console_embedding_probe(
         State(state),
@@ -10473,6 +10633,21 @@ async fn embedding_probe_requires_admin_read() {
     .await
     .into_response();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn embedding_probe_rejects_admin_read() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::post_console_embedding_probe(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Json(console::ProbeEmbeddingBody {
+            url: "http://example.com".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 // ── Coverage-lift batch (PR #66) ───────────────────────────────────────────

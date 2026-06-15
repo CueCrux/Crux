@@ -23,6 +23,18 @@ on:
           outage; the skip is logged in the run, never silent).
         type: boolean
         default: false
+      trivy_waiver_owner:
+        description: "Required when skip_trivy_gate=true; team or passport owning the waiver."
+        type: string
+        required: false
+      trivy_waiver_expires:
+        description: "Required when skip_trivy_gate=true; waiver expiry as YYYY-MM-DD."
+        type: string
+        required: false
+      trivy_waiver_reason:
+        description: "Required when skip_trivy_gate=true; short outage or risk rationale."
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -126,9 +138,57 @@ jobs:
           # SARIF step above — don't reinstall.
           skip-setup-trivy: true
 
+      - name: Validate Trivy gate waiver
+        if: ${{ inputs.skip_trivy_gate == true }}
+        env:
+          WAIVER_OWNER: ${{ inputs.trivy_waiver_owner }}
+          WAIVER_EXPIRES: ${{ inputs.trivy_waiver_expires }}
+          WAIVER_REASON: ${{ inputs.trivy_waiver_reason }}
+        run: |
+          set -euo pipefail
+          if [ -z "$WAIVER_OWNER" ] || [ -z "$WAIVER_EXPIRES" ] || [ -z "$WAIVER_REASON" ]; then
+            echo "::error::skip_trivy_gate=true requires trivy_waiver_owner, trivy_waiver_expires, and trivy_waiver_reason"
+            exit 1
+          fi
+          if ! expiry_epoch=$(date -u -d "$WAIVER_EXPIRES" +%s 2>/dev/null); then
+            echo "::error::trivy_waiver_expires must be a valid YYYY-MM-DD date"
+            exit 1
+          fi
+          today_epoch=$(date -u -d "$(date -u +%Y-%m-%d)" +%s)
+          if [ "$expiry_epoch" -lt "$today_epoch" ]; then
+            echo "::error::trivy_waiver_expires must not be in the past"
+            exit 1
+          fi
+          jq -n \
+            --arg owner "$WAIVER_OWNER" \
+            --arg expires "$WAIVER_EXPIRES" \
+            --arg reason "$WAIVER_REASON" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg sha "${{ github.sha }}" \
+            --arg image "local/crux-daemon:scan" \
+            '{
+              schema: "cuecrux.trivy_waiver.v1",
+              owner: $owner,
+              expires: $expires,
+              reason: $reason,
+              run_id: $run_id,
+              commit_sha: $sha,
+              image_ref: $image,
+              gate: "trivy-critical"
+            }' > trivy-waiver.json
+
       - name: Log Trivy gate skip
         if: ${{ inputs.skip_trivy_gate == true }}
-        run: echo "::warning::Trivy CRITICAL gate SKIPPED via workflow_dispatch input (skip_trivy_gate=true). Image pushed unscanned-gated; re-run the scan when the outage clears."
+        run: echo "::warning::Trivy CRITICAL gate SKIPPED via workflow_dispatch input; structured waiver artifact recorded."
+
+      - name: Upload Trivy waiver
+        if: ${{ inputs.skip_trivy_gate == true }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: trivy-waiver-${{ github.run_id }}
+          path: trivy-waiver.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Build and push
         if: github.event_name != 'pull_request'

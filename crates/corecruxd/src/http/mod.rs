@@ -48,6 +48,8 @@ mod receipts;
 mod relations;
 mod replay;
 mod result_envelope;
+#[cfg(test)]
+mod route_auth;
 mod routing;
 pub mod session;
 mod storybook;
@@ -381,6 +383,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/ops-log", get(self::admin::get_ops_log))
         .route("/v1/admin/valves", axum::routing::post(self::admin::post_valves))
         .route("/v1/admin/replication/status", get(self::admin::get_replication_status))
+        .route("/v1/admin/version", get(self::health::get_admin_version))
         .route("/v1/admin/actions", axum::routing::post(self::admin::post_admin_action))
         .route("/v1/admin/actions/{actionId}", get(self::admin::get_admin_action))
         .route(

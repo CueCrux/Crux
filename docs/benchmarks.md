@@ -1,5 +1,22 @@
 # Benchmarks
 
+## Evidence Status
+
+This repository carries reproducible local daemon baselines and gate fixtures.
+Any benchmark number used in trust, release, or marketing material must name:
+
+- corpus or workload name
+- `commit_sha`
+- run ID or artifact path
+- lane flags / feature flags
+- hardware class and operating system
+- pass/fail threshold when the number is used as a gate
+
+The LongMemEval-style hosted retrieval result mentioned in the README is an
+internal preliminary CoreCrux/AMR result, not a bare local-daemon claim. Treat
+it as unpublished until a public evidence pack with corpus, run ID, lane flags,
+and commit SHA is available.
+
 ## Criterion Benchmarks
 
 The `corecrux-retrieval` crate includes a Criterion benchmark for BM25 scoring:
@@ -10,9 +27,11 @@ cargo bench -p corecrux-retrieval --bench bm25_bench
 
 Results are written to `target/criterion/` with HTML reports.
 
-### Latest Results
+### Latest Local Results
 
-Measured on the development host (WSL2, Linux 5.15). Times are wall-clock per iteration (lower is better).
+Measured on the development host (WSL2, Linux 5.15). Times are wall-clock per
+iteration (lower is better). These historical figures should be refreshed and
+recorded with a `commit_sha` before being used as current release evidence.
 
 #### BM25 Single-Segment Search (`bm25_search`)
 

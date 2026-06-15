@@ -16,6 +16,24 @@ Each target bundle includes:
 exclusion boundary, package-script artifact markers, and a package smoke test
 whenever release binaries already exist under `target/release`.
 
+The boundary script proves only the local daemon distribution shape:
+
+- required daemon, alias, CLI, licence, trust-contract, README, config, content,
+  and release-manifest files are present in the staged package
+- hosted GPU/CUDA surfaces are excluded from the daemon package
+- package-script smoke markers are produced for the staged binaries
+
+It does not prove hosted backend behavior, GPU/CUDA acceleration, production
+deployment safety, Trivy scan results, cosign signatures, SLSA provenance, or
+runtime configuration on an operator host. Those are covered by the Docker and
+release workflows, [docs/verify-release.md](verify-release.md), and any
+deployment-specific ExecPlan gate.
+
+Container release scans fail on actionable CRITICAL vulnerabilities by default.
+If a Trivy outage or registry failure forces an emergency skip, the Docker
+workflow requires a structured waiver with owner, expiry, reason, commit SHA,
+run ID, and image reference, and uploads it as a 90-day artifact.
+
 Enterprise customer-hosted installs can set the `enterprise` block in
 `config.example.yaml` or the corresponding `CORECRUXD_ENTERPRISE_*` environment
 variables. `corecruxd` validates the configured trust root on startup before any

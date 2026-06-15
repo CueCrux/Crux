@@ -16,6 +16,9 @@ use tonic::Status;
 
 use crate::problem::ProblemResponse;
 
+const MIN_HS256_SECRET_BYTES: usize = 32;
+const ALLOW_WEAK_HS256_SECRET_ENV: &str = "CORECRUXD_ALLOW_WEAK_HS256_SECRET";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
     Off,
@@ -206,19 +209,36 @@ impl Authz {
 }
 
 fn parse_secret(raw: &str) -> Result<Vec<u8>, String> {
-    if let Some(b64) = raw.strip_prefix("base64:") {
+    let bytes = if let Some(b64) = raw.strip_prefix("base64:") {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(b64)
             .map_err(|e| format!("invalid base64 jwt secret: {e}"))?;
         if bytes.is_empty() {
             return Err("empty jwt secret".to_string());
         }
-        return Ok(bytes);
-    }
-    if raw.is_empty() {
+        bytes
+    } else if raw.is_empty() {
         return Err("empty jwt secret".to_string());
+    } else {
+        raw.as_bytes().to_vec()
+    };
+    validate_hs256_secret(&bytes)?;
+    Ok(bytes)
+}
+
+fn validate_hs256_secret(secret: &[u8]) -> Result<(), String> {
+    if secret.len() >= MIN_HS256_SECRET_BYTES || weak_hs256_secret_allowed() {
+        return Ok(());
     }
-    Ok(raw.as_bytes().to_vec())
+    Err(format!(
+        "CORECRUXD_JWT_HS256_SECRET must decode to at least {MIN_HS256_SECRET_BYTES} bytes; set {ALLOW_WEAK_HS256_SECRET_ENV}=1 only for local dev/tests"
+    ))
+}
+
+fn weak_hs256_secret_allowed() -> bool {
+    std::env::var(ALLOW_WEAK_HS256_SECRET_ENV)
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn parse_scopes(raw: &str) -> BTreeSet<String> {
@@ -1078,6 +1098,8 @@ pub fn require_grpc_scopes_for_tenant(
 mod tests {
     use super::*;
 
+    const TEST_HS256_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
     #[test]
     fn parse_scopes_splits_commas_and_spaces() {
         let s = parse_scopes("a:b,c:d  e:f\tg:h\n");
@@ -1094,8 +1116,35 @@ mod tests {
         let _g = lock.lock().unwrap();
 
         std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
         let err = Authz::from_env(AuthMode::JwtHs256).unwrap_err();
         assert!(err.contains("CORECRUXD_JWT_HS256_SECRET"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hs256_rejects_short_secret() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", "secret");
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        let err = Authz::from_env(AuthMode::JwtHs256).unwrap_err();
+        assert!(err.contains("at least 32 bytes"));
+        std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hs256_accepts_32_byte_secret() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        let auth = Authz::from_env(AuthMode::JwtHs256).expect("strong secret accepted");
+        assert_eq!(auth.mode(), AuthMode::JwtHs256);
+        std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
     }
 
     #[test]
@@ -1106,7 +1155,8 @@ mod tests {
         let lock = env_lock();
         let _g = lock.lock().unwrap();
 
-        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", "secret");
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
         std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
         std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
 
@@ -1135,7 +1185,7 @@ mod tests {
         let token = encode(
             &Header::new(Algorithm::HS256),
             &claims,
-            &EncodingKey::from_secret(b"secret"),
+            &EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
         )
         .expect("jwt");
 
@@ -1283,7 +1333,8 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
     fn hs256_auth_headers(mut claims: serde_json::Value) -> (Authz, HeaderMap) {
         use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 
-        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", "secret");
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
         std::env::set_var("CORECRUXD_JWT_ISS", "corecrux-test");
         std::env::set_var("CORECRUXD_JWT_AUD", "corecrux");
 
@@ -1305,7 +1356,7 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
         let token = encode(
             &Header::new(Algorithm::HS256),
             &claims,
-            &EncodingKey::from_secret(b"secret"),
+            &EncodingKey::from_secret(TEST_HS256_SECRET.as_bytes()),
         )
         .expect("jwt");
         let mut headers = HeaderMap::new();
@@ -1398,14 +1449,14 @@ rG+Vg0mnrwArNdy2hX9Qkwc=
 
     #[test]
     fn parse_secret_plain_text() {
-        let s = parse_secret("my-secret").unwrap();
-        assert_eq!(s, b"my-secret");
+        let s = parse_secret(TEST_HS256_SECRET).unwrap();
+        assert_eq!(s, TEST_HS256_SECRET.as_bytes());
     }
 
     #[test]
     fn parse_secret_base64_prefix() {
-        let s = parse_secret("base64:aGVsbG8=").unwrap();
-        assert_eq!(s, b"hello");
+        let s = parse_secret("base64:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=").unwrap();
+        assert_eq!(s, TEST_HS256_SECRET.as_bytes());
     }
 
     #[test]
