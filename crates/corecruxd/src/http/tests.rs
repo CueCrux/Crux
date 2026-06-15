@@ -7455,6 +7455,7 @@ async fn console_onboarding_complete_persists_and_marks_restart_required() {
     let state = test_app_state(16);
     let resp = console::post_console_onboarding_complete(
         State(state.clone()),
+        HeaderMap::new(),
         Json(console::CompleteOnboardingBody {
             auth_mode: "dev_scopes".to_string(),
             hide_onboarding: true,
@@ -7479,6 +7480,7 @@ async fn console_onboarding_complete_rejects_unknown_auth_mode() {
     let state = test_app_state(16);
     let resp = console::post_console_onboarding_complete(
         State(state),
+        HeaderMap::new(),
         Json(console::CompleteOnboardingBody {
             auth_mode: "magical".to_string(),
             hide_onboarding: false,
@@ -7496,6 +7498,7 @@ async fn console_onboarding_complete_refuses_off_on_non_loopback() {
     state.allow_insecure_dev_auth_bind = false;
     let resp = console::post_console_onboarding_complete(
         State(state),
+        HeaderMap::new(),
         Json(console::CompleteOnboardingBody {
             auth_mode: "off".to_string(),
             hide_onboarding: true,
@@ -7508,11 +7511,12 @@ async fn console_onboarding_complete_refuses_off_on_non_loopback() {
 
 #[tokio::test]
 async fn console_onboarding_complete_allows_off_when_insecure_bind_overridden() {
-    let mut state = test_app_state(16);
+    let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
     state.http_bind_loopback = false;
     state.allow_insecure_dev_auth_bind = true;
     let resp = console::post_console_onboarding_complete(
         State(state),
+        dev_scope_headers("admin:write"),
         Json(console::CompleteOnboardingBody {
             auth_mode: "off".to_string(),
             hide_onboarding: false,
@@ -7521,6 +7525,31 @@ async fn console_onboarding_complete_allows_off_when_insecure_bind_overridden() 
     .await
     .into_response();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn onboarding_complete_is_first_run_only_without_admin_write() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut current = state.onboarding.write().await;
+        current.completed_at_unix_ms = Some(123);
+        current.chosen_auth_mode = Some("dev_scopes".to_string());
+        crate::onboarding::write_state(&state.data_dir, &current).expect("seed write");
+    }
+    let resp = console::post_console_onboarding_complete(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Json(console::CompleteOnboardingBody {
+            auth_mode: "jwt_hs256".to_string(),
+            hide_onboarding: true,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let reloaded = crate::onboarding::read_state(&state.data_dir).expect("reload settings");
+    assert_eq!(reloaded.chosen_auth_mode.as_deref(), Some("dev_scopes"));
+    assert_eq!(reloaded.completed_at_unix_ms, Some(123));
 }
 
 #[tokio::test]
@@ -8180,7 +8209,7 @@ async fn console_settings_put_persists_choices_and_flags_restart() {
     let state = test_app_state_with_auth(16, AuthMode::DevScopes);
     let resp = console::put_console_settings(
         State(state.clone()),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(console::UpdateSettingsBody {
             auth_mode: Some("jwt_hs256".to_string()),
             embedding_enabled: Some(true),
@@ -8203,13 +8232,31 @@ async fn console_settings_put_persists_choices_and_flags_restart() {
 }
 
 #[tokio::test]
+async fn console_settings_requires_admin_write() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = console::put_console_settings(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Json(console::UpdateSettingsBody {
+            auth_mode: Some("jwt_hs256".to_string()),
+            embedding_enabled: None,
+            embedding_url: None,
+            embedding_model: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn console_settings_put_rejects_off_on_non_loopback() {
     let mut state = test_app_state_with_auth(16, AuthMode::DevScopes);
     state.http_bind_loopback = false;
     state.allow_insecure_dev_auth_bind = false;
     let resp = console::put_console_settings(
         State(state),
-        dev_scope_headers("admin:read"),
+        dev_scope_headers("admin:write"),
         Json(console::UpdateSettingsBody {
             auth_mode: Some("off".to_string()),
             embedding_enabled: None,
@@ -8841,13 +8888,30 @@ async fn console_onboarding_restart_clears_completed_marker() {
         current.chosen_auth_mode = Some("dev_scopes".to_string());
         crate::onboarding::write_state(&state.data_dir, &current).expect("seed write");
     }
-    let resp = console::post_console_onboarding_restart(State(state.clone()), dev_scope_headers("admin:read"))
+    let resp = console::post_console_onboarding_restart(State(state.clone()), dev_scope_headers("admin:write"))
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::OK);
     let reloaded = crate::onboarding::read_state(&state.data_dir).expect("reload");
     assert!(reloaded.completed_at_unix_ms.is_none());
     assert_eq!(reloaded.chosen_auth_mode.as_deref(), Some("dev_scopes"));
+}
+
+#[tokio::test]
+async fn onboarding_restart_requires_admin_write() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    {
+        let mut current = state.onboarding.write().await;
+        current.completed_at_unix_ms = Some(123);
+        current.chosen_auth_mode = Some("dev_scopes".to_string());
+        crate::onboarding::write_state(&state.data_dir, &current).expect("seed write");
+    }
+    let resp = console::post_console_onboarding_restart(State(state.clone()), dev_scope_headers("admin:read"))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let reloaded = crate::onboarding::read_state(&state.data_dir).expect("reload");
+    assert_eq!(reloaded.completed_at_unix_ms, Some(123));
 }
 
 #[tokio::test]

@@ -71,6 +71,7 @@ pub(super) async fn get_console_onboarding(State(state): State<AppState>) -> imp
 
 pub(super) async fn post_console_onboarding_complete(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CompleteOnboardingBody>,
 ) -> impl IntoResponse {
     let chosen = body.auth_mode.trim().to_ascii_lowercase();
@@ -92,6 +93,19 @@ pub(super) async fn post_console_onboarding_complete(
     let restart_required = chosen != running;
 
     let mut current = state.onboarding.write().await;
+    let anonymous_first_run_allowed = current.completed_at_unix_ms.is_none() && state.http_bind_loopback;
+    if !anonymous_first_run_allowed {
+        if !state.http_bind_loopback && state.auth.mode().as_str() == "off" {
+            return problem_response(
+                StatusCode::FORBIDDEN,
+                "onboarding completion on a non-loopback bind requires authenticated admin:write",
+            );
+        }
+        if let Err(problem) = require_console_write(&state, &headers) {
+            return problem.into_response();
+        }
+    }
+
     current.chosen_auth_mode = Some(chosen.clone());
     if body.hide_onboarding {
         current.completed_at_unix_ms = Some(now_unix_ms());
@@ -167,7 +181,7 @@ pub(super) async fn put_console_settings(
     headers: HeaderMap,
     Json(body): Json<UpdateSettingsBody>,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_console_write(&state, &headers) {
         return problem.into_response();
     }
 
@@ -1125,7 +1139,7 @@ pub(super) async fn post_console_onboarding_restart(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+    if let Err(problem) = require_console_write(&state, &headers) {
         return problem.into_response();
     }
     let mut current = state.onboarding.write().await;
