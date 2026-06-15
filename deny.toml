@@ -49,8 +49,8 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 #   - zip 8.6.0 -> pbkdf2 0.13 -> hmac 0.13 / digest 0.11.
 # Owner: receipts/crypto. Expiry: re-evaluate when cms ships a stable 0.3 and
 # ed25519-dalek/elliptic-curve move to the digest 0.11 generation, then flip the
-# crypto subset to a targeted deny. Tracked in
-# PlanCrux/docs/audits/Crux-review-notes.md (C1).
+# crypto subset to a targeted deny. Tracked in the repository audit review
+# notes (finding C1).
 multiple-versions = "warn"
 # wildcards stays "allow" for now. Enabling `wildcards = "deny"` is the desired
 # end state (a published "*" version is a supply-chain footgun), but every
