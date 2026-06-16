@@ -17,6 +17,39 @@ use super::{require_http_scopes, AppState, HeaderMap, IntoResponse, Json, Respon
 
 /// Reserved entity holding one fact per machine (keyed by hostname).
 const MACHINES_ENTITY: &str = "__infra__::machines";
+/// Reserved entity holding one fact per saved config bundle (keyed by name).
+const CONFIGS_ENTITY: &str = "__infra__::configs";
+/// Reserved entity holding one fact per shared session snapshot (keyed by id).
+const SESSIONS_ENTITY: &str = "__infra__::sessions";
+
+/// Latest, non-deleted fact per key under `entity`, mapped via `f`.
+fn latest_by_key<F: Fn(&str, &corecrux_memory::fact_store::Fact, &serde_json::Value) -> serde_json::Value>(
+    store: &corecrux_memory::FactStore,
+    entity: &str,
+    f: F,
+) -> Vec<serde_json::Value> {
+    let mut latest: BTreeMap<String, &corecrux_memory::fact_store::Fact> = BTreeMap::new();
+    for fact in store.get_by_entity(entity) {
+        if fact.deleted {
+            continue;
+        }
+        latest
+            .entry(fact.key.clone())
+            .and_modify(|cur| {
+                if fact.version > cur.version {
+                    *cur = fact;
+                }
+            })
+            .or_insert(fact);
+    }
+    latest
+        .values()
+        .map(|fact| {
+            let value: serde_json::Value = serde_json::from_str(&fact.value).unwrap_or(serde_json::Value::Null);
+            f(&fact.key, fact, &value)
+        })
+        .collect()
+}
 
 pub(super) async fn get_infra_summary(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
@@ -29,30 +62,32 @@ pub(super) async fn get_infra_summary(State(state): State<AppState>, headers: He
         "http_accept_agent_tokens": env_flag_enabled("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS"),
     });
 
-    // Latest, non-deleted machine record per hostname.
-    let machines: Vec<serde_json::Value> = {
+    // Latest, non-deleted records under each __infra__ entity. Config bundles +
+    // session snapshots return metadata only (not full contents).
+    let (machines, configs, sessions) = {
         let store = state.fact_store.read().await;
-        let mut latest: BTreeMap<String, &corecrux_memory::fact_store::Fact> = BTreeMap::new();
-        for fact in store.get_by_entity(MACHINES_ENTITY) {
-            if fact.deleted {
-                continue;
-            }
-            latest
-                .entry(fact.key.clone())
-                .and_modify(|cur| {
-                    if fact.version > cur.version {
-                        *cur = fact;
-                    }
-                })
-                .or_insert(fact);
-        }
-        latest
-            .values()
-            .map(|fact| {
-                let record: serde_json::Value = serde_json::from_str(&fact.value).unwrap_or(serde_json::Value::Null);
-                serde_json::json!({ "id": fact.key, "record": record, "updated_at": fact.stored_at })
+        let machines = latest_by_key(
+            &store,
+            MACHINES_ENTITY,
+            |key, fact, record| serde_json::json!({ "id": key, "record": record, "updated_at": fact.stored_at }),
+        );
+        let configs = latest_by_key(&store, CONFIGS_ENTITY, |key, fact, b| {
+            serde_json::json!({
+                "name": key,
+                "source_host": b.get("source_host"),
+                "files": b.get("files").and_then(|v| v.as_array()).map_or(0, |a| a.len()),
+                "updated_at": fact.stored_at,
             })
-            .collect()
+        });
+        let sessions = latest_by_key(&store, SESSIONS_ENTITY, |key, fact, snap| {
+            serde_json::json!({
+                "id": key,
+                "source_host": snap.get("source_host"),
+                "bytes": snap.get("bytes"),
+                "updated_at": fact.stored_at,
+            })
+        });
+        (machines, configs, sessions)
     };
 
     let presence_count = state.presence.snapshot().await.len();
@@ -76,6 +111,8 @@ pub(super) async fn get_infra_summary(State(state): State<AppState>, headers: He
             "node_id": state.node_id,
             "rails": rails,
             "machines": machines,
+            "configs": configs,
+            "sessions": sessions,
             "presence_count": presence_count,
             "checklist": checklist,
         })),

@@ -16,10 +16,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use corecruxctl::{
-    admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, evidence, explain, extensions, fixture_digest,
-    gaps, hooks, identity_cli, inspect_receipt, login, machine, memory, memory_pack, output_verify, parity,
-    projections, receipts, reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import, storage, structured_log,
-    tooling_env, verify_store,
+    admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, config_bundle, evidence, explain, extensions,
+    fixture_digest, gaps, hooks, identity_cli, inspect_receipt, login, machine, memory, memory_pack, output_verify,
+    parity, projections, receipts, reconcile, replay, session_sync, shard, shardmap, smoke, snapshot, stage1_import,
+    storage, structured_log, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -90,6 +90,20 @@ enum Command {
     Machine {
         #[command(subcommand)]
         command: MachineCommand,
+    },
+
+    /// Save / restore a machine's Claude Code config across machines.
+    #[command(name = "config")]
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+
+    /// Share session state across machines via the shared daemon.
+    #[command(name = "session")]
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
     },
 
     /// Deterministic replay checks from a replay pack (preferred) or legacy JSONL input.
@@ -630,6 +644,55 @@ enum MachineCommand {
         url: Option<String>,
     },
     /// List the machines registered with the daemon.
+    List {
+        #[arg(long)]
+        url: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Capture ~/.claude (secrets redacted) and store it on the daemon.
+    Push {
+        /// Bundle name (e.g. `myles-pc` or `default`).
+        name: String,
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Restore a stored bundle into ~/.claude (backs up existing files).
+    Pull {
+        /// Bundle name to restore.
+        name: String,
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// List config bundles stored on the daemon.
+    List {
+        #[arg(long)]
+        url: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// Push a session-state snapshot (from --file or stdin) to the daemon.
+    Push {
+        /// Session id.
+        id: String,
+        /// Read state JSON from this file (default: stdin).
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Print a session-state snapshot shared from any machine.
+    Pull {
+        /// Session id.
+        id: String,
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// List session snapshots shared across machines.
     List {
         #[arg(long)]
         url: Option<String>,
@@ -1942,6 +2005,16 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Machine { command } => match command {
             MachineCommand::Register { url } => machine::run_register(url),
             MachineCommand::List { url } => machine::run_list(url),
+        },
+        Command::Config { command } => match command {
+            ConfigCommand::Push { name, url } => config_bundle::run_push(name, url),
+            ConfigCommand::Pull { name, url } => config_bundle::run_pull(name, url),
+            ConfigCommand::List { url } => config_bundle::run_list(url),
+        },
+        Command::Session { command } => match command {
+            SessionCommand::Push { id, file, url } => session_sync::run_push(id, file, url),
+            SessionCommand::Pull { id, url } => session_sync::run_pull(id, url),
+            SessionCommand::List { url } => session_sync::run_list(url),
         },
         Command::Replay {
             pack,
