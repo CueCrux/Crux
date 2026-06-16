@@ -15,6 +15,10 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY proto/ proto/
+# corecruxctl embeds integrations/claude-code/hooks/crux-observe.sh via
+# include_str! (the `corecruxctl hooks install` asset), so it must be present in
+# the build context for the release build to compile.
+COPY integrations/ integrations/
 
 # Git sha for `corecruxd --version` / the boot banner. The build context does
 # NOT include `.git`, so corecruxd's build.rs cannot derive it via `git` here —
