@@ -113,6 +113,102 @@ pub struct Authz {
     mode: AuthMode,
     jwt_hs256: Option<JwtHs256Config>,
     jwt_jwks: Option<JwtJwksConfig>,
+    /// Opt-in: under a JWT mode, also accept a registered MCP agent token
+    /// (`CRUX_AGENT_TOKENS`) on HTTP so a single credential unlocks both the
+    /// HTTP API and the MCP plane. `None` unless `CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS`
+    /// is enabled.
+    agent_http: Option<AgentTokenHttpConfig>,
+}
+
+/// Opt-in HTTP acceptance of MCP agent tokens (see [`Authz::agent_http`]).
+///
+/// Agent tokens carry no claims, so every accepted agent token maps to the same
+/// operator-configured scope set + tenant binding (`CORECRUXD_AGENT_TOKEN_HTTP_SCOPES`
+/// / `CORECRUXD_AGENT_TOKEN_HTTP_TENANT`).
+#[derive(Clone)]
+struct AgentTokenHttpConfig {
+    registry: crux_mcp::agent::AgentRegistry,
+    scopes: BTreeSet<String>,
+    tenants: TenantAllow,
+}
+
+/// Env flag enabling HTTP acceptance of MCP agent tokens. Default off.
+const HTTP_ACCEPT_AGENT_TOKENS_ENV: &str = "CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS";
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+}
+
+/// Build the agent-token HTTP config from env, or `None` if disabled / no tokens.
+fn build_agent_http_config() -> Option<AgentTokenHttpConfig> {
+    if !env_truthy(HTTP_ACCEPT_AGENT_TOKENS_ENV) {
+        return None;
+    }
+    let registry = crux_mcp::agent::AgentRegistry::from_env();
+    if registry.is_empty() {
+        return None;
+    }
+    let scopes = std::env::var("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES")
+        .ok()
+        .map(|s| parse_scopes(&s))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(default_agent_http_scopes);
+    let tenant_raw = std::env::var("CORECRUXD_AGENT_TOKEN_HTTP_TENANT")
+        .ok()
+        .unwrap_or_else(|| "*".to_string());
+    let tenants = tenant_allow_from_str(&tenant_raw);
+    Some(AgentTokenHttpConfig {
+        registry,
+        scopes,
+        tenants,
+    })
+}
+
+fn default_agent_http_scopes() -> BTreeSet<String> {
+    [
+        "admin:read",
+        "admin:write",
+        "facts:write",
+        "query:read",
+        "sessions:read",
+        "sessions:write",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
+fn tenant_allow_from_str(raw: &str) -> TenantAllow {
+    let trimmed = raw.trim();
+    if trimmed == "*" {
+        return TenantAllow::Any;
+    }
+    let set: BTreeSet<String> = trimmed
+        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if set.is_empty() {
+        TenantAllow::Missing
+    } else {
+        TenantAllow::Only(set)
+    }
+}
+
+impl AgentTokenHttpConfig {
+    /// If `token` is a registered agent token, return an `AuthContext` carrying
+    /// the configured scopes + tenant binding, attributed to the agent name.
+    fn try_auth(&self, token: &str) -> Option<AuthContext> {
+        self.registry.lookup(token).map(|agent| AuthContext {
+            subject: Some(format!("agent:{}", agent.name)),
+            passport_id: Some(format!("agent:{}", agent.name)),
+            scopes: self.scopes.clone(),
+            tenants: self.tenants.clone(),
+        })
+    }
 }
 
 impl std::fmt::Debug for Authz {
@@ -130,6 +226,7 @@ impl Authz {
                 mode,
                 jwt_hs256: None,
                 jwt_jwks: None,
+                agent_http: None,
             }),
             AuthMode::JwtHs256 => {
                 let raw = std::env::var("CORECRUXD_JWT_HS256_SECRET")
@@ -145,6 +242,7 @@ impl Authz {
                         audience,
                     }),
                     jwt_jwks: None,
+                    agent_http: build_agent_http_config(),
                 })
             }
             AuthMode::JwtJwks => {
@@ -198,6 +296,7 @@ impl Authz {
                             last_error: None,
                         })),
                     }),
+                    agent_http: build_agent_http_config(),
                 })
             }
         }
@@ -745,15 +844,21 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
                     }),
                 ))
             })?;
-            let ctx = verify_jwt_hs256(cfg, &token).map_err(|msg| {
-                ProblemResponse(ProblemDetails::unauthorized("invalid bearer token").with_extensions(
-                    serde_json::json!({
-                        "code": "UNAUTHENTICATED",
-                        "details": msg,
+            match verify_jwt_hs256(cfg, &token) {
+                Ok(ctx) => Ok(ctx),
+                Err(msg) => auth
+                    .agent_http
+                    .as_ref()
+                    .and_then(|a| a.try_auth(&token))
+                    .ok_or_else(|| {
+                        ProblemResponse(ProblemDetails::unauthorized("invalid bearer token").with_extensions(
+                            serde_json::json!({
+                                "code": "UNAUTHENTICATED",
+                                "details": msg,
+                            }),
+                        ))
                     }),
-                ))
-            })?;
-            Ok(ctx)
+            }
         }
         AuthMode::JwtJwks => {
             let cfg = auth.jwt_jwks.as_ref().ok_or_else(|| {
@@ -770,15 +875,21 @@ fn http_ctx(auth: &Authz, headers: &HeaderMap) -> Result<AuthContext, ProblemRes
                     }),
                 ))
             })?;
-            let ctx = verify_jwt_jwks(cfg, &token).map_err(|msg| {
-                ProblemResponse(ProblemDetails::unauthorized("invalid bearer token").with_extensions(
-                    serde_json::json!({
-                        "code": "UNAUTHENTICATED",
-                        "details": msg,
+            match verify_jwt_jwks(cfg, &token) {
+                Ok(ctx) => Ok(ctx),
+                Err(msg) => auth
+                    .agent_http
+                    .as_ref()
+                    .and_then(|a| a.try_auth(&token))
+                    .ok_or_else(|| {
+                        ProblemResponse(ProblemDetails::unauthorized("invalid bearer token").with_extensions(
+                            serde_json::json!({
+                                "code": "UNAUTHENTICATED",
+                                "details": msg,
+                            }),
+                        ))
                     }),
-                ))
-            })?;
-            Ok(ctx)
+            }
         }
     }
 }
@@ -1145,6 +1256,79 @@ mod tests {
         let auth = Authz::from_env(AuthMode::JwtHs256).expect("strong secret accepted");
         assert_eq!(auth.mode(), AuthMode::JwtHs256);
         std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn agent_token_accepted_on_http_when_enabled() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        const AGENT_TOK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        std::env::remove_var("CORECRUXD_JWT_ISS");
+        std::env::remove_var("CORECRUXD_JWT_AUD");
+        std::env::set_var("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS", "1");
+        std::env::set_var("CRUX_AGENT_TOKENS", format!("drivew:{AGENT_TOK}"));
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES", "query:read facts:write");
+        std::env::set_var("CORECRUXD_AGENT_TOKEN_HTTP_TENANT", "*");
+
+        let auth = Authz::from_env(AuthMode::JwtHs256).expect("auth from env");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {AGENT_TOK}").parse().unwrap(),
+        );
+        // The agent token authenticates on HTTP with the configured scopes.
+        require_http_scopes(&auth, &headers, &["query:read", "facts:write"]).expect("agent token accepted");
+        require_http_scopes_for_tenant(&auth, &headers, &["query:read"], "any-tenant").expect("tenant * allows any");
+
+        // A bogus bearer is still rejected.
+        let mut bad = HeaderMap::new();
+        bad.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer ffffffffffffffffffffffffffffffffffffffffffffffff"
+                .parse()
+                .unwrap(),
+        );
+        assert!(require_http_scopes(&auth, &bad, &["query:read"]).is_err());
+
+        for k in [
+            "CORECRUXD_JWT_HS256_SECRET",
+            "CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS",
+            "CRUX_AGENT_TOKENS",
+            "CORECRUXD_AGENT_TOKEN_HTTP_SCOPES",
+            "CORECRUXD_AGENT_TOKEN_HTTP_TENANT",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn agent_token_rejected_on_http_when_disabled() {
+        let lock = env_lock();
+        let _g = lock.lock().unwrap();
+
+        const AGENT_TOK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::env::set_var("CORECRUXD_JWT_HS256_SECRET", TEST_HS256_SECRET);
+        std::env::remove_var(ALLOW_WEAK_HS256_SECRET_ENV);
+        std::env::remove_var("CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS"); // disabled (default)
+        std::env::set_var("CRUX_AGENT_TOKENS", format!("drivew:{AGENT_TOK}"));
+
+        let auth = Authz::from_env(AuthMode::JwtHs256).expect("auth from env");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {AGENT_TOK}").parse().unwrap(),
+        );
+        // Default posture unchanged: an agent token is NOT accepted on HTTP.
+        assert!(require_http_scopes(&auth, &headers, &["query:read"]).is_err());
+
+        std::env::remove_var("CORECRUXD_JWT_HS256_SECRET");
+        std::env::remove_var("CRUX_AGENT_TOKENS");
     }
 
     #[test]
