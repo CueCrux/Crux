@@ -685,7 +685,8 @@ const SCOPES = [
   { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-usage','cx-documents','cx-gates','cx-review','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-identity','cx-receipts','cx-mediation','cx-workbench','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-lane-weights','cx-settings','cx-raw'] },
   { id:'dx', label:'DX', tag:'Docs',         sections:['dx-articles','dx-readme','dx-sites'] },
   { id:'gx', label:'GX', tag:'Global',       sections:['gx-engrams','gx-bench','gx-sites','gx-factstore'] },
-  { id:'ax', label:'AX', tag:'Agent',        sections:['ax-overview','ax-activity','ax-memory','ax-bulk','ax-snapshots','ax-tools','ax-handoff','ax-graph','ax-storybook','ax-dossiers','ax-story'] }
+  { id:'ax', label:'AX', tag:'Agent',        sections:['ax-overview','ax-activity','ax-memory','ax-bulk','ax-snapshots','ax-tools','ax-handoff','ax-graph','ax-storybook','ax-dossiers','ax-story'] },
+  { id:'ix', label:'IX', tag:'Infra',        sections:['ix-index','ix-machines','ix-rails'] }
 ];
 
 const N = {
@@ -1122,6 +1123,10 @@ const N = {
 
   /* ── AX ── */
   'ax-overview':{kind:'panel',label:'Overview',sub:'agent cockpit',fields:[['active agents','2'],['handoffs','1 open']],children:['st-sess','ho1']},
+  /* ── IX panels (Infra / config) ── */
+  'ix-index':{kind:'panel',label:'Onboarding',sub:'machine setup checklist',children:[],doc:'IX / INFRA\n\nOnboarding checklist + the machines logged into this daemon.\nWire a machine with one command:\n  corecruxctl login   (auth + hooks + machine capture)\nNeeds the console bearer token set for a remote jwt daemon (setConsoleToken in the Raw console).'},
+  'ix-machines':{kind:'panel',label:'Machines',sub:'logged into this daemon',children:[]},
+  'ix-rails':{kind:'panel',label:'Auth rails',sub:'what is enabled',children:[]},
   'ax-activity':{kind:'panel',label:'Activity',sub:'live tool stream',status:'run',fields:[['events/min','~40']],children:['hk-agentux','hk5']},
   'ax-memory':{kind:'panel',label:'Memory',sub:'agent recall',fields:[['acks today','12']],children:['mem1','mem2','mem3']},
   'ax-bulk':{kind:'panel',label:'Bulk',sub:'batch ops',children:['bulk-import','bulk-sweep']},
@@ -1217,9 +1222,14 @@ const DUMMY_CHILDREN = {};        // id -> original dummy children (degrade-to-d
 
 function $scopeHeader(){ const el=document.getElementById('scopeHeader'); return el ? (el.value||'').trim() : ''; }
 function currentBoundPassportId(){ try{ return localStorage.getItem('crux-console-bound-passport')||''; }catch{ return ''; } }
+// Optional bearer for remote / jwt_hs256 daemons (loopback consoles don't need it).
+// Stored in localStorage; set via setConsoleToken() in the Raw console or DevTools.
+function currentConsoleToken(){ try{ return (localStorage.getItem('crux-console-token')||'').trim(); }catch{ return ''; } }
+function setConsoleToken(t){ try{ if(t){ localStorage.setItem('crux-console-token', t.trim()); } else { localStorage.removeItem('crux-console-token'); } return true; }catch{ return false; } }
 function apiHeaders(){
   const scopes=$scopeHeader(); const out=scopes?{'X-Corecrux-Scopes':scopes}:{};
   try{ const pid=currentBoundPassportId(); if(pid) out['X-Corecrux-Passport-Id']=pid; }catch{}
+  try{ const tok=currentConsoleToken(); if(tok) out['Authorization']='Bearer '+tok; }catch{}
   return out;
 }
 async function api(path){
@@ -1324,6 +1334,30 @@ function st2(s){ s=(s||'').toLowerCase();
   if(['complete','done','released','ok','success'].includes(s)) return 'ok';
   if(['blocked','error','expired','force_released','err','cancelled'].includes(s)) return 'err';
   return 'idle';
+}
+// ── IX / Infra transforms (/v1/console/infra/summary) ──
+function railSummary(r){ r=r||{}; const on=[]; if(r.tailscale)on.push('tailscale'); if(r.device)on.push('device'); if(r.http_accept_agent_tokens)on.push('agent-token→http'); return on.length?on.join(', '):'none enabled'; }
+function txInfraIndex(json){
+  const s=(json&&json.s)||json||{}; const c=s.checklist||{}; const tick=b=>b?'✓':'○';
+  return [
+    {id:'ix-ck-auth',kind:'tile',label:tick(c.auth_configured)+' Login auth',sub:s.auth_mode||'?',status:c.auth_configured?'ok':'idle',fields:[['auth_mode',s.auth_mode||'?']]},
+    {id:'ix-ck-mcp',kind:'tile',label:tick(c.mcp_enabled)+' MCP',sub:c.mcp_enabled?'enabled':'disabled',status:c.mcp_enabled?'ok':'idle',fields:[]},
+    {id:'ix-ck-machines',kind:'tile',label:tick((c.machines_registered||0)>0)+' Machines captured',sub:(c.machines_registered||0)+' registered · '+(c.machines_with_hooks||0)+' with hooks',status:(c.machines_registered||0)>0?'ok':'idle',fields:[['registered',String(c.machines_registered||0)],['with hooks',String(c.machines_with_hooks||0)]]},
+    {id:'ix-ck-rails',kind:'tile',label:'Auth rails',sub:railSummary(s.rails),status:'idle',fields:[['tailscale',(s.rails&&s.rails.tailscale)?'on':'off'],['device',(s.rails&&s.rails.device)?'on':'off'],['agent-token→http',(s.rails&&s.rails.http_accept_agent_tokens)?'on':'off']]},
+  ];
+}
+function txInfraMachines(json){
+  const ms=(json&&json.machines)||[]; if(!ms.length) return [];
+  return ms.map(m=>{ const r=m.record||{}; return { id:idFor('ixm', m.id), kind:'tile', label:m.id, sub:(r.os||'?')+' · '+(r.rail||'?'), status:r.hooks_installed?'ok':'idle',
+    fields:[['tailnet_ip',r.tailnet_ip||'-'],['os',(r.os||'?')+'/'+(r.arch||'?')],['rail',r.rail||'?'],['hooks',r.hooks_installed?'yes':'no'],['ctl',r.ctl_version||'?']] }; });
+}
+function txInfraRails(json){
+  const r=(json&&json.rails)||{};
+  return [
+    {id:'ix-rail-ts',kind:'tile',label:'Tailscale identity',sub:r.tailscale?'enabled':'disabled',status:r.tailscale?'ok':'idle'},
+    {id:'ix-rail-dev',kind:'tile',label:'Device grant',sub:r.device?'enabled':'disabled',status:r.device?'ok':'idle'},
+    {id:'ix-rail-tok',kind:'tile',label:'Agent token → HTTP',sub:r.http_accept_agent_tokens?'enabled':'disabled',status:r.http_accept_agent_tokens?'ok':'idle'},
+  ];
 }
 function txSessions(json){   // /v1/console/sessions → {session_rows:[{session_id(friendly), agent, raw_key, archived, archived_at}], sessions:[friendly-string] (compat)}
   // Prefer the structured rows; fall back to the flat string list for older daemons.
@@ -1679,6 +1713,10 @@ function registerLoaders(){
   // receipts: no daemon list endpoint — the panel projects this browser's lookup history (no network)
   LOADERS['cx-receipts']      = { fetch: async()=>({ recent: recentReceiptLookups() }), noun:'verified receipts yet — use ✓ Verify receipt (toolbar)', transform: txReceiptRecent };
   LOADERS['cx-gates']         = { endpoint:'/v1/work/gate/pending', noun:'pending gates', transform: txGates };            // M6
+  // IX / Infra — one endpoint feeds all three panels (rails + machines + checklist).
+  LOADERS['ix-index']         = { endpoint:'/v1/console/infra/summary', noun:'checklist items', transform: txInfraIndex };
+  LOADERS['ix-machines']      = { endpoint:'/v1/console/infra/summary', noun:'machines',        transform: txInfraMachines };
+  LOADERS['ix-rails']         = { endpoint:'/v1/console/infra/summary', noun:'rails',           transform: txInfraRails };
   // drill-down loaders (prefix match): orchestrator members + session audit chain + receipt verify + work thread
   LOADERS['__work_thread'] = { match:n=> n.kind==='execplan' && n.__workId, noun:'comments + transitions',
     fetch: async n=>({ com: await api('/v1/work/'+encodeURIComponent(n.__workId)+'/comments').catch(()=>({comments:[]})),

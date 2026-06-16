@@ -25,6 +25,7 @@ mod features;
 mod gpu1;
 mod health;
 mod identity_links;
+mod infra;
 pub mod ingress;
 mod integrations_github;
 mod integrations_openai;
@@ -1122,6 +1123,7 @@ pub fn router(state: AppState) -> Router {
         )
         // Read-only console aggregation APIs.
         .route("/v1/console/summary", get(self::console::get_console_summary))
+        .route("/v1/console/infra/summary", get(self::infra::get_infra_summary))
         .route(
             "/v1/console/storage-breakdown",
             get(self::console::get_console_storage_breakdown),

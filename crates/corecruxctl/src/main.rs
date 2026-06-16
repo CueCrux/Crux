@@ -17,9 +17,9 @@ use clap::{Parser, Subcommand};
 
 use corecruxctl::{
     admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, evidence, explain, extensions, fixture_digest,
-    gaps, identity_cli, inspect_receipt, login, memory, memory_pack, output_verify, parity, projections, receipts,
-    reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import, storage, structured_log, tooling_env,
-    verify_store,
+    gaps, hooks, identity_cli, inspect_receipt, login, machine, memory, memory_pack, output_verify, parity,
+    projections, receipts, reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import, storage, structured_log,
+    tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -53,6 +53,12 @@ enum Command {
         /// Skip the post-login tools/list + fact round-trip verification.
         #[arg(long, default_value_t = false)]
         no_verify: bool,
+        /// Skip installing the Claude Code hooks (banner + observe capture).
+        #[arg(long, default_value_t = false)]
+        no_hooks: bool,
+        /// Skip registering this machine with the daemon.
+        #[arg(long, default_value_t = false)]
+        no_register: bool,
     },
 
     /// Clear stored Crux Daemon credentials (and revoke device refresh credentials).
@@ -70,6 +76,20 @@ enum Command {
         /// Restrict output to a single daemon URL.
         #[arg(long)]
         url: Option<String>,
+    },
+
+    /// Install or inspect the Crux Claude Code hooks (banner + observe capture).
+    #[command(name = "hooks")]
+    Hooks {
+        #[command(subcommand)]
+        command: HooksCommand,
+    },
+
+    /// Register this machine with the daemon, or list registered machines.
+    #[command(name = "machine")]
+    Machine {
+        #[command(subcommand)]
+        command: MachineCommand,
     },
 
     /// Deterministic replay checks from a replay pack (preferred) or legacy JSONL input.
@@ -578,6 +598,41 @@ enum Command {
         /// Emit compact JSON instead of pretty JSON.
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HooksCommand {
+    /// Install the Crux hooks into a Claude Code settings.json.
+    Install {
+        /// Install user-wide (~/.claude/settings.json) instead of the project.
+        #[arg(long, default_value_t = false)]
+        user: bool,
+        /// Project directory (default: current dir → .claude/settings.local.json).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// Show whether the Crux hooks are wired in the target settings.json.
+    Status {
+        #[arg(long, default_value_t = false)]
+        user: bool,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MachineCommand {
+    /// Register (or refresh) this machine's record on the daemon.
+    Register {
+        /// Daemon URL (default: the sole daemon in the credential store).
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// List the machines registered with the daemon.
+    List {
+        #[arg(long)]
+        url: Option<String>,
     },
 }
 
@@ -1868,14 +1923,26 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             token,
             device,
             no_verify,
+            no_hooks,
+            no_register,
         } => login::run(login::LoginArgs {
             url,
             token,
             device,
             no_verify,
+            no_hooks,
+            no_register,
         }),
         Command::Logout { url, all } => login::run_logout(login::LogoutArgs { url, all }),
         Command::Whoami { url } => login::run_whoami(login::WhoamiArgs { url }),
+        Command::Hooks { command } => match command {
+            HooksCommand::Install { user, project } => hooks::run_install(user, project),
+            HooksCommand::Status { user, project } => hooks::run_status(user, project),
+        },
+        Command::Machine { command } => match command {
+            MachineCommand::Register { url } => machine::run_register(url),
+            MachineCommand::List { url } => machine::run_list(url),
+        },
         Command::Replay {
             pack,
             input,
