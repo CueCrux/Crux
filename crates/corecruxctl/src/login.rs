@@ -99,11 +99,16 @@ pub enum AuthPosture {
 pub struct RailInputs {
     /// The resolved daemon HTTP base is a loopback address.
     pub is_loopback: bool,
-    /// `--token` was supplied (or a static token resolved from the environment).
-    pub has_token: bool,
+    /// An explicit `--token` was supplied (forces the static-token rail).
+    pub explicit_token: bool,
+    /// An ambient static token is present (e.g. `CRUX_AGENT_TOKEN` in the env
+    /// file). Used only as a last-resort fallback — it must NOT override an
+    /// explicit `--device`, and (since the MCP agent token lives under the same
+    /// var) it must not hijack the loopback/tailnet rails.
+    pub ambient_token: bool,
     /// `--device` was requested explicitly.
     pub device_flag: bool,
-    /// A verified tailnet identity is present (M2; always false in M1).
+    /// A verified tailnet identity is present.
     pub tailscale_identity: bool,
     /// The probed auth posture.
     pub posture: AuthPosture,
@@ -111,12 +116,14 @@ pub struct RailInputs {
 
 /// Select the highest-preference secure rail for the given signals.
 ///
-/// Explicit operator intent wins (an explicit `--token` or `--device` is honoured
-/// before auto-selection), then auto-selection prefers the lowest-friction rail:
-/// loopback `auth=off` → tailnet identity → (error: a credential is required).
+/// Order: explicit `--token` → explicit `--device` → loopback (`auth=off`) →
+/// tailnet identity → ambient static token (fallback) → error. An *ambient*
+/// token (env-file `CRUX_AGENT_TOKEN`, which doubles as the MCP agent token) is
+/// deliberately the lowest-priority signal so it never hijacks `--device` or the
+/// loopback/tailnet rails.
 pub fn select_rail(inputs: RailInputs) -> Result<Rail, String> {
-    // Explicit operator intent.
-    if inputs.has_token {
+    // Explicit operator intent first.
+    if inputs.explicit_token {
         return Ok(Rail::StaticToken);
     }
     if inputs.device_flag {
@@ -128,6 +135,10 @@ pub fn select_rail(inputs: RailInputs) -> Result<Rail, String> {
     }
     if inputs.tailscale_identity {
         return Ok(Rail::Tailscale);
+    }
+    // Last resort: an ambient static token, if one is present.
+    if inputs.ambient_token {
+        return Ok(Rail::StaticToken);
     }
     let transport_note = if inputs.is_loopback {
         ""
@@ -807,7 +818,20 @@ pub fn run(args: LoginArgs) -> Result<(), DynErr> {
     println!("==========");
 
     let agent = http_agent();
-    let token = resolve_token(&args, &env_vars);
+    // An explicit `--token` forces the static-token rail. An *ambient*
+    // `CRUX_AGENT_TOKEN` from the env file is the MCP agent token — keep it
+    // separate so it never hijacks `--device`/loopback, and never gets stored as
+    // the HTTP credential unless it is genuinely the chosen static token.
+    let explicit_token = args
+        .token
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let ambient_token = env_vars
+        .get("CRUX_AGENT_TOKEN")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let static_token = explicit_token.clone().or_else(|| ambient_token.clone());
 
     // 2. probe each candidate until one is reachable.
     let mut chosen: Option<(String, ProbeResult)> = None;
@@ -826,7 +850,9 @@ pub fn run(args: LoginArgs) -> Result<(), DynErr> {
         chosen.ok_or_else(|| format!("no reachable Crux Daemon among candidates: {}", candidates.join(", ")))?;
 
     let is_loopback = is_loopback_url(&http_base);
-    let posture = probe_posture(&agent, &http_base, token.as_deref())?;
+    // Posture is "does an unauthenticated read get rejected" — probe with no
+    // bearer so an ambient MCP token can't skew the result.
+    let posture = probe_posture(&agent, &http_base, None)?;
     println!(
         "auth posture: {}",
         match posture {
@@ -845,7 +871,8 @@ pub fn run(args: LoginArgs) -> Result<(), DynErr> {
     let tailscale_identity = whoami.as_ref().is_some_and(|w| w.trusted && w.allowlisted);
     let inputs = RailInputs {
         is_loopback,
-        has_token: token.is_some(),
+        explicit_token: explicit_token.is_some(),
+        ambient_token: ambient_token.is_some(),
         device_flag: args.device,
         tailscale_identity,
         posture,
@@ -855,7 +882,7 @@ pub fn run(args: LoginArgs) -> Result<(), DynErr> {
 
     // 4. obtain + persist the credential for the rail.
     let mcp_url = derive_mcp_url(&http_base)?;
-    let (cred, effective_bearer) = build_credential(&agent, rail, &http_base, &mcp_url, token.clone())?;
+    let (cred, effective_bearer) = build_credential(&agent, rail, &http_base, &mcp_url, static_token.clone())?;
     let store_path = credentials_path(&cfg_dir);
     let mut store = load_store(&store_path)?;
     store.upsert(&http_base, cred);
@@ -863,13 +890,25 @@ pub fn run(args: LoginArgs) -> Result<(), DynErr> {
     println!("stored credential → {} (0600)", store_path.display());
 
     // 5. register MCP + verify.
-    register_mcp(&cfg_dir, &mcp_url, effective_bearer.as_deref())?;
+    // Only the static-token rail's token is an MCP agent token; the device /
+    // tailscale rails issue *HTTP* JWTs which must NOT be written over
+    // `CRUX_AGENT_TOKEN` (MCP uses a separate static token). Preserve any
+    // existing MCP token for those rails.
+    let mcp_agent_token = if rail == Rail::StaticToken {
+        effective_bearer.clone()
+    } else {
+        None
+    };
+    register_mcp(&cfg_dir, &mcp_url, mcp_agent_token.as_deref())?;
     println!("registered MCP endpoint {mcp_url} → {}", env_file.display());
 
     if args.no_verify {
         println!("verification skipped (--no-verify)");
     } else {
-        match verify_mcp_tools_list(&agent, &mcp_url, effective_bearer.as_deref()) {
+        // MCP authenticates with the agent token (ambient `CRUX_AGENT_TOKEN`),
+        // not the HTTP bearer — verify with that.
+        let mcp_bearer = mcp_agent_token.or_else(|| ambient_token.clone());
+        match verify_mcp_tools_list(&agent, &mcp_url, mcp_bearer.as_deref()) {
             Ok(n) => println!("verify: MCP tools/list ok ({n} tools)"),
             Err(e) => println!("verify: MCP tools/list skipped ({e})"),
         }
@@ -1069,18 +1108,6 @@ pub fn resolve_fresh_bearer(http_url: &str) -> Result<Option<String>, DynErr> {
     Ok(cred.access_token)
 }
 
-/// Resolve the token to use: explicit `--token` wins, else a static token from
-/// the env file (`CRUX_AGENT_TOKEN`). Never reads it from the process args log.
-fn resolve_token(args: &LoginArgs, env_vars: &BTreeMap<String, String>) -> Option<String> {
-    if let Some(t) = args.token.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        return Some(t.to_string());
-    }
-    env_vars
-        .get("CRUX_AGENT_TOKEN")
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 fn rail_description(rail: Rail) -> &'static str {
     match rail {
         Rail::Loopback => "loopback trust, auth=off — zero friction",
@@ -1114,14 +1141,63 @@ mod tests {
 
     // ── rail selection table (matrix cell → expected rail) ──
 
+    // `has_token` here means an *explicit* --token (the historical meaning of
+    // these cases); ambient token defaults off.
     fn inputs(is_loopback: bool, has_token: bool, device: bool, ts: bool, posture: AuthPosture) -> RailInputs {
         RailInputs {
             is_loopback,
-            has_token,
+            explicit_token: has_token,
+            ambient_token: false,
             device_flag: device,
             tailscale_identity: ts,
             posture,
         }
+    }
+
+    #[test]
+    fn ambient_token_does_not_override_device() {
+        // Regression: an ambient CRUX_AGENT_TOKEN (the MCP agent token) must not
+        // hijack an explicit --device.
+        let r = select_rail(RailInputs {
+            is_loopback: false,
+            explicit_token: false,
+            ambient_token: true,
+            device_flag: true,
+            tailscale_identity: false,
+            posture: AuthPosture::Required,
+        })
+        .unwrap();
+        assert_eq!(r, Rail::Device);
+    }
+
+    #[test]
+    fn ambient_token_does_not_override_loopback() {
+        let r = select_rail(RailInputs {
+            is_loopback: true,
+            explicit_token: false,
+            ambient_token: true,
+            device_flag: false,
+            tailscale_identity: false,
+            posture: AuthPosture::Off,
+        })
+        .unwrap();
+        assert_eq!(r, Rail::Loopback);
+    }
+
+    #[test]
+    fn ambient_token_is_last_resort_fallback() {
+        // No explicit flags, auth required, no identity → fall back to the
+        // ambient static token rather than erroring.
+        let r = select_rail(RailInputs {
+            is_loopback: false,
+            explicit_token: false,
+            ambient_token: true,
+            device_flag: false,
+            tailscale_identity: false,
+            posture: AuthPosture::Required,
+        })
+        .unwrap();
+        assert_eq!(r, Rail::StaticToken);
     }
 
     #[test]
