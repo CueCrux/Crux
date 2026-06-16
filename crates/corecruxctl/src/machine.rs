@@ -27,7 +27,8 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn agent() -> ureq::Agent {
+/// Shared HTTP agent for the infra subcommands (machine / config / session).
+pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(3)))
         .timeout_global(Some(Duration::from_secs(15)))
@@ -79,9 +80,9 @@ fn hooks_installed() -> bool {
     })
 }
 
-/// Resolve which daemon to register against: explicit `--url`, else the sole
-/// daemon in the credential store, else error.
-fn resolve_daemon(url: Option<String>) -> Result<String, DynErr> {
+/// Resolve which daemon to act against: explicit `--url`, else the sole daemon
+/// in the credential store, else error. Shared by the infra subcommands.
+pub(crate) fn resolve_daemon(url: Option<String>) -> Result<String, DynErr> {
     if let Some(u) = url {
         return Ok(login::normalize_http_base(&u)?);
     }
