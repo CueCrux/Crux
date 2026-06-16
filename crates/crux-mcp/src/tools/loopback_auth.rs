@@ -109,21 +109,78 @@ fn mint_loopback_jwt_inner(
     iss: Option<&str>,
     aud: Option<&str>,
 ) -> Result<String, jsonwebtoken::errors::Error> {
-    let claims = LoopbackClaims {
+    mint_scoped_jwt_inner(
+        now_secs,
+        secret,
         iss,
         aud,
-        sub: "mcp-loopback",
-        scopes: LOOPBACK_SCOPES,
-        tenant_id: "*",
+        &ScopedClaims {
+            sub: "mcp-loopback",
+            scopes: LOOPBACK_SCOPES,
+            tenant_id: "*",
+            ttl_secs: JWT_TTL_SECS,
+        },
+    )
+}
+
+/// Parameters for minting a scoped issuance JWT (the tailnet + device rails reuse
+/// this single signing path — see [`crate::tools::loopback_auth`] module docs and
+/// the `crux-unified-login-rails` ExecPlan: "one minter, one scope model").
+///
+/// Unlike the loopback token, an issued credential carries a *specific* subject,
+/// scope set, and `tenant_id` (derived from the approving identity, never
+/// client-supplied — threat ref T.1).
+pub struct ScopedClaims<'a> {
+    /// Token subject (the principal the credential acts as).
+    pub sub: &'a str,
+    /// Granted scopes (the daemon's `scopes_from_claims` reads the `scopes` array).
+    pub scopes: &'a [&'a str],
+    /// Tenant binding. Use a concrete tenant id; `"*"` only for cross-tenant
+    /// internal callers.
+    pub tenant_id: &'a str,
+    /// Lifetime in seconds. Issuance rails MUST keep this ≤ 300 (5 min).
+    pub ttl_secs: u64,
+}
+
+/// Pure: mint a scoped HS256 JWT with the daemon-compatible claim shape. No env
+/// or clock reads; lets tests assert the claim shape against the daemon's
+/// `verify_jwt_hs256` with a deterministic clock.
+pub fn mint_scoped_jwt_inner(
+    now_secs: u64,
+    secret: &[u8],
+    iss: Option<&str>,
+    aud: Option<&str>,
+    claims: &ScopedClaims,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    let payload = LoopbackClaims {
+        iss,
+        aud,
+        sub: claims.sub,
+        scopes: claims.scopes,
+        tenant_id: claims.tenant_id,
         iat: now_secs,
         nbf: now_secs.saturating_sub(JWT_NBF_BACKDATE_SECS),
-        exp: now_secs + JWT_TTL_SECS,
+        exp: now_secs + claims.ttl_secs,
     };
     encode(
         &Header::new(Algorithm::HS256),
-        &claims,
+        &payload,
         &EncodingKey::from_secret(secret),
     )
+}
+
+/// Mint a scoped issuance JWT from the daemon's env (`CORECRUXD_JWT_HS256_SECRET`,
+/// plus optional `CORECRUXD_JWT_ISS` / `CORECRUXD_JWT_AUD`). Returns `None` when
+/// the secret is unset or malformed — issuance requires the daemon to be running
+/// in a JWT mode so the minted token verifies. Not cached: each issued token is a
+/// distinct subject/tenant and is minted per request.
+pub fn mint_scoped_jwt_from_env(claims: &ScopedClaims) -> Option<String> {
+    let secret_raw = std::env::var(JWT_SECRET_ENV).ok()?;
+    let secret = parse_jwt_secret(&secret_raw)?;
+    let iss = std::env::var(JWT_ISS_ENV).ok();
+    let aud = std::env::var(JWT_AUD_ENV).ok();
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    mint_scoped_jwt_inner(now_secs, &secret, iss.as_deref(), aud.as_deref(), claims).ok()
 }
 
 /// Try to mint and cache a loopback JWT from current env + clock.
@@ -295,6 +352,63 @@ mod tests {
         assert_eq!(claims["iat"].as_u64().unwrap(), now);
         assert_eq!(claims["exp"].as_u64().unwrap(), now + 300);
         assert_eq!(claims["nbf"].as_u64().unwrap(), now - 30);
+    }
+
+    #[test]
+    fn scoped_mint_carries_specific_sub_scopes_and_tenant() {
+        // Issuance rails (tailnet/device) mint with a concrete principal +
+        // tenant — not the loopback "*"/mcp-loopback defaults. Verify the claim
+        // shape round-trips through the daemon's validation rules.
+        let secret = b"some-test-secret-bytes-long-enough";
+        let now: u64 = 1_700_000_000;
+        let token = mint_scoped_jwt_inner(
+            now,
+            secret,
+            Some("cuecrux-crux-mint"),
+            Some("crux.cuecrux.com"),
+            &ScopedClaims {
+                sub: "ts:alice@example.com",
+                scopes: &["facts:write", "query:read"],
+                tenant_id: "acme",
+                ttl_secs: 300,
+            },
+        )
+        .unwrap();
+        let claims = verify_with_daemon_rules(&token, secret, Some("cuecrux-crux-mint"), Some("crux.cuecrux.com"));
+        assert_eq!(claims["sub"], "ts:alice@example.com");
+        assert_eq!(claims["tenant_id"], "acme");
+        let scopes: Vec<&str> = claims["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert_eq!(scopes, vec!["facts:write", "query:read"]);
+        assert_eq!(claims["exp"].as_u64().unwrap(), now + 300);
+        assert_eq!(claims["nbf"].as_u64().unwrap(), now - 30);
+    }
+
+    #[test]
+    fn loopback_inner_matches_scoped_inner_for_loopback_defaults() {
+        // The loopback minter must remain a thin wrapper over the scoped minter:
+        // identical inputs ⇒ identical token (one signing path).
+        let secret = b"some-test-secret-bytes-long-enough";
+        let now: u64 = 1_700_000_000;
+        let a = mint_loopback_jwt_inner(now, secret, None, None).unwrap();
+        let b = mint_scoped_jwt_inner(
+            now,
+            secret,
+            None,
+            None,
+            &ScopedClaims {
+                sub: "mcp-loopback",
+                scopes: LOOPBACK_SCOPES,
+                tenant_id: "*",
+                ttl_secs: JWT_TTL_SECS,
+            },
+        )
+        .unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]

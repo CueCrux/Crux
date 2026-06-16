@@ -146,8 +146,82 @@ pub fn routes(enabled: bool) -> Router {
         .route("/playground", get(serve_console))
         .route("/console-assets/{name}", get(serve_console_asset))
         .route("/console-3d/{*path}", get(serve_console3d))
+        // Device-grant approval page (ExecPlan crux-unified-login-rails, M3).
+        .route("/activate", get(serve_activate))
         .layer(CorsLayer::permissive())
 }
+
+/// `/activate` — operator approval page for the device-authorization grant.
+/// The form POSTs to `/v1/auth/device/approve` on the same origin; that endpoint
+/// is gated to an authenticated console admin (`admin:write`) and the
+/// approver-chosen tenant + scopes are what get minted (threat ref T.1).
+async fn serve_activate() -> impl IntoResponse {
+    Html(ACTIVATE_HTML)
+}
+
+const ACTIVATE_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Crux — Approve device login</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; }
+  label { display: block; margin: 0.75rem 0 0.25rem; font-weight: 600; }
+  input { width: 100%; padding: 0.5rem; font-size: 1rem; box-sizing: border-box; }
+  .row { display: flex; gap: 0.75rem; margin-top: 1.25rem; }
+  button { flex: 1; padding: 0.6rem; font-size: 1rem; cursor: pointer; border-radius: 6px; border: 1px solid #888; }
+  button.approve { background: #1a7f37; color: #fff; border-color: #1a7f37; }
+  button.deny { background: #fff; color: #b00; border-color: #b00; }
+  #result { margin-top: 1rem; padding: 0.75rem; border-radius: 6px; white-space: pre-wrap; }
+  .ok { background: #e6ffed; } .err { background: #ffeef0; }
+  small { color: #555; }
+</style>
+</head>
+<body>
+  <h1>Approve a device login</h1>
+  <p><small>Enter the code shown by the client, choose the tenant and scopes to
+  grant, then approve. Only approve codes you initiated.</small></p>
+  <label for="user_code">User code</label>
+  <input id="user_code" placeholder="ABCD-2345" autocomplete="off" />
+  <label for="tenant_id">Tenant</label>
+  <input id="tenant_id" placeholder="acme" autocomplete="off" />
+  <label for="scopes">Scopes (space or comma separated)</label>
+  <input id="scopes" placeholder="query:read facts:write" autocomplete="off" />
+  <div class="row">
+    <button class="approve" onclick="decide(false)">Approve</button>
+    <button class="deny" onclick="decide(true)">Deny</button>
+  </div>
+  <div id="result" hidden></div>
+<script>
+async function decide(deny) {
+  const out = document.getElementById('result');
+  const scopes = document.getElementById('scopes').value.split(/[\s,]+/).filter(Boolean);
+  const body = {
+    user_code: document.getElementById('user_code').value.trim(),
+    tenant_id: document.getElementById('tenant_id').value.trim(),
+    scopes: scopes,
+    deny: deny,
+  };
+  try {
+    const resp = await fetch('/v1/auth/device/approve', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(body),
+    });
+    const text = await resp.text();
+    out.hidden = false;
+    out.className = resp.ok ? 'ok' : 'err';
+    out.textContent = (resp.ok ? 'OK — ' : ('HTTP ' + resp.status + ' — ')) + text;
+  } catch (e) {
+    out.hidden = false; out.className = 'err'; out.textContent = String(e);
+  }
+}
+</script>
+</body>
+</html>"#;
 
 fn resolve_console_html() -> Cow<'static, str> {
     match dev_html_override() {

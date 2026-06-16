@@ -17,8 +17,9 @@ use clap::{Parser, Subcommand};
 
 use corecruxctl::{
     admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, evidence, explain, extensions, fixture_digest,
-    gaps, identity_cli, inspect_receipt, memory, memory_pack, output_verify, parity, projections, receipts, reconcile,
-    replay, shard, shardmap, smoke, snapshot, stage1_import, storage, structured_log, tooling_env, verify_store,
+    gaps, identity_cli, inspect_receipt, login, memory, memory_pack, output_verify, parity, projections, receipts,
+    reconcile, replay, shard, shardmap, smoke, snapshot, stage1_import, storage, structured_log, tooling_env,
+    verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -32,6 +33,45 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)] // CLI subcommands — allocation cost is negligible at startup
 enum Command {
+    /// Authenticate to a Crux Daemon, auto-selecting the lowest-friction secure rail.
+    ///
+    /// Discovers the daemon (--url → ~/.config/cuecrux/env → localhost), probes
+    /// reachability + auth posture, picks a rail (loopback / static token / —
+    /// tailscale + device land in M2/M3), persists the credential to
+    /// ~/.config/cuecrux/credentials.json (0600), registers the MCP endpoint, and
+    /// verifies the connection.
+    Login {
+        /// Explicit daemon URL (e.g. http://127.0.0.1:14800 or https://crux.example.com).
+        #[arg(long)]
+        url: Option<String>,
+        /// Static named token (Rail 4) for CI / headless / air-gapped clients.
+        #[arg(long)]
+        token: Option<String>,
+        /// Force the device-authorization grant (Rail 3; lands in M3).
+        #[arg(long, default_value_t = false)]
+        device: bool,
+        /// Skip the post-login tools/list + fact round-trip verification.
+        #[arg(long, default_value_t = false)]
+        no_verify: bool,
+    },
+
+    /// Clear stored Crux Daemon credentials (and revoke device refresh credentials).
+    Logout {
+        /// Daemon URL to log out of.
+        #[arg(long)]
+        url: Option<String>,
+        /// Log out of every stored daemon.
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
+
+    /// Show stored Crux Daemon credential posture per daemon.
+    Whoami {
+        /// Restrict output to a single daemon URL.
+        #[arg(long)]
+        url: Option<String>,
+    },
+
     /// Deterministic replay checks from a replay pack (preferred) or legacy JSONL input.
     Replay {
         /// Replay pack directory (normative contract for v3.1 hardening).
@@ -1823,6 +1863,19 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match cli.command {
+        Command::Login {
+            url,
+            token,
+            device,
+            no_verify,
+        } => login::run(login::LoginArgs {
+            url,
+            token,
+            device,
+            no_verify,
+        }),
+        Command::Logout { url, all } => login::run_logout(login::LogoutArgs { url, all }),
+        Command::Whoami { url } => login::run_whoami(login::WhoamiArgs { url }),
         Command::Replay {
             pack,
             input,

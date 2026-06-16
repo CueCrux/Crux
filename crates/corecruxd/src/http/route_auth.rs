@@ -58,6 +58,15 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
         return Some(RouteAuthContract::new(RouteAuthClass::Public, &[]));
     }
 
+    if path.starts_with("/v1/auth/") {
+        // Unified-login auth rails (whoami, tailscale token, device grant) perform
+        // their own identity gating (verified tailnet identity, device-grant
+        // codes) and are reachable without a prior bearer by design — that is the
+        // bootstrap they exist to provide. The device *approve* step is gated to
+        // an authenticated console admin inside the handler, not by route scope.
+        return Some(RouteAuthContract::new(RouteAuthClass::Public, &[]));
+    }
+
     if path.starts_with("/v1/internal/replication/") {
         return Some(RouteAuthContract::new(
             RouteAuthClass::InternalReplication,
