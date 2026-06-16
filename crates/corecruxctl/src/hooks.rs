@@ -239,3 +239,50 @@ pub fn run_status(user: bool, project: Option<PathBuf>) -> Result<(), DynErr> {
     );
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hooks_block_observe_only_when_no_binary() {
+        let w = Path::new("/x/crux-hook-env.sh");
+        let h = build_hooks_block(w, false);
+        let map = h.as_object().unwrap();
+        for ev in ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"] {
+            assert!(map.contains_key(ev), "missing {ev}");
+        }
+        assert!(!map.contains_key("PreCompact"));
+        assert!(!h.to_string().contains("banner"));
+    }
+
+    #[test]
+    fn hooks_block_adds_banner_when_binary_present() {
+        let w = Path::new("/x/crux-hook-env.sh");
+        let h = build_hooks_block(w, true);
+        assert!(h.as_object().unwrap().contains_key("PreCompact"));
+        let s = h.to_string();
+        assert!(s.contains("banner"));
+        assert!(s.contains("precompact"));
+        assert!(s.contains("context"));
+    }
+
+    #[test]
+    fn merge_is_idempotent_and_preserves_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"permissions":{"allow":["x"]}}"#).unwrap();
+        let w = Path::new("/x/crux-hook-env.sh");
+
+        merge_into_settings(&path, build_hooks_block(w, true)).unwrap();
+        let after1 = std::fs::read_to_string(&path).unwrap();
+        merge_into_settings(&path, build_hooks_block(w, true)).unwrap();
+        let after2 = std::fs::read_to_string(&path).unwrap();
+
+        assert_eq!(after1, after2, "merge must be idempotent");
+        let v: serde_json::Value = serde_json::from_str(&after2).unwrap();
+        assert_eq!(v["permissions"]["allow"][0], "x", "preserves existing keys");
+        assert!(v["hooks"]["SessionStart"].is_array());
+    }
+}

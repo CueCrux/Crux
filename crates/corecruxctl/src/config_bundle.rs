@@ -73,29 +73,73 @@ fn key_is_secret(key: &str) -> bool {
     .any(|needle| k.contains(needle))
 }
 
-/// Recursively replace values under secret-looking keys with `"${REDACTED}"`.
-/// Returns whether anything was redacted.
-fn redact_json(value: &mut serde_json::Value) -> bool {
-    let mut redacted = false;
-    match value {
-        serde_json::Value::Object(map) => {
-            for (k, v) in map.iter_mut() {
-                if key_is_secret(k) && (v.is_string() || v.is_number()) {
-                    *v = serde_json::Value::String("${REDACTED}".to_string());
-                    redacted = true;
-                } else {
-                    redacted |= redact_json(v);
-                }
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                redacted |= redact_json(v);
-            }
-        }
-        _ => {}
+/// Whether a string *value* looks like a secret regardless of its key — catches
+/// tokens hidden under innocuous keys (`url`, `args`, `env`, …). Conservative:
+/// known prefixes, `Bearer …`, and long token-shaped strings (no spaces / path
+/// separators, so prose and file paths are left alone).
+fn value_looks_secret(s: &str) -> bool {
+    let t = s.trim();
+    if t.starts_with("Bearer ") || t.starts_with("bearer ") {
+        return true;
     }
-    redacted
+    let lower = t.to_ascii_lowercase();
+    for prefix in [
+        "sk-",
+        "sk_",
+        "ghp_",
+        "gho_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "aws_",
+        "akia",
+        "glpat-",
+        "eyj",
+    ] {
+        if lower.starts_with(prefix) {
+            return true;
+        }
+    }
+    // Token-shaped: long, single run of base64/hex chars, no path/prose markers.
+    let token_shaped = t.len() >= 40
+        && !t.contains(['/', ' ', '\t', '\n', '.', ':'])
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '='));
+    token_shaped
+}
+
+/// Recursively redact secrets: values under secret-looking keys, plus any string
+/// value that looks like a token. Returns whether anything was redacted.
+fn redact_json(value: &mut serde_json::Value) -> bool {
+    fn redact_entry(key: Option<&str>, v: &mut serde_json::Value) -> bool {
+        let key_secret = key.is_some_and(key_is_secret);
+        match v {
+            serde_json::Value::String(s) if key_secret || value_looks_secret(s) => {
+                *v = serde_json::Value::String("${REDACTED}".to_string());
+                true
+            }
+            serde_json::Value::Number(_) if key_secret => {
+                *v = serde_json::Value::String("${REDACTED}".to_string());
+                true
+            }
+            serde_json::Value::Object(map) => {
+                let mut any = false;
+                for (k, child) in map.iter_mut() {
+                    any |= redact_entry(Some(k), child);
+                }
+                any
+            }
+            serde_json::Value::Array(arr) => {
+                let mut any = false;
+                for child in arr.iter_mut() {
+                    any |= redact_entry(None, child);
+                }
+                any
+            }
+            _ => false,
+        }
+    }
+    redact_entry(None, value)
 }
 
 /// The curated set of `~/.claude` paths to capture. Top-level config files plus
@@ -310,10 +354,10 @@ pub fn run_pull(name: String, url: Option<String>) -> Result<(), DynErr> {
         ) else {
             continue;
         };
-        if rel.contains("..") {
-            continue; // path-traversal guard
-        }
-        let target = base.join(rel);
+        let Some(target) = safe_target(&base, rel) else {
+            println!("  skip unsafe path '{rel}'");
+            continue;
+        };
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -334,6 +378,23 @@ pub fn run_pull(name: String, url: Option<String>) -> Result<(), DynErr> {
         }
     }
     Ok(())
+}
+
+/// Resolve a bundle-relative path under `base`, rejecting absolute paths and any
+/// `..` traversal. Returns `None` for unsafe input.
+fn safe_target(base: &Path, rel: &str) -> Option<PathBuf> {
+    let rp = Path::new(rel);
+    if rp.is_absolute() {
+        return None;
+    }
+    for comp in rp.components() {
+        match comp {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            // ParentDir / RootDir / Prefix → reject.
+            _ => return None,
+        }
+    }
+    Some(base.join(rp))
 }
 
 #[cfg(test)]
@@ -365,5 +426,39 @@ mod tests {
         assert_eq!(v["mcpServers"]["x"]["command"], "node");
         assert_eq!(v["list"][0]["api_key"], "${REDACTED}");
         assert_eq!(v["keep"], "value");
+    }
+
+    #[test]
+    fn value_based_redaction_catches_hidden_tokens() {
+        // A token under an innocuous key + in an array is redacted; prose/paths/short are not.
+        assert!(value_looks_secret("ghp_0123456789ABCDEFabcdef0123456789ABCD"));
+        assert!(value_looks_secret("Bearer abc.def.ghi"));
+        assert!(value_looks_secret("0123456789abcdef0123456789abcdef0123456789ab")); // 44-char hex
+        assert!(!value_looks_secret("claude-opus-4-8"));
+        assert!(!value_looks_secret(
+            "/home/myles/.local/share/crux/hooks/crux-hook-env.sh"
+        ));
+        assert!(!value_looks_secret("a short value with spaces"));
+
+        let mut v = serde_json::json!({
+            "args": ["--key", "ghp_0123456789ABCDEFabcdef0123456789ABCD"],
+            "url": "https://example.com/path",
+            "note": "just prose here"
+        });
+        assert!(redact_json(&mut v));
+        assert_eq!(v["args"][1], "${REDACTED}");
+        assert_eq!(v["args"][0], "--key");
+        assert_eq!(v["url"], "https://example.com/path");
+        assert_eq!(v["note"], "just prose here");
+    }
+
+    #[test]
+    fn safe_target_blocks_traversal_and_absolute() {
+        let base = Path::new("/home/u/.claude");
+        assert_eq!(safe_target(base, "settings.json"), Some(base.join("settings.json")));
+        assert_eq!(safe_target(base, "commands/x.md"), Some(base.join("commands/x.md")));
+        assert!(safe_target(base, "../../../etc/passwd").is_none());
+        assert!(safe_target(base, "a/../../b").is_none());
+        assert!(safe_target(base, "/etc/passwd").is_none());
     }
 }
