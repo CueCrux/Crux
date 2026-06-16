@@ -161,6 +161,15 @@ and revocable (`logout` revokes it). Off-host rails require encrypted transport
 (WireGuard for tailnet, TLS for remote) — a plaintext non-loopback `auth=off`
 bind is refused.
 
+**One credential for HTTP + MCP.** HTTP (`:14800`) and MCP (`:14801`) use
+different auth systems (signed JWT vs the `CRUX_AGENT_TOKENS` registry). To unlock
+both with a single login, set `CORECRUXD_HTTP_ACCEPT_AGENT_TOKENS=1`: under a JWT
+mode the HTTP API then *also* accepts a registered MCP agent token (mapped to
+`CORECRUXD_AGENT_TOKEN_HTTP_SCOPES` / `CORECRUXD_AGENT_TOKEN_HTTP_TENANT`). Then
+`corecruxctl login --token <agent-token>` stores one long-lived token that works
+on both ports, survives daemon restarts, and works with native MCP clients that
+send a fixed bearer. Default off, so HTTP stays JWT-only unless you opt in.
+
 Daemon-side rails 2 and 3 are opt-in and default off (see `config.example.env`:
 `CORECRUXD_TS_IDENTITY_ENABLED`, `CORECRUXD_DEVICE_GRANT_ENABLED`). Issuance mints
 HS256 JWTs, so the daemon must run in `jwt_hs256` mode. The issued `tenant_id`
