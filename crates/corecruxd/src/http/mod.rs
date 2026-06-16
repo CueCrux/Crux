@@ -8,6 +8,8 @@ mod actions;
 mod admin;
 mod agent_usage;
 mod append;
+mod auth_device;
+mod auth_rails;
 mod cloud;
 mod console;
 mod context_surface;
@@ -352,6 +354,32 @@ pub fn router(state: AppState) -> Router {
             get(self::receipts::get_receipt_verification_v1),
         )
         .route("/v1/witness/smoke", get(self::witness::get_witness_smoke))
+        // Unified-login auth rails (ExecPlan crux-unified-login-rails).
+        .route("/v1/auth/whoami", get(self::auth_rails::get_whoami))
+        .route(
+            "/v1/auth/tailscale/token",
+            axum::routing::post(self::auth_rails::post_tailscale_token),
+        )
+        .route(
+            "/v1/auth/device/start",
+            axum::routing::post(self::auth_device::post_device_start),
+        )
+        .route(
+            "/v1/auth/device/token",
+            axum::routing::post(self::auth_device::post_device_token),
+        )
+        .route(
+            "/v1/auth/device/approve",
+            axum::routing::post(self::auth_device::post_device_approve),
+        )
+        .route(
+            "/v1/auth/device/refresh",
+            axum::routing::post(self::auth_device::post_device_refresh),
+        )
+        .route(
+            "/v1/auth/device/revoke",
+            axum::routing::post(self::auth_device::post_device_revoke),
+        )
         .route(
             "/v1/replay/exports/receipts/{receiptId}",
             get(self::receipts::get_receipt_export_v1),

@@ -125,6 +125,49 @@ curl -s -X POST http://localhost:14801/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_agent_identity","arguments":{}}}'
 ```
 
+## Unified login (`crux login`)
+
+One command authenticates a client to a daemon wherever it lives, auto-selecting
+the lowest-friction *secure* rail. The shipped binary is `corecruxctl`:
+
+```bash
+corecruxctl login                 # discover + auto-select a rail
+corecruxctl login --url https://crux.example.com
+corecruxctl login --token <static-named-token>   # CI / headless / air-gapped
+corecruxctl login --device        # force the browser device-grant flow
+corecruxctl whoami                # show stored credential posture per daemon
+corecruxctl logout --url <daemon> # revoke + clear (or --all)
+```
+
+`login` discovers the daemon (`--url` → `~/.config/cuecrux/env` → localhost),
+probes `/readyz` + `/v1/version` for reachability and a Read route for the auth
+posture, picks a rail, persists the credential to
+`~/.config/cuecrux/credentials.json` (mode `0600`), registers the MCP endpoint in
+`~/.config/cuecrux/env`, and verifies `tools/list` + a `store_fact`→`query_facts`
+round-trip.
+
+The four rails, in auto-selection preference order:
+
+| Rail | When | Credential |
+|---|---|---|
+| 1 — loopback | same host, `auth=off` | none |
+| 2 — tailscale | verified tailnet identity (`tailscale serve`) | daemon-minted scoped JWT |
+| 3 — device | no host/env access (remote) | device-grant access + refresh token |
+| 4 — static token | `--token` / CI / air-gapped | operator-provided named token |
+
+An explicit `--token` or `--device` overrides auto-selection. Short-lived access
+tokens (≤5 min JWTs) auto-refresh; the device rail's refresh credential is named
+and revocable (`logout` revokes it). Off-host rails require encrypted transport
+(WireGuard for tailnet, TLS for remote) — a plaintext non-loopback `auth=off`
+bind is refused.
+
+Daemon-side rails 2 and 3 are opt-in and default off (see `config.example.env`:
+`CORECRUXD_TS_IDENTITY_ENABLED`, `CORECRUXD_DEVICE_GRANT_ENABLED`). Issuance mints
+HS256 JWTs, so the daemon must run in `jwt_hs256` mode. The issued `tenant_id`
+and scopes are always set by the approving identity (tailnet allowlist or device
+approver), never by the requesting client — this is what keeps cross-tenant
+issuance closed (threat ref T.1).
+
 ## Human-Guided vs Automatic Integration
 
 Choose the integration style that matches the environment:

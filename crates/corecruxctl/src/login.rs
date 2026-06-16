@@ -1,0 +1,1345 @@
+// Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+// Licensed under the CueCrux Community Licence (CCL v1.0).
+// See LICENCE.md in the repository root.
+
+//! `corecruxctl login` — unified, auto-selected auth rails for the Crux Daemon.
+//!
+//! One command authenticates a client to a daemon wherever it lives, picking
+//! the lowest-friction *secure* rail automatically:
+//!
+//! 1. **discover** the daemon: `--url` → `~/.config/cuecrux/env` → localhost.
+//!    (Tailnet MagicDNS discovery arrives with the Tailscale rail, M2.)
+//! 2. **probe** `/readyz` + `/v1/version` for reachability + version, then an
+//!    authenticated read route to learn the auth posture (off vs required).
+//! 3. **select a rail** (highest-preference reachable & secure):
+//!    - Rail 1 `loopback` + `auth=off`  → no credential.
+//!    - Rail 2 `tailscale` identity      → daemon auto-mints a scoped JWT (M2).
+//!    - Rail 3 `device` grant            → device-authorization flow (M3).
+//!    - Rail 4 `static_token` (`--token`)→ store a static named token (CI/air-gapped).
+//! 4. **persist** the credential → `~/.config/cuecrux/credentials.json` (0600).
+//! 5. **register MCP** for the resolved daemon (`~/.config/cuecrux/env`) and
+//!    verify `tools/list` + a `store_fact`→`query_facts` round-trip.
+//!
+//! This module is the M1 scaffold: Rail 1 (loopback) and Rail 4 (`--token`) are
+//! wired end-to-end with no daemon changes. The Tailscale and device rails are
+//! recognised by the selector but gated to "not yet implemented" until M2/M3.
+//! Network I/O is isolated in thin functions; the rail-selection, credential
+//! store, URL, and env-file logic is pure and unit-tested.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+type DynErr = Box<dyn std::error::Error + Send + Sync>;
+
+/// Default loopback HTTP base for the Crux Daemon. Port 14800 is fixed.
+pub const DEFAULT_HTTP_BASE: &str = "http://127.0.0.1:14800";
+/// HTTP port (REST API). Never changed.
+pub const HTTP_PORT: u16 = 14800;
+/// MCP port (agent-facing tools). Never changed.
+pub const MCP_PORT: u16 = 14801;
+/// Credential store schema version. Bump on incompatible shape changes.
+const STORE_SCHEMA_VERSION: u32 = 1;
+
+// ──────────────────────────────────────────────────────────────────────────
+// Rails + posture
+// ──────────────────────────────────────────────────────────────────────────
+
+/// The auth rail selected for a daemon. Each rail degrades closed: an off-host
+/// rail only works over encrypted transport, and every issued credential reuses
+/// the daemon's existing scope model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rail {
+    /// Rail 1 — loopback trust on a daemon with `auth=off`. No credential.
+    Loopback,
+    /// Rail 2 — verified tailnet identity → daemon-minted scoped JWT (M2).
+    Tailscale,
+    /// Rail 3 — RFC 8628 device-authorization grant (M3).
+    Device,
+    /// Rail 4 — operator-provided static named token (CI / air-gapped).
+    StaticToken,
+}
+
+impl Rail {
+    /// Stable string form persisted in the credential store.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Rail::Loopback => "loopback",
+            Rail::Tailscale => "tailscale",
+            Rail::Device => "device",
+            Rail::StaticToken => "static_token",
+        }
+    }
+
+    /// Whether this rail is wired end-to-end in the current build. All four
+    /// rails are implemented as of M4 (loopback + static token in M1, tailscale
+    /// in M2, device grant in M3).
+    pub fn is_implemented(self) -> bool {
+        matches!(
+            self,
+            Rail::Loopback | Rail::StaticToken | Rail::Tailscale | Rail::Device
+        )
+    }
+}
+
+/// The daemon's authentication posture as observed by an unauthenticated probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthPosture {
+    /// `auth=off` — read routes succeed without a credential.
+    Off,
+    /// A credential is required (any of `dev_scopes` / `jwt_hs256` / `jwt_jwks`).
+    Required,
+}
+
+/// Signals fed to rail selection. Kept as a plain struct so the selection table
+/// is exhaustively unit-testable without any network or environment access.
+#[derive(Debug, Clone, Copy)]
+pub struct RailInputs {
+    /// The resolved daemon HTTP base is a loopback address.
+    pub is_loopback: bool,
+    /// `--token` was supplied (or a static token resolved from the environment).
+    pub has_token: bool,
+    /// `--device` was requested explicitly.
+    pub device_flag: bool,
+    /// A verified tailnet identity is present (M2; always false in M1).
+    pub tailscale_identity: bool,
+    /// The probed auth posture.
+    pub posture: AuthPosture,
+}
+
+/// Select the highest-preference secure rail for the given signals.
+///
+/// Explicit operator intent wins (an explicit `--token` or `--device` is honoured
+/// before auto-selection), then auto-selection prefers the lowest-friction rail:
+/// loopback `auth=off` → tailnet identity → (error: a credential is required).
+pub fn select_rail(inputs: RailInputs) -> Result<Rail, String> {
+    // Explicit operator intent.
+    if inputs.has_token {
+        return Ok(Rail::StaticToken);
+    }
+    if inputs.device_flag {
+        return Ok(Rail::Device);
+    }
+    // Auto-selection: cheapest secure rail first.
+    if inputs.posture == AuthPosture::Off {
+        return Ok(Rail::Loopback);
+    }
+    if inputs.tailscale_identity {
+        return Ok(Rail::Tailscale);
+    }
+    let transport_note = if inputs.is_loopback {
+        ""
+    } else {
+        " (off-host rails require encrypted transport)"
+    };
+    Err(format!(
+        "daemon requires authentication but no rail is available: pass --token for a static named \
+         token (Rail 4), or use --device for the device grant (Rail 3, lands in M3){transport_note}"
+    ))
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Credential store  (~/.config/cuecrux/credentials.json, 0600)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// One daemon's stored credential, keyed in the store by its HTTP URL.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonCredential {
+    /// Which rail produced this credential (`as_str` of [`Rail`]).
+    pub rail: String,
+    /// Short-lived access token (JWT) or static named token. Absent for Rail 1.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub access_token: Option<String>,
+    /// Long-lived, named + revocable refresh credential (device rail; M3).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub refresh_token: Option<String>,
+    /// Unix-seconds expiry of `access_token`, if it is short-lived.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub expiry: Option<u64>,
+    /// Scopes granted to this credential (informational; the daemon is the gate).
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Resolved MCP endpoint for this daemon.
+    pub mcp_url: String,
+    /// Resolved HTTP base for this daemon.
+    pub http_url: String,
+}
+
+/// The on-disk credential store, keyed by daemon HTTP URL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialStore {
+    /// Schema version for forward-compatibility.
+    #[serde(default = "default_schema_version")]
+    pub version: u32,
+    /// daemon HTTP URL → credential.
+    #[serde(default)]
+    pub daemons: BTreeMap<String, DaemonCredential>,
+}
+
+fn default_schema_version() -> u32 {
+    STORE_SCHEMA_VERSION
+}
+
+impl Default for CredentialStore {
+    fn default() -> Self {
+        Self {
+            version: STORE_SCHEMA_VERSION,
+            daemons: BTreeMap::new(),
+        }
+    }
+}
+
+impl CredentialStore {
+    /// Insert or replace the credential for `http_url`.
+    pub fn upsert(&mut self, http_url: &str, cred: DaemonCredential) {
+        self.daemons.insert(http_url.to_string(), cred);
+    }
+}
+
+/// Resolve `~/.config/cuecrux` from `$HOME`. Returns `None` when `$HOME` is unset.
+pub fn config_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| Path::new(&home).join(".config").join("cuecrux"))
+}
+
+/// Path to the credential store under a given config dir.
+pub fn credentials_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("credentials.json")
+}
+
+/// Path to the shared env file under a given config dir.
+pub fn env_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("env")
+}
+
+/// Load the credential store, returning an empty store if the file is absent.
+pub fn load_store(path: &Path) -> Result<CredentialStore, DynErr> {
+    match std::fs::read_to_string(path) {
+        Ok(s) if s.trim().is_empty() => Ok(CredentialStore::default()),
+        Ok(s) => Ok(serde_json::from_str(&s)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CredentialStore::default()),
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+/// Persist the credential store with owner-only (0600) permissions, creating
+/// the parent directory if needed. The directory is created 0700 on unix.
+pub fn save_store(path: &Path, store: &CredentialStore) -> Result<(), DynErr> {
+    if let Some(parent) = path.parent() {
+        create_dir_private(parent)?;
+    }
+    let json = serde_json::to_string_pretty(store)?;
+    write_private(path, json.as_bytes())?;
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Private filesystem helpers (0600 files, 0700 dirs)
+// ──────────────────────────────────────────────────────────────────────────
+
+fn create_dir_private(dir: &Path) -> Result<(), DynErr> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(dir)?.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(dir, perms)?;
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `path`, leaving the file 0600. Truncates any existing file.
+#[cfg(unix)]
+fn write_private(path: &Path, bytes: &[u8]) -> Result<(), DynErr> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)?;
+    // Re-assert in case the file pre-existed with looser perms (the create-mode
+    // does not relax an existing file's bits).
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, bytes: &[u8]) -> Result<(), DynErr> {
+    use std::io::Write as _;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(bytes)?;
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// URL helpers
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Normalise a user-supplied daemon URL into an HTTP base: add `http://` when no
+/// scheme is present and strip a trailing slash. Returns an error for input that
+/// cannot be parsed as a URL.
+pub fn normalize_http_base(input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("empty daemon URL".to_string());
+    }
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let parsed = url::Url::parse(&with_scheme).map_err(|e| format!("invalid daemon URL '{input}': {e}"))?;
+    if parsed.host_str().is_none() {
+        return Err(format!("daemon URL '{input}' has no host"));
+    }
+    Ok(with_scheme.trim_end_matches('/').to_string())
+}
+
+/// Derive the MCP endpoint (`http(s)://host:14801/mcp`) from an HTTP base.
+/// The MCP port is fixed at 14801; only the port and path are rewritten.
+pub fn derive_mcp_url(http_base: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(http_base).map_err(|e| format!("invalid HTTP base '{http_base}': {e}"))?;
+    let scheme = parsed.scheme();
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("HTTP base '{http_base}' has no host"))?;
+    Ok(format!("{scheme}://{host}:{MCP_PORT}/mcp"))
+}
+
+/// Whether an HTTP base points at a loopback address (127.0.0.0/8, ::1, localhost).
+pub fn is_loopback_url(http_base: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(http_base) else {
+        return false;
+    };
+    match parsed.host_str() {
+        Some("localhost") => true,
+        Some(host) => {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+                return v4.is_loopback();
+            }
+            if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+                return v6.is_loopback();
+            }
+            false
+        }
+        None => false,
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Env-file parsing + discovery
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Parse a dotenv-style `KEY=VALUE` file. Blank lines and `#` comments are
+/// skipped; a leading `export ` is tolerated; surrounding quotes are stripped.
+pub fn parse_env_file(content: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let val = v.trim().trim_matches('"').trim_matches('\'').to_string();
+        out.insert(key, val);
+    }
+    out
+}
+
+/// Merge `updates` into the existing env-file `content`, replacing in place where
+/// a key already exists and appending new keys at the end. Comments and unrelated
+/// lines are preserved. Returns the rendered file content.
+pub fn render_env_file(existing: &str, updates: &BTreeMap<String, String>) -> String {
+    let mut applied: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut lines: Vec<String> = Vec::new();
+    for raw in existing.lines() {
+        let trimmed = raw.trim();
+        let body = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        if let Some((k, _)) = body.split_once('=') {
+            let key = k.trim();
+            if let Some(val) = updates.get(key) {
+                lines.push(format!("{key}={val}"));
+                applied.insert(key.to_string());
+                continue;
+            }
+        }
+        lines.push(raw.to_string());
+    }
+    for (key, val) in updates {
+        if !applied.contains(key) {
+            lines.push(format!("{key}={val}"));
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// Build the ordered daemon-discovery candidate list from the available signals.
+///
+/// Order: explicit `--url` → `CRUX_HTTP_URL` / `CORECRUXD_HTTP_URL` from the env
+/// file → an HTTP base derived from `CRUX_MCP_URL` in the env file → localhost.
+/// Each entry is normalised; duplicates and un-parseable entries are dropped.
+pub fn discover_candidates(explicit: Option<&str>, env_vars: &BTreeMap<String, String>) -> Vec<String> {
+    let mut raw: Vec<String> = Vec::new();
+    if let Some(u) = explicit {
+        raw.push(u.to_string());
+    }
+    for key in ["CRUX_HTTP_URL", "CORECRUXD_HTTP_URL"] {
+        if let Some(v) = env_vars.get(key) {
+            if !v.trim().is_empty() {
+                raw.push(v.clone());
+            }
+        }
+    }
+    if let Some(mcp) = env_vars.get("CRUX_MCP_URL") {
+        if let Some(base) = http_base_from_mcp_url(mcp) {
+            raw.push(base);
+        }
+    }
+    raw.push(DEFAULT_HTTP_BASE.to_string());
+
+    let mut out: Vec<String> = Vec::new();
+    for candidate in raw {
+        if let Ok(norm) = normalize_http_base(&candidate) {
+            if !out.contains(&norm) {
+                out.push(norm);
+            }
+        }
+    }
+    out
+}
+
+/// Derive an HTTP base from an MCP URL by rewriting the port to 14800 and
+/// dropping the path. Returns `None` if the MCP URL cannot be parsed.
+fn http_base_from_mcp_url(mcp_url: &str) -> Option<String> {
+    let parsed = url::Url::parse(mcp_url.trim()).ok()?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str()?;
+    Some(format!("{scheme}://{host}:{HTTP_PORT}"))
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Network probes (thin wrappers over ureq; not unit-tested without a server)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Outcome of probing a daemon for reachability + version.
+#[derive(Debug, Clone)]
+pub struct ProbeResult {
+    pub version: String,
+}
+
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(3)))
+        .timeout_global(Some(Duration::from_secs(15)))
+        // Treat non-2xx as a normal response (not a transport error) so we can
+        // read status codes *and* error bodies — the device-grant poll returns
+        // its `authorization_pending`/`slow_down` code in a 400 JSON body.
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
+/// Current unix time in seconds (CLI context — real clock is appropriate).
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Call a GET and reduce it to an HTTP status code, treating a non-2xx response
+/// as a status (not a transport error). `Err` means the host was unreachable.
+fn get_status(agent: &ureq::Agent, url: &str, bearer: Option<&str>) -> Result<u16, DynErr> {
+    let mut req = agent.get(url).header("accept", "application/json");
+    if let Some(t) = bearer {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    match req.call() {
+        Ok(resp) => Ok(resp.status().as_u16()),
+        Err(ureq::Error::StatusCode(code)) => Ok(code),
+        Err(other) => Err(Box::new(other)),
+    }
+}
+
+/// GET `/readyz` then `/v1/version`; return the daemon's reported version.
+fn probe_reachability(agent: &ureq::Agent, http_base: &str) -> Result<ProbeResult, DynErr> {
+    // /readyz — reachability (may be 200 or 503 while warming; either proves the
+    // socket is live, so we accept any HTTP status and only fail on transport).
+    let _ = get_status(agent, &format!("{http_base}/readyz"), None)?;
+
+    let url = format!("{http_base}/v1/version");
+    let body = match agent.get(&url).header("accept", "application/json").call() {
+        Ok(resp) => resp.into_body().read_to_string()?,
+        Err(ureq::Error::StatusCode(code)) => {
+            return Err(format!("/v1/version returned HTTP {code}").into());
+        }
+        Err(other) => return Err(Box::new(other)),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    let version = parsed
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    Ok(ProbeResult { version })
+}
+
+/// Probe the auth posture: a Read-classified route returns 200 under `auth=off`
+/// and 401/403 when a credential is required. `/v1/projections/entity/count` is
+/// a cheap GET with no side effects.
+fn probe_posture(agent: &ureq::Agent, http_base: &str, bearer: Option<&str>) -> Result<AuthPosture, DynErr> {
+    let url = format!("{http_base}/v1/projections/entity/count");
+    let status = get_status(agent, &url, bearer)?;
+    match status {
+        401 | 403 => Ok(AuthPosture::Required),
+        _ => Ok(AuthPosture::Off),
+    }
+}
+
+/// Best-effort verification that the resolved daemon answers MCP `tools/list`.
+/// Returns the advertised tool count. Non-fatal on the caller's side.
+fn verify_mcp_tools_list(agent: &ureq::Agent, mcp_url: &str, bearer: Option<&str>) -> Result<usize, DynErr> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {}
+    });
+    let mut req = agent
+        .post(mcp_url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    if let Some(t) = bearer {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let text = match req.send_json(body) {
+        Ok(resp) => resp.into_body().read_to_string()?,
+        Err(ureq::Error::StatusCode(code)) => return Err(format!("MCP tools/list returned HTTP {code}").into()),
+        Err(other) => return Err(Box::new(other)),
+    };
+    // The MCP endpoint may answer as JSON or as an SSE `data:` frame.
+    let json_text = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("data:").map(str::trim))
+        .unwrap_or(text.as_str());
+    let parsed: serde_json::Value = serde_json::from_str(json_text)?;
+    let count = parsed
+        .get("result")
+        .and_then(|r| r.get("tools"))
+        .and_then(|t| t.as_array())
+        .map(|a| a.len())
+        .ok_or("MCP tools/list response missing result.tools")?;
+    Ok(count)
+}
+
+/// Best-effort end-to-end memory check: `store_fact` (PUT /v1/facts) then read
+/// it back (GET /v1/facts?query=). Returns Ok on a successful round-trip.
+fn verify_fact_roundtrip(agent: &ureq::Agent, http_base: &str, bearer: Option<&str>) -> Result<(), DynErr> {
+    let entity = "__crux_login_selfcheck";
+    let key = "last_login_probe";
+    let value = "ok";
+    let put_url = format!("{http_base}/v1/facts");
+    let put_body = serde_json::json!({
+        "entity": entity,
+        "key": key,
+        "value": value,
+        "confidence": 1.0,
+    });
+    let mut put = agent.put(&put_url).header("content-type", "application/json");
+    if let Some(t) = bearer {
+        put = put.header("authorization", format!("Bearer {t}"));
+    }
+    match put.send_json(put_body) {
+        Ok(_) => {}
+        Err(ureq::Error::StatusCode(code)) => return Err(format!("store_fact returned HTTP {code}").into()),
+        Err(other) => return Err(Box::new(other)),
+    }
+
+    let get_url = format!("{http_base}/v1/facts");
+    let mut get = agent
+        .get(&get_url)
+        .query("entity", entity)
+        .query("top_k", "5")
+        .header("accept", "application/json");
+    if let Some(t) = bearer {
+        get = get.header("authorization", format!("Bearer {t}"));
+    }
+    let text = match get.call() {
+        Ok(resp) => resp.into_body().read_to_string()?,
+        Err(ureq::Error::StatusCode(code)) => return Err(format!("query_facts returned HTTP {code}").into()),
+        Err(other) => return Err(Box::new(other)),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    let found = parsed
+        .get("facts")
+        .and_then(|f| f.as_array())
+        .is_some_and(|arr| arr.iter().any(|f| f.get("key").and_then(|k| k.as_str()) == Some(key)));
+    if found {
+        Ok(())
+    } else {
+        Err("query_facts did not return the just-written fact".into())
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Issuance rails (tailscale + device) — daemon token endpoints
+// ──────────────────────────────────────────────────────────────────────────
+
+/// A token issued by the daemon (tailscale or device rail).
+#[derive(Debug, Clone)]
+struct IssuedToken {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: u64,
+    scopes: Vec<String>,
+    tenant_id: Option<String>,
+}
+
+/// Identity echo from `GET /v1/auth/whoami`.
+#[derive(Debug, Clone, Default)]
+struct WhoAmI {
+    trusted: bool,
+    login: Option<String>,
+    allowlisted: bool,
+}
+
+/// Parse an issuance response (`{access_token, refresh_token?, expires_in,
+/// scopes, tenant_id?}`) shared by the tailscale + device rails.
+fn parse_issued_token(text: &str) -> Result<IssuedToken, DynErr> {
+    let v: serde_json::Value = serde_json::from_str(text)?;
+    let access_token = v
+        .get("access_token")
+        .and_then(|x| x.as_str())
+        .ok_or("issuance response missing access_token")?
+        .to_string();
+    Ok(IssuedToken {
+        access_token,
+        refresh_token: v.get("refresh_token").and_then(|x| x.as_str()).map(str::to_string),
+        expires_in: v.get("expires_in").and_then(|x| x.as_u64()).unwrap_or(300),
+        scopes: v
+            .get("scopes")
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+        tenant_id: v.get("tenant_id").and_then(|x| x.as_str()).map(str::to_string),
+    })
+}
+
+/// POST JSON and capture `(status, body)` regardless of HTTP status (the agent is
+/// configured with `http_status_as_error(false)`).
+fn post_json_capture(agent: &ureq::Agent, url: &str, body: serde_json::Value) -> Result<(u16, String), DynErr> {
+    match agent
+        .post(url)
+        .header("content-type", "application/json")
+        .send_json(body)
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let text = resp.into_body().read_to_string()?;
+            Ok((status, text))
+        }
+        Err(ureq::Error::StatusCode(code)) => Ok((code, String::new())),
+        Err(other) => Err(Box::new(other)),
+    }
+}
+
+/// Probe `GET /v1/auth/whoami`. Returns `None` when the rail is disabled (404) or
+/// the daemon is unreachable — i.e. the tailnet rail is not available.
+fn probe_whoami(agent: &ureq::Agent, http_base: &str) -> Option<WhoAmI> {
+    let url = format!("{http_base}/v1/auth/whoami");
+    let resp = agent.get(&url).header("accept", "application/json").call().ok()?;
+    if resp.status().as_u16() != 200 {
+        return None;
+    }
+    let text = resp.into_body().read_to_string().ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some(WhoAmI {
+        trusted: v.get("trusted").and_then(|x| x.as_bool()).unwrap_or(false),
+        login: v.get("login").and_then(|x| x.as_str()).map(str::to_string),
+        allowlisted: v.get("allowlisted").and_then(|x| x.as_bool()).unwrap_or(false),
+    })
+}
+
+/// Rail 2 — mint a scoped JWT from the verified tailnet identity.
+fn mint_tailscale(agent: &ureq::Agent, http_base: &str) -> Result<IssuedToken, DynErr> {
+    let url = format!("{http_base}/v1/auth/tailscale/token");
+    let (status, text) = post_json_capture(agent, &url, serde_json::json!({}))?;
+    if status != 200 {
+        return Err(format!("tailscale token issuance failed (HTTP {status}): {text}").into());
+    }
+    parse_issued_token(&text)
+}
+
+/// Rail 3 — drive the device-authorization grant to completion (start → poll).
+fn run_device_flow(agent: &ureq::Agent, http_base: &str) -> Result<IssuedToken, DynErr> {
+    let start_url = format!("{http_base}/v1/auth/device/start");
+    let (status, text) = post_json_capture(agent, &start_url, serde_json::json!({ "client_name": "corecruxctl" }))?;
+    if status != 200 {
+        return Err(format!("device/start failed (HTTP {status}): {text}").into());
+    }
+    let start: serde_json::Value = serde_json::from_str(&text)?;
+    let device_code = start
+        .get("device_code")
+        .and_then(|v| v.as_str())
+        .ok_or("device/start missing device_code")?
+        .to_string();
+    let user_code = start.get("user_code").and_then(|v| v.as_str()).unwrap_or("?");
+    let verification_uri = start
+        .get("verification_uri")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/activate");
+    let mut interval = start.get("interval").and_then(|v| v.as_u64()).unwrap_or(5).max(1);
+    let expires_in = start.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(600);
+
+    println!();
+    println!("To authorize this client, open:  {verification_uri}");
+    println!("and enter the code:              {user_code}");
+    println!("waiting for approval (expires in {expires_in}s) …");
+
+    let deadline = now_unix() + expires_in;
+    let token_url = format!("{http_base}/v1/auth/device/token");
+    let poll_body = serde_json::json!({ "device_code": device_code });
+    loop {
+        if now_unix() >= deadline {
+            return Err("device authorization timed out before approval".into());
+        }
+        std::thread::sleep(Duration::from_secs(interval));
+        let (status, text) = post_json_capture(agent, &token_url, poll_body.clone())?;
+        if status == 200 {
+            return parse_issued_token(&text);
+        }
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        match v.get("error").and_then(|e| e.as_str()).unwrap_or("") {
+            "authorization_pending" => {}
+            "slow_down" => interval = interval.saturating_add(5),
+            "access_denied" => return Err("device authorization was denied by the approver".into()),
+            "expired_token" => return Err("device code expired before approval".into()),
+            "" => return Err(format!("device/token error (HTTP {status}): {text}").into()),
+            other => return Err(format!("device/token error: {other}").into()),
+        }
+    }
+}
+
+/// Refresh a stored credential's access token if it is expired/near-expiry.
+/// Returns `Some(updated)` if a refresh happened, `None` if no refresh was needed
+/// or possible. Device rails use the refresh credential; the tailnet rail
+/// re-mints from the (still-present) identity; static/loopback never refresh.
+fn refresh_credential(agent: &ureq::Agent, cred: &DaemonCredential) -> Result<Option<DaemonCredential>, DynErr> {
+    // 60 s safety lead so an in-flight request never trips expiry.
+    let near_expiry = cred.expiry.is_some_and(|e| now_unix() + 60 >= e);
+    if !near_expiry {
+        return Ok(None);
+    }
+    let issued = match cred.rail.as_str() {
+        "device" => {
+            let Some(refresh) = cred.refresh_token.as_deref() else {
+                return Ok(None);
+            };
+            let url = format!("{}/v1/auth/device/refresh", cred.http_url);
+            let (status, text) = post_json_capture(agent, &url, serde_json::json!({ "refresh_token": refresh }))?;
+            if status != 200 {
+                return Err(format!("device refresh failed (HTTP {status}): {text}").into());
+            }
+            parse_issued_token(&text)?
+        }
+        "tailscale" => mint_tailscale(agent, &cred.http_url)?,
+        _ => return Ok(None),
+    };
+    let mut updated = cred.clone();
+    updated.access_token = Some(issued.access_token);
+    if issued.refresh_token.is_some() {
+        updated.refresh_token = issued.refresh_token;
+    }
+    updated.expiry = Some(now_unix() + issued.expires_in);
+    if !issued.scopes.is_empty() {
+        updated.scopes = issued.scopes;
+    }
+    Ok(Some(updated))
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// CLI entry point
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Parsed arguments for `corecruxctl login`.
+#[derive(Debug, Clone, Default)]
+pub struct LoginArgs {
+    /// Explicit daemon URL (`--url`). When absent, discovery runs.
+    pub url: Option<String>,
+    /// Static named token (`--token`) → Rail 4.
+    pub token: Option<String>,
+    /// Force the device-authorization grant (`--device`) → Rail 3 (M3).
+    pub device: bool,
+    /// Skip the post-login `tools/list` + fact round-trip verification.
+    pub no_verify: bool,
+}
+
+/// Run `corecruxctl login`.
+pub fn run(args: LoginArgs) -> Result<(), DynErr> {
+    let cfg_dir = config_dir().ok_or("HOME is not set; cannot locate ~/.config/cuecrux")?;
+    let env_file = env_path(&cfg_dir);
+    let env_vars = match std::fs::read_to_string(&env_file) {
+        Ok(content) => parse_env_file(&content),
+        Err(_) => BTreeMap::new(),
+    };
+
+    // 1. discover.
+    let candidates = discover_candidates(args.url.as_deref(), &env_vars);
+    println!("crux login");
+    println!("==========");
+
+    let agent = http_agent();
+    let token = resolve_token(&args, &env_vars);
+
+    // 2. probe each candidate until one is reachable.
+    let mut chosen: Option<(String, ProbeResult)> = None;
+    for candidate in &candidates {
+        print!("probe {candidate} … ");
+        match probe_reachability(&agent, candidate) {
+            Ok(probe) => {
+                println!("reachable (daemon v{})", probe.version);
+                chosen = Some((candidate.clone(), probe));
+                break;
+            }
+            Err(e) => println!("unreachable ({e})"),
+        }
+    }
+    let (http_base, _probe) =
+        chosen.ok_or_else(|| format!("no reachable Crux Daemon among candidates: {}", candidates.join(", ")))?;
+
+    let is_loopback = is_loopback_url(&http_base);
+    let posture = probe_posture(&agent, &http_base, token.as_deref())?;
+    println!(
+        "auth posture: {}",
+        match posture {
+            AuthPosture::Off => "off (no credential required)",
+            AuthPosture::Required => "credential required",
+        }
+    );
+
+    // 3. select rail — probe the tailnet identity rail first (cheap GET).
+    let whoami = probe_whoami(&agent, &http_base);
+    if let Some(w) = whoami.as_ref().filter(|w| w.trusted) {
+        if let Some(login) = &w.login {
+            println!("tailnet identity: {login} (allowlisted: {})", w.allowlisted);
+        }
+    }
+    let tailscale_identity = whoami.as_ref().is_some_and(|w| w.trusted && w.allowlisted);
+    let inputs = RailInputs {
+        is_loopback,
+        has_token: token.is_some(),
+        device_flag: args.device,
+        tailscale_identity,
+        posture,
+    };
+    let rail = select_rail(inputs)?;
+    println!("selected rail: {} ({})", rail.as_str(), rail_description(rail));
+
+    // 4. obtain + persist the credential for the rail.
+    let mcp_url = derive_mcp_url(&http_base)?;
+    let (cred, effective_bearer) = build_credential(&agent, rail, &http_base, &mcp_url, token.clone())?;
+    let store_path = credentials_path(&cfg_dir);
+    let mut store = load_store(&store_path)?;
+    store.upsert(&http_base, cred);
+    save_store(&store_path, &store)?;
+    println!("stored credential → {} (0600)", store_path.display());
+
+    // 5. register MCP + verify.
+    register_mcp(&cfg_dir, &mcp_url, effective_bearer.as_deref())?;
+    println!("registered MCP endpoint {mcp_url} → {}", env_file.display());
+
+    if args.no_verify {
+        println!("verification skipped (--no-verify)");
+    } else {
+        match verify_mcp_tools_list(&agent, &mcp_url, effective_bearer.as_deref()) {
+            Ok(n) => println!("verify: MCP tools/list ok ({n} tools)"),
+            Err(e) => println!("verify: MCP tools/list skipped ({e})"),
+        }
+        match verify_fact_roundtrip(&agent, &http_base, effective_bearer.as_deref()) {
+            Ok(()) => println!("verify: store_fact → query_facts round-trip ok"),
+            Err(e) => println!("verify: fact round-trip skipped ({e})"),
+        }
+    }
+
+    println!();
+    println!("logged in to {http_base} via the {} rail.", rail.as_str());
+    Ok(())
+}
+
+/// Obtain the credential for the selected rail, returning the stored credential
+/// and the bearer token to use immediately (for MCP registration + verification).
+fn build_credential(
+    agent: &ureq::Agent,
+    rail: Rail,
+    http_base: &str,
+    mcp_url: &str,
+    token: Option<String>,
+) -> Result<(DaemonCredential, Option<String>), DynErr> {
+    let base =
+        |access_token: Option<String>, refresh_token: Option<String>, expiry: Option<u64>, scopes: Vec<String>| {
+            DaemonCredential {
+                rail: rail.as_str().to_string(),
+                access_token,
+                refresh_token,
+                expiry,
+                scopes,
+                mcp_url: mcp_url.to_string(),
+                http_url: http_base.to_string(),
+            }
+        };
+    match rail {
+        Rail::Loopback => Ok((base(None, None, None, vec![]), None)),
+        Rail::StaticToken => Ok((base(token.clone(), None, None, vec![]), token)),
+        Rail::Tailscale => {
+            let issued = mint_tailscale(agent, http_base)?;
+            print_issued("minted scoped token", &issued);
+            let bearer = Some(issued.access_token.clone());
+            let cred = base(
+                Some(issued.access_token),
+                None,
+                Some(now_unix() + issued.expires_in),
+                issued.scopes,
+            );
+            Ok((cred, bearer))
+        }
+        Rail::Device => {
+            let issued = run_device_flow(agent, http_base)?;
+            print_issued("approved — minted scoped token", &issued);
+            let bearer = Some(issued.access_token.clone());
+            let cred = base(
+                Some(issued.access_token),
+                issued.refresh_token,
+                Some(now_unix() + issued.expires_in),
+                issued.scopes,
+            );
+            Ok((cred, bearer))
+        }
+    }
+}
+
+fn print_issued(prefix: &str, issued: &IssuedToken) {
+    println!(
+        "{prefix} (tenant {}, {} scope(s), ttl {}s)",
+        issued.tenant_id.as_deref().unwrap_or("?"),
+        issued.scopes.len(),
+        issued.expires_in
+    );
+}
+
+/// Parsed arguments for `corecruxctl logout`.
+#[derive(Debug, Clone, Default)]
+pub struct LogoutArgs {
+    /// Daemon URL to log out of.
+    pub url: Option<String>,
+    /// Log out of every stored daemon.
+    pub all: bool,
+}
+
+/// Run `corecruxctl logout` — revoke device refresh credentials (best-effort) and
+/// clear the stored credential(s).
+pub fn run_logout(args: LogoutArgs) -> Result<(), DynErr> {
+    let cfg_dir = config_dir().ok_or("HOME is not set; cannot locate ~/.config/cuecrux")?;
+    let store_path = credentials_path(&cfg_dir);
+    let mut store = load_store(&store_path)?;
+    let agent = http_agent();
+
+    let targets: Vec<String> = if args.all {
+        store.daemons.keys().cloned().collect()
+    } else if let Some(u) = &args.url {
+        vec![normalize_http_base(u)?]
+    } else {
+        return Err("specify --url <daemon> or --all".into());
+    };
+    if targets.is_empty() {
+        println!("no stored credentials to clear");
+        return Ok(());
+    }
+    for url in targets {
+        match store.daemons.remove(&url) {
+            Some(cred) => {
+                if cred.rail == "device" {
+                    if let Some(refresh) = cred.refresh_token.as_deref() {
+                        let revoke_url = format!("{url}/v1/auth/device/revoke");
+                        match post_json_capture(&agent, &revoke_url, serde_json::json!({ "refresh_token": refresh })) {
+                            Ok((200, _)) => println!("revoked device refresh credential at {url}"),
+                            Ok((s, t)) => println!("revoke returned HTTP {s} ({t}) — clearing locally anyway"),
+                            Err(e) => println!("revoke failed ({e}) — clearing locally anyway"),
+                        }
+                    }
+                }
+                println!("cleared credential for {url}");
+            }
+            None => println!("no stored credential for {url}"),
+        }
+    }
+    save_store(&store_path, &store)?;
+    Ok(())
+}
+
+/// Parsed arguments for `corecruxctl whoami`.
+#[derive(Debug, Clone, Default)]
+pub struct WhoamiArgs {
+    /// Restrict output to a single daemon URL.
+    pub url: Option<String>,
+}
+
+/// Run `corecruxctl whoami` — show stored credential posture per daemon.
+pub fn run_whoami(args: WhoamiArgs) -> Result<(), DynErr> {
+    let cfg_dir = config_dir().ok_or("HOME is not set; cannot locate ~/.config/cuecrux")?;
+    let store = load_store(&credentials_path(&cfg_dir))?;
+    if store.daemons.is_empty() {
+        println!("no stored credentials (run `corecruxctl login`)");
+        return Ok(());
+    }
+    let target = args.url.as_deref().map(normalize_http_base).transpose()?;
+    let now = now_unix();
+    for (url, cred) in &store.daemons {
+        if let Some(t) = &target {
+            if t != url {
+                continue;
+            }
+        }
+        let expiry = match cred.expiry {
+            Some(e) if e > now => format!("{}s remaining", e - now),
+            Some(_) => "expired".to_string(),
+            None => "n/a".to_string(),
+        };
+        println!("{url}");
+        println!("  rail:   {}", cred.rail);
+        println!(
+            "  scopes: {}",
+            if cred.scopes.is_empty() {
+                "(daemon-defined)".to_string()
+            } else {
+                cred.scopes.join(", ")
+            }
+        );
+        println!(
+            "  token:  {}",
+            if cred.access_token.is_some() {
+                "present"
+            } else {
+                "none (loopback)"
+            }
+        );
+        println!("  expiry: {expiry}");
+    }
+    Ok(())
+}
+
+/// Resolve a fresh bearer token for `http_url`, transparently refreshing an
+/// expired short-lived token and persisting the result. Returns `Ok(None)` when
+/// there is no stored credential or the rail carries no token (loopback).
+///
+/// Reusable refresh entry point for the CLI and the MCP bridge (bridge wiring is
+/// tracked as a follow-up — see ExecPlan M4 notes).
+pub fn resolve_fresh_bearer(http_url: &str) -> Result<Option<String>, DynErr> {
+    let cfg_dir = config_dir().ok_or("HOME is not set; cannot locate ~/.config/cuecrux")?;
+    let store_path = credentials_path(&cfg_dir);
+    let mut store = load_store(&store_path)?;
+    let key = normalize_http_base(http_url)?;
+    let Some(cred) = store.daemons.get(&key).cloned() else {
+        return Ok(None);
+    };
+    let agent = http_agent();
+    if let Some(updated) = refresh_credential(&agent, &cred)? {
+        let bearer = updated.access_token.clone();
+        store.upsert(&key, updated);
+        save_store(&store_path, &store)?;
+        return Ok(bearer);
+    }
+    Ok(cred.access_token)
+}
+
+/// Resolve the token to use: explicit `--token` wins, else a static token from
+/// the env file (`CRUX_AGENT_TOKEN`). Never reads it from the process args log.
+fn resolve_token(args: &LoginArgs, env_vars: &BTreeMap<String, String>) -> Option<String> {
+    if let Some(t) = args.token.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        return Some(t.to_string());
+    }
+    env_vars
+        .get("CRUX_AGENT_TOKEN")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn rail_description(rail: Rail) -> &'static str {
+    match rail {
+        Rail::Loopback => "loopback trust, auth=off — zero friction",
+        Rail::Tailscale => "verified tailnet identity",
+        Rail::Device => "device-authorization grant",
+        Rail::StaticToken => "static named token",
+    }
+}
+
+/// Register the resolved MCP endpoint in `~/.config/cuecrux/env` so the agent
+/// bridges resolve it. Writes `CRUX_MCP_URL` (and, for the static-token rail,
+/// `CRUX_AGENT_TOKEN`) into the 0600 env file, preserving other keys.
+fn register_mcp(cfg_dir: &Path, mcp_url: &str, token: Option<&str>) -> Result<(), DynErr> {
+    let path = env_path(cfg_dir);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut updates: BTreeMap<String, String> = BTreeMap::new();
+    updates.insert("CRUX_MCP_URL".to_string(), mcp_url.to_string());
+    if let Some(t) = token {
+        updates.insert("CRUX_AGENT_TOKEN".to_string(), t.to_string());
+    }
+    let rendered = render_env_file(&existing, &updates);
+    create_dir_private(cfg_dir)?;
+    write_private(&path, rendered.as_bytes())?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // ── rail selection table (matrix cell → expected rail) ──
+
+    fn inputs(is_loopback: bool, has_token: bool, device: bool, ts: bool, posture: AuthPosture) -> RailInputs {
+        RailInputs {
+            is_loopback,
+            has_token,
+            device_flag: device,
+            tailscale_identity: ts,
+            posture,
+        }
+    }
+
+    #[test]
+    fn rail_loopback_auth_off_no_token() {
+        // Same host, have host/env access, auth off → Rail 1.
+        let r = select_rail(inputs(true, false, false, false, AuthPosture::Off)).unwrap();
+        assert_eq!(r, Rail::Loopback);
+    }
+
+    #[test]
+    fn rail_explicit_token_wins_even_when_auth_off() {
+        // Operator intent (--token) is honoured before auto-selection.
+        let r = select_rail(inputs(true, true, false, false, AuthPosture::Off)).unwrap();
+        assert_eq!(r, Rail::StaticToken);
+    }
+
+    #[test]
+    fn rail_static_token_remote_auth_required() {
+        // Remote (no tailscale), have token → Rail 4.
+        let r = select_rail(inputs(false, true, false, false, AuthPosture::Required)).unwrap();
+        assert_eq!(r, Rail::StaticToken);
+    }
+
+    #[test]
+    fn rail_device_flag_selects_device() {
+        let r = select_rail(inputs(false, false, true, false, AuthPosture::Required)).unwrap();
+        assert_eq!(r, Rail::Device);
+    }
+
+    #[test]
+    fn rail_tailscale_identity_when_present_and_auth_required() {
+        let r = select_rail(inputs(false, false, false, true, AuthPosture::Required)).unwrap();
+        assert_eq!(r, Rail::Tailscale);
+    }
+
+    #[test]
+    fn rail_auth_required_no_credential_is_error() {
+        // No host access, remote, no token, no identity → cannot select.
+        let err = select_rail(inputs(false, false, false, false, AuthPosture::Required)).unwrap_err();
+        assert!(err.contains("--token"), "error should suggest --token: {err}");
+    }
+
+    #[test]
+    fn all_four_rails_implemented() {
+        assert!(Rail::Loopback.is_implemented());
+        assert!(Rail::StaticToken.is_implemented());
+        assert!(Rail::Tailscale.is_implemented());
+        assert!(Rail::Device.is_implemented());
+    }
+
+    // ── URL helpers ──
+
+    #[test]
+    fn normalize_adds_scheme_and_strips_slash() {
+        assert_eq!(
+            normalize_http_base("127.0.0.1:14800/").unwrap(),
+            "http://127.0.0.1:14800"
+        );
+        assert_eq!(
+            normalize_http_base("https://crux.example.com/").unwrap(),
+            "https://crux.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_empty() {
+        assert!(normalize_http_base("   ").is_err());
+    }
+
+    #[test]
+    fn derive_mcp_url_rewrites_port_and_path() {
+        assert_eq!(
+            derive_mcp_url("http://127.0.0.1:14800").unwrap(),
+            "http://127.0.0.1:14801/mcp"
+        );
+        assert_eq!(
+            derive_mcp_url("https://crux.example.com").unwrap(),
+            "https://crux.example.com:14801/mcp"
+        );
+    }
+
+    #[test]
+    fn loopback_detection() {
+        assert!(is_loopback_url("http://127.0.0.1:14800"));
+        assert!(is_loopback_url("http://localhost:14800"));
+        assert!(is_loopback_url("http://[::1]:14800"));
+        assert!(!is_loopback_url("http://100.89.67.6:14800"));
+        assert!(!is_loopback_url("https://crux.example.com"));
+    }
+
+    // ── env-file parse + merge ──
+
+    #[test]
+    fn parse_env_handles_comments_export_and_quotes() {
+        let content = "# comment\nexport CRUX_MCP_URL=\"http://x:14801/mcp\"\nCRUX_AGENT_TOKEN=abc\n\n";
+        let parsed = parse_env_file(content);
+        assert_eq!(parsed.get("CRUX_MCP_URL").unwrap(), "http://x:14801/mcp");
+        assert_eq!(parsed.get("CRUX_AGENT_TOKEN").unwrap(), "abc");
+    }
+
+    #[test]
+    fn render_env_replaces_existing_and_appends_new() {
+        let existing = "# header\nCRUX_MCP_URL=http://old:14801/mcp\nOTHER=keepme\n";
+        let mut updates = BTreeMap::new();
+        updates.insert("CRUX_MCP_URL".to_string(), "http://new:14801/mcp".to_string());
+        updates.insert("CRUX_AGENT_TOKEN".to_string(), "tok".to_string());
+        let out = render_env_file(existing, &updates);
+        assert!(out.contains("# header"));
+        assert!(out.contains("OTHER=keepme"));
+        assert!(out.contains("CRUX_MCP_URL=http://new:14801/mcp"));
+        assert!(!out.contains("http://old:14801/mcp"));
+        assert!(out.contains("CRUX_AGENT_TOKEN=tok"));
+    }
+
+    // ── discovery ordering ──
+
+    #[test]
+    fn discover_prefers_explicit_then_env_then_localhost() {
+        let mut env = BTreeMap::new();
+        env.insert("CRUX_HTTP_URL".to_string(), "http://envhost:14800".to_string());
+        let c = discover_candidates(Some("http://explicit:14800"), &env);
+        assert_eq!(c[0], "http://explicit:14800");
+        assert_eq!(c[1], "http://envhost:14800");
+        assert_eq!(c.last().unwrap(), DEFAULT_HTTP_BASE);
+    }
+
+    #[test]
+    fn discover_derives_http_base_from_mcp_url() {
+        let mut env = BTreeMap::new();
+        env.insert("CRUX_MCP_URL".to_string(), "http://tail:14801/mcp".to_string());
+        let c = discover_candidates(None, &env);
+        assert!(c.contains(&"http://tail:14800".to_string()));
+    }
+
+    #[test]
+    fn discover_dedupes() {
+        let mut env = BTreeMap::new();
+        env.insert("CRUX_HTTP_URL".to_string(), DEFAULT_HTTP_BASE.to_string());
+        let c = discover_candidates(Some(DEFAULT_HTTP_BASE), &env);
+        assert_eq!(c.iter().filter(|x| *x == DEFAULT_HTTP_BASE).count(), 1);
+    }
+
+    // ── credential store round-trip + 0600 ──
+
+    #[test]
+    fn store_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = credentials_path(dir.path());
+        let mut store = CredentialStore::default();
+        store.upsert(
+            "http://127.0.0.1:14800",
+            DaemonCredential {
+                rail: "loopback".to_string(),
+                access_token: None,
+                refresh_token: None,
+                expiry: None,
+                scopes: vec![],
+                mcp_url: "http://127.0.0.1:14801/mcp".to_string(),
+                http_url: "http://127.0.0.1:14800".to_string(),
+            },
+        );
+        save_store(&path, &store).unwrap();
+        let loaded = load_store(&path).unwrap();
+        assert_eq!(loaded.version, STORE_SCHEMA_VERSION);
+        assert_eq!(loaded.daemons.len(), 1);
+        assert_eq!(loaded.daemons["http://127.0.0.1:14800"].rail, "loopback");
+    }
+
+    #[test]
+    fn load_missing_store_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = credentials_path(dir.path());
+        let store = load_store(&path).unwrap();
+        assert!(store.daemons.is_empty());
+    }
+
+    #[test]
+    fn upsert_replaces_same_key() {
+        let mut store = CredentialStore::default();
+        let base = DaemonCredential {
+            rail: "loopback".to_string(),
+            access_token: None,
+            refresh_token: None,
+            expiry: None,
+            scopes: vec![],
+            mcp_url: "m".to_string(),
+            http_url: "h".to_string(),
+        };
+        store.upsert("k", base.clone());
+        let mut updated = base;
+        updated.rail = "static_token".to_string();
+        store.upsert("k", updated);
+        assert_eq!(store.daemons.len(), 1);
+        assert_eq!(store.daemons["k"].rail, "static_token");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_store_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = credentials_path(dir.path());
+        save_store(&path, &CredentialStore::default()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "credential store must be owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewriting_existing_store_stays_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = credentials_path(dir.path());
+        // Pre-create with loose perms.
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_store(&path, &CredentialStore::default()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "rewrite must tighten perms to 0600");
+    }
+}
