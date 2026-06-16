@@ -476,6 +476,18 @@ pub fn router(state: AppState) -> Router {
             "/v1/identity/links/{linkId}/revoke",
             axum::routing::post(self::identity_links::post_identity_link_revoke),
         )
+        .route(
+            "/v1/identity/candidates/{candidateId}/confirm",
+            axum::routing::post(self::identity_links::post_identity_candidate_confirm),
+        )
+        .route(
+            "/v1/identity/candidates/{candidateId}/reject",
+            axum::routing::post(self::identity_links::post_identity_candidate_reject),
+        )
+        .route(
+            "/v1/identity/candidates",
+            get(self::identity_links::get_identity_candidates),
+        )
         .route("/v1/facts/{factId}", get(self::facts::get_fact))
         .route("/v1/facts/{factId}", axum::routing::delete(self::facts::delete_fact))
         .route("/v1/facts/entity/{entity}", get(self::facts::get_facts_by_entity))

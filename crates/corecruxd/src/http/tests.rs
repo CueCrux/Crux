@@ -1025,6 +1025,15 @@ fn resolve_query(passport_id: &str) -> axum::extract::Query<principal::ResolvePr
     axum::extract::Query(principal::ResolvePrincipalQuery {
         session_id: None,
         passport_id: Some(passport_id.to_string()),
+        include_candidates: None,
+    })
+}
+
+fn resolve_query_with_candidates(passport_id: &str) -> axum::extract::Query<principal::ResolvePrincipalQuery> {
+    axum::extract::Query(principal::ResolvePrincipalQuery {
+        session_id: None,
+        passport_id: Some(passport_id.to_string()),
+        include_candidates: Some("1".to_string()),
     })
 }
 
@@ -12533,6 +12542,34 @@ async fn signed_link_request(state: &AppState) -> (crate::identity_links::Create
     )
 }
 
+async fn candidate_for_signed_request(state: &AppState, remote_fpr: &str) -> String {
+    let facts = state.fact_store.read().await;
+    let local = crate::passports::get_passport(&facts, "personal-default").expect("local passport");
+    let mut entities = state.entity_store.write().await;
+    let (candidate_id, _) = crate::candidate_links::create_candidate(
+        &mut entities,
+        &facts,
+        crate::candidate_links::CreateCandidateInput {
+            local_passport_fpr: local.principal_id,
+            observed_subject: remote_fpr.to_string(),
+            signals: vec![corecrux_memory::candidate_link::CandidateLinkSignal {
+                kind: "temporal_adjacency".to_string(),
+                confidence: 0.82,
+                evidence_ref: Some("session_binding:test-a|session_binding:test-b".to_string()),
+            }],
+            confidence: 0.82,
+            evidence_refs: vec![
+                "session_binding:test-a".to_string(),
+                "session_binding:test-b".to_string(),
+            ],
+            proposed_at: Some("2026-06-15T00:00:00Z".to_string()),
+        },
+        "operator",
+    )
+    .expect("candidate");
+    candidate_id
+}
+
 #[tokio::test]
 async fn identity_links_disabled_returns_404() {
     let mut state = test_app_state(16);
@@ -12562,6 +12599,296 @@ async fn identity_link_create_requires_admin_write_t3() {
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn identity_candidate_confirm_promotes_to_resolving_link() {
+    let state = test_app_state(16);
+    let (req, remote_fpr) = signed_link_request(&state).await;
+    let candidate_id = candidate_for_signed_request(&state, &remote_fpr).await;
+
+    let resp = identity_links::post_identity_candidate_confirm(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(candidate_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = json_body(resp).await;
+    let link_id = body["link_id"].as_str().expect("link id").to_string();
+    assert_eq!(body["candidate"]["status"], "confirmed");
+    assert_eq!(body["candidate"]["resolved_link_id"], link_id);
+
+    {
+        let entities = state.entity_store.read().await;
+        let candidate_history = entities.history(corecrux_memory::candidate_link::CANDIDATE_LINK_KIND, &candidate_id);
+        assert_eq!(candidate_history.len(), 2, "proposal + confirmation are versioned");
+        let link_history = entities.history(corecrux_memory::identity_link::IDENTITY_LINK_KIND, &link_id);
+        assert_eq!(link_history.len(), 1);
+    }
+
+    let resp = principal::get_resolve_principal(State(state), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn identity_candidate_confirm_rejects_mismatched_remote_fpr() {
+    let state = test_app_state(16);
+    let (req, remote_fpr) = signed_link_request(&state).await;
+    let candidate_id = candidate_for_signed_request(&state, "p_observed-but-not-signed").await;
+
+    let resp = identity_links::post_identity_candidate_confirm(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(candidate_id),
+        Json(req),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let entities = state.entity_store.read().await;
+    assert!(
+        crate::identity_links::find_live_link_for_remote(&entities, &remote_fpr).is_none(),
+        "mismatched candidate must not create a resolving edge"
+    );
+}
+
+#[tokio::test]
+async fn identity_candidate_reject_is_versioned_and_non_resolving() {
+    let state = test_app_state(16);
+    let (_req, remote_fpr) = signed_link_request(&state).await;
+    let candidate_id = candidate_for_signed_request(&state, &remote_fpr).await;
+
+    let resp = identity_links::post_identity_candidate_reject(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(candidate_id.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["candidate"]["status"], "rejected");
+    assert!(body["candidate"]["resolved_link_id"].is_null());
+
+    {
+        let entities = state.entity_store.read().await;
+        let candidate_history = entities.history(corecrux_memory::candidate_link::CANDIDATE_LINK_KIND, &candidate_id);
+        assert_eq!(candidate_history.len(), 2, "proposal + rejection are versioned");
+        assert!(crate::identity_links::find_live_link_for_remote(&entities, &remote_fpr).is_none());
+    }
+
+    let resp = principal::get_resolve_principal(State(state), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn identity_candidates_list_requires_admin_read_and_filters() {
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let (_req, remote_fpr) = signed_link_request(&state).await;
+    let candidate_id = candidate_for_signed_request(&state, &remote_fpr).await;
+
+    let resp = identity_links::get_identity_candidates(
+        State(state.clone()),
+        HeaderMap::new(),
+        Query(identity_links::ListIdentityCandidatesQuery { status: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = identity_links::get_identity_candidates(
+        State(state.clone()),
+        dev_scope_headers("facts:read"),
+        Query(identity_links::ListIdentityCandidatesQuery { status: None }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = identity_links::get_identity_candidates(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(identity_links::ListIdentityCandidatesQuery {
+            status: Some("proposed".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let candidates = body["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["candidate_id"], candidate_id);
+
+    let resp = identity_links::get_identity_candidates(
+        State(state.clone()),
+        dev_scope_headers("admin:read"),
+        Query(identity_links::ListIdentityCandidatesQuery {
+            status: Some("rejected".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(json_body(resp).await["candidates"]
+        .as_array()
+        .expect("candidates")
+        .is_empty());
+
+    let resp = identity_links::get_identity_candidates(
+        State(state),
+        dev_scope_headers("admin:read"),
+        Query(identity_links::ListIdentityCandidatesQuery {
+            status: Some("bogus".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn resolve_principal_include_candidates_surfaces_suggestions_without_resolving() {
+    let state = test_app_state(16);
+    let (_req, remote_fpr) = signed_link_request(&state).await;
+    let candidate_id = candidate_for_signed_request(&state, &remote_fpr).await;
+
+    let resp = principal::get_resolve_principal(
+        State(state.clone()),
+        resolve_query_with_candidates(&remote_fpr),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = json_body(resp).await;
+    assert_eq!(body["candidates_resolve"], false);
+    let candidates = body["candidates"].as_array().expect("candidate suggestions");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["candidate_id"], candidate_id);
+    assert_eq!(candidates[0]["resolving"], false);
+
+    let resp = principal::get_resolve_principal(State(state), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "candidate remains non-resolving without confirmation"
+    );
+}
+
+#[tokio::test]
+async fn synthetic_anonymous_session_resolution_demo_m6() {
+    let state = test_app_state(16);
+    let (req, remote_fpr) = signed_link_request(&state).await;
+    let local_fpr = {
+        let facts = state.fact_store.read().await;
+        crate::passports::get_passport(&facts, "personal-default")
+            .expect("local passport")
+            .principal_id
+    };
+
+    let observations = vec![
+        crate::candidate_links::CandidateObservation {
+            local_passport_fpr: local_fpr.clone(),
+            observed_subject: local_fpr,
+            tenant_id: "work::team".to_string(),
+            project_id: Some("alpha".to_string()),
+            observed_at_unix_ms: 1_000,
+            evidence_ref: "synthetic:session-a".to_string(),
+            cruxpack_source_receipt: None,
+        },
+        crate::candidate_links::CandidateObservation {
+            local_passport_fpr: {
+                let facts = state.fact_store.read().await;
+                crate::passports::get_passport(&facts, "personal-default")
+                    .expect("local passport")
+                    .principal_id
+            },
+            observed_subject: remote_fpr.clone(),
+            tenant_id: "work::team".to_string(),
+            project_id: Some("alpha".to_string()),
+            observed_at_unix_ms: 2_000,
+            evidence_ref: "synthetic:session-b".to_string(),
+            cruxpack_source_receipt: None,
+        },
+        crate::candidate_links::CandidateObservation {
+            local_passport_fpr: {
+                let facts = state.fact_store.read().await;
+                crate::passports::get_passport(&facts, "personal-default")
+                    .expect("local passport")
+                    .principal_id
+            },
+            observed_subject: "p_decoy_remote".to_string(),
+            tenant_id: "work::other-team".to_string(),
+            project_id: Some("alpha".to_string()),
+            observed_at_unix_ms: 2_100,
+            evidence_ref: "synthetic:decoy".to_string(),
+            cruxpack_source_receipt: None,
+        },
+    ];
+
+    let created = {
+        let facts = state.fact_store.read().await;
+        let mut entities = state.entity_store.write().await;
+        crate::candidate_links::propose_from_observations(
+            &mut entities,
+            &facts,
+            &observations,
+            "m6-demo",
+            &crate::candidate_links::ProposerConfig::default(),
+        )
+        .expect("propose")
+    };
+    assert_eq!(created.len(), 1, "decoy pair must not emit a candidate");
+    let candidate_id = created[0].0.clone();
+    assert_eq!(created[0].1.observed_subject, remote_fpr);
+
+    let resp = principal::get_resolve_principal(
+        State(state.clone()),
+        resolve_query_with_candidates(&remote_fpr),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "candidate is a suggestion only");
+    let body = json_body(resp).await;
+    assert_eq!(body["candidates"][0]["candidate_id"], candidate_id);
+    assert_eq!(body["candidates_resolve"], false);
+
+    let resp = identity_links::post_identity_candidate_confirm(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path(candidate_id),
+        Json(req),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = principal::get_resolve_principal(State(state.clone()), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let principal = json_body(resp).await;
+    assert_eq!(principal["passport_id"], "personal-default");
+    assert!(principal["resolved_via"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("identity_link:"));
+
+    let resp = principal::get_resolve_principal(State(state), resolve_query("p_decoy_remote"), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "decoy never resolves");
 }
 
 #[tokio::test]
@@ -12597,12 +12924,15 @@ async fn identity_link_lifecycle_create_resolve_revoke_deny() {
         .iter()
         .map(|v| v.as_str().unwrap_or_default().to_string())
         .collect();
-    for cap in &caps {
-        assert!(
-            crate::principal::MEMORY_READ_CAPABILITIES.contains(&cap.as_str()),
-            "linked passport must never hold non-memory.read capability {cap}"
-        );
-    }
+    assert_eq!(caps, crate::policy::federation_read_allowed_capabilities());
+    assert_eq!(
+        principal["federation_grant"]["capability"],
+        crate::policy::FEDERATION_READ_CAPABILITY
+    );
+    assert_eq!(
+        principal["federation_grant"]["scope"],
+        crate::policy::FEDERATION_READ_SCOPE
+    );
 
     // List shows it.
     let resp = identity_links::get_identity_links(State(state.clone()), HeaderMap::new())
@@ -12627,6 +12957,62 @@ async fn identity_link_lifecycle_create_resolve_revoke_deny() {
         .await
         .into_response();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "revoked link must be denied");
+}
+
+#[tokio::test]
+async fn identity_link_resolution_consumes_rcx_federation_read_grant() {
+    let mut state = test_app_state(16);
+    state.rcx_router = Some(test_rcx_router(vec![crate::policy::FEDERATION_READ_CAPABILITY]));
+    let (req, remote_fpr) = signed_link_request(&state).await;
+
+    let resp = identity_links::post_identity_link(State(state.clone()), HeaderMap::new(), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = principal::get_resolve_principal(State(state), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-crux-mode").unwrap(), "local");
+    let principal = json_body(resp).await;
+    assert_eq!(
+        principal["federation_grant"]["capability"],
+        crate::policy::FEDERATION_READ_CAPABILITY
+    );
+}
+
+#[tokio::test]
+async fn identity_link_resolution_denied_when_rcx_federation_read_missing() {
+    let mut state = test_app_state(16);
+    state.rcx_router = Some(test_rcx_router(vec!["corecrux.query.local"]));
+    let (req, remote_fpr) = signed_link_request(&state).await;
+
+    let resp = principal::get_resolve_principal(State(state.clone()), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "unlinked passport stays 404 before RCX"
+    );
+
+    let resp = identity_links::post_identity_link(State(state.clone()), HeaderMap::new(), Json(req))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = principal::get_resolve_principal(State(state), resolve_query(&remote_fpr), HeaderMap::new())
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.headers().get("x-crux-mode").unwrap(), "refused");
+    let body = json_body(resp).await;
+    assert_eq!(body["error"], "rcx_capability_denied");
+    assert_eq!(
+        body["refusal_receipt"]["capability"],
+        crate::policy::FEDERATION_READ_CAPABILITY
+    );
 }
 
 #[tokio::test]

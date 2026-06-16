@@ -55,7 +55,7 @@ use std::collections::HashSet;
 
 use crate::dispatch::McpContext;
 use crate::protocol::JsonRpcError;
-use crux_router::{McpToolCapability, RcxRouter};
+use crux_router::{McpToolCapability, RcxRouter, FEDERATION_READ_CAPABILITY};
 use rcx_capability_token::{DataEgressClass, RcxCapabilityToken};
 
 /// Describes a single MCP tool for the `tools/list` response.
@@ -2375,7 +2375,7 @@ pub fn rcx_local_capabilities() -> Vec<String> {
 /// [`rcx_local_capabilities`] — the static `[hosted]` tier excludes it.
 pub fn rcx_local_capabilities_with_flag(agent_passports_enabled: bool) -> Vec<String> {
     let mut seen = HashSet::new();
-    list_tools()
+    let mut capabilities: Vec<String> = list_tools()
         .into_iter()
         .filter_map(|tool| {
             let promoted_local = agent_passports_enabled && tool.name == "issue_passport";
@@ -2385,7 +2385,11 @@ pub fn rcx_local_capabilities_with_flag(agent_passports_enabled: bool) -> Vec<St
             let capability = rcx_capability_for_tool(&tool.name);
             seen.insert(capability.clone()).then_some(capability)
         })
-        .collect()
+        .collect();
+    if seen.insert(FEDERATION_READ_CAPABILITY.to_string()) {
+        capabilities.push(FEDERATION_READ_CAPABILITY.to_string());
+    }
+    capabilities
 }
 
 fn rcx_capability_for_tool(tool_name: &str) -> String {
@@ -2448,7 +2452,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "verify_observation", "output": "{ observation_id, ok: bool, hash_match: bool, signature_valid: bool, recomputed_hash, receipt_hash, reason?: string }" },
         { "tool": "receipt_verify", "output": "{ content: [...], receipt_id, tenant_id, feature_enabled: bool, verified: bool, signer_passport: string|null, errors: [string], http_status: int, report: VerificationReportV1 } — when feature off, omits report and returns errors:[FEATURE_DISABLED]. agent-ux-04 source-linked traceability." },
         { "tool": "get_agent_identity", "output": "{ agent_name: string }" },
-        { "tool": "resolve_principal",  "output": "{ content: [...], principal: { passport_id, category, tier, tier_rank: int, capabilities: [string], tenant_id, agent_work_gate: bool, resolved_via: 'session'|'passport' }, resolved_param: 'session_id'|'passport_id' } — loopback to GET /v1/principal/resolve; tenant-scoped server-side. agent→passport resolution parity for the MCP surface." },
+        { "tool": "resolve_principal",  "output": "{ content: [...], principal: { passport_id, category, tier, tier_rank: int, capabilities: [string], tenant_id, agent_work_gate: bool, resolved_via: 'session'|'passport'|'identity_link:<id>', federation_grant?: { capability, scope, allowed_capabilities } }, resolved_param: 'session_id'|'passport_id' } — loopback to GET /v1/principal/resolve; tenant-scoped server-side. agent→passport resolution parity for the MCP surface." },
         { "tool": "create_handoff",     "output": "{ package_json, content_hash, signature, relevant_fact_count }" },
         { "tool": "accept_handoff",     "output": "{ session_loaded, facts_loaded, verified: bool }" },
         { "tool": "record_decision",    "output": "{ decision_id, decision_hash, entity, action }" },
@@ -3044,6 +3048,7 @@ mod tests {
         let capabilities = rcx_local_capabilities();
 
         assert!(capabilities.contains(&"corecrux.query.local".to_string()));
+        assert!(capabilities.contains(&FEDERATION_READ_CAPABILITY.to_string()));
         assert!(capabilities.contains(&"crux-mcp.sync_status".to_string()));
         assert!(!capabilities.contains(&"crux-mcp.issue_passport".to_string()));
         assert!(!capabilities.contains(&"crux-mcp.sync_pull".to_string()));

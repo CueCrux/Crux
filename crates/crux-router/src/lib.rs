@@ -18,6 +18,7 @@ use rcx_capability_token::{
 };
 
 pub const RCX_MODE_HEADER: &str = "X-Crux-Mode";
+pub const FEDERATION_READ_CAPABILITY: &str = "federation.read";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouterMode {

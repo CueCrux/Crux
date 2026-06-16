@@ -166,6 +166,20 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
         return Some(RouteAuthContract::new(class, scopes));
     }
 
+    if path == "/v1/identity/candidates" || path.starts_with("/v1/identity/candidates/") {
+        let class = if method == "GET" {
+            RouteAuthClass::AdminRead
+        } else {
+            RouteAuthClass::AdminWrite
+        };
+        let scopes = if method == "GET" {
+            &["admin:read", "admin:write"][..]
+        } else {
+            &["admin:write"][..]
+        };
+        return Some(RouteAuthContract::new(class, scopes));
+    }
+
     if path.starts_with("/v1/memory/import")
         || path.starts_with("/v1/result-envelope/import")
         || path.starts_with("/v1/identity/links")
@@ -470,6 +484,24 @@ mod tests {
                 "/v1/gpu1/answer",
                 RouteAuthClass::FeatureGated,
                 &["query:read", "admin:read"][..],
+            ),
+            (
+                "GET",
+                "/v1/identity/candidates",
+                RouteAuthClass::AdminRead,
+                &["admin:read"][..],
+            ),
+            (
+                "POST",
+                "/v1/identity/candidates/{candidateId}/confirm",
+                RouteAuthClass::AdminWrite,
+                &["admin:write"][..],
+            ),
+            (
+                "POST",
+                "/v1/identity/candidates/{candidateId}/reject",
+                RouteAuthClass::AdminWrite,
+                &["admin:write"][..],
             ),
         ];
 

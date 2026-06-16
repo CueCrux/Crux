@@ -697,6 +697,42 @@ enum IdentityCommand {
         #[arg(long)]
         created_at: String,
     },
+    /// Confirm a proposed identity-link candidate by submitting the completed
+    /// cross-signature proof to the granting daemon.
+    ConfirmCandidate {
+        /// Candidate identifier (`cl_...`) to promote.
+        candidate_id: String,
+        /// Daemon HTTP base URL (defaults to CORECRUXD_HTTP_URL or localhost).
+        #[arg(long)]
+        http_url: Option<String>,
+        /// Daemon-local passport record id granting memory.read.
+        #[arg(long)]
+        local_passport_id: String,
+        /// Fingerprint of the remote passport being linked.
+        #[arg(long)]
+        remote_fpr: String,
+        /// 64-hex ed25519 verifying key of the remote passport.
+        #[arg(long)]
+        remote_public_key_hex: String,
+        /// RFC 3339 statement timestamp both sides signed.
+        #[arg(long)]
+        created_at: String,
+        /// 128-hex ed25519 signature by the local passport.
+        #[arg(long)]
+        sig_local: String,
+        /// 128-hex ed25519 signature by the remote passport.
+        #[arg(long)]
+        sig_remote: String,
+    },
+    /// Reject a proposed identity-link candidate without deleting its audit
+    /// trail.
+    RejectCandidate {
+        /// Candidate identifier (`cl_...`) to reject.
+        candidate_id: String,
+        /// Daemon HTTP base URL (defaults to CORECRUXD_HTTP_URL or localhost).
+        #[arg(long)]
+        http_url: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -3224,6 +3260,39 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("{}", serde_json::to_string_pretty(&out)?);
                 Ok(())
             }
+            IdentityCommand::ConfirmCandidate {
+                candidate_id,
+                http_url,
+                local_passport_id,
+                remote_fpr,
+                remote_public_key_hex,
+                created_at,
+                sig_local,
+                sig_remote,
+            } => {
+                let out = identity_cli::run_identity_confirm_candidate(&identity_cli::ConfirmCandidateArgs {
+                    http_url,
+                    token: None,
+                    candidate_id,
+                    local_passport_id,
+                    remote_fpr,
+                    remote_public_key_hex,
+                    created_at,
+                    sig_local,
+                    sig_remote,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                Ok(())
+            }
+            IdentityCommand::RejectCandidate { candidate_id, http_url } => {
+                let out = identity_cli::run_identity_reject_candidate(&identity_cli::RejectCandidateArgs {
+                    http_url,
+                    token: None,
+                    candidate_id,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                Ok(())
+            }
         },
         Command::AuditExport {
             data_dir,
@@ -3690,6 +3759,67 @@ mod tests {
                 assert_eq!(mode, "sampled");
                 assert!((sample_rate - 0.25).abs() < f64::EPSILON);
                 assert!(!strict);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_identity_candidate_commands() {
+        let cli = Cli::try_parse_from([
+            "corecruxctl",
+            "identity",
+            "confirm-candidate",
+            "cl_abc",
+            "--http-url",
+            "http://127.0.0.1:14800",
+            "--local-passport-id",
+            "personal-default",
+            "--remote-fpr",
+            "p_remote",
+            "--remote-public-key-hex",
+            "aa",
+            "--created-at",
+            "2026-06-15T00:00:00Z",
+            "--sig-local",
+            "bb",
+            "--sig-remote",
+            "cc",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Identity {
+                command:
+                    IdentityCommand::ConfirmCandidate {
+                        candidate_id,
+                        http_url,
+                        local_passport_id,
+                        remote_fpr,
+                        remote_public_key_hex,
+                        created_at,
+                        sig_local,
+                        sig_remote,
+                    },
+            } => {
+                assert_eq!(candidate_id, "cl_abc");
+                assert_eq!(http_url.as_deref(), Some("http://127.0.0.1:14800"));
+                assert_eq!(local_passport_id, "personal-default");
+                assert_eq!(remote_fpr, "p_remote");
+                assert_eq!(remote_public_key_hex, "aa");
+                assert_eq!(created_at, "2026-06-15T00:00:00Z");
+                assert_eq!(sig_local, "bb");
+                assert_eq!(sig_remote, "cc");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["corecruxctl", "identity", "reject-candidate", "cl_abc"]).unwrap();
+        match cli.command {
+            Command::Identity {
+                command: IdentityCommand::RejectCandidate { candidate_id, http_url },
+            } => {
+                assert_eq!(candidate_id, "cl_abc");
+                assert!(http_url.is_none());
             }
             other => panic!("unexpected command: {other:?}"),
         }
