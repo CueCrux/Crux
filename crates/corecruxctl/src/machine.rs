@@ -212,3 +212,21 @@ pub fn run_list(url: Option<String>) -> Result<(), DynErr> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_has_expected_shape() {
+        let r = build_record("http://127.0.0.1:14800");
+        assert!(r["hostname"].is_string());
+        assert_eq!(r["os"], std::env::consts::OS);
+        assert_eq!(r["arch"], std::env::consts::ARCH);
+        assert_eq!(r["http_url"], "http://127.0.0.1:14800");
+        assert!(r["hooks_installed"].is_boolean());
+        assert!(r["last_login_unix_ms"].as_u64().is_some());
+        assert!(r["ctl_version"].is_string());
+    }
+}

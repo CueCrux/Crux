@@ -177,6 +177,43 @@ and scopes are always set by the approving identity (tailnet allowlist or device
 approver), never by the requesting client — this is what keeps cross-tenant
 issuance closed (threat ref T.1).
 
+## IX / Infra: machines, hooks, config & session sync
+
+Onboarding is login-driven and observable. `corecruxctl login` does three things:
+authenticates, installs the Claude Code hooks, and registers the machine. The
+console's **IX (Infra)** section surfaces it all.
+
+```bash
+corecruxctl login            # auth + hooks + machine capture (skip: --no-hooks / --no-register)
+corecruxctl machine list     # machines logged into the daemon
+corecruxctl hooks install    # (re)install Claude Code hooks; --user for ~/.claude, else project
+corecruxctl hooks status     # what's wired
+
+# Carry a known-good Claude config across machines (secrets redacted):
+corecruxctl config push myles-pc     # capture ~/.claude → daemon
+corecruxctl config pull myles-pc     # deploy onto another machine (re-run `login` to re-fill secrets)
+corecruxctl config list
+
+# Share session-state snapshots across machines (event-driven, not real-time):
+corecruxctl session push <id> --file state.json
+corecruxctl session pull <id>
+corecruxctl session list
+```
+
+Storage model: machines, config bundles, and session snapshots are **public
+facts** under `__infra__::machines` / `__infra__::configs` / `__infra__::sessions`
+on the shared daemon, so every machine reads the same view. Config bundles carry
+*structure* (settings, `.mcp.json`, `CLAUDE.md`, `commands/` + `agents/`), not
+secrets — values under secret-looking keys and token-shaped strings are replaced
+with `${REDACTED}` and re-resolved per machine via `login`. They are readable by
+any `admin:read` caller on the daemon, so don't push data you wouldn't share
+within the daemon's tenant.
+
+Console: the IX section reads `GET /v1/console/infra/summary` (auth `admin:read`).
+On a remote `jwt_hs256` daemon, set a bearer once in the browser:
+`setConsoleToken("<your-agent-token>")` (stored in `localStorage`), then open the
+**IX** pill → Onboarding / Machines / Auth rails / Config bundles / Session sync.
+
 ## Human-Guided vs Automatic Integration
 
 Choose the integration style that matches the environment:
