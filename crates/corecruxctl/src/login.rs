@@ -801,6 +801,10 @@ pub struct LoginArgs {
     pub device: bool,
     /// Skip the post-login `tools/list` + fact round-trip verification.
     pub no_verify: bool,
+    /// Skip installing the Claude Code hooks (banner + observe capture).
+    pub no_hooks: bool,
+    /// Skip registering this machine with the daemon.
+    pub no_register: bool,
 }
 
 /// Run `corecruxctl login`.
@@ -899,7 +903,7 @@ pub fn run(args: LoginArgs) -> Result<(), DynErr> {
     } else {
         None
     };
-    register_mcp(&cfg_dir, &mcp_url, mcp_agent_token.as_deref())?;
+    register_mcp(&cfg_dir, &http_base, &mcp_url, mcp_agent_token.as_deref())?;
     println!("registered MCP endpoint {mcp_url} → {}", env_file.display());
 
     if args.no_verify {
@@ -915,6 +919,25 @@ pub fn run(args: LoginArgs) -> Result<(), DynErr> {
         match verify_fact_roundtrip(&agent, &http_base, effective_bearer.as_deref()) {
             Ok(()) => println!("verify: store_fact → query_facts round-trip ok"),
             Err(e) => println!("verify: fact round-trip skipped ({e})"),
+        }
+    }
+
+    // 6. orchestrate machine setup: install Claude Code hooks + register the
+    //    machine. Both best-effort (non-fatal) so login still succeeds offline.
+    if args.no_hooks {
+        println!("hooks: skipped (--no-hooks)");
+    } else {
+        match crate::hooks::install(true, None) {
+            Ok(summary) => println!("hooks: {summary}"),
+            Err(e) => println!("hooks: skipped ({e})"),
+        }
+    }
+    if args.no_register {
+        println!("machine: registration skipped (--no-register)");
+    } else {
+        match crate::machine::register(&http_base) {
+            Ok(s) => println!("machine: {s}"),
+            Err(e) => println!("machine: registration skipped ({e})"),
         }
     }
 
@@ -1117,14 +1140,16 @@ fn rail_description(rail: Rail) -> &'static str {
     }
 }
 
-/// Register the resolved MCP endpoint in `~/.config/cuecrux/env` so the agent
-/// bridges resolve it. Writes `CRUX_MCP_URL` (and, for the static-token rail,
-/// `CRUX_AGENT_TOKEN`) into the 0600 env file, preserving other keys.
-fn register_mcp(cfg_dir: &Path, mcp_url: &str, token: Option<&str>) -> Result<(), DynErr> {
+/// Register the resolved daemon endpoints in `~/.config/cuecrux/env` so the agent
+/// bridges + hooks resolve them. Writes `CRUX_MCP_URL` + `CRUX_HTTP_URL` (and, for
+/// the static-token rail, `CRUX_AGENT_TOKEN`) into the 0600 env file, preserving
+/// other keys.
+fn register_mcp(cfg_dir: &Path, http_url: &str, mcp_url: &str, token: Option<&str>) -> Result<(), DynErr> {
     let path = env_path(cfg_dir);
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let mut updates: BTreeMap<String, String> = BTreeMap::new();
     updates.insert("CRUX_MCP_URL".to_string(), mcp_url.to_string());
+    updates.insert("CRUX_HTTP_URL".to_string(), http_url.to_string());
     if let Some(t) = token {
         updates.insert("CRUX_AGENT_TOKEN".to_string(), t.to_string());
     }
