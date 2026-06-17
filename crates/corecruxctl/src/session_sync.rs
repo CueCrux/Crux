@@ -169,3 +169,172 @@ pub fn run_list(url: Option<String>) -> Result<(), DynErr> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// Point HOME at a fresh empty dir so `login::resolve_fresh_bearer`
+    /// resolves to `Ok(None)` (empty credential store) deterministically.
+    fn clean_home() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("crux-sess-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("HOME", &dir);
+        dir
+    }
+
+    fn snapshot_fact(key: &str, host: &str, state: serde_json::Value, bytes: u64) -> serde_json::Value {
+        let snap = serde_json::json!({
+            "state": state,
+            "source_host": host,
+            "updated_at_unix_ms": 1,
+            "bytes": bytes,
+        });
+        serde_json::json!({ "key": key, "value": snap.to_string() })
+    }
+
+    #[test]
+    fn now_unix_ms_is_nonzero() {
+        assert!(now_unix_ms() > 0);
+    }
+
+    #[test]
+    fn hostname_is_nonempty() {
+        assert!(!hostname().is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn push_from_file_sends_snapshot() {
+        clean_home();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, "{}".to_string())]);
+        let file = std::env::temp_dir().join(format!("crux-sess-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&file, r#"{"working_set":["a.rs"]}"#).unwrap();
+        run_push(
+            "sess-1".to_string(),
+            Some(file.to_string_lossy().into_owned()),
+            Some(format!("http://127.0.0.1:{port}")),
+        )
+        .expect("push ok");
+        let reqs = h.join().unwrap();
+        assert!(reqs[0].contains("__infra__::sessions"));
+        assert!(reqs[0].contains("working_set"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn push_wraps_non_json_payload() {
+        clean_home();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, "{}".to_string())]);
+        let file = std::env::temp_dir().join(format!("crux-sess-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&file, "just some prose, not json").unwrap();
+        run_push(
+            "sess-prose".to_string(),
+            Some(file.to_string_lossy().into_owned()),
+            Some(format!("http://127.0.0.1:{port}")),
+        )
+        .expect("push ok");
+        let reqs = h.join().unwrap();
+        assert!(reqs[0].contains("just some prose"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn push_surfaces_upstream_error() {
+        clean_home();
+        let (port, h) = crate::test_support::serve_responses(vec![(500, "boom".to_string())]);
+        let file = std::env::temp_dir().join(format!("crux-sess-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&file, "{}").unwrap();
+        let err = run_push(
+            "sess-err".to_string(),
+            Some(file.to_string_lossy().into_owned()),
+            Some(format!("http://127.0.0.1:{port}")),
+        )
+        .expect_err("must fail");
+        h.join().ok();
+        assert!(err.to_string().contains("session push failed (HTTP 500)"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn push_missing_file_errors() {
+        clean_home();
+        let err = run_push(
+            "x".to_string(),
+            Some("/no/such/file/at/all".to_string()),
+            Some("http://127.0.0.1:1".to_string()),
+        )
+        .expect_err("must fail");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pull_prints_matching_snapshot() {
+        clean_home();
+        let body = serde_json::json!({
+            "facts": [snapshot_fact("sess-1", "host-a", serde_json::json!({"k":"v"}), 12)]
+        })
+        .to_string();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, body)]);
+        run_pull("sess-1".to_string(), Some(format!("http://127.0.0.1:{port}"))).expect("pull ok");
+        h.join().ok();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pull_missing_session_errors() {
+        clean_home();
+        let body = serde_json::json!({ "facts": [] }).to_string();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, body)]);
+        let err = run_pull("nope".to_string(), Some(format!("http://127.0.0.1:{port}"))).expect_err("must fail");
+        h.join().ok();
+        assert!(err.to_string().contains("no session snapshot 'nope'"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pull_malformed_value_errors() {
+        clean_home();
+        let body = serde_json::json!({
+            "facts": [{ "key": "sess-bad", "value": "not-json" }]
+        })
+        .to_string();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, body)]);
+        let err = run_pull("sess-bad".to_string(), Some(format!("http://127.0.0.1:{port}"))).expect_err("must fail");
+        h.join().ok();
+        assert!(err.to_string().contains("malformed"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_empty_and_populated() {
+        clean_home();
+        // Empty.
+        let (port, h) = crate::test_support::serve_responses(vec![(200, r#"{"facts":[]}"#.to_string())]);
+        run_list(Some(format!("http://127.0.0.1:{port}"))).expect("list ok");
+        h.join().ok();
+        // Populated.
+        let body = serde_json::json!({
+            "facts": [
+                snapshot_fact("sess-1", "host-a", serde_json::json!({"k":"v"}), 10),
+                snapshot_fact("sess-2", "host-b", serde_json::Value::Null, 0),
+            ]
+        })
+        .to_string();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, body)]);
+        run_list(Some(format!("http://127.0.0.1:{port}"))).expect("list ok");
+        h.join().ok();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_surfaces_get_error() {
+        clean_home();
+        let (port, h) = crate::test_support::serve_responses(vec![(503, "down".to_string())]);
+        let err = run_list(Some(format!("http://127.0.0.1:{port}"))).expect_err("must fail");
+        h.join().ok();
+        assert!(err.to_string().contains("session list failed (HTTP 503)"));
+    }
+}

@@ -102,4 +102,34 @@ pub(crate) mod test_support {
         }
         String::from_utf8_lossy(&data).into_owned()
     }
+
+    /// Spawn a loopback HTTP stub that answers a fixed sequence of responses,
+    /// one per accepted connection, and captures each raw request. Returns the
+    /// bound port plus a join handle that yields the captured requests in
+    /// arrival order. Each response sends `Connection: close` so `ureq` opens a
+    /// fresh connection per request (keeps the accept loop in lock-step with
+    /// the client's call sequence). `responses` is `(status_code, body)`.
+    pub(crate) fn serve_responses(responses: Vec<(u16, String)>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let mut captured = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                captured.push(read_full_request(&mut stream));
+                let resp = format!(
+                    "HTTP/1.1 {status} S\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+            captured
+        });
+        (port, handle)
+    }
 }

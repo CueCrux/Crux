@@ -292,3 +292,248 @@ pub(super) async fn get_reconciliation(
     let report = crate::dossier::reconcile(&dossiers, now_unix_ms());
     (StatusCode::OK, Json(report)).into_response()
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::dossier::{Claim, Dossier};
+
+    fn state() -> AppState {
+        super::super::tests::test_app_state(16)
+    }
+
+    fn claim(id: &str) -> Claim {
+        Claim {
+            claim_id: id.to_string(),
+            kind: "implements".to_string(),
+            subject: "plane:a:b".to_string(),
+            object: Some("module:x".to_string()),
+            confidence: 0.9,
+            evidence: vec!["ev1".to_string()],
+            rationale: Some("because".to_string()),
+        }
+    }
+
+    fn dossier(id: &str, project: &str, agent: &str, ts: u64, claims: Vec<Claim>) -> Dossier {
+        Dossier {
+            dossier_id: id.to_string(),
+            project_id: project.to_string(),
+            agent_passport: agent.to_string(),
+            generated_at_unix_ms: ts,
+            based_on: Default::default(),
+            claims,
+            uncertainties: vec![],
+            contradictions: vec![],
+            open_questions: vec![],
+            stats: Default::default(),
+        }
+    }
+
+    async fn parts(resp: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn publish(st: &AppState, d: Dossier) -> StatusCode {
+        post_publish(State(st.clone()), Path(d.project_id.clone()), HeaderMap::new(), Json(d))
+            .await
+            .into_response()
+            .status()
+    }
+
+    #[test]
+    fn entity_and_passport_helpers() {
+        assert_eq!(entity_for("proj", "d1"), "__dossier__::proj::d1");
+        let mut headers = HeaderMap::new();
+        assert_eq!(extract_passport_id(&headers), "anonymous");
+        headers.insert("x-corecrux-passport-id", "p_abc".parse().unwrap());
+        assert_eq!(extract_passport_id(&headers), "p_abc");
+    }
+
+    #[tokio::test]
+    async fn publish_then_list_get_roundtrip() {
+        let st = state();
+        let status = publish(
+            &st,
+            dossier("d1", "proj", "agent-1", 1000, vec![claim("c1"), claim("c2")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, body) = parts(
+            list_dossiers(State(st.clone()), Path("proj".into()), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["dossiers"][0]["dossier_id"], "d1");
+
+        let (status, body) = parts(
+            get_dossier(State(st.clone()), Path(("proj".into(), "d1".into())), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["claims"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn publish_fills_defaults_and_validates() {
+        let st = state();
+        // project_id mismatch → 400.
+        let status = post_publish(
+            State(st.clone()),
+            Path("urlproj".into()),
+            HeaderMap::new(),
+            Json(dossier("d1", "otherproj", "a", 1, vec![])),
+        )
+        .await
+        .into_response()
+        .status();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // empty dossier_id → 400.
+        let status = post_publish(
+            State(st.clone()),
+            Path("proj".into()),
+            HeaderMap::new(),
+            Json(dossier("", "proj", "a", 1, vec![])),
+        )
+        .await
+        .into_response()
+        .status();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // empty agent + zero ts get filled from headers/clock.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-corecrux-passport-id", "p_filled".parse().unwrap());
+        let (status, body) = parts(
+            post_publish(
+                State(st.clone()),
+                Path("proj".into()),
+                headers,
+                Json(dossier("d2", "proj", "", 0, vec![claim("c1")])),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["agent"], "p_filled");
+        assert_eq!(body["claim_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn get_dossier_missing_is_404() {
+        let st = state();
+        let (status, _) = parts(
+            get_dossier(State(st), Path(("proj".into(), "nope".into())), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn diff_two_dossiers_and_missing_arms() {
+        let st = state();
+        publish(&st, dossier("a", "proj", "agent-1", 1000, vec![claim("c1")])).await;
+        publish(
+            &st,
+            dossier("b", "proj", "agent-1", 2000, vec![claim("c1"), claim("c2")]),
+        )
+        .await;
+
+        let (status, _) = parts(
+            get_diff(
+                State(st.clone()),
+                Path("proj".into()),
+                Query(DiffQuery {
+                    a: "a".into(),
+                    b: "b".into(),
+                }),
+                HeaderMap::new(),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Missing 'a'.
+        let (status, _) = parts(
+            get_diff(
+                State(st.clone()),
+                Path("proj".into()),
+                Query(DiffQuery {
+                    a: "ghost".into(),
+                    b: "b".into(),
+                }),
+                HeaderMap::new(),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Missing 'b'.
+        let (status, _) = parts(
+            get_diff(
+                State(st.clone()),
+                Path("proj".into()),
+                Query(DiffQuery {
+                    a: "a".into(),
+                    b: "ghost".into(),
+                }),
+                HeaderMap::new(),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_prefers_latest_per_agent() {
+        let st = state();
+        // Same agent publishes twice; reconcile should pull only the latest.
+        publish(&st, dossier("old", "proj", "agent-1", 1000, vec![claim("c1")])).await;
+        publish(
+            &st,
+            dossier("new", "proj", "agent-1", 2000, vec![claim("c1"), claim("c2")]),
+        )
+        .await;
+        publish(&st, dossier("other", "proj", "agent-2", 1500, vec![claim("c3")])).await;
+
+        let (status, _) = parts(
+            get_reconciliation(State(st.clone()), Path("proj".into()), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_auto_missing_project_is_404() {
+        let st = state();
+        let (status, _) = parts(
+            post_auto(State(st), Path("no-such-project".into()), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}

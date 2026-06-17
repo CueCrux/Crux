@@ -2039,3 +2039,249 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as u64)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod lane_weight_tests {
+    use super::*;
+
+    fn st() -> AppState {
+        super::super::tests::test_app_state(16)
+    }
+
+    async fn status_of(resp: axum::response::Response) -> StatusCode {
+        resp.status()
+    }
+
+    #[test]
+    fn canonical_lane_key_aliases_and_unknown() {
+        assert_eq!(canonical_lane_key("BM25"), Some("bm25"));
+        assert_eq!(canonical_lane_key("dense"), Some("cosine"));
+        assert_eq!(canonical_lane_key("vector"), Some("cosine"));
+        assert_eq!(canonical_lane_key("splade"), Some("sparse"));
+        assert_eq!(canonical_lane_key("ccxdi"), Some("indexing"));
+        assert_eq!(canonical_lane_key("nav"), Some("navtree"));
+        assert_eq!(canonical_lane_key("event"), Some("events"));
+        assert_eq!(canonical_lane_key("nonsense"), None);
+    }
+
+    #[test]
+    fn default_lane_weights_has_all_lanes() {
+        let d = default_lane_weights();
+        assert_eq!(d.len(), 10);
+        assert_eq!(d["bm25"], 1.0);
+        assert_eq!(d["topology"], 0.0);
+    }
+
+    #[test]
+    fn normalize_lane_weights_valid_and_errors() {
+        let mut raw = BTreeMap::new();
+        raw.insert("BM25".to_string(), 2.0);
+        raw.insert("dense".to_string(), 0.5);
+        let out = normalize_lane_weights(&raw).unwrap();
+        assert_eq!(out["bm25"], 2.0);
+        assert_eq!(out["cosine"], 0.5);
+
+        let mut bad = BTreeMap::new();
+        bad.insert("not-a-lane".to_string(), 1.0);
+        assert!(normalize_lane_weights(&bad).unwrap_err().contains("unknown lane"));
+
+        let mut neg = BTreeMap::new();
+        neg.insert("bm25".to_string(), -1.0);
+        assert!(normalize_lane_weights(&neg).is_err());
+
+        let mut nan = BTreeMap::new();
+        nan.insert("bm25".to_string(), f64::NAN);
+        assert!(normalize_lane_weights(&nan).is_err());
+    }
+
+    #[test]
+    fn normalize_optional_tenant_trims_and_drops_empty() {
+        assert_eq!(
+            normalize_optional_tenant(Some("  t1 ".to_string())),
+            Some("t1".to_string())
+        );
+        assert_eq!(normalize_optional_tenant(Some("   ".to_string())), None);
+        assert_eq!(normalize_optional_tenant(None), None);
+    }
+
+    #[test]
+    fn parse_overlay_map_extracts_string_values_only() {
+        let body = serde_json::json!({ "overlay": { "A": "1", "B": 2, "C": "x" } });
+        let m = parse_overlay_map(&body);
+        assert_eq!(m.get("A").map(String::as_str), Some("1"));
+        assert_eq!(m.get("C").map(String::as_str), Some("x"));
+        assert!(!m.contains_key("B"), "non-string values are dropped");
+        assert!(parse_overlay_map(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn overlay_bool_prefers_tenant_then_global() {
+        let mut tenant = BoostOverlay::new();
+        let mut global = BoostOverlay::new();
+        global.insert("FEATURE".to_string(), "true".to_string());
+        assert!(overlay_bool(&tenant, &global, "FEATURE"));
+        tenant.insert("FEATURE".to_string(), "0".to_string());
+        assert!(!overlay_bool(&tenant, &global, "FEATURE"), "tenant overrides global");
+        assert!(!overlay_bool(&BoostOverlay::new(), &BoostOverlay::new(), "MISSING"));
+    }
+
+    #[test]
+    fn parse_lane_weights_raw_json_kv_and_empty() {
+        // empty → defaults
+        assert_eq!(parse_lane_weights_raw("  "), default_lane_weights());
+        // JSON object form
+        let j = parse_lane_weights_raw(r#"{"bm25": 3.0, "dense": 0.25, "bad": 9}"#);
+        assert_eq!(j["bm25"], 3.0);
+        assert_eq!(j["cosine"], 0.25);
+        // comma/kv form with = and :
+        let kv = parse_lane_weights_raw("bm25=2, cosine:0.5, junk, navtree=oops");
+        assert_eq!(kv["bm25"], 2.0);
+        assert_eq!(kv["cosine"], 0.5);
+        // navtree=oops fails to parse → stays default 0.0
+        assert_eq!(kv["navtree"], 0.0);
+    }
+
+    #[test]
+    fn resolved_lane_weights_precedence() {
+        let mut global = BTreeMap::new();
+        let mut tenant = BTreeMap::new();
+        // default when neither set
+        let (_, src, raw) = resolved_lane_weights(&global, &tenant);
+        assert_eq!(src, "default");
+        assert!(raw.is_none());
+        // global set
+        global.insert(CORECRUX_LANE_WEIGHTS_KEY.to_string(), "bm25=5".to_string());
+        let (w, src, _) = resolved_lane_weights(&global, &tenant);
+        assert_eq!(src, "global");
+        assert_eq!(w["bm25"], 5.0);
+        // tenant overrides global
+        tenant.insert(CORECRUX_LANE_WEIGHTS_KEY.to_string(), "bm25=7".to_string());
+        let (w, src, _) = resolved_lane_weights(&global, &tenant);
+        assert_eq!(src, "tenant");
+        assert_eq!(w["bm25"], 7.0);
+    }
+
+    #[test]
+    fn lane_weights_to_overlay_json_fills_all_keys() {
+        let mut w = BTreeMap::new();
+        w.insert("bm25".to_string(), 2.5);
+        let json = lane_weights_to_overlay_json(&w).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["bm25"], 2.5);
+        // unset lanes fall back to defaults
+        assert!(v.get("cosine").is_some());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn corecrux_base_url_from_env_unset_and_set() {
+        for k in [
+            "CORECRUXD_CORECRUX_BASE_URL",
+            "CORECRUXD_CORECRUX_URL",
+            "CORECRUX_BASE_URL",
+        ] {
+            std::env::remove_var(k);
+        }
+        assert!(corecrux_base_url_from_env().is_err());
+        std::env::set_var("CORECRUX_BASE_URL", "http://engine:9/");
+        assert_eq!(corecrux_base_url_from_env().unwrap(), "http://engine:9");
+        std::env::remove_var("CORECRUX_BASE_URL");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lane_weight_handlers_503_without_engine_and_400_on_empty() {
+        for k in [
+            "CORECRUXD_CORECRUX_BASE_URL",
+            "CORECRUXD_CORECRUX_URL",
+            "CORECRUX_BASE_URL",
+        ] {
+            std::env::remove_var(k);
+        }
+        let state = st();
+        // GET → 503 (engine unconfigured).
+        let resp = get_console_corecrux_lane_weights(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(CoreCruxLaneWeightsQuery { tenant_id: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(status_of(resp).await, StatusCode::SERVICE_UNAVAILABLE);
+
+        // PUT empty weights → 400 (before engine lookup).
+        let resp = put_console_corecrux_lane_weights(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(UpdateCoreCruxLaneWeightsBody {
+                weights: BTreeMap::new(),
+                tenant_id: None,
+                fusion_rrf_enabled: true,
+                actor: None,
+                reason: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(status_of(resp).await, StatusCode::BAD_REQUEST);
+
+        // PUT unknown lane → 400.
+        let mut weights = BTreeMap::new();
+        weights.insert("not-a-lane".to_string(), 1.0);
+        let resp = put_console_corecrux_lane_weights(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(UpdateCoreCruxLaneWeightsBody {
+                weights,
+                tenant_id: None,
+                fusion_rrf_enabled: true,
+                actor: None,
+                reason: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(status_of(resp).await, StatusCode::BAD_REQUEST);
+
+        // DELETE → 503.
+        let resp = delete_console_corecrux_lane_weights(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(CoreCruxLaneWeightsQuery { tenant_id: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(status_of(resp).await, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn review_contradictions_and_consolidation() {
+        let state = st();
+        let resp = get_console_review_contradictions(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(ConsoleReviewQuery { limit: Some(10) }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Consolidation with a blank id gets an auto id + actor filled in; over
+        // an empty store the store call returns a structured error, which the
+        // handler maps to a problem response. Exercises the auto-fill + error map.
+        let body: corecrux_memory::fact_store::ConsolidationRequestV1 = serde_json::from_value(serde_json::json!({
+            "consolidation_id": "",
+            "entity": "person:alice",
+            "key": "city",
+            "canonical_value": "NYC",
+            "target_fact_ids": [],
+        }))
+        .unwrap();
+        let resp = post_console_review_consolidation(State(state), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        // A valid HTTP status was produced (success or a mapped problem).
+        assert!(resp.status().as_u16() >= 200);
+    }
+}

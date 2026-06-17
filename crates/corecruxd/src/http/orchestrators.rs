@@ -1013,4 +1013,315 @@ mod tests {
             "a validated passport member must not be reported missing"
         );
     }
+
+    // ── async HTTP handlers (gate-on path) ───────────────────────────
+
+    async fn handler_state() -> AppState {
+        let st = super::super::tests::test_app_state(16);
+        {
+            let mut reg = st.kind_registry.write().await;
+            crate::agentgraph_kinds::bootstrap(&mut reg).expect("bootstrap kinds");
+        }
+        st
+    }
+
+    async fn parts(resp: axum::response::Response) -> (StatusCode, Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    async fn seed_work(st: &AppState, id: &str) {
+        let mut store = st.fact_store.write().await;
+        crate::work::write_work_record(&mut store, &work_item(id, None)).unwrap();
+    }
+
+    async fn seed_passport(st: &AppState, id: &str, principal: &str) {
+        use corecrux_memory::fact_store::StoreFact;
+        let rec = json!({
+            "id": id,
+            "principal_id": principal,
+            "public_key_hex": "deadbeef",
+            "category": "work",
+            "issued_at_unix_ms": 1u64,
+        });
+        st.fact_store.write().await.store(StoreFact {
+            entity: format!("__passport__::{id}"),
+            key: "record".to_string(),
+            value: rec.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: true,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    async fn create(st: &AppState, body: Value) -> (StatusCode, Value) {
+        let body: CreateOrchestratorBody = serde_json::from_value(body).unwrap();
+        parts(
+            create_orchestrator(State(st.clone()), HeaderMap::new(), Json(body))
+                .await
+                .into_response(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn gate_off_returns_501() {
+        std::env::remove_var("CORECRUXD_ORCHESTRATORS");
+        let st = handler_state().await;
+        let (status, _) = create(&st, json!({ "name": "x" })).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_get_list_patch_lifecycle() {
+        std::env::set_var("CORECRUXD_ORCHESTRATORS", "1");
+        let st = handler_state().await;
+
+        // Create (defaults: state=planned, assignee=created_by=actor).
+        let (status, body) = create(&st, json!({ "name": "Coord", "tenant_id": "tenant-a" })).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = body["orchestrator"]["id"].as_str().unwrap().to_string();
+        assert_eq!(body["orchestrator"]["payload"]["state"], "planned");
+
+        // Validation: empty name, bad state.
+        assert_eq!(create(&st, json!({ "name": "  " })).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            create(&st, json!({ "name": "z", "state": "bogus" })).await.0,
+            StatusCode::BAD_REQUEST
+        );
+
+        // Get found + missing.
+        let (status, body) = parts(
+            get_orchestrator(State(st.clone()), Path(id.clone()), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["orchestrator"]["payload"]["name"], "Coord");
+        let (status, _) = parts(
+            get_orchestrator(State(st.clone()), Path("orc_missing".into()), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // List with filters.
+        let list = |q: ListOrchestratorsQuery| {
+            let st = st.clone();
+            async move {
+                parts(
+                    list_orchestrators(State(st), Query(q), HeaderMap::new())
+                        .await
+                        .into_response(),
+                )
+                .await
+            }
+        };
+        let (_, body) = list(ListOrchestratorsQuery {
+            assignee: None,
+            tenant_id: None,
+            state: None,
+            limit: None,
+        })
+        .await;
+        assert!(body["count"].as_u64().unwrap() >= 1);
+        let (_, body) = list(ListOrchestratorsQuery {
+            assignee: None,
+            tenant_id: Some("tenant-a".into()),
+            state: Some("planned".into()),
+            limit: Some(10),
+        })
+        .await;
+        assert_eq!(body["count"], 1);
+        let (_, body) = list(ListOrchestratorsQuery {
+            assignee: None,
+            tenant_id: Some("nope".into()),
+            state: None,
+            limit: None,
+        })
+        .await;
+        assert_eq!(body["count"], 0);
+
+        // Patch: name + state + assignee.
+        let (status, body) = parts(
+            patch_orchestrator(
+                State(st.clone()),
+                Path(id.clone()),
+                HeaderMap::new(),
+                Json(
+                    serde_json::from_value(json!({ "name": "Coord2", "state": "active", "assignee_passport": "p9" }))
+                        .unwrap(),
+                ),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["orchestrator"]["payload"]["name"], "Coord2");
+        assert_eq!(body["orchestrator"]["payload"]["state"], "active");
+        assert_eq!(body["orchestrator"]["payload"]["assignee_passport"], "p9");
+
+        // Patch invalid state, empty name, missing id.
+        let patch = |id: String, b: Value| {
+            let st = st.clone();
+            async move {
+                patch_orchestrator(
+                    State(st),
+                    Path(id),
+                    HeaderMap::new(),
+                    Json(serde_json::from_value(b).unwrap()),
+                )
+                .await
+                .into_response()
+                .status()
+            }
+        };
+        assert_eq!(
+            patch(id.clone(), json!({ "state": "bogus" })).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            patch(id.clone(), json!({ "name": "  " })).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            patch("orc_missing".into(), json!({ "name": "x" })).await,
+            StatusCode::NOT_FOUND
+        );
+
+        std::env::remove_var("CORECRUXD_ORCHESTRATORS");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn membership_add_remove_and_resolution() {
+        std::env::set_var("CORECRUXD_ORCHESTRATORS", "1");
+        let st = handler_state().await;
+        let (_, body) = create(&st, json!({ "name": "Coord" })).await; // empty tenant = wildcard
+        let id = body["orchestrator"]["id"].as_str().unwrap().to_string();
+
+        seed_work(&st, "w_1").await;
+        seed_passport(&st, "claude-work", "ce:abc:local").await;
+
+        let add = |id: String, b: Value| {
+            let st = st.clone();
+            async move {
+                parts(
+                    add_member(
+                        State(st),
+                        Path(id),
+                        HeaderMap::new(),
+                        Json(serde_json::from_value(b).unwrap()),
+                    )
+                    .await
+                    .into_response(),
+                )
+                .await
+            }
+        };
+
+        // Work member (explicit type).
+        assert_eq!(
+            add(id.clone(), json!({ "type": "work", "ref": "w_1" })).await.0,
+            StatusCode::OK
+        );
+        // Passport member (type inferred via passport store lookup).
+        assert_eq!(add(id.clone(), json!({ "ref": "claude-work" })).await.0, StatusCode::OK);
+        // Handoff member (prefix-inferred, never validated server-side).
+        assert_eq!(add(id.clone(), json!({ "ref": "ho_9" })).await.0, StatusCode::OK);
+        // ExecPlan member (no root env → accepted optimistically).
+        assert_eq!(add(id.clone(), json!({ "ref": "execplan:p1" })).await.0, StatusCode::OK);
+        // Dedup: re-adding w_1 stays OK and does not duplicate.
+        assert_eq!(
+            add(id.clone(), json!({ "type": "work", "ref": "w_1" })).await.0,
+            StatusCode::OK
+        );
+
+        // Error arms.
+        assert_eq!(
+            add(id.clone(), json!({ "type": "work", "ref": "  " })).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            add(id.clone(), json!({ "type": "bogus", "ref": "x" })).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            add(id.clone(), json!({ "type": "work", "ref": "w_missing" })).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            add(id.clone(), json!({ "ref": "bare-token-no-prefix" })).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            add("orc_missing".into(), json!({ "type": "work", "ref": "w_1" }))
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+
+        // Resolve members → live work resolves, handoff/execplan-missing flagged.
+        let (status, body) = parts(
+            list_orchestrator_work(State(st.clone()), Path(id.clone()), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["count"], 4, "w_1, passport, handoff, execplan");
+
+        // Remove the work member (also unstamps), then a non-member, then missing orchestrator.
+        assert_eq!(
+            parts(
+                remove_member(State(st.clone()), Path((id.clone(), "w_1".into())), HeaderMap::new())
+                    .await
+                    .into_response()
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            remove_member(
+                State(st.clone()),
+                Path((id.clone(), "not-a-member".into())),
+                HeaderMap::new()
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            remove_member(
+                State(st.clone()),
+                Path(("orc_missing".into(), "w_1".into())),
+                HeaderMap::new()
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // list_orchestrator_work on a missing orchestrator → 404.
+        assert_eq!(
+            list_orchestrator_work(State(st.clone()), Path("orc_missing".into()), HeaderMap::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        std::env::remove_var("CORECRUXD_ORCHESTRATORS");
+    }
 }

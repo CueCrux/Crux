@@ -4935,4 +4935,221 @@ mod tests {
             "non-indexable frames should not produce a ccxi file"
         );
     }
+
+    // ── append error paths + end-to-end read/replay (coverage batch) ─────
+
+    fn ev<'a>(event_id: &'a str, payload: &'a [u8]) -> AppendEventInput<'a> {
+        AppendEventInput {
+            event_id,
+            occurred_at: "2026-06-17T00:00:00Z",
+            event_type: "evt.created",
+            content_type: "application/json",
+            payload_bytes: payload,
+        }
+    }
+
+    fn append_n(storage: &mut ShardStorage, stream_hash: u64, tenant: &str, st: &str, sid: &str, n: u64) {
+        for i in 1..=n {
+            let id = format!("e{i}");
+            let payload = format!("payload-{i}");
+            let out = storage
+                .append_batch(
+                    stream_hash,
+                    0,
+                    tenant,
+                    st,
+                    sid,
+                    "2026-06-17T00:00:01Z",
+                    &[ev(&id, payload.as_bytes())],
+                )
+                .expect("append ok");
+            assert_eq!(out[0].status, AppendStatus::Appended);
+            assert_eq!(out[0].seq, i);
+        }
+    }
+
+    #[test]
+    fn append_rejects_batch_exceeding_max_events() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let mut opts = ShardStorageOptions::default();
+        opts.max_events_per_batch = 1;
+        let (_dir, mut storage) = open_test_storage(opts);
+        let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
+        let err = storage
+            .append_batch(
+                sh,
+                0,
+                "t",
+                "a",
+                "s",
+                "2026-06-17T00:00:01Z",
+                &[ev("e1", b"x"), ev("e2", b"y")],
+            )
+            .expect_err("too many events");
+        match err {
+            StorageError::ResourceExhausted { code, .. } => assert_eq!(code, "BACKPRESSURE_MAX_EVENTS"),
+            other => panic!("unexpected: {other}"),
+        }
+    }
+
+    #[test]
+    fn append_rejects_oversized_batch_bytes() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let mut opts = ShardStorageOptions::default();
+        opts.max_batch_bytes = 8;
+        let (_dir, mut storage) = open_test_storage(opts);
+        let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
+        let err = storage
+            .append_batch(
+                sh,
+                0,
+                "t",
+                "a",
+                "s",
+                "2026-06-17T00:00:01Z",
+                &[ev("e1", b"a-large-payload")],
+            )
+            .expect_err("oversized batch");
+        match err {
+            StorageError::ResourceExhausted { code, .. } => assert_eq!(code, "BACKPRESSURE_MAX_BATCH_BYTES"),
+            other => panic!("unexpected: {other}"),
+        }
+    }
+
+    #[test]
+    fn append_rejects_sequence_mismatch() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+        let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
+        let err = storage
+            .append_batch(sh, 99, "t", "a", "s", "2026-06-17T00:00:01Z", &[ev("e1", b"x")])
+            .expect_err("seq mismatch");
+        assert!(matches!(err, StorageError::ManifestRecordInvalid { .. }));
+    }
+
+    #[test]
+    fn append_per_event_rejections_empty_and_oversized_id() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let mut opts = ShardStorageOptions::default();
+        opts.max_event_id_bytes = 4;
+        let (_dir, mut storage) = open_test_storage(opts);
+        let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
+        let out = storage
+            .append_batch(
+                sh,
+                0,
+                "t",
+                "a",
+                "s",
+                "2026-06-17T00:00:01Z",
+                &[ev("", b"x"), ev("toolongid", b"y"), ev("ok", b"z")],
+            )
+            .expect("batch returns per-event outcomes");
+        assert_eq!(out[0].status, AppendStatus::Rejected, "empty id rejected");
+        assert_eq!(out[1].status, AppendStatus::Rejected, "oversized id rejected");
+        assert_eq!(out[2].status, AppendStatus::Appended, "valid id appended");
+    }
+
+    #[test]
+    fn append_idempotent_duplicate_across_batches() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+        let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
+        let first = storage
+            .append_batch(sh, 0, "t", "a", "s", "2026-06-17T00:00:01Z", &[ev("dup", b"v1")])
+            .unwrap();
+        assert_eq!(first[0].status, AppendStatus::Appended);
+        let again = storage
+            .append_batch(sh, 0, "t", "a", "s", "2026-06-17T00:00:02Z", &[ev("dup", b"v1")])
+            .unwrap();
+        assert_eq!(again[0].status, AppendStatus::DuplicateCommitted);
+        assert_eq!(again[0].seq, first[0].seq, "duplicate keeps original seq");
+    }
+
+    #[test]
+    fn append_dedupes_within_single_batch() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+        let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
+        let out = storage
+            .append_batch(
+                sh,
+                0,
+                "t",
+                "a",
+                "s",
+                "2026-06-17T00:00:01Z",
+                &[ev("d", b"x"), ev("d", b"x")],
+            )
+            .unwrap();
+        assert_eq!(out[0].status, AppendStatus::Appended);
+        assert_eq!(out[1].status, AppendStatus::DuplicateInBatch);
+    }
+
+    #[test]
+    fn read_stream_ranges_and_tail() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+        let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
+        append_n(&mut storage, sh, "t", "a", "s", 5);
+
+        // from seq 3, max 2 → seq 3,4.
+        let mid = storage.read_stream("t", "a", "s", sh, 3, 2).unwrap();
+        assert_eq!(mid.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4]);
+
+        // from beyond the end → empty.
+        let empty = storage.read_stream("t", "a", "s", sh, 99, 10).unwrap();
+        assert!(empty.is_empty());
+
+        // tail of 2 → last two seqs present.
+        let tail = storage.read_tail("t", "a", "s", sh, 2).unwrap();
+        let seqs: Vec<u64> = tail.iter().map(|e| e.seq).collect();
+        assert!(seqs.contains(&5) && seqs.contains(&4), "tail has latest: {seqs:?}");
+    }
+
+    #[test]
+    fn force_seal_head_on_empty_head_is_noop_and_reads_resolve() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+        let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
+        append_n(&mut storage, sh, "t", "a", "s", 3);
+
+        // Default options seal each append into its own segment, so the head is
+        // already empty — force_seal_head is a no-op (sealed=false), not an error.
+        let sealed = storage.force_seal_head().expect("seal call ok");
+        assert!(!sealed.sealed, "empty head seals to nothing");
+        // Reads still resolve across the sealed segments.
+        let all = storage.read_stream("t", "a", "s", sh, 1, 0).unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn replay_from_walks_all_frames() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+        let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
+        append_n(&mut storage, sh, "t", "a", "s", 4);
+        storage.force_seal_head().expect("seal");
+
+        let (frames, _cursor) = storage.replay_from(None, 0).expect("replay");
+        assert!(frames.len() >= 4, "replay surfaces all appended frames");
+    }
+
+    #[test]
+    fn tombstoned_stream_rejects_append() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
+        let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
+        append_n(&mut storage, sh, "t", "a", "s", 2);
+        // Tombstone at seq 5 (monotonic).
+        let (_min, tomb) = storage.update_stream_meta(sh, 0, 5).expect("tombstone");
+        assert_eq!(tomb, 5);
+        let err = storage
+            .append_batch(sh, 0, "t", "a", "s", "2026-06-17T00:00:09Z", &[ev("post", b"x")])
+            .expect_err("tombstoned");
+        match err {
+            StorageError::FailedPrecondition { code, .. } => assert_eq!(code, "STREAM_TOMBSTONED"),
+            other => panic!("unexpected: {other}"),
+        }
+    }
 }

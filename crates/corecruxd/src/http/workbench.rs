@@ -1553,3 +1553,138 @@ mod tests {
         assert!(scopes.contains(&"facts:write"));
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod helper_tests {
+    use super::*;
+
+    fn st_free() -> AppState {
+        super::super::tests::test_app_state(16)
+    }
+
+    fn seed(store: &mut FactStore, entity: &str, key: &str, value: &str) {
+        store.store(StoreFact {
+            entity: entity.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        });
+    }
+
+    #[test]
+    fn estimate_tokens_rounds_up_by_four() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
+    }
+
+    #[test]
+    fn source_label_covers_each_prefix() {
+        assert_eq!(source_label_for_entity("__constraints__::x"), "constraint");
+        assert_eq!(source_label_for_entity("__decisions__::x"), "decision");
+        assert_eq!(source_label_for_entity("__work__::x"), "work");
+        assert_eq!(source_label_for_entity("__workspace_scan__::x"), "workspace_scan");
+        assert_eq!(source_label_for_entity("github::x"), "github");
+        assert_eq!(source_label_for_entity("person:alice"), "fact_store");
+    }
+
+    #[test]
+    fn tenant_id_validates() {
+        assert_eq!(tenant_id("  t1 ").unwrap(), "t1");
+        assert!(tenant_id("   ").is_err());
+    }
+
+    #[test]
+    fn truncate_caps_length() {
+        assert_eq!(truncate("hello", 100), "hello");
+        let t = truncate(&"x".repeat(300), 240);
+        assert!(t.len() <= 244, "truncated + ellipsis stays bounded: {}", t.len());
+    }
+
+    #[test]
+    fn workbench_receipt_shape() {
+        let payload = json!({ "a": 1 });
+        let r = workbench_receipt("brief", "t1", &payload);
+        assert_eq!(r["schema"], WORKBENCH_RECEIPT_SCHEMA);
+        assert_eq!(r["tenant_id"], "t1");
+        assert_eq!(r["event_type"], "agent_workbench_brief");
+        assert!(r["receipt_id"].as_str().unwrap().starts_with("workbench:brief:"));
+        assert!(r["payload_hash"].as_str().unwrap().starts_with("blake3:"));
+    }
+
+    #[test]
+    fn service_contract_status_transitions() {
+        use crate::product::{OperatingMode, ProductPosture};
+        let cap = WorkbenchSurface::AgentBrief.capability().to_string();
+        // Free tier → pro_required.
+        let free = ProductPosture::new(OperatingMode::FreeLocal, &[]);
+        assert_eq!(
+            service_contract(&free, WorkbenchSurface::AgentBrief)["status"],
+            "pro_required"
+        );
+        // Pro tier, capability enabled → enabled.
+        let enabled = ProductPosture::new(OperatingMode::ProHybrid, std::slice::from_ref(&cap));
+        assert_eq!(
+            service_contract(&enabled, WorkbenchSurface::AgentBrief)["status"],
+            "enabled"
+        );
+        // Pro tier, not enabled → entitled_not_enabled.
+        let pro_off = ProductPosture::new(OperatingMode::ProHybrid, &[]);
+        assert_eq!(
+            service_contract(&pro_off, WorkbenchSurface::AgentBrief)["status"],
+            "entitled_not_enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_and_workbench_facts_round_trip() {
+        let st = st_free();
+        {
+            let mut store = st.fact_store.write().await;
+            seed(
+                &mut store,
+                "__workbench__::t1::brief::r1",
+                "brief",
+                r#"{"hello":"world"}"#,
+            );
+            seed(&mut store, "person:alice", "city", "NYC");
+        }
+        let store = st.fact_store.read().await;
+        // query_facts by prefix.
+        let facts = query_facts(&store, None, Some("__workbench__::t1::"), 10);
+        assert!(!facts.is_empty());
+        // fact_summary builds a preview object.
+        let summary = fact_summary(facts[0].clone());
+        assert!(summary["entity"].as_str().unwrap().contains("__workbench__::t1::brief"));
+        // workbench_facts parses the stored JSON value.
+        let wf = workbench_facts(&store, "t1", "brief", 10);
+        assert_eq!(wf.len(), 1);
+        assert_eq!(wf[0]["hello"], "world");
+        // tenant_facts filters by tenant occurrence.
+        let tf = tenant_facts(&store, "t1", 10);
+        assert!(tf.iter().all(|f| f.entity.contains("t1") || f.value.contains("t1")));
+    }
+
+    #[tokio::test]
+    async fn contract_handler_ok_and_brief_requires_pro() {
+        let st = st_free();
+        // Contract is always readable (Off-mode bypasses scope).
+        let resp = get_workbench_contract(State(st.clone()), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Empty tenant → 400.
+        let q: TenantWorkbenchQuery = serde_json::from_value(json!({ "tenant_id": "" })).unwrap();
+        let resp = get_agent_brief(State(st.clone()), HeaderMap::new(), Query(q)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Valid tenant but FreeLocal → AgentBrief pro capability not enabled → 402.
+        let q: TenantWorkbenchQuery = serde_json::from_value(json!({ "tenant_id": "t1" })).unwrap();
+        let resp = get_agent_brief(State(st), HeaderMap::new(), Query(q)).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+}

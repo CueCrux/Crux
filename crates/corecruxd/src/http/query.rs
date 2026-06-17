@@ -803,3 +803,117 @@ mod tests {
 }
 
 // ── Fact Store API (Phase 1.5) ──────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod query_tests {
+    use super::super::tests::{test_app_state, TestDataplane};
+    use super::*;
+
+    fn enabled() -> AppState {
+        let mut s = test_app_state(16);
+        s.http_dataplane = TestDataplane::shared(vec![]);
+        s
+    }
+
+    fn graph_body(seeds: Vec<u32>) -> GraphExpandBody {
+        GraphExpandBody {
+            tenant_id: "t1".to_string(),
+            seed_artifact_ids: seeds,
+            edge_types: vec![],
+            max_hops: 2,
+            budget: 64,
+            min_confidence: 0.0,
+            include_state: false,
+        }
+    }
+
+    #[test]
+    fn tenant_hash_is_deterministic_and_distinct() {
+        assert_eq!(tenant_hash("acme"), tenant_hash("acme"));
+        assert_ne!(tenant_hash("acme"), tenant_hash("globex"));
+    }
+
+    #[test]
+    fn current_unix_seconds_is_nonzero() {
+        assert!(current_unix_seconds() > 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn graph_expand_feature_and_dataplane_gates() {
+        std::env::remove_var("CORECRUXD_QUERY_GRAPH_EXPAND");
+        // Feature flag off → 404.
+        let resp = post_query_graph_expand(State(enabled()), HeaderMap::new(), Json(graph_body(vec![1])))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        std::env::set_var("CORECRUXD_QUERY_GRAPH_EXPAND", "1");
+        // Feature on but dataplane disabled → upgrade 501.
+        let resp = post_query_graph_expand(State(test_app_state(16)), HeaderMap::new(), Json(graph_body(vec![1])))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+
+        // Feature on, dataplane enabled, empty seeds → 400.
+        let resp = post_query_graph_expand(State(enabled()), HeaderMap::new(), Json(graph_body(vec![])))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        std::env::remove_var("CORECRUXD_QUERY_GRAPH_EXPAND");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn time_range_feature_and_dataplane_gates() {
+        std::env::remove_var("CORECRUXD_QUERY_TIME_RANGE");
+        let body = TimeRangeBody {
+            tenant_id: "t1".to_string(),
+            start_micros: 0,
+            end_micros: 1_000_000,
+            artifact_ids: vec![],
+            include_relations: false,
+            limit: 10,
+        };
+        let resp = post_query_time_range(State(enabled()), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        std::env::set_var("CORECRUXD_QUERY_TIME_RANGE", "1");
+        let body = TimeRangeBody {
+            tenant_id: "t1".to_string(),
+            start_micros: 0,
+            end_micros: 1_000_000,
+            artifact_ids: vec![],
+            include_relations: false,
+            limit: 10,
+        };
+        let resp = post_query_time_range(State(test_app_state(16)), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        std::env::remove_var("CORECRUXD_QUERY_TIME_RANGE");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn text_search_feature_gate_off_is_404() {
+        std::env::remove_var("CORECRUXD_QUERY_TEXT_SEARCH");
+        let body = TextSearchBody {
+            tenant_id: "t1".to_string(),
+            query: "hello".to_string(),
+            limit: 10,
+            token_budget: None,
+            min_score: None,
+            mode: None,
+            include_receipt: None,
+        };
+        let resp = post_query_text_search(State(enabled()), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
