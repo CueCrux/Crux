@@ -807,12 +807,12 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod query_tests {
-    use super::super::tests::{test_app_state, TestDataplane};
+    use super::super::tests::{enabled_dataplane, test_app_state};
     use super::*;
 
     fn enabled() -> AppState {
         let mut s = test_app_state(16);
-        s.http_dataplane = TestDataplane::shared(vec![]);
+        s.http_dataplane = enabled_dataplane(vec![], None);
         s
     }
 

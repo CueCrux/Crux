@@ -14,6 +14,10 @@ mod tests {
     use corecrux_frame::{canonical_header_bytes_v1, compute_header_hash, compute_payload_hash, CanonicalHeaderV1};
     use corecrux_segment::FrameMetaV1;
 
+    // Serialises tests that touch process-global state. Acquired poison-tolerant
+    // (`unwrap_or_else(PoisonError::into_inner)`) so ONE panicking test does not
+    // poison the mutex and cascade `PoisonError` panics across every other test,
+    // masking the real failure (testing-system audit 2026-06-17, M6).
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // ── ShardPaths::for_root ────────────────────────────────────────
@@ -531,7 +535,7 @@ mod tests {
 
     #[test]
     fn startup_dirrun_bootstrap_skip_gate_is_stable() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         assert!(!should_skip_startup_dirrun_bootstrap(false, 10_000));
         assert!(!should_skip_startup_dirrun_bootstrap(
@@ -621,7 +625,7 @@ mod tests {
 
     #[test]
     fn apply_replicated_segment_roundtrip_and_idempotent() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
         let tenant_id = "tenant-a";
@@ -654,7 +658,7 @@ mod tests {
 
     #[test]
     fn apply_replicated_segment_conflict_rejected() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
         let tenant_id = "tenant-a";
@@ -691,7 +695,7 @@ mod tests {
 
     #[test]
     fn apply_replicated_segment_rejects_shard_mismatch() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
         let seg = build_test_replicated_segment(2, 1, 89, "tenant-a", "artifact", "1", 1, "evt-1", b"payload");
@@ -708,7 +712,7 @@ mod tests {
 
     #[test]
     fn apply_replicated_segment_rejects_epoch_mismatch() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
         let seg = build_test_replicated_segment(1, 2, 90, "tenant-a", "artifact", "1", 1, "evt-1", b"payload");
@@ -725,7 +729,7 @@ mod tests {
 
     #[test]
     fn read_segment_bytes_for_replication_roundtrip_and_missing_segment() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
         let seg = build_test_replicated_segment(1, 1, 91, "tenant-a", "artifact", "1", 1, "evt-1", b"payload");
@@ -752,7 +756,7 @@ mod tests {
 
     #[test]
     fn read_segment_bytes_for_replication_detects_manifest_hash_mismatch() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
         let seg = build_test_replicated_segment(1, 1, 92, "tenant-a", "artifact", "1", 1, "evt-1", b"payload");
@@ -775,7 +779,7 @@ mod tests {
 
     #[test]
     fn strict_scan_verifies_segment_hashes_and_detects_manifest_mismatch() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
         let tenant_id = "tenant-a";
@@ -819,7 +823,7 @@ mod tests {
 
     #[test]
     fn manifest_tail_truncation_ignores_partial_record() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("MANIFEST");
@@ -907,7 +911,7 @@ mod tests {
 
     #[test]
     fn directory_compaction_keeps_l0_runs_bounded() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             enable_directory_compaction: true,
@@ -958,7 +962,7 @@ mod tests {
     #[test]
     #[ignore]
     fn soak_ingest_under_compaction_pressure() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let secs: u64 = std::env::var("CORECRUX_SOAK_SECS")
             .ok()
@@ -1122,7 +1126,7 @@ mod tests {
 
     #[test]
     fn tombstone_and_checkpoint_filter_reads_deterministically() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             enable_directory_compaction: true,
@@ -1174,7 +1178,7 @@ mod tests {
 
     #[test]
     fn tombstoned_stream_rejects_appends() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
@@ -1214,7 +1218,7 @@ mod tests {
 
     #[test]
     fn stream_meta_updates_are_monotonic() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
@@ -1240,7 +1244,7 @@ mod tests {
 
     #[test]
     fn append_batch_dedupes_within_batch() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let (dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
@@ -1295,7 +1299,7 @@ mod tests {
 
     #[test]
     fn append_batch_with_stats_reports_stage_timings() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
@@ -1339,7 +1343,7 @@ mod tests {
 
     #[test]
     fn append_batch_with_stats_reports_write_confirmation_hash() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
@@ -1408,7 +1412,7 @@ mod tests {
 
     #[test]
     fn append_batch_seal_receipt_links_previous_segment_hash() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
         let tenant_id = "t1";
@@ -1461,7 +1465,7 @@ mod tests {
 
     #[test]
     fn load_manifest_segment_catalog_returns_sorted_segments() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
         let tenant_id = "tenant-a";
@@ -1502,7 +1506,7 @@ mod tests {
 
     #[test]
     fn duplicate_committed_returns_existing_seq_and_location() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
@@ -1554,7 +1558,7 @@ mod tests {
 
     #[test]
     fn hash_collision_does_not_cause_false_dedupe() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             event_id_hash_prefix_len: 1,
@@ -1644,7 +1648,7 @@ mod tests {
 
     #[test]
     fn eviction_falls_back_to_cold_scan_for_correctness() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             idem_hot_capacity_entries: 1,
@@ -1719,7 +1723,7 @@ mod tests {
 
     #[test]
     fn event_id_too_large_is_rejected_and_does_not_consume_seq() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             max_event_id_bytes: 3,
@@ -1779,7 +1783,7 @@ mod tests {
 
     #[test]
     fn backpressure_max_events_rejects_entire_request() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             max_events_per_batch: 1,
@@ -1830,7 +1834,7 @@ mod tests {
 
     #[test]
     fn crash_after_manifest_commit_is_idempotent_on_restart() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             idem_hot_capacity_entries: 4,
@@ -1892,7 +1896,7 @@ mod tests {
 
     #[test]
     fn crash_after_manifest_commit_keeps_replay_digest_stable_after_retry() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             idem_hot_capacity_entries: 4,
@@ -1963,7 +1967,7 @@ mod tests {
 
     #[test]
     fn crash_after_rename_before_manifest_quarantines_orphan_and_avoids_seq_reuse() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions::default();
         let (dir, mut storage) = open_test_storage(opts.clone());
@@ -2023,7 +2027,7 @@ mod tests {
 
     #[test]
     fn commit_frame_roundtrip_and_crc_validation() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let frame = encode_commit_frame_v1(7, 42, 8192, 0xAABB_CCDD);
         let parsed = decode_commit_frame_v1(&frame).expect("commit frame decode");
@@ -2043,7 +2047,7 @@ mod tests {
 
     #[test]
     fn head_recovery_truncates_tail_to_last_commit_frame_boundary() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             head_max_record_bytes: 1024 * 1024,
@@ -2101,7 +2105,7 @@ mod tests {
 
     #[test]
     fn crash_after_head_commit_fence_before_ack_is_idempotent_after_restart() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             head_max_record_bytes: 1024 * 1024,
@@ -2178,7 +2182,7 @@ mod tests {
     /// (seq 1, Appended), and exactly one frame replays afterwards.
     #[test]
     fn crash_after_seq_assignment_persists_nothing_and_retry_is_fresh_append() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             idem_hot_capacity_entries: 4,
@@ -2252,7 +2256,7 @@ mod tests {
     /// with a stable replay digest.
     #[test]
     fn crash_after_write_tmp_ignores_partial_and_recovers_cleanly() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             idem_hot_capacity_entries: 4,
@@ -2354,7 +2358,7 @@ mod tests {
     /// recognised as DuplicateCommitted (no double-append).
     #[test]
     fn crash_after_head_commit_frame_write_before_fence_is_idempotent_after_restart() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             head_max_record_bytes: 1024 * 1024,
@@ -2423,7 +2427,7 @@ mod tests {
 
     #[test]
     fn read_tail_returns_last_n_across_segments() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
@@ -2469,7 +2473,7 @@ mod tests {
 
     #[test]
     fn read_stream_range_respects_from_seq_and_limit() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
@@ -2511,7 +2515,7 @@ mod tests {
 
     #[test]
     fn tail_locator_helpers_truncate_group_and_fallback() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
         let stream_hash = 0x42;
@@ -2578,7 +2582,7 @@ mod tests {
 
     #[test]
     fn replay_from_cursor_continues_deterministically() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
@@ -2631,7 +2635,7 @@ mod tests {
 
     #[test]
     fn head_segment_serves_reads_before_seal() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             head_max_record_bytes: 1024 * 1024, // large enough to avoid sealing during test
@@ -2706,7 +2710,7 @@ mod tests {
 
     #[test]
     fn read_frame_bytes_batch_supports_mixed_sealed_and_head_locations() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             head_max_record_bytes: 1024 * 1024,
@@ -2799,7 +2803,7 @@ mod tests {
 
     #[test]
     fn read_frame_bytes_batch_packed_empty_returns_empty_payload() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, storage) = open_test_storage(ShardStorageOptions::default());
 
         let packed = storage.read_frame_bytes_batch_packed(&[]).expect("empty packed batch");
@@ -2811,7 +2815,7 @@ mod tests {
 
     #[test]
     fn head_segment_is_sealed_on_restart_when_disabled() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             head_max_record_bytes: 1024 * 1024,
@@ -2860,7 +2864,7 @@ mod tests {
 
     #[test]
     fn read_blocks_supports_lz4_codec() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("block.bin");
@@ -2896,7 +2900,7 @@ mod tests {
 
     #[test]
     fn sealed_segments_with_lz4_blocks_support_tail_and_range_reads() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             record_block_codec: corecrux_segment::RECORD_BLOCK_CODEC_LZ4_V1,
@@ -3000,7 +3004,7 @@ mod tests {
 
     #[test]
     fn replay_golden_segment_fixture_digest_matches_expected() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let fixture_dir = repo_root().join("tests/fixtures_segments/minimal");
         let fixture_seg = fixture_dir.join("minimal.ccxseg");
@@ -3088,7 +3092,7 @@ mod tests {
 
     #[test]
     fn integrity_scan_golden_segment_fixture_matches_expected_frame_count() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let fixture_dir = repo_root().join("tests/fixtures_segments/minimal");
         let fixture_seg = fixture_dir.join("minimal.ccxseg");
@@ -3158,7 +3162,7 @@ mod tests {
 
     #[test]
     fn replay_and_integrity_scan_reject_zero_budget() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, storage) = open_test_storage(ShardStorageOptions::default());
 
         let replay_err = storage
@@ -3180,7 +3184,7 @@ mod tests {
 
     #[test]
     fn replay_scan_stats_counts_sealed_and_head_segments() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let opts = ShardStorageOptions {
             head_max_record_bytes: 1024 * 1024,
             ..Default::default()
@@ -3244,7 +3248,7 @@ mod tests {
 
     #[test]
     fn replay_and_integrity_scan_reject_missing_trailer_index() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
 
         let tenant_id = "t1";
@@ -3295,7 +3299,7 @@ mod tests {
 
     #[test]
     fn integrity_scan_detects_sealed_and_head_frame_count_mismatches() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut sealed_storage) = open_test_storage(ShardStorageOptions::default());
 
         let tenant_id = "t1";
@@ -3381,7 +3385,7 @@ mod tests {
 
     #[test]
     fn tail_and_range_match_cpu_reference_scan_on_interleaved_segments() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -3684,7 +3688,7 @@ mod tests {
 
     #[test]
     fn randomized_tail_and_range_match_cpu_reference_scan() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         #[derive(Debug)]
         struct SplitMix64 {
@@ -4001,7 +4005,7 @@ mod tests {
     /// which was the root cause of the decision-plane 500 bug (2026-03-24).
     #[test]
     fn second_open_on_locked_shard_returns_would_block() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (dir, _storage) = open_test_storage(ShardStorageOptions::default());
 
         // Attempt to open the same shard while the first handle is live.
@@ -4507,7 +4511,7 @@ mod tests {
 
     #[test]
     fn open_rejects_invalid_hash_prefix_len() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let opts = ShardStorageOptions {
             event_id_hash_prefix_len: 0,
@@ -4687,7 +4691,7 @@ mod tests {
 
     #[test]
     fn manifest_record_crc_mismatch_truncates_gracefully() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("MANIFEST");
@@ -4721,7 +4725,7 @@ mod tests {
 
     #[test]
     fn backpressure_max_batch_bytes_rejects() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let opts = ShardStorageOptions {
             max_batch_bytes: 1, // extremely small
@@ -4765,7 +4769,7 @@ mod tests {
 
     #[test]
     fn replay_from_sealed_empty_store() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, storage) = open_test_storage(ShardStorageOptions::default());
         let (frames, cursor) = storage.replay_from_sealed(None, 100).unwrap();
         assert!(frames.is_empty());
@@ -4776,7 +4780,7 @@ mod tests {
 
     #[test]
     fn force_seal_head_with_no_head() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
         let result = storage.force_seal_head().unwrap();
         assert!(!result.sealed);
@@ -4788,7 +4792,7 @@ mod tests {
 
     #[test]
     fn directory_lsm_stats_empty() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, storage) = open_test_storage(ShardStorageOptions::default());
         let stats = storage.directory_lsm_stats_v1();
         assert!(stats.levels.is_empty());
@@ -4970,7 +4974,7 @@ mod tests {
 
     #[test]
     fn append_rejects_batch_exceeding_max_events() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut opts = ShardStorageOptions::default();
         opts.max_events_per_batch = 1;
         let (_dir, mut storage) = open_test_storage(opts);
@@ -4994,7 +4998,7 @@ mod tests {
 
     #[test]
     fn append_rejects_oversized_batch_bytes() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut opts = ShardStorageOptions::default();
         opts.max_batch_bytes = 8;
         let (_dir, mut storage) = open_test_storage(opts);
@@ -5018,7 +5022,7 @@ mod tests {
 
     #[test]
     fn append_rejects_sequence_mismatch() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
         let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
         let err = storage
@@ -5029,7 +5033,7 @@ mod tests {
 
     #[test]
     fn append_per_event_rejections_empty_and_oversized_id() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut opts = ShardStorageOptions::default();
         opts.max_event_id_bytes = 4;
         let (_dir, mut storage) = open_test_storage(opts);
@@ -5052,7 +5056,7 @@ mod tests {
 
     #[test]
     fn append_idempotent_duplicate_across_batches() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
         let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
         let first = storage
@@ -5068,7 +5072,7 @@ mod tests {
 
     #[test]
     fn append_dedupes_within_single_batch() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
         let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
         let out = storage
@@ -5088,7 +5092,7 @@ mod tests {
 
     #[test]
     fn read_stream_ranges_and_tail() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
         let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
         append_n(&mut storage, sh, "t", "a", "s", 5);
@@ -5109,7 +5113,7 @@ mod tests {
 
     #[test]
     fn force_seal_head_on_empty_head_is_noop_and_reads_resolve() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
         let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
         append_n(&mut storage, sh, "t", "a", "s", 3);
@@ -5125,7 +5129,7 @@ mod tests {
 
     #[test]
     fn replay_from_walks_all_frames() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
         let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
         append_n(&mut storage, sh, "t", "a", "s", 4);
@@ -5137,7 +5141,7 @@ mod tests {
 
     #[test]
     fn tombstoned_stream_rejects_append() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_dir, mut storage) = open_test_storage(ShardStorageOptions::default());
         let sh = corecrux_frame::stream_hash_xxhash64("t", "a", "s").unwrap();
         append_n(&mut storage, sh, "t", "a", "s", 2);
