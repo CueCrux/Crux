@@ -2267,9 +2267,8 @@ mod lane_weight_tests {
         .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Consolidation with a blank id gets an auto id + actor filled in; over
-        // an empty store the store call returns a structured error, which the
-        // handler maps to a problem response. Exercises the auto-fill + error map.
+        // Blank id gets an auto id + actor filled in; an empty `target_fact_ids`
+        // is a `NoTargets` error which the handler maps to 400 (not a silent 200).
         let body: corecrux_memory::fact_store::ConsolidationRequestV1 = serde_json::from_value(serde_json::json!({
             "consolidation_id": "",
             "entity": "person:alice",
@@ -2281,7 +2280,10 @@ mod lane_weight_tests {
         let resp = post_console_review_consolidation(State(state), HeaderMap::new(), Json(body))
             .await
             .into_response();
-        // A valid HTTP status was produced (success or a mapped problem).
-        assert!(resp.status().as_u16() >= 200);
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "empty target set is rejected, not laundered into 200"
+        );
     }
 }

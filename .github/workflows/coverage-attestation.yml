@@ -19,8 +19,10 @@ jobs:
       # Keep in lock-step with ci.yml's COVERAGE_IGNORE_REGEX (see the rationale
       # there). Excluded = binary entry points (main.rs for corecruxd/corecruxctl/
       # crux-claude-hooks/crux-config-wizard + crux_llm_shim), the interactive
-      # config wizard, and the CE-inert dataplane (pool.rs, dataplane_store.rs,
-      # http/dataplane.rs). Critical data-plane / receipts / projections / admin /
+      # config wizard, and the dataplane layer which is an unconstructable
+      # typecheck stub in CE (pool.rs `DataPlanePool` is never built / methods are
+      # `unreachable!()`; dataplane_store.rs; http/dataplane.rs). Critical
+      # data-plane / receipts / projections / admin /
       # audit-pack surfaces are in scope and gated (2026-04-05 audit HIGH #9).
       COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/http/dataplane\.rs|.*/corecruxd/src/main\.rs|.*/corecruxctl/src/main\.rs|.*/crux-claude-hooks/src/main\.rs|.*/crux-claude-hooks/src/bin/crux_llm_shim\.rs|.*/crux-config-wizard/src/main\.rs|.*/crux-config-wizard/src/interactive\.rs)$'
       CORECRUX_COVERAGE_ATTEST_SIGNING_KEY_B64: ${{ secrets.CORECRUX_COVERAGE_ATTEST_SIGNING_KEY_B64 }}

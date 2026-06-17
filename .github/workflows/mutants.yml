@@ -1,0 +1,57 @@
+# Mutation testing for the tamper-evidence trust core.
+#
+# Region coverage proves a line executed; it does NOT prove a test would catch
+# a regression. `cargo-mutants` mutates the code and checks that some test
+# fails — surviving mutants are assertion gaps (the failure mode the 2026-06-17
+# testing-system audit flagged). Scoped to the trust-core crates and run
+# nightly / on-demand; NON-BLOCKING (report-only) so it never gates a PR until
+# the survivor backlog is triaged. See PlanCrux ExecPlan
+# crux-testing-system-hardening-2026-06-17 (M5).
+name: Mutation (trust core)
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # nightly 04:00 UTC
+  workflow_dispatch: {}
+
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mutants:
+    name: cargo-mutants (receipts/segment/storage)
+    runs-on: [self-hosted, ci]
+    # Report-only: a surviving mutant must not fail the workflow yet.
+    continue-on-error: true
+    env:
+      CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
+    steps:
+      - name: Seed per-job CARGO_HOME from shared toolchain
+        run: |
+          mkdir -p "$CARGO_HOME/bin"
+          for tool in /home/gha-runner/.cargo/bin/*; do
+            [ -e "$tool" ] || continue
+            ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
+          done
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - name: Run cargo-mutants on the trust-core crates
+        run: |
+          cargo mutants --no-shuffle --timeout 120 \
+            -p corecrux-receipts -p corecrux-segment -p corecrux-storage \
+            || true
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-report
+          path: mutants.out/
+          if-no-files-found: ignore
+      - name: Reclaim per-job CARGO_HOME
+        if: always()
+        run: rm -rf "$CARGO_HOME"

@@ -165,7 +165,7 @@ mod append_tests {
 
     fn enabled_state() -> AppState {
         let mut s = super::super::tests::test_app_state(16);
-        s.http_dataplane = super::super::tests::TestDataplane::shared(vec![]);
+        s.http_dataplane = super::super::tests::enabled_dataplane(vec![], None);
         s
     }
 

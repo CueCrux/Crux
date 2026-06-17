@@ -1111,12 +1111,18 @@ pub(super) fn build_tar_zst_deterministic_bytes(files: &[(String, Vec<u8>)]) -> 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod receipts_tests {
-    use super::super::tests::{receipt_stored_event, test_app_state, TestDataplane};
+    use super::super::tests::{enabled_dataplane, receipt_stored_event, sample_verification_report, test_app_state};
     use super::*;
 
     fn enabled(events: Vec<corecrux_storage::StoredEvent>) -> AppState {
         let mut s = test_app_state(16);
-        s.http_dataplane = TestDataplane::shared(events);
+        s.http_dataplane = enabled_dataplane(events, None);
+        s
+    }
+
+    fn enabled_with_report(report: corecrux_receipts::VerificationReportV1) -> AppState {
+        let mut s = test_app_state(16);
+        s.http_dataplane = enabled_dataplane(vec![], Some(report));
         s
     }
 
@@ -1128,7 +1134,8 @@ mod receipts_tests {
 
     #[tokio::test]
     async fn body_found_returns_json_envelope() {
-        let ev = receipt_stored_event(EVT_RECEIPT_BODY_V1, 1, b"{\"r\":1}");
+        let payload = b"{\"r\":1}";
+        let ev = receipt_stored_event(EVT_RECEIPT_BODY_V1, 1, payload);
         let resp = get_receipt_body_v1(
             State(enabled(vec![ev])),
             Path("rcpt-1".to_string()),
@@ -1142,8 +1149,35 @@ mod receipts_tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["receipt_id"], "rcpt-1");
         assert_eq!(v["seq"], 1);
-        assert!(!v["payloadBase64"].as_str().unwrap().is_empty());
-        assert!(v["payloadHash"].as_str().unwrap().len() == 64);
+        // Payload round-trips exactly (base64) and the hash matches the bytes by
+        // value — not just "is 64 chars" (which a wrong hash would also satisfy).
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(v["payloadBase64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, payload);
+        let expected_hash = hex32(&corecrux_frame::compute_payload_hash(payload));
+        assert_eq!(v["payloadHash"].as_str().unwrap(), expected_hash);
+    }
+
+    #[tokio::test]
+    async fn verification_success_returns_report() {
+        // The success path (not just the 404 arm): a populated verification
+        // report flows through to a 200 with its fields intact.
+        let report = sample_verification_report("crx_ok", "t1");
+        let resp = get_receipt_verification_v1(
+            State(enabled_with_report(report)),
+            Path("crx_ok".to_string()),
+            Query(tq()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["receipt_id"], "crx_ok");
+        assert_eq!(v["signature_valid"], true);
+        assert_eq!(v["error_code"], "OK");
     }
 
     #[tokio::test]
@@ -1157,6 +1191,31 @@ mod receipts_tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn verification_relays_negative_verdict_not_a_clean_200() {
+        // Fail-closed at the API boundary: a tampered receipt (signature_valid
+        // false, error_code != OK) must surface its NEGATIVE verdict to the
+        // caller, not be laundered into a clean-looking report. (The crypto-level
+        // fail-closed is covered in corecrux-receipts verify_v1.rs:856; this
+        // guards the handler relay.)
+        let mut report = sample_verification_report("crx_tampered", "t1");
+        report.signature_valid = false;
+        report.error_code = "SIGNATURE_INVALID".to_string();
+        let resp = get_receipt_verification_v1(
+            State(enabled_with_report(report)),
+            Path("crx_tampered".to_string()),
+            Query(tq()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["signature_valid"], false, "negative verdict must reach the caller");
+        assert_eq!(v["error_code"], "SIGNATURE_INVALID");
     }
 
     #[tokio::test]
