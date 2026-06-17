@@ -804,3 +804,176 @@ pub(super) async fn post_projection_batch_lookup(
     }))
     .into_response()
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod projections_tests {
+    use super::super::tests::{test_app_state, TestDataplane};
+    use super::*;
+    use std::collections::HashMap;
+
+    fn enabled() -> AppState {
+        let mut s = test_app_state(16);
+        s.http_dataplane = TestDataplane::shared(vec![]);
+        s
+    }
+
+    fn params(pairs: &[(&str, &str)]) -> axum::extract::Query<HashMap<String, String>> {
+        axum::extract::Query(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+    }
+
+    #[tokio::test]
+    async fn proj_meta_disabled_and_not_found() {
+        let q = ProjMetaQuery {
+            shard_id: "0".to_string(),
+        };
+        let resp = get_proj_meta(State(test_app_state(16)), Query(q), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let q = ProjMetaQuery {
+            shard_id: "0".to_string(),
+        };
+        let resp = get_proj_meta(State(enabled()), Query(q), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND); // stub returns None
+    }
+
+    #[tokio::test]
+    async fn rebuild_disabled_and_ok() {
+        let resp = post_projection_rebuild(State(test_app_state(16)), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let resp = post_projection_rebuild(State(enabled()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK); // empty results, no failures
+    }
+
+    #[tokio::test]
+    async fn projection_modules_runtime_path_no_shard() {
+        let q = ProjectionModulesQuery { shard_id: None };
+        let resp = get_projection_modules(State(test_app_state(16)), Query(q), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn artifact_state_disabled_and_absent() {
+        let resp = get_proj_artifact_state(
+            State(test_app_state(16)),
+            Path(7u32),
+            Query(TenantQuery {
+                tenant_id: "t1".to_string(),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+
+        // Enabled but the stub returns None → 200 with present:false.
+        let resp = get_proj_artifact_state(
+            State(enabled()),
+            Path(7u32),
+            Query(TenantQuery {
+                tenant_id: "t1".to_string(),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn artifact_relations_ok_when_enabled() {
+        let q = RelationsQuery {
+            tenant_id: "t1".to_string(),
+            direction: Some("out".to_string()),
+            relation_type: None,
+            limit: Some(10),
+            offset: Some(0),
+        };
+        let resp = get_proj_artifact_relations(State(enabled()), Path(1u32), Query(q), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn pressure_events_disabled_and_ok() {
+        let q = PressureQuery {
+            tenant_id: "t1".to_string(),
+            open_only: Some(true),
+            limit: Some(25),
+            offset: Some(0),
+        };
+        let resp = get_proj_artifact_pressure_events(State(test_app_state(16)), Path(1u32), Query(q), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let q = PressureQuery {
+            tenant_id: "t1".to_string(),
+            open_only: None,
+            limit: None,
+            offset: None,
+        };
+        let resp = get_proj_artifact_pressure_events(State(enabled()), Path(1u32), Query(q), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn entity_count_timeline_current_state() {
+        // disabled → 501.
+        let resp = get_entity_count(
+            State(test_app_state(16)),
+            HeaderMap::new(),
+            params(&[("tenant_id", "t1")]),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+
+        // enabled → 200 with canned data.
+        let resp = get_entity_count(
+            State(enabled()),
+            HeaderMap::new(),
+            params(&[
+                ("tenant_id", "t1"),
+                ("entity_type", "person"),
+                ("predicate", "lives_in"),
+            ]),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = get_entity_timeline(
+            State(enabled()),
+            HeaderMap::new(),
+            params(&[
+                ("tenant_id", "t1"),
+                ("entity_type", "person"),
+                ("predicate", "lives_in"),
+            ]),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = get_entity_current_state(
+            State(enabled()),
+            HeaderMap::new(),
+            params(&[("tenant_id", "t1"), ("entity_name", "alice"), ("predicate", "lives_in")]),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+}

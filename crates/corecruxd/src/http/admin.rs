@@ -2491,3 +2491,74 @@ mod compact_facts_tests {
         assert!(err.contains("CORECRUXD_RETENTION_DAYS is unset"));
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod admin_read_tests {
+    use super::super::tests::test_app_state;
+    use super::*;
+
+    #[tokio::test]
+    async fn read_handlers_return_ok_on_default_state() {
+        let s = test_app_state(16);
+        assert_eq!(
+            get_shard_map(State(s.clone()), HeaderMap::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_control(State(s.clone()), HeaderMap::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_replication_status(State(s.clone()), HeaderMap::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_segment_fingerprints(State(s.clone()), HeaderMap::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_sharing_posture(State(s.clone()), HeaderMap::new())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn ops_log_default_query_ok() {
+        let s = test_app_state(16);
+        let q = OpsLogQuery {
+            node_id: None,
+            since: None,
+            until: None,
+            from_seq: None,
+            max_events: None,
+        };
+        let resp = get_ops_log(State(s), Query(q), HeaderMap::new()).await.into_response();
+        // CE test state has no dataplane pool → ops log is precondition-failed.
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn get_admin_action_missing_is_404() {
+        let s = test_app_state(16);
+        let resp = get_admin_action(State(s), HeaderMap::new(), Path("nope".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}

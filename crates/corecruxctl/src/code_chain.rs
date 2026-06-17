@@ -733,5 +733,159 @@ fn problem_response(x: impl Sized) -> Resp { Resp }
         }];
         assert_eq!(resolve_root("/v1/work/gate/{id}/approve", &routes), "post_gate_approve");
         assert_eq!(resolve_root("post_gate_approve", &routes), "post_gate_approve");
+        // Unknown route path falls through to itself.
+        assert_eq!(resolve_root("/v1/unknown", &routes), "/v1/unknown");
+    }
+
+    #[test]
+    fn slugify_root_collapses_non_alnum_runs() {
+        assert_eq!(
+            slugify_root("/v1/work/gate/{actionId}/approve"),
+            "v1-work-gate-actionId-approve"
+        );
+        // `_` is not alphanumeric → becomes `-`.
+        assert_eq!(slugify_root("post_gate_approve"), "post-gate-approve");
+        assert_eq!(slugify_root("///a//b///"), "a-b");
+    }
+
+    #[test]
+    fn parse_route_inner_rejects_non_path_and_missing_literal() {
+        // No leading slash → rejected.
+        assert!(parse_axum_routes(r#".route("notapath", get(h))"#.into()).is_empty());
+        // No string literal at all → rejected.
+        assert!(parse_axum_routes(r#".route(foo, get(h))"#.into()).is_empty());
+    }
+
+    #[test]
+    fn resolve_handles_methods_macros_and_ambiguity() {
+        let mut i = Index::default();
+        // Two defs sharing the simple name `new` under different modules.
+        index_file(
+            &mut i,
+            "crates/corecruxd/src/a.rs",
+            "struct A; impl A { fn build() -> A { A } }\nstruct B; impl B { fn build() -> B { B } }",
+        );
+        // method/macro calls always terminate.
+        assert_eq!(
+            i.resolve(&CallRef {
+                segs: vec!["foo".into()],
+                kind: CallKind::Method
+            }),
+            Resolution::Boundary("method")
+        );
+        assert_eq!(
+            i.resolve(&CallRef {
+                segs: vec!["bar".into()],
+                kind: CallKind::Macro
+            }),
+            Resolution::Boundary("macro")
+        );
+        // empty after normalisation → external.
+        assert_eq!(
+            i.resolve(&CallRef {
+                segs: vec!["crate".into()],
+                kind: CallKind::Func
+            }),
+            Resolution::Boundary("external")
+        );
+        // ambiguous simple name (`build` defined twice).
+        assert_eq!(
+            i.resolve(&CallRef {
+                segs: vec!["build".into()],
+                kind: CallKind::Func
+            }),
+            Resolution::Ambiguous(2)
+        );
+        // unknown name → external boundary.
+        assert_eq!(
+            i.resolve(&CallRef {
+                segs: vec!["nope".into()],
+                kind: CallKind::Func
+            }),
+            Resolution::Boundary("external")
+        );
+    }
+
+    #[test]
+    fn extract_chain_root_not_found_emits_single_termination() {
+        let index = idx();
+        let chain = extract_chain(&index, "r", "s", "does_not_exist", 5);
+        assert_eq!(chain.steps.len(), 1);
+        assert_eq!(chain.steps[0].kind, "termination");
+        assert_eq!(chain.steps[0].note.as_deref(), Some("root not found"));
+    }
+
+    fn tmp_repo() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("crux-cc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(d.join("crates/corecruxd/src/http")).unwrap();
+        std::fs::create_dir_all(d.join("target")).unwrap();
+        std::fs::write(d.join("crates/corecruxd/src/lib.rs"), FIXTURE).unwrap();
+        std::fs::write(
+            d.join("crates/corecruxd/src/http/mod.rs"),
+            r#"Router::new().route("/v1/gate/approve", post(self::work::post_gate_approve))"#,
+        )
+        .unwrap();
+        std::fs::write(d.join("target/ignored.rs"), "fn ignored() {}").unwrap();
+        d
+    }
+
+    #[test]
+    fn index_repo_walks_rs_files_and_skips_target() {
+        let repo = tmp_repo();
+        let index = index_repo(&repo);
+        // post_gate_approve from lib.rs is indexed; target/ is skipped.
+        assert!(index.defs.iter().any(|d| d.simple == "post_gate_approve"));
+        assert!(!index.defs.iter().any(|d| d.simple == "ignored"));
+    }
+
+    #[test]
+    fn run_trace_text_and_json_without_push() {
+        let repo = tmp_repo();
+        // Root via a route path → resolved to the handler.
+        run_trace(&repo, "/v1/gate/approve", "text", 4, false, "http://127.0.0.1:1", None).unwrap();
+        run_trace(&repo, "post_gate_approve", "json", 4, false, "http://127.0.0.1:1", None).unwrap();
+        // Missing repo → Err.
+        assert!(run_trace(
+            &repo.join("nope"),
+            "post_gate_approve",
+            "json",
+            4,
+            false,
+            "http://127.0.0.1:1",
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn push_chain_succeeds_and_run_trace_push_path() {
+        let chain = extract_chain(&idx(), "r", "sha", "post_gate_approve", 4);
+        let (port, h) = crate::test_support::serve_responses(vec![(200, "{}".to_string())]);
+        let slug = push_chain(&format!("http://127.0.0.1:{port}"), Some("tok"), &chain).expect("push ok");
+        let reqs = h.join().unwrap();
+        assert_eq!(slug, "post-gate-approve");
+        assert!(reqs[0].starts_with("PUT /v1/entities/codechain/post-gate-approve"));
+        assert!(reqs[0].to_lowercase().contains("authorization: bearer tok"));
+
+        // run_trace with push=true drives index→extract→push.
+        let repo = tmp_repo();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, "{}".to_string())]);
+        run_trace(
+            &repo,
+            "post_gate_approve",
+            "json",
+            4,
+            true,
+            &format!("http://127.0.0.1:{port}"),
+            None,
+        )
+        .unwrap();
+        h.join().ok();
+    }
+
+    #[test]
+    fn push_chain_transport_error_on_dead_port() {
+        let chain = extract_chain(&idx(), "r", "sha", "post_gate_approve", 4);
+        assert!(push_chain("http://127.0.0.1:1", None, &chain).is_err());
     }
 }

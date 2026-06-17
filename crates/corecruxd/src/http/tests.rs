@@ -32,6 +32,181 @@ fn test_node(node_id: &str, http_addr: &str, grpc_addr: &str) -> NodeAddr {
     }
 }
 
+/// In-memory [`HttpDataplane`] stub for handler tests. Reports `enabled = true`
+/// so the data-plane HTTP surface (append/receipts/query/projections) runs its
+/// real logic instead of short-circuiting to the CE upgrade response. Read
+/// methods return the canned `events`; mutating/projection methods succeed with
+/// trivial values; `graph_expand`/`time_range` (whose response types aren't
+/// `Default`) return `Disabled` to exercise the handlers' error-mapping arm.
+pub(super) struct TestDataplane {
+    pub events: Vec<corecrux_storage::StoredEvent>,
+    pub verify: Option<corecrux_receipts::VerificationReportV1>,
+}
+
+impl TestDataplane {
+    pub(super) fn shared(events: Vec<corecrux_storage::StoredEvent>) -> super::dataplane::SharedHttpDataplane {
+        std::sync::Arc::new(TestDataplane { events, verify: None })
+    }
+}
+
+#[tonic::async_trait]
+impl super::dataplane::HttpDataplane for TestDataplane {
+    fn enabled(&self) -> bool {
+        true
+    }
+    async fn append_batch(
+        &self,
+        _t: &str,
+        _st: &str,
+        _si: &str,
+        _seq: u64,
+        _e: &[corecrux_proto::dataplane_v1::AppendEvent],
+    ) -> Result<(), super::dataplane::HttpDataplaneError> {
+        Ok(())
+    }
+    async fn read_stream(
+        &self,
+        _t: &str,
+        _st: &str,
+        _si: &str,
+        _f: u64,
+        _m: u32,
+    ) -> Result<Vec<corecrux_storage::StoredEvent>, super::dataplane::HttpDataplaneError> {
+        Ok(self.events.clone())
+    }
+    async fn read_tail(
+        &self,
+        _t: &str,
+        _st: &str,
+        _si: &str,
+        _c: u32,
+    ) -> Result<Vec<corecrux_storage::StoredEvent>, super::dataplane::HttpDataplaneError> {
+        Ok(self.events.clone())
+    }
+    async fn verify_receipt_stream(
+        &self,
+        _t: &str,
+        _r: &str,
+        _s: Option<u32>,
+    ) -> Result<Option<corecrux_receipts::VerificationReportV1>, super::dataplane::HttpDataplaneError> {
+        Ok(self.verify.clone())
+    }
+    async fn graph_expand(
+        &self,
+        _r: super::dataplane::GraphExpandRequest<'_>,
+    ) -> Result<corecrux_projections::query::graph_expand::GraphExpandResponse, super::dataplane::HttpDataplaneError>
+    {
+        Err(super::dataplane::HttpDataplaneError::Disabled)
+    }
+    async fn time_range(
+        &self,
+        _t: &str,
+        _s: i64,
+        _e: i64,
+        _a: &[u32],
+        _ir: bool,
+        _l: usize,
+    ) -> Result<corecrux_projections::query::time_range::TimeRangeResponse, super::dataplane::HttpDataplaneError> {
+        Err(super::dataplane::HttpDataplaneError::Disabled)
+    }
+    async fn projection_meta(
+        &self,
+        _s: &str,
+    ) -> Result<Option<corecrux_projections::ProjectionsMetaV1>, super::dataplane::HttpDataplaneError> {
+        Ok(None)
+    }
+    async fn projection_artifact_state(
+        &self,
+        _t: &str,
+        _a: u32,
+    ) -> Result<Option<corecrux_projections::LivingStateRowV1>, super::dataplane::HttpDataplaneError> {
+        Ok(None)
+    }
+    async fn projection_relations(
+        &self,
+        _t: &str,
+        _a: u32,
+        _d: &str,
+        _rt: Option<&str>,
+        _l: usize,
+        _o: usize,
+    ) -> Result<Vec<crate::dataplane_store::ProjectionRelationRowV1>, super::dataplane::HttpDataplaneError> {
+        Ok(vec![])
+    }
+    async fn projection_dependents(
+        &self,
+        _t: &str,
+        _a: u32,
+        _dt: Option<&str>,
+        _l: usize,
+        _o: usize,
+    ) -> Result<Vec<crate::dataplane_store::ProjectionDependentRowV1>, super::dataplane::HttpDataplaneError> {
+        Ok(vec![])
+    }
+    async fn projection_pressure_events(
+        &self,
+        _t: &str,
+        _a: u32,
+        _oo: bool,
+        _l: usize,
+        _o: usize,
+    ) -> Result<Vec<crate::dataplane_store::ProjectionPressureEventRowV1>, super::dataplane::HttpDataplaneError> {
+        Ok(vec![])
+    }
+    async fn rebuild_projections_online(
+        &self,
+        _m: u32,
+    ) -> Result<
+        Vec<(String, Result<crate::dataplane_store::ForceSealAndTickResult, String>)>,
+        super::dataplane::HttpDataplaneError,
+    > {
+        Ok(vec![])
+    }
+    async fn entity_count(
+        &self,
+        _t: &str,
+        _et: &str,
+        _p: &str,
+    ) -> Result<Vec<String>, super::dataplane::HttpDataplaneError> {
+        Ok(vec!["alice".to_string(), "bob".to_string()])
+    }
+    async fn entity_timeline(
+        &self,
+        _t: &str,
+        _et: &str,
+        _p: &str,
+    ) -> Result<Vec<(String, String, i64)>, super::dataplane::HttpDataplaneError> {
+        Ok(vec![("alice".to_string(), "nyc".to_string(), 1)])
+    }
+    async fn entity_current_state(
+        &self,
+        _t: &str,
+        _en: &str,
+        _p: &str,
+    ) -> Result<Option<(String, i64, Option<String>, Option<i64>)>, super::dataplane::HttpDataplaneError> {
+        Ok(Some(("nyc".to_string(), 1, None, None)))
+    }
+}
+
+/// Build a canned receipt-stream [`StoredEvent`] for the dataplane stub.
+pub(super) fn receipt_stored_event(event_type: &str, seq: u64, payload: &[u8]) -> corecrux_storage::StoredEvent {
+    corecrux_storage::StoredEvent {
+        seq,
+        event_id: format!("evt-{seq}"),
+        occurred_at: "2026-06-17T00:00:00Z".to_string(),
+        ingested_at: "2026-06-17T00:00:01Z".to_string(),
+        event_type: event_type.to_string(),
+        content_type: "application/cbor".to_string(),
+        payload: payload.to_vec(),
+        location: corecrux_storage::FrameLocation {
+            shard_id: 0,
+            epoch: 1,
+            segment_seq: 1,
+            offset: 0,
+        },
+    }
+}
+
 #[tokio::test]
 async fn sync_manifest_and_collection_page_are_tenant_scoped() {
     let state = test_app_state(1);

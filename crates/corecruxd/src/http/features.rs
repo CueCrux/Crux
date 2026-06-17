@@ -262,3 +262,348 @@ pub(super) async fn post_audit(
         Err(e) => problem_response(StatusCode::BAD_REQUEST, e.to_string()),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn state() -> AppState {
+        super::super::tests::test_app_state(16)
+    }
+
+    async fn seed_cap(state: &AppState, id: &str, payload: Value) {
+        let mut store = state.entity_store.write().await;
+        store.upsert(CAPABILITY_KIND, id, payload, "tester", None).unwrap();
+    }
+
+    async fn seed_edge(state: &AppState, from: &str, to: &str) {
+        let mut store = state.edge_store.write().await;
+        store
+            .upsert(
+                CAPABILITY_KIND,
+                from,
+                "depends_on",
+                CAPABILITY_KIND,
+                to,
+                json!({}),
+                "tester",
+            )
+            .unwrap();
+    }
+
+    async fn parts(resp: axum::response::Response) -> (StatusCode, Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    fn cap(id: &str, system: &str, maturity: &str) -> Value {
+        json!({
+            "id": id,
+            "name": format!("Capability {id}"),
+            "description": "does something useful",
+            "system": system,
+            "maturity": maturity,
+            "promise_alignment": [1, 2],
+            "audit": { "status": "gap" },
+        })
+    }
+
+    #[test]
+    fn payload_matches_each_filter_dimension() {
+        let p = cap("c1", "billing", "ga");
+        // system
+        assert!(payload_matches(
+            &p,
+            &ListCapabilitiesQuery {
+                system: Some("billing".into()),
+                maturity: None,
+                audit: None,
+                promise: None,
+                search: None
+            }
+        ));
+        assert!(!payload_matches(
+            &p,
+            &ListCapabilitiesQuery {
+                system: Some("other".into()),
+                maturity: None,
+                audit: None,
+                promise: None,
+                search: None
+            }
+        ));
+        // maturity
+        assert!(payload_matches(
+            &p,
+            &ListCapabilitiesQuery {
+                system: None,
+                maturity: Some("ga".into()),
+                audit: None,
+                promise: None,
+                search: None
+            }
+        ));
+        assert!(!payload_matches(
+            &p,
+            &ListCapabilitiesQuery {
+                system: None,
+                maturity: Some("beta".into()),
+                audit: None,
+                promise: None,
+                search: None
+            }
+        ));
+        // audit status (defaults to "gap" when absent)
+        assert!(payload_matches(
+            &p,
+            &ListCapabilitiesQuery {
+                system: None,
+                maturity: None,
+                audit: Some("gap".into()),
+                promise: None,
+                search: None
+            }
+        ));
+        assert!(!payload_matches(
+            &p,
+            &ListCapabilitiesQuery {
+                system: None,
+                maturity: None,
+                audit: Some("audited".into()),
+                promise: None,
+                search: None
+            }
+        ));
+        // promise alignment membership
+        assert!(payload_matches(
+            &p,
+            &ListCapabilitiesQuery {
+                system: None,
+                maturity: None,
+                audit: None,
+                promise: Some(2),
+                search: None
+            }
+        ));
+        assert!(!payload_matches(
+            &p,
+            &ListCapabilitiesQuery {
+                system: None,
+                maturity: None,
+                audit: None,
+                promise: Some(99),
+                search: None
+            }
+        ));
+        // search (case-insensitive over id/name/description)
+        assert!(payload_matches(
+            &p,
+            &ListCapabilitiesQuery {
+                system: None,
+                maturity: None,
+                audit: None,
+                promise: None,
+                search: Some("USEFUL".into())
+            }
+        ));
+        assert!(!payload_matches(
+            &p,
+            &ListCapabilitiesQuery {
+                system: None,
+                maturity: None,
+                audit: None,
+                promise: None,
+                search: Some("nonexistent".into())
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_capabilities_filters_and_counts() {
+        let st = state();
+        seed_cap(&st, "c1", cap("c1", "billing", "ga")).await;
+        seed_cap(&st, "c2", cap("c2", "search", "beta")).await;
+
+        let (status, body) = parts(
+            list_capabilities(
+                State(st.clone()),
+                Query(ListCapabilitiesQuery {
+                    system: None,
+                    maturity: None,
+                    audit: None,
+                    promise: None,
+                    search: None,
+                }),
+                HeaderMap::new(),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["count"], 2);
+
+        let (_, body) = parts(
+            list_capabilities(
+                State(st.clone()),
+                Query(ListCapabilitiesQuery {
+                    system: Some("billing".into()),
+                    maturity: None,
+                    audit: None,
+                    promise: None,
+                    search: None,
+                }),
+                HeaderMap::new(),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(body["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn get_capability_found_and_missing() {
+        let st = state();
+        seed_cap(&st, "c1", cap("c1", "billing", "ga")).await;
+        let (status, body) = parts(
+            get_capability(State(st.clone()), Path("c1".into()), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], "c1");
+
+        let (status, _) = parts(
+            get_capability(State(st.clone()), Path("missing".into()), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dependency_tree_walks_both_directions() {
+        let st = state();
+        for id in ["a", "b", "c"] {
+            seed_cap(&st, id, cap(id, "sys", "ga")).await;
+        }
+        // a → b → c
+        seed_edge(&st, "a", "b").await;
+        seed_edge(&st, "b", "c").await;
+
+        let (status, body) = parts(
+            get_dependency_tree(State(st.clone()), Path("b".into()), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let upstream: Vec<String> = body["upstream"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let downstream: Vec<String> = body["downstream"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(upstream.contains(&"c".to_string()), "b depends on c (upstream)");
+        assert!(downstream.contains(&"a".to_string()), "a depends on b (downstream)");
+
+        // Missing root → 404.
+        let (status, _) = parts(
+            get_dependency_tree(State(st.clone()), Path("zzz".into()), HeaderMap::new())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn analysis_endpoints_return_ok() {
+        let st = state();
+        seed_cap(&st, "c1", cap("c1", "billing", "ga")).await;
+        for resp in [
+            analysis_gaps(State(st.clone()), HeaderMap::new()).await.into_response(),
+            analysis_promises(State(st.clone()), HeaderMap::new())
+                .await
+                .into_response(),
+            analysis_coverage(State(st.clone()), HeaderMap::new())
+                .await
+                .into_response(),
+        ] {
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn post_audit_validates_status_and_updates_payload() {
+        let st = state();
+        seed_cap(&st, "c1", cap("c1", "billing", "ga")).await;
+
+        // Invalid status → 400.
+        let (status, _) = parts(
+            post_audit(
+                State(st.clone()),
+                Path("c1".into()),
+                HeaderMap::new(),
+                Json(AuditBody {
+                    status: "bogus".into(),
+                    auditor: None,
+                    notes: None,
+                }),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Valid "audited" → 200, payload carries audit block + timestamp.
+        let (status, body) = parts(
+            post_audit(
+                State(st.clone()),
+                Path("c1".into()),
+                HeaderMap::new(),
+                Json(AuditBody {
+                    status: "audited".into(),
+                    auditor: Some("ops".into()),
+                    notes: Some("ok".into()),
+                }),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["audit"]["status"], "audited");
+        assert!(body["audit"]["last_audited"].is_string());
+
+        // Missing capability → 404.
+        let (status, _) = parts(
+            post_audit(
+                State(st.clone()),
+                Path("missing".into()),
+                HeaderMap::new(),
+                Json(AuditBody {
+                    status: "gap".into(),
+                    auditor: None,
+                    notes: None,
+                }),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}

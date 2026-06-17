@@ -229,4 +229,106 @@ mod tests {
         assert!(r["last_login_unix_ms"].as_u64().is_some());
         assert!(r["ctl_version"].is_string());
     }
+
+    fn clean_home() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("crux-mach-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("HOME", &dir);
+        dir
+    }
+
+    #[test]
+    fn now_unix_ms_is_nonzero() {
+        assert!(now_unix_ms() > 0);
+    }
+
+    #[test]
+    fn hostname_falls_back_when_env_unset() {
+        // Whatever the resolution path, it must yield a non-empty string.
+        assert!(!hostname().is_empty());
+    }
+
+    #[test]
+    fn resolve_daemon_normalises_explicit_url() {
+        // Explicit URL bypasses the credential store and is normalised.
+        assert_eq!(
+            resolve_daemon(Some("127.0.0.1:14800".to_string())).unwrap(),
+            "http://127.0.0.1:14800"
+        );
+        assert_eq!(
+            resolve_daemon(Some("http://host:9/".to_string())).unwrap(),
+            "http://host:9"
+        );
+    }
+
+    #[test]
+    fn resolve_daemon_rejects_empty_url() {
+        assert!(resolve_daemon(Some("   ".to_string())).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn register_succeeds_against_stub() {
+        clean_home();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, "{}".to_string())]);
+        let msg = register(&format!("http://127.0.0.1:{port}")).expect("register ok");
+        let reqs = h.join().unwrap();
+        assert!(msg.starts_with("registered machine "));
+        assert!(reqs[0].contains("__infra__::machines"));
+        assert!(reqs[0].starts_with("PUT /v1/facts"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn register_surfaces_upstream_error() {
+        clean_home();
+        let (port, h) = crate::test_support::serve_responses(vec![(409, "conflict".to_string())]);
+        let err = register(&format!("http://127.0.0.1:{port}")).expect_err("must fail");
+        h.join().ok();
+        assert!(err.to_string().contains("machine register failed (HTTP 409)"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_register_prints_summary() {
+        clean_home();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, "{}".to_string())]);
+        run_register(Some(format!("http://127.0.0.1:{port}"))).expect("run_register ok");
+        h.join().ok();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_list_empty_and_populated() {
+        clean_home();
+        // Empty list.
+        let (port, h) = crate::test_support::serve_responses(vec![(200, r#"{"facts":[]}"#.to_string())]);
+        run_list(Some(format!("http://127.0.0.1:{port}"))).expect("list ok");
+        h.join().ok();
+
+        // Populated with a full record + a record with missing fields.
+        let rec = serde_json::json!({
+            "os": "linux", "tailnet_ip": "100.1.2.3", "rail": "tailscale", "hooks_installed": true
+        });
+        let body = serde_json::json!({
+            "facts": [
+                { "key": "host-a", "value": rec.to_string() },
+                { "key": "host-b", "value": "not-json" },
+            ]
+        })
+        .to_string();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, body)]);
+        run_list(Some(format!("http://127.0.0.1:{port}"))).expect("list ok");
+        h.join().ok();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_list_surfaces_upstream_error() {
+        clean_home();
+        let (port, h) = crate::test_support::serve_responses(vec![(500, "boom".to_string())]);
+        let err = run_list(Some(format!("http://127.0.0.1:{port}"))).expect_err("must fail");
+        h.join().ok();
+        assert!(err.to_string().contains("machine list failed (HTTP 500)"));
+    }
 }

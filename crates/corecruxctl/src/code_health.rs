@@ -1044,4 +1044,137 @@ mod tests {
         assert_eq!(v["counts"]["todo"], 1);
         assert_eq!(v["tools_missing"][0], "machete");
     }
+
+    // ── filesystem + orchestration helpers ───────────────────────────
+
+    fn tmp() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("crux-ch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn collect_source_files_filters_extensions_and_skips_vendor_dirs() {
+        let root = tmp();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "// code").unwrap();
+        std::fs::write(root.join("web.ts"), "// ts").unwrap();
+        std::fs::write(root.join("README.md"), "# docs").unwrap();
+        std::fs::write(root.join("target/skip.rs"), "// skip").unwrap();
+        std::fs::write(root.join("node_modules/x.js"), "// skip").unwrap();
+        std::fs::write(root.join(".hidden/h.rs"), "// skip").unwrap();
+
+        let mut files: Vec<String> = collect_source_files(&root).into_iter().map(|(p, _)| p).collect();
+        files.sort();
+        assert_eq!(files, vec!["src/a.rs".to_string(), "web.ts".to_string()]);
+    }
+
+    #[test]
+    fn short_sha_and_repo_slug_on_non_git_dir() {
+        let root = tmp();
+        assert_eq!(short_sha(&root), "unknown");
+        assert!(!repo_slug(&root).is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_token_prefers_file_then_env() {
+        std::env::remove_var("CRUX_AGENT_TOKEN");
+        let home = tmp();
+        std::env::set_var("HOME", &home); // no anthropic.jwt under it → None fallback
+
+        // explicit file wins.
+        let tf = tmp().join("tok");
+        std::fs::write(&tf, "  file-token\n").unwrap();
+        assert_eq!(resolve_token(Some(&tf)).as_deref(), Some("file-token"));
+
+        // env when no file.
+        std::env::set_var("CRUX_AGENT_TOKEN", "env-token");
+        assert_eq!(resolve_token(None).as_deref(), Some("env-token"));
+
+        // nothing → None.
+        std::env::remove_var("CRUX_AGENT_TOKEN");
+        assert_eq!(resolve_token(None), None);
+    }
+
+    #[test]
+    fn harvest_grep_only_on_plain_dir_and_missing_repo() {
+        let root = tmp();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "// TODO: rename this\nfn ok() {}\n").unwrap();
+        let h = harvest(&root).expect("harvest ok");
+        assert_eq!(h.commit_sha, "unknown");
+        assert!(h.tools_ran.contains(&"grep".to_string()));
+        assert!(h
+            .findings
+            .iter()
+            .any(|f| f.class == class::TODO && f.file == "src/a.rs"));
+
+        // text + json renderers run without error.
+        run_harvest(&root, "text").unwrap();
+        run_harvest(&root, "json").unwrap();
+
+        // missing repo → Err.
+        assert!(harvest(&tmp().join("does-not-exist")).is_err());
+    }
+
+    #[test]
+    fn push_empty_repo_writes_only_run_summary() {
+        let repo = tmp(); // no source files, no Cargo.toml → empty harvest
+        let (port, h) = crate::test_support::serve_responses(vec![
+            (200, r#"{"facts":[]}"#.to_string()), // fetch_entity_facts
+            (200, "{}".to_string()),              // run-summary PUT
+        ]);
+        let report = push(&repo, &format!("http://127.0.0.1:{port}"), Some("tok"), "2026-06-17").expect("push ok");
+        let reqs = h.join().unwrap();
+        assert_eq!(report.written, 0);
+        assert_eq!(report.retired, 0);
+        assert_eq!(report.run_key, "run:2026-06-17");
+        assert!(reqs[0].starts_with("GET /v1/facts/entity/"));
+        assert!(
+            reqs[0].contains("authorization: Bearer tok")
+                || reqs[0].to_lowercase().contains("authorization: bearer tok")
+        );
+        assert!(reqs[1].contains("run:2026-06-17"));
+    }
+
+    #[test]
+    fn push_retires_stale_finding_facts() {
+        let repo = tmp(); // empty harvest → every existing finding key is retired
+        let existing = serde_json::json!({
+            "facts": [
+                { "key": "dead:old.rs:5", "fact_id": "f_stale", "value": "v" }
+            ]
+        })
+        .to_string();
+        let (port, h) = crate::test_support::serve_responses(vec![
+            (200, existing),         // fetch
+            (200, "{}".to_string()), // DELETE f_stale
+            (200, "{}".to_string()), // run summary PUT
+        ]);
+        let report = push(&repo, &format!("http://127.0.0.1:{port}"), None, "2026-06-17").expect("push ok");
+        let reqs = h.join().unwrap();
+        assert_eq!(report.retired, 1);
+        assert!(reqs[1].starts_with("DELETE /v1/facts/f_stale"));
+    }
+
+    #[test]
+    fn push_writes_new_findings_in_bulk() {
+        let repo = tmp();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/a.rs"), "// TODO: do it\n").unwrap();
+        let (port, h) = crate::test_support::serve_responses(vec![
+            (200, r#"{"facts":[]}"#.to_string()), // fetch (nothing yet)
+            (200, "{}".to_string()),              // bulk write PUT
+            (200, "{}".to_string()),              // run summary PUT
+        ]);
+        let report = push(&repo, &format!("http://127.0.0.1:{port}"), None, "2026-06-17").expect("push ok");
+        let reqs = h.join().unwrap();
+        assert_eq!(report.written, 1);
+        assert!(reqs[1].starts_with("PUT /v1/facts/bulk"));
+        assert!(reqs[1].contains("todo:src/a.rs:1"));
+    }
 }

@@ -16,7 +16,13 @@ jobs:
     runs-on: [self-hosted, ci]
     env:
       CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
-      COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/main\.rs|.*/corecruxd/src/http/admin\.rs|.*/corecruxd/src/http/append\.rs|.*/corecruxd/src/http/query\.rs|.*/corecruxd/src/http/projections\.rs|.*/corecruxd/src/http/receipts\.rs|.*/corecruxctl/src/main\.rs|.*/corecruxctl/src/audit_pack\.rs)$'
+      # Keep in lock-step with ci.yml's COVERAGE_IGNORE_REGEX (see the rationale
+      # there). Excluded = binary entry points (main.rs for corecruxd/corecruxctl/
+      # crux-claude-hooks/crux-config-wizard + crux_llm_shim), the interactive
+      # config wizard, and the CE-inert dataplane (pool.rs, dataplane_store.rs,
+      # http/dataplane.rs). Critical data-plane / receipts / projections / admin /
+      # audit-pack surfaces are in scope and gated (2026-04-05 audit HIGH #9).
+      COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/http/dataplane\.rs|.*/corecruxd/src/main\.rs|.*/corecruxctl/src/main\.rs|.*/crux-claude-hooks/src/main\.rs|.*/crux-claude-hooks/src/bin/crux_llm_shim\.rs|.*/crux-config-wizard/src/main\.rs|.*/crux-config-wizard/src/interactive\.rs)$'
       CORECRUX_COVERAGE_ATTEST_SIGNING_KEY_B64: ${{ secrets.CORECRUX_COVERAGE_ATTEST_SIGNING_KEY_B64 }}
       CORECRUX_COVERAGE_ATTEST_KEY_ID: ${{ vars.CORECRUX_COVERAGE_ATTEST_KEY_ID || 'coverage-attest' }}
     steps:

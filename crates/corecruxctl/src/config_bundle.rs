@@ -461,4 +461,203 @@ mod tests {
         assert!(safe_target(base, "a/../../b").is_none());
         assert!(safe_target(base, "/etc/passwd").is_none());
     }
+
+    #[test]
+    fn key_secret_negative_and_more_positives() {
+        for k in [
+            "client_secret",
+            "PRIVATE_KEY",
+            "x-bearer",
+            "ACCESS_KEY_ID",
+            "credential",
+        ] {
+            assert!(key_is_secret(k), "{k} should be secret");
+        }
+        for k in ["temperature", "name", "args", "command"] {
+            assert!(!key_is_secret(k), "{k} should not be secret");
+        }
+    }
+
+    #[test]
+    fn value_secret_prefixes_and_shape_edges() {
+        assert!(value_looks_secret("sk-aaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(value_looks_secret("glpat-xxxxxxxxxxxxxxxxxxxx"));
+        assert!(value_looks_secret("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"));
+        // Exactly token-shaped (>=40 alnum, no separators).
+        assert!(value_looks_secret(&"a".repeat(40)));
+        // Just under length cutoff with separators stays clear.
+        assert!(!value_looks_secret(&"a".repeat(39)));
+        assert!(!value_looks_secret("https://api.example.com/v1/endpoint/path"));
+    }
+
+    #[test]
+    fn redact_json_reports_no_change_on_clean_input() {
+        let mut v = serde_json::json!({ "model": "opus", "nested": { "temp": 0.2 }, "list": ["a", "b"] });
+        assert!(!redact_json(&mut v));
+        assert_eq!(v["model"], "opus");
+    }
+
+    #[test]
+    fn redact_json_redacts_numeric_under_secret_key() {
+        let mut v = serde_json::json!({ "api_key": 12345 });
+        assert!(redact_json(&mut v));
+        assert_eq!(v["api_key"], "${REDACTED}");
+    }
+
+    #[test]
+    fn walk_md_recurses_and_filters_extension() {
+        let root = std::env::temp_dir().join(format!("crux-walkmd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.md"), "# a").unwrap();
+        std::fs::write(root.join("ignore.txt"), "x").unwrap();
+        std::fs::write(root.join("sub/b.MD"), "# b").unwrap();
+        let mut found: Vec<String> = walk_md(&root)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        assert_eq!(found, vec!["a.md".to_string(), "b.MD".to_string()]);
+        // Non-existent dir yields empty (the read_dir error path).
+        assert!(walk_md(&root.join("does-not-exist")).is_empty());
+    }
+
+    #[test]
+    fn collect_files_captures_curated_set_and_redacts_json() {
+        let base = std::env::temp_dir().join(format!("crux-collect-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("commands")).unwrap();
+        std::fs::create_dir_all(base.join("agents")).unwrap();
+        std::fs::write(base.join("settings.json"), r#"{"model":"opus","token":"sekret-value"}"#).unwrap();
+        std::fs::write(base.join("CLAUDE.md"), "# project rules").unwrap();
+        std::fs::write(base.join("commands/do.md"), "do a thing").unwrap();
+        std::fs::write(base.join("agents/helper.md"), "helper agent").unwrap();
+        // Not in the curated set → ignored.
+        std::fs::write(base.join("history.jsonl"), "noise").unwrap();
+
+        let files = collect_files(&base).expect("collect ok");
+        let paths: Vec<String> = files.iter().map(|f| f["path"].as_str().unwrap().to_string()).collect();
+        assert!(paths.contains(&"settings.json".to_string()));
+        assert!(paths.contains(&"CLAUDE.md".to_string()));
+        assert!(paths.contains(&"commands/do.md".to_string()));
+        assert!(paths.contains(&"agents/helper.md".to_string()));
+        assert!(!paths.iter().any(|p| p.contains("history")));
+
+        let settings = files.iter().find(|f| f["path"] == "settings.json").unwrap();
+        assert_eq!(settings["redacted"], true);
+        assert!(settings["content"].as_str().unwrap().contains("${REDACTED}"));
+        assert!(!settings["content"].as_str().unwrap().contains("sekret-value"));
+
+        let md = files.iter().find(|f| f["path"] == "CLAUDE.md").unwrap();
+        assert_eq!(md["redacted"], false);
+    }
+
+    fn clean_home() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("crux-cfg-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("HOME", &dir);
+        dir
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_list_empty_populated_and_error() {
+        clean_home();
+        // empty
+        let (port, h) = crate::test_support::serve_responses(vec![(200, r#"{"facts":[]}"#.to_string())]);
+        run_list(Some(format!("http://127.0.0.1:{port}"))).expect("list ok");
+        h.join().ok();
+        // populated
+        let bundle = serde_json::json!({ "name": "n", "source_host": "host-a", "files": [{"path":"settings.json"}] });
+        let body = serde_json::json!({ "facts": [{ "key": "mybundle", "value": bundle.to_string() }] }).to_string();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, body)]);
+        run_list(Some(format!("http://127.0.0.1:{port}"))).expect("list ok");
+        h.join().ok();
+        // upstream error
+        let (port, h) = crate::test_support::serve_responses(vec![(500, "boom".to_string())]);
+        let err = run_list(Some(format!("http://127.0.0.1:{port}"))).expect_err("must fail");
+        h.join().ok();
+        assert!(err.to_string().contains("config list failed (HTTP 500)"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_pull_restores_files_and_skips_unsafe_paths() {
+        let home = clean_home();
+        let files = serde_json::json!([
+            { "path": "settings.json", "content": "{\"model\":\"opus\"}", "redacted": true },
+            { "path": "commands/do.md", "content": "do", "redacted": false },
+            { "path": "../escape.txt", "content": "nope", "redacted": false },
+        ]);
+        let bundle = serde_json::json!({ "name": "b1", "files": files });
+        let body = serde_json::json!({ "facts": [{ "key": "b1", "value": bundle.to_string() }] }).to_string();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, body)]);
+        run_pull("b1".to_string(), Some(format!("http://127.0.0.1:{port}"))).expect("pull ok");
+        h.join().ok();
+        assert!(home.join(".claude/settings.json").is_file());
+        assert!(home.join(".claude/commands/do.md").is_file());
+        assert!(!home.join(".claude/escape.txt").exists());
+        assert!(!home.join("escape.txt").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_pull_missing_and_malformed() {
+        clean_home();
+        // not found
+        let (port, h) = crate::test_support::serve_responses(vec![(200, r#"{"facts":[]}"#.to_string())]);
+        let err = run_pull("ghost".to_string(), Some(format!("http://127.0.0.1:{port}"))).expect_err("must fail");
+        h.join().ok();
+        assert!(err.to_string().contains("no config bundle named 'ghost'"));
+        // malformed value
+        let body = serde_json::json!({ "facts": [{ "key": "bad", "value": "not-json" }] }).to_string();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, body)]);
+        let err = run_pull("bad".to_string(), Some(format!("http://127.0.0.1:{port}"))).expect_err("must fail");
+        h.join().ok();
+        assert!(err.to_string().contains("malformed"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_push_captures_and_uploads() {
+        let home = clean_home();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(
+            home.join(".claude/settings.json"),
+            r#"{"token":"sekret","model":"opus"}"#,
+        )
+        .unwrap();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, "{}".to_string())]);
+        run_push("mybundle".to_string(), Some(format!("http://127.0.0.1:{port}"))).expect("push ok");
+        let reqs = h.join().unwrap();
+        assert!(reqs[0].starts_with("PUT /v1/facts"));
+        assert!(reqs[0].contains("__infra__::configs"));
+        assert!(reqs[0].contains("${REDACTED}"));
+        assert!(!reqs[0].contains("sekret"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_push_errors_without_claude_dir() {
+        clean_home(); // HOME exists but no ~/.claude
+        let err = run_push("x".to_string(), Some("http://127.0.0.1:1".to_string())).expect_err("must fail");
+        assert!(err.to_string().contains("nothing to push"));
+    }
+
+    #[test]
+    fn collect_files_skips_oversized_and_passes_through_bad_json() {
+        let base = std::env::temp_dir().join(format!("crux-collect2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        // Oversized file is skipped (no panic, not included).
+        std::fs::write(base.join("settings.json"), "x".repeat(MAX_FILE_BYTES + 1)).unwrap();
+        // Invalid JSON under a .json name passes through verbatim, unredacted.
+        std::fs::write(base.join(".mcp.json"), "{ not valid json").unwrap();
+        let files = collect_files(&base).expect("collect ok");
+        let paths: Vec<String> = files.iter().map(|f| f["path"].as_str().unwrap().to_string()).collect();
+        assert!(
+            !paths.contains(&"settings.json".to_string()),
+            "oversized must be skipped"
+        );
+        let mcp = files.iter().find(|f| f["path"] == ".mcp.json").unwrap();
+        assert_eq!(mcp["redacted"], false);
+        assert!(mcp["content"].as_str().unwrap().contains("not valid json"));
+    }
 }

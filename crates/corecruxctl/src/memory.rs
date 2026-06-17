@@ -272,6 +272,7 @@ pub fn render_list(facts: &[MemoryFact]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -307,5 +308,278 @@ mod tests {
         assert!(out.contains("f_1"));
         assert!(out.contains("person:bob"));
         assert!(out.contains("memory_edit:moved"));
+    }
+
+    #[test]
+    fn render_fact_marks_deleted() {
+        let f = MemoryFact {
+            fact_id: "f_2".to_string(),
+            entity: "e".to_string(),
+            key: "k".to_string(),
+            value: "v".to_string(),
+            version: 1,
+            confidence: 1.0,
+            stored_at: "t".to_string(),
+            source_receipt: None,
+            deleted: true,
+        };
+        let out = render_fact(&f);
+        assert!(out.contains("status    : DELETED"));
+        assert!(!out.contains("receipt   :"));
+    }
+
+    #[test]
+    fn render_list_formats_each_fact() {
+        let facts = vec![
+            MemoryFact {
+                fact_id: "f_a".to_string(),
+                entity: "person:a".to_string(),
+                key: "city".to_string(),
+                value: "LDN".to_string(),
+                version: 3,
+                confidence: 0.5,
+                stored_at: "t".to_string(),
+                source_receipt: None,
+                deleted: false,
+            },
+            MemoryFact {
+                fact_id: "f_b".to_string(),
+                entity: "person:b".to_string(),
+                key: "lang".to_string(),
+                value: "rust".to_string(),
+                version: 1,
+                confidence: 0.9,
+                stored_at: "t".to_string(),
+                source_receipt: None,
+                deleted: false,
+            },
+        ];
+        let out = render_list(&facts);
+        assert!(out.contains("f_a  v3  [person:a]  city = LDN"));
+        assert!(out.contains("f_b  v1  [person:b]  lang = rust"));
+    }
+
+    // ── MemoryClient (driven against a loopback stub) ───────────────────
+
+    fn fact_json(fact_id: &str, entity: &str) -> serde_json::Value {
+        serde_json::json!({
+            "fact_id": fact_id,
+            "entity": entity,
+            "key": "k",
+            "value": "v",
+            "version": 1,
+            "confidence": 1.0,
+            "stored_at": "2026-06-17T00:00:00Z",
+        })
+    }
+
+    #[test]
+    fn url_joins_and_normalises_slashes() {
+        let c = MemoryClient::new("http://host:1/", None);
+        assert_eq!(c.url("/v1/facts"), "http://host:1/v1/facts");
+        assert_eq!(c.url("v1/facts"), "http://host:1/v1/facts");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn from_env_defaults_and_overrides() {
+        std::env::remove_var("CORECRUXD_HTTP_URL");
+        std::env::remove_var("CRUX_AGENT_TOKEN");
+        let c = MemoryClient::from_env();
+        assert_eq!(c.base, "http://127.0.0.1:14800");
+        assert!(c.bearer.is_none());
+
+        std::env::set_var("CORECRUXD_HTTP_URL", "http://example:9/");
+        std::env::set_var("CRUX_AGENT_TOKEN", "tok123");
+        let c = MemoryClient::from_env();
+        assert_eq!(c.base, "http://example:9");
+        assert_eq!(c.bearer.as_deref(), Some("tok123"));
+        std::env::remove_var("CORECRUXD_HTTP_URL");
+        std::env::remove_var("CRUX_AGENT_TOKEN");
+    }
+
+    #[test]
+    fn list_filters_reserved_and_deleted_and_sends_bearer() {
+        let body = serde_json::json!({
+            "facts": [
+                fact_json("f_keep", "person:alice"),
+                { "fact_id": "f_del", "entity": "person:bob", "key": "k", "value": "v",
+                  "version": 1, "confidence": 1.0, "stored_at": "t", "deleted": true },
+                fact_json("f_reserved", "__agent::secret"),
+                fact_json("f_keep2", "project:beta"),
+            ]
+        })
+        .to_string();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, body)]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), Some("bearer-xyz".to_string()));
+        let facts = c.list(10, Some("person:alice")).expect("list ok");
+        let reqs = h.join().expect("join");
+
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].fact_id, "f_keep");
+        assert_eq!(facts[1].fact_id, "f_keep2");
+        assert!(reqs[0].to_lowercase().contains("authorization: bearer bearer-xyz"));
+        assert!(reqs[0].contains("entity=person%3Aalice") || reqs[0].contains("entity=person:alice"));
+    }
+
+    #[test]
+    fn list_respects_top_k_cap() {
+        let body = serde_json::json!({
+            "facts": [fact_json("f1", "e1"), fact_json("f2", "e2"), fact_json("f3", "e3")]
+        })
+        .to_string();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, body)]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), None);
+        let facts = c.list(2, None).expect("list ok");
+        h.join().ok();
+        assert_eq!(facts.len(), 2);
+    }
+
+    #[test]
+    fn list_missing_facts_field_errors() {
+        let (port, h) = crate::test_support::serve_responses(vec![(200, "{}".to_string())]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), None);
+        let err = c.list(5, None).expect_err("must fail");
+        h.join().ok();
+        assert!(matches!(err, MemoryCliError::MissingField("facts")));
+    }
+
+    #[test]
+    fn list_upstream_error_status() {
+        // This client's agent leaves `http_status_as_error` at its default
+        // (true), so a 5xx surfaces as a transport error rather than reaching
+        // the `status >= 400` branch.
+        let (port, h) = crate::test_support::serve_responses(vec![(503, "down".to_string())]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), None);
+        let err = c.list(5, None).expect_err("must fail");
+        h.join().ok();
+        assert!(matches!(err, MemoryCliError::Transport(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn show_success() {
+        let (port, h) = crate::test_support::serve_responses(vec![(200, fact_json("f_x", "person:a").to_string())]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), None);
+        let fact = c.show("f_x").expect("show ok");
+        h.join().ok();
+        assert_eq!(fact.fact_id, "f_x");
+    }
+
+    #[test]
+    fn show_rejects_reserved_entity() {
+        let (port, h) = crate::test_support::serve_responses(vec![(200, fact_json("f_r", "__ops::x").to_string())]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), None);
+        let err = c.show("f_r").expect_err("reserved must fail");
+        h.join().ok();
+        match err {
+            MemoryCliError::UpstreamStatus { status, body } => {
+                assert_eq!(status, 403);
+                assert!(body.contains("reserved"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_upstream_error() {
+        let (port, h) = crate::test_support::serve_responses(vec![(404, "nope".to_string())]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), None);
+        let err = c.show("missing").expect_err("must fail");
+        h.join().ok();
+        assert!(matches!(err, MemoryCliError::Transport(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn edit_reads_then_supersedes() {
+        let (port, h) = crate::test_support::serve_responses(vec![
+            (200, fact_json("f_e", "person:a").to_string()),
+            (200, fact_json("f_e", "person:a").to_string()),
+        ]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), None);
+        let updated = c.edit("f_e", "new-value", Some("typo")).expect("edit ok");
+        let reqs = h.join().expect("join");
+        assert_eq!(updated.fact_id, "f_e");
+        // Second request is the PUT carrying the new value + receipt reason.
+        assert!(reqs[1].contains("new-value"));
+        assert!(reqs[1].contains("memory_edit:typo"));
+    }
+
+    #[test]
+    fn edit_fails_when_show_fails() {
+        let (port, h) = crate::test_support::serve_responses(vec![(500, "boom".to_string())]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), None);
+        let err = c.edit("f", "v", None).expect_err("must fail");
+        h.join().ok();
+        assert!(matches!(err, MemoryCliError::Transport(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn edit_surfaces_put_error() {
+        let (port, h) = crate::test_support::serve_responses(vec![
+            (200, fact_json("f_e", "person:a").to_string()),
+            (409, "conflict".to_string()),
+        ]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), None);
+        let err = c.edit("f_e", "v", None).expect_err("put fails");
+        h.join().ok();
+        assert!(matches!(err, MemoryCliError::Transport(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn pin_on_and_off() {
+        for pinned in [true, false] {
+            let (port, h) = crate::test_support::serve_responses(vec![
+                (200, fact_json("f_p", "person:a").to_string()),
+                (200, "{}".to_string()),
+            ]);
+            let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), None);
+            c.pin("f_p", pinned).expect("pin ok");
+            let reqs = h.join().expect("join");
+            let want = if pinned { "\"1\"" } else { "\"0\"" };
+            assert!(reqs[1].contains(want), "value should be {want}: {}", reqs[1]);
+            assert!(reqs[1].contains("__memory_pin::cli::f_p"));
+        }
+    }
+
+    #[test]
+    fn pin_surfaces_put_error() {
+        let (port, h) = crate::test_support::serve_responses(vec![
+            (200, fact_json("f_p", "person:a").to_string()),
+            (500, "boom".to_string()),
+        ]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), None);
+        let err = c.pin("f_p", true).expect_err("must fail");
+        h.join().ok();
+        assert!(matches!(err, MemoryCliError::Transport(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn error_display_and_transport_helper() {
+        assert_eq!(
+            MemoryCliError::transport("dns boom").to_string(),
+            "transport error: dns boom"
+        );
+        assert_eq!(
+            MemoryCliError::MissingField("facts").to_string(),
+            "response missing field: facts"
+        );
+        assert_eq!(
+            MemoryCliError::UpstreamStatus {
+                status: 418,
+                body: "tea".to_string()
+            }
+            .to_string(),
+            "daemon returned status 418: tea"
+        );
+        let json_err: MemoryCliError = serde_json::from_str::<MemoryFact>("not json").unwrap_err().into();
+        assert!(json_err.to_string().contains("JSON error"));
+    }
+
+    #[test]
+    fn list_transport_error_on_dead_port() {
+        // Nothing listening: ureq fails to connect → Transport error.
+        let c = MemoryClient::new("http://127.0.0.1:1", None);
+        let err = c.list(5, None).expect_err("must fail");
+        assert!(matches!(err, MemoryCliError::Transport(_)));
     }
 }

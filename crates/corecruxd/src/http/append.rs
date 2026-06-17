@@ -158,4 +158,68 @@ pub(super) async fn post_admin_append(
         .into_response()
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod append_tests {
+    use super::*;
+
+    fn enabled_state() -> AppState {
+        let mut s = super::super::tests::test_app_state(16);
+        s.http_dataplane = super::super::tests::TestDataplane::shared(vec![]);
+        s
+    }
+
+    fn body(n: usize) -> AppendBody {
+        AppendBody {
+            tenant_id: "t1".to_string(),
+            stream_type: "artifact".to_string(),
+            stream_id: "s1".to_string(),
+            expected_next_seq: 0,
+            events: (0..n)
+                .map(|i| AppendEventBody {
+                    event_id: format!("e{i}"),
+                    occurred_at: "2026-06-17T00:00:00Z".to_string(),
+                    event_type: "evt.created".to_string(),
+                    content_type: "application/json".to_string(),
+                    payload: "{}".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_dataplane_returns_upgrade_501() {
+        // Default test state has the dataplane disabled (CE build).
+        let state = super::super::tests::test_app_state(16);
+        let resp = post_admin_append(State(state), HeaderMap::new(), Json(body(1)))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn empty_events_rejected() {
+        let resp = post_admin_append(State(enabled_state()), HeaderMap::new(), Json(body(0)))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn too_many_events_rejected() {
+        let resp = post_admin_append(State(enabled_state()), HeaderMap::new(), Json(body(1025)))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn happy_path_appends_and_returns_created() {
+        let resp = post_admin_append(State(enabled_state()), HeaderMap::new(), Json(body(2)))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+}
+
 // ── v5 text retrieval ────────────────────────────────────────────────

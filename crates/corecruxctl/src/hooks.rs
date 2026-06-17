@@ -285,4 +285,85 @@ mod tests {
         assert_eq!(v["permissions"]["allow"][0], "x", "preserves existing keys");
         assert!(v["hooks"]["SessionStart"].is_array());
     }
+
+    fn tmp() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("crux-hooks-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn settings_path_user_project_and_default() {
+        let home = tmp();
+        std::env::set_var("HOME", &home);
+        assert_eq!(settings_path(true, None).unwrap(), home.join(".claude/settings.json"));
+        let proj = tmp();
+        assert_eq!(
+            settings_path(false, Some(proj.clone())).unwrap(),
+            proj.join(".claude/settings.local.json")
+        );
+        // default (cwd) variant just needs to resolve without error.
+        assert!(settings_path(false, None).is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn locate_and_jq_probes_follow_home_and_path() {
+        let home = tmp();
+        std::env::set_var("HOME", &home);
+        std::env::set_var("PATH", ""); // nothing on PATH
+        assert!(locate_crux_hook().is_none());
+        assert!(!jq_present());
+
+        // Drop a fake crux-hook + jq under ~/.local/bin.
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("crux-hook"), "#!/bin/sh\n").unwrap();
+        std::fs::write(bin.join("jq"), "#!/bin/sh\n").unwrap();
+        assert_eq!(locate_crux_hook(), Some(bin.join("crux-hook")));
+        assert!(jq_present());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_observe_only_then_with_binary_and_status() {
+        let home = tmp();
+        std::env::set_var("HOME", &home);
+        std::env::set_var("PATH", "");
+
+        // No crux-hook binary → observe-only install.
+        let summary = install(true, None).unwrap();
+        assert!(summary.contains("observe only"));
+        let settings = home.join(".claude/settings.json");
+        assert!(settings.is_file());
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(v["hooks"]["SessionStart"].is_array());
+        assert!(!v["hooks"].as_object().unwrap().contains_key("PreCompact"));
+        // launcher + observe script landed under ~/.local/share/crux/hooks.
+        assert!(home.join(".local/share/crux/hooks/crux-hook-env.sh").is_file());
+        assert!(home.join(".local/share/crux/hooks/crux-observe.sh").is_file());
+
+        // run_install + run_status execute without error.
+        run_install(true, None).unwrap();
+        run_status(true, None).unwrap();
+
+        // Now add the binary → banner + PreCompact appear.
+        let bin = home.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("crux-hook"), "#!/bin/sh\n").unwrap();
+        let summary = install(true, None).unwrap();
+        assert!(summary.contains("banner + observe"));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(v["hooks"].as_object().unwrap().contains_key("PreCompact"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_status_when_settings_absent() {
+        let home = tmp();
+        std::env::set_var("HOME", &home);
+        // No ~/.claude/settings.json → the "not present" branch.
+        run_status(true, None).unwrap();
+    }
 }

@@ -164,8 +164,50 @@ fn prompt(message: &str, default: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    struct CwdGuard(std::path::PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    fn enter_tmp_cwd() -> CwdGuard {
+        let original = std::env::current_dir().unwrap();
+        let dir = std::env::temp_dir().join(format!("crux-qs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        CwdGuard(original)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_non_interactive_happy_path() {
+        let _cwd = enter_tmp_cwd();
+        // readyz, PUT (fact_id), query GET, DELETE.
+        let (port, h) = crate::test_support::serve_responses(vec![
+            (200, "{}".to_string()),
+            (200, r#"{"fact_id":"f_qs"}"#.to_string()),
+            (200, r#"{"facts":[]}"#.to_string()),
+            (200, "{}".to_string()),
+        ]);
+        run(&format!("http://127.0.0.1:{port}"), true).expect("quickstart ok");
+        h.join().ok();
+        assert!(std::path::Path::new("config.env").exists());
+        let cfg = std::fs::read_to_string("config.env").unwrap();
+        assert!(cfg.contains("CORECRUXD_AUTH_MODE=off"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_errors_when_daemon_unreachable() {
+        let _cwd = enter_tmp_cwd();
+        let err = run("http://127.0.0.1:1", true).expect_err("must fail");
+        assert!(err.to_string().contains("Daemon unreachable"));
+    }
 
     #[test]
     fn config_env_content() {

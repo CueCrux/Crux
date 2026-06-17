@@ -1107,3 +1107,129 @@ pub(super) fn build_tar_zst_deterministic_bytes(files: &[(String, Vec<u8>)]) -> 
     enc.write_all(&tar_bytes).map_err(|e| e.to_string())?;
     enc.finish().map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod receipts_tests {
+    use super::super::tests::{receipt_stored_event, test_app_state, TestDataplane};
+    use super::*;
+
+    fn enabled(events: Vec<corecrux_storage::StoredEvent>) -> AppState {
+        let mut s = test_app_state(16);
+        s.http_dataplane = TestDataplane::shared(events);
+        s
+    }
+
+    fn tq() -> TenantQuery {
+        TenantQuery {
+            tenant_id: "t1".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn body_found_returns_json_envelope() {
+        let ev = receipt_stored_event(EVT_RECEIPT_BODY_V1, 1, b"{\"r\":1}");
+        let resp = get_receipt_body_v1(
+            State(enabled(vec![ev])),
+            Path("rcpt-1".to_string()),
+            Query(tq()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["receipt_id"], "rcpt-1");
+        assert_eq!(v["seq"], 1);
+        assert!(!v["payloadBase64"].as_str().unwrap().is_empty());
+        assert!(v["payloadHash"].as_str().unwrap().len() == 64);
+    }
+
+    #[tokio::test]
+    async fn body_missing_is_404() {
+        let resp = get_receipt_body_v1(
+            State(enabled(vec![])),
+            Path("x".to_string()),
+            Query(tq()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn body_disabled_dataplane_is_501() {
+        let resp = get_receipt_body_v1(
+            State(test_app_state(16)),
+            Path("x".to_string()),
+            Query(tq()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn body_cbor_accept_returns_raw_bytes() {
+        let ev = receipt_stored_event(EVT_RECEIPT_BODY_V1, 1, b"\x01\x02cbor-bytes");
+        let mut h = HeaderMap::new();
+        h.insert(header::ACCEPT, "application/cbor".parse().unwrap());
+        let resp = get_receipt_body_v1(State(enabled(vec![ev])), Path("r".to_string()), Query(tq()), h)
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&bytes[..], b"\x01\x02cbor-bytes");
+    }
+
+    #[tokio::test]
+    async fn signature_found_and_missing() {
+        let ev = receipt_stored_event(EVT_RECEIPT_SIG_V1, 2, b"sig-bytes");
+        let resp = get_receipt_signature_v1(
+            State(enabled(vec![ev])),
+            Path("r".to_string()),
+            Query(tq()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = get_receipt_signature_v1(
+            State(enabled(vec![])),
+            Path("r".to_string()),
+            Query(tq()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn verification_disabled_501_and_not_found_404() {
+        let resp = get_receipt_verification_v1(
+            State(test_app_state(16)),
+            Path("r".to_string()),
+            Query(tq()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+
+        // Enabled but the stub returns no verification report → 404.
+        let resp = get_receipt_verification_v1(
+            State(enabled(vec![])),
+            Path("r".to_string()),
+            Query(tq()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
