@@ -269,7 +269,20 @@ jobs:
     env:
       # See `lint` job above for the per-job CARGO_HOME rationale.
       CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
-      COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/main\.rs|.*/corecruxd/src/http/admin\.rs|.*/corecruxd/src/http/append\.rs|.*/corecruxd/src/http/query\.rs|.*/corecruxd/src/http/projections\.rs|.*/corecruxd/src/http/receipts\.rs|.*/corecruxctl/src/main\.rs|.*/corecruxctl/src/audit_pack\.rs)$'
+      # Coverage scope. The exclusion list is deliberately narrow — only code
+      # that is not meaningfully unit-testable:
+      #   * binary entry points: `main.rs` (#[tokio::main] bootstrap / clap
+      #     dispatch) for corecruxd, corecruxctl, crux-claude-hooks,
+      #     crux-config-wizard, plus the `crux_llm_shim` bin;
+      #   * the interactive config wizard (`crux-config-wizard/interactive.rs` —
+      #     stdin-driven prompts);
+      #   * the dataplane layer, inert in the CPU-only CE build (no GPU
+      #     dataplane): `pool.rs`, `dataplane_store.rs`, `http/dataplane.rs`.
+      # Everything else is gated. The 2026-04-05 audit (HIGH #9 / Action #10)
+      # called out append→query + receipts; those critical data-plane, receipt,
+      # projection, admin, and audit-pack surfaces were previously exempted here
+      # (masking their true coverage) and are now IN scope and gated.
+      COVERAGE_IGNORE_REGEX: '(.*/corecruxd/src/pool\.rs|.*/corecruxd/src/dataplane_store\.rs|.*/corecruxd/src/http/dataplane\.rs|.*/corecruxd/src/main\.rs|.*/corecruxctl/src/main\.rs|.*/crux-claude-hooks/src/main\.rs|.*/crux-claude-hooks/src/bin/crux_llm_shim\.rs|.*/crux-config-wizard/src/main\.rs|.*/crux-config-wizard/src/interactive\.rs)$'
     steps:
       - name: Seed per-job CARGO_HOME from shared toolchain
         run: |
