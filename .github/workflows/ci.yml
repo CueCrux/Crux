@@ -276,8 +276,16 @@ jobs:
       #     crux-config-wizard, plus the `crux_llm_shim` bin;
       #   * the interactive config wizard (`crux-config-wizard/interactive.rs` —
       #     stdin-driven prompts);
-      #   * the dataplane layer, inert in the CPU-only CE build (no GPU
-      #     dataplane): `pool.rs`, `dataplane_store.rs`, `http/dataplane.rs`.
+      #   * the dataplane layer, which is an UNCONSTRUCTABLE typecheck stub in
+      #     the CPU-only CE build: `pool.rs` (`DataPlanePool { _private: () }`,
+      #     every method `unreachable!()`, never constructed — `main.rs` hardcodes
+      #     `dataplane_pool = None`), `dataplane_store.rs`, and `http/dataplane.rs`
+      #     (`PoolBackedHttpDataplane` whose `pool` is always `None`, so its real
+      #     methods are statically unreachable in CE). The real dataplane —
+      #     and its append→read→verify integration coverage — lives in the
+      #     dataplane-enabled (CoreCrux) distribution, not here. Handler-level
+      #     behaviour against this trait is covered via the `FakeHttpDataplane`
+      #     test double (http/tests.rs).
       # Everything else is gated. The 2026-04-05 audit (HIGH #9 / Action #10)
       # called out append→query + receipts; those critical data-plane, receipt,
       # projection, admin, and audit-pack surfaces were previously exempted here
@@ -317,6 +325,10 @@ jobs:
           set -euo pipefail
           bash scripts/ci-cargo-with-fallback.sh llvm-cov --workspace --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --lcov --output-path lcov.info
           cargo llvm-cov report --ignore-filename-regex "$COVERAGE_IGNORE_REGEX" --summary-only | tee coverage-summary.txt
+          # Transparency: also print the UNGATED total (no exclusions) so the
+          # ignore-regex can't quietly hide low-coverage code from review.
+          UNGATED=$(cargo llvm-cov report --summary-only | grep '^TOTAL' | awk '{print $4}')
+          echo "::notice::Gated total (excl. entry-points/dataplane): $(grep '^TOTAL' coverage-summary.txt | awk '{print $4}') | Ungated total (full tree): ${UNGATED}"
       - name: Enforce coverage thresholds
         run: |
           SUMMARY=$(cat coverage-summary.txt)
@@ -325,16 +337,30 @@ jobs:
 
           FAILED=0
 
-          if (( $(echo "$TOTAL < 84" | bc -l) )); then
-            echo "::error::Workspace coverage ${TOTAL}% is below 84% floor"
+          if (( $(echo "$TOTAL < 86" | bc -l) )); then
+            echo "::error::Workspace coverage ${TOTAL}% is below 86% floor"
             FAILED=1
           fi
 
-          for crate in corecrux-memory crux-sync crux-contrib; do
-            COV=$(echo "$SUMMARY" | grep "^${crate}/" | awk '{sum+=$1; missed+=$2} END {if(sum>0) printf "%.1f", (1-missed/sum)*100; else print "100.0"}')
-            echo "${crate}: ${COV}%"
-            if (( $(echo "$COV < 95" | bc -l) )); then
-              echo "::error::${crate} coverage ${COV}% is below 95% floor"
+          # Per-crate region-coverage floors.
+          #
+          # BUGFIX (2026-06-17): the prior awk summed `$1` — the file PATH (a
+          # string → 0 in awk) — so `sum` was always 0 and every crate evaluated
+          # to "100.0"; the corecrux-memory/crux-sync/crux-contrib ≥95% floors
+          # were inert no-ops that never failed. It now sums `$2` (regions) /
+          # `$3` (missed), and the no-match branch yields 0.0 (fails loudly)
+          # instead of 100.0. Floors are set at current-rounded-down (ratchet
+          # from reality); raise as coverage improves. NOTE: corecrux-memory's
+          # historical 95% target was never actually enforced — it is 93.5%
+          # today, so the enforced floor is 93 with 95 as the ratchet target.
+          # The trust-core crates (receipts/segment/storage) are newly gated.
+          for pair in "corecrux-memory:93" "crux-sync:98" "crux-contrib:99" \
+                      "corecrux-receipts:88" "corecrux-segment:85" "corecrux-storage:79"; do
+            crate="${pair%%:*}"; floor="${pair##*:}"
+            COV=$(echo "$SUMMARY" | grep "^${crate}/" | awk '{sum+=$2; missed+=$3} END {if(sum>0) printf "%.1f", (1-missed/sum)*100; else print "0.0"}')
+            echo "${crate}: ${COV}% (floor ${floor}%)"
+            if (( $(echo "$COV < ${floor}" | bc -l) )); then
+              echo "::error::${crate} coverage ${COV}% is below ${floor}% floor"
               FAILED=1
             fi
           done
