@@ -30,6 +30,24 @@ pub struct AgentRegistry {
     agents: Vec<AgentIdentity>,
 }
 
+/// Why building an [`AgentRegistry`] from environment failed.
+///
+/// Returned only when an agent-token env var is *present but invalid*: the
+/// caller must fail closed rather than silently fall back to no-auth MCP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRegistryError {
+    /// Operator-facing explanation (which var, what was wrong).
+    pub message: String,
+}
+
+impl std::fmt::Display for AgentRegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AgentRegistryError {}
+
 impl AgentRegistry {
     /// Build a registry from environment variables.
     ///
@@ -41,19 +59,73 @@ impl AgentRegistry {
     /// - `CRUX_AGENT_TOKEN=<32-byte-token>`
     ///   — single agent named `"default"`.
     ///
-    /// If neither variable is set, returns an empty registry (single-user mode).
-    pub fn from_env() -> Self {
+    /// Fail-closed semantics:
+    ///
+    /// - Neither variable set → `Ok(empty)` (legitimate single-user / no-auth mode).
+    /// - A variable is set but **any** entry is malformed, too short, or otherwise
+    ///   fails the token policy → `Err(AgentRegistryError)`. The caller must abort
+    ///   startup; a typo or weak token must never silently degrade enforced MCP auth
+    ///   into no-auth MCP.
+    pub fn from_env() -> Result<Self, AgentRegistryError> {
         // Try multi-agent first.
         if let Ok(val) = env::var("CRUX_AGENT_TOKENS") {
-            return Self::from_pairs_str(&val);
+            return Self::from_pairs_str_checked(&val);
         }
 
         // Try single-agent fallback.
         if let Ok(token) = env::var("CRUX_AGENT_TOKEN") {
-            return Self::from_single_token(&token);
+            let reg = Self::from_single_token(&token);
+            if reg.is_empty() {
+                return Err(AgentRegistryError {
+                    message: "CRUX_AGENT_TOKEN is set but the token fails the policy \
+                              (need 32..=256 bytes, charset [A-Za-z0-9._~-])"
+                        .to_string(),
+                });
+            }
+            return Ok(reg);
         }
 
-        Self::empty()
+        Ok(Self::empty())
+    }
+
+    /// Strict variant of [`Self::from_pairs_str`]: every non-empty `name:token`
+    /// segment must parse, and at least one must be present. Returns an error
+    /// (not a silently-shorter registry) on the first invalid entry, so a typo
+    /// in one of several tokens fails startup rather than dropping that agent.
+    fn from_pairs_str_checked(pairs: &str) -> Result<Self, AgentRegistryError> {
+        let mut agents = Vec::new();
+        for raw in pairs.split(',') {
+            let pair = raw.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let invalid = |what: &str| AgentRegistryError {
+                message: format!(
+                    "CRUX_AGENT_TOKENS contains an invalid entry ({what}); \
+                     expected comma-separated name:token pairs, token 32..=256 bytes, \
+                     charset [A-Za-z0-9._~-]"
+                ),
+            };
+            let (name, token) = pair.split_once(':').ok_or_else(|| invalid("missing ':' delimiter"))?;
+            let name = name.trim();
+            let token = token.trim();
+            if !is_safe_agent_name(name) {
+                return Err(invalid("bad agent name"));
+            }
+            if !is_safe_agent_token(token) {
+                return Err(invalid("token fails length/charset policy"));
+            }
+            agents.push(AgentIdentity {
+                name: name.to_string(),
+                token_hash: blake3::hash(token.as_bytes()).into(),
+            });
+        }
+        if agents.is_empty() {
+            return Err(AgentRegistryError {
+                message: "CRUX_AGENT_TOKENS is set but contained no valid name:token pairs".to_string(),
+            });
+        }
+        Ok(Self { agents })
     }
 
     /// Parse a comma-separated `name:token` string into a registry.
@@ -181,6 +253,74 @@ mod tests {
         assert!(AgentRegistry::from_single_token("contains whitespace 0123456789abcdef").is_empty());
         assert!(AgentRegistry::from_single_token("contains:colon:0123456789abcdef").is_empty());
         assert_eq!(AgentRegistry::from_single_token(TOKEN_A).len(), 1);
+    }
+
+    fn clear_agent_token_env() {
+        std::env::remove_var("CRUX_AGENT_TOKEN");
+        std::env::remove_var("CRUX_AGENT_TOKENS");
+    }
+
+    #[test]
+    fn mcp_no_token_env_allows_single_user_mode() {
+        let _g = crate::test_env_lock().blocking_lock();
+        clear_agent_token_env();
+        let reg = AgentRegistry::from_env().expect("no token env is single-user mode");
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn mcp_env_token_present_but_invalid_fails_startup() {
+        let _g = crate::test_env_lock().blocking_lock();
+        clear_agent_token_env();
+        std::env::set_var("CRUX_AGENT_TOKEN", "too-short");
+        let result = AgentRegistry::from_env();
+        clear_agent_token_env();
+        assert!(result.is_err(), "weak single token must fail closed, got {result:?}");
+    }
+
+    #[test]
+    fn mcp_valid_single_token_env_parses() {
+        let _g = crate::test_env_lock().blocking_lock();
+        clear_agent_token_env();
+        std::env::set_var("CRUX_AGENT_TOKEN", TOKEN_A);
+        let result = AgentRegistry::from_env();
+        clear_agent_token_env();
+        assert_eq!(result.expect("valid token parses").len(), 1);
+    }
+
+    #[test]
+    fn mcp_multi_token_any_invalid_fails_startup() {
+        let _g = crate::test_env_lock().blocking_lock();
+        clear_agent_token_env();
+        // First token is valid, second is too short: must fail closed rather
+        // than silently registering only the good one.
+        std::env::set_var("CRUX_AGENT_TOKENS", &format!("alice:{TOKEN_A},bob:tiny"));
+        let result = AgentRegistry::from_env();
+        clear_agent_token_env();
+        assert!(
+            result.is_err(),
+            "one bad token in the list must fail closed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_multi_token_all_valid_parses() {
+        let _g = crate::test_env_lock().blocking_lock();
+        clear_agent_token_env();
+        std::env::set_var("CRUX_AGENT_TOKENS", &format!("alice:{TOKEN_A},bob:{TOKEN_B}"));
+        let result = AgentRegistry::from_env();
+        clear_agent_token_env();
+        assert_eq!(result.expect("all valid parses").len(), 2);
+    }
+
+    #[test]
+    fn mcp_multi_token_only_empty_segments_fails() {
+        let _g = crate::test_env_lock().blocking_lock();
+        clear_agent_token_env();
+        std::env::set_var("CRUX_AGENT_TOKENS", ",, ,");
+        let result = AgentRegistry::from_env();
+        clear_agent_token_env();
+        assert!(result.is_err(), "no valid pairs must fail closed");
     }
 
     #[test]

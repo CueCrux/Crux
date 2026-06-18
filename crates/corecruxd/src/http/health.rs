@@ -21,28 +21,66 @@ use super::{
 )]
 pub(super) async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let _ = state.commit_level;
-    let routing = state.routing.read().await.clone();
-    let control_state = state.control.read().await.clone();
+    // Minimal public mode: omit routing (node id, shard map) and valve state so
+    // an unauthenticated, broadly-reachable probe leaks nothing beyond liveness
+    // + build identity. Full diagnostics stay available behind admin:read.
+    let minimal = public_probes_minimal();
+    let (routing_info, valves_info) = if minimal {
+        (None, None)
+    } else {
+        let routing = state.routing.read().await.clone();
+        let control_state = state.control.read().await.clone();
+        (
+            Some(RoutingInfo {
+                shard_map_version: routing.current_version(),
+                shard_count: routing.shard_count() as u64,
+                last_reload_at: Some(routing.loaded_at),
+                node_id: state.node_id.clone(),
+            }),
+            Some(ValvesInfo {
+                pause_ingest: to_valve_info(&control_state.valves.pause_ingest),
+                pause_compaction: to_valve_info(&control_state.valves.pause_compaction),
+                throttle: to_valve_info(&control_state.valves.throttle),
+                read_only: to_valve_info(&control_state.valves.read_only),
+                emergency_brake: to_valve_info(&control_state.valves.emergency_brake),
+            }),
+        )
+    };
     let body = HealthzResponse {
         ok: true,
         build: state.build.clone(),
         compat: state.compat.clone(),
         sdk_version: state.sdk_version.clone(),
-        routing: Some(RoutingInfo {
-            shard_map_version: routing.current_version(),
-            shard_count: routing.shard_count() as u64,
-            last_reload_at: Some(routing.loaded_at),
-            node_id: state.node_id.clone(),
-        }),
-        valves: Some(ValvesInfo {
-            pause_ingest: to_valve_info(&control_state.valves.pause_ingest),
-            pause_compaction: to_valve_info(&control_state.valves.pause_compaction),
-            throttle: to_valve_info(&control_state.valves.throttle),
-            read_only: to_valve_info(&control_state.valves.read_only),
-            emergency_brake: to_valve_info(&control_state.valves.emergency_brake),
-        }),
+        routing: routing_info,
+        valves: valves_info,
     };
     (StatusCode::OK, Json(body))
+}
+
+/// Deployment flag: strip rich routing/projection/capacity detail from the
+/// unauthenticated `/healthz` and `/readyz` probes for environments that can't
+/// fully network-restrict them. Off by default (full detail).
+pub(super) fn public_probes_minimal() -> bool {
+    std::env::var("CORECRUXD_PUBLIC_PROBES_MINIMAL")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+/// Build the `/readyz` failure response, suppressing per-check detail in minimal
+/// public-probe mode (the 503 + `ok:false` is still returned).
+fn readyz_fail_response(checks: Vec<ReadyCheck>, minimal: bool) -> Response {
+    let checks = filter_public_checks(checks, minimal);
+    (StatusCode::SERVICE_UNAVAILABLE, Json(ReadyFail { ok: false, checks })).into_response()
+}
+
+/// In minimal public-probe mode the readiness check breakdown (which names
+/// projection/capacity/topology internals) is withheld; otherwise returned as-is.
+fn filter_public_checks(checks: Vec<ReadyCheck>, minimal: bool) -> Vec<ReadyCheck> {
+    if minimal {
+        Vec::new()
+    } else {
+        checks
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -296,7 +334,7 @@ pub(super) async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
         });
     }
 
-    (StatusCode::SERVICE_UNAVAILABLE, Json(ReadyFail { ok: false, checks })).into_response()
+    readyz_fail_response(checks, public_probes_minimal())
 }
 
 #[utoipa::path(
@@ -508,4 +546,56 @@ pub(super) fn sync_runtime_status() -> corecrux_memory::sync::SyncRuntimeStatus 
         remote_url.as_deref(),
         api_key_configured,
     )
+}
+
+#[cfg(test)]
+mod public_probe_tests {
+    use super::{filter_public_checks, public_probes_minimal, ReadyCheck};
+
+    const FLAG: &str = "CORECRUXD_PUBLIC_PROBES_MINIMAL";
+
+    fn sample_checks() -> Vec<ReadyCheck> {
+        vec![ReadyCheck {
+            name: "data_dir_capacity",
+            ok: false,
+            error: Some("free ratio below threshold".to_string()),
+        }]
+    }
+
+    #[test]
+    fn filter_public_checks_withholds_detail_when_minimal() {
+        assert!(filter_public_checks(sample_checks(), true).is_empty());
+    }
+
+    #[test]
+    fn filter_public_checks_keeps_detail_by_default() {
+        assert_eq!(filter_public_checks(sample_checks(), false).len(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn public_probes_minimal_defaults_false() {
+        std::env::remove_var(FLAG);
+        assert!(!public_probes_minimal());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn public_probes_minimal_true_variants() {
+        for val in ["1", "true", "TRUE", "yes", "YES"] {
+            std::env::set_var(FLAG, val);
+            assert!(public_probes_minimal(), "expected true for {val}");
+        }
+        std::env::remove_var(FLAG);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn public_probes_minimal_false_for_other_values() {
+        std::env::set_var(FLAG, "0");
+        assert!(!public_probes_minimal());
+        std::env::set_var(FLAG, "off");
+        assert!(!public_probes_minimal());
+        std::env::remove_var(FLAG);
+    }
 }

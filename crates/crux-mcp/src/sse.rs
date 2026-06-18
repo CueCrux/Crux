@@ -58,8 +58,17 @@ impl SseLimits {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RegisterError {
-    GlobalLimit { max: usize },
-    OwnerLimit { max: usize },
+    GlobalLimit {
+        max: usize,
+    },
+    OwnerLimit {
+        max: usize,
+    },
+    /// A live session with this id is owned by a different caller. Replacement
+    /// is only permitted by the original owner — a cross-owner takeover (e.g. a
+    /// guessed/copied session id) is rejected rather than silently replacing the
+    /// stream.
+    OwnerMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +104,8 @@ fn registry() -> &'static Mutex<RegistryState> {
 }
 
 /// Register an SSE stream for `session_id`, returning the receiver the stream
-/// drains. A prior stream for the same id is replaced (last writer wins).
+/// drains. A prior stream for the same id is replaced only by its original
+/// owner; a different owner is rejected with [`RegisterError::OwnerMismatch`].
 pub fn register(session_id: &str, owner_key: &str) -> Result<RegisteredSse, RegisterError> {
     let limits = SseLimits::from_env();
     let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
@@ -110,7 +120,18 @@ fn register_locked(
 ) -> Result<RegisteredSse, RegisterError> {
     prune_closed(reg);
 
-    let replaces_existing = reg.sessions.contains_key(session_id);
+    // Owner-bound replacement: a live session may only be replaced by its own
+    // owner. A different owner attempting to reuse the id is rejected (no
+    // cross-owner takeover of an open stream).
+    let replaces_existing = match reg.sessions.get(session_id) {
+        Some(existing) => {
+            if existing.owner_key != owner_key {
+                return Err(RegisterError::OwnerMismatch);
+            }
+            true
+        }
+        None => false,
+    };
     if !replaces_existing && reg.sessions.len() >= limits.max_sessions {
         return Err(RegisterError::GlobalLimit {
             max: limits.max_sessions,
@@ -263,6 +284,38 @@ mod tests {
         let _first = register_locked(&mut reg, "sess-global-1", "owner-1", limits).expect("first registered");
         let second = register_locked(&mut reg, "sess-global-2", "owner-2", limits);
         assert_eq!(second.err(), Some(RegisterError::GlobalLimit { max: 1 }));
+    }
+
+    #[test]
+    fn sse_same_owner_can_replace_session() {
+        let mut reg = RegistryState::default();
+        let limits = SseLimits {
+            max_sessions: 10,
+            max_sessions_per_owner: 10,
+        };
+        let first = register_locked(&mut reg, "sess-own", "owner-1", limits)
+            .expect("first registered")
+            .registration();
+        let second = register_locked(&mut reg, "sess-own", "owner-1", limits)
+            .expect("same owner replaces")
+            .registration();
+        assert_ne!(first.generation, second.generation);
+        assert_eq!(reg.sessions.len(), 1);
+    }
+
+    #[test]
+    fn sse_different_owner_cannot_replace_session() {
+        let mut reg = RegistryState::default();
+        let limits = SseLimits {
+            max_sessions: 10,
+            max_sessions_per_owner: 10,
+        };
+        let _first = register_locked(&mut reg, "sess-own", "owner-1", limits).expect("first registered");
+        let intruder = register_locked(&mut reg, "sess-own", "owner-2", limits);
+        assert_eq!(intruder.err(), Some(RegisterError::OwnerMismatch));
+        // Original owner's stream is untouched and still replaceable by them.
+        assert!(reg.sessions.contains_key("sess-own"));
+        assert!(register_locked(&mut reg, "sess-own", "owner-1", limits).is_ok());
     }
 
     #[test]

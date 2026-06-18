@@ -52,16 +52,14 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 # crypto subset to a targeted deny. Tracked in the repository audit review
 # notes (finding C1).
 multiple-versions = "warn"
-# wildcards stays "allow" for now. Enabling `wildcards = "deny"` is the desired
-# end state (a published "*" version is a supply-chain footgun), but every
-# workspace member uses unversioned `{ path = "../x" }` deps which cargo-deny
-# treats as wildcards, and `allow-wildcard-paths = true` only exempts crates
-# marked `publish = false`. These CCL crates are source-available and never
-# published, so the correct enablement is: add `publish = false` to
-# `[workspace.package]` + `publish.workspace = true` on each member, THEN flip
-# this to `deny` with `allow-wildcard-paths = true`. Tracked as a follow-up so
-# CI is not broken by the 27-crate metadata change in this pass. (C2)
-wildcards = "allow"
+# A published "*" version requirement is a supply-chain footgun, so wildcards
+# are denied. Workspace members all use unversioned `{ path = "../x" }` deps,
+# which cargo-deny treats as wildcards; `allow-wildcard-paths = true` exempts
+# those because every member is non-publishable (`publish = false` via
+# `[workspace.package]` + `publish.workspace = true`). Net: path wildcards are
+# tolerated, registry wildcards are denied. (C2 resolved)
+wildcards = "deny"
+allow-wildcard-paths = true
 highlight = "all"
 deny = []
 skip = []

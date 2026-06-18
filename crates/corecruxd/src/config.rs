@@ -321,6 +321,10 @@ pub struct Config {
     pub replicated_commit_require_all_followers: bool,
     pub auth_mode: AuthMode,
     pub auth_mode_explicitly_set: bool,
+    /// The raw `CORECRUXD_AUTH_MODE` value when it was set but did not parse to a
+    /// known [`AuthMode`]. `Some` here is fatal at startup (fail closed): an
+    /// unknown/typo'd mode must not silently degrade to dev scopes.
+    pub auth_mode_invalid: Option<String>,
     pub passport_key_path: PathBuf,
     pub passport_claim_on_startup: bool,
     pub passport_claim_endpoint: String,
@@ -715,10 +719,15 @@ pub fn load_config() -> Config {
 
     let auth_mode_raw = env_string("CORECRUXD_AUTH_MODE").or(file_config.daemon.auth_mode.clone());
     let auth_mode_explicitly_set = auth_mode_raw.is_some();
-    let auth_mode = auth_mode_raw
-        .as_deref()
-        .and_then(AuthMode::parse)
-        .unwrap_or(AuthMode::DevScopes);
+    let auth_mode_parsed = auth_mode_raw.as_deref().and_then(AuthMode::parse);
+    // Fail closed: a present-but-unparseable mode is recorded so startup can
+    // abort. We still set a placeholder `auth_mode` (never reached in prod —
+    // `main` aborts on `auth_mode_invalid` before using it).
+    let auth_mode_invalid = match (&auth_mode_raw, auth_mode_parsed) {
+        (Some(raw), None) => Some(raw.clone()),
+        _ => None,
+    };
+    let auth_mode = auth_mode_parsed.unwrap_or(AuthMode::DevScopes);
     let passport_key_path = env_string("CORECRUXD_PASSPORT_KEY_PATH")
         .or_else(|| file_config.passport.key_path.clone())
         .map_or_else(|| state_dir.join("passport.key"), |value| expand_path(&value));
@@ -981,6 +990,7 @@ pub fn load_config() -> Config {
         replicated_commit_require_all_followers,
         auth_mode,
         auth_mode_explicitly_set,
+        auth_mode_invalid,
         passport_key_path,
         passport_claim_on_startup,
         passport_claim_endpoint,
@@ -1513,6 +1523,7 @@ mod tests {
         assert!(cfg.replicated_commit_require_all_followers);
         assert_eq!(cfg.auth_mode, crate::auth::AuthMode::DevScopes);
         assert!(!cfg.auth_mode_explicitly_set);
+        assert!(cfg.auth_mode_invalid.is_none());
         assert_eq!(
             cfg.passport_key_path.to_str().unwrap(),
             "../CoreCruxData/v1/passport.key"
@@ -1591,6 +1602,62 @@ mod tests {
         // Coordination plane is default OFF; presence TTL defaults to 15 min.
         assert!(!cfg.coord_enabled);
         assert_eq!(cfg.coord_presence_ttl_secs, crate::coord::DEFAULT_PRESENCE_TTL_SECS);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn missing_auth_mode_is_startup_error() {
+        // Unset → not explicitly set (main aborts) and not flagged invalid.
+        let _g = env_lock().lock().unwrap();
+        clear_corecruxd_env();
+        let cfg = super::load_config();
+        assert!(
+            !cfg.auth_mode_explicitly_set,
+            "unset mode must not count as explicitly set"
+        );
+        assert!(cfg.auth_mode_invalid.is_none(), "unset is not the same as invalid");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn invalid_auth_mode_is_startup_error() {
+        // Present but unknown → flagged invalid (main aborts), never degraded to
+        // dev scopes silently.
+        let _g = env_lock().lock().unwrap();
+        clear_corecruxd_env();
+        std::env::set_var("CORECRUXD_AUTH_MODE", "prod-typo");
+        let cfg = super::load_config();
+        clear_corecruxd_env();
+        assert!(cfg.auth_mode_explicitly_set);
+        assert_eq!(cfg.auth_mode_invalid.as_deref(), Some("prod-typo"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn valid_auth_modes_parse_exactly() {
+        // Every accepted spelling parses to the right mode and is never flagged
+        // invalid; canonical round-trip holds.
+        let _g = env_lock().lock().unwrap();
+        let cases = [
+            ("off", crate::auth::AuthMode::Off),
+            ("dev_scopes", crate::auth::AuthMode::DevScopes),
+            ("jwt_hs256", crate::auth::AuthMode::JwtHs256),
+            ("jwt", crate::auth::AuthMode::JwtHs256),
+            ("jwt_jwks", crate::auth::AuthMode::JwtJwks),
+            ("jwt_oidc", crate::auth::AuthMode::JwtJwks),
+        ];
+        for (raw, expected) in cases {
+            clear_corecruxd_env();
+            std::env::set_var("CORECRUXD_AUTH_MODE", raw);
+            let cfg = super::load_config();
+            assert_eq!(cfg.auth_mode, expected, "raw `{raw}` should parse to {expected:?}");
+            assert!(cfg.auth_mode_explicitly_set, "raw `{raw}` is explicitly set");
+            assert!(
+                cfg.auth_mode_invalid.is_none(),
+                "raw `{raw}` must not be flagged invalid"
+            );
+        }
+        clear_corecruxd_env();
     }
 
     #[test]

@@ -146,10 +146,13 @@ fn build_agent_http_config() -> Option<AgentTokenHttpConfig> {
     if !env_truthy(HTTP_ACCEPT_AGENT_TOKENS_ENV) {
         return None;
     }
-    let registry = crux_mcp::agent::AgentRegistry::from_env();
-    if registry.is_empty() {
-        return None;
-    }
+    // Fail closed: if the agent-token env is present but invalid, `from_env`
+    // returns Err. Treat that as "no usable registry" here (HTTP agent-token
+    // auth stays disabled = deny); startup is independently gated in `main`.
+    let registry = match crux_mcp::agent::AgentRegistry::from_env() {
+        Ok(registry) if !registry.is_empty() => registry,
+        _ => return None,
+    };
     let scopes = std::env::var("CORECRUXD_AGENT_TOKEN_HTTP_SCOPES")
         .ok()
         .map(|s| parse_scopes(&s))
