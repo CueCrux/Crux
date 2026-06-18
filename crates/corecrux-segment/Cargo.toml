@@ -1,5 +1,6 @@
 [package]
 name = "corecrux-segment"
+publish.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true

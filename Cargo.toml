@@ -35,6 +35,11 @@ edition = "2021"
 version = "0.3.1"
 license = "LicenseRef-CCL-1.0"
 rust-version = "1.88.0"
+# CCL crates are source-available and never published to a registry. Marking
+# them non-publishable lets cargo-deny's `allow-wildcard-paths` exempt the
+# unversioned `{ path = "../x" }` workspace deps so `wildcards = "deny"` can be
+# enforced against real (registry) wildcard requirements. (deny.toml C2)
+publish = false
 
 # ── Strictest lint configuration ────────────────────────────────────
 # All clippy lint groups denied. Pedantic enabled. Specific overrides below.

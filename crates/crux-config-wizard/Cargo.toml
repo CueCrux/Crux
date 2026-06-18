@@ -1,5 +1,6 @@
 [package]
 name = "crux-config-wizard"
+publish.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
