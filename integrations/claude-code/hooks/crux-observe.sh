@@ -48,19 +48,66 @@ fi
 
 CLIENT_TS="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
 
-# Build the observation body. We pass the entire hook event JSON through as
-# the `payload` so the daemon can replay arbitrary lifecycle details without
-# this script needing to know the schema for every hook kind.
-BODY="$(jq -nc \
+# Build the observation body in a temp file. The hook payload can be large
+# (full tool_use events), so we stream it to jq via stdin and write the rendered
+# body to a file — it is never placed on a command line, which would blow past
+# ARG_MAX ("Argument list too long") for big events. We pass the entire hook
+# event JSON through as `payload` so the daemon can replay arbitrary lifecycle
+# details without this script knowing the schema for every hook kind.
+#
+# Size guards: the daemon caps the per-observation payload (HTTP 413 above the
+# cap), so we keep payloads small client-side. Every string field longer than
+# MAX_FIELD_CHARS is truncated with a marker, and if the whole body still
+# exceeds MAX_BODY_BYTES it is replaced with a compact stub — so an oversize
+# event is still recorded (truncated) rather than silently dropped. Keep
+# MAX_BODY_BYTES at or below the daemon's CORECRUXD_MAX_OBSERVATION_PAYLOAD_BYTES.
+MAX_FIELD_CHARS="${CRUX_OBSERVE_MAX_FIELD_CHARS:-16384}"
+MAX_BODY_BYTES="${CRUX_OBSERVE_MAX_BODY_BYTES:-262144}"
+
+TMP_BODY="$(mktemp "${TMPDIR:-/tmp}/crux-observe.XXXXXX" 2>/dev/null)" || {
+  log_err "mktemp failed"
+  exit 0
+}
+trap 'rm -f "${TMP_BODY}"' EXIT
+
+printf '%s' "${PAYLOAD_RAW}" | jq -c \
   --arg kind "${KIND}" \
   --arg provider "claude-code" \
   --arg client_ts "${CLIENT_TS}" \
-  --argjson payload "${PAYLOAD_RAW}" \
-  '{kind: $kind, provider: $provider, client_ts: $client_ts, payload: $payload}' 2>/dev/null)"
+  --argjson cap "${MAX_FIELD_CHARS}" '
+    def trunc:
+      walk(if type == "string" and (length > $cap)
+           then .[0:$cap] + "…[crux-truncated " + ((length - $cap) | tostring) + " chars]"
+           else . end);
+    {kind: $kind, provider: $provider, client_ts: $client_ts, payload: (trunc)}
+  ' > "${TMP_BODY}" 2>>"${ERR_LOG}"
 
-if [ -z "${BODY}" ]; then
+if [ ! -s "${TMP_BODY}" ]; then
   log_err "failed to build observation body"
   exit 0
+fi
+
+# Final safety net: if per-field truncation still left an oversize body (very
+# many fields, or large non-string structures), replace the payload with a stub
+# that records the event existed and why it was reduced.
+if [ "$(wc -c < "${TMP_BODY}")" -gt "${MAX_BODY_BYTES}" ]; then
+  ORIG_BYTES="$(printf '%s' "${PAYLOAD_RAW}" | wc -c)"
+  jq -nc \
+    --arg kind "${KIND}" \
+    --arg provider "claude-code" \
+    --arg client_ts "${CLIENT_TS}" \
+    --arg sid "${SESSION_ID}" \
+    --argjson bytes "${ORIG_BYTES}" \
+    --argjson cap "${MAX_BODY_BYTES}" \
+    '{kind: $kind, provider: $provider, client_ts: $client_ts,
+      payload: {session_id: $sid, crux_truncated: true, original_bytes: $bytes,
+                note: ("observation body exceeded " + ($cap | tostring)
+                       + " bytes after field truncation; reduced to stub")}}' \
+    > "${TMP_BODY}" 2>>"${ERR_LOG}"
+  if [ ! -s "${TMP_BODY}" ]; then
+    log_err "failed to build truncation stub"
+    exit 0
+  fi
 fi
 
 AUTH_ARGS=()
@@ -81,7 +128,7 @@ HTTP_CODE="$(curl -sS \
   -X POST \
   -H 'Content-Type: application/json' \
   "${AUTH_ARGS[@]}" \
-  --data-raw "${BODY}" \
+  --data-binary "@${TMP_BODY}" \
   "${CORECRUXD_URL}/v1/sessions/${SESSION_ID}/observations" 2>>"${ERR_LOG}")"
 
 if [ "${HTTP_CODE}" != "201" ] && [ "${HTTP_CODE}" != "200" ]; then

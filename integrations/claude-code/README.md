@@ -26,7 +26,26 @@ The daemon writes one JSONL file per session at
 `body_hash=blake3:…`, `signature=<hex>`) that verifies against the
 daemon's published passport public key.
 
-## Install
+## Install (recommended: `corecruxctl hooks install`)
+
+`corecruxctl hooks install` installs the launcher + observe script under
+`~/.local/share/crux/hooks/`, merges the hooks block into your settings, and
+**captures the daemon endpoint** the hooks read at runtime:
+
+```bash
+# Point the hooks at a daemon and wire them up in one step.
+corecruxctl hooks install --user --endpoint crux-host:14800
+# Omit --endpoint to be prompted (interactive), or to keep an already-saved one.
+```
+
+The endpoint is saved to `~/.config/cuecrux/env` (0600) as `CRUX_HTTP_URL` +
+the derived `CRUX_MCP_URL`; the launcher (`crux-hook-env.sh`) sources that file
+so the URL and bearer token never live in `settings.json`. Re-run with a new
+`--endpoint` to repoint (e.g. when moving from localhost to a Tailscale host).
+`corecruxctl login --url <daemon>` writes the same file and additionally mints
+the auth token.
+
+## Install (manual)
 
 1. Copy the hook script somewhere stable on disk. The snippet assumes
    `/usr/local/share/crux/integrations/claude-code/`, but anywhere works
@@ -59,6 +78,19 @@ daemon's published passport public key.
 | `CORECRUXD_URL`           | `http://127.0.0.1:14800` | Daemon base URL.                                                     |
 | `CORECRUXD_AUTH_TOKEN`    | _unset_                  | Bearer token, only required if daemon `auth_mode` is not `off`.      |
 | `CRUX_OBSERVE_TIMEOUT`    | `0.5`                    | curl `--max-time` in seconds. The hook is fire-and-forget; keep low. |
+| `CRUX_OBSERVE_MAX_FIELD_CHARS` | `16384`             | Per string-field truncation cap. Longer strings are cut with a `…[crux-truncated N chars]` marker. |
+| `CRUX_OBSERVE_MAX_BODY_BYTES`  | `262144`            | Whole-body cap. If field truncation still leaves the body over this, the payload is replaced with a compact stub (event still recorded). Keep ≤ the daemon's payload cap. |
+
+The daemon caps each observation's `payload` at
+`CORECRUXD_MAX_OBSERVATION_PAYLOAD_BYTES` (default 1 MiB) and returns `413`
+above it. The hook's two size guards keep payloads under that cap so large tool
+I/O is captured *truncated* rather than dropped; raise both sides together if
+you want larger observations retained.
+
+When installed via `corecruxctl hooks install`, the launcher sources
+`~/.config/cuecrux/env` and maps `CRUX_HTTP_URL` → `CORECRUXD_URL` and
+`CRUX_AGENT_TOKEN` → `CORECRUXD_AUTH_TOKEN`, so you configure the endpoint once
+in that file rather than per-variable here.
 
 ## Failure mode
 

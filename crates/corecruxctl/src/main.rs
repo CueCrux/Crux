@@ -625,6 +625,11 @@ enum HooksCommand {
         /// Project directory (default: current dir → .claude/settings.local.json).
         #[arg(long)]
         project: Option<PathBuf>,
+        /// Daemon endpoint the hooks should talk to (host:port or URL). Saved to
+        /// ~/.config/cuecrux/env. If omitted and none is configured, prompts when
+        /// interactive.
+        #[arg(long)]
+        endpoint: Option<String>,
     },
     /// Show whether the Crux hooks are wired in the target settings.json.
     Status {
@@ -1999,7 +2004,11 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Logout { url, all } => login::run_logout(login::LogoutArgs { url, all }),
         Command::Whoami { url } => login::run_whoami(login::WhoamiArgs { url }),
         Command::Hooks { command } => match command {
-            HooksCommand::Install { user, project } => hooks::run_install(user, project),
+            HooksCommand::Install {
+                user,
+                project,
+                endpoint,
+            } => hooks::run_install(user, project, endpoint),
             HooksCommand::Status { user, project } => hooks::run_status(user, project),
         },
         Command::Machine { command } => match command {

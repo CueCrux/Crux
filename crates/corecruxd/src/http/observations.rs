@@ -25,10 +25,26 @@ use serde::{Deserialize, Serialize};
 use super::facts::{require_fact_read_ctx, require_session_write_ctx, scoped_session_id_for_http};
 use super::{problem_response, AppState};
 
-/// Maximum JSON-payload size we accept per observation (bytes). Hooks &
-/// proxy adapters should keep payloads small; the daemon enforces this as a
-/// hard limit to keep replay/verification cheap.
-const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
+/// Default maximum JSON-payload size we accept per observation (bytes). Hooks &
+/// proxy adapters should keep payloads small (and truncate oversize tool I/O);
+/// the daemon enforces this as a hard limit to keep replay/verification cheap.
+const DEFAULT_MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Floor for the operator override — an absurdly small cap would silently drop
+/// nearly every observation, so values below this are ignored.
+const MIN_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+
+/// Effective per-observation payload cap. Overridable via
+/// `CORECRUXD_MAX_OBSERVATION_PAYLOAD_BYTES` (bytes); values below
+/// [`MIN_MAX_PAYLOAD_BYTES`] or unparseable values fall back to
+/// [`DEFAULT_MAX_PAYLOAD_BYTES`]. Read once at first use.
+static MAX_PAYLOAD_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("CORECRUXD_MAX_OBSERVATION_PAYLOAD_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= MIN_MAX_PAYLOAD_BYTES)
+        .unwrap_or(DEFAULT_MAX_PAYLOAD_BYTES)
+});
 
 /// Default cap for GET responses.
 const DEFAULT_GET_LIMIT: usize = 500;
@@ -499,10 +515,11 @@ pub(super) fn append_one(
     let payload_size = serde_json::to_vec(&body.payload)
         .map_err(|err| (StatusCode::BAD_REQUEST, format!("payload serialise: {err}")))?
         .len();
-    if payload_size > MAX_PAYLOAD_BYTES {
+    let max_payload_bytes = *MAX_PAYLOAD_BYTES;
+    if payload_size > max_payload_bytes {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
-            format!("payload {} bytes exceeds {}-byte cap", payload_size, MAX_PAYLOAD_BYTES),
+            format!("payload {payload_size} bytes exceeds {max_payload_bytes}-byte cap"),
         ));
     }
 
@@ -1883,8 +1900,8 @@ mod tests {
         let key_path = tmp.path().join("passport.key");
         let key = crux_session::LocalPassportKey::from_path(&key_path).unwrap();
         let state = stub_state_with_passport(tmp.path(), &key);
-        // Build a payload > MAX_PAYLOAD_BYTES by stuffing a long string.
-        let oversize = "x".repeat(MAX_PAYLOAD_BYTES + 100);
+        // Build a payload > the effective cap by stuffing a long string.
+        let oversize = "x".repeat(*MAX_PAYLOAD_BYTES + 100);
         let resp = post_observation(
             State(state),
             HeaderMap::new(),
