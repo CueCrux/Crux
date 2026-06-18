@@ -12327,6 +12327,79 @@ async fn activity_get_cross_tenant_is_empty() {
     std::env::remove_var("CORECRUXD_FEATURE_ACTIVITY_LOG");
 }
 
+/// M4 parity invariant — "both lanes join on turn_id and point at one
+/// receipt". The agent-lane row's `receipt_ids` for a turn must be
+/// byte-identical to the human-lane deref's `refs.receipt_ids` for the same
+/// `turn_id`. This is the cross-walk the console ✓verify badge relies on.
+#[tokio::test]
+#[serial_test::serial]
+async fn activity_turn_id_parity_agent_vs_human_lane() {
+    use tower::ServiceExt;
+    std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_LOG", "1");
+    let app = router(test_app_state(16));
+
+    let post = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/activity")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "tenant_id": "par-tenant",
+                        "session_id": "par-sess",
+                        "turn_id": "turn-parity",
+                        "kind": "answer",
+                        "text": "the parity answer"
+                    })
+                    .to_string(),
+                ))
+                .expect("build post"),
+        )
+        .await
+        .expect("post response");
+    assert_eq!(post.status(), StatusCode::CREATED);
+
+    // Agent lane row.
+    let get = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/activity?tenant_id=par-tenant&session=par-sess&token_budget=500")
+                .body(axum::body::Body::empty())
+                .expect("build get"),
+        )
+        .await
+        .expect("get response");
+    let pulled = json_body(get).await;
+    let agent_receipts = pulled["rows"][0]["receipt_ids"].clone();
+
+    // Human-lane deref by turn_id.
+    let deref = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/activity/turn/turn-parity?tenant_id=par-tenant&session=par-sess")
+                .body(axum::body::Body::empty())
+                .expect("build deref"),
+        )
+        .await
+        .expect("deref response");
+    assert_eq!(deref.status(), StatusCode::OK);
+    let expanded = json_body(deref).await;
+    let human_receipts = expanded["entries"][0]["refs"]["receipt_ids"].clone();
+
+    assert_eq!(
+        agent_receipts, human_receipts,
+        "agent-lane and human-lane receipt_ids must be byte-identical for the same turn_id"
+    );
+    // And the human lane carries the verbatim text the agent lane only previews.
+    assert_eq!(expanded["entries"][0]["text"], "the parity answer");
+    std::env::remove_var("CORECRUXD_FEATURE_ACTIVITY_LOG");
+}
+
 // ── Agent usage rollup: /v1/agents/{passport}/usage (action-ledger M3) ────
 
 fn usage_query(window_hours: Option<u32>) -> axum::extract::Query<agent_usage::UsageQuery> {
