@@ -132,6 +132,12 @@ signature bound to both receipt ID and payload hash so it can't be transplanted.
 Release artifacts are signed and attested end-to-end: cosign keyless signatures + CycloneDX SBOMs
 on every binary and image, SLSA provenance on every release — [docs/verify-release.md](docs/verify-release.md).
 
+**Testing & coverage:** **4,489** tests and **~87%** CI-gated region coverage, with per-crate floors
+on the trust core (`corecrux-receipts` / `-segment` / `-storage`) and the ungated total reported
+alongside so exclusions can't hide low-coverage code. How it's measured, exactly what's excluded and
+why, and an honest account of why the number sits where it does:
+[docs/testing-and-coverage.md](docs/testing-and-coverage.md).
+
 ## Your context window is the scarce resource
 
 Most memory layers measure recall. Crux also measures what recall *costs*: every retrieval call

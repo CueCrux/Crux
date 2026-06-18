@@ -19,6 +19,7 @@
 - [ADRs](docs/adr/): 001 append-only sealed segments, 002 CROWN receipts, 003 CPU-only daemon
 
 ## Verify
+- [testing & coverage](docs/testing-and-coverage.md): how tests + the coverage gate work, what's excluded and why
 - `cargo test --workspace`
 - `corecruxctl verify-store --strict` — per-segment BLAKE3 + chain walk
 - `corecruxctl replay --strict` — recompute + compare
