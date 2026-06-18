@@ -282,10 +282,21 @@ fn sse_owner_key(agent: Option<&AgentIdentity>, peer_ip: Option<IpAddr>) -> Stri
 }
 
 fn sse_register_error_response(err: RegisterError) -> Response {
-    let (scope, limit) = match err {
-        RegisterError::GlobalLimit { max } => ("global", max),
-        RegisterError::OwnerLimit { max } => ("owner", max),
-    };
+    match err {
+        RegisterError::GlobalLimit { max } => sse_session_limit_response("global", max),
+        RegisterError::OwnerLimit { max } => sse_session_limit_response("owner", max),
+        RegisterError::OwnerMismatch => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "sse_session_owner_mismatch",
+                "detail": "session id is owned by a different caller; only the original owner may replace it"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn sse_session_limit_response(scope: &str, limit: usize) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
         Json(json!({

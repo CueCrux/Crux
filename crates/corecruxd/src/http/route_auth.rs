@@ -110,7 +110,9 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
         let scopes = if method == "GET" {
             &["admin:read"][..]
         } else {
-            &["admin:write", "admin:read"][..]
+            // Write-class: only a write scope authorizes (handler requires
+            // admin:write). Read scopes must never be sufficient for a mutation.
+            &["admin:write"][..]
         };
         return Some(RouteAuthContract::new(class, scopes));
     }
@@ -199,10 +201,14 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
         } else {
             RouteAuthClass::Write
         };
-        return Some(RouteAuthContract::new(
-            class,
-            &["facts:write", "admin:write", "admin:read"],
-        ));
+        // Write-class (POST/…) must not accept a read-only scope; the GET
+        // read-class branch may keep the broader union.
+        let scopes = if method == "GET" {
+            &["facts:write", "admin:write", "admin:read"][..]
+        } else {
+            &["facts:write", "admin:write"][..]
+        };
+        return Some(RouteAuthContract::new(class, scopes));
     }
 
     if path.starts_with("/v1/console/") {
@@ -270,7 +276,9 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
         let scopes = if method == "GET" {
             &["admin:read", "facts:read", "query:read", "sessions:read"][..]
         } else {
-            &["admin:write", "facts:write", "integrations:install", "query:read"][..]
+            // Write-class: drop the read-only query:read — a read token must not
+            // authorize a mutation here.
+            &["admin:write", "facts:write", "integrations:install"][..]
         };
         return Some(RouteAuthContract::new(class, scopes));
     }
@@ -352,6 +360,22 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scope that only grants read access. Such a scope must never appear in a
+    /// write-class route's accepted (sufficient) set.
+    fn is_read_only_scope(scope: &str) -> bool {
+        scope.ends_with(":read") || scope == "tenant:content:preview"
+    }
+
+    /// A scope that grants a mutation. Every write-class route must accept at
+    /// least one of these.
+    fn is_write_scope(scope: &str) -> bool {
+        scope.ends_with(":write")
+            || matches!(
+                scope,
+                "integrations:install" | "integrations:grant" | "integrations:disable"
+            )
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct ParsedRoute {
@@ -521,6 +545,120 @@ mod tests {
                 assert!(
                     contract.scopes.contains(scope),
                     "{method} {path} missing expected scope {scope}; got {:?}",
+                    contract.scopes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn write_class_routes_do_not_accept_read_only_scopes() {
+        // Sweep every live route: any classified Write/AdminWrite contract must
+        // require a write scope and must not list a read-only scope as
+        // sufficient (else a read token could authorize a mutation).
+        for route in router_routes() {
+            let Some(contract) = classify_route(&route.method, &route.path) else {
+                continue;
+            };
+            if !matches!(contract.class, RouteAuthClass::Write | RouteAuthClass::AdminWrite) {
+                continue;
+            }
+            for scope in contract.scopes {
+                assert!(
+                    !is_read_only_scope(scope),
+                    "{} {} is write-class but accepts read-only scope {scope}; got {:?}",
+                    route.method,
+                    route.path,
+                    contract.scopes
+                );
+            }
+            assert!(
+                contract.scopes.iter().any(|s| is_write_scope(s)),
+                "{} {} is write-class but accepts no write scope; got {:?}",
+                route.method,
+                route.path,
+                contract.scopes
+            );
+        }
+    }
+
+    #[test]
+    fn write_class_contracts_for_known_mutations_are_write_only() {
+        // Direct check on representative mutations (independent of the router
+        // parser) so a regression is caught even if a path drops out of the
+        // parsed sources.
+        let mutations = [
+            ("POST", "/v1/projections/rebuild"),
+            ("POST", "/v1/append"),
+            ("POST", "/v1/work/items"),
+            ("POST", "/v1/facts"),
+            ("PUT", "/v1/sync/tenants/abc"),
+            ("POST", "/v1/features/capabilities/x/audit"),
+            ("POST", "/v1/identity/candidates/x/confirm"),
+            ("POST", "/v1/admin/restart"),
+        ];
+        for (method, path) in mutations {
+            let contract = classify_route(method, path).expect("contract");
+            assert!(
+                matches!(contract.class, RouteAuthClass::Write | RouteAuthClass::AdminWrite),
+                "{method} {path} should classify write-class, got {:?}",
+                contract.class
+            );
+            for scope in contract.scopes {
+                assert!(
+                    !is_read_only_scope(scope),
+                    "{method} {path} accepts read-only scope {scope}; got {:?}",
+                    contract.scopes
+                );
+            }
+            assert!(
+                contract.scopes.iter().any(|s| is_write_scope(s)),
+                "{method} {path} has no write scope; got {:?}",
+                contract.scopes
+            );
+        }
+    }
+
+    #[test]
+    fn admin_write_routes_do_not_accept_admin_read_only() {
+        for route in router_routes() {
+            let Some(contract) = classify_route(&route.method, &route.path) else {
+                continue;
+            };
+            if contract.class == RouteAuthClass::AdminWrite {
+                assert!(
+                    !contract.scopes.contains(&"admin:read"),
+                    "{} {} is AdminWrite but accepts admin:read; got {:?}",
+                    route.method,
+                    route.path,
+                    contract.scopes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn feature_gated_write_routes_have_write_scope() {
+        // Feature-gated routes invoked with a mutating method must require a
+        // write scope and reject read-only scopes on the write branch.
+        let gated_mutations = [
+            ("POST", "/v1/coord/lease"),
+            ("POST", "/v1/observe/sessions/abc/event"),
+            ("POST", "/v1/orchestrators/run"),
+            ("POST", "/v1/punchcards/x"),
+        ];
+        for (method, path) in gated_mutations {
+            let contract = classify_route(method, path).expect("contract");
+            assert_eq!(contract.class, RouteAuthClass::FeatureGated, "{method} {path}");
+            assert!(
+                contract.scopes.iter().any(|s| is_write_scope(s)),
+                "{method} {path} gated write must include a write scope; got {:?}",
+                contract.scopes
+            );
+            for scope in contract.scopes {
+                assert!(
+                    !is_read_only_scope(scope),
+                    "{method} {path} gated write accepts read-only scope {scope}; got {:?}",
                     contract.scopes
                 );
             }
