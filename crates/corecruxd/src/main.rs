@@ -232,21 +232,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .into());
     }
+    // Fail closed: an unknown/typo'd auth mode must abort, never degrade to dev
+    // scopes. (Distinct message from the unset case above.)
+    if let Some(bad) = &config.auth_mode_invalid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unknown CORECRUXD_AUTH_MODE `{bad}`; valid values: off, dev_scopes, jwt_hs256, jwt_jwks"),
+        )
+        .into());
+    }
     let auth = crate::auth::Authz::from_env(config.auth_mode)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let mcp_agent_registry = crux_mcp::agent::AgentRegistry::from_env();
-    // Security: an agent-token env var set to a value that fails the strength
-    // policy (>= 32 bytes, charset [A-Za-z0-9._~-]) yields an empty registry,
-    // and MCP then falls open to no-auth. Warn loudly so a misconfigured weak
-    // token is never mistaken for enforced auth.
-    if mcp_agent_registry.is_empty()
-        && (std::env::var_os("CRUX_AGENT_TOKEN").is_some() || std::env::var_os("CRUX_AGENT_TOKENS").is_some())
-    {
-        tracing::warn!(
-            "CRUX_AGENT_TOKEN(S) is set but no valid agent token was parsed (need >= 32 bytes, \
-             charset [A-Za-z0-9._~-]); MCP auth is NOT enforced. Fix the token to enable auth."
-        );
-    }
+    // Security (fail closed): an agent-token env var set to a value that fails
+    // the strength policy must abort startup, not silently fall back to no-auth
+    // MCP. The only way to proceed with an empty registry when a token var is
+    // present is the explicit dev override.
+    let mcp_agent_registry =
+        match resolve_mcp_agent_registry(crux_mcp::agent::AgentRegistry::from_env(), allow_empty_agent_registry()) {
+            Ok(registry) => registry,
+            Err(message) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, message).into());
+            }
+        };
     validate_network_auth_posture(
         config.auth_mode,
         config.http_addr,
@@ -1463,6 +1470,46 @@ fn insecure_dev_auth_bind_allowed() -> bool {
     std::env::var("CORECRUXD_ALLOW_INSECURE_DEV_AUTH_BIND")
         .ok()
         .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+/// Dev-only escape hatch: when an agent-token env var is present but invalid,
+/// allow the daemon to boot with no MCP auth instead of aborting. Never set in
+/// production — it re-opens the fail-open path the strict parse exists to close.
+const ALLOW_EMPTY_AGENT_REGISTRY_ENV: &str = "CRUX_MCP_ALLOW_EMPTY_AGENT_REGISTRY";
+
+fn allow_empty_agent_registry() -> bool {
+    std::env::var(ALLOW_EMPTY_AGENT_REGISTRY_ENV)
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+/// Decide the effective MCP agent registry, failing closed on an invalid
+/// agent-token config unless the dev override is set.
+///
+/// - `Ok(registry)` from `from_env` (incl. the legitimate empty single-user
+///   registry when no token var is set) → use it.
+/// - `Err` (a token var was present but invalid) → abort with an operator
+///   message, unless `override_allowed`, in which case fall back to an empty
+///   (no-auth) registry with the caller responsible for warning.
+fn resolve_mcp_agent_registry(
+    parsed: Result<crux_mcp::agent::AgentRegistry, crux_mcp::agent::AgentRegistryError>,
+    override_allowed: bool,
+) -> Result<crux_mcp::agent::AgentRegistry, String> {
+    match parsed {
+        Ok(registry) => Ok(registry),
+        Err(err) if override_allowed => {
+            tracing::warn!(
+                "{err}; {} is set so continuing with MCP auth NOT enforced (dev-only)",
+                ALLOW_EMPTY_AGENT_REGISTRY_ENV
+            );
+            Ok(crux_mcp::agent::AgentRegistry::empty())
+        }
+        Err(err) => Err(format!(
+            "{err}. Fix the agent token to enable MCP auth, or set {}=1 to run with no MCP \
+             auth (local dev/tests only).",
+            ALLOW_EMPTY_AGENT_REGISTRY_ENV
+        )),
+    }
 }
 
 fn replication_auth_bearer_configured() -> bool {
@@ -3207,6 +3254,43 @@ mod tests {
         state.valves.read_only.set(true, "op", "r", 4);
         state.valves.emergency_brake.set(true, "op", "r", 5);
         super::update_control_metrics(&metrics, &state);
+    }
+
+    // ── resolve_mcp_agent_registry (fail-closed) ────────────────────────
+
+    #[test]
+    fn mcp_ok_registry_passes_through() {
+        let reg = crux_mcp::agent::AgentRegistry::from_single_token("crux_at_0123456789abcdef01234567");
+        assert!(!reg.is_empty());
+        let resolved = super::resolve_mcp_agent_registry(Ok(reg), false).expect("ok passes through");
+        assert!(!resolved.is_empty());
+    }
+
+    #[test]
+    fn mcp_empty_single_user_registry_passes_through() {
+        // No token env → Ok(empty) is a legitimate single-user mode, not an error.
+        let resolved =
+            super::resolve_mcp_agent_registry(Ok(crux_mcp::agent::AgentRegistry::empty()), false).expect("empty ok");
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn mcp_invalid_token_fails_startup_without_override() {
+        let err = crux_mcp::agent::AgentRegistryError {
+            message: "bad token".to_string(),
+        };
+        let resolved = super::resolve_mcp_agent_registry(Err(err), false);
+        assert!(resolved.is_err(), "invalid token must abort startup without override");
+        assert!(resolved.unwrap_err().contains(super::ALLOW_EMPTY_AGENT_REGISTRY_ENV));
+    }
+
+    #[test]
+    fn mcp_invalid_token_with_dev_override_allows_empty() {
+        let err = crux_mcp::agent::AgentRegistryError {
+            message: "bad token".to_string(),
+        };
+        let resolved = super::resolve_mcp_agent_registry(Err(err), true).expect("override permits boot");
+        assert!(resolved.is_empty(), "override falls back to empty no-auth registry");
     }
 
     // ── insecure_dev_auth_bind_allowed ──────────────────────────────────
