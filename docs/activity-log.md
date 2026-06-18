@@ -1,8 +1,8 @@
 # Activity Log — dual-surface "what just happened"
 
-> Status: **M1+M2 shipped** (agent lane + capture). M3 (human console tab) is
-> blocked on console-source provenance (OD-16). ExecPlan
-> `crux-dual-surface-activity-log-2026-06-18`.
+> Status: **M0–M4 shipped.** ExecPlan
+> `crux-dual-surface-activity-log-2026-06-18`. Capture + agent lane + human
+> page + verify cross-walk, all behind `CORECRUXD_FEATURE_ACTIVITY_LOG`.
 
 The activity log gives every session a rolling, chronological record of what
 agents do — captured **once per turn-event** and read two ways off one source
@@ -111,6 +111,22 @@ Same pull from chat; applies a default `token_budget` of 500.
 activity_recent({ "session_id": "sess-abc", "kinds": ["error","command"], "token_budget": 500 })
 ```
 
+## Human lane — `/console/activity`
+
+A new page on the embedded console (linked from the console header). It is a
+self-contained, dependency-free page that:
+
+- streams live rows via `EventSource('/v1/events/stream?types=activity.appended')`,
+- backfills via `GET /v1/activity` (tenant / session / token_budget inputs),
+- colour-codes rows by kind, filters client-side by free text,
+- expands a row to its verbatim `text` via `GET /v1/activity/turn/{turn_id}`
+  with a ✓verify badge per receipt ref.
+
+Deep-link with `?session=<id>&tenant_id=<t>`. The page is inert (its API calls
+return 404) unless `CORECRUXD_FEATURE_ACTIVITY_LOG=1`. Iterate without a
+rebuild by pointing `CORECRUXD_CONSOLE_DEV_PATH` at a dir containing
+`activity.html`.
+
 ## Verification cross-walk (M4)
 
 The agent-lane row's `receipt_ids` for a turn are byte-identical to the
@@ -121,10 +137,6 @@ ids.
 
 ## What's not here yet
 
-- **Human console Activity tab (M3)** — the console SPA is Rust/WASM shipped
-  as `dist/` only; the source is not a member of the working-tree workspace
-  (OD-16). The tab + ✓verify badge land once console-source provenance is
-  decided.
 - **Reasoning capture (category 3)** — best-effort, pending OD-15.
 - **Full CROWN signing of each append** — today the append id + the
   `activity.appended` projection row satisfy the audit-trail requirement
