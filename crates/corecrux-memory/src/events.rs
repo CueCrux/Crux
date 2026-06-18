@@ -44,6 +44,17 @@ pub enum CruxEvent {
     /// Agent-graph: a punchcard lease transitioned status.
     #[serde(rename = "punchcard.changed")]
     PunchcardChanged { id: String, status: String },
+    /// Activity log: a journal entry was appended (dual-surface activity
+    /// log, ExecPlan `crux-dual-surface-activity-log-2026-06-18`). Carries
+    /// only ids + kind — never the verbatim text — so the live SSE row is
+    /// the cheap projection; the human lane derefs the text by `turn_id`.
+    /// Gated by `CORECRUXD_FEATURE_ACTIVITY_LOG`; never emitted when off.
+    #[serde(rename = "activity.appended")]
+    ActivityAppended {
+        entry_id: String,
+        session_id: String,
+        kind: String,
+    },
 }
 
 /// Broadcast-based event bus for store mutations.

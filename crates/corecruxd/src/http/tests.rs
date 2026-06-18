@@ -12171,6 +12171,162 @@ async fn openapi_json_route_serves_valid_openapi_3_document() {
     );
 }
 
+// ── Activity log: /v1/activity (crux-dual-surface-activity-log M1+M2) ─────
+
+/// `POST /v1/activity` then `GET /v1/activity` round-trips an entry, and the
+/// agent-lane row carries the append id as a receipt reference (T.4). Also
+/// proves the cheap row reaches the same receipt id the human deref would.
+#[tokio::test]
+#[serial_test::serial]
+async fn activity_post_then_get_round_trip() {
+    use tower::ServiceExt;
+    std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_LOG", "1");
+    let app = router(test_app_state(16));
+
+    let post = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/activity")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "tenant_id": "rt-tenant",
+                        "session_id": "rt-sess",
+                        "turn_id": "turn-rt-1",
+                        "kind": "question",
+                        "text": "what changed in __ops::config-audit today?"
+                    })
+                    .to_string(),
+                ))
+                .expect("build post"),
+        )
+        .await
+        .expect("post response");
+    assert_eq!(post.status(), StatusCode::CREATED);
+    let created = json_body(post).await;
+    let entry_id = created["entry_id"].as_str().expect("entry_id").to_string();
+    // T.1 — reserved prefix redacted from verbatim text on persist.
+    assert!(!created["text"].as_str().unwrap().contains("__ops::"));
+    // T.4 — append id present as a receipt reference.
+    assert!(created["refs"]["receipt_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some(&entry_id)));
+
+    let get = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/activity?tenant_id=rt-tenant&session=rt-sess&token_budget=500")
+                .body(axum::body::Body::empty())
+                .expect("build get"),
+        )
+        .await
+        .expect("get response");
+    assert_eq!(get.status(), StatusCode::OK);
+    let pulled = json_body(get).await;
+    assert_eq!(pulled["returned"].as_u64(), Some(1));
+    let row = &pulled["rows"][0];
+    assert_eq!(row["kind"], "question");
+    assert_eq!(row["turn_id"], "turn-rt-1");
+    // Parity seed (M4): the agent-lane row references the same append receipt.
+    assert!(row["receipt_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some(&entry_id)));
+    std::env::remove_var("CORECRUXD_FEATURE_ACTIVITY_LOG");
+}
+
+/// QC.2 — the agent pull is rejected without a `token_budget`.
+#[tokio::test]
+#[serial_test::serial]
+async fn activity_get_without_token_budget_is_400() {
+    use tower::ServiceExt;
+    std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_LOG", "1");
+    let app = router(test_app_state(16));
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/activity?tenant_id=t&session=s")
+                .body(axum::body::Body::empty())
+                .expect("build get"),
+        )
+        .await
+        .expect("get response");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    std::env::remove_var("CORECRUXD_FEATURE_ACTIVITY_LOG");
+}
+
+/// Flag off ⇒ the route is a 404 disabled-problem (the daemon behaves as
+/// today).
+#[tokio::test]
+#[serial_test::serial]
+async fn activity_get_when_flag_off_is_404() {
+    use tower::ServiceExt;
+    std::env::remove_var("CORECRUXD_FEATURE_ACTIVITY_LOG");
+    let app = router(test_app_state(16));
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/activity?tenant_id=t&session=s&token_budget=500")
+                .body(axum::body::Body::empty())
+                .expect("build get"),
+        )
+        .await
+        .expect("get response");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// T.1 — a pull for a different tenant never returns another tenant's rows.
+#[tokio::test]
+#[serial_test::serial]
+async fn activity_get_cross_tenant_is_empty() {
+    use tower::ServiceExt;
+    std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_LOG", "1");
+    let app = router(test_app_state(16));
+    let _ = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/activity")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "tenant_id": "xt-tenant-a",
+                        "session_id": "xt-sess",
+                        "kind": "answer",
+                        "text": "tenant A only"
+                    })
+                    .to_string(),
+                ))
+                .expect("build post"),
+        )
+        .await
+        .expect("post response");
+
+    let get = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/activity?tenant_id=xt-tenant-b&session=xt-sess&token_budget=500")
+                .body(axum::body::Body::empty())
+                .expect("build get"),
+        )
+        .await
+        .expect("get response");
+    assert_eq!(get.status(), StatusCode::OK);
+    let pulled = json_body(get).await;
+    assert_eq!(pulled["returned"].as_u64(), Some(0));
+    std::env::remove_var("CORECRUXD_FEATURE_ACTIVITY_LOG");
+}
+
 // ── Agent usage rollup: /v1/agents/{passport}/usage (action-ledger M3) ────
 
 fn usage_query(window_hours: Option<u32>) -> axum::extract::Query<agent_usage::UsageQuery> {

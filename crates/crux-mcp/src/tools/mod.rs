@@ -9,6 +9,7 @@
 //! MCP clients via the `tools/list` response.
 
 pub mod action;
+pub mod activity;
 pub mod approvals;
 pub mod artefacts;
 pub mod audit;
@@ -1917,6 +1918,36 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
             description: traces::TOOL_DESCRIPTION.to_string(),
             input_schema: traces::tool_input_schema(),
         },
+        // ── Activity log agent lane (crux-dual-surface-activity-log M2) ───
+        ToolDefinition {
+            name: "activity_recent".to_string(),
+            description: "Cheap 'what just happened in this session' pull across the seven \
+                          activity categories (questions, answers, reasoning, commands, facts, \
+                          execplans/handoffs, errors). Required: session_id, token_budget (QC.2; \
+                          defaults to 500). Optional: tenant_id (default 'default'), since \
+                          (exclusive seq), kinds (array or csv of question|answer|reasoning|\
+                          command|fact|execplan|handoff|error). Returns compact rows newest-first \
+                          (turn_id, seq, ts, kind, intent?, tool?, confidence?, fact_refs, \
+                          receipt_ids, preview), reserved-prefix-stripped and privacy-scoped, \
+                          trimmed to the budget. Deref a turn to verbatim via the daemon's \
+                          /v1/activity/turn/{turn_id}. Gated by CORECRUXD_FEATURE_ACTIVITY_LOG \
+                          (default off) — returns feature_enabled:false when off."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id":   { "type": "string", "description": "Session to read activity for." },
+                    "tenant_id":    { "type": "string", "description": "Tenant (defaults to 'default')." },
+                    "since":        { "type": "string", "description": "Return only entries with seq greater than this." },
+                    "kinds":        { "type": "array", "items": {"type": "string"}, "description": "Filter to these kinds (also accepts a csv string)." },
+                    "token_budget": { "type": "integer", "description": "QC.2 — caps response size. Defaults to 500." }
+                },
+                "required": ["session_id"],
+                "examples": [
+                    { "session_id": "sess-abc", "kinds": ["error", "command"], "token_budget": 500 }
+                ]
+            }),
+        },
         // ── Token accounting (action-ledger M1) ──────────────────────────
         ToolDefinition {
             name: "session_token_usage".to_string(),
@@ -2502,6 +2533,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "feature_trigger_audit",   "output": "{ content: [...], capability: <updated payload>, version }" },
         { "tool": "feature_suggest_next",    "output": "{ content: [...], suggestions: [{kind, capability_id?, gap_type?, severity?, promise?, rationale}], count }" },
         { "tool": "tool_trace_recent",       "output": "{ content: [...], traces: [{tool, ts_us, turn_id?, predicted_effects: [{kind, entity, key, ts_us?}], outcome}], count, feature_disabled? } — per-passport; reserved-prefix effects stripped." },
+        { "tool": "activity_recent",         "output": "{ content: [...], session_id, tenant_id, feature_enabled, token_budget, returned, truncated, rows: [{turn_id?, seq, ts, kind, intent?, tool?, confidence?, fact_refs, receipt_ids, preview}] } — per (tenant,session); reserved-prefix-stripped, privacy-scoped, budget-trimmed." },
         { "tool": "session_token_usage",     "output": "{ content: [...], passport, used, tokens_in, tokens_out, declared_budget_in, calls, estimator, limit?, pct? } — per-passport estimated token spend (~4 chars/token); limit/pct only when CORECRUXD_SESSION_TOKEN_BUDGET is set." },
         { "tool": "approval_request",        "output": "{ content: [...], request_id, status: 'pending'|'feature_disabled', risk_tier, tenant_id, feature_enabled } — pending entries also visible via list_work(state='pending_approval')." },
         { "tool": "approval_decide",         "output": "{ content: [...], ok, request_id, status: 'approved'|'rejected', reviewer_passport, decided_at, receipt_id, receipt_body_hash_hex, tenant_id, risk_tier } — non-operator callers receive a 403-style JSON-RPC error with `why_denied`." },
@@ -2654,6 +2686,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "feature_suggest_next" => features::handle_feature_suggest_next(args, ctx).await,
         // Typed action traces (agent-ux-06).
         "tool_trace_recent" => traces::handle_tool_trace_recent(args, ctx).await,
+        "activity_recent" => activity::handle_activity_recent(args, ctx).await,
         // Token accounting (action-ledger M1).
         "session_token_usage" => token_usage::handle_session_token_usage(args, ctx).await,
         // Risk-tiered HITL (agent-ux-05).
