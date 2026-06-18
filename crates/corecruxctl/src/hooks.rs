@@ -201,9 +201,66 @@ pub fn install(user: bool, project: Option<PathBuf>) -> Result<String, DynErr> {
 }
 
 /// `corecruxctl hooks install`.
-pub fn run_install(user: bool, project: Option<PathBuf>) -> Result<(), DynErr> {
+///
+/// Before wiring the hooks, ensure the daemon endpoint they read
+/// (`~/.config/cuecrux/env`) is configured: `--endpoint <url>` saves it
+/// non-interactively; otherwise, when nothing is configured yet and we have a
+/// terminal, prompt for it (default: the loopback daemon).
+pub fn run_install(user: bool, project: Option<PathBuf>, endpoint: Option<String>) -> Result<(), DynErr> {
+    configure_endpoint(endpoint)?;
     println!("{}", install(user, project)?);
     Ok(())
+}
+
+/// Save / confirm the daemon endpoint the hooks resolve at runtime.
+fn configure_endpoint(endpoint: Option<String>) -> Result<(), DynErr> {
+    use std::io::IsTerminal as _;
+
+    if let Some(url) = endpoint {
+        let (http, mcp, path) = crate::login::save_endpoint(&url)?;
+        println!("endpoint saved → {}", path.display());
+        println!("  CRUX_HTTP_URL={http}");
+        println!("  CRUX_MCP_URL={mcp}");
+        return Ok(());
+    }
+    if let Some(existing) = crate::login::configured_endpoint() {
+        println!("endpoint already configured: {existing} (change with `hooks install --endpoint <url>`)");
+        return Ok(());
+    }
+    // Nothing configured yet. Prompt when interactive; otherwise note the default.
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "note: no daemon endpoint configured — hooks default to {}.\n  \
+             point them at a remote daemon with `hooks install --endpoint <url>` (or `corecruxctl login --url <url>`).",
+            crate::login::DEFAULT_HTTP_BASE
+        );
+        return Ok(());
+    }
+    let answer = prompt_endpoint();
+    let url = if answer.is_empty() {
+        crate::login::DEFAULT_HTTP_BASE.to_string()
+    } else {
+        answer
+    };
+    let (http, mcp, path) = crate::login::save_endpoint(&url)?;
+    println!("endpoint saved → {}", path.display());
+    println!("  CRUX_HTTP_URL={http}");
+    println!("  CRUX_MCP_URL={mcp}");
+    Ok(())
+}
+
+/// Prompt for the daemon HTTP endpoint, returning the trimmed answer (empty ⇒
+/// caller substitutes the default).
+fn prompt_endpoint() -> String {
+    use std::io::Write as _;
+    print!(
+        "Crux daemon HTTP endpoint (host:port or URL) [{}]: ",
+        crate::login::DEFAULT_HTTP_BASE
+    );
+    let _ = std::io::stdout().flush();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap_or(0);
+    input.trim().to_string()
 }
 
 /// `corecruxctl hooks status` — show whether Crux hooks are wired in the target.
@@ -344,8 +401,9 @@ mod tests {
         assert!(home.join(".local/share/crux/hooks/crux-hook-env.sh").is_file());
         assert!(home.join(".local/share/crux/hooks/crux-observe.sh").is_file());
 
-        // run_install + run_status execute without error.
-        run_install(true, None).unwrap();
+        // run_install + run_status execute without error. (No endpoint + no TTY
+        // in tests → configure_endpoint takes the non-interactive note branch.)
+        run_install(true, None, None).unwrap();
         run_status(true, None).unwrap();
 
         // Now add the binary → banner + PreCompact appear.

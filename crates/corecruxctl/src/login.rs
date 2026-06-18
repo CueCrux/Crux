@@ -402,6 +402,35 @@ pub fn render_env_file(existing: &str, updates: &BTreeMap<String, String>) -> St
     out
 }
 
+/// Persist a daemon endpoint into `~/.config/cuecrux/env` (0600) so the Claude
+/// Code hooks + agent bridges resolve it. Writes `CRUX_HTTP_URL` and the derived
+/// `CRUX_MCP_URL`, preserving any other keys (notably `CRUX_AGENT_TOKEN`). The
+/// input is normalised (a bare `host:port` gains `http://`). Returns the resolved
+/// `(http_base, mcp_url)` and the path written. Shared by `login` and
+/// `hooks install --endpoint`.
+pub fn save_endpoint(http_base_input: &str) -> Result<(String, String, PathBuf), DynErr> {
+    let http_base = normalize_http_base(http_base_input)?;
+    let mcp_url = derive_mcp_url(&http_base)?;
+    let cfg_dir = config_dir().ok_or("HOME is not set")?;
+    let path = env_path(&cfg_dir);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut updates: BTreeMap<String, String> = BTreeMap::new();
+    updates.insert("CRUX_MCP_URL".to_string(), mcp_url.clone());
+    updates.insert("CRUX_HTTP_URL".to_string(), http_base.clone());
+    let rendered = render_env_file(&existing, &updates);
+    create_dir_private(&cfg_dir)?;
+    write_private(&path, rendered.as_bytes())?;
+    Ok((http_base, mcp_url, path))
+}
+
+/// Read the daemon HTTP endpoint currently configured in `~/.config/cuecrux/env`,
+/// if any. Returns `None` when the file is absent or has no `CRUX_HTTP_URL`.
+pub fn configured_endpoint() -> Option<String> {
+    let cfg_dir = config_dir()?;
+    let content = std::fs::read_to_string(env_path(&cfg_dir)).ok()?;
+    parse_env_file(&content).get("CRUX_HTTP_URL").cloned()
+}
+
 /// Build the ordered daemon-discovery candidate list from the available signals.
 ///
 /// Order: explicit `--url` → `CRUX_HTTP_URL` / `CORECRUXD_HTTP_URL` from the env
@@ -1335,6 +1364,39 @@ mod tests {
         assert!(out.contains("CRUX_MCP_URL=http://new:14801/mcp"));
         assert!(!out.contains("http://old:14801/mcp"));
         assert!(out.contains("CRUX_AGENT_TOKEN=tok"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn save_endpoint_roundtrips_and_preserves_token() {
+        let home = std::env::temp_dir().join(format!("crux-ep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+
+        // Nothing configured yet.
+        assert!(configured_endpoint().is_none());
+
+        // A bare host:port is normalised and the MCP url derived.
+        let (http, mcp, path) = save_endpoint("100.70.12.73:14800").unwrap();
+        assert_eq!(http, "http://100.70.12.73:14800");
+        assert_eq!(mcp, "http://100.70.12.73:14801/mcp");
+        assert!(path.exists());
+        assert_eq!(configured_endpoint().as_deref(), Some("http://100.70.12.73:14800"));
+
+        // An unrelated key (the agent token) must survive a re-save.
+        let with_token = format!("{}CRUX_AGENT_TOKEN=secret\n", std::fs::read_to_string(&path).unwrap());
+        std::fs::write(&path, with_token).unwrap();
+        save_endpoint("http://other:14800").unwrap();
+        let after = parse_env_file(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(after.get("CRUX_AGENT_TOKEN").map(String::as_str), Some("secret"));
+        assert_eq!(
+            after.get("CRUX_HTTP_URL").map(String::as_str),
+            Some("http://other:14800")
+        );
+        assert_eq!(
+            after.get("CRUX_MCP_URL").map(String::as_str),
+            Some("http://other:14801/mcp")
+        );
     }
 
     // ── discovery ordering ──
