@@ -552,6 +552,54 @@
   .legend { display:flex; gap:14px; flex-wrap:wrap; color:var(--text-muted); font-size:11px; padding:8px 16px; border-top:1px solid var(--border-default); background:var(--surface-glass); }
   .legend i { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; vertical-align:middle; }
   @media (max-width:760px){ aside{display:none} .wc-centre-pill small{display:none} }
+  /* ── Activity lane (ExecPlan crux-dual-surface-activity-log) ── */
+  .content-area{ flex:1; display:flex; min-width:0; min-height:0; position:relative; }
+  #dashActivity{ display:none; flex-direction:column; background:var(--bg-page); border-top:1px solid var(--border-default); }   /* flow element inside #canvasScroll, below the 4 cards (marginTop set by renderDash) — the whole page scrolls together, no inner list scroll */
+  .cxd-bar{ position:sticky; top:0; z-index:3; display:flex; align-items:center; gap:8px; padding:7px 24px; border-bottom:1px solid var(--border-default); background:var(--surface-glass-muted); backdrop-filter:blur(var(--blur-sm)); flex-wrap:wrap; }
+  .cxd-input{ font-family:var(--font-mono); font-size:11.5px; padding:5px 9px; border-radius:8px; border:1px solid var(--border-default); background:var(--surface-glass-strong); color:var(--text-primary); min-height:28px; }
+  #cxd-search{ flex:0 1 220px; } #cxd-session{ flex:0 1 200px; }
+  .cxd-list{ padding:6px 24px 22px; }
+  .ap-head{ display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid var(--border-default); }
+  .ap-title{ font-weight:600; font-size:13px; }
+  .ap-live{ display:flex; align-items:center; gap:5px; font-family:var(--font-mono); font-size:10.5px; color:var(--text-muted); }
+  .ap-dot{ width:8px; height:8px; border-radius:999px; background:var(--idle); display:inline-block; }
+  .ap-dot.on{ background:var(--ok); box-shadow:0 0 6px var(--ok); }
+  .ap-grow{ flex:1; }
+  .ap-expand{ background:none; border:1px solid var(--border-default); border-radius:8px; color:var(--text-secondary); cursor:pointer; min-width:30px; height:28px; font-size:14px; }
+  .ap-expand:hover{ color:var(--accent); border-color:var(--accent); }
+  .ap-status{ padding:5px 12px; font-family:var(--font-mono); font-size:10.5px; color:var(--text-muted); border-bottom:1px solid var(--border-light); }
+  .ap-list{ flex:1; overflow-y:auto; padding:6px 10px 24px; }
+  .actrow{ border:1px solid var(--border-default); border-left-width:4px; border-radius:10px; padding:8px 11px; margin:6px 0; background:var(--surface-glass-strong); cursor:pointer; }
+  .actrow:hover{ border-color:var(--accent); }
+  .actrow .ar-meta{ display:flex; gap:9px; align-items:center; flex-wrap:wrap; font-family:var(--font-mono); font-size:10px; color:var(--text-muted); }
+  .actrow .ar-kind{ font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+  .actrow .ar-sess{ color:var(--text-secondary); }
+  .actrow .ar-preview{ margin-top:4px; color:var(--text-secondary); white-space:pre-wrap; word-break:break-word; font-size:12.5px; }
+  .actrow .ar-exp{ margin-top:8px; border-top:1px dashed var(--border-default); padding-top:8px; display:none; }
+  .actrow.open .ar-exp{ display:block; }
+  .actrow .ar-verbatim{ font-family:var(--font-mono); font-size:11.5px; background:var(--code-bg); border-radius:8px; padding:8px; white-space:pre-wrap; word-break:break-word; }
+  .ar-badge{ display:inline-block; font-family:var(--font-mono); font-size:10px; padding:2px 7px; border-radius:999px; margin:4px 5px 0 0; border:1px solid var(--border-default); color:var(--text-secondary); }
+  .ar-badge.ok{ color:var(--ok); border-color:var(--ok); } .ar-badge.warn{ color:var(--run); border-color:var(--run); } .ar-badge.err{ color:var(--err); border-color:var(--err); }
+  .actrow.k-question{ border-left-color:var(--accent); } .actrow.k-question .ar-kind{ color:var(--accent); }
+  .actrow.k-answer{ border-left-color:var(--ok); } .actrow.k-answer .ar-kind{ color:var(--ok); }
+  .actrow.k-reasoning{ border-left-color:var(--idle); } .actrow.k-reasoning .ar-kind{ color:var(--idle); }
+  .actrow.k-command{ border-left-color:var(--run); } .actrow.k-command .ar-kind{ color:var(--run); }
+  .actrow.k-fact{ border-left-color:#8b5cf6; } .actrow.k-fact .ar-kind{ color:#8b5cf6; }
+  .actrow.k-execplan,.actrow.k-handoff{ border-left-color:#0ea5e9; } .actrow.k-execplan .ar-kind,.actrow.k-handoff .ar-kind{ color:#0ea5e9; }
+  .actrow.k-error{ border-left-color:var(--err); } .actrow.k-error .ar-kind{ color:var(--err); }
+  .ap-empty{ padding:30px 16px; text-align:center; color:var(--text-muted); font-family:var(--font-mono); font-size:11.5px; }
+  #activityFullPage{ position:absolute; inset:0; z-index:25; background:var(--bg-page); display:none; flex-direction:column; padding:12px 18px 0; overflow:hidden; }
+  #activityFullPage .af-head{ display:flex; align-items:center; gap:12px; padding-bottom:8px; }
+  #activityFullPage .af-head h1{ font-size:1.05rem; margin:0; font-weight:600; }
+  #activityFullPage .af-headsub{ font-family:var(--font-mono); font-size:11px; color:var(--text-muted); }
+  #af-close{ margin-left:auto; background:none; border:1px solid var(--border-default); border-radius:8px; min-width:30px; height:28px; color:var(--text-secondary); cursor:pointer; font-size:15px; }
+  .actbar{ display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; padding:6px 0 12px; border-bottom:1px solid var(--border-default); }
+  .actbar label{ display:flex; flex-direction:column; gap:3px; font-family:var(--font-mono); font-size:10px; color:var(--text-muted); }
+  .actbar input{ font-family:var(--font-mono); font-size:12px; padding:6px 9px; border-radius:8px; border:1px solid var(--border-default); background:var(--surface-glass-strong); color:var(--text-primary); min-height:30px; }
+  .akinds{ display:flex; gap:5px; flex-wrap:wrap; }
+  .akchip{ font-family:var(--font-mono); font-size:10px; padding:3px 9px; border-radius:999px; border:1px solid var(--border-default); cursor:pointer; user-select:none; color:var(--text-secondary); }
+  .akchip.on{ color:#fff; border-color:transparent; }
+  .actfull-list{ flex:1; overflow-y:auto; padding:8px 0 30px; }
 </style>
 </head>
 <body>
@@ -616,8 +664,9 @@
     <nav id="sidebar" aria-label="Panels — click an icon to show only that panel's nodes">
       <!-- panel icons injected at boot (buildSidebar) -->
     </nav>
+    <div class="content-area" id="contentArea">
     <div class="canvas-wrap" id="canvas">
-      <div id="canvasScroll"><svg id="edges"></svg><div id="nodes"></div></div>
+      <div id="canvasScroll"><svg id="edges"></svg><div id="nodes"></div><div id="dashActivity" aria-label="Activity (All panels)"></div></div>
       <iframe id="cx3dFrame" title="Crux Substrate — 3D view"></iframe>
       <!-- floating build dock pinned top-right: the "New Orchestrator" form card, with the candidate-card palette on the canvas directly beneath it -->
       <div id="buildDock">
@@ -668,6 +717,8 @@
       <h2 id="i-links-h" style="display:none">Linked</h2>
       <div class="links" id="i-links"></div>
     </aside>
+    <div id="activityFullPage" aria-label="Activity (full page)"></div>
+    </div>
   </main>
 
   <div class="legend">
@@ -683,7 +734,7 @@
 <script>
 /* ════════════ DUMMY GRAPH — flat node registry with id links (daemon-styled) ════════════ */
 const SCOPES = [
-  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-cost','cx-projects','cx-work','cx-usage','cx-documents','cx-gates','cx-review','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-identity','cx-receipts','cx-mediation','cx-workbench','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-lane-weights','cx-settings','cx-raw'] },
+  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-activity','cx-cost','cx-projects','cx-work','cx-usage','cx-documents','cx-gates','cx-review','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-identity','cx-receipts','cx-mediation','cx-workbench','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-lane-weights','cx-settings','cx-raw'] },
   { id:'dx', label:'DX', tag:'Docs',         sections:['dx-articles','dx-readme','dx-sites'] },
   { id:'gx', label:'GX', tag:'Global',       sections:['gx-engrams','gx-bench','gx-sites','gx-factstore'] },
   { id:'ax', label:'AX', tag:'Agent',        sections:['ax-overview','ax-activity','ax-memory','ax-bulk','ax-snapshots','ax-tools','ax-handoff','ax-graph','ax-storybook','ax-dossiers','ax-story'] },
@@ -693,6 +744,7 @@ const SCOPES = [
 const N = {
   /* ── CX panels ── */
   'cx-overview':{kind:'panel',label:'Overview',sub:'daemon at a glance',fields:[['mode','local_only'],['facts','1,911'],['sessions','3 active']],children:['ov-node','ov-work','ov-usage','ov-storage','ov-integrations','ov-tenants']},
+  'cx-activity':{kind:'panel',label:'Activity',sub:'all sessions · live rolling log',children:[]},
   'cx-cost':{kind:'panel',label:'Token burn',sub:'cost lens · what each session cost + how to cut it',children:[]},
   'cx-projects':{kind:'panel',label:'Projects',sub:'4 tracked',fields:[['count','4'],['active','CueCrux']],children:['proj-cuecrux','proj-crux','proj-audit','proj-plan']},
   'cx-work':{kind:'panel',label:'ExecPlans',sub:'kanban · /v1/work',children:['ep-agentux','ep-chaincrux','ep-trait','ep-cruxengine','ep-gemma','ep-plancrux','ep-verbatim']},
@@ -1934,7 +1986,7 @@ function renderDash(){
   if(activeScope!=='cx'){ renderScopeDash(); return; }
   const canvasEl=document.getElementById('canvas');
   const cw=canvasEl.clientWidth||1100;
-  const PAD=30, GAP=18, W=Math.max(700, cw-PAD*2);
+  const PAD=24, GAP=14, W=Math.max(300, cw-PAD*2);   /* track canvas width (no h-overflow when the activity pane takes 60%) */
   const ovn=N['ov-node']||{}, wk=N['cx-work']||{};
   const eps=childrenOf(wk).filter(n=>n.kind==='execplan');
   const stateOf=n=>{ const s=(n.state||n.status||'').toLowerCase(); return s==='complete'?'done':(s||'planned'); };
@@ -1959,7 +2011,7 @@ function renderDash(){
   const H0=174, H1=240;
   const halfW=(W-GAP)/2;
   const heroW=halfW;                              /* equal split — right column (gateway / kanban) shares one left edge */
-  const stack = (W-heroW) < 360;                  /* narrow → single column */
+  const stack = (W-heroW) < 200;                  /* keep the 4 hero cards 2-wide even when compacted; only stack when very narrow */
   const k=v=>v>=1000?Math.round(v/1000)+'k':String(v);
   let usage=null; try{ usage=JSON.parse((N['ov-usage']||{}).payload||''); }catch(e){ /* live shape may differ */ }
   const by=usage&&usage.by_session?Object.entries(usage.by_session):[];
@@ -2007,27 +2059,13 @@ function renderDash(){
     `<div class="dash-plans">${plans}</div>`,
     'cx-work');
 
-  /* panel grid: every other panel, general info */
-  const ids=(SCOPES.find(s=>s.id==='cx')?.sections||[]).filter(id=>id!=='cx-overview'&&id!=='cx-work'&&N[id]);
-  const busY=Math.max(u.y+u.h, g2.y+g2.h)+34, gridTop=busY+26;
-  const cols=Math.max(2, Math.min(4, Math.floor((W+GAP)/(272+GAP))));
-  const gw=(W-(cols-1)*GAP)/cols, gh=128;
-  const cells=[];
-  ids.forEach((id,i)=>{
-    const n=N[id], r=Math.floor(i/cols), c=i%cols;
-    const kids=childrenOf(n).length;
-    const ffs=(n.fields||[]).slice(0,2).map(([k,v])=>`<span class="gf"><b>${esc(k)}</b>${esc(String(v))}</span>`).join('');
-    const cell=mk(PAD+c*(gw+GAP), gridTop+r*(gh+GAP), gw, gh, 's-'+norm(n.status),
-      `<div class="gstripe"></div>`+
-      `<div class="dash-g"><span class="dash-ico">${sbSvg(SB_ICONS[id]||SB_ICONS.__dot)}</span>`+
-      `<span class="dash-g-main"><span class="gtitle">${esc(n.label)}</span><span class="gsub">${esc(n.sub||'')}</span>`+
-      `<span class="gmeta">${ffs}</span></span>${kids?`<span class="gcount">${kids}</span>`:''}</div>`,
-      id);
-    cells.push(cell);
-  });
+  /* only the 4 hero cards remain — the activity list fills the space below them */
+  const busY=Math.max(u.y+u.h, g2.y+g2.h)+18;
+  const da=document.getElementById('dashActivity');
+  const csEl=document.getElementById('canvasScroll'); if(csEl) csEl.style.overflowX='hidden';   /* dashboard never scrolls sideways — clip the vertical-scrollbar gutter */
+  if(da){ da.style.marginTop=busY+'px'; da.style.display='flex'; if(typeof __dashShown!=='undefined' && !__dashShown && typeof Activity!=='undefined'){ __dashShown=true; Activity.mountDash(); } }
 
-  /* no connector lines on the dash (operator request) — cards stand alone */
-  const Wt=W+PAD*2, Ht=(cells.length?cells[cells.length-1].y+gh:busY)+PAD;
+  const Wt=W+PAD*2, Ht=busY;
   edgesEl.setAttribute('width',Wt); edgesEl.setAttribute('height',Ht); edgesEl.setAttribute('viewBox',`0 0 ${Wt} ${Ht}`);
   edgesEl.style.width=Wt+'px'; edgesEl.style.height=Ht+'px'; edgesEl.innerHTML='';
   nodesEl.style.width=Wt+'px'; nodesEl.style.height=Ht+'px';
@@ -2077,7 +2115,7 @@ function donutSvg(pct,color,label){
 function renderScopeDash(){
   const canvasEl=document.getElementById('canvas');
   const cw=canvasEl.clientWidth||1100;
-  const PAD=30, GAP=18, W=Math.max(700, cw-PAD*2);
+  const PAD=24, GAP=14, W=Math.max(300, cw-PAD*2);   /* track canvas width (no h-overflow when the activity pane takes 60%) */
   nodesEl.innerHTML='';
   const scope=SCOPES.find(sc=>sc.id===activeScope)||SCOPES[0];
   const mk=(x,y,w,h,cls,inner,openId)=>{
@@ -2253,7 +2291,14 @@ function renderScopeDash(){
   renderCrumbs();
 }
 
+var __dashShown=false;
+function setActivityPaneDisplay(){   // hide-only — renderDash positions+shows #dashActivity on the CX All-panels view
+  const da=document.getElementById('dashActivity'); if(!da||typeof Activity==='undefined') return;
+  const show = (typeof dashMode!=='undefined' && dashMode) && activeScope==='cx' && !searchActive && !focusMode && (!openPageId || openPageId==='cx-activity');
+  if(!show){ da.style.display='none'; const cs=document.getElementById('canvasScroll'); if(cs) cs.style.overflowX=''; if(__dashShown){ __dashShown=false; Activity.stopDash(); } }
+}
 function render(){
+  setActivityPaneDisplay();   /* CX All-panels dashboard shows the activity pane; every other view hides it */
   populatePassportFilter();   /* options track whatever passports the loaded data mentions */
   if(dashMode && !searchActive && !focusMode){ renderDash(); return; }
   positions={}; let maxBottom=0;
@@ -2818,6 +2863,7 @@ const SB_ICONS={
   'cx-tenants':'<rect x="5" y="3.5" width="14" height="17" rx="1.5"/><path d="M9 7.5h2M13 7.5h2M9 11h2M13 11h2M9 14.5h2M13 14.5h2M10.5 20.5v-3h3v3"/>',
   'cx-lane-weights':'<path d="M4 18h16M6 14l3-5 4 3 4-7"/><circle cx="9" cy="9" r="1.7"/><circle cx="13" cy="12" r="1.7"/><circle cx="17" cy="5" r="1.7"/>',
   'cx-settings':'<path d="M4 7h8M16 7h4M4 12h2M10 12h10M4 17h11M19 17h1"/><circle cx="14" cy="7" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="17" cy="17" r="2"/>',
+  'cx-activity':'<path d="M3 12h4l3-7 4 14 3-7h4"/>',
   'cx-raw':'<path d="m8.5 8-4 4 4 4M15.5 8l4 4-4 4"/>',
   'cx-usage':'<path d="M5 19V9.5M10 19V4.5M15 19v-7M20 19v-11M3 21h18"/>',
   'cx-documents':'<path d="M7 3.5h7l4 4V17a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5.5a2 2 0 0 1 2-2z"/><path d="M14 3.5V8h4M3.5 20.5h13"/>',
@@ -3322,6 +3368,7 @@ function identityCandidateSections(){
       {t:'btn',label:'Confirm candidate',danger:true,hint:'creates the resolving identity_link only after both signatures verify'}]}];
 }
 const PAGES={
+ 'cx-activity':{title:'Activity',sub:'all sessions · live rolling log',sections:[]},
  'cx-work':{title:'ExecPlans',sub:'list view · kanban available from the rail pull-out',sections:workListSections()},
  'cx-sessions':{title:'Sessions',sub:'execplan-scoped sessions — searchable list; graph from the rail pull-out',sections:sessionsListSections()},
  'cx-identity':{title:'Identity',sub:'candidate links — inference proposes, consent disposes',sections:identityCandidateSections()},
@@ -3835,7 +3882,7 @@ const PAGES={
   .forEach(pid=>{ ((PAGES[pid]||{}).sections||[]).forEach(s=>{ s.wide=true; }); });
 function openSettings(){ openPage('cx-settings'); }
 function closeSettings(){ closePage(); }
-function closePage(){ openPageId=null; const el=document.getElementById('settingsPage'); if(el) el.style.display='none'; updateSidebarActive(); }
+function closePage(){ openPageId=null; const el=document.getElementById('settingsPage'); if(el) el.style.display='none'; const af=document.getElementById('activityFullPage'); if(af) af.style.display='none'; if(typeof Activity!=='undefined'&&Activity.stopFull) Activity.stopFull(); if(typeof setActivityPaneDisplay==='function') setActivityPaneDisplay(); updateSidebarActive(); }
 /* ── M1: live operator pages. PAGE_WIRES[pageId] =
      load(def)  — async; pull /v1 state and mutate the page def's control values/options before re-render
      set{k}/setAny(k,v) — persist one control change to the daemon (called from confSet when LIVE)
@@ -4592,6 +4639,8 @@ function openPage(id, opts){
   const def=PAGES[id]; if(!def) return;
   openPageId=id;
   updateSidebarActive();   // full-card pages highlight their rail icon, same as graph panels
+  setActivityPaneDisplay();   // operator pages hide the activity pane → canvas reclaims full width
+  if(id==='cx-activity'){ Activity.openFull(); return; }   // custom full-page render (not the sp-grid)
   const wire=PAGE_WIRES[id];
   if(LIVE && wire && wire.load && !(opts&&opts.__wired))
     Promise.resolve(wire.load(def))
@@ -4805,10 +4854,178 @@ if(typeof performance!=='undefined' && typeof setInterval==='function'){
 window.__cxStats=()=>({ heapMB:(typeof performance!=='undefined'&&performance.memory)?Math.round(performance.memory.usedJSHeapSize/1048576):null,
   domNodes:document.getElementsByTagName('*').length, view:viewMode });
 
+/* ════════════ Activity lane — ExecPlan crux-dual-surface-activity-log ════════════
+   One /v1/activity source (session optional → all sessions) feeds two surfaces:
+   the embedded #dashActivity panel below the 4 CX cards (filter bar + infinite-scroll list) and the full
+   cx-activity CX page (toolbar + searchable tenant/session dropdowns). */
+const Activity=(function(){
+  const KINDS=["question","answer","reasoning","command","fact","execplan","handoff","error"];
+  let currentTenant='default', fullEs=null, fullRows=[], fullActive=new Set(KINDS);
+  let dashEs=null, dashRows=[], dashVisible=[], dashCursor=null, dashHasMore=false, dashLoading=false, dashActive=new Set(KINDS);
+  function headers(){ const h={'X-Corecrux-Scopes':'facts:read,admin:read'};
+    try{ const p=localStorage.getItem('crux-console-bound-passport'); if(p) h['X-Corecrux-Passport-Id']=p; }catch{} return h; }
+  async function apiGet(path){ const r=await fetch(path,{headers:headers()}); const t=await r.text();
+    let d; try{ d=JSON.parse(t); }catch{ d={text:t}; } if(!r.ok) throw {status:r.status,data:d}; return d; }
+  const enc=encodeURIComponent;
+  function url(tenant,session,budget,kinds,limit,before){
+    let u=`/v1/activity?tenant_id=${enc(tenant||'default')}&token_budget=${budget||2000}`;
+    if(session) u+=`&session=${enc(session)}`;
+    if(kinds&&kinds.length&&kinds.length<KINDS.length) u+=`&kinds=${enc(kinds.join(','))}`;
+    if(limit) u+=`&limit=${limit}`;
+    if(before!=null) u+=`&before=${before}`;
+    return u; }
+  function kindColor(k){ if(k==='fact') return '#8b5cf6'; if(k==='execplan'||k==='handoff') return '#0ea5e9';
+    const m={question:'--accent',answer:'--ok',reasoning:'--idle',command:'--run',error:'--err'};
+    try{ return getComputedStyle(document.documentElement).getPropertyValue(m[k]||'--idle').trim()||'#6b7689'; }catch{ return '#6b7689'; } }
+  function rowEl(r,showSession){
+    const el=document.createElement('div'); el.className='actrow k-'+(r.kind||'idle');
+    const meta=document.createElement('div'); meta.className='ar-meta';
+    const k=document.createElement('span'); k.className='ar-kind'; k.textContent=r.kind||''; meta.appendChild(k);
+    if(showSession&&r.session_id){ const s=document.createElement('span'); s.className='ar-sess'; s.textContent=r.session_id; meta.appendChild(s); }
+    const seq=document.createElement('span'); seq.textContent='seq '+r.seq; meta.appendChild(seq);
+    if(r.turn_id){ const t=document.createElement('span'); t.textContent='turn '+r.turn_id; meta.appendChild(t); }
+    const extra=[r.tool,r.intent,(r.confidence!=null?'conf '+r.confidence:null)].filter(Boolean).join(' · ');
+    if(extra){ const e=document.createElement('span'); e.textContent=extra; meta.appendChild(e); }
+    el.appendChild(meta);
+    const pv=document.createElement('div'); pv.className='ar-preview'; pv.textContent=r.preview||''; el.appendChild(pv);
+    const ex=document.createElement('div'); ex.className='ar-exp';
+    const vb=document.createElement('div'); vb.className='ar-verbatim'; vb.textContent='loading…'; ex.appendChild(vb);
+    const rc=document.createElement('div'); rc.className='ar-receipts'; ex.appendChild(rc);
+    el.appendChild(ex);
+    el.onclick=()=>{ const open=el.classList.toggle('open'); if(open) expand(vb,rc,r); };
+    return el; }
+  async function expand(vb,rc,r){
+    if(!r.turn_id||!r.session_id){ vb.textContent=r.preview||'(preview only — no turn id)'; return; }
+    const tenant=currentTenant||'default';
+    try{
+      const d=await apiGet(`/v1/activity/turn/${enc(r.turn_id)}?tenant_id=${enc(tenant)}&session=${enc(r.session_id)}`);
+      const entries=d.entries||[];
+      vb.textContent=entries.map(e=>`[${e.kind}] ${e.text}`).join('\n\n')||'(no entries)';
+      const ids=[...new Set(entries.flatMap(e=>(e.refs&&e.refs.receipt_ids)||[]))];
+      rc.innerHTML=''; if(!ids.length){ const b=document.createElement('span'); b.className='ar-badge'; b.textContent='no receipt refs'; rc.appendChild(b); }
+      ids.forEach(id=>{ const b=document.createElement('span'); b.className='ar-badge'; b.textContent='⏳ '+id; rc.appendChild(b); verify(b,id,tenant); });
+    }catch(e){ vb.textContent='deref failed (HTTP '+((e&&e.status)||'?')+')'; } }
+  async function verify(b,id,tenant){
+    try{ const d=await apiGet(`/v1/receipts/${enc(id)}/verification?tenant_id=${enc(tenant)}`);
+      if(d&&d.signature_valid&&d.error_code==='OK'){ b.className='ar-badge ok'; b.textContent='✓ '+id; }
+      else { b.className='ar-badge warn'; b.textContent='• recorded '+id; } }
+    catch(e){ if((e&&e.status)===404||String(id).startsWith('act_')){ b.className='ar-badge warn'; b.textContent='• recorded '+id; } else { b.className='ar-badge err'; b.textContent='✕ '+id; } } }
+  function renderList(listEl,rows,q,active,showSession,emptyMsg){
+    listEl.innerHTML='';
+    const vis=rows.filter(r=>active.has(r.kind)&&(!q||((r.kind||'')+' '+(r.preview||'')+' '+(r.session_id||'')+' '+(r.tool||'')+' '+(r.intent||'')+' '+(r.turn_id||'')).toLowerCase().includes(q)));
+    if(!vis.length){ const e=document.createElement('div'); e.className='ap-empty'; e.textContent=emptyMsg||'No activity.'; listEl.appendChild(e); return; }
+    vis.forEach(r=>listEl.appendChild(rowEl(r,showSession))); }
+  // ── embedded dash surface (under the 4 cards · all sessions · live · infinite scroll) ──
+  function rowText(r){ return ((r.kind||'')+' '+(r.preview||'')+' '+(r.session_id||'')+' '+(r.tool||'')+' '+(r.intent||'')+' '+(r.turn_id||'')).toLowerCase(); }
+  function valOf(id){ const e=document.getElementById(id); return e?(e.value||'').trim():''; }
+  function renderDashKinds(){ const kr=document.getElementById('cxd-kinds'); if(!kr) return; kr.innerHTML='';
+    KINDS.forEach(k=>{ const c=document.createElement('span'); c.className='akchip'+(dashActive.has(k)?' on':''); c.textContent=k; if(dashActive.has(k)) c.style.background=kindColor(k);
+      c.onclick=()=>{ dashActive.has(k)?dashActive.delete(k):dashActive.add(k); renderDashKinds(); dashRender(); }; kr.appendChild(c); }); }
+  const PAGE=50;
+  function refreshSessionOpts(){ const dl=document.getElementById('cxdSessionOpts'); if(!dl) return;
+    const seen=[...new Set(dashRows.map(r=>r.session_id).filter(Boolean))]; dl.innerHTML=''; seen.forEach(s=>{ const o=document.createElement('option'); o.value=s; dl.appendChild(o); }); }
+  function dashRender(){ const list=document.getElementById('cxd-list'); if(!list) return;   // render ALL loaded rows — the whole page scrolls (no inner list scroll)
+    const q=valOf('cxd-search').toLowerCase();
+    dashVisible=dashRows.filter(r=>dashActive.has(r.kind)&&(!q||rowText(r).includes(q)));
+    list.innerHTML='';
+    if(!dashVisible.length){ const e=document.createElement('div'); e.className='ap-empty'; e.textContent='No matching activity.'; list.appendChild(e); return; }
+    dashVisible.forEach(r=>list.appendChild(rowEl(r,true))); }
+  async function loadDash(){ const list=document.getElementById('cxd-list'); if(!list) return;   // reset to the newest page
+    currentTenant='default'; const session=valOf('cxd-session'); dashLoading=true;
+    try{ const d=await apiGet(url('default',session,8000,null,PAGE,null)); dashRows=d.rows||[]; dashCursor=(d.next_cursor!=null)?d.next_cursor:null; dashHasMore=!!d.has_more;
+      refreshSessionOpts(); dashRender(); }
+    catch(e){ list.innerHTML=''; const m=document.createElement('div'); m.className='ap-empty'; m.textContent=(e&&e.status===404)?'Activity disabled (CORECRUXD_FEATURE_ACTIVITY_LOG=1)':'Load failed (HTTP '+((e&&e.status)||'?')+')'; list.appendChild(m); }
+    finally{ dashLoading=false; } }
+  async function loadMoreDash(){ if(dashLoading||!dashHasMore||dashCursor==null) return;   // infinite scroll: page older via the backend ?before= cursor
+    dashLoading=true; const session=valOf('cxd-session');
+    try{ const d=await apiGet(url('default',session,8000,null,PAGE,dashCursor)); const more=d.rows||[];
+      if(more.length){ dashRows=dashRows.concat(more); dashCursor=(d.next_cursor!=null)?d.next_cursor:null; dashHasMore=!!d.has_more; refreshSessionOpts(); dashRender(); }
+      else { dashHasMore=false; } }
+    catch{} finally{ dashLoading=false; } }
+  function onDashScroll(){ const cs=document.getElementById('canvasScroll'), da=document.getElementById('dashActivity');
+    if(!cs||!da||da.style.display==='none') return;
+    if(cs.scrollTop+cs.clientHeight >= cs.scrollHeight-140) loadMoreDash(); }
+  function liveDash(on){ const dot=document.getElementById('cxdLiveDot'), lab=document.getElementById('cxdLiveLabel');
+    if(dashEs){ dashEs.close(); dashEs=null; }
+    if(on){ try{ dashEs=new EventSource('/v1/events/stream?types=activity.appended'); let p=null;
+      dashEs.addEventListener('activity.appended',()=>{ clearTimeout(p); p=setTimeout(loadDash,400); });
+      dashEs.onerror=()=>{ if(lab) lab.textContent='live (retry)'; };
+      if(dot) dot.classList.add('on'); if(lab) lab.textContent='live'; }catch{} } }
+  function mountDash(){ const host=document.getElementById('dashActivity'); if(!host) return;
+    host.innerHTML='';
+    const bar=document.createElement('div'); bar.className='cxd-bar';
+    const live=document.createElement('span'); live.className='ap-live';
+    const ld=document.createElement('span'); ld.id='cxdLiveDot'; ld.className='ap-dot'; live.appendChild(ld);
+    const ll=document.createElement('span'); ll.id='cxdLiveLabel'; ll.textContent='live'; live.appendChild(ll); bar.appendChild(live);
+    const s=document.createElement('input'); s.id='cxd-search'; s.className='cxd-input'; s.placeholder='search activity…'; s.autocomplete='off'; bar.appendChild(s);
+    const se=document.createElement('input'); se.id='cxd-session'; se.className='cxd-input'; se.setAttribute('list','cxdSessionOpts'); se.placeholder='session · all'; se.autocomplete='off'; bar.appendChild(se);
+    const dl=document.createElement('datalist'); dl.id='cxdSessionOpts'; bar.appendChild(dl);
+    const kinds=document.createElement('div'); kinds.className='akinds'; kinds.id='cxd-kinds'; bar.appendChild(kinds);
+    const grow=document.createElement('span'); grow.style.flex='1'; bar.appendChild(grow);
+    const ex=document.createElement('button'); ex.id='cxd-expand'; ex.className='ap-expand'; ex.title='Open full Activity page (CX)'; ex.textContent='⤢'; ex.onclick=()=>{ openScope('cx'); openPage('cx-activity'); }; bar.appendChild(ex);
+    host.appendChild(bar);
+    const list=document.createElement('div'); list.className='cxd-list'; list.id='cxd-list'; host.appendChild(list);
+    dashActive=new Set(KINDS); renderDashKinds();
+    s.oninput=()=>dashRender();
+    se.onchange=()=>loadDash(); se.addEventListener('keydown',e=>{ if(e.key==='Enter') loadDash(); });
+    const cs=document.getElementById('canvasScroll'); if(cs) cs.onscroll=onDashScroll;   // whole-page scroll drives infinite load
+    loadDash(); liveDash(true); }
+  // ── full cx-activity page (toolbar + searchable dropdowns) ──
+  function combo(id,label,listId,opts,val){ const l=document.createElement('label'); l.textContent=label;
+    const i=document.createElement('input'); i.id=id; i.setAttribute('list',listId); i.value=val||''; i.autocomplete='off'; i.size=22;
+    const dl=document.createElement('datalist'); dl.id=listId; (opts||[]).forEach(o=>{ const op=document.createElement('option'); op.value=o; dl.appendChild(op); });
+    l.appendChild(i); l.appendChild(dl); return l; }
+  function field(id,label,val,ph,size){ const l=document.createElement('label'); l.textContent=label;
+    const i=document.createElement('input'); i.id=id; if(val!=null) i.value=val; if(ph) i.placeholder=ph; i.size=size||10; l.appendChild(i); return l; }
+  const fv=(id,d)=>{ const e=document.getElementById(id); return e?(e.value||'').trim():d; };
+  function openFull(){
+    let el=document.getElementById('activityFullPage');
+    if(!el){ el=document.createElement('div'); el.id='activityFullPage'; (document.getElementById('contentArea')||document.body).appendChild(el); }
+    el.innerHTML='';
+    const head=document.createElement('div'); head.className='af-head';
+    const h1=document.createElement('h1'); h1.textContent='Activity'; head.appendChild(h1);
+    const sub=document.createElement('span'); sub.className='af-headsub'; sub.textContent='all sessions · live rolling log'; head.appendChild(sub);
+    const live=document.createElement('span'); live.className='ap-live';
+    const ld=document.createElement('span'); ld.id='afLiveDot'; ld.className='ap-dot'; live.appendChild(ld);
+    const ll=document.createElement('span'); ll.id='afLiveLabel'; ll.textContent='live'; live.appendChild(ll); head.appendChild(live);
+    const x=document.createElement('button'); x.id='af-close'; x.title='Close (Esc)'; x.textContent='×'; x.onclick=closePage; head.appendChild(x);
+    el.appendChild(head);
+    const bar=document.createElement('div'); bar.className='actbar'; el.appendChild(bar);
+    bar.appendChild(combo('af-tenant','tenant','tenantOpts',['default'],currentTenant||'default'));
+    bar.appendChild(combo('af-session','session (blank = all)','sessionOpts',[],''));
+    bar.appendChild(field('af-budget','token_budget','4000',null,7));
+    bar.appendChild(field('af-search','search',null,'filter text…',16));
+    const kl=document.createElement('label'); kl.textContent='kinds'; const kr=document.createElement('div'); kr.className='akinds'; kl.appendChild(kr); bar.appendChild(kl);
+    const list=document.createElement('div'); list.className='actfull-list'; list.id='afList'; el.appendChild(list);
+    el.style.display='flex';
+    fullActive=new Set(KINDS);
+    function renderKinds(){ kr.innerHTML=''; KINDS.forEach(k=>{ const c=document.createElement('span'); c.className='akchip'+(fullActive.has(k)?' on':''); c.textContent=k; if(fullActive.has(k)) c.style.background=kindColor(k);
+      c.onclick=()=>{ fullActive.has(k)?fullActive.delete(k):fullActive.add(k); renderKinds(); loadFull(); }; kr.appendChild(c); }); }
+    renderKinds();
+    document.getElementById('af-search').oninput=renderFull;
+    document.getElementById('af-budget').onchange=loadFull;
+    const tn=document.getElementById('af-tenant'); tn.onchange=loadFull; tn.addEventListener('keydown',e=>{ if(e.key==='Enter') loadFull(); });
+    const sn=document.getElementById('af-session'); sn.onchange=loadFull; sn.addEventListener('keydown',e=>{ if(e.key==='Enter') loadFull(); });
+    loadFull(); liveFull(true); }
+  async function loadFull(){ const list=document.getElementById('afList'); if(!list){ if(fullEs){ fullEs.close(); fullEs=null; } return; }
+    currentTenant=fv('af-tenant','default')||'default'; const session=fv('af-session',''); const budget=parseInt(fv('af-budget','4000'),10)||4000;
+    try{ const d=await apiGet(url(currentTenant,session,budget,[...fullActive])); fullRows=d.rows||[];
+      const dl=document.getElementById('sessionOpts'); if(dl){ const seen=[...new Set(fullRows.map(r=>r.session_id).filter(Boolean))]; dl.innerHTML=''; seen.forEach(s=>{ const o=document.createElement('option'); o.value=s; dl.appendChild(o); }); }
+      renderFull(); }
+    catch(e){ list.innerHTML=''; const m=document.createElement('div'); m.className='ap-empty';
+      m.textContent=(e&&e.status===404)?'Activity disabled (CORECRUXD_FEATURE_ACTIVITY_LOG=1)':(e&&e.status===400)?'Bad request — check token_budget':'Load failed (HTTP '+((e&&e.status)||'?')+')'; list.appendChild(m); } }
+  function renderFull(){ const list=document.getElementById('afList'); if(!list) return; const q=fv('af-search','').toLowerCase(); renderList(list,fullRows,q,fullActive,true,'No matching activity.'); }
+  function liveFull(on){ const dot=document.getElementById('afLiveDot'), lab=document.getElementById('afLiveLabel'); if(fullEs){ fullEs.close(); fullEs=null; }
+    if(on){ try{ fullEs=new EventSource('/v1/events/stream?types=activity.appended'); let p=null;
+      fullEs.addEventListener('activity.appended',()=>{ clearTimeout(p); p=setTimeout(loadFull,400); });
+      if(dot) dot.classList.add('on'); if(lab) lab.textContent='live'; }catch{} } }
+  function stopFull(){ if(fullEs){ fullEs.close(); fullEs=null; } }
+  function stopDash(){ if(dashEs){ dashEs.close(); dashEs=null; } }
+  return { mountDash, openFull, stopFull, stopDash }; })();
 buildSidebar();    // after PANEL_TO_DISTRICT exists — rail icons carry their 3D mapping
 try{ if(localStorage.getItem('cx-view')==='3d') setView('3d'); }catch(e){}
 
-openScope('cx');   // immediate render with dummy data
+openScope('cx');   // immediate render with dummy data; render()→setActivityPaneDisplay lazy-mounts the pane on the CX dashboard
 bootProbe().then(()=>{ receiptsDeepLink(); coordDeepLink(); laneWeightsDeepLink(); });   // probe /readyz; if live, lazy-replace panels with real /v1 data; then honour stable hash deep links
 </script>
 </body>

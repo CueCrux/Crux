@@ -134,9 +134,10 @@ pub(super) async fn get_activity(
     let Some(tenant_id) = params.get("tenant_id").filter(|s| !s.trim().is_empty()) else {
         return problem_response(StatusCode::BAD_REQUEST, "tenant_id is required".to_string());
     };
-    let Some(session) = params.get("session").filter(|s| !s.trim().is_empty()) else {
-        return problem_response(StatusCode::BAD_REQUEST, "session is required".to_string());
-    };
+    // `session` is OPTIONAL: when omitted, return recent activity across ALL
+    // sessions for the tenant (powers the human-lane "all activity" pane and
+    // the session dropdown). `tenant_id` + `token_budget` stay required.
+    let session = params.get("session").map(|s| s.trim()).filter(|s| !s.is_empty());
     // QC.2 — token_budget is mandatory on every retrieval pull.
     let token_budget = match params.get("token_budget") {
         Some(raw) => match raw.trim().parse::<u64>() {
@@ -165,19 +166,25 @@ pub(super) async fn get_activity(
         .unwrap_or_else(|| activity::ANON_PASSPORT.to_string());
 
     let since_seq = params.get("since").and_then(|s| s.trim().parse::<u64>().ok());
+    // Infinite-scroll cursor (all-sessions): `before` = an entry `ts_us`;
+    // `limit` = page size (clamped). The dash pages down by passing the last
+    // row's `cursor` back as `before`.
+    let before = params.get("before").and_then(|s| s.trim().parse::<i64>().ok());
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, DEFAULT_TOP_K))
+        .unwrap_or(DEFAULT_TOP_K);
     let kinds = parse_kinds(params.get("kinds"));
 
     let entries = {
         let mut store = activity::global().lock().await;
-        store.recent(
-            tenant_id,
-            session,
-            &caller_passport,
-            since_seq,
-            kinds.as_deref(),
-            DEFAULT_TOP_K,
-        )
+        match session {
+            Some(s) => store.recent(tenant_id, s, &caller_passport, since_seq, kinds.as_deref(), limit),
+            None => store.recent_all(tenant_id, &caller_passport, before, kinds.as_deref(), limit),
+        }
     };
+    let full_page = entries.len() >= limit;
 
     // Budget trim using the shared estimator (~4 chars/token) so every
     // budget check in the daemon uses the same yardstick. Always return at
@@ -198,12 +205,17 @@ pub(super) async fn get_activity(
         rows.push(row);
     }
     truncated = truncated || rows.len() < entries.len();
+    let next_cursor = rows.last().map(|r| r.cursor);
+    let has_more = full_page || rows.len() < entries.len();
 
     Json(serde_json::json!({
         "session_id": session,
+        "all_sessions": session.is_none(),
         "token_budget": token_budget,
         "returned": rows.len(),
         "truncated": truncated,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
         "rows": rows,
     }))
     .into_response()

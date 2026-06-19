@@ -342,6 +342,45 @@ impl JournalStore {
             .collect()
     }
 
+    /// Like [`recent`] but across **all sessions** for `tenant`, newest-first
+    /// globally (by absolute `ts_us`). Powers the human-lane "all activity"
+    /// pane and the session dropdown. Same privacy scope + reserved-strip as
+    /// [`recent`]. `before` is a pagination cursor (an entry `ts_us`): when
+    /// `Some`, only entries strictly older are returned — the dash's infinite
+    /// scroll passes the last row's `cursor` back as `before` to page down.
+    pub fn recent_all(
+        &mut self,
+        tenant: &str,
+        caller_passport: &str,
+        before: Option<i64>,
+        kinds: Option<&[JournalKind]>,
+        limit: usize,
+    ) -> Vec<JournalEntry> {
+        let mut out: Vec<JournalEntry> = Vec::new();
+        for ((t, _s), log) in self.by_session.iter_mut() {
+            if t != tenant {
+                continue;
+            }
+            Self::trim(&mut log.entries, retention());
+            for e in &log.entries {
+                if before.is_some_and(|b| e.ts_us >= b) {
+                    continue;   // cursor: only entries strictly older than `before`
+                }
+                if kinds.is_some_and(|ks| !ks.contains(&e.kind)) {
+                    continue;
+                }
+                if e.private && e.actor_passport != caller_passport {
+                    continue;
+                }
+                out.push(e.clone());
+            }
+        }
+        // Newest-first across sessions by absolute time, then cap to the page limit.
+        out.sort_by(|a, b| b.ts_us.cmp(&a.ts_us));
+        out.truncate(limit);
+        out
+    }
+
     /// Fetch a single entry by `(tenant, session, turn_id)` for the human
     /// lane's row-expand, honouring the same privacy scope as [`recent`].
     pub fn by_turn(&self, tenant: &str, session: &str, turn_id: &str, caller_passport: &str) -> Vec<JournalEntry> {
@@ -383,8 +422,14 @@ pub fn global() -> &'static Mutex<JournalStore> {
 pub struct ActivityRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// Owning session — always present so the all-sessions pane can group/label
+    /// rows and the session dropdown can enumerate distinct values.
+    pub session_id: String,
     pub seq: u64,
     pub ts: String,
+    /// Opaque pagination cursor (the entry's `ts_us`); pass back as `?before=`
+    /// to fetch the next older page (infinite scroll).
+    pub cursor: i64,
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent: Option<String>,
@@ -413,8 +458,10 @@ impl ActivityRow {
     pub fn from_entry(entry: &JournalEntry, preview_chars: usize) -> Self {
         ActivityRow {
             turn_id: entry.turn_id.clone(),
+            session_id: entry.session_id.clone(),
             seq: entry.seq,
             ts: entry.created_at.clone(),
+            cursor: entry.ts_us,
             kind: entry.kind.as_str(),
             intent: entry.meta.intent.clone(),
             tool: entry.meta.tool.clone(),
