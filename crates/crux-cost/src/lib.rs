@@ -27,6 +27,7 @@
 pub mod attribution;
 pub mod levers;
 pub mod report;
+pub mod summary;
 pub mod transcript;
 
 pub use report::{BlockCost, Bucket, CostReport, Headline, Lever, Measured, Severity, COST_REPORT_SCHEMA};
