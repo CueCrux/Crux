@@ -26,6 +26,12 @@ jobs:
     continue-on-error: true
     env:
       CARGO_HOME: /home/gha-runner/.cargo-${{ github.job }}-${{ github.run_id }}
+      # Cap build parallelism so the baseline workspace build doesn't spike host
+      # RAM and trip the OOM-killer that took down the shared self-hosted CI
+      # runners (incident 2026-06-22 — runner fleet down 1-2 days). cargo-mutants
+      # already runs mutants serially; this bounds the cargo build phase. Nightly
+      # + non-blocking, so a slower run is an acceptable trade for fleet safety.
+      CARGO_BUILD_JOBS: "4"
     steps:
       - name: Seed per-job CARGO_HOME from shared toolchain
         run: |
