@@ -37,7 +37,7 @@
 //! ## Feature flag
 //!
 //! Everything is gated by `CORECRUXD_FEATURE_ACTIVITY_LOG`, **default OFF**.
-//! With the flag off, [`record`] is a no-op and the HTTP handlers return a
+//! With the flag off, `record` is a no-op and the HTTP handlers return a
 //! disabled problem, so the daemon behaves exactly as it does today.
 
 use std::collections::HashMap;
@@ -342,10 +342,10 @@ impl JournalStore {
             .collect()
     }
 
-    /// Like [`recent`] but across **all sessions** for `tenant`, newest-first
+    /// Like `recent` but across **all sessions** for `tenant`, newest-first
     /// globally (by absolute `ts_us`). Powers the human-lane "all activity"
     /// pane and the session dropdown. Same privacy scope + reserved-strip as
-    /// [`recent`]. `before` is a pagination cursor (an entry `ts_us`): when
+    /// `recent`. `before` is a pagination cursor (an entry `ts_us`): when
     /// `Some`, only entries strictly older are returned — the dash's infinite
     /// scroll passes the last row's `cursor` back as `before` to page down.
     pub fn recent_all(
@@ -357,14 +357,14 @@ impl JournalStore {
         limit: usize,
     ) -> Vec<JournalEntry> {
         let mut out: Vec<JournalEntry> = Vec::new();
-        for ((t, _s), log) in self.by_session.iter_mut() {
+        for ((t, _s), log) in &mut self.by_session {
             if t != tenant {
                 continue;
             }
             Self::trim(&mut log.entries, retention());
             for e in &log.entries {
                 if before.is_some_and(|b| e.ts_us >= b) {
-                    continue;   // cursor: only entries strictly older than `before`
+                    continue; // cursor: only entries strictly older than `before`
                 }
                 if kinds.is_some_and(|ks| !ks.contains(&e.kind)) {
                     continue;
@@ -382,7 +382,7 @@ impl JournalStore {
     }
 
     /// Fetch a single entry by `(tenant, session, turn_id)` for the human
-    /// lane's row-expand, honouring the same privacy scope as [`recent`].
+    /// lane's row-expand, honouring the same privacy scope as `recent`.
     pub fn by_turn(&self, tenant: &str, session: &str, turn_id: &str, caller_passport: &str) -> Vec<JournalEntry> {
         let Some(log) = self.by_session.get(&(tenant.to_string(), session.to_string())) else {
             return Vec::new();

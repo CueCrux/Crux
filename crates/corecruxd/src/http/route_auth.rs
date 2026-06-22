@@ -355,6 +355,22 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
         ));
     }
 
+    if path.starts_with("/v1/activity") {
+        // Dual-surface activity log (CORECRUXD_FEATURE_ACTIVITY_LOG, default OFF).
+        // GET reads the journal (tenant + privacy scoped, token_budget required);
+        // POST ingests a journal append.
+        let scopes = if method == "GET" {
+            &["facts:read", "admin:read"][..]
+        } else {
+            &["facts:write", "admin:write"][..]
+        };
+        return Some(RouteAuthContract::gated(
+            RouteAuthClass::FeatureGated,
+            scopes,
+            "CORECRUXD_FEATURE_ACTIVITY_LOG",
+        ));
+    }
+
     None
 }
 
@@ -647,6 +663,7 @@ mod tests {
             ("POST", "/v1/observe/sessions/abc/event"),
             ("POST", "/v1/orchestrators/run"),
             ("POST", "/v1/punchcards/x"),
+            ("POST", "/v1/activity"),
         ];
         for (method, path) in gated_mutations {
             let contract = classify_route(method, path).expect("contract");

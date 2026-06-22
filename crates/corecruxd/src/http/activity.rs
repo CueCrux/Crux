@@ -173,8 +173,7 @@ pub(super) async fn get_activity(
     let limit = params
         .get("limit")
         .and_then(|s| s.trim().parse::<usize>().ok())
-        .map(|n| n.clamp(1, DEFAULT_TOP_K))
-        .unwrap_or(DEFAULT_TOP_K);
+        .map_or(DEFAULT_TOP_K, |n| n.clamp(1, DEFAULT_TOP_K));
     let kinds = parse_kinds(params.get("kinds"));
 
     let entries = {
