@@ -16,10 +16,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use corecruxctl::{
-    admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, config_bundle, evidence, explain, extensions,
-    fixture_digest, gaps, hooks, identity_cli, inspect_receipt, login, machine, memory, memory_pack, output_verify,
-    parity, projections, receipts, reconcile, replay, session_sync, shard, shardmap, smoke, snapshot, stage1_import,
-    storage, structured_log, tooling_env, verify_store,
+    admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, config_bundle, cost, evidence, explain,
+    extensions, fixture_digest, gaps, hooks, identity_cli, inspect_receipt, login, machine, memory, memory_pack,
+    output_verify, parity, projections, receipts, reconcile, replay, session_sync, shard, shardmap, smoke, snapshot,
+    stage1_import, storage, structured_log, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -699,6 +699,28 @@ enum SessionCommand {
     },
     /// List session snapshots shared across machines.
     List {
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Token-burn cost lens: parse a Claude Code transcript and print a
+    /// shareable usage table with the headline burn number + reduction levers.
+    Cost {
+        /// Transcript file (default: newest under ~/.claude/projects).
+        #[arg(long)]
+        file: Option<String>,
+        /// Session id to analyze (its `<id>.jsonl` under ~/.claude/projects).
+        #[arg(long)]
+        session: Option<String>,
+        /// Emit the machine `CostReport` JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+        /// Post the report to the daemon's `/v1/cost/report` (for the console).
+        #[arg(long)]
+        post: bool,
+        /// Tenant id for `--post` (default: "default").
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Daemon base URL override.
         #[arg(long)]
         url: Option<String>,
     },
@@ -2024,6 +2046,14 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             SessionCommand::Push { id, file, url } => session_sync::run_push(id, file, url),
             SessionCommand::Pull { id, url } => session_sync::run_pull(id, url),
             SessionCommand::List { url } => session_sync::run_list(url),
+            SessionCommand::Cost {
+                file,
+                session,
+                json,
+                post,
+                tenant,
+                url,
+            } => cost::run_cost(file, session, json, post, tenant, url),
         },
         Command::Replay {
             pack,

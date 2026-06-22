@@ -1,0 +1,18 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+# See LICENCE.md in the repository root.
+
+[package]
+name = "crux-cost"
+publish.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ground-truth token-burn cost lens: parses a Claude Code transcript for measured usage, attributes carried context cost per source, and generates reduction levers. Shared CostReport contract for the CLI (producer) and daemon (reader)."
+
+[dependencies]
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.150"
+
+[lints]
+workspace = true

@@ -682,7 +682,7 @@
 <script>
 /* ════════════ DUMMY GRAPH — flat node registry with id links (daemon-styled) ════════════ */
 const SCOPES = [
-  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-projects','cx-work','cx-usage','cx-documents','cx-gates','cx-review','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-identity','cx-receipts','cx-mediation','cx-workbench','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-lane-weights','cx-settings','cx-raw'] },
+  { id:'cx', label:'CX', tag:'Crux Console', sections:['cx-overview','cx-cost','cx-projects','cx-work','cx-usage','cx-documents','cx-gates','cx-review','cx-coord','cx-sessions','cx-orchestrators','cx-punchcards','cx-passport','cx-identity','cx-receipts','cx-mediation','cx-workbench','cx-integrations','cx-extensions','cx-facts','cx-memory','cx-tenants','cx-lane-weights','cx-settings','cx-raw'] },
   { id:'dx', label:'DX', tag:'Docs',         sections:['dx-articles','dx-readme','dx-sites'] },
   { id:'gx', label:'GX', tag:'Global',       sections:['gx-engrams','gx-bench','gx-sites','gx-factstore'] },
   { id:'ax', label:'AX', tag:'Agent',        sections:['ax-overview','ax-activity','ax-memory','ax-bulk','ax-snapshots','ax-tools','ax-handoff','ax-graph','ax-storybook','ax-dossiers','ax-story'] },
@@ -692,6 +692,7 @@ const SCOPES = [
 const N = {
   /* ── CX panels ── */
   'cx-overview':{kind:'panel',label:'Overview',sub:'daemon at a glance',fields:[['mode','local_only'],['facts','1,911'],['sessions','3 active']],children:['ov-node','ov-work','ov-usage','ov-storage','ov-integrations','ov-tenants']},
+  'cx-cost':{kind:'panel',label:'Token burn',sub:'cost lens · what each session cost + how to cut it',children:[]},
   'cx-projects':{kind:'panel',label:'Projects',sub:'4 tracked',fields:[['count','4'],['active','CueCrux']],children:['proj-cuecrux','proj-crux','proj-audit','proj-plan']},
   'cx-work':{kind:'panel',label:'ExecPlans',sub:'kanban · /v1/work',children:['ep-agentux','ep-chaincrux','ep-trait','ep-cruxengine','ep-gemma','ep-plancrux','ep-verbatim']},
   'cx-sessions':{kind:'panel',label:'Sessions',sub:'active · execplan-scoped',fields:[['active','3'],['passport','ce:4e6c4e2a:local']],children:['sess-agentux','sess-chaincrux','sess-trait']},
@@ -2800,6 +2801,7 @@ const SB_ICONS={
   __home:'<rect x="4" y="4" width="7" height="7" rx="1.5"/><rect x="13" y="4" width="7" height="7" rx="1.5"/><rect x="4" y="13" width="7" height="7" rx="1.5"/><rect x="13" y="13" width="7" height="7" rx="1.5"/>',
   __dot:'<circle cx="12" cy="12" r="3"/>',
   'cx-overview':'<path d="M5.5 19a9 9 0 1 1 13 0"/><path d="m12 13 3.5-3.5"/>',
+  'cx-cost':'<path d="M12 2c1.5 3-1.5 4.5-1.5 7a3 3 0 0 0 6 0c0-1.5-1-2.5-1-4 2 1.5 3 3.5 3 6a6 6 0 0 1-12 0c0-4 3.5-6 5.5-9z"/>',
   'cx-projects':'<path d="M3.5 6.5a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>',
   'cx-work':'<rect x="4" y="4" width="4.4" height="11" rx="1.4"/><rect x="9.8" y="4" width="4.4" height="16" rx="1.4"/><rect x="15.6" y="4" width="4.4" height="8" rx="1.4"/>',
   'cx-coord':'<circle cx="12" cy="12" r="2.2"/><path d="M7.4 16.6a6.5 6.5 0 0 1 0-9.2M16.6 7.4a6.5 6.5 0 0 1 0 9.2M4.6 19.4a10.5 10.5 0 0 1 0-14.8M19.4 4.6a10.5 10.5 0 0 1 0 14.8"/>',
@@ -3687,6 +3689,14 @@ const PAGES={
    {t:'select',k:'story_depth',label:'depth',options:['2','3','all'],v:'all'},
    {t:'toggle',k:'story_reads',label:'include Read calls',v:false},
    {t:'btn',label:'Browse call tree as graph',action:'graph'}]}]},
+ 'cx-cost':{title:'Token burn',sub:'ground-truth cost lens — what each session cost + how to cut it · /v1/cost/report',sections:[
+  {h:'Session',sub:'measured from the transcript message.usage (not an estimate)',wide:true,controls:[
+   {t:'select',k:'sess',label:'session',options:['latest'],v:'latest'},
+   {t:'info',label:'status',v:'loading…'}]},
+  {h:'Headline',sub:'carried context per model call',wide:true,controls:[]},
+  {h:'Where it goes',sub:'carried-cost buckets',wide:true,controls:[]},
+  {h:'Biggest single blocks',sub:'tokens × re-reads',wide:true,controls:[]},
+  {h:'What you can do to reduce burn',sub:'grounded in this session',wide:true,controls:[]}]},
  'cx-usage':{title:'Token usage',sub:'derived from save_session / pre-compact hooks · /v1/observations/aggregate',sections:[
   {h:'Periods',sub:'window + filter ride this toolbar · input · output tokens',wide:true,controls:[
    {t:'select',k:'win',label:'window',options:['7d','30d','90d'],v:'7d'},
@@ -3996,6 +4006,38 @@ const PAGE_WIRES={
       ctx.reload(); return 'installed · '+src;
     },
   }},
+ 'cx-cost':{
+  load: async def=>{
+    const sel=pageCtrl('cx-cost','sess');
+    const chosen=pageVal('cx-cost','sess')||'latest';
+    let d=null;
+    try{ d=await api('/v1/cost/report?tenant_id=default&token_budget=4000'+(chosen&&chosen!=='latest'?('&session='+encodeURIComponent(chosen)):'')); }
+    catch(e){ d=null; }
+    const sessions=(d&&d.sessions)||[];
+    if(sel) sel.options=['latest'].concat(sessions.map(s=>s.session_id));
+    const status=t=>{ def.sections[0].controls=[sel,infoRow('status',t)].filter(Boolean); };
+    const clear=from=>{ for(let i=from;i<def.sections.length;i++) def.sections[i].controls=[]; };
+    if(!d){ status('cost lens off or unreachable — set CORECRUXD_FEATURE_COST_LENS=1'); def.sections[1].controls=[infoRow('no data','run:  corecruxctl session cost --post')]; clear(2); return; }
+    if(!d.has_report){ status(sessions.length?'pick a session above':'no reports posted yet'); def.sections[1].controls=[infoRow('get started','run:  corecruxctl session cost --post   (then refresh)')]; clear(2); return; }
+    const stored=d.report, r=stored.report, h=r.headline, m=r.measured;
+    status(r.source+'  ·  received '+String(stored.received_at||'').slice(0,16).replace('T',' '));
+    def.sections[0].sub='ground-truth from message.usage · for daily/weekly aggregates see Token usage (cx-usage)';
+    def.sections[1].controls=[
+     infoRow('context / turn', fmtK(h.context_tokens_per_turn)+' tokens re-read per model call'),
+     infoRow('cache replay', Math.round(h.cache_read_to_output_ratio)+'× output   ('+fmtK(m.cache_read)+' read · '+fmtK(m.output)+' generated)'),
+     infoRow('turns / tasks', h.assistant_turns+' / '+h.tasks+'   ·   '+h.segments+' compaction segment'+(h.segments===1?'':'s')),
+     infoRow('fixed prefix', Math.round(h.prefix_pct)+'% of carried context (re-read every turn)')];
+    const mx=Math.max.apply(null,[1].concat((r.buckets||[]).map(b=>b.pct)));
+    def.sections[2].controls=(r.buckets||[]).map(b=>({t:'bar',label:b.source,pct:Math.max(2,Math.round(100*b.pct/mx)),v:Math.round(b.pct)+'% · '+fmtK(b.carried_cost),tone:(b.source==='session_prefix'||b.pct>=20)?'err':undefined}));
+    def.sections[2].doc='Carried cost = a block’s tokens × how many later turns re-read it before the next\ncompaction. Buckets reconcile exactly to the measured context total.';
+    def.sections[3].controls=(r.top_blocks||[]).slice(0,8).map((b,i)=>({t:'exp',label:(i+1)+'. '+b.source,sub:fmtK(b.carried_cost)+' · ×'+b.turns_live+' re-reads',badge:fmtK(b.carried_cost),controls:[infoRow('est tokens',fmtK(b.est_tokens)),infoRow('re-reads','×'+b.turns_live),infoRow('preview',b.preview||'')]}));
+    if(!def.sections[3].controls.length) def.sections[3].controls=[infoRow('—','no attributed blocks')];
+    const SEV={high:'● HIGH',medium:'● MED',low:'○ LOW'};
+    def.sections[4].sub=((r.levers||[]).length)+' grounded recommendation'+((r.levers||[]).length===1?'':'s');
+    def.sections[4].controls=(r.levers||[]).map(lv=>({t:'exp',label:(SEV[lv.severity]||'')+'  '+lv.title,sub:lv.est_pct?('addresses ~'+Math.round(lv.est_pct)+'% of carried cost'):'',badge:lv.severity,controls:[infoRow('how',lv.detail)]}));
+    if(!def.sections[4].controls.length) def.sections[4].controls=[infoRow('—','already lean')];
+  },
+  set:{ sess:()=>{ if(openPageId==='cx-cost') openPage('cx-cost'); return null; } }},
  'cx-usage':{
   load: async def=>{
     const days={'7d':7,'30d':30,'90d':90}[pageVal('cx-usage','win')]||7;

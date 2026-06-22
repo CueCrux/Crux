@@ -14,6 +14,7 @@ mod cloud;
 mod console;
 mod context_surface;
 mod coord;
+mod cost;
 mod dataplane;
 mod dossier;
 mod engrams;
@@ -609,6 +610,9 @@ pub fn router(state: AppState) -> Router {
         )
         // Per-passport tool-usage rollup over the action ledger (action-ledger M3).
         .route("/v1/agents/{passport}/usage", get(self::agent_usage::get_agent_usage))
+        // Token-burn cost lens — POST a ground-truth report, GET it for the console.
+        .route("/v1/cost/report", get(self::cost::get_cost_report))
+        .route("/v1/cost/report", axum::routing::post(self::cost::post_cost_report))
         // Real-time event stream (SSE)
         .route("/v1/events/stream", get(self::events::event_stream))
         // Self-observation (crux-observe)

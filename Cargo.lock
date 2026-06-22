@@ -872,6 +872,7 @@ dependencies = [
  "corecrux-storage",
  "corecrux-types",
  "crc32c",
+ "crux-cost",
  "crux-integrations",
  "crux-session",
  "ed25519-dalek",
@@ -920,6 +921,7 @@ dependencies = [
  "corecrux-storage",
  "corecrux-types",
  "crc32fast",
+ "crux-cost",
  "crux-enterprise-shim",
  "crux-integrations",
  "crux-lens-features",
@@ -1263,6 +1265,14 @@ dependencies = [
  "blake3",
  "chrono",
  "ed25519-dalek",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "crux-cost"
+version = "0.3.1"
+dependencies = [
  "serde",
  "serde_json",
 ]
