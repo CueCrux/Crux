@@ -26,12 +26,15 @@
 //!   asserts `receipt_chain_ok` / `is_attributed` / `enrich_ok` across the
 //!   session and enumerates every failure (none silent).
 
+use std::borrow::Cow;
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::agentgraph_kinds::{observe_enabled, AGENT_TRACE_NODE_KIND};
 use corecrux_memory::events::CruxEvent;
 use corecrux_memory::EntityQuery;
+use crux_observe::redact::{RedactMode, Redactor};
 use crux_observe_api::{
     AuditStep, NodeKind, RiskClass, SessionAudit, StepStatus, TraceInput, TraceNode, TraceOutput, CONTRACT_VERSION,
 };
@@ -222,6 +225,46 @@ async fn upsert_node(state: &AppState, node: &TraceNode, actor: &str) -> Result<
 
 // ── M2: capture (open + close) ──────────────────────────────────────────────
 
+// ── Redact-then-sign (M2) ─────────────────────────────────────────────────
+//
+// The observe ingest lane folds `inputs[]` / `outputs[]` into an Ed25519-signed,
+// append-only hash chain. A secret signed into that chain cannot be retracted
+// without breaking it (T.4-adjacent), so we mask secret patterns in each `ref`
+// value **before** the node is built — redact-then-sign, never sign-then-regret.
+
+/// Redaction mode for the observe lane. Fails safe toward redaction: default
+/// `On` (mask before signing), decoupled from the log-sink `CORECRUXD_REDACT`
+/// default (`Audit`). Lane-scoped override: `CORECRUXD_OBSERVE_REDACT =
+/// off | audit | on` (anything else, or unset, ⇒ `On`).
+fn observe_redact_mode() -> RedactMode {
+    match std::env::var("CORECRUXD_OBSERVE_REDACT") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "off" => RedactMode::Off,
+            "audit" => RedactMode::Audit,
+            _ => RedactMode::On,
+        },
+        Err(_) => RedactMode::On,
+    }
+}
+
+/// Mask secret patterns in each input `ref`, in place (no-op in `Audit`/`Off`).
+fn redact_input_refs(redactor: &Redactor, inputs: &mut [TraceInput]) {
+    for input in inputs {
+        if let Cow::Owned(masked) = redactor.redact_value(&input.reference) {
+            input.reference = masked;
+        }
+    }
+}
+
+/// Mask secret patterns in each output `ref`, in place (no-op in `Audit`/`Off`).
+fn redact_output_refs(redactor: &Redactor, outputs: &mut [TraceOutput]) {
+    for output in outputs {
+        if let Cow::Owned(masked) = redactor.redact_value(&output.reference) {
+            output.reference = masked;
+        }
+    }
+}
+
 /// `POST /v1/observe/sessions/{id}/steps` — open a step.
 ///
 /// Mints the monotonic `seq`, stamps `status = running`, and persists a new
@@ -231,7 +274,7 @@ pub(super) async fn open_step(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<OpenStepBody>,
+    Json(mut body): Json<OpenStepBody>,
 ) -> Response {
     if !observe_enabled() {
         return observe_disabled();
@@ -245,6 +288,10 @@ pub(super) async fn open_step(
     if body.label.trim().is_empty() {
         return problem_response(StatusCode::BAD_REQUEST, "label is required");
     }
+
+    // Redact-then-sign (M2): mask secrets in input refs before the node is
+    // built and folded into the signed chain.
+    redact_input_refs(&Redactor::with_mode(observe_redact_mode()), &mut body.inputs);
 
     let seq = next_seq(&state, &session_id).await;
     let node_id = body
@@ -338,7 +385,10 @@ pub(super) async fn close_step(
 
 /// Mutate `node` in place from a [`CloseStepBody`]. Pure (no IO) so the close
 /// semantics are unit-testable without a daemon.
-fn apply_close(node: &mut TraceNode, body: CloseStepBody) {
+fn apply_close(node: &mut TraceNode, mut body: CloseStepBody) {
+    // Redact-then-sign (M2): mask secrets in output refs before they are
+    // appended to the node and re-folded into the signed chain.
+    redact_output_refs(&Redactor::with_mode(observe_redact_mode()), &mut body.outputs);
     // Append outputs, back-filling a step receipt onto any mutating output
     // that lacks its own.
     for mut out in body.outputs {
@@ -772,6 +822,104 @@ mod tests {
         // chain check is a single per-node gate, so exactly one receipt_chain
         // failure for node a.
         assert_eq!(report.failures.iter().filter(|f| f.check == "receipt_chain").count(), 1);
+    }
+
+    // ── Redact-then-sign (M2) ────────────────────────────────────────────
+
+    const AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+
+    #[test]
+    fn redact_input_refs_masks_secret_when_on() {
+        let mut inputs = vec![TraceInput::query(format!("grep for {AWS_KEY} in repo"), 1, 100)];
+        redact_input_refs(&Redactor::with_mode(RedactMode::On), &mut inputs);
+        assert!(
+            !inputs[0].reference.contains(AWS_KEY),
+            "secret must be masked before signing: {}",
+            inputs[0].reference
+        );
+        assert!(inputs[0].reference.contains("REDACTED"));
+    }
+
+    #[test]
+    fn redact_input_refs_passthrough_when_off() {
+        let original = format!("grep for {AWS_KEY} in repo");
+        let mut inputs = vec![TraceInput::query(original.clone(), 1, 100)];
+        redact_input_refs(&Redactor::with_mode(RedactMode::Off), &mut inputs);
+        assert_eq!(inputs[0].reference, original, "Off mode must not alter the value");
+    }
+
+    #[test]
+    fn redact_input_refs_counts_but_keeps_value_in_audit() {
+        // Audit = count-don't-alter: the value is unchanged so attribution
+        // survives, but the hit is tallied (no masking).
+        let original = format!("grep for {AWS_KEY} in repo");
+        let mut inputs = vec![TraceInput::query(original.clone(), 1, 100)];
+        redact_input_refs(&Redactor::with_mode(RedactMode::Audit), &mut inputs);
+        assert_eq!(inputs[0].reference, original);
+    }
+
+    #[test]
+    fn redact_output_refs_masks_secret_when_on() {
+        let mut outputs = vec![TraceOutput {
+            kind: OutputKind::Bash,
+            reference: format!("aws configure set secret {AWS_KEY}"),
+            added: None,
+            removed: None,
+            exit_code: Some(0),
+            mutation_receipt_id: None,
+        }];
+        redact_output_refs(&Redactor::with_mode(RedactMode::On), &mut outputs);
+        assert!(!outputs[0].reference.contains(AWS_KEY));
+        assert!(outputs[0].reference.contains("REDACTED"));
+    }
+
+    #[test]
+    fn apply_close_redacts_output_secret_before_chaining() {
+        let _guard = OBSERVE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("CORECRUXD_OBSERVE_REDACT", "on");
+        let mut node = running_node("n1", 1);
+        let body = CloseStepBody {
+            outputs: vec![TraceOutput {
+                kind: OutputKind::Bash,
+                reference: format!("curl -sS https://x/ && echo {AWS_KEY}"),
+                added: None,
+                removed: None,
+                exit_code: Some(0),
+                mutation_receipt_id: None,
+            }],
+            status: Some(StepStatus::Ok),
+            ..Default::default()
+        };
+        apply_close(&mut node, body);
+        std::env::remove_var("CORECRUXD_OBSERVE_REDACT");
+        let stored = &node.outputs[0].reference;
+        assert!(!stored.contains(AWS_KEY), "secret welded into node: {stored}");
+        assert!(stored.contains("REDACTED"));
+        // Redaction rewrites the ref before the node is (re)chained; a Bash
+        // output is not a mutation, so the chain stays internally consistent.
+        assert!(
+            node.receipt_chain_ok(),
+            "chain must still verify after redact-then-sign"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn observe_redact_mode_defaults_on_and_parses_overrides() {
+        let _guard = OBSERVE_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CORECRUXD_OBSERVE_REDACT");
+        assert_eq!(
+            observe_redact_mode(),
+            RedactMode::On,
+            "observe lane fails safe toward redaction"
+        );
+        std::env::set_var("CORECRUXD_OBSERVE_REDACT", "off");
+        assert_eq!(observe_redact_mode(), RedactMode::Off);
+        std::env::set_var("CORECRUXD_OBSERVE_REDACT", "audit");
+        assert_eq!(observe_redact_mode(), RedactMode::Audit);
+        std::env::set_var("CORECRUXD_OBSERVE_REDACT", "garbage");
+        assert_eq!(observe_redact_mode(), RedactMode::On, "unknown values fail safe to On");
+        std::env::remove_var("CORECRUXD_OBSERVE_REDACT");
     }
 
     // ── Handler: gating ───────────────────────────────────────────────────
