@@ -91,7 +91,13 @@ pub fn run_push(id: String, file: Option<String>, url: Option<String>) -> Result
         }
     };
     // Accept JSON; fall back to wrapping a plain string.
-    let state: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or(serde_json::Value::String(raw.clone()));
+    let mut state: serde_json::Value =
+        serde_json::from_str(raw.trim()).unwrap_or(serde_json::Value::String(raw.clone()));
+    // Session snapshots are stored as PUBLIC facts on the shared daemon (the
+    // `/v1/facts` plane forbids `private:true`), so they're readable by any
+    // facts:read caller across machines. Redact secret-shaped values before
+    // sharing — same best-effort filter as `config push` (not a guarantee).
+    let redacted = crate::config_bundle::redact_json(&mut state);
     let snapshot = serde_json::json!({
         "state": state,
         "source_host": hostname(),
@@ -109,7 +115,11 @@ pub fn run_push(id: String, file: Option<String>, url: Option<String>) -> Result
     }
     match req.send_json(body) {
         Ok(resp) if resp.status().as_u16() < 300 => {
-            println!("pushed session '{id}' snapshot ({} bytes) → {http_url}", raw.len());
+            println!(
+                "pushed session '{id}' snapshot ({} bytes{}) → {http_url}",
+                raw.len(),
+                if redacted { ", secrets redacted" } else { "" }
+            );
             Ok(())
         }
         Ok(resp) => {
@@ -220,6 +230,39 @@ mod tests {
         let reqs = h.join().unwrap();
         assert!(reqs[0].contains("__infra__::sessions"));
         assert!(reqs[0].contains("working_set"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn push_redacts_secrets_before_sharing() {
+        clean_home();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, "{}".to_string())]);
+        let file = std::env::temp_dir().join(format!("crux-sess-{}.json", uuid::Uuid::new_v4()));
+        // A snapshot carrying a token-shaped value + a secret-named key.
+        std::fs::write(
+            &file,
+            r#"{"working_set":["a.rs"],"api_key":"sk-1234567890abcdefghij","note":"AKIAIOSFODNN7EXAMPLE"}"#,
+        )
+        .unwrap();
+        run_push(
+            "sess-secret".to_string(),
+            Some(file.to_string_lossy().into_owned()),
+            Some(format!("http://127.0.0.1:{port}")),
+        )
+        .expect("push ok");
+        let reqs = h.join().unwrap();
+        // Public fact must not carry the raw secrets…
+        assert!(
+            !reqs[0].contains("sk-1234567890abcdefghij"),
+            "sk- token leaked into public fact"
+        );
+        assert!(
+            !reqs[0].contains("AKIAIOSFODNN7EXAMPLE"),
+            "AWS key leaked into public fact"
+        );
+        // …but the non-secret structure survives.
+        assert!(reqs[0].contains("working_set"));
+        assert!(reqs[0].contains("REDACTED"));
     }
 
     #[test]
