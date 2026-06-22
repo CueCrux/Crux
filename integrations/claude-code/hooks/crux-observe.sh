@@ -135,4 +135,53 @@ if [ "${HTTP_CODE}" != "201" ] && [ "${HTTP_CODE}" != "200" ]; then
   log_err "POST returned HTTP ${HTTP_CODE} for session=${SESSION_ID}"
 fi
 
+# ── Activity journal leg (crux-dual-surface-activity-log) ───────────────────
+# Opt-in (CRUX_HOOK_ACTIVITY=1): map the hook event to a readable journal kind
+# and append it to /v1/activity (the human-rich Activity lane that the console
+# renders). Questions + commands are captured live; answers/reasoning ride the
+# post-hoc `corecruxctl observe ingest` path. Fire-and-forget; fail-open.
+if [ "${CRUX_HOOK_ACTIVITY:-0}" = "1" ]; then
+  ACT_KIND=""
+  case "${KIND}" in
+    user_prompt) ACT_KIND="question" ;;
+    tool_use)    ACT_KIND="command"  ;;
+  esac
+  if [ -n "${ACT_KIND}" ]; then
+    ACT_TENANT="${CRUX_ACTIVITY_TENANT:-default}"
+    ACT_MAXTEXT="${CRUX_ACTIVITY_MAX_TEXT:-4000}"
+    ACT_BODY="$(mktemp "${TMPDIR:-/tmp}/crux-activity.XXXXXX" 2>/dev/null)" || ACT_BODY=""
+    if [ -n "${ACT_BODY}" ]; then
+      printf '%s' "${PAYLOAD_RAW}" | jq -c \
+        --arg kind "${ACT_KIND}" \
+        --arg sid "${SESSION_ID}" \
+        --arg tenant "${ACT_TENANT}" \
+        --argjson cap "${ACT_MAXTEXT}" '
+        def clip($s): if ($s|type)=="string" and ($s|length)>$cap then ($s[0:$cap] + "…") else $s end;
+        ( if $kind=="question" then (.prompt // .message // .text // "")
+          elif $kind=="command" then
+            ((.tool_name // .tool.name // "tool")
+             + (if (.tool_input|type)=="object"
+                then (": " + ((.tool_input.command // .tool_input.file_path // .tool_input.pattern // (.tool_input.description) // (.tool_input|tostring))|tostring))
+                else "" end))
+          else "" end ) as $txt
+        | ( if $kind=="command" then {tool: (.tool_name // .tool.name // null)} else {} end ) as $meta
+        | {tenant_id: $tenant, session_id: $sid, kind: $kind, text: clip($txt), meta: $meta, private: true}
+      ' > "${ACT_BODY}" 2>>"${ERR_LOG}"
+      if [ -s "${ACT_BODY}" ]; then
+        # Activity append needs a write scope; on jwt daemons the bearer carries
+        # it, on dev_scopes daemons the header does. Send both (header is ignored
+        # where a bearer is required).
+        ACT_AUTH=("${AUTH_ARGS[@]}")
+        ACT_AUTH+=(-H "X-Corecrux-Scopes: ${CRUX_ACTIVITY_SCOPES:-facts:write admin:write}")
+        ACT_CODE="$(curl -sS --max-time "${TIMEOUT}" -o /dev/null -w '%{http_code}' \
+          -X POST -H 'Content-Type: application/json' "${ACT_AUTH[@]}" \
+          --data-binary "@${ACT_BODY}" \
+          "${CORECRUXD_URL}/v1/activity" 2>>"${ERR_LOG}")"
+        [ "${ACT_CODE}" = "201" ] || log_err "activity POST HTTP ${ACT_CODE} (kind=${ACT_KIND})"
+      fi
+      rm -f "${ACT_BODY}"
+    fi
+  fi
+fi
+
 exit 0
