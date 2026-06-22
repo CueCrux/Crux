@@ -262,6 +262,7 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
         || path.starts_with("/v1/policy/")
         || path.starts_with("/v1/relations")
         || path.starts_with("/v1/agents/")
+        || path.starts_with("/v1/cost/")
         || path.starts_with("/v1/cloud/")
         || path.starts_with("/v1/actions/")
         || path.starts_with("/v1/workbench/")

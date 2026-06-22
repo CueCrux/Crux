@@ -15,6 +15,7 @@ members = [
   "crates/crux-integrations",
   "crates/crux-observe",
   "crates/crux-observe-api",
+  "crates/crux-cost",
   "crates/vaultcrux-local",
   "crates/crux-config-wizard",
   "crates/crux-lens-features",

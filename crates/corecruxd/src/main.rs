@@ -29,6 +29,7 @@ mod config;
 mod console_index;
 mod control;
 mod coord;
+mod cost;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]
 mod dataplane_store;

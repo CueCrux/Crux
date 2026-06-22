@@ -68,6 +68,7 @@ corecrux-receipts = { path = "../corecrux-receipts" }
 corecrux-segment = { path = "../corecrux-segment" }
 corecrux-storage = { path = "../corecrux-storage" }
 corecrux-types = { path = "../corecrux-types" }
+crux-cost = { path = "../crux-cost" }
 crux-observe = { path = "../crux-observe" }
 crux-observe-api = { path = "../crux-observe-api" }
 crux-integrations = { path = "../crux-integrations" }

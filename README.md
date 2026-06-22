@@ -7,10 +7,13 @@
 
 # CRUX
 
-### Memory your agents can **prove**.
+### Know what every coding session **cost** — then prove what your agent **did**.
 
-Crux is a local-first memory daemon for AI agents — fact storage with deterministic freshness
-decay, BM25 + graph retrieval under hard token budgets, and an Ed25519 receipt for every write.
+Crux opens on the one number you can't easily get anywhere else — your session's **token burn**:
+how much context every model call re-read, where it went, and what to change to cut it
+(`corecruxctl session cost`, or the **Token burn** console page). Underneath, it's a local-first
+**signed recorder** for AI agents — fact storage with deterministic freshness decay, BM25 + graph
+retrieval under hard token budgets, and an Ed25519 receipt for every write.
 One binary. No API keys. Nothing leaves your machine.
 
 [Quickstart](#quickstart) · [Console](#the-console) · [How it works](#how-it-works) ·
