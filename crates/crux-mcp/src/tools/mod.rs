@@ -15,6 +15,7 @@ pub mod artefacts;
 pub mod audit;
 pub mod audit_export;
 pub mod autonomy;
+pub mod consolidation;
 pub mod constraint;
 pub mod coordination;
 pub mod cuecrux_session;
@@ -585,6 +586,59 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                 "examples": [
                     { "token_budget": 500 },
                     { "top_k": 100, "token_budget": 2000 }
+                ]
+            }),
+        },
+        // ── Contradiction surfacing + safe consolidation (Audit II M4) ─
+        ToolDefinition {
+            name: "memory_contradictions".to_string(),
+            description: "Janitor (read-only): list contradiction CANDIDATES — active, \
+                          non-superseded facts that share the same (entity, key) but carry \
+                          opposite deterministic polarity (e.g. enabled vs disabled, \
+                          active vs inactive). NON-mutating: it only DETECTS + SURFACES, \
+                          never resolves. Resolve explicitly via memory_consolidate. Pass \
+                          `token_budget` (default 500) per QC.2. Enabled by default; set \
+                          CORECRUXD_FEATURE_CONSOLIDATION=0 to disable."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit":        { "type": "integer", "description": "Maximum candidate groups", "default": 50 },
+                    "token_budget": { "type": "integer", "description": "Token budget cap", "default": 500 }
+                },
+                "examples": [
+                    { "token_budget": 500 },
+                    { "limit": 100, "token_budget": 2000 }
+                ]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_consolidate".to_string(),
+            description: "Explicit resolve (write): collapse the named target facts under \
+                          one (entity, key) into a single canonical fact, superseding the \
+                          targets (history preserved — never hard-deleted) and emitting a \
+                          consolidation receipt. Requires an authenticated passport. REFUSES \
+                          to collapse PROTECTED targets — pinned (pass them in \
+                          `protected_fact_ids`), receipt-linked, private, or high-confidence \
+                          (>= `protected_confidence_floor`, default 0.99). Enabled by \
+                          default; set CORECRUXD_FEATURE_CONSOLIDATION=0 to disable."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity":          { "type": "string", "description": "Entity all targets + the canonical fact share" },
+                    "key":             { "type": "string", "description": "Key all targets + the canonical fact share" },
+                    "canonical_value": { "type": "string", "description": "Value for the surviving canonical fact" },
+                    "target_fact_ids": { "type": "array", "items": { "type": "string" }, "description": "Fact ids to collapse (non-empty); each must be in (entity,key) and unprotected" },
+                    "protected_fact_ids": { "type": "array", "items": { "type": "string" }, "description": "Caller-pinned fact ids: if any appears in target_fact_ids the call is rejected" },
+                    "confidence":      { "type": "number", "description": "Confidence for the canonical fact (default 1.0)" },
+                    "protected_confidence_floor": { "type": "number", "description": "Targets with confidence >= this floor are refused (default 0.99)" },
+                    "consolidation_id": { "type": "string", "description": "Optional stable id for the receipt; auto-generated if omitted" },
+                    "horizon_class":   { "type": "string", "enum": ["volatile", "medium", "stable", "none"], "description": "Optional horizon class for the canonical fact" }
+                },
+                "required": ["entity", "key", "canonical_value", "target_fact_ids"],
+                "examples": [
+                    { "entity": "proj", "key": "status", "canonical_value": "active", "target_fact_ids": ["f_old", "f_dup"] }
                 ]
             }),
         },
@@ -2461,6 +2515,8 @@ pub fn tool_output_docs() -> Value {
         { "tool": "memory_history",     "output": "{ content: [...], structuredContent: { versions: [{id, value, version, stored_at, supersedes, deleted, source_receipt}] } } — consumer-friendly version chain (excludes reserved prefixes)." },
         { "tool": "memory_freshness",   "output": "{ rows: [{fact_id, entity, key, horizon_class, freshness, age_hours, stored_at, reverified_at?}], policy: {volatile_stale_hours, medium_stale_days, stable_stale_days}, now }" },
         { "tool": "memory_sweep_candidates", "output": "{ content: [...], structuredContent: { rows: [{fact_id, entity, key, reason: 'stale'|'superseded'|'stale+superseded', freshness, horizon_class, age_hours, superseded_by?, stored_at}], dry_run: true, now } } — read-only janitor; nothing mutated." },
+        { "tool": "memory_contradictions", "output": "{ content: [...], structuredContent: { candidates: [{entity, key, reason, polarity_a, polarity_b, fact_ids: [string], values: [string]}], count, limit, dry_run: true } } — read-only Audit II M1 pass; surfaces opposite-polarity facts under one (entity,key); nothing mutated." },
+        { "tool": "memory_consolidate", "output": "{ content: [...], structuredContent: { status: 'consolidated', receipt: { consolidation_id, canonical_fact_id, superseded_fact_ids: [string], source_fact_ids: [string] } } } — Audit II M2 explicit resolve; refuses protected (pinned/receipt-linked/private/high-confidence) targets with a CAPABILITY_DENIED + {reason}; preserves history." },
         { "tool": "memory_set_horizon", "output": "{ fact_id, horizon_class, ok: bool }" },
         { "tool": "memory_reverify",    "output": "{ fact_id, receipt_id, receipt_class: 'Reverify', reverified_at }" },
         { "tool": "artefact_put",       "output": "{ content: [...], structuredContent: { artefact_id, mime_type, tool_origin, size_bytes, created_at, expires_at } } — id is `art_<blake3_hex>`; identical bytes coalesce." },
@@ -2593,6 +2649,9 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         // Freshness + decay (agent-ux-03 M3).
         "memory_freshness" => freshness::handle_memory_freshness(args, ctx).await,
         "memory_sweep_candidates" => freshness::handle_memory_sweep_candidates(args, ctx).await,
+        // Contradiction surfacing + safe consolidation (Audit II M4).
+        "memory_contradictions" => consolidation::handle_memory_contradictions(args, ctx).await,
+        "memory_consolidate" => consolidation::handle_memory_consolidate(args, ctx).await,
         "memory_set_horizon" => freshness::handle_memory_set_horizon(args, ctx).await,
         "memory_reverify" => freshness::handle_memory_reverify(args, ctx).await,
         // Artefacts (agent-ux-12).
@@ -2780,7 +2839,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 107; // main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2).
+    const TOOL_COUNT: usize = 109; // main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
