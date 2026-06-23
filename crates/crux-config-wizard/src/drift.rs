@@ -17,6 +17,10 @@ use crate::Target;
 pub struct DriftReport {
     pub drifted: bool,
     pub details: Vec<String>,
+    /// Advisory warnings (free-span duplication, oversize composed file) that
+    /// `regenerate` cannot fix — surfaced separately from drift `details`, and
+    /// they do NOT set `drifted`.
+    pub warnings: Vec<String>,
 }
 
 impl DriftReport {
@@ -50,6 +54,7 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<DriftReport> {
             return Ok(DriftReport {
                 drifted: false,
                 details: Vec::new(),
+                warnings: Vec::new(),
             });
         }
     };
@@ -59,6 +64,7 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<DriftReport> {
             return Ok(DriftReport {
                 drifted: true,
                 details: vec![format!("failed to load bundled profiles: {e}")],
+                warnings: Vec::new(),
             });
         }
     };
@@ -103,7 +109,11 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<DriftReport> {
     }
 
     let drifted = !details.is_empty();
-    Ok(DriftReport { drifted, details })
+    Ok(DriftReport {
+        drifted,
+        details,
+        warnings: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -124,6 +134,7 @@ mod tests {
         let r = DriftReport {
             drifted: false,
             details: Vec::new(),
+            warnings: Vec::new(),
         };
         assert!(r.message_for_claude().is_empty());
     }
@@ -133,6 +144,7 @@ mod tests {
         let r = DriftReport {
             drifted: true,
             details: vec!["profile 'x' is at v1 in config but v2 in the crate".into()],
+            warnings: Vec::new(),
         };
         let msg = r.message_for_claude();
         assert!(msg.contains("out of date"));
@@ -145,6 +157,7 @@ mod tests {
         let r = DriftReport {
             drifted: true,
             details: Vec::new(),
+            warnings: Vec::new(),
         };
         let msg = r.message_for_claude();
         assert!(msg.contains("regenerate"));

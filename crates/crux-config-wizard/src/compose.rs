@@ -37,6 +37,28 @@ pub struct ComposeReport {
     pub managed_sections_updated: usize,
     pub managed_sections_added: usize,
     pub drift_detected: Vec<String>,
+    /// Total bytes of the composed file (free + managed spans). The M2 size
+    /// budget reads this.
+    pub composed_bytes: usize,
+    /// Bytes occupied by free spans (text outside the managed markers).
+    pub free_span_bytes: usize,
+    /// Enabled managed profiles whose body is substantially restated in the
+    /// file's free spans (the M1 duplication lint). Advisory only — the
+    /// composer never rewrites free spans.
+    pub free_span_overlaps: Vec<FreeSpanOverlap>,
+}
+
+/// One enabled managed profile whose rule text is substantially duplicated in
+/// the file's free spans (text outside the `<!-- ... MANAGED ... -->` markers).
+/// `regenerate` cannot fix this — a human/agent must replace the duplicated
+/// prose with a pointer to the managed section.
+#[derive(Debug, Clone)]
+pub struct FreeSpanOverlap {
+    pub profile: String,
+    pub matched_lines: usize,
+    pub distinctive_lines: usize,
+    /// One representative duplicated line, for triage in the warning text.
+    pub sample: String,
 }
 
 /// Compose `target` (CLAUDE.md or AGENTS.md) by replacing managed sections
@@ -152,12 +174,34 @@ pub fn compose_file(
         false
     };
 
+    let composed_bytes = new_text.len();
+    let free_span_bytes = spans
+        .iter()
+        .map(|s| match s {
+            Span::Free(t) => t.len(),
+            Span::Managed(_) => 0,
+        })
+        .sum();
+    let free_span_overlaps = detect_free_span_overlaps(&spans, &relevant);
+
     Ok(ComposeReport {
         wrote,
         managed_sections_updated: updated,
         managed_sections_added: added,
         drift_detected: drift,
+        composed_bytes,
+        free_span_bytes,
+        free_span_overlaps,
     })
+}
+
+/// Detect free-span text that substantially restates an enabled managed
+/// profile's body. Compares each fragment's "distinctive lines" (non-blank,
+/// non-heading, non-table, length-gated) against the concatenated free-span
+/// text. Advisory: never mutates anything. (Populated in M1; M0 stub returns
+/// empty.)
+fn detect_free_span_overlaps(_spans: &[Span], _relevant: &[&ProfileFragment]) -> Vec<FreeSpanOverlap> {
+    Vec::new()
 }
 
 fn render_full_section(f: &ProfileFragment) -> String {
