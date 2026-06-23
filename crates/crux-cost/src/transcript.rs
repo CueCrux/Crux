@@ -52,6 +52,12 @@ pub struct ContentBlock {
     pub text_chars: usize,
     /// Single-lined preview (≤80 chars; thinking is redacted).
     pub preview: String,
+    /// Full block text — populated **only** when parsed via
+    /// [`parse_str_capturing`] / [`parse_file_capturing`] (the M3 ingester
+    /// path); `None` in the default redact-by-default mode. For thinking blocks
+    /// this is the raw reasoning, surfaced solely so the ingester can summarise
+    /// it — never persisted as-is (R1).
+    pub text: Option<String>,
 }
 
 /// A parsed transcript record.
@@ -73,12 +79,26 @@ pub struct Event {
 /// # Errors
 /// Returns the underlying [`std::io::Error`] if the file cannot be opened.
 pub fn parse_file(path: &Path) -> std::io::Result<Vec<Event>> {
-    let file = std::fs::File::open(path)?;
-    Ok(parse_reader(BufReader::new(file)))
+    parse_file_opts(path, false)
 }
 
-/// Parse from any reader, line by line, skipping malformed lines.
-pub fn parse_reader<R: Read>(reader: BufReader<R>) -> Vec<Event> {
+/// Like [`parse_file`] but captures full block text into [`ContentBlock::text`]
+/// (the M3 ingester path; raw thinking is surfaced only to summarise it).
+///
+/// # Errors
+/// Returns the underlying [`std::io::Error`] if the file cannot be opened.
+pub fn parse_file_capturing(path: &Path) -> std::io::Result<Vec<Event>> {
+    parse_file_opts(path, true)
+}
+
+fn parse_file_opts(path: &Path, capture: bool) -> std::io::Result<Vec<Event>> {
+    let file = std::fs::File::open(path)?;
+    Ok(parse_reader(BufReader::new(file), capture))
+}
+
+/// Parse from any reader, line by line, skipping malformed lines. `capture`
+/// fills [`ContentBlock::text`] with the full block text.
+pub fn parse_reader<R: Read>(reader: BufReader<R>, capture: bool) -> Vec<Event> {
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut events = Vec::new();
     for line in reader.lines() {
@@ -88,7 +108,7 @@ pub fn parse_reader<R: Read>(reader: BufReader<R>) -> Vec<Event> {
             continue;
         }
         if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-            events.push(parse_record(&value, &mut tool_names));
+            events.push(parse_record(&value, &mut tool_names, capture));
         }
     }
     events
@@ -98,16 +118,26 @@ pub fn parse_reader<R: Read>(reader: BufReader<R>) -> Vec<Event> {
 /// tests and small inputs.
 #[must_use]
 pub fn parse_str(text: &str) -> Vec<Event> {
+    parse_str_opts(text, false)
+}
+
+/// Like [`parse_str`] but captures full block text into [`ContentBlock::text`].
+#[must_use]
+pub fn parse_str_capturing(text: &str) -> Vec<Event> {
+    parse_str_opts(text, true)
+}
+
+fn parse_str_opts(text: &str, capture: bool) -> Vec<Event> {
     let mut tool_names: HashMap<String, String> = HashMap::new();
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .map(|v| parse_record(&v, &mut tool_names))
+        .map(|v| parse_record(&v, &mut tool_names, capture))
         .collect()
 }
 
-fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>) -> Event {
+fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>, capture: bool) -> Event {
     let session_id = value.get("sessionId").and_then(Value::as_str).map(str::to_owned);
     let rtype = value.get("type").and_then(Value::as_str);
 
@@ -130,10 +160,10 @@ fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>) -> Even
         .and_then(parse_usage);
 
     let blocks = if rtype == Some("attachment") {
-        attachment_blocks(value)
+        attachment_blocks(value, capture)
     } else {
         match (kind, message) {
-            (EventKind::Assistant | EventKind::User, Some(msg)) => extract_blocks(msg, kind, tool_names),
+            (EventKind::Assistant | EventKind::User, Some(msg)) => extract_blocks(msg, kind, tool_names, capture),
             _ => Vec::new(),
         }
     };
@@ -148,11 +178,11 @@ fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>) -> Even
 
 /// A top-level `type:"attachment"` record stores its payload in the
 /// `attachment` field (not `message.content`).
-fn attachment_blocks(value: &Value) -> Vec<ContentBlock> {
+fn attachment_blocks(value: &Value, capture: bool) -> Vec<ContentBlock> {
     match value.get("attachment") {
         Some(a) if !a.is_null() => {
             let text = value_to_text(a);
-            vec![text_block("attachment", None, &text)]
+            vec![text_block("attachment", None, &text, capture)]
         }
         _ => Vec::new(),
     }
@@ -197,7 +227,12 @@ fn parse_usage(raw: &Value) -> Option<Measured> {
     })
 }
 
-fn extract_blocks(message: &Value, kind: EventKind, tool_names: &mut HashMap<String, String>) -> Vec<ContentBlock> {
+fn extract_blocks(
+    message: &Value,
+    kind: EventKind,
+    tool_names: &mut HashMap<String, String>,
+    capture: bool,
+) -> Vec<ContentBlock> {
     let content = match message.get("content") {
         Some(c) => c,
         None => return Vec::new(),
@@ -213,7 +248,7 @@ fn extract_blocks(message: &Value, kind: EventKind, tool_names: &mut HashMap<Str
         } else {
             "assistant_prose"
         };
-        return vec![text_block(source, None, text)];
+        return vec![text_block(source, None, text, capture)];
     }
 
     let Some(items) = content.as_array() else {
@@ -222,14 +257,19 @@ fn extract_blocks(message: &Value, kind: EventKind, tool_names: &mut HashMap<Str
 
     let mut blocks = Vec::new();
     for item in items {
-        if let Some(block) = parse_block(item, kind, tool_names) {
+        if let Some(block) = parse_block(item, kind, tool_names, capture) {
             blocks.push(block);
         }
     }
     blocks
 }
 
-fn parse_block(item: &Value, kind: EventKind, tool_names: &mut HashMap<String, String>) -> Option<ContentBlock> {
+fn parse_block(
+    item: &Value,
+    kind: EventKind,
+    tool_names: &mut HashMap<String, String>,
+    capture: bool,
+) -> Option<ContentBlock> {
     match item.get("type").and_then(Value::as_str)? {
         "text" => {
             let text = item.get("text").and_then(Value::as_str).unwrap_or_default();
@@ -238,19 +278,20 @@ fn parse_block(item: &Value, kind: EventKind, tool_names: &mut HashMap<String, S
             } else {
                 "assistant_prose"
             };
-            Some(text_block(source, None, text))
+            Some(text_block(source, None, text, capture))
         }
         "thinking" => {
-            // Count the tokens, but never surface the reasoning text (R1 posture).
-            let chars = item
-                .get("thinking")
-                .and_then(Value::as_str)
-                .map_or(0, |s| s.chars().count());
+            // Always redact the preview (R1 posture); carry the raw text only
+            // when explicitly capturing (the ingester summarises it, never
+            // persists it).
+            let raw = item.get("thinking").and_then(Value::as_str).unwrap_or_default();
+            let chars = raw.chars().count();
             Some(ContentBlock {
                 source: "assistant_thinking".to_owned(),
                 tool: None,
                 text_chars: chars,
                 preview: format!("(thinking · {chars} chars · redacted)"),
+                text: capture.then(|| raw.to_owned()),
             })
         }
         "tool_use" => {
@@ -259,7 +300,12 @@ fn parse_block(item: &Value, kind: EventKind, tool_names: &mut HashMap<String, S
                 tool_names.insert(id.to_owned(), name.clone());
             }
             let input_text = item.get("input").map(value_to_text).unwrap_or_default();
-            Some(text_block(&format!("tool_use_args:{name}"), Some(name), &input_text))
+            Some(text_block(
+                &format!("tool_use_args:{name}"),
+                Some(name),
+                &input_text,
+                capture,
+            ))
         }
         "tool_result" => {
             let name = item
@@ -269,7 +315,12 @@ fn parse_block(item: &Value, kind: EventKind, tool_names: &mut HashMap<String, S
                 .cloned()
                 .unwrap_or_else(|| "unknown".to_owned());
             let result_text = item.get("content").map(value_to_text).unwrap_or_default();
-            Some(text_block(&format!("tool_result:{name}"), Some(name), &result_text))
+            Some(text_block(
+                &format!("tool_result:{name}"),
+                Some(name),
+                &result_text,
+                capture,
+            ))
         }
         // Images count as a tiny fixed marker, never the base64 payload
         // (matches TokenBurn; avoids a base64 spike dominating attribution).
@@ -279,18 +330,19 @@ fn parse_block(item: &Value, kind: EventKind, tool_names: &mut HashMap<String, S
             } else {
                 "assistant_image"
             };
-            Some(text_block(source, None, "[image]"))
+            Some(text_block(source, None, "[image]", capture))
         }
         _ => None,
     }
 }
 
-fn text_block(source: &str, tool: Option<String>, text: &str) -> ContentBlock {
+fn text_block(source: &str, tool: Option<String>, text: &str, capture: bool) -> ContentBlock {
     ContentBlock {
         source: source.to_owned(),
         tool,
         text_chars: text.chars().count(),
         preview: preview_of(text),
+        text: capture.then(|| text.to_owned()),
     }
 }
 

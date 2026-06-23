@@ -110,7 +110,12 @@ fn value_looks_secret(s: &str) -> bool {
 
 /// Recursively redact secrets: values under secret-looking keys, plus any string
 /// value that looks like a token. Returns whether anything was redacted.
-fn redact_json(value: &mut serde_json::Value) -> bool {
+///
+/// Shared with `session push` (`session_sync.rs`) so session snapshots get the
+/// same best-effort masking before they land as a public fact on the shared
+/// daemon. Not a security boundary — a convenience filter for common token
+/// shapes; see the module docs.
+pub(crate) fn redact_json(value: &mut serde_json::Value) -> bool {
     fn redact_entry(key: Option<&str>, v: &mut serde_json::Value) -> bool {
         let key_secret = key.is_some_and(key_is_secret);
         match v {

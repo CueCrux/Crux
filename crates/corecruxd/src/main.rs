@@ -23,6 +23,7 @@
 //! workspace-scan + storyline materialiser. Configuration is
 //! environment-variable driven; see `config.example.env`.
 
+mod activity;
 mod agentgraph_kinds;
 mod auth;
 mod config;

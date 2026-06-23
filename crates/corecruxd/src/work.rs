@@ -94,6 +94,15 @@ pub struct WorkItem {
     /// + `#[serde(default)]` so existing records remain byte-compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_id: Option<String>,
+    /// ExecPlan milestone progress: how many declared milestones are done and
+    /// the total declared. Populated only for ExecPlan-aggregator items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestones_done: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestones_total: Option<u32>,
+    /// Number of notes (work comments) attached to this item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -181,6 +190,9 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         current_milestone: None,
         superseded_by: None,
         orchestrator_id: None,
+        milestones_done: None,
+        milestones_total: None,
+        notes_count: None,
     };
     write_record(store, &item)?;
     write_transition(
@@ -259,7 +271,9 @@ pub struct UpdateWorkContext {
 
 #[derive(Debug)]
 pub enum UpdateOutcome {
-    Applied(WorkItem),
+    // Boxed: WorkItem is much larger than PendingGateAction (clippy
+    // large_enum_variant); this enum is a transient return value.
+    Applied(Box<WorkItem>),
     Queued(PendingGateAction),
 }
 
@@ -332,7 +346,7 @@ pub fn update_work(
             )?;
         }
     }
-    Ok(UpdateOutcome::Applied(item))
+    Ok(UpdateOutcome::Applied(Box::new(item)))
 }
 
 fn apply_non_state_fields(item: &mut WorkItem, input: &UpdateWorkInput) {
