@@ -1541,9 +1541,18 @@ pub(super) async fn get_console_sessions(
 
     let store = state.session_store.read().await;
 
+    // A session is "active" if it was written within this window, "idle" beyond
+    // it, "archived" if soft-archived. `updated_at` is refreshed on every
+    // `put()`, so it is the authoritative last-activity signal — the console
+    // previously surfaced none, which is why every tile read as idle.
+    const LIVE_WINDOW_MS: i64 = 15 * 60 * 1000; // 15 min (matches coord presence TTL)
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
     // Build structured rows: friendly title (scoped prefix stripped), owning
-    // agent, the raw key (needed by the console to issue archive calls), and the
-    // archive flag. Archived rows are hidden unless `include_archived=true`.
+    // agent, the raw key (needed by the console to issue archive calls), the
+    // archive flag, plus last-active time + derived live state (the console
+    // sorts by recency, splits archived out, and time-filters on these).
+    // Archived rows are hidden unless `include_archived=true`.
     let mut rows: Vec<serde_json::Value> = store
         .list_filtered(query.include_archived)
         .into_iter()
@@ -1553,18 +1562,35 @@ pub(super) async fn get_console_sessions(
                 Some((owner, logical)) => (Some(owner.to_string()), logical.to_string()),
                 None => (None, raw_key.clone()),
             };
+            let last_active_ms = session.updated_at.timestamp_millis();
+            let live_state = if session.archived {
+                "archived"
+            } else if now_ms.saturating_sub(last_active_ms) <= LIVE_WINDOW_MS {
+                "active"
+            } else {
+                "idle"
+            };
             serde_json::json!({
                 "session_id": title,
                 "agent": agent,
                 "raw_key": raw_key,
                 "archived": session.archived,
                 "archived_at": session.archived_at,
+                "last_active_unix_ms": last_active_ms,
+                "updated_at": session.updated_at.to_rfc3339(),
+                "state": live_state,
             })
         })
         .collect();
-    rows.sort_by(|a, b| a["session_id"].as_str().cmp(&b["session_id"].as_str()));
-    if rows.len() > 50 {
-        rows.truncate(50);
+    // Most-recently-active first (was alphabetic by id).
+    rows.sort_by(|a, b| {
+        b["last_active_unix_ms"]
+            .as_i64()
+            .unwrap_or(0)
+            .cmp(&a["last_active_unix_ms"].as_i64().unwrap_or(0))
+    });
+    if rows.len() > 100 {
+        rows.truncate(100);
     }
 
     // Backward-compatible flat list of friendly ids (consumed by the classic
