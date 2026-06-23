@@ -106,6 +106,10 @@ pub enum OutputKind {
     Bash,
     /// A fact stored through the substrate.
     Fact,
+    /// The assistant's text answer for the turn — captured by the M3 transcript
+    /// ingester. Prose, not a durable mutation, so `is_mutation` is false and no
+    /// CROWN receipt is required.
+    Answer,
 }
 
 impl OutputKind {

@@ -53,7 +53,7 @@ pub fn run_cost(
 
 // ── transcript discovery ────────────────────────────────────────────────────
 
-fn resolve_transcript(file: Option<String>, session: Option<String>) -> Result<PathBuf, DynErr> {
+pub(crate) fn resolve_transcript(file: Option<String>, session: Option<String>) -> Result<PathBuf, DynErr> {
     if let Some(f) = file {
         let p = PathBuf::from(f);
         if !p.is_file() {

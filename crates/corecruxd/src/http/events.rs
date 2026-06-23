@@ -73,6 +73,7 @@ pub(super) async fn event_stream(
                     corecrux_memory::events::CruxEvent::AuditStep { .. } => "observe.audit_step",
                     corecrux_memory::events::CruxEvent::OrchestratorChanged { .. } => "orchestrator.changed",
                     corecrux_memory::events::CruxEvent::PunchcardChanged { .. } => "punchcard.changed",
+                    corecrux_memory::events::CruxEvent::ActivityAppended { .. } => "activity.appended",
                 };
                 if let Some(ref f) = filter {
                     if !f.contains(event_type) {

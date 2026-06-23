@@ -20,6 +20,11 @@ const PLAYGROUND_HTML: &str = include_str!("../playground/index.html");
 // this const) in a follow-up once panel parity is confirmed. See ExecPlan
 // crux-console-graph-cutover-2026-05-30.
 const CLASSIC_HTML: &str = include_str!("../playground/index.classic.html");
+// Activity log human lane (ExecPlan crux-dual-surface-activity-log-2026-06-18,
+// M3). A new self-contained page on the embedded console, served at
+// `/console/activity`. The page itself is inert unless the daemon has
+// `CORECRUXD_FEATURE_ACTIVITY_LOG=1` (its API calls 404 otherwise).
+const ACTIVITY_HTML: &str = include_str!("../playground/activity.html");
 const CONSOLE_DEV_PATH_ENV: &str = "CORECRUXD_CONSOLE_DEV_PATH";
 
 // Bundled PNG assets — embedded so the binary can serve them with no on-disk
@@ -56,6 +61,22 @@ async fn serve_console() -> impl IntoResponse {
 /// cutover escape hatch served from the same binary.
 async fn serve_classic() -> impl IntoResponse {
     Html(CLASSIC_HTML)
+}
+
+/// Activity log human-lane page (M3), served at `/console/activity`. A dev
+/// override (`CORECRUXD_CONSOLE_DEV_PATH`) reads `activity.html` next to the
+/// console index so the page can be iterated without a rebuild.
+async fn serve_activity() -> impl IntoResponse {
+    if let Some(dev_path) = std::env::var(CONSOLE_DEV_PATH_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let file_path = resolve_dev_html_path(Path::new(dev_path.trim())).with_file_name("activity.html");
+        if let Ok(contents) = std::fs::read_to_string(&file_path) {
+            return Html(contents).into_response();
+        }
+    }
+    Html(ACTIVITY_HTML).into_response()
 }
 
 async fn redirect_to_console() -> impl IntoResponse {
@@ -142,6 +163,7 @@ pub fn routes(enabled: bool) -> Router {
     Router::new()
         .route("/", get(redirect_to_console))
         .route("/console", get(serve_console))
+        .route("/console/activity", get(serve_activity))
         .route("/console-classic", get(serve_classic))
         .route("/playground", get(serve_console))
         .route("/console-assets/{name}", get(serve_console_asset))
@@ -340,6 +362,43 @@ mod tests {
                 "missing lane-weight console marker: {required}"
             );
         }
+    }
+
+    #[test]
+    fn activity_page_wires_both_lanes_and_stays_dependency_free() {
+        // Capture/agent-lane endpoints + live stream are wired.
+        for required in [
+            "/v1/activity?",
+            "/v1/activity/turn/",
+            "/v1/events/stream?types=activity.appended",
+            "/v1/receipts/", // verify cross-walk badge
+            "token_budget",
+            "CORECRUXD_FEATURE_ACTIVITY_LOG",
+        ] {
+            assert!(
+                super::ACTIVITY_HTML.contains(required),
+                "activity page missing wiring: {required}"
+            );
+        }
+        // Same security posture as the console shell — no external runtime deps.
+        for blocked in [
+            r#"<script src="http"#,
+            r#"<link rel="stylesheet" href="http"#,
+            r#"<iframe src="http"#,
+            "unpkg.com",
+            "jsdelivr.net",
+            "cdnjs.cloudflare",
+        ] {
+            assert!(
+                !super::ACTIVITY_HTML.contains(blocked),
+                "activity page has external runtime dependency: {blocked}"
+            );
+        }
+        // The main console links to the new page.
+        assert!(
+            super::PLAYGROUND_HTML.contains(r#"href="/console/activity""#),
+            "console shell should link to the activity page"
+        );
     }
 
     #[test]

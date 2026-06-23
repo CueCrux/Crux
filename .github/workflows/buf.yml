@@ -19,7 +19,7 @@ jobs:
     # proto files are reorganised into subdirectories.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: bufbuild/buf-action@v1
         with:
           setup_only: true
@@ -33,7 +33,7 @@ jobs:
     if: github.event_name == 'release'
     needs: lint
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: bufbuild/buf-action@v1
         with:
           setup_only: true

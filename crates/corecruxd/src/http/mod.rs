@@ -5,6 +5,7 @@
 //! Top-level HTTP module: composes the axum `Router`, defines `AppState`, declares all `/v1/*` route handlers.
 
 mod actions;
+mod activity;
 mod admin;
 mod agent_usage;
 mod append;
@@ -446,6 +447,9 @@ pub fn router(state: AppState) -> Router {
             get(self::projections::get_projection_modules),
         )
         // Phase 7: Entity projection query endpoints
+        .route("/v1/activity", get(self::activity::get_activity))
+        .route("/v1/activity", axum::routing::post(self::activity::post_activity))
+        .route("/v1/activity/turn/{turn_id}", get(self::activity::get_activity_turn))
         .route("/v1/projections/entity/count", get(self::projections::get_entity_count))
         .route("/v1/projections/entity/timeline", get(self::projections::get_entity_timeline))
         .route("/v1/projections/entity/current-state", get(self::projections::get_entity_current_state))

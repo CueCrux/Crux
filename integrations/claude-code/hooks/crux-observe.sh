@@ -135,4 +135,77 @@ if [ "${HTTP_CODE}" != "201" ] && [ "${HTTP_CODE}" != "200" ]; then
   log_err "POST returned HTTP ${HTTP_CODE} for session=${SESSION_ID}"
 fi
 
+# ── Activity journal leg (crux-dual-surface-activity-log) ───────────────────
+# Opt-in (CRUX_HOOK_ACTIVITY=1): map the hook event to a readable journal kind
+# and append it to /v1/activity (the human-rich Activity lane the console
+# renders): user_prompt→question, tool_use→command, stop→answer (the last
+# assistant text pulled from the turn's transcript). Reasoning rides the
+# post-hoc `corecruxctl observe ingest` path. Fire-and-forget; fail-open.
+if [ "${CRUX_HOOK_ACTIVITY:-0}" = "1" ]; then
+  ACT_KIND=""; ACT_TOOL=""
+  case "${KIND}" in
+    user_prompt) ACT_KIND="question" ;;
+    tool_use)    ACT_KIND="command"  ;;
+    stop)        ACT_KIND="answer"   ;;
+  esac
+  if [ -n "${ACT_KIND}" ]; then
+    ACT_TENANT="${CRUX_ACTIVITY_TENANT:-default}"
+    ACT_MAXTEXT="${CRUX_ACTIVITY_MAX_TEXT:-4000}"
+    ACT_TXT="$(mktemp "${TMPDIR:-/tmp}/crux-act-txt.XXXXXX" 2>/dev/null)" || ACT_TXT=""
+    ACT_BODY="$(mktemp "${TMPDIR:-/tmp}/crux-act.XXXXXX" 2>/dev/null)" || ACT_BODY=""
+    if [ -n "${ACT_TXT}" ] && [ -n "${ACT_BODY}" ]; then
+      # Derive the entry text per kind (written to a file → jq --rawfile, so a
+      # long prompt/answer never hits ARG_MAX).
+      case "${ACT_KIND}" in
+        question)
+          printf '%s' "${PAYLOAD_RAW}" | jq -r '.prompt // .message // .text // ""' > "${ACT_TXT}" 2>>"${ERR_LOG}" ;;
+        command)
+          ACT_TOOL="$(printf '%s' "${PAYLOAD_RAW}" | jq -r '.tool_name // .tool.name // "tool"' 2>>"${ERR_LOG}")"
+          printf '%s' "${PAYLOAD_RAW}" | jq -r '
+            (.tool_name // .tool.name // "tool")
+            + (if (.tool_input|type)=="object"
+               then ": " + ((.tool_input.command // .tool_input.file_path // .tool_input.pattern // .tool_input.description // (.tool_input|tostring))|tostring)
+               else "" end)' > "${ACT_TXT}" 2>>"${ERR_LOG}" ;;
+        answer)
+          # The Stop event carries the transcript path; the answer is the last
+          # assistant message's text (thinking is excluded). Bound the scan to
+          # the file's tail so this stays cheap on big transcripts.
+          ACT_TR="$(printf '%s' "${PAYLOAD_RAW}" | jq -r '.transcript_path // empty' 2>>"${ERR_LOG}")"
+          if [ -n "${ACT_TR}" ] && [ -f "${ACT_TR}" ]; then
+            tail -n "${CRUX_ACTIVITY_TAIL_LINES:-160}" "${ACT_TR}" 2>/dev/null \
+              | jq -c -R 'fromjson? // empty' 2>/dev/null \
+              | jq -s -r 'map(select(.type=="assistant" and (.message.content|type=="array") and ([.message.content[]?|select(.type=="text")]|length>0))) | (last // {}) | [.message.content[]?|select(.type=="text")|.text] | join("\n\n")' > "${ACT_TXT}" 2>>"${ERR_LOG}"
+          fi ;;
+      esac
+      if [ -s "${ACT_TXT}" ]; then
+        jq -n --rawfile text "${ACT_TXT}" \
+          --arg kind "${ACT_KIND}" --arg sid "${SESSION_ID}" \
+          --arg tenant "${ACT_TENANT}" --arg tool "${ACT_TOOL}" \
+          --arg execplan "${CRUX_ACTIVITY_EXECPLAN:-}" \
+          --argjson cap "${ACT_MAXTEXT}" '
+          ($text | sub("\\s+$";"")) as $t0
+          | ($t0 | if length>$cap then .[0:$cap]+"…" else . end) as $t
+          | ( (if $tool!="" then {tool:$tool} else {} end)
+              + (if $execplan!="" then {execplan_slug:$execplan} else {} end) ) as $meta
+          | if ($t|length)==0 then empty
+            else {tenant_id:$tenant, session_id:$sid, kind:$kind, text:$t,
+                  meta:$meta, private:true} end' \
+          > "${ACT_BODY}" 2>>"${ERR_LOG}"
+      fi
+      if [ -s "${ACT_BODY}" ]; then
+        # Activity append needs a write scope; jwt daemons take it from the
+        # bearer, dev_scopes daemons from the header (ignored where unused).
+        ACT_AUTH=("${AUTH_ARGS[@]}")
+        ACT_AUTH+=(-H "X-Corecrux-Scopes: ${CRUX_ACTIVITY_SCOPES:-facts:write admin:write}")
+        ACT_CODE="$(curl -sS --max-time "${TIMEOUT}" -o /dev/null -w '%{http_code}' \
+          -X POST -H 'Content-Type: application/json' "${ACT_AUTH[@]}" \
+          --data-binary "@${ACT_BODY}" \
+          "${CORECRUXD_URL}/v1/activity" 2>>"${ERR_LOG}")"
+        [ "${ACT_CODE}" = "201" ] || log_err "activity POST HTTP ${ACT_CODE} (kind=${ACT_KIND})"
+      fi
+    fi
+    rm -f "${ACT_TXT}" "${ACT_BODY}"
+  fi
+fi
+
 exit 0
