@@ -175,12 +175,15 @@ pub(super) async fn get_activity(
         .and_then(|s| s.trim().parse::<usize>().ok())
         .map_or(DEFAULT_TOP_K, |n| n.clamp(1, DEFAULT_TOP_K));
     let kinds = parse_kinds(params.get("kinds"));
+    // Optional ExecPlan filter (cross-session view only): `?execplan=<slug>`
+    // returns entries tagged `meta.execplan_slug == slug`.
+    let execplan = params.get("execplan").map(|s| s.trim()).filter(|s| !s.is_empty());
 
     let entries = {
         let mut store = activity::global().lock().await;
         match session {
             Some(s) => store.recent(tenant_id, s, &caller_passport, since_seq, kinds.as_deref(), limit),
-            None => store.recent_all(tenant_id, &caller_passport, before, kinds.as_deref(), limit),
+            None => store.recent_all(tenant_id, &caller_passport, before, kinds.as_deref(), execplan, limit),
         }
     };
     let full_page = entries.len() >= limit;
