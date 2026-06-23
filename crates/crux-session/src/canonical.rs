@@ -137,7 +137,10 @@ struct Cursor<'a> {
 
 impl Cursor<'_> {
     fn take(&mut self, n: usize) -> Result<&[u8], SessionError> {
-        if self.pos + n > self.bytes.len() {
+        // Overflow-safe: `n` derives from an attacker-controlled CBOR length
+        // prefix and can be near usize::MAX, so `self.pos + n` would overflow
+        // (a panic under overflow checks). Compare against bytes remaining.
+        if n > self.remaining() {
             return Err(SessionError::Decode("unexpected eof".to_string()));
         }
         let slice = &self.bytes[self.pos..self.pos + n];
@@ -147,6 +150,13 @@ impl Cursor<'_> {
 
     fn take_u8(&mut self) -> Result<u8, SessionError> {
         Ok(self.take(1)?[0])
+    }
+
+    /// Bytes left to read. Used to bound pre-allocation against an
+    /// attacker-controlled length prefix (a CBOR array/map count cannot
+    /// legitimately exceed the bytes remaining in the input).
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
     }
 }
 
@@ -178,14 +188,20 @@ fn read_value(c: &mut Cursor) -> Result<CborValue, SessionError> {
             Ok(CborValue::Text(s))
         }
         MAJOR_ARRAY => {
-            let mut items = Vec::with_capacity(arg as usize);
+            // Bound pre-allocation by remaining input: each element needs >=1 byte,
+            // so a valid length prefix cannot exceed the bytes left. Without this an
+            // attacker-controlled length prefix triggers an unbounded alloc (OOM).
+            let cap = (arg as usize).min(c.remaining());
+            let mut items = Vec::with_capacity(cap);
             for _ in 0..arg {
                 items.push(read_value(c)?);
             }
             Ok(CborValue::Array(items))
         }
         MAJOR_MAP => {
-            let mut pairs = Vec::with_capacity(arg as usize);
+            // Each entry needs >=2 bytes (text key + value), so bound by remaining/2.
+            let cap = (arg as usize).min(c.remaining() / 2);
+            let mut pairs = Vec::with_capacity(cap);
             for _ in 0..arg {
                 let key = read_value(c)?;
                 let value = read_value(c)?;
@@ -300,6 +316,36 @@ mod tests {
         out.clear();
         write_head(MAJOR_UINT, 0x1_0000_0000, &mut out);
         assert_eq!(out, vec![0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_length_prefix_without_oom() {
+        // Array header (major 4) with a u64::MAX element count but no elements.
+        // Pre-fix this pre-allocated u64::MAX capacity and OOM-aborted; now the
+        // pre-alloc is bounded by remaining input and decode returns Err cleanly.
+        let mut arr = vec![0x80 | 0x1B]; // major 4, info 27 => 8-byte length follows
+        arr.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(decode(&arr).is_err());
+
+        // Same for a map header (major 5).
+        let mut map = vec![0xA0 | 0x1B];
+        map.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(decode(&map).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_oversized_byte_and_text_length_without_overflow() {
+        // Byte-string (major 2) / text (major 3) headers with a near-usize::MAX
+        // length but no payload. Pre-fix, `Cursor::take`'s `self.pos + n` bounds
+        // check overflowed and panicked (found by the rcx_canonical_token fuzz
+        // target); now it compares against `remaining()` and returns Err cleanly.
+        let mut bytes = vec![0x40 | 0x1B]; // major 2, info 27 => 8-byte length
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(decode(&bytes).is_err());
+
+        let mut text = vec![0x60 | 0x1B]; // major 3, info 27 => 8-byte length
+        text.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(decode(&text).is_err());
     }
 
     #[test]

@@ -450,6 +450,14 @@ pub struct Config {
     // via the journaled delete path. Default OFF.
     pub ephemeral_gc_enabled: bool,
 
+    // Consolidation scheduler (Audit II M4): periodically runs the read-only
+    // contradiction-candidate pass and SURFACES the result as a receipt fact
+    // under `__consolidation_review__::*`. Detect+surface only — resolution
+    // stays an explicit operator action via the MCP `memory_consolidate` tool
+    // or the console review route. Default OFF; interval config-driven.
+    pub consolidation_scheduler_enabled: bool,
+    pub consolidation_scheduler_interval_secs: u64,
+
     // Multi-agent coordination plane (`/v1/coord/*`, `crate::coord`):
     // presence-joined session board + advisory claims. Default OFF.
     pub coord_enabled: bool,
@@ -1132,6 +1140,12 @@ pub fn load_config() -> Config {
             .map(PathBuf::from)
             .filter(|path| !path.as_os_str().is_empty()),
         ephemeral_gc_enabled: env_bool("CORECRUXD_EPHEMERAL_GC").unwrap_or(false),
+        consolidation_scheduler_enabled: env_bool("CORECRUXD_CONSOLIDATION_SCHEDULER").unwrap_or(false),
+        consolidation_scheduler_interval_secs: std::env::var("CORECRUXD_CONSOLIDATION_SCHEDULER_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3600)
+            .clamp(60, 86_400),
         coord_enabled: env_bool("CORECRUXD_COORD").unwrap_or(false),
         coord_presence_ttl_secs: std::env::var("CORECRUXD_COORD_PRESENCE_TTL_SECS")
             .ok()

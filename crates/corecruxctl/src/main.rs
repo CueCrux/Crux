@@ -849,6 +849,35 @@ enum MemoryCommand {
         #[arg(long, default_value_t = false)]
         off: bool,
     },
+    /// List contradiction CANDIDATES (read-only; Audit II M1). Surfaces active,
+    /// non-superseded facts sharing one (entity,key) with opposite polarity.
+    /// Detect-only — resolve explicitly with `memory consolidate`.
+    Contradictions {
+        /// Maximum candidate groups to list.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Explicitly consolidate target facts into one canonical fact (Audit II
+    /// M2). Supersedes the targets (history preserved) and emits a receipt.
+    /// Refuses protected (pinned/receipt-linked/private/high-confidence)
+    /// targets. Requires admin:write on the daemon.
+    Consolidate {
+        /// Entity all targets + the canonical fact share.
+        #[arg(long)]
+        entity: String,
+        /// Key all targets + the canonical fact share.
+        #[arg(long)]
+        key: String,
+        /// Value for the surviving canonical fact.
+        #[arg(long)]
+        canonical_value: String,
+        /// Fact ids to collapse (repeatable; at least one).
+        #[arg(long = "target", required = true)]
+        targets: Vec<String>,
+        /// Confidence for the canonical fact.
+        #[arg(long, default_value_t = 1.0)]
+        confidence: f32,
+    },
     /// Export the local memory store to a signed `.cruxpack` file
     /// (read-only against --data-dir; private + erased facts excluded —
     /// see Memory-Portability-v1).
@@ -1979,6 +2008,62 @@ enum ReceiptsCommand {
         /// Receipt creation timestamp.
         #[arg(long)]
         created_at: String,
+    },
+
+    /// Scan a tenant's store over a time window and emit a SIGNED coverage
+    /// report `{events, receipts, anchored, gaps, chain_head}`. Gaps (events
+    /// without a receipt; receipts without an anchor) are bound into the
+    /// signed body and cannot be hidden.
+    #[command(name = "coverage-window-attest")]
+    CoverageWindowAttest {
+        /// CoreCrux data dir (defaults to CORECRUXD_DATA_DIR or ../CoreCruxData/v1).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Optional shard numeric id (e.g. 1 for shard-0001); scans all when omitted.
+        #[arg(long)]
+        shard: Option<u32>,
+        /// Tenant whose store is scanned.
+        #[arg(long)]
+        tenant_id: String,
+        /// Window lower bound (RFC3339, inclusive).
+        #[arg(long)]
+        from: String,
+        /// Window upper bound (RFC3339, exclusive).
+        #[arg(long)]
+        to: String,
+        /// Output path for the standalone canonical-JSON window report.
+        #[arg(long)]
+        out_report: PathBuf,
+        /// Output path for the raw receipt.body.v1 CBOR bytes.
+        #[arg(long)]
+        out_body: PathBuf,
+        /// Optional output path for detached receipt.sig.v1 CBOR bytes.
+        #[arg(long)]
+        out_sig: Option<PathBuf>,
+        /// Base64 32-byte Ed25519 signing key. Required when --out-sig is set.
+        #[arg(long)]
+        signing_key_b64: Option<String>,
+        /// Signature key identifier.
+        #[arg(long, default_value = "coverage-window-attest")]
+        key_id: String,
+        /// Signature timestamp; defaults to --created-at when omitted.
+        #[arg(long)]
+        signed_at: Option<String>,
+        /// Receipt ID.
+        #[arg(long)]
+        receipt_id: String,
+        /// Attestation ID. Defaults to --receipt-id when omitted.
+        #[arg(long)]
+        attestation_id: Option<String>,
+        /// Actor/passport creating the attestation.
+        #[arg(long, default_value = "corecruxctl")]
+        actor_passport: String,
+        /// Receipt creation timestamp.
+        #[arg(long)]
+        created_at: String,
+        /// Replay batch size (frames per page).
+        #[arg(long, default_value_t = 4096)]
+        batch_frames: u32,
     },
 }
 
@@ -3182,6 +3267,50 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 Ok(())
             }
+            ReceiptsCommand::CoverageWindowAttest {
+                data_dir,
+                shard,
+                tenant_id,
+                from,
+                to,
+                out_report,
+                out_body,
+                out_sig,
+                signing_key_b64,
+                key_id,
+                signed_at,
+                receipt_id,
+                attestation_id,
+                actor_passport,
+                created_at,
+                batch_frames,
+            } => {
+                let default_dir =
+                    std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string());
+                let data_dir = data_dir.unwrap_or_else(|| PathBuf::from(default_dir));
+                let attestation_id = attestation_id.unwrap_or_else(|| receipt_id.clone());
+                let signed_at = signed_at.unwrap_or_else(|| created_at.clone());
+                let report = receipts::coverage_window_attest_v1(&receipts::CoverageWindowAttestOptionsV1 {
+                    data_dir: &data_dir,
+                    shard,
+                    tenant_id: &tenant_id,
+                    from: &from,
+                    to: &to,
+                    out_report: &out_report,
+                    out_body: &out_body,
+                    out_sig: out_sig.as_deref(),
+                    signing_key_b64: signing_key_b64.as_deref(),
+                    key_id: &key_id,
+                    signed_at: &signed_at,
+                    receipt_id: &receipt_id,
+                    attestation_id: &attestation_id,
+                    actor_passport: &actor_passport,
+                    created_at: &created_at,
+                    batch_frames,
+                })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                Ok(())
+            }
         },
         Command::Snapshot { command } => match command {
             SnapshotCommand::List { data_dir, shard } => {
@@ -3450,6 +3579,27 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     } else {
                         println!("pinned fact {fact_id}");
                     }
+                    Ok(())
+                }
+                MemoryCommand::Contradictions { limit } => {
+                    let candidates = client.contradictions(limit)?;
+                    print!("{}", memory::render_contradictions(&candidates));
+                    Ok(())
+                }
+                MemoryCommand::Consolidate {
+                    entity,
+                    key,
+                    canonical_value,
+                    targets,
+                    confidence,
+                } => {
+                    let receipt = client.consolidate(&entity, &key, &canonical_value, &targets, confidence)?;
+                    println!(
+                        "consolidated {} target(s) into {} (receipt {})",
+                        receipt.superseded_fact_ids.len(),
+                        receipt.canonical_fact_id,
+                        receipt.consolidation_id,
+                    );
                     Ok(())
                 }
                 MemoryCommand::Export {

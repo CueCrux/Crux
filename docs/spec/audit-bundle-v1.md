@@ -90,6 +90,17 @@ A conforming verifier must:
 
 Text-friendly vector directories live under
 `crates/corecrux-receipts/vectors/audit-bundle-v1/`. Each vector contains the
-three bundle members plus `expected.json`. The generator is
-`tools/gen_audit_bundle_vectors.py`; the independent verifier is
-`tools/verify_audit_bundle_v1.py`.
+three bundle members plus `expected.json`, and a packed `audit-bundle.tar.zst`
+holding the same three members in the production archive layout.
+
+`tools/gen_audit_bundle_vectors.py` emits both forms (the unpacked members and
+the `.tar.zst`); the byte-canonical archive is also reproducible via the Rust
+example `cargo run -p corecrux-receipts --example
+gen_audit_bundle_archive_vectors`. The independent verifier
+`tools/verify_audit_bundle_v1.py` accepts either an unpacked vector directory
+or an `audit-bundle.tar.zst` and compares the verdict against `expected.json`.
+
+The generator and verifier need the `cryptography` (Ed25519) and `zstandard`
+(zstd) Python modules; the verifier and generator also accept the `zstd` CLI as
+a fallback when the module is unavailable. CI exercises every vector in both
+forms in `.github/workflows/audit-vectors.yml`.

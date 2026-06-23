@@ -15,6 +15,7 @@ mod audit_gap_v1;
 mod body_v1;
 mod c2pa_manifest_v1;
 mod candidate_digest_v1;
+mod chain_reanchor_v1;
 mod crypto_shred_v1;
 mod export_v1;
 mod forget_v1;
@@ -40,13 +41,16 @@ pub use audit_bundle_v1::{
 };
 pub use audit_gap_v1::{
     assert_chain_reanchor_kind_v1, assert_consolidation_kind_v1, assert_coverage_attestation_kind_v1,
-    assert_model_invocation_kind_v1, assert_redaction_receipt_kind_v1, build_chain_reanchor_body_v1,
-    build_consolidation_body_v1, build_coverage_attestation_body_v1, build_model_invocation_body_v1,
-    build_redaction_receipt_body_v1, sign_chain_reanchor_v1, sign_consolidation_v1, sign_coverage_attestation_v1,
-    sign_model_invocation_v1, sign_redaction_receipt_v1, verify_chain_reanchor_body_v1, ChainReanchorBodyInputV1,
-    ConsolidationBodyInputV1, CoverageAttestationBodyInputV1, ModelInvocationBodyInputV1, RedactionReceiptBodyInputV1,
+    assert_coverage_window_kind_v1, assert_model_invocation_kind_v1, assert_redaction_receipt_kind_v1,
+    build_chain_reanchor_body_v1, build_consolidation_body_v1, build_coverage_attestation_body_v1,
+    build_coverage_window_body_v1, build_model_invocation_body_v1, build_redaction_receipt_body_v1,
+    coverage_window_chain_fold_v1, coverage_window_chain_head_hex_v1, coverage_window_report_canonical_json_v1,
+    sign_chain_reanchor_v1, sign_consolidation_v1, sign_coverage_attestation_v1, sign_coverage_window_v1,
+    sign_model_invocation_v1, sign_redaction_receipt_v1, verify_chain_reanchor_body_v1, verify_coverage_window_body_v1,
+    ChainReanchorBodyInputV1, ConsolidationBodyInputV1, CoverageAttestationBodyInputV1, CoverageWindowBodyInputV1,
+    CoverageWindowCountsV1, CoverageWindowReportV1, ModelInvocationBodyInputV1, RedactionReceiptBodyInputV1,
     AUDIT_GAP_BODY_SCHEMA_V1, CHAIN_REANCHOR_KIND_V1, CONSOLIDATION_KIND_V1, COVERAGE_ATTESTATION_KIND_V1,
-    MODEL_INVOCATION_KIND_V1, REDACTION_RECEIPT_KIND_V1,
+    COVERAGE_WINDOW_KIND_V1, COVERAGE_WINDOW_REPORT_SCHEMA_V1, MODEL_INVOCATION_KIND_V1, REDACTION_RECEIPT_KIND_V1,
 };
 pub use body_v1::{extract_body_index_v1, extract_linked_receipts_v1, ReceiptBodyIndexV1};
 pub use c2pa_manifest_v1::{
@@ -55,6 +59,13 @@ pub use c2pa_manifest_v1::{
     C2paManifestInputV1, C2paManifestV1, C2paSignedManifestV1, C2paSigner, C2paVerificationReportV1,
     SignedManifestParts, C2PA_ACTION_CREATED, C2PA_MANIFEST_SCHEMA_V1, C2PA_SPEC_VERSION, CUECRUX_CROWN_RECEIPT_LABEL,
     DIGITAL_SOURCE_TYPE_AI, SOFTWARE_AGENT_DEFAULT,
+};
+pub use chain_reanchor_v1::{
+    assert_chain_signature_reanchor_kind_v1, build_chain_signature_reanchor_body_v1,
+    sign_chain_signature_reanchor_hybrid_v1, sign_chain_signature_reanchor_v1,
+    verify_chain_signature_reanchor_hybrid_v1, verify_chain_signature_reanchor_v1, ChainSignatureReanchorBodyInputV1,
+    ChainSignatureReanchorVerifyReportV1, ReanchorSigningKeyV1, ReanchorVerifyingKeyV1, ALG_ED25519_V1,
+    ALG_P256_ECDSA_SHA256_V1, CHAIN_SIGNATURE_REANCHOR_BODY_SCHEMA_V1, CHAIN_SIGNATURE_REANCHOR_KIND_V1,
 };
 pub use crypto_shred_v1::{
     build_crypto_shred_destroy_marker_v1, open_crypto_shred_payload_v1, seal_crypto_shred_payload_v1,

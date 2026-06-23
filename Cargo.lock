@@ -772,6 +772,7 @@ dependencies = [
  "ed25519-dalek",
  "p256",
  "parking_lot",
+ "proptest",
  "rand 0.10.1",
  "rand_core 0.6.4",
  "rcgen",
@@ -833,6 +834,7 @@ dependencies = [
  "crc32c",
  "fs2",
  "lz4_flex",
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",
@@ -3504,6 +3506,7 @@ dependencies = [
  "crux-session",
  "ed25519-dalek",
  "hex",
+ "proptest",
 ]
 
 [[package]]

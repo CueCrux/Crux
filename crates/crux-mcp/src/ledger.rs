@@ -36,7 +36,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use prometheus::{CounterVec, HistogramOpts, HistogramVec, Opts, Registry};
+use prometheus::{CounterVec, HistogramOpts, HistogramVec, IntGauge, Opts, Registry};
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
@@ -207,6 +207,28 @@ pub struct LedgerMetrics {
     pub token_spend_total: CounterVec,
     pub tool_response_truncated_total: CounterVec,
     pub emit_failures_total: CounterVec,
+    // ── G7 coverage-attestation gauges ───────────────────────────────
+    //
+    // First-class unsigned / un-anchored / gap counts from the most
+    // recent `corecruxctl receipts coverage-window-attest` run. These are
+    // *gauges* (current state), not counters: each attestation overwrites
+    // them via [`set_coverage_gaps`]. Unlabelled to avoid tenant
+    // cardinality — they describe the latest attested window; per-window
+    // detail lives in the signed report itself.
+    /// Events observed in the last attested window with no corresponding
+    /// receipt (i.e. unsigned activity — a CROWN receipt was never minted).
+    pub coverage_events_without_receipt: IntGauge,
+    /// Receipt bodies in the last attested window with no external anchor.
+    pub coverage_receipts_without_anchor: IntGauge,
+    /// Total gaps in the last attested window
+    /// (`events_without_receipt + receipts_without_anchor`).
+    pub coverage_gaps_total: IntGauge,
+    /// Total events the last attested window covered.
+    pub coverage_events_total: IntGauge,
+    /// Total receipts the last attested window covered.
+    pub coverage_receipts_total: IntGauge,
+    /// Total anchored receipts in the last attested window.
+    pub coverage_anchored_total: IntGauge,
 }
 
 /// Global metrics handles — usable (and unit-testable) even before
@@ -255,7 +277,116 @@ pub fn metrics() -> &'static LedgerMetrics {
             &["reason"],
         )
         .expect("static counter opts are valid"),
+        coverage_events_without_receipt: IntGauge::new(
+            "corecrux_coverage_events_without_receipt",
+            "Events in the last attested coverage window with no corresponding receipt (unsigned activity).",
+        )
+        .expect("static gauge opts are valid"),
+        coverage_receipts_without_anchor: IntGauge::new(
+            "corecrux_coverage_receipts_without_anchor",
+            "Receipt bodies in the last attested coverage window with no external anchor (un-anchored).",
+        )
+        .expect("static gauge opts are valid"),
+        coverage_gaps_total: IntGauge::new(
+            "corecrux_coverage_gaps_total",
+            "Total gaps in the last attested coverage window (unsigned events + un-anchored receipts).",
+        )
+        .expect("static gauge opts are valid"),
+        coverage_events_total: IntGauge::new(
+            "corecrux_coverage_events_total",
+            "Events covered by the last attested coverage window.",
+        )
+        .expect("static gauge opts are valid"),
+        coverage_receipts_total: IntGauge::new(
+            "corecrux_coverage_receipts_total",
+            "Receipts covered by the last attested coverage window.",
+        )
+        .expect("static gauge opts are valid"),
+        coverage_anchored_total: IntGauge::new(
+            "corecrux_coverage_anchored_total",
+            "Anchored receipts in the last attested coverage window.",
+        )
+        .expect("static gauge opts are valid"),
     })
+}
+
+/// Counts mirrored from a `coverage-window-attest` run, for the gauges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverageGapCounts {
+    pub events: u64,
+    pub receipts: u64,
+    pub anchored: u64,
+    pub events_without_receipt: u64,
+    pub receipts_without_anchor: u64,
+}
+
+impl CoverageGapCounts {
+    /// `events_without_receipt + receipts_without_anchor`.
+    #[must_use]
+    pub fn gaps(&self) -> u64 {
+        self.events_without_receipt.saturating_add(self.receipts_without_anchor)
+    }
+}
+
+/// Publish the latest coverage-window counts to the gauges. Called after a
+/// `coverage-window-attest` run (CLI emits the report; an operator/daemon hook
+/// pushes the counts here). Values are clamped into the i64 gauge domain.
+pub fn set_coverage_gaps(counts: CoverageGapCounts) {
+    let m = metrics();
+    let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    m.coverage_events_total.set(clamp(counts.events));
+    m.coverage_receipts_total.set(clamp(counts.receipts));
+    m.coverage_anchored_total.set(clamp(counts.anchored));
+    m.coverage_events_without_receipt
+        .set(clamp(counts.events_without_receipt));
+    m.coverage_receipts_without_anchor
+        .set(clamp(counts.receipts_without_anchor));
+    m.coverage_gaps_total.set(clamp(counts.gaps()));
+}
+
+/// Prometheus alert rules (YAML, `groups:` form) for the coverage gauges.
+/// Returned as a static string so it can be written to a rules file by
+/// deploy tooling and asserted in tests. Thresholds are conservative
+/// defaults: any unsigned activity or un-anchored receipt is a warning, a
+/// growing gap total is a page.
+#[must_use]
+pub fn coverage_alert_rules_yaml() -> &'static str {
+    r#"groups:
+  - name: crux-coverage-attestation
+    rules:
+      - alert: CruxUnsignedActivity
+        expr: corecrux_coverage_events_without_receipt > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unsigned activity in the last attested coverage window"
+          description: "{{ $value }} events had no CROWN receipt. Every state mutation must mint a receipt (Art.12 record-keeping)."
+      - alert: CruxUnanchoredReceipts
+        expr: corecrux_coverage_receipts_without_anchor > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Un-anchored receipts in the last attested coverage window"
+          description: "{{ $value }} receipts lack an external anchor. Re-run the anchoring job or investigate the witness pipeline."
+      - alert: CruxCoverageGapsHigh
+        expr: corecrux_coverage_gaps_total > 10
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "Coverage gap total is high"
+          description: "{{ $value }} total gaps (unsigned events + un-anchored receipts) in the last attested window."
+      - alert: CruxCoverageAttestationStale
+        expr: absent(corecrux_coverage_gaps_total)
+        for: 25h
+        labels:
+          severity: warning
+        annotations:
+          summary: "No coverage attestation has run recently"
+          description: "The coverage gauges are absent — the daily coverage-window-attest job may have stopped."
+"#
 }
 
 /// Register the ledger collectors into a Prometheus registry (called
@@ -268,6 +399,12 @@ pub fn register_metrics(registry: &Registry) {
         Box::new(m.token_spend_total.clone()),
         Box::new(m.tool_response_truncated_total.clone()),
         Box::new(m.emit_failures_total.clone()),
+        Box::new(m.coverage_events_without_receipt.clone()),
+        Box::new(m.coverage_receipts_without_anchor.clone()),
+        Box::new(m.coverage_gaps_total.clone()),
+        Box::new(m.coverage_events_total.clone()),
+        Box::new(m.coverage_receipts_total.clone()),
+        Box::new(m.coverage_anchored_total.clone()),
     ] {
         if let Err(err) = registry.register(collector) {
             // Double-registration (e.g. two MCP routers in one process)
@@ -384,6 +521,73 @@ mod tests {
     fn ledger_session_id_shape() {
         assert_eq!(ledger_session_id("__anon__"), "ledger::__anon__");
         assert_eq!(ledger_session_id("alice"), "ledger::alice");
+    }
+
+    #[test]
+    fn coverage_gap_counts_reconcile() {
+        let c = CoverageGapCounts {
+            events: 10,
+            receipts: 8,
+            anchored: 5,
+            events_without_receipt: 2,
+            receipts_without_anchor: 3,
+        };
+        assert_eq!(c.gaps(), 5);
+    }
+
+    #[test]
+    fn set_coverage_gaps_sets_first_class_gauges() {
+        set_coverage_gaps(CoverageGapCounts {
+            events: 42,
+            receipts: 40,
+            anchored: 37,
+            events_without_receipt: 2,
+            receipts_without_anchor: 3,
+        });
+        let m = metrics();
+        assert_eq!(m.coverage_events_total.get(), 42);
+        assert_eq!(m.coverage_receipts_total.get(), 40);
+        assert_eq!(m.coverage_anchored_total.get(), 37);
+        assert_eq!(m.coverage_events_without_receipt.get(), 2);
+        assert_eq!(m.coverage_receipts_without_anchor.get(), 3);
+        assert_eq!(m.coverage_gaps_total.get(), 5);
+
+        // A subsequent attestation overwrites (gauge, not counter).
+        set_coverage_gaps(CoverageGapCounts {
+            events: 1,
+            receipts: 1,
+            anchored: 1,
+            events_without_receipt: 0,
+            receipts_without_anchor: 0,
+        });
+        assert_eq!(m.coverage_gaps_total.get(), 0);
+        assert_eq!(m.coverage_events_without_receipt.get(), 0);
+    }
+
+    #[test]
+    fn coverage_alert_rules_yaml_names_each_gauge() {
+        let yaml = coverage_alert_rules_yaml();
+        assert!(yaml.contains("corecrux_coverage_events_without_receipt"));
+        assert!(yaml.contains("corecrux_coverage_receipts_without_anchor"));
+        assert!(yaml.contains("corecrux_coverage_gaps_total"));
+        assert!(yaml.contains("alert: CruxUnsignedActivity"));
+        assert!(yaml.contains("alert: CruxUnanchoredReceipts"));
+        assert!(yaml.contains("alert: CruxCoverageGapsHigh"));
+        assert!(yaml.contains("severity: critical"));
+    }
+
+    #[test]
+    fn coverage_gauges_register_into_a_registry() {
+        let registry = Registry::new();
+        register_metrics(&registry);
+        let names: Vec<String> = registry
+            .gather()
+            .into_iter()
+            .map(|mf| mf.get_name().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "corecrux_coverage_gaps_total"));
+        assert!(names.iter().any(|n| n == "corecrux_coverage_events_without_receipt"));
+        assert!(names.iter().any(|n| n == "corecrux_coverage_receipts_without_anchor"));
     }
 
     #[test]

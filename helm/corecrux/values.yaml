@@ -65,6 +65,16 @@ serviceMonitor:
   # -- Additional labels for Prometheus Operator discovery
   additionalLabels: {}
 
+# Prometheus alerting rules for the G7 coverage-attestation gauges
+# (corecrux_coverage_* metrics, set by `corecruxctl receipts
+# coverage-window-attest`). Mirrors crux_mcp::ledger::coverage_alert_rules_yaml.
+prometheusRule:
+  enabled: false
+  # -- Additional labels for Prometheus Operator rule discovery
+  additionalLabels: {}
+  # Gap-total threshold above which CruxCoverageGapsHigh pages.
+  gapsHighThreshold: 10
+
 podAnnotations: {}
 
 podSecurityContext:

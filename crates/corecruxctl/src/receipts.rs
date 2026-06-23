@@ -12,14 +12,17 @@ use sha2::{Digest as _, Sha256};
 
 use corecrux_frame::{decode_canonical_header_bytes_v1, stream_hash_xxhash64};
 use corecrux_receipts::{
-    assert_external_anchor_kind_v1, assert_rfc3161_timestamp_kind_v1, build_crypto_shred_destroy_marker_v1,
-    seal_crypto_shred_payload_v1, update_subject_index_v1, verify_chain_reanchor_body_v1,
+    assert_coverage_window_kind_v1, assert_external_anchor_kind_v1, assert_rfc3161_timestamp_kind_v1,
+    build_crypto_shred_destroy_marker_v1, coverage_window_chain_fold_v1, coverage_window_chain_head_hex_v1,
+    coverage_window_report_canonical_json_v1, extract_linked_receipts_v1, seal_crypto_shred_payload_v1,
+    update_subject_index_v1, verify_chain_reanchor_body_v1, verify_coverage_window_body_v1,
     verify_external_anchor_body_v1, verify_rfc3161_timestamp_token_binding_v1,
     verify_rfc3161_timestamp_token_strict_v1, ChainReanchorBodyInputV1, CoverageAttestationBodyInputV1,
-    CryptoShredDestroyMarkerInputV1, CryptoShredSealInputV1, Ed25519KeyEntryV1, Ed25519KeyRingV1,
-    ExternalAnchorBodyInputV1, ReceiptSigV1, RedactionReceiptBodyInputV1, Rfc3161StrictValidationOptionsV1,
-    Rfc3161StrictValidationReportV1, Rfc3161TimestampBodyInputV1, CONTENT_TYPE_RECEIPT_BODY_V1,
-    CONTENT_TYPE_RECEIPT_SIG_V1, EVT_RECEIPT_BODY_V1, EVT_RECEIPT_SIG_V1, STREAM_TYPE_RECEIPT,
+    CoverageWindowBodyInputV1, CoverageWindowCountsV1, CoverageWindowReportV1, CryptoShredDestroyMarkerInputV1,
+    CryptoShredSealInputV1, Ed25519KeyEntryV1, Ed25519KeyRingV1, ExternalAnchorBodyInputV1, ReceiptSigV1,
+    RedactionReceiptBodyInputV1, Rfc3161StrictValidationOptionsV1, Rfc3161StrictValidationReportV1,
+    Rfc3161TimestampBodyInputV1, CONTENT_TYPE_RECEIPT_BODY_V1, CONTENT_TYPE_RECEIPT_SIG_V1, EVT_RECEIPT_BODY_V1,
+    EVT_RECEIPT_SIG_V1, STREAM_TYPE_RECEIPT,
 };
 use corecrux_segment::decode_frame_v1;
 use corecrux_storage::{AppendEventInput, ShardStorage, ShardStorageOptions};
@@ -139,6 +142,52 @@ pub struct CoverageAttestReportV1 {
     pub attestation_id: String,
     pub report_hash: String,
     pub signed: bool,
+}
+
+/// CLI report for `receipts coverage-window-attest`: the scanned counts, the
+/// emitted standalone report path + hash, the signed receipt body path, and an
+/// independent re-verification of the body that was just written.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CoverageWindowAttestReportV1 {
+    pub tenant_id: String,
+    pub from: String,
+    pub to: String,
+    pub events: u64,
+    pub receipts: u64,
+    pub anchored: u64,
+    pub gaps: u64,
+    pub events_without_receipt: u64,
+    pub receipts_without_anchor: u64,
+    pub chain_head: String,
+    pub report_hash: String,
+    pub report_path: String,
+    pub body_path: String,
+    pub sig_path: Option<String>,
+    pub signed: bool,
+    /// Independent structural verification of the body that was written.
+    pub verified: bool,
+    pub scanned_shards: u64,
+    pub scanned_frames: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoverageWindowAttestOptionsV1<'a> {
+    pub data_dir: &'a Path,
+    pub shard: Option<u32>,
+    pub tenant_id: &'a str,
+    pub from: &'a str,
+    pub to: &'a str,
+    pub out_report: &'a Path,
+    pub out_body: &'a Path,
+    pub out_sig: Option<&'a Path>,
+    pub signing_key_b64: Option<&'a str>,
+    pub key_id: &'a str,
+    pub signed_at: &'a str,
+    pub receipt_id: &'a str,
+    pub attestation_id: &'a str,
+    pub actor_passport: &'a str,
+    pub created_at: &'a str,
+    pub batch_frames: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -770,6 +819,211 @@ pub fn write_coverage_attestation_v1(
         attestation_id: attestation_id.to_string(),
         report_hash,
         signed: out_sig.is_some(),
+    })
+}
+
+/// Read a receipt id from a receipt-body CBOR map (top-level `receipt_id`).
+fn body_receipt_id_v1(body_bytes: &[u8]) -> Option<String> {
+    let v: ciborium::value::Value = ciborium::de::from_reader(std::io::Cursor::new(body_bytes)).ok()?;
+    let ciborium::value::Value::Map(map) = v else {
+        return None;
+    };
+    for (k, val) in &map {
+        if let (ciborium::value::Value::Text(k), ciborium::value::Value::Text(s)) = (k, val) {
+            if k == "receipt_id" {
+                return Some(s.clone());
+            }
+        }
+    }
+    None
+}
+
+/// True if `ts` (RFC3339) falls in `[from, to)`. Falls back to lexical string
+/// comparison when a bound fails to parse — RFC3339 UTC timestamps are
+/// lexically ordered, and our producers emit `...Z`, so this is sound for the
+/// common case while never panicking on malformed input.
+fn ts_in_window(ts: &str, from: &str, to: &str) -> bool {
+    use chrono::DateTime;
+    match (
+        DateTime::parse_from_rfc3339(ts),
+        DateTime::parse_from_rfc3339(from),
+        DateTime::parse_from_rfc3339(to),
+    ) {
+        (Ok(t), Ok(f), Ok(u)) => t >= f && t < u,
+        _ => ts >= from && ts < to,
+    }
+}
+
+/// Scan a tenant's store over `[from, to)`, count events / receipts / anchored
+/// receipts, compute gaps, fold a deterministic chain head, then write a
+/// standalone canonical-JSON report and a signed `coverage_window` receipt
+/// body. The written body is re-verified independently before returning.
+pub fn coverage_window_attest_v1(
+    opts: &CoverageWindowAttestOptionsV1<'_>,
+) -> Result<CoverageWindowAttestReportV1, Box<dyn std::error::Error + Send + Sync>> {
+    let shard_root = opts.data_dir.join("shards");
+    if !shard_root.exists() {
+        return Err(format!("shard root not found: {}", shard_root.display()).into());
+    }
+    let shard_ids = if let Some(id) = opts.shard {
+        vec![id]
+    } else {
+        list_shards(&shard_root)?
+    };
+
+    let mut events = 0u64;
+    let mut receipts = 0u64;
+    let mut scanned_frames = 0u64;
+    let mut scanned_shards = 0u64;
+    let mut chain_head = [0u8; 32];
+    // Receipt ids that are anchor receipts themselves OR are linked from an anchor.
+    let mut anchor_receipt_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Receipt ids of plain (non-anchor) receipt bodies seen in the window.
+    let mut receipt_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for shard_id in shard_ids {
+        let storage = ShardStorage::open(&shard_root, shard_id, /*epoch=*/ 1, ShardStorageOptions::default())?;
+        scanned_shards += 1;
+
+        let mut cursor: Option<corecrux_storage::ReplayCursor> = None;
+        loop {
+            let (frames, next) = storage.replay_from(cursor, opts.batch_frames)?;
+            if frames.is_empty() {
+                break;
+            }
+            for (_loc, frame_bytes) in frames {
+                let frame = match decode_frame_v1(&frame_bytes) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let hdr = match decode_canonical_header_bytes_v1(&frame.header_bytes) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                if hdr.tenant_id != opts.tenant_id {
+                    continue;
+                }
+                if !ts_in_window(&hdr.ingested_at, opts.from, opts.to) {
+                    continue;
+                }
+                scanned_frames += 1;
+                // Fold every in-window frame's payload hash into the chain head,
+                // in deterministic replay order.
+                let ph = corecrux_frame::compute_payload_hash(&frame.payload_bytes);
+                chain_head = coverage_window_chain_fold_v1(chain_head, &ph);
+
+                let is_receipt_body = hdr.stream_type == STREAM_TYPE_RECEIPT && hdr.event_type == EVT_RECEIPT_BODY_V1;
+                if !is_receipt_body {
+                    // Receipt sig frames are bookkeeping, not first-class events;
+                    // everything else in-window is an event that should be covered.
+                    if !(hdr.stream_type == STREAM_TYPE_RECEIPT && hdr.event_type == EVT_RECEIPT_SIG_V1) {
+                        events += 1;
+                    }
+                    continue;
+                }
+
+                receipts += 1;
+                let payload = &frame.payload_bytes;
+                let is_anchor = assert_external_anchor_kind_v1(payload) || assert_rfc3161_timestamp_kind_v1(payload);
+                if let Some(rid) = body_receipt_id_v1(payload) {
+                    if is_anchor {
+                        anchor_receipt_ids.insert(rid);
+                    } else {
+                        receipt_ids.insert(rid);
+                    }
+                }
+                if is_anchor {
+                    // An anchor's linked_receipts are the receipt ids it anchors.
+                    if let Some(linked) = extract_linked_receipts_v1(payload) {
+                        for r in linked {
+                            anchor_receipt_ids.insert(r);
+                        }
+                    }
+                }
+            }
+            cursor = next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+    }
+
+    // A receipt body counts as "anchored" if it is an anchor receipt itself or
+    // is referenced by an anchor's linked_receipts. The deduped id set may name
+    // anchor targets that fell outside the window, so clamp to `receipts` (the
+    // verify step enforces `anchored <= receipts`).
+    let _ = &receipt_ids; // distinct-id population is informational only.
+    let anchored = receipts.min(anchor_receipt_ids.len() as u64);
+    let receipts_without_anchor = receipts.saturating_sub(anchored);
+    let events_without_receipt = events.saturating_sub(receipts);
+    let counts = CoverageWindowCountsV1 {
+        events,
+        receipts,
+        anchored,
+        events_without_receipt,
+        receipts_without_anchor,
+    };
+
+    let chain_head_hex = coverage_window_chain_head_hex_v1(chain_head);
+    let report = CoverageWindowReportV1::new(opts.tenant_id, opts.from, opts.to, counts, &chain_head_hex);
+    let report_hash = report.report_hash();
+    let report_bytes = coverage_window_report_canonical_json_v1(&report);
+    write_parented(opts.out_report, &report_bytes)?;
+
+    let input = CoverageWindowBodyInputV1 {
+        tenant_id: opts.tenant_id,
+        receipt_id: opts.receipt_id,
+        attestation_id: opts.attestation_id,
+        actor_passport: opts.actor_passport,
+        from: opts.from,
+        to: opts.to,
+        events,
+        receipts,
+        anchored,
+        gaps: counts.gaps(),
+        events_without_receipt,
+        receipts_without_anchor,
+        chain_head: &chain_head_hex,
+        report_hash: &report_hash,
+        created_at: opts.created_at,
+    };
+    let (body, body_hash) = corecrux_receipts::build_coverage_window_body_v1(&input);
+    let verified = verify_coverage_window_body_v1(&body) && assert_coverage_window_kind_v1(&body);
+    if !verified {
+        return Err("coverage_window body failed structural verification".into());
+    }
+    write_parented(opts.out_body, &body)?;
+
+    let sig_path = write_optional_sig_v1(OptionalSigWriteV1 {
+        out_sig: opts.out_sig,
+        signing_key_b64: opts.signing_key_b64,
+        receipt_id: opts.receipt_id,
+        body: &body,
+        body_hash,
+        key_id: opts.key_id,
+        signed_at: opts.signed_at,
+        signer: corecrux_receipts::sign_coverage_window_v1,
+    })?;
+
+    Ok(CoverageWindowAttestReportV1 {
+        tenant_id: opts.tenant_id.to_string(),
+        from: opts.from.to_string(),
+        to: opts.to.to_string(),
+        events,
+        receipts,
+        anchored,
+        gaps: counts.gaps(),
+        events_without_receipt,
+        receipts_without_anchor,
+        chain_head: chain_head_hex,
+        report_hash,
+        report_path: opts.out_report.display().to_string(),
+        body_path: opts.out_body.display().to_string(),
+        sig_path,
+        signed: opts.out_sig.is_some(),
+        verified,
+        scanned_shards,
+        scanned_frames,
     })
 }
 
@@ -1832,6 +2086,314 @@ mod tests {
         assert!(report.report_hash.starts_with("blake3:"));
         let body = std::fs::read(body_path).unwrap();
         assert!(corecrux_receipts::assert_coverage_attestation_kind_v1(&body));
+    }
+
+    // ── coverage_window_attest_v1 ───────────────────────────────────
+
+    /// Append one frame (event or receipt body) into a shard with an
+    /// explicit `ingested_at` so the window scan is deterministic.
+    fn seed_frame(
+        storage: &mut ShardStorage,
+        tenant: &str,
+        stream_type: &str,
+        stream_id: &str,
+        event_type: &str,
+        content_type: &str,
+        ingested_at: &str,
+        payload: &[u8],
+    ) {
+        use corecrux_frame::stream_hash_xxhash64;
+        let stream_hash = stream_hash_xxhash64(tenant, stream_type, stream_id).unwrap();
+        let event_id = format!("seed:{stream_type}:{stream_id}:{event_type}");
+        let inputs = [AppendEventInput {
+            event_id: &event_id,
+            occurred_at: ingested_at,
+            event_type,
+            content_type,
+            payload_bytes: payload,
+        }];
+        storage
+            .append_batch(stream_hash, 0, tenant, stream_type, stream_id, ingested_at, &inputs)
+            .unwrap();
+    }
+
+    fn anchor_body_linking(tenant: &str, receipt_id: &str, anchor_id: &str, linked: &str) -> Vec<u8> {
+        let leaf = "00".repeat(32);
+        // build_external_anchor_body_v1 has no linked_receipts field, so append
+        // one via a wrapper map is not possible; instead we link by anchoring
+        // a receipt whose id we also seed as a plain receipt. The scan treats
+        // an anchor body's own receipt_id as anchored, and linked_receipts when
+        // present. Here we exercise the anchor-kind path; `linked` is the id we
+        // also seed as a plain receipt to assert it stays unanchored.
+        let _ = linked;
+        let input = corecrux_receipts::ExternalAnchorBodyInputV1 {
+            tenant_id: tenant,
+            receipt_id,
+            anchor_id,
+            actor_passport: "passport:operator",
+            transparency_log: "rekor",
+            log_url: "https://rekor.example",
+            rekor_uuid: Some("uuid-1"),
+            leaf_hash: &leaf,
+            log_index: 0,
+            tree_size: 1,
+            root_hash: &leaf,
+            inclusion_proof: &[],
+            checkpoint: None,
+            integrated_time: "2026-06-14T12:00:00Z",
+            created_at: "2026-06-14T12:00:00Z",
+        };
+        let (body, _) = corecrux_receipts::build_external_anchor_body_v1(&input);
+        body
+    }
+
+    fn plain_receipt_body(receipt_id: &str, tenant: &str) -> Vec<u8> {
+        let body = ciborium::value::Value::Map(vec![
+            (
+                ciborium::value::Value::Text("schema".into()),
+                ciborium::value::Value::Text("cuecrux.receipt.body.v1".into()),
+            ),
+            (
+                ciborium::value::Value::Text("kind".into()),
+                ciborium::value::Value::Text("answer".into()),
+            ),
+            (
+                ciborium::value::Value::Text("receipt_id".into()),
+                ciborium::value::Value::Text(receipt_id.into()),
+            ),
+            (
+                ciborium::value::Value::Text("tenant_id".into()),
+                ciborium::value::Value::Text(tenant.into()),
+            ),
+        ]);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&body, &mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn coverage_window_attest_scans_signs_and_surfaces_gaps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_root = tmp.path().join("shards");
+        std::fs::create_dir_all(&shard_root).unwrap();
+        let tenant = "tenant-cov";
+        let in_window = "2026-06-14T10:00:00Z";
+        let out_window = "2026-06-20T10:00:00Z"; // after `to`, excluded
+        let mut storage = ShardStorage::open(&shard_root, 1, 1, ShardStorageOptions::default()).unwrap();
+
+        // 3 events (non-receipt, e.g. observations) in window.
+        for i in 0..3 {
+            seed_frame(
+                &mut storage,
+                tenant,
+                "agent.observation",
+                &format!("obs-{i}"),
+                "agent.observation.body.v1",
+                "application/json",
+                in_window,
+                format!("{{\"obs\":{i}}}").as_bytes(),
+            );
+        }
+        // 2 plain receipt bodies in window (so 1 event lacks a receipt).
+        for i in 0..2 {
+            let rid = format!("r-{i}");
+            seed_frame(
+                &mut storage,
+                tenant,
+                STREAM_TYPE_RECEIPT,
+                &rid,
+                EVT_RECEIPT_BODY_V1,
+                CONTENT_TYPE_RECEIPT_BODY_V1,
+                in_window,
+                &plain_receipt_body(&rid, tenant),
+            );
+        }
+        // 1 anchor receipt body in window (anchors itself).
+        seed_frame(
+            &mut storage,
+            tenant,
+            STREAM_TYPE_RECEIPT,
+            "anchor-0",
+            EVT_RECEIPT_BODY_V1,
+            CONTENT_TYPE_RECEIPT_BODY_V1,
+            in_window,
+            &anchor_body_linking(tenant, "anchor-0", "anchor-0", "r-0"),
+        );
+        // 1 event OUTSIDE the window — must be excluded.
+        seed_frame(
+            &mut storage,
+            tenant,
+            "agent.observation",
+            "obs-late",
+            "agent.observation.body.v1",
+            "application/json",
+            out_window,
+            b"{\"obs\":\"late\"}",
+        );
+        // 1 event for a DIFFERENT tenant — must be excluded.
+        seed_frame(
+            &mut storage,
+            "other-tenant",
+            "agent.observation",
+            "obs-other",
+            "agent.observation.body.v1",
+            "application/json",
+            in_window,
+            b"{\"obs\":\"other\"}",
+        );
+
+        // Release the shard lock before the scan re-opens the same shard.
+        drop(storage);
+
+        let signing_key = SigningKey::from_bytes(&[77u8; 32]);
+        let signing_key_b64 = base64::engine::general_purpose::STANDARD.encode(signing_key.to_bytes());
+        let out_report = tmp.path().join("out/window.json");
+        let out_body = tmp.path().join("out/window.cbor");
+        let out_sig = tmp.path().join("out/window.sig.cbor");
+
+        let report = coverage_window_attest_v1(&CoverageWindowAttestOptionsV1 {
+            data_dir: tmp.path(),
+            shard: None,
+            tenant_id: tenant,
+            from: "2026-06-14T00:00:00Z",
+            to: "2026-06-15T00:00:00Z",
+            out_report: &out_report,
+            out_body: &out_body,
+            out_sig: Some(&out_sig),
+            signing_key_b64: Some(&signing_key_b64),
+            key_id: "cov-window-key",
+            signed_at: "2026-06-15T00:01:00Z",
+            receipt_id: "cw_1",
+            attestation_id: "coverage-window-1",
+            actor_passport: "passport:operator",
+            created_at: "2026-06-15T00:01:00Z",
+            batch_frames: 1024,
+        })
+        .unwrap();
+
+        // 3 in-window, in-tenant events; the out-of-window and other-tenant
+        // events are excluded.
+        assert_eq!(report.events, 3, "{report:?}");
+        // 3 receipt bodies (2 plain + 1 anchor).
+        assert_eq!(report.receipts, 3, "{report:?}");
+        // 1 anchored (the anchor body's own receipt_id).
+        assert_eq!(report.anchored, 1, "{report:?}");
+        // events_without_receipt = max(0, 3 - 3) = 0; receipts_without_anchor = 3 - 1 = 2.
+        assert_eq!(report.events_without_receipt, 0, "{report:?}");
+        assert_eq!(report.receipts_without_anchor, 2, "{report:?}");
+        // gaps reconcile and are NOT hidden.
+        assert_eq!(report.gaps, 2, "{report:?}");
+        assert!(report.signed);
+        assert!(report.verified);
+        assert!(report.chain_head.starts_with("blake3:"));
+        assert!(out_report.exists() && out_body.exists() && out_sig.exists());
+
+        // The signed body verifies independently (re-read from disk).
+        let body = std::fs::read(&out_body).unwrap();
+        assert!(corecrux_receipts::verify_coverage_window_body_v1(&body));
+        assert!(corecrux_receipts::assert_coverage_window_kind_v1(&body));
+
+        // The detached signature checks out over the on-disk body bytes.
+        let sig_bytes = std::fs::read(&out_sig).unwrap();
+        let sig: ReceiptSigV1 = ciborium::de::from_reader(std::io::Cursor::new(&sig_bytes)).unwrap();
+        let vk = signing_key.verifying_key();
+        let sig64: [u8; 64] = sig.signature.as_slice().try_into().unwrap();
+        vk.verify_strict(&body, &ed25519_dalek::Signature::from_bytes(&sig64))
+            .expect("detached signature verifies over body bytes");
+
+        // The standalone report's bound hash matches the body's report_hash.
+        let report_json = std::fs::read(&out_report).unwrap();
+        let parsed: corecrux_receipts::CoverageWindowReportV1 = serde_json::from_slice(&report_json).unwrap();
+        assert_eq!(parsed.report_hash(), report.report_hash);
+        assert_eq!(parsed.gaps, 2);
+    }
+
+    #[test]
+    fn coverage_window_attest_empty_window_signs_zero_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("shards")).unwrap();
+        let out_report = tmp.path().join("w.json");
+        let out_body = tmp.path().join("w.cbor");
+        let report = coverage_window_attest_v1(&CoverageWindowAttestOptionsV1 {
+            data_dir: tmp.path(),
+            shard: None,
+            tenant_id: "tenant-empty",
+            from: "2026-06-14T00:00:00Z",
+            to: "2026-06-15T00:00:00Z",
+            out_report: &out_report,
+            out_body: &out_body,
+            out_sig: None,
+            signing_key_b64: None,
+            key_id: "k",
+            signed_at: "2026-06-15T00:01:00Z",
+            receipt_id: "cw_empty",
+            attestation_id: "cw_empty",
+            actor_passport: "passport:operator",
+            created_at: "2026-06-15T00:01:00Z",
+            batch_frames: 1024,
+        })
+        .unwrap();
+        assert_eq!(report.events, 0);
+        assert_eq!(report.receipts, 0);
+        assert_eq!(report.gaps, 0);
+        assert!(report.verified);
+        assert!(!report.signed);
+        let body = std::fs::read(&out_body).unwrap();
+        assert!(corecrux_receipts::verify_coverage_window_body_v1(&body));
+    }
+
+    #[test]
+    fn coverage_window_attest_errors_on_missing_shard_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_report = tmp.path().join("w.json");
+        let out_body = tmp.path().join("w.cbor");
+        let err = coverage_window_attest_v1(&CoverageWindowAttestOptionsV1 {
+            data_dir: tmp.path(),
+            shard: None,
+            tenant_id: "t",
+            from: "2026-06-14T00:00:00Z",
+            to: "2026-06-15T00:00:00Z",
+            out_report: &out_report,
+            out_body: &out_body,
+            out_sig: None,
+            signing_key_b64: None,
+            key_id: "k",
+            signed_at: "2026-06-15T00:01:00Z",
+            receipt_id: "cw",
+            attestation_id: "cw",
+            actor_passport: "p",
+            created_at: "2026-06-15T00:01:00Z",
+            batch_frames: 1024,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("shard root not found"));
+    }
+
+    #[test]
+    fn coverage_window_attest_report_serializes() {
+        let report = CoverageWindowAttestReportV1 {
+            tenant_id: "t".into(),
+            from: "a".into(),
+            to: "b".into(),
+            events: 10,
+            receipts: 8,
+            anchored: 5,
+            gaps: 5,
+            events_without_receipt: 2,
+            receipts_without_anchor: 3,
+            chain_head: "blake3:00".into(),
+            report_hash: "blake3:11".into(),
+            report_path: "/r.json".into(),
+            body_path: "/b.cbor".into(),
+            sig_path: None,
+            signed: false,
+            verified: true,
+            scanned_shards: 1,
+            scanned_frames: 18,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"gaps\":5"));
+        assert!(json.contains("\"verified\":true"));
     }
 
     #[test]
