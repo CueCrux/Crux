@@ -58,6 +58,32 @@ impl Default for TargetsConfig {
     }
 }
 
+/// Soft size budgets for the composed files. Over the budget, `check`/`diff`
+/// and the session-start advisory emit a warning (not drift) — a large
+/// CLAUDE.md inflates every session prefix and risks the boot load cap.
+/// Default ≈ 48 KB ≈ ~24 K tokens for dense markdown (~2 B/token), a margin
+/// under the ~25 K-token cap; tighten per-workspace via `[limits]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LimitsConfig {
+    #[serde(default = "default_max_bytes")]
+    pub claude_md_max_bytes: usize,
+    #[serde(default = "default_max_bytes")]
+    pub agents_md_max_bytes: usize,
+}
+
+fn default_max_bytes() -> usize {
+    49_152
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            claude_md_max_bytes: default_max_bytes(),
+            agents_md_max_bytes: default_max_bytes(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentProfileConfig {
     #[serde(default = "default_schema_version")]
@@ -67,6 +93,8 @@ pub struct AgentProfileConfig {
     pub profiles: BTreeMap<String, ProfileEntry>,
     #[serde(default)]
     pub targets: TargetsConfig,
+    #[serde(default)]
+    pub limits: LimitsConfig,
 }
 
 fn default_schema_version() -> u32 {
@@ -80,6 +108,7 @@ impl AgentProfileConfig {
             workspace_fingerprint,
             profiles: BTreeMap::new(),
             targets: TargetsConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 
@@ -223,5 +252,38 @@ mod tests {
         let t = TargetsConfig::default();
         assert_eq!(t.claude_md, "CLAUDE.md");
         assert_eq!(t.agents_md, "AGENTS.md");
+    }
+
+    #[test]
+    fn limits_config_defaults() {
+        let l = LimitsConfig::default();
+        assert_eq!(l.claude_md_max_bytes, 49_152);
+        assert_eq!(l.agents_md_max_bytes, 49_152);
+    }
+
+    #[test]
+    fn config_without_limits_section_uses_defaults() {
+        // A config written before `[limits]` existed must still load.
+        let dir = TempDir::new().unwrap();
+        let cfg_dir = dir.path().join(".crux");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("agent-profile.toml"),
+            "schema_version = 1\nworkspace_fingerprint = \"blake3:x\"\n",
+        )
+        .unwrap();
+        let cfg = AgentProfileConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.limits.claude_md_max_bytes, 49_152);
+    }
+
+    #[test]
+    fn limits_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = AgentProfileConfig::new("blake3:abc".into());
+        cfg.limits.claude_md_max_bytes = 30_000;
+        cfg.save(dir.path()).unwrap();
+        let loaded = AgentProfileConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.limits.claude_md_max_bytes, 30_000);
+        assert_eq!(loaded.limits.agents_md_max_bytes, 49_152);
     }
 }

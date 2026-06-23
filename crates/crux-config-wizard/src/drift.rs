@@ -17,6 +17,10 @@ use crate::Target;
 pub struct DriftReport {
     pub drifted: bool,
     pub details: Vec<String>,
+    /// Advisory warnings (free-span duplication, oversize composed file) that
+    /// `regenerate` cannot fix — surfaced separately from drift `details`, and
+    /// they do NOT set `drifted`.
+    pub warnings: Vec<String>,
 }
 
 impl DriftReport {
@@ -24,19 +28,38 @@ impl DriftReport {
         self.drifted
     }
 
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+
+    /// Render for the boot advisory / `check` output. Two distinct blocks with
+    /// distinct remediation: drift `details` → run `regenerate`; advisory
+    /// `warnings` → `regenerate` will NOT fix these, edit the free spans.
     pub fn message_for_claude(&self) -> String {
-        if !self.drifted {
-            return String::new();
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        if self.drifted {
+            out.push_str("[crux-config-wizard] CLAUDE.md or AGENTS.md is out of date.\n");
+            if self.details.is_empty() {
+                out.push_str("Run `crux-config-wizard regenerate` to refresh.");
+            } else {
+                out.push_str(&self.details.join("\n"));
+                out.push_str("\n\nRun `crux-config-wizard regenerate` to refresh.");
+            }
         }
-        let detail = if self.details.is_empty() {
-            "Run `crux-config-wizard regenerate` to refresh.".to_string()
-        } else {
-            format!(
-                "{}\n\nRun `crux-config-wizard regenerate` to refresh.",
-                self.details.join("\n")
+        if !self.warnings.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            write!(
+                out,
+                "[crux-config-wizard] advisory ({} item(s)) — `regenerate` will NOT fix these; edit the free spans:\n{}",
+                self.warnings.len(),
+                self.warnings.join("\n")
             )
-        };
-        format!("[crux-config-wizard] CLAUDE.md or AGENTS.md is out of date.\n{detail}")
+            .expect("write to String cannot fail");
+        }
+        out
     }
 }
 
@@ -50,6 +73,7 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<DriftReport> {
             return Ok(DriftReport {
                 drifted: false,
                 details: Vec::new(),
+                warnings: Vec::new(),
             });
         }
     };
@@ -59,6 +83,7 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<DriftReport> {
             return Ok(DriftReport {
                 drifted: true,
                 details: vec![format!("failed to load bundled profiles: {e}")],
+                warnings: Vec::new(),
             });
         }
     };
@@ -69,6 +94,7 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<DriftReport> {
         .collect();
 
     let mut details = Vec::new();
+    let mut warnings = Vec::new();
 
     // Version mismatch between config + bundled.
     for f in &enabled {
@@ -86,13 +112,41 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<DriftReport> {
     for target in [Target::ClaudeMd, Target::AgentsMd] {
         let report = compose_file(workspace_root, target, &enabled, false, true);
         match report {
-            Ok(r) if r.wrote => details.push(format!(
-                "{} would be rewritten (updated={}, added={})",
-                target.filename(),
-                r.managed_sections_updated,
-                r.managed_sections_added
-            )),
-            Ok(_) => {}
+            Ok(r) => {
+                if r.wrote {
+                    details.push(format!(
+                        "{} would be rewritten (updated={}, added={})",
+                        target.filename(),
+                        r.managed_sections_updated,
+                        r.managed_sections_added
+                    ));
+                }
+                // Advisory (not drift): free-span text restating a managed profile.
+                for ov in &r.free_span_overlaps {
+                    warnings.push(format!(
+                        "{}: free-span text restates managed profile '{}' ({}/{} distinctive lines duplicated, e.g. \"{}\"). Replace the duplicated prose with a pointer to the managed section — `regenerate` cannot fix this.",
+                        target.filename(),
+                        ov.profile,
+                        ov.matched_lines,
+                        ov.distinctive_lines,
+                        ov.sample
+                    ));
+                }
+                // Advisory (not drift): composed file over its soft size budget.
+                let max = match target {
+                    Target::ClaudeMd => cfg.limits.claude_md_max_bytes,
+                    Target::AgentsMd => cfg.limits.agents_md_max_bytes,
+                };
+                if r.composed_bytes > max {
+                    warnings.push(format!(
+                        "{} is {} B (soft budget {} B); free-span text is {} B of that. Trim free spans or split content — a large file inflates every session prefix and risks the boot load cap.",
+                        target.filename(),
+                        r.composed_bytes,
+                        max,
+                        r.free_span_bytes
+                    ));
+                }
+            }
             Err(crate::compose::ComposeError::Drift { profile, .. }) => details.push(format!(
                 "{} has manual edits inside managed section '{}'",
                 target.filename(),
@@ -103,7 +157,11 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<DriftReport> {
     }
 
     let drifted = !details.is_empty();
-    Ok(DriftReport { drifted, details })
+    Ok(DriftReport {
+        drifted,
+        details,
+        warnings,
+    })
 }
 
 #[cfg(test)]
@@ -124,6 +182,7 @@ mod tests {
         let r = DriftReport {
             drifted: false,
             details: Vec::new(),
+            warnings: Vec::new(),
         };
         assert!(r.message_for_claude().is_empty());
     }
@@ -133,6 +192,7 @@ mod tests {
         let r = DriftReport {
             drifted: true,
             details: vec!["profile 'x' is at v1 in config but v2 in the crate".into()],
+            warnings: Vec::new(),
         };
         let msg = r.message_for_claude();
         assert!(msg.contains("out of date"));
@@ -145,8 +205,57 @@ mod tests {
         let r = DriftReport {
             drifted: true,
             details: Vec::new(),
+            warnings: Vec::new(),
         };
         let msg = r.message_for_claude();
         assert!(msg.contains("regenerate"));
+    }
+
+    #[test]
+    fn oversize_composed_file_warns_but_is_not_drift() {
+        let dir = TempDir::new().unwrap();
+        let bundled = load_bundled_profiles().unwrap();
+        let mp = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "memory-practices")
+            .expect("memory-practices bundled");
+        let mut cfg = AgentProfileConfig::new("blake3:test".into());
+        cfg.enable("memory-practices", mp.frontmatter.version);
+        cfg.limits.claude_md_max_bytes = 10; // force over-budget
+        cfg.limits.agents_md_max_bytes = 10_000_000; // avoid an AGENTS.md warning
+        cfg.save(dir.path()).unwrap();
+
+        let enabled: Vec<_> = bundled
+            .into_iter()
+            .filter(|f| cfg.profiles.contains_key(&f.frontmatter.name))
+            .collect();
+        for t in [Target::ClaudeMd, Target::AgentsMd] {
+            compose_file(dir.path(), t, &enabled, false, false).unwrap();
+        }
+
+        let r = check_workspace(dir.path()).unwrap();
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("CLAUDE.md") && w.contains("soft budget")),
+            "expected size warning, got: {:?}",
+            r.warnings
+        );
+        assert!(!r.drifted(), "over-budget is a warning, not drift: {:?}", r.details);
+    }
+
+    #[test]
+    fn warnings_only_message_is_advisory_not_drift() {
+        let r = DriftReport {
+            drifted: false,
+            details: Vec::new(),
+            warnings: vec!["CLAUDE.md: free-span text restates managed profile 'x'".into()],
+        };
+        assert!(!r.drifted());
+        assert!(r.has_warnings());
+        let msg = r.message_for_claude();
+        assert!(msg.contains("advisory"), "msg: {msg}");
+        assert!(msg.contains("free-span"));
+        assert!(!msg.contains("out of date"));
     }
 }

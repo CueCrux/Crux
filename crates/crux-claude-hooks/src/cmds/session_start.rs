@@ -85,8 +85,8 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
     if std::env::var("CRUX_HOOK_WIZARD_CHECK").as_deref() != Ok("off") {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         match crux_config_wizard::drift::check_workspace(&cwd) {
-            Ok(report) if report.drifted() => {
-                sections.push(format!("**Crux config drift**\n{}", report.message_for_claude()));
+            Ok(report) if report.drifted() || report.has_warnings() => {
+                sections.push(format!("**Crux config**\n{}", report.message_for_claude()));
             }
             Ok(_) => {}
             Err(err) => {

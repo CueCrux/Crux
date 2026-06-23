@@ -127,13 +127,20 @@ pub fn run_regenerate(workspace: &Path, force: bool) -> std::io::Result<CommandR
     Ok(CommandReport::ok(stdout))
 }
 
-pub fn run_check(workspace: &Path) -> std::io::Result<CommandReport> {
+pub fn run_check(workspace: &Path, strict: bool) -> std::io::Result<CommandReport> {
     let report = check_workspace(workspace)?;
     if report.drifted() {
-        Ok(CommandReport::exit(1, report.message_for_claude(), String::new()))
-    } else {
-        Ok(CommandReport::ok("crux-config-wizard: workspace clean.\n".into()))
+        return Ok(CommandReport::exit(1, report.message_for_claude(), String::new()));
     }
+    if report.has_warnings() {
+        let msg = report.message_for_claude();
+        return Ok(if strict {
+            CommandReport::exit(1, msg, String::new())
+        } else {
+            CommandReport::ok(msg)
+        });
+    }
+    Ok(CommandReport::ok("crux-config-wizard: workspace clean.\n".into()))
 }
 
 pub fn run_list(workspace: &Path) -> std::io::Result<CommandReport> {
@@ -180,13 +187,20 @@ pub fn run_remove(workspace: &Path, name: &str) -> std::io::Result<CommandReport
     run_regenerate(workspace, false)
 }
 
-pub fn run_diff(workspace: &Path) -> std::io::Result<CommandReport> {
+pub fn run_diff(workspace: &Path, strict: bool) -> std::io::Result<CommandReport> {
     let report = check_workspace(workspace)?;
     if report.drifted() {
-        Ok(CommandReport::exit(1, report.message_for_claude(), String::new()))
-    } else {
-        Ok(CommandReport::ok("no diff.\n".into()))
+        return Ok(CommandReport::exit(1, report.message_for_claude(), String::new()));
     }
+    if report.has_warnings() {
+        let msg = report.message_for_claude();
+        return Ok(if strict {
+            CommandReport::exit(1, msg, String::new())
+        } else {
+            CommandReport::ok(msg)
+        });
+    }
+    Ok(CommandReport::ok("no diff.\n".into()))
 }
 
 fn map_compose(e: ComposeError) -> std::io::Error {
@@ -246,7 +260,7 @@ mod tests {
     fn check_clean_after_init() {
         let ws = fresh_ws();
         run_init(ws.path(), &["memory-practices".into()]).unwrap();
-        let r = run_check(ws.path()).unwrap();
+        let r = run_check(ws.path(), false).unwrap();
         assert_eq!(r.outcome, CommandOutcome::Ok);
         assert!(r.stdout.contains("workspace clean"));
     }
@@ -254,8 +268,25 @@ mod tests {
     #[test]
     fn check_empty_workspace_is_clean() {
         let ws = fresh_ws();
-        let r = run_check(ws.path()).unwrap();
+        let r = run_check(ws.path(), false).unwrap();
         assert_eq!(r.outcome, CommandOutcome::Ok);
+    }
+
+    #[test]
+    fn warning_exit_code_depends_on_strict() {
+        let ws = fresh_ws();
+        run_init(ws.path(), &["memory-practices".into()]).unwrap();
+        // Force an advisory (oversize) without drift by tightening the budget.
+        let mut cfg = AgentProfileConfig::load(ws.path()).unwrap();
+        cfg.limits.claude_md_max_bytes = 10;
+        cfg.save(ws.path()).unwrap();
+
+        let lenient = run_check(ws.path(), false).unwrap();
+        assert_eq!(lenient.outcome, CommandOutcome::Ok, "non-strict: advisory is exit 0");
+        assert!(lenient.stdout.contains("advisory"), "stdout: {}", lenient.stdout);
+
+        let strict = run_check(ws.path(), true).unwrap();
+        assert_eq!(strict.outcome, CommandOutcome::Exit(1), "strict: advisory is exit 1");
     }
 
     #[test]
@@ -312,7 +343,7 @@ mod tests {
     fn diff_clean_after_init() {
         let ws = fresh_ws();
         run_init(ws.path(), &["memory-practices".into()]).unwrap();
-        let r = run_diff(ws.path()).unwrap();
+        let r = run_diff(ws.path(), false).unwrap();
         assert_eq!(r.outcome, CommandOutcome::Ok);
         assert!(r.stdout.contains("no diff"));
     }
@@ -325,7 +356,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let tampered = text.replace("Crux Daemon Memory Practices", "TAMPERED HEADER");
         std::fs::write(&path, tampered).unwrap();
-        let r = run_diff(ws.path()).unwrap();
+        let r = run_diff(ws.path(), false).unwrap();
         assert_eq!(r.outcome, CommandOutcome::Exit(1));
     }
 
