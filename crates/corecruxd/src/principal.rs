@@ -247,6 +247,11 @@ mod tests {
                 sponsor_id: None,
                 agent_work_gate: true,
                 is_default_for_category: false,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
             1,
         )
@@ -261,6 +266,11 @@ mod tests {
                 sponsor_id: None,
                 reputation_tier: None,
                 receipt_count: Some(600),
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
         )
         .expect("promote");
@@ -296,6 +306,11 @@ mod tests {
                 sponsor_id: None,
                 reputation_tier: None,
                 receipt_count: Some(600), // trusted tier
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
         )
         .expect("promote");

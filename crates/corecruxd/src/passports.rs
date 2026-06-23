@@ -71,12 +71,28 @@ pub struct PassportRecord {
     pub agent_work_gate: bool,
     #[serde(default)]
     pub is_default_for_category: bool,
+    // Optional human/directory metadata (Art. 13 transparency). All additive +
+    // skip-if-none so existing records and the crypto-identity contract are
+    // unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
     pub issued_at_unix_ms: u64,
 }
 
 fn default_tier() -> String {
     "unverified".to_string()
 }
+
+/// Max length for a free-text passport metadata field (name/owner/notes/…).
+const MAX_PASSPORT_META_CHARS: usize = 2000;
 
 pub fn resolve_tier(receipt_count: u64) -> &'static str {
     if receipt_count >= TIER_ELITE_RECEIPTS {
@@ -119,6 +135,18 @@ pub struct CreatePassportInput {
     pub sponsor_id: Option<String>,
     pub agent_work_gate: bool,
     pub is_default_for_category: bool,
+    pub name: Option<String>,
+    pub owner: Option<String>,
+    pub position: Option<String>,
+    pub company: Option<String>,
+    pub notes: Option<String>,
+}
+
+/// Normalise an optional free-text metadata field: trim, drop if empty, cap at
+/// `MAX_PASSPORT_META_CHARS` so notes can't bloat the record.
+fn clean_meta(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().chars().take(MAX_PASSPORT_META_CHARS).collect::<String>())
+        .filter(|s| !s.is_empty())
 }
 
 pub fn list_passports(store: &FactStore, category_filter: Option<&str>) -> Vec<PassportRecord> {
@@ -170,6 +198,11 @@ pub fn create_passport(
         receipt_count: 0,
         agent_work_gate: input.agent_work_gate,
         is_default_for_category: input.is_default_for_category,
+        name: clean_meta(input.name),
+        owner: clean_meta(input.owner),
+        position: clean_meta(input.position),
+        company: clean_meta(input.company),
+        notes: clean_meta(input.notes),
         issued_at_unix_ms: now_unix_ms,
     };
     if record.is_default_for_category {
@@ -185,6 +218,13 @@ pub struct UpdatePassportInput {
     pub sponsor_id: Option<Option<String>>, // outer Some = "user supplied"; inner None clears.
     pub reputation_tier: Option<String>,
     pub receipt_count: Option<u64>,
+    // Metadata edits: outer Some = "user supplied"; inner cleared to None when
+    // the trimmed value is empty (so PATCH `""` clears the field).
+    pub name: Option<Option<String>>,
+    pub owner: Option<Option<String>>,
+    pub position: Option<Option<String>>,
+    pub company: Option<Option<String>>,
+    pub notes: Option<Option<String>>,
 }
 
 pub fn update_passport(
@@ -211,6 +251,21 @@ pub fn update_passport(
     if let Some(c) = input.receipt_count {
         record.receipt_count = c;
         record.reputation_tier = resolve_tier(c).to_string();
+    }
+    if let Some(v) = input.name {
+        record.name = clean_meta(v);
+    }
+    if let Some(v) = input.owner {
+        record.owner = clean_meta(v);
+    }
+    if let Some(v) = input.position {
+        record.position = clean_meta(v);
+    }
+    if let Some(v) = input.company {
+        record.company = clean_meta(v);
+    }
+    if let Some(v) = input.notes {
+        record.notes = clean_meta(v);
     }
     write_record(store, &record)?;
     Ok(record)
@@ -257,6 +312,11 @@ pub fn seed_defaults_if_missing(
                 sponsor_id: None,
                 agent_work_gate: false,
                 is_default_for_category: true,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
             now_unix_ms,
         )?;
@@ -361,6 +421,11 @@ mod tests {
                 sponsor_id: None,
                 agent_work_gate: false,
                 is_default_for_category: true,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
             1_000,
         )
@@ -411,6 +476,11 @@ mod tests {
                 sponsor_id: None,
                 agent_work_gate: false,
                 is_default_for_category: true,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
             1,
         )
@@ -424,6 +494,11 @@ mod tests {
                 sponsor_id: None,
                 agent_work_gate: false,
                 is_default_for_category: false,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
             2,
         )
@@ -438,6 +513,11 @@ mod tests {
                 sponsor_id: None,
                 reputation_tier: None,
                 receipt_count: None,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
         )
         .expect("flip");
@@ -460,6 +540,11 @@ mod tests {
             sponsor_id: None,
             agent_work_gate: false,
             is_default_for_category: false,
+            name: None,
+            owner: None,
+            position: None,
+            company: None,
+            notes: None,
         };
         create_passport(&dir, &mut store, mk(), 1).expect("first");
         let err = create_passport(&dir, &mut store, mk(), 2).expect_err("second should fail");
@@ -480,6 +565,11 @@ mod tests {
                 sponsor_id: None,
                 agent_work_gate: false,
                 is_default_for_category: false,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
             1,
         )
@@ -502,6 +592,11 @@ mod tests {
                 sponsor_id: None,
                 agent_work_gate: false,
                 is_default_for_category: false,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
             1,
         )
@@ -515,6 +610,11 @@ mod tests {
                 sponsor_id: None,
                 agent_work_gate: false,
                 is_default_for_category: true,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
             2,
         )

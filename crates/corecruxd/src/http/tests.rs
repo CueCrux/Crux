@@ -9154,6 +9154,11 @@ async fn passports_post_round_trip_to_get() {
             sponsor_id: None,
             agent_work_gate: false,
             is_default_for_category: false,
+            name: None,
+            owner: None,
+            position: None,
+            company: None,
+            notes: None,
         }),
     )
     .await
@@ -9180,6 +9185,11 @@ async fn passports_post_duplicate_id_returns_409() {
         sponsor_id: None,
         agent_work_gate: false,
         is_default_for_category: false,
+        name: None,
+        owner: None,
+        position: None,
+        company: None,
+        notes: None,
     };
     let first = super::passports::post_passport(State(state.clone()), dev_scope_headers("admin:read"), Json(mk()))
         .await
@@ -9204,6 +9214,11 @@ async fn passports_patch_updates_gate_and_default_flag() {
             sponsor_id: None,
             agent_work_gate: false,
             is_default_for_category: false,
+            name: None,
+            owner: None,
+            position: None,
+            company: None,
+            notes: None,
         }),
     )
     .await
@@ -9218,6 +9233,11 @@ async fn passports_patch_updates_gate_and_default_flag() {
             sponsor_id: None,
             reputation_tier: None,
             receipt_count: None,
+            name: None,
+            owner: None,
+            position: None,
+            company: None,
+            notes: None,
         }),
     )
     .await
@@ -9240,6 +9260,11 @@ async fn passports_delete_removes_record() {
             sponsor_id: None,
             agent_work_gate: false,
             is_default_for_category: false,
+            name: None,
+            owner: None,
+            position: None,
+            company: None,
+            notes: None,
         }),
     )
     .await
@@ -9599,6 +9624,11 @@ async fn rcx_publish_passport_preview_builds_signed_schema_record() {
                 sponsor_id: None,
                 agent_work_gate: true,
                 is_default_for_category: true,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
             1_700_000_000_000,
         )
@@ -9645,6 +9675,11 @@ async fn rcx_publish_project_emit_stores_local_receipt() {
                 sponsor_id: None,
                 agent_work_gate: true,
                 is_default_for_category: true,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
             1_700_000_000_000,
         )
@@ -10118,6 +10153,11 @@ async fn work_patch_with_gated_passport_returns_202_queued() {
                 sponsor_id: None,
                 reputation_tier: None,
                 receipt_count: None,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
         )
         .expect("flip gate");
@@ -10242,6 +10282,11 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
                 sponsor_id: None,
                 reputation_tier: None,
                 receipt_count: None,
+                name: None,
+                owner: None,
+                position: None,
+                company: None,
+                notes: None,
             },
         )
         .expect("flip gate");
