@@ -148,6 +148,13 @@ impl Cursor<'_> {
     fn take_u8(&mut self) -> Result<u8, SessionError> {
         Ok(self.take(1)?[0])
     }
+
+    /// Bytes left to read. Used to bound pre-allocation against an
+    /// attacker-controlled length prefix (a CBOR array/map count cannot
+    /// legitimately exceed the bytes remaining in the input).
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
 }
 
 fn read_value(c: &mut Cursor) -> Result<CborValue, SessionError> {
@@ -178,14 +185,20 @@ fn read_value(c: &mut Cursor) -> Result<CborValue, SessionError> {
             Ok(CborValue::Text(s))
         }
         MAJOR_ARRAY => {
-            let mut items = Vec::with_capacity(arg as usize);
+            // Bound pre-allocation by remaining input: each element needs >=1 byte,
+            // so a valid length prefix cannot exceed the bytes left. Without this an
+            // attacker-controlled length prefix triggers an unbounded alloc (OOM).
+            let cap = (arg as usize).min(c.remaining());
+            let mut items = Vec::with_capacity(cap);
             for _ in 0..arg {
                 items.push(read_value(c)?);
             }
             Ok(CborValue::Array(items))
         }
         MAJOR_MAP => {
-            let mut pairs = Vec::with_capacity(arg as usize);
+            // Each entry needs >=2 bytes (text key + value), so bound by remaining/2.
+            let cap = (arg as usize).min(c.remaining() / 2);
+            let mut pairs = Vec::with_capacity(cap);
             for _ in 0..arg {
                 let key = read_value(c)?;
                 let value = read_value(c)?;
@@ -300,6 +313,21 @@ mod tests {
         out.clear();
         write_head(MAJOR_UINT, 0x1_0000_0000, &mut out);
         assert_eq!(out, vec![0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn decode_rejects_oversized_length_prefix_without_oom() {
+        // Array header (major 4) with a u64::MAX element count but no elements.
+        // Pre-fix this pre-allocated u64::MAX capacity and OOM-aborted; now the
+        // pre-alloc is bounded by remaining input and decode returns Err cleanly.
+        let mut arr = vec![0x80 | 0x1B]; // major 4, info 27 => 8-byte length follows
+        arr.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(decode(&arr).is_err());
+
+        // Same for a map header (major 5).
+        let mut map = vec![0xA0 | 0x1B];
+        map.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(decode(&map).is_err());
     }
 
     #[test]
