@@ -101,6 +101,31 @@ error: manual edit detected inside managed section 'memory-practices' in CLAUDE.
 
 This is intentional. To accept the bundled version and overwrite your edit: `crux-config-wizard regenerate --force`. To keep your edit instead, move it outside the markers (anywhere in the file works — the composer only touches managed spans).
 
+## Advisory lints (duplication + size)
+
+Beyond managed-section drift, `check` / `diff` and the session-start advisory surface two **advisory warnings**. These are *not* drift: `regenerate` cannot fix them (it only touches managed spans), so they are reported separately and do not, by themselves, make `check` fail — unless you pass `--strict` (for CI).
+
+- **Free-span duplication.** When text *outside* the managed markers substantially restates an enabled profile's body — e.g. a hand-written "§11" section that repeats the `memory-practices` rules — the wizard flags it:
+
+  ```text
+  CLAUDE.md: free-span text restates managed profile 'memory-practices'
+  (7/16 distinctive lines duplicated, e.g. "When calling `store_fact`, …").
+  Replace the duplicated prose with a pointer to the managed section.
+  ```
+
+  Heuristic: flagged when ≥3 of a profile's "distinctive" lines (non-blank/heading/table/marker, ≥24 chars, bullet-marker-normalised) appear in the free spans, **or** ≥30% of a ≥4-line body does. Fix by replacing the duplicated prose with a one-line pointer to the managed section below it.
+
+- **Composed size.** A large `CLAUDE.md` inflates every session prefix and risks the boot load cap. Over the soft byte budget (default ≈ 48 KB ≈ ~24 K tokens for dense markdown — a margin under the ~25 K-token cap), the wizard warns and names the byte split:
+
+  ```text
+  CLAUDE.md is 51,200 B (soft budget 49,152 B); free-span text is 18,000 B of
+  that. Trim free spans or split content.
+  ```
+
+  Tune per-workspace via the `[limits]` section (see [Configuration file](#configuration-file)).
+
+`crux-config-wizard check --strict` (or `diff --strict`) makes either warning exit non-zero so CI can enforce them.
+
 ## Authoring a new profile
 
 Add `crates/crux-config-wizard/profiles/<your-name>.md`:
@@ -135,11 +160,11 @@ Then:
 |---|---|---|
 | `init` | First-run; writes `.crux/agent-profile.toml` + composes target files | 0 ok, 2 if already initialised, 1 on error |
 | `regenerate [--force]` | Re-compose from saved choice | 0 ok, 1 on drift without `--force` |
-| `check` | CI mode | 0 clean, 1 stale |
+| `check [--strict]` | CI mode; reports drift **and** advisory lints | 0 clean, 1 stale; with `--strict`, also 1 on advisory warnings |
 | `list` | Show available + enabled | 0 |
 | `add <name>` | Enable + regenerate | 0 ok, 1 on error |
 | `remove <name>` | Disable + regenerate | 0 ok, 2 if not enabled |
-| `diff` | Same as check, more verbose output | 0 clean, 1 stale |
+| `diff [--strict]` | Same as check, more verbose output | 0 clean, 1 stale; with `--strict`, also 1 on advisory warnings |
 
 Global flag: `--workspace <path>` to operate on a directory other than the current one.
 
@@ -160,9 +185,13 @@ enabled_at = "2026-05-19T11:29:50Z"
 [targets]
 claude_md = "CLAUDE.md"
 agents_md = "AGENTS.md"
+
+[limits]                       # optional — soft size budgets in bytes
+claude_md_max_bytes = 49152    # default ≈ 48 KB; over budget → advisory warning
+agents_md_max_bytes = 49152
 ```
 
-The file is meant to be committed. The fingerprint is a stable hash of the workspace's absolute path; useful when the same Crux daemon serves multiple workspaces and the drift facts need to distinguish them.
+The file is meant to be committed. The fingerprint is a stable hash of the workspace's absolute path; useful when the same Crux daemon serves multiple workspaces and the drift facts need to distinguish them. The `[limits]` section is optional — omit it for the defaults.
 
 ## Tests
 

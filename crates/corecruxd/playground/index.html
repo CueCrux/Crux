@@ -1442,12 +1442,18 @@ function txSessions(json){   // /v1/console/sessions → {session_rows:[{session
         fields:[['passport',pass]], children:[] };
       kids=[ppId];
     }
+    const la = (typeof s.last_active_unix_ms==='number') ? s.last_active_unix_ms : null;
+    const rel = la!=null ? (()=>{ const sec=Math.max(0,Math.round((Date.now()-la)/1000));
+        return (sec<60?sec+'s':(sec<3600?Math.round(sec/60)+'m':(sec<86400?Math.round(sec/3600)+'h':Math.round(sec/86400)+'d')))+' ago'; })() : null;
+    const st = s.state || (archived?'archived':'idle');   // server-derived live state (fixes the "all idle" bug)
     return { id: idFor('sess', raw), kind:'session', __sessId:title, __raw:raw, __archived:archived, __title:title,
+      __lastActive: la, __state: st,
       label: title || 'session',
-      sub: [agent? ('agent '+agent):null, archived? 'archived':null, s.archived_at? ('· '+String(s.archived_at).slice(0,10)):null]
-             .filter(Boolean).join(' · ') || 'session · open for audit chain →',
-      status: archived? 'idle' : st2(s.status || (s.active?'active':'idle')),
-      fields: [['session_id',title],['agent',agent],['archived',archived?'yes':null],['archived_at',s.archived_at],['raw_key',raw]]
+      sub: [agent? ('agent '+agent):null, st!=='idle'? st:null, rel? ('· '+rel):null,
+            (archived && s.archived_at)? ('· arch '+String(s.archived_at).slice(0,10)):null]
+             .filter(Boolean).join(' ') || 'session · open for audit chain →',
+      status: archived? 'idle' : st2(st),
+      fields: [['session_id',title],['agent',agent],['state',st],['last_active',rel],['archived',archived?'yes':null],['archived_at',s.archived_at],['raw_key',raw]]
                .filter(([,v])=>v!=null&&v!==''),
       children:kids, doc:(s.summary||s.doc||''), payload: JSON.stringify(s,null,2) };
   });
@@ -1569,9 +1575,9 @@ function txTenants(json){   // M8
 }
 function txPassports(json){   // M8
   const ps = json.passports || (json.passport? [json.passport] : (Array.isArray(json)? json : []));
-  return ps.map(p=>({ id: idFor('pp', p.id), kind:'passport', label: p.id,
-    sub:[p.category,p.reputation_tier].filter(Boolean).join(' · '), status:'ok',
-    fields:[['id',p.id],['category',p.category],['tier',p.reputation_tier],['receipts',p.receipt_count],['gate',p.agent_work_gate]].filter(([,v])=>v!=null),
+  return ps.map(p=>({ id: idFor('pp', p.id), kind:'passport', label: (p.name? (p.name+' · '+p.id) : p.id),
+    sub:[p.position, p.company, p.category, p.reputation_tier].filter(Boolean).join(' · '), status:'ok',
+    fields:[['id',p.id],['name',p.name],['owner',p.owner],['position',p.position],['company',p.company],['category',p.category],['tier',p.reputation_tier],['receipts',p.receipt_count],['gate',p.agent_work_gate],['notes',p.notes]].filter(([,v])=>v!=null&&v!==''),
     children:[], payload: JSON.stringify(p,null,2) }));
 }
 function txPassportsPresence(json){   // gap-closure M7 — join /v1/passports/presence onto the passport panel
@@ -3330,9 +3336,23 @@ function sessionExpRow(s){
 }
 function sessionsListSections(){
   const kids=((N['cx-sessions']||{}).children||[]).map(cid=>N[cid]).filter(Boolean);
-  return [{h:'Sessions',sub:'active + saved — list view; graph from the rail pull-out',wide:true,
-    controls:[{t:'search',ph:'Filter sessions…'}].concat(kids.map(sessionExpRow))
-      .concat([{t:'btn',label:'Browse as graph',action:'graph'}])}];
+  // Time filter (all/day/week/month) — drops cards whose last-active is older
+  // than the window. Persisted via confPut under cx-sessions.window.
+  const win = confGet('cx-sessions.window','all');
+  const WIN = {day:864e5, week:7*864e5, month:30*864e5}[win];
+  const now = Date.now();
+  const inWindow = s => !WIN || s.__lastActive==null || (now - s.__lastActive) <= WIN;
+  const filterBtns = ['all','day','week','month'].map(w=>({t:'btn',
+    label: w==='all'?'all time':w, action:'showsec', key:'window', value:w, active: w===win}));
+  const live = kids.filter(s=> !s.__archived && inWindow(s));   // already most-recent-first from the server sort
+  const arch = kids.filter(s=>  s.__archived && inWindow(s));
+  return [
+    {h:'Active & idle', sub: live.length+' session'+(live.length===1?'':'s')+' · most-recent first', wide:true,
+      controls:[{t:'search',ph:'Filter sessions…'}].concat(filterBtns).concat(live.map(sessionExpRow))},
+    {h:'Archived', sub: arch.length+' archived'+(WIN?' in window':''), wide:true,
+      controls: arch.length? arch.map(sessionExpRow) : [{t:'info',label:'—',v:'no archived sessions'+(WIN?' in window':'')}]},
+    {h:'',wide:true,controls:[{t:'btn',label:'Browse as graph',action:'graph'}]},
+  ];
 }
 function identityCandidateRowData(n){
   try{ return JSON.parse(n.payload||'{}'); }catch(e){ return {}; }
@@ -3390,6 +3410,18 @@ const PAGES={
    tenantExpRow('__agent::anthropic','agent-private store',true),
    tenantExpRow('__bootstrap__::patterns','boot playbooks',true),
    {t:'btn',label:'Browse as graph',action:'graph'}]}]},
+ 'cx-passport':{title:'Passport',sub:'agent + people identities · create and view passports',sections:[
+  {h:'New passport',sub:'mint a passport and attach who owns it (POST /v1/passports)',wide:true,controls:[
+   {t:'input',k:'pp_id',label:'id',ph:'lowercase, digits, - or _',mono:true},
+   {t:'select',k:'pp_category',label:'category',options:[{v:'work',label:'work'},{v:'personal',label:'personal'},{v:'public',label:'public'}],v:'work'},
+   {t:'input',k:'pp_name',label:'name',ph:'display name'},
+   {t:'input',k:'pp_owner',label:'owner',ph:'who owns / manages this passport'},
+   {t:'input',k:'pp_position',label:'position',ph:'role / title'},
+   {t:'input',k:'pp_company',label:'company',ph:'organisation'},
+   {t:'textarea',k:'pp_notes',label:'notes',rows:2,ph:'any other notes'},
+   {t:'btn',label:'Create passport',hint:'POST /v1/passports'}]},
+  {h:'Passports',sub:'loaded from /v1/passports',wide:true,controls:[
+   {t:'search',ph:'Filter passports…'},{t:'btn',label:'Browse as graph',action:'graph'}]}]},
  'cx-review':{title:'Review',sub:'contradiction candidates · guarded fact consolidation',sections:[
   {h:'Contradictions',sub:'read-only candidates from active facts with opposite polarity',wide:true,controls:[
    {t:'search',ph:'Filter candidates…'},
@@ -4367,6 +4399,30 @@ const PAGE_WIRES={
     try{ localStorage.setItem('cxconf',JSON.stringify(CXCONF)); }catch(e){}
     if(openPageId==='cx-tenants') openPage('cx-tenants',{__wired:true});
     return 'defaults applied — all tenants inherit'; } }},
+ 'cx-passport':{
+  load: async def=>{
+    const r=await api('/v1/passports'); const ps=r.passports||[];
+    const head=def.sections[1].controls.filter(c=>c.t==='search'||(c.t==='btn'&&c.action==='graph'));
+    const rows=ps.map(p=>({t:'exp',label:(p.name?(p.name+' · '+p.id):p.id),
+      sub:[p.position,p.company,p.category,p.reputation_tier].filter(Boolean).join(' · '),
+      controls:[['id',p.id],['name',p.name],['owner',p.owner],['position',p.position],['company',p.company],['category',p.category],['tier',p.reputation_tier],['receipts',p.receipt_count]]
+        .filter(([,v])=>v!=null&&v!=='').map(([k,v])=>infoRow(k,String(v)))
+        .concat(p.notes?[infoRow('notes',String(p.notes))]:[])}));
+    def.sections[1].sub=ps.length+' passport'+(ps.length===1?'':'s');
+    def.sections[1].controls=head.filter(c=>c.t==='search')
+      .concat(rows.length?rows:[infoRow('none','no passports yet')])
+      .concat(head.filter(c=>c.t!=='search'));
+  },
+  act:{ 'Create passport': async ctx=>{
+    const id=(pageVal('cx-passport','pp_id')||'').trim();
+    if(!id) throw {status:'id is required'};
+    const category=(pageVal('cx-passport','pp_category')||'work').trim();
+    const meta=k=>{ const v=(pageVal('cx-passport','pp_'+k)||'').trim(); return v||null; };
+    const r=await postApi('/v1/passports',{ id, category,
+      name:meta('name'), owner:meta('owner'), position:meta('position'), company:meta('company'), notes:meta('notes') });
+    await PAGE_WIRES['cx-passport'].load(PAGES['cx-passport']);
+    ctx.reopen(); return 'created passport '+((r&&r.id)||id);
+  } }},
  'cx-review':{
   load: async def=>{
     const r=await api('/v1/console/review/contradictions?limit=50');

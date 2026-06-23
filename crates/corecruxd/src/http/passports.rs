@@ -25,6 +25,16 @@ pub(super) struct CreatePassportBody {
     pub agent_work_gate: bool,
     #[serde(default)]
     pub is_default_for_category: bool,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub position: Option<String>,
+    #[serde(default)]
+    pub company: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -39,6 +49,16 @@ pub(super) struct UpdatePassportBody {
     pub reputation_tier: Option<String>,
     #[serde(default)]
     pub receipt_count: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_some_option")]
+    pub name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_some_option")]
+    pub owner: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_some_option")]
+    pub position: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_some_option")]
+    pub company: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_some_option")]
+    pub notes: Option<Option<String>>,
 }
 
 /// Treats explicit `null` as `Some(None)` (clear the sponsor) and absent as
@@ -120,6 +140,11 @@ pub(super) async fn post_passport(
             sponsor_id: body.sponsor_id,
             agent_work_gate: body.agent_work_gate,
             is_default_for_category: body.is_default_for_category,
+            name: body.name,
+            owner: body.owner,
+            position: body.position,
+            company: body.company,
+            notes: body.notes,
         },
         now_ms,
     );
@@ -152,6 +177,11 @@ pub(super) async fn patch_passport(
             sponsor_id: body.sponsor_id,
             reputation_tier: body.reputation_tier,
             receipt_count: body.receipt_count,
+            name: body.name,
+            owner: body.owner,
+            position: body.position,
+            company: body.company,
+            notes: body.notes,
         },
     );
     drop(store);
