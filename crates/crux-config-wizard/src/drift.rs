@@ -75,6 +75,7 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<DriftReport> {
         .collect();
 
     let mut details = Vec::new();
+    let mut warnings = Vec::new();
 
     // Version mismatch between config + bundled.
     for f in &enabled {
@@ -92,13 +93,27 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<DriftReport> {
     for target in [Target::ClaudeMd, Target::AgentsMd] {
         let report = compose_file(workspace_root, target, &enabled, false, true);
         match report {
-            Ok(r) if r.wrote => details.push(format!(
-                "{} would be rewritten (updated={}, added={})",
-                target.filename(),
-                r.managed_sections_updated,
-                r.managed_sections_added
-            )),
-            Ok(_) => {}
+            Ok(r) => {
+                if r.wrote {
+                    details.push(format!(
+                        "{} would be rewritten (updated={}, added={})",
+                        target.filename(),
+                        r.managed_sections_updated,
+                        r.managed_sections_added
+                    ));
+                }
+                // Advisory (not drift): free-span text restating a managed profile.
+                for ov in &r.free_span_overlaps {
+                    warnings.push(format!(
+                        "{}: free-span text restates managed profile '{}' ({}/{} distinctive lines duplicated, e.g. \"{}\"). Replace the duplicated prose with a pointer to the managed section — `regenerate` cannot fix this.",
+                        target.filename(),
+                        ov.profile,
+                        ov.matched_lines,
+                        ov.distinctive_lines,
+                        ov.sample
+                    ));
+                }
+            }
             Err(crate::compose::ComposeError::Drift { profile, .. }) => details.push(format!(
                 "{} has manual edits inside managed section '{}'",
                 target.filename(),
@@ -112,7 +127,7 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<DriftReport> {
     Ok(DriftReport {
         drifted,
         details,
-        warnings: Vec::new(),
+        warnings,
     })
 }
 

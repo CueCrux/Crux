@@ -195,13 +195,107 @@ pub fn compose_file(
     })
 }
 
+// Thresholds for the free-span duplication lint. Conservative defaults so the
+// boot advisory only fires on genuine restatement, not an incidental quote.
+// Tracked as OD-17 (crux-config-wizard-dedup-lint-2026-06-23).
+const MIN_OVERLAP_LINES: usize = 3;
+const MIN_OVERLAP_RATIO: f64 = 0.30;
+const MIN_DISTINCTIVE_FOR_RATIO: usize = 4;
+const MIN_DISTINCTIVE_LINE_LEN: usize = 24;
+
 /// Detect free-span text that substantially restates an enabled managed
 /// profile's body. Compares each fragment's "distinctive lines" (non-blank,
 /// non-heading, non-table, length-gated) against the concatenated free-span
-/// text. Advisory: never mutates anything. (Populated in M1; M0 stub returns
-/// empty.)
-fn detect_free_span_overlaps(_spans: &[Span], _relevant: &[&ProfileFragment]) -> Vec<FreeSpanOverlap> {
-    Vec::new()
+/// text. Advisory only: never mutates anything, and `regenerate` cannot fix
+/// what it finds (free spans are preserved verbatim).
+fn detect_free_span_overlaps(spans: &[Span], relevant: &[&ProfileFragment]) -> Vec<FreeSpanOverlap> {
+    let free_lines: std::collections::HashSet<String> = spans
+        .iter()
+        .filter_map(|s| match s {
+            Span::Free(t) => Some(t),
+            Span::Managed(_) => None,
+        })
+        .flat_map(|t| t.lines())
+        .map(normalise_line)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if free_lines.is_empty() {
+        return Vec::new();
+    }
+
+    let mut overlaps = Vec::new();
+    for f in relevant {
+        let body = render_managed_body(f);
+        let distinctive: Vec<String> = body
+            .lines()
+            .map(normalise_line)
+            .filter(|l| is_distinctive_line(l))
+            .collect();
+        if distinctive.is_empty() {
+            continue;
+        }
+        let matched_lines: Vec<&String> = distinctive.iter().filter(|d| free_lines.contains(*d)).collect();
+        let matched = matched_lines.len();
+        let ratio = matched as f64 / distinctive.len() as f64;
+        let flagged = matched >= MIN_OVERLAP_LINES
+            || (distinctive.len() >= MIN_DISTINCTIVE_FOR_RATIO && ratio >= MIN_OVERLAP_RATIO);
+        if flagged {
+            overlaps.push(FreeSpanOverlap {
+                profile: f.frontmatter.name.clone(),
+                matched_lines: matched,
+                distinctive_lines: distinctive.len(),
+                sample: matched_lines.first().map(|s| truncate_chars(s, 80)).unwrap_or_default(),
+            });
+        }
+    }
+    overlaps
+}
+
+/// Normalise a single line for overlap comparison: trim, then strip a leading
+/// list marker (`- `, `* `, `+ `, or `N. `) so bullet-style differences don't
+/// hide a genuine restatement. Applied to both free and managed lines.
+fn normalise_line(line: &str) -> String {
+    let t = line.trim();
+    let stripped = t
+        .strip_prefix("- ")
+        .or_else(|| t.strip_prefix("* "))
+        .or_else(|| t.strip_prefix("+ "))
+        .unwrap_or_else(|| strip_ordered_marker(t));
+    stripped.trim().to_string()
+}
+
+/// Strip a leading ordered-list marker like `1. ` / `12. `; returns the input
+/// unchanged when there is none.
+fn strip_ordered_marker(t: &str) -> &str {
+    let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        if let Some(rest) = t[digits.len()..].strip_prefix(". ") {
+            return rest;
+        }
+    }
+    t
+}
+
+/// A line is "distinctive" (worth matching) when it is substantive rule prose,
+/// not structure: non-empty, not a heading/table/marker, and long enough that a
+/// coincidental match is unlikely.
+fn is_distinctive_line(line: &str) -> bool {
+    !line.is_empty()
+        && !line.starts_with('#')
+        && !line.starts_with('|')
+        && !line.starts_with("<!--")
+        && !line.starts_with("> ")
+        && line.len() >= MIN_DISTINCTIVE_LINE_LEN
+}
+
+/// Truncate to at most `max` chars on a char boundary, appending `…` if cut.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}…")
+    }
 }
 
 fn render_full_section(f: &ProfileFragment) -> String {
@@ -349,6 +443,49 @@ mod tests {
             "+++\nname = \"{name}\"\nversion = {ver}\ndescription = \"d\"\ntargets = [\"claude_md\"]\norder = {order}\n+++\n\n{body}\n"
         );
         ProfileFragment::parse(name, &raw).unwrap()
+    }
+
+    // M1 — free-span duplication lint -------------------------------------
+
+    const RULES_BODY: &str = "## Rules\n\n- Always pass a token_budget on every retrieval call here.\n- Never store secrets inside the committed configuration file.\n- Prefer addressed recall over keyword search for stored facts.\n- Do not migrate the memory index wholesale into the fact store.\n";
+
+    #[test]
+    fn free_span_restating_managed_body_is_flagged() {
+        let dir = TempDir::new().unwrap();
+        let fragments = vec![frag("a", 1, 10, RULES_BODY)];
+        // Lay down the managed section, then prepend a free preamble that
+        // restates 3 of the 4 distinctive rule lines.
+        compose_file(dir.path(), Target::ClaudeMd, &fragments, false, false).unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        let existing = std::fs::read_to_string(&path).unwrap();
+        let preamble = "## Local notes\n- Always pass a token_budget on every retrieval call here.\n- Never store secrets inside the committed configuration file.\n- Prefer addressed recall over keyword search for stored facts.\n\n";
+        std::fs::write(&path, format!("{preamble}{existing}")).unwrap();
+
+        let r = compose_file(dir.path(), Target::ClaudeMd, &fragments, false, true).unwrap();
+        assert_eq!(r.free_span_overlaps.len(), 1, "expected one overlap");
+        let ov = &r.free_span_overlaps[0];
+        assert_eq!(ov.profile, "a");
+        assert!(ov.matched_lines >= 3, "matched={}", ov.matched_lines);
+        assert_eq!(ov.distinctive_lines, 4);
+    }
+
+    #[test]
+    fn single_quoted_line_is_not_flagged() {
+        let dir = TempDir::new().unwrap();
+        let fragments = vec![frag("a", 1, 10, RULES_BODY)];
+        compose_file(dir.path(), Target::ClaudeMd, &fragments, false, false).unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        let existing = std::fs::read_to_string(&path).unwrap();
+        // Quoting ONE rule line for context is legitimate — must not flag.
+        let preamble = "## Local notes\nWe follow one important rule in this repo:\n- Always pass a token_budget on every retrieval call here.\n\n";
+        std::fs::write(&path, format!("{preamble}{existing}")).unwrap();
+
+        let r = compose_file(dir.path(), Target::ClaudeMd, &fragments, false, true).unwrap();
+        assert!(
+            r.free_span_overlaps.is_empty(),
+            "one quoted line should not flag: {:?}",
+            r.free_span_overlaps
+        );
     }
 
     #[test]
