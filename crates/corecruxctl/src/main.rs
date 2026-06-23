@@ -18,8 +18,8 @@ use clap::{Parser, Subcommand};
 use corecruxctl::{
     admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, config_bundle, cost, evidence, explain,
     extensions, fixture_digest, gaps, hooks, identity_cli, inspect_receipt, login, machine, memory, memory_pack,
-    output_verify, parity, projections, receipts, reconcile, replay, session_sync, shard, shardmap, smoke, snapshot,
-    stage1_import, storage, structured_log, tooling_env, verify_store,
+    observe_ingest, output_verify, parity, projections, receipts, reconcile, replay, session_sync, shard, shardmap,
+    smoke, snapshot, stage1_import, storage, structured_log, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -104,6 +104,13 @@ enum Command {
     Session {
         #[command(subcommand)]
         command: SessionCommand,
+    },
+
+    /// Observe audit-chain tools (transcript ingest).
+    #[command(name = "observe")]
+    Observe {
+        #[command(subcommand)]
+        command: ObserveCommand,
     },
 
     /// Deterministic replay checks from a replay pack (preferred) or legacy JSONL input.
@@ -718,6 +725,36 @@ enum SessionCommand {
         #[arg(long)]
         post: bool,
         /// Tenant id for `--post` (default: "default").
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Daemon base URL override.
+        #[arg(long)]
+        url: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ObserveCommand {
+    /// Ingest a Claude Code transcript into signed observe trace nodes:
+    /// capture each turn's assistant answer + a private extractive
+    /// thinking-summary (reasoning blob), all `private:true`.
+    Ingest {
+        /// Transcript file (default: newest under ~/.claude/projects).
+        #[arg(long)]
+        file: Option<String>,
+        /// Session id to ingest (its `<id>.jsonl` under ~/.claude/projects).
+        #[arg(long)]
+        session: Option<String>,
+        /// Directory for reasoning blobs (default: ~/.local/share/cuecrux/observe).
+        #[arg(long)]
+        blob_dir: Option<String>,
+        /// Passport/actor to attribute the nodes to (default: agent:claude-code-ingest).
+        #[arg(long)]
+        actor: Option<String>,
+        /// Post the nodes to the daemon's observe surface (needs CORECRUXD_OBSERVE=1).
+        #[arg(long)]
+        post: bool,
+        /// Tenant id for `--post`.
         #[arg(long)]
         tenant: Option<String>,
         /// Daemon base URL override.
@@ -2054,6 +2091,17 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 tenant,
                 url,
             } => cost::run_cost(file, session, json, post, tenant, url),
+        },
+        Command::Observe { command } => match command {
+            ObserveCommand::Ingest {
+                file,
+                session,
+                blob_dir,
+                actor,
+                post,
+                tenant,
+                url,
+            } => observe_ingest::run_ingest(file, session, blob_dir, actor, post, tenant, url),
         },
         Command::Replay {
             pack,
