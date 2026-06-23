@@ -1,19 +1,37 @@
 #!/usr/bin/env python3
-"""Generate Audit Bundle v1 unpacked conformance vectors.
+"""Generate Audit Bundle v1 conformance vectors.
 
-The vectors are intentionally small and deterministic. They are unpacked bundle
-directories so git can review the JSON members directly; `receipts.cbor` is
-generated as the raw CBOR empty-array byte. To regenerate the committed
-archive-level `audit-bundle.tar.zst` fixtures, run:
+Each vector is emitted in two interchangeable forms so downstream tooling can
+review and verify whichever it prefers:
 
-    cargo run -p corecrux-receipts --example gen_audit_bundle_archive_vectors
+* an **unpacked directory** holding the three bundle members
+  (`manifest.json`, `events.jsonl`, `receipts.cbor`) plus `expected.json`, so
+  git can diff the JSON/CBOR members directly; and
+* a deterministic `audit-bundle.tar.zst` matching the production on-disk layout
+  (`tar.zst` with the same three members), so external verifiers can exercise
+  the real archive shape.
+
+The Rust example `cargo run -p corecrux-receipts --example
+gen_audit_bundle_archive_vectors` produces a byte-canonical archive from the
+same unpacked members; this generator is the toolchain-free fallback (stdlib
+`tarfile` + a zstd backend) so the vectors can be regenerated and verified
+without a Rust build. The two archives are semantically identical — same three
+members, same content — and both are accepted/rejected identically by
+`tools/verify_audit_bundle_v1.py`.
+
+zstd backend: the `zstandard` Python module is preferred; the `zstd` CLI is used
+as a fallback. CI installs `zstandard` (see `.github/workflows/audit-vectors.yml`).
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
+import shutil
+import subprocess
+import tarfile
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -22,6 +40,11 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 ROOT = Path(__file__).resolve().parents[1]
 VECTORS = ROOT / "crates/corecrux-receipts/vectors/audit-bundle-v1"
+
+ARCHIVE_FILENAME = "audit-bundle.tar.zst"
+# Order matters: the verifier reads members by name, but keeping a stable order
+# (and deterministic tar headers) makes the archive reproducible.
+BUNDLE_MEMBERS = ("manifest.json", "events.jsonl", "receipts.cbor")
 
 
 def canonical_manifest_bytes(manifest: dict) -> bytes:
@@ -62,6 +85,57 @@ def build_manifest(events: bytes, receipts: bytes) -> dict:
     return manifest
 
 
+def _zstd_compress(data: bytes) -> bytes:
+    """Compress with zstd level 3, preferring the python module over the CLI."""
+    try:
+        import zstandard as zstd  # type: ignore[import-not-found]
+    except Exception:
+        zstd = None
+
+    if zstd is not None:
+        return zstd.ZstdCompressor(level=3).compress(data)
+    if shutil.which("zstd"):
+        return subprocess.run(
+            ["zstd", "-3", "-c"],
+            input=data,
+            stdout=subprocess.PIPE,
+            check=True,
+        ).stdout
+    raise RuntimeError(
+        "generating .tar.zst vectors requires the python `zstandard` module or the `zstd` CLI; "
+        "install with `pip install zstandard`"
+    )
+
+
+def write_archive(dir_path: Path) -> None:
+    """Pack the unpacked members of `dir_path` into a deterministic tar.zst."""
+    tar_buf = io.BytesIO()
+    # GNU format + fixed metadata = reproducible archive across runs.
+    with tarfile.open(fileobj=tar_buf, mode="w", format=tarfile.GNU_FORMAT) as archive:
+        for member in BUNDLE_MEMBERS:
+            payload = (dir_path / member).read_bytes()
+            info = tarfile.TarInfo(name=member)
+            info.size = len(payload)
+            info.mode = 0o644
+            info.mtime = 0
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            archive.addfile(info, io.BytesIO(payload))
+
+    (dir_path / ARCHIVE_FILENAME).write_bytes(_zstd_compress(tar_buf.getvalue()))
+
+
+def write_vector(dir_path: Path, *, manifest: dict, events: bytes, receipts: bytes, expected: dict) -> None:
+    dir_path.mkdir(parents=True, exist_ok=True)
+    write_json(dir_path / "manifest.json", manifest)
+    (dir_path / "events.jsonl").write_bytes(events)
+    (dir_path / "receipts.cbor").write_bytes(receipts)
+    write_json(dir_path / "expected.json", expected)
+    write_archive(dir_path)
+
+
 def main() -> None:
     events = (
         b'{"fact_id":"f_vector_001","entity":"vector:fixture","key":"status",'
@@ -71,21 +145,20 @@ def main() -> None:
     receipts = b"\x80"
     manifest = build_manifest(events, receipts)
 
-    valid = VECTORS / "valid-minimal"
-    valid.mkdir(parents=True, exist_ok=True)
-    write_json(valid / "manifest.json", manifest)
-    (valid / "events.jsonl").write_bytes(events)
-    (valid / "receipts.cbor").write_bytes(receipts)
-    write_json(valid / "expected.json", {"ok": True})
+    write_vector(
+        VECTORS / "valid-minimal",
+        manifest=manifest,
+        events=events,
+        receipts=receipts,
+        expected={"ok": True},
+    )
 
-    invalid = VECTORS / "invalid-events-hash"
-    invalid.mkdir(parents=True, exist_ok=True)
-    write_json(invalid / "manifest.json", manifest)
-    (invalid / "events.jsonl").write_bytes(events.replace(b"shipped", b"tampered"))
-    (invalid / "receipts.cbor").write_bytes(receipts)
-    write_json(
-        invalid / "expected.json",
-        {"ok": False, "failure_reason_contains": "events.jsonl sha256 mismatch"},
+    write_vector(
+        VECTORS / "invalid-events-hash",
+        manifest=manifest,
+        events=events.replace(b"shipped", b"tampered"),
+        receipts=receipts,
+        expected={"ok": False, "failure_reason_contains": "events.jsonl sha256 mismatch"},
     )
 
 

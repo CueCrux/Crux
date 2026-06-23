@@ -1,0 +1,115 @@
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+#
+# Audit Bundle v1 conformance gate (ExecPlan audit-ii-gap-closure-hardening-2026-06-14, M5 / G4).
+#
+# Runs the independent Python verifier (tools/verify_audit_bundle_v1.py) against
+# every conformance vector under crates/corecrux-receipts/vectors/audit-bundle-v1/,
+# in BOTH forms — the unpacked directory and the audit-bundle.tar.zst archive —
+# and asserts the accept/reject verdict matches each vector's expected.json.
+#
+# Also regenerates the vectors with tools/gen_audit_bundle_vectors.py and asserts
+# the tracked members (manifest.json, events.jsonl, receipts.cbor) did not drift,
+# so the fixtures stay in sync with the generator.
+name: Audit bundle vectors
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify audit-bundle-v1 vectors
+    runs-on: [self-hosted, ci]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: '3.12'
+
+      # cryptography → Ed25519 verify; zstandard → decompress audit-bundle.tar.zst.
+      - name: Install verifier dependencies
+        run: python3 -m pip install --disable-pip-version-check 'cryptography>=41' 'zstandard>=0.22'
+
+      - name: Verify every vector (unpacked dir + .tar.zst) against expected.json
+        run: |
+          set -euo pipefail
+          vectors_root="crates/corecrux-receipts/vectors/audit-bundle-v1"
+          status=0
+          for dir in "$vectors_root"/*/; do
+            dir="${dir%/}"
+            [ -f "$dir/expected.json" ] || continue
+            name="$(basename "$dir")"
+
+            echo "::group::$name (unpacked dir)"
+            if python3 tools/verify_audit_bundle_v1.py "$dir" --json; then
+              echo "PASS: $name unpacked dir verdict matches expected.json"
+            else
+              echo "FAIL: $name unpacked dir verdict did NOT match expected.json"
+              status=1
+            fi
+            echo "::endgroup::"
+
+            archive="$dir/audit-bundle.tar.zst"
+            if [ -f "$archive" ]; then
+              echo "::group::$name (.tar.zst)"
+              if python3 tools/verify_audit_bundle_v1.py "$archive" --json; then
+                echo "PASS: $name .tar.zst verdict matches expected.json"
+              else
+                echo "FAIL: $name .tar.zst verdict did NOT match expected.json"
+                status=1
+              fi
+              echo "::endgroup::"
+            else
+              echo "FAIL: $name has no audit-bundle.tar.zst"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      # The generator is the source of truth for the tracked members. Regenerate
+      # and fail if the committed manifest.json / events.jsonl / receipts.cbor drift.
+      # (audit-bundle.tar.zst is excluded: the byte-canonical archive is produced by
+      # the Rust example; the Python generator emits a semantically-equivalent one
+      # whose zstd framing differs across implementations.)
+      - name: Assert vectors are in sync with the generator
+        run: |
+          set -euo pipefail
+          python3 tools/gen_audit_bundle_vectors.py
+          if ! git diff --quiet -- \
+            'crates/corecrux-receipts/vectors/audit-bundle-v1/**/manifest.json' \
+            'crates/corecrux-receipts/vectors/audit-bundle-v1/**/events.jsonl' \
+            'crates/corecrux-receipts/vectors/audit-bundle-v1/**/receipts.cbor' \
+            'crates/corecrux-receipts/vectors/audit-bundle-v1/**/expected.json'; then
+            echo "FAIL: audit-bundle-v1 vector members drifted from the generator output:"
+            git --no-pager diff --stat -- 'crates/corecrux-receipts/vectors/audit-bundle-v1/**'
+            exit 1
+          fi
+          echo "PASS: tracked vector members match tools/gen_audit_bundle_vectors.py"
+
+      # Independently re-verify the freshly Python-generated .tar.zst archives so
+      # the generator's archive output is exercised end-to-end (not just the
+      # committed Rust-canonical archives).
+      - name: Verify Python-generated .tar.zst archives
+        run: |
+          set -euo pipefail
+          vectors_root="crates/corecrux-receipts/vectors/audit-bundle-v1"
+          status=0
+          for dir in "$vectors_root"/*/; do
+            dir="${dir%/}"
+            [ -f "$dir/expected.json" ] || continue
+            if ! python3 tools/verify_audit_bundle_v1.py "$dir/audit-bundle.tar.zst" --json; then
+              echo "FAIL: Python-generated $(basename "$dir") .tar.zst verdict mismatch"
+              status=1
+            fi
+          done
+          exit "$status"
