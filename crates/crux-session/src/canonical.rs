@@ -137,7 +137,10 @@ struct Cursor<'a> {
 
 impl Cursor<'_> {
     fn take(&mut self, n: usize) -> Result<&[u8], SessionError> {
-        if self.pos + n > self.bytes.len() {
+        // Overflow-safe: `n` derives from an attacker-controlled CBOR length
+        // prefix and can be near usize::MAX, so `self.pos + n` would overflow
+        // (a panic under overflow checks). Compare against bytes remaining.
+        if n > self.remaining() {
             return Err(SessionError::Decode("unexpected eof".to_string()));
         }
         let slice = &self.bytes[self.pos..self.pos + n];
@@ -328,6 +331,21 @@ mod tests {
         let mut map = vec![0xA0 | 0x1B];
         map.extend_from_slice(&u64::MAX.to_be_bytes());
         assert!(decode(&map).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_oversized_byte_and_text_length_without_overflow() {
+        // Byte-string (major 2) / text (major 3) headers with a near-usize::MAX
+        // length but no payload. Pre-fix, `Cursor::take`'s `self.pos + n` bounds
+        // check overflowed and panicked (found by the rcx_canonical_token fuzz
+        // target); now it compares against `remaining()` and returns Err cleanly.
+        let mut bytes = vec![0x40 | 0x1B]; // major 2, info 27 => 8-byte length
+        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(decode(&bytes).is_err());
+
+        let mut text = vec![0x60 | 0x1B]; // major 3, info 27 => 8-byte length
+        text.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(decode(&text).is_err());
     }
 
     #[test]
