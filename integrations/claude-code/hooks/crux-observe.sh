@@ -181,12 +181,15 @@ if [ "${CRUX_HOOK_ACTIVITY:-0}" = "1" ]; then
         jq -n --rawfile text "${ACT_TXT}" \
           --arg kind "${ACT_KIND}" --arg sid "${SESSION_ID}" \
           --arg tenant "${ACT_TENANT}" --arg tool "${ACT_TOOL}" \
+          --arg execplan "${CRUX_ACTIVITY_EXECPLAN:-}" \
           --argjson cap "${ACT_MAXTEXT}" '
           ($text | sub("\\s+$";"")) as $t0
           | ($t0 | if length>$cap then .[0:$cap]+"…" else . end) as $t
+          | ( (if $tool!="" then {tool:$tool} else {} end)
+              + (if $execplan!="" then {execplan_slug:$execplan} else {} end) ) as $meta
           | if ($t|length)==0 then empty
             else {tenant_id:$tenant, session_id:$sid, kind:$kind, text:$t,
-                  meta:(if $tool!="" then {tool:$tool} else {} end), private:true} end' \
+                  meta:$meta, private:true} end' \
           > "${ACT_BODY}" 2>>"${ERR_LOG}"
       fi
       if [ -s "${ACT_BODY}" ]; then

@@ -42,6 +42,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -58,9 +59,11 @@ pub const FEATURE_FLAG_ENV: &str = "CORECRUXD_FEATURE_ACTIVITY_LOG";
 /// Canonical schema id stamped on every persisted entry.
 pub const JOURNAL_ENTRY_SCHEMA_V1: &str = "crux.activity.journal_entry.v1";
 
-/// Default sliding-window retention horizon (24h). Overridable via
+/// Default sliding-window retention horizon (365 days). The journal is now
+/// disk-durable (see [`JournalStore::open`]), so the default keeps activity for
+/// a year rather than the original 24h volatile window. Overridable via
 /// `CORECRUXD_FEATURE_ACTIVITY_LOG_TTL_SECS`.
-pub const DEFAULT_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+pub const DEFAULT_RETENTION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// Per-session ring hard cap. Older entries are evicted FIFO.
 pub const MAX_ENTRIES_PER_SESSION: usize = 5_000;
@@ -261,9 +264,81 @@ struct SessionLog {
 #[derive(Debug, Default)]
 pub struct JournalStore {
     by_session: HashMap<(String, String), SessionLog>,
+    /// When set, every append is written through to this JSONL file and the
+    /// store is hydrated from it at [`JournalStore::open`]. `None` → in-memory
+    /// only (the default, used by tests).
+    persist_path: Option<PathBuf>,
 }
 
 impl JournalStore {
+    /// Open a store optionally backed by `path` (a JSONL append log). When
+    /// `Some`, existing entries are loaded (retention-trimmed + compacted) and
+    /// subsequent appends are written through. `None` keeps it purely in-memory.
+    pub fn open(path: Option<PathBuf>) -> Self {
+        let mut store = JournalStore {
+            persist_path: path.clone(),
+            ..Default::default()
+        };
+        if let Some(p) = path {
+            store.load_from_disk(&p);
+        }
+        store
+    }
+
+    /// Hydrate `by_session` from the on-disk JSONL, skipping unparseable lines
+    /// (forward-compatible), applying retention, then compacting the file to the
+    /// retained set so it can't grow without bound across restarts.
+    fn load_from_disk(&mut self, path: &Path) {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return; // first run / unreadable → start empty
+        };
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(mut entry) = serde_json::from_str::<JournalEntry>(line) else {
+                continue;
+            };
+            // `ts_us` is `#[serde(skip)]` (kept out of the public JSON), so it
+            // deserialises to 0 — recompute the sort/eviction key from the
+            // persisted RFC3339 `created_at`.
+            entry.ts_us = chrono::DateTime::parse_from_rfc3339(&entry.created_at)
+                .map(|d| d.timestamp_micros())
+                .unwrap_or(0);
+            let log = self
+                .by_session
+                .entry((entry.tenant_id.clone(), entry.session_id.clone()))
+                .or_default();
+            log.next_seq = log.next_seq.max(entry.seq + 1);
+            log.entries.push(entry);
+        }
+        let ttl = retention();
+        for log in self.by_session.values_mut() {
+            log.entries.sort_by(|a, b| a.ts_us.cmp(&b.ts_us));
+            Self::trim(&mut log.entries, ttl);
+        }
+        self.compact_to_disk(path);
+    }
+
+    /// Rewrite the persist file with the current (retained) entries, oldest
+    /// first. Atomic via a temp file + rename so a crash mid-write can't corrupt
+    /// the log. Best-effort: failures are logged by the caller's context, never
+    /// fatal.
+    fn compact_to_disk(&self, path: &Path) {
+        let mut rows: Vec<&JournalEntry> = self.by_session.values().flat_map(|l| l.entries.iter()).collect();
+        rows.sort_by(|a, b| a.ts_us.cmp(&b.ts_us));
+        let mut buf = String::new();
+        for e in rows {
+            if let Ok(line) = serde_json::to_string(e) {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        }
+        let tmp = path.with_extension("jsonl.tmp");
+        if std::fs::write(&tmp, &buf).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
     /// Append an entry, assigning `seq`/`created_at`/`entry_id` and stripping
     /// reserved-prefix tokens from `text`. Returns the finalised entry
     /// (caller emits the event + receipt reference from it).
@@ -311,6 +386,12 @@ impl JournalStore {
 
         log.entries.push(entry.clone());
         Self::trim(&mut log.entries, retention());
+        // Write-through to the durable log (best-effort; an unwritable disk must
+        // never break the in-memory append). Appends are idempotent enough for
+        // the load path: duplicates are tolerated and compacted on next open.
+        if let Some(path) = self.persist_path.clone() {
+            append_line_to_disk(&path, &entry);
+        }
         entry
     }
 
@@ -354,6 +435,7 @@ impl JournalStore {
         caller_passport: &str,
         before: Option<i64>,
         kinds: Option<&[JournalKind]>,
+        execplan: Option<&str>,
         limit: usize,
     ) -> Vec<JournalEntry> {
         let mut out: Vec<JournalEntry> = Vec::new();
@@ -368,6 +450,9 @@ impl JournalStore {
                 }
                 if kinds.is_some_and(|ks| !ks.contains(&e.kind)) {
                     continue;
+                }
+                if execplan.is_some_and(|want| e.meta.execplan_slug.as_deref() != Some(want)) {
+                    continue; // plan filter: only entries tagged for this ExecPlan
                 }
                 if e.private && e.actor_passport != caller_passport {
                     continue;
@@ -409,11 +494,37 @@ impl JournalStore {
     }
 }
 
+/// Resolve the on-disk journal log path: `<CORECRUXD_DATA_DIR>/activity/journal.jsonl`.
+/// `None` when the data dir is unset (e.g. tests) → the store stays in-memory.
+/// Creates the `activity/` directory as a side effect.
+pub fn activity_persist_path() -> Option<PathBuf> {
+    let dir = std::env::var("CORECRUXD_DATA_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    let activity_dir = PathBuf::from(dir).join("activity");
+    if std::fs::create_dir_all(&activity_dir).is_err() {
+        return None;
+    }
+    Some(activity_dir.join("journal.jsonl"))
+}
+
+/// Append one entry as a JSON line to the durable log. Best-effort: any IO error
+/// is swallowed so a full/unwritable disk never propagates into the append path.
+fn append_line_to_disk(path: &Path, entry: &JournalEntry) {
+    use std::io::Write as _;
+    let Ok(line) = serde_json::to_string(entry) else { return };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// Process-wide journal store (lazy-init, single mutex), mirroring the trace
-/// ring's [`crux_mcp::traces::global`] singleton pattern.
+/// ring's [`crux_mcp::traces::global`] singleton pattern. Hydrates from
+/// `<CORECRUXD_DATA_DIR>/activity/journal.jsonl` on first access so activity
+/// survives daemon restarts.
 pub fn global() -> &'static Mutex<JournalStore> {
     static STORE: OnceLock<Mutex<JournalStore>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(JournalStore::default()))
+    STORE.get_or_init(|| Mutex::new(JournalStore::open(activity_persist_path())))
 }
 
 /// Compact agent-lane row (schema 2 in the design doc): the cheap projection
@@ -503,6 +614,42 @@ mod tests {
             assert!(!activity_log_enabled(), "{off:?} should disable");
         }
         std::env::remove_var(FEATURE_FLAG_ENV);
+    }
+
+    #[test]
+    fn disk_persistence_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!("crux-activity-persist-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("journal.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut store = JournalStore::open(Some(path.clone()));
+            store.append(input("t", "s1", JournalKind::Question, "q1"));
+            store.append(input("t", "s1", JournalKind::Answer, "a1"));
+            store.append(input("t", "s2", JournalKind::Command, "c1"));
+        } // dropped — only the on-disk log remains
+
+        let mut store2 = JournalStore::open(Some(path.clone()));
+        assert_eq!(
+            store2.recent("t", "s1", "alice", None, None, 100).len(),
+            2,
+            "s1 persisted"
+        );
+        assert_eq!(
+            store2.recent_all("t", "alice", None, None, None, 100).len(),
+            3,
+            "all sessions persisted"
+        );
+        // next_seq continues past the reloaded entries — no seq collision.
+        assert_eq!(store2.append(input("t", "s1", JournalKind::Answer, "a2")).seq, 2);
+
+        // In-memory mode (no path) writes nothing.
+        let mut mem = JournalStore::open(None);
+        mem.append(input("t", "s", JournalKind::Question, "x"));
+        assert_eq!(mem.recent("t", "s", "alice", None, None, 10).len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
