@@ -40,6 +40,9 @@ __pycache__/
 *.jsonl
 # code-intelligence harvester fixture (recorded cargo-check JSON) is intentionally tracked
 !crates/corecruxctl/tests/fixtures_code_health/cargo_check.jsonl
+# audit-bundle-v1 conformance vectors: the unpacked events.jsonl member is a
+# reviewable fixture (the same bytes packed inside audit-bundle.tar.zst), not a data dump
+!crates/corecrux-receipts/vectors/audit-bundle-v1/**/events.jsonl
 crux-data/
 passport.key
 passports/
