@@ -10,12 +10,12 @@
 //! Two tools:
 //!
 //! - `memory_contradictions` (read) — runs the deterministic, NON-mutating
-//!   [`FactStore::contradiction_candidates_v1`] pass and returns ranked
+//!   `FactStore::contradiction_candidates_v1` pass and returns ranked
 //!   `{entity, key, reason, fact_ids, values, …}` candidates. It only
 //!   DETECTS + SURFACES; it never resolves anything. Honours
 //!   `token_budget` (default 500, QC.2).
 //! - `memory_consolidate` (write, passport-required) — drives the safe
-//!   [`FactStore::consolidate_facts_v1`] pass. This is the EXPLICIT resolve
+//!   `FactStore::consolidate_facts_v1` pass. This is the EXPLICIT resolve
 //!   step: it creates a canonical fact, supersedes the named targets, and
 //!   emits a consolidation receipt — but only after the store's protection
 //!   guards reject pinned / receipt-linked / private / high-confidence /
