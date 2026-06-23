@@ -53,7 +53,7 @@ jobs:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'

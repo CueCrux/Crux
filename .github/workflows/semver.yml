@@ -13,7 +13,7 @@ jobs:
     env:
       CARGO_HOME: /home/gha-runner/.cargo
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
