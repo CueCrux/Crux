@@ -41,7 +41,7 @@ jobs:
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:

@@ -24,6 +24,6 @@ jobs:
     name: Verify agent-doc references resolve
     runs-on: [self-hosted, ci]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Check agent docs
         run: bash scripts/check-agent-docs.sh

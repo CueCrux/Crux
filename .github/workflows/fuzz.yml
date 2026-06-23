@@ -64,7 +64,7 @@ jobs:
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - name: Ensure cargo-fuzz
         run: |

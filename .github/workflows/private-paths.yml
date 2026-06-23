@@ -20,6 +20,6 @@ jobs:
     name: No private-monorepo refs
     runs-on: [self-hosted, ci]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Run guard
         run: bash scripts/check-no-private-paths.sh
