@@ -43,11 +43,11 @@ fn run(workspace: &Path, cmd: cli::Command) -> std::io::Result<ExitCode> {
             profiles,
         } => init_dispatch(&workspace, non_interactive, profiles)?,
         cli::Command::Regenerate { force } => run_regenerate(&workspace, force)?,
-        cli::Command::Check => run_check(&workspace)?,
+        cli::Command::Check { strict } => run_check(&workspace, strict)?,
         cli::Command::List => run_list(&workspace)?,
         cli::Command::Add { name } => run_add(&workspace, &name)?,
         cli::Command::Remove { name } => run_remove(&workspace, &name)?,
-        cli::Command::Diff => run_diff(&workspace)?,
+        cli::Command::Diff { strict } => run_diff(&workspace, strict)?,
     };
     emit(&report);
     Ok(match report.outcome {
