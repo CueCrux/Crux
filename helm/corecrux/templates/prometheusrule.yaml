@@ -1,0 +1,49 @@
+{{- if .Values.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "corecrux.fullname" . }}-coverage
+  labels:
+    {{- include "corecrux.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: crux-coverage-attestation
+      rules:
+        # G7: events in the last attested window with no CROWN receipt.
+        - alert: CruxUnsignedActivity
+          expr: corecrux_coverage_events_without_receipt > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Unsigned activity in the last attested coverage window"
+            description: "{{`{{ $value }}`}} events had no CROWN receipt. Every state mutation must mint a receipt (Art.12 record-keeping)."
+        # G7: receipts in the last attested window with no external anchor.
+        - alert: CruxUnanchoredReceipts
+          expr: corecrux_coverage_receipts_without_anchor > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Un-anchored receipts in the last attested coverage window"
+            description: "{{`{{ $value }}`}} receipts lack an external anchor. Re-run the anchoring job or investigate the witness pipeline."
+        - alert: CruxCoverageGapsHigh
+          expr: corecrux_coverage_gaps_total > {{ .Values.prometheusRule.gapsHighThreshold }}
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: "Coverage gap total is high"
+            description: "{{`{{ $value }}`}} total gaps (unsigned events + un-anchored receipts) in the last attested window."
+        - alert: CruxCoverageAttestationStale
+          expr: absent(corecrux_coverage_gaps_total)
+          for: 25h
+          labels:
+            severity: warning
+          annotations:
+            summary: "No coverage attestation has run recently"
+            description: "The coverage gauges are absent — the daily coverage-window-attest job may have stopped."
+{{- end }}

@@ -41,13 +41,16 @@ pub use audit_bundle_v1::{
 };
 pub use audit_gap_v1::{
     assert_chain_reanchor_kind_v1, assert_consolidation_kind_v1, assert_coverage_attestation_kind_v1,
-    assert_model_invocation_kind_v1, assert_redaction_receipt_kind_v1, build_chain_reanchor_body_v1,
-    build_consolidation_body_v1, build_coverage_attestation_body_v1, build_model_invocation_body_v1,
-    build_redaction_receipt_body_v1, sign_chain_reanchor_v1, sign_consolidation_v1, sign_coverage_attestation_v1,
-    sign_model_invocation_v1, sign_redaction_receipt_v1, verify_chain_reanchor_body_v1, ChainReanchorBodyInputV1,
-    ConsolidationBodyInputV1, CoverageAttestationBodyInputV1, ModelInvocationBodyInputV1, RedactionReceiptBodyInputV1,
+    assert_coverage_window_kind_v1, assert_model_invocation_kind_v1, assert_redaction_receipt_kind_v1,
+    build_chain_reanchor_body_v1, build_consolidation_body_v1, build_coverage_attestation_body_v1,
+    build_coverage_window_body_v1, build_model_invocation_body_v1, build_redaction_receipt_body_v1,
+    coverage_window_chain_fold_v1, coverage_window_chain_head_hex_v1, coverage_window_report_canonical_json_v1,
+    sign_chain_reanchor_v1, sign_consolidation_v1, sign_coverage_attestation_v1, sign_coverage_window_v1,
+    sign_model_invocation_v1, sign_redaction_receipt_v1, verify_chain_reanchor_body_v1, verify_coverage_window_body_v1,
+    ChainReanchorBodyInputV1, ConsolidationBodyInputV1, CoverageAttestationBodyInputV1, CoverageWindowBodyInputV1,
+    CoverageWindowCountsV1, CoverageWindowReportV1, ModelInvocationBodyInputV1, RedactionReceiptBodyInputV1,
     AUDIT_GAP_BODY_SCHEMA_V1, CHAIN_REANCHOR_KIND_V1, CONSOLIDATION_KIND_V1, COVERAGE_ATTESTATION_KIND_V1,
-    MODEL_INVOCATION_KIND_V1, REDACTION_RECEIPT_KIND_V1,
+    COVERAGE_WINDOW_KIND_V1, COVERAGE_WINDOW_REPORT_SCHEMA_V1, MODEL_INVOCATION_KIND_V1, REDACTION_RECEIPT_KIND_V1,
 };
 pub use body_v1::{extract_body_index_v1, extract_linked_receipts_v1, ReceiptBodyIndexV1};
 pub use c2pa_manifest_v1::{

@@ -23,6 +23,18 @@ pub const REDACTION_RECEIPT_KIND_V1: &str = "redaction";
 pub const CONSOLIDATION_KIND_V1: &str = "consolidation";
 pub const COVERAGE_ATTESTATION_KIND_V1: &str = "coverage_attestation";
 
+/// G7 coverage-attestation finish: a signed *window* report attesting how
+/// many events, receipts and external anchors a tenant's store held over a
+/// `[from, to)` interval, plus the gaps (events with no receipt; receipts
+/// with no anchor). The report is bound by hash into the receipt body so the
+/// signature covers the exact counts — a gap can never be hidden from the
+/// signed object.
+pub const COVERAGE_WINDOW_KIND_V1: &str = "coverage_window";
+
+/// Schema tag for the standalone coverage-window report JSON (the object the
+/// receipt body's `report_hash` is computed over).
+pub const COVERAGE_WINDOW_REPORT_SCHEMA_V1: &str = "cuecrux.coverage.window.report.v1";
+
 #[derive(Debug, Clone)]
 pub struct ModelInvocationBodyInputV1<'a> {
     pub tenant_id: &'a str,
@@ -119,6 +131,146 @@ pub struct CoverageAttestationBodyInputV1<'a> {
     pub gaps_hash: Option<&'a str>,
     pub report_hash: &'a str,
     pub created_at: &'a str,
+}
+
+/// Deterministic counts for a coverage window. `events` is the population of
+/// non-receipt events in the window that *should* carry a receipt; `receipts`
+/// is the receipt-body population; `anchored` is the receipt subset that is an
+/// external anchor / RFC3161 timestamp (or is linked from one). Gaps are
+/// computed, never supplied, so the two summands always reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CoverageWindowCountsV1 {
+    /// Non-receipt events observed in the window.
+    pub events: u64,
+    /// Receipt bodies observed in the window.
+    pub receipts: u64,
+    /// Receipt bodies that are anchored (anchor-kind, or linked from an anchor).
+    pub anchored: u64,
+    /// Events in the window with no corresponding receipt.
+    pub events_without_receipt: u64,
+    /// Receipts in the window with no external anchor.
+    pub receipts_without_anchor: u64,
+}
+
+impl CoverageWindowCountsV1 {
+    /// Total gap count surfaced by the window = unreceipted events +
+    /// unanchored receipts. This is the headline "gaps" figure.
+    #[must_use]
+    pub fn gaps(&self) -> u64 {
+        self.events_without_receipt.saturating_add(self.receipts_without_anchor)
+    }
+}
+
+/// A standalone, signable coverage-window report. Serialized to canonical
+/// JSON (sorted keys via [`coverage_window_report_canonical_json_v1`]); its
+/// BLAKE3 hash is bound into the [`COVERAGE_WINDOW_KIND_V1`] receipt body.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CoverageWindowReportV1 {
+    pub schema: String,
+    pub tenant_id: String,
+    /// RFC3339 lower bound, inclusive.
+    pub from: String,
+    /// RFC3339 upper bound, exclusive.
+    pub to: String,
+    pub events: u64,
+    pub receipts: u64,
+    pub anchored: u64,
+    pub gaps: u64,
+    pub events_without_receipt: u64,
+    pub receipts_without_anchor: u64,
+    /// Rolling BLAKE3 head over the ordered in-window payload hashes;
+    /// `blake3:<64-hex>` of an empty window is the all-zero seed digest.
+    pub chain_head: String,
+}
+
+impl CoverageWindowReportV1 {
+    /// Build a report from a tenant id, `[from, to)` bounds, the reconciled
+    /// counts, and a precomputed `chain_head`.
+    #[must_use]
+    pub fn new(tenant_id: &str, from: &str, to: &str, counts: CoverageWindowCountsV1, chain_head: &str) -> Self {
+        Self {
+            schema: COVERAGE_WINDOW_REPORT_SCHEMA_V1.to_string(),
+            tenant_id: tenant_id.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+            events: counts.events,
+            receipts: counts.receipts,
+            anchored: counts.anchored,
+            gaps: counts.gaps(),
+            events_without_receipt: counts.events_without_receipt,
+            receipts_without_anchor: counts.receipts_without_anchor,
+            chain_head: chain_head.to_string(),
+        }
+    }
+
+    /// `blake3:<64-hex>` of the canonical JSON serialization.
+    #[must_use]
+    pub fn report_hash(&self) -> String {
+        let bytes = coverage_window_report_canonical_json_v1(self);
+        format!("blake3:{}", blake3::hash(&bytes).to_hex())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CoverageWindowBodyInputV1<'a> {
+    pub tenant_id: &'a str,
+    pub receipt_id: &'a str,
+    pub attestation_id: &'a str,
+    pub actor_passport: &'a str,
+    pub from: &'a str,
+    pub to: &'a str,
+    pub events: u64,
+    pub receipts: u64,
+    pub anchored: u64,
+    pub gaps: u64,
+    pub events_without_receipt: u64,
+    pub receipts_without_anchor: u64,
+    pub chain_head: &'a str,
+    pub report_hash: &'a str,
+    pub created_at: &'a str,
+}
+
+/// Canonical (sorted-key) JSON bytes for a coverage-window report. Pure and
+/// deterministic so the standalone report and the hash bound into the receipt
+/// body always agree, independent of struct field order or `serde` settings.
+#[must_use]
+pub fn coverage_window_report_canonical_json_v1(report: &CoverageWindowReportV1) -> Vec<u8> {
+    // BTreeMap gives sorted keys; numeric values are exact integers.
+    let mut map: std::collections::BTreeMap<&str, serde_json::Value> = std::collections::BTreeMap::new();
+    map.insert("schema", serde_json::Value::String(report.schema.clone()));
+    map.insert("tenant_id", serde_json::Value::String(report.tenant_id.clone()));
+    map.insert("from", serde_json::Value::String(report.from.clone()));
+    map.insert("to", serde_json::Value::String(report.to.clone()));
+    map.insert("events", serde_json::Value::from(report.events));
+    map.insert("receipts", serde_json::Value::from(report.receipts));
+    map.insert("anchored", serde_json::Value::from(report.anchored));
+    map.insert("gaps", serde_json::Value::from(report.gaps));
+    map.insert(
+        "events_without_receipt",
+        serde_json::Value::from(report.events_without_receipt),
+    );
+    map.insert(
+        "receipts_without_anchor",
+        serde_json::Value::from(report.receipts_without_anchor),
+    );
+    map.insert("chain_head", serde_json::Value::String(report.chain_head.clone()));
+    serde_json::to_vec(&map).unwrap_or_default()
+}
+
+/// Fold one payload hash into a rolling coverage-window chain head.
+/// `head_{n} = blake3(head_{n-1} || payload_hash)`. Seed is all-zero.
+#[must_use]
+pub fn coverage_window_chain_fold_v1(head: [u8; 32], payload_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&head);
+    hasher.update(payload_hash);
+    *hasher.finalize().as_bytes()
+}
+
+/// Render a 32-byte chain head as `blake3:<64-hex>`.
+#[must_use]
+pub fn coverage_window_chain_head_hex_v1(head: [u8; 32]) -> String {
+    format!("blake3:{}", blake3::Hash::from(head).to_hex())
 }
 
 fn text_entry(key: &str, value: &str) -> (CborValue, CborValue) {
@@ -389,6 +541,39 @@ pub fn sign_coverage_attestation_v1(
     sign_receipt_body_v1(receipt_id, body_bytes, body_hash, signing_key, key_id, signed_at)
 }
 
+pub fn build_coverage_window_body_v1(input: &CoverageWindowBodyInputV1<'_>) -> (Vec<u8>, [u8; 32]) {
+    encode(vec![
+        text_entry("schema", AUDIT_GAP_BODY_SCHEMA_V1),
+        text_entry("kind", COVERAGE_WINDOW_KIND_V1),
+        text_entry("receipt_id", input.receipt_id),
+        text_entry("tenant_id", input.tenant_id),
+        text_entry("attestation_id", input.attestation_id),
+        text_entry("actor_passport", input.actor_passport),
+        text_entry("from", input.from),
+        text_entry("to", input.to),
+        uint_entry("events", input.events),
+        uint_entry("receipts", input.receipts),
+        uint_entry("anchored", input.anchored),
+        uint_entry("gaps", input.gaps),
+        uint_entry("events_without_receipt", input.events_without_receipt),
+        uint_entry("receipts_without_anchor", input.receipts_without_anchor),
+        text_entry("chain_head", input.chain_head),
+        text_entry("report_hash", input.report_hash),
+        text_entry("created_at", input.created_at),
+    ])
+}
+
+pub fn sign_coverage_window_v1(
+    receipt_id: &str,
+    body_bytes: &[u8],
+    body_hash: [u8; 32],
+    signing_key: &SigningKey,
+    key_id: &str,
+    signed_at: &str,
+) -> ReceiptSigV1 {
+    sign_receipt_body_v1(receipt_id, body_bytes, body_hash, signing_key, key_id, signed_at)
+}
+
 fn top_level_text(body_bytes: &[u8], field: &str) -> Option<String> {
     let v: CborValue = ciborium::de::from_reader(std::io::Cursor::new(body_bytes)).ok()?;
     let CborValue::Map(map) = v else { return None };
@@ -426,6 +611,10 @@ pub fn assert_coverage_attestation_kind_v1(body_bytes: &[u8]) -> bool {
     assert_kind(body_bytes, COVERAGE_ATTESTATION_KIND_V1)
 }
 
+pub fn assert_coverage_window_kind_v1(body_bytes: &[u8]) -> bool {
+    assert_kind(body_bytes, COVERAGE_WINDOW_KIND_V1)
+}
+
 pub fn verify_chain_reanchor_body_v1(body_bytes: &[u8]) -> bool {
     let Some(map) = top_level_map(body_bytes) else {
         return false;
@@ -444,6 +633,43 @@ pub fn verify_chain_reanchor_body_v1(body_bytes: &[u8]) -> bool {
         && valid_chain_alg(&map, "new_hash_alg")
         && required_uint(&map, "receipt_count").is_some_and(|v| v > 0)
         && text_array_len(&map, "linked_receipts").is_some_and(|v| v > 0)
+}
+
+/// Structural verification of a coverage-window receipt body. Confirms the
+/// schema/kind, required string fields, and — critically — that the gap
+/// arithmetic reconciles: `gaps == events_without_receipt +
+/// receipts_without_anchor`, `anchored <= receipts`, and
+/// `receipts_without_anchor == receipts - anchored`. A receipt that under-
+/// reports its gaps therefore fails verification — gaps cannot be hidden.
+pub fn verify_coverage_window_body_v1(body_bytes: &[u8]) -> bool {
+    let Some(map) = top_level_map(body_bytes) else {
+        return false;
+    };
+    if required_text(&map, "schema") != Some(AUDIT_GAP_BODY_SCHEMA_V1)
+        || required_text(&map, "kind") != Some(COVERAGE_WINDOW_KIND_V1)
+        || !required_nonempty_text(&map, "receipt_id")
+        || !required_nonempty_text(&map, "tenant_id")
+        || !required_nonempty_text(&map, "attestation_id")
+        || !required_nonempty_text(&map, "actor_passport")
+        || !required_nonempty_text(&map, "from")
+        || !required_nonempty_text(&map, "to")
+        || !required_nonempty_text(&map, "chain_head")
+        || !required_nonempty_text(&map, "report_hash")
+        || !required_nonempty_text(&map, "created_at")
+    {
+        return false;
+    }
+    let (Some(events), Some(receipts), Some(anchored), Some(gaps), Some(ewr), Some(rwa)) = (
+        required_uint(&map, "events"),
+        required_uint(&map, "receipts"),
+        required_uint(&map, "anchored"),
+        required_uint(&map, "gaps"),
+        required_uint(&map, "events_without_receipt"),
+        required_uint(&map, "receipts_without_anchor"),
+    ) else {
+        return false;
+    };
+    anchored <= receipts && rwa == receipts.saturating_sub(anchored) && ewr <= events && gaps == ewr.saturating_add(rwa)
 }
 
 fn top_level_map(body_bytes: &[u8]) -> Option<Vec<(CborValue, CborValue)>> {
@@ -784,5 +1010,167 @@ mod tests {
             assert_eq!(sig.signature.len(), 64);
             assert_eq!(sig.signed_payload_hash.len(), 32);
         }
+    }
+
+    fn window_counts() -> CoverageWindowCountsV1 {
+        // 10 events, 8 receipts (so 2 events lack a receipt), 5 anchored
+        // (so 3 receipts lack an anchor). Gaps = 2 + 3 = 5.
+        CoverageWindowCountsV1 {
+            events: 10,
+            receipts: 8,
+            anchored: 5,
+            events_without_receipt: 2,
+            receipts_without_anchor: 3,
+        }
+    }
+
+    fn window_body_input<'a>(report_hash: &'a str, counts: CoverageWindowCountsV1) -> CoverageWindowBodyInputV1<'a> {
+        CoverageWindowBodyInputV1 {
+            tenant_id: "tenant-a",
+            receipt_id: "cw_1",
+            attestation_id: "coverage-window-1",
+            actor_passport: "passport:operator",
+            from: "2026-06-14T00:00:00Z",
+            to: "2026-06-15T00:00:00Z",
+            events: counts.events,
+            receipts: counts.receipts,
+            anchored: counts.anchored,
+            gaps: counts.gaps(),
+            events_without_receipt: counts.events_without_receipt,
+            receipts_without_anchor: counts.receipts_without_anchor,
+            chain_head: "blake3:00",
+            report_hash,
+            created_at: "2026-06-15T00:01:00Z",
+        }
+    }
+
+    #[test]
+    fn coverage_window_counts_gaps_reconcile() {
+        let c = window_counts();
+        assert_eq!(c.gaps(), 5);
+    }
+
+    #[test]
+    fn coverage_window_report_hash_is_deterministic_and_self_consistent() {
+        let head = coverage_window_chain_head_hex_v1([0u8; 32]);
+        let report = CoverageWindowReportV1::new(
+            "tenant-a",
+            "2026-06-14T00:00:00Z",
+            "2026-06-15T00:00:00Z",
+            window_counts(),
+            &head,
+        );
+        let h1 = report.report_hash();
+        let h2 = report.report_hash();
+        assert_eq!(h1, h2);
+        assert!(h1.starts_with("blake3:"));
+        // Mutating any count changes the hash (no hidden gaps).
+        let mut tampered = report.clone();
+        tampered.gaps = 0;
+        assert_ne!(report.report_hash(), tampered.report_hash());
+        // Canonical JSON is sorted-key stable.
+        let bytes = coverage_window_report_canonical_json_v1(&report);
+        let json = String::from_utf8(bytes).unwrap();
+        assert!(json.contains("\"gaps\":5"));
+        assert!(json.contains("\"events_without_receipt\":2"));
+    }
+
+    #[test]
+    fn coverage_window_chain_fold_changes_head_per_event() {
+        let h0 = [0u8; 32];
+        let h1 = coverage_window_chain_fold_v1(h0, blake3::hash(b"e1").as_bytes());
+        let h2 = coverage_window_chain_fold_v1(h1, blake3::hash(b"e2").as_bytes());
+        assert_ne!(h0, h1);
+        assert_ne!(h1, h2);
+        // Order-sensitive: folding the same hashes in a different order differs.
+        let alt = coverage_window_chain_fold_v1(
+            coverage_window_chain_fold_v1(h0, blake3::hash(b"e2").as_bytes()),
+            blake3::hash(b"e1").as_bytes(),
+        );
+        assert_ne!(h2, alt);
+    }
+
+    #[test]
+    fn coverage_window_body_verifies_and_is_specific() {
+        let head = coverage_window_chain_head_hex_v1([7u8; 32]);
+        let report = CoverageWindowReportV1::new(
+            "tenant-a",
+            "2026-06-14T00:00:00Z",
+            "2026-06-15T00:00:00Z",
+            window_counts(),
+            &head,
+        );
+        let report_hash = report.report_hash();
+        let (body, _) = build_coverage_window_body_v1(&window_body_input(&report_hash, window_counts()));
+        assert!(verify_coverage_window_body_v1(&body));
+        assert!(assert_coverage_window_kind_v1(&body));
+        // Not confused with the older coverage_attestation kind.
+        assert!(!assert_coverage_attestation_kind_v1(&body));
+        assert!(!verify_coverage_window_body_v1(b"not cbor"));
+    }
+
+    #[test]
+    fn coverage_window_body_rejects_understated_gaps() {
+        // Claim zero gaps despite 8 receipts / 5 anchored / 10 events / 8 receipts.
+        let mut input = window_body_input("blake3:report", window_counts());
+        input.gaps = 0;
+        input.events_without_receipt = 0;
+        input.receipts_without_anchor = 0;
+        let (body, _) = build_coverage_window_body_v1(&input);
+        // anchored (5) != receipts (8) so receipts_without_anchor must be 3, not 0.
+        assert!(!verify_coverage_window_body_v1(&body));
+    }
+
+    #[test]
+    fn coverage_window_body_rejects_anchored_exceeding_receipts() {
+        let counts = CoverageWindowCountsV1 {
+            events: 4,
+            receipts: 2,
+            anchored: 5, // impossible
+            events_without_receipt: 2,
+            receipts_without_anchor: 0,
+        };
+        let (body, _) = build_coverage_window_body_v1(&window_body_input("blake3:report", counts));
+        assert!(!verify_coverage_window_body_v1(&body));
+    }
+
+    #[test]
+    fn coverage_window_empty_window_verifies() {
+        let counts = CoverageWindowCountsV1 {
+            events: 0,
+            receipts: 0,
+            anchored: 0,
+            events_without_receipt: 0,
+            receipts_without_anchor: 0,
+        };
+        let (body, _) = build_coverage_window_body_v1(&window_body_input("blake3:report", counts));
+        assert!(verify_coverage_window_body_v1(&body));
+    }
+
+    #[test]
+    fn sign_and_verify_coverage_window_body() {
+        let report = CoverageWindowReportV1::new(
+            "tenant-a",
+            "2026-06-14T00:00:00Z",
+            "2026-06-15T00:00:00Z",
+            window_counts(),
+            &coverage_window_chain_head_hex_v1([1u8; 32]),
+        );
+        let report_hash = report.report_hash();
+        let (bytes, hash) = build_coverage_window_body_v1(&window_body_input(&report_hash, window_counts()));
+        let signing_key = SigningKey::from_bytes(&[13u8; 32]);
+        let sig = sign_coverage_window_v1("cw_1", &bytes, hash, &signing_key, "key-1", "2026-06-15T00:01:00Z");
+        assert_eq!(sig.signed_payload_hash, hash.to_vec());
+        let vk: VerifyingKey = signing_key.verifying_key();
+        let sig_bytes: [u8; 64] = sig.signature.as_slice().try_into().unwrap();
+        vk.verify_strict(&bytes, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
+            .expect("signature verifies over canonical body bytes");
+
+        // Tamper any byte → signature fails (the report counts are inside the body).
+        let mut tampered = bytes.clone();
+        tampered[0] ^= 0xFF;
+        assert!(vk
+            .verify_strict(&tampered, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
+            .is_err());
     }
 }
