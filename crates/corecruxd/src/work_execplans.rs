@@ -85,6 +85,10 @@ pub struct ParsedPlan {
     pub risk_class: Option<String>,
     /// Milestone numbers declared in the `## Milestones` section (e.g. 1, 2, 3).
     pub milestones_declared: Vec<u32>,
+    /// Subset of `milestones_declared` whose declaring (parent) checklist line is
+    /// ticked (`- [x] **M<n> …**`). Used to derive `complete` straight from the
+    /// markdown checkboxes, independent of gate facts.
+    pub milestones_checked: Vec<u32>,
     /// A `Status:` line if present (e.g. "Status: Archived").
     pub status_line: Option<String>,
     /// Slug captured from `Superseded by [[<slug>]]` or `Status: Superseded by <slug>`.
@@ -104,6 +108,10 @@ pub struct ExecplanFactSummary {
     /// Earliest `stored_at` across all related facts (ms since epoch).
     pub first_fact_at_unix_ms: Option<u64>,
     pub decision_count: usize,
+    /// Owner passport, auto-derived from the actor of the most-recent fact whose
+    /// actor is a real principal (not a `system:`/`__` placeholder). None when no
+    /// fact carries a usable actor.
+    pub owner_passport: Option<String>,
 }
 
 impl ExecplanFactSummary {
@@ -112,12 +120,35 @@ impl ExecplanFactSummary {
     }
 }
 
+/// One fact row fed to [`summarise_facts`]: `(key, value, stored_at, actor)`.
+pub type ExecplanFactRow = (String, String, DateTime<Utc>, Option<String>);
+
+/// True when an actor string names a real principal (a passport/agent), not a
+/// synthetic placeholder. Filters the empty string, `system:*` (e.g. the
+/// aggregator), and reserved `__…` prefixes so the auto-owner is a usable id.
+fn is_principal_actor(actor: &str) -> bool {
+    let a = actor.trim();
+    !a.is_empty() && !a.starts_with("system:") && !a.starts_with("__")
+}
+
+/// Auto-derive a plan owner from its facts: the actor of the most-recent fact
+/// whose actor is a real principal (see [`is_principal_actor`]). None when no
+/// fact carries a usable actor.
+fn owner_from_facts(facts: &[ExecplanFactRow]) -> Option<String> {
+    facts
+        .iter()
+        .filter(|(_, _, _, actor)| actor.as_deref().is_some_and(is_principal_actor))
+        .max_by_key(|(_, _, stored_at, _)| stored_at.timestamp_millis())
+        .and_then(|(_, _, _, actor)| actor.clone())
+}
+
 /// Parse a single plan markdown. Cheap text-level scan — no DOM, no regex
 /// crate — so M1 stays dependency-light.
 pub fn parse_plan(md: &str) -> ParsedPlan {
     let mut out = ParsedPlan::default();
     let mut in_milestones = false;
     let mut seen_milestone_numbers = Vec::new();
+    let mut checked_milestone_numbers = Vec::new();
 
     for line in md.lines() {
         let trimmed = line.trim_start();
@@ -168,14 +199,52 @@ pub fn parse_plan(md: &str) -> ParsedPlan {
         if in_milestones {
             if let Some(n) = first_milestone_number(trimmed) {
                 if !seen_milestone_numbers.contains(&n) {
+                    // First (parent) line for this milestone number decides its
+                    // checkbox rollup; later sub-bullets (`M<n>.x`) don't override.
                     seen_milestone_numbers.push(n);
+                    if checkbox_state(trimmed) == Some(true) {
+                        checked_milestone_numbers.push(n);
+                    }
                 }
             }
         }
     }
 
     out.milestones_declared = seen_milestone_numbers;
+    out.milestones_checked = checked_milestone_numbers;
     out
+}
+
+/// Read a markdown task-list checkbox at the start of a (already left-trimmed)
+/// line: `[x]`/`[X]` → `Some(true)`, `[ ]` → `Some(false)`, otherwise `None`.
+/// Tolerates a leading list marker (`- `, `* `, `1. `).
+fn checkbox_state(line: &str) -> Option<bool> {
+    let s = line
+        .trim_start_matches(['-', '*', '+', ' '])
+        .trim_start_matches(|c: char| c.is_ascii_digit())
+        .trim_start_matches(['.', ')', ' ']);
+    let inner = s.strip_prefix('[')?.split_once(']')?.0.trim();
+    match inner {
+        "x" | "X" => Some(true),
+        "" => Some(false),
+        _ => None,
+    }
+}
+
+/// Gate-fact status strings that mean "this milestone is done". The workflow
+/// stores `passed`, `passed+merged`, `done`, `merged`, etc. — not just the
+/// literal `complete` — so match any of these as a substring (case-insensitive),
+/// excluding the negation `incomplete`.
+fn is_complete_status(status: &str) -> bool {
+    let s = status.to_ascii_lowercase();
+    if s.contains("incomplete") {
+        return false;
+    }
+    [
+        "complete", "passed", "pass", "done", "merged", "shipped", "deployed", "landed",
+    ]
+    .iter()
+    .any(|t| s.contains(t))
 }
 
 fn find_ci(haystack: &str, needle_lower: &str) -> Option<usize> {
@@ -357,19 +426,31 @@ pub fn derive_state(
         return mk_item(file, parsed, "complete", None, None, facts);
     }
 
-    // Rule 4: all declared milestones gated complete.
-    if !parsed.milestones_declared.is_empty()
-        && parsed
+    // Rule 4: all declared milestones complete — via gate facts (any "done"
+    // synonym, see is_complete_status) OR every milestone's markdown checkbox
+    // ticked. Either signal flips the board so a finished plan stops reading as
+    // in_progress.
+    if !parsed.milestones_declared.is_empty() {
+        let all_gated = parsed
             .milestones_declared
             .iter()
-            .all(|n| facts.gate_statuses.get(n).is_some_and(|s| s == "complete"))
-    {
-        return mk_item(file, parsed, "complete", None, None, facts);
+            .all(|n| facts.gate_statuses.get(n).is_some_and(|s| is_complete_status(s)));
+        let all_checked = parsed
+            .milestones_declared
+            .iter()
+            .all(|n| parsed.milestones_checked.contains(n));
+        if all_gated || all_checked {
+            return mk_item(file, parsed, "complete", None, None, facts);
+        }
     }
 
     // Rule 5: blocked gate on the highest fact'd milestone.
     if let Some(cur) = facts.highest_milestone_with_fact {
-        if facts.gate_statuses.get(&cur).is_some_and(|s| s == "blocked") {
+        if facts
+            .gate_statuses
+            .get(&cur)
+            .is_some_and(|s| s.to_ascii_lowercase().contains("blocked"))
+        {
             return mk_item(file, parsed, "blocked", Some(format!("M{cur}")), None, facts);
         }
     }
@@ -410,13 +491,27 @@ fn mk_item(
     } else {
         parsed.title.clone()
     };
+    let total = parsed.milestones_declared.len() as u32;
+    let (milestones_done, milestones_total) = if total > 0 {
+        let done = parsed
+            .milestones_declared
+            .iter()
+            .filter(|n| {
+                facts.gate_statuses.get(n).is_some_and(|s| is_complete_status(s))
+                    || parsed.milestones_checked.contains(n)
+            })
+            .count() as u32;
+        (Some(done), Some(total))
+    } else {
+        (None, None)
+    };
     WorkItem {
         id: format!("execplan:{}", file.slug),
         project_id: VIRTUAL_PROJECT_ID.to_string(),
         state: state.to_string(),
         title,
         body,
-        assignee_passport: None,
+        assignee_passport: facts.owner_passport.clone(),
         tenant_id: None,
         linked_pr: None,
         linked_issue: None,
@@ -428,6 +523,9 @@ fn mk_item(
         current_milestone,
         superseded_by,
         orchestrator_id: None,
+        milestones_done,
+        milestones_total,
+        notes_count: None,
     }
 }
 
@@ -485,7 +583,7 @@ pub fn execplans_root_from_env() -> Option<PathBuf> {
 
 /// Group all fact-store rows under `entity = "execplan:*"` by slug. One scan
 /// instead of N per-slug queries.
-fn collect_execplan_facts(store: &FactStore) -> HashMap<String, Vec<(String, String, DateTime<Utc>)>> {
+fn collect_execplan_facts(store: &FactStore) -> HashMap<String, Vec<ExecplanFactRow>> {
     let result = store.query(&FactQuery {
         query: None,
         entity: None,
@@ -493,7 +591,7 @@ fn collect_execplan_facts(store: &FactStore) -> HashMap<String, Vec<(String, Str
         top_k: FACT_SCAN_TOP_K,
         token_budget: None,
     });
-    let mut by_slug: HashMap<String, Vec<(String, String, DateTime<Utc>)>> = HashMap::new();
+    let mut by_slug: HashMap<String, Vec<ExecplanFactRow>> = HashMap::new();
     for fact in dedup_latest(result.facts) {
         if fact.deleted {
             continue;
@@ -504,7 +602,7 @@ fn collect_execplan_facts(store: &FactStore) -> HashMap<String, Vec<(String, Str
         by_slug
             .entry(slug.to_string())
             .or_default()
-            .push((fact.key, fact.value, fact.stored_at));
+            .push((fact.key, fact.value, fact.stored_at, fact.actor));
     }
     by_slug
 }
@@ -526,8 +624,17 @@ pub fn list_execplans(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::
     for file in files {
         let parsed = parse_plan(&file.content);
         let facts = facts_by_slug.remove(&file.slug).unwrap_or_default();
-        let summary = summarise_facts(&facts);
-        out.push(derive_state(&file, &parsed, &summary, now_unix_ms));
+        // summarise_facts works on (key, value, stored_at); the owner is derived
+        // from the 4th element (actor), which only the raw rows carry.
+        let owner = owner_from_facts(&facts);
+        let rows3: Vec<(String, String, DateTime<Utc>)> = facts.into_iter().map(|(k, v, s, _)| (k, v, s)).collect();
+        let mut summary = summarise_facts(&rows3);
+        summary.owner_passport = owner;
+        let mut item = derive_state(&file, &parsed, &summary, now_unix_ms);
+        // Surface attached notes (work comments keyed by the item id).
+        let n = crate::work::list_comments(store, &item.id).len() as u32;
+        item.notes_count = (n > 0).then_some(n);
+        out.push(item);
     }
     out.sort_by(|a, b| b.updated_at_unix_ms.cmp(&a.updated_at_unix_ms));
     Ok(out)
@@ -747,6 +854,85 @@ mod tests {
         assert_eq!(item.state, "complete");
         assert_eq!(item.current_milestone, None);
         assert_eq!(item.updated_at_unix_ms, 3_000);
+    }
+
+    #[test]
+    fn rule_4_broadened_gate_vocab_is_complete() {
+        // The workflow stores "passed" / "passed+merged" / "done", not the
+        // literal "complete" — these must still flip the board.
+        let f = file("done", 1_000, "# Done\n## Milestones\n- M1\n- M2\n");
+        let p = parse_plan(&f.content);
+        let s = summarise_facts(&[
+            ("gate:M1".to_string(), r#"{"status":"passed"}"#.to_string(), ts(2_000)),
+            (
+                "gate:M2".to_string(),
+                r#"{"status":"passed+merged"}"#.to_string(),
+                ts(3_000),
+            ),
+        ]);
+        assert_eq!(derive_state(&f, &p, &s, 4_000).state, "complete");
+    }
+
+    #[test]
+    fn incomplete_status_does_not_count_as_complete() {
+        assert!(!is_complete_status("incomplete"));
+        assert!(is_complete_status("passed"));
+        assert!(is_complete_status("DONE"));
+        assert!(is_complete_status("passed+merged"));
+    }
+
+    #[test]
+    fn rule_4_all_checkboxes_ticked_is_complete_without_facts() {
+        // A plan whose `## Milestones` are all ticked reads complete even with
+        // no gate facts stored.
+        let md = "# Done\n## Milestones\n- [x] **M1 — a**\n  - [x] M1.1 sub\n- [x] **M2 — b**\n";
+        let f = file("checked", 1_000, md);
+        let p = parse_plan(&f.content);
+        assert_eq!(p.milestones_declared, vec![1, 2]);
+        assert_eq!(p.milestones_checked, vec![1, 2]);
+        let item = derive_state(&f, &p, &ExecplanFactSummary::default(), 4_000);
+        assert_eq!(item.state, "complete");
+    }
+
+    #[test]
+    fn rule_4_partial_checkboxes_is_not_complete() {
+        let md = "# WIP\n## Milestones\n- [x] **M1 — a**\n- [ ] **M2 — b**\n";
+        let f = file("wip", 1_000, md);
+        let p = parse_plan(&f.content);
+        assert_eq!(p.milestones_checked, vec![1]);
+        // No facts + recent mtime + not all checked → planned, not complete.
+        assert_ne!(
+            derive_state(&f, &p, &ExecplanFactSummary::default(), 1_500).state,
+            "complete"
+        );
+    }
+
+    #[test]
+    fn owner_auto_derived_from_latest_principal_fact_actor() {
+        let rows: Vec<ExecplanFactRow> = vec![
+            (
+                "gate:M1".to_string(),
+                "{}".to_string(),
+                ts(1_000),
+                Some("alice".to_string()),
+            ),
+            (
+                "gate:M2".to_string(),
+                "{}".to_string(),
+                ts(3_000),
+                Some("bob".to_string()),
+            ),
+            // system / reserved actors are ignored even though newer.
+            (
+                "milestone:M3".to_string(),
+                "{}".to_string(),
+                ts(4_000),
+                Some("system:x".to_string()),
+            ),
+            ("decision:y".to_string(), "{}".to_string(), ts(2_000), None),
+        ];
+        assert_eq!(owner_from_facts(&rows).as_deref(), Some("bob"));
+        assert_eq!(owner_from_facts(&[]).as_deref(), None);
     }
 
     #[test]
