@@ -33,7 +33,8 @@ Audit II gap closure adds these typed bodies in `corecrux-receipts`:
 | Kind | Builder | Purpose |
 |---|---|---|
 | `model_invocation` | `build_model_invocation_body_v1` | AI-call provenance: binds provider/model metadata, prompt hash, retrieval-set hash, output hash, and request timing. |
-| `chain_reanchor` | `build_chain_reanchor_body_v1` | Crypto migration: records old/new chain heads, hash algorithms, receipt window, and linked migration receipts. |
+| `chain_reanchor` | `build_chain_reanchor_body_v1` | Body-hash-algorithm migration: records old/new chain heads, hash algorithms, receipt window, and linked migration receipts. |
+| `chain_signature_reanchor` | `build_chain_signature_reanchor_body_v1` | Signature-algorithm migration (G6): re-anchors a chain head originally signed under alg A under a new alg B without invalidating the original. Verified under **both** algorithms; optional hybrid two-signature mode. See [`crypto-migration-v1.md`](crypto-migration-v1.md). |
 | `redaction` | `build_redaction_receipt_body_v1` | Crypto-shred erasure: records subject scope, CEK commitment, destruction timestamp, and before/after content commitments without storing plaintext. |
 | `consolidation` | `build_consolidation_body_v1` | Memory consolidation: records canonical fact, superseded fact ids, source receipts, and deterministic strategy. |
 | `coverage_attestation` | `build_coverage_attestation_body_v1` | Reproducible coverage/eval: binds corpus, run id, commit, lane flags, score, floor, gaps hash, and report hash. |
