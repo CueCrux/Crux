@@ -28,19 +28,38 @@ impl DriftReport {
         self.drifted
     }
 
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+
+    /// Render for the boot advisory / `check` output. Two distinct blocks with
+    /// distinct remediation: drift `details` → run `regenerate`; advisory
+    /// `warnings` → `regenerate` will NOT fix these, edit the free spans.
     pub fn message_for_claude(&self) -> String {
-        if !self.drifted {
-            return String::new();
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        if self.drifted {
+            out.push_str("[crux-config-wizard] CLAUDE.md or AGENTS.md is out of date.\n");
+            if self.details.is_empty() {
+                out.push_str("Run `crux-config-wizard regenerate` to refresh.");
+            } else {
+                out.push_str(&self.details.join("\n"));
+                out.push_str("\n\nRun `crux-config-wizard regenerate` to refresh.");
+            }
         }
-        let detail = if self.details.is_empty() {
-            "Run `crux-config-wizard regenerate` to refresh.".to_string()
-        } else {
-            format!(
-                "{}\n\nRun `crux-config-wizard regenerate` to refresh.",
-                self.details.join("\n")
+        if !self.warnings.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            write!(
+                out,
+                "[crux-config-wizard] advisory ({} item(s)) — `regenerate` will NOT fix these; edit the free spans:\n{}",
+                self.warnings.len(),
+                self.warnings.join("\n")
             )
-        };
-        format!("[crux-config-wizard] CLAUDE.md or AGENTS.md is out of date.\n{detail}")
+            .expect("write to String cannot fail");
+        }
+        out
     }
 }
 
@@ -223,5 +242,20 @@ mod tests {
             r.warnings
         );
         assert!(!r.drifted(), "over-budget is a warning, not drift: {:?}", r.details);
+    }
+
+    #[test]
+    fn warnings_only_message_is_advisory_not_drift() {
+        let r = DriftReport {
+            drifted: false,
+            details: Vec::new(),
+            warnings: vec!["CLAUDE.md: free-span text restates managed profile 'x'".into()],
+        };
+        assert!(!r.drifted());
+        assert!(r.has_warnings());
+        let msg = r.message_for_claude();
+        assert!(msg.contains("advisory"), "msg: {msg}");
+        assert!(msg.contains("free-span"));
+        assert!(!msg.contains("out of date"));
     }
 }

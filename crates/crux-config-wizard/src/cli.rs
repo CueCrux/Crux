@@ -41,7 +41,11 @@ pub enum Command {
         force: bool,
     },
     /// CI mode: exit 0 if files match what regenerate would produce, non-zero otherwise.
-    Check,
+    Check {
+        /// Treat advisory warnings (free-span duplication, oversize) as failures (exit 1).
+        #[arg(long)]
+        strict: bool,
+    },
     /// List available bundled profiles and which are enabled in this workspace.
     List,
     /// Enable a profile and re-compose.
@@ -49,5 +53,9 @@ pub enum Command {
     /// Disable a profile and re-compose.
     Remove { name: String },
     /// Show the diff between current files and what regenerate would produce.
-    Diff,
+    Diff {
+        /// Treat advisory warnings (free-span duplication, oversize) as failures (exit 1).
+        #[arg(long)]
+        strict: bool,
+    },
 }
