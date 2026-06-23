@@ -113,6 +113,20 @@ pub fn check_workspace(workspace_root: &Path) -> std::io::Result<DriftReport> {
                         ov.sample
                     ));
                 }
+                // Advisory (not drift): composed file over its soft size budget.
+                let max = match target {
+                    Target::ClaudeMd => cfg.limits.claude_md_max_bytes,
+                    Target::AgentsMd => cfg.limits.agents_md_max_bytes,
+                };
+                if r.composed_bytes > max {
+                    warnings.push(format!(
+                        "{} is {} B (soft budget {} B); free-span text is {} B of that. Trim free spans or split content — a large file inflates every session prefix and risks the boot load cap.",
+                        target.filename(),
+                        r.composed_bytes,
+                        max,
+                        r.free_span_bytes
+                    ));
+                }
             }
             Err(crate::compose::ComposeError::Drift { profile, .. }) => details.push(format!(
                 "{} has manual edits inside managed section '{}'",
@@ -176,5 +190,38 @@ mod tests {
         };
         let msg = r.message_for_claude();
         assert!(msg.contains("regenerate"));
+    }
+
+    #[test]
+    fn oversize_composed_file_warns_but_is_not_drift() {
+        let dir = TempDir::new().unwrap();
+        let bundled = load_bundled_profiles().unwrap();
+        let mp = bundled
+            .iter()
+            .find(|f| f.frontmatter.name == "memory-practices")
+            .expect("memory-practices bundled");
+        let mut cfg = AgentProfileConfig::new("blake3:test".into());
+        cfg.enable("memory-practices", mp.frontmatter.version);
+        cfg.limits.claude_md_max_bytes = 10; // force over-budget
+        cfg.limits.agents_md_max_bytes = 10_000_000; // avoid an AGENTS.md warning
+        cfg.save(dir.path()).unwrap();
+
+        let enabled: Vec<_> = bundled
+            .into_iter()
+            .filter(|f| cfg.profiles.contains_key(&f.frontmatter.name))
+            .collect();
+        for t in [Target::ClaudeMd, Target::AgentsMd] {
+            compose_file(dir.path(), t, &enabled, false, false).unwrap();
+        }
+
+        let r = check_workspace(dir.path()).unwrap();
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("CLAUDE.md") && w.contains("soft budget")),
+            "expected size warning, got: {:?}",
+            r.warnings
+        );
+        assert!(!r.drifted(), "over-budget is a warning, not drift: {:?}", r.details);
     }
 }
