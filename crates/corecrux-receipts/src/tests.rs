@@ -2050,3 +2050,44 @@ fn decode_receipts_cbor_rejects_malformed_inputs() {
     .expect("encode");
     assert!(decode_receipts_cbor(&arr_bytes).is_err());
 }
+
+mod proptests {
+    use crate::audit_bundle_v1::decode_receipts_cbor;
+    use crate::verify_v1::{verify_receipt_v1, VerifyReceiptInput};
+    use proptest::prelude::*;
+
+    proptest! {
+        // The CBOR receipt decoder must reject (never panic on) arbitrary bytes.
+        // ciborium decode of a malformed stream returns Err; the wrapper maps it
+        // to AuditBundleError. Any Ok/Err is acceptable — the contract is "no panic".
+        #[test]
+        fn decode_receipts_cbor_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = decode_receipts_cbor(&bytes);
+        }
+
+        // The full receipt-verify path decodes a CBOR body + CBOR signature from
+        // attacker-controlled bytes; it must surface a VerificationReport (failure
+        // codes), never panic. Mirrors fuzz_targets/receipt_verify_cbor.rs.
+        #[test]
+        fn verify_receipt_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
+            let split_at = bytes.len() / 2;
+            let (body_bytes, sig_bytes) = bytes.split_at(split_at);
+            let stored_body_payload_hash = *blake3::hash(body_bytes).as_bytes();
+            let verifier_build = corecrux_types::BuildInfo {
+                version: "proptest".to_string(),
+                commit: "proptest".to_string(),
+            };
+            let _ = verify_receipt_v1(VerifyReceiptInput {
+                tenant_id: "proptest-tenant",
+                receipt_id: "proptest-receipt",
+                body_bytes,
+                stored_body_payload_hash,
+                sig_bytes: Some(sig_bytes),
+                keyring: None,
+                verified_at: "1970-01-01T00:00:00Z",
+                verifier_build: &verifier_build,
+                recompute_candidate_digest: true,
+            });
+        }
+    }
+}

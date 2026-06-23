@@ -5157,3 +5157,33 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use proptest::prelude::*;
+
+    proptest! {
+        // `scan_frames_v1_block_bytes` is the hot path that walks an arbitrary
+        // record block and must be panic-free on hostile input: it returns
+        // `Err(StorageError::ManifestRecordInvalid)` for any malformed block,
+        // never unwrap-panics or indexes out of bounds. Drive it through the
+        // `fuzzing`/test-gated wrapper with arbitrary bytes.
+        #[test]
+        fn scan_frames_never_panics_on_arbitrary_input(block in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            // The contract under test is "no panic"; any Ok/Err is acceptable.
+            let _ = crate::fuzz_scan_frames_v1_block_bytes(&block);
+        }
+
+        // Inputs that begin with a plausible CRX1 frame magic exercise the
+        // length-arithmetic branches (header_len/payload_len/frame_len) where an
+        // overflow or out-of-bounds slice would otherwise panic.
+        #[test]
+        fn scan_frames_never_panics_with_frame_magic_prefix(
+            tail in proptest::collection::vec(any::<u8>(), 0..256),
+        ) {
+            let mut block = corecrux_segment::FRAME_MAGIC_CRX1.to_le_bytes().to_vec();
+            block.extend_from_slice(&tail);
+            let _ = crate::fuzz_scan_frames_v1_block_bytes(&block);
+        }
+    }
+}
