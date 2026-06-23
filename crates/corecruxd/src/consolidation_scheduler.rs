@@ -18,7 +18,7 @@
 //! reads and writes one bookkeeping receipt per tick. Resolution stays an
 //! EXPLICIT operator action through the `memory_consolidate` MCP tool or
 //! `POST /v1/console/review/consolidations` — both of which require an
-//! authenticated actor and run the full [`ConsolidationRequestV1`] protection
+//! authenticated actor and run the full `ConsolidationRequestV1` protection
 //! guards. Keeping resolution explicit is the whole point: an automatic
 //! collapser could silently lose a fact.
 //!

@@ -141,7 +141,7 @@ jobs:
           cargo fuzz --version
 
       - name: Build fuzz target
-        run: cargo fuzz build --locked "${{ matrix.target }}"
+        run: cargo fuzz build "${{ matrix.target }}"
 
       - name: Run bounded fuzz
         run: |
@@ -155,7 +155,7 @@ jobs:
           fi
           echo "::notice::Fuzzing ${{ matrix.target }} for ${SECS}s (rss ${FUZZ_RSS_LIMIT_MB}MiB)"
           mkdir -p "fuzz/corpus/${{ matrix.target }}"
-          cargo fuzz run --locked "${{ matrix.target }}" -- \
+          cargo fuzz run "${{ matrix.target }}" -- \
             -max_total_time="$SECS" \
             -rss_limit_mb="$FUZZ_RSS_LIMIT_MB" \
             -malloc_limit_mb="$FUZZ_MALLOC_LIMIT_MB" \
@@ -174,7 +174,7 @@ jobs:
           find "$CORPUS" -type f -size +"${FUZZ_CORPUS_MAX_BYTES}"c -delete || true
           # Minimise to the smallest set preserving coverage (best-effort; a
           # cmin failure must not fail the job).
-          cargo fuzz cmin --locked "${{ matrix.target }}" || true
+          cargo fuzz cmin "${{ matrix.target }}" || true
           echo "corpus entries: $(find "$CORPUS" -type f | wc -l), bytes: $(du -sb "$CORPUS" | cut -f1)"
 
       - name: Upload crash artifacts
