@@ -34,7 +34,7 @@ jobs:
     outputs:
       code: ${{ steps.scope.outputs.code }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Classify changed files
@@ -87,7 +87,7 @@ jobs:
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Preflight (self-hosted runner toolchain)
         run: |
           set +e
@@ -137,7 +137,7 @@ jobs:
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Preflight (self-hosted runner toolchain)
         run: |
           set +e
@@ -242,7 +242,7 @@ jobs:
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Preflight (self-hosted runner toolchain)
         run: |
           set +e
@@ -300,7 +300,7 @@ jobs:
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Preflight (self-hosted runner toolchain)
         run: |
           set +e
