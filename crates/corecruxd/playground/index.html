@@ -1367,9 +1367,9 @@ function txWork(json){   // M3 — kanban WorkItem[] → execplan nodes (status 
   return items.map(w=>({
     id: idFor('work', w.id), kind:'execplan', __workId: w.id,
     label: w.title || w.id,
-    sub: w.current_milestone || w.plan_path || '',   // state rides the chip — repeating it here printed in_progress twice
+    sub: (w.milestones_total? ('M '+(w.milestones_done||0)+'/'+w.milestones_total+(w.current_milestone? ' · '+w.current_milestone : '')) : (w.current_milestone || w.plan_path || '')),
     status: WSTATE[w.state] || 'planned',
-    fields: [['state',w.state],['risk_class',w.risk_class],['plan_path',w.plan_path],['milestone',w.current_milestone],['assignee',w.assignee_passport],['orchestrator',w.orchestrator_id],['linked_pr',w.linked_pr]].filter(([,v])=>v!=null && v!==''),
+    fields: [['state',w.state],['progress', w.milestones_total? ((w.milestones_done||0)+'/'+w.milestones_total) : null],['risk_class',w.risk_class],['plan_path',w.plan_path],['milestone',w.current_milestone],['owner',w.assignee_passport],['notes', w.notes_count],['orchestrator',w.orchestrator_id],['linked_pr',w.linked_pr]].filter(([,v])=>v!=null && v!==''),
     children: [],
     doc: (w.body || w.title || '') + (w.plan_path? '\n\nplan: '+w.plan_path : ''),
     payload: JSON.stringify(w, null, 2),
@@ -4271,11 +4271,11 @@ const PAGE_WIRES={
   load: async def=>{
     const r=await api('/v1/work?source=all'); const items=r.work||r.items||[];
     if(!items.length) return;
-    const mk=w=>({t:'exp',label:w.title||w.id,sub:w.current_milestone||w.plan_path||'',
+    const mk=w=>({t:'exp',label:w.title||w.id,sub:(w.milestones_total? ('M '+(w.milestones_done||0)+'/'+w.milestones_total):'')||w.current_milestone||w.plan_path||'',
       badge:workStageOf(w).replace('_',' '),
-      controls:[['state',w.state],['risk',w.risk_class],['plan',w.plan_path],['milestone',w.current_milestone],['assignee',w.assignee_passport],['orchestrator',w.orchestrator_id],['pr',w.linked_pr]]
+      controls:[['state',w.state],['progress', w.milestones_total? ((w.milestones_done||0)+'/'+w.milestones_total):null],['risk',w.risk_class],['plan',w.plan_path],['milestone',w.current_milestone],['owner',w.assignee_passport],['notes',w.notes_count],['orchestrator',w.orchestrator_id],['pr',w.linked_pr]]
         .filter(([,v])=>v!=null&&v!=='').map(([k,v])=>infoRow(k,String(v)))
-        .concat([{t:'btn',label:'Open in kanban',action:'graph'}])});
+        .concat([{t:'btn',label:'+ note',action:'addnote',workId:w.id,title:w.title,author:w.assignee_passport},{t:'btn',label:'Open in kanban',action:'graph'}])});
     def.sections=[def.sections[0]]
       .concat(WORK_STAGES.map(([s,h])=>({h,wide:true,controls:items.filter(w=>workStageOf(w)===s).map(mk)})));
   }},
@@ -4768,6 +4768,19 @@ function renderControl(pageId,c){
             loadState['cx-sessions']=null; const sn=N['cx-sessions']; if(sn) sn.children=[];   // invalidate cache → refetch fresh archive state
             if(openPageId===pageId) openPage(pageId); })
           .catch(e=>toast((c.archived?'restore':'archive')+' · failed ('+((e&&e.status)||'network')+')'))
+          .finally(()=>{ b.disabled=false; });
+        return;
+      }
+      if(c.action==='addnote'){
+        if(!LIVE){ toast('note · start the daemon'); return; }
+        const body=(window.prompt('Add a note to '+(c.title||c.workId)+':')||'').trim();
+        if(!body) return;
+        b.disabled=true;
+        postApi('/v1/work/'+encodeURIComponent(c.workId)+'/comments', {author_passport: c.author||'console-operator', body})
+          .then(()=>{ toast('note added · '+(c.title||c.workId));
+            loadState['cx-work']=null; const wn=N['cx-work']; if(wn) wn.children=[];   // invalidate so the count refreshes
+            if(openPageId===pageId) openPage(pageId); })
+          .catch(e=>toast('note · failed ('+((e&&e.status)||'network')+')'))
           .finally(()=>{ b.disabled=false; });
         return;
       }

@@ -925,6 +925,9 @@ mod tests {
             current_milestone: None,
             superseded_by: None,
             orchestrator_id: None,
+            milestones_done: None,
+            milestones_total: None,
+            notes_count: None,
         }
     }
 
