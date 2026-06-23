@@ -46,6 +46,7 @@ ring = "0.17.14"
 corecrux-types = { path = "../corecrux-types" }
 
 [dev-dependencies]
+proptest = "1"
 rand = "0.10.1"
 tempfile = "3.16.0"
 

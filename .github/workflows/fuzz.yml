@@ -1,6 +1,28 @@
 # Copyright (c) 2026 CueCrux Ltd. All rights reserved.
 # Licensed under the CueCrux Community Licence (CCL v1.0).
 
+# Scheduled fuzzing for the trust-core decoders (Audit II G5).
+#
+# Triggers:
+#   * pull_request — a SHORT smoke (FUZZ_SMOKE_SECS per target) to catch
+#     obvious panics on the diff before merge.
+#   * schedule (daily) — a long bounded run (FUZZ_SCHED_SECS per target) with
+#     corpus persistence across runs and crash-artifact upload on failure.
+#   * workflow_dispatch — manual run with an overridable per-target budget.
+#
+# Runner-safety posture (the self-hosted `ci` runners have a documented
+# disk-full crash-loop history — incident 2026-06-15, 263 orphan CARGO_HOME
+# dirs / 118 GiB on md3):
+#   * one target at a time (`max-parallel: 1`) so only one fuzzer + one
+#     per-job CARGO_HOME exist on the data disk at once;
+#   * `-rss_limit_mb` + `-malloc_limit_mb` bound libFuzzer memory so an
+#     unbounded-allocation input (e.g. the canonical-CBOR length-prefix OOM
+#     surfaced by the rcx_canonical_token target) is reported as a crash
+#     rather than OOM-killing the runner;
+#   * the cached corpus is capped (cmin + size trim) before re-caching so it
+#     cannot grow without bound across daily runs;
+#   * the per-run CARGO_HOME is reclaimed unconditionally at the end.
+
 name: Scheduled Fuzz
 
 on:
@@ -8,22 +30,30 @@ on:
     branches: [main]
     paths:
       - "fuzz/**"
-      - "crates/corecrux-frame/**"
+      - "crates/corecrux-segment/**"
+      - "crates/corecrux-storage/**"
       - "crates/corecrux-receipts/**"
-      - "crates/crux-router/**"
+      - "crates/rcx-capability-token/**"
+      - "crates/crux-session/**"
+      - "crates/corecrux-types/**"
+      - ".github/workflows/fuzz.yml"
       - "Cargo.lock"
+  schedule:
+    # 03:30 UTC daily.
+    - cron: "30 3 * * *"
   workflow_dispatch:
     inputs:
-      runs:
-        description: "libFuzzer runs per target"
+      max_total_time:
+        description: "libFuzzer -max_total_time (seconds) per target"
         required: false
-        default: "512"
-  schedule:
-    - cron: "30 3 * * 0"
+        default: "300"
 
 permissions:
   contents: read
 
+# Never cancel an in-flight scheduled fuzz run when a new one is queued —
+# coverage of a partial run is still worth keeping, and the corpus cache
+# write at the end is not safe to interrupt mid-flight.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -32,14 +62,27 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_FUZZ_VERSION: 0.13.2
+  # Per-target wall-clock budget. PRs get a short smoke; the daily schedule
+  # runs each target ~5 min; workflow_dispatch can override via the input.
+  FUZZ_SMOKE_SECS: 30
+  FUZZ_SCHED_SECS: 300
+  # libFuzzer memory ceilings (MiB). Keep well under runner RAM so a runaway
+  # allocation is a reportable crash, not a host OOM. Corpus entries larger
+  # than this many bytes are dropped from the persisted corpus.
+  FUZZ_RSS_LIMIT_MB: 2048
+  FUZZ_MALLOC_LIMIT_MB: 2048
+  FUZZ_CORPUS_MAX_BYTES: 4096
 
 jobs:
   fuzz:
     name: Fuzz (${{ matrix.target }})
     runs-on: [self-hosted, ci]
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
+      # ONE target at a time: bounds the number of concurrent fuzzers and
+      # per-job CARGO_HOME dirs on the shared self-hosted data disk.
+      max-parallel: 1
       matrix:
         target:
           - segment_decode
@@ -47,13 +90,11 @@ jobs:
           - receipt_verify_cbor
           - rcx_canonical_token
     env:
+      # Per-run, per-target CARGO_HOME on the runner data disk; reclaimed at
+      # the end (see the `lint` job in ci.yml for the disk-leak rationale).
       CARGO_HOME: /home/gha-runner/.cargo-fuzz-${{ matrix.target }}-${{ github.run_id }}
-      FUZZ_RUNS: ${{ github.event.inputs.runs || (github.event_name == 'pull_request' && '64' || '512') }}
-      # cargo-fuzz (and its deps, e.g. cargo-platform >= 0.3.3) require a newer
-      # rustc than the repo's pinned stable toolchain, and libFuzzer needs
-      # nightly anyway. Override rust-toolchain.toml for every cargo call in this
-      # job so `cargo install cargo-fuzz` and `cargo fuzz` use the nightly that
-      # dtolnay/rust-toolchain@nightly installs below.
+      # cargo-fuzz + libFuzzer require nightly; override the repo's pinned
+      # stable rust-toolchain.toml for every cargo call in this job.
       RUSTUP_TOOLCHAIN: nightly
     steps:
       - name: Seed per-job CARGO_HOME from shared toolchain
@@ -64,12 +105,33 @@ jobs:
             ln -sf "$tool" "$CARGO_HOME/bin/$(basename "$tool")"
           done
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # nightly
+        with:
+          toolchain: nightly
+
+      - name: Restore corpus cache
+        id: corpus
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          # Per-target corpus; the key rotates so each run writes a fresh
+          # entry, and restore-keys fall back to the newest prior corpus for
+          # this target. This is the persistence mechanism: a daily run seeds
+          # libFuzzer from the corpus the previous run grew.
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
       - name: Ensure cargo-fuzz
         run: |
           set -euo pipefail
           mkdir -p "$CARGO_HOME/bin"
+          # Lock so a future parallel matrix expansion can't double-install.
           (
             flock 9
             if ! cargo fuzz --version 2>/dev/null | grep -q "cargo-fuzz $CARGO_FUZZ_VERSION"; then
@@ -77,25 +139,62 @@ jobs:
             fi
           ) 9>/tmp/cargo-fuzz-install.lock
           cargo fuzz --version
-      - name: Compile fuzz targets
-        run: cargo check --manifest-path fuzz/Cargo.toml --bins
-      - name: Run bounded fuzz target
-        run: cargo fuzz run "${{ matrix.target }}" -- -runs="$FUZZ_RUNS"
-      - name: Upload fuzz artifacts
+
+      - name: Build fuzz target
+        run: cargo fuzz build --locked "${{ matrix.target }}"
+
+      - name: Run bounded fuzz
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            SECS="$FUZZ_SMOKE_SECS"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SECS="${{ github.event.inputs.max_total_time }}"
+          else
+            SECS="$FUZZ_SCHED_SECS"
+          fi
+          echo "::notice::Fuzzing ${{ matrix.target }} for ${SECS}s (rss ${FUZZ_RSS_LIMIT_MB}MiB)"
+          mkdir -p "fuzz/corpus/${{ matrix.target }}"
+          cargo fuzz run --locked "${{ matrix.target }}" -- \
+            -max_total_time="$SECS" \
+            -rss_limit_mb="$FUZZ_RSS_LIMIT_MB" \
+            -malloc_limit_mb="$FUZZ_MALLOC_LIMIT_MB" \
+            -max_len=4096
+
+      - name: Trim corpus before re-caching
+        # Always runs so the cached corpus stays bounded even if fuzzing failed
+        # on a crash (the crash input itself is uploaded separately below).
         if: always()
-        uses: actions/upload-artifact@v7
+        run: |
+          set -euo pipefail
+          CORPUS="fuzz/corpus/${{ matrix.target }}"
+          [ -d "$CORPUS" ] || exit 0
+          # Drop any corpus entry larger than the cap so a pathological input
+          # can't inflate the cache indefinitely.
+          find "$CORPUS" -type f -size +"${FUZZ_CORPUS_MAX_BYTES}"c -delete || true
+          # Minimise to the smallest set preserving coverage (best-effort; a
+          # cmin failure must not fail the job).
+          cargo fuzz cmin --locked "${{ matrix.target }}" || true
+          echo "corpus entries: $(find "$CORPUS" -type f | wc -l), bytes: $(du -sb "$CORPUS" | cut -f1)"
+
+      - name: Upload crash artifacts
+        # Only on failure — a fuzz failure means libFuzzer wrote a reproducer
+        # under fuzz/artifacts/<target>/. Upload it (and the corpus) for triage.
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
           path: |
             fuzz/artifacts/${{ matrix.target }}
             fuzz/corpus/${{ matrix.target }}
           if-no-files-found: ignore
           retention-days: 14
+
       - name: Reclaim per-job CARGO_HOME
         if: always()
-        # The per-run CARGO_HOME lives on the self-hosted runner's data disk and
-        # is not reused across runs. Without this, every fuzz run leaks a
-        # multi-hundred-MB cache dir and eventually fills the disk, crash-looping
-        # the runner listeners. Artifacts above are uploaded from the workspace,
-        # not CARGO_HOME, so this is safe to remove unconditionally.
+        # Per-run CARGO_HOME on the runner data disk is never reused; without
+        # this it leaks a multi-hundred-MB dir every run until md3 fills and
+        # the listeners crash-loop (incident 2026-06-15). Artifacts and the
+        # corpus cache are written from the workspace, not CARGO_HOME, so this
+        # is safe to remove unconditionally.
         run: rm -rf "$CARGO_HOME"

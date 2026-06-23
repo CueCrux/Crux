@@ -1086,3 +1086,35 @@ mod tests {
         assert!(json.contains("\"airgap\":true"));
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // The capability-token parser/verifier must never panic on arbitrary
+        // input. `verify_token` is fed an attacker-controlled trust-root key (any
+        // length) and an arbitrary `now`; it returns BadTrustRoot / BadSignature /
+        // StructuralFailure / Verified, never a panic. `validate_basic` and
+        // `permits_egress` are likewise exercised against arbitrary clock values.
+        //
+        // NOTE: the *canonical CBOR decode* path (`crux_session::canonical::decode`)
+        // exercised by fuzz_targets/rcx_canonical_token.rs is deliberately NOT
+        // driven here — it is owned by the `crux-session` crate and currently
+        // pre-allocates an attacker-controlled length prefix (unbounded-allocation
+        // OOM, see canonical.rs read_value MAJOR_ARRAY/MAJOR_MAP). The scheduled
+        // libFuzzer target catches that class under its `-rss_limit_mb` guard; a
+        // proptest cannot bound the allocator, so it would abort the test process.
+        #[test]
+        fn token_parser_never_panics(
+            key in proptest::collection::vec(any::<u8>(), 0..96),
+            now in any::<u64>(),
+        ) {
+            let token = free_local_verified_fixture();
+            let _ = token.validate_basic(now);
+            let _ = token.permits_egress("local", "corecrux.query.local", DataEgressClass::None);
+            let _ = verify_token(&token, &key, now);
+        }
+    }
+}

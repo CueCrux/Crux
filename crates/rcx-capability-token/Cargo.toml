@@ -12,5 +12,8 @@ crux-session = { path = "../crux-session" }
 ed25519-dalek = { version = "2.1.1", features = ["std"] }
 hex = "0.4.3"
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true
