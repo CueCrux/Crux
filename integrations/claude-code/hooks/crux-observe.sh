@@ -142,10 +142,23 @@ fi
 # assistant text pulled from the turn's transcript). Reasoning rides the
 # post-hoc `corecruxctl observe ingest` path. Fire-and-forget; fail-open.
 if [ "${CRUX_HOOK_ACTIVITY:-0}" = "1" ]; then
-  ACT_KIND=""; ACT_TOOL=""
+  ACT_KIND=""; ACT_TOOL=""; ACT_ERRCLASS=""
   case "${KIND}" in
     user_prompt) ACT_KIND="question" ;;
-    tool_use)    ACT_KIND="command"  ;;
+    tool_use)
+      # Category 4 vs 7: a failed tool dispatch is an error/gotcha, a clean one
+      # is a command. Probe the common error shapes the PostToolUse payload
+      # may carry (Claude Code surfaces tool failures as `is_error`/`error`).
+      if printf '%s' "${PAYLOAD_RAW}" | jq -e '
+            (.tool_response.is_error == true)
+            or (.tool_response.error != null)
+            or (.tool_response.status == "error")
+            or (.is_error == true)
+            or (.error != null)' >/dev/null 2>>"${ERR_LOG}"; then
+        ACT_KIND="error"
+      else
+        ACT_KIND="command"
+      fi ;;
     stop)        ACT_KIND="answer"   ;;
   esac
   if [ -n "${ACT_KIND}" ]; then
@@ -159,13 +172,26 @@ if [ "${CRUX_HOOK_ACTIVITY:-0}" = "1" ]; then
       case "${ACT_KIND}" in
         question)
           printf '%s' "${PAYLOAD_RAW}" | jq -r '.prompt // .message // .text // ""' > "${ACT_TXT}" 2>>"${ERR_LOG}" ;;
-        command)
+        command|error)
           ACT_TOOL="$(printf '%s' "${PAYLOAD_RAW}" | jq -r '.tool_name // .tool.name // "tool"' 2>>"${ERR_LOG}")"
           printf '%s' "${PAYLOAD_RAW}" | jq -r '
             (.tool_name // .tool.name // "tool")
             + (if (.tool_input|type)=="object"
                then ": " + ((.tool_input.command // .tool_input.file_path // .tool_input.pattern // .tool_input.description // (.tool_input|tostring))|tostring)
-               else "" end)' > "${ACT_TXT}" 2>>"${ERR_LOG}" ;;
+               else "" end)' > "${ACT_TXT}" 2>>"${ERR_LOG}"
+          if [ "${ACT_KIND}" = "error" ]; then
+            # Tag the gotcha class and append the failure message to the verbatim.
+            # `?` guards each object-index so a string-shaped `error` can't raise
+            # (jq's `//` does not catch indexing errors, only null/false).
+            ACT_ERRCLASS="$(printf '%s' "${PAYLOAD_RAW}" | jq -r '
+              (.tool_response.error.type? // .tool_response.error_code? // .error.type?
+               // (if (.tool_response.error|type)=="string" then .tool_response.error else null end)
+               // "tool_error") | tostring' 2>>"${ERR_LOG}")"
+            ACT_ERRMSG="$(printf '%s' "${PAYLOAD_RAW}" | jq -r '
+              (.tool_response.error.message? // (if (.tool_response.error|type)=="string" then .tool_response.error else null end)
+               // .tool_response.stderr? // .error.message? // "") | tostring' 2>>"${ERR_LOG}")"
+            [ -n "${ACT_ERRMSG}" ] && printf '\n[error] %s' "${ACT_ERRMSG}" >> "${ACT_TXT}"
+          fi ;;
         answer)
           # The Stop event carries the transcript path; the answer is the last
           # assistant message's text (thinking is excluded). Bound the scan to
@@ -182,11 +208,13 @@ if [ "${CRUX_HOOK_ACTIVITY:-0}" = "1" ]; then
           --arg kind "${ACT_KIND}" --arg sid "${SESSION_ID}" \
           --arg tenant "${ACT_TENANT}" --arg tool "${ACT_TOOL}" \
           --arg execplan "${CRUX_ACTIVITY_EXECPLAN:-}" \
+          --arg errclass "${ACT_ERRCLASS}" \
           --argjson cap "${ACT_MAXTEXT}" '
           ($text | sub("\\s+$";"")) as $t0
           | ($t0 | if length>$cap then .[0:$cap]+"…" else . end) as $t
           | ( (if $tool!="" then {tool:$tool} else {} end)
-              + (if $execplan!="" then {execplan_slug:$execplan} else {} end) ) as $meta
+              + (if $execplan!="" then {execplan_slug:$execplan} else {} end)
+              + (if $errclass!="" then {error_class:$errclass} else {} end) ) as $meta
           | if ($t|length)==0 then empty
             else {tenant_id:$tenant, session_id:$sid, kind:$kind, text:$t,
                   meta:$meta, private:true} end' \
