@@ -28,6 +28,7 @@ mod agentgraph_kinds;
 mod auth;
 mod config;
 mod console_index;
+mod consolidation_scheduler;
 mod control;
 mod coord;
 mod cost;
@@ -810,6 +811,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // delete path. See `crate::ephemeral_gc`.
     ephemeral_gc::spawn_ephemeral_gc(
         config.ephemeral_gc_enabled,
+        state.fact_store.clone(),
+        shutdown_tx.subscribe(),
+    );
+    // Consolidation review scheduler (Audit II M4). Gated at spawn by
+    // CORECRUXD_CONSOLIDATION_SCHEDULER (default OFF); interval config-driven.
+    // Detect+surface only: each tick runs the read-only contradiction pass and
+    // appends ONE `__consolidation_review__::*` receipt — it never resolves.
+    // See `crate::consolidation_scheduler`.
+    consolidation_scheduler::spawn_consolidation_scheduler(
+        config.consolidation_scheduler_enabled,
+        config.consolidation_scheduler_interval_secs,
         state.fact_store.clone(),
         shutdown_tx.subscribe(),
     );

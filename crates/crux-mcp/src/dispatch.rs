@@ -2158,6 +2158,10 @@ mod tests {
             "memory_pin" => json!({"fact_id": "f_stub"}),
             "memory_set_horizon" => json!({"fact_id": "f_stub", "horizon_class": "standard"}),
             "memory_freshness" => json!({"query": "v", "token_budget": 1000}),
+            "memory_contradictions" => json!({"token_budget": 1000}),
+            "memory_consolidate" => json!({
+                "entity": "e", "key": "k", "canonical_value": "v", "target_fact_ids": ["f_stub"]
+            }),
             "artefact_put" => json!({"content_bytes_base64": "AAAA", "mime_type": "text/plain"}),
             "artefact_get" => json!({"artefact_id": "a_stub"}),
             "get_session" | "list_observations" | "delete_session" | "archive_session" | "unarchive_session" => {

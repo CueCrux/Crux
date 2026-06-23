@@ -56,6 +56,36 @@ impl MemoryCliError {
     }
 }
 
+/// One contradiction candidate surfaced by the read-only Audit II M1 pass
+/// (`GET /v1/console/review/contradictions`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContradictionCandidate {
+    pub entity: String,
+    pub key: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub polarity_a: String,
+    #[serde(default)]
+    pub polarity_b: String,
+    #[serde(default)]
+    pub fact_ids: Vec<String>,
+    #[serde(default)]
+    pub values: Vec<String>,
+}
+
+/// Receipt returned by the safe consolidation pass (Audit II M2,
+/// `POST /v1/console/review/consolidations`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsolidationReceipt {
+    pub consolidation_id: String,
+    pub canonical_fact_id: String,
+    #[serde(default)]
+    pub superseded_fact_ids: Vec<String>,
+    #[serde(default)]
+    pub source_fact_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryFact {
     pub fact_id: String,
@@ -232,6 +262,88 @@ impl MemoryClient {
         }
         Ok(())
     }
+
+    /// List contradiction candidates via the read-only review endpoint
+    /// (`GET /v1/console/review/contradictions`). Detect-only; the daemon
+    /// never mutates state on this path.
+    pub fn contradictions(&self, limit: usize) -> Result<Vec<ContradictionCandidate>, MemoryCliError> {
+        let url = self.url("/v1/console/review/contradictions");
+        let req = self.apply_auth(self.agent.get(&url).query("limit", limit.to_string()));
+        let resp = req.call().map_err(MemoryCliError::transport)?;
+        let status = resp.status().as_u16();
+        let body = resp.into_body().read_to_string().map_err(MemoryCliError::transport)?;
+        if status >= 400 {
+            return Err(MemoryCliError::UpstreamStatus { status, body });
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&body)?;
+        let arr = parsed
+            .get("candidates")
+            .and_then(|v| v.as_array())
+            .ok_or(MemoryCliError::MissingField("candidates"))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for c in arr {
+            out.push(serde_json::from_value(c.clone())?);
+        }
+        Ok(out)
+    }
+
+    /// Explicitly consolidate target facts into one canonical fact via
+    /// `POST /v1/console/review/consolidations`. The daemon runs the M2
+    /// protection guards (pinned/receipt-linked/private/high-confidence
+    /// targets are refused with a 4xx) and emits a consolidation receipt.
+    pub fn consolidate(
+        &self,
+        entity: &str,
+        key: &str,
+        canonical_value: &str,
+        targets: &[String],
+        confidence: f32,
+    ) -> Result<ConsolidationReceipt, MemoryCliError> {
+        let body = serde_json::json!({
+            "consolidation_id": "",
+            "entity": entity,
+            "key": key,
+            "canonical_value": canonical_value,
+            "target_fact_ids": targets,
+            "confidence": confidence,
+        });
+        let url = self.url("/v1/console/review/consolidations");
+        let req = self.apply_auth_body(self.agent.post(&url));
+        let resp = req.send_json(body).map_err(MemoryCliError::transport)?;
+        let status = resp.status().as_u16();
+        let resp_body = resp.into_body().read_to_string().map_err(MemoryCliError::transport)?;
+        if status >= 400 {
+            return Err(MemoryCliError::UpstreamStatus {
+                status,
+                body: resp_body,
+            });
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&resp_body)?;
+        let receipt = parsed.get("receipt").ok_or(MemoryCliError::MissingField("receipt"))?;
+        Ok(serde_json::from_value(receipt.clone())?)
+    }
+}
+
+/// Pretty-print contradiction candidates (used by `memory contradictions`).
+pub fn render_contradictions(candidates: &[ContradictionCandidate]) -> String {
+    use std::fmt::Write as _;
+    if candidates.is_empty() {
+        return "no contradiction candidates\n".to_string();
+    }
+    let mut out = String::new();
+    for c in candidates {
+        let _ = writeln!(
+            out,
+            "[{}::{}] {} ({} vs {})  facts={}",
+            c.entity,
+            c.key,
+            c.reason,
+            c.polarity_a,
+            c.polarity_b,
+            c.fact_ids.join(","),
+        );
+    }
+    out
 }
 
 /// Pretty-print a single fact (used by `show`).
@@ -573,6 +685,104 @@ mod tests {
         );
         let json_err: MemoryCliError = serde_json::from_str::<MemoryFact>("not json").unwrap_err().into();
         assert!(json_err.to_string().contains("JSON error"));
+    }
+
+    #[test]
+    fn render_contradictions_handles_empty_and_rows() {
+        assert_eq!(render_contradictions(&[]), "no contradiction candidates\n");
+        let cands = vec![ContradictionCandidate {
+            entity: "service:api".to_string(),
+            key: "enabled".to_string(),
+            reason: "opposite_polarity_same_entity_key".to_string(),
+            polarity_a: "positive".to_string(),
+            polarity_b: "negative".to_string(),
+            fact_ids: vec!["f_a".to_string(), "f_b".to_string()],
+            values: vec!["enabled".to_string(), "disabled".to_string()],
+        }];
+        let out = render_contradictions(&cands);
+        assert!(out.contains("[service:api::enabled]"));
+        assert!(out.contains("positive vs negative"));
+        assert!(out.contains("f_a,f_b"));
+    }
+
+    #[test]
+    fn contradictions_parses_candidates_and_sends_bearer() {
+        let body = serde_json::json!({
+            "schema": "crux.console.review.contradictions.v1",
+            "limit": 50,
+            "count": 1,
+            "candidates": [{
+                "entity": "service:api", "key": "enabled",
+                "reason": "opposite_polarity_same_entity_key",
+                "polarity_a": "positive", "polarity_b": "negative",
+                "fact_ids": ["f_a", "f_b"], "values": ["enabled", "disabled"]
+            }]
+        })
+        .to_string();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, body)]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), Some("tok-c".to_string()));
+        let cands = c.contradictions(50).expect("contradictions ok");
+        let reqs = h.join().expect("join");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].entity, "service:api");
+        assert!(reqs[0].to_lowercase().contains("authorization: bearer tok-c"));
+        assert!(reqs[0].contains("limit=50"));
+    }
+
+    #[test]
+    fn contradictions_missing_field_errors() {
+        let (port, h) = crate::test_support::serve_responses(vec![(200, "{}".to_string())]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), None);
+        let err = c.contradictions(10).expect_err("must fail");
+        h.join().ok();
+        assert!(matches!(err, MemoryCliError::MissingField("candidates")));
+    }
+
+    #[test]
+    fn consolidate_posts_request_and_parses_receipt() {
+        let body = serde_json::json!({
+            "schema": "crux.console.review.consolidation.v1",
+            "status": "consolidated",
+            "receipt": {
+                "consolidation_id": "con-1",
+                "canonical_fact_id": "f_canon",
+                "superseded_fact_ids": ["f_old", "f_dup"],
+                "source_fact_ids": ["f_old", "f_dup"]
+            }
+        })
+        .to_string();
+        let (port, h) = crate::test_support::serve_responses(vec![(200, body)]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), Some("tok-w".to_string()));
+        let receipt = c
+            .consolidate(
+                "proj",
+                "status",
+                "active",
+                &["f_old".to_string(), "f_dup".to_string()],
+                0.8,
+            )
+            .expect("consolidate ok");
+        let reqs = h.join().expect("join");
+        assert_eq!(receipt.canonical_fact_id, "f_canon");
+        assert_eq!(receipt.superseded_fact_ids.len(), 2);
+        // The POST body carries entity/key/value/targets (ureq pretty-prints
+        // JSON with a space after the colon, so match key + value loosely).
+        assert!(reqs[0].contains("\"entity\"") && reqs[0].contains("\"proj\""));
+        assert!(reqs[0].contains("\"canonical_value\"") && reqs[0].contains("\"active\""));
+        assert!(reqs[0].contains("f_old"));
+        assert!(reqs[0].to_lowercase().contains("authorization: bearer tok-w"));
+    }
+
+    #[test]
+    fn consolidate_surfaces_protection_conflict() {
+        // The daemon rejects a protected target with a 409 (CONFLICT).
+        let (port, h) = crate::test_support::serve_responses(vec![(409, "target receipt-linked".to_string())]);
+        let c = MemoryClient::new(&format!("http://127.0.0.1:{port}"), None);
+        let err = c
+            .consolidate("proj", "status", "active", &["f_linked".to_string()], 0.8)
+            .expect_err("protected target must fail");
+        h.join().ok();
+        assert!(matches!(err, MemoryCliError::Transport(_)), "got {err:?}");
     }
 
     #[test]

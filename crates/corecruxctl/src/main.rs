@@ -849,6 +849,35 @@ enum MemoryCommand {
         #[arg(long, default_value_t = false)]
         off: bool,
     },
+    /// List contradiction CANDIDATES (read-only; Audit II M1). Surfaces active,
+    /// non-superseded facts sharing one (entity,key) with opposite polarity.
+    /// Detect-only — resolve explicitly with `memory consolidate`.
+    Contradictions {
+        /// Maximum candidate groups to list.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Explicitly consolidate target facts into one canonical fact (Audit II
+    /// M2). Supersedes the targets (history preserved) and emits a receipt.
+    /// Refuses protected (pinned/receipt-linked/private/high-confidence)
+    /// targets. Requires admin:write on the daemon.
+    Consolidate {
+        /// Entity all targets + the canonical fact share.
+        #[arg(long)]
+        entity: String,
+        /// Key all targets + the canonical fact share.
+        #[arg(long)]
+        key: String,
+        /// Value for the surviving canonical fact.
+        #[arg(long)]
+        canonical_value: String,
+        /// Fact ids to collapse (repeatable; at least one).
+        #[arg(long = "target", required = true)]
+        targets: Vec<String>,
+        /// Confidence for the canonical fact.
+        #[arg(long, default_value_t = 1.0)]
+        confidence: f32,
+    },
     /// Export the local memory store to a signed `.cruxpack` file
     /// (read-only against --data-dir; private + erased facts excluded —
     /// see Memory-Portability-v1).
@@ -3450,6 +3479,27 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     } else {
                         println!("pinned fact {fact_id}");
                     }
+                    Ok(())
+                }
+                MemoryCommand::Contradictions { limit } => {
+                    let candidates = client.contradictions(limit)?;
+                    print!("{}", memory::render_contradictions(&candidates));
+                    Ok(())
+                }
+                MemoryCommand::Consolidate {
+                    entity,
+                    key,
+                    canonical_value,
+                    targets,
+                    confidence,
+                } => {
+                    let receipt = client.consolidate(&entity, &key, &canonical_value, &targets, confidence)?;
+                    println!(
+                        "consolidated {} target(s) into {} (receipt {})",
+                        receipt.superseded_fact_ids.len(),
+                        receipt.canonical_fact_id,
+                        receipt.consolidation_id,
+                    );
                     Ok(())
                 }
                 MemoryCommand::Export {
