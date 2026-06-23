@@ -1442,12 +1442,18 @@ function txSessions(json){   // /v1/console/sessions → {session_rows:[{session
         fields:[['passport',pass]], children:[] };
       kids=[ppId];
     }
+    const la = (typeof s.last_active_unix_ms==='number') ? s.last_active_unix_ms : null;
+    const rel = la!=null ? (()=>{ const sec=Math.max(0,Math.round((Date.now()-la)/1000));
+        return (sec<60?sec+'s':(sec<3600?Math.round(sec/60)+'m':(sec<86400?Math.round(sec/3600)+'h':Math.round(sec/86400)+'d')))+' ago'; })() : null;
+    const st = s.state || (archived?'archived':'idle');   // server-derived live state (fixes the "all idle" bug)
     return { id: idFor('sess', raw), kind:'session', __sessId:title, __raw:raw, __archived:archived, __title:title,
+      __lastActive: la, __state: st,
       label: title || 'session',
-      sub: [agent? ('agent '+agent):null, archived? 'archived':null, s.archived_at? ('· '+String(s.archived_at).slice(0,10)):null]
-             .filter(Boolean).join(' · ') || 'session · open for audit chain →',
-      status: archived? 'idle' : st2(s.status || (s.active?'active':'idle')),
-      fields: [['session_id',title],['agent',agent],['archived',archived?'yes':null],['archived_at',s.archived_at],['raw_key',raw]]
+      sub: [agent? ('agent '+agent):null, st!=='idle'? st:null, rel? ('· '+rel):null,
+            (archived && s.archived_at)? ('· arch '+String(s.archived_at).slice(0,10)):null]
+             .filter(Boolean).join(' ') || 'session · open for audit chain →',
+      status: archived? 'idle' : st2(st),
+      fields: [['session_id',title],['agent',agent],['state',st],['last_active',rel],['archived',archived?'yes':null],['archived_at',s.archived_at],['raw_key',raw]]
                .filter(([,v])=>v!=null&&v!==''),
       children:kids, doc:(s.summary||s.doc||''), payload: JSON.stringify(s,null,2) };
   });
@@ -3330,9 +3336,23 @@ function sessionExpRow(s){
 }
 function sessionsListSections(){
   const kids=((N['cx-sessions']||{}).children||[]).map(cid=>N[cid]).filter(Boolean);
-  return [{h:'Sessions',sub:'active + saved — list view; graph from the rail pull-out',wide:true,
-    controls:[{t:'search',ph:'Filter sessions…'}].concat(kids.map(sessionExpRow))
-      .concat([{t:'btn',label:'Browse as graph',action:'graph'}])}];
+  // Time filter (all/day/week/month) — drops cards whose last-active is older
+  // than the window. Persisted via confPut under cx-sessions.window.
+  const win = confGet('cx-sessions.window','all');
+  const WIN = {day:864e5, week:7*864e5, month:30*864e5}[win];
+  const now = Date.now();
+  const inWindow = s => !WIN || s.__lastActive==null || (now - s.__lastActive) <= WIN;
+  const filterBtns = ['all','day','week','month'].map(w=>({t:'btn',
+    label: w==='all'?'all time':w, action:'showsec', key:'window', value:w, active: w===win}));
+  const live = kids.filter(s=> !s.__archived && inWindow(s));   // already most-recent-first from the server sort
+  const arch = kids.filter(s=>  s.__archived && inWindow(s));
+  return [
+    {h:'Active & idle', sub: live.length+' session'+(live.length===1?'':'s')+' · most-recent first', wide:true,
+      controls:[{t:'search',ph:'Filter sessions…'}].concat(filterBtns).concat(live.map(sessionExpRow))},
+    {h:'Archived', sub: arch.length+' archived'+(WIN?' in window':''), wide:true,
+      controls: arch.length? arch.map(sessionExpRow) : [{t:'info',label:'—',v:'no archived sessions'+(WIN?' in window':'')}]},
+    {h:'',wide:true,controls:[{t:'btn',label:'Browse as graph',action:'graph'}]},
+  ];
 }
 function identityCandidateRowData(n){
   try{ return JSON.parse(n.payload||'{}'); }catch(e){ return {}; }
