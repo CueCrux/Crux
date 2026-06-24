@@ -26,6 +26,7 @@
 mod activity;
 mod agentgraph_kinds;
 mod auth;
+mod cek_registry;
 mod config;
 mod console_index;
 mod consolidation_scheduler;
