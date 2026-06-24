@@ -41,6 +41,85 @@ pub const EXTERNAL_ANCHOR_KIND_V1: &str = "external_anchor";
 pub const RFC3161_TIMESTAMP_KIND_V1: &str = "rfc3161_timestamp";
 const ID_CT_TST_INFO: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
 
+/// An RFC6962 inclusion proof returned by a witness submission.
+///
+/// Carries everything an offline verifier needs to re-check that a seal-chain
+/// head was anchored in a transparency log *without trusting the daemon*: the
+/// leaf hash, its position, the signed tree head, and the audit path. Produced
+/// by the daemon's witness adapter and embedded in `audit_bundle_v1`. The
+/// fields map one-for-one onto [`ExternalAnchorBodyInputV1`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WitnessProofV1 {
+    /// Transparency-log provider label, e.g. `rekor`.
+    pub transparency_log: String,
+    /// Base URL of the log the entry was written to.
+    pub log_url: String,
+    /// Provider entry identifier (Rekor entry UUID), when returned.
+    pub rekor_uuid: Option<String>,
+    /// RFC6962 leaf hash, lowercase hex (SHA-256 of `0x00 || entry_body`).
+    pub leaf_hash: String,
+    /// Zero-based index of the leaf within the tree of size `tree_size`.
+    pub log_index: u64,
+    /// Size of the tree the proof is anchored against.
+    pub tree_size: u64,
+    /// RFC6962 signed-tree-head root hash, lowercase hex.
+    pub root_hash: String,
+    /// Audit-path sibling hashes, leaf to root, lowercase hex.
+    pub inclusion_proof: Vec<String>,
+    /// Optional signed checkpoint / signed-tree-head note.
+    pub checkpoint: Option<String>,
+    /// Provider's integrated time, unix seconds rendered as a string.
+    pub integrated_time: String,
+}
+
+/// Re-check a [`WitnessProofV1`]'s RFC6962 inclusion proof: hash the leaf along
+/// the audit path up to the signed root. Pure and offline — proves the head was
+/// in the log of size `tree_size` without trusting the daemon. Does not by
+/// itself prove the root is endorsed by the log operator (that needs the
+/// checkpoint/SET signature against the pinned log public key).
+pub fn verify_witness_proof_v1(proof: &WitnessProofV1) -> bool {
+    verify_rfc6962_inclusion_proof_v1(
+        &proof.leaf_hash,
+        proof.log_index,
+        proof.tree_size,
+        &proof.root_hash,
+        &proof.inclusion_proof,
+    )
+}
+
+/// Read the witnessed [`WitnessProofV1`]s from a daemon `witness_proofs.jsonl`
+/// journal. The journal interleaves `{"kind":"pending",…}` and
+/// `{"kind":"witnessed","head_hash":…,"proof":{…}}` records; this returns the
+/// `proof` of each witnessed record. Tolerant — unparseable lines are skipped,
+/// and a missing file yields an empty vec — so the bundle assembler (in a
+/// different crate than the daemon's store) can read proofs off disk without
+/// depending on the store's record types.
+pub fn read_witnessed_proofs_jsonl(path: &std::path::Path) -> Vec<WitnessProofV1> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("kind").and_then(serde_json::Value::as_str) != Some("witnessed") {
+            continue;
+        }
+        let Some(proof_val) = value.get("proof") else {
+            continue;
+        };
+        if let Ok(proof) = serde_json::from_value::<WitnessProofV1>(proof_val.clone()) {
+            out.push(proof);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct ExternalAnchorBodyInputV1<'a> {
     pub tenant_id: &'a str,

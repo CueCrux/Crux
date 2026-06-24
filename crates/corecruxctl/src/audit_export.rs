@@ -115,6 +115,9 @@ pub fn run_audit_export(args: AuditExportArgs) -> Result<(u64, u64, String), Box
         scope: scope_record,
         events,
         receipt_refs,
+        // corecruxctl exports facts only; witness proofs are populated by the
+        // daemon-side assembler (it has the witness store / data_dir).
+        witness_proofs: Vec::new(),
         signing_key: &signing_key,
         signer_key_id,
     })?;

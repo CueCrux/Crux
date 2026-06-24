@@ -119,11 +119,11 @@ pub use verify_v1::{verify_receipt_v1, ReceiptSigV1, VerificationReportV1, Verif
 pub use witness_v1::{
     assert_external_anchor_kind_v1, assert_rfc3161_timestamp_kind_v1, build_external_anchor_body_v1,
     build_rfc3161_timestamp_body_v1, is_valid_object_identifier_text_v1, parse_x509_certs_der_or_pem_v1,
-    sign_external_anchor_v1, sign_rfc3161_timestamp_v1, verify_external_anchor_body_v1,
+    read_witnessed_proofs_jsonl, sign_external_anchor_v1, sign_rfc3161_timestamp_v1, verify_external_anchor_body_v1,
     verify_rfc3161_timestamp_token_binding_v1, verify_rfc3161_timestamp_token_strict_v1,
-    verify_rfc6962_inclusion_proof_v1, ExternalAnchorBodyInputV1, Rfc3161StrictValidationOptionsV1,
-    Rfc3161StrictValidationReportV1, Rfc3161TimestampBodyInputV1, EXTERNAL_ANCHOR_KIND_V1, RFC3161_TIMESTAMP_KIND_V1,
-    WITNESS_BODY_SCHEMA_V1,
+    verify_rfc6962_inclusion_proof_v1, verify_witness_proof_v1, ExternalAnchorBodyInputV1,
+    Rfc3161StrictValidationOptionsV1, Rfc3161StrictValidationReportV1, Rfc3161TimestampBodyInputV1, WitnessProofV1,
+    EXTERNAL_ANCHOR_KIND_V1, RFC3161_TIMESTAMP_KIND_V1, WITNESS_BODY_SCHEMA_V1,
 };
 
 pub const STREAM_TYPE_RECEIPT: &str = "receipt";

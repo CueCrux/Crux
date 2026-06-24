@@ -27,35 +27,11 @@ use sha2::{Digest as _, Sha256};
 /// Provider label recorded on proofs produced by [`RekorWitness`].
 pub const REKOR_PROVIDER_V1: &str = "rekor";
 
-/// An RFC6962 inclusion proof returned by a witness submission.
-///
-/// The fields map one-for-one onto the inputs
-/// `corecrux_receipts::ExternalAnchorBodyInputV1` needs to build a signed
-/// `external_anchor` receipt body (M2), so callers never have to reshape the
-/// transparency-log response by hand.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct WitnessProofV1 {
-    /// Transparency-log provider label, e.g. `rekor`.
-    pub transparency_log: String,
-    /// Base URL of the log the entry was written to.
-    pub log_url: String,
-    /// Provider entry identifier (Rekor entry UUID), when returned.
-    pub rekor_uuid: Option<String>,
-    /// RFC6962 leaf hash, lowercase hex (SHA-256 of `0x00 || entry_body`).
-    pub leaf_hash: String,
-    /// Zero-based index of the leaf within the tree of size `tree_size`.
-    pub log_index: u64,
-    /// Size of the tree the proof is anchored against.
-    pub tree_size: u64,
-    /// RFC6962 signed-tree-head root hash, lowercase hex.
-    pub root_hash: String,
-    /// Audit-path sibling hashes, leaf to root, lowercase hex.
-    pub inclusion_proof: Vec<String>,
-    /// Optional signed checkpoint / signed-tree-head note.
-    pub checkpoint: Option<String>,
-    /// Provider's integrated time, unix seconds rendered as a string.
-    pub integrated_time: String,
-}
+// The witness inclusion-proof type lives in `corecrux-receipts` (it is a
+// receipt artifact, embedded in `audit_bundle_v1` and re-checked by the offline
+// bundle verifier). Re-exported here so the daemon's witness modules keep their
+// `crate::witness_submit::WitnessProofV1` import path.
+pub use corecrux_receipts::WitnessProofV1;
 
 /// Failure modes of a witness submission. Network and decode failures are
 /// recoverable (the head stays unwitnessed and is retried by the M2 task);
