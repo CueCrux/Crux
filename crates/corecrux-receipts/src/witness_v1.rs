@@ -26,6 +26,8 @@ use const_oid::{
     ObjectIdentifier,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
+use p256::ecdsa::signature::Verifier as _;
+use p256::pkcs8::DecodePublicKey as _;
 use ring::signature;
 use sha2::{Digest as _, Sha256, Sha384, Sha512};
 use x509_cert::{der::Encode as X509Cert02Encode, Certificate as PemCertificate};
@@ -138,44 +140,47 @@ pub fn read_witnessed_proofs_jsonl(path: &std::path::Path) -> Vec<WitnessProofV1
 /// self-hosted / private (Trillian/cosign) logs keyed with Ed25519. The
 /// public-good Sigstore Rekor signs with **ECDSA P-256**; a P-256 variant is a
 /// follow-up needed for live public-Rekor verification (Track W / M4).
-pub fn verify_rekor_checkpoint_v1(checkpoint: &str, log_ed25519_pubkey: &[u8; 32], expected_root_hex: &str) -> bool {
-    let Some(sep) = checkpoint.find("\n\n") else {
-        return false;
-    };
-    let text = &checkpoint[..=sep]; // up to and including the last text newline
+/// Split a signed-note checkpoint into `(signed_text, sig_block)` iff its root
+/// line commits to `expected_root_hex`. `signed_text` ends with the last text
+/// line's newline — the exact bytes the note signature covers.
+fn checkpoint_text_if_root_matches<'a>(checkpoint: &'a str, expected_root_hex: &str) -> Option<(&'a str, &'a str)> {
+    let sep = checkpoint.find("\n\n")?;
+    let text = &checkpoint[..=sep];
     let sig_block = &checkpoint[sep + 2..];
-
     let mut lines = text.lines();
-    let (Some(_origin), Some(_size), Some(root_b64)) = (lines.next(), lines.next(), lines.next()) else {
-        return false;
-    };
-    let Ok(root_bytes) = base64::engine::general_purpose::STANDARD.decode(root_b64.trim()) else {
-        return false;
-    };
-    let Some(expected_root) = parse_sha256_hex(expected_root_hex) else {
-        return false;
-    };
-    if root_bytes.as_slice() != expected_root {
-        return false;
+    let (_origin, _size, root_b64) = (lines.next()?, lines.next()?, lines.next()?);
+    let root_bytes = base64::engine::general_purpose::STANDARD.decode(root_b64.trim()).ok()?;
+    if root_bytes.as_slice() != parse_sha256_hex(expected_root_hex)?.as_slice() {
+        return None;
     }
+    Some((text, sig_block))
+}
 
+/// The signature payload (after the 4-byte key-hash prefix) of a signed-note
+/// `— <name> <base64(keyhash[4] || sig)>` line.
+fn note_signature_payload(sig_line: &str) -> Option<Vec<u8>> {
+    let rest = sig_line.trim_start().strip_prefix("\u{2014} ")?;
+    let (_name, sig_b64) = rest.rsplit_once(' ')?;
+    let raw = base64::engine::general_purpose::STANDARD.decode(sig_b64.trim()).ok()?;
+    (raw.len() > 4).then(|| raw[4..].to_vec())
+}
+
+/// Verify a Rekor checkpoint signed with **Ed25519** (self-hosted / private
+/// Trillian/cosign logs) against `log_ed25519_pubkey`, confirming it commits to
+/// `expected_root_hex`. See [`verify_rekor_checkpoint_p256_v1`] for public-good
+/// Sigstore Rekor (ECDSA P-256), and [`verify_rekor_checkpoint`] to dispatch.
+pub fn verify_rekor_checkpoint_v1(checkpoint: &str, log_ed25519_pubkey: &[u8; 32], expected_root_hex: &str) -> bool {
+    let Some((text, sig_block)) = checkpoint_text_if_root_matches(checkpoint, expected_root_hex) else {
+        return false;
+    };
     let Ok(verifying) = ed25519_dalek::VerifyingKey::from_bytes(log_ed25519_pubkey) else {
         return false;
     };
     for sig_line in sig_block.lines() {
-        let Some(rest) = sig_line.trim_start().strip_prefix("\u{2014} ") else {
+        let Some(payload) = note_signature_payload(sig_line) else {
             continue;
         };
-        let Some((_name, sig_b64)) = rest.rsplit_once(' ') else {
-            continue;
-        };
-        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(sig_b64.trim()) else {
-            continue;
-        };
-        if raw.len() != 4 + 64 {
-            continue;
-        }
-        let Ok(sig_arr) = <[u8; 64]>::try_from(&raw[4..]) else {
+        let Ok(sig_arr) = <[u8; 64]>::try_from(payload.as_slice()) else {
             continue;
         };
         let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
@@ -184,6 +189,66 @@ pub fn verify_rekor_checkpoint_v1(checkpoint: &str, log_ed25519_pubkey: &[u8; 32
         }
     }
     false
+}
+
+/// Verify a Rekor checkpoint signed with **ECDSA P-256** (public-good Sigstore
+/// Rekor) against `log_p256_key`, confirming it commits to `expected_root_hex`.
+/// The note signature is `keyhash[4] || DER-ECDSA-sig`.
+pub fn verify_rekor_checkpoint_p256_v1(
+    checkpoint: &str,
+    log_p256_key: &p256::ecdsa::VerifyingKey,
+    expected_root_hex: &str,
+) -> bool {
+    let Some((text, sig_block)) = checkpoint_text_if_root_matches(checkpoint, expected_root_hex) else {
+        return false;
+    };
+    for sig_line in sig_block.lines() {
+        let Some(payload) = note_signature_payload(sig_line) else {
+            continue;
+        };
+        let Ok(signature) = p256::ecdsa::Signature::from_der(&payload) else {
+            continue;
+        };
+        if log_p256_key.verify(text.as_bytes(), &signature).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// A transparency-log public key for checkpoint/SET verification.
+#[derive(Debug, Clone)]
+pub enum WitnessLogPublicKeyV1 {
+    /// Ed25519 (self-hosted / private Trillian/cosign logs).
+    Ed25519([u8; 32]),
+    /// ECDSA P-256 (public-good Sigstore Rekor).
+    P256(p256::ecdsa::VerifyingKey),
+}
+
+impl WitnessLogPublicKeyV1 {
+    /// Parse a log key: a 32-byte input is Ed25519; otherwise the bytes are
+    /// treated as a P-256 SPKI public key (PEM or DER).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if let Ok(key) = <[u8; 32]>::try_from(bytes) {
+            return Some(WitnessLogPublicKeyV1::Ed25519(key));
+        }
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            if let Ok(vk) = p256::ecdsa::VerifyingKey::from_public_key_pem(text.trim()) {
+                return Some(WitnessLogPublicKeyV1::P256(vk));
+            }
+        }
+        p256::ecdsa::VerifyingKey::from_public_key_der(bytes)
+            .ok()
+            .map(WitnessLogPublicKeyV1::P256)
+    }
+}
+
+/// Verify a Rekor checkpoint against either log key type.
+pub fn verify_rekor_checkpoint(checkpoint: &str, key: &WitnessLogPublicKeyV1, expected_root_hex: &str) -> bool {
+    match key {
+        WitnessLogPublicKeyV1::Ed25519(k) => verify_rekor_checkpoint_v1(checkpoint, k, expected_root_hex),
+        WitnessLogPublicKeyV1::P256(vk) => verify_rekor_checkpoint_p256_v1(checkpoint, vk, expected_root_hex),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1522,5 +1587,36 @@ mod tests {
         assert!(!verify_rekor_checkpoint_v1(&checkpoint, &pk, &"cd".repeat(32)));
         let tampered = checkpoint.replace("\n42\n", "\n43\n");
         assert!(!verify_rekor_checkpoint_v1(&tampered, &pk, &root_hex));
+    }
+
+    #[test]
+    fn rekor_checkpoint_p256_verifies_and_dispatches() {
+        use p256::ecdsa::{signature::Signer as _, SigningKey};
+        use p256::pkcs8::EncodePublicKey as _;
+        let sk = SigningKey::from_slice(&[0x55; 32]).expect("scalar");
+        let vk = *sk.verifying_key();
+        let root = [0xAB_u8; 32];
+        let root_b64 = base64::engine::general_purpose::STANDARD.encode(root);
+        let text = format!("rekor.example\n7\n{root_b64}\n");
+        let sig: p256::ecdsa::Signature = sk.sign(text.as_bytes());
+        let mut keyhash_sig = vec![0u8; 4];
+        keyhash_sig.extend_from_slice(sig.to_der().as_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&keyhash_sig);
+        let checkpoint = format!("{text}\n\u{2014} rekor.example {sig_b64}\n");
+        let root_hex: String = root.iter().map(|b| format!("{b:02x}")).collect();
+
+        assert!(verify_rekor_checkpoint_p256_v1(&checkpoint, &vk, &root_hex));
+        // Dispatcher via a key parsed from SPKI PEM (the form Rekor publishes).
+        let pem = vk.to_public_key_pem(p256::pkcs8::LineEnding::LF).expect("pem");
+        let key = WitnessLogPublicKeyV1::parse(pem.as_bytes()).expect("parse p256 pem");
+        assert!(matches!(key, WitnessLogPublicKeyV1::P256(_)));
+        assert!(verify_rekor_checkpoint(&checkpoint, &key, &root_hex));
+        // Wrong root and tampered text are rejected.
+        assert!(!verify_rekor_checkpoint_p256_v1(&checkpoint, &vk, &"cd".repeat(32)));
+        assert!(!verify_rekor_checkpoint_p256_v1(
+            &checkpoint.replace("\n7\n", "\n8\n"),
+            &vk,
+            &root_hex
+        ));
     }
 }
