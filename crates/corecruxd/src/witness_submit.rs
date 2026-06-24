@@ -17,8 +17,6 @@
 //! its tests without wiring it into the daemon runtime; the background submit
 //! task and proof store land in M2.
 
-#![allow(dead_code)] // M1 ships the witness adapter + tests standalone; the daemon background submit task wires these into the runtime in M2.
-
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -35,7 +33,7 @@ pub const REKOR_PROVIDER_V1: &str = "rekor";
 /// `corecrux_receipts::ExternalAnchorBodyInputV1` needs to build a signed
 /// `external_anchor` receipt body (M2), so callers never have to reshape the
 /// transparency-log response by hand.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WitnessProofV1 {
     /// Transparency-log provider label, e.g. `rekor`.
     pub transparency_log: String,
@@ -82,9 +80,6 @@ pub enum WitnessError {
 /// (blocking): the M2 background task invokes it from a blocking context so the
 /// async runtime is never stalled on network I/O.
 pub trait Witness: Send + Sync {
-    /// Provider label, e.g. `rekor`.
-    fn provider(&self) -> &str;
-
     /// Submit `head_hash` (the latest `SegmentSealMaterialV1::material_hash()`)
     /// to the log and return its verified inclusion proof.
     fn submit(&self, head_hash: &[u8; 32]) -> Result<WitnessProofV1, WitnessError>;
@@ -155,10 +150,6 @@ impl RekorWitness {
 }
 
 impl Witness for RekorWitness {
-    fn provider(&self) -> &str {
-        REKOR_PROVIDER_V1
-    }
-
     fn submit(&self, head_hash: &[u8; 32]) -> Result<WitnessProofV1, WitnessError> {
         let request = self.build_request(head_hash);
         let request_value = serde_json::to_value(&request).map_err(|e| WitnessError::Decode(e.to_string()))?;

@@ -149,6 +149,7 @@ pub struct Metrics {
     seal_duration_seconds: HistogramVec,
     seal_backlog_frames: Gauge,
     ccxi_missing_total: Gauge,
+    witness_unwitnessed_heads: Gauge,
 }
 
 #[allow(dead_code)] // See struct-level comment above.
@@ -1439,6 +1440,15 @@ impl Metrics {
             .register(Box::new(ccxi_missing_total.clone()))
             .expect("register corecrux_ccxi_missing_total");
 
+        let witness_unwitnessed_heads = Gauge::new(
+            "crux_witness_unwitnessed_heads",
+            "Seal-chain heads sealed but not yet witnessed to a transparency log",
+        )
+        .expect("crux_witness_unwitnessed_heads gauge");
+        registry
+            .register(Box::new(witness_unwitnessed_heads.clone()))
+            .expect("register crux_witness_unwitnessed_heads");
+
         Self {
             registry,
             io_backend,
@@ -1567,6 +1577,7 @@ impl Metrics {
             seal_duration_seconds,
             seal_backlog_frames,
             ccxi_missing_total,
+            witness_unwitnessed_heads,
         }
     }
 
@@ -2156,6 +2167,10 @@ impl Metrics {
 
     pub fn set_ccxi_missing_total(&self, count: u64) {
         self.ccxi_missing_total.set(count as f64);
+    }
+
+    pub fn set_witness_unwitnessed_heads(&self, count: u64) {
+        self.witness_unwitnessed_heads.set(count as f64);
     }
 
     pub fn render(&self) -> Result<String, prometheus::Error> {

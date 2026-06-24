@@ -180,6 +180,7 @@ pub struct AppState {
     pub rcx_router: Option<Arc<crux_router::RcxRouter>>,
     pub data_dir: PathBuf,
     pub witness: crate::witness::WitnessRuntimeConfigV1,
+    pub witness_proofs: Arc<RwLock<crate::witness_proofs::WitnessProofStore>>,
     pub mcp_enabled: bool,
     pub console_enabled: bool,
     /// Multi-agent coordination plane (`/v1/coord/*`). Default OFF
