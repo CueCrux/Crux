@@ -25,10 +25,48 @@ use axum::Json;
 
 use corecrux_memory::events::CruxEvent;
 
-use crate::activity::{self, ActivityRow, JournalInput, JournalKind};
+use crate::activity::{self, ActivityReceiptV1, ActivityRow, ActivitySigner, JournalEntry, JournalInput, JournalKind};
 use crate::auth::{http_scope_context, require_http_any_scope_for_tenant};
 
 use super::{problem_response, AppState};
+
+/// Co-signs activity appends with the daemon passport key (M2). Mirrors the
+/// observe lane's `mint_receipt` — Ed25519 over `blake3(body)` — so the
+/// embedded receipt is dataplane-independent and offline-verifiable.
+struct PassportSigner {
+    key: crux_session::LocalPassportKey,
+    fpr: String,
+}
+
+impl ActivitySigner for PassportSigner {
+    fn sign_body(&self, body: &[u8]) -> ActivityReceiptV1 {
+        let hash = blake3::hash(body);
+        let signature = self.key.sign_hash(hash.as_bytes());
+        ActivityReceiptV1 {
+            alg: "ed25519".to_string(),
+            signed_by: self.fpr.clone(),
+            body_hash: format!("blake3:{}", hex::encode(hash.as_bytes())),
+            signature: hex::encode(signature),
+        }
+    }
+}
+
+/// Build the co-signer when signing is enabled and the passport key loads and
+/// matches `state.passport_fpr`. Returns `None` (append stays unsigned,
+/// best-effort) on any mismatch/failure so a key problem never breaks capture.
+fn build_signer(state: &AppState) -> Option<PassportSigner> {
+    if !activity::activity_sign_enabled() {
+        return None;
+    }
+    let key = crux_session::LocalPassportKey::from_path(&state.passport_key_path).ok()?;
+    if key.passport_fpr() != state.passport_fpr {
+        return None;
+    }
+    Some(PassportSigner {
+        fpr: state.passport_fpr.clone(),
+        key,
+    })
+}
 
 /// Write scopes for an activity append — mirrors the observe-audit surface.
 const WRITE_SCOPES: &[&str] = &["facts:write", "admin:write"];
@@ -80,9 +118,10 @@ pub(super) async fn post_activity(
         input.actor_passport = passport;
     }
 
+    let signer = build_signer(&state);
     let entry = {
         let mut store = activity::global().lock().await;
-        store.append(input)
+        store.append_with_signer(input, signer.as_ref().map(|s| s as &dyn ActivitySigner))
     };
 
     // T.4 — projection row / live SSE. Ids + kind only, never the text.
@@ -260,4 +299,164 @@ pub(super) async fn get_activity_turn(
         "entries": entries,
     }))
     .into_response()
+}
+
+/// Verify one entry's embedded receipt (M2). Dataplane-independent: it
+/// reconstructs the canonical body, blake3-hashes it, and checks the Ed25519
+/// signature against the daemon passport public key. Unsigned entries report
+/// `status:"recorded"` (the no-regression default), never a failure.
+fn verify_entry(entry: &JournalEntry, passport_pubkey_hex: &str) -> serde_json::Value {
+    let Some(receipt) = &entry.receipt else {
+        return serde_json::json!({
+            "entry_id": entry.entry_id, "signed": false, "verified": false, "status": "recorded",
+        });
+    };
+    let body = activity::canonical_signing_bytes(entry);
+    let hash = blake3::hash(&body);
+    let expect = format!("blake3:{}", hex::encode(hash.as_bytes()));
+    let mut errors: Vec<String> = Vec::new();
+    if receipt.body_hash != expect {
+        errors.push("BODY_HASH_MISMATCH".to_string());
+    }
+    let sig_ok = (|| -> Option<()> {
+        let pk: [u8; 32] = hex::decode(passport_pubkey_hex).ok()?.try_into().ok()?;
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk).ok()?;
+        let sig: [u8; 64] = hex::decode(&receipt.signature).ok()?.try_into().ok()?;
+        let sig = ed25519_dalek::Signature::from_bytes(&sig);
+        ed25519_dalek::Verifier::verify(&vk, hash.as_bytes(), &sig).ok()
+    })()
+    .is_some();
+    if !sig_ok {
+        errors.push("SIGNATURE_INVALID".to_string());
+    }
+    serde_json::json!({
+        "entry_id": entry.entry_id,
+        "signed": true,
+        "verified": errors.is_empty(),
+        "signed_by": receipt.signed_by,
+        "errors": errors,
+    })
+}
+
+/// `GET /v1/activity/turn/{turn_id}/verify` — verify the embedded receipts for
+/// a turn against the daemon passport key (M2). Reuses the same tenant/session
+/// scope as the deref. The console ✓verify badge calls this.
+pub(super) async fn get_activity_turn_verify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(turn_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !activity::activity_log_enabled() {
+        return activity_disabled_response();
+    }
+    let Some(tenant_id) = params.get("tenant_id").filter(|s| !s.trim().is_empty()) else {
+        return problem_response(StatusCode::BAD_REQUEST, "tenant_id is required".to_string());
+    };
+    let Some(session) = params.get("session").filter(|s| !s.trim().is_empty()) else {
+        return problem_response(StatusCode::BAD_REQUEST, "session is required".to_string());
+    };
+    if let Err(p) = require_http_any_scope_for_tenant(&state.auth, &headers, READ_SCOPES, tenant_id) {
+        return p.into_response();
+    }
+    let caller_passport = http_scope_context(&state.auth, &headers)
+        .ok()
+        .and_then(|c| c.passport_id)
+        .unwrap_or_else(|| activity::ANON_PASSPORT.to_string());
+
+    let entries = {
+        let store = activity::global().lock().await;
+        store.by_turn(tenant_id, session, &turn_id, &caller_passport)
+    };
+    let results: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| verify_entry(e, &state.passport_public_key_hex))
+        .collect();
+
+    Json(serde_json::json!({
+        "turn_id": turn_id,
+        "session_id": session,
+        "signer": state.passport_fpr,
+        "entries": results,
+    }))
+    .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::activity::{JournalInput, JournalKind, JournalMeta, JournalRefs, JournalStore, SIGN_FLAG_ENV};
+
+    fn signed_entry(text: &str) -> (JournalEntry, String) {
+        let key = crux_session::LocalPassportKey::from_seed([7_u8; 32]).expect("seed key");
+        let pubkey = key.public_key_hex().to_string();
+        let signer = PassportSigner {
+            fpr: key.passport_fpr().to_string(),
+            key,
+        };
+        let mut store = JournalStore::default();
+        let entry = store.append_with_signer(
+            JournalInput {
+                tenant_id: "t".to_string(),
+                session_id: "s".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                kind: JournalKind::Answer,
+                actor_passport: Some("alice".to_string()),
+                text: text.to_string(),
+                refs: JournalRefs::default(),
+                meta: JournalMeta::default(),
+                private: false,
+            },
+            Some(&signer),
+        );
+        (entry, pubkey)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn verify_entry_round_trip_tamper_and_wrong_key() {
+        std::env::set_var(SIGN_FLAG_ENV, "1");
+        let (entry, pubkey) = signed_entry("the signed answer");
+        // The append embedded a receipt.
+        assert!(entry.receipt.is_some(), "sign flag on ⇒ entry carries a receipt");
+
+        // Valid signature verifies green.
+        let v = verify_entry(&entry, &pubkey);
+        assert_eq!(v["signed"], true);
+        assert_eq!(v["verified"], true, "valid receipt must verify: {v}");
+
+        // Tampered text breaks both the body hash and the signature.
+        let mut tampered = entry.clone();
+        tampered.text = "tampered".to_string();
+        let vt = verify_entry(&tampered, &pubkey);
+        assert_eq!(vt["verified"], false, "tampered body must fail");
+
+        // A different public key fails the signature check.
+        let vk = verify_entry(&entry, &"00".repeat(32));
+        assert_eq!(vk["verified"], false, "wrong key must fail");
+
+        std::env::remove_var(SIGN_FLAG_ENV);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unsigned_entry_reports_recorded() {
+        std::env::remove_var(SIGN_FLAG_ENV);
+        let mut store = JournalStore::default();
+        let entry = store.append(JournalInput {
+            tenant_id: "t".to_string(),
+            session_id: "s".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            kind: JournalKind::Command,
+            actor_passport: Some("alice".to_string()),
+            text: "no signing".to_string(),
+            refs: JournalRefs::default(),
+            meta: JournalMeta::default(),
+            private: false,
+        });
+        assert!(entry.receipt.is_none());
+        let v = verify_entry(&entry, &"00".repeat(32));
+        assert_eq!(v["signed"], false);
+        assert_eq!(v["status"], "recorded");
+    }
 }
