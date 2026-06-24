@@ -41,14 +41,103 @@ def fail(manifest: dict | None, reason: str, *, events_match: bool = False, rece
         "events_jsonl_sha256_match": events_match,
         "receipts_cbor_sha256_match": receipts_match,
         "signature_valid": False,
+        "witness_proof_count": manifest.get("witness_proof_count", 0) if manifest else 0,
+        "witness_proofs_sha256_match": False,
+        "witness_proofs_valid": False,
         "failure_reason": reason,
     }
 
 
 REQUIRED_MEMBERS = ("manifest.json", "events.jsonl", "receipts.cbor")
+WITNESS_MEMBER = "witness_proofs.jsonl"
 
 
-def read_archive_members(path: Path) -> tuple[dict, bytes, bytes]:
+def _parse_sha256_hex(value: str) -> bytes | None:
+    """Parse a 32-byte SHA-256 hex digest, tolerating a `sha256:` prefix."""
+    if value.startswith("sha256:"):
+        value = value[len("sha256:") :]
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError:
+        return None
+    return raw if len(raw) == 32 else None
+
+
+def _rfc6962_node_hash(left: bytes, right: bytes) -> bytes:
+    return hashlib.sha256(b"\x01" + left + right).digest()
+
+
+def verify_rfc6962_inclusion_proof(
+    leaf_hash: str, log_index: int, tree_size: int, root_hash: str, proof: list[str]
+) -> bool:
+    """Independent mirror of corecrux_receipts::verify_rfc6962_inclusion_proof_v1."""
+    if tree_size == 0 or log_index >= tree_size:
+        return False
+    computed = _parse_sha256_hex(leaf_hash)
+    expected_root = _parse_sha256_hex(root_hash)
+    if computed is None or expected_root is None:
+        return False
+    if tree_size == 1:
+        return len(proof) == 0 and computed == expected_root
+    fn = log_index
+    sn = tree_size - 1
+    for sibling in proof:
+        sib = _parse_sha256_hex(sibling)
+        if sib is None or sn == 0:
+            return False
+        if fn % 2 == 1 or fn == sn:
+            computed = _rfc6962_node_hash(sib, computed)
+            while fn != 0 and fn % 2 == 0:
+                fn >>= 1
+                sn >>= 1
+        else:
+            computed = _rfc6962_node_hash(computed, sib)
+        fn >>= 1
+        sn >>= 1
+    return sn == 0 and computed == expected_root
+
+
+def verify_witness_member(manifest: dict, witness_bytes: bytes | None) -> tuple[bool, bool, str | None]:
+    """Re-check the optional witness_proofs.jsonl against the signed manifest.
+
+    Returns (sha256_match, all_proofs_valid, failure_reason). The signed manifest
+    carries the proof count and the member SHA-256, so a stripped or mutated
+    member is detectable here without trusting the daemon.
+    """
+    count = manifest.get("witness_proof_count", 0) or 0
+    has_member = bool(witness_bytes)
+    if count == 0:
+        if not has_member:
+            return True, True, None
+        return False, False, "witness_proofs.jsonl present but the signed manifest declares none"
+    if witness_bytes is None:
+        return False, False, f"manifest declares {count} witness proof(s) but witness_proofs.jsonl is missing"
+    sha = hashlib.sha256(witness_bytes).hexdigest()
+    if manifest.get("witness_proofs_sha256") != sha:
+        return False, False, "witness_proofs.jsonl sha256 mismatch"
+    parsed = 0
+    for i, line in enumerate(witness_bytes.split(b"\n")):
+        if not line.strip():
+            continue
+        try:
+            proof = json.loads(line)
+        except Exception as exc:  # noqa: BLE001
+            return True, False, f"witness proof on line {i} is malformed: {exc}"
+        if not verify_rfc6962_inclusion_proof(
+            proof.get("leaf_hash", ""),
+            int(proof.get("log_index", 0)),
+            int(proof.get("tree_size", 0)),
+            proof.get("root_hash", ""),
+            list(proof.get("inclusion_proof", [])),
+        ):
+            return True, False, f"witness proof {i} (leaf {proof.get('leaf_hash')}) failed RFC6962 verification"
+        parsed += 1
+    if parsed != count:
+        return True, False, f"witness proof count mismatch: manifest {count}, member {parsed}"
+    return True, True, None
+
+
+def read_archive_members(path: Path) -> tuple[dict, bytes, bytes, bytes | None]:
     try:
         import zstandard as zstd  # type: ignore[import-not-found]
     except Exception:
@@ -66,7 +155,7 @@ def read_archive_members(path: Path) -> tuple[dict, bytes, bytes]:
     members: dict[str, bytes] = {}
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
         for member in archive.getmembers():
-            if member.name not in REQUIRED_MEMBERS:
+            if member.name not in REQUIRED_MEMBERS and member.name != WITNESS_MEMBER:
                 continue
             extracted = archive.extractfile(member)
             if extracted is None:
@@ -77,10 +166,10 @@ def read_archive_members(path: Path) -> tuple[dict, bytes, bytes]:
     if missing:
         raise RuntimeError(f"archive missing required member(s): {', '.join(missing)}")
     manifest = json.loads(members["manifest.json"].decode("utf-8"))
-    return manifest, members["events.jsonl"], members["receipts.cbor"]
+    return manifest, members["events.jsonl"], members["receipts.cbor"], members.get(WITNESS_MEMBER)
 
 
-def read_unpacked_members(path: Path) -> tuple[dict, bytes, bytes] | dict:
+def read_unpacked_members(path: Path) -> tuple[dict, bytes, bytes, bytes | None] | dict:
     manifest_path = path / "manifest.json"
     events_path = path / "events.jsonl"
     receipts_path = path / "receipts.cbor"
@@ -96,7 +185,9 @@ def read_unpacked_members(path: Path) -> tuple[dict, bytes, bytes] | dict:
     if not receipts_path.exists():
         return fail(manifest, "missing receipts.cbor")
 
-    return manifest, events_path.read_bytes(), receipts_path.read_bytes()
+    witness_path = path / WITNESS_MEMBER
+    witness = witness_path.read_bytes() if witness_path.exists() else None
+    return manifest, events_path.read_bytes(), receipts_path.read_bytes(), witness
 
 
 def verify_vector(path: Path) -> dict:
@@ -114,7 +205,7 @@ def verify_vector(path: Path) -> dict:
 
     if isinstance(loaded, dict):
         return loaded
-    manifest, events, receipts = loaded
+    manifest, events, receipts, witness = loaded
 
     if manifest.get("bundle_format_version") != SUPPORTED_VERSION:
         return fail(manifest, f"unsupported bundle_format_version: {manifest.get('bundle_format_version')}")
@@ -160,8 +251,10 @@ def verify_vector(path: Path) -> dict:
             receipts_match=True,
         )
 
+    witness_sha_match, witness_valid, witness_failure = verify_witness_member(manifest, witness)
+
     return {
-        "ok": True,
+        "ok": witness_sha_match and witness_valid,
         "bundle_format_version": manifest["bundle_format_version"],
         "bundle_id": manifest["bundle_id"],
         "fact_count": manifest["fact_count"],
@@ -169,7 +262,10 @@ def verify_vector(path: Path) -> dict:
         "events_jsonl_sha256_match": True,
         "receipts_cbor_sha256_match": True,
         "signature_valid": True,
-        "failure_reason": None,
+        "witness_proof_count": manifest.get("witness_proof_count", 0),
+        "witness_proofs_sha256_match": witness_sha_match,
+        "witness_proofs_valid": witness_valid,
+        "failure_reason": witness_failure,
     }
 
 
