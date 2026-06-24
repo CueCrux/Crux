@@ -153,7 +153,7 @@ impl Witness for RekorWitness {
 
         let (uuid, entry) = entries.into_iter().next().ok_or(WitnessError::EmptyResponse)?;
 
-        let proof = entry.into_proof(uuid, self.rekor_url.clone())?;
+        let proof = entry.into_proof(uuid, self.rekor_url.clone(), hex::encode(head_hash))?;
 
         // Never hand back a proof we cannot re-derive ourselves: a lying or
         // garbled log must surface as Inconsistent, not be persisted as if the
@@ -168,6 +168,14 @@ impl Witness for RekorWitness {
             return Err(WitnessError::Inconsistent(format!(
                 "leaf {} at index {}/{} does not hash to root {}",
                 proof.leaf_hash, proof.log_index, proof.tree_size, proof.root_hash
+            )));
+        }
+
+        // Bind the proof to the head we submitted: the log entry must commit to it.
+        if !corecrux_receipts::verify_witness_binding_v1(&proof) {
+            return Err(WitnessError::Inconsistent(format!(
+                "witness proof is not bound to head {}",
+                proof.head_hash
             )));
         }
 
@@ -262,7 +270,7 @@ struct RekorInclusionProof {
 }
 
 impl RekorLogEntry {
-    fn into_proof(self, uuid: String, log_url: String) -> Result<WitnessProofV1, WitnessError> {
+    fn into_proof(self, uuid: String, log_url: String, head_hash: String) -> Result<WitnessProofV1, WitnessError> {
         let body_bytes = base64::engine::general_purpose::STANDARD
             .decode(self.body.as_bytes())
             .map_err(|e| WitnessError::Decode(format!("entry body is not base64: {e}")))?;
@@ -284,6 +292,8 @@ impl RekorLogEntry {
             inclusion_proof: proof.hashes,
             checkpoint: proof.checkpoint,
             integrated_time: self.integrated_time.to_string(),
+            head_hash,
+            entry_body_b64: self.body,
         })
     }
 }
@@ -306,6 +316,17 @@ mod tests {
         hasher.update([0x00]);
         hasher.update(body);
         hasher.finalize().into()
+    }
+
+    /// A minimal `hashedrekord` entry body whose artifact digest commits to
+    /// `head`, so the witness binding check holds (mirrors real Rekor).
+    fn hashedrekord_body(head: &[u8; 32]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "apiVersion": "0.0.1",
+            "kind": "hashedrekord",
+            "spec": { "data": { "hash": { "algorithm": "sha256", "value": hex::encode(Sha256::digest(head)) } } }
+        }))
+        .expect("body json")
     }
 
     /// RFC6962 interior node hash — `SHA-256(0x01 || left || right)`.
@@ -428,15 +449,16 @@ mod tests {
     #[test]
     fn submit_maps_tree_size_one_proof_and_self_verifies() {
         // Smallest valid RFC6962 proof: tree_size == 1, leaf == root, no path.
-        let body = b"canonical-rekor-entry-body";
-        let body_b64 = base64::engine::general_purpose::STANDARD.encode(body);
-        let leaf = rfc6962_leaf(body);
+        let head = [0x22u8; 32];
+        let body = hashedrekord_body(&head);
+        let body_b64 = base64::engine::general_purpose::STANDARD.encode(&body);
+        let leaf = rfc6962_leaf(&body);
         let root_hex = hex::encode(leaf);
         let response = rekor_response(&body_b64, 0, 1, &root_hex, vec![]);
 
         let (url, rx, handle) = start_mock("201 Created", response);
         let witness = RekorWitness::new(url, test_key(), Duration::from_secs(5));
-        let proof = witness.submit(&[0x22u8; 32]).expect("submit ok");
+        let proof = witness.submit(&head).expect("submit ok");
         handle.join().expect("join");
 
         let request = rx.recv().expect("recorded request");
@@ -463,20 +485,26 @@ mod tests {
     #[test]
     fn submit_maps_tree_size_two_proof_with_sibling() {
         // Two-leaf tree: our entry is leaf 0, sibling is leaf 1.
-        let body = b"entry-zero";
-        let body_b64 = base64::engine::general_purpose::STANDARD.encode(body);
-        let leaf0 = rfc6962_leaf(body);
+        let head = [0x33u8; 32];
+        let body = hashedrekord_body(&head);
+        let body_b64 = base64::engine::general_purpose::STANDARD.encode(&body);
+        let leaf0 = rfc6962_leaf(&body);
         let leaf1 = rfc6962_leaf(b"entry-one");
         let root = rfc6962_node(&leaf0, &leaf1);
         let response = rekor_response(&body_b64, 0, 2, &hex::encode(root), vec![hex::encode(leaf1)]);
 
         let (url, rx, handle) = start_mock("201 Created", response);
         let witness = RekorWitness::new(url, test_key(), Duration::from_secs(5));
-        let proof = witness.submit(&[0x33u8; 32]).expect("submit ok");
+        let proof = witness.submit(&head).expect("submit ok");
         handle.join().expect("join");
         let _ = rx.recv();
 
         assert_eq!(proof.tree_size, 2);
+        assert_eq!(proof.head_hash, hex::encode(head));
+        assert!(
+            corecrux_receipts::verify_witness_binding_v1(&proof),
+            "proof binds to head"
+        );
         assert_eq!(proof.inclusion_proof, vec![hex::encode(leaf1)]);
         assert!(corecrux_receipts::verify_rfc6962_inclusion_proof_v1(
             &proof.leaf_hash,
@@ -529,5 +557,10 @@ mod tests {
         assert!(proof.tree_size >= 1);
         assert!(proof.checkpoint.is_some());
         assert!(proof.rekor_uuid.is_some());
+        assert_eq!(proof.head_hash, hex::encode(head));
+        assert!(
+            corecrux_receipts::verify_witness_binding_v1(&proof),
+            "real Rekor proof binds to the submitted head"
+        );
     }
 }

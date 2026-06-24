@@ -100,6 +100,36 @@ def verify_rfc6962_inclusion_proof(
     return sn == 0 and computed == expected_root
 
 
+def verify_witness_binding(proof: dict) -> bool:
+    """Mirror of verify_witness_binding_v1: the entry body hashes to the proof's
+    RFC6962 leaf, and the entry's hashedrekord artifact digest equals
+    SHA-256(head_hash). True for legacy/unbound proofs (no head/body)."""
+    head = proof.get("head_hash") or ""
+    body_b64 = proof.get("entry_body_b64") or ""
+    if not head and not body_b64:
+        return True
+    if not head or not body_b64:
+        return False
+    try:
+        body = base64.b64decode(body_b64, validate=True)
+    except Exception:  # noqa: BLE001
+        return False
+    leaf = hashlib.sha256(b"\x00" + body).hexdigest()
+    proof_leaf = (proof.get("leaf_hash") or "").removeprefix("sha256:")
+    if leaf != proof_leaf:
+        return False
+    head_bytes = _parse_sha256_hex(head)
+    if head_bytes is None:
+        return False
+    head_digest = hashlib.sha256(head_bytes).hexdigest()
+    try:
+        entry = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return False
+    value = (((entry.get("spec") or {}).get("data") or {}).get("hash") or {}).get("value", "")
+    return value.removeprefix("sha256:") == head_digest
+
+
 def verify_rekor_checkpoint(checkpoint: str, log_pubkey, expected_root_hex: str) -> bool:
     """Independent mirror of verify_rekor_checkpoint{,_p256}_v1.
 
@@ -184,6 +214,8 @@ def verify_witness_member(
             list(proof.get("inclusion_proof", [])),
         ):
             return True, False, None, f"witness proof {i} (leaf {proof.get('leaf_hash')}) failed RFC6962 verification"
+        if not verify_witness_binding(proof):
+            return True, False, None, f"witness proof {i} (head {proof.get('head_hash')}) is not bound to its log entry"
         if rekor_pubkey is not None:
             cp = proof.get("checkpoint")
             if not cp or not verify_rekor_checkpoint(cp, rekor_pubkey, proof.get("root_hash", "")):

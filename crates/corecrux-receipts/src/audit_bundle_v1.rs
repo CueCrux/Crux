@@ -34,7 +34,9 @@ use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::witness_v1::{verify_rekor_checkpoint, verify_witness_proof_v1, WitnessLogPublicKeyV1, WitnessProofV1};
+use crate::witness_v1::{
+    verify_rekor_checkpoint, verify_witness_binding_v1, verify_witness_proof_v1, WitnessLogPublicKeyV1, WitnessProofV1,
+};
 
 /// Schema version. Bumping this requires a verifier upgrade.
 pub const BUNDLE_FORMAT_VERSION: u32 = 1;
@@ -560,6 +562,17 @@ fn verify_witness_member(
                         )),
                     );
                 }
+                if !verify_witness_binding_v1(&proof) {
+                    return (
+                        true,
+                        false,
+                        None,
+                        Some(format!(
+                            "witness proof {i} (head {}) is not bound to its log entry",
+                            proof.head_hash
+                        )),
+                    );
+                }
                 if let Some(key) = log_key {
                     let endorsed = proof
                         .checkpoint
@@ -883,6 +896,8 @@ mod tests {
             inclusion_proof: Vec::new(),
             checkpoint: None,
             integrated_time: "1700000000".to_string(),
+            head_hash: String::new(),
+            entry_body_b64: String::new(),
         }
     }
 
@@ -1073,5 +1088,48 @@ mod tests {
         assert!(!r2.ok);
         assert!(r2.witness_proofs_valid, "inclusion still valid");
         assert_eq!(r2.witness_root_endorsed, Some(false));
+    }
+
+    #[test]
+    fn witness_proof_binding_is_enforced_in_the_bundle() {
+        use sha2::{Digest as _, Sha256};
+        let hx = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+        // A bound proof: the entry body's artifact digest commits to the head,
+        // and the proof's leaf is the RFC6962 leaf of that body.
+        let head = [0x9a_u8; 32];
+        let body = serde_json::to_vec(&serde_json::json!({
+            "spec": { "data": { "hash": { "value": hx(&Sha256::digest(head)) } } }
+        }))
+        .unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update([0x00]);
+        hasher.update(&body);
+        let leaf = hx(&hasher.finalize());
+
+        let mut proof = sample_witness_proof("11");
+        proof.leaf_hash = leaf.clone();
+        proof.root_hash = leaf; // tree_size 1: leaf == root
+        proof.head_hash = hx(&head[..]);
+        proof.entry_body_b64 = base64::engine::general_purpose::STANDARD.encode(&body);
+
+        let mut input = sample_input();
+        input.witness_proofs = vec![proof.clone()];
+        let built = build_bundle_v1(input).expect("build");
+        let mut tar = Vec::new();
+        built.write_tar_zst(&mut tar).unwrap();
+        assert!(verify_bundle_v1(&tar).expect("verify").ok, "bound proof verifies");
+
+        // Re-point the proof at a different head: the body no longer commits to
+        // it, so binding fails and the bundle is rejected.
+        let mut unbound = proof;
+        unbound.head_hash = hx(&[0u8; 32]);
+        let mut input2 = sample_input();
+        input2.witness_proofs = vec![unbound];
+        let built2 = build_bundle_v1(input2).expect("build");
+        let mut tar2 = Vec::new();
+        built2.write_tar_zst(&mut tar2).unwrap();
+        let r2 = verify_bundle_v1(&tar2).expect("verify");
+        assert!(!r2.ok);
+        assert!(r2.failure_reason.unwrap().contains("not bound"));
     }
 }

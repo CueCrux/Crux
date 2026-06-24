@@ -73,6 +73,61 @@ pub struct WitnessProofV1 {
     pub checkpoint: Option<String>,
     /// Provider's integrated time, unix seconds rendered as a string.
     pub integrated_time: String,
+    /// The seal-chain head this proof anchors, lowercase hex (32-byte
+    /// `material_hash`). Empty on legacy/synthetic proofs. Binds the proof to a
+    /// specific head so it cannot be silently re-pointed (see
+    /// [`verify_witness_binding_v1`]).
+    #[serde(default)]
+    pub head_hash: String,
+    /// Base64 of the transparency-log entry body (the `hashedrekord`). Lets an
+    /// offline verifier re-derive the leaf and confirm the entry's artifact
+    /// digest commits to `head_hash`. Empty on legacy/synthetic proofs.
+    #[serde(default)]
+    pub entry_body_b64: String,
+}
+
+/// Re-check that a [`WitnessProofV1`] is bound to its seal-chain head: the entry
+/// body hashes to the proof's RFC6962 leaf, and the entry's `hashedrekord`
+/// artifact digest (`spec.data.hash.value`) equals `SHA-256(head_hash)`. Proves
+/// the proof anchors *this* head, not some other entry.
+///
+/// Returns `true` when there is no binding material (`head_hash`/`entry_body_b64`
+/// empty — legacy/synthetic proofs); callers that require binding should also
+/// check `head_hash` is non-empty. Returns `false` only when binding material is
+/// present but inconsistent.
+pub fn verify_witness_binding_v1(proof: &WitnessProofV1) -> bool {
+    if proof.head_hash.is_empty() && proof.entry_body_b64.is_empty() {
+        return true;
+    }
+    // Both must be present to bind.
+    if proof.head_hash.is_empty() || proof.entry_body_b64.is_empty() {
+        return false;
+    }
+    let Ok(body) = base64::engine::general_purpose::STANDARD.decode(&proof.entry_body_b64) else {
+        return false;
+    };
+    // entry body -> RFC6962 leaf (SHA-256 over a 0x00 prefix).
+    let mut hasher = Sha256::new();
+    hasher.update([0x00]);
+    hasher.update(&body);
+    let leaf_hex = hex_lower(&hasher.finalize());
+    let proof_leaf = proof.leaf_hash.strip_prefix("sha256:").unwrap_or(&proof.leaf_hash);
+    if leaf_hex != proof_leaf {
+        return false;
+    }
+    // head_hash -> the entry's artifact digest (spec.data.hash.value).
+    let Some(head_bytes) = parse_sha256_hex(&proof.head_hash) else {
+        return false;
+    };
+    let head_digest_hex = hex_lower(&Sha256::digest(head_bytes));
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return false;
+    };
+    value
+        .pointer("/spec/data/hash/value")
+        .and_then(serde_json::Value::as_str)
+        .map(|v| v.strip_prefix("sha256:").unwrap_or(v))
+        == Some(head_digest_hex.as_str())
 }
 
 /// Re-check a [`WitnessProofV1`]'s RFC6962 inclusion proof: hash the leaf along

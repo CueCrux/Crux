@@ -122,7 +122,7 @@ pub use witness_v1::{
     read_witnessed_proofs_jsonl, sign_external_anchor_v1, sign_rfc3161_timestamp_v1, verify_external_anchor_body_v1,
     verify_rekor_checkpoint, verify_rekor_checkpoint_p256_v1, verify_rekor_checkpoint_v1,
     verify_rfc3161_timestamp_token_binding_v1, verify_rfc3161_timestamp_token_strict_v1,
-    verify_rfc6962_inclusion_proof_v1, verify_witness_proof_v1, ExternalAnchorBodyInputV1,
+    verify_rfc6962_inclusion_proof_v1, verify_witness_binding_v1, verify_witness_proof_v1, ExternalAnchorBodyInputV1,
     Rfc3161StrictValidationOptionsV1, Rfc3161StrictValidationReportV1, Rfc3161TimestampBodyInputV1,
     WitnessLogPublicKeyV1, WitnessProofV1, EXTERNAL_ANCHOR_KIND_V1, RFC3161_TIMESTAMP_KIND_V1, WITNESS_BODY_SCHEMA_V1,
 };

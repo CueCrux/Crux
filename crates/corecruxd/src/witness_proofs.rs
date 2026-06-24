@@ -54,7 +54,8 @@ enum WitnessProofRecordV1 {
     /// A previously-pending head was witnessed; carries the verified proof.
     Witnessed {
         head_hash: String,
-        proof: WitnessProofV1,
+        // Boxed: WitnessProofV1 is much larger than the Pending variant.
+        proof: Box<WitnessProofV1>,
         witnessed_at_unix: i64,
     },
 }
@@ -119,7 +120,7 @@ impl WitnessProofStore {
         let head_hash = head_hash.into();
         self.append(&WitnessProofRecordV1::Witnessed {
             head_hash: head_hash.clone(),
-            proof: proof.clone(),
+            proof: Box::new(proof.clone()),
             witnessed_at_unix: now_unix(),
         })?;
         self.pending.remove(&head_hash);
@@ -179,7 +180,7 @@ impl WitnessProofStore {
                 }
                 Ok(WitnessProofRecordV1::Witnessed { head_hash, proof, .. }) => {
                     self.pending.remove(&head_hash);
-                    self.witnessed.insert(head_hash, proof);
+                    self.witnessed.insert(head_hash, *proof);
                 }
                 Err(err) => {
                     tracing::warn!(?err, line_no, "skipping malformed witness_proofs record during reload");
@@ -252,6 +253,8 @@ mod tests {
             inclusion_proof: vec![],
             checkpoint: None,
             integrated_time: "1700000000".to_string(),
+            head_hash: String::new(),
+            entry_body_b64: String::new(),
         }
     }
 
