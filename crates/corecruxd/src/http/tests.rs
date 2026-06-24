@@ -365,6 +365,9 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         rcx_router: None,
         data_dir: root.clone(),
         witness: crate::witness::WitnessRuntimeConfigV1::disabled(),
+        witness_proofs: std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::witness_proofs::WitnessProofStore::default(),
+        )),
         mcp_enabled: true,
         console_enabled: true,
         coord_enabled: true,

@@ -81,6 +81,10 @@ vaultcrux-local = { path = "../vaultcrux-local" }
 
 wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime"], optional = true }
 sha2 = "0.11"
+# Witness (Track W / G1): Sigstore Rekor's hashedrekord verification requires
+# ECDSA P-256 (the daemon seal key is Ed25519), so the witness signs entries
+# with a dedicated P-256 key. Already a workspace dep via corecrux-receipts.
+p256 = { version = "0.13.2", default-features = false, features = ["std", "ecdsa", "pem"] }
 
 [dev-dependencies]
 corecrux-index = { path = "../corecrux-index" }

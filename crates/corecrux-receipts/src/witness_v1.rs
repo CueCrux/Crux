@@ -10,6 +10,7 @@
 //! verification helpers for the parts that are deterministic without
 //! network access.
 
+use base64::Engine as _;
 use ciborium::value::Value as CborValue;
 use cms::cert::x509::der::{Decode, Encode, Tag as CmsTag, Tagged};
 use cms::{
@@ -25,6 +26,8 @@ use const_oid::{
     ObjectIdentifier,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
+use p256::ecdsa::signature::Verifier as _;
+use p256::pkcs8::DecodePublicKey as _;
 use ring::signature;
 use sha2::{Digest as _, Sha256, Sha384, Sha512};
 use x509_cert::{der::Encode as X509Cert02Encode, Certificate as PemCertificate};
@@ -40,6 +43,268 @@ pub const WITNESS_BODY_SCHEMA_V1: &str = "cuecrux.receipt.body.v1";
 pub const EXTERNAL_ANCHOR_KIND_V1: &str = "external_anchor";
 pub const RFC3161_TIMESTAMP_KIND_V1: &str = "rfc3161_timestamp";
 const ID_CT_TST_INFO: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
+
+/// An RFC6962 inclusion proof returned by a witness submission.
+///
+/// Carries everything an offline verifier needs to re-check that a seal-chain
+/// head was anchored in a transparency log *without trusting the daemon*: the
+/// leaf hash, its position, the signed tree head, and the audit path. Produced
+/// by the daemon's witness adapter and embedded in `audit_bundle_v1`. The
+/// fields map one-for-one onto [`ExternalAnchorBodyInputV1`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WitnessProofV1 {
+    /// Transparency-log provider label, e.g. `rekor`.
+    pub transparency_log: String,
+    /// Base URL of the log the entry was written to.
+    pub log_url: String,
+    /// Provider entry identifier (Rekor entry UUID), when returned.
+    pub rekor_uuid: Option<String>,
+    /// RFC6962 leaf hash, lowercase hex (SHA-256 of `0x00 || entry_body`).
+    pub leaf_hash: String,
+    /// Zero-based index of the leaf within the tree of size `tree_size`.
+    pub log_index: u64,
+    /// Size of the tree the proof is anchored against.
+    pub tree_size: u64,
+    /// RFC6962 signed-tree-head root hash, lowercase hex.
+    pub root_hash: String,
+    /// Audit-path sibling hashes, leaf to root, lowercase hex.
+    pub inclusion_proof: Vec<String>,
+    /// Optional signed checkpoint / signed-tree-head note.
+    pub checkpoint: Option<String>,
+    /// Provider's integrated time, unix seconds rendered as a string.
+    pub integrated_time: String,
+    /// The seal-chain head this proof anchors, lowercase hex (32-byte
+    /// `material_hash`). Empty on legacy/synthetic proofs. Binds the proof to a
+    /// specific head so it cannot be silently re-pointed (see
+    /// [`verify_witness_binding_v1`]).
+    #[serde(default)]
+    pub head_hash: String,
+    /// Base64 of the transparency-log entry body (the `hashedrekord`). Lets an
+    /// offline verifier re-derive the leaf and confirm the entry's artifact
+    /// digest commits to `head_hash`. Empty on legacy/synthetic proofs.
+    #[serde(default)]
+    pub entry_body_b64: String,
+}
+
+/// Re-check that a [`WitnessProofV1`] is bound to its seal-chain head: the entry
+/// body hashes to the proof's RFC6962 leaf, and the entry's `hashedrekord`
+/// artifact digest (`spec.data.hash.value`) equals `SHA-256(head_hash)`. Proves
+/// the proof anchors *this* head, not some other entry.
+///
+/// Returns `true` when there is no binding material (`head_hash`/`entry_body_b64`
+/// empty — legacy/synthetic proofs); callers that require binding should also
+/// check `head_hash` is non-empty. Returns `false` only when binding material is
+/// present but inconsistent.
+pub fn verify_witness_binding_v1(proof: &WitnessProofV1) -> bool {
+    if proof.head_hash.is_empty() && proof.entry_body_b64.is_empty() {
+        return true;
+    }
+    // Both must be present to bind.
+    if proof.head_hash.is_empty() || proof.entry_body_b64.is_empty() {
+        return false;
+    }
+    let Ok(body) = base64::engine::general_purpose::STANDARD.decode(&proof.entry_body_b64) else {
+        return false;
+    };
+    // entry body -> RFC6962 leaf (SHA-256 over a 0x00 prefix).
+    let mut hasher = Sha256::new();
+    hasher.update([0x00]);
+    hasher.update(&body);
+    let leaf_hex = hex_lower(&hasher.finalize());
+    let proof_leaf = proof.leaf_hash.strip_prefix("sha256:").unwrap_or(&proof.leaf_hash);
+    if leaf_hex != proof_leaf {
+        return false;
+    }
+    // head_hash -> the entry's artifact digest (spec.data.hash.value).
+    let Some(head_bytes) = parse_sha256_hex(&proof.head_hash) else {
+        return false;
+    };
+    let head_digest_hex = hex_lower(&Sha256::digest(head_bytes));
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return false;
+    };
+    value
+        .pointer("/spec/data/hash/value")
+        .and_then(serde_json::Value::as_str)
+        .map(|v| v.strip_prefix("sha256:").unwrap_or(v))
+        == Some(head_digest_hex.as_str())
+}
+
+/// Re-check a [`WitnessProofV1`]'s RFC6962 inclusion proof: hash the leaf along
+/// the audit path up to the signed root. Pure and offline — proves the head was
+/// in the log of size `tree_size` without trusting the daemon. Does not by
+/// itself prove the root is endorsed by the log operator (that needs the
+/// checkpoint/SET signature against the pinned log public key).
+pub fn verify_witness_proof_v1(proof: &WitnessProofV1) -> bool {
+    verify_rfc6962_inclusion_proof_v1(
+        &proof.leaf_hash,
+        proof.log_index,
+        proof.tree_size,
+        &proof.root_hash,
+        &proof.inclusion_proof,
+    )
+}
+
+/// Read the witnessed [`WitnessProofV1`]s from a daemon `witness_proofs.jsonl`
+/// journal. The journal interleaves `{"kind":"pending",…}` and
+/// `{"kind":"witnessed","head_hash":…,"proof":{…}}` records; this returns the
+/// `proof` of each witnessed record. Tolerant — unparseable lines are skipped,
+/// and a missing file yields an empty vec — so the bundle assembler (in a
+/// different crate than the daemon's store) can read proofs off disk without
+/// depending on the store's record types.
+pub fn read_witnessed_proofs_jsonl(path: &std::path::Path) -> Vec<WitnessProofV1> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("kind").and_then(serde_json::Value::as_str) != Some("witnessed") {
+            continue;
+        }
+        let Some(proof_val) = value.get("proof") else {
+            continue;
+        };
+        if let Ok(proof) = serde_json::from_value::<WitnessProofV1>(proof_val.clone()) {
+            out.push(proof);
+        }
+    }
+    out
+}
+
+/// Verify a Rekor checkpoint (signed-note / c2sp tlog-checkpoint format) against
+/// the log's Ed25519 public key and confirm it commits to `expected_root_hex`.
+///
+/// This is the **trust root** for witness verification. RFC6962 inclusion only
+/// proves a leaf hashes up to *some* root; this proves that root is the one the
+/// log operator signed, so an internally-consistent but fabricated tree is
+/// rejected. Returns false on any parse, signature, or root mismatch.
+///
+/// A signed note is `text` (newline-terminated lines: origin, tree_size,
+/// base64(root_hash), …) then a blank line then one or more
+/// `— <name> <base64(keyhash[4] || ed25519_sig[64])>` lines. The signature
+/// covers `text` only.
+///
+/// Algorithm scope: this verifies an **Ed25519**-signed checkpoint — correct for
+/// self-hosted / private (Trillian/cosign) logs keyed with Ed25519. The
+/// public-good Sigstore Rekor signs with **ECDSA P-256**; a P-256 variant is a
+/// follow-up needed for live public-Rekor verification (Track W / M4).
+/// Split a signed-note checkpoint into `(signed_text, sig_block)` iff its root
+/// line commits to `expected_root_hex`. `signed_text` ends with the last text
+/// line's newline — the exact bytes the note signature covers.
+fn checkpoint_text_if_root_matches<'a>(checkpoint: &'a str, expected_root_hex: &str) -> Option<(&'a str, &'a str)> {
+    let sep = checkpoint.find("\n\n")?;
+    let text = &checkpoint[..=sep];
+    let sig_block = &checkpoint[sep + 2..];
+    let mut lines = text.lines();
+    let (_origin, _size, root_b64) = (lines.next()?, lines.next()?, lines.next()?);
+    let root_bytes = base64::engine::general_purpose::STANDARD.decode(root_b64.trim()).ok()?;
+    if root_bytes.as_slice() != parse_sha256_hex(expected_root_hex)?.as_slice() {
+        return None;
+    }
+    Some((text, sig_block))
+}
+
+/// The signature payload (after the 4-byte key-hash prefix) of a signed-note
+/// `— <name> <base64(keyhash[4] || sig)>` line.
+fn note_signature_payload(sig_line: &str) -> Option<Vec<u8>> {
+    let rest = sig_line.trim_start().strip_prefix("\u{2014} ")?;
+    let (_name, sig_b64) = rest.rsplit_once(' ')?;
+    let raw = base64::engine::general_purpose::STANDARD.decode(sig_b64.trim()).ok()?;
+    (raw.len() > 4).then(|| raw[4..].to_vec())
+}
+
+/// Verify a Rekor checkpoint signed with **Ed25519** (self-hosted / private
+/// Trillian/cosign logs) against `log_ed25519_pubkey`, confirming it commits to
+/// `expected_root_hex`. See [`verify_rekor_checkpoint_p256_v1`] for public-good
+/// Sigstore Rekor (ECDSA P-256), and [`verify_rekor_checkpoint`] to dispatch.
+pub fn verify_rekor_checkpoint_v1(checkpoint: &str, log_ed25519_pubkey: &[u8; 32], expected_root_hex: &str) -> bool {
+    let Some((text, sig_block)) = checkpoint_text_if_root_matches(checkpoint, expected_root_hex) else {
+        return false;
+    };
+    let Ok(verifying) = ed25519_dalek::VerifyingKey::from_bytes(log_ed25519_pubkey) else {
+        return false;
+    };
+    for sig_line in sig_block.lines() {
+        let Some(payload) = note_signature_payload(sig_line) else {
+            continue;
+        };
+        let Ok(sig_arr) = <[u8; 64]>::try_from(payload.as_slice()) else {
+            continue;
+        };
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        if verifying.verify_strict(text.as_bytes(), &signature).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Verify a Rekor checkpoint signed with **ECDSA P-256** (public-good Sigstore
+/// Rekor) against `log_p256_key`, confirming it commits to `expected_root_hex`.
+/// The note signature is `keyhash[4] || DER-ECDSA-sig`.
+pub fn verify_rekor_checkpoint_p256_v1(
+    checkpoint: &str,
+    log_p256_key: &p256::ecdsa::VerifyingKey,
+    expected_root_hex: &str,
+) -> bool {
+    let Some((text, sig_block)) = checkpoint_text_if_root_matches(checkpoint, expected_root_hex) else {
+        return false;
+    };
+    for sig_line in sig_block.lines() {
+        let Some(payload) = note_signature_payload(sig_line) else {
+            continue;
+        };
+        let Ok(signature) = p256::ecdsa::Signature::from_der(&payload) else {
+            continue;
+        };
+        if log_p256_key.verify(text.as_bytes(), &signature).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// A transparency-log public key for checkpoint/SET verification.
+#[derive(Debug, Clone)]
+pub enum WitnessLogPublicKeyV1 {
+    /// Ed25519 (self-hosted / private Trillian/cosign logs).
+    Ed25519([u8; 32]),
+    /// ECDSA P-256 (public-good Sigstore Rekor).
+    P256(p256::ecdsa::VerifyingKey),
+}
+
+impl WitnessLogPublicKeyV1 {
+    /// Parse a log key: a 32-byte input is Ed25519; otherwise the bytes are
+    /// treated as a P-256 SPKI public key (PEM or DER).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if let Ok(key) = <[u8; 32]>::try_from(bytes) {
+            return Some(WitnessLogPublicKeyV1::Ed25519(key));
+        }
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            if let Ok(vk) = p256::ecdsa::VerifyingKey::from_public_key_pem(text.trim()) {
+                return Some(WitnessLogPublicKeyV1::P256(vk));
+            }
+        }
+        p256::ecdsa::VerifyingKey::from_public_key_der(bytes)
+            .ok()
+            .map(WitnessLogPublicKeyV1::P256)
+    }
+}
+
+/// Verify a Rekor checkpoint against either log key type.
+pub fn verify_rekor_checkpoint(checkpoint: &str, key: &WitnessLogPublicKeyV1, expected_root_hex: &str) -> bool {
+    match key {
+        WitnessLogPublicKeyV1::Ed25519(k) => verify_rekor_checkpoint_v1(checkpoint, k, expected_root_hex),
+        WitnessLogPublicKeyV1::P256(vk) => verify_rekor_checkpoint_p256_v1(checkpoint, vk, expected_root_hex),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ExternalAnchorBodyInputV1<'a> {
@@ -1351,5 +1616,62 @@ mod tests {
         assert_eq!(sig.schema, "cuecrux.receipt.sig.v1");
         assert_eq!(sig.alg, "ed25519");
         assert_eq!(sig.signature.len(), 64);
+    }
+
+    #[test]
+    fn rekor_checkpoint_verifies_against_pinned_key() {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+        let sk = SigningKey::from_bytes(&[0x11; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let root = [0xAB_u8; 32];
+        let root_b64 = base64::engine::general_purpose::STANDARD.encode(root);
+        let text = format!("rekor.example\n42\n{root_b64}\n");
+        let sig = sk.sign(text.as_bytes()).to_bytes();
+        let mut keyhash_sig = vec![0u8; 4];
+        keyhash_sig.extend_from_slice(&sig);
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&keyhash_sig);
+        let checkpoint = format!("{text}\n\u{2014} rekor.example {sig_b64}\n");
+        let root_hex: String = root.iter().map(|b| format!("{b:02x}")).collect();
+
+        assert!(verify_rekor_checkpoint_v1(&checkpoint, &pk, &root_hex));
+
+        // Wrong log key, wrong expected root, and tampered text each fail.
+        let wrong_key = SigningKey::from_bytes(&[0x22; 32]).verifying_key().to_bytes();
+        assert!(!verify_rekor_checkpoint_v1(&checkpoint, &wrong_key, &root_hex));
+        assert!(!verify_rekor_checkpoint_v1(&checkpoint, &pk, &"cd".repeat(32)));
+        let tampered = checkpoint.replace("\n42\n", "\n43\n");
+        assert!(!verify_rekor_checkpoint_v1(&tampered, &pk, &root_hex));
+    }
+
+    #[test]
+    fn rekor_checkpoint_p256_verifies_and_dispatches() {
+        use p256::ecdsa::{signature::Signer as _, SigningKey};
+        use p256::pkcs8::EncodePublicKey as _;
+        let sk = SigningKey::from_slice(&[0x55; 32]).expect("scalar");
+        let vk = *sk.verifying_key();
+        let root = [0xAB_u8; 32];
+        let root_b64 = base64::engine::general_purpose::STANDARD.encode(root);
+        let text = format!("rekor.example\n7\n{root_b64}\n");
+        let sig: p256::ecdsa::Signature = sk.sign(text.as_bytes());
+        let mut keyhash_sig = vec![0u8; 4];
+        keyhash_sig.extend_from_slice(sig.to_der().as_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&keyhash_sig);
+        let checkpoint = format!("{text}\n\u{2014} rekor.example {sig_b64}\n");
+        let root_hex: String = root.iter().map(|b| format!("{b:02x}")).collect();
+
+        assert!(verify_rekor_checkpoint_p256_v1(&checkpoint, &vk, &root_hex));
+        // Dispatcher via a key parsed from SPKI PEM (the form Rekor publishes).
+        let pem = vk.to_public_key_pem(p256::pkcs8::LineEnding::LF).expect("pem");
+        let key = WitnessLogPublicKeyV1::parse(pem.as_bytes()).expect("parse p256 pem");
+        assert!(matches!(key, WitnessLogPublicKeyV1::P256(_)));
+        assert!(verify_rekor_checkpoint(&checkpoint, &key, &root_hex));
+        // Wrong root and tampered text are rejected.
+        assert!(!verify_rekor_checkpoint_p256_v1(&checkpoint, &vk, &"cd".repeat(32)));
+        assert!(!verify_rekor_checkpoint_p256_v1(
+            &checkpoint.replace("\n7\n", "\n8\n"),
+            &vk,
+            &root_hex
+        ));
     }
 }

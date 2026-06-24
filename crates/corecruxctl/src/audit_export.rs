@@ -20,8 +20,8 @@ use ed25519_dalek::SigningKey;
 
 use corecrux_memory::FactStore;
 use corecrux_receipts::{
-    build_bundle_v1, verify_bundle_v1, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1,
-    VerifyReportV1,
+    build_bundle_v1, verify_bundle_with_trust_roots_v1, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1,
+    BuildBundleInputV1, VerifyReportV1, WitnessLogPublicKeyV1,
 };
 
 const RESERVED_PREFIXES: &[&str] = &["__agent::", "__ops::", "__bootstrap__::", "__agent_session::"];
@@ -115,6 +115,9 @@ pub fn run_audit_export(args: AuditExportArgs) -> Result<(u64, u64, String), Box
         scope: scope_record,
         events,
         receipt_refs,
+        // corecruxctl exports facts only; witness proofs are populated by the
+        // daemon-side assembler (it has the witness store / data_dir).
+        witness_proofs: Vec::new(),
         signing_key: &signing_key,
         signer_key_id,
     })?;
@@ -130,10 +133,39 @@ pub fn run_audit_export(args: AuditExportArgs) -> Result<(u64, u64, String), Box
 }
 
 /// Verify a bundle on disk and return a structured report. Fully OFFLINE.
-pub fn run_audit_verify(path: &Path) -> Result<VerifyReportV1, Box<dyn std::error::Error + Send + Sync>> {
+pub fn run_audit_verify(
+    path: &Path,
+    rekor_pubkey_path: Option<&Path>,
+) -> Result<VerifyReportV1, Box<dyn std::error::Error + Send + Sync>> {
     let raw = std::fs::read(path)?;
-    let report = verify_bundle_v1(&raw)?;
+    let log_key = match rekor_pubkey_path {
+        Some(p) => Some(load_log_public_key(p)?),
+        None => None,
+    };
+    let report = verify_bundle_with_trust_roots_v1(&raw, log_key.as_ref())?;
     Ok(report)
+}
+
+/// Load a transparency-log public key for checkpoint/SET trust-root
+/// verification: a 32-byte file is Ed25519 (self-hosted logs); otherwise a P-256
+/// SPKI key in PEM or DER (public-good Rekor). A base64-wrapped 32-byte Ed25519
+/// key is also accepted.
+fn load_log_public_key(path: &Path) -> Result<WitnessLogPublicKeyV1, Box<dyn std::error::Error + Send + Sync>> {
+    use base64::Engine as _;
+    let raw = std::fs::read(path)?;
+    if let Some(key) = WitnessLogPublicKeyV1::parse(&raw) {
+        return Ok(key);
+    }
+    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(String::from_utf8_lossy(&raw).trim()) {
+        if let Some(key) = WitnessLogPublicKeyV1::parse(&decoded) {
+            return Ok(key);
+        }
+    }
+    Err(format!(
+        "rekor pubkey at {} is not an Ed25519 (32-byte/base64) or P-256 (PEM/DER) key",
+        path.display()
+    )
+    .into())
 }
 
 fn parse_rfc3339(value: Option<&str>) -> Result<Option<DateTime<Utc>>, Box<dyn std::error::Error + Send + Sync>> {
@@ -225,7 +257,7 @@ mod tests {
         assert_eq!(receipts, 1);
         assert!(!bundle_id.is_empty());
 
-        let report = run_audit_verify(&out).unwrap();
+        let report = run_audit_verify(&out, None).unwrap();
         assert!(
             report.ok,
             "offline verifier should accept freshly built bundle: {report:?}"
@@ -263,7 +295,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(facts, 1);
-        let report = run_audit_verify(&out).unwrap();
+        let report = run_audit_verify(&out, None).unwrap();
         assert!(report.ok);
     }
 
@@ -306,7 +338,7 @@ mod tests {
         // Either zstd will reject the corruption (Err) or the verifier
         // will catch the content-hash mismatch (Ok with !ok). Both are
         // acceptable failure modes.
-        match run_audit_verify(&out) {
+        match run_audit_verify(&out, None) {
             Ok(report) => {
                 assert!(!report.ok, "tampered bundle should not pass verification: {report:?}");
             }

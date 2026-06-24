@@ -90,6 +90,8 @@ mod wasm_dispatcher;
 #[cfg(feature = "wasm-extensions")]
 mod wasm_host;
 mod witness;
+mod witness_proofs;
+mod witness_submit;
 mod work;
 mod work_execplans;
 mod workspace_scan;
@@ -574,6 +576,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         rcx_router: Some(rcx_router.clone()),
         data_dir: config.data_dir.clone(),
         witness: crate::witness::WitnessRuntimeConfigV1::from_config(&config),
+        witness_proofs: Arc::new(RwLock::new(
+            match crate::witness_proofs::WitnessProofStore::with_persistence(&config.data_dir) {
+                Ok(store) => store,
+                Err(err) => {
+                    tracing::warn!(?err, "witness_proofs replay failed; starting empty");
+                    crate::witness_proofs::WitnessProofStore::default()
+                }
+            },
+        )),
         mcp_enabled: config.mcp_enabled,
         console_enabled: config.console_enabled,
         coord_enabled: config.coord_enabled,
@@ -872,6 +883,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let mcp_app = mcp_context.clone().map(crux_mcp::server::router);
 
+    let witness_proofs_handle = state.witness_proofs.clone();
     let mut state = state;
     state.mcp_context = mcp_context.map(std::sync::Arc::new);
     // Ingress hardening (crux-http-ingress-hardening-2026-06-11 M1): body
@@ -998,6 +1010,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             remote = %config.sync_remote_url,
             interval_secs = config.sync_interval_secs,
             "sync: background sync enabled"
+        );
+    }
+
+    // Background witness submission (Track W / G1) — drains pending seal-chain
+    // heads to the configured transparency log on an interval. Off unless
+    // witnessing is enabled; needs the rekor provider + a URL + the daemon
+    // signing key, else it logs and idles (heads stay pending and retry).
+    if config.witness_enabled {
+        let witness_store = witness_proofs_handle;
+        let task_metrics = metrics.clone();
+        let provider = config.witness_provider.clone();
+        let rekor_url = config.rekor_url.clone();
+        let timeout = std::time::Duration::from_millis(config.witness_timeout_ms.max(1));
+        let interval_secs = std::env::var("CORECRUXD_WITNESS_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(300)
+            .max(1);
+        let mut rx = shutdown_tx.subscribe();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            interval.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Publish the gauge every tick, even when we can't submit.
+                        let pending = {
+                            let store = witness_store.read().await;
+                            task_metrics.set_witness_unwitnessed_heads(store.unwitnessed_count() as u64);
+                            store.pending_heads()
+                        };
+                        if pending.is_empty() {
+                            continue;
+                        }
+                        if !provider.eq_ignore_ascii_case("rekor") {
+                            tracing::warn!(provider = %provider, "witness: unsupported provider; heads remain pending");
+                            continue;
+                        }
+                        let Some(url) = rekor_url.clone().filter(|u| !u.is_empty()) else {
+                            tracing::warn!("witness: CORECRUXD_REKOR_URL unset; heads remain pending");
+                            continue;
+                        };
+                        let Some(signing_key) = crate::witness_submit::load_witness_signing_key() else {
+                            tracing::warn!(
+                                "witness: no witness signing key (CORECRUXD_WITNESS_SIGNING_KEY); heads remain pending"
+                            );
+                            continue;
+                        };
+                        let witness = crate::witness_submit::RekorWitness::new(url, signing_key, timeout);
+                        let n_pending = pending.len();
+                        tracing::debug!(provider = %provider, pending = n_pending, "witness: draining heads");
+                        // Network I/O off the async runtime and without the store lock.
+                        let outcomes = match tokio::task::spawn_blocking(move || {
+                            crate::witness_proofs::drain_once(&pending, &witness)
+                        })
+                        .await
+                        {
+                            Ok(outcomes) => outcomes,
+                            Err(err) => {
+                                tracing::warn!(?err, "witness: drain task join failed");
+                                continue;
+                            }
+                        };
+                        let mut witnessed = 0usize;
+                        {
+                            let mut store = witness_store.write().await;
+                            for (head_hash, result) in outcomes {
+                                match result {
+                                    Ok(proof) => match store.record_witnessed(head_hash, proof) {
+                                        Ok(()) => witnessed += 1,
+                                        Err(err) => tracing::warn!(?err, "witness: failed to persist proof"),
+                                    },
+                                    Err(err) => {
+                                        tracing::warn!(error = %err, "witness: submission failed; head stays pending");
+                                    }
+                                }
+                            }
+                            task_metrics.set_witness_unwitnessed_heads(store.unwitnessed_count() as u64);
+                        }
+                        if witnessed > 0 {
+                            tracing::info!(witnessed, "witness: anchored seal-chain heads");
+                        }
+                    }
+                    _ = rx.recv() => break,
+                }
+            }
+        });
+
+        info!(
+            interval_secs,
+            provider = %config.witness_provider,
+            "witness: background submission enabled"
         );
     }
 
@@ -4025,6 +4132,9 @@ mod tests {
             rcx_router: None,
             data_dir: tmp.path().to_path_buf(),
             witness: crate::witness::WitnessRuntimeConfigV1::disabled(),
+            witness_proofs: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::witness_proofs::WitnessProofStore::default(),
+            )),
             mcp_enabled: true,
             console_enabled: true,
             coord_enabled: false,

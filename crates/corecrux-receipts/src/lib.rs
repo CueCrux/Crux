@@ -35,9 +35,9 @@ pub use approval_decision_v1::{
     APPROVAL_DECISION_KIND_V1,
 };
 pub use audit_bundle_v1::{
-    build_bundle_v1, decode_receipts_cbor, verify_bundle_v1, AuditBundleError, AuditBundleManifestV1,
-    AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1, BuiltBundleV1, VerifyReportV1,
-    BUNDLE_FORMAT_VERSION, EVENTS_FILENAME, MANIFEST_FILENAME, RECEIPTS_FILENAME,
+    build_bundle_v1, decode_receipts_cbor, verify_bundle_v1, verify_bundle_with_trust_roots_v1, AuditBundleError,
+    AuditBundleManifestV1, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1, BuiltBundleV1,
+    VerifyReportV1, BUNDLE_FORMAT_VERSION, EVENTS_FILENAME, MANIFEST_FILENAME, RECEIPTS_FILENAME,
 };
 pub use audit_gap_v1::{
     assert_chain_reanchor_kind_v1, assert_consolidation_kind_v1, assert_coverage_attestation_kind_v1,
@@ -119,11 +119,12 @@ pub use verify_v1::{verify_receipt_v1, ReceiptSigV1, VerificationReportV1, Verif
 pub use witness_v1::{
     assert_external_anchor_kind_v1, assert_rfc3161_timestamp_kind_v1, build_external_anchor_body_v1,
     build_rfc3161_timestamp_body_v1, is_valid_object_identifier_text_v1, parse_x509_certs_der_or_pem_v1,
-    sign_external_anchor_v1, sign_rfc3161_timestamp_v1, verify_external_anchor_body_v1,
+    read_witnessed_proofs_jsonl, sign_external_anchor_v1, sign_rfc3161_timestamp_v1, verify_external_anchor_body_v1,
+    verify_rekor_checkpoint, verify_rekor_checkpoint_p256_v1, verify_rekor_checkpoint_v1,
     verify_rfc3161_timestamp_token_binding_v1, verify_rfc3161_timestamp_token_strict_v1,
-    verify_rfc6962_inclusion_proof_v1, ExternalAnchorBodyInputV1, Rfc3161StrictValidationOptionsV1,
-    Rfc3161StrictValidationReportV1, Rfc3161TimestampBodyInputV1, EXTERNAL_ANCHOR_KIND_V1, RFC3161_TIMESTAMP_KIND_V1,
-    WITNESS_BODY_SCHEMA_V1,
+    verify_rfc6962_inclusion_proof_v1, verify_witness_binding_v1, verify_witness_proof_v1, ExternalAnchorBodyInputV1,
+    Rfc3161StrictValidationOptionsV1, Rfc3161StrictValidationReportV1, Rfc3161TimestampBodyInputV1,
+    WitnessLogPublicKeyV1, WitnessProofV1, EXTERNAL_ANCHOR_KIND_V1, RFC3161_TIMESTAMP_KIND_V1, WITNESS_BODY_SCHEMA_V1,
 };
 
 pub const STREAM_TYPE_RECEIPT: &str = "receipt";

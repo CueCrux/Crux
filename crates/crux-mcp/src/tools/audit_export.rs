@@ -271,6 +271,15 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
         caller: agent_name.map(str::to_string),
     };
 
+    // Track W / G1: include witnessed seal-chain inclusion-proofs from the
+    // daemon's witness journal so the bundle is independently anchorable. Empty
+    // when witnessing is off or no data_dir is wired.
+    let witness_proofs = ctx
+        .data_dir
+        .as_ref()
+        .map(|dir| corecrux_receipts::read_witnessed_proofs_jsonl(&dir.join("witness_proofs.jsonl")))
+        .unwrap_or_default();
+
     let (signing_key, signer_key_id) = load_signing_key();
     let built = build_bundle_v1(BuildBundleInputV1 {
         bundle_id: bundle_id.clone(),
@@ -280,6 +289,7 @@ pub async fn handle_audit_export_bundle(args: &Value, ctx: &McpContext) -> Resul
         scope: scope_record.clone(),
         events,
         receipt_refs,
+        witness_proofs,
         signing_key: &signing_key,
         signer_key_id,
     })

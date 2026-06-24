@@ -890,6 +890,25 @@ pub(super) async fn execute_admin_action(
             })
         }
         "force-seal" => {
+            // Track W / G1: enqueue each freshly-sealed chain head for
+            // witnessing. The background submit task drains the queue; enqueue
+            // is idempotent and a no-op when witnessing is disabled.
+            fn enqueue_sealed_head(
+                store: &mut crate::witness_proofs::WitnessProofStore,
+                seal: &corecrux_storage::SealResultV1,
+            ) {
+                if !seal.sealed {
+                    return;
+                }
+                let Some(material) = &seal.seal_receipt else {
+                    return;
+                };
+                let head_hex = hex::encode(material.material_hash());
+                if let Err(err) = store.enqueue(head_hex, seal.segment_seq) {
+                    tracing::warn!(?err, "witness: failed to enqueue sealed head");
+                }
+            }
+
             if !state.admin_force_seal_enabled {
                 return Err(admin_action_error(
                     "force-seal is disabled (set CORECRUXD_ADMIN_FORCE_SEAL=1)",
@@ -915,6 +934,14 @@ pub(super) async fn execute_admin_action(
 
             if wait_proj {
                 let results = pool.force_seal_all_and_tick(max_frames).await;
+                if state.witness.witness_enabled {
+                    let mut store = state.witness_proofs.write().await;
+                    for (_, r) in &results {
+                        if let Ok(res) = r {
+                            enqueue_sealed_head(&mut store, &res.seal_result);
+                        }
+                    }
+                }
                 let wait_ms = started.elapsed().as_millis() as u64;
                 let shards: Vec<serde_json::Value> = results
                     .into_iter()
@@ -954,6 +981,14 @@ pub(super) async fn execute_admin_action(
                 })
             } else {
                 let results = pool.force_seal_all().await;
+                if state.witness.witness_enabled {
+                    let mut store = state.witness_proofs.write().await;
+                    for (_, r) in &results {
+                        if let Ok(seal) = r {
+                            enqueue_sealed_head(&mut store, seal);
+                        }
+                    }
+                }
                 let wait_ms = started.elapsed().as_millis() as u64;
                 let shards: Vec<serde_json::Value> = results
                     .into_iter()

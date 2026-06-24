@@ -940,6 +940,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "p256",
  "prometheus",
  "prost",
  "rand 0.10.1",

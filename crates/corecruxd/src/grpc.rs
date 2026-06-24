@@ -1014,7 +1014,7 @@ fn fallback_write_confirmation_material(outcomes: &[AppendOutcome]) -> corecrux_
     }
 }
 
-fn load_write_confirmation_signing_key() -> Option<SigningKey> {
+pub(crate) fn load_write_confirmation_signing_key() -> Option<SigningKey> {
     let encoded = std::env::var(WRITE_CONFIRMATION_SIGNING_KEY_ENV)
         .ok()
         .map(|value| value.trim().to_string())
