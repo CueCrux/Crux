@@ -156,8 +156,11 @@ pub fn run_ingest(
 
     if post {
         let actor = actor.unwrap_or_else(|| "agent:claude-code-ingest".to_owned());
-        let posted = post_nodes(&nodes, &actor, tenant, url)?;
+        let (posted, reasoning_acts) = post_nodes(&nodes, &actor, tenant, url)?;
         println!("  posted    {posted} nodes → daemon observe surface");
+        if reasoning_acts > 0 {
+            println!("  activity  {reasoning_acts} reasoning entries → activity lane (kind=reasoning)");
+        }
     } else {
         println!("  (dry run — pass --post to ship nodes to the daemon)");
     }
@@ -209,13 +212,24 @@ fn resolve_blob_dir(blob_dir: Option<String>) -> Result<PathBuf, DynErr> {
 }
 
 /// Post each node to the daemon: `open_step` then `close_step` with the captured
-/// answer output + reasoning_ref. Returns the count posted.
-fn post_nodes(nodes: &[IngestNode], actor: &str, tenant: Option<String>, url: Option<String>) -> Result<usize, DynErr> {
+/// answer output + reasoning_ref. Additionally surfaces each reasoning summary
+/// as a `kind=reasoning` activity entry (M3, so the console renders category 3
+/// — best-effort: a disabled activity log never fails the observe ingest).
+/// Returns `(observe_nodes_posted, reasoning_activity_entries_posted)`.
+fn post_nodes(
+    nodes: &[IngestNode],
+    actor: &str,
+    tenant: Option<String>,
+    url: Option<String>,
+) -> Result<(usize, usize), DynErr> {
     let http_url = resolve_daemon(url)?;
-    let _tenant = tenant; // observe routes are scope-gated, not tenant-scoped
+    // Observe routes are scope-gated (not tenant-scoped); the activity lane IS
+    // tenant-scoped, so the reasoning entries use the passed tenant (or default).
+    let activity_tenant = tenant.unwrap_or_else(|| "default".to_string());
     let bearer = login::resolve_fresh_bearer(&http_url)?;
     let ts = now_rfc3339();
     let mut posted = 0;
+    let mut reasoning_acts = 0;
     for node in nodes {
         let open = serde_json::json!({
             "node_id": node.node_id,
@@ -253,8 +267,48 @@ fn post_nodes(nodes: &[IngestNode], actor: &str, tenant: Option<String>, url: Op
             &close,
         )?;
         posted += 1;
+
+        // M3 — surface the honest extractive reasoning summary as a
+        // `kind=reasoning` activity entry (private, cross-walked to its blob via
+        // event_ids). Best-effort so a daemon without the activity log enabled
+        // (404) doesn't fail the observe ingest.
+        if let Some(act) = reasoning_activity_body(node, &activity_tenant) {
+            if post_activity_best_effort(&http_url, bearer.as_deref(), &act) {
+                reasoning_acts += 1;
+            }
+        }
     }
-    Ok(posted)
+    Ok((posted, reasoning_acts))
+}
+
+/// Build the `kind=reasoning` activity body for a node, or `None` when the node
+/// carried no reasoning summary. Private, cross-walked to the reasoning blob via
+/// `refs.event_ids`, joined to the observe step by `turn_id = node_id`.
+fn reasoning_activity_body(node: &IngestNode, tenant: &str) -> Option<serde_json::Value> {
+    let summary = node.reasoning_summary.as_ref()?;
+    Some(serde_json::json!({
+        "tenant_id": tenant,
+        "session_id": node.session_id,
+        "turn_id": node.node_id,
+        "kind": "reasoning",
+        "text": summary,
+        "meta": { "intent": "reasoning" },
+        "refs": { "event_ids": node.reasoning_ref.clone().into_iter().collect::<Vec<_>>() },
+        "private": true,
+    }))
+}
+
+/// POST a `kind=reasoning` entry to `/v1/activity`. Returns `true` on a 2xx;
+/// any non-2xx (incl. 404 when the activity log is disabled) is swallowed so
+/// reasoning-surfacing never breaks the observe ingest.
+fn post_activity_best_effort(http_url: &str, bearer: Option<&str>, body: &serde_json::Value) -> bool {
+    let url = format!("{http_url}/v1/activity");
+    let mut req = agent().post(&url).header("content-type", "application/json");
+    match bearer {
+        Some(t) => req = req.header("authorization", format!("Bearer {t}")),
+        None => req = req.header("x-corecrux-scopes", "facts:write"),
+    }
+    matches!(req.send_json(body.clone()), Ok(resp) if resp.status().as_u16() < 300)
 }
 
 fn send(
@@ -320,6 +374,33 @@ mod tests {
             r#"{"type":"assistant","sessionId":"abcdef123456","message":{"role":"assistant","content":[{"type":"thinking","thinking":"quick"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#.to_string(),
         ];
         transcript::parse_str_capturing(&lines.join("\n"))
+    }
+
+    #[test]
+    fn reasoning_activity_body_shape_and_skip() {
+        let nodes = build_nodes(&fixture(), "abcdef123456");
+        let n = &nodes[0];
+        // M3: a node with a reasoning summary yields a private kind=reasoning
+        // activity body cross-walked to its blob.
+        let body = reasoning_activity_body(n, "acme").expect("reasoning body");
+        assert_eq!(body["kind"], "reasoning");
+        assert_eq!(body["tenant_id"], "acme");
+        assert_eq!(body["session_id"], "abcdef123456");
+        assert_eq!(body["turn_id"], "ingest_abcdef12_1");
+        assert_eq!(body["private"], true);
+        assert_eq!(body["meta"]["intent"], "reasoning");
+        assert_eq!(body["refs"]["event_ids"][0], "blob:reasoning/ingest_abcdef12_1.txt");
+        assert!(body["text"].as_str().is_some_and(|t| !t.is_empty()));
+
+        // A node with no reasoning summary produces no activity body.
+        let bare = IngestNode {
+            node_id: "n0".into(),
+            session_id: "s".into(),
+            answer: Some("a".into()),
+            reasoning_summary: None,
+            reasoning_ref: None,
+        };
+        assert!(reasoning_activity_body(&bare, "acme").is_none());
     }
 
     #[test]
