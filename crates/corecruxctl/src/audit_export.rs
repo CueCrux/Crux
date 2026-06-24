@@ -20,8 +20,8 @@ use ed25519_dalek::SigningKey;
 
 use corecrux_memory::FactStore;
 use corecrux_receipts::{
-    build_bundle_v1, verify_bundle_v1, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1, BuildBundleInputV1,
-    VerifyReportV1,
+    build_bundle_v1, verify_bundle_with_trust_roots_v1, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1,
+    BuildBundleInputV1, VerifyReportV1,
 };
 
 const RESERVED_PREFIXES: &[&str] = &["__agent::", "__ops::", "__bootstrap__::", "__agent_session::"];
@@ -133,10 +133,41 @@ pub fn run_audit_export(args: AuditExportArgs) -> Result<(u64, u64, String), Box
 }
 
 /// Verify a bundle on disk and return a structured report. Fully OFFLINE.
-pub fn run_audit_verify(path: &Path) -> Result<VerifyReportV1, Box<dyn std::error::Error + Send + Sync>> {
+pub fn run_audit_verify(
+    path: &Path,
+    rekor_pubkey_path: Option<&Path>,
+) -> Result<VerifyReportV1, Box<dyn std::error::Error + Send + Sync>> {
     let raw = std::fs::read(path)?;
-    let report = verify_bundle_v1(&raw)?;
+    let pubkey = match rekor_pubkey_path {
+        Some(p) => Some(load_ed25519_pubkey(p)?),
+        None => None,
+    };
+    let report = verify_bundle_with_trust_roots_v1(&raw, pubkey.as_ref())?;
     Ok(report)
+}
+
+/// Load a 32-byte Ed25519 log public key (raw 32 bytes or base64) for
+/// checkpoint/SET trust-root verification.
+fn load_ed25519_pubkey(path: &Path) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    use base64::Engine as _;
+    let raw = std::fs::read(path)?;
+    let candidate: Option<Vec<u8>> = if raw.len() == 32 {
+        Some(raw.clone())
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(String::from_utf8_lossy(&raw).trim())
+            .ok()
+            .filter(|b| b.len() == 32)
+    };
+    let bytes = candidate.ok_or_else(|| {
+        format!(
+            "rekor pubkey at {} is not a 32-byte ed25519 key (raw or base64)",
+            path.display()
+        )
+    })?;
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(key)
 }
 
 fn parse_rfc3339(value: Option<&str>) -> Result<Option<DateTime<Utc>>, Box<dyn std::error::Error + Send + Sync>> {
@@ -228,7 +259,7 @@ mod tests {
         assert_eq!(receipts, 1);
         assert!(!bundle_id.is_empty());
 
-        let report = run_audit_verify(&out).unwrap();
+        let report = run_audit_verify(&out, None).unwrap();
         assert!(
             report.ok,
             "offline verifier should accept freshly built bundle: {report:?}"
@@ -266,7 +297,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(facts, 1);
-        let report = run_audit_verify(&out).unwrap();
+        let report = run_audit_verify(&out, None).unwrap();
         assert!(report.ok);
     }
 
@@ -309,7 +340,7 @@ mod tests {
         // Either zstd will reject the corruption (Err) or the verifier
         // will catch the content-hash mismatch (Ok with !ok). Both are
         // acceptable failure modes.
-        match run_audit_verify(&out) {
+        match run_audit_verify(&out, None) {
             Ok(report) => {
                 assert!(!report.ok, "tampered bundle should not pass verification: {report:?}");
             }

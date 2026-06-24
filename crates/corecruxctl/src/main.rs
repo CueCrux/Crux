@@ -530,6 +530,11 @@ enum Command {
         /// Print the structured report as JSON to stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Optional pinned log Ed25519 public key (raw 32 bytes or base64) to
+        /// verify each witness proof's Rekor checkpoint/SET — the trust root
+        /// that proves the tree head is the log operator's, not fabricated.
+        #[arg(long)]
+        rekor_pubkey: Option<PathBuf>,
     },
 
     /// Print the active C2PA leaf certificate's subject, issuer, validity
@@ -3751,8 +3756,12 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
             Ok(())
         }
-        Command::AuditVerify { bundle, json } => {
-            let report = audit_export::run_audit_verify(&bundle)?;
+        Command::AuditVerify {
+            bundle,
+            json,
+            rekor_pubkey,
+        } => {
+            let report = audit_export::run_audit_verify(&bundle, rekor_pubkey.as_deref())?;
             if json {
                 let s = serde_json::to_string_pretty(&report)?;
                 println!("{s}");

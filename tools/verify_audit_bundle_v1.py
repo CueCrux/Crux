@@ -44,6 +44,7 @@ def fail(manifest: dict | None, reason: str, *, events_match: bool = False, rece
         "witness_proof_count": manifest.get("witness_proof_count", 0) if manifest else 0,
         "witness_proofs_sha256_match": False,
         "witness_proofs_valid": False,
+        "witness_root_endorsed": None,
         "failure_reason": reason,
     }
 
@@ -97,24 +98,66 @@ def verify_rfc6962_inclusion_proof(
     return sn == 0 and computed == expected_root
 
 
-def verify_witness_member(manifest: dict, witness_bytes: bytes | None) -> tuple[bool, bool, str | None]:
+def verify_rekor_checkpoint(checkpoint: str, log_pubkey: bytes, expected_root_hex: str) -> bool:
+    """Independent mirror of verify_rekor_checkpoint_v1 (Ed25519 signed note)."""
+    sep = checkpoint.find("\n\n")
+    if sep < 0:
+        return False
+    text = checkpoint[: sep + 1]
+    sig_block = checkpoint[sep + 2 :]
+    lines = text.split("\n")
+    if len(lines) < 3:
+        return False
+    try:
+        root_bytes = base64.b64decode(lines[2].strip(), validate=True)
+    except Exception:  # noqa: BLE001
+        return False
+    expected = _parse_sha256_hex(expected_root_hex.strip())
+    if expected is None or root_bytes != expected:
+        return False
+    for sig_line in sig_block.split("\n"):
+        s = sig_line.strip()
+        if not s.startswith("— "):
+            continue
+        parts = s[len("— ") :].rsplit(" ", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            raw = base64.b64decode(parts[1].strip(), validate=True)
+        except Exception:  # noqa: BLE001
+            continue
+        if len(raw) != 4 + 64:
+            continue
+        try:
+            ed25519.Ed25519PublicKey.from_public_bytes(log_pubkey).verify(raw[4:], text.encode("utf-8"))
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def verify_witness_member(
+    manifest: dict, witness_bytes: bytes | None, rekor_pubkey: bytes | None = None
+) -> tuple[bool, bool, bool | None, str | None]:
     """Re-check the optional witness_proofs.jsonl against the signed manifest.
 
-    Returns (sha256_match, all_proofs_valid, failure_reason). The signed manifest
-    carries the proof count and the member SHA-256, so a stripped or mutated
-    member is detectable here without trusting the daemon.
+    Returns (sha256_match, all_proofs_valid, root_endorsed, failure_reason). The
+    signed manifest carries the proof count and the member SHA-256, so a stripped
+    or mutated member is detectable here without trusting the daemon. When a
+    pinned log key is supplied, each proof's checkpoint/SET is verified (the trust
+    root); root_endorsed is None when no key was supplied.
     """
     count = manifest.get("witness_proof_count", 0) or 0
     has_member = bool(witness_bytes)
     if count == 0:
         if not has_member:
-            return True, True, None
-        return False, False, "witness_proofs.jsonl present but the signed manifest declares none"
+            return True, True, None, None
+        return False, False, None, "witness_proofs.jsonl present but the signed manifest declares none"
     if witness_bytes is None:
-        return False, False, f"manifest declares {count} witness proof(s) but witness_proofs.jsonl is missing"
+        return False, False, None, f"manifest declares {count} witness proof(s) but witness_proofs.jsonl is missing"
     sha = hashlib.sha256(witness_bytes).hexdigest()
     if manifest.get("witness_proofs_sha256") != sha:
-        return False, False, "witness_proofs.jsonl sha256 mismatch"
+        return False, False, None, "witness_proofs.jsonl sha256 mismatch"
     parsed = 0
     for i, line in enumerate(witness_bytes.split(b"\n")):
         if not line.strip():
@@ -122,7 +165,7 @@ def verify_witness_member(manifest: dict, witness_bytes: bytes | None) -> tuple[
         try:
             proof = json.loads(line)
         except Exception as exc:  # noqa: BLE001
-            return True, False, f"witness proof on line {i} is malformed: {exc}"
+            return True, False, None, f"witness proof on line {i} is malformed: {exc}"
         if not verify_rfc6962_inclusion_proof(
             proof.get("leaf_hash", ""),
             int(proof.get("log_index", 0)),
@@ -130,11 +173,15 @@ def verify_witness_member(manifest: dict, witness_bytes: bytes | None) -> tuple[
             proof.get("root_hash", ""),
             list(proof.get("inclusion_proof", [])),
         ):
-            return True, False, f"witness proof {i} (leaf {proof.get('leaf_hash')}) failed RFC6962 verification"
+            return True, False, None, f"witness proof {i} (leaf {proof.get('leaf_hash')}) failed RFC6962 verification"
+        if rekor_pubkey is not None:
+            cp = proof.get("checkpoint")
+            if not cp or not verify_rekor_checkpoint(cp, rekor_pubkey, proof.get("root_hash", "")):
+                return True, True, False, f"witness proof {i} root not endorsed by the pinned log key (checkpoint/SET)"
         parsed += 1
     if parsed != count:
-        return True, False, f"witness proof count mismatch: manifest {count}, member {parsed}"
-    return True, True, None
+        return True, False, None, f"witness proof count mismatch: manifest {count}, member {parsed}"
+    return True, True, (True if rekor_pubkey is not None else None), None
 
 
 def read_archive_members(path: Path) -> tuple[dict, bytes, bytes, bytes | None]:
@@ -190,7 +237,7 @@ def read_unpacked_members(path: Path) -> tuple[dict, bytes, bytes, bytes | None]
     return manifest, events_path.read_bytes(), receipts_path.read_bytes(), witness
 
 
-def verify_vector(path: Path) -> dict:
+def verify_vector(path: Path, rekor_pubkey: bytes | None = None) -> dict:
     try:
         if path.is_dir():
             loaded = read_unpacked_members(path)
@@ -251,10 +298,12 @@ def verify_vector(path: Path) -> dict:
             receipts_match=True,
         )
 
-    witness_sha_match, witness_valid, witness_failure = verify_witness_member(manifest, witness)
+    witness_sha_match, witness_valid, witness_endorsed, witness_failure = verify_witness_member(
+        manifest, witness, rekor_pubkey
+    )
 
     return {
-        "ok": witness_sha_match and witness_valid,
+        "ok": witness_sha_match and witness_valid and (witness_endorsed if witness_endorsed is not None else True),
         "bundle_format_version": manifest["bundle_format_version"],
         "bundle_id": manifest["bundle_id"],
         "fact_count": manifest["fact_count"],
@@ -265,6 +314,7 @@ def verify_vector(path: Path) -> dict:
         "witness_proof_count": manifest.get("witness_proof_count", 0),
         "witness_proofs_sha256_match": witness_sha_match,
         "witness_proofs_valid": witness_valid,
+        "witness_root_endorsed": witness_endorsed,
         "failure_reason": witness_failure,
     }
 
@@ -281,13 +331,34 @@ def compare_expected(report: dict, expected_path: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def load_pinned_pubkey(path: Path) -> bytes:
+    """Load a 32-byte Ed25519 log key (raw 32 bytes or base64) for trust-root checks."""
+    raw = path.read_bytes()
+    if len(raw) == 32:
+        return raw
+    try:
+        decoded = base64.b64decode(raw.decode("utf-8").strip(), validate=True)
+    except Exception:  # noqa: BLE001
+        decoded = b""
+    if len(decoded) == 32:
+        return decoded
+    raise SystemExit(f"rekor pubkey at {path} is not a 32-byte ed25519 key (raw or base64)")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("vector", type=Path, help="unpacked vector directory or audit-bundle.tar.zst")
     parser.add_argument("--json", action="store_true", help="print report JSON")
+    parser.add_argument(
+        "--rekor-pubkey",
+        type=Path,
+        default=None,
+        help="pinned log Ed25519 public key (raw 32 bytes or base64) for checkpoint/SET trust-root verification",
+    )
     args = parser.parse_args()
 
-    report = verify_vector(args.vector)
+    rekor_pubkey = load_pinned_pubkey(args.rekor_pubkey) if args.rekor_pubkey else None
+    report = verify_vector(args.vector, rekor_pubkey)
     expected_path = args.vector / "expected.json" if args.vector.is_dir() else args.vector.parent / "expected.json"
     matches, mismatch = compare_expected(report, expected_path)
     if args.json or not matches:
