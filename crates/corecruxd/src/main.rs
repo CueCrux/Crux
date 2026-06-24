@@ -90,6 +90,7 @@ mod wasm_dispatcher;
 #[cfg(feature = "wasm-extensions")]
 mod wasm_host;
 mod witness;
+mod witness_submit;
 mod work;
 mod work_execplans;
 mod workspace_scan;
