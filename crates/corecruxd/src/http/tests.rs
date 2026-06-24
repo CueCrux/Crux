@@ -12448,6 +12448,70 @@ async fn activity_turn_id_parity_agent_vs_human_lane() {
     std::env::remove_var("CORECRUXD_FEATURE_ACTIVITY_LOG");
 }
 
+/// M2 end-to-end: with `CORECRUXD_FEATURE_ACTIVITY_SIGN=1`, a posted entry
+/// carries an embedded Ed25519 receipt, and the turn verify endpoint reports
+/// it green against the daemon passport key. With the sign flag off, the same
+/// entry reports `signed:false / status:recorded` (no regression).
+#[tokio::test]
+#[serial_test::serial]
+async fn activity_co_sign_then_verify_green_end_to_end() {
+    use tower::ServiceExt;
+    std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_LOG", "1");
+    std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_SIGN", "1");
+    let mut state = test_app_state(16);
+    bind_test_state_to_root_passport_key(&mut state);
+    let app = router(state);
+
+    let post = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/activity")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "tenant_id": "sign-tenant",
+                        "session_id": "sign-sess",
+                        "turn_id": "turn-sign",
+                        "kind": "answer",
+                        "text": "the signed answer"
+                    })
+                    .to_string(),
+                ))
+                .expect("build post"),
+        )
+        .await
+        .expect("post response");
+    assert_eq!(post.status(), StatusCode::CREATED);
+    let created = json_body(post).await;
+    assert_eq!(
+        created["receipt"]["alg"], "ed25519",
+        "sign flag on ⇒ embedded receipt: {created}"
+    );
+
+    let verify = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/v1/activity/turn/turn-sign/verify?tenant_id=sign-tenant&session=sign-sess")
+                .body(axum::body::Body::empty())
+                .expect("build verify"),
+        )
+        .await
+        .expect("verify response");
+    assert_eq!(verify.status(), StatusCode::OK);
+    let v = json_body(verify).await;
+    assert_eq!(v["entries"][0]["signed"], true);
+    assert_eq!(
+        v["entries"][0]["verified"], true,
+        "co-signed entry must verify green: {v}"
+    );
+
+    std::env::remove_var("CORECRUXD_FEATURE_ACTIVITY_SIGN");
+    std::env::remove_var("CORECRUXD_FEATURE_ACTIVITY_LOG");
+}
+
 // ── Agent usage rollup: /v1/agents/{passport}/usage (action-ledger M3) ────
 
 fn usage_query(window_hours: Option<u32>) -> axum::extract::Query<agent_usage::UsageQuery> {

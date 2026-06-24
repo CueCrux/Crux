@@ -451,6 +451,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/activity", get(self::activity::get_activity))
         .route("/v1/activity", axum::routing::post(self::activity::post_activity))
         .route("/v1/activity/turn/{turn_id}", get(self::activity::get_activity_turn))
+        .route("/v1/activity/turn/{turn_id}/verify", get(self::activity::get_activity_turn_verify))
         .route("/v1/projections/entity/count", get(self::projections::get_entity_count))
         .route("/v1/projections/entity/timeline", get(self::projections::get_entity_timeline))
         .route("/v1/projections/entity/current-state", get(self::projections::get_entity_current_state))
