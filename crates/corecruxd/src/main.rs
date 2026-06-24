@@ -1055,9 +1055,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             tracing::warn!("witness: CORECRUXD_REKOR_URL unset; heads remain pending");
                             continue;
                         };
-                        let Some(signing_key) = crate::grpc::load_write_confirmation_signing_key() else {
+                        let Some(signing_key) = crate::witness_submit::load_witness_signing_key() else {
                             tracing::warn!(
-                                "witness: no daemon signing key (CORECRUXD_WRITE_CONFIRMATION_SIGNING_KEY); heads remain pending"
+                                "witness: no witness signing key (CORECRUXD_WITNESS_SIGNING_KEY); heads remain pending"
                             );
                             continue;
                         };

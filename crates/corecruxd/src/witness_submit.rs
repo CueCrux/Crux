@@ -20,7 +20,9 @@
 use std::time::Duration;
 
 use base64::Engine as _;
-use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
+use p256::ecdsa::signature::Signer as _;
+use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
+use p256::pkcs8::EncodePublicKey as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -63,27 +65,34 @@ pub trait Witness: Send + Sync {
 
 /// Anchors seal-chain heads into a Sigstore Rekor transparency log.
 ///
-/// Each submission signs the head hash with the daemon's Ed25519 key and writes
+/// Each submission signs the head hash with the witness ECDSA P-256 key and writes
 /// a `hashedrekord` entry, then maps Rekor's response into a [`WitnessProofV1`]
 /// and self-verifies the returned Merkle proof before handing it back.
 pub struct RekorWitness {
     agent: ureq::Agent,
     rekor_url: String,
-    signing_key: SigningKey,
+    signing_key: P256SigningKey,
     public_key_pem_b64: String,
 }
 
 impl RekorWitness {
-    /// Build a Rekor witness pointing at `rekor_url`, signing entries with
-    /// `signing_key`, and bounding every network phase by `timeout`.
-    pub fn new(rekor_url: impl Into<String>, signing_key: SigningKey, timeout: Duration) -> Self {
+    /// Build a Rekor witness pointing at `rekor_url`, signing entries with the
+    /// ECDSA P-256 `signing_key`, and bounding every network phase by `timeout`.
+    ///
+    /// P-256 (not the daemon's Ed25519 seal key) because Sigstore Rekor's
+    /// `hashedrekord` verification rejects plain-Ed25519 signatures and accepts
+    /// ECDSA-P256/SHA-256 (verified against live Rekor staging; see ExecPlan M4).
+    pub fn new(rekor_url: impl Into<String>, signing_key: P256SigningKey, timeout: Duration) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_connect(Some(timeout))
             .timeout_recv_response(Some(timeout))
             .timeout_recv_body(Some(timeout))
             .build()
             .into();
-        let public_key_pem = ed25519_spki_pem(&signing_key.verifying_key());
+        let public_key_pem = signing_key
+            .verifying_key()
+            .to_public_key_pem(p256::pkcs8::LineEnding::LF)
+            .unwrap_or_default();
         let public_key_pem_b64 = base64::engine::general_purpose::STANDARD.encode(public_key_pem.as_bytes());
         Self {
             agent,
@@ -98,12 +107,12 @@ impl RekorWitness {
     }
 
     /// Build the `hashedrekord` create payload for `head_hash`: the SHA-256 of
-    /// the head as the artifact digest, an Ed25519 signature over the head, and
-    /// the daemon's SPKI public key.
+    /// the head as the artifact digest, an ECDSA-P256/SHA-256 (DER) signature
+    /// over the head, and the witness's SPKI public key.
     fn build_request(&self, head_hash: &[u8; 32]) -> HashedRekordCreate {
         let digest_hex = hex::encode(Sha256::digest(head_hash));
-        let signature = self.signing_key.sign(head_hash).to_bytes();
-        let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature);
+        let signature: P256Signature = self.signing_key.sign(head_hash);
+        let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_der().as_bytes());
         HashedRekordCreate {
             api_version: "0.0.1",
             kind: "hashedrekord",
@@ -166,26 +175,25 @@ impl Witness for RekorWitness {
     }
 }
 
-/// SPKI (`SubjectPublicKeyInfo`) PEM for an Ed25519 verifying key.
-///
-/// The DER prefix for Ed25519 SPKI is fixed (`AlgorithmIdentifier` with OID
-/// 1.3.101.112 and no parameters, then a 32-byte `BIT STRING`), so we emit it
-/// directly rather than pulling in the `pkcs8` feature.
-fn ed25519_spki_pem(vk: &VerifyingKey) -> String {
-    const ED25519_SPKI_PREFIX: [u8; 12] = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
-    let mut der = Vec::with_capacity(ED25519_SPKI_PREFIX.len() + 32);
-    der.extend_from_slice(&ED25519_SPKI_PREFIX);
-    der.extend_from_slice(vk.as_bytes());
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&der);
+/// Environment variable holding the witness's ECDSA P-256 signing key.
+pub const WITNESS_SIGNING_KEY_ENV: &str = "CORECRUXD_WITNESS_SIGNING_KEY";
 
-    let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
-    for chunk in b64.as_bytes().chunks(64) {
-        // chunk is ASCII base64, always valid UTF-8.
-        pem.push_str(std::str::from_utf8(chunk).unwrap_or_default());
-        pem.push('\n');
+/// Load the witness's ECDSA P-256 signing key from
+/// [`WITNESS_SIGNING_KEY_ENV`] (base64 of a 32-byte P-256 scalar). Separate from
+/// the daemon's Ed25519 seal key because Rekor's `hashedrekord` verification
+/// requires ECDSA P-256. Returns `None` when unset/empty/invalid (the witness
+/// task then logs and idles — heads stay pending).
+pub fn load_witness_signing_key() -> Option<P256SigningKey> {
+    let encoded = std::env::var(WITNESS_SIGNING_KEY_ENV).ok()?;
+    let encoded = encoded.trim();
+    if encoded.is_empty() {
+        return None;
     }
-    pem.push_str("-----END PUBLIC KEY-----\n");
-    pem
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(encoded))
+        .ok()?;
+    P256SigningKey::from_slice(&decoded).ok()
 }
 
 // ---- Rekor wire types ------------------------------------------------------
@@ -288,8 +296,8 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
-    fn test_key() -> SigningKey {
-        SigningKey::from_bytes(&[0xab; 32])
+    fn test_key() -> P256SigningKey {
+        P256SigningKey::from_slice(&[0x42; 32]).expect("valid p256 scalar")
     }
 
     /// RFC6962 leaf hash for an entry body — mirrors `into_proof`.
@@ -397,16 +405,16 @@ mod tests {
         assert_eq!(req.api_version, "0.0.1");
         assert_eq!(req.spec.data.hash.algorithm, "sha256");
         assert_eq!(req.spec.data.hash.value, hex::encode(Sha256::digest(head)));
-        // Signature verifies against the head with the daemon key.
+        // Signature is a DER ECDSA-P256 sig that verifies over the head.
+        use p256::ecdsa::signature::Verifier as _;
         let sig_bytes = base64::engine::general_purpose::STANDARD
             .decode(req.spec.signature.content.as_bytes())
             .expect("sig b64");
-        let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().expect("64-byte sig");
-        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        let sig = P256Signature::from_der(&sig_bytes).expect("der sig");
         test_key()
             .verifying_key()
-            .verify_strict(&head, &sig)
-            .expect("daemon signature verifies over the head");
+            .verify(&head, &sig)
+            .expect("p256 signature verifies over the head");
         // Public key is a base64 of a PEM SPKI block.
         let pem = String::from_utf8(
             base64::engine::general_purpose::STANDARD
@@ -504,9 +512,22 @@ mod tests {
     }
 
     #[test]
-    fn ed25519_spki_pem_is_well_formed() {
-        let pem = ed25519_spki_pem(&test_key().verifying_key());
-        assert!(pem.starts_with("-----BEGIN PUBLIC KEY-----\n"));
-        assert!(pem.trim_end().ends_with("-----END PUBLIC KEY-----"));
+    #[ignore = "hits live Rekor staging over the network; run with --ignored"]
+    fn live_submit_to_rekor_staging_p256() {
+        // Real end-to-end: the reworked P-256 adapter submits to Sigstore Rekor
+        // staging and the returned inclusion proof self-verifies (RFC6962).
+        let witness = RekorWitness::new(
+            "https://rekor.sigstage.dev",
+            P256SigningKey::from_slice(&[0x3c; 32]).expect("scalar"),
+            Duration::from_secs(30),
+        );
+        // Vary the head per run (env seed) to avoid Rekor duplicate-entry 409s.
+        let seed = std::env::var("CRUX_LIVE_REKOR_SEED").unwrap_or_else(|_| "default-seed".to_string());
+        let head: [u8; 32] = Sha256::digest(seed.as_bytes()).into();
+        let proof = witness.submit(&head).expect("live submit + self-verify");
+        assert_eq!(proof.transparency_log, "rekor");
+        assert!(proof.tree_size >= 1);
+        assert!(proof.checkpoint.is_some());
+        assert!(proof.rekor_uuid.is_some());
     }
 }
