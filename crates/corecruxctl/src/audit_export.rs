@@ -21,7 +21,7 @@ use ed25519_dalek::SigningKey;
 use corecrux_memory::FactStore;
 use corecrux_receipts::{
     build_bundle_v1, verify_bundle_with_trust_roots_v1, AuditBundleScopeV1, AuditEventV1, AuditReceiptRefV1,
-    BuildBundleInputV1, VerifyReportV1,
+    BuildBundleInputV1, VerifyReportV1, WitnessLogPublicKeyV1,
 };
 
 const RESERVED_PREFIXES: &[&str] = &["__agent::", "__ops::", "__bootstrap__::", "__agent_session::"];
@@ -138,36 +138,34 @@ pub fn run_audit_verify(
     rekor_pubkey_path: Option<&Path>,
 ) -> Result<VerifyReportV1, Box<dyn std::error::Error + Send + Sync>> {
     let raw = std::fs::read(path)?;
-    let pubkey = match rekor_pubkey_path {
-        Some(p) => Some(load_ed25519_pubkey(p)?),
+    let log_key = match rekor_pubkey_path {
+        Some(p) => Some(load_log_public_key(p)?),
         None => None,
     };
-    let report = verify_bundle_with_trust_roots_v1(&raw, pubkey.as_ref())?;
+    let report = verify_bundle_with_trust_roots_v1(&raw, log_key.as_ref())?;
     Ok(report)
 }
 
-/// Load a 32-byte Ed25519 log public key (raw 32 bytes or base64) for
-/// checkpoint/SET trust-root verification.
-fn load_ed25519_pubkey(path: &Path) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+/// Load a transparency-log public key for checkpoint/SET trust-root
+/// verification: a 32-byte file is Ed25519 (self-hosted logs); otherwise a P-256
+/// SPKI key in PEM or DER (public-good Rekor). A base64-wrapped 32-byte Ed25519
+/// key is also accepted.
+fn load_log_public_key(path: &Path) -> Result<WitnessLogPublicKeyV1, Box<dyn std::error::Error + Send + Sync>> {
     use base64::Engine as _;
     let raw = std::fs::read(path)?;
-    let candidate: Option<Vec<u8>> = if raw.len() == 32 {
-        Some(raw.clone())
-    } else {
-        base64::engine::general_purpose::STANDARD
-            .decode(String::from_utf8_lossy(&raw).trim())
-            .ok()
-            .filter(|b| b.len() == 32)
-    };
-    let bytes = candidate.ok_or_else(|| {
-        format!(
-            "rekor pubkey at {} is not a 32-byte ed25519 key (raw or base64)",
-            path.display()
-        )
-    })?;
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&bytes);
-    Ok(key)
+    if let Some(key) = WitnessLogPublicKeyV1::parse(&raw) {
+        return Ok(key);
+    }
+    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(String::from_utf8_lossy(&raw).trim()) {
+        if let Some(key) = WitnessLogPublicKeyV1::parse(&decoded) {
+            return Ok(key);
+        }
+    }
+    Err(format!(
+        "rekor pubkey at {} is not an Ed25519 (32-byte/base64) or P-256 (PEM/DER) key",
+        path.display()
+    )
+    .into())
 }
 
 fn parse_rfc3339(value: Option<&str>) -> Result<Option<DateTime<Utc>>, Box<dyn std::error::Error + Send + Sync>> {

@@ -19,7 +19,9 @@ import tarfile
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519
+from cryptography.hazmat.primitives.serialization import load_der_public_key, load_pem_public_key
 
 
 SUPPORTED_VERSION = 1
@@ -98,8 +100,12 @@ def verify_rfc6962_inclusion_proof(
     return sn == 0 and computed == expected_root
 
 
-def verify_rekor_checkpoint(checkpoint: str, log_pubkey: bytes, expected_root_hex: str) -> bool:
-    """Independent mirror of verify_rekor_checkpoint_v1 (Ed25519 signed note)."""
+def verify_rekor_checkpoint(checkpoint: str, log_pubkey, expected_root_hex: str) -> bool:
+    """Independent mirror of verify_rekor_checkpoint{,_p256}_v1.
+
+    `log_pubkey` is a cryptography public key object — Ed25519 (self-hosted logs)
+    or ECDSA P-256 (public-good Rekor). The note signature is keyhash[4]||sig.
+    """
     sep = checkpoint.find("\n\n")
     if sep < 0:
         return False
@@ -126,10 +132,14 @@ def verify_rekor_checkpoint(checkpoint: str, log_pubkey: bytes, expected_root_he
             raw = base64.b64decode(parts[1].strip(), validate=True)
         except Exception:  # noqa: BLE001
             continue
-        if len(raw) != 4 + 64:
+        if len(raw) <= 4:
             continue
+        payload = raw[4:]
         try:
-            ed25519.Ed25519PublicKey.from_public_bytes(log_pubkey).verify(raw[4:], text.encode("utf-8"))
+            if isinstance(log_pubkey, ed25519.Ed25519PublicKey):
+                log_pubkey.verify(payload, text.encode("utf-8"))
+            else:
+                log_pubkey.verify(payload, text.encode("utf-8"), ec.ECDSA(hashes.SHA256()))
             return True
         except Exception:  # noqa: BLE001
             continue
@@ -331,18 +341,24 @@ def compare_expected(report: dict, expected_path: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def load_pinned_pubkey(path: Path) -> bytes:
-    """Load a 32-byte Ed25519 log key (raw 32 bytes or base64) for trust-root checks."""
+def load_pinned_pubkey(path: Path):
+    """Load a log public key: a 32-byte file is Ed25519; otherwise a PEM/DER key
+    (Ed25519 or ECDSA P-256, the public-good Rekor key form)."""
     raw = path.read_bytes()
     if len(raw) == 32:
-        return raw
+        return ed25519.Ed25519PublicKey.from_public_bytes(raw)
     try:
         decoded = base64.b64decode(raw.decode("utf-8").strip(), validate=True)
+        if len(decoded) == 32:
+            return ed25519.Ed25519PublicKey.from_public_bytes(decoded)
     except Exception:  # noqa: BLE001
-        decoded = b""
-    if len(decoded) == 32:
-        return decoded
-    raise SystemExit(f"rekor pubkey at {path} is not a 32-byte ed25519 key (raw or base64)")
+        pass
+    for loader in (load_pem_public_key, load_der_public_key):
+        try:
+            return loader(raw)
+        except Exception:  # noqa: BLE001
+            continue
+    raise SystemExit(f"rekor pubkey at {path} is not Ed25519 (32-byte/base64) or P-256 (PEM/DER)")
 
 
 def main() -> int:

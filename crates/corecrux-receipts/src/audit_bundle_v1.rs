@@ -34,7 +34,7 @@ use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::witness_v1::{verify_rekor_checkpoint_v1, verify_witness_proof_v1, WitnessProofV1};
+use crate::witness_v1::{verify_rekor_checkpoint, verify_witness_proof_v1, WitnessLogPublicKeyV1, WitnessProofV1};
 
 /// Schema version. Bumping this requires a verifier upgrade.
 pub const BUNDLE_FORMAT_VERSION: u32 = 1;
@@ -351,14 +351,14 @@ pub fn verify_bundle_v1(tar_zst_bytes: &[u8]) -> Result<VerifyReportV1, AuditBun
     verify_bundle_with_trust_roots_v1(tar_zst_bytes, None)
 }
 
-/// Like [`verify_bundle_v1`], but when `rekor_ed25519_pubkey` is supplied it
-/// also verifies each witness proof's Rekor checkpoint/SET against that pinned
-/// key — proving the tree root is the one the log operator signed (the trust
-/// root), not merely internally consistent. Without a key, root endorsement is
-/// reported as `None` (not checked).
+/// Like [`verify_bundle_v1`], but when `log_key` is supplied it also verifies
+/// each witness proof's Rekor checkpoint/SET against that pinned log key
+/// (Ed25519 for self-hosted logs, ECDSA P-256 for public-good Rekor) — proving
+/// the tree root is the one the log operator signed (the trust root), not merely
+/// internally consistent. Without a key, root endorsement is `None` (not checked).
 pub fn verify_bundle_with_trust_roots_v1(
     tar_zst_bytes: &[u8],
-    rekor_ed25519_pubkey: Option<&[u8; 32]>,
+    log_key: Option<&WitnessLogPublicKeyV1>,
 ) -> Result<VerifyReportV1, AuditBundleError> {
     let decoded = zstd::stream::decode_all(tar_zst_bytes)?;
     let mut archive = tar::Archive::new(decoded.as_slice());
@@ -477,7 +477,7 @@ pub fn verify_bundle_with_trust_roots_v1(
     // Manifest is authentic — now re-check the witness inclusion-proofs it
     // commits to. A stripped, mutated, or non-verifying proof fails the bundle.
     let (witness_sha_match, witness_valid, witness_endorsed, witness_failure) =
-        verify_witness_member(&manifest, witness_bytes.as_deref(), rekor_ed25519_pubkey);
+        verify_witness_member(&manifest, witness_bytes.as_deref(), log_key);
 
     Ok(VerifyReportV1 {
         ok: witness_sha_match && witness_valid && witness_endorsed.unwrap_or(true),
@@ -504,7 +504,7 @@ pub fn verify_bundle_with_trust_roots_v1(
 fn verify_witness_member(
     manifest: &AuditBundleManifestV1,
     witness_bytes: Option<&[u8]>,
-    rekor_pubkey: Option<&[u8; 32]>,
+    log_key: Option<&WitnessLogPublicKeyV1>,
 ) -> (bool, bool, Option<bool>, Option<String>) {
     match (manifest.witness_proof_count, witness_bytes) {
         (0, None) => (true, true, None, None),
@@ -560,11 +560,11 @@ fn verify_witness_member(
                         )),
                     );
                 }
-                if let Some(pubkey) = rekor_pubkey {
+                if let Some(key) = log_key {
                     let endorsed = proof
                         .checkpoint
                         .as_deref()
-                        .is_some_and(|cp| verify_rekor_checkpoint_v1(cp, pubkey, &proof.root_hash));
+                        .is_some_and(|cp| verify_rekor_checkpoint(cp, key, &proof.root_hash));
                     if !endorsed {
                         return (
                             true,
@@ -588,7 +588,7 @@ fn verify_witness_member(
                     )),
                 );
             }
-            (true, true, rekor_pubkey.map(|_| true), None)
+            (true, true, log_key.map(|_| true), None)
         }
     }
 }
@@ -1061,14 +1061,15 @@ mod tests {
         assert_eq!(r0.witness_root_endorsed, None);
 
         // Correct pinned key: root endorsed -> bundle ok.
-        let r1 = verify_bundle_with_trust_roots_v1(&tar, Some(&rekor_pk)).expect("verify");
+        let r1 =
+            verify_bundle_with_trust_roots_v1(&tar, Some(&WitnessLogPublicKeyV1::Ed25519(rekor_pk))).expect("verify");
         assert!(r1.ok, "{r1:?}");
         assert_eq!(r1.witness_root_endorsed, Some(true));
 
         // Wrong pinned key: endorsement fails -> bundle rejected even though
         // inclusion is valid.
         let wrong = SigningKey::from_bytes(&[0x88; 32]).verifying_key().to_bytes();
-        let r2 = verify_bundle_with_trust_roots_v1(&tar, Some(&wrong)).expect("verify");
+        let r2 = verify_bundle_with_trust_roots_v1(&tar, Some(&WitnessLogPublicKeyV1::Ed25519(wrong))).expect("verify");
         assert!(!r2.ok);
         assert!(r2.witness_proofs_valid, "inclusion still valid");
         assert_eq!(r2.witness_root_endorsed, Some(false));
