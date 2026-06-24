@@ -371,7 +371,7 @@ mod tests {
             "/v1/activity?",
             "/v1/activity/turn/",
             "/v1/events/stream?types=activity.appended",
-            "/v1/receipts/", // verify cross-walk badge
+            "/verify", // M2 ✓verify cross-walk badge (embedded-receipt verify endpoint)
             "token_budget",
             "CORECRUXD_FEATURE_ACTIVITY_LOG",
         ] {

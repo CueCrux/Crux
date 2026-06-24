@@ -177,25 +177,29 @@ async function expand(el, r){
     const data = await apiGet(`/v1/activity/turn/${enc(r.turn_id)}?tenant_id=${enc(tenant())}&session=${enc(session())}`);
     const entries = data.entries||[];
     vb.textContent = entries.map(e=> `[${e.kind}] ${e.text}`).join('\n\n') || '(no entries)';
-    const receiptIds = [...new Set(entries.flatMap(e=> (e.refs&&e.refs.receipt_ids)||[]))];
-    rc.innerHTML = '';
-    receiptIds.forEach(id=>{
-      const b = document.createElement('span'); b.className='badge'; b.textContent='⏳ '+id;
-      rc.appendChild(b); verifyBadge(b, id);
-    });
-    if(!receiptIds.length){ rc.innerHTML = '<span class="badge">no receipt refs</span>'; }
+    rc.innerHTML = '<span class="badge">⏳ verifying…</span>';
+    verifyBadges(rc, r.turn_id);
   }catch(e){ vb.textContent = 'deref failed (HTTP '+(e.status||'?')+')'; }
 }
-async function verifyBadge(b, id){
-  // Cross-walk verification. Synthetic append ids ("act_…") have no signed
-  // CROWN receipt yet (T.4 follow-up) → shown as "recorded", not a failure.
+// M2 cross-walk: verify the turn's embedded Ed25519 receipts against the
+// daemon passport key (dataplane-independent). A signed+verified entry shows
+// green ✓; an unsigned entry shows "recorded" (sign flag off, no regression);
+// a tampered/invalid signature shows ✕.
+async function verifyBadges(rc, turnId){
   try{
-    const data = await apiGet(`/v1/receipts/${enc(id)}/verification?tenant_id=${enc(tenant())}`);
-    if(data && data.signature_valid && data.error_code==='OK'){ b.className='badge ok'; b.textContent='✓ verified '+id; }
-    else { b.className='badge warn'; b.textContent='• recorded '+id; }
+    const data = await apiGet(`/v1/activity/turn/${enc(turnId)}/verify?tenant_id=${enc(tenant())}&session=${enc(session())}`);
+    const rows = data.entries||[];
+    rc.innerHTML = '';
+    if(!rows.length){ rc.innerHTML = '<span class="badge">no entries</span>'; return; }
+    rows.forEach(v=>{
+      const b = document.createElement('span');
+      if(!v.signed){ b.className='badge warn'; b.textContent='• recorded '+v.entry_id; }
+      else if(v.verified){ b.className='badge ok'; b.textContent='✓ verified '+v.entry_id+(data.signer?(' · '+data.signer.slice(0,12)):''); }
+      else { b.className='badge err'; b.textContent='✕ '+(v.errors&&v.errors[0]||'unverifiable')+' '+v.entry_id; }
+      rc.appendChild(b);
+    });
   }catch(e){
-    if(e.status===404 || (id+'').startsWith('act_')){ b.className='badge warn'; b.textContent='• recorded '+id; }
-    else { b.className='badge err'; b.textContent='✕ unverifiable '+id; }
+    rc.innerHTML = '<span class="badge warn">• recorded (verify unavailable HTTP '+(e.status||'?')+')</span>';
   }
 }
 

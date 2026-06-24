@@ -209,10 +209,56 @@ pub struct JournalEntry {
     pub meta: JournalMeta,
     pub private: bool,
     pub created_at: String,
+    /// Optional embedded Ed25519 receipt over the canonical body (M2). Present
+    /// only when `CORECRUXD_FEATURE_ACTIVITY_SIGN` is on at append time; the
+    /// human-lane ✓verify badge verifies it against the daemon passport key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<ActivityReceiptV1>,
     /// Microseconds since UNIX epoch — sort/eviction key (not serialised to
     /// agents; `created_at` is the human-facing timestamp).
     #[serde(skip)]
     pub ts_us: i64,
+}
+
+/// A self-contained Ed25519 receipt over an entry's canonical body
+/// (`crux-activity-log-completion` M2). Same shape as the observe lane's
+/// `ReceiptEnvelopeV1` (`mint_receipt`), so it is dataplane-independent and
+/// verifiable offline against the daemon passport public key. Embedded in the
+/// entry rather than written to the dataplane receipt stream (which is
+/// pool-gated and unavailable in CE).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityReceiptV1 {
+    /// Signature algorithm — always `ed25519`.
+    pub alg: String,
+    /// Signer fingerprint (`state.passport_fpr`).
+    pub signed_by: String,
+    /// `blake3:<hex>` of the canonical signing bytes.
+    pub body_hash: String,
+    /// Hex Ed25519 signature over the blake3 hash.
+    pub signature: String,
+}
+
+/// Mints an [`ActivityReceiptV1`] over an entry's canonical body. Implemented
+/// in the HTTP layer (which owns the passport key); the store stays
+/// crypto-agnostic.
+pub trait ActivitySigner {
+    fn sign_body(&self, body: &[u8]) -> ActivityReceiptV1;
+}
+
+/// Environment variable that gates per-append co-signing. **Default OFF** —
+/// when off, entries carry no `receipt` and the badge shows "recorded"
+/// (today's behaviour), so there is no regression.
+pub const SIGN_FLAG_ENV: &str = "CORECRUXD_FEATURE_ACTIVITY_SIGN";
+
+/// Return true if per-append co-signing is enabled.
+pub fn activity_sign_enabled() -> bool {
+    match std::env::var(SIGN_FLAG_ENV) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "" | "0" | "false" | "off" | "no")
+        }
+        Err(_) => false,
+    }
 }
 
 /// Redact whitespace-delimited tokens that begin with a reserved entity
@@ -237,11 +283,40 @@ pub fn strip_reserved_text(text: &str) -> String {
 
 /// Deterministic, content-addressed entry id over the immutable fields. Used
 /// as the append-receipt reference.
-fn compute_entry_id(tenant: &str, session: &str, seq: u64, kind: JournalKind, created_at: &str, text: &str) -> String {
-    let canonical = format!(
+/// Canonical, delimited byte representation of an entry's immutable fields —
+/// the single source the `entry_id` hashes **and** the M2 signature signs, so
+/// a verifier reconstructs identical bytes from the public entry fields.
+fn canonical_entry_string(
+    tenant: &str,
+    session: &str,
+    seq: u64,
+    kind: JournalKind,
+    created_at: &str,
+    text: &str,
+) -> String {
+    format!(
         "{tenant}\u{1f}{session}\u{1f}{seq}\u{1f}{}\u{1f}{created_at}\u{1f}{text}",
         kind.as_str()
-    );
+    )
+}
+
+/// Reconstruct the canonical signing bytes from a finalised entry. The M2
+/// verify path calls this, blake3-hashes it, and checks the embedded
+/// signature against the daemon passport key.
+pub fn canonical_signing_bytes(entry: &JournalEntry) -> Vec<u8> {
+    canonical_entry_string(
+        &entry.tenant_id,
+        &entry.session_id,
+        entry.seq,
+        entry.kind,
+        &entry.created_at,
+        &entry.text,
+    )
+    .into_bytes()
+}
+
+fn compute_entry_id(tenant: &str, session: &str, seq: u64, kind: JournalKind, created_at: &str, text: &str) -> String {
+    let canonical = canonical_entry_string(tenant, session, seq, kind, created_at, text);
     let digest = compute_header_hash(canonical.as_bytes());
     let mut s = String::with_capacity(4 + 32);
     s.push_str("act_");
@@ -339,10 +414,21 @@ impl JournalStore {
             let _ = std::fs::rename(&tmp, path);
         }
     }
-    /// Append an entry, assigning `seq`/`created_at`/`entry_id` and stripping
-    /// reserved-prefix tokens from `text`. Returns the finalised entry
-    /// (caller emits the event + receipt reference from it).
+    /// Append an entry (no co-signing). Convenience wrapper over
+    /// [`JournalStore::append_with_signer`]; used by the test suite and any
+    /// caller that does not co-sign (the HTTP handler always passes a signer).
+    #[allow(dead_code)]
     pub fn append(&mut self, input: JournalInput) -> JournalEntry {
+        self.append_with_signer(input, None)
+    }
+
+    /// Append an entry, assigning `seq`/`created_at`/`entry_id` and stripping
+    /// reserved-prefix tokens from `text`. When `signer` is provided **and**
+    /// `CORECRUXD_FEATURE_ACTIVITY_SIGN` is on, the finalised entry is co-signed
+    /// (M2): an [`ActivityReceiptV1`] over the canonical body is embedded before
+    /// persist, so the durable copy carries the receipt too. Returns the
+    /// finalised entry (caller emits the event + receipt reference from it).
+    pub fn append_with_signer(&mut self, input: JournalInput, signer: Option<&dyn ActivitySigner>) -> JournalEntry {
         let log = self
             .by_session
             .entry((input.tenant_id.clone(), input.session_id.clone()))
@@ -367,7 +453,7 @@ impl JournalStore {
             refs.receipt_ids.push(entry_id.clone());
         }
 
-        let entry = JournalEntry {
+        let mut entry = JournalEntry {
             schema: JOURNAL_ENTRY_SCHEMA_V1.to_string(),
             entry_id,
             tenant_id: input.tenant_id,
@@ -381,8 +467,18 @@ impl JournalStore {
             meta: input.meta,
             private: input.private,
             created_at,
+            receipt: None,
             ts_us,
         };
+
+        // M2 — co-sign the canonical body when enabled. Best-effort: the entry
+        // is still appended unsigned if signing is off or no signer is wired.
+        if activity_sign_enabled() {
+            if let Some(signer) = signer {
+                let body = canonical_signing_bytes(&entry);
+                entry.receipt = Some(signer.sign_body(&body));
+            }
+        }
 
         log.entries.push(entry.clone());
         Self::trim(&mut log.entries, retention());
