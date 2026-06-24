@@ -34,7 +34,7 @@ use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::witness_v1::{verify_witness_proof_v1, WitnessProofV1};
+use crate::witness_v1::{verify_rekor_checkpoint_v1, verify_witness_proof_v1, WitnessProofV1};
 
 /// Schema version. Bumping this requires a verifier upgrade.
 pub const BUNDLE_FORMAT_VERSION: u32 = 1;
@@ -325,6 +325,11 @@ pub struct VerifyReportV1 {
     /// Whether every embedded witness proof re-verified (RFC6962). True when
     /// there are no witness proofs.
     pub witness_proofs_valid: bool,
+    /// Whether every witness root was endorsed by the pinned log key
+    /// (checkpoint/SET verified). `None` when no trust root was supplied — in
+    /// that mode inclusion is checked but root endorsement is not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness_root_endorsed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
 }
@@ -343,6 +348,18 @@ pub struct VerifyReportV1 {
 /// Any failure short-circuits with `ok=false` and a populated
 /// `failure_reason`.
 pub fn verify_bundle_v1(tar_zst_bytes: &[u8]) -> Result<VerifyReportV1, AuditBundleError> {
+    verify_bundle_with_trust_roots_v1(tar_zst_bytes, None)
+}
+
+/// Like [`verify_bundle_v1`], but when `rekor_ed25519_pubkey` is supplied it
+/// also verifies each witness proof's Rekor checkpoint/SET against that pinned
+/// key — proving the tree root is the one the log operator signed (the trust
+/// root), not merely internally consistent. Without a key, root endorsement is
+/// reported as `None` (not checked).
+pub fn verify_bundle_with_trust_roots_v1(
+    tar_zst_bytes: &[u8],
+    rekor_ed25519_pubkey: Option<&[u8; 32]>,
+) -> Result<VerifyReportV1, AuditBundleError> {
     let decoded = zstd::stream::decode_all(tar_zst_bytes)?;
     let mut archive = tar::Archive::new(decoded.as_slice());
 
@@ -393,6 +410,7 @@ pub fn verify_bundle_v1(tar_zst_bytes: &[u8]) -> Result<VerifyReportV1, AuditBun
             witness_proof_count: manifest.witness_proof_count,
             witness_proofs_sha256_match: false,
             witness_proofs_valid: false,
+            witness_root_endorsed: None,
             failure_reason: Some(format!(
                 "{EVENTS_FILENAME} sha256 mismatch: expected {}, got {}",
                 manifest.events_jsonl_sha256, events_hash
@@ -412,6 +430,7 @@ pub fn verify_bundle_v1(tar_zst_bytes: &[u8]) -> Result<VerifyReportV1, AuditBun
             witness_proof_count: manifest.witness_proof_count,
             witness_proofs_sha256_match: false,
             witness_proofs_valid: false,
+            witness_root_endorsed: None,
             failure_reason: Some(format!(
                 "{RECEIPTS_FILENAME} sha256 mismatch: expected {}, got {}",
                 manifest.receipts_cbor_sha256, receipts_hash
@@ -450,17 +469,18 @@ pub fn verify_bundle_v1(tar_zst_bytes: &[u8]) -> Result<VerifyReportV1, AuditBun
             witness_proof_count: manifest.witness_proof_count,
             witness_proofs_sha256_match: false,
             witness_proofs_valid: false,
+            witness_root_endorsed: None,
             failure_reason: Some("manifest signature failed Ed25519 verification".to_string()),
         });
     }
 
     // Manifest is authentic — now re-check the witness inclusion-proofs it
     // commits to. A stripped, mutated, or non-verifying proof fails the bundle.
-    let (witness_sha_match, witness_valid, witness_failure) =
-        verify_witness_member(&manifest, witness_bytes.as_deref());
+    let (witness_sha_match, witness_valid, witness_endorsed, witness_failure) =
+        verify_witness_member(&manifest, witness_bytes.as_deref(), rekor_ed25519_pubkey);
 
     Ok(VerifyReportV1 {
-        ok: witness_sha_match && witness_valid,
+        ok: witness_sha_match && witness_valid && witness_endorsed.unwrap_or(true),
         bundle_format_version: manifest.bundle_format_version,
         bundle_id: manifest.bundle_id,
         fact_count: manifest.fact_count,
@@ -471,6 +491,7 @@ pub fn verify_bundle_v1(tar_zst_bytes: &[u8]) -> Result<VerifyReportV1, AuditBun
         witness_proof_count: manifest.witness_proof_count,
         witness_proofs_sha256_match: witness_sha_match,
         witness_proofs_valid: witness_valid,
+        witness_root_endorsed: witness_endorsed,
         failure_reason: witness_failure,
     })
 }
@@ -483,16 +504,18 @@ pub fn verify_bundle_v1(tar_zst_bytes: &[u8]) -> Result<VerifyReportV1, AuditBun
 fn verify_witness_member(
     manifest: &AuditBundleManifestV1,
     witness_bytes: Option<&[u8]>,
-) -> (bool, bool, Option<String>) {
+    rekor_pubkey: Option<&[u8; 32]>,
+) -> (bool, bool, Option<bool>, Option<String>) {
     match (manifest.witness_proof_count, witness_bytes) {
-        (0, None) => (true, true, None),
+        (0, None) => (true, true, None, None),
         (0, Some(bytes)) => {
             if bytes.is_empty() {
-                (true, true, None)
+                (true, true, None, None)
             } else {
                 (
                     false,
                     false,
+                    None,
                     Some("witness_proofs.jsonl present but the signed manifest declares none".to_string()),
                 )
             }
@@ -500,6 +523,7 @@ fn verify_witness_member(
         (count, None) => (
             false,
             false,
+            None,
             Some(format!(
                 "manifest declares {count} witness proof(s) but witness_proofs.jsonl is missing"
             )),
@@ -507,7 +531,7 @@ fn verify_witness_member(
         (count, Some(bytes)) => {
             let sha = hex_sha256(bytes);
             if manifest.witness_proofs_sha256.as_deref() != Some(sha.as_str()) {
-                return (false, false, Some(format!("{WITNESS_FILENAME} sha256 mismatch")));
+                return (false, false, None, Some(format!("{WITNESS_FILENAME} sha256 mismatch")));
             }
             let mut parsed: u64 = 0;
             for (i, line) in bytes.split(|b| *b == b'\n').enumerate() {
@@ -520,6 +544,7 @@ fn verify_witness_member(
                         return (
                             true,
                             false,
+                            None,
                             Some(format!("witness proof on line {i} is malformed: {err}")),
                         )
                     }
@@ -528,11 +553,28 @@ fn verify_witness_member(
                     return (
                         true,
                         false,
+                        None,
                         Some(format!(
                             "witness proof {i} (leaf {}) failed RFC6962 verification",
                             proof.leaf_hash
                         )),
                     );
+                }
+                if let Some(pubkey) = rekor_pubkey {
+                    let endorsed = proof
+                        .checkpoint
+                        .as_deref()
+                        .is_some_and(|cp| verify_rekor_checkpoint_v1(cp, pubkey, &proof.root_hash));
+                    if !endorsed {
+                        return (
+                            true,
+                            true,
+                            Some(false),
+                            Some(format!(
+                                "witness proof {i} root not endorsed by the pinned log key (checkpoint/SET)"
+                            )),
+                        );
+                    }
                 }
                 parsed += 1;
             }
@@ -540,12 +582,13 @@ fn verify_witness_member(
                 return (
                     true,
                     false,
+                    None,
                     Some(format!(
                         "witness proof count mismatch: manifest {count}, member {parsed}"
                     )),
                 );
             }
-            (true, true, None)
+            (true, true, rekor_pubkey.map(|_| true), None)
         }
     }
 }
@@ -988,5 +1031,46 @@ mod tests {
         assert_eq!(proofs.len(), 1, "only the witnessed record yields a proof");
         assert_eq!(proofs[0].leaf_hash, proof.leaf_hash);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trust_root_checkpoint_endorsement_gates_the_bundle() {
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let rekor_sk = SigningKey::from_bytes(&[0x77; 32]);
+        let rekor_pk = rekor_sk.verifying_key().to_bytes();
+
+        // A witness proof whose root ("ab"*32) is endorsed by a checkpoint the
+        // synthetic Rekor key signs.
+        let mut proof = sample_witness_proof("ab");
+        let root_b64 = base64::engine::general_purpose::STANDARD.encode([0xab_u8; 32]);
+        let text = format!("rekor.example\n1\n{root_b64}\n");
+        let mut keyhash_sig = vec![0u8; 4];
+        keyhash_sig.extend_from_slice(&rekor_sk.sign(text.as_bytes()).to_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&keyhash_sig);
+        proof.checkpoint = Some(format!("{text}\n\u{2014} rekor.example {sig_b64}\n"));
+
+        let mut input = sample_input();
+        input.witness_proofs = vec![proof];
+        let built = build_bundle_v1(input).expect("build");
+        let mut tar = Vec::new();
+        built.write_tar_zst(&mut tar).unwrap();
+
+        // No pinned key: inclusion verified, endorsement not checked.
+        let r0 = verify_bundle_v1(&tar).expect("verify");
+        assert!(r0.ok);
+        assert_eq!(r0.witness_root_endorsed, None);
+
+        // Correct pinned key: root endorsed -> bundle ok.
+        let r1 = verify_bundle_with_trust_roots_v1(&tar, Some(&rekor_pk)).expect("verify");
+        assert!(r1.ok, "{r1:?}");
+        assert_eq!(r1.witness_root_endorsed, Some(true));
+
+        // Wrong pinned key: endorsement fails -> bundle rejected even though
+        // inclusion is valid.
+        let wrong = SigningKey::from_bytes(&[0x88; 32]).verifying_key().to_bytes();
+        let r2 = verify_bundle_with_trust_roots_v1(&tar, Some(&wrong)).expect("verify");
+        assert!(!r2.ok);
+        assert!(r2.witness_proofs_valid, "inclusion still valid");
+        assert_eq!(r2.witness_root_endorsed, Some(false));
     }
 }

@@ -10,6 +10,7 @@
 //! verification helpers for the parts that are deterministic without
 //! network access.
 
+use base64::Engine as _;
 use ciborium::value::Value as CborValue;
 use cms::cert::x509::der::{Decode, Encode, Tag as CmsTag, Tagged};
 use cms::{
@@ -118,6 +119,71 @@ pub fn read_witnessed_proofs_jsonl(path: &std::path::Path) -> Vec<WitnessProofV1
         }
     }
     out
+}
+
+/// Verify a Rekor checkpoint (signed-note / c2sp tlog-checkpoint format) against
+/// the log's Ed25519 public key and confirm it commits to `expected_root_hex`.
+///
+/// This is the **trust root** for witness verification. RFC6962 inclusion only
+/// proves a leaf hashes up to *some* root; this proves that root is the one the
+/// log operator signed, so an internally-consistent but fabricated tree is
+/// rejected. Returns false on any parse, signature, or root mismatch.
+///
+/// A signed note is `text` (newline-terminated lines: origin, tree_size,
+/// base64(root_hash), …) then a blank line then one or more
+/// `— <name> <base64(keyhash[4] || ed25519_sig[64])>` lines. The signature
+/// covers `text` only.
+///
+/// Algorithm scope: this verifies an **Ed25519**-signed checkpoint — correct for
+/// self-hosted / private (Trillian/cosign) logs keyed with Ed25519. The
+/// public-good Sigstore Rekor signs with **ECDSA P-256**; a P-256 variant is a
+/// follow-up needed for live public-Rekor verification (Track W / M4).
+pub fn verify_rekor_checkpoint_v1(checkpoint: &str, log_ed25519_pubkey: &[u8; 32], expected_root_hex: &str) -> bool {
+    let Some(sep) = checkpoint.find("\n\n") else {
+        return false;
+    };
+    let text = &checkpoint[..=sep]; // up to and including the last text newline
+    let sig_block = &checkpoint[sep + 2..];
+
+    let mut lines = text.lines();
+    let (Some(_origin), Some(_size), Some(root_b64)) = (lines.next(), lines.next(), lines.next()) else {
+        return false;
+    };
+    let Ok(root_bytes) = base64::engine::general_purpose::STANDARD.decode(root_b64.trim()) else {
+        return false;
+    };
+    let Some(expected_root) = parse_sha256_hex(expected_root_hex) else {
+        return false;
+    };
+    if root_bytes.as_slice() != expected_root {
+        return false;
+    }
+
+    let Ok(verifying) = ed25519_dalek::VerifyingKey::from_bytes(log_ed25519_pubkey) else {
+        return false;
+    };
+    for sig_line in sig_block.lines() {
+        let Some(rest) = sig_line.trim_start().strip_prefix("\u{2014} ") else {
+            continue;
+        };
+        let Some((_name, sig_b64)) = rest.rsplit_once(' ') else {
+            continue;
+        };
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(sig_b64.trim()) else {
+            continue;
+        };
+        if raw.len() != 4 + 64 {
+            continue;
+        }
+        let Ok(sig_arr) = <[u8; 64]>::try_from(&raw[4..]) else {
+            continue;
+        };
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        if verifying.verify_strict(text.as_bytes(), &signature).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -1430,5 +1496,31 @@ mod tests {
         assert_eq!(sig.schema, "cuecrux.receipt.sig.v1");
         assert_eq!(sig.alg, "ed25519");
         assert_eq!(sig.signature.len(), 64);
+    }
+
+    #[test]
+    fn rekor_checkpoint_verifies_against_pinned_key() {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+        let sk = SigningKey::from_bytes(&[0x11; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let root = [0xAB_u8; 32];
+        let root_b64 = base64::engine::general_purpose::STANDARD.encode(root);
+        let text = format!("rekor.example\n42\n{root_b64}\n");
+        let sig = sk.sign(text.as_bytes()).to_bytes();
+        let mut keyhash_sig = vec![0u8; 4];
+        keyhash_sig.extend_from_slice(&sig);
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&keyhash_sig);
+        let checkpoint = format!("{text}\n\u{2014} rekor.example {sig_b64}\n");
+        let root_hex: String = root.iter().map(|b| format!("{b:02x}")).collect();
+
+        assert!(verify_rekor_checkpoint_v1(&checkpoint, &pk, &root_hex));
+
+        // Wrong log key, wrong expected root, and tampered text each fail.
+        let wrong_key = SigningKey::from_bytes(&[0x22; 32]).verifying_key().to_bytes();
+        assert!(!verify_rekor_checkpoint_v1(&checkpoint, &wrong_key, &root_hex));
+        assert!(!verify_rekor_checkpoint_v1(&checkpoint, &pk, &"cd".repeat(32)));
+        let tampered = checkpoint.replace("\n42\n", "\n43\n");
+        assert!(!verify_rekor_checkpoint_v1(&tampered, &pk, &root_hex));
     }
 }
