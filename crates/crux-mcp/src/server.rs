@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use crate::agent::AgentIdentity;
 use crate::dispatch::{self, McpContext, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse, PARSE_ERROR};
+use crate::protocol::{JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND, PARSE_ERROR};
 use crate::sse::{RegisterError, Registration};
 
 /// MCP Streamable HTTP session-correlation header.
@@ -69,10 +69,12 @@ async fn handle_oauth_protected_resource() -> Response {
 
 /// `POST /mcp` — JSON-RPC 2.0 endpoint (MCP Streamable HTTP).
 async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap, body: String) -> Response {
-    let agent = match authenticate_agent(&ctx, &headers) {
-        Ok(agent) => agent,
+    let outcome = match authenticate_agent(&ctx, &headers).await {
+        Ok(outcome) => outcome,
         Err(problem) => return problem.into_response(),
     };
+    let oauth_read_only = outcome.is_oauth();
+    let agent = outcome.into_identity();
     let incoming_session = match mcp_session_id_from_headers(&headers) {
         Ok(session_id) => session_id,
         Err(problem) => return problem.into_response(),
@@ -117,6 +119,25 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
             return (StatusCode::OK, Json(resp)).into_response();
         }
     };
+
+    // M3.3: hosted-client OAuth callers (mcp:read) are restricted to the
+    // read-only method-allowlist — reject writes before dispatch (default-deny).
+    if oauth_read_only {
+        let tool = if req.method == "tools/call" {
+            req.params.get("name").and_then(|v| v.as_str())
+        } else {
+            None
+        };
+        if !crate::oauth::oauth_request_allowed(&req.method, tool) {
+            let denied = tool.unwrap_or(req.method.as_str()).to_string();
+            let resp = JsonRpcResponse::error(
+                req.id.clone(),
+                METHOD_NOT_FOUND,
+                format!("'{denied}' is not available to read-only OAuth callers (mcp:read scope)"),
+            );
+            return (StatusCode::OK, Json(resp)).into_response();
+        }
+    }
 
     info!(method = %req.method, id = ?req.id, "mcp request");
 
@@ -174,8 +195,8 @@ async fn handle_mcp_get(State(ctx): State<Arc<McpContext>>, req: axum::extract::
         .into_response();
     }
 
-    let agent = match authenticate_agent(&ctx, headers) {
-        Ok(agent) => agent,
+    let agent = match authenticate_agent(&ctx, headers).await {
+        Ok(outcome) => outcome.into_identity(),
         Err(problem) => return problem.into_response(),
     };
     let session_id = match mcp_session_id_from_headers(headers) {
@@ -239,12 +260,69 @@ impl IntoResponse for UnauthorizedAgent {
     }
 }
 
-fn authenticate_agent(ctx: &McpContext, headers: &HeaderMap) -> Result<Option<AgentIdentity>, UnauthorizedAgent> {
-    let agent = bearer_token(headers).and_then(|token| ctx.agent_registry.lookup(token).cloned());
-    if !ctx.agent_registry.is_empty() && agent.is_none() {
-        Err(UnauthorizedAgent)
+/// Outcome of authenticating an MCP request.
+enum AuthOutcome {
+    /// No credentials presented and none required (no-auth daemon).
+    Anonymous,
+    /// A registered static agent token (Desktop, `gemini-prod`, …) — full access.
+    Agent(AgentIdentity),
+    /// A valid hosted-client OAuth token — read-only (`mcp:read`).
+    OAuth(AgentIdentity),
+}
+
+impl AuthOutcome {
+    fn is_oauth(&self) -> bool {
+        matches!(self, AuthOutcome::OAuth(_))
+    }
+    fn into_identity(self) -> Option<AgentIdentity> {
+        match self {
+            AuthOutcome::Anonymous => None,
+            AuthOutcome::Agent(id) | AuthOutcome::OAuth(id) => Some(id),
+        }
+    }
+}
+
+/// Authenticate an MCP request. Order: (1) registered static agent token
+/// (unchanged legacy path), (2) hosted-client OAuth bearer via introspection
+/// (opt-in; only when configured), (3) reject unless this is a no-auth daemon.
+async fn authenticate_agent(ctx: &McpContext, headers: &HeaderMap) -> Result<AuthOutcome, UnauthorizedAgent> {
+    let Some(token) = bearer_token(headers) else {
+        return if ctx.agent_registry.is_empty() {
+            Ok(AuthOutcome::Anonymous)
+        } else {
+            Err(UnauthorizedAgent)
+        };
+    };
+
+    // 1. Registered static agent token — exact pre-OAuth behaviour.
+    if let Some(agent) = ctx.agent_registry.lookup(token).cloned() {
+        return Ok(AuthOutcome::Agent(agent));
+    }
+
+    // 2. Hosted-client OAuth bearer. Introspection is blocking (ureq) so it runs
+    //    on a blocking thread; the ≤60s cache keeps the common case off the wire.
+    if crate::oauth::introspection_enabled() {
+        let token_owned = token.to_string();
+        let introspection = tokio::task::spawn_blocking(move || {
+            crate::oauth::shared_introspector().map(|i| i.introspect_cached(&token_owned))
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(intro) = introspection {
+            if let Some(resource) = crate::oauth::ResourceConfig::from_env() {
+                if let Some(identity) = crate::oauth::authorize_oauth(&intro, &resource.resource_url) {
+                    return Ok(AuthOutcome::OAuth(identity));
+                }
+            }
+        }
+    }
+
+    // 3. Unknown bearer: anonymous only on a no-auth daemon, else 401.
+    if ctx.agent_registry.is_empty() {
+        Ok(AuthOutcome::Anonymous)
     } else {
-        Ok(agent)
+        Err(UnauthorizedAgent)
     }
 }
 
