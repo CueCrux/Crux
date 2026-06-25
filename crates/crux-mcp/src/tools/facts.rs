@@ -473,7 +473,10 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     // legacy shape, byte-identical.
     if crate::crc_v1::enabled(args) {
         let crc = crate::crc_v1::wrap_facts(&rows, entity.as_deref(), query.as_deref());
-        let text = serde_json::to_string_pretty(&crc).unwrap_or_default();
+        // M3: minified text surface when CRUX_PAYLOAD_COMPACT is on (query_facts
+        // is the heaviest retrieval payload per the M0 baseline); the structured
+        // `crc_v1` Value below is unchanged.
+        let text = crate::payload::serialize(&crc);
         return Ok(json!({
             "content": [{ "type": "text", "text": text }],
             "structuredContent": { "rows": rows, "crc_v1": crc }

@@ -80,3 +80,37 @@ against the host daemon before any default-ON cutover (the follow-up gated plan)
 The full JSON record array (one `{metric, value, corpus, lane_flags,
 commit_sha, run_id}`-style object per row) is emitted to stdout by the harness;
 it is the input for the M3/M1 before/after deltas and the M5 holdout CI report.
+
+---
+
+# M3 — payload compaction result
+
+Flag `CRUX_PAYLOAD_COMPACT` (default OFF). ON ⇒ retrieval payloads are minified
+(`to_string`) instead of pretty (`to_string_pretty`) at the four wire sites:
+`query` ×1, `query_scan` ×1, `query_expand` ×1 ([`tools/query.rs`](../../crates/crux-mcp/src/tools/query.rs)),
+and the `query_facts` CRC-v1 text ([`tools/facts.rs:476`](../../crates/crux-mcp/src/tools/facts.rs#L476)).
+Measured on `__synthetic__::token-bench`, commit `c4b0e17`:
+
+| scenario | budget | tokens OFF | tokens ON | reduction | hits OFF→ON |
+|---|---:|---:|---:|---:|---:|
+| query | 500 | 348 | 259 | −25.6% | 2→2 |
+| query | 2000 | 467 | 333 | −28.7% | 9→9 |
+| query | 4000 | 740 | 501 | −32.3% | 25→25 |
+| query_facts | 500 | 747 | 664 | −11.1% | 1→1 |
+| query_facts | 2000 | 2432 | 2209 | −9.2% | 6→6 |
+| query_facts | 4000 | 5481 | 5089 | −7.2% | 12→12 |
+| query_scan | — | 801 | 539 | −32.7% | 30→30 |
+| get_bootstrap | — | 1196 | 1196 | 0% (text surface, not JSON) | 8→8 |
+
+**Reading:** the win scales with how many small JSON objects the payload holds —
+pointer surfaces (`query`, `query_scan`) shed ~26–33% (mostly indentation +
+newlines), while the full-content fact path sheds ~7–11% (content dominates, less
+proportional whitespace). **Hits/candidates are identical in every row** — pure
+wire reduction, zero semantic change. `get_bootstrap` emits newline text (not
+JSON), so it is untouched by M3 (it is the M2 cache-align target instead).
+
+Per QC.4/R5 these are corpus-named per-scenario measurements, **not** a single
+counterfactual headline number — M5 turns them into a holdout-controlled CI
+report. Gate M3: golden tests (`payload::tests`, flag-OFF byte-identical to
+`to_string_pretty`; flag-ON identical parsed `Value`, strictly fewer bytes,
+opaque-string whitespace preserved) + full crux-mcp lib suite green (651 tests).

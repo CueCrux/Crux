@@ -181,7 +181,13 @@ fn candidates(text: &str) -> u64 {
         .unwrap_or_else(|| inline_hits(text))
 }
 
-fn record(scenario: &str, budget: Option<usize>, text: &str, commit: &str, run_id: &str) -> Value {
+struct RunMeta {
+    commit: String,
+    run_id: String,
+    lane_flags: String,
+}
+
+fn record(scenario: &str, budget: Option<usize>, text: &str, m: &RunMeta) -> Value {
     json!({
         "corpus": CORPUS,
         "scenario": scenario,
@@ -191,16 +197,26 @@ fn record(scenario: &str, budget: Option<usize>, text: &str, commit: &str, run_i
         "inline_hits": inline_hits(text),
         "candidates": candidates(text),
         "contract": "crc-v1",
-        "lane_flags": "baseline:all-off",
-        "commit_sha": commit,
-        "run_id": run_id,
+        "lane_flags": m.lane_flags,
+        "commit_sha": m.commit,
+        "run_id": m.run_id,
     })
 }
 
 #[tokio::main]
 async fn main() {
-    let commit = std::env::var("CRUX_BENCH_COMMIT").unwrap_or_else(|_| "unknown".to_string());
-    let run_id = std::env::var("CRUX_BENCH_RUN_ID").unwrap_or_else(|_| "local".to_string());
+    // lane_flags reflects the LIVE flag state the handlers read, so an M3 run
+    // (CRUX_PAYLOAD_COMPACT=1) is self-documenting against the baseline.
+    let lane_flags = if crux_mcp::payload::compact_enabled() {
+        "m3:payload-compact".to_string()
+    } else {
+        "baseline:all-off".to_string()
+    };
+    let m = RunMeta {
+        commit: std::env::var("CRUX_BENCH_COMMIT").unwrap_or_else(|_| "unknown".to_string()),
+        run_id: std::env::var("CRUX_BENCH_RUN_ID").unwrap_or_else(|_| "local".to_string()),
+        lane_flags,
+    };
 
     let ctx = McpContext::new_default("token-bench-node");
     seed(&ctx).await;
@@ -215,33 +231,27 @@ async fn main() {
         )
         .await
         .expect("query");
-        records.push(record("query", Some(budget), &content_text(&q), &commit, &run_id));
+        records.push(record("query", Some(budget), &content_text(&q), &m));
 
         // query_facts (M1 budget cut on the fact plane)
         let qf = facts::handle_query_facts(&json!({"query": "needle", "token_budget": budget, "top_k": 50}), &ctx)
             .await
             .expect("query_facts");
-        records.push(record(
-            "query_facts",
-            Some(budget),
-            &content_text(&qf),
-            &commit,
-            &run_id,
-        ));
+        records.push(record("query_facts", Some(budget), &content_text(&qf), &m));
     }
 
     // query_scan — metadata-only; measured once (no budget knob in the handler).
     let qs = query::handle_query_scan(&json!({"tenant_id": TENANT, "query": "alpha", "limit": 50}), &ctx)
         .await
         .expect("query_scan");
-    records.push(record("query_scan", None, &content_text(&qs), &commit, &run_id));
+    records.push(record("query_scan", None, &content_text(&qs), &m));
 
     // get_bootstrap — no budget enforcement today (FactQuery.token_budget=None);
     // measured once. The absence of a budget knob is the M2 cache-align context.
     let gb = facts::handle_get_bootstrap(&json!({"topic": "patterns"}), &ctx)
         .await
         .expect("get_bootstrap");
-    records.push(record("get_bootstrap", None, &content_text(&gb), &commit, &run_id));
+    records.push(record("get_bootstrap", None, &content_text(&gb), &m));
 
     let out = json!({
         "harness": "token_bench",
@@ -249,13 +259,17 @@ async fn main() {
         "corpus": CORPUS,
         "n_docs": N_DOCS,
         "budgets": BUDGETS,
-        "commit_sha": commit,
-        "run_id": run_id,
+        "commit_sha": m.commit,
+        "run_id": m.run_id,
+        "lane_flags": m.lane_flags,
         "records": records,
     });
 
     // Human summary to stderr (does not pollute the JSON on stdout).
-    eprintln!("token_bench — corpus={CORPUS} commit={commit} run_id={run_id}");
+    eprintln!(
+        "token_bench — corpus={CORPUS} commit={} run_id={} lane_flags={}",
+        m.commit, m.run_id, m.lane_flags
+    );
     eprintln!(
         "{:<14} {:>7} {:>8} {:>8} {:>6} {:>11}",
         "scenario", "budget", "tokens", "bytes", "hits", "candidates"

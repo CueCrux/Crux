@@ -106,7 +106,9 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string_pretty(&inner).unwrap_or_default()
+            // M3: minified on the wire when CRUX_PAYLOAD_COMPACT is on; pretty
+            // (byte-identical to pre-M3) when off.
+            "text": crate::payload::serialize(&inner)
         }]
     }))
 }
@@ -172,7 +174,7 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string_pretty(&inner).unwrap_or_default()
+            "text": crate::payload::serialize(&inner)
         }]
     }))
 }
@@ -270,7 +272,7 @@ pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Val
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string_pretty(&response).unwrap_or_default()
+            "text": crate::payload::serialize(&response)
         }]
     }))
 }

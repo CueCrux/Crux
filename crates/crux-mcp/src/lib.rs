@@ -34,6 +34,7 @@ pub mod handoff;
 pub mod ledger;
 pub mod oauth;
 pub mod otel;
+pub mod payload;
 pub mod protocol;
 pub mod scope;
 pub mod server;
