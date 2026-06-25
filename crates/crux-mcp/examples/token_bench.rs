@@ -187,6 +187,64 @@ struct RunMeta {
     lane_flags: String,
 }
 
+/// Run the compaction-sensitive scenarios and return `(scenario_key, response_text)`
+/// for each, honouring whatever efficiency flags are currently set in the env
+/// (the handlers read them at call time). Used by the M5 paired holdout
+/// measurement, which calls this once with flags OFF (control) and once with
+/// M3 compaction ON (treatment).
+async fn measure_scenarios(ctx: &McpContext) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for &budget in &BUDGETS {
+        let q = query::handle_query(
+            &json!({"tenant_id": TENANT, "query": "alpha", "limit": 50, "token_budget": budget}),
+            ctx,
+        )
+        .await
+        .expect("query");
+        out.push((format!("query@{budget}"), content_text(&q)));
+
+        let qf = facts::handle_query_facts(&json!({"query": "needle", "token_budget": budget, "top_k": 50}), ctx)
+            .await
+            .expect("query_facts");
+        out.push((format!("query_facts@{budget}"), content_text(&qf)));
+    }
+    let qs = query::handle_query_scan(&json!({"tenant_id": TENANT, "query": "alpha", "limit": 50}), ctx)
+        .await
+        .expect("query_scan");
+    out.push(("query_scan".to_string(), content_text(&qs)));
+    out
+}
+
+/// M5 — paired holdout savings of a treatment (M3 payload compaction ON) vs. the
+/// control arm (all efficiency flags OFF), measured on the same scenarios, with
+/// a 95% CI. Reproduces the M3 saving through the holdout path rather than as a
+/// bare counterfactual number (gate M5). Env is saved/restored around the toggle.
+async fn paired_holdout_savings(ctx: &McpContext) -> crux_mcp::holdout::SavingsReport {
+    use crux_mcp::{budget::REVERSIBLE_ENV, payload::COMPACT_ENV};
+    let saved_compact = std::env::var(COMPACT_ENV).ok();
+    let saved_reversible = std::env::var(REVERSIBLE_ENV).ok();
+    let restore = |k: &str, v: &Option<String>| match v {
+        Some(val) => std::env::set_var(k, val),
+        None => std::env::remove_var(k),
+    };
+
+    // Control arm: every efficiency flag OFF.
+    std::env::set_var(COMPACT_ENV, "0");
+    std::env::set_var(REVERSIBLE_ENV, "0");
+    let control = measure_scenarios(ctx).await;
+
+    // Treatment arm: M3 payload compaction ON (the clean, hits-identical win).
+    std::env::set_var(COMPACT_ENV, "1");
+    let treatment = measure_scenarios(ctx).await;
+
+    restore(COMPACT_ENV, &saved_compact);
+    restore(REVERSIBLE_ENV, &saved_reversible);
+
+    let control_tokens: Vec<u64> = control.iter().map(|(_, t)| estimate_tokens_str(t)).collect();
+    let treatment_tokens: Vec<u64> = treatment.iter().map(|(_, t)| estimate_tokens_str(t)).collect();
+    crux_mcp::holdout::paired_savings(&control_tokens, &treatment_tokens)
+}
+
 fn record(scenario: &str, budget: Option<usize>, text: &str, m: &RunMeta) -> Value {
     json!({
         "corpus": CORPUS,
@@ -253,6 +311,11 @@ async fn main() {
         .expect("query_scan");
     records.push(record("query_scan", None, &content_text(&qs), &m));
 
+    // M5 — paired holdout savings (M3 compaction treatment vs. all-OFF control),
+    // reported as a point estimate WITH a 95% CI (never a bare number).
+    let savings = paired_holdout_savings(&ctx).await;
+    let savings_line = savings.format(CORPUS, &m.commit);
+
     // get_bootstrap — no budget enforcement today (FactQuery.token_budget=None);
     // measured once. The absence of a budget knob is the M2 cache-align context.
     let gb = facts::handle_get_bootstrap(&json!({"topic": "patterns"}), &ctx)
@@ -270,6 +333,20 @@ async fn main() {
         "run_id": m.run_id,
         "lane_flags": m.lane_flags,
         "records": records,
+        // M5 — holdout savings: M3 compaction (treatment) vs all-OFF (control),
+        // paired per scenario, with a 95% CI (Headroom holdout / QC.4 / QC.5).
+        "savings": {
+            "treatment": "m3:payload-compact",
+            "control": "baseline:all-off",
+            "method": "paired per-scenario reduction, 95% CI (normal approx, z=1.96)",
+            "n": savings.n,
+            "reduction_pct": savings.reduction * 100.0,
+            "ci95_low_pct": savings.ci_low * 100.0,
+            "ci95_high_pct": savings.ci_high * 100.0,
+            "control_tokens": savings.control_tokens,
+            "treatment_tokens": savings.treatment_tokens,
+            "report": savings_line,
+        },
     });
 
     // Human summary to stderr (does not pollute the JSON on stdout).
@@ -292,6 +369,8 @@ async fn main() {
             r["candidates"].as_u64().unwrap_or(0),
         );
     }
+
+    eprintln!("M5 holdout — {savings_line}");
 
     // Machine-parseable JSON to stdout (the bench record).
     println!("{}", serde_json::to_string_pretty(&out).expect("serialise"));
