@@ -90,6 +90,20 @@ pub struct WorkItem {
     pub current_milestone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// Lineage graph: plans this one builds on / is blocked by (`Depends on
+    /// [[slug]]`), and plans that build on this one (`Extended by [[slug]]`).
+    /// Slugs only. The reciprocal edge is derived at projection time, so a plan
+    /// declares one direction and `list_execplans` fills the other. Additive +
+    /// empty-skipped so the kanban path stays byte-compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extended_by: Vec<String>,
+    /// Unresolved Open-Decision ids (`OD-<n>`) this plan references, per the
+    /// registry — overdue first. Empty unless the daemon has the registry path
+    /// (`CRUX_OPEN_DECISIONS_PATH`) set and the plan cites a still-open OD.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_decisions: Vec<String>,
     /// Agent-graph: orchestrator this work item belongs to, if any. Additive
     /// + `#[serde(default)]` so existing records remain byte-compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +117,32 @@ pub struct WorkItem {
     /// Number of notes (work comments) attached to this item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes_count: Option<u32>,
+    /// Fact-derived provenance rollup (ExecPlan-aggregator items only). Surfaces
+    /// the activity window, contributing agents, and decision commit SHAs that
+    /// the fact store + CROWN receipts already hold — read-only, never written
+    /// back to the plan `.md`. `None` for kanban items and fact-less plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+}
+
+/// Compact, fact-derived provenance for an ExecPlan work item. Assembled at
+/// projection time from `execplan:<slug>` facts (milestone/gate/decision) — the
+/// same data that produced CROWN receipts upstream — so it carries no new
+/// authority and mutates nothing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Provenance {
+    /// Earliest fact timestamp (ms since epoch) — when work on the plan began.
+    pub first_activity_unix_ms: u64,
+    /// Most recent fact timestamp (ms since epoch) — last touch.
+    pub last_activity_unix_ms: u64,
+    /// Distinct real-principal actors that contributed facts, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contributing_agents: Vec<String>,
+    /// Distinct commit SHAs from `decision:*` facts, in insertion order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commit_shas: Vec<String>,
+    /// Count of `decision:*` facts logged against the plan.
+    pub decision_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,10 +229,14 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         plan_path: None,
         current_milestone: None,
         superseded_by: None,
+        depends_on: Vec::new(),
+        extended_by: Vec::new(),
+        open_decisions: Vec::new(),
         orchestrator_id: None,
         milestones_done: None,
         milestones_total: None,
         notes_count: None,
+        provenance: None,
     };
     write_record(store, &item)?;
     write_transition(
