@@ -114,3 +114,38 @@ counterfactual headline number — M5 turns them into a holdout-controlled CI
 report. Gate M3: golden tests (`payload::tests`, flag-OFF byte-identical to
 `to_string_pretty`; flag-ON identical parsed `Value`, strictly fewer bytes,
 opaque-string whitespace preserved) + full crux-mcp lib suite green (651 tests).
+
+---
+
+# M1 — reversible overflow on `token_budget` (part 1: segment query path)
+
+Flag `CRUX_BUDGET_REVERSIBLE` (default OFF). The segment `query` response is
+pointer-only, so M1 **budgets the emitted pointer tier** (`budget / POINTER_TOKENS`,
+`POINTER_TOKENS=40` mirroring CRC-v1's `cost_estimate.pointer`) instead of
+charging the *full-doc* hydration cost and dropping the overflow
+([`tools/query.rs:48-72`](../../crates/crux-mcp/src/tools/query.rs#L48-L72)). The
+full price stays in `cost_estimate.full`; `total_candidates` discloses any capped
+remainder; expand via `result_id` (`query_expand`), which now returns a typed
+`error_kind:"evicted"` when a handle's segment is gone (T.2). OFF ⇒ the legacy
+`take_while`-drop, byte-identical to pre-M1.
+
+`query` hits (recall) at fixed budget on `__synthetic__::token-bench` (30 candidates):
+
+| budget | OFF hits | ON hits | ON tokens | ON+M3 tokens |
+|---:|---:|---:|---:|---:|
+| 500 | 2 | **12** (6×) | 518 | **364** |
+| 2000 | 9 | **30** (all) | 825 | 554 |
+| 4000 | 25 | **30** (all) | 825 | 554 |
+
+**Reading:** M1 converts `token_budget` from a *recall-destroying* cut into a
+*recall lever* — at budget 500 the agent now sees 12 candidates instead of 2,
+and at 2000+ the full set surfaces. M1 alone slightly overshoots the asked budget
+(518 > 500) because emitted pointers carry envelope overhead beyond the 40-token
+weight; **M1+M3 compose** to bring it back under budget (364 < 500) — full recall
+*within* the budget. `query_facts` / `query_scan` / `get_bootstrap` are unchanged
+(M1 part 1 is the segment path only; the fact-path full→epitome demotion is
+deferred to M1 part 2). Gate M1: `budget::tests` (pointer-budget math,
+env-truthy) + `query::tests::reversible_admits_more_than_full_doc_drop`
+(flag-OFF→ON recall parity, total_candidates disclosure) +
+`query_expand_evicted_error_kind` + full lib suite green (656 tests); flag-OFF
+byte-identical (regression net).

@@ -205,12 +205,19 @@ fn record(scenario: &str, budget: Option<usize>, text: &str, m: &RunMeta) -> Val
 
 #[tokio::main]
 async fn main() {
-    // lane_flags reflects the LIVE flag state the handlers read, so an M3 run
-    // (CRUX_PAYLOAD_COMPACT=1) is self-documenting against the baseline.
-    let lane_flags = if crux_mcp::payload::compact_enabled() {
-        "m3:payload-compact".to_string()
-    } else {
+    // lane_flags reflects the LIVE flag state the handlers read, so an M1/M3 run
+    // is self-documenting against the baseline.
+    let mut flags: Vec<&str> = Vec::new();
+    if crux_mcp::budget::reversible_enabled() {
+        flags.push("m1:budget-reversible");
+    }
+    if crux_mcp::payload::compact_enabled() {
+        flags.push("m3:payload-compact");
+    }
+    let lane_flags = if flags.is_empty() {
         "baseline:all-off".to_string()
+    } else {
+        flags.join("+")
     };
     let m = RunMeta {
         commit: std::env::var("CRUX_BENCH_COMMIT").unwrap_or_else(|_| "unknown".to_string()),

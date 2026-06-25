@@ -26,6 +26,7 @@
 
 pub mod agent;
 pub mod agent_passport;
+pub mod budget;
 pub mod category_enforce;
 pub mod crc_v1;
 pub mod dispatch;
