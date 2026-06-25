@@ -98,6 +98,7 @@ jobs:
           tags: local/crux-daemon:scan
           build-args: |
             GIT_SHA=${{ github.sha }}
+            RELEASE_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
 
       - name: Trivy scan (SARIF report, CRITICAL+HIGH)
         # aquasecurity/trivy-action v0.36.0
@@ -203,6 +204,7 @@ jobs:
           # (the build context has no .git, so build.rs can't derive it).
           build-args: |
             GIT_SHA=${{ github.sha }}
+            RELEASE_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
 
       # --- Image SBOM + keyless sign/attest (ExecPlan crux-supply-chain-attestation-2026-06-11, M3) ---
       # syft generates the SBOM from the image as pushed (digest-addressed),
