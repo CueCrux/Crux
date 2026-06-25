@@ -99,6 +99,11 @@
   .crux-degraded-banner .cdb-reasons { margin:2px 0 0; padding-left:18px; opacity:.95; }
   .crux-degraded-banner .cdb-hint { opacity:.85; }
   .crux-degraded-banner .cdb-recheck { align-self:center; background:var(--err); color:#fff; border:none; border-radius:var(--radius-full); padding:4px 12px; font-weight:700; cursor:pointer; }
+  /* bottom-right build/version footer */
+  .crux-footer { position:fixed; right:12px; bottom:9px; z-index:30; font-size:11px; letter-spacing:.3px; color:var(--text-muted); background:var(--surface-glass-strong); border:1px solid var(--border-default); border-radius:var(--radius-full); padding:2px 9px; pointer-events:auto; }
+  .crux-footer__link { font-weight:800; color:var(--text-secondary); text-decoration:none; }
+  .crux-footer__link:hover { color:var(--accent, #1d4ed8); text-decoration:underline; }
+  .crux-footer--dev .crux-footer__link { color:var(--run); }
   /* live-data status tiles (loading/empty/error/unavailable) — inert placeholders */
   .gnode[data-kind="loading"], .gnode[data-kind="empty"], .gnode[data-kind="unavailable"], .gnode[data-kind="error"] { opacity:.9; font-style:italic; }
   .gnode[data-kind="loading"] .gstripe { background:var(--run); animation:cxpulse 1s ease-in-out infinite; }
@@ -646,6 +651,8 @@
     </div>
     <button class="cdb-recheck" id="cdbRecheck" type="button">Re-check</button>
   </div>
+
+  <div id="cruxFooter" class="crux-footer"></div>
 
   <div class="toolbar">
     <div class="crumbs" id="breadcrumb"></div>
@@ -1425,6 +1432,39 @@ function renderDegradedBanner(){
     el.hidden=false;
   } else { el.hidden=true; }
 }
+
+// ── bottom-right version/build footer ─────────────────────────────
+// CRUX_RELEASE is substituted at image-build time (Dockerfile sed) with the git
+// tag on release builds; on untagged/edge/local builds it stays the placeholder
+// or empty, and the footer falls back to the build commit from /healthz.
+const CRUX_RELEASE_RAW = "__CRUX_RELEASE__";
+const CRUX_RELEASE = (CRUX_RELEASE_RAW && CRUX_RELEASE_RAW.charAt(0) !== '_') ? CRUX_RELEASE_RAW.trim() : "";
+const CRUX_REPO = "https://github.com/CueCrux/Crux";
+let BUILD = { version:'', commit:'' };
+function renderFooter(){
+  const el=document.getElementById('cruxFooter'); if(!el) return;
+  if(CRUX_RELEASE){
+    el.classList.remove('crux-footer--dev');
+    el.innerHTML = `<a class="crux-footer__link" href="${CRUX_REPO}/releases/tag/${encodeURIComponent(CRUX_RELEASE)}" target="_blank" rel="noreferrer" title="Crux Daemon release ${esc(CRUX_RELEASE)}"><strong>${esc(CRUX_RELEASE)}</strong></a>`;
+  } else {
+    // Not an official tag — show the build commit (or cargo version) so it is
+    // clearly an unreleased build.
+    el.classList.add('crux-footer--dev');
+    const c=(BUILD.commit||'').trim();
+    const short = c && c!=='unknown' ? c.slice(0,7) : '';
+    const label = short ? ('build '+short) : (BUILD.version ? ('dev '+BUILD.version) : 'dev build');
+    const href = short ? `${CRUX_REPO}/commit/${encodeURIComponent(c)}` : CRUX_REPO;
+    el.innerHTML = `<a class="crux-footer__link" href="${href}" target="_blank" rel="noreferrer" title="Unreleased build — not on an official tag${BUILD.version?(' · v'+esc(BUILD.version)):''}"><strong>${esc(label)}</strong></a>`;
+  }
+}
+async function initFooter(){
+  renderFooter();                       // show release immediately (no fetch needed)
+  if(!CRUX_RELEASE){                     // only need the commit for the untagged fallback
+    try{ const r=await fetch('/healthz',{cache:'no-store'}); if(r.ok){ const h=await r.json(); BUILD.version=(h&&h.build&&h.build.version)||''; BUILD.commit=(h&&h.build&&h.build.commit)||''; } }catch{}
+    renderFooter();
+  }
+}
+
 // ── per-panel transforms (json → child nodes) ──
 const WSTATE = { planned:'planned', in_progress:'in_progress', blocked:'blocked', complete:'done', deployed:'done', archive:'done', done:'done' };
 function txWork(json){   // M3 — kanban WorkItem[] → execplan nodes (status drives the stage filter)
@@ -1881,6 +1921,7 @@ async function bootProbe(){
   const rc=document.getElementById('cdbRecheck'); if(rc) rc.addEventListener('click', cruxHealthPoll);
   cruxHealthPoll();
   if(typeof setInterval==='function'){ setInterval(cruxHealthPoll, 15000); }
+  initFooter();
 }
 // debug/test handle (used by the Node smoke harness; inert in prod)
 try{ globalThis.__cx = { get LIVE(){return LIVE;}, setLive:(v)=>{LIVE=v;}, N, LOADERS, loadState, ensureLoaded, mergeChildren, makeStatusNode, bootProbe, prefetchScope, api, idFor }; }catch{}
