@@ -34,6 +34,7 @@ pub mod gaps;
 pub mod hooks;
 pub mod identity_cli;
 pub mod inspect_receipt;
+pub mod learn;
 pub mod login;
 pub mod machine;
 pub mod memory;
