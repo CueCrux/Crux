@@ -32,6 +32,7 @@ pub mod handoff;
 pub mod hardening;
 pub mod identity;
 pub mod kinds;
+pub mod learn;
 pub mod loopback_auth;
 pub mod memory;
 pub mod memory_use;
@@ -1972,6 +1973,12 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
             description: traces::TOOL_DESCRIPTION.to_string(),
             input_schema: traces::tool_input_schema(),
         },
+        // ── Session-mining / loop-weighting (token-efficiency M4) ─────────
+        ToolDefinition {
+            name: "learn".to_string(),
+            description: learn::TOOL_DESCRIPTION.to_string(),
+            input_schema: learn::tool_input_schema(),
+        },
         // ── Activity log agent lane (crux-dual-surface-activity-log M2) ───
         ToolDefinition {
             name: "activity_recent".to_string(),
@@ -2589,6 +2596,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "feature_trigger_audit",   "output": "{ content: [...], capability: <updated payload>, version }" },
         { "tool": "feature_suggest_next",    "output": "{ content: [...], suggestions: [{kind, capability_id?, gap_type?, severity?, promise?, rationale}], count }" },
         { "tool": "tool_trace_recent",       "output": "{ content: [...], traces: [{tool, ts_us, turn_id?, predicted_effects: [{kind, entity, key, ts_us?}], outcome}], count, feature_disabled? } — per-passport; reserved-prefix effects stripped." },
+        { "tool": "learn",                   "output": "{ content: [...], proposals: [{signature, occurrences, wasted_tokens, draft_guardrail}], count, scanned, propose_only:true, feature_disabled? } — per-passport; read-only, ranks looping re-fetches by measured token waste, writes nothing." },
         { "tool": "activity_recent",         "output": "{ content: [...], session_id, tenant_id, feature_enabled, token_budget, returned, truncated, rows: [{turn_id?, seq, ts, kind, intent?, tool?, confidence?, fact_refs, receipt_ids, preview}] } — per (tenant,session); reserved-prefix-stripped, privacy-scoped, budget-trimmed." },
         { "tool": "session_token_usage",     "output": "{ content: [...], passport, used, tokens_in, tokens_out, declared_budget_in, calls, estimator, limit?, pct? } — per-passport estimated token spend (~4 chars/token); limit/pct only when CORECRUXD_SESSION_TOKEN_BUDGET is set." },
         { "tool": "approval_request",        "output": "{ content: [...], request_id, status: 'pending'|'feature_disabled', risk_tier, tenant_id, feature_enabled } — pending entries also visible via list_work(state='pending_approval')." },
@@ -2745,6 +2753,8 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "feature_suggest_next" => features::handle_feature_suggest_next(args, ctx).await,
         // Typed action traces (agent-ux-06).
         "tool_trace_recent" => traces::handle_tool_trace_recent(args, ctx).await,
+        // Session-mining / loop-weighting (token-efficiency M4).
+        "learn" => learn::handle_learn(args, ctx).await,
         "activity_recent" => activity::handle_activity_recent(args, ctx).await,
         // Token accounting (action-ledger M1).
         "session_token_usage" => token_usage::handle_session_token_usage(args, ctx).await,
@@ -2839,7 +2849,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 109; // main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4).
+    const TOOL_COUNT: usize = 110; // main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

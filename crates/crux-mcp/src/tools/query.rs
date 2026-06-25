@@ -45,19 +45,30 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
         min_score,
     );
 
-    // Apply token budget: trim results if cumulative doc tokens exceed budget.
-    let hits = if let Some(budget) = token_budget {
-        let mut cumulative = 0usize;
-        result
-            .hits
-            .into_iter()
-            .take_while(|h| {
-                cumulative += h.doc_length_tokens as usize;
-                cumulative <= budget
-            })
-            .collect::<Vec<_>>()
-    } else {
-        result.hits
+    // Apply token budget. M1 (CRUX_BUDGET_REVERSIBLE, default OFF): the response
+    // is pointer-only, so budget the *emitted* pointer tier — admit
+    // `budget / POINTER_TOKENS` hits — instead of charging the *full-doc*
+    // hydration cost and dropping the overflow. Far more candidates fit the same
+    // budget (the full price stays in `cost_estimate.full`; `total_candidates`
+    // discloses any capped remainder; expand via `result_id`). OFF ⇒ the legacy
+    // `take_while`-drop, byte-identical to pre-M1.
+    let hits = match token_budget {
+        Some(budget) if crate::budget::reversible_enabled() => {
+            let max_pointers = crate::budget::pointers_within_budget(budget);
+            result.hits.into_iter().take(max_pointers).collect::<Vec<_>>()
+        }
+        Some(budget) => {
+            let mut cumulative = 0usize;
+            result
+                .hits
+                .into_iter()
+                .take_while(|h| {
+                    cumulative += h.doc_length_tokens as usize;
+                    cumulative <= budget
+                })
+                .collect::<Vec<_>>()
+        }
+        None => result.hits,
     };
 
     let results_json: Vec<Value> = hits
@@ -106,7 +117,9 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string_pretty(&inner).unwrap_or_default()
+            // M3: minified on the wire when CRUX_PAYLOAD_COMPACT is on; pretty
+            // (byte-identical to pre-M3) when off.
+            "text": crate::payload::serialize(&inner)
         }]
     }))
 }
@@ -172,7 +185,7 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string_pretty(&inner).unwrap_or_default()
+            "text": crate::payload::serialize(&inner)
         }]
     }))
 }
@@ -209,27 +222,32 @@ pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Val
         let id_str = rid.as_str().unwrap_or_default();
         let parts: Vec<&str> = id_str.split(':').collect();
         if parts.len() != 2 {
-            errors.push(json!({ "result_id": id_str, "error": "invalid result_id format" }));
+            errors.push(
+                json!({ "result_id": id_str, "error": "invalid result_id format", "error_kind": "invalid_format" }),
+            );
             continue;
         }
 
         let seg_idx: usize = parts[0].parse().unwrap_or(usize::MAX);
         let doc_id: usize = parts[1].parse().unwrap_or(usize::MAX);
 
+        // T.2: a handle whose segment is gone (forgotten / re-paved / not yet
+        // loaded) is `evicted` — the agent must re-query, not retry. Typed so a
+        // client distinguishes a stale handle from a malformed one.
         if seg_idx >= readers.len() {
-            errors.push(json!({ "result_id": id_str, "error": "segment not found" }));
+            errors.push(json!({ "result_id": id_str, "error": "segment not found", "error_kind": "evicted" }));
             continue;
         }
 
         let reader = readers[seg_idx];
         if doc_id >= reader.docs.len() {
-            errors.push(json!({ "result_id": id_str, "error": "doc_id out of range" }));
+            errors.push(json!({ "result_id": id_str, "error": "doc_id out of range", "error_kind": "evicted" }));
             continue;
         }
 
         let doc = &reader.docs[doc_id];
         if doc.tenant_hash_full != tenant_hash {
-            errors.push(json!({ "result_id": id_str, "error": "tenant mismatch" }));
+            errors.push(json!({ "result_id": id_str, "error": "tenant mismatch", "error_kind": "tenant_mismatch" }));
             continue;
         }
         tokens_loaded += doc.doc_length_tokens as usize;
@@ -270,7 +288,7 @@ pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Val
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string_pretty(&response).unwrap_or_default()
+            "text": crate::payload::serialize(&response)
         }]
     }))
 }
@@ -423,5 +441,88 @@ mod tests {
         let data = err.data.unwrap();
         assert_eq!(data["param"], "result_ids");
         assert_eq!(data["required"], true);
+    }
+
+    // ── M1: reversible overflow (CRUX_BUDGET_REVERSIBLE) ──────────────────────
+
+    /// Seed an index with `n` docs of varied length, all matching "alpha".
+    async fn seed_alpha_index(ctx: &McpContext, tenant: &str, n: u32) {
+        use corecrux_index::CcxiBuilder;
+        let th = xxhash_rust::xxh64::xxh64(tenant.as_bytes(), 0);
+        let mut b = CcxiBuilder::new(0, 1, 1);
+        for i in 0..n {
+            // ~100 tokens each: "alpha" repeated so BM25 returns every doc.
+            let text = std::iter::repeat("alpha").take(100).collect::<Vec<_>>().join(" ");
+            b.add_document(i, &text, i * 1000, th);
+        }
+        let bytes = b.build();
+        ctx.retrieval_index.write().await.load_ccxi_bytes(&bytes).unwrap();
+    }
+
+    fn pointer_count(resp: &serde_json::Value) -> usize {
+        let text = resp["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        // CRC-v1 default → pointers[]; count them.
+        parsed["pointers"].as_array().map(Vec::len).unwrap_or(0)
+    }
+
+    /// The headline parity: flag OFF drops at full-doc cost; flag ON budgets the
+    /// emitted pointer tier and admits strictly more candidates for the SAME
+    /// budget — while staying within `budget / POINTER_TOKENS` pointers (QC.2).
+    /// One test owns the env var (no other test reads it) to avoid parallel
+    /// races on process-global env.
+    #[tokio::test]
+    async fn reversible_admits_more_than_full_doc_drop() {
+        let ctx = test_ctx();
+        seed_alpha_index(&ctx, "t1", 30).await;
+        let budget = 200u64; // 200/40 = 5 pointers when reversible.
+
+        // OFF: legacy take_while over ~100-tok docs → at most 2 fit 200.
+        std::env::remove_var(crate::budget::REVERSIBLE_ENV);
+        let off = handle_query(
+            &json!({"tenant_id": "t1", "query": "alpha", "limit": 50, "token_budget": budget}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let off_n = pointer_count(&off);
+
+        // ON: pointer-budgeted → exactly 5, strictly more than OFF.
+        std::env::set_var(crate::budget::REVERSIBLE_ENV, "1");
+        let on = handle_query(
+            &json!({"tenant_id": "t1", "query": "alpha", "limit": 50, "token_budget": budget}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let on_n = pointer_count(&on);
+        std::env::remove_var(crate::budget::REVERSIBLE_ENV);
+
+        assert_eq!(
+            on_n,
+            crate::budget::pointers_within_budget(budget as usize),
+            "ON admits budget/POINTER_TOKENS"
+        );
+        assert!(on_n > off_n, "reversible recall lift: ON {on_n} !> OFF {off_n}");
+        // Disclosure intact: total_candidates still reports the full set.
+        let on_text = on["content"][0]["text"].as_str().unwrap();
+        let on_parsed: Value = serde_json::from_str(on_text).unwrap();
+        assert_eq!(on_parsed["meta"]["total_candidates"], 30);
+    }
+
+    /// T.2: an expand handle whose segment is gone returns a typed `evicted`
+    /// error (not a malformed/format error) so the caller re-queries.
+    #[tokio::test]
+    async fn query_expand_evicted_error_kind() {
+        let ctx = test_ctx();
+        let result = handle_query_expand(
+            &json!({"tenant_id": "t1", "result_ids": ["9:9"], "contract": "legacy"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["errors"][0]["error_kind"], "evicted");
     }
 }

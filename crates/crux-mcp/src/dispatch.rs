@@ -458,7 +458,20 @@ async fn dispatch_tool_call(
         crate::ledger::emit(ctx.daemon_base_url.clone(), &passport, body);
     }
 
-    crate::traces::record_dispatch(&passport, name, turn_id.as_deref(), predicted, trace_outcome).await;
+    // M4: record the canonical signature + response-token estimate alongside the
+    // trace so `crux learn` can mine the ring for looping re-fetches. Both ride
+    // data already computed on this path (`args`, `est_out`).
+    let learn_signature = crate::learn::canonical_signature(name, &args);
+    crate::traces::record_dispatch_metered(
+        &passport,
+        name,
+        turn_id.as_deref(),
+        Some(learn_signature),
+        Some(est_out),
+        predicted,
+        trace_outcome,
+    )
+    .await;
 
     match outcome {
         Ok(result) => {
