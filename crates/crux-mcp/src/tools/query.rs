@@ -481,8 +481,9 @@ mod tests {
         seed_alpha_index(&ctx, "t1", 30).await;
         let budget = 200u64; // 200/40 = 5 pointers when reversible.
 
-        // OFF: legacy take_while over ~100-tok docs → at most 2 fit 200.
-        std::env::remove_var(crate::budget::REVERSIBLE_ENV);
+        // OFF (explicit opt-out, since CO-3 makes ON the default): legacy
+        // take_while over ~100-tok docs → at most 2 fit 200.
+        std::env::set_var(crate::budget::REVERSIBLE_ENV, "0");
         let off = handle_query(
             &json!({"tenant_id": "t1", "query": "alpha", "limit": 50, "token_budget": budget}),
             &ctx,

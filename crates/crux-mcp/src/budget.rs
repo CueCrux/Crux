@@ -25,30 +25,39 @@
 //! capped remainder, so nothing is silently lost: the agent expands the pointers
 //! it wants via `query_expand` (handle = `result_id`, OD-A).
 //!
-//! Flag `CRUX_BUDGET_REVERSIBLE` (default **OFF**). OFF ⇒ the legacy
-//! `take_while`-drop, byte-identical to pre-M1.
+//! Flag `CRUX_BUDGET_REVERSIBLE` (**default ON** since the CO-3 cutover). Opt
+//! back out with `CRUX_BUDGET_REVERSIBLE=0` (also `false`/`off`/`no`) for the
+//! legacy `take_while`-drop, byte-identical to pre-M1 — the escape hatch /
+//! instant rollback. The cutover canary on the host daemon proved the flip lifts
+//! `query_facts` recall 1→10 at budget 60 while emitting valid JSON the
+//! passthrough consumers (WikiCrux, VaultCrux) parse unchanged.
 
 /// Per-pointer token weight — mirrors `crc_v1`'s `cost_estimate.pointer`
 /// (`n * 40`). The reversible budget admits `budget / POINTER_TOKENS` pointers.
 pub const POINTER_TOKENS: usize = 40;
 
-/// Env flag name for M1 reversible overflow. Default OFF.
+/// Env flag name for M1 reversible overflow. **Default ON** since CO-3; set to
+/// `0`/`false`/`off`/`no` to opt back out to the legacy drop.
 pub const REVERSIBLE_ENV: &str = "CRUX_BUDGET_REVERSIBLE";
 
-/// Truthy-env parse matching the crate convention (see `ledger::env_truthy`).
-fn env_truthy(var: &str) -> bool {
+/// Opt-out env parse: the flag is **ON unless explicitly disabled**. Unset /
+/// `""` / any value other than `0`/`false`/`off`/`no` ⇒ true; only an explicit
+/// falsey value ⇒ false. (Inverts the pre-cutover `env_truthy` default.)
+fn env_opt_out_enabled(var: &str) -> bool {
     match std::env::var(var) {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
-            !matches!(v.as_str(), "" | "0" | "false" | "off" | "no")
+            !matches!(v.as_str(), "0" | "false" | "off" | "no")
         }
-        Err(_) => false,
+        // Unset ⇒ default ON (the CO-3 cutover).
+        Err(_) => true,
     }
 }
 
-/// True when reversible overflow is enabled via `CRUX_BUDGET_REVERSIBLE`.
+/// True when reversible overflow is enabled (the default since CO-3).
+/// `CRUX_BUDGET_REVERSIBLE=0`/`false`/`off`/`no` opts back out to the legacy drop.
 pub fn reversible_enabled() -> bool {
-    env_truthy(REVERSIBLE_ENV)
+    env_opt_out_enabled(REVERSIBLE_ENV)
 }
 
 /// Number of pointers that fit `budget` at the emitted pointer price (≥1, so a
@@ -120,12 +129,18 @@ mod tests {
 
     #[test]
     fn env_truthy_matches_convention() {
-        std::env::set_var("CRUX_BUDGET_REVERSIBLE_TEST_A", "1");
-        assert!(env_truthy("CRUX_BUDGET_REVERSIBLE_TEST_A"));
-        std::env::set_var("CRUX_BUDGET_REVERSIBLE_TEST_A", "no");
-        assert!(!env_truthy("CRUX_BUDGET_REVERSIBLE_TEST_A"));
-        std::env::remove_var("CRUX_BUDGET_REVERSIBLE_TEST_A");
-        assert!(!env_truthy("CRUX_BUDGET_REVERSIBLE_TEST_A"));
+        // CO-3: default ON when unset; only an explicit falsey value opts out.
+        let k = "CRUX_BUDGET_REVERSIBLE_TEST_A";
+        std::env::remove_var(k);
+        assert!(env_opt_out_enabled(k), "unset ⇒ default ON");
+        std::env::set_var(k, "1");
+        assert!(env_opt_out_enabled(k));
+        std::env::set_var(k, "no");
+        assert!(!env_opt_out_enabled(k), "no ⇒ opt-out");
+        std::env::set_var(k, "0");
+        assert!(!env_opt_out_enabled(k), "0 ⇒ opt-out");
+        std::env::remove_var(k);
+        assert!(env_opt_out_enabled(k));
     }
 
     // ---- M1 part 2 — fact-path reversible overflow -------------------------

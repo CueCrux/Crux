@@ -18,29 +18,40 @@
 //! value is ever touched (R4), so a code/string payload that happens to contain
 //! significant whitespace is preserved byte-for-byte inside its quotes.
 //!
-//! Flag OFF ⇒ byte-identical to today (the regression safety net for every
-//! consumer: VaultCrux BFF, Crucible backends, WikiCrux deref).
+//! ## Default-ON cutover (CO-1, 2026-06-25)
+//!
+//! As of the token-efficiency default-ON cutover (CO-1), compaction is the
+//! **default**: it is pure whitespace minification with identical parsed
+//! semantics, the cross-client consumers all `JSON.parse` the body (whitespace-
+//! insensitive), and the contract pre-flight confirmed no consumer string-scrapes
+//! the payload. An operator opts back out to pretty with
+//! `CRUX_PAYLOAD_COMPACT=0` (also `false`/`off`/`no`) — that OFF path is still
+//! byte-identical to pre-M3, the permanent escape hatch / instant rollback.
 
 use serde_json::Value;
 
-/// Env flag name for M3 payload compaction. Default OFF.
+/// Env flag name for M3 payload compaction. **Default ON** since the CO-1
+/// cutover; set to `0`/`false`/`off`/`no` to opt back out to pretty.
 pub const COMPACT_ENV: &str = "CRUX_PAYLOAD_COMPACT";
 
-/// Truthy-env parse matching the crate convention (see `ledger::env_truthy`):
-/// unset / `""` / `0` / `false` / `off` / `no` ⇒ false; anything else ⇒ true.
-fn env_truthy(var: &str) -> bool {
+/// Opt-out env parse: the flag is **ON unless explicitly disabled**. Unset /
+/// `""` / any value other than `0`/`false`/`off`/`no` ⇒ true; only an explicit
+/// falsey value ⇒ false. (Inverts the pre-cutover `env_truthy` default.)
+fn env_opt_out_enabled(var: &str) -> bool {
     match std::env::var(var) {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
-            !matches!(v.as_str(), "" | "0" | "false" | "off" | "no")
+            !matches!(v.as_str(), "0" | "false" | "off" | "no")
         }
-        Err(_) => false,
+        // Unset ⇒ default ON (the CO-1 cutover).
+        Err(_) => true,
     }
 }
 
-/// True when wire-payload compaction is enabled via `CRUX_PAYLOAD_COMPACT`.
+/// True when wire-payload compaction is enabled (the default since CO-1).
+/// `CRUX_PAYLOAD_COMPACT=0`/`false`/`off`/`no` opts back out to pretty.
 pub fn compact_enabled() -> bool {
-    env_truthy(COMPACT_ENV)
+    env_opt_out_enabled(COMPACT_ENV)
 }
 
 /// Serialize a retrieval payload for the wire. `compact == true` ⇒ minified
@@ -56,7 +67,8 @@ pub fn serialize_with(value: &Value, compact: bool) -> String {
 }
 
 /// Serialize a retrieval payload honoring the `CRUX_PAYLOAD_COMPACT` flag
-/// (default OFF ⇒ pretty, byte-identical to pre-M3 behaviour).
+/// (**default ON** since CO-1 ⇒ minified; opt out with `CRUX_PAYLOAD_COMPACT=0`
+/// for the byte-identical pre-M3 pretty payload).
 pub fn serialize(value: &Value) -> String {
     serialize_with(value, compact_enabled())
 }
@@ -112,14 +124,21 @@ mod tests {
     }
 
     #[test]
-    fn env_truthy_matches_convention() {
-        // Default OFF when unset (cannot rely on env in parallel tests, so test
-        // the parse via a name we control and set/unset locally).
-        std::env::set_var("CRUX_PAYLOAD_COMPACT_TEST_A", "1");
-        assert!(env_truthy("CRUX_PAYLOAD_COMPACT_TEST_A"));
-        std::env::set_var("CRUX_PAYLOAD_COMPACT_TEST_A", "off");
-        assert!(!env_truthy("CRUX_PAYLOAD_COMPACT_TEST_A"));
-        std::env::remove_var("CRUX_PAYLOAD_COMPACT_TEST_A");
-        assert!(!env_truthy("CRUX_PAYLOAD_COMPACT_TEST_A"));
+    fn env_opt_out_default_on_and_explicit_off() {
+        // CO-1: default ON when unset; only an explicit falsey value opts out.
+        // (Test the parse via a name we control to avoid racing the real env.)
+        let k = "CRUX_PAYLOAD_COMPACT_TEST_A";
+        std::env::remove_var(k);
+        assert!(env_opt_out_enabled(k), "unset ⇒ default ON");
+        std::env::set_var(k, "1");
+        assert!(env_opt_out_enabled(k), "truthy ⇒ ON");
+        std::env::set_var(k, "0");
+        assert!(!env_opt_out_enabled(k), "0 ⇒ opt-out OFF");
+        std::env::set_var(k, "off");
+        assert!(!env_opt_out_enabled(k), "off ⇒ opt-out OFF");
+        std::env::set_var(k, "false");
+        assert!(!env_opt_out_enabled(k), "false ⇒ opt-out OFF");
+        std::env::remove_var(k);
+        assert!(env_opt_out_enabled(k));
     }
 }
