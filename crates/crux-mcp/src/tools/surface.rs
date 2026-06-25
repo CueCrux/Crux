@@ -225,7 +225,8 @@ pub fn tool_affinity(tool: &str) -> &'static str {
         | "get_observation"
         | "verify_observation"
         | "tool_trace_recent"
-        | "learn" => "audit",
+        | "learn"
+        | "token_savings" => "audit",
         "proof_verify" | "receipt_verify" | "output_attest" => "proof",
         _ => "",
     }
