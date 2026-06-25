@@ -1,6 +1,6 @@
 # Token-Efficiency Baseline (M0)
 
-> ExecPlan: `PlanCrux/.agent/execplans/crux-headroom-token-efficiency-learnings-2026-06-24.md` — milestone **M0**.
+> Token-efficiency learnings (Headroom port) — milestone **M0** (baseline + measurement harness).
 > Harness: [`crates/crux-mcp/examples/token_bench.rs`](../../crates/crux-mcp/examples/token_bench.rs).
 > Corpus: **`__synthetic__::token-bench`** (deterministic, in-process — no daemon/network/prod data).
 > Baseline commit: `f9d8e6b` (origin/main at branch cut). All efficiency flags OFF (`lane_flags=baseline:all-off`).
@@ -71,7 +71,7 @@ byte-identical across runs** (the M0 reproducibility gate) — `commit_sha` /
 M0 calls for a `feature_coverage_report` check on the daemon retrieval
 capability. The `feature_*` MCP tools are **not exposed on the current
 local-only daemon surface** (`sync_status.mode = local_only`; the Features lens
-lives on the MCP-wired host daemon per `PlanCrux/CLAUDE.md §5`). No critical/high
+lives on the MCP-wired host daemon). No critical/high
 gap could be pulled in this environment — **deferred**: re-run the coverage check
 against the host daemon before any default-ON cutover (the follow-up gated plan).
 
