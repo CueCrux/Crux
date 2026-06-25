@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use corecrux_memory::fact_store::{FactQuery, FactStore};
 
 use crate::fact_helpers::dedup_latest;
@@ -99,6 +99,8 @@ pub struct ParsedPlan {
     /// Slugs from `Extended by [[<slug>]]` declaration lines — plans that build
     /// on this one.
     pub extended_by: Vec<String>,
+    /// Distinct `OD-<n>` Open-Decision ids referenced anywhere in the plan body.
+    pub open_decision_refs: Vec<String>,
 }
 
 /// Rollup of facts stored under `entity = "execplan:<slug>"`. Fields cover the
@@ -228,6 +230,8 @@ pub fn parse_plan(md: &str) -> ParsedPlan {
                 out.extended_by.push(slug);
             }
         }
+
+        collect_od_refs(trimmed, &mut out.open_decision_refs);
 
         if trimmed.starts_with("## ") {
             let heading = trimmed.trim_start_matches("## ").trim().to_ascii_lowercase();
@@ -406,6 +410,37 @@ fn extract_ref_slugs(line: &str, keyword: &str) -> Vec<String> {
         }
     }
     slugs
+}
+
+/// Collect distinct `OD-<n>` ids referenced in a line into `out` (first-seen
+/// order preserved). Requires a non-alphanumeric boundary before `OD` and after
+/// the digits, mirroring the `\bOD-\d+\b` lint convention so `FOOD-9` / `OD-3X`
+/// don't match. ASCII-only, so byte indices align with the `&str`.
+fn collect_od_refs(line: &str, out: &mut Vec<String>) {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        if bytes[i] == b'O'
+            && bytes[i + 1] == b'D'
+            && bytes[i + 2] == b'-'
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
+            let mut j = i + 3;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            let next_ok = j >= bytes.len() || !bytes[j].is_ascii_alphanumeric();
+            if j > i + 3 && next_ok {
+                let id = format!("OD-{}", &line[i + 3..j]);
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
 }
 
 /// Find the first `M<digits>` token in a line, returning the number.
@@ -631,6 +666,8 @@ fn mk_item(
         superseded_by,
         depends_on: parsed.depends_on.clone(),
         extended_by: parsed.extended_by.clone(),
+        // Raw OD refs; apply_open_decisions refines these to the open subset.
+        open_decisions: parsed.open_decision_refs.clone(),
         orchestrator_id: None,
         milestones_done,
         milestones_total,
@@ -730,6 +767,9 @@ pub fn list_execplans(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::
         return Ok(Vec::new());
     }
     let mut facts_by_slug = collect_execplan_facts(store);
+    let od_registry = open_decisions_path_from_env()
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .map(|s| parse_open_decisions(&s));
     let mut out = Vec::with_capacity(files.len());
     for file in files {
         let parsed = parse_plan(&file.content);
@@ -749,6 +789,7 @@ pub fn list_execplans(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::
         out.push(item);
     }
     apply_reciprocal_refs(&mut out);
+    apply_open_decisions(&mut out, od_registry.as_ref(), now_unix_ms);
     out.sort_by(|a, b| b.updated_at_unix_ms.cmp(&a.updated_at_unix_ms));
     Ok(out)
 }
@@ -805,6 +846,121 @@ fn apply_reciprocal_refs(items: &mut [WorkItem]) {
         it.depends_on.dedup();
         it.extended_by.sort();
         it.extended_by.dedup();
+    }
+}
+
+/// Env var pointing at the Open Decisions registry markdown
+/// (`docs/master-plan/tracking/open-decisions.md`). Unset → OD wiring is off and
+/// `WorkItem::open_decisions` stays empty.
+pub const OPEN_DECISIONS_PATH_ENV: &str = "CRUX_OPEN_DECISIONS_PATH";
+
+/// Resolve the OD registry path from the environment. `None` (or empty) → the
+/// projection leaves `open_decisions` empty.
+fn open_decisions_path_from_env() -> Option<PathBuf> {
+    std::env::var(OPEN_DECISIONS_PATH_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// One row of the Open Decisions registry table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenDecision {
+    pub id: String,
+    /// The `Decides-by` cell verbatim — a `YYYY-MM-DD` date or free text
+    /// (`"M1"`, `"RCX rollout phase 2"`, `"—"`).
+    pub decides_by: String,
+    pub resolved: bool,
+}
+
+/// Parse the Open Decisions registry markdown table into `id → OpenDecision`.
+/// Cells (after splitting a row on `|`): 1=id, 7=decides-by, 8=status. Only rows
+/// whose first cell is an `OD-<n>` id are taken — header / separator / prose
+/// lines are skipped.
+pub fn parse_open_decisions(md: &str) -> HashMap<String, OpenDecision> {
+    let mut out = HashMap::new();
+    for line in md.lines() {
+        let t = line.trim_start();
+        if !t.starts_with("| OD-") {
+            continue;
+        }
+        let cells: Vec<&str> = t.split('|').map(|c| c.trim()).collect();
+        // 0 = before-first-pipe, 1 = id … 7 = decides-by, 8 = status.
+        if cells.len() < 9 {
+            continue;
+        }
+        let id = cells[1].to_string();
+        if !id.starts_with("OD-") {
+            continue;
+        }
+        let resolved = cells[8].to_ascii_lowercase().contains("resolved");
+        out.insert(
+            id.clone(),
+            OpenDecision {
+                id,
+                decides_by: cells[7].to_string(),
+                resolved,
+            },
+        );
+    }
+    out
+}
+
+/// True when `decides_by` is a `YYYY-MM-DD` date strictly before `now`. Free-text
+/// decides-by values (milestone tags, "—") are never overdue.
+fn od_is_overdue(decides_by: &str, now_unix_ms: u64) -> bool {
+    NaiveDate::parse_from_str(decides_by.trim(), "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(23, 59, 59))
+        .is_some_and(|dt| (now_unix_ms as i64) > Utc.from_utc_datetime(&dt).timestamp_millis())
+}
+
+/// Numeric part of an `OD-<n>` id, for stable sorting. Non-conforming → MAX.
+fn od_num(id: &str) -> u32 {
+    id.strip_prefix("OD-").and_then(|n| n.parse().ok()).unwrap_or(u32::MAX)
+}
+
+/// Cross-reference each item's referenced `OD-<n>` ids (populated raw by
+/// `mk_item`) against the registry and keep only the *unresolved* ones, overdue
+/// first. An **overdue** open OD soft-blocks an otherwise-active
+/// (`planned`/`in_progress`) plan — flipping it to `blocked` with a
+/// `blocker_reason` — because the registry carries no per-OD blocker flag, so
+/// "past its decides-by date and still open" is the strongest available signal.
+/// Non-overdue open ODs annotate `open_decisions` without changing state.
+/// `registry == None` (path unset/unreadable) → clears `open_decisions`, since
+/// without the registry we can't assert any are still open.
+fn apply_open_decisions(items: &mut [WorkItem], registry: Option<&HashMap<String, OpenDecision>>, now_unix_ms: u64) {
+    for item in items.iter_mut() {
+        let Some(reg) = registry else {
+            item.open_decisions.clear();
+            continue;
+        };
+        // (id, decides_by, overdue) for refs that are registered AND open.
+        let mut open: Vec<(String, String, bool)> = item
+            .open_decisions
+            .iter()
+            .filter_map(|id| reg.get(id))
+            .filter(|od| !od.resolved)
+            .map(|od| {
+                let overdue = od_is_overdue(&od.decides_by, now_unix_ms);
+                (od.id.clone(), od.decides_by.clone(), overdue)
+            })
+            .collect();
+        if open.is_empty() {
+            item.open_decisions.clear();
+            continue;
+        }
+        // Overdue first, then by numeric id.
+        open.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| od_num(&a.0).cmp(&od_num(&b.0))));
+        item.open_decisions = open.iter().map(|(id, _, _)| id.clone()).collect();
+
+        // An overdue open OD soft-blocks an active plan.
+        if let Some((id, decides_by, _)) = open.iter().find(|(_, _, overdue)| *overdue) {
+            if item.state == "planned" || item.state == "in_progress" {
+                item.state = "blocked".to_string();
+                item.blocker_reason = Some(format!("Overdue open decision {id} (decides-by {decides_by})"));
+            }
+        }
     }
 }
 
@@ -867,12 +1023,21 @@ mod tests {
             superseded_by: None,
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
             extended_by: extended_by.iter().map(|s| s.to_string()).collect(),
+            open_decisions: Vec::new(),
             orchestrator_id: None,
             milestones_done: None,
             milestones_total: None,
             notes_count: None,
             provenance: None,
         }
+    }
+
+    /// A `planned` ExecPlan item carrying raw OD references (as `mk_item` leaves
+    /// them, pre-`apply_open_decisions`).
+    fn wi_od(slug: &str, ods: &[&str]) -> WorkItem {
+        let mut w = wi(slug, &[], &[]);
+        w.open_decisions = ods.iter().map(|s| s.to_string()).collect();
+        w
     }
 
     fn item<'a>(items: &'a [WorkItem], slug: &str) -> &'a WorkItem {
@@ -1066,6 +1231,83 @@ mod tests {
         assert_eq!(prov.contributing_agents, vec!["agent-amy".to_string()]);
         assert_eq!(prov.commit_shas, vec!["abc123".to_string()]);
         assert_eq!(prov.decision_count, 2);
+    }
+
+    // ── M3: Open Decisions registry wiring ──
+
+    const REGISTRY: &str = "\
+# Open Decisions Registry
+
+| id | Question | Plane | Options | Owner | Opened | Decides-by | Status | Resolution |
+|---|---|---|---|---|---|---|---|---|
+| OD-1 | q1 | p | o | operator | 2026-06-12 | 2099-07-12 | open | — |
+| OD-2 | q2 | p | o | operator | 2026-06-12 | 2000-01-01 | open | — |
+| OD-3 | q3 | p | o | operator | 2026-06-12 | M1 | open | — |
+| OD-9 | q9 | p | o | operator | 2026-06-12 | 2026-06-12 | resolved | done |
+";
+
+    #[test]
+    fn parse_open_decisions_reads_table() {
+        let reg = parse_open_decisions(REGISTRY);
+        assert_eq!(reg.len(), 4);
+        assert!(!reg["OD-1"].resolved);
+        assert_eq!(reg["OD-1"].decides_by, "2099-07-12");
+        assert!(reg["OD-9"].resolved);
+    }
+
+    #[test]
+    fn parse_plan_collects_distinct_od_refs() {
+        let md = "# T\n\nResolves OD-15 and tracks OD-3, OD-15 again.\nFOOD-9 must not match; OD-3X neither.\n";
+        let p = parse_plan(md);
+        assert_eq!(p.open_decision_refs, vec!["OD-15".to_string(), "OD-3".to_string()]);
+    }
+
+    #[test]
+    fn od_overdue_only_for_past_dates() {
+        let now = 1_750_000_000_000u64; // ~2025-06-15
+        assert!(od_is_overdue("2000-01-01", now));
+        assert!(!od_is_overdue("2099-01-01", now));
+        assert!(!od_is_overdue("M1", now)); // free text never overdue
+        assert!(!od_is_overdue("—", now));
+    }
+
+    #[test]
+    fn apply_open_decisions_surfaces_open_drops_resolved() {
+        let reg = parse_open_decisions(REGISTRY);
+        let now = 1_750_000_000_000u64; // before OD-1's 2099 date
+        let mut items = vec![wi_od("a", &["OD-1", "OD-9", "OD-3"])];
+        apply_open_decisions(&mut items, Some(&reg), now);
+        // OD-9 resolved → dropped; OD-1 + OD-3 open; neither overdue → no block.
+        assert_eq!(items[0].open_decisions, vec!["OD-1".to_string(), "OD-3".to_string()]);
+        assert_eq!(items[0].state, "planned");
+        assert!(items[0].blocker_reason.is_none());
+    }
+
+    #[test]
+    fn apply_open_decisions_overdue_blocks_active_plan() {
+        let reg = parse_open_decisions(REGISTRY);
+        let now = 1_750_000_000_000u64; // after OD-2's 2000-01-01
+        let mut items = vec![wi_od("a", &["OD-1", "OD-2"])];
+        apply_open_decisions(&mut items, Some(&reg), now);
+        // OD-2 overdue → sorted first, plan flips to blocked with a reason.
+        assert_eq!(items[0].open_decisions, vec!["OD-2".to_string(), "OD-1".to_string()]);
+        assert_eq!(items[0].state, "blocked");
+        assert!(items[0].blocker_reason.as_deref().unwrap().contains("OD-2"));
+    }
+
+    #[test]
+    fn apply_open_decisions_unknown_ref_is_dropped() {
+        let reg = parse_open_decisions(REGISTRY);
+        let mut items = vec![wi_od("a", &["OD-999"])];
+        apply_open_decisions(&mut items, Some(&reg), 1_750_000_000_000);
+        assert!(items[0].open_decisions.is_empty(), "unregistered OD dropped");
+    }
+
+    #[test]
+    fn apply_open_decisions_none_registry_clears() {
+        let mut items = vec![wi_od("a", &["OD-1"])];
+        apply_open_decisions(&mut items, None, 1_750_000_000_000);
+        assert!(items[0].open_decisions.is_empty());
     }
 
     #[test]

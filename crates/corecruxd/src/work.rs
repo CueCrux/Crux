@@ -99,6 +99,11 @@ pub struct WorkItem {
     pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extended_by: Vec<String>,
+    /// Unresolved Open-Decision ids (`OD-<n>`) this plan references, per the
+    /// registry — overdue first. Empty unless the daemon has the registry path
+    /// (`CRUX_OPEN_DECISIONS_PATH`) set and the plan cites a still-open OD.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_decisions: Vec<String>,
     /// Agent-graph: orchestrator this work item belongs to, if any. Additive
     /// + `#[serde(default)]` so existing records remain byte-compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -226,6 +231,7 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         superseded_by: None,
         depends_on: Vec::new(),
         extended_by: Vec::new(),
+        open_decisions: Vec::new(),
         orchestrator_id: None,
         milestones_done: None,
         milestones_total: None,
