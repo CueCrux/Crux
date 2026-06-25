@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 
 use corecruxctl::{
     admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, config_bundle, cost, evidence, explain,
-    extensions, fixture_digest, gaps, hooks, identity_cli, inspect_receipt, login, machine, memory, memory_pack,
+    extensions, fixture_digest, gaps, hooks, identity_cli, inspect_receipt, learn, login, machine, memory, memory_pack,
     observe_ingest, output_verify, parity, projections, receipts, reconcile, replay, session_sync, shard, shardmap,
     smoke, snapshot, stage1_import, storage, structured_log, tooling_env, verify_store,
 };
@@ -428,6 +428,26 @@ enum Command {
         /// Only show gaps since this date (ISO 8601).
         #[arg(long)]
         since: Option<String>,
+    },
+
+    /// Mine recent tool-call traces for looping re-fetches and propose
+    /// guardrails (token-efficiency M4). Read-only; writes nothing.
+    ///
+    /// Thin wrapper over the daemon's `learn` MCP tool: ranks signatures
+    /// repeated >=3x (pagination variants folded) by measured token waste.
+    Learn {
+        /// Minimum repeats before a signature is flagged as a loop.
+        #[arg(long)]
+        min_repeats: Option<usize>,
+        /// How many recent traces to mine (newest first).
+        #[arg(long)]
+        scan: Option<usize>,
+        /// Daemon HTTP base URL (defaults to discovery: --url → ~/.config → localhost).
+        #[arg(long)]
+        url: Option<String>,
+        /// Emit the raw JSON tool result instead of the human report.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Code-intelligence harvester — ingest cargo-check / machete / grep /
@@ -3455,6 +3475,16 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 std::env::var("CORECRUXD_DATA_DIR").unwrap_or_else(|_| "../CoreCruxData/v1".to_string())
             });
             gaps::run(&dd, since.as_deref())?;
+            Ok(())
+        }
+
+        Command::Learn {
+            min_repeats,
+            scan,
+            url,
+            json,
+        } => {
+            learn::run_learn(min_repeats, scan, url, json)?;
             Ok(())
         }
 
