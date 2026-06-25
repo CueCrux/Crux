@@ -401,13 +401,18 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     let id_ref = identity.as_deref();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
+    // CO-4 live holdout: a sampled fraction of requests run UNSHAPED (control).
+    // When unshaped, force the efficiency flags OFF for this request so the
+    // control arm pays the full (legacy) cost. No-op when CRUX_OUTPUT_HOLDOUT=0.
+    let unshaped = crate::holdout::request_is_control(&args.to_string());
     // M1 part 2 — reversible overflow on the fact path. Active only for the
     // CRC-v1 surface (the legacy text path has no epitome tier to demote into, so
     // it keeps its budget-drop). When active, the store query does NOT budget-drop
     // overflow facts (it returns the full ranked top_k); the CRC-v1 reshape below
     // demotes the over-budget tail to epitome-only pointers instead. Flag OFF (or
-    // legacy contract) ⇒ legacy budget-drop, byte-identical.
-    let reversible = crate::budget::reversible_enabled() && token_budget.is_some() && crate::crc_v1::enabled(args);
+    // legacy contract, or holdout control) ⇒ legacy budget-drop, byte-identical.
+    let reversible =
+        crate::budget::reversible_enabled() && !unshaped && token_budget.is_some() && crate::crc_v1::enabled(args);
     let q = FactQuery {
         // cloned so `query`/`entity` remain available for the CRC-v1 reshape below
         query: query.clone(),
@@ -494,8 +499,10 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
         };
         // M3: minified text surface when CRUX_PAYLOAD_COMPACT is on (query_facts
         // is the heaviest retrieval payload per the M0 baseline); the structured
-        // `crc_v1` Value below is unchanged.
-        let text = crate::payload::serialize(&crc);
+        // `crc_v1` Value below is unchanged. CO-4: unshaped control forces pretty.
+        let compact = crate::payload::compact_enabled() && !unshaped;
+        let text = crate::payload::serialize_with(&crc, compact);
+        crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
         return Ok(json!({
             "content": [{ "type": "text", "text": text }],
             "structuredContent": { "rows": rows, "crc_v1": crc }

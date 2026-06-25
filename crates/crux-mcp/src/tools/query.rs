@@ -52,8 +52,14 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
     // budget (the full price stays in `cost_estimate.full`; `total_candidates`
     // discloses any capped remainder; expand via `result_id`). OFF ⇒ the legacy
     // `take_while`-drop, byte-identical to pre-M1.
+    // CO-4 live holdout: a sampled fraction of requests run UNSHAPED (control)
+    // so savings are measured against a live control, not a counterfactual. When
+    // unshaped, force the efficiency flags OFF for this request. No-op (always
+    // shaped) when CRUX_OUTPUT_HOLDOUT is 0 (the default).
+    let unshaped = crate::holdout::request_is_control(&params.to_string());
+    let reversible = crate::budget::reversible_enabled() && !unshaped;
     let hits = match token_budget {
-        Some(budget) if crate::budget::reversible_enabled() => {
+        Some(budget) if reversible => {
             let max_pointers = crate::budget::pointers_within_budget(budget);
             result.hits.into_iter().take(max_pointers).collect::<Vec<_>>()
         }
@@ -114,14 +120,12 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
     if crate::crc_v1::enabled(params) {
         inner = crate::crc_v1::wrap_query(inner);
     }
-    Ok(json!({
-        "content": [{
-            "type": "text",
-            // M3: minified on the wire when CRUX_PAYLOAD_COMPACT is on; pretty
-            // (byte-identical to pre-M3) when off.
-            "text": crate::payload::serialize(&inner)
-        }]
-    }))
+    // M3: minified when CRUX_PAYLOAD_COMPACT is on; pretty otherwise. CO-4: the
+    // unshaped control arm forces pretty so it pays the full (unshaped) cost.
+    let compact = crate::payload::compact_enabled() && !unshaped;
+    let text = crate::payload::serialize_with(&inner, compact);
+    crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
+    Ok(json!({ "content": [{ "type": "text", "text": text }] }))
 }
 
 /// `query_scan` — metadata-only scan (no full content).
@@ -182,12 +186,12 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
     if crate::crc_v1::enabled(params) {
         inner = crate::crc_v1::wrap_scan(inner);
     }
-    Ok(json!({
-        "content": [{
-            "type": "text",
-            "text": crate::payload::serialize(&inner)
-        }]
-    }))
+    // CO-4 live holdout: unshaped control arm forces pretty; record the cost.
+    let unshaped = crate::holdout::request_is_control(&params.to_string());
+    let compact = crate::payload::compact_enabled() && !unshaped;
+    let text = crate::payload::serialize_with(&inner, compact);
+    crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
+    Ok(json!({ "content": [{ "type": "text", "text": text }] }))
 }
 
 /// `query_expand` — expand previously retrieved results by segment:doc_id.
@@ -285,12 +289,12 @@ pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Val
         response = crate::crc_v1::wrap_expand(response);
     }
 
-    Ok(json!({
-        "content": [{
-            "type": "text",
-            "text": crate::payload::serialize(&response)
-        }]
-    }))
+    // CO-4 live holdout: unshaped control arm forces pretty; record the cost.
+    let unshaped = crate::holdout::request_is_control(&params.to_string());
+    let compact = crate::payload::compact_enabled() && !unshaped;
+    let text = crate::payload::serialize_with(&response, compact);
+    crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
+    Ok(json!({ "content": [{ "type": "text", "text": text }] }))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
