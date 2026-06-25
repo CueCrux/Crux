@@ -401,13 +401,22 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     let id_ref = identity.as_deref();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
 
+    // M1 part 2 — reversible overflow on the fact path. Active only for the
+    // CRC-v1 surface (the legacy text path has no epitome tier to demote into, so
+    // it keeps its budget-drop). When active, the store query does NOT budget-drop
+    // overflow facts (it returns the full ranked top_k); the CRC-v1 reshape below
+    // demotes the over-budget tail to epitome-only pointers instead. Flag OFF (or
+    // legacy contract) ⇒ legacy budget-drop, byte-identical.
+    let reversible = crate::budget::reversible_enabled() && token_budget.is_some() && crate::crc_v1::enabled(args);
     let q = FactQuery {
         // cloned so `query`/`entity` remain available for the CRC-v1 reshape below
         query: query.clone(),
         entity: entity.clone(),
         entity_prefix: None,
         top_k,
-        token_budget,
+        // Suppress the store-level drop under reversible mode; the demotion
+        // boundary is computed from the full ranked set below.
+        token_budget: if reversible { None } else { token_budget },
     };
 
     let store = ctx.fact_store.read().await;
@@ -472,7 +481,17 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     // carries the CRC-v1 envelope for text-reading agents. Absent contract →
     // legacy shape, byte-identical.
     if crate::crc_v1::enabled(args) {
-        let crc = crate::crc_v1::wrap_facts(&rows, entity.as_deref(), query.as_deref());
+        // M1 part 2: under reversible mode, demote the over-budget tail to
+        // epitome-only instead of dropping it. `full_count` = how many leading
+        // facts fit the budget at full cost (== the count the legacy drop kept).
+        let crc = if reversible {
+            let costs: Vec<usize> = visible.iter().map(|f| f.tokens).collect();
+            let budget = token_budget.unwrap_or(0);
+            let full_count = crate::budget::fact_full_within_budget(&costs, budget);
+            crate::crc_v1::wrap_facts_tiered(&rows, entity.as_deref(), query.as_deref(), full_count)
+        } else {
+            crate::crc_v1::wrap_facts(&rows, entity.as_deref(), query.as_deref())
+        };
         // M3: minified text surface when CRUX_PAYLOAD_COMPACT is on (query_facts
         // is the heaviest retrieval payload per the M0 baseline); the structured
         // `crc_v1` Value below is unchanged.
@@ -754,6 +773,69 @@ mod tests {
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
+    }
+
+    // ── M1 part 2 — fact-path reversible overflow ──────────────────────────
+
+    #[tokio::test]
+    async fn query_facts_reversible_demotes_overflow_instead_of_dropping() {
+        let _g = crate::test_env_lock().lock().await;
+        let ctx = test_ctx();
+        {
+            let mut store = ctx.fact_store.write().await;
+            // Six facts with longish values so a tight budget cuts the tail.
+            for i in 0..6 {
+                store.store(StoreFact {
+                    entity: "proj".to_string(),
+                    key: format!("k{i}"),
+                    value: format!("needle {}", "lorem ipsum dolor sit amet ".repeat(8)),
+                    source_receipt: None,
+                    confidence: 1.0,
+                    private: false,
+                    horizon_class: None,
+                    actor: None,
+                });
+            }
+        }
+        let args = json!({"query": "needle", "token_budget": 80, "top_k": 50});
+
+        // Flag OFF (default): legacy budget-drop — overflow facts vanish.
+        std::env::remove_var(crate::budget::REVERSIBLE_ENV);
+        let off = handle_query_facts(&args, &ctx).await.unwrap();
+        let off_rows = off["structuredContent"]["rows"].as_array().unwrap().len();
+        let off_crc = &off["structuredContent"]["crc_v1"];
+        assert_eq!(off_crc["hydrate_tier"], "full");
+        assert!(off_crc["meta"].get("demoted").is_none(), "OFF must not demote");
+        assert!(off_rows < 6, "OFF drops overflow (kept {off_rows} of 6)");
+
+        // Flag ON: reversible — overflow demoted to epitome-only, nothing dropped.
+        std::env::set_var(crate::budget::REVERSIBLE_ENV, "1");
+        let on = handle_query_facts(&args, &ctx).await.unwrap();
+        let on_crc = &on["structuredContent"]["crc_v1"];
+        std::env::remove_var(crate::budget::REVERSIBLE_ENV);
+
+        assert_eq!(on_crc["hydrate_tier"], "mixed");
+        let pointers = on_crc["pointers"].as_array().unwrap().len();
+        let content = on_crc["content"].as_array().unwrap().len();
+        let demoted = on_crc["meta"]["demoted"].as_u64().unwrap();
+        let emitted_full = on_crc["meta"]["emitted_full"].as_u64().unwrap();
+        assert_eq!(pointers, 6, "ON keeps all candidates as pointers (none dropped)");
+        assert!(content < pointers, "ON hydrates only the within-budget head");
+        assert_eq!(on_crc["meta"]["total_candidates"], 6);
+        assert!(demoted > 0);
+        // Drop→demote parity: the count hydrated full == the count OFF kept.
+        assert_eq!(
+            emitted_full as usize, off_rows,
+            "emitted_full must match the legacy drop count"
+        );
+        // Demoted pointers carry the OD-A content hash for stale detection.
+        let demoted_ptr = on_crc["pointers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["reason"] == "Demoted")
+            .unwrap();
+        assert!(demoted_ptr["content_hash"].is_string());
     }
 
     /// agent-passport M5: seed a passport record so the flag-ON write
