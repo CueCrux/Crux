@@ -8,12 +8,79 @@
 //! 3. Inject the combined result as `additionalContext`.
 //!
 //! Best-effort: a missing daemon yields no injected context but never blocks.
+//!
+//! ## M2 — cache-aligned boot banner (Headroom *CacheAligner* analogue)
+//!
+//! ExecPlan: `crux-headroom-token-efficiency-learnings-2026-06-24` (milestone M2).
+//!
+//! The injected `additionalContext` becomes a *prefix* of the model's context.
+//! Anthropic (and other) providers serve a cached prefix at ~90% off, but the
+//! cache only hits while the leading bytes are **byte-identical** boot-to-boot.
+//! Today the banner leads with the most *volatile* content — `sync_status`
+//! (timestamps, `local_fact_count`, sync mode) and the live-session coord
+//! digest — so a single changed fact count busts the whole prefix.
+//!
+//! Behind `CRUX_BANNER_CACHE_ALIGN` (default **OFF**) we tag each section
+//! [`Stability::Stable`] (playbook/patterns — identical session-to-session) or
+//! [`Stability::Volatile`] (sync state, live sessions, config hashes) and emit
+//! all stable sections first, volatile last. The stable *prefix* then stays
+//! byte-identical across boots; only the tail churns. Flag OFF ⇒ insertion
+//! order, byte-identical to pre-M2.
 
 use serde_json::{json, Value};
 
 use crate::{config_audit, hook_input::HookInput, hook_output::HookOutput, mcp_client};
 
 const BOOTSTRAP_TOKEN_BUDGET: u64 = 500;
+
+/// Env flag name for M2 cache-aligned banner ordering. Default OFF.
+const CACHE_ALIGN_ENV: &str = "CRUX_BANNER_CACHE_ALIGN";
+
+/// Truthy-env parse matching the crate convention (`unset`/`""`/`0`/`false`/
+/// `off`/`no` ⇒ false; anything else ⇒ true).
+fn env_truthy(var: &str) -> bool {
+    match std::env::var(var) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "" | "0" | "false" | "off" | "no")
+        }
+        Err(_) => false,
+    }
+}
+
+/// True when cache-aligned banner ordering is enabled via `CRUX_BANNER_CACHE_ALIGN`.
+fn cache_align_enabled() -> bool {
+    env_truthy(CACHE_ALIGN_ENV)
+}
+
+/// Boot-banner section stability, for M2 cache alignment. `Stable` content is
+/// identical session-to-session (playbook/patterns) and belongs at the front so
+/// the cached prefix stays warm; `Volatile` content (timestamps, fact counts,
+/// sync/coord state, config hashes) belongs at the tail.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stability {
+    Stable,
+    Volatile,
+}
+
+/// Order tagged banner sections for emission. When `align` is true, all
+/// `Stable` sections come first (in insertion order) then all `Volatile` ones
+/// (in insertion order) — a stable partition, so within-class order is
+/// preserved. When false, pure insertion order ⇒ byte-identical to pre-M2.
+fn order_sections(sections: Vec<(Stability, String)>, align: bool) -> Vec<String> {
+    if !align {
+        return sections.into_iter().map(|(_, body)| body).collect();
+    }
+    let mut stable = Vec::new();
+    let mut volatile = Vec::new();
+    for (stability, body) in sections {
+        match stability {
+            Stability::Stable => stable.push(body),
+            Stability::Volatile => volatile.push(body),
+        }
+    }
+    stable.into_iter().chain(volatile).collect()
+}
 
 pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
     let _input = HookInput::read_from(reader)?;
@@ -22,12 +89,16 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut sections: Vec<String> = Vec::new();
+    // Each section is tagged with its M2 cache-alignment stability. Insertion
+    // order is preserved when the flag is OFF (byte-identical to pre-M2); when
+    // ON, `order_sections` floats `Stable` ahead of `Volatile`.
+    let mut sections: Vec<(Stability, String)> = Vec::new();
 
     match mcp_client::call_tool("sync_status", json!({})) {
         Ok(result) => {
             let summary = render_sync_status(&result);
-            sections.push(format!("**Crux sync_status**\n{summary}"));
+            // Volatile: timestamps, local_fact_count, sync mode all change boot-to-boot.
+            sections.push((Stability::Volatile, format!("**Crux sync_status**\n{summary}")));
 
             if sync_is_healthy(&result) {
                 let args = json!({
@@ -38,7 +109,8 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
                     Ok(boot) => {
                         let text = extract_text(&boot);
                         if !text.is_empty() {
-                            sections.push(format!("**Crux bootstrap (patterns)**\n{text}"));
+                            // Stable: playbook/patterns — identical session-to-session.
+                            sections.push((Stability::Stable, format!("**Crux bootstrap (patterns)**\n{text}")));
                         }
                     }
                     Err(err) => {
@@ -61,7 +133,8 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
         match mcp_client::call_tool("coord_status", json!({})) {
             Ok(result) => {
                 if let Some(digest) = render_coord_digest(&extract_text(&result)) {
-                    sections.push(digest);
+                    // Volatile: the live-session / work-in-flight list changes constantly.
+                    sections.push((Stability::Volatile, digest));
                 }
             }
             Err(err) => {
@@ -77,7 +150,8 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
     // which content hashes are unreviewed, surface inline. Operators clear
     // by calling `audit_config(...)` after review.
     if let Some(warning) = config_audit::session_start_warning() {
-        sections.push(warning);
+        // Volatile: lists unreviewed content hashes, which change as configs change.
+        sections.push((Stability::Volatile, warning));
     }
 
     // Drift check against bundled profile fragments. Cheap, filesystem-only;
@@ -86,7 +160,12 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         match crux_config_wizard::drift::check_workspace(&cwd) {
             Ok(report) if report.drifted() || report.has_warnings() => {
-                sections.push(format!("**Crux config**\n{}", report.message_for_claude()));
+                // Stable: bundled-profile drift guidance — the same text until the
+                // operator's CLAUDE.md or the bundled profiles change.
+                sections.push((
+                    Stability::Stable,
+                    format!("**Crux config**\n{}", report.message_for_claude()),
+                ));
             }
             Ok(_) => {}
             Err(err) => {
@@ -95,8 +174,9 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
         }
     }
 
-    if !sections.is_empty() {
-        let body = sections.join("\n\n");
+    let ordered = order_sections(sections, cache_align_enabled());
+    if !ordered.is_empty() {
+        let body = ordered.join("\n\n");
         HookOutput::new("SessionStart", body).emit()?;
     }
     Ok(())
@@ -251,6 +331,91 @@ mod tests {
         let text = r#"{"now_unix_ms":1,"presence_ttl_secs":900,"active_sessions":[],"work_in_flight":[]}"#;
         assert!(render_coord_digest(text).is_none());
         assert!(render_coord_digest("not json").is_none());
+    }
+
+    // ---- M2 — cache-aligned boot banner ------------------------------------
+
+    /// Two boots: identical stable content, *different* volatile content (a
+    /// changed fact count / timestamp). Models the cache-align invariant.
+    fn boot_sections(volatile_marker: &str) -> Vec<(Stability, String)> {
+        vec![
+            (
+                Stability::Volatile,
+                format!("**Crux sync_status**\nlocal_fact_count={volatile_marker}"),
+            ),
+            (
+                Stability::Stable,
+                "**Crux bootstrap (patterns)**\nalways do X; never do Y".to_string(),
+            ),
+            (
+                Stability::Volatile,
+                format!("**Crux coord**\nlive sessions: {volatile_marker}"),
+            ),
+            (
+                Stability::Stable,
+                "**Crux config**\nyour CLAUDE.md is current".to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn order_off_is_insertion_order() {
+        // Flag OFF ⇒ byte-identical to pre-M2 (pure insertion order).
+        let s = boot_sections("42");
+        let bodies: Vec<String> = s.iter().map(|(_, b)| b.clone()).collect();
+        assert_eq!(order_sections(s, false), bodies);
+    }
+
+    #[test]
+    fn order_on_floats_stable_to_front_preserving_within_class_order() {
+        let ordered = order_sections(boot_sections("42"), true);
+        // Stable sections first, in their original relative order…
+        assert!(ordered[0].starts_with("**Crux bootstrap (patterns)**"));
+        assert!(ordered[1].starts_with("**Crux config**"));
+        // …then volatile, in their original relative order.
+        assert!(ordered[2].starts_with("**Crux sync_status**"));
+        assert!(ordered[3].starts_with("**Crux coord**"));
+    }
+
+    #[test]
+    fn gate_m2_two_boot_prefix_is_byte_identical_only_tail_churns() {
+        // The M2 gate: with cache-align ON, two boots whose only difference is
+        // volatile content share a byte-identical prefix; the diff is the tail.
+        let boot_a = order_sections(boot_sections("42"), true).join("\n\n");
+        let boot_b = order_sections(boot_sections("99"), true).join("\n\n");
+        assert_ne!(boot_a, boot_b, "volatile content must still differ in the tail");
+
+        // The stable block (everything up to the first volatile section header)
+        // is identical across boots.
+        let prefix_end = boot_a.find("**Crux sync_status**").expect("volatile tail present");
+        assert_eq!(&boot_a[..prefix_end], &boot_b[..prefix_end]);
+        assert!(prefix_end > 0, "stable prefix must be non-empty");
+        // And that shared prefix carries the stable playbook, not volatile state.
+        assert!(boot_a[..prefix_end].contains("always do X"));
+        assert!(!boot_a[..prefix_end].contains("local_fact_count"));
+
+        // Quantify the win: the cached prefix is the run of bytes shared before
+        // the first divergence. Aligned ⇒ long shared prefix (volatile is in the
+        // tail); unaligned ⇒ short (volatile sync_status leads, busts it early).
+        let off_a = order_sections(boot_sections("42"), false).join("\n\n");
+        let off_b = order_sections(boot_sections("99"), false).join("\n\n");
+        let common = |x: &str, y: &str| x.bytes().zip(y.bytes()).take_while(|(a, b)| a == b).count();
+        assert!(
+            common(&boot_a, &boot_b) > common(&off_a, &off_b),
+            "cache-align must extend the shared prefix (aligned {} > unaligned {})",
+            common(&boot_a, &boot_b),
+            common(&off_a, &off_b)
+        );
+    }
+
+    #[test]
+    fn cache_align_env_default_off() {
+        std::env::set_var("CRUX_BANNER_CACHE_ALIGN_TEST_A", "1");
+        assert!(env_truthy("CRUX_BANNER_CACHE_ALIGN_TEST_A"));
+        std::env::set_var("CRUX_BANNER_CACHE_ALIGN_TEST_A", "off");
+        assert!(!env_truthy("CRUX_BANNER_CACHE_ALIGN_TEST_A"));
+        std::env::remove_var("CRUX_BANNER_CACHE_ALIGN_TEST_A");
+        assert!(!env_truthy("CRUX_BANNER_CACHE_ALIGN_TEST_A"));
     }
 
     #[test]
