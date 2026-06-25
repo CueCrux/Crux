@@ -21,8 +21,8 @@
 //! digest — so a single changed fact count busts the whole prefix.
 //!
 //! Behind `CRUX_BANNER_CACHE_ALIGN` (default **OFF**) we tag each section
-//! [`Stability::Stable`] (playbook/patterns — identical session-to-session) or
-//! [`Stability::Volatile`] (sync state, live sessions, config hashes) and emit
+//! `Stable` (playbook/patterns — identical session-to-session) or
+//! `Volatile` (sync state, live sessions, config hashes) and emit
 //! all stable sections first, volatile last. The stable *prefix* then stays
 //! byte-identical across boots; only the tail churns. Flag OFF ⇒ insertion
 //! order, byte-identical to pre-M2.
