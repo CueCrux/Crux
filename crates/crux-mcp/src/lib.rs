@@ -32,6 +32,7 @@ pub mod dispatch;
 pub mod envelope;
 pub mod handoff;
 pub mod ledger;
+pub mod oauth;
 pub mod otel;
 pub mod protocol;
 pub mod scope;

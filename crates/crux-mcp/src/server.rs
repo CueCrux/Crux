@@ -49,7 +49,22 @@ pub fn router(ctx: McpContext) -> axum::Router {
     axum::Router::new()
         .route("/mcp", post(handle_mcp_post))
         .route("/mcp", get(handle_mcp_get))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(handle_oauth_protected_resource),
+        )
         .with_state(state)
+}
+
+/// `GET /.well-known/oauth-protected-resource` — RFC 9728 Protected Resource
+/// Metadata. Lets hosted MCP clients discover the Authorization Server
+/// (VaultCrux) that fronts this daemon. Returns `404` when OAuth is not
+/// configured for this daemon (`CRUX_MCP_RESOURCE_URL` unset).
+async fn handle_oauth_protected_resource() -> Response {
+    match crate::oauth::ResourceConfig::from_env() {
+        Some(cfg) => (StatusCode::OK, Json(cfg.protected_resource_document())).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// `POST /mcp` — JSON-RPC 2.0 endpoint (MCP Streamable HTTP).
@@ -241,14 +256,24 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn unauthorized_response() -> Response {
-    (
+    let mut response = (
         StatusCode::UNAUTHORIZED,
         Json(json!({
             "error": "unauthorized",
             "hint": "set Authorization: Bearer <CRUX_AGENT_TOKEN>"
         })),
     )
-        .into_response()
+        .into_response();
+    // When this daemon fronts a hosted-client OAuth flow, add the RFC 9728
+    // challenge so claude.ai / ChatGPT can discover the Authorization Server.
+    if let Some(cfg) = crate::oauth::ResourceConfig::from_env() {
+        if let Ok(value) = HeaderValue::from_str(&cfg.www_authenticate_value()) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::WWW_AUTHENTICATE, value);
+        }
+    }
+    response
 }
 
 fn mcp_session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, InvalidMcpSessionId> {
