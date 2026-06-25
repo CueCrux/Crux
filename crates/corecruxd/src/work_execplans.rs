@@ -34,11 +34,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use corecrux_memory::fact_store::{FactQuery, FactStore};
 
 use crate::fact_helpers::dedup_latest;
-use crate::work::WorkItem;
+use crate::work::{Provenance, WorkItem};
 
 /// Env var that resolves the plan root for the aggregator. Unset → no plans.
 pub const EXECPLANS_ROOT_ENV: &str = "CRUX_EXECPLANS_ROOT";
@@ -93,6 +93,14 @@ pub struct ParsedPlan {
     pub status_line: Option<String>,
     /// Slug captured from `Superseded by [[<slug>]]` or `Status: Superseded by <slug>`.
     pub superseded_by: Option<String>,
+    /// Slugs from `Depends on [[<slug>]]` declaration lines — plans this one
+    /// builds on / is blocked by. Accumulated across lines, deduped.
+    pub depends_on: Vec<String>,
+    /// Slugs from `Extended by [[<slug>]]` declaration lines — plans that build
+    /// on this one.
+    pub extended_by: Vec<String>,
+    /// Distinct `OD-<n>` Open-Decision ids referenced anywhere in the plan body.
+    pub open_decision_refs: Vec<String>,
 }
 
 /// Rollup of facts stored under `entity = "execplan:<slug>"`. Fields cover the
@@ -108,6 +116,12 @@ pub struct ExecplanFactSummary {
     /// Earliest `stored_at` across all related facts (ms since epoch).
     pub first_fact_at_unix_ms: Option<u64>,
     pub decision_count: usize,
+    /// Distinct commit SHAs pulled from `decision:*` fact values (`commit_sha`
+    /// field; QC.1 guarantees decisions carry one). Insertion order, deduped.
+    pub commit_shas: Vec<String>,
+    /// Distinct real-principal actors that contributed facts to this plan,
+    /// sorted. The "who built this" rollup surfaced in `WorkItem::provenance`.
+    pub contributing_agents: Vec<String>,
     /// Owner passport, auto-derived from the actor of the most-recent fact whose
     /// actor is a real principal (not a `system:`/`__` placeholder). None when no
     /// fact carries a usable actor.
@@ -129,6 +143,22 @@ pub type ExecplanFactRow = (String, String, DateTime<Utc>, Option<String>);
 fn is_principal_actor(actor: &str) -> bool {
     let a = actor.trim();
     !a.is_empty() && !a.starts_with("system:") && !a.starts_with("__")
+}
+
+/// Distinct real-principal actors across a plan's facts (see
+/// [`is_principal_actor`]), sorted for deterministic output. These are the
+/// agents that contributed milestone/gate/decision facts — the "who built this"
+/// rollup surfaced in [`crate::work::WorkItem::provenance`].
+fn contributing_agents_from_facts(facts: &[ExecplanFactRow]) -> Vec<String> {
+    let mut agents: Vec<String> = facts
+        .iter()
+        .filter_map(|(_, _, _, actor)| actor.as_deref())
+        .filter(|a| is_principal_actor(a))
+        .map(|a| a.trim().to_string())
+        .collect();
+    agents.sort();
+    agents.dedup();
+    agents
 }
 
 /// Auto-derive a plan owner from its facts: the actor of the most-recent fact
@@ -189,6 +219,19 @@ pub fn parse_plan(md: &str) -> ParsedPlan {
                 out.superseded_by = Some(slug);
             }
         }
+
+        for slug in extract_ref_slugs(trimmed, "Depends on") {
+            if !out.depends_on.contains(&slug) {
+                out.depends_on.push(slug);
+            }
+        }
+        for slug in extract_ref_slugs(trimmed, "Extended by") {
+            if !out.extended_by.contains(&slug) {
+                out.extended_by.push(slug);
+            }
+        }
+
+        collect_od_refs(trimmed, &mut out.open_decision_refs);
 
         if trimmed.starts_with("## ") {
             let heading = trimmed.trim_start_matches("## ").trim().to_ascii_lowercase();
@@ -320,6 +363,86 @@ fn extract_superseded_slug(line: &str) -> Option<String> {
     }
 }
 
+/// Extract typed plan-reference slugs from a *declaration* line, after stripping
+/// leading markdown markup. `keyword` is the case-sensitive lead token
+/// (`"Depends on"`, `"Extended by"`). Mirrors [`extract_superseded_slug`]'s
+/// prose rejection: the keyword must sit at the line's declarative prefix and be
+/// followed by a `:`/space separator, so mid-sentence prose ("…which depends on
+/// the older plan…") and `Depends online`-style words never match.
+///
+/// Captures every `[[<slug>]]` group on the line (comma-separated targets inside
+/// one group are split); if no `[[…]]` group is present, the single bare token
+/// after the keyword is taken.
+fn extract_ref_slugs(line: &str, keyword: &str) -> Vec<String> {
+    let trimmed = strip_leading_markup(line);
+    let Some(after) = trimmed.strip_prefix(keyword) else {
+        return Vec::new();
+    };
+    // Require an explicit `:`/space separator so the keyword can't run into the
+    // next word (`Depends online` must NOT yield a bare token `line`).
+    let Some(after) = after.strip_prefix([':', ' ']) else {
+        return Vec::new();
+    };
+    let after = after.trim_start_matches([':', ' ']);
+
+    let mut slugs = Vec::new();
+    if after.contains("[[") {
+        let mut rest = after;
+        while let Some(open) = rest.find("[[") {
+            rest = &rest[open + 2..];
+            let Some(close) = rest.find("]]") else { break };
+            let group = &rest[..close];
+            rest = &rest[close + 2..];
+            for part in group.split(',') {
+                let s = part.trim();
+                if !s.is_empty() {
+                    slugs.push(s.to_string());
+                }
+            }
+        }
+    } else {
+        let token: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+            .collect();
+        if !token.is_empty() {
+            slugs.push(token);
+        }
+    }
+    slugs
+}
+
+/// Collect distinct `OD-<n>` ids referenced in a line into `out` (first-seen
+/// order preserved). Requires a non-alphanumeric boundary before `OD` and after
+/// the digits, mirroring the `\bOD-\d+\b` lint convention so `FOOD-9` / `OD-3X`
+/// don't match. ASCII-only, so byte indices align with the `&str`.
+fn collect_od_refs(line: &str, out: &mut Vec<String>) {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        if bytes[i] == b'O'
+            && bytes[i + 1] == b'D'
+            && bytes[i + 2] == b'-'
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
+            let mut j = i + 3;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            let next_ok = j >= bytes.len() || !bytes[j].is_ascii_alphanumeric();
+            if j > i + 3 && next_ok {
+                let id = format!("OD-{}", &line[i + 3..j]);
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
 /// Find the first `M<digits>` token in a line, returning the number.
 /// Accepts: `- **M1 — title**`, `- [ ] M1 ...`, `M1: ...`, etc.
 fn first_milestone_number(line: &str) -> Option<u32> {
@@ -389,6 +512,16 @@ pub fn summarise_facts(facts: &[(String, String, DateTime<Utc>)]) -> ExecplanFac
             }
         } else if key.starts_with("decision:") {
             summary.decision_count += 1;
+            // QC.1: decision facts carry a `commit_sha`. Collect distinct ones
+            // (insertion order) for the provenance rollup.
+            if let Some(sha) = serde_json::from_str::<serde_json::Value>(value)
+                .ok()
+                .and_then(|v| v.get("commit_sha").and_then(|s| s.as_str()).map(String::from))
+            {
+                if !sha.is_empty() && !summary.commit_shas.contains(&sha) {
+                    summary.commit_shas.push(sha);
+                }
+            }
         }
     }
 
@@ -505,6 +638,15 @@ fn mk_item(
     } else {
         (None, None)
     };
+    // Provenance is the fact-derived rollup; only meaningful when the plan has
+    // facts. Fact-less plans (and the kanban path) leave it `None`.
+    let provenance = facts.any_fact().then(|| Provenance {
+        first_activity_unix_ms: facts.first_fact_at_unix_ms.unwrap_or(created),
+        last_activity_unix_ms: facts.last_fact_at_unix_ms.unwrap_or(updated),
+        contributing_agents: facts.contributing_agents.clone(),
+        commit_shas: facts.commit_shas.clone(),
+        decision_count: facts.decision_count,
+    });
     WorkItem {
         id: format!("execplan:{}", file.slug),
         project_id: VIRTUAL_PROJECT_ID.to_string(),
@@ -522,10 +664,15 @@ fn mk_item(
         plan_path: Some(file.path.display().to_string()),
         current_milestone,
         superseded_by,
+        depends_on: parsed.depends_on.clone(),
+        extended_by: parsed.extended_by.clone(),
+        // Raw OD refs; apply_open_decisions refines these to the open subset.
+        open_decisions: parsed.open_decision_refs.clone(),
         orchestrator_id: None,
         milestones_done,
         milestones_total,
         notes_count: None,
+        provenance,
     }
 }
 
@@ -620,6 +767,9 @@ pub fn list_execplans(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::
         return Ok(Vec::new());
     }
     let mut facts_by_slug = collect_execplan_facts(store);
+    let od_registry = open_decisions_path_from_env()
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .map(|s| parse_open_decisions(&s));
     let mut out = Vec::with_capacity(files.len());
     for file in files {
         let parsed = parse_plan(&file.content);
@@ -627,17 +777,191 @@ pub fn list_execplans(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::
         // summarise_facts works on (key, value, stored_at); the owner is derived
         // from the 4th element (actor), which only the raw rows carry.
         let owner = owner_from_facts(&facts);
+        let agents = contributing_agents_from_facts(&facts);
         let rows3: Vec<(String, String, DateTime<Utc>)> = facts.into_iter().map(|(k, v, s, _)| (k, v, s)).collect();
         let mut summary = summarise_facts(&rows3);
         summary.owner_passport = owner;
+        summary.contributing_agents = agents;
         let mut item = derive_state(&file, &parsed, &summary, now_unix_ms);
         // Surface attached notes (work comments keyed by the item id).
         let n = crate::work::list_comments(store, &item.id).len() as u32;
         item.notes_count = (n > 0).then_some(n);
         out.push(item);
     }
+    apply_reciprocal_refs(&mut out);
+    apply_open_decisions(&mut out, od_registry.as_ref(), now_unix_ms);
     out.sort_by(|a, b| b.updated_at_unix_ms.cmp(&a.updated_at_unix_ms));
     Ok(out)
+}
+
+/// Derive reciprocal lineage edges across the walked plan set: for every
+/// `A depends_on B`, ensure `B.extended_by` contains `A` (and the mirror for a
+/// declared `extended_by`). Authors declare one direction; this fills the other.
+/// A declared edge whose target slug has no matching plan is left one-sided —
+/// the source keeps the declared edge so a client can flag it as dangling — and
+/// never mints a phantom item. Each item's edge lists are sorted + deduped for
+/// deterministic output.
+fn apply_reciprocal_refs(items: &mut [WorkItem]) {
+    // slug -> index, where slug is the id minus the `execplan:` prefix.
+    let slug_to_idx: HashMap<String, usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, it)| it.id.strip_prefix(EXECPLAN_ENTITY_PREFIX).map(|s| (s.to_string(), i)))
+        .collect();
+
+    // Read pass: collect reverse edges as (target_idx, source_slug, is_extended)
+    // where is_extended means "push source into target.extended_by". Deferring
+    // the writes keeps the borrow checker happy.
+    let mut additions: Vec<(usize, String, bool)> = Vec::new();
+    for it in items.iter() {
+        let Some(src) = it.id.strip_prefix(EXECPLAN_ENTITY_PREFIX) else {
+            continue;
+        };
+        for target in &it.depends_on {
+            if let Some(&j) = slug_to_idx.get(target) {
+                additions.push((j, src.to_string(), true)); // target.extended_by += src
+            }
+        }
+        for target in &it.extended_by {
+            if let Some(&j) = slug_to_idx.get(target) {
+                additions.push((j, src.to_string(), false)); // target.depends_on += src
+            }
+        }
+    }
+
+    // Write pass.
+    for (j, src, is_extended) in additions {
+        let edges = if is_extended {
+            &mut items[j].extended_by
+        } else {
+            &mut items[j].depends_on
+        };
+        if !edges.contains(&src) {
+            edges.push(src);
+        }
+    }
+
+    for it in items.iter_mut() {
+        it.depends_on.sort();
+        it.depends_on.dedup();
+        it.extended_by.sort();
+        it.extended_by.dedup();
+    }
+}
+
+/// Env var pointing at the Open Decisions registry markdown
+/// (`docs/master-plan/tracking/open-decisions.md`). Unset → OD wiring is off and
+/// `WorkItem::open_decisions` stays empty.
+pub const OPEN_DECISIONS_PATH_ENV: &str = "CRUX_OPEN_DECISIONS_PATH";
+
+/// Resolve the OD registry path from the environment. `None` (or empty) → the
+/// projection leaves `open_decisions` empty.
+fn open_decisions_path_from_env() -> Option<PathBuf> {
+    std::env::var(OPEN_DECISIONS_PATH_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// One row of the Open Decisions registry table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenDecision {
+    pub id: String,
+    /// The `Decides-by` cell verbatim — a `YYYY-MM-DD` date or free text
+    /// (`"M1"`, `"RCX rollout phase 2"`, `"—"`).
+    pub decides_by: String,
+    pub resolved: bool,
+}
+
+/// Parse the Open Decisions registry markdown table into `id → OpenDecision`.
+/// Cells (after splitting a row on `|`): 1=id, 7=decides-by, 8=status. Only rows
+/// whose first cell is an `OD-<n>` id are taken — header / separator / prose
+/// lines are skipped.
+pub fn parse_open_decisions(md: &str) -> HashMap<String, OpenDecision> {
+    let mut out = HashMap::new();
+    for line in md.lines() {
+        let t = line.trim_start();
+        if !t.starts_with("| OD-") {
+            continue;
+        }
+        let cells: Vec<&str> = t.split('|').map(|c| c.trim()).collect();
+        // 0 = before-first-pipe, 1 = id … 7 = decides-by, 8 = status.
+        if cells.len() < 9 {
+            continue;
+        }
+        let id = cells[1].to_string();
+        if !id.starts_with("OD-") {
+            continue;
+        }
+        let resolved = cells[8].to_ascii_lowercase().contains("resolved");
+        out.insert(
+            id.clone(),
+            OpenDecision {
+                id,
+                decides_by: cells[7].to_string(),
+                resolved,
+            },
+        );
+    }
+    out
+}
+
+/// True when `decides_by` is a `YYYY-MM-DD` date strictly before `now`. Free-text
+/// decides-by values (milestone tags, "—") are never overdue.
+fn od_is_overdue(decides_by: &str, now_unix_ms: u64) -> bool {
+    NaiveDate::parse_from_str(decides_by.trim(), "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(23, 59, 59))
+        .is_some_and(|dt| (now_unix_ms as i64) > Utc.from_utc_datetime(&dt).timestamp_millis())
+}
+
+/// Numeric part of an `OD-<n>` id, for stable sorting. Non-conforming → MAX.
+fn od_num(id: &str) -> u32 {
+    id.strip_prefix("OD-").and_then(|n| n.parse().ok()).unwrap_or(u32::MAX)
+}
+
+/// Cross-reference each item's referenced `OD-<n>` ids (populated raw by
+/// `mk_item`) against the registry and keep only the *unresolved* ones, overdue
+/// first. An **overdue** open OD soft-blocks an otherwise-active
+/// (`planned`/`in_progress`) plan — flipping it to `blocked` with a
+/// `blocker_reason` — because the registry carries no per-OD blocker flag, so
+/// "past its decides-by date and still open" is the strongest available signal.
+/// Non-overdue open ODs annotate `open_decisions` without changing state.
+/// `registry == None` (path unset/unreadable) → clears `open_decisions`, since
+/// without the registry we can't assert any are still open.
+fn apply_open_decisions(items: &mut [WorkItem], registry: Option<&HashMap<String, OpenDecision>>, now_unix_ms: u64) {
+    for item in items.iter_mut() {
+        let Some(reg) = registry else {
+            item.open_decisions.clear();
+            continue;
+        };
+        // (id, decides_by, overdue) for refs that are registered AND open.
+        let mut open: Vec<(String, String, bool)> = item
+            .open_decisions
+            .iter()
+            .filter_map(|id| reg.get(id))
+            .filter(|od| !od.resolved)
+            .map(|od| {
+                let overdue = od_is_overdue(&od.decides_by, now_unix_ms);
+                (od.id.clone(), od.decides_by.clone(), overdue)
+            })
+            .collect();
+        if open.is_empty() {
+            item.open_decisions.clear();
+            continue;
+        }
+        // Overdue first, then by numeric id.
+        open.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| od_num(&a.0).cmp(&od_num(&b.0))));
+        item.open_decisions = open.iter().map(|(id, _, _)| id.clone()).collect();
+
+        // An overdue open OD soft-blocks an active plan.
+        if let Some((id, decides_by, _)) = open.iter().find(|(_, _, overdue)| *overdue) {
+            if item.state == "planned" || item.state == "in_progress" {
+                item.state = "blocked".to_string();
+                item.blocker_reason = Some(format!("Overdue open decision {id} (decides-by {decides_by})"));
+            }
+        }
+    }
 }
 
 /// Stamp `orchestrator_id` on the ExecPlan-derived [`WorkItem`]s whose `id`
@@ -676,6 +1000,314 @@ mod tests {
 
     fn ts(ms: i64) -> DateTime<Utc> {
         Utc.timestamp_millis_opt(ms).unwrap()
+    }
+
+    /// Build a minimal ExecPlan-shaped WorkItem for reciprocal-closure tests.
+    fn wi(slug: &str, depends_on: &[&str], extended_by: &[&str]) -> WorkItem {
+        WorkItem {
+            id: format!("execplan:{slug}"),
+            project_id: VIRTUAL_PROJECT_ID.to_string(),
+            state: "planned".to_string(),
+            title: slug.to_string(),
+            body: String::new(),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            created_by_passport: VIRTUAL_PASSPORT.to_string(),
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            plan_path: None,
+            current_milestone: None,
+            superseded_by: None,
+            depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
+            extended_by: extended_by.iter().map(|s| s.to_string()).collect(),
+            open_decisions: Vec::new(),
+            orchestrator_id: None,
+            milestones_done: None,
+            milestones_total: None,
+            notes_count: None,
+            provenance: None,
+        }
+    }
+
+    /// A `planned` ExecPlan item carrying raw OD references (as `mk_item` leaves
+    /// them, pre-`apply_open_decisions`).
+    fn wi_od(slug: &str, ods: &[&str]) -> WorkItem {
+        let mut w = wi(slug, &[], &[]);
+        w.open_decisions = ods.iter().map(|s| s.to_string()).collect();
+        w
+    }
+
+    fn item<'a>(items: &'a [WorkItem], slug: &str) -> &'a WorkItem {
+        items
+            .iter()
+            .find(|i| i.id == format!("execplan:{slug}"))
+            .expect("item present")
+    }
+
+    // ── M1: typed plan-reference parsing ──
+
+    #[test]
+    fn parse_extracts_depends_and_extended() {
+        let md = "# T\n\n> Depends on [[plan-a]]\nExtended by [[plan-b]]\n";
+        let p = parse_plan(md);
+        assert_eq!(p.depends_on, vec!["plan-a".to_string()]);
+        assert_eq!(p.extended_by, vec!["plan-b".to_string()]);
+    }
+
+    #[test]
+    fn parse_depends_multiple_targets_and_bare_form() {
+        let md = "# T\n\n- Depends on [[a]] [[b]]\nDepends on bare-slug-2026-01-01 (note)\n";
+        let p = parse_plan(md);
+        assert_eq!(
+            p.depends_on,
+            vec!["a".to_string(), "b".to_string(), "bare-slug-2026-01-01".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_depends_comma_separated_group() {
+        let md = "# T\n\nDepends on [[a, b, c]]\n";
+        let p = parse_plan(md);
+        assert_eq!(p.depends_on, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn parse_refs_reject_prose_mentions() {
+        // lowercase mid-sentence "depends on" / "extended by" must not match.
+        let md = "# T\n\n- This milestone depends on [[a]] for context.\n- The work is extended by [[b]] later.\n";
+        let p = parse_plan(md);
+        assert!(p.depends_on.is_empty(), "prose 'depends on' must not match");
+        assert!(p.extended_by.is_empty(), "prose 'extended by' must not match");
+    }
+
+    #[test]
+    fn parse_refs_reject_keyword_without_separator() {
+        // "Depends online" must not yield a bare token "line".
+        let md = "# T\n\nDepends online resources are great\n";
+        let p = parse_plan(md);
+        assert!(p.depends_on.is_empty());
+    }
+
+    #[test]
+    fn parse_refs_ignore_backtick_quoted_pattern() {
+        // A docs line that quotes the convention must not mint an edge.
+        let md = "# T\n\n6. `Depends on [[slug]]` declares a lineage edge → projection.\n";
+        let p = parse_plan(md);
+        assert!(p.depends_on.is_empty(), "pattern example must not match");
+    }
+
+    // ── M1: reciprocal closure ──
+
+    #[test]
+    fn reciprocal_closure_fills_reverse_edge() {
+        let mut items = vec![wi("a", &["b"], &[]), wi("b", &[], &[])];
+        apply_reciprocal_refs(&mut items);
+        assert_eq!(item(&items, "a").depends_on, vec!["b".to_string()]);
+        assert_eq!(item(&items, "b").extended_by, vec!["a".to_string()]);
+        assert!(item(&items, "b").depends_on.is_empty());
+    }
+
+    #[test]
+    fn reciprocal_closure_mirrors_declared_extended_by() {
+        let mut items = vec![wi("a", &[], &["b"]), wi("b", &[], &[])];
+        apply_reciprocal_refs(&mut items);
+        assert_eq!(item(&items, "b").depends_on, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn reciprocal_closure_no_duplicate_when_both_declared() {
+        let mut items = vec![wi("a", &["b"], &[]), wi("b", &[], &["a"])];
+        apply_reciprocal_refs(&mut items);
+        assert_eq!(
+            item(&items, "b").extended_by,
+            vec!["a".to_string()],
+            "no duplicate reverse edge"
+        );
+    }
+
+    #[test]
+    fn reciprocal_closure_dangling_target_keeps_source_edge() {
+        let mut items = vec![wi("a", &["ghost"], &[])];
+        apply_reciprocal_refs(&mut items);
+        assert_eq!(
+            items[0].depends_on,
+            vec!["ghost".to_string()],
+            "dangling edge retained on source"
+        );
+        assert_eq!(items.len(), 1, "no phantom item minted for a missing target");
+    }
+
+    // ── M2: provenance rollup ──
+
+    #[test]
+    fn summarise_extracts_distinct_commit_shas_from_decisions() {
+        let facts = vec![
+            (
+                "decision:a".to_string(),
+                r#"{"commit_sha":"abc123","note":"x"}"#.to_string(),
+                ts(10),
+            ),
+            (
+                "decision:b".to_string(),
+                r#"{"commit_sha":"def456"}"#.to_string(),
+                ts(20),
+            ),
+            (
+                "decision:c".to_string(),
+                r#"{"commit_sha":"abc123"}"#.to_string(),
+                ts(30),
+            ),
+            ("decision:d".to_string(), r#"{"no_sha":true}"#.to_string(), ts(40)),
+            ("milestone:M1".to_string(), "{}".to_string(), ts(5)),
+        ];
+        let s = summarise_facts(&facts);
+        // Distinct, insertion order; the sha-less decision is counted but adds none.
+        assert_eq!(s.commit_shas, vec!["abc123".to_string(), "def456".to_string()]);
+        assert_eq!(s.decision_count, 4);
+    }
+
+    #[test]
+    fn contributing_agents_are_distinct_principals_sorted() {
+        let rows: Vec<ExecplanFactRow> = vec![
+            (
+                "milestone:M1".to_string(),
+                "{}".to_string(),
+                ts(1),
+                Some("agent-zed".to_string()),
+            ),
+            (
+                "gate:M1".to_string(),
+                "{}".to_string(),
+                ts(2),
+                Some("agent-amy".to_string()),
+            ),
+            (
+                "decision:x".to_string(),
+                "{}".to_string(),
+                ts(3),
+                Some("agent-zed".to_string()),
+            ),
+            (
+                "decision:y".to_string(),
+                "{}".to_string(),
+                ts(4),
+                Some("system:execplan-aggregator".to_string()),
+            ),
+            ("decision:z".to_string(), "{}".to_string(), ts(5), None),
+        ];
+        // Distinct + sorted; system:/None actors filtered out.
+        assert_eq!(
+            contributing_agents_from_facts(&rows),
+            vec!["agent-amy".to_string(), "agent-zed".to_string()]
+        );
+    }
+
+    #[test]
+    fn provenance_present_with_facts_absent_without() {
+        let f = file("p", 1_000, "# P\n\n## Milestones\n- M1\n");
+        let parsed = parse_plan(&f.content);
+
+        // No facts → no provenance (planned by age).
+        let none = derive_state(&f, &parsed, &ExecplanFactSummary::default(), 2_000);
+        assert!(none.provenance.is_none());
+
+        // With facts → provenance carries the rollup.
+        let sum = ExecplanFactSummary {
+            highest_milestone_with_fact: Some(1),
+            first_fact_at_unix_ms: Some(500),
+            last_fact_at_unix_ms: Some(900),
+            decision_count: 2,
+            commit_shas: vec!["abc123".to_string()],
+            contributing_agents: vec!["agent-amy".to_string()],
+            ..Default::default()
+        };
+        let item = derive_state(&f, &parsed, &sum, 2_000);
+        let prov = item.provenance.expect("provenance present when facts exist");
+        assert_eq!(prov.first_activity_unix_ms, 500);
+        assert_eq!(prov.last_activity_unix_ms, 900);
+        assert_eq!(prov.contributing_agents, vec!["agent-amy".to_string()]);
+        assert_eq!(prov.commit_shas, vec!["abc123".to_string()]);
+        assert_eq!(prov.decision_count, 2);
+    }
+
+    // ── M3: Open Decisions registry wiring ──
+
+    const REGISTRY: &str = "\
+# Open Decisions Registry
+
+| id | Question | Plane | Options | Owner | Opened | Decides-by | Status | Resolution |
+|---|---|---|---|---|---|---|---|---|
+| OD-1 | q1 | p | o | operator | 2026-06-12 | 2099-07-12 | open | — |
+| OD-2 | q2 | p | o | operator | 2026-06-12 | 2000-01-01 | open | — |
+| OD-3 | q3 | p | o | operator | 2026-06-12 | M1 | open | — |
+| OD-9 | q9 | p | o | operator | 2026-06-12 | 2026-06-12 | resolved | done |
+";
+
+    #[test]
+    fn parse_open_decisions_reads_table() {
+        let reg = parse_open_decisions(REGISTRY);
+        assert_eq!(reg.len(), 4);
+        assert!(!reg["OD-1"].resolved);
+        assert_eq!(reg["OD-1"].decides_by, "2099-07-12");
+        assert!(reg["OD-9"].resolved);
+    }
+
+    #[test]
+    fn parse_plan_collects_distinct_od_refs() {
+        let md = "# T\n\nResolves OD-15 and tracks OD-3, OD-15 again.\nFOOD-9 must not match; OD-3X neither.\n";
+        let p = parse_plan(md);
+        assert_eq!(p.open_decision_refs, vec!["OD-15".to_string(), "OD-3".to_string()]);
+    }
+
+    #[test]
+    fn od_overdue_only_for_past_dates() {
+        let now = 1_750_000_000_000u64; // ~2025-06-15
+        assert!(od_is_overdue("2000-01-01", now));
+        assert!(!od_is_overdue("2099-01-01", now));
+        assert!(!od_is_overdue("M1", now)); // free text never overdue
+        assert!(!od_is_overdue("—", now));
+    }
+
+    #[test]
+    fn apply_open_decisions_surfaces_open_drops_resolved() {
+        let reg = parse_open_decisions(REGISTRY);
+        let now = 1_750_000_000_000u64; // before OD-1's 2099 date
+        let mut items = vec![wi_od("a", &["OD-1", "OD-9", "OD-3"])];
+        apply_open_decisions(&mut items, Some(&reg), now);
+        // OD-9 resolved → dropped; OD-1 + OD-3 open; neither overdue → no block.
+        assert_eq!(items[0].open_decisions, vec!["OD-1".to_string(), "OD-3".to_string()]);
+        assert_eq!(items[0].state, "planned");
+        assert!(items[0].blocker_reason.is_none());
+    }
+
+    #[test]
+    fn apply_open_decisions_overdue_blocks_active_plan() {
+        let reg = parse_open_decisions(REGISTRY);
+        let now = 1_750_000_000_000u64; // after OD-2's 2000-01-01
+        let mut items = vec![wi_od("a", &["OD-1", "OD-2"])];
+        apply_open_decisions(&mut items, Some(&reg), now);
+        // OD-2 overdue → sorted first, plan flips to blocked with a reason.
+        assert_eq!(items[0].open_decisions, vec!["OD-2".to_string(), "OD-1".to_string()]);
+        assert_eq!(items[0].state, "blocked");
+        assert!(items[0].blocker_reason.as_deref().unwrap().contains("OD-2"));
+    }
+
+    #[test]
+    fn apply_open_decisions_unknown_ref_is_dropped() {
+        let reg = parse_open_decisions(REGISTRY);
+        let mut items = vec![wi_od("a", &["OD-999"])];
+        apply_open_decisions(&mut items, Some(&reg), 1_750_000_000_000);
+        assert!(items[0].open_decisions.is_empty(), "unregistered OD dropped");
+    }
+
+    #[test]
+    fn apply_open_decisions_none_registry_clears() {
+        let mut items = vec![wi_od("a", &["OD-1"])];
+        apply_open_decisions(&mut items, None, 1_750_000_000_000);
+        assert!(items[0].open_decisions.is_empty());
     }
 
     #[test]

@@ -76,6 +76,58 @@ url_encode() {
   echo "${raw}"
 }
 
+# ── Dangling plan-reference check (filesystem; no daemon) ──────────────────
+# Verify every typed plan reference — `Superseded by [[slug]]`,
+# `Depends on [[slug]]`, `Extended by [[slug]]` — resolves to a real
+# <slug>.md in the same directory. Declaration lines only (keyword at the line
+# start after optional >/-/* and bold markup), mirroring the
+# work_execplans.rs parser so prose mentions are ignored. Only the `[[…]]` form
+# is linted; bare-token targets are parser-accepted but not checked here.
+check_plan_refs() {
+  local plans_dir="$1"
+  local dangling=0 checked=0
+  local log
+  log="$(mktemp)"
+
+  shopt -s nullglob
+  local plan_files=("${plans_dir}"/*.md)
+  shopt -u nullglob
+
+  local plan slug targets t
+  for plan in "${plan_files[@]}"; do
+    slug="$(basename "${plan}" .md)"
+    # Declaration lines carrying a [[…]] group; pull every [[slug]] target,
+    # split comma groups, one per line.
+    targets="$(grep -E '^[[:space:]]*>?[[:space:]]*([-*][[:space:]]+)?\*{0,2}(Superseded by|Depends on|Extended by)[: ].*\[\[' "${plan}" 2>/dev/null \
+      | grep -oE '\[\[[^]]+\]\]' \
+      | sed -E 's/\[\[|\]\]//g' \
+      | tr ',' '\n' || true)"
+    [ -z "${targets}" ] && continue
+    while IFS= read -r t; do
+      t="$(printf '%s' "${t}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+      [ -z "${t}" ] && continue
+      checked=$((checked + 1))
+      if [ ! -f "${plans_dir}/${t}.md" ]; then
+        printf '%s\t%s\n' "${slug}" "${t}" >> "${log}"
+        dangling=$((dangling + 1))
+      fi
+    done <<< "${targets}"
+  done
+
+  echo "plan-refs: checked ${checked} declared [[…]] links, dangling ${dangling}"
+  if [ "${dangling}" -gt 0 ]; then
+    echo "" >&2
+    echo "Dangling plan references ([[slug]] with no matching <slug>.md):" >&2
+    while IFS=$'\t' read -r slug t; do
+      echo "  ${slug}: ${t}" >&2
+    done < "${log}"
+    rm -f "${log}"
+    return 1
+  fi
+  rm -f "${log}"
+  return 0
+}
+
 # ── Plan walker ────────────────────────────────────────────────────────────
 walk_plans() {
   local plans_dir="$1"
@@ -191,6 +243,33 @@ EOF
     return 1
   fi
 
+  # ── plan-ref dangling detection ──
+  # good-plan-2026-05-20.md exists in ${tmp} (created above); the Extended-by
+  # target does not. The prose line must NOT be linted.
+  cat > "${tmp}/refsrc-2026-05-20.md" <<'EOF'
+# Ref Source
+
+> Depends on [[good-plan-2026-05-20]]
+Extended by [[missing-xyz-2026-01-01]]
+This milestone depends on [[should-not-be-linted]] in prose.
+EOF
+  if check_plan_refs "${tmp}" >/dev/null 2>&1; then
+    echo "FAIL: check_plan_refs should flag the missing-xyz dangling ref" >&2
+    return 1
+  fi
+  rm -f "${tmp}/refsrc-2026-05-20.md"
+
+  cat > "${tmp}/refok-2026-05-20.md" <<'EOF'
+# Ref OK
+
+Depends on [[good-plan-2026-05-20]]
+EOF
+  if ! check_plan_refs "${tmp}" >/dev/null 2>&1; then
+    echo "FAIL: check_plan_refs should pass when every [[…]] target resolves" >&2
+    return 1
+  fi
+  rm -f "${tmp}/refok-2026-05-20.md"
+
   echo "self-test: PASS"
   return 0
 }
@@ -214,7 +293,10 @@ main() {
         echo "NOTICE: execplans directory not found: ${plans_dir}; skipping" >&2
         exit 0
       fi
-      walk_plans "${plans_dir}"
+      local rc=0
+      check_plan_refs "${plans_dir}" || rc=1
+      walk_plans "${plans_dir}" || rc=$?
+      exit "${rc}"
       ;;
   esac
 }
