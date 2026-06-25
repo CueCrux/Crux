@@ -112,6 +112,32 @@ pub struct WorkItem {
     /// Number of notes (work comments) attached to this item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes_count: Option<u32>,
+    /// Fact-derived provenance rollup (ExecPlan-aggregator items only). Surfaces
+    /// the activity window, contributing agents, and decision commit SHAs that
+    /// the fact store + CROWN receipts already hold — read-only, never written
+    /// back to the plan `.md`. `None` for kanban items and fact-less plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+}
+
+/// Compact, fact-derived provenance for an ExecPlan work item. Assembled at
+/// projection time from `execplan:<slug>` facts (milestone/gate/decision) — the
+/// same data that produced CROWN receipts upstream — so it carries no new
+/// authority and mutates nothing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Provenance {
+    /// Earliest fact timestamp (ms since epoch) — when work on the plan began.
+    pub first_activity_unix_ms: u64,
+    /// Most recent fact timestamp (ms since epoch) — last touch.
+    pub last_activity_unix_ms: u64,
+    /// Distinct real-principal actors that contributed facts, sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contributing_agents: Vec<String>,
+    /// Distinct commit SHAs from `decision:*` facts, in insertion order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commit_shas: Vec<String>,
+    /// Count of `decision:*` facts logged against the plan.
+    pub decision_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,6 +230,7 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         milestones_done: None,
         milestones_total: None,
         notes_count: None,
+        provenance: None,
     };
     write_record(store, &item)?;
     write_transition(

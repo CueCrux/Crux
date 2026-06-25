@@ -930,6 +930,7 @@ mod tests {
             milestones_done: None,
             milestones_total: None,
             notes_count: None,
+            provenance: None,
         }
     }
 

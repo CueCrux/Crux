@@ -38,7 +38,7 @@ use chrono::{DateTime, Utc};
 use corecrux_memory::fact_store::{FactQuery, FactStore};
 
 use crate::fact_helpers::dedup_latest;
-use crate::work::WorkItem;
+use crate::work::{Provenance, WorkItem};
 
 /// Env var that resolves the plan root for the aggregator. Unset → no plans.
 pub const EXECPLANS_ROOT_ENV: &str = "CRUX_EXECPLANS_ROOT";
@@ -114,6 +114,12 @@ pub struct ExecplanFactSummary {
     /// Earliest `stored_at` across all related facts (ms since epoch).
     pub first_fact_at_unix_ms: Option<u64>,
     pub decision_count: usize,
+    /// Distinct commit SHAs pulled from `decision:*` fact values (`commit_sha`
+    /// field; QC.1 guarantees decisions carry one). Insertion order, deduped.
+    pub commit_shas: Vec<String>,
+    /// Distinct real-principal actors that contributed facts to this plan,
+    /// sorted. The "who built this" rollup surfaced in `WorkItem::provenance`.
+    pub contributing_agents: Vec<String>,
     /// Owner passport, auto-derived from the actor of the most-recent fact whose
     /// actor is a real principal (not a `system:`/`__` placeholder). None when no
     /// fact carries a usable actor.
@@ -135,6 +141,22 @@ pub type ExecplanFactRow = (String, String, DateTime<Utc>, Option<String>);
 fn is_principal_actor(actor: &str) -> bool {
     let a = actor.trim();
     !a.is_empty() && !a.starts_with("system:") && !a.starts_with("__")
+}
+
+/// Distinct real-principal actors across a plan's facts (see
+/// [`is_principal_actor`]), sorted for deterministic output. These are the
+/// agents that contributed milestone/gate/decision facts — the "who built this"
+/// rollup surfaced in [`crate::work::WorkItem::provenance`].
+fn contributing_agents_from_facts(facts: &[ExecplanFactRow]) -> Vec<String> {
+    let mut agents: Vec<String> = facts
+        .iter()
+        .filter_map(|(_, _, _, actor)| actor.as_deref())
+        .filter(|a| is_principal_actor(a))
+        .map(|a| a.trim().to_string())
+        .collect();
+    agents.sort();
+    agents.dedup();
+    agents
 }
 
 /// Auto-derive a plan owner from its facts: the actor of the most-recent fact
@@ -455,6 +477,16 @@ pub fn summarise_facts(facts: &[(String, String, DateTime<Utc>)]) -> ExecplanFac
             }
         } else if key.starts_with("decision:") {
             summary.decision_count += 1;
+            // QC.1: decision facts carry a `commit_sha`. Collect distinct ones
+            // (insertion order) for the provenance rollup.
+            if let Some(sha) = serde_json::from_str::<serde_json::Value>(value)
+                .ok()
+                .and_then(|v| v.get("commit_sha").and_then(|s| s.as_str()).map(String::from))
+            {
+                if !sha.is_empty() && !summary.commit_shas.contains(&sha) {
+                    summary.commit_shas.push(sha);
+                }
+            }
         }
     }
 
@@ -571,6 +603,15 @@ fn mk_item(
     } else {
         (None, None)
     };
+    // Provenance is the fact-derived rollup; only meaningful when the plan has
+    // facts. Fact-less plans (and the kanban path) leave it `None`.
+    let provenance = facts.any_fact().then(|| Provenance {
+        first_activity_unix_ms: facts.first_fact_at_unix_ms.unwrap_or(created),
+        last_activity_unix_ms: facts.last_fact_at_unix_ms.unwrap_or(updated),
+        contributing_agents: facts.contributing_agents.clone(),
+        commit_shas: facts.commit_shas.clone(),
+        decision_count: facts.decision_count,
+    });
     WorkItem {
         id: format!("execplan:{}", file.slug),
         project_id: VIRTUAL_PROJECT_ID.to_string(),
@@ -594,6 +635,7 @@ fn mk_item(
         milestones_done,
         milestones_total,
         notes_count: None,
+        provenance,
     }
 }
 
@@ -695,9 +737,11 @@ pub fn list_execplans(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::
         // summarise_facts works on (key, value, stored_at); the owner is derived
         // from the 4th element (actor), which only the raw rows carry.
         let owner = owner_from_facts(&facts);
+        let agents = contributing_agents_from_facts(&facts);
         let rows3: Vec<(String, String, DateTime<Utc>)> = facts.into_iter().map(|(k, v, s, _)| (k, v, s)).collect();
         let mut summary = summarise_facts(&rows3);
         summary.owner_passport = owner;
+        summary.contributing_agents = agents;
         let mut item = derive_state(&file, &parsed, &summary, now_unix_ms);
         // Surface attached notes (work comments keyed by the item id).
         let n = crate::work::list_comments(store, &item.id).len() as u32;
@@ -827,6 +871,7 @@ mod tests {
             milestones_done: None,
             milestones_total: None,
             notes_count: None,
+            provenance: None,
         }
     }
 
@@ -928,6 +973,99 @@ mod tests {
             "dangling edge retained on source"
         );
         assert_eq!(items.len(), 1, "no phantom item minted for a missing target");
+    }
+
+    // ── M2: provenance rollup ──
+
+    #[test]
+    fn summarise_extracts_distinct_commit_shas_from_decisions() {
+        let facts = vec![
+            (
+                "decision:a".to_string(),
+                r#"{"commit_sha":"abc123","note":"x"}"#.to_string(),
+                ts(10),
+            ),
+            (
+                "decision:b".to_string(),
+                r#"{"commit_sha":"def456"}"#.to_string(),
+                ts(20),
+            ),
+            (
+                "decision:c".to_string(),
+                r#"{"commit_sha":"abc123"}"#.to_string(),
+                ts(30),
+            ),
+            ("decision:d".to_string(), r#"{"no_sha":true}"#.to_string(), ts(40)),
+            ("milestone:M1".to_string(), "{}".to_string(), ts(5)),
+        ];
+        let s = summarise_facts(&facts);
+        // Distinct, insertion order; the sha-less decision is counted but adds none.
+        assert_eq!(s.commit_shas, vec!["abc123".to_string(), "def456".to_string()]);
+        assert_eq!(s.decision_count, 4);
+    }
+
+    #[test]
+    fn contributing_agents_are_distinct_principals_sorted() {
+        let rows: Vec<ExecplanFactRow> = vec![
+            (
+                "milestone:M1".to_string(),
+                "{}".to_string(),
+                ts(1),
+                Some("agent-zed".to_string()),
+            ),
+            (
+                "gate:M1".to_string(),
+                "{}".to_string(),
+                ts(2),
+                Some("agent-amy".to_string()),
+            ),
+            (
+                "decision:x".to_string(),
+                "{}".to_string(),
+                ts(3),
+                Some("agent-zed".to_string()),
+            ),
+            (
+                "decision:y".to_string(),
+                "{}".to_string(),
+                ts(4),
+                Some("system:execplan-aggregator".to_string()),
+            ),
+            ("decision:z".to_string(), "{}".to_string(), ts(5), None),
+        ];
+        // Distinct + sorted; system:/None actors filtered out.
+        assert_eq!(
+            contributing_agents_from_facts(&rows),
+            vec!["agent-amy".to_string(), "agent-zed".to_string()]
+        );
+    }
+
+    #[test]
+    fn provenance_present_with_facts_absent_without() {
+        let f = file("p", 1_000, "# P\n\n## Milestones\n- M1\n");
+        let parsed = parse_plan(&f.content);
+
+        // No facts → no provenance (planned by age).
+        let none = derive_state(&f, &parsed, &ExecplanFactSummary::default(), 2_000);
+        assert!(none.provenance.is_none());
+
+        // With facts → provenance carries the rollup.
+        let sum = ExecplanFactSummary {
+            highest_milestone_with_fact: Some(1),
+            first_fact_at_unix_ms: Some(500),
+            last_fact_at_unix_ms: Some(900),
+            decision_count: 2,
+            commit_shas: vec!["abc123".to_string()],
+            contributing_agents: vec!["agent-amy".to_string()],
+            ..Default::default()
+        };
+        let item = derive_state(&f, &parsed, &sum, 2_000);
+        let prov = item.provenance.expect("provenance present when facts exist");
+        assert_eq!(prov.first_activity_unix_ms, 500);
+        assert_eq!(prov.last_activity_unix_ms, 900);
+        assert_eq!(prov.contributing_agents, vec!["agent-amy".to_string()]);
+        assert_eq!(prov.commit_shas, vec!["abc123".to_string()]);
+        assert_eq!(prov.decision_count, 2);
     }
 
     #[test]
