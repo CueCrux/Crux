@@ -89,6 +89,16 @@
   /* live/demo connection badge */
   .live-badge { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; color:var(--text-muted); background:var(--surface-glass-strong); border:1px solid var(--border-default); border-radius:var(--radius-full); padding:2px 8px; }
   .live-badge.on { color:var(--ok); border-color:var(--ok); }
+  .live-badge.degraded { color:#fff; background:var(--err); border-color:var(--err); cursor:help; }
+  /* daemon-degraded banner — shown when /healthz reports a problem */
+  .crux-degraded-banner { display:flex; align-items:flex-start; gap:10px; padding:10px 16px; background:color-mix(in srgb, var(--err) 12%, transparent); border-bottom:1px solid var(--err); color:var(--err); font-size:13px; }
+  .crux-degraded-banner[hidden] { display:none; }
+  .crux-degraded-banner .cdb-icon { font-size:16px; line-height:1.3; }
+  .crux-degraded-banner .cdb-body { flex:1; }
+  .crux-degraded-banner strong { font-weight:800; }
+  .crux-degraded-banner .cdb-reasons { margin:2px 0 0; padding-left:18px; opacity:.95; }
+  .crux-degraded-banner .cdb-hint { opacity:.85; }
+  .crux-degraded-banner .cdb-recheck { align-self:center; background:var(--err); color:#fff; border:none; border-radius:var(--radius-full); padding:4px 12px; font-weight:700; cursor:pointer; }
   /* live-data status tiles (loading/empty/error/unavailable) — inert placeholders */
   .gnode[data-kind="loading"], .gnode[data-kind="empty"], .gnode[data-kind="unavailable"], .gnode[data-kind="error"] { opacity:.9; font-style:italic; }
   .gnode[data-kind="loading"] .gstripe { background:var(--run); animation:cxpulse 1s ease-in-out infinite; }
@@ -626,6 +636,16 @@
       </div>
     </div>
   </header>
+
+  <div id="cruxDegradedBanner" class="crux-degraded-banner" role="alert" hidden>
+    <span class="cdb-icon" aria-hidden="true">⚠️</span>
+    <div class="cdb-body">
+      <strong id="cdbTitle">Crux daemon is degraded</strong>
+      <ul class="cdb-reasons" id="cdbReasons"></ul>
+      <div class="cdb-hint">Some answers, audits or background work may be affected. Check the daemon, or contact your operator.</div>
+    </div>
+    <button class="cdb-recheck" id="cdbRecheck" type="button">Re-check</button>
+  </div>
 
   <div class="toolbar">
     <div class="crumbs" id="breadcrumb"></div>
@@ -1272,6 +1292,8 @@ const workStages={planned:true, in_progress:true, blocked:true, done:true};   //
    Panels lazy-load from /v1/* on first expand; render()/childrenOf/focus/search/loop-guard
    stay UNCHANGED because children are merged into N before childrenOf runs. */
 let LIVE = false;                 // true after a successful /readyz probe
+let DEGRADED = false;             // true when a live daemon reports a problem (/healthz)
+let DEGRADED_REASONS = [];        // human-readable reasons the daemon is degraded
 const loadState = {};             // node id -> 'loading'|'done'|'error'|'unavailable'
 const LOADERS = {};               // node id (or {match}) -> {endpoint, transform, noun, flagHint}
 const DUMMY_CHILDREN = {};        // id -> original dummy children (degrade-to-demo)
@@ -1359,7 +1381,50 @@ function retryLoad(statusNode){
   if(pid){ loadState[pid]='idle'; ensureLoaded(N[pid]); }
 }
 function prefetchScope(id){ const sc=SCOPES.find(s=>s.id===id); if(!sc) return; sc.sections.forEach(sid=>{ const n=N[sid]; if(n && loaderFor(n)) ensureLoaded(n); }); }
-function updateLiveBadge(){ const b=document.getElementById('liveBadge'); if(b){ b.textContent=LIVE?'live':'demo'; b.classList.toggle('on', LIVE); } announce(LIVE?'Connected — live data':'Demo data'); }
+function updateLiveBadge(){
+  const b=document.getElementById('liveBadge');
+  if(b){
+    if(LIVE && DEGRADED){
+      b.textContent='degraded'; b.classList.remove('on'); b.classList.add('degraded');
+      b.title=DEGRADED_REASONS.length? ('Daemon degraded — '+DEGRADED_REASONS.join('; ')) : 'Daemon reports a degraded state';
+    } else {
+      b.textContent=LIVE?'live':'demo'; b.classList.toggle('on', LIVE); b.classList.remove('degraded');
+      b.title='live = connected to the daemon · demo = sample data';
+    }
+  }
+  announce(LIVE? (DEGRADED?'Connected — daemon DEGRADED':'Connected — live data') : 'Demo data');
+}
+
+// Poll the daemon's unauthenticated /healthz and fold ok + engaged valves into
+// a single degraded signal. Same-origin, so it works on every customer build.
+async function cruxHealthPoll(){
+  if(!LIVE){ DEGRADED=false; DEGRADED_REASONS=[]; renderDegradedBanner(); return; }
+  let reasons=[];
+  try{
+    const r=await fetch('/healthz',{cache:'no-store'});
+    if(!r.ok){ reasons.push('healthz returned HTTP '+r.status); }
+    else {
+      const h=await r.json();
+      if(h && h.ok!==true) reasons.push('daemon reported ok=false');
+      const valves=(h&&h.valves)||{};
+      for(const name of Object.keys(valves)){
+        const v=valves[name]||{};
+        if(v.enabled) reasons.push('valve "'+name+'" engaged'+(v.reason?(': '+v.reason):''));
+      }
+    }
+  }catch(e){ reasons.push('healthz unreachable: '+(e&&e.message?e.message:e)); }
+  DEGRADED=reasons.length>0; DEGRADED_REASONS=reasons;
+  updateLiveBadge(); renderDegradedBanner();
+}
+
+function renderDegradedBanner(){
+  const el=document.getElementById('cruxDegradedBanner'); if(!el) return;
+  if(DEGRADED && LIVE){
+    const ul=document.getElementById('cdbReasons');
+    if(ul) ul.innerHTML=DEGRADED_REASONS.map(r=>'<li>'+esc(r)+'</li>').join('');
+    el.hidden=false;
+  } else { el.hidden=true; }
+}
 // ── per-panel transforms (json → child nodes) ──
 const WSTATE = { planned:'planned', in_progress:'in_progress', blocked:'blocked', complete:'done', deployed:'done', archive:'done', done:'done' };
 function txWork(json){   // M3 — kanban WorkItem[] → execplan nodes (status drives the stage filter)
@@ -1812,6 +1877,10 @@ async function bootProbe(){
   try{ const r=await fetch('/readyz',{cache:'no-store'}); LIVE=!!(r&&r.ok); }catch{ LIVE=false; }
   registerLoaders(); updateLiveBadge();
   if(LIVE){ prefetchScope(activeScope); startEventStream(); }
+  // Degraded-health: probe now, re-check on a 15s cadence, and on demand.
+  const rc=document.getElementById('cdbRecheck'); if(rc) rc.addEventListener('click', cruxHealthPoll);
+  cruxHealthPoll();
+  if(typeof setInterval==='function'){ setInterval(cruxHealthPoll, 15000); }
 }
 // debug/test handle (used by the Node smoke harness; inert in prod)
 try{ globalThis.__cx = { get LIVE(){return LIVE;}, setLive:(v)=>{LIVE=v;}, N, LOADERS, loadState, ensureLoaded, mergeChildren, makeStatusNode, bootProbe, prefetchScope, api, idFor }; }catch{}
