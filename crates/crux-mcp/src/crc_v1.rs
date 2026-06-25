@@ -205,10 +205,29 @@ fn value_str(v: &Value) -> String {
 /// nests this under `structuredContent.crc_v1` so the daemon's audit-envelope
 /// wrapper (which overwrites `structuredContent.envelope`) does NOT collide.
 pub fn wrap_facts(rows: &[Value], entity: Option<&str>, query: Option<&str>) -> Value {
+    // No demotion: every row is hydrated full (byte-identical to pre-M1-part-2).
+    wrap_facts_tiered(rows, entity, query, rows.len())
+}
+
+/// As [`wrap_facts`], but the first `full_count` rows (ranked order) are
+/// hydrated **full** (epitome pointer + inline `content`) and the rest are
+/// **demoted** to an epitome-only pointer — no inline `content`, a `reason` of
+/// `"Demoted"`, and a `content_hash` (OD-A) so the caller can detect staleness
+/// when it re-addresses the fact by entity+key. This is M1 part 2's reversible
+/// overflow on the fact path: over-budget facts are demoted, not dropped, and
+/// the emitted payload pays the epitome price for them, not the full price.
+///
+/// **Byte-identical guarantee:** when `full_count >= rows.len()` there is no
+/// demotion — no `content_hash`, no `"Demoted"` reason, `content[]` carries
+/// every row, `hydrate_tier` stays `"full"`, and `meta` gains no demotion keys —
+/// so the output is identical to the pre-M1-part-2 `wrap_facts`.
+pub fn wrap_facts_tiered(rows: &[Value], entity: Option<&str>, query: Option<&str>, full_count: usize) -> Value {
     let mut pointers = Vec::with_capacity(rows.len());
     let mut content = Vec::with_capacity(rows.len());
     let mut memories_used = Vec::with_capacity(rows.len());
     let mut full_cost: u64 = 0;
+    let mut demoted: u64 = 0;
+    let mut emitted_ix: usize = 0; // index among non-empty-fid rows
     for r in rows {
         let fid = r.get("fact_id").and_then(Value::as_str).unwrap_or("");
         if fid.is_empty() {
@@ -222,18 +241,33 @@ pub fn wrap_facts(rows: &[Value], entity: Option<&str>, query: Option<&str>) -> 
             epitome.truncate(80);
         }
         full_cost += (val.len() / 4) as u64;
-        pointers.push(json!({
-            "id": fid,
-            "score": r.get("effective_confidence").cloned().unwrap_or(Value::Null),
-            "epitome": epitome,
-            "reason": "Exact",
-        }));
-        content.push(json!({"id": fid, "text": val}));
+        let is_demoted = emitted_ix >= full_count;
+        if is_demoted {
+            demoted += 1;
+            // Epitome-only pointer: no inline content, carry the content hash so
+            // a re-address (entity+key) can detect a changed/forgotten value.
+            pointers.push(json!({
+                "id": fid,
+                "score": r.get("effective_confidence").cloned().unwrap_or(Value::Null),
+                "epitome": epitome,
+                "reason": "Demoted",
+                "content_hash": crate::budget::content_hash(&val),
+            }));
+        } else {
+            pointers.push(json!({
+                "id": fid,
+                "score": r.get("effective_confidence").cloned().unwrap_or(Value::Null),
+                "epitome": epitome,
+                "reason": "Exact",
+            }));
+            content.push(json!({"id": fid, "text": val}));
+        }
         memories_used.push(json!({
             "fact_id": fid,
             "topic": ent,
             "freshness": r.get("freshness").cloned().unwrap_or(Value::Null),
         }));
+        emitted_ix += 1;
     }
     let n = pointers.len() as u64;
     // Freshness summarised from the top (most-relevant / highest-confidence) row;
@@ -255,7 +289,12 @@ pub fn wrap_facts(rows: &[Value], entity: Option<&str>, query: Option<&str>) -> 
     let mut out = Map::new();
     out.insert("contract".into(), json!("crc-v1"));
     out.insert("kind".into(), json!("fact"));
-    out.insert("hydrate_tier".into(), json!("full")); // values returned inline
+    // `full` when nothing demoted (byte-identical to pre-M1-part-2); `mixed`
+    // once the reversible budget demotes overflow facts to epitome-only.
+    out.insert(
+        "hydrate_tier".into(),
+        json!(if demoted == 0 { "full" } else { "mixed" }),
+    );
     out.insert("pointers".into(), Value::Array(pointers));
     out.insert("content".into(), Value::Array(content));
     out.insert(
@@ -281,13 +320,20 @@ pub fn wrap_facts(rows: &[Value], entity: Option<&str>, query: Option<&str>) -> 
             "expand": Value::Null,
         }),
     );
-    out.insert(
-        "meta".into(),
-        json!({
-            "resolved_by": if addressed { "entity+key" } else { "query" },
-            "ranked": query.is_some() && !addressed,
-        }),
-    );
+    let mut meta = json!({
+        "resolved_by": if addressed { "entity+key" } else { "query" },
+        "ranked": query.is_some() && !addressed,
+    });
+    if demoted > 0 {
+        // Disclosure (additive, demotion-only): how many facts were demoted to
+        // epitome-only and the full candidate count, so nothing is silently lost.
+        if let Some(m) = meta.as_object_mut() {
+            m.insert("demoted".into(), json!(demoted));
+            m.insert("total_candidates".into(), json!(n));
+            m.insert("emitted_full".into(), json!(n - demoted));
+        }
+    }
+    out.insert("meta".into(), meta);
     Value::Object(out)
 }
 
@@ -414,6 +460,52 @@ mod tests {
         assert_eq!(out["meta"]["resolved_by"], "entity+key");
         // addressed recall is not ranked
         assert_eq!(out["meta"]["ranked"], false);
+    }
+
+    // ---- M1 part 2 — fact-path reversible overflow (tiered demotion) --------
+
+    fn fact_row(id: &str, val: &str) -> Value {
+        json!({
+            "fact_id": id, "entity": "proj", "key": id, "value": val,
+            "effective_confidence": 1.0, "freshness": "fresh",
+            "age_hours": 1, "horizon_class": "medium", "superseded_by": null
+        })
+    }
+
+    #[test]
+    fn wrap_facts_no_demotion_is_byte_identical_to_full() {
+        // full_count == rows.len() must equal the plain wrap_facts (the OFF net).
+        let rows = vec![fact_row("a", "alpha"), fact_row("b", "beta")];
+        let full = wrap_facts(&rows, Some("proj"), None);
+        let tiered = wrap_facts_tiered(&rows, Some("proj"), None, rows.len());
+        assert_eq!(full, tiered);
+        // …and neither leaks demotion fields.
+        assert_eq!(full["hydrate_tier"], "full");
+        assert!(full["pointers"][0].get("content_hash").is_none());
+        assert!(full["meta"].get("demoted").is_none());
+    }
+
+    #[test]
+    fn wrap_facts_tiered_demotes_overflow_to_epitome_only() {
+        let rows = vec![fact_row("a", "alpha"), fact_row("b", "beta"), fact_row("c", "gamma")];
+        // Keep 1 full, demote the other 2.
+        let out = wrap_facts_tiered(&rows, Some("proj"), None, 1);
+        assert_eq!(out["hydrate_tier"], "mixed");
+        // Only the first fact carries inline content.
+        assert_eq!(out["content"].as_array().unwrap().len(), 1);
+        assert_eq!(out["content"][0]["id"], "a");
+        // All three remain as pointers; the demoted ones carry content_hash +
+        // reason "Demoted" so nothing is dropped and staleness is detectable.
+        assert_eq!(out["pointers"].as_array().unwrap().len(), 3);
+        assert_eq!(out["pointers"][0]["reason"], "Exact");
+        assert!(out["pointers"][0].get("content_hash").is_none());
+        assert_eq!(out["pointers"][1]["reason"], "Demoted");
+        assert_eq!(out["pointers"][1]["content_hash"], crate::budget::content_hash("beta"));
+        assert_eq!(out["pointers"][2]["reason"], "Demoted");
+        // Disclosure: nothing silently lost.
+        assert_eq!(out["meta"]["demoted"], 2);
+        assert_eq!(out["meta"]["total_candidates"], 3);
+        assert_eq!(out["meta"]["emitted_full"], 1);
     }
 
     #[test]
