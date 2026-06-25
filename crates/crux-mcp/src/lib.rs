@@ -32,6 +32,7 @@ pub mod crc_v1;
 pub mod dispatch;
 pub mod envelope;
 pub mod handoff;
+pub mod learn;
 pub mod ledger;
 pub mod oauth;
 pub mod otel;

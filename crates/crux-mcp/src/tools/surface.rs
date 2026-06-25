@@ -224,7 +224,8 @@ pub fn tool_affinity(tool: &str) -> &'static str {
         | "list_observations"
         | "get_observation"
         | "verify_observation"
-        | "tool_trace_recent" => "audit",
+        | "tool_trace_recent"
+        | "learn" => "audit",
         "proof_verify" | "receipt_verify" | "output_attest" => "proof",
         _ => "",
     }
@@ -481,6 +482,8 @@ mod tests {
             ts_us: 0,
             predicted_effects: vec![],
             outcome: crate::traces::TraceOutcome::Ok,
+            signature: None,
+            response_tokens: None,
         }
     }
 

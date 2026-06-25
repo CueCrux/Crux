@@ -116,6 +116,16 @@ pub struct TraceEntry {
     pub predicted_effects: Vec<PredictedEffect>,
     /// Whether the dispatch succeeded.
     pub outcome: TraceOutcome,
+    /// M4 — canonical, pagination-insensitive signature of this call
+    /// (`crate::learn::canonical_signature`). `None` for traces recorded before
+    /// M4 or via the non-metered [`record_dispatch`] path. Additive +
+    /// `#[serde(default)]` keeps pre-M4 journal lines replay-safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// M4 — estimated tokens in this call's response (the dispatch path's
+    /// `est_out`). Pairs with `signature` to feed `crux learn` loop-weighting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_tokens: Option<u64>,
 }
 
 /// Per-passport sliding-window store of [`TraceEntry`] values.
@@ -216,6 +226,23 @@ pub async fn record_dispatch(
     predicted_effects: Vec<PredictedEffect>,
     outcome: TraceOutcome,
 ) {
+    record_dispatch_metered(passport, tool, turn_id, None, None, predicted_effects, outcome).await;
+}
+
+/// Record a tool dispatch including the M4 loop-weighting metadata (the canonical
+/// signature + response token estimate). The production dispatch path uses this
+/// so `crux learn` can mine the ring; tests and effect-only callers use the
+/// thinner [`record_dispatch`] (which passes `None`/`None`).
+#[allow(clippy::too_many_arguments)]
+pub async fn record_dispatch_metered(
+    passport: &str,
+    tool: &str,
+    turn_id: Option<&str>,
+    signature: Option<String>,
+    response_tokens: Option<u64>,
+    predicted_effects: Vec<PredictedEffect>,
+    outcome: TraceOutcome,
+) {
     if !traces_enabled() {
         return;
     }
@@ -225,6 +252,8 @@ pub async fn record_dispatch(
         ts_us: Utc::now().timestamp_micros(),
         predicted_effects,
         outcome,
+        signature,
+        response_tokens,
     };
     let mut store = global().lock().await;
     store.push(passport, entry);
@@ -282,6 +311,8 @@ mod tests {
             ts_us: Utc::now().timestamp_micros(),
             predicted_effects: effects,
             outcome: TraceOutcome::Ok,
+            signature: None,
+            response_tokens: None,
         }
     }
 
