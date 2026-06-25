@@ -799,8 +799,9 @@ mod tests {
         }
         let args = json!({"query": "needle", "token_budget": 80, "top_k": 50});
 
-        // Flag OFF (default): legacy budget-drop — overflow facts vanish.
-        std::env::remove_var(crate::budget::REVERSIBLE_ENV);
+        // Flag OFF (explicit opt-out, since CO-3 makes ON the default): legacy
+        // budget-drop — overflow facts vanish.
+        std::env::set_var(crate::budget::REVERSIBLE_ENV, "0");
         let off = handle_query_facts(&args, &ctx).await.unwrap();
         let off_rows = off["structuredContent"]["rows"].as_array().unwrap().len();
         let off_crc = &off["structuredContent"]["crc_v1"];
