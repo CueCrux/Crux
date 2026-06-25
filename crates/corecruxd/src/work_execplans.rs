@@ -93,6 +93,12 @@ pub struct ParsedPlan {
     pub status_line: Option<String>,
     /// Slug captured from `Superseded by [[<slug>]]` or `Status: Superseded by <slug>`.
     pub superseded_by: Option<String>,
+    /// Slugs from `Depends on [[<slug>]]` declaration lines — plans this one
+    /// builds on / is blocked by. Accumulated across lines, deduped.
+    pub depends_on: Vec<String>,
+    /// Slugs from `Extended by [[<slug>]]` declaration lines — plans that build
+    /// on this one.
+    pub extended_by: Vec<String>,
 }
 
 /// Rollup of facts stored under `entity = "execplan:<slug>"`. Fields cover the
@@ -187,6 +193,17 @@ pub fn parse_plan(md: &str) -> ParsedPlan {
         if out.superseded_by.is_none() {
             if let Some(slug) = extract_superseded_slug(trimmed) {
                 out.superseded_by = Some(slug);
+            }
+        }
+
+        for slug in extract_ref_slugs(trimmed, "Depends on") {
+            if !out.depends_on.contains(&slug) {
+                out.depends_on.push(slug);
+            }
+        }
+        for slug in extract_ref_slugs(trimmed, "Extended by") {
+            if !out.extended_by.contains(&slug) {
+                out.extended_by.push(slug);
             }
         }
 
@@ -318,6 +335,55 @@ fn extract_superseded_slug(line: &str) -> Option<String> {
     } else {
         Some(token)
     }
+}
+
+/// Extract typed plan-reference slugs from a *declaration* line, after stripping
+/// leading markdown markup. `keyword` is the case-sensitive lead token
+/// (`"Depends on"`, `"Extended by"`). Mirrors [`extract_superseded_slug`]'s
+/// prose rejection: the keyword must sit at the line's declarative prefix and be
+/// followed by a `:`/space separator, so mid-sentence prose ("…which depends on
+/// the older plan…") and `Depends online`-style words never match.
+///
+/// Captures every `[[<slug>]]` group on the line (comma-separated targets inside
+/// one group are split); if no `[[…]]` group is present, the single bare token
+/// after the keyword is taken.
+fn extract_ref_slugs(line: &str, keyword: &str) -> Vec<String> {
+    let trimmed = strip_leading_markup(line);
+    let Some(after) = trimmed.strip_prefix(keyword) else {
+        return Vec::new();
+    };
+    // Require an explicit `:`/space separator so the keyword can't run into the
+    // next word (`Depends online` must NOT yield a bare token `line`).
+    let Some(after) = after.strip_prefix([':', ' ']) else {
+        return Vec::new();
+    };
+    let after = after.trim_start_matches([':', ' ']);
+
+    let mut slugs = Vec::new();
+    if after.contains("[[") {
+        let mut rest = after;
+        while let Some(open) = rest.find("[[") {
+            rest = &rest[open + 2..];
+            let Some(close) = rest.find("]]") else { break };
+            let group = &rest[..close];
+            rest = &rest[close + 2..];
+            for part in group.split(',') {
+                let s = part.trim();
+                if !s.is_empty() {
+                    slugs.push(s.to_string());
+                }
+            }
+        }
+    } else {
+        let token: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+            .collect();
+        if !token.is_empty() {
+            slugs.push(token);
+        }
+    }
+    slugs
 }
 
 /// Find the first `M<digits>` token in a line, returning the number.
@@ -522,6 +588,8 @@ fn mk_item(
         plan_path: Some(file.path.display().to_string()),
         current_milestone,
         superseded_by,
+        depends_on: parsed.depends_on.clone(),
+        extended_by: parsed.extended_by.clone(),
         orchestrator_id: None,
         milestones_done,
         milestones_total,
@@ -636,8 +704,64 @@ pub fn list_execplans(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::
         item.notes_count = (n > 0).then_some(n);
         out.push(item);
     }
+    apply_reciprocal_refs(&mut out);
     out.sort_by(|a, b| b.updated_at_unix_ms.cmp(&a.updated_at_unix_ms));
     Ok(out)
+}
+
+/// Derive reciprocal lineage edges across the walked plan set: for every
+/// `A depends_on B`, ensure `B.extended_by` contains `A` (and the mirror for a
+/// declared `extended_by`). Authors declare one direction; this fills the other.
+/// A declared edge whose target slug has no matching plan is left one-sided —
+/// the source keeps the declared edge so a client can flag it as dangling — and
+/// never mints a phantom item. Each item's edge lists are sorted + deduped for
+/// deterministic output.
+fn apply_reciprocal_refs(items: &mut [WorkItem]) {
+    // slug -> index, where slug is the id minus the `execplan:` prefix.
+    let slug_to_idx: HashMap<String, usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, it)| it.id.strip_prefix(EXECPLAN_ENTITY_PREFIX).map(|s| (s.to_string(), i)))
+        .collect();
+
+    // Read pass: collect reverse edges as (target_idx, source_slug, is_extended)
+    // where is_extended means "push source into target.extended_by". Deferring
+    // the writes keeps the borrow checker happy.
+    let mut additions: Vec<(usize, String, bool)> = Vec::new();
+    for it in items.iter() {
+        let Some(src) = it.id.strip_prefix(EXECPLAN_ENTITY_PREFIX) else {
+            continue;
+        };
+        for target in &it.depends_on {
+            if let Some(&j) = slug_to_idx.get(target) {
+                additions.push((j, src.to_string(), true)); // target.extended_by += src
+            }
+        }
+        for target in &it.extended_by {
+            if let Some(&j) = slug_to_idx.get(target) {
+                additions.push((j, src.to_string(), false)); // target.depends_on += src
+            }
+        }
+    }
+
+    // Write pass.
+    for (j, src, is_extended) in additions {
+        let edges = if is_extended {
+            &mut items[j].extended_by
+        } else {
+            &mut items[j].depends_on
+        };
+        if !edges.contains(&src) {
+            edges.push(src);
+        }
+    }
+
+    for it in items.iter_mut() {
+        it.depends_on.sort();
+        it.depends_on.dedup();
+        it.extended_by.sort();
+        it.extended_by.dedup();
+    }
 }
 
 /// Stamp `orchestrator_id` on the ExecPlan-derived [`WorkItem`]s whose `id`
@@ -676,6 +800,134 @@ mod tests {
 
     fn ts(ms: i64) -> DateTime<Utc> {
         Utc.timestamp_millis_opt(ms).unwrap()
+    }
+
+    /// Build a minimal ExecPlan-shaped WorkItem for reciprocal-closure tests.
+    fn wi(slug: &str, depends_on: &[&str], extended_by: &[&str]) -> WorkItem {
+        WorkItem {
+            id: format!("execplan:{slug}"),
+            project_id: VIRTUAL_PROJECT_ID.to_string(),
+            state: "planned".to_string(),
+            title: slug.to_string(),
+            body: String::new(),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: None,
+            created_by_passport: VIRTUAL_PASSPORT.to_string(),
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            plan_path: None,
+            current_milestone: None,
+            superseded_by: None,
+            depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
+            extended_by: extended_by.iter().map(|s| s.to_string()).collect(),
+            orchestrator_id: None,
+            milestones_done: None,
+            milestones_total: None,
+            notes_count: None,
+        }
+    }
+
+    fn item<'a>(items: &'a [WorkItem], slug: &str) -> &'a WorkItem {
+        items
+            .iter()
+            .find(|i| i.id == format!("execplan:{slug}"))
+            .expect("item present")
+    }
+
+    // ── M1: typed plan-reference parsing ──
+
+    #[test]
+    fn parse_extracts_depends_and_extended() {
+        let md = "# T\n\n> Depends on [[plan-a]]\nExtended by [[plan-b]]\n";
+        let p = parse_plan(md);
+        assert_eq!(p.depends_on, vec!["plan-a".to_string()]);
+        assert_eq!(p.extended_by, vec!["plan-b".to_string()]);
+    }
+
+    #[test]
+    fn parse_depends_multiple_targets_and_bare_form() {
+        let md = "# T\n\n- Depends on [[a]] [[b]]\nDepends on bare-slug-2026-01-01 (note)\n";
+        let p = parse_plan(md);
+        assert_eq!(
+            p.depends_on,
+            vec!["a".to_string(), "b".to_string(), "bare-slug-2026-01-01".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_depends_comma_separated_group() {
+        let md = "# T\n\nDepends on [[a, b, c]]\n";
+        let p = parse_plan(md);
+        assert_eq!(p.depends_on, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn parse_refs_reject_prose_mentions() {
+        // lowercase mid-sentence "depends on" / "extended by" must not match.
+        let md = "# T\n\n- This milestone depends on [[a]] for context.\n- The work is extended by [[b]] later.\n";
+        let p = parse_plan(md);
+        assert!(p.depends_on.is_empty(), "prose 'depends on' must not match");
+        assert!(p.extended_by.is_empty(), "prose 'extended by' must not match");
+    }
+
+    #[test]
+    fn parse_refs_reject_keyword_without_separator() {
+        // "Depends online" must not yield a bare token "line".
+        let md = "# T\n\nDepends online resources are great\n";
+        let p = parse_plan(md);
+        assert!(p.depends_on.is_empty());
+    }
+
+    #[test]
+    fn parse_refs_ignore_backtick_quoted_pattern() {
+        // A docs line that quotes the convention must not mint an edge.
+        let md = "# T\n\n6. `Depends on [[slug]]` declares a lineage edge → projection.\n";
+        let p = parse_plan(md);
+        assert!(p.depends_on.is_empty(), "pattern example must not match");
+    }
+
+    // ── M1: reciprocal closure ──
+
+    #[test]
+    fn reciprocal_closure_fills_reverse_edge() {
+        let mut items = vec![wi("a", &["b"], &[]), wi("b", &[], &[])];
+        apply_reciprocal_refs(&mut items);
+        assert_eq!(item(&items, "a").depends_on, vec!["b".to_string()]);
+        assert_eq!(item(&items, "b").extended_by, vec!["a".to_string()]);
+        assert!(item(&items, "b").depends_on.is_empty());
+    }
+
+    #[test]
+    fn reciprocal_closure_mirrors_declared_extended_by() {
+        let mut items = vec![wi("a", &[], &["b"]), wi("b", &[], &[])];
+        apply_reciprocal_refs(&mut items);
+        assert_eq!(item(&items, "b").depends_on, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn reciprocal_closure_no_duplicate_when_both_declared() {
+        let mut items = vec![wi("a", &["b"], &[]), wi("b", &[], &["a"])];
+        apply_reciprocal_refs(&mut items);
+        assert_eq!(
+            item(&items, "b").extended_by,
+            vec!["a".to_string()],
+            "no duplicate reverse edge"
+        );
+    }
+
+    #[test]
+    fn reciprocal_closure_dangling_target_keeps_source_edge() {
+        let mut items = vec![wi("a", &["ghost"], &[])];
+        apply_reciprocal_refs(&mut items);
+        assert_eq!(
+            items[0].depends_on,
+            vec!["ghost".to_string()],
+            "dangling edge retained on source"
+        );
+        assert_eq!(items.len(), 1, "no phantom item minted for a missing target");
     }
 
     #[test]

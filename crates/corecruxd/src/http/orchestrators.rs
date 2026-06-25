@@ -924,6 +924,8 @@ mod tests {
             plan_path: None,
             current_milestone: None,
             superseded_by: None,
+            depends_on: Vec::new(),
+            extended_by: Vec::new(),
             orchestrator_id: None,
             milestones_done: None,
             milestones_total: None,

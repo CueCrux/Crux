@@ -90,6 +90,15 @@ pub struct WorkItem {
     pub current_milestone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// Lineage graph: plans this one builds on / is blocked by (`Depends on
+    /// [[slug]]`), and plans that build on this one (`Extended by [[slug]]`).
+    /// Slugs only. The reciprocal edge is derived at projection time, so a plan
+    /// declares one direction and `list_execplans` fills the other. Additive +
+    /// empty-skipped so the kanban path stays byte-compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extended_by: Vec<String>,
     /// Agent-graph: orchestrator this work item belongs to, if any. Additive
     /// + `#[serde(default)]` so existing records remain byte-compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,6 +198,8 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         plan_path: None,
         current_milestone: None,
         superseded_by: None,
+        depends_on: Vec::new(),
+        extended_by: Vec::new(),
         orchestrator_id: None,
         milestones_done: None,
         milestones_total: None,
