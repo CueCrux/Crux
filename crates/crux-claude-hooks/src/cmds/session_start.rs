@@ -20,12 +20,12 @@
 //! (timestamps, `local_fact_count`, sync mode) and the live-session coord
 //! digest — so a single changed fact count busts the whole prefix.
 //!
-//! Behind `CRUX_BANNER_CACHE_ALIGN` (default **OFF**) we tag each section
-//! `Stable` (playbook/patterns — identical session-to-session) or
-//! `Volatile` (sync state, live sessions, config hashes) and emit
-//! all stable sections first, volatile last. The stable *prefix* then stays
-//! byte-identical across boots; only the tail churns. Flag OFF ⇒ insertion
-//! order, byte-identical to pre-M2.
+//! Behind `CRUX_BANNER_CACHE_ALIGN` (**default ON** since the CO-2 cutover) we
+//! tag each section `Stable` (playbook/patterns — identical session-to-session)
+//! or `Volatile` (sync state, live sessions, config hashes) and emit all stable
+//! sections first, volatile last. The stable *prefix* then stays byte-identical
+//! across boots; only the tail churns. Opt out with `CRUX_BANNER_CACHE_ALIGN=0`
+//! for the original insertion order (byte-identical to pre-M2) — the escape hatch.
 
 use serde_json::{json, Value};
 
@@ -33,24 +33,30 @@ use crate::{config_audit, hook_input::HookInput, hook_output::HookOutput, mcp_cl
 
 const BOOTSTRAP_TOKEN_BUDGET: u64 = 500;
 
-/// Env flag name for M2 cache-aligned banner ordering. Default OFF.
+/// Env flag name for M2 cache-aligned banner ordering. **Default ON** since the
+/// CO-2 cutover; set to `0`/`false`/`off`/`no` to opt back out to insertion order.
 const CACHE_ALIGN_ENV: &str = "CRUX_BANNER_CACHE_ALIGN";
 
-/// Truthy-env parse matching the crate convention (`unset`/`""`/`0`/`false`/
-/// `off`/`no` ⇒ false; anything else ⇒ true).
-fn env_truthy(var: &str) -> bool {
+/// Opt-out env parse: **ON unless explicitly disabled**. Unset / `""` / any value
+/// other than `0`/`false`/`off`/`no` ⇒ true; only an explicit falsey value ⇒
+/// false. The banner reorder is consumer-free (it only reorders sections in the
+/// agent's `additionalContext`), so default-ON is safe; the OFF path stays the
+/// original insertion order — the escape hatch / instant rollback.
+fn env_opt_out_enabled(var: &str) -> bool {
     match std::env::var(var) {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
-            !matches!(v.as_str(), "" | "0" | "false" | "off" | "no")
+            !matches!(v.as_str(), "0" | "false" | "off" | "no")
         }
-        Err(_) => false,
+        // Unset ⇒ default ON (the CO-2 cutover).
+        Err(_) => true,
     }
 }
 
-/// True when cache-aligned banner ordering is enabled via `CRUX_BANNER_CACHE_ALIGN`.
+/// True when cache-aligned banner ordering is enabled (the default since CO-2).
+/// `CRUX_BANNER_CACHE_ALIGN=0`/`false`/`off`/`no` opts back out to insertion order.
 fn cache_align_enabled() -> bool {
-    env_truthy(CACHE_ALIGN_ENV)
+    env_opt_out_enabled(CACHE_ALIGN_ENV)
 }
 
 /// Boot-banner section stability, for M2 cache alignment. `Stable` content is
@@ -409,13 +415,19 @@ mod tests {
     }
 
     #[test]
-    fn cache_align_env_default_off() {
-        std::env::set_var("CRUX_BANNER_CACHE_ALIGN_TEST_A", "1");
-        assert!(env_truthy("CRUX_BANNER_CACHE_ALIGN_TEST_A"));
-        std::env::set_var("CRUX_BANNER_CACHE_ALIGN_TEST_A", "off");
-        assert!(!env_truthy("CRUX_BANNER_CACHE_ALIGN_TEST_A"));
-        std::env::remove_var("CRUX_BANNER_CACHE_ALIGN_TEST_A");
-        assert!(!env_truthy("CRUX_BANNER_CACHE_ALIGN_TEST_A"));
+    fn cache_align_env_default_on_with_opt_out() {
+        // CO-2: default ON when unset; only an explicit falsey value opts out.
+        let k = "CRUX_BANNER_CACHE_ALIGN_TEST_A";
+        std::env::remove_var(k);
+        assert!(env_opt_out_enabled(k), "unset ⇒ default ON");
+        std::env::set_var(k, "1");
+        assert!(env_opt_out_enabled(k));
+        std::env::set_var(k, "off");
+        assert!(!env_opt_out_enabled(k), "off ⇒ opt-out");
+        std::env::set_var(k, "0");
+        assert!(!env_opt_out_enabled(k), "0 ⇒ opt-out");
+        std::env::remove_var(k);
+        assert!(env_opt_out_enabled(k));
     }
 
     #[test]

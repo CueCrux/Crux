@@ -167,6 +167,145 @@ impl SavingsReport {
     }
 }
 
+// ── CO-4: live holdout accumulator + unpaired savings ───────────────────────
+
+use std::sync::{Mutex, OnceLock};
+
+/// Per-arm bounded ring of emitted-token samples for the *live* holdout. Live
+/// traffic is **unpaired** (a control request and a treatment request are
+/// different requests), so we accumulate each arm's per-request token counts
+/// separately and compare them with [`unpaired_savings`].
+#[derive(Default)]
+pub struct HoldoutAccumulator {
+    control: Vec<u64>,
+    treatment: Vec<u64>,
+}
+
+/// Per-arm hard cap — keeps the accumulator memory-bounded; oldest samples are
+/// evicted FIFO so the report reflects a rolling recent window.
+pub const MAX_SAMPLES_PER_ARM: usize = 5_000;
+
+impl HoldoutAccumulator {
+    fn push(&mut self, is_control: bool, tokens: u64) {
+        let arm = if is_control {
+            &mut self.control
+        } else {
+            &mut self.treatment
+        };
+        arm.push(tokens);
+        if arm.len() > MAX_SAMPLES_PER_ARM {
+            let overflow = arm.len() - MAX_SAMPLES_PER_ARM;
+            arm.drain(0..overflow);
+        }
+    }
+
+    /// Snapshot (n_control, n_treatment, report) of the live savings so far.
+    pub fn report(&self) -> (usize, usize, SavingsReport) {
+        (
+            self.control.len(),
+            self.treatment.len(),
+            unpaired_savings(&self.control, &self.treatment),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn clear_for_test(&mut self) {
+        self.control.clear();
+        self.treatment.clear();
+    }
+}
+
+/// Process-wide live holdout accumulator.
+pub fn accumulator() -> &'static Mutex<HoldoutAccumulator> {
+    static ACC: OnceLock<Mutex<HoldoutAccumulator>> = OnceLock::new();
+    ACC.get_or_init(|| Mutex::new(HoldoutAccumulator::default()))
+}
+
+/// Per-request control-arm decision for a live retrieval. `key` should be a
+/// stable per-request string (e.g. the serialized tool args) so the same request
+/// always lands in the same arm. Returns `false` whenever the holdout is OFF
+/// (`fraction == 0`, the default) ⇒ no request is ever unshaped ⇒ behaviour is
+/// byte-identical to holdout-off. When this returns `true`, the caller must
+/// force the efficiency flags OFF for that request (the unshaped control arm).
+pub fn request_is_control(key: &str) -> bool {
+    let fraction = holdout_fraction();
+    fraction > 0.0 && is_control(key, fraction)
+}
+
+/// Record one live retrieval's emitted token cost into its arm. No-op unless the
+/// holdout is enabled (`fraction > 0`) — when OFF there is no control arm to
+/// measure against, so we don't accumulate noise.
+pub fn record_sample(is_control: bool, tokens: u64) {
+    if holdout_fraction() <= 0.0 {
+        return;
+    }
+    if let Ok(mut acc) = accumulator().lock() {
+        acc.push(is_control, tokens);
+    }
+}
+
+fn mean_var(xs: &[u64]) -> (f64, f64) {
+    let n = xs.len() as f64;
+    let mean = xs.iter().map(|x| *x as f64).sum::<f64>() / n;
+    let var = if xs.len() >= 2 {
+        xs.iter().map(|x| (*x as f64 - mean).powi(2)).sum::<f64>() / (n - 1.0)
+    } else {
+        0.0
+    };
+    (mean, var)
+}
+
+/// Savings of the treatment (shaped) arm vs. the control (unshaped) arm for
+/// **unpaired** live traffic. `reduction = 1 - mean_treatment / mean_control`,
+/// with a 95% CI on that ratio via the delta method:
+/// `Var(ratio) ≈ ratio² · (var_t/(n_t·mean_t²) + var_c/(n_c·mean_c²))`.
+/// Needs ≥2 samples in each arm and a positive control mean; otherwise the CI
+/// collapses to the point estimate. Deterministic for identical inputs.
+pub fn unpaired_savings(control: &[u64], treatment: &[u64]) -> SavingsReport {
+    let control_tokens: u64 = control.iter().sum();
+    let treatment_tokens: u64 = treatment.iter().sum();
+    let n = control.len() + treatment.len();
+    if control.is_empty() || treatment.is_empty() {
+        return SavingsReport {
+            n,
+            reduction: 0.0,
+            ci_low: 0.0,
+            ci_high: 0.0,
+            control_tokens,
+            treatment_tokens,
+        };
+    }
+    let (mean_c, var_c) = mean_var(control);
+    let (mean_t, var_t) = mean_var(treatment);
+    if mean_c <= 0.0 {
+        return SavingsReport {
+            n,
+            reduction: 0.0,
+            ci_low: 0.0,
+            ci_high: 0.0,
+            control_tokens,
+            treatment_tokens,
+        };
+    }
+    let ratio = mean_t / mean_c;
+    let reduction = 1.0 - ratio;
+    let se = if control.len() >= 2 && treatment.len() >= 2 {
+        let rel_var_t = var_t / (treatment.len() as f64 * mean_t.max(f64::EPSILON).powi(2));
+        let rel_var_c = var_c / (control.len() as f64 * mean_c.powi(2));
+        (ratio.powi(2) * (rel_var_t + rel_var_c)).sqrt()
+    } else {
+        0.0
+    };
+    SavingsReport {
+        n,
+        reduction,
+        ci_low: reduction - Z_95 * se,
+        ci_high: reduction + Z_95 * se,
+        control_tokens,
+        treatment_tokens,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +375,41 @@ mod tests {
         let r = paired_savings(&control, &treatment);
         assert_eq!(r.n, 1); // the zero-control pair is skipped
         assert!((r.reduction - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unpaired_savings_reduction_and_ci() {
+        // Control (unshaped) averages ~400 tok, treatment (shaped) ~300 ⇒ ~25%.
+        let control = [400u64, 420, 380, 400, 410, 390];
+        let treatment = [300u64, 310, 290, 300, 305, 295];
+        let r = unpaired_savings(&control, &treatment);
+        assert!((r.reduction - 0.25).abs() < 0.02, "reduction {}", r.reduction);
+        assert!(r.ci_low < r.reduction && r.ci_high > r.reduction, "CI straddles point");
+        assert!(r.ci_low > 0.0, "a real saving's CI should clear zero here");
+    }
+
+    #[test]
+    fn unpaired_savings_empty_arm_is_zero() {
+        let r = unpaired_savings(&[100, 100], &[]);
+        assert_eq!(r.reduction, 0.0);
+        assert_eq!(r.control_tokens, 200);
+    }
+
+    #[test]
+    fn accumulator_records_per_arm_and_reports() {
+        let acc = accumulator();
+        {
+            let mut a = acc.lock().unwrap();
+            a.clear_for_test();
+            for _ in 0..5 {
+                a.push(true, 400); // control
+                a.push(false, 300); // treatment
+            }
+        }
+        let (nc, nt, rep) = acc.lock().unwrap().report();
+        assert_eq!((nc, nt), (5, 5));
+        assert!((rep.reduction - 0.25).abs() < 1e-9);
+        acc.lock().unwrap().clear_for_test();
     }
 
     #[test]
