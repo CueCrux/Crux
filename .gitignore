@@ -58,3 +58,6 @@ LOCK
 
 # crux-console-ui build artifacts (WASM/JS bundles are generated, not source)
 crates/crux-console-ui/dist/
+
+# Coverage instrumentation artifacts (cargo-llvm-cov / -Cinstrument-coverage)
+*.profraw

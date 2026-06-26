@@ -230,6 +230,8 @@ mod tests {
             reverified_at: None,
             superseded_by: None,
             actor: None,
+            valid_from: None,
+            valid_to: None,
         }
     }
 
@@ -257,6 +259,8 @@ mod tests {
             reverified_at: None,
             superseded_by: None,
             actor: None,
+            valid_from: None,
+            valid_to: None,
         }
     }
 
