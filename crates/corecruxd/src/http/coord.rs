@@ -39,6 +39,11 @@ pub(super) struct AnnounceBody {
     pub execplan_slug: Option<String>,
     #[serde(default)]
     pub milestone: Option<String>,
+    /// Optional deploy-axis focus (e.g. `"deploy:crux"`). When two live peers
+    /// announce the same target, the response `overlaps[]` carries a
+    /// `deploy_target` warning. Advisory only.
+    #[serde(default)]
+    pub deploy_target: Option<String>,
     #[serde(default)]
     pub paths: Vec<String>,
     #[serde(default)]
@@ -204,6 +209,7 @@ pub(super) async fn post_coord_announce(
         passport_id,
         execplan_slug: body.execplan_slug.filter(|s| !s.trim().is_empty()),
         milestone: body.milestone.filter(|s| !s.trim().is_empty()),
+        deploy_target: body.deploy_target.filter(|s| !s.trim().is_empty()),
         paths: body.paths,
         note: body.note.filter(|s| !s.trim().is_empty()),
         announced_at_unix_ms: now,
@@ -268,6 +274,7 @@ mod tests {
             by_passport: Some("personal-default".to_string()),
             execplan_slug: Some("plan-x".to_string()),
             milestone: Some("M2".to_string()),
+            deploy_target: None,
             paths: vec!["crates/corecruxd/src/coord.rs".to_string()],
             note: None,
             ttl_seconds: None,

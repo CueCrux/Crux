@@ -17,6 +17,18 @@
 //! 2. **Audit capture** — fire-and-forget attempt to record the step. Errors
 //!    are swallowed; this never blocks the tool call.
 //!
+//! 3. **Deploy-axis probe** (B3 Part 3, deferred from B1) — when the tool is a
+//!    deploy action (a `Bash` command invoking the deploy script, or an
+//!    explicit deploy tool), construct the `deploy://<host>/<path>` resource
+//!    and probe the punchcard lease via the same `check_punchcard` path. Under
+//!    enforce mode a held-by-other deploy lease DENIES; under advisory mode it
+//!    ALLOWS but injects a warning for the agent; any ambiguity (not clearly a
+//!    deploy, can't resolve a host, daemon error) FAILS OPEN to a plain allow.
+//!    The probe's runtime correctness depends on B1's `deploy://` punchcard
+//!    endpoint (sibling branch) — it compiles and is unit-testable
+//!    independently because it only POSTs a resource string and interprets the
+//!    same `{held_by_other, enforce}` contract the file probe already uses.
+//!
 //! The hook ALWAYS exits 0. A deny is communicated via the
 //! `permissionDecision` JSON field, never via a non-zero exit code — this
 //! preserves the workspace's "hooks never block via exit code" philosophy.
@@ -53,6 +65,14 @@ fn decide(input: &HookInput) -> PreToolUseOutput {
     let Some(tool) = input.tool_name.as_deref() else {
         return PreToolUseOutput::allow();
     };
+
+    // Deploy-axis probe runs first: a deploy action is never an Edit/Write, so
+    // the two branches are disjoint. If this isn't recognisably a deploy, the
+    // probe returns a plain allow and we fall through to the write-tool path.
+    if let Some(out) = deploy_probe::decide_deploy(input) {
+        return out;
+    }
+
     if !WRITE_TOOLS.contains(&tool) {
         return PreToolUseOutput::allow();
     }
@@ -135,6 +155,278 @@ fn extract_structured(value: &Value) -> Option<Value> {
 /// unreachable daemon is swallowed so the hook never blocks the tool call.
 fn capture_audit_step(input: &HookInput) {
     observe_capture::open(input);
+}
+
+/// Deploy-axis PreToolUse probe (B3 Part 3). Detects a deploy action, builds a
+/// `deploy://<host>/<path>` punchcard resource, and probes the lease via the
+/// same `check_punchcard` MCP path the file probe uses — enforcing under
+/// `enforce`, warning under `advisory`, failing open on any ambiguity.
+mod deploy_probe {
+    use super::extract_structured;
+    use crate::hook_input::HookInput;
+    use crate::hook_output::PreToolUseOutput;
+    use crate::mcp_client;
+    use serde_json::{json, Value};
+
+    /// Deploy-script basenames whose invocation in a `Bash` command marks the
+    /// call as a deploy action. Matched as a substring so a relative or
+    /// absolute path (`scripts/crux-deploy.sh`, `./deploy-train.sh`) hits.
+    const DEPLOY_SCRIPTS: &[&str] = &["crux-deploy.sh", "deploy-train.sh", "cargo-deploy"];
+
+    /// Explicit tool names that are themselves a deploy action (future deploy
+    /// MCP tool). Kept alongside the Bash-script detection so both surfaces
+    /// route through the same probe.
+    const DEPLOY_TOOLS: &[&str] = &["crux_deploy", "deploy"];
+
+    /// Resolve a deploy decision for this input.
+    ///
+    /// - `Some(deny)` — daemon clearly reports the deploy target's lease is held
+    ///   by another holder AND it is in enforce mode.
+    /// - `Some(allow_with_context)` — held-by-other but advisory mode: warn, do
+    ///   not block.
+    /// - `Some(allow)` — recognised deploy, no conflicting lease.
+    /// - `None` — NOT a deploy action (or the host/resource is ambiguous): the
+    ///   caller falls through to the write-tool path. This is the fail-open
+    ///   branch for any ambiguity in *classification*.
+    pub(super) fn decide_deploy(input: &HookInput) -> Option<PreToolUseOutput> {
+        let resource = deploy_resource(input)?;
+        // From here we KNOW it's a deploy. Any probe ambiguity fails open to a
+        // plain allow (never None, so we don't double-dip the write path).
+        Some(match probe_deploy_lease(&resource) {
+            DeployVerdict::DenyEnforced(reason) => PreToolUseOutput::deny(reason),
+            DeployVerdict::WarnAdvisory(reason) => PreToolUseOutput::allow_with_context(reason),
+            DeployVerdict::Clear => PreToolUseOutput::allow(),
+        })
+    }
+
+    /// Build the `deploy://<host>/<path>` resource for a deploy action, or
+    /// `None` when the input is not recognisably a deploy. Host resolution is
+    /// best-effort; an unresolved host falls back to `unknown-host` rather than
+    /// dropping the probe, so an enforce-mode broad lease (`tree://deploy://…`
+    /// style) can still match — but a *non*-deploy command always returns
+    /// `None` (fail-open on classification).
+    fn deploy_resource(input: &HookInput) -> Option<String> {
+        let tool = input.tool_name.as_deref()?;
+        if DEPLOY_TOOLS.contains(&tool) {
+            let host = input
+                .tool_input
+                .as_ref()
+                .and_then(|v| v.get("host"))
+                .and_then(Value::as_str)
+                .map_or_else(|| "unknown-host".to_string(), str::to_string);
+            let path = input
+                .tool_input
+                .as_ref()
+                .and_then(|v| v.get("path"))
+                .and_then(Value::as_str)
+                .unwrap_or("deploy");
+            return Some(format!("deploy://{host}/{path}"));
+        }
+        if tool != "Bash" {
+            return None;
+        }
+        let command = input
+            .tool_input
+            .as_ref()
+            .and_then(|v| v.get("command"))
+            .and_then(Value::as_str)?;
+        let script = DEPLOY_SCRIPTS.iter().find(|s| command.contains(**s))?;
+        let host = resolve_host(command);
+        Some(format!("deploy://{host}/{script}"))
+    }
+
+    /// Extract a deploy target host from a deploy command. Looks, in order, for
+    /// an explicit `deploy:<host>` token, a `--host <h>`/`--host=<h>` flag, or a
+    /// `CRUX_SERVICE=<h>` env assignment. Falls back to `unknown-host` so the
+    /// probe still runs (an enforce-mode lease keyed on the resource path can
+    /// still match); classification already proved this is a deploy.
+    fn resolve_host(command: &str) -> String {
+        if let Some(idx) = command.find("deploy:") {
+            let rest = &command[idx + "deploy:".len()..];
+            let host: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+                .collect();
+            if !host.is_empty() {
+                return host;
+            }
+        }
+        for (i, tok) in command.split_whitespace().enumerate() {
+            if let Some(h) = tok.strip_prefix("--host=") {
+                if !h.is_empty() {
+                    return h.to_string();
+                }
+            }
+            if tok == "--host" {
+                if let Some(h) = command.split_whitespace().nth(i + 1) {
+                    if !h.is_empty() {
+                        return h.to_string();
+                    }
+                }
+            }
+            if let Some(h) = tok.strip_prefix("CRUX_SERVICE=") {
+                if !h.is_empty() {
+                    return h.to_string();
+                }
+            }
+        }
+        "unknown-host".to_string()
+    }
+
+    /// The three outcomes of a deploy-lease probe.
+    enum DeployVerdict {
+        /// Held by another holder, daemon in enforce mode → deny.
+        DenyEnforced(String),
+        /// Held by another holder, daemon in advisory mode → warn, allow.
+        WarnAdvisory(String),
+        /// No conflicting lease, or any error/ambiguity → fail open to allow.
+        Clear,
+    }
+
+    /// Probe the daemon for a lease conflict on the deploy resource. Reuses the
+    /// `check_punchcard` MCP tool and the `{held_by_other, enforce}` contract.
+    /// Any error / timeout / 501 / empty response → `Clear` (fail-open).
+    fn probe_deploy_lease(resource: &str) -> DeployVerdict {
+        match mcp_client::call_tool("check_punchcard", json!({ "resource": resource, "mode": "modify" })) {
+            Ok(value) => interpret_deploy_result(&value, resource),
+            Err(_) => DeployVerdict::Clear,
+        }
+    }
+
+    /// Interpret a `check_punchcard` result for a deploy resource. Splits on the
+    /// `enforce` flag the daemon reports (it is `true` only when
+    /// `CORECRUXD_PUNCHCARD=enforce`): held-by-other + enforce → deny;
+    /// held-by-other + advisory → warn; anything else → clear.
+    fn interpret_deploy_result(value: &Value, resource: &str) -> DeployVerdict {
+        let structured = extract_structured(value);
+        let obj = structured.as_ref().unwrap_or(value);
+        let held_by_other = obj.get("held_by_other").and_then(Value::as_bool).unwrap_or(false);
+        if !held_by_other {
+            return DeployVerdict::Clear;
+        }
+        let enforce = obj.get("enforce").and_then(Value::as_bool).unwrap_or(false);
+        let holder = obj
+            .get("holder_passport")
+            .and_then(Value::as_str)
+            .unwrap_or("another passport");
+        let res = obj.get("resource").and_then(Value::as_str).unwrap_or(resource);
+        if enforce {
+            DeployVerdict::DenyEnforced(format!(
+                "deploy punchcard: {res} is held by {holder}; another session is deploying this target — wait for release before cutting over"
+            ))
+        } else {
+            DeployVerdict::WarnAdvisory(format!(
+                "advisory: {res} deploy lease is held by {holder}; coordinate before cutting over (CORECRUXD_PUNCHCARD=advisory, not blocking)"
+            ))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use serde_json::json;
+
+        fn bash(command: &str) -> HookInput {
+            HookInput {
+                session_id: "s".into(),
+                transcript_path: String::new(),
+                cwd: String::new(),
+                hook_event_name: "PreToolUse".into(),
+                tool_name: Some("Bash".into()),
+                tool_input: Some(json!({ "command": command })),
+                tool_response: None,
+                trigger: None,
+                source: None,
+            }
+        }
+
+        #[test]
+        fn non_deploy_bash_is_not_classified() {
+            assert!(deploy_resource(&bash("ls -la && cargo test")).is_none());
+        }
+
+        #[test]
+        fn deploy_script_classified_with_explicit_host() {
+            let r = deploy_resource(&bash("bash scripts/crux-deploy.sh # deploy:crux")).unwrap();
+            assert_eq!(r, "deploy://crux/crux-deploy.sh");
+        }
+
+        #[test]
+        fn deploy_script_host_from_flag() {
+            let r = deploy_resource(&bash("./deploy-train.sh --host gpu-1")).unwrap();
+            assert_eq!(r, "deploy://gpu-1/deploy-train.sh");
+        }
+
+        #[test]
+        fn deploy_script_falls_back_to_unknown_host() {
+            let r = deploy_resource(&bash("bash scripts/crux-deploy.sh")).unwrap();
+            assert_eq!(r, "deploy://unknown-host/crux-deploy.sh");
+        }
+
+        #[test]
+        fn explicit_deploy_tool_classified() {
+            let input = HookInput {
+                tool_name: Some("crux_deploy".into()),
+                tool_input: Some(json!({ "host": "data-1", "path": "stack" })),
+                ..bash("")
+            };
+            assert_eq!(deploy_resource(&input).unwrap(), "deploy://data-1/stack");
+        }
+
+        #[test]
+        fn interpret_denies_under_enforce() {
+            let held = json!({ "held_by_other": true, "enforce": true, "holder_passport": "agent:other" });
+            assert!(matches!(
+                interpret_deploy_result(&held, "deploy://crux/x"),
+                DeployVerdict::DenyEnforced(_)
+            ));
+        }
+
+        #[test]
+        fn interpret_warns_under_advisory() {
+            let held = json!({ "held_by_other": true, "enforce": false, "holder_passport": "agent:other" });
+            assert!(matches!(
+                interpret_deploy_result(&held, "deploy://crux/x"),
+                DeployVerdict::WarnAdvisory(_)
+            ));
+        }
+
+        #[test]
+        fn interpret_clears_when_not_held_or_ambiguous() {
+            let free = json!({ "held_by_other": false, "enforce": true });
+            assert!(matches!(
+                interpret_deploy_result(&free, "deploy://crux/x"),
+                DeployVerdict::Clear
+            ));
+            let empty = json!({});
+            assert!(matches!(
+                interpret_deploy_result(&empty, "deploy://crux/x"),
+                DeployVerdict::Clear
+            ));
+        }
+
+        #[test]
+        fn decide_deploy_fails_open_on_daemon_error() {
+            // Daemon unreachable → probe errs → recognised deploy still ALLOWS.
+            let _env = crate::test_support::env_guard();
+            let prev = std::env::var("CRUX_MCP_URL").ok();
+            std::env::set_var("CRUX_MCP_URL", "http://127.0.0.1:1/mcp");
+            let out = decide_deploy(&bash("bash scripts/crux-deploy.sh # deploy:crux"));
+            match prev {
+                Some(v) => std::env::set_var("CRUX_MCP_URL", v),
+                None => std::env::remove_var("CRUX_MCP_URL"),
+            }
+            let out = out.expect("recognised deploy returns a decision");
+            let v = serde_json::to_value(&out).unwrap();
+            assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "allow");
+        }
+
+        #[test]
+        fn decide_deploy_returns_none_for_non_deploy() {
+            // Not a deploy → None so the caller falls through to the write path.
+            assert!(decide_deploy(&bash("echo hi")).is_none());
+        }
+    }
 }
 
 #[cfg(test)]
