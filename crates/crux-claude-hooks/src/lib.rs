@@ -26,6 +26,7 @@ pub mod hook_output;
 pub mod llm_shim;
 pub mod mcp_client;
 pub mod observe_capture;
+pub mod observe_filemod;
 pub mod state;
 
 /// Default Crux MCP endpoint. Override with `CRUX_MCP_URL`.

@@ -1236,6 +1236,7 @@ name = "crux-claude-hooks"
 version = "0.3.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "crux-config-wizard",
  "serde",

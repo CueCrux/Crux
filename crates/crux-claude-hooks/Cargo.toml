@@ -34,6 +34,10 @@ ureq = { version = "3.3.0", features = ["json"] }
 # Already in the workspace lockfile (corecruxctl) — no new network fetch.
 urlencoding = "2.1"
 sha2 = "0.11"
+# B4 file-modification ledger: content-address Edit/Write before/after for the
+# observe lane. Pinned to the workspace version already in Cargo.lock (corecruxd,
+# corecrux-storage, …) so this adds zero new network fetch / lockfile delta.
+blake3 = "1.8.5"
 crux-config-wizard = { path = "../crux-config-wizard" }
 
 [dev-dependencies]
