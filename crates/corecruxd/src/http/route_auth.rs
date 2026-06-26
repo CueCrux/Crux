@@ -130,6 +130,21 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
         ));
     }
 
+    // Case store (M3). `/v1/cases/retrieve` is a POST but semantically a read
+    // (similar-case lookup), so it is read-scoped; recording a case is a write.
+    if path == "/v1/cases/retrieve" {
+        return Some(RouteAuthContract::new(
+            RouteAuthClass::Read,
+            &["query:read", "admin:read"],
+        ));
+    }
+    if path.starts_with("/v1/cases") {
+        return Some(RouteAuthContract::new(
+            RouteAuthClass::Write,
+            &["facts:write", "admin:write"],
+        ));
+    }
+
     if path.starts_with("/v1/facts")
         || path.starts_with("/v1/sessions/")
         || path.starts_with("/v1/entities")
