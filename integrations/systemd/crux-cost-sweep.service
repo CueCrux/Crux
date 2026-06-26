@@ -1,0 +1,31 @@
+# Crux token-burn cost-lens reconcile sweep (user service).
+#
+# The completeness backstop for the Claude Code `SessionEnd` cost hook: posts any
+# transcript under ~/.claude/projects whose stored cost report is missing or
+# older than the transcript's mtime. Idempotent (latest-wins) — safe to run on a
+# timer. Install as a *user* unit so it runs with access to ~/.claude and
+# ~/.config/cuecrux:
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp integrations/systemd/crux-cost-sweep.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now crux-cost-sweep.timer
+#   loginctl enable-linger "$USER"   # so the timer runs while logged out
+#
+# Auth: corecruxctl resolves the daemon URL + bearer from ~/.config/cuecrux
+# (the single stored daemon in credentials.json — no --url needed). The bearer
+# must be valid; prefer a refreshable login (`corecruxctl login --url <daemon>`,
+# tailscale/device rail) over a short-lived hand-minted token so the timer keeps
+# working unattended.
+
+[Unit]
+Description=Crux token-burn cost-lens reconcile sweep
+Documentation=https://github.com/CueCrux/Crux
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/corecruxctl session cost-sweep --since-days 30
+# A sweep that can't reach the daemon exits non-zero; the timer retries next
+# tick, so don't spam the journal with hard failures.
+Nice=10

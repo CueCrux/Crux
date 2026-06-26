@@ -1,0 +1,16 @@
+# Periodic trigger for the Crux cost-lens reconcile sweep. See the matching
+# .service for install instructions.
+
+[Unit]
+Description=Run the Crux cost-lens reconcile sweep periodically
+Documentation=https://github.com/CueCrux/Crux
+
+[Timer]
+# First run shortly after boot/login, then every 30 minutes. Persistent catches
+# up a missed run after the machine was asleep (laptop).
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
