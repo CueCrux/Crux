@@ -54,6 +54,11 @@ const FACT_SCAN_TOP_K: usize = 8000;
 /// 90 days in milliseconds. Used by the no-facts age cutoff.
 pub const ARCHIVE_AGE_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 
+/// 14 days in milliseconds. An `in_progress` plan with no fact/file activity for
+/// longer than this is flagged `stale` (likely finished-but-unmarked, not in
+/// flight) so the board can split in_progress into active vs stale.
+pub const STALE_AGE_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+
 /// Synthetic project_id under which aggregator-derived work items live. Not a
 /// real project row — `list_work` callers must accept it without project
 /// validation.
@@ -588,10 +593,26 @@ pub fn derive_state(
         }
     }
 
-    // Rule 6: any fact = in_progress.
+    // Rule 6: any fact = in_progress — but a fact'd plan untouched beyond the
+    // archive window is a finished-but-unmarked / abandoned plan that can never
+    // reach `complete` on its own, so it archives like a stale no-fact plan
+    // (this is the structural fix for "milestone fact, no declared milestones,
+    // pinned in_progress forever"). Otherwise it stays in_progress, flagged
+    // `stale` once activity lapses past STALE_AGE_MS so the board can separate
+    // active from done-but-unmarked.
     if facts.any_fact() {
+        let last_activity = facts
+            .last_fact_at_unix_ms
+            .unwrap_or(file.mtime_unix_ms)
+            .max(file.mtime_unix_ms);
+        let age = now_unix_ms.saturating_sub(last_activity);
+        if age > ARCHIVE_AGE_MS {
+            return mk_item(file, parsed, "archive", None, None, facts);
+        }
         let current = facts.highest_milestone_with_fact.map(|n| format!("M{n}"));
-        return mk_item(file, parsed, "in_progress", current, None, facts);
+        let mut item = mk_item(file, parsed, "in_progress", current, None, facts);
+        item.stale = Some(age > STALE_AGE_MS);
+        return item;
     }
 
     // Rules 7 & 8: no facts → planned or archive by file age.
@@ -673,6 +694,7 @@ fn mk_item(
         milestones_total,
         notes_count: None,
         provenance,
+        stale: None,
     }
 }
 
@@ -1029,6 +1051,7 @@ mod tests {
             milestones_total: None,
             notes_count: None,
             provenance: None,
+            stale: None,
         }
     }
 
@@ -1588,6 +1611,56 @@ mod tests {
         let item = derive_state(&f, &p, &s, 4_000);
         assert_eq!(item.state, "in_progress");
         assert_eq!(item.current_milestone.as_deref(), Some("M2"));
+    }
+
+    // ── Board-fidelity M1: staleness flag + archive-age cap on fact'd plans ──
+
+    #[test]
+    fn rule_6_stale_flag_and_archive_age_cap() {
+        const DAY: i64 = 86_400_000;
+        let now: u64 = 1_000 * DAY as u64;
+        let f = file("p", 1_000, "# P\n## Milestones\n- M1\n- M2\n");
+        let p = parse_plan(&f.content);
+        let mk = |days_ago: i64| {
+            summarise_facts(&[(
+                "milestone:M1".to_string(),
+                "{}".to_string(),
+                ts(now as i64 - days_ago * DAY),
+            )])
+        };
+        // fresh (5d) → in_progress, not stale
+        let it = derive_state(&f, &p, &mk(5), now);
+        assert_eq!(it.state, "in_progress");
+        assert_eq!(it.stale, Some(false));
+        // lapsed (20d > 14d) → in_progress, stale
+        let it = derive_state(&f, &p, &mk(20), now);
+        assert_eq!(it.state, "in_progress");
+        assert_eq!(it.stale, Some(true));
+        // ancient (120d > 90d) → archive via the age cap, stale cleared
+        let it = derive_state(&f, &p, &mk(120), now);
+        assert_eq!(it.state, "archive");
+        assert_eq!(it.stale, None);
+    }
+
+    #[test]
+    fn no_declared_milestones_archives_when_past_cap() {
+        const DAY: i64 = 86_400_000;
+        let now: u64 = 1_000 * DAY as u64;
+        // A fact'd doc with no `## Milestones` — can never reach `complete`.
+        let f = file("handoff", 1_000, "# Handoff\n\nNo milestones section.\n");
+        let p = parse_plan(&f.content);
+        assert!(p.milestones_declared.is_empty());
+        let mk = |days_ago: i64| {
+            summarise_facts(&[(
+                "milestone:M1".to_string(),
+                "{}".to_string(),
+                ts(now as i64 - days_ago * DAY),
+            )])
+        };
+        // recently active → in_progress (honest: it IS being touched)
+        assert_eq!(derive_state(&f, &p, &mk(3), now).state, "in_progress");
+        // past the cap → archive (no path to complete; not pinned forever)
+        assert_eq!(derive_state(&f, &p, &mk(100), now).state, "archive");
     }
 
     #[test]
