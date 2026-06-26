@@ -1935,6 +1935,7 @@ async fn query_facts_by_keyword() {
         entity_prefix: None,
         top_k: None,
         token_budget: None,
+        as_of: None,
     };
 
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
@@ -1946,6 +1947,88 @@ async fn query_facts_by_keyword() {
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0]["entity"], "deploy");
     assert!(body["total_tokens"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn query_facts_as_of_filters_world_time() {
+    let state = test_app_state(16);
+    let ts = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    };
+    for value in ["London", "Berlin"] {
+        let body = corecrux_memory::fact_store::StoreFact {
+            entity: "person:zoe".to_string(),
+            key: "city".to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        };
+        let _ = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+    }
+    {
+        let mut store = state.fact_store.write().await;
+        let entries: Vec<(String, String)> = store
+            .get_by_entity("person:zoe")
+            .into_iter()
+            .map(|f| (f.fact_id.clone(), f.value.clone()))
+            .collect();
+        for (id, value) in entries {
+            if value == "London" {
+                store.set_validity(&id, Some(ts("2026-01-01T00:00:00Z")), Some(ts("2026-06-01T00:00:00Z")));
+            } else {
+                store.set_validity(&id, Some(ts("2026-06-01T00:00:00Z")), None);
+            }
+        }
+    }
+
+    let params = QueryFactsParams {
+        query: None,
+        entity: Some("person:zoe".to_string()),
+        entity_prefix: None,
+        top_k: Some(10),
+        token_budget: None,
+        as_of: Some("2026-03-01T00:00:00Z".to_string()),
+    };
+    let resp = facts::query_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let values: Vec<String> = body["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["value"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        values.contains(&"London".to_string()),
+        "as-of March → London, got {values:?}"
+    );
+    assert!(
+        !values.contains(&"Berlin".to_string()),
+        "as-of March must exclude Berlin"
+    );
+
+    // A bad (unparseable) as_of → 400.
+    let bad = QueryFactsParams {
+        query: None,
+        entity: None,
+        entity_prefix: None,
+        top_k: None,
+        token_budget: None,
+        as_of: Some("nope".to_string()),
+    };
+    let resp = facts::query_facts(State(state), HeaderMap::new(), Query(bad))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1973,6 +2056,7 @@ async fn query_facts_no_params_returns_all() {
         entity_prefix: None,
         top_k: None,
         token_budget: None,
+        as_of: None,
     };
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
         .await
@@ -2006,6 +2090,7 @@ async fn query_facts_accepts_admin_read_fallback_in_dev_scopes_mode() {
         entity_prefix: None,
         top_k: None,
         token_budget: None,
+        as_of: None,
     };
     let resp = facts::query_facts(State(state), dev_scope_headers("admin:read"), Query(params))
         .await
@@ -2345,6 +2430,7 @@ async fn query_facts_supports_entity_prefix_top_k_and_token_budget() {
         entity_prefix: Some("proj-a".to_string()),
         top_k: Some(99),
         token_budget: Some(1),
+        as_of: None,
     };
 
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
@@ -2401,6 +2487,7 @@ async fn query_facts_applies_passport_private_visibility() {
         entity_prefix: None,
         top_k: Some(10),
         token_budget: None,
+        as_of: None,
     };
     let alice = facts::query_facts(
         State(state.clone()),
@@ -2422,6 +2509,7 @@ async fn query_facts_applies_passport_private_visibility() {
         entity_prefix: None,
         top_k: Some(10),
         token_budget: None,
+        as_of: None,
     };
     let anonymous = facts::query_facts(
         State(state.clone()),
@@ -2442,6 +2530,7 @@ async fn query_facts_applies_passport_private_visibility() {
         entity_prefix: None,
         top_k: Some(10),
         token_budget: None,
+        as_of: None,
     };
     let admin = facts::query_facts(State(state), dev_scope_headers("admin:read"), Query(admin_params))
         .await

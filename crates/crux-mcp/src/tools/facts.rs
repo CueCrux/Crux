@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::dispatch::McpContext;
 use crate::protocol::{JsonRpcError, INTERNAL_ERROR, INVALID_PARAMS};
@@ -407,6 +407,20 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
         .get("include_superseded")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // Bi-temporal as-of (M1): only facts true in the world at this instant.
+    // Reject an unparseable timestamp rather than silently dropping the filter.
+    let as_of = match args.get("as_of").and_then(|v| v.as_str()) {
+        Some(raw) => Some(
+            DateTime::parse_from_rfc3339(raw)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|_| JsonRpcError {
+                    code: INVALID_PARAMS,
+                    message: "as_of must be an RFC 3339 timestamp (e.g. 2026-01-15T00:00:00Z)".to_string(),
+                    data: None,
+                })?,
+        ),
+        None => None,
+    };
     let (identity, aliases) = scope_ctx(ctx);
     let id_ref = identity.as_deref();
     let alias_refs: Vec<&str> = aliases.iter().map(String::as_str).collect();
@@ -435,7 +449,7 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     };
 
     let store = ctx.fact_store.read().await;
-    let visible = query_visible_facts_opts(&store, &q, id_ref, &alias_refs, include_superseded);
+    let visible = query_visible_facts_opts_as_of(&store, &q, id_ref, &alias_refs, include_superseded, as_of);
     drop(store);
 
     // M2 salience: record that these facts were just recalled so they decay
@@ -637,9 +651,23 @@ fn query_visible_facts_opts(
     aliases: &[&str],
     include_superseded: bool,
 ) -> Vec<Fact> {
+    query_visible_facts_opts_as_of(store, q, identity, aliases, include_superseded, None)
+}
+
+/// As [`query_visible_facts_opts`] with an optional bi-temporal `as_of` filter
+/// (M1): when set, only facts valid in the world at that instant are returned.
+fn query_visible_facts_opts_as_of(
+    store: &corecrux_memory::FactStore,
+    q: &FactQuery,
+    identity: Option<&str>,
+    aliases: &[&str],
+    include_superseded: bool,
+    as_of: Option<DateTime<Utc>>,
+) -> Vec<Fact> {
     let mut results: Vec<&Fact> = store
         .all_facts()
         .filter(|fact| !fact.deleted)
+        .filter(|fact| as_of.is_none_or(|instant| fact.valid_at(instant)))
         .filter(|fact| include_superseded || fact.superseded_by.is_none())
         .filter(|fact| scope::fact_visible_to_identity(fact, identity, aliases))
         .filter(|fact| {
@@ -877,6 +905,70 @@ mod tests {
             .find(|p| p["reason"] == "Demoted")
             .unwrap();
         assert!(demoted_ptr["content_hash"].is_string());
+    }
+
+    // ── D1: bi-temporal as_of on query_facts ────────────────────────
+
+    #[tokio::test]
+    async fn query_facts_as_of_filters_by_valid_time() {
+        let ctx = test_ctx();
+        let ts = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+
+        handle_store_fact(&json!({"entity": "person:zoe", "key": "city", "value": "London"}), &ctx)
+            .await
+            .unwrap();
+        handle_store_fact(&json!({"entity": "person:zoe", "key": "city", "value": "Berlin"}), &ctx)
+            .await
+            .unwrap();
+
+        // Zoe lived in London Jan–Jun 2026, then Berlin from Jun on.
+        {
+            let mut store = ctx.fact_store.write().await;
+            let facts: Vec<(String, String)> = store
+                .get_by_entity("person:zoe")
+                .into_iter()
+                .map(|f| (f.fact_id.clone(), f.value.clone()))
+                .collect();
+            for (id, value) in facts {
+                if value == "London" {
+                    store.set_validity(&id, Some(ts("2026-01-01T00:00:00Z")), Some(ts("2026-06-01T00:00:00Z")));
+                } else if value == "Berlin" {
+                    store.set_validity(&id, Some(ts("2026-06-01T00:00:00Z")), None);
+                }
+            }
+        }
+
+        // include_superseded so the version chain doesn't hide the prior value;
+        // the as_of filter is what should select the world-true fact.
+        let march = handle_query_facts(
+            &json!({"entity": "person:zoe", "as_of": "2026-03-01T00:00:00Z", "include_superseded": true, "token_budget": 500}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let march_txt = serde_json::to_string(&march).unwrap();
+        assert!(march_txt.contains("London"), "as-of March should surface London");
+        assert!(!march_txt.contains("Berlin"), "as-of March must not surface Berlin");
+
+        let sept = handle_query_facts(
+            &json!({"entity": "person:zoe", "as_of": "2026-09-01T00:00:00Z", "include_superseded": true, "token_budget": 500}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let sept_txt = serde_json::to_string(&sept).unwrap();
+        assert!(sept_txt.contains("Berlin"), "as-of September should surface Berlin");
+        assert!(!sept_txt.contains("London"), "as-of September must not surface London");
+    }
+
+    #[tokio::test]
+    async fn query_facts_rejects_bad_as_of() {
+        let ctx = test_ctx();
+        let err = handle_query_facts(&json!({"query": "x", "as_of": "not-a-timestamp"}), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("as_of"));
     }
 
     /// agent-passport M5: seed a passport record so the flag-ON write
