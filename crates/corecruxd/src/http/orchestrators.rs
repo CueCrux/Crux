@@ -932,6 +932,7 @@ mod tests {
             milestones_total: None,
             notes_count: None,
             provenance: None,
+            stale: None,
         }
     }
 
