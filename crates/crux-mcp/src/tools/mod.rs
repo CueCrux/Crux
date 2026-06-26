@@ -53,6 +53,7 @@ pub mod token_savings;
 pub mod token_usage;
 pub mod traces;
 pub mod update;
+pub mod upsell;
 
 use serde_json::{json, Value};
 use std::collections::HashSet;
