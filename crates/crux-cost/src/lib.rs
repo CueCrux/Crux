@@ -181,6 +181,39 @@ mod tests {
     }
 
     #[test]
+    fn session_window_spans_earliest_to_latest_timestamp() {
+        // Out-of-order + a meta (queue-operation) record: the window must be the
+        // lexical min/max across all records, meta included.
+        let lines = [
+            json!({"type":"assistant","sessionId":"w","timestamp":"2026-06-25T11:38:40.060Z",
+                   "message":{"role":"assistant","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":1},
+                   "content":[{"type":"text","text":"mid"}]}}),
+            json!({"type":"queue-operation","sessionId":"w","timestamp":"2026-06-25T11:30:00.000Z","operation":"x"}),
+            json!({"type":"assistant","sessionId":"w","timestamp":"2026-06-25T12:05:09.500Z",
+                   "message":{"role":"assistant","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":1},
+                   "content":[{"type":"text","text":"end"}]}}),
+            // Malformed timestamp must be ignored, not widen the window.
+            json!({"type":"user","sessionId":"w","timestamp":"not-a-timestamp",
+                   "message":{"role":"user","content":"hi"}}),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        let r = analyze_str(&lines, "w.jsonl");
+        assert_eq!(r.started_at.as_deref(), Some("2026-06-25T11:30:00.000Z"));
+        assert_eq!(r.ended_at.as_deref(), Some("2026-06-25T12:05:09.500Z"));
+    }
+
+    #[test]
+    fn session_window_none_when_no_timestamps() {
+        let r = analyze_str(&fixture(), "fixture.jsonl");
+        // The fixture records carry no `timestamp` field.
+        assert!(r.started_at.is_none());
+        assert!(r.ended_at.is_none());
+    }
+
+    #[test]
     fn empty_transcript_yields_no_levers() {
         let r = analyze_str("", "empty.jsonl");
         assert_eq!(r.headline.assistant_turns, 0);

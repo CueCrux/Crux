@@ -107,6 +107,16 @@ impl CostStore {
             .cloned()
     }
 
+    /// All stored reports for a tenant (clones), for the read-time per-ExecPlan
+    /// token-burn join. Unordered — the attribution join is order-independent.
+    pub fn reports_for_tenant(&self, tenant_id: &str) -> Vec<StoredReport> {
+        self.by_session
+            .values()
+            .filter(|s| s.tenant_id == tenant_id)
+            .cloned()
+            .collect()
+    }
+
     /// The most-recently-received report for a tenant.
     pub fn latest_for_tenant(&self, tenant_id: &str) -> Option<StoredReport> {
         self.by_session
@@ -153,6 +163,8 @@ mod tests {
             session_id: session.to_owned(),
             source: source.to_owned(),
             generated_at: Some("2026-06-21T00:00:00Z".to_owned()),
+            started_at: None,
+            ended_at: None,
             headline: crux_cost::Headline {
                 assistant_turns: 10,
                 tasks: 2,

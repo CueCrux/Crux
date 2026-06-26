@@ -43,6 +43,12 @@ pub fn analyze(events: &[Event]) -> CostReport {
     let mut fine_buckets: HashMap<String, u64> = HashMap::new();
     let mut all_blocks: Vec<BlockCost> = Vec::new();
     let mut session_id = String::new();
+    // Session active window: lexical min/max over the records' RFC3339 `Z`
+    // timestamps (fixed-width UTC strings sort chronologically). Every record —
+    // turns and meta alike — contributes, so the window spans the whole
+    // transcript. The daemon overlaps this against each ExecPlan's fact window.
+    let mut started_at: Option<&str> = None;
+    let mut ended_at: Option<&str> = None;
 
     let mut seg: Vec<Pending> = Vec::new();
     let mut seg_turn: u64 = 0;
@@ -53,6 +59,14 @@ pub fn analyze(events: &[Event]) -> CostReport {
                 if !sid.is_empty() {
                     sid.clone_into(&mut session_id);
                 }
+            }
+        }
+        if let Some(ts) = ev.timestamp.as_deref() {
+            if started_at.is_none_or(|s| ts < s) {
+                started_at = Some(ts);
+            }
+            if ended_at.is_none_or(|e| ts > e) {
+                ended_at = Some(ts);
             }
         }
         if let Some(u) = ev.usage {
@@ -147,6 +161,8 @@ pub fn analyze(events: &[Event]) -> CostReport {
         session_id,
         source: String::new(),
         generated_at: None,
+        started_at: started_at.map(str::to_owned),
+        ended_at: ended_at.map(str::to_owned),
         headline,
         measured,
         buckets,

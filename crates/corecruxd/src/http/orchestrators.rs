@@ -933,6 +933,7 @@ mod tests {
             notes_count: None,
             provenance: None,
             stale: None,
+            token_burn: None,
         }
     }
 
