@@ -8,6 +8,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Merge queue: the required checks (Lint / Test / MSRV / Coverage) must run
+  # on the speculative `gh-readonly-queue/main/...` ref or the queue hangs
+  # waiting on them. No-op until a merge queue is enabled on `main`.
+  merge_group:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -41,7 +45,21 @@ jobs:
         id: scope
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            # Queue entry: diff the speculative merge against the base it was
+            # built on. base_sha is main's tip at enqueue; head_sha is the
+            # gh-readonly-queue merge commit. If base_sha isn't reachable (it
+            # should be — `changes` checks out with fetch-depth: 0), leave files
+            # empty so classify falls through to code=true (full gate, the safe
+            # default).
+            base="${{ github.event.merge_group.base_sha }}"
+            head="${{ github.event.merge_group.head_sha }}"
+            if [ -n "$base" ] && git cat-file -e "$base" 2>/dev/null; then
+              files=$(git diff --name-only "$base".."$head")
+            else
+              files=""
+            fi
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
             base="origin/${{ github.base_ref }}"
             git fetch --quiet origin "${{ github.base_ref }}"
             files=$(git diff --name-only "$(git merge-base "$base" HEAD)"..HEAD)

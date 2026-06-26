@@ -634,6 +634,7 @@ mod tests {
             updated_at_unix_ms: last_ms,
             plan_path: None,
             current_milestone: None,
+            next_ready_milestone: None,
             superseded_by: None,
             depends_on: Vec::new(),
             extended_by: Vec::new(),

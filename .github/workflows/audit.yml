@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Merge queue: "Cargo deny policy", "Cargo audit", and "Licence check" are
+  # required checks, so they must report on the speculative queue ref or the
+  # queue hangs. No-op until a queue is enabled on `main`.
+  merge_group:
   schedule:
     - cron: "0 6 * * 1" # Weekly on Monday at 06:00 UTC
 

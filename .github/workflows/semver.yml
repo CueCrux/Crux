@@ -5,6 +5,10 @@ name: Semver Check
 on:
   pull_request:
     branches: [main]
+  # Merge queue: "Semver Compatibility" is a required check, so it must report
+  # on the speculative queue ref or the queue hangs. No-op until a queue is
+  # enabled on `main`.
+  merge_group:
 
 jobs:
   semver:

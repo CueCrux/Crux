@@ -923,6 +923,7 @@ mod tests {
             updated_at_unix_ms: 1,
             plan_path: None,
             current_milestone: None,
+            next_ready_milestone: None,
             superseded_by: None,
             depends_on: Vec::new(),
             extended_by: Vec::new(),
