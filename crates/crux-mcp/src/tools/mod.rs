@@ -1692,6 +1692,7 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                     "by_passport":   { "type": "string", "description": "Optional; the session binding's passport wins when the session is bound." },
                     "execplan_slug": { "type": "string" },
                     "milestone":     { "type": "string" },
+                    "deploy_target": { "type": "string", "description": "Optional deploy-axis focus (e.g. \"deploy:crux\"). When a live peer announces the same target, the response overlaps[] carries a deploy_target warning — serialise the deploy, don't double-cut. Advisory only." },
                     "paths":         { "type": "array", "items": { "type": "string" }, "description": "Repo-relative files/dirs you expect to touch (informational; use punch_in for an enforceable lease)." },
                     "note":          { "type": "string" },
                     "ttl_seconds":   { "type": "integer", "description": "Intent lifetime (default 14400 = 4h, max 86400). 0 clears your intent." }
@@ -1699,6 +1700,7 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                 "required": ["session_id", "project_id"],
                 "examples": [
                     { "session_id": "deadbeefcafe", "project_id": "default", "execplan_slug": "crux-agent-presence-coordination-2026-06-11", "milestone": "M3", "paths": ["crates/crux-mcp/src/tools/coordination.rs"] },
+                    { "session_id": "deadbeefcafe", "project_id": "default", "execplan_slug": "crux-daemon-deploy-host-crux", "deploy_target": "deploy:crux" },
                     { "session_id": "deadbeefcafe", "project_id": "default", "ttl_seconds": 0 }
                 ]
             }),
@@ -2582,7 +2584,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "update_work_state",  "output": "{ applied: bool, work?: WorkItem, queued?: { action_id, work_id, requested_by_passport, target_state, status: 'pending', requested_at_unix_ms } }" },
         { "tool": "comment_on_work",    "output": "{ id, work_id, author_passport, body, posted_at_unix_ms }" },
         { "tool": "coord_status",       "output": "{ now_unix_ms, presence_ttl_secs, project_id?, active_sessions: [{ session_id_hex, passport_id, tenant_id, project_id?, bound_at_unix_ms, last_seen_at_unix_ms, active_until_unix_ms, intent?: { execplan_slug?, milestone?, paths, note?, announced_at_unix_ms, expires_at_unix_ms }, leases?: [{ punchcard_id, resource, mode, holder_passport, expires_at_unix_ms }] }], work_in_flight: [WorkItem] }" },
-        { "tool": "coord_announce",     "output": "{ intent: { project_id, session_id_hex, passport_id, execplan_slug?, milestone?, paths, note?, announced_at_unix_ms, expires_at_unix_ms }, cleared: bool, live_peer_intents: n, overlaps: [{ peer_session_id_hex, peer_passport_id, kind: execplan|intent_path|lease, theirs, yours }] } — surface any overlaps to the operator and coordinate before editing those paths" },
+        { "tool": "coord_announce",     "output": "{ intent: { project_id, session_id_hex, passport_id, execplan_slug?, milestone?, deploy_target?, paths, note?, announced_at_unix_ms, expires_at_unix_ms }, cleared: bool, live_peer_intents: n, overlaps: [{ peer_session_id_hex, peer_passport_id, kind: execplan|deploy_target|intent_path|lease, theirs, yours }] } — surface any overlaps to the operator and coordinate before editing those paths or cutting that deploy" },
         { "tool": "github_search",         "output": "{ count, facts: [{ entity, key, value, ... }] } — value strings hold JSON-encoded CommitRecord / PrRecord / IssueRecord / CommentRecord depending on the entity prefix." },
         { "tool": "github_recent_commits", "output": "{ count, facts: [Fact] } — entities are `github::owner/repo::commit/{sha}`; value JSON contains sha, message, author_name, author_login?, committed_at, parents[], html_url." },
         { "tool": "github_open_prs",       "output": "{ count, facts: [Fact] } — entities are `github::owner/repo::pr/{number}`; value JSON contains title, state, author_login?, head_sha, base_branch, body, merged_at?, closed_at?, html_url." },
