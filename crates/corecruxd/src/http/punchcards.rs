@@ -178,12 +178,23 @@ fn split_resource(uri: &str) -> (&str, &str) {
 /// - Symmetrically, a `file://F`/`tree://F` lease is covered by a request for
 ///   the enclosing `tree://T` — i.e. acquiring a subtree conflicts with an
 ///   existing leaf lease inside it.
+/// - `service://` and `deploy://` leases are **point-exclusive**: they conflict
+///   ONLY on exact URI equality (host+path), never by prefix containment. A
+///   `deploy://host/a` lease therefore does NOT cover `deploy://host/a/b` — a
+///   deploy target is an atomic resource, not a subtree.
 fn resources_overlap(held_resource: &str, req_resource: &str) -> bool {
     if held_resource == req_resource {
         return true;
     }
     let (held_scheme, held_path) = split_resource(held_resource);
     let (req_scheme, req_path) = split_resource(req_resource);
+
+    // `deploy://` (and `service://`) are point-exclusive: only exact equality
+    // (handled above) conflicts. Never apply subtree containment to a deploy
+    // lease, even if the other side is a `tree://` request.
+    if held_scheme == "deploy" || req_scheme == "deploy" {
+        return false;
+    }
 
     // `tree://` held lease covering a deeper request.
     if held_scheme == "tree" && path_contains(held_path, req_path) {
@@ -770,6 +781,43 @@ mod tests {
         assert!(!resources_overlap("service://gpu1", "service://data1"));
     }
 
+    // ── deploy:// (point-exclusive: exact host+path only) ────────────────
+
+    #[test]
+    fn deploy_resources_conflict_on_exact_host_and_path() {
+        assert!(resources_overlap(
+            "deploy://crux/opt/crux/bin",
+            "deploy://crux/opt/crux/bin"
+        ));
+    }
+
+    #[test]
+    fn deploy_resources_differ_on_path() {
+        // Same host, different path → no conflict (point-exclusive).
+        assert!(!resources_overlap(
+            "deploy://crux/opt/crux/bin",
+            "deploy://crux/opt/crux/other"
+        ));
+    }
+
+    #[test]
+    fn deploy_resources_differ_on_host() {
+        assert!(!resources_overlap("deploy://crux/path", "deploy://data1/path"));
+    }
+
+    #[test]
+    fn deploy_is_not_prefix_based_unlike_tree() {
+        // A deploy lease on a "parent" path must NOT cover a deeper path the way
+        // a tree:// lease would. Deploy targets are atomic, not subtrees.
+        assert!(!resources_overlap(
+            "deploy://crux/opt/crux",
+            "deploy://crux/opt/crux/bin"
+        ));
+        // And a tree:// request must not swallow a deploy:// leaf lease.
+        assert!(!resources_overlap("deploy://crux/opt/crux/bin", "tree:///opt/crux"));
+        assert!(!resources_overlap("tree:///opt/crux", "deploy://crux/opt/crux/bin"));
+    }
+
     #[test]
     fn path_contains_respects_segment_boundary() {
         assert!(path_contains("/a/b", "/a/b/c"));
@@ -1216,6 +1264,118 @@ mod tests {
         .await;
         let body = body_json(resp).await;
         assert_eq!(body["held_by_other"], false);
+
+        std::env::remove_var("CORECRUXD_PUNCHCARD");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn deploy_card_lifecycle_enforce() {
+        // A deploy lease is point-exclusive under enforce: a second holder on
+        // the SAME host+path is rejected (409); a DIFFERENT path on the same
+        // host is unaffected; releasing frees the resource for the next holder.
+        std::env::set_var("CORECRUXD_PUNCHCARD", "enforce");
+        let state = state_with_kind().await;
+
+        // A acquires a deploy lease (host+path point).
+        let resp = acquire(
+            StateExtract(state.clone()),
+            headers_for("A"),
+            JsonExtract(AcquireBody {
+                resource: "deploy://crux/opt/crux/bin".to_string(),
+                mode: "deploy".to_string(),
+                reason: Some("release-train v0.5.22".to_string()),
+                ttl_secs: Some(600),
+                tenant_id: None,
+                holder_passport: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let card = body_json(resp).await;
+        assert_eq!(card["punchcard"]["status"], "held");
+        assert_eq!(card["punchcard"]["resource"], "deploy://crux/opt/crux/bin");
+
+        // B acquires the EXACT same deploy target → 409 conflict naming A.
+        let resp = acquire(
+            StateExtract(state.clone()),
+            headers_for("B"),
+            JsonExtract(AcquireBody {
+                resource: "deploy://crux/opt/crux/bin".to_string(),
+                mode: "deploy".to_string(),
+                reason: None,
+                ttl_secs: Some(600),
+                tenant_id: None,
+                holder_passport: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(resp).await["held_by"], "A");
+
+        // B acquires a DIFFERENT path on the same host → 201 (point-exclusive,
+        // not prefix-based).
+        let resp = acquire(
+            StateExtract(state.clone()),
+            headers_for("B"),
+            JsonExtract(AcquireBody {
+                resource: "deploy://crux/opt/crux/other".to_string(),
+                mode: "deploy".to_string(),
+                reason: None,
+                ttl_secs: Some(600),
+                tenant_id: None,
+                holder_passport: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // check for B on A's target → held_by_other:true under enforce.
+        let resp = check(
+            StateExtract(state.clone()),
+            headers_for("B"),
+            JsonExtract(CheckBody {
+                resource: "deploy://crux/opt/crux/bin".to_string(),
+                mode: "deploy".to_string(),
+                passport: Some("B".to_string()),
+            }),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_eq!(body["held_by_other"], true);
+        assert_eq!(body["enforce"], true);
+        assert_eq!(body["holder_passport"], "A");
+
+        // A releases its deploy target.
+        let resp = release(
+            StateExtract(state.clone()),
+            headers_for("A"),
+            JsonExtract(ReleaseBody {
+                id: None,
+                resource: Some("deploy://crux/opt/crux/bin".to_string()),
+                release_commit_sha: Some("d432319".to_string()),
+                holder_passport: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["punchcard"]["status"], "released");
+
+        // B can now acquire the freed deploy target → 201.
+        let resp = acquire(
+            StateExtract(state.clone()),
+            headers_for("B"),
+            JsonExtract(AcquireBody {
+                resource: "deploy://crux/opt/crux/bin".to_string(),
+                mode: "deploy".to_string(),
+                reason: None,
+                ttl_secs: Some(600),
+                tenant_id: None,
+                holder_passport: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
 
         std::env::remove_var("CORECRUXD_PUNCHCARD");
     }
