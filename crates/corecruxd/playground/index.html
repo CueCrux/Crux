@@ -657,7 +657,7 @@
     <button class="focus-exit" id="focusExit" style="display:none">← back</button>
     <button class="insp-toggle" id="orcNew" title="Create an orchestrator (group ExecPlans for a session)" style="display:none">＋ Orchestrator</button>
     <button class="insp-toggle" id="rcptVerify" title="Verify a CROWN receipt (GET /v1/receipts/{id}/verification + /signature)" style="display:none">✓ Verify receipt</button>
-    <button class="active-toggle" id="activeToggle" title="Show only running sessions"><span class="led"></span> Active sessions only</button>
+    <button class="active-toggle" id="activeToggle" title="Show only active work — in_progress ExecPlans that aren't stale (no activity >14d)"><span class="led"></span> Active only</button>
     <div class="work-filter" id="workFilter" style="display:none">
       <span class="wf-label">Stage</span>
       <button class="wf-chip on s-idle" data-stage="planned">Planned</button>
@@ -1473,7 +1473,8 @@ function txWork(json){   // M3 — kanban WorkItem[] → execplan nodes (status 
     label: w.title || w.id,
     sub: (w.milestones_total? ('M '+(w.milestones_done||0)+'/'+w.milestones_total+(w.current_milestone? ' · '+w.current_milestone : '')) : (w.current_milestone || w.plan_path || '')),
     status: WSTATE[w.state] || 'planned',
-    fields: [['state',w.state],['progress', w.milestones_total? ((w.milestones_done||0)+'/'+w.milestones_total) : null],['risk_class',w.risk_class],['plan_path',w.plan_path],['milestone',w.current_milestone],['owner',w.assignee_passport],['notes', w.notes_count],['orchestrator',w.orchestrator_id],['linked_pr',w.linked_pr]].filter(([,v])=>v!=null && v!==''),
+    stale: w.stale===true,
+    fields: [['state', w.state + (w.stale===true?' · stale':(w.stale===false?' · active':''))],['progress', w.milestones_total? ((w.milestones_done||0)+'/'+w.milestones_total) : null],['risk_class',w.risk_class],['depends on',(w.depends_on||[]).join(', ')||null],['extended by',(w.extended_by||[]).join(', ')||null],['open decisions',(w.open_decisions||[]).join(', ')||null],['agents', w.provenance?((w.provenance.contributing_agents||[]).join(', ')||null):null],['commits', w.provenance?((w.provenance.commit_shas||[]).join(', ')||null):null],['plan_path',w.plan_path],['milestone',w.current_milestone],['owner',w.assignee_passport],['notes', w.notes_count],['orchestrator',w.orchestrator_id],['linked_pr',w.linked_pr]].filter(([,v])=>v!=null && v!==''),
     children: [],
     doc: (w.body || w.title || '') + (w.plan_path? '\n\nplan: '+w.plan_path : ''),
     payload: JSON.stringify(w, null, 2),
@@ -2062,7 +2063,11 @@ function passOf(n){
 }
 // active-session filter: hide non-running sessions when activeOnly is on
 const filt = (ns, parentId) => {
-  let out = activeOnly ? ns.filter(n => n.kind!=='session' || norm(n.status)==='run') : ns;
+  let out = activeOnly ? ns.filter(n => {
+    if(n.kind==='execplan') return norm(n.status)==='run' && n.stale!==true;   // active = in_progress & not stale
+    if(n.kind==='session')  return norm(n.status)==='run';
+    return true;
+  }) : ns;
   if(parentId==='cx-work') out = out.filter(n => n.kind!=='execplan' || workStages[n.status]!==false);   // stage filter, scoped to the Work panel column
   if(passportFilter!=='all') out = out.filter(n => { const p=passOf(n); return !p || p===passportFilter; });
   return out;
@@ -2106,7 +2111,8 @@ function renderDash(){
   const eps=childrenOf(wk).filter(n=>n.kind==='execplan');
   const stateOf=n=>{ const s=(n.state||n.status||'').toLowerCase(); return s==='complete'?'done':(s||'planned'); };
   const counts={planned:0,in_progress:0,blocked:0,done:0};
-  eps.forEach(n=>{ const s=stateOf(n); if(counts[s]!=null) counts[s]++; });
+  let inprogStale=0;
+  eps.forEach(n=>{ const s=stateOf(n); if(counts[s]!=null) counts[s]++; if(s==='in_progress' && n.stale===true) inprogStale++; });
   const pr=progressOf(wk) || (eps.length?{done:counts.done,total:eps.length,pct:Math.round(100*counts.done/eps.length)}:null);
   const mchip=(k,v)=>v?`<span class="dash-chip"><b>${esc(k)}</b>${esc(v)}</span>`:'';
   const aChip=id=>{ const a=N[id]; return a?mchip(a.label.replace(/^GET /,'').toLowerCase(), a.sub||''):''; };
@@ -2169,7 +2175,7 @@ function renderDash(){
     `<div class="gstripe"></div>`+
     `<div class="ghead"><span class="gkind">execplans · kanban</span>${eps.length?`<span class="gcount">${eps.length}</span>`:''}</div>`+
     `<div class="dash-title">ExecPlans — task totals</div>`+
-    `<div class="dash-stages"><span class="st idle">● ${counts.planned} planned</span><span class="st run">● ${counts.in_progress} in progress</span><span class="st err">● ${counts.blocked} blocked</span><span class="st ok">● ${counts.done} done</span></div>`+
+    `<div class="dash-stages"><span class="st idle">● ${counts.planned} planned</span><span class="st run">● ${counts.in_progress} in progress${inprogStale?` <small style="opacity:.75">(${counts.in_progress-inprogStale} active · ${inprogStale} stale)</small>`:''}</span><span class="st err">● ${counts.blocked} blocked</span><span class="st ok">● ${counts.done} done</span></div>`+
     (pr?`<div class="dbar"><i style="width:${pr.pct}%"></i></div><div class="dash-pct">${pr.done}/${pr.total} milestone gates passed · ${pr.pct}%</div>`:'')+
     `<div class="dash-plans">${plans}</div>`,
     'cx-work');
