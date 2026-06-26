@@ -36,6 +36,18 @@ enum JournalEvent {
     /// Reverse of `Supersede` (M6): un-retire `fact_id`.
     #[serde(rename = "clear_supersede")]
     ClearSupersede { fact_id: String, cleared_at: String },
+    /// Bi-temporal valid-time update (Graphiti model). Sets/clears the
+    /// world-time interval `[valid_from, valid_to)` on an existing fact
+    /// without rewriting its value. `None` on either end means open-ended.
+    #[serde(rename = "set_validity")]
+    SetValidity {
+        fact_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        valid_from: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        valid_to: Option<DateTime<Utc>>,
+        set_at: String,
+    },
 }
 
 /// Per-fact freshness horizon class (child ExecPlan
@@ -165,10 +177,40 @@ pub struct Fact {
     /// deserialize as `actor = None` and serialize without the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+    /// Bi-temporal VALID-TIME start (Graphiti model). When the fact became
+    /// true IN THE WORLD — distinct from `stored_at`, which is *transaction
+    /// time* (when this node learned it). `None` = "true since the beginning
+    /// of time" (open lower bound). Set via [`FactStore::set_validity`].
+    /// Additive schema change: pre-bitemporal on-disk facts and journal
+    /// replay entries deserialize as `None` (valid for all past time),
+    /// mirroring `supersedes` / `reverified_at` / `superseded_by` / `actor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<DateTime<Utc>>,
+    /// Bi-temporal VALID-TIME end (exclusive). When the fact stopped being
+    /// true in the world. `None` = "still true" (open upper bound). A fact
+    /// retired in transaction time (`superseded_by`) is independent of this:
+    /// validity records world-truth, supersession records our belief state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<DateTime<Utc>>,
 }
 
 fn default_version() -> u32 {
     1
+}
+
+impl Fact {
+    /// Bi-temporal predicate: was this fact true IN THE WORLD at `instant`?
+    ///
+    /// The valid-time interval is half-open `[valid_from, valid_to)`:
+    /// `instant >= valid_from` (or `valid_from` is open) AND
+    /// `instant < valid_to` (or `valid_to` is open). A fact with both ends
+    /// open (the default for pre-bitemporal facts) is valid at every instant,
+    /// so adding this filter never hides legacy facts. Pure — no clock read.
+    pub fn valid_at(&self, instant: DateTime<Utc>) -> bool {
+        let after_start = self.valid_from.is_none_or(|from| instant >= from);
+        let before_end = self.valid_to.is_none_or(|to| instant < to);
+        after_start && before_end
+    }
 }
 
 /// Request to store a new fact.
@@ -405,6 +447,17 @@ impl FactStore {
                         fact.superseded_by = None;
                     }
                 }
+                Ok(JournalEvent::SetValidity {
+                    fact_id,
+                    valid_from,
+                    valid_to,
+                    ..
+                }) => {
+                    if let Some(fact) = self.facts.get_mut(&fact_id) {
+                        fact.valid_from = valid_from;
+                        fact.valid_to = valid_to;
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(line_no = line_no + 1, ?err, "fact-journal-parse-skip");
                 }
@@ -467,6 +520,12 @@ impl FactStore {
             reverified_at: None,
             superseded_by: None,
             actor: req.actor,
+            // Valid-time defaults open on both ends (true for all world-time)
+            // until an explicit `set_validity` records when the fact actually
+            // held. Keeping it out of `StoreFact` avoids churning the ~300
+            // store sites; callers that care set validity right after `store`.
+            valid_from: None,
+            valid_to: None,
         }
     }
 
@@ -542,6 +601,38 @@ impl FactStore {
         }
         if let Some(fact) = self.facts.get_mut(fact_id) {
             fact.superseded_by = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the bi-temporal valid-time interval `[valid_from, valid_to)` on an
+    /// existing fact without rewriting its value (Graphiti model). Either end
+    /// may be `None` for an open bound. Journaled (like `mark_superseded`) so
+    /// the world-time record survives a restart — unlike `set_horizon` /
+    /// `reverify`, validity is a durable historical claim, not a re-derivable
+    /// hint. Returns `true` if the fact existed.
+    pub fn set_validity(
+        &mut self,
+        fact_id: &str,
+        valid_from: Option<DateTime<Utc>>,
+        valid_to: Option<DateTime<Utc>>,
+    ) -> bool {
+        if !self.facts.contains_key(fact_id) {
+            return false;
+        }
+        if let Err(err) = self.append_journal(&JournalEvent::SetValidity {
+            fact_id: fact_id.to_string(),
+            valid_from,
+            valid_to,
+            set_at: Utc::now().to_rfc3339(),
+        }) {
+            tracing::warn!(?err, "fact-journal-append-failed");
+        }
+        if let Some(fact) = self.facts.get_mut(fact_id) {
+            fact.valid_from = valid_from;
+            fact.valid_to = valid_to;
             true
         } else {
             false
@@ -707,10 +798,29 @@ impl FactStore {
     /// Query facts by keyword match (simple substring search).
     /// Returns facts sorted by relevance, limited by top_k or token_budget.
     pub fn query(&self, q: &FactQuery) -> FactQueryResult {
+        self.query_inner(q, None)
+    }
+
+    /// Bi-temporal recall (Graphiti model): like [`Self::query`], but only
+    /// returns facts that were TRUE IN THE WORLD at `as_of` — i.e. whose
+    /// valid-time interval `[valid_from, valid_to)` contains `as_of`,
+    /// regardless of when (transaction time) they were learned. Answers
+    /// "what did we believe about X *as of* date Y". Facts with open valid
+    /// bounds (the default) match any `as_of`, so this is a strict superset
+    /// filter over [`Self::query`]. Ranking/budget logic is shared.
+    pub fn query_as_of(&self, q: &FactQuery, as_of: DateTime<Utc>) -> FactQueryResult {
+        self.query_inner(q, Some(as_of))
+    }
+
+    fn query_inner(&self, q: &FactQuery, as_of: Option<DateTime<Utc>>) -> FactQueryResult {
         let mut results: Vec<&Fact> = self
             .facts
             .values()
             .filter(|f| !f.deleted)
+            .filter(|f| match as_of {
+                Some(instant) => f.valid_at(instant),
+                None => true,
+            })
             .filter(|f| {
                 if let Some(prefix) = &q.entity_prefix {
                     if !f.entity.starts_with(prefix.as_str()) {
@@ -2675,5 +2785,151 @@ mod tests {
         assert!(fact.superseded_by.is_none());
         assert!(fact.reverified_at.is_none());
         assert_eq!(fact.horizon_class, HorizonClass::None);
+        // Bi-temporal (M1): a pre-bitemporal fact has open valid bounds and
+        // is therefore valid at every instant — the as_of filter never hides
+        // legacy facts.
+        assert!(fact.valid_from.is_none());
+        assert!(fact.valid_to.is_none());
+        assert!(fact.valid_at(Utc::now()));
+    }
+
+    // ── M1: bi-temporal valid-time (Graphiti model) ─────────────────
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn sample_fact(entity: &str, key: &str, value: &str) -> Fact {
+        let mut store = FactStore::new();
+        store.store(StoreFact {
+            entity: entity.into(),
+            key: key.into(),
+            value: value.into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: Some(HorizonClass::None),
+            actor: None,
+        })
+    }
+
+    #[test]
+    fn valid_at_open_bounds_match_everything() {
+        let mut f = sample_fact("e", "k", "v");
+        // Both ends open (default).
+        assert!(f.valid_at(ts("2000-01-01T00:00:00Z")));
+        assert!(f.valid_at(ts("2099-01-01T00:00:00Z")));
+        // Open upper bound only: valid from 2026 onward, forever.
+        f.valid_from = Some(ts("2026-01-01T00:00:00Z"));
+        assert!(!f.valid_at(ts("2025-12-31T23:59:59Z")));
+        assert!(f.valid_at(ts("2026-01-01T00:00:00Z")));
+        assert!(f.valid_at(ts("2099-01-01T00:00:00Z")));
+    }
+
+    #[test]
+    fn valid_at_is_half_open_interval() {
+        let mut f = sample_fact("e", "k", "v");
+        f.valid_from = Some(ts("2026-01-01T00:00:00Z"));
+        f.valid_to = Some(ts("2026-06-01T00:00:00Z"));
+        // Lower bound inclusive.
+        assert!(f.valid_at(ts("2026-01-01T00:00:00Z")));
+        // Inside.
+        assert!(f.valid_at(ts("2026-03-15T12:00:00Z")));
+        // Upper bound EXCLUSIVE.
+        assert!(!f.valid_at(ts("2026-06-01T00:00:00Z")));
+        // Before / after.
+        assert!(!f.valid_at(ts("2025-12-31T23:59:59Z")));
+        assert!(!f.valid_at(ts("2026-09-01T00:00:00Z")));
+    }
+
+    #[test]
+    fn set_validity_and_query_as_of_picks_world_true_fact() {
+        let mut store = FactStore::new();
+        // Two facts under the same entity describing the office at different
+        // world-times. Same transaction time (now); different valid time.
+        let old = store.store(StoreFact {
+            entity: "person:alice".into(),
+            key: "city".into(),
+            value: "London".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: Some(HorizonClass::None),
+            actor: None,
+        });
+        let new = store.store(StoreFact {
+            entity: "person:alice".into(),
+            key: "city".into(),
+            value: "Berlin".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: Some(HorizonClass::None),
+            actor: None,
+        });
+        // Alice lived in London Jan–Jun 2026, then Berlin from Jun 2026 on.
+        assert!(store.set_validity(
+            &old.fact_id,
+            Some(ts("2026-01-01T00:00:00Z")),
+            Some(ts("2026-06-01T00:00:00Z"))
+        ));
+        assert!(store.set_validity(&new.fact_id, Some(ts("2026-06-01T00:00:00Z")), None));
+
+        let q = FactQuery {
+            query: None,
+            entity: Some("person:alice".into()),
+            entity_prefix: None,
+            top_k: 10,
+            token_budget: None,
+        };
+
+        // As of March: only London is world-true.
+        let march = store.query_as_of(&q, ts("2026-03-01T00:00:00Z"));
+        assert_eq!(march.facts.len(), 1);
+        assert_eq!(march.facts[0].value, "London");
+
+        // As of September: only Berlin is world-true.
+        let sept = store.query_as_of(&q, ts("2026-09-01T00:00:00Z"));
+        assert_eq!(sept.facts.len(), 1);
+        assert_eq!(sept.facts[0].value, "Berlin");
+
+        // Plain query (no as_of) is unfiltered by validity — both come back
+        // (one is the superseded prior version, surfaced here only because
+        // query() does not hide them; the point is as_of did the filtering).
+        let all = store.query(&q);
+        assert!(all.facts.len() >= 1);
+
+        // set_validity on a missing fact is a no-op false.
+        assert!(!store.set_validity("f_nope", None, None));
+    }
+
+    #[test]
+    fn set_validity_persists_across_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let fact_id: String;
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let f = store.store(StoreFact {
+                entity: "person:bob".into(),
+                key: "role".into(),
+                value: "ic".into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: Some(HorizonClass::None),
+                actor: None,
+            });
+            fact_id = f.fact_id.clone();
+            assert!(store.set_validity(
+                &fact_id,
+                Some(ts("2026-01-01T00:00:00Z")),
+                Some(ts("2026-12-31T00:00:00Z"))
+            ));
+        }
+        // Reopen: replay must restore the valid-time interval.
+        let store = FactStore::with_persistence(dir.path()).unwrap();
+        let f = store.get(&fact_id).unwrap();
+        assert_eq!(f.valid_from, Some(ts("2026-01-01T00:00:00Z")));
+        assert_eq!(f.valid_to, Some(ts("2026-12-31T00:00:00Z")));
     }
 }

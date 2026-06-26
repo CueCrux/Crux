@@ -1591,6 +1591,8 @@ mod tests {
             reverified_at,
             superseded_by: None,
             actor: None,
+            valid_from: None,
+            valid_to: None,
         }
     }
 
