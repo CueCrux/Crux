@@ -38,11 +38,14 @@ use std::path::Path;
 /// Maximum number of top carried-cost blocks retained in a report.
 pub const TOP_BLOCKS: usize = 25;
 
-/// Maximum number of distinct ExecPlan slugs carried on a report's
-/// `execplan_slugs` (OD-29 top-K). A session that genuinely worked more than this
-/// keeps its highest-evidence plans; the daemon falls back to window-overlap only
-/// when the list is empty, never when it is merely truncated.
-pub const MAX_EXECPLAN_SLUGS: usize = 3;
+/// Upper bound on the distinct ExecPlan slugs carried on a report's
+/// `execplan_slugs`. This is a **sanity bound, not a precision cap** (OD-30 v2):
+/// the daemon **even-splits** a session's burn across its linked plans, so a
+/// high-fan-out session no longer over-credits — there is no inflation to defend
+/// against by truncating. The bound only guards against a pathological transcript
+/// emitting an unbounded list; real sessions top out well under it (observed max
+/// 16). Slugs beyond the bound are the lowest-evidence ones (ranked last).
+pub const MAX_EXECPLAN_SLUGS: usize = 25;
 
 /// Parse and analyze a transcript file into a [`CostReport`], with `source` set
 /// to the file name (corpus identity — QC.4).

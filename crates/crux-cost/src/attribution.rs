@@ -378,15 +378,27 @@ mod slug_rank_tests {
     }
 
     #[test]
-    fn top_k_caps_the_list() {
+    fn caps_at_the_k_parameter() {
         let signals: Vec<ExecPlanSignal> = ["p1", "p2", "p3", "p4"]
             .iter()
             .map(|s| sig(s, SignalStrength::Strong))
             .collect();
+        // Explicit small k caps; equal score → stable first-seen order.
+        assert_eq!(rank_execplan_slugs(&signals, None, 2), vec!["p1", "p2"]);
+        // Under the production sanity bound, all are kept (no precision cap — the
+        // daemon even-splits, so high fan-out is not over-credited by keeping them).
+        assert_eq!(
+            rank_execplan_slugs(&signals, None, MAX_EXECPLAN_SLUGS),
+            vec!["p1", "p2", "p3", "p4"]
+        );
+    }
+
+    #[test]
+    fn sanity_bound_truncates_only_pathological_lists() {
+        let slugs: Vec<String> = (0..30).map(|i| format!("p{i:02}-plan")).collect();
+        let signals: Vec<ExecPlanSignal> = slugs.iter().map(|s| sig(s, SignalStrength::Strong)).collect();
         let out = rank_execplan_slugs(&signals, None, MAX_EXECPLAN_SLUGS);
-        assert_eq!(out.len(), MAX_EXECPLAN_SLUGS);
-        // All equal score → stable first-seen order, capped at K.
-        assert_eq!(out, vec!["p1", "p2", "p3"]);
+        assert_eq!(out.len(), MAX_EXECPLAN_SLUGS); // bounded at 25, far above real sessions (max ~16)
     }
 
     #[test]
