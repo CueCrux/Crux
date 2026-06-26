@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::daemon_client;
 use crate::hook_input::HookInput;
+use crate::observe_filemod;
 
 /// Env flag opting in to audit capture. Default OFF — capture writes to the
 /// daemon only when the operator sets this (paired with `CORECRUXD_OBSERVE=1`).
@@ -82,10 +83,12 @@ pub fn inputs_for(tool: &str, tool_input: Option<&Value>) -> Vec<Value> {
     vec![]
 }
 
-/// Build the `outputs[]` for a CLOSE step from the tool name + its input/result.
+/// Build the **base** `outputs[]` for a CLOSE step from the tool name + its
+/// input/result. This is the pre-B4 shape (no file-mod enrichment) and is what
+/// the unit tests assert against.
 ///
 /// - `Write` → a `write` output naming the file.
-/// - `Edit` / `NotebookEdit` → an `edit` output naming the file.
+/// - `Edit` / `MultiEdit` / `NotebookEdit` → an `edit` output naming the file.
 /// - `Bash` → a `bash` output naming the command, with the exit code lifted
 ///   from the tool response when present.
 ///
@@ -96,7 +99,7 @@ pub fn outputs_for(tool: &str, tool_input: Option<&Value>, tool_response: Option
         "Write" => file
             .map(|f| vec![json!({ "type": "write", "ref": f })])
             .unwrap_or_default(),
-        "Edit" | "NotebookEdit" => file
+        "Edit" | "MultiEdit" | "NotebookEdit" => file
             .map(|f| vec![json!({ "type": "edit", "ref": f })])
             .unwrap_or_default(),
         "Bash" => {
@@ -112,6 +115,50 @@ pub fn outputs_for(tool: &str, tool_input: Option<&Value>, tool_response: Option
         }
         _ => vec![],
     }
+}
+
+/// B4 — build the **enriched** `outputs[]` for a file-modification CLOSE: the
+/// base output ([`outputs_for`]) plus `blake3_before`/`blake3_after`,
+/// `added`/`removed` line counts, and `execplan_slug`/`milestone` scope.
+///
+/// `blake3_before` is the hash captured at PreToolUse open (carried through
+/// `prior_before`, read back from the stored step). `blake3_after` is recomputed
+/// here from the on-disk file, which now holds the post-edit bytes. Non-file-mod
+/// tools fall through to the base [`outputs_for`] unchanged.
+///
+/// Best-effort throughout: an unreadable file simply omits the hash; the
+/// `edit`/`write` output (and therefore the CROWN-receipted mutation record) is
+/// always produced.
+pub fn enriched_outputs_for(
+    tool: &str,
+    tool_input: Option<&Value>,
+    tool_response: Option<&Value>,
+    cwd: &str,
+    prior_before: Option<&str>,
+) -> Vec<Value> {
+    let mut outs = outputs_for(tool, tool_input, tool_response);
+    if !observe_filemod::is_file_mod_tool(tool) {
+        return outs;
+    }
+    let Some(file) = tool_input.and_then(|v| v.get("file_path")).and_then(Value::as_str) else {
+        return outs;
+    };
+    // After the edit lands the file on disk holds the post-edit bytes.
+    let after = observe_filemod::hash_file(file);
+    let (added, removed) = observe_filemod::line_delta(tool, tool_input, None);
+    let (slug, milestone) = observe_filemod::scope(cwd);
+    if let Some(out) = outs.first_mut() {
+        observe_filemod::enrich_output(
+            out,
+            prior_before,
+            after.as_deref(),
+            added,
+            removed,
+            slug.as_deref(),
+            milestone.as_deref(),
+        );
+    }
+    outs
 }
 
 /// Terminal status for a CLOSE, inferred from the tool response. A non-zero
@@ -150,6 +197,13 @@ fn extract_exit_code(resp: Option<&Value>) -> Option<i64> {
 }
 
 /// OPEN a step for this tool call. Best-effort: returns silently on any error.
+///
+/// For a file-modification tool (B4) the file on disk still holds the
+/// *pre-edit* bytes at this point, so we hash it now and stamp `blake3_before`
+/// onto an output stub on the OPEN body. The matching CLOSE reads that hash back
+/// (via the audit GET) and re-stamps it onto the final enriched output, so the
+/// before/after pair survives the two-process split without a shared in-memory
+/// state.
 pub fn open(input: &HookInput) {
     if !capture_enabled() {
         return;
@@ -161,7 +215,7 @@ pub fn open(input: &HookInput) {
         return;
     };
     let actor = actor();
-    let body = json!({
+    let mut body = json!({
         "node_id": node_id,
         "kind": "tool_call",
         "label": format!("{tool}"),
@@ -169,12 +223,36 @@ pub fn open(input: &HookInput) {
         "ts_start": now_rfc3339(),
         "inputs": inputs_for(tool, input.tool_input.as_ref()),
     });
+    if let Some(stub) = open_before_stub(tool, input.tool_input.as_ref()) {
+        body["outputs"] = json!([stub]);
+    }
     let path = format!("/v1/observe/sessions/{}/steps", input.session_id);
     let _ = daemon_client::post_json(&path, &body);
 }
 
+/// For a file-modification tool, build the OPEN-time output stub carrying the
+/// pre-edit `blake3_before` (hashed from the on-disk file, which is still
+/// pre-edit at PreToolUse). `None` for non-file-mod tools, a missing path, or an
+/// unreadable / not-yet-existing file (a new `Write` has no prior content).
+fn open_before_stub(tool: &str, tool_input: Option<&Value>) -> Option<Value> {
+    if !observe_filemod::is_file_mod_tool(tool) {
+        return None;
+    }
+    let file = tool_input?.get("file_path")?.as_str()?;
+    let before = observe_filemod::hash_file(file)?;
+    let kind = if tool == "Write" { "write" } else { "edit" };
+    Some(json!({ "type": kind, "ref": file, "blake3_before": before }))
+}
+
 /// CLOSE the step for this tool call. Best-effort: returns silently on any
 /// error (including the daemon never having seen the open).
+///
+/// For a file-modification tool the outputs are B4-enriched
+/// ([`enriched_outputs_for`]): the `blake3_before` stamped at open is read back
+/// from the stored step and combined with the post-edit `blake3_after`, the
+/// line delta, and the ExecPlan scope. The PATCH still flows the existing
+/// receipted `/v1/observe` path (one CROWN receipt per mutation), so the
+/// enrichment rides the receipt rather than minting a separate one.
 pub fn close(input: &HookInput) {
     if !capture_enabled() {
         return;
@@ -185,13 +263,43 @@ pub fn close(input: &HookInput) {
     let Some(node_id) = node_id_for(input) else {
         return;
     };
+    let outputs = if observe_filemod::is_file_mod_tool(tool) {
+        let prior_before = stored_blake3_before(&input.session_id, &node_id);
+        enriched_outputs_for(
+            tool,
+            input.tool_input.as_ref(),
+            input.tool_response.as_ref(),
+            &input.cwd,
+            prior_before.as_deref(),
+        )
+    } else {
+        outputs_for(tool, input.tool_input.as_ref(), input.tool_response.as_ref())
+    };
     let body = json!({
-        "outputs": outputs_for(tool, input.tool_input.as_ref(), input.tool_response.as_ref()),
+        "outputs": outputs,
         "ts_end": now_rfc3339(),
         "status": close_status(input.tool_response.as_ref()),
     });
     let path = format!("/v1/observe/sessions/{}/steps/{node_id}", input.session_id);
     let _ = daemon_client::patch_json(&path, &body);
+}
+
+/// Read back the `blake3_before` the OPEN stamped on this step's output stub.
+/// Reconstructs the session audit chain (the same GET the reasoning pass uses),
+/// finds the step by `node_id`, and lifts the first output's `blake3_before`.
+/// `None` on any error (daemon unreachable / step not found / no hash) so the
+/// close degrades to an after-only record rather than blocking.
+fn stored_blake3_before(session_id: &str, node_id: &str) -> Option<String> {
+    let path = format!("/v1/observe/sessions/{session_id}/audit");
+    let audit = daemon_client::get_json(&path).ok()?;
+    let steps = audit.get("steps")?.as_array()?;
+    steps
+        .iter()
+        .find(|s| s.get("node_id").and_then(Value::as_str) == Some(node_id))?
+        .get("outputs")?
+        .as_array()?
+        .iter()
+        .find_map(|o| o.get("blake3_before").and_then(Value::as_str).map(String::from))
 }
 
 /// M3 reasoning pass. For every step in the session that does not yet carry a
@@ -361,6 +469,109 @@ mod tests {
     #[test]
     fn read_tool_produces_no_output() {
         assert!(outputs_for("Read", Some(&json!({"file_path": "/x.rs"})), None).is_empty());
+    }
+
+    #[test]
+    fn multiedit_base_output_is_edit() {
+        let m = outputs_for("MultiEdit", Some(&json!({"file_path": "/m.rs"})), None);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0]["type"], "edit");
+        assert_eq!(m[0]["ref"], "/m.rs");
+    }
+
+    // ── B4 enrichment ──────────────────────────────────────────────────────
+
+    #[test]
+    fn enriched_output_carries_b4_fields_for_edit() {
+        let _env = crate::test_support::env_guard();
+        // Pin scope to env so the assertion is deterministic.
+        let prev_slug = std::env::var("CRUX_EXECPLAN_SLUG").ok();
+        let prev_ms = std::env::var("CRUX_MILESTONE").ok();
+        std::env::set_var("CRUX_EXECPLAN_SLUG", "genexec-b4-ledger");
+        std::env::set_var("CRUX_MILESTONE", "M4");
+
+        // A real file on disk so blake3_after is computed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.rs");
+        std::fs::write(&path, b"after content\n").unwrap();
+        let p = path.to_str().unwrap();
+
+        let ti = json!({ "file_path": p, "old_string": "a", "new_string": "a\nb" });
+        let outs = enriched_outputs_for("Edit", Some(&ti), None, "/tmp", Some("BEFOREHASH"));
+        assert_eq!(outs.len(), 1);
+        let o = &outs[0];
+        assert_eq!(o["type"], "edit");
+        assert_eq!(o["ref"], p);
+        assert_eq!(o["blake3_before"], "BEFOREHASH", "carried prior before-hash");
+        assert_eq!(
+            o["blake3_after"],
+            observe_filemod::hash_file(p).unwrap(),
+            "after-hash recomputed from on-disk file"
+        );
+        assert_eq!(o["added"], 2);
+        assert_eq!(o["removed"], 1);
+        assert_eq!(o["execplan_slug"], "genexec-b4-ledger");
+        assert_eq!(o["milestone"], "M4");
+
+        match prev_slug {
+            Some(v) => std::env::set_var("CRUX_EXECPLAN_SLUG", v),
+            None => std::env::remove_var("CRUX_EXECPLAN_SLUG"),
+        }
+        match prev_ms {
+            Some(v) => std::env::set_var("CRUX_MILESTONE", v),
+            None => std::env::remove_var("CRUX_MILESTONE"),
+        }
+    }
+
+    #[test]
+    fn enriched_output_for_non_file_mod_is_base_shape() {
+        // Bash is not a file-mod tool → enriched == base (no B4 fields).
+        let ti = json!({ "command": "cargo test" });
+        let base = outputs_for("Bash", Some(&ti), Some(&json!({"exit_code": 0})));
+        let enriched = enriched_outputs_for("Bash", Some(&ti), Some(&json!({"exit_code": 0})), "/tmp", None);
+        assert_eq!(base, enriched, "non-file-mod tool must be byte-identical to base");
+        assert!(enriched[0].get("blake3_after").is_none());
+    }
+
+    #[test]
+    fn open_before_stub_hashes_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre.rs");
+        std::fs::write(&path, b"pre-edit bytes").unwrap();
+        let p = path.to_str().unwrap();
+        let stub = open_before_stub("Edit", Some(&json!({ "file_path": p }))).unwrap();
+        assert_eq!(stub["type"], "edit");
+        assert_eq!(stub["ref"], p);
+        assert_eq!(stub["blake3_before"], observe_filemod::hash_file(p).unwrap());
+
+        // Write on a non-existent file → no before-hash (no prior content).
+        assert!(open_before_stub("Write", Some(&json!({ "file_path": "/no/such/file.rs" }))).is_none());
+        // Non-file-mod tool → no stub.
+        assert!(open_before_stub("Bash", Some(&json!({ "command": "ls" }))).is_none());
+    }
+
+    #[test]
+    fn flag_off_skips_all_capture() {
+        // With capture OFF, open/close are pure no-ops (return before any I/O):
+        // the wire path is byte-identical to pre-B4 (nothing is sent at all).
+        let _env = crate::test_support::env_guard();
+        let prev = std::env::var(CAPTURE_FLAG).ok();
+        std::env::remove_var(CAPTURE_FLAG);
+        assert!(!capture_enabled());
+        let input = mk_input(
+            "s1",
+            "Edit",
+            json!({"file_path": "/tmp/x.rs"}),
+            Some(json!({"ok": true})),
+        );
+        // No daemon configured; if these did any I/O they'd still be best-effort,
+        // but the guard returns immediately. Exercise both halves for coverage.
+        open(&input);
+        close(&input);
+        match prev {
+            Some(v) => std::env::set_var(CAPTURE_FLAG, v),
+            None => std::env::remove_var(CAPTURE_FLAG),
+        }
     }
 
     #[test]
