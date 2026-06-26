@@ -2016,7 +2016,7 @@ async fn query_facts_as_of_filters_world_time() {
         "as-of March must exclude Berlin"
     );
 
-    // Unparseable as_of → 400.
+    // A bad (unparseable) as_of → 400.
     let bad = QueryFactsParams {
         query: None,
         entity: None,
