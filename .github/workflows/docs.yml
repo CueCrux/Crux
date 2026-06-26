@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Merge queue: "Build rustdoc" is a required check, so it must report on the
+  # speculative queue ref. The Pages deploy job stays push+main-gated and is
+  # correctly skipped for merge_group events. No-op until a queue is enabled.
+  merge_group:
 
 permissions:
   contents: read
