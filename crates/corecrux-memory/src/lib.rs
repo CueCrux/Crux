@@ -20,6 +20,14 @@
 //! constraints) keyed by session ID. Sessions cost ~87 tokens vs ~15K tokens
 //! for replaying a full conversation.
 //!
+//! ## Case Store (procedural memory)
+//!
+//! [`CaseStore`] is a Memento-style case bank: `(task, action, outcome)` cases
+//! recording what worked for a situation. Agents `retrieve_similar` past cases
+//! at the start of a task and reuse the successful ones — learning from
+//! experience with no model fine-tuning. Complements the declarative fact
+//! store with procedural know-how.
+//!
 //! ## Entity / Edge Substrate
 //!
 //! [`EntityStore`] and [`EdgeStore`], paired with a [`KindRegistry`], form the
@@ -30,6 +38,7 @@
 pub mod action_enrichment;
 pub mod artefact_store;
 pub mod candidate_link;
+pub mod case_store;
 pub mod cruxpack;
 pub mod edge_store;
 pub mod embeddings;
@@ -46,6 +55,7 @@ pub mod signed_bundle;
 pub mod sync;
 
 pub use artefact_store::{ArtefactError, ArtefactMetadata, ArtefactRecord, ArtefactStore, PutArtefact};
+pub use case_store::{Case, CaseStore, RecordCase};
 pub use cruxpack::{
     build_manifest, build_pack_sections, cruxpack_content_hash, plan_import, private_summary, sign_pack, verify_pack,
     CruxPack, ExportOptions, ImportOptions, ImportPlan, PackCounts, PackManifest, PackSections, PackSignature,
