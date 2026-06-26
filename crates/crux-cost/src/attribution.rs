@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use crate::levers;
 use crate::report::{BlockCost, Bucket, CostReport, Headline, Measured, COST_REPORT_SCHEMA};
-use crate::transcript::{Event, EventKind};
-use crate::TOP_BLOCKS;
+use crate::transcript::{Event, EventKind, ExecPlanSignal, SignalStrength};
+use crate::{MAX_EXECPLAN_SLUGS, TOP_BLOCKS};
 
 /// A block parked in the current segment, awaiting flush (when `k` is known).
 struct Pending {
@@ -156,6 +156,13 @@ pub fn analyze(events: &[Event]) -> CostReport {
 
     let levers = levers::generate(&headline, &buckets, &all_blocks);
 
+    // OD-29: rank the transcript's ExecPlan-link signals into the top-K slugs the
+    // session actually worked. The daemon prefers these over window-overlap.
+    let signals: Vec<ExecPlanSignal> = events.iter().flat_map(|e| e.execplan_signals.iter().cloned()).collect();
+    let branch = most_common_branch(events);
+    let branch_leaf = branch.as_deref().map(branch_leaf_of);
+    let execplan_slugs = rank_execplan_slugs(&signals, branch_leaf, MAX_EXECPLAN_SLUGS);
+
     CostReport {
         schema: COST_REPORT_SCHEMA.to_owned(),
         session_id,
@@ -163,12 +170,78 @@ pub fn analyze(events: &[Event]) -> CostReport {
         generated_at: None,
         started_at: started_at.map(str::to_owned),
         ended_at: ended_at.map(str::to_owned),
+        execplan_slugs,
         headline,
         measured,
         buckets,
         top_blocks: all_blocks,
         levers,
     }
+}
+
+/// Rank ExecPlan-link signals into the top-K distinct slugs the session worked
+/// (OD-29). Each slug accumulates its signals' [`SignalStrength::weight`]; a slug
+/// whose strongest signal is only [`SignalStrength::Weak`] (e.g. a bare
+/// `[[slug]]` mention) is dropped — **weak is a tie-breaker, never sole
+/// evidence**. Ranking: total weight desc, then `git`-branch affinity, then
+/// first-appearance order (stable), then slug — all deterministic, no clock.
+#[must_use]
+pub fn rank_execplan_slugs(signals: &[ExecPlanSignal], branch_leaf: Option<&str>, k: usize) -> Vec<String> {
+    if signals.is_empty() || k == 0 {
+        return Vec::new();
+    }
+    struct Agg {
+        score: u32,
+        max: SignalStrength,
+        first: usize,
+    }
+    let mut agg: HashMap<String, Agg> = HashMap::new();
+    for (i, sig) in signals.iter().enumerate() {
+        let e = agg.entry(sig.slug.clone()).or_insert_with(|| Agg {
+            score: 0,
+            max: SignalStrength::Weak,
+            first: i,
+        });
+        e.score = e.score.saturating_add(sig.strength.weight());
+        if sig.strength > e.max {
+            e.max = sig.strength;
+        }
+    }
+    let mut candidates: Vec<(String, Agg)> = agg.into_iter().filter(|(_, a)| a.max > SignalStrength::Weak).collect();
+    candidates.sort_by(|(sa, a), (sb, b)| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| branch_affinity(sb, branch_leaf).cmp(&branch_affinity(sa, branch_leaf)))
+            .then_with(|| a.first.cmp(&b.first))
+            .then_with(|| sa.cmp(sb))
+    });
+    candidates.into_iter().take(k).map(|(slug, _)| slug).collect()
+}
+
+/// 1 when the slug starts with the (non-empty) branch leaf — a deterministic
+/// tie-breaker that can only reorder already-evidenced slugs, never introduce one.
+fn branch_affinity(slug: &str, branch_leaf: Option<&str>) -> u8 {
+    u8::from(matches!(branch_leaf, Some(leaf) if !leaf.is_empty() && slug.starts_with(leaf)))
+}
+
+/// The trailing path segment of a branch name: `feat/token-burn` → `token-burn`.
+fn branch_leaf_of(branch: &str) -> &str {
+    branch.rsplit('/').next().unwrap_or(branch)
+}
+
+/// The most frequently-seen `gitBranch` across the records (ties broken
+/// lexically). Branches rarely change mid-session, so this is effectively *the*
+/// branch; used only as a ranking tie-breaker.
+fn most_common_branch(events: &[Event]) -> Option<String> {
+    let mut counts: HashMap<&str, u32> = HashMap::new();
+    for e in events {
+        if let Some(b) = e.git_branch.as_deref() {
+            *counts.entry(b).or_default() += 1;
+        }
+    }
+    let mut entries: Vec<(&str, u32)> = counts.into_iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    entries.first().map(|(b, _)| (*b).to_owned())
 }
 
 fn park_blocks(ev: &Event, entry_turn: u64, seg: &mut Vec<Pending>) {
@@ -249,4 +322,122 @@ fn round2(x: f64) -> f64 {
 
 fn to_u64(x: usize) -> u64 {
     u64::try_from(x).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod slug_rank_tests {
+    use super::*;
+
+    fn sig(slug: &str, strength: SignalStrength) -> ExecPlanSignal {
+        ExecPlanSignal {
+            slug: slug.to_owned(),
+            strength,
+        }
+    }
+
+    #[test]
+    fn empty_or_zero_k_yields_empty() {
+        assert!(rank_execplan_slugs(&[], None, 3).is_empty());
+        assert!(rank_execplan_slugs(&[sig("a-plan", SignalStrength::Strongest)], None, 0).is_empty());
+    }
+
+    #[test]
+    fn strength_orders_when_frequency_is_equal() {
+        let signals = [
+            sig("strong-plan", SignalStrength::Strong),
+            sig("strongest-plan", SignalStrength::Strongest),
+        ];
+        // 3 (strongest) > 2 (strong).
+        assert_eq!(
+            rank_execplan_slugs(&signals, None, 3),
+            vec!["strongest-plan", "strong-plan"]
+        );
+    }
+
+    #[test]
+    fn accumulated_weight_beats_a_single_stronger_signal() {
+        // Two Strong hits (2+2=4) on `edited` outrank one Strongest (3) on `wrote`.
+        let signals = [
+            sig("wrote", SignalStrength::Strongest),
+            sig("edited", SignalStrength::Strong),
+            sig("edited", SignalStrength::Strong),
+        ];
+        assert_eq!(rank_execplan_slugs(&signals, None, 3), vec!["edited", "wrote"]);
+    }
+
+    #[test]
+    fn weak_only_slug_is_dropped_but_weak_plus_strong_is_kept() {
+        let signals = [
+            sig("mentioned-only", SignalStrength::Weak),
+            sig("worked-plan", SignalStrength::Weak),
+            sig("worked-plan", SignalStrength::Strong),
+        ];
+        // `mentioned-only` has weak-only evidence → dropped; `worked-plan` survives.
+        assert_eq!(rank_execplan_slugs(&signals, None, 3), vec!["worked-plan"]);
+    }
+
+    #[test]
+    fn caps_at_the_k_parameter() {
+        let signals: Vec<ExecPlanSignal> = ["p1", "p2", "p3", "p4"]
+            .iter()
+            .map(|s| sig(s, SignalStrength::Strong))
+            .collect();
+        // Explicit small k caps; equal score → stable first-seen order.
+        assert_eq!(rank_execplan_slugs(&signals, None, 2), vec!["p1", "p2"]);
+        // Under the production sanity bound, all are kept (no precision cap — the
+        // daemon even-splits, so high fan-out is not over-credited by keeping them).
+        assert_eq!(
+            rank_execplan_slugs(&signals, None, MAX_EXECPLAN_SLUGS),
+            vec!["p1", "p2", "p3", "p4"]
+        );
+    }
+
+    #[test]
+    fn sanity_bound_truncates_only_pathological_lists() {
+        let slugs: Vec<String> = (0..30).map(|i| format!("p{i:02}-plan")).collect();
+        let signals: Vec<ExecPlanSignal> = slugs.iter().map(|s| sig(s, SignalStrength::Strong)).collect();
+        let out = rank_execplan_slugs(&signals, None, MAX_EXECPLAN_SLUGS);
+        assert_eq!(out.len(), MAX_EXECPLAN_SLUGS); // bounded at 25, far above real sessions (max ~16)
+    }
+
+    #[test]
+    fn branch_affinity_breaks_score_ties() {
+        let signals = [
+            sig("alpha-plan", SignalStrength::Strong),
+            sig("beta-plan", SignalStrength::Strong),
+        ];
+        // Equal score; the branch leaf prefixes `beta-plan` → it sorts first,
+        // overriding the alphabetical/first-seen order that would pick alpha.
+        assert_eq!(
+            rank_execplan_slugs(&signals, Some("beta-plan"), 3),
+            vec!["beta-plan", "alpha-plan"]
+        );
+        // Without the branch hint, first-seen wins.
+        assert_eq!(rank_execplan_slugs(&signals, None, 3), vec!["alpha-plan", "beta-plan"]);
+    }
+
+    #[test]
+    fn ranking_is_deterministic() {
+        let signals = [
+            sig("b-plan", SignalStrength::Strong),
+            sig("a-plan", SignalStrength::Strong),
+            sig("a-plan", SignalStrength::Weak),
+        ];
+        let once = rank_execplan_slugs(&signals, None, 3);
+        let twice = rank_execplan_slugs(&signals, None, 3);
+        assert_eq!(once, twice);
+        // a-plan (2+1=3) outranks b-plan (2).
+        assert_eq!(once, vec!["a-plan", "b-plan"]);
+    }
+
+    #[test]
+    fn branch_helpers() {
+        assert_eq!(branch_leaf_of("feat/token-burn"), "token-burn");
+        assert_eq!(branch_leaf_of("main"), "main");
+        assert_eq!(branch_affinity("token-burn-x", Some("token-burn")), 1);
+        assert_eq!(branch_affinity("other", Some("token-burn")), 0);
+        assert_eq!(branch_affinity("any", None), 0);
+        assert_eq!(branch_affinity("any", Some("")), 0);
+    }
 }
