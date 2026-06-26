@@ -131,6 +131,13 @@ pub struct WorkItem {
     /// hiding anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale: Option<bool>,
+    /// Per-ExecPlan **token-burn** rollup: the sum of attributed session cost
+    /// reports (the cost lens, keyed by transcript UUID, joined to this plan at
+    /// read time — see [`crate::cost_attribution`]). ExecPlan-aggregator items
+    /// only, and only when the cost lens is fed; `None` for kanban items and
+    /// plans with no attributed session, so the field is omitted on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_burn: Option<crate::cost_attribution::TokenBurn>,
 }
 
 /// Compact, fact-derived provenance for an ExecPlan work item. Assembled at
@@ -246,6 +253,7 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         notes_count: None,
         provenance: None,
         stale: None,
+        token_burn: None,
     };
     write_record(store, &item)?;
     write_transition(

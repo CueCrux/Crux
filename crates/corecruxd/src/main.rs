@@ -32,6 +32,7 @@ mod consolidation_scheduler;
 mod control;
 mod coord;
 mod cost;
+mod cost_attribution;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]
 mod dataplane_store;

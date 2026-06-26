@@ -71,6 +71,21 @@ pub struct Event {
     pub blocks: Vec<ContentBlock>,
     /// `sessionId`, when present.
     pub session_id: Option<String>,
+    /// The record's RFC3339 `timestamp` (e.g. `2026-06-25T11:38:40.060Z`), kept
+    /// verbatim when it has the expected fixed-width UTC `Z` shape. Used by the
+    /// analyzer to derive the session's active time window; `None` when absent or
+    /// malformed. Every Claude Code record (including `queue-operation`/meta)
+    /// carries one, so the window spans the whole transcript, not just turns.
+    pub timestamp: Option<String>,
+}
+
+/// Cheap shape check for the Claude Code transcript timestamp: a fixed-width
+/// RFC3339 UTC instant like `2026-06-25T11:38:40.060Z`. Strings of this form
+/// compare lexically in chronological order, so the analyzer can take a min/max
+/// without a date-time dependency. Anything that doesn't match is ignored.
+fn looks_like_rfc3339_utc(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 20 && b[0].is_ascii_digit() && s.contains('T') && s.ends_with('Z')
 }
 
 /// Parse a transcript file path, failing soft on bad lines. Errors only on the
@@ -139,6 +154,11 @@ fn parse_str_opts(text: &str, capture: bool) -> Vec<Event> {
 
 fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>, capture: bool) -> Event {
     let session_id = value.get("sessionId").and_then(Value::as_str).map(str::to_owned);
+    let timestamp = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .filter(|s| looks_like_rfc3339_utc(s))
+        .map(str::to_owned);
     let rtype = value.get("type").and_then(Value::as_str);
 
     let kind = if is_compaction(value) {
@@ -173,6 +193,7 @@ fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>, capture
         usage,
         blocks,
         session_id,
+        timestamp,
     }
 }
 
