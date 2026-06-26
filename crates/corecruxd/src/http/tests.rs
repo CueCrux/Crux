@@ -224,6 +224,8 @@ async fn sync_promotion_confirm_applies_remote_records() {
         actor: None,
         valid_from: None,
         valid_to: None,
+        access_count: 0,
+        last_accessed_at: None,
     };
     let record = corecrux_memory::sync::SyncCollectionRecord {
         collection: "facts".to_string(),
@@ -290,6 +292,8 @@ async fn sync_offboard_signs_wipe_receipt_and_stores_proof() {
             actor: None,
             valid_from: None,
             valid_to: None,
+            access_count: 0,
+            last_accessed_at: None,
         });
     }
 
@@ -6963,6 +6967,8 @@ async fn m11_closure_suite_exercises_hybrid_workbench_replay_and_offboarding() {
             actor: None,
             valid_from: None,
             valid_to: None,
+            access_count: 0,
+            last_accessed_at: None,
         });
         evidence
     };

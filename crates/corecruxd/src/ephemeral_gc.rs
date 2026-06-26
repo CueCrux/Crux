@@ -232,6 +232,8 @@ mod tests {
             actor: None,
             valid_from: None,
             valid_to: None,
+            access_count: 0,
+            last_accessed_at: None,
         }
     }
 
@@ -261,6 +263,8 @@ mod tests {
             actor: None,
             valid_from: None,
             valid_to: None,
+            access_count: 0,
+            last_accessed_at: None,
         }
     }
 

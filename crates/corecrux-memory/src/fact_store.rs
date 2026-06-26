@@ -17,6 +17,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Journal event for fact persistence.
+//
+// `large_enum_variant`: `Store` legitimately carries a whole `Fact` and is the
+// DOMINANT variant (every write emits one), while the others hold only a few
+// Strings. `JournalEvent` is a short-lived serialization DTO — constructed,
+// written to one JSONL line, and dropped; it is never held in bulk where the
+// size disparity would matter. Boxing the `Fact` would add a heap allocation to
+// the hot write path for the common case to save stack bytes we never keep, so
+// allowing the lint here is the deliberate, lower-cost choice.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op")]
 enum JournalEvent {
@@ -192,6 +201,25 @@ pub struct Fact {
     /// validity records world-truth, supersession records our belief state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_to: Option<DateTime<Utc>>,
+    /// Salience signal (M2): how many times this fact has been returned by
+    /// recall. A frequently-recalled fact is evidently important, so decay is
+    /// slowed for it (see `corecrux_projections::decay::salience_factor`).
+    /// Maintained in-memory by [`FactStore::record_access`] on the read path —
+    /// NOT journaled (journaling every recall would balloon the append log on
+    /// the hot path); it is a ranking heuristic, not a durable claim, and
+    /// re-accumulates after a restart. `#[serde(default)]` ⇒ 0 for all
+    /// pre-M2 on-disk facts, where `salience_factor(0) == 1.0` makes decay
+    /// byte-identical to pre-salience behaviour.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub access_count: u32,
+    /// Wall-clock of the most recent recall (M2). In-memory companion to
+    /// `access_count`; not journaled. `None` until first recalled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_accessed_at: Option<DateTime<Utc>>,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 fn default_version() -> u32 {
@@ -526,6 +554,11 @@ impl FactStore {
             // store sites; callers that care set validity right after `store`.
             valid_from: None,
             valid_to: None,
+            // Salience starts at zero (never recalled). `record_access` bumps
+            // it on the read path; `salience_factor(0) == 1.0` so a brand-new
+            // fact decays exactly as before until it is actually recalled.
+            access_count: 0,
+            last_accessed_at: None,
         }
     }
 
@@ -637,6 +670,32 @@ impl FactStore {
         } else {
             false
         }
+    }
+
+    /// Record that the given facts were just returned by recall (M2 salience).
+    /// Increments each fact's `access_count` and stamps `last_accessed_at`,
+    /// so frequently-recalled facts decay slower
+    /// (see `corecrux_projections::decay::salience_factor`). Unknown/deleted
+    /// ids are skipped. Returns the number of facts actually updated.
+    ///
+    /// Deliberately NOT journaled: this runs on the hot read path and the
+    /// signal is a re-derivable ranking heuristic, not a durable claim —
+    /// journaling every recall would bloat the append-only log. Access counts
+    /// reset on restart and re-accumulate, exactly like a cold cache.
+    pub fn record_access(&mut self, fact_ids: &[&str]) -> usize {
+        let now = Utc::now();
+        let mut updated = 0usize;
+        for fact_id in fact_ids {
+            if let Some(fact) = self.facts.get_mut(*fact_id) {
+                if fact.deleted {
+                    continue;
+                }
+                fact.access_count = fact.access_count.saturating_add(1);
+                fact.last_accessed_at = Some(now);
+                updated += 1;
+            }
+        }
+        updated
     }
 
     fn insert_fact_indexes(&mut self, fact: &Fact) {
@@ -2931,5 +2990,87 @@ mod tests {
         let f = store.get(&fact_id).unwrap();
         assert_eq!(f.valid_from, Some(ts("2026-01-01T00:00:00Z")));
         assert_eq!(f.valid_to, Some(ts("2026-12-31T00:00:00Z")));
+    }
+
+    // ── M2: salience access tracking ────────────────────────────────
+
+    #[test]
+    fn record_access_increments_count_and_stamps_time() {
+        let mut store = FactStore::new();
+        let f = store.store(StoreFact {
+            entity: "e".into(),
+            key: "k".into(),
+            value: "v".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: Some(HorizonClass::None),
+            actor: None,
+        });
+        // Fresh fact: no accesses yet.
+        assert_eq!(store.get(&f.fact_id).unwrap().access_count, 0);
+        assert!(store.get(&f.fact_id).unwrap().last_accessed_at.is_none());
+
+        // One recall of one fact updates exactly one fact.
+        assert_eq!(store.record_access(&[f.fact_id.as_str()]), 1);
+        assert_eq!(store.get(&f.fact_id).unwrap().access_count, 1);
+        assert!(store.get(&f.fact_id).unwrap().last_accessed_at.is_some());
+
+        // Repeated recalls accumulate.
+        store.record_access(&[f.fact_id.as_str()]);
+        store.record_access(&[f.fact_id.as_str()]);
+        assert_eq!(store.get(&f.fact_id).unwrap().access_count, 3);
+
+        // Unknown ids are skipped (returns 0, no panic).
+        assert_eq!(store.record_access(&["f_nope"]), 0);
+    }
+
+    #[test]
+    fn record_access_skips_deleted_facts() {
+        let mut store = FactStore::new();
+        let f = store.store(StoreFact {
+            entity: "e".into(),
+            key: "k".into(),
+            value: "v".into(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: Some(HorizonClass::None),
+            actor: None,
+        });
+        store.delete(&f.fact_id);
+        // A tombstoned fact is not a recall target.
+        assert_eq!(store.record_access(&[f.fact_id.as_str()]), 0);
+    }
+
+    #[test]
+    fn access_count_is_not_journaled_resets_on_replay() {
+        // Salience is an in-memory heuristic: it deliberately does NOT survive
+        // a restart (journaling every recall would bloat the hot-path log).
+        let dir = tempfile::tempdir().unwrap();
+        let fact_id: String;
+        {
+            let mut store = FactStore::with_persistence(dir.path()).unwrap();
+            let f = store.store(StoreFact {
+                entity: "e".into(),
+                key: "k".into(),
+                value: "v".into(),
+                source_receipt: None,
+                confidence: 1.0,
+                private: false,
+                horizon_class: Some(HorizonClass::None),
+                actor: None,
+            });
+            fact_id = f.fact_id.clone();
+            store.record_access(&[fact_id.as_str()]);
+            store.record_access(&[fact_id.as_str()]);
+            assert_eq!(store.get(&fact_id).unwrap().access_count, 2);
+        }
+        // Reopen: access_count resets to 0 (cold cache), value intact.
+        let store = FactStore::with_persistence(dir.path()).unwrap();
+        let f = store.get(&fact_id).unwrap();
+        assert_eq!(f.access_count, 0);
+        assert!(f.last_accessed_at.is_none());
+        assert_eq!(f.value, "v");
     }
 }

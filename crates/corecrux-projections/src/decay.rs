@@ -146,6 +146,45 @@ impl Default for DecayPolicy {
 /// fall back to a heuristic in that case but must not pretend it's
 /// fresh.
 pub fn apply_at(class: HorizonClass, written_ms: i64, now_ms: i64, policy: DecayPolicy) -> Freshness {
+    // Delegates to the salience-aware variant with zero accesses. Because
+    // `salience_factor(0) == 1.0`, this is byte-for-byte the pre-M2 behaviour;
+    // keeping one implementation guarantees the two can never diverge.
+    apply_at_salient(class, written_ms, now_ms, 0, policy)
+}
+
+/// Salience reinforcement multiplier (M2). A fact that recall has returned
+/// `access_count` times is evidently important, so its staleness threshold is
+/// stretched by this bounded factor — frequently-recalled facts decay SLOWER.
+///
+/// Shape: `1 + SALIENCE_SLOPE * ln(1 + access_count)`, clamped to
+/// [`SALIENCE_MAX_FACTOR`]. Two load-bearing properties:
+///
+/// - `salience_factor(0) == 1.0` — a never-recalled fact decays exactly as it
+///   did before M2, so the feature is strictly backward-compatible for cold
+///   facts.
+/// - Monotonically non-decreasing and `>= 1.0` — salience can only EXTEND a
+///   fact's fresh window, never shorten it.
+///
+/// Pure and deterministic: same `access_count` -> same factor.
+pub const SALIENCE_SLOPE: f64 = 0.25;
+pub const SALIENCE_MAX_FACTOR: f64 = 4.0;
+
+pub fn salience_factor(access_count: u32) -> f64 {
+    let raw = 1.0 + SALIENCE_SLOPE * ((access_count as f64) + 1.0).ln();
+    raw.clamp(1.0, SALIENCE_MAX_FACTOR)
+}
+
+/// [`apply_at`] with M2 salience: the per-class staleness threshold is
+/// multiplied by `salience_factor(access_count)` before the age comparison, so
+/// a frequently-recalled fact stays [`Freshness::Fresh`] longer. Identical to
+/// [`apply_at`] when `access_count == 0`. Pure — no clock read, no random.
+pub fn apply_at_salient(
+    class: HorizonClass,
+    written_ms: i64,
+    now_ms: i64,
+    access_count: u32,
+    policy: DecayPolicy,
+) -> Freshness {
     if class == HorizonClass::None {
         return Freshness::Fresh;
     }
@@ -158,12 +197,15 @@ pub fn apply_at(class: HorizonClass, written_ms: i64, now_ms: i64, policy: Decay
         return Freshness::Unknown;
     }
     let age_ms = now_ms - written_ms;
-    let threshold_ms: i64 = match class {
+    let base_threshold_ms: i64 = match class {
         HorizonClass::Volatile => policy.volatile_stale_hours.saturating_mul(60 * 60 * 1_000),
         HorizonClass::Medium => policy.medium_stale_days.saturating_mul(24 * 60 * 60 * 1_000),
         HorizonClass::Stable => policy.stable_stale_days.saturating_mul(24 * 60 * 60 * 1_000),
         HorizonClass::None => unreachable!(),
     };
+    // Threshold values (<= ~3.15e10 ms) are far inside f64 integer precision,
+    // so `* 1.0` for the access_count==0 path is exact (preserves `apply_at`).
+    let threshold_ms = ((base_threshold_ms as f64) * salience_factor(access_count)) as i64;
     if age_ms > threshold_ms {
         Freshness::Stale
     } else {
@@ -186,6 +228,28 @@ pub fn apply_at_chrono(
 ) -> Freshness {
     let anchor = reverified_at.unwrap_or(written_at);
     apply_at(class, anchor.timestamp_millis(), now.timestamp_millis(), policy)
+}
+
+/// [`apply_at_chrono`] with M2 salience reinforcement. Prefers the
+/// `reverified_at` anchor (like [`apply_at_chrono`]) and additionally stretches
+/// the staleness threshold by `salience_factor(access_count)`. Identical to
+/// [`apply_at_chrono`] when `access_count == 0`.
+pub fn apply_at_chrono_salient(
+    class: HorizonClass,
+    written_at: DateTime<Utc>,
+    reverified_at: Option<DateTime<Utc>>,
+    access_count: u32,
+    now: DateTime<Utc>,
+    policy: DecayPolicy,
+) -> Freshness {
+    let anchor = reverified_at.unwrap_or(written_at);
+    apply_at_salient(
+        class,
+        anchor.timestamp_millis(),
+        now.timestamp_millis(),
+        access_count,
+        policy,
+    )
 }
 
 /// Ranking-time demotion factor applied to a fact's STORED confidence
@@ -404,6 +468,84 @@ mod tests {
         assert!(p.volatile_stale_hours > 0);
         assert!(p.medium_stale_days > 0);
         assert!(p.stable_stale_days > 0);
+    }
+
+    // ── M2: salience-weighted decay ─────────────────────────────────
+
+    #[test]
+    fn salience_factor_zero_is_identity() {
+        // The load-bearing invariant: a never-recalled fact is unaffected.
+        assert_eq!(salience_factor(0), 1.0);
+    }
+
+    #[test]
+    fn salience_factor_monotonic_bounded_and_ge_one() {
+        let mut prev = salience_factor(0);
+        for n in [1u32, 2, 5, 10, 100, 1_000, 100_000, u32::MAX] {
+            let f = salience_factor(n);
+            assert!(f >= 1.0, "salience never shortens the fresh window");
+            assert!(f <= SALIENCE_MAX_FACTOR, "salience is bounded");
+            assert!(f >= prev, "salience is monotonically non-decreasing");
+            prev = f;
+        }
+    }
+
+    #[test]
+    fn apply_at_salient_with_zero_accesses_equals_apply_at() {
+        // Exhaustive-ish equality across classes and ages: the salient path at
+        // access_count==0 must be byte-identical to the legacy `apply_at`.
+        let now = 1_700_000_000_000_i64;
+        for class in [
+            HorizonClass::Volatile,
+            HorizonClass::Medium,
+            HorizonClass::Stable,
+            HorizonClass::None,
+        ] {
+            for age_days in [0_i64, 1, 30, 40, 300, 400, 500] {
+                let written = now - age_days * DAY_MS;
+                assert_eq!(
+                    apply_at_salient(class, written, now, 0, p()),
+                    apply_at(class, written, now, p()),
+                    "class={class:?} age_days={age_days}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn salient_fact_stays_fresh_past_the_base_threshold() {
+        // A Medium fact at day 40 is Stale (base threshold 35d) when never
+        // recalled, but a frequently-recalled one is still Fresh because its
+        // threshold is stretched by salience.
+        let written = 1_700_000_000_000_i64;
+        let day_40 = written + 40 * DAY_MS;
+        assert_eq!(
+            apply_at_salient(HorizonClass::Medium, written, day_40, 0, p()),
+            Freshness::Stale
+        );
+        // salience_factor(1000) ≈ 1 + 0.25*ln(1001) ≈ 2.73 → threshold ≈ 95d.
+        assert_eq!(
+            apply_at_salient(HorizonClass::Medium, written, day_40, 1_000, p()),
+            Freshness::Fresh,
+            "a hot fact decays slower"
+        );
+        // …but salience cannot resurrect a truly ancient fact: at day 400 even
+        // a hot Medium fact (threshold ≈ 95d) is Stale.
+        let day_400 = written + 400 * DAY_MS;
+        assert_eq!(
+            apply_at_salient(HorizonClass::Medium, written, day_400, 1_000, p()),
+            Freshness::Stale
+        );
+    }
+
+    #[test]
+    fn apply_at_chrono_salient_matches_non_salient_at_zero() {
+        let written = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+        let now = Utc.timestamp_millis_opt(1_700_000_000_000 + 40 * DAY_MS).unwrap();
+        assert_eq!(
+            apply_at_chrono_salient(HorizonClass::Medium, written, None, 0, now, p()),
+            apply_at_chrono(HorizonClass::Medium, written, None, now, p()),
+        );
     }
 
     // Property-style coverage via proptest. Demonstrates the pure-function

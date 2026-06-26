@@ -17,6 +17,16 @@ use crate::scope;
 use corecrux_memory::fact_store::{Fact, FactQuery, HorizonClass, StoreFact};
 use corecrux_projections::decay;
 
+/// M2 salience switch. When `CORECRUXD_MEMORY_SALIENCE` is set to a truthy
+/// value (`1`/`true`/`yes`/`on`, case-insensitive) the recall path records
+/// per-fact access counts so frequently-recalled facts decay slower. Default
+/// OFF keeps recall strictly read-only and byte-identical to pre-M2.
+fn salience_enabled() -> bool {
+    std::env::var("CORECRUXD_MEMORY_SALIENCE")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 /// Resolve the (scope_identity, aliases) pair for `ctx` (agent-passport M5).
 ///
 /// Flag-OFF: identity is the raw agent name and aliases is empty — every
@@ -426,6 +436,16 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
 
     let store = ctx.fact_store.read().await;
     let visible = query_visible_facts_opts(&store, &q, id_ref, &alias_refs, include_superseded);
+    drop(store);
+
+    // M2 salience: record that these facts were just recalled so they decay
+    // slower on subsequent reads. Default-OFF (env `CORECRUXD_MEMORY_SALIENCE`)
+    // because it takes a brief write lock on the otherwise read-only recall
+    // path; when off the recall path is byte-identical to pre-M2.
+    if salience_enabled() && !visible.is_empty() {
+        let ids: Vec<&str> = visible.iter().map(|f| f.fact_id.as_str()).collect();
+        ctx.fact_store.write().await.record_access(&ids);
+    }
 
     if visible.is_empty() {
         return Ok(json!({
@@ -446,7 +466,9 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     for f in &visible {
         let entity = scope::visible_entity_for_identity(f, id_ref, &alias_refs).unwrap_or_else(|| f.entity.clone());
         let class = crate::tools::freshness::projection_class_of(f.horizon_class);
-        let fresh = decay::apply_at_chrono(class, f.stored_at, f.reverified_at, now, policy);
+        // Salience-aware (M2): the surfaced freshness/effective_confidence
+        // matches the ranking key computed in `query_visible_facts_opts`.
+        let fresh = decay::apply_at_chrono_salient(class, f.stored_at, f.reverified_at, f.access_count, now, policy);
         let effective_confidence = decay::effective_confidence(f.confidence as f64, fresh);
         let anchor = f.reverified_at.unwrap_or(f.stored_at);
         let age_hours = (now - anchor).num_hours().max(0);
@@ -644,9 +666,19 @@ fn query_visible_facts_opts(
     // confidence.
     let policy = decay::DecayPolicy::from_env();
     let now = Utc::now();
+    // M2 salience: a frequently-recalled fact decays slower, so it resists the
+    // stale demotion longer. `access_count == 0` (every fact until salience is
+    // enabled and accrues recalls) makes this identical to `apply_at_chrono`.
     let eff = |fact: &Fact| -> f64 {
         let class = crate::tools::freshness::projection_class_of(fact.horizon_class);
-        let fresh = decay::apply_at_chrono(class, fact.stored_at, fact.reverified_at, now, policy);
+        let fresh = decay::apply_at_chrono_salient(
+            class,
+            fact.stored_at,
+            fact.reverified_at,
+            fact.access_count,
+            now,
+            policy,
+        );
         decay::effective_confidence(fact.confidence as f64, fresh)
     };
     results.sort_by(|left, right| {
@@ -1593,6 +1625,8 @@ mod tests {
             actor: None,
             valid_from: None,
             valid_to: None,
+            access_count: 0,
+            last_accessed_at: None,
         }
     }
 

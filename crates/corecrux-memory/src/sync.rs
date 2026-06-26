@@ -1272,6 +1272,8 @@ mod tests {
             actor: None,
             valid_from: None,
             valid_to: None,
+            access_count: 0,
+            last_accessed_at: None,
         };
 
         store.store_synced(fact);
@@ -1314,6 +1316,8 @@ mod tests {
                 actor: None,
                 valid_from: None,
                 valid_to: None,
+                access_count: 0,
+                last_accessed_at: None,
             };
             store.store_synced(fact);
             assert_eq!(store.count(), 1);
@@ -1387,6 +1391,8 @@ mod tests {
             actor: None,
             valid_from: None,
             valid_to: None,
+            access_count: 0,
+            last_accessed_at: None,
         };
         store.store_synced(synced);
 
@@ -1544,6 +1550,8 @@ mod tests {
             actor: None,
             valid_from: None,
             valid_to: None,
+            access_count: 0,
+            last_accessed_at: None,
         });
         store.store(StoreFact {
             entity: "business::acme::constraint::deploy".to_string(),
@@ -1610,6 +1618,8 @@ mod tests {
             actor: None,
             valid_from: None,
             valid_to: None,
+            access_count: 0,
+            last_accessed_at: None,
         });
 
         let receipt = offboard_tenant_mirror(&mut store, "business::acme", 11);
