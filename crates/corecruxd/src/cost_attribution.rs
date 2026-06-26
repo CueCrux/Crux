@@ -39,7 +39,8 @@
 //! session carries that link, [`attribute`] credits **only** those plans
 //! (`method = "link"`) and skips window-overlap entirely for it; a session with no
 //! link still uses the window-overlap fallback. OD-30 (how to split a multi-plan
-//! session) is resolved as **full-credit-each** — see [`attribute`].
+//! session) is resolved as **even-split** (v2): each linked plan gets `burn / N`,
+//! so high-fan-out sessions are not inflated — see [`attribute`].
 //!
 //! This module is split:
 //! * [`attribute`] is the **pure** core (no IO, no clock) — unit-tested
@@ -127,14 +128,15 @@ fn overlaps(a0: i64, a1: i64, b0: i64, b1: i64) -> bool {
 /// `finding:window-overlap-too-coarse` (a multi-day session credited ~every
 /// concurrently-active plan).
 ///
-/// **OD-30 — multi-plan split: full-credit-each.** When a session links N plans,
-/// each linked plan receives the **whole** session burn (not an even or weighted
-/// split). This matches window-overlap's existing semantics (each overlapping
-/// plan already got full credit) so per-plan numbers stay comparable across the
-/// two methods; the win is that far fewer plans are credited (only worked ones).
-/// The `method` label surfaces link vs window so any residual co-credit across
-/// genuinely co-worked plans is never read as silently precise. Even/weighted
-/// splits are a deferred refinement if a real session proves badly co-credited.
+/// **OD-30 v2 — multi-plan split: even-split.** When a session links N plans, its
+/// burn is split **evenly** — each linked plan receives `burn / N` (N = the
+/// emitted slug count). This keeps a high-fan-out session (observed: up to 16
+/// plans) from inflating every plan it touched: the sum across plans is ≤ the
+/// session total, never a multiple of it. A single-plan session still gives the
+/// full burn. The denominator is the worked-plan count, not the projected count,
+/// so a plan's share is stable as siblings project. (v1 was full-credit-each,
+/// which over-counted high-fan-out sessions and relied on a tight top-K cap to
+/// hide it; the cap is now just a sanity bound — see `crux_cost::MAX_EXECPLAN_SLUGS`.)
 ///
 /// Returns `plan id → TokenBurn` for the plans that received at least one session.
 /// No IO, no clock — deterministic in its inputs.
@@ -180,15 +182,24 @@ pub fn attribute(sessions: &[SessionBurn], plans: &[PlanWindow]) -> BTreeMap<Str
                 }
             }
         } else {
-            // Precise: credit ONLY the worked plans (full-credit-each, OD-30).
+            // Precise: split the session's burn EVENLY across the plans it worked
+            // (OD-30 v2). The denominator is the worked-plan **count** (len of the
+            // emitted slugs), so a plan's share is stable even if a sibling slug
+            // has not yet projected as a work item (it does not jump when the
+            // sibling lands). Integer division floors the share — the dropped
+            // remainder means the sum across plans is ≤ the session total, never
+            // inflated. A single-plan session (n=1) still gets the full burn.
+            let n = s.execplan_slugs.len() as u64; // ≥ 1 in this branch (non-empty)
+            let ctx_share = s.context_tokens / n;
+            let out_share = s.output_tokens / n;
             for slug in &s.execplan_slugs {
                 let id = format!("execplan:{slug}");
                 if !plan_ids.contains(id.as_str()) {
                     continue;
                 }
                 let e = acc.entry(id).or_default();
-                e.ctx = e.ctx.saturating_add(s.context_tokens);
-                e.out = e.out.saturating_add(s.output_tokens);
+                e.ctx = e.ctx.saturating_add(ctx_share);
+                e.out = e.out.saturating_add(out_share);
                 e.sessions += 1;
                 e.link_hits += 1;
             }
@@ -447,25 +458,38 @@ mod tests {
     }
 
     #[test]
-    fn link_full_credit_each_for_multi_plan_session() {
-        // OD-30: a session that worked two plans credits each the whole burn.
+    fn link_even_split_across_multi_plan_session() {
+        // OD-30 v2: a session that worked two plans splits its burn evenly.
         let sessions = vec![sess_linked("s", 900, 9, &["a", "b"])];
         let plans = vec![plan("execplan:a", 0, 1, &[]), plan("execplan:b", 0, 1, &[])];
         let out = attribute(&sessions, &plans);
-        assert_eq!(out.get("execplan:a").unwrap().context_tokens, 900);
-        assert_eq!(out.get("execplan:b").unwrap().context_tokens, 900);
+        assert_eq!(out.get("execplan:a").unwrap().context_tokens, 450); // 900 / 2
+        assert_eq!(out.get("execplan:b").unwrap().context_tokens, 450);
+        assert_eq!(out.get("execplan:a").unwrap().output_tokens, 4); // 9 / 2, floored
         assert_eq!(out.get("execplan:a").unwrap().method, "link");
-        assert_eq!(out.get("execplan:b").unwrap().method, "link");
+        // Sum across plans never exceeds the session total (no inflation).
+        let total: u64 = out.values().map(|t| t.context_tokens).sum();
+        assert!(total <= 900);
     }
 
     #[test]
-    fn link_skips_slug_with_no_projected_plan() {
-        // `ghost` has no work item yet (rsync lag) → skipped; `known` is credited.
+    fn link_single_plan_session_gets_full_burn() {
+        let sessions = vec![sess_linked("s", 1000, 10, &["solo"])];
+        let plans = vec![plan("execplan:solo", 0, 1, &[])];
+        let out = attribute(&sessions, &plans);
+        assert_eq!(out.get("execplan:solo").unwrap().context_tokens, 1000); // n=1
+    }
+
+    #[test]
+    fn link_denominator_is_worked_count_not_projected_count() {
+        // `ghost` has no work item yet (rsync lag) → not credited; but the split
+        // denominator is still 2 (the worked-plan count), so `known` gets 500/2,
+        // NOT 500/1 — its share stays stable when `ghost` later projects.
         let sessions = vec![sess_linked("s", 500, 5, &["known", "ghost"])];
         let plans = vec![plan("execplan:known", 0, 1, &[])];
         let out = attribute(&sessions, &plans);
         assert_eq!(out.len(), 1);
-        assert_eq!(out.get("execplan:known").unwrap().context_tokens, 500);
+        assert_eq!(out.get("execplan:known").unwrap().context_tokens, 250); // 500 / 2
         assert!(!out.contains_key("execplan:ghost"));
     }
 
