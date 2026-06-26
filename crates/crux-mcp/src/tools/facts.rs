@@ -525,6 +525,7 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
         let compact = crate::payload::compact_enabled() && !unshaped;
         let text = crate::payload::serialize_with(&crc, compact);
         crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
+        crate::holdout::sample_compaction(&args.to_string(), &crc); // CO-5 compaction-only
         return Ok(json!({
             "content": [{ "type": "text", "text": text }],
             "structuredContent": { "rows": rows, "crc_v1": crc }
