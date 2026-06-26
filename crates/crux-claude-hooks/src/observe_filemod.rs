@@ -12,7 +12,7 @@
 //!   and after the mutation, so a reader can prove *which bytes* changed (and
 //!   detect an out-of-band edit between two trace steps).
 //! - `added` / `removed` — line-delta of the change (these reuse the existing
-//!   [`crux_observe_api::TraceOutput`] `added`/`removed` schema fields, so no
+//!   `crux_observe_api::TraceOutput` `added`/`removed` schema fields, so no
 //!   shared-schema change is needed for the line count).
 //! - `execplan_slug` / `milestone` — the scope the mutation belongs to, so the
 //!   ledger can be sliced per ExecPlan / per milestone gate.
