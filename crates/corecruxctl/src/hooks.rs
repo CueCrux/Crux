@@ -47,6 +47,23 @@ case "$mode" in
   context)    exec crux-hook context-monitor ;;
   precompact) exec crux-hook pre-compact ;;
   observe)    exec "$OBSERVE" "$@" ;;
+  cost)
+    # SessionEnd: post the just-ended transcript's token-burn cost report to the
+    # daemon (feeds the cx-cost lens + per-ExecPlan token_burn). Read the hook
+    # payload on stdin for the exact transcript path; fall back to the newest.
+    # Quiet + non-fatal — a missing corecruxctl / expired token / parse error
+    # must never block session end (the cost-sweep timer backstops misses).
+    payload="$(cat 2>/dev/null || true)"
+    tx="$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
+    ctl="$(command -v corecruxctl 2>/dev/null || echo "$HOME/.local/bin/corecruxctl")"
+    if [ -x "$ctl" ]; then
+      if [ -n "$tx" ] && [ -f "$tx" ]; then
+        "$ctl" session cost --post --file "$tx" --url "${CRUX_HTTP_URL}" >/dev/null 2>&1 || true
+      else
+        "$ctl" session cost --post --url "${CRUX_HTTP_URL}" >/dev/null 2>&1 || true
+      fi
+    fi
+    exit 0 ;;
   *) echo "crux-hook-env: unknown mode '$mode'" >&2; exit 0 ;;
 esac
 "#;
@@ -151,9 +168,12 @@ fn build_hooks_block(wrapper: &Path, have_binary: bool) -> serde_json::Value {
     );
     map.insert("PostToolUse".to_string(), event(post_tool));
     map.insert("Stop".to_string(), event(vec![cmd(wrapper, "observe stop")]));
+    // SessionEnd: capture the lifecycle node AND post the token-burn cost report
+    // (cost runs corecruxctl directly, so it is independent of the crux-hook
+    // binary and is always wired).
     map.insert(
         "SessionEnd".to_string(),
-        event(vec![cmd(wrapper, "observe session_end")]),
+        event(vec![cmd(wrapper, "observe session_end"), cmd(wrapper, "cost")]),
     );
     serde_json::Value::Object(map)
 }
@@ -312,6 +332,26 @@ mod tests {
         }
         assert!(!map.contains_key("PreCompact"));
         assert!(!h.to_string().contains("banner"));
+        // The cost-post is always wired on SessionEnd (independent of crux-hook).
+        assert!(
+            map["SessionEnd"].to_string().contains("cost"),
+            "SessionEnd must post the cost report"
+        );
+    }
+
+    #[test]
+    fn session_end_wires_observe_then_cost() {
+        let w = Path::new("/x/crux-hook-env.sh");
+        let h = build_hooks_block(w, true);
+        let hooks = h["SessionEnd"][0]["hooks"].as_array().unwrap();
+        let cmds: Vec<String> = hooks
+            .iter()
+            .map(|c| c["command"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert!(cmds.iter().any(|c| c.ends_with("observe session_end")));
+        assert!(cmds.iter().any(|c| c.ends_with(" cost")), "cost mode wired: {cmds:?}");
+        // And the launcher knows the `cost` mode.
+        assert!(WRAPPER_SH.contains("session cost --post"));
     }
 
     #[test]

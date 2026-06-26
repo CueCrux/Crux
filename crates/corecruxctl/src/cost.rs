@@ -128,18 +128,33 @@ fn post_report(report: &CostReport, tenant: Option<String>, url: Option<String>)
     let http_url = resolve_daemon(url)?;
     let tenant_id = tenant.unwrap_or_else(|| "default".to_owned());
     let bearer = login::resolve_fresh_bearer(&http_url)?;
+    post_report_to(report, &tenant_id, &http_url, bearer.as_deref(), true)
+}
+
+/// Post one report to an already-resolved daemon + bearer. `announce` prints the
+/// success line (the single-shot `--post` path); the sweep silences it and keeps
+/// its own tally. Reused by [`run_cost`]'s `--post` and [`run_cost_sweep`].
+fn post_report_to(
+    report: &CostReport,
+    tenant_id: &str,
+    http_url: &str,
+    bearer: Option<&str>,
+    announce: bool,
+) -> Result<(), DynErr> {
     let body = serde_json::json!({ "tenant_id": tenant_id, "report": report });
     let mut req = agent()
         .post(&format!("{http_url}/v1/cost/report"))
         .header("content-type", "application/json");
-    match &bearer {
+    match bearer {
         Some(t) => req = req.header("authorization", format!("Bearer {t}")),
         // Local dev without login: dev_scopes mode accepts a scope header.
         None => req = req.header("x-corecrux-scopes", "facts:write"),
     }
     match req.send_json(body) {
         Ok(resp) if resp.status().as_u16() < 300 => {
-            println!("\nposted cost report for session '{}' → {http_url}", report.session_id);
+            if announce {
+                println!("\nposted cost report for session '{}' → {http_url}", report.session_id);
+            }
             Ok(())
         }
         Ok(resp) => {
@@ -164,6 +179,170 @@ fn post_report(report: &CostReport, tenant: Option<String>, url: Option<String>)
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+// ── reconcile sweep ─────────────────────────────────────────────────────────
+
+/// `corecruxctl session cost-sweep` — the **completeness** half of the capture
+/// dual-trigger (the `SessionEnd` hook is the freshness half). Walks every
+/// transcript under `~/.claude/projects` and posts any whose stored cost report
+/// is **missing or older than the transcript's mtime**, so a hook missed on a
+/// crash never loses a session. Idempotent (latest-wins per session); a fresh
+/// report is left untouched.
+pub fn run_cost_sweep(
+    tenant: Option<String>,
+    url: Option<String>,
+    dry_run: bool,
+    force: bool,
+    since_days: u64,
+) -> Result<(), DynErr> {
+    let http_url = resolve_daemon(url)?;
+    let tenant_id = tenant.unwrap_or_else(|| "default".to_owned());
+    let bearer = login::resolve_fresh_bearer(&http_url)?;
+    let stored = fetch_stored_sessions(&http_url, &tenant_id, bearer.as_deref())?;
+
+    let root = claude_projects_root()?;
+    let now = std::time::SystemTime::now();
+    // Don't backfill ancient transcripts (a hook missed a month ago isn't worth
+    // re-analysing). `since_days == 0` means "no window — sweep everything".
+    let cutoff = (since_days > 0).then(|| now.checked_sub(std::time::Duration::from_secs(since_days * 86_400)));
+
+    let (mut posted, mut skipped_fresh, mut skipped_old, mut failed) = (0u64, 0u64, 0u64, 0u64);
+    for (path, session_id, mtime) in walk_transcripts(&root) {
+        if let Some(Some(c)) = cutoff {
+            if mtime < c {
+                skipped_old += 1;
+                continue;
+            }
+        }
+        if !should_post(stored.get(&session_id).copied(), mtime, force) {
+            skipped_fresh += 1;
+            continue;
+        }
+        if dry_run {
+            println!("would post {session_id}  ({})", path.display());
+            posted += 1;
+            continue;
+        }
+        match analyze_and_post(&path, &tenant_id, &http_url, bearer.as_deref()) {
+            Ok(()) => posted += 1,
+            Err(e) => {
+                failed += 1;
+                eprintln!("cost-sweep: {session_id} failed: {e}");
+            }
+        }
+    }
+    let verb = if dry_run { "would post" } else { "posted" };
+    println!(
+        "cost-sweep → {http_url} (tenant {tenant_id}): {verb} {posted}, skipped {skipped_fresh} fresh / {skipped_old} \
+         outside {since_days}d, failed {failed}"
+    );
+    Ok(())
+}
+
+/// Analyze one transcript and post it (stamping `generated_at` like [`run_cost`]).
+fn analyze_and_post(path: &Path, tenant_id: &str, http_url: &str, bearer: Option<&str>) -> Result<(), DynErr> {
+    let mut report = crux_cost::analyze_file(path)?;
+    report.generated_at = Some(now_rfc3339());
+    post_report_to(&report, tenant_id, http_url, bearer, false)
+}
+
+/// Pure freshness decision: post when forced, when the daemon has no stored
+/// report for the session, or when the transcript was modified at/after the
+/// stored report's freshness timestamp (so its content changed since the last
+/// analysis). A `>=` comparison re-posts a same-second change rather than risk
+/// missing it.
+fn should_post(stored_fresh_at: Option<std::time::SystemTime>, mtime: std::time::SystemTime, force: bool) -> bool {
+    if force {
+        return true;
+    }
+    match stored_fresh_at {
+        None => true,
+        Some(g) => mtime >= g,
+    }
+}
+
+/// Walk every `<session>.jsonl` under `~/.claude/projects/*/`, returning
+/// `(path, session_id, mtime)`. Bad entries are skipped (fails soft).
+fn walk_transcripts(root: &Path) -> Vec<(PathBuf, String, std::time::SystemTime)> {
+    let mut out = Vec::new();
+    for dir in subdirs(root) {
+        let Ok(inner) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for f in inner.flatten() {
+            let p = f.path();
+            if !is_jsonl(&p) {
+                continue;
+            }
+            let Some(session_id) = p.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+                continue;
+            };
+            let Some(mtime) = f.metadata().ok().and_then(|m| m.modified().ok()) else {
+                continue;
+            };
+            out.push((p, session_id, mtime));
+        }
+    }
+    out
+}
+
+/// GET the daemon's stored cost-report session picker and reduce it to
+/// `session_id → freshness timestamp` (the report's `generated_at`, falling back
+/// to the daemon `received_at`). A missing/disabled lens yields an empty map so
+/// the first sweep posts everything.
+fn fetch_stored_sessions(
+    http_url: &str,
+    tenant_id: &str,
+    bearer: Option<&str>,
+) -> Result<std::collections::HashMap<String, std::time::SystemTime>, DynErr> {
+    // token_budget is mandatory (QC.2); the picker is tiny, 2000 is ample.
+    let url = format!("{http_url}/v1/cost/report?tenant_id={tenant_id}&token_budget=2000");
+    let mut req = agent().get(&url).header("accept", "application/json");
+    match bearer {
+        Some(t) => req = req.header("authorization", format!("Bearer {t}")),
+        None => req = req.header("x-corecrux-scopes", "facts:read"),
+    }
+    let text = match req.call() {
+        Ok(resp) if resp.status().as_u16() < 300 => resp.into_body().read_to_string()?,
+        // A disabled/absent lens (404) or any non-2xx → treat as "nothing stored"
+        // so the sweep still posts (the post path surfaces a real failure).
+        Ok(_) => return Ok(std::collections::HashMap::new()),
+        Err(ureq::Error::StatusCode(_)) => return Ok(std::collections::HashMap::new()),
+        Err(other) => return Err(Box::new(other)),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&text)?;
+    Ok(parse_stored_sessions(&parsed))
+}
+
+/// Pure: reduce a `GET /v1/cost/report` body to `session_id → freshness time`.
+fn parse_stored_sessions(v: &serde_json::Value) -> std::collections::HashMap<String, std::time::SystemTime> {
+    let mut map = std::collections::HashMap::new();
+    let Some(sessions) = v.get("sessions").and_then(|s| s.as_array()) else {
+        return map;
+    };
+    for s in sessions {
+        let Some(id) = s.get("session_id").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        let fresh = s
+            .get("generated_at")
+            .and_then(|x| x.as_str())
+            .or_else(|| s.get("received_at").and_then(|x| x.as_str()))
+            .and_then(parse_rfc3339_systemtime);
+        if let Some(t) = fresh {
+            map.insert(id.to_owned(), t);
+        }
+    }
+    map
+}
+
+/// Parse an RFC3339 timestamp into a `SystemTime`. `None` on parse failure or a
+/// pre-epoch instant (never expected for session timestamps).
+fn parse_rfc3339_systemtime(s: &str) -> Option<std::time::SystemTime> {
+    let ms = chrono::DateTime::parse_from_rfc3339(s).ok()?.timestamp_millis();
+    let ms = u64::try_from(ms).ok()?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
 }
 
 // ── rendering ───────────────────────────────────────────────────────────────
@@ -376,6 +555,45 @@ mod tests {
         assert_eq!(found, target);
         assert!(find_session_file(&root, "missing").is_none());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn should_post_missing_stale_fresh_and_force() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000);
+        let t1 = UNIX_EPOCH + Duration::from_secs(2_000);
+        // No stored report → post.
+        assert!(should_post(None, t0, false));
+        // Transcript newer than the stored freshness time → post (stale).
+        assert!(should_post(Some(t0), t1, false));
+        // Same instant → post (re-post a same-second change rather than miss it).
+        assert!(should_post(Some(t1), t1, false));
+        // Transcript older than the stored report → skip (fresh).
+        assert!(!should_post(Some(t1), t0, false));
+        // Force overrides the fresh check.
+        assert!(should_post(Some(t1), t0, true));
+    }
+
+    #[test]
+    fn parse_stored_sessions_maps_id_to_generated_at_then_received_at() {
+        let v = serde_json::json!({
+            "sessions": [
+                {"session_id": "a", "generated_at": "2026-06-25T10:00:00Z", "received_at": "2026-06-25T11:00:00Z"},
+                {"session_id": "b", "received_at": "2026-06-25T09:00:00Z"}, // no generated_at → falls back
+                {"session_id": "c"}, // no timestamp → dropped
+                {"generated_at": "2026-06-25T10:00:00Z"}, // no id → dropped
+            ]
+        });
+        let map = parse_stored_sessions(&v);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("a"), parse_rfc3339_systemtime("2026-06-25T10:00:00Z").as_ref());
+        assert_eq!(map.get("b"), parse_rfc3339_systemtime("2026-06-25T09:00:00Z").as_ref());
+        assert!(!map.contains_key("c"));
+    }
+
+    #[test]
+    fn parse_stored_sessions_empty_when_no_sessions_key() {
+        assert!(parse_stored_sessions(&serde_json::json!({"has_report": false})).is_empty());
     }
 
     #[test]

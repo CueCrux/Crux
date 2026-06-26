@@ -756,6 +756,28 @@ enum SessionCommand {
         #[arg(long)]
         url: Option<String>,
     },
+    /// Reconcile sweep: walk every transcript under `~/.claude/projects` and
+    /// post any whose stored cost report is missing or older than the
+    /// transcript's mtime. The completeness backstop for the `SessionEnd` hook —
+    /// idempotent (latest-wins), safe to run on a timer.
+    #[command(name = "cost-sweep")]
+    CostSweep {
+        /// Tenant id (default: "default").
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Daemon base URL override.
+        #[arg(long)]
+        url: Option<String>,
+        /// Report what would be posted without posting.
+        #[arg(long)]
+        dry_run: bool,
+        /// Re-post every transcript regardless of stored freshness.
+        #[arg(long)]
+        force: bool,
+        /// Only consider transcripts modified within this many days (0 = all).
+        #[arg(long, default_value_t = 30)]
+        since_days: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2201,6 +2223,13 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 tenant,
                 url,
             } => cost::run_cost(file, session, json, post, tenant, url),
+            SessionCommand::CostSweep {
+                tenant,
+                url,
+                dry_run,
+                force,
+                since_days,
+            } => cost::run_cost_sweep(tenant, url, dry_run, force, since_days),
         },
         Command::Observe { command } => match command {
             ObserveCommand::Ingest {
