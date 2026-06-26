@@ -195,6 +195,8 @@ mod tests {
             session_id: "s".to_owned(),
             source: "s.jsonl".to_owned(),
             generated_at: None,
+            started_at: None,
+            ended_at: None,
             headline: crux_cost::Headline {
                 assistant_turns: 10,
                 tasks: 1,

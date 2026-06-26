@@ -181,6 +181,22 @@ pub(super) async fn get_work(
     }
     drop(store);
 
+    // Per-ExecPlan token-burn rollup: join the cost lens (one report per coding
+    // session, keyed by transcript UUID) onto the ExecPlan items at read time
+    // (window-overlap + passport-refine; see `crate::cost_attribution`). Gated by
+    // the cost-lens flag so the daemon is byte-identical when it's off, and
+    // skipped when there are no ExecPlan items to stamp. Cost reports are
+    // per-tenant; attribute the requested tenant's (default `default`).
+    if crate::cost::cost_lens_enabled() && !execplan_items.is_empty() {
+        let tenant = q.tenant_id.as_deref().unwrap_or("default");
+        let reports = {
+            let cstore = crate::cost::global().lock().await;
+            cstore.reports_for_tenant(tenant)
+        };
+        let sessions = crate::cost_attribution::session_burns_from_reports(&reports);
+        crate::cost_attribution::stamp_token_burn(&mut execplan_items, &sessions);
+    }
+
     // Merge: kanban first (wins on id collision), then execplan items not
     // already present. ExecPlan ids are namespaced (`execplan:<slug>`) so
     // collisions are not expected in practice — the dedup is defence in depth.

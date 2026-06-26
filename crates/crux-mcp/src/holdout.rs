@@ -179,6 +179,11 @@ use std::sync::{Mutex, OnceLock};
 pub struct HoldoutAccumulator {
     control: Vec<u64>,
     treatment: Vec<u64>,
+    // CO-5 per-mechanism: paired (pretty, compact) token counts of the SAME
+    // emitted payload, so the compaction (M3) saving is measured exactly and in
+    // isolation from the reversible (M1) recall cost the net arm folds in.
+    compaction_pretty: Vec<u64>,
+    compaction_compact: Vec<u64>,
 }
 
 /// Per-arm hard cap — keeps the accumulator memory-bounded; oldest samples are
@@ -199,20 +204,50 @@ impl HoldoutAccumulator {
         }
     }
 
-    /// Snapshot (n_control, n_treatment, report) of the live savings so far.
-    pub fn report(&self) -> (usize, usize, SavingsReport) {
-        (
-            self.control.len(),
-            self.treatment.len(),
-            unpaired_savings(&self.control, &self.treatment),
-        )
+    fn push_compaction(&mut self, pretty: u64, compact: u64) {
+        self.compaction_pretty.push(pretty);
+        self.compaction_compact.push(compact);
+        if self.compaction_pretty.len() > MAX_SAMPLES_PER_ARM {
+            let overflow = self.compaction_pretty.len() - MAX_SAMPLES_PER_ARM;
+            self.compaction_pretty.drain(0..overflow);
+            self.compaction_compact.drain(0..overflow);
+        }
+    }
+
+    /// Per-mechanism snapshot. The **compaction** report is the *exact* M3 saving
+    /// (paired pretty→compact on the same payloads — always ≥ 0); the **net**
+    /// report is the unpaired holdout (all-shaped vs all-unshaped), which folds in
+    /// the reversible recall cost and can be negative.
+    pub fn report(&self) -> HoldoutSnapshot {
+        HoldoutSnapshot {
+            n_control: self.control.len(),
+            n_treatment: self.treatment.len(),
+            net: unpaired_savings(&self.control, &self.treatment),
+            n_compaction: self.compaction_pretty.len(),
+            compaction: paired_savings(&self.compaction_pretty, &self.compaction_compact),
+        }
     }
 
     #[cfg(test)]
     pub fn clear_for_test(&mut self) {
         self.control.clear();
         self.treatment.clear();
+        self.compaction_pretty.clear();
+        self.compaction_compact.clear();
     }
+}
+
+/// Per-mechanism live holdout snapshot (CO-5): the isolated compaction saving and
+/// the conflated net, so the operator never reads one as the other.
+#[derive(Clone, Debug)]
+pub struct HoldoutSnapshot {
+    pub n_control: usize,
+    pub n_treatment: usize,
+    /// All-shaped vs all-unshaped (folds in reversible's recall cost; may be < 0).
+    pub net: SavingsReport,
+    pub n_compaction: usize,
+    /// Compaction-only (M3) saving — exact, paired, always ≥ 0.
+    pub compaction: SavingsReport,
 }
 
 /// Process-wide live holdout accumulator.
@@ -241,6 +276,27 @@ pub fn record_sample(is_control: bool, tokens: u64) {
     }
     if let Ok(mut acc) = accumulator().lock() {
         acc.push(is_control, tokens);
+    }
+}
+
+/// CO-5 — sample the **compaction-only** saving for one retrieval, exactly. For a
+/// sampled fraction of requests (independent of the holdout arm, salted key) we
+/// serialize the *same* emitted `value` both pretty and compact and record the
+/// paired token counts, so the M3 saving is measured in isolation from M1's
+/// recall cost. No-op when the holdout is OFF. Cheap: one extra serialization on
+/// ~`fraction` of requests.
+pub fn sample_compaction(key: &str, value: &serde_json::Value) {
+    let fraction = holdout_fraction();
+    if fraction <= 0.0 {
+        return;
+    }
+    if !is_control(&format!("{key}:m3"), fraction) {
+        return;
+    }
+    let pretty = crate::token_estimate::estimate_tokens_str(&serde_json::to_string_pretty(value).unwrap_or_default());
+    let compact = crate::token_estimate::estimate_tokens_str(&serde_json::to_string(value).unwrap_or_default());
+    if let Ok(mut acc) = accumulator().lock() {
+        acc.push_compaction(pretty, compact);
     }
 }
 
@@ -406,9 +462,39 @@ mod tests {
                 a.push(false, 300); // treatment
             }
         }
-        let (nc, nt, rep) = acc.lock().unwrap().report();
-        assert_eq!((nc, nt), (5, 5));
-        assert!((rep.reduction - 0.25).abs() < 1e-9);
+        let snap = acc.lock().unwrap().report();
+        assert_eq!((snap.n_control, snap.n_treatment), (5, 5));
+        assert!((snap.net.reduction - 0.25).abs() < 1e-9);
+        acc.lock().unwrap().clear_for_test();
+    }
+
+    #[test]
+    fn snapshot_separates_compaction_from_net() {
+        let acc = accumulator();
+        {
+            let mut a = acc.lock().unwrap();
+            a.clear_for_test();
+            // Net arm: treatment (shaped, reversible recall) BIGGER than control
+            // (unshaped, dropped) ⇒ a NEGATIVE net, like the live finding.
+            for _ in 0..6 {
+                a.push(true, 400); // control (unshaped)
+                a.push(false, 600); // treatment (shaped — reversible added tokens)
+            }
+            // Compaction arm: same payload pretty→compact ⇒ a clean +25%.
+            for _ in 0..6 {
+                a.push_compaction(400, 300);
+            }
+        }
+        let snap = acc.lock().unwrap().report();
+        // Net is negative (reversible dominates)…
+        assert!(
+            snap.net.reduction < 0.0,
+            "net {} should be negative",
+            snap.net.reduction
+        );
+        // …but compaction is cleanly positive and isolated.
+        assert!((snap.compaction.reduction - 0.25).abs() < 1e-9);
+        assert_eq!(snap.n_compaction, 6);
         acc.lock().unwrap().clear_for_test();
     }
 

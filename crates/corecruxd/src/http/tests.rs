@@ -459,6 +459,11 @@ pub(super) fn test_app_state(action_max_pending: usize) -> AppState {
     test_app_state_with_auth(action_max_pending, AuthMode::Off)
 }
 
+/// Fresh in-memory case store for `router(state, …)` test calls (M3).
+fn test_case_store() -> std::sync::Arc<tokio::sync::RwLock<corecrux_memory::CaseStore>> {
+    std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::CaseStore::new()))
+}
+
 fn pro_workbench_state(services: &[&str]) -> AppState {
     let mut state = test_app_state(16);
     state.operating_mode = crate::product::OperatingMode::ProHybrid;
@@ -1935,6 +1940,7 @@ async fn query_facts_by_keyword() {
         entity_prefix: None,
         top_k: None,
         token_budget: None,
+        as_of: None,
     };
 
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
@@ -1946,6 +1952,88 @@ async fn query_facts_by_keyword() {
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0]["entity"], "deploy");
     assert!(body["total_tokens"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn query_facts_as_of_filters_world_time() {
+    let state = test_app_state(16);
+    let ts = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    };
+    for value in ["London", "Berlin"] {
+        let body = corecrux_memory::fact_store::StoreFact {
+            entity: "person:zoe".to_string(),
+            key: "city".to_string(),
+            value: value.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: None,
+        };
+        let _ = facts::put_fact(State(state.clone()), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+    }
+    {
+        let mut store = state.fact_store.write().await;
+        let entries: Vec<(String, String)> = store
+            .get_by_entity("person:zoe")
+            .into_iter()
+            .map(|f| (f.fact_id.clone(), f.value.clone()))
+            .collect();
+        for (id, value) in entries {
+            if value == "London" {
+                store.set_validity(&id, Some(ts("2026-01-01T00:00:00Z")), Some(ts("2026-06-01T00:00:00Z")));
+            } else {
+                store.set_validity(&id, Some(ts("2026-06-01T00:00:00Z")), None);
+            }
+        }
+    }
+
+    let params = QueryFactsParams {
+        query: None,
+        entity: Some("person:zoe".to_string()),
+        entity_prefix: None,
+        top_k: Some(10),
+        token_budget: None,
+        as_of: Some("2026-03-01T00:00:00Z".to_string()),
+    };
+    let resp = facts::query_facts(State(state.clone()), HeaderMap::new(), Query(params))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let values: Vec<String> = body["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["value"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        values.contains(&"London".to_string()),
+        "as-of March → London, got {values:?}"
+    );
+    assert!(
+        !values.contains(&"Berlin".to_string()),
+        "as-of March must exclude Berlin"
+    );
+
+    // A bad (unparseable) as_of → 400.
+    let bad = QueryFactsParams {
+        query: None,
+        entity: None,
+        entity_prefix: None,
+        top_k: None,
+        token_budget: None,
+        as_of: Some("nope".to_string()),
+    };
+    let resp = facts::query_facts(State(state), HeaderMap::new(), Query(bad))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1973,6 +2061,7 @@ async fn query_facts_no_params_returns_all() {
         entity_prefix: None,
         top_k: None,
         token_budget: None,
+        as_of: None,
     };
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
         .await
@@ -1981,6 +2070,77 @@ async fn query_facts_no_params_returns_all() {
     let body = json_body(resp).await;
     let facts = body["facts"].as_array().expect("facts array");
     assert_eq!(facts.len(), 3);
+}
+
+// ── Case store (POST /v1/cases, /v1/cases/retrieve) ─────────────
+
+#[tokio::test]
+async fn cases_record_and_retrieve_similar() {
+    let state = test_app_state(16);
+    let case_store = std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::CaseStore::new()));
+
+    let mk = |task: &str, action: &str, success: bool, reward: f32| corecrux_memory::case_store::RecordCase {
+        task: task.to_string(),
+        context: None,
+        action: action.to_string(),
+        outcome: "done".to_string(),
+        success,
+        reward,
+        tags: vec![],
+        source_receipt: None,
+    };
+
+    for req in [
+        mk(
+            "deploy daemon to gpu host",
+            "staged cargo-deploy + dense-lane flags",
+            true,
+            0.9,
+        ),
+        mk("deploy daemon to gpu host", "flipped flag, broke prod", false, 0.0),
+        mk("write a changelog entry", "wrote prose", true, 1.0),
+    ] {
+        let resp = cases::record_case(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::Extension(case_store.clone()),
+            Json(req),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // only_success=true drops the failed deploy case and the unrelated one.
+    let body = cases::RetrieveCasesBody {
+        task: "deploy daemon gpu host".to_string(),
+        top_k: 5,
+        only_success: true,
+    };
+    let resp = cases::retrieve_cases(
+        State(state.clone()),
+        HeaderMap::new(),
+        axum::Extension(case_store.clone()),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let cases = json["cases"].as_array().expect("cases array");
+    assert_eq!(cases.len(), 1, "only the successful deploy precedent matches");
+    assert!(cases[0]["action"].as_str().unwrap().contains("dense-lane"));
+
+    // Missing action → 400.
+    let bad = cases::record_case(
+        State(state),
+        HeaderMap::new(),
+        axum::Extension(case_store),
+        Json(mk("t", "  ", true, 1.0)),
+    )
+    .await
+    .into_response();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -2006,6 +2166,7 @@ async fn query_facts_accepts_admin_read_fallback_in_dev_scopes_mode() {
         entity_prefix: None,
         top_k: None,
         token_budget: None,
+        as_of: None,
     };
     let resp = facts::query_facts(State(state), dev_scope_headers("admin:read"), Query(params))
         .await
@@ -2345,6 +2506,7 @@ async fn query_facts_supports_entity_prefix_top_k_and_token_budget() {
         entity_prefix: Some("proj-a".to_string()),
         top_k: Some(99),
         token_budget: Some(1),
+        as_of: None,
     };
 
     let resp = facts::query_facts(State(state), HeaderMap::new(), Query(params))
@@ -2401,6 +2563,7 @@ async fn query_facts_applies_passport_private_visibility() {
         entity_prefix: None,
         top_k: Some(10),
         token_budget: None,
+        as_of: None,
     };
     let alice = facts::query_facts(
         State(state.clone()),
@@ -2422,6 +2585,7 @@ async fn query_facts_applies_passport_private_visibility() {
         entity_prefix: None,
         top_k: Some(10),
         token_budget: None,
+        as_of: None,
     };
     let anonymous = facts::query_facts(
         State(state.clone()),
@@ -2442,6 +2606,7 @@ async fn query_facts_applies_passport_private_visibility() {
         entity_prefix: None,
         top_k: Some(10),
         token_budget: None,
+        as_of: None,
     };
     let admin = facts::query_facts(State(state), dev_scope_headers("admin:read"), Query(admin_params))
         .await
@@ -6082,7 +6247,7 @@ async fn bootstrap_status_returns_seeded_true_after_seed() {
 #[tokio::test]
 async fn router_with_timeout_and_panic_layers_compiles() {
     let state = test_app_state(16);
-    let app = router(state);
+    let app = router(state, test_case_store());
     // Verify the router can be converted to a service (layers are applied).
     let _service = app.into_service::<axum::body::Body>();
 }
@@ -12157,7 +12322,7 @@ async fn openapi_json_route_serves_valid_openapi_3_document() {
     use tower::ServiceExt;
 
     let state = test_app_state(16);
-    let app = router(state);
+    let app = router(state, test_case_store());
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -12241,7 +12406,7 @@ async fn openapi_json_route_serves_valid_openapi_3_document() {
 async fn activity_post_then_get_round_trip() {
     use tower::ServiceExt;
     std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_LOG", "1");
-    let app = router(test_app_state(16));
+    let app = router(test_app_state(16), test_case_store());
 
     let post = app
         .clone()
@@ -12307,7 +12472,7 @@ async fn activity_post_then_get_round_trip() {
 async fn activity_get_without_token_budget_is_400() {
     use tower::ServiceExt;
     std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_LOG", "1");
-    let app = router(test_app_state(16));
+    let app = router(test_app_state(16), test_case_store());
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -12329,7 +12494,7 @@ async fn activity_get_without_token_budget_is_400() {
 async fn activity_get_when_flag_off_is_404() {
     use tower::ServiceExt;
     std::env::remove_var("CORECRUXD_FEATURE_ACTIVITY_LOG");
-    let app = router(test_app_state(16));
+    let app = router(test_app_state(16), test_case_store());
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -12349,7 +12514,7 @@ async fn activity_get_when_flag_off_is_404() {
 async fn activity_get_cross_tenant_is_empty() {
     use tower::ServiceExt;
     std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_LOG", "1");
-    let app = router(test_app_state(16));
+    let app = router(test_app_state(16), test_case_store());
     let _ = app
         .clone()
         .oneshot(
@@ -12396,7 +12561,7 @@ async fn activity_get_cross_tenant_is_empty() {
 async fn activity_turn_id_parity_agent_vs_human_lane() {
     use tower::ServiceExt;
     std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_LOG", "1");
-    let app = router(test_app_state(16));
+    let app = router(test_app_state(16), test_case_store());
 
     let post = app
         .clone()
@@ -12472,7 +12637,7 @@ async fn activity_co_sign_then_verify_green_end_to_end() {
     std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_SIGN", "1");
     let mut state = test_app_state(16);
     bind_test_state_to_root_passport_key(&mut state);
-    let app = router(state);
+    let app = router(state, test_case_store());
 
     let post = app
         .clone()
@@ -12679,7 +12844,11 @@ async fn sse_session_survives_30s_idle() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let state = test_app_state(1);
-    let app = super::ingress::apply_ingress_limits(router(state), &crate::config::IngressConfig::default(), None);
+    let app = super::ingress::apply_ingress_limits(
+        router(state, test_case_store()),
+        &crate::config::IngressConfig::default(),
+        None,
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);

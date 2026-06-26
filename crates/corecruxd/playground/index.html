@@ -1466,15 +1466,27 @@ async function initFooter(){
 
 // ── per-panel transforms (json → child nodes) ──
 const WSTATE = { planned:'planned', in_progress:'in_progress', blocked:'blocked', complete:'done', deployed:'done', archive:'done', done:'done' };
+// Per-ExecPlan token-burn rollup (read-time cost-lens × execplan join). The
+// `method` flags attribution confidence so coarse window-only numbers never read
+// as precise: `window` over-credits (multi-day session windows touch many plans),
+// `passport+window` is poster-confirmed, `mixed` is partial.
+function burnField(tb){
+  if(!tb) return null;
+  const note = tb.method==='window' ? ' (coarse — multi-day windows over-credit)'
+             : tb.method==='passport+window' ? ' (precise)'
+             : tb.method==='mixed' ? ' (partial)' : '';
+  const n = tb.sessions||0;
+  return fmtK(tb.context_tokens)+' ctx · '+fmtK(tb.output_tokens)+' out · '+n+' session'+(n===1?'':'s')+' · '+(tb.method||'?')+note;
+}
 function txWork(json){   // M3 — kanban WorkItem[] → execplan nodes (status drives the stage filter)
   const items = json.work || json.items || (Array.isArray(json)? json : []);
   return items.map(w=>({
     id: idFor('work', w.id), kind:'execplan', __workId: w.id,
     label: w.title || w.id,
-    sub: (w.milestones_total? ('M '+(w.milestones_done||0)+'/'+w.milestones_total+(w.current_milestone? ' · '+w.current_milestone : '')) : (w.current_milestone || w.plan_path || '')),
+    sub: ((w.milestones_total? ('M '+(w.milestones_done||0)+'/'+w.milestones_total+(w.current_milestone? ' · '+w.current_milestone : '')) : (w.current_milestone || w.plan_path || '')) + (w.token_burn? (' · burn '+fmtK(w.token_burn.context_tokens)+(w.token_burn.method==='window'?'~':'')) : '')),
     status: WSTATE[w.state] || 'planned',
     stale: w.stale===true,
-    fields: [['state', w.state + (w.stale===true?' · stale':(w.stale===false?' · active':''))],['progress', w.milestones_total? ((w.milestones_done||0)+'/'+w.milestones_total) : null],['risk_class',w.risk_class],['depends on',(w.depends_on||[]).join(', ')||null],['extended by',(w.extended_by||[]).join(', ')||null],['open decisions',(w.open_decisions||[]).join(', ')||null],['agents', w.provenance?((w.provenance.contributing_agents||[]).join(', ')||null):null],['commits', w.provenance?((w.provenance.commit_shas||[]).join(', ')||null):null],['plan_path',w.plan_path],['milestone',w.current_milestone],['owner',w.assignee_passport],['notes', w.notes_count],['orchestrator',w.orchestrator_id],['linked_pr',w.linked_pr]].filter(([,v])=>v!=null && v!==''),
+    fields: [['state', w.state + (w.stale===true?' · stale':(w.stale===false?' · active':''))],['progress', w.milestones_total? ((w.milestones_done||0)+'/'+w.milestones_total) : null],['token burn', burnField(w.token_burn)],['risk_class',w.risk_class],['depends on',(w.depends_on||[]).join(', ')||null],['extended by',(w.extended_by||[]).join(', ')||null],['open decisions',(w.open_decisions||[]).join(', ')||null],['agents', w.provenance?((w.provenance.contributing_agents||[]).join(', ')||null):null],['commits', w.provenance?((w.provenance.commit_shas||[]).join(', ')||null):null],['plan_path',w.plan_path],['milestone',w.current_milestone],['owner',w.assignee_passport],['notes', w.notes_count],['orchestrator',w.orchestrator_id],['linked_pr',w.linked_pr]].filter(([,v])=>v!=null && v!==''),
     children: [],
     doc: (w.body || w.title || '') + (w.plan_path? '\n\nplan: '+w.plan_path : ''),
     payload: JSON.stringify(w, null, 2),
@@ -4221,7 +4233,8 @@ const PAGE_WIRES={
      infoRow('context / turn', fmtK(h.context_tokens_per_turn)+' tokens re-read per model call'),
      infoRow('cache replay', Math.round(h.cache_read_to_output_ratio)+'× output   ('+fmtK(m.cache_read)+' read · '+fmtK(m.output)+' generated)'),
      infoRow('turns / tasks', h.assistant_turns+' / '+h.tasks+'   ·   '+h.segments+' compaction segment'+(h.segments===1?'':'s')),
-     infoRow('fixed prefix', Math.round(h.prefix_pct)+'% of carried context (re-read every turn)')];
+     infoRow('fixed prefix', Math.round(h.prefix_pct)+'% of carried context (re-read every turn)'),
+     ...(r.started_at&&r.ended_at? [infoRow('session window', String(r.started_at).slice(0,16).replace('T',' ')+' → '+String(r.ended_at).slice(0,16).replace('T',' ')+'  ·  per-ExecPlan burn on the ExecPlans board')] : [])];
     const mx=Math.max.apply(null,[1].concat((r.buckets||[]).map(b=>b.pct)));
     def.sections[2].controls=(r.buckets||[]).map(b=>({t:'bar',label:b.source,pct:Math.max(2,Math.round(100*b.pct/mx)),v:Math.round(b.pct)+'% · '+fmtK(b.carried_cost),tone:(b.source==='session_prefix'||b.pct>=20)?'err':undefined}));
     def.sections[2].doc='Carried cost = a block’s tokens × how many later turns re-read it before the next\ncompaction. Buckets reconcile exactly to the measured context total.';

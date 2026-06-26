@@ -32,6 +32,7 @@ mod consolidation_scheduler;
 mod control;
 mod coord;
 mod cost;
+mod cost_attribution;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]
 mod dataplane_store;
@@ -889,8 +890,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Ingress hardening (crux-http-ingress-hardening-2026-06-11 M1): body
     // limit + problem+json 413s, applied before TraceLayer so rejected
     // requests still show up in traces.
-    let app: Router = http::ingress::apply_ingress_limits(http::router(state), &config.ingress, Some(&metrics))
-        .layer(TraceLayer::new_for_http());
+    // Procedural memory case bank (M3). Persisted alongside the other stores;
+    // passed to the router via an Extension layer rather than added to AppState.
+    let case_store = Arc::new(RwLock::new(if config.fact_persistence_enabled {
+        corecrux_memory::CaseStore::with_persistence(&config.data_dir)?
+    } else {
+        corecrux_memory::CaseStore::new()
+    }));
+    let app: Router =
+        http::ingress::apply_ingress_limits(http::router(state, case_store), &config.ingress, Some(&metrics))
+            .layer(TraceLayer::new_for_http());
 
     // Session TTL reaper — runs every 60s, removes expired sessions.
     {
@@ -4206,7 +4215,8 @@ mod tests {
             artefact_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::ArtefactStore::new())),
         };
 
-        let router: axum::Router = crate::http::router(state);
+        let case_store = std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::CaseStore::new()));
+        let router: axum::Router = crate::http::router(state, case_store);
         // Verify it's a valid Router by converting to a service
         let _service = router.into_make_service();
     }

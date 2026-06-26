@@ -11,6 +11,7 @@ mod agent_usage;
 mod append;
 mod auth_device;
 mod auth_rails;
+mod cases;
 mod cloud;
 mod console;
 mod context_surface;
@@ -339,7 +340,7 @@ pub struct AppState {
     pub artefact_store: Arc<RwLock<corecrux_memory::ArtefactStore>>,
 }
 
-pub fn router(state: AppState) -> Router {
+pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Router {
     let console_enabled = state.console_enabled;
     Router::new()
         .route("/healthz", get(self::health::healthz))
@@ -1181,6 +1182,12 @@ pub fn router(state: AppState) -> Router {
         .merge(self::observe_audit::routes())
         .merge(self::orchestrators::routes())
         .merge(self::punchcards::routes())
+        // Procedural memory (M3): case bank record/retrieve. The store is
+        // supplied via an Extension layer (handlers also extract State<AppState>
+        // for scope auth), so this adds no field to AppState's ~25 call sites.
+        .route("/v1/cases", axum::routing::post(self::cases::record_case))
+        .route("/v1/cases/retrieve", axum::routing::post(self::cases::retrieve_cases))
+        .layer(axum::Extension(case_store))
         .layer(middleware::from_fn_with_state(state.clone(), presence_middleware))
         // G20 per-surface request quota (pass-through unless CORECRUXD_QUOTA=1
         // AND the path matches a configured hosted-surface prefix).
