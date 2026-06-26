@@ -36,6 +36,7 @@ use std::time::UNIX_EPOCH;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use corecrux_memory::fact_store::{FactQuery, FactStore};
+use serde::{Deserialize, Serialize};
 
 use crate::fact_helpers::dedup_latest;
 use crate::work::{Provenance, WorkItem};
@@ -175,6 +176,11 @@ pub struct ParsedPlan {
     /// Slugs from `Extended by [[<slug>]]` declaration lines — plans that build
     /// on this one.
     pub extended_by: Vec<String>,
+    /// Deploy-axis edge targets from `Deploys to [[deploy:<host>]]` declaration
+    /// lines — the deploy targets (hosts/lanes) this plan ships to. Captured as
+    /// the full `deploy:<host>` token so the projection can group plans by the
+    /// exact target they queue against. Accumulated across lines, deduped.
+    pub deploys_to: Vec<String>,
     /// Distinct `OD-<n>` Open-Decision ids referenced anywhere in the plan body.
     pub open_decision_refs: Vec<String>,
 }
@@ -317,6 +323,17 @@ pub fn parse_plan(md: &str) -> ParsedPlan {
         for slug in extract_ref_slugs(trimmed, "Extended by") {
             if !out.extended_by.contains(&slug) {
                 out.extended_by.push(slug);
+            }
+        }
+        // Deploy-axis edge: `Deploys to [[deploy:<host>]]`. Reuses the shared
+        // declaration parser so it inherits the same prose-rejection discipline
+        // (case-sensitive lead token, required `:`/space separator). The captured
+        // token keeps its `deploy:` prefix; only well-formed `deploy:<host>`
+        // targets are retained so a bare `[[some-plan]]` typo never lands on the
+        // deploy axis.
+        for target in extract_ref_slugs(trimmed, "Deploys to") {
+            if target.starts_with("deploy:") && target.len() > "deploy:".len() && !out.deploys_to.contains(&target) {
+                out.deploys_to.push(target);
             }
         }
 
@@ -1041,6 +1058,129 @@ fn apply_reciprocal_refs(items: &mut [WorkItem]) {
     }
 }
 
+// ── Deploy-axis projection (B3 Part 1) ───────────────────────────────────────
+//
+// The deploy queue is a read-time grouping over plans that declare
+// `Deploys to [[deploy:<host>]]`, surfacing — per target host — which ExecPlans
+// are still queued (in an executable, non-archive state) to ship there. It is a
+// pure projection: it reads `WorkItem::state` (already derived) joined with the
+// per-plan `deploys_to` parse, and never mutates a plan or a WorkItem. It lives
+// alongside the lineage projection and shares its closure discipline; it does
+// not touch `derive_state`/`mk_item`/`summarise_facts`.
+
+/// One ExecPlan queued to deploy to a given target. Slug + the state that made
+/// it eligible, so a client can render the queue without re-deriving.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployQueueEntry {
+    /// Bare ExecPlan slug (the `execplan:` id minus its prefix).
+    pub slug: String,
+    /// Derived state at projection time — always an executable (non-archive)
+    /// state for an entry that appears in the queue.
+    pub state: String,
+}
+
+/// Per-deploy-target queue: every executable ExecPlan that declares
+/// `Deploys to [[deploy:<host>]]` for the same `target`. `count` mirrors
+/// `entries.len()` for clients that only want the headline number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployTargetQueue {
+    /// The full `deploy:<host>` target token.
+    pub target: String,
+    /// Number of executable plans queued for this target (`== entries.len()`).
+    pub count: usize,
+    /// Queued plans, sorted by slug for deterministic output.
+    pub entries: Vec<DeployQueueEntry>,
+}
+
+/// States that count as "queued for deploy" — i.e. still executable, not an
+/// archive/superseded terminal. A plan in any of these can still ship; an
+/// `archive` plan never appears in the deploy queue.
+//
+// `dead_code`-allowed because the deploy-queue projection API is consumed only
+// by the tests in this module today; the HTTP wiring (a `/v1/work` deploy-queue
+// query) is a follow-up that lives outside this file's ownership scope. Keeping
+// the projection here (data-flow + tests) mirrors how `list_execplans` shipped
+// its pure layer in M1 before the HTTP layer bound it in M2.
+#[allow(dead_code)]
+fn is_executable_state(state: &str) -> bool {
+    state != "archive"
+}
+
+/// Build the per-deploy-target queue from a slice of derived ExecPlan items
+/// joined with their parsed `deploys_to` edges. `plans` pairs each
+/// [`WorkItem`] with the [`ParsedPlan`] it was derived from (same order is not
+/// required — the join is by id/slug). Only executable (non-archive) plans
+/// contribute. Output is sorted by target, entries within a target sorted by
+/// slug — deterministic for clients and tests.
+// See `is_executable_state` for why this projection API is `dead_code`-allowed
+// pending HTTP wiring outside this file's scope.
+#[allow(dead_code)]
+pub fn deploy_queue_from_pairs(plans: &[(&WorkItem, &ParsedPlan)]) -> Vec<DeployTargetQueue> {
+    let mut by_target: BTreeMap<String, Vec<DeployQueueEntry>> = BTreeMap::new();
+    for (item, parsed) in plans {
+        if !is_executable_state(&item.state) {
+            continue;
+        }
+        let slug = item
+            .id
+            .strip_prefix(EXECPLAN_ENTITY_PREFIX)
+            .unwrap_or(&item.id)
+            .to_string();
+        for target in &parsed.deploys_to {
+            let entries = by_target.entry(target.clone()).or_default();
+            if !entries.iter().any(|e| e.slug == slug) {
+                entries.push(DeployQueueEntry {
+                    slug: slug.clone(),
+                    state: item.state.clone(),
+                });
+            }
+        }
+    }
+    by_target
+        .into_iter()
+        .map(|(target, mut entries)| {
+            entries.sort_by(|a, b| a.slug.cmp(&b.slug));
+            DeployTargetQueue {
+                target,
+                count: entries.len(),
+                entries,
+            }
+        })
+        .collect()
+}
+
+/// Walk `root`, derive each plan's state (reusing the same pure pipeline as
+/// [`list_execplans`]) and parse its deploy edges, then group into the
+/// per-target deploy queue. Read-only; `root` missing/empty → `Ok(vec![])`.
+/// This is the deploy-axis sibling of `list_execplans` — it answers "what is
+/// queued to ship to `deploy:<host>`?" without adding a field to `WorkItem`.
+// `dead_code`-allowed pending HTTP wiring (see `is_executable_state`).
+#[allow(dead_code)]
+pub fn list_deploy_queue(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::io::Result<Vec<DeployTargetQueue>> {
+    let files = walk_execplans_root(root)?;
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut facts_by_slug = collect_execplan_facts(store);
+    // Hold parsed plans alongside their derived items so the pairs borrow lives
+    // for the projection call.
+    let mut parsed_items: Vec<(WorkItem, ParsedPlan)> = Vec::with_capacity(files.len());
+    for file in files {
+        let parsed = parse_plan(&file.content);
+        let facts = facts_by_slug.remove(&file.slug).unwrap_or_default();
+        let owner = owner_from_facts(&facts);
+        let agents = contributing_agents_from_facts(&facts);
+        let rows3: Vec<(String, String, DateTime<Utc>)> = facts.into_iter().map(|(k, v, s, _)| (k, v, s)).collect();
+        let mut summary = summarise_facts(&rows3);
+        summary.owner_passport = owner;
+        summary.contributing_agents = agents;
+        let item = derive_state(&file, &parsed, &summary, now_unix_ms);
+        parsed_items.push((item, parsed));
+    }
+    let pairs: Vec<(&WorkItem, &ParsedPlan)> = parsed_items.iter().map(|(i, p)| (i, p)).collect();
+    Ok(deploy_queue_from_pairs(&pairs))
+}
+
 /// Env var pointing at the Open Decisions registry markdown
 /// (`docs/master-plan/tracking/open-decisions.md`). Unset → OD wiring is off and
 /// `WorkItem::open_decisions` stays empty.
@@ -1333,6 +1473,104 @@ mod tests {
             "dangling edge retained on source"
         );
         assert_eq!(items.len(), 1, "no phantom item minted for a missing target");
+    }
+
+    // ── B3 Part 1: deploy-axis lineage edge + queue projection ──
+
+    #[test]
+    fn parse_extracts_deploys_to_edge() {
+        let md = "# T\n\nDeploys to [[deploy:crux]]\n";
+        let p = parse_plan(md);
+        assert_eq!(p.deploys_to, vec!["deploy:crux".to_string()]);
+    }
+
+    #[test]
+    fn parse_deploys_to_multiple_and_comma_group() {
+        let md = "# T\n\n- Deploys to [[deploy:crux]] [[deploy:gpu-1]]\nDeploys to [[deploy:data-1, deploy:crux]]\n";
+        let p = parse_plan(md);
+        // dedup keeps first-seen order; deploy:crux appears once.
+        assert_eq!(
+            p.deploys_to,
+            vec![
+                "deploy:crux".to_string(),
+                "deploy:gpu-1".to_string(),
+                "deploy:data-1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_deploys_to_rejects_non_deploy_target() {
+        // A bare slug or a malformed token (no host after the prefix) is not a
+        // deploy target and must not land on the deploy axis.
+        let md = "# T\n\nDeploys to [[some-plan-2026-01-01]]\nDeploys to [[deploy:]]\n";
+        let p = parse_plan(md);
+        assert!(p.deploys_to.is_empty(), "non-deploy targets rejected");
+    }
+
+    #[test]
+    fn parse_deploys_to_rejects_prose_mention() {
+        let md = "# T\n\n- This milestone deploys to the staging box first.\n";
+        let p = parse_plan(md);
+        assert!(p.deploys_to.is_empty(), "prose 'deploys to' must not match");
+    }
+
+    /// Build an ExecPlan WorkItem with an explicit state for queue tests.
+    fn wi_state(slug: &str, state: &str) -> WorkItem {
+        let mut it = wi(slug, &[], &[]);
+        it.state = state.to_string();
+        it
+    }
+
+    fn parsed_with_deploys(targets: &[&str]) -> ParsedPlan {
+        ParsedPlan {
+            deploys_to: targets.iter().map(|s| s.to_string()).collect(),
+            ..ParsedPlan::default()
+        }
+    }
+
+    #[test]
+    fn deploy_queue_groups_executable_plans_by_target() {
+        let a = wi_state("plan-a", "in_progress");
+        let pa = parsed_with_deploys(&["deploy:crux"]);
+        let b = wi_state("plan-b", "planned");
+        let pb = parsed_with_deploys(&["deploy:crux", "deploy:gpu-1"]);
+        let pairs = vec![(&a, &pa), (&b, &pb)];
+        let q = deploy_queue_from_pairs(&pairs);
+        // Sorted by target: deploy:crux then deploy:gpu-1.
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0].target, "deploy:crux");
+        assert_eq!(q[0].count, 2);
+        assert_eq!(
+            q[0].entries.iter().map(|e| e.slug.as_str()).collect::<Vec<_>>(),
+            vec!["plan-a", "plan-b"]
+        );
+        assert_eq!(q[1].target, "deploy:gpu-1");
+        assert_eq!(q[1].count, 1);
+        assert_eq!(q[1].entries[0].slug, "plan-b");
+    }
+
+    #[test]
+    fn deploy_queue_excludes_archived_plans() {
+        let a = wi_state("plan-a", "archive");
+        let pa = parsed_with_deploys(&["deploy:crux"]);
+        let b = wi_state("plan-b", "blocked");
+        let pb = parsed_with_deploys(&["deploy:crux"]);
+        let pairs = vec![(&a, &pa), (&b, &pb)];
+        let q = deploy_queue_from_pairs(&pairs);
+        // Only the blocked (executable) plan is queued; archived is excluded.
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].count, 1);
+        assert_eq!(q[0].entries[0].slug, "plan-b");
+        assert_eq!(q[0].entries[0].state, "blocked");
+    }
+
+    #[test]
+    fn deploy_queue_empty_when_no_deploy_edges() {
+        let a = wi_state("plan-a", "in_progress");
+        let pa = ParsedPlan::default();
+        let pairs = vec![(&a, &pa)];
+        assert!(deploy_queue_from_pairs(&pairs).is_empty());
     }
 
     // ── M2: provenance rollup ──
