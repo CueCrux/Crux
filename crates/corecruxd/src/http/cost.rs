@@ -197,6 +197,7 @@ mod tests {
             generated_at: None,
             started_at: None,
             ended_at: None,
+            execplan_slugs: Vec::new(),
             headline: crux_cost::Headline {
                 assistant_turns: 10,
                 tasks: 1,

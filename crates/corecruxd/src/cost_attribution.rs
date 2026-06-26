@@ -445,6 +445,7 @@ mod tests {
                 generated_at: Some("2026-06-25T12:31:00Z".to_string()),
                 started_at: Some(started.to_string()),
                 ended_at: Some(ended.to_string()),
+                execplan_slugs: Vec::new(),
                 headline: crux_cost::Headline {
                     assistant_turns: 10,
                     tasks: 2,
