@@ -234,7 +234,10 @@ mod tests {
     /// end-to-end. `/healthz` stands in for an arbitrary surface: it is
     /// classified hosted only when configured as such.
     async fn router_status(state: &AppState, path: &str) -> (StatusCode, HeaderMap) {
-        let app = crate::http::router(state.clone());
+        let app = crate::http::router(
+            state.clone(),
+            std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::CaseStore::new())),
+        );
         let resp = app
             .oneshot(HttpRequest::get(path).body(Body::empty()).expect("request"))
             .await
@@ -321,7 +324,10 @@ mod tests {
                 },
             );
         }
-        let app = crate::http::router(state.clone());
+        let app = crate::http::router(
+            state.clone(),
+            std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::CaseStore::new())),
+        );
         let send = |passport: &'static str| {
             let app = app.clone();
             async move {

@@ -459,6 +459,11 @@ pub(super) fn test_app_state(action_max_pending: usize) -> AppState {
     test_app_state_with_auth(action_max_pending, AuthMode::Off)
 }
 
+/// Fresh in-memory case store for `router(state, …)` test calls (M3).
+fn test_case_store() -> std::sync::Arc<tokio::sync::RwLock<corecrux_memory::CaseStore>> {
+    std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::CaseStore::new()))
+}
+
 fn pro_workbench_state(services: &[&str]) -> AppState {
     let mut state = test_app_state(16);
     state.operating_mode = crate::product::OperatingMode::ProHybrid;
@@ -2065,6 +2070,77 @@ async fn query_facts_no_params_returns_all() {
     let body = json_body(resp).await;
     let facts = body["facts"].as_array().expect("facts array");
     assert_eq!(facts.len(), 3);
+}
+
+// ── Case store (POST /v1/cases, /v1/cases/retrieve) ─────────────
+
+#[tokio::test]
+async fn cases_record_and_retrieve_similar() {
+    let state = test_app_state(16);
+    let case_store = std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::CaseStore::new()));
+
+    let mk = |task: &str, action: &str, success: bool, reward: f32| corecrux_memory::case_store::RecordCase {
+        task: task.to_string(),
+        context: None,
+        action: action.to_string(),
+        outcome: "done".to_string(),
+        success,
+        reward,
+        tags: vec![],
+        source_receipt: None,
+    };
+
+    for req in [
+        mk(
+            "deploy daemon to gpu host",
+            "staged cargo-deploy + dense-lane flags",
+            true,
+            0.9,
+        ),
+        mk("deploy daemon to gpu host", "flipped flag, broke prod", false, 0.0),
+        mk("write a changelog entry", "wrote prose", true, 1.0),
+    ] {
+        let resp = cases::record_case(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::Extension(case_store.clone()),
+            Json(req),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // only_success=true drops the failed deploy case and the unrelated one.
+    let body = cases::RetrieveCasesBody {
+        task: "deploy daemon gpu host".to_string(),
+        top_k: 5,
+        only_success: true,
+    };
+    let resp = cases::retrieve_cases(
+        State(state.clone()),
+        HeaderMap::new(),
+        axum::Extension(case_store.clone()),
+        Json(body),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let cases = json["cases"].as_array().expect("cases array");
+    assert_eq!(cases.len(), 1, "only the successful deploy precedent matches");
+    assert!(cases[0]["action"].as_str().unwrap().contains("dense-lane"));
+
+    // Missing action → 400.
+    let bad = cases::record_case(
+        State(state),
+        HeaderMap::new(),
+        axum::Extension(case_store),
+        Json(mk("t", "  ", true, 1.0)),
+    )
+    .await
+    .into_response();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -6171,7 +6247,7 @@ async fn bootstrap_status_returns_seeded_true_after_seed() {
 #[tokio::test]
 async fn router_with_timeout_and_panic_layers_compiles() {
     let state = test_app_state(16);
-    let app = router(state);
+    let app = router(state, test_case_store());
     // Verify the router can be converted to a service (layers are applied).
     let _service = app.into_service::<axum::body::Body>();
 }
@@ -12246,7 +12322,7 @@ async fn openapi_json_route_serves_valid_openapi_3_document() {
     use tower::ServiceExt;
 
     let state = test_app_state(16);
-    let app = router(state);
+    let app = router(state, test_case_store());
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -12330,7 +12406,7 @@ async fn openapi_json_route_serves_valid_openapi_3_document() {
 async fn activity_post_then_get_round_trip() {
     use tower::ServiceExt;
     std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_LOG", "1");
-    let app = router(test_app_state(16));
+    let app = router(test_app_state(16), test_case_store());
 
     let post = app
         .clone()
@@ -12396,7 +12472,7 @@ async fn activity_post_then_get_round_trip() {
 async fn activity_get_without_token_budget_is_400() {
     use tower::ServiceExt;
     std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_LOG", "1");
-    let app = router(test_app_state(16));
+    let app = router(test_app_state(16), test_case_store());
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -12418,7 +12494,7 @@ async fn activity_get_without_token_budget_is_400() {
 async fn activity_get_when_flag_off_is_404() {
     use tower::ServiceExt;
     std::env::remove_var("CORECRUXD_FEATURE_ACTIVITY_LOG");
-    let app = router(test_app_state(16));
+    let app = router(test_app_state(16), test_case_store());
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -12438,7 +12514,7 @@ async fn activity_get_when_flag_off_is_404() {
 async fn activity_get_cross_tenant_is_empty() {
     use tower::ServiceExt;
     std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_LOG", "1");
-    let app = router(test_app_state(16));
+    let app = router(test_app_state(16), test_case_store());
     let _ = app
         .clone()
         .oneshot(
@@ -12485,7 +12561,7 @@ async fn activity_get_cross_tenant_is_empty() {
 async fn activity_turn_id_parity_agent_vs_human_lane() {
     use tower::ServiceExt;
     std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_LOG", "1");
-    let app = router(test_app_state(16));
+    let app = router(test_app_state(16), test_case_store());
 
     let post = app
         .clone()
@@ -12561,7 +12637,7 @@ async fn activity_co_sign_then_verify_green_end_to_end() {
     std::env::set_var("CORECRUXD_FEATURE_ACTIVITY_SIGN", "1");
     let mut state = test_app_state(16);
     bind_test_state_to_root_passport_key(&mut state);
-    let app = router(state);
+    let app = router(state, test_case_store());
 
     let post = app
         .clone()
@@ -12768,7 +12844,11 @@ async fn sse_session_survives_30s_idle() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let state = test_app_state(1);
-    let app = super::ingress::apply_ingress_limits(router(state), &crate::config::IngressConfig::default(), None);
+    let app = super::ingress::apply_ingress_limits(
+        router(state, test_case_store()),
+        &crate::config::IngressConfig::default(),
+        None,
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
