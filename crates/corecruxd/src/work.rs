@@ -34,6 +34,12 @@ pub const RECORD_KEY: &str = "record";
 /// [`crux_mcp::tools::approvals`]. Validators accept it so the existing
 /// `/v1/work?state=pending_approval` path returns approval entries without
 /// rejecting the query.
+/// `drafting` is the A4 generative-ExecPlan front-door state: a plan whose
+/// markdown declares `Status: Draft` (and the `CORECRUXD_FEATURE_DRAFTING_STATE`
+/// flag is on) projects into this state so the board can separate not-yet-ready
+/// drafts from `planned` work. It is accepted by the validators so the existing
+/// `/v1/work?state=drafting` query path and `update_state` transitions to it
+/// resolve without rejecting; the kanban write path never originates it.
 pub const WORK_STATES: &[&str] = &[
     "planned",
     "in_progress",
@@ -42,6 +48,7 @@ pub const WORK_STATES: &[&str] = &[
     "complete",
     "deployed",
     "pending_approval",
+    "drafting",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +95,15 @@ pub struct WorkItem {
     pub plan_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_milestone: Option<String>,
+    /// ExecPlan-aggregator only: the lowest-ordered milestone id whose `after`
+    /// dependency list (declared via `deps:<ID>` facts) is fully satisfied by
+    /// milestones with a passing gate — i.e. the next milestone that is ready to
+    /// start. `None` when the plan declares no `deps:*` facts, or behind the
+    /// `CORECRUXD_FEATURE_NEXT_READY_MILESTONE` flag (default OFF). Milestone ids
+    /// are alphanumeric (`M0`, `A1`, `B5`); see `work_execplans::milestone_id_key`
+    /// for the ordering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_ready_milestone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
     /// Lineage graph: plans this one builds on / is blocked by (`Depends on
@@ -243,6 +259,7 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         updated_at_unix_ms: now_unix_ms,
         plan_path: None,
         current_milestone: None,
+        next_ready_milestone: None,
         superseded_by: None,
         depends_on: Vec::new(),
         extended_by: Vec::new(),
