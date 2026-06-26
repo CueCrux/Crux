@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn slug_from_path_matches_plan_files_only() {
         assert_eq!(
-            slug_from_execplan_path("/home/me/CueCrux/PlanCrux/.agent/execplans/bar-2026-06-26.md").as_deref(),
+            slug_from_execplan_path("/home/me/work/planning/.agent/execplans/bar-2026-06-26.md").as_deref(),
             Some("bar-2026-06-26")
         );
         // Windows-style separators are tolerated.
