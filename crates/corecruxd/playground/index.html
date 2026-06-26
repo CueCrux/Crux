@@ -100,7 +100,7 @@
   .crux-degraded-banner .cdb-hint { opacity:.85; }
   .crux-degraded-banner .cdb-recheck { align-self:center; background:var(--err); color:#fff; border:none; border-radius:var(--radius-full); padding:4px 12px; font-weight:700; cursor:pointer; }
   /* bottom-right build/version footer */
-  .crux-footer { position:fixed; right:12px; bottom:9px; z-index:30; font-size:11px; letter-spacing:.3px; color:var(--text-muted); background:var(--surface-glass-strong); border:1px solid var(--border-default); border-radius:var(--radius-full); padding:2px 9px; pointer-events:auto; }
+  .crux-footer { margin-left:auto; display:inline-flex; align-items:center; line-height:1; font-size:11px; letter-spacing:.3px; color:var(--text-muted); background:var(--surface-glass-strong); border:1px solid var(--border-default); border-radius:var(--radius-full); padding:3px 9px; }
   .crux-footer__link { font-weight:800; color:var(--text-secondary); text-decoration:none; }
   .crux-footer__link:hover { color:var(--accent, #1d4ed8); text-decoration:underline; }
   .crux-footer--dev .crux-footer__link { color:var(--run); }
@@ -564,7 +564,7 @@
   .view-switch button.on { color:var(--accent); background:color-mix(in srgb, var(--accent) 13%, transparent); }
   #cx3dFrame { position:absolute; inset:0; width:100%; height:100%; border:0; display:none; }
   pre { background:var(--code-bg); border:1px solid var(--border-default); border-radius:8px; padding:10px; font-size:11px; color:var(--text-secondary); overflow:auto; margin:0 0 14px; font-family:var(--font-mono); white-space:pre-wrap; word-break:break-word; }
-  .legend { display:flex; gap:14px; flex-wrap:wrap; color:var(--text-muted); font-size:11px; padding:8px 16px; border-top:1px solid var(--border-default); background:var(--surface-glass); }
+  .legend { display:flex; align-items:center; gap:14px; flex-wrap:wrap; color:var(--text-muted); font-size:11px; padding:8px 16px; border-top:1px solid var(--border-default); background:var(--surface-glass); }
   .legend i { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; vertical-align:middle; }
   @media (max-width:760px){ aside{display:none} .wc-centre-pill small{display:none} }
   /* ── Activity lane (ExecPlan crux-dual-surface-activity-log) ── */
@@ -651,8 +651,6 @@
     </div>
     <button class="cdb-recheck" id="cdbRecheck" type="button">Re-check</button>
   </div>
-
-  <div id="cruxFooter" class="crux-footer"></div>
 
   <div class="toolbar">
     <div class="crumbs" id="breadcrumb"></div>
@@ -753,7 +751,8 @@
     <span><i style="background:var(--ok)"></i>done / ok</span>
     <span><i style="background:var(--err)"></i>blocked / error</span>
     <span><i style="background:var(--idle)"></i>planned / idle</span>
-    <span style="margin-left:auto">accent edge = active drill path · double-click a node to open its document</span>
+    <span>accent edge = active drill path · double-click a node to open its document</span>
+    <div id="cruxFooter" class="crux-footer"></div>
   </div>
 
   <!-- (orchestrator builder is the floating #buildCard pinned top-right inside #canvas) -->
