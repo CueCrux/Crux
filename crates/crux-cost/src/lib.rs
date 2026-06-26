@@ -31,11 +31,18 @@ pub mod summary;
 pub mod transcript;
 
 pub use report::{BlockCost, Bucket, CostReport, Headline, Lever, Measured, Severity, COST_REPORT_SCHEMA};
+pub use transcript::{ExecPlanSignal, SignalStrength};
 
 use std::path::Path;
 
 /// Maximum number of top carried-cost blocks retained in a report.
 pub const TOP_BLOCKS: usize = 25;
+
+/// Maximum number of distinct ExecPlan slugs carried on a report's
+/// `execplan_slugs` (OD-29 top-K). A session that genuinely worked more than this
+/// keeps its highest-evidence plans; the daemon falls back to window-overlap only
+/// when the list is empty, never when it is merely truncated.
+pub const MAX_EXECPLAN_SLUGS: usize = 3;
 
 /// Parse and analyze a transcript file into a [`CostReport`], with `source` set
 /// to the file name (corpus identity — QC.4).
@@ -273,5 +280,61 @@ mod tests {
             .find(|l| l.id == "offload-tool-output")
             .expect("offload lever present");
         assert!(offload.detail.contains("Bash"));
+    }
+
+    /// A transcript that writes a fact to `execplan:foo`, edits `bar`'s plan
+    /// file, and merely mentions `[[baz-2026-01-01]]` in prose. The fact-write +
+    /// edit are picked up (foo strongest, bar strong); the bare mention is weak
+    /// and so dropped.
+    fn linked_transcript() -> String {
+        [
+            json!({"type":"user","sessionId":"s","message":{"role":"user",
+                "content":"start [[baz-2026-01-01]]"}}),
+            json!({"type":"assistant","sessionId":"s","message":{"role":"assistant",
+            "usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":100},
+            "content":[
+              {"type":"tool_use","id":"t1","name":"mcp__crux__store_fact",
+               "input":{"entity":"execplan:foo-2026-06-26","key":"gate:M1","value":"x"}},
+              {"type":"tool_use","id":"t2","name":"Edit",
+               "input":{"file_path":"/x/.agent/execplans/bar-2026-06-26.md","old_string":"a","new_string":"b"}}
+            ]}}),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+
+    #[test]
+    fn execplan_slugs_extracted_and_ranked_end_to_end() {
+        let r = analyze_str(&linked_transcript(), "s.jsonl");
+        // Strongest (fact-write) ranks above strong (plan-file edit); the weak
+        // `[[baz]]` mention has no other evidence and is dropped.
+        assert_eq!(r.execplan_slugs, vec!["foo-2026-06-26", "bar-2026-06-26"]);
+    }
+
+    #[test]
+    fn plain_transcript_has_no_slugs() {
+        // The base fixture touches no plan facts/files.
+        let r = analyze_str(&fixture(), "fixture.jsonl");
+        assert!(r.execplan_slugs.is_empty());
+        let empty = analyze_str("", "empty.jsonl");
+        assert!(empty.execplan_slugs.is_empty());
+    }
+
+    #[test]
+    fn execplan_slugs_skipped_on_wire_when_empty() {
+        // Back-compat: a slug-less report omits the field entirely (an old daemon
+        // sees a byte-identical shape); a linked report carries it.
+        let plain = analyze_str(&fixture(), "fixture.jsonl");
+        let plain_json = serde_json::to_string(&plain).expect("serialize");
+        assert!(!plain_json.contains("execplan_slugs"));
+
+        let linked = analyze_str(&linked_transcript(), "s.jsonl");
+        let linked_json = serde_json::to_string(&linked).expect("serialize");
+        assert!(linked_json.contains("execplan_slugs"));
+        // Round-trips.
+        let back: CostReport = serde_json::from_str(&linked_json).expect("deserialize");
+        assert_eq!(back.execplan_slugs, linked.execplan_slugs);
     }
 }

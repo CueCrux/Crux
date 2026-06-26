@@ -60,6 +60,47 @@ pub struct ContentBlock {
     pub text: Option<String>,
 }
 
+/// How strong a transcript signal is that the session **worked** an ExecPlan
+/// (OD-29). Ordered weakest→strongest by declaration, so `>`/`Ord` compares
+/// reliability directly. Weak signals are **tie-breakers only** — never sole
+/// evidence (see [`crate::attribution`]'s ranking).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SignalStrength {
+    /// A prose `[[<slug>]]` wiki-link mention — the plan was merely *referenced*.
+    Weak,
+    /// An `Edit`/`Write`/`Read`/`MultiEdit`/`NotebookEdit` `tool_use` whose path
+    /// is `*/.agent/execplans/<slug>.md` — the session opened/changed the plan
+    /// file.
+    Strong,
+    /// An MCP `store_fact`/`save_session`/`coord_announce` `tool_use` that wrote
+    /// to `entity="execplan:<slug>"` / `session_id="execplan:<slug>"` / an
+    /// `execplan_slug` field — the agent literally recorded work against the plan.
+    Strongest,
+}
+
+impl SignalStrength {
+    /// Additive weight used to rank slugs by accumulated evidence.
+    #[must_use]
+    pub fn weight(self) -> u32 {
+        match self {
+            SignalStrength::Weak => 1,
+            SignalStrength::Strong => 2,
+            SignalStrength::Strongest => 3,
+        }
+    }
+}
+
+/// One piece of evidence, extracted at parse time, that the session worked a
+/// given ExecPlan. Collected per record into [`Event::execplan_signals`] and
+/// ranked into `CostReport.execplan_slugs` by [`crate::attribution::analyze`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecPlanSignal {
+    /// The plan slug (the `<slug>` in `execplan:<slug>` / `<slug>.md`).
+    pub slug: String,
+    /// How reliable this signal is.
+    pub strength: SignalStrength,
+}
+
 /// A parsed transcript record.
 #[derive(Debug, Clone)]
 pub struct Event {
@@ -77,6 +118,15 @@ pub struct Event {
     /// malformed. Every Claude Code record (including `queue-operation`/meta)
     /// carries one, so the window spans the whole transcript, not just turns.
     pub timestamp: Option<String>,
+    /// ExecPlan-link signals found in this record's `tool_use` inputs and prose
+    /// (OD-29). Empty for records that touched no plan. Detected at parse time
+    /// because the full `tool_use` input + block text is only available here
+    /// (block previews are truncated to 80 chars downstream).
+    pub execplan_signals: Vec<ExecPlanSignal>,
+    /// The record's `gitBranch`, when present and non-empty. A weak tie-breaker
+    /// only (often `HEAD`/detached or a `feat/...` name that doesn't map cleanly
+    /// to a dated slug) — never introduces a slug on its own.
+    pub git_branch: Option<String>,
 }
 
 /// Cheap shape check for the Claude Code transcript timestamp: a fixed-width
@@ -179,14 +229,24 @@ fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>, capture
         .or_else(|| value.get("usage"))
         .and_then(parse_usage);
 
+    let mut execplan_signals: Vec<ExecPlanSignal> = Vec::new();
     let blocks = if rtype == Some("attachment") {
         attachment_blocks(value, capture)
     } else {
         match (kind, message) {
-            (EventKind::Assistant | EventKind::User, Some(msg)) => extract_blocks(msg, kind, tool_names, capture),
+            (EventKind::Assistant | EventKind::User, Some(msg)) => {
+                extract_blocks(msg, kind, tool_names, capture, &mut execplan_signals)
+            }
             _ => Vec::new(),
         }
     };
+
+    let git_branch = value
+        .get("gitBranch")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "HEAD")
+        .map(str::to_owned);
 
     Event {
         kind,
@@ -194,6 +254,8 @@ fn parse_record(value: &Value, tool_names: &mut HashMap<String, String>, capture
         blocks,
         session_id,
         timestamp,
+        execplan_signals,
+        git_branch,
     }
 }
 
@@ -253,6 +315,7 @@ fn extract_blocks(
     kind: EventKind,
     tool_names: &mut HashMap<String, String>,
     capture: bool,
+    signals: &mut Vec<ExecPlanSignal>,
 ) -> Vec<ContentBlock> {
     let content = match message.get("content") {
         Some(c) => c,
@@ -264,6 +327,7 @@ fn extract_blocks(
         if text.is_empty() {
             return Vec::new();
         }
+        collect_wikilink_signals(text, signals);
         let source = if kind == EventKind::User {
             "user_prompt"
         } else {
@@ -278,7 +342,7 @@ fn extract_blocks(
 
     let mut blocks = Vec::new();
     for item in items {
-        if let Some(block) = parse_block(item, kind, tool_names, capture) {
+        if let Some(block) = parse_block(item, kind, tool_names, capture, signals) {
             blocks.push(block);
         }
     }
@@ -290,10 +354,12 @@ fn parse_block(
     kind: EventKind,
     tool_names: &mut HashMap<String, String>,
     capture: bool,
+    signals: &mut Vec<ExecPlanSignal>,
 ) -> Option<ContentBlock> {
     match item.get("type").and_then(Value::as_str)? {
         "text" => {
             let text = item.get("text").and_then(Value::as_str).unwrap_or_default();
+            collect_wikilink_signals(text, signals);
             let source = if kind == EventKind::User {
                 "user_prompt"
             } else {
@@ -319,6 +385,9 @@ fn parse_block(
             let name = item.get("name").and_then(Value::as_str).unwrap_or("unknown").to_owned();
             if let Some(id) = item.get("id").and_then(Value::as_str) {
                 tool_names.insert(id.to_owned(), name.clone());
+            }
+            if let Some(input) = item.get("input") {
+                collect_tool_use_signals(&name, input, signals);
             }
             let input_text = item.get("input").map(value_to_text).unwrap_or_default();
             Some(text_block(
@@ -365,6 +434,113 @@ fn text_block(source: &str, tool: Option<String>, text: &str, capture: bool) -> 
         preview: preview_of(text),
         text: capture.then(|| text.to_owned()),
     }
+}
+
+/// Detect ExecPlan-link signals in a `tool_use` block's `input` (OD-29). MCP
+/// fact-writes to an `execplan:<slug>` entity are the strongest evidence; file
+/// tools opening a plan file are strong. Fails soft — an unknown tool or shape
+/// adds nothing.
+fn collect_tool_use_signals(name: &str, input: &Value, signals: &mut Vec<ExecPlanSignal>) {
+    match tool_leaf(name) {
+        "store_fact" | "save_session" | "coord_announce" => {
+            // `entity` (store_fact) / `session_id` (save_session) = "execplan:<slug>".
+            for key in ["entity", "session_id"] {
+                if let Some(slug) = input
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(slug_from_execplan_entity)
+                {
+                    signals.push(ExecPlanSignal {
+                        slug,
+                        strength: SignalStrength::Strongest,
+                    });
+                }
+            }
+            // `execplan_slug` (coord_announce) carries the bare slug.
+            if let Some(slug) = input
+                .get("execplan_slug")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                signals.push(ExecPlanSignal {
+                    slug: slug.to_owned(),
+                    strength: SignalStrength::Strongest,
+                });
+            }
+        }
+        "Edit" | "Write" | "Read" | "MultiEdit" | "NotebookEdit" => {
+            for key in ["file_path", "path", "notebook_path"] {
+                if let Some(slug) = input.get(key).and_then(Value::as_str).and_then(slug_from_execplan_path) {
+                    signals.push(ExecPlanSignal {
+                        slug,
+                        strength: SignalStrength::Strong,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Scan prose for `[[<slug>]]` wiki-link mentions — a weak signal. Only
+/// slug-shaped inner text counts, so `[[1]]` / arbitrary brackets are ignored.
+fn collect_wikilink_signals(text: &str, signals: &mut Vec<ExecPlanSignal>) {
+    if !text.contains("[[") {
+        return;
+    }
+    let mut rest = text;
+    while let Some(open) = rest.find("[[") {
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("]]") else { break };
+        let inner = after[..close].trim();
+        if is_plausible_slug(inner) {
+            signals.push(ExecPlanSignal {
+                slug: inner.to_owned(),
+                strength: SignalStrength::Weak,
+            });
+        }
+        rest = &after[close + 2..];
+    }
+}
+
+/// The leaf of a (possibly MCP-namespaced) tool name: `mcp__crux__store_fact` →
+/// `store_fact`; `Edit` → `Edit`.
+fn tool_leaf(name: &str) -> &str {
+    name.rsplit("__").next().unwrap_or(name)
+}
+
+/// `execplan:<slug>` → `Some(<slug>)`; anything without the prefix → `None`.
+fn slug_from_execplan_entity(value: &str) -> Option<String> {
+    let slug = value.strip_prefix("execplan:")?.trim();
+    (!slug.is_empty()).then(|| slug.to_owned())
+}
+
+/// `…/.agent/execplans/<slug>.md` → `Some(<slug>)`. Tolerates `\` separators so
+/// a Windows-style path still matches.
+fn slug_from_execplan_path(path: &str) -> Option<String> {
+    let norm = path.replace('\\', "/");
+    let after = norm.split(".agent/execplans/").nth(1)?;
+    let file = after.split('/').next()?;
+    let slug = file.strip_suffix(".md")?.trim();
+    (!slug.is_empty()).then(|| slug.to_owned())
+}
+
+/// A conservative check that a string looks like an ExecPlan slug (`kebab-case`,
+/// usually date-suffixed). Guards the weak wiki-link signal against arbitrary
+/// `[[…]]` text. ASCII-only by construction (slugs are).
+fn is_plausible_slug(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    if !(3..=120).contains(&len) || !s.contains('-') {
+        return false;
+    }
+    let edge_ok = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    edge_ok(bytes[0])
+        && edge_ok(bytes[len - 1])
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Best-effort flattening of a `content` value to text for token estimation.
@@ -417,4 +593,186 @@ fn preview_of(text: &str) -> String {
         }
     }
     collapsed.trim_end().to_owned()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// One assistant record carrying a single `tool_use` block.
+    fn tool_use_record(name: &str, input: Value) -> String {
+        json!({"type":"assistant","sessionId":"s","message":{"role":"assistant",
+            "content":[{"type":"tool_use","id":"t1","name":name,"input":input}]}})
+        .to_string()
+    }
+
+    fn first_signals(record: &str) -> Vec<ExecPlanSignal> {
+        parse_str(record)
+            .into_iter()
+            .next()
+            .map(|e| e.execplan_signals)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn slug_from_entity_strips_prefix_only() {
+        assert_eq!(
+            slug_from_execplan_entity("execplan:foo-2026-01-01").as_deref(),
+            Some("foo-2026-01-01")
+        );
+        assert_eq!(
+            slug_from_execplan_entity("execplan: spaced ").as_deref(),
+            Some("spaced")
+        );
+        assert!(slug_from_execplan_entity("bench:lme-s").is_none());
+        assert!(slug_from_execplan_entity("execplan:").is_none());
+    }
+
+    #[test]
+    fn slug_from_path_matches_plan_files_only() {
+        assert_eq!(
+            slug_from_execplan_path("/home/me/work/planning/.agent/execplans/bar-2026-06-26.md").as_deref(),
+            Some("bar-2026-06-26")
+        );
+        // Windows-style separators are tolerated.
+        assert_eq!(
+            slug_from_execplan_path(r"C:\repo\.agent\execplans\baz.md").as_deref(),
+            Some("baz")
+        );
+        // A non-plan path, or the directory itself, yields nothing.
+        assert!(slug_from_execplan_path("/home/me/src/main.rs").is_none());
+        assert!(slug_from_execplan_path("x/.agent/execplans/").is_none());
+    }
+
+    #[test]
+    fn plausible_slug_guards_weak_signal() {
+        assert!(is_plausible_slug("token-burn-precise-attribution-2026-06-26"));
+        assert!(is_plausible_slug("a-b"));
+        // Rejected: no dash, too short, non-slug chars, edge punctuation.
+        assert!(!is_plausible_slug("1"));
+        assert!(!is_plausible_slug("nodash"));
+        assert!(!is_plausible_slug("-leading"));
+        assert!(!is_plausible_slug("Has_Caps-x"));
+        assert!(!is_plausible_slug("a b-c"));
+    }
+
+    #[test]
+    fn store_fact_to_execplan_entity_is_strongest() {
+        let rec = tool_use_record(
+            "mcp__crux__store_fact",
+            json!({"entity":"execplan:foo-2026-01-01","key":"gate:M1","value":"x"}),
+        );
+        let sigs = first_signals(&rec);
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].slug, "foo-2026-01-01");
+        assert_eq!(sigs[0].strength, SignalStrength::Strongest);
+    }
+
+    #[test]
+    fn save_session_execplan_id_is_strongest() {
+        let rec = tool_use_record(
+            "mcp__crux__save_session",
+            json!({"session_id":"execplan:bar","state":{}}),
+        );
+        let sigs = first_signals(&rec);
+        assert_eq!(
+            sigs,
+            vec![ExecPlanSignal {
+                slug: "bar".to_owned(),
+                strength: SignalStrength::Strongest
+            }]
+        );
+    }
+
+    #[test]
+    fn coord_announce_execplan_slug_field_is_strongest() {
+        let rec = tool_use_record(
+            "coord_announce",
+            json!({"session_id":"uuid-123","execplan_slug":"qux-plan"}),
+        );
+        let sigs = first_signals(&rec);
+        assert_eq!(
+            sigs,
+            vec![ExecPlanSignal {
+                slug: "qux-plan".to_owned(),
+                strength: SignalStrength::Strongest
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_file_edit_is_strong() {
+        let rec = tool_use_record(
+            "Edit",
+            json!({"file_path":"/x/.agent/execplans/bar-2026-06-26.md","old_string":"a","new_string":"b"}),
+        );
+        let sigs = first_signals(&rec);
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].slug, "bar-2026-06-26");
+        assert_eq!(sigs[0].strength, SignalStrength::Strong);
+    }
+
+    #[test]
+    fn non_plan_tool_use_yields_no_signal() {
+        // A fact write to a non-execplan entity, and a Bash command, are inert.
+        assert!(first_signals(&tool_use_record(
+            "mcp__crux__store_fact",
+            json!({"entity":"bench:lme-s","key":"k","value":"v"})
+        ))
+        .is_empty());
+        assert!(first_signals(&tool_use_record("Bash", json!({"command":"ls /x/.agent/execplans/"}))).is_empty());
+        // A Read of a source file (not a plan) is inert.
+        assert!(first_signals(&tool_use_record("Read", json!({"file_path":"/x/src/main.rs"}))).is_empty());
+    }
+
+    #[test]
+    fn prose_wikilink_is_weak_and_validated() {
+        let rec = json!({"type":"assistant","sessionId":"s","message":{"role":"assistant",
+            "content":[{"type":"text","text":"see [[real-plan-2026-01-01]] but ignore [[1]] and [[Bad_Caps]]"}]}})
+        .to_string();
+        let sigs = first_signals(&rec);
+        assert_eq!(
+            sigs,
+            vec![ExecPlanSignal {
+                slug: "real-plan-2026-01-01".to_owned(),
+                strength: SignalStrength::Weak
+            }]
+        );
+    }
+
+    #[test]
+    fn user_prompt_string_content_is_scanned_for_wikilinks() {
+        // The bare-string content path (not an array of blocks) is also scanned.
+        let rec = json!({"type":"user","sessionId":"s","message":{"role":"user","content":"work on [[my-plan-2026-02-02]] please"}})
+            .to_string();
+        let sigs = first_signals(&rec);
+        assert_eq!(
+            sigs,
+            vec![ExecPlanSignal {
+                slug: "my-plan-2026-02-02".to_owned(),
+                strength: SignalStrength::Weak
+            }]
+        );
+    }
+
+    #[test]
+    fn git_branch_captured_except_head() {
+        let with = json!({"type":"assistant","sessionId":"s","gitBranch":"feat/token-burn","message":{"role":"assistant","content":[]}}).to_string();
+        let detached =
+            json!({"type":"assistant","sessionId":"s","gitBranch":"HEAD","message":{"role":"assistant","content":[]}})
+                .to_string();
+        assert_eq!(parse_str(&with)[0].git_branch.as_deref(), Some("feat/token-burn"));
+        assert!(parse_str(&detached)[0].git_branch.is_none());
+    }
+
+    #[test]
+    fn malformed_tool_input_fails_soft() {
+        // `input` is a string, not an object — must not panic, yields no signal.
+        let rec = json!({"type":"assistant","sessionId":"s","message":{"role":"assistant",
+            "content":[{"type":"tool_use","id":"t1","name":"mcp__crux__store_fact","input":"oops"}]}})
+        .to_string();
+        assert!(first_signals(&rec).is_empty());
+    }
 }

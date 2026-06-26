@@ -165,6 +165,7 @@ mod tests {
             generated_at: Some("2026-06-21T00:00:00Z".to_owned()),
             started_at: None,
             ended_at: None,
+            execplan_slugs: Vec::new(),
             headline: crux_cost::Headline {
                 assistant_turns: 10,
                 tasks: 2,
