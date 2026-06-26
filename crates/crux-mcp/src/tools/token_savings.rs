@@ -40,41 +40,69 @@ pub async fn handle_token_savings(_args: &Value, _ctx: &McpContext) -> Result<Va
         }));
     }
 
-    let (n_control, n_treatment, report) = match crate::holdout::accumulator().lock() {
+    let snap = match crate::holdout::accumulator().lock() {
         Ok(acc) => acc.report(),
         Err(_) => {
             return Ok(json!({ "content": [{ "type": "text", "text": "token_savings: accumulator unavailable" }] }))
         }
     };
 
-    let summary = if n_control == 0 || n_treatment == 0 {
+    // Per-mechanism (CO-5): the compaction (M3) line is the isolated, always-≥0
+    // token saving; the net line folds in reversible's (M1) recall cost and can be
+    // negative — never read one as the other.
+    let compaction_line = if snap.n_compaction == 0 {
+        "  compaction (M3): no samples yet".to_string()
+    } else {
         format!(
-            "token_savings: holdout fraction {:.3}, but not enough samples yet (control={n_control}, treatment={n_treatment})",
-            fraction
+            "  compaction (M3): {:.1}% (95% CI {:.1}–{:.1}%) · n={} — the token saving",
+            snap.compaction.reduction * 100.0,
+            snap.compaction.ci_low * 100.0,
+            snap.compaction.ci_high * 100.0,
+            snap.n_compaction,
+        )
+    };
+    let net_line = if snap.n_control == 0 || snap.n_treatment == 0 {
+        format!(
+            "  net (all-shaped vs unshaped): not enough samples (control={}, treatment={})",
+            snap.n_control, snap.n_treatment
         )
     } else {
         format!(
-            "token_savings: {:.1}% (95% CI {:.1}–{:.1}%) · control={n_control} reqs/{} tok · treatment={n_treatment} reqs/{} tok · holdout={:.3}",
-            report.reduction * 100.0,
-            report.ci_low * 100.0,
-            report.ci_high * 100.0,
-            report.control_tokens,
-            report.treatment_tokens,
-            fraction,
+            "  net (all-shaped vs unshaped): {:.1}% (95% CI {:.1}–{:.1}%) · control={} reqs/{} tok · treatment={} reqs/{} tok — includes reversible's (M1) recall cost, so it can be negative",
+            snap.net.reduction * 100.0,
+            snap.net.ci_low * 100.0,
+            snap.net.ci_high * 100.0,
+            snap.n_control,
+            snap.net.control_tokens,
+            snap.n_treatment,
+            snap.net.treatment_tokens,
         )
     };
+    let summary = format!("token_savings (holdout={fraction:.3}):\n{compaction_line}\n{net_line}");
 
     Ok(json!({
         "content": [{ "type": "text", "text": summary }],
         "holdout_enabled": true,
         "holdout_fraction": fraction,
-        "n_control": n_control,
-        "n_treatment": n_treatment,
-        "reduction_pct": report.reduction * 100.0,
-        "ci95_low_pct": report.ci_low * 100.0,
-        "ci95_high_pct": report.ci_high * 100.0,
-        "control_tokens": report.control_tokens,
-        "treatment_tokens": report.treatment_tokens,
+        // Compaction (M3) — the isolated token saving (always ≥ 0).
+        "compaction": {
+            "n": snap.n_compaction,
+            "reduction_pct": snap.compaction.reduction * 100.0,
+            "ci95_low_pct": snap.compaction.ci_low * 100.0,
+            "ci95_high_pct": snap.compaction.ci_high * 100.0,
+            "pretty_tokens": snap.compaction.control_tokens,
+            "compact_tokens": snap.compaction.treatment_tokens,
+        },
+        // Net (all-shaped vs all-unshaped) — folds in reversible's recall cost.
+        "net": {
+            "n_control": snap.n_control,
+            "n_treatment": snap.n_treatment,
+            "reduction_pct": snap.net.reduction * 100.0,
+            "ci95_low_pct": snap.net.ci_low * 100.0,
+            "ci95_high_pct": snap.net.ci_high * 100.0,
+            "control_tokens": snap.net.control_tokens,
+            "treatment_tokens": snap.net.treatment_tokens,
+        },
     }))
 }
 
@@ -105,10 +133,15 @@ mod tests {
             crate::holdout::record_sample(true, 400);
             crate::holdout::record_sample(false, 300);
         }
+        // Seed compaction samples directly (sample_compaction needs a sampled
+        // key; the accumulator is the unit under test here).
+        crate::holdout::sample_compaction("k", &json!({"a": 1, "b": [1, 2, 3]}));
         let res = handle_token_savings(&json!({}), &ctx()).await.unwrap();
         assert_eq!(res["holdout_enabled"], true);
-        assert_eq!(res["n_control"], 4);
-        assert!((res["reduction_pct"].as_f64().unwrap() - 25.0).abs() < 1.0);
+        assert_eq!(res["net"]["n_control"], 4);
+        assert!((res["net"]["reduction_pct"].as_f64().unwrap() - 25.0).abs() < 1.0);
+        // Compaction is reported separately and is non-negative.
+        assert!(res["compaction"].is_object());
         crate::holdout::accumulator().lock().unwrap().clear_for_test();
         std::env::remove_var(crate::holdout::HOLDOUT_ENV);
     }

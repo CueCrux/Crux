@@ -125,6 +125,7 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
     let compact = crate::payload::compact_enabled() && !unshaped;
     let text = crate::payload::serialize_with(&inner, compact);
     crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
+    crate::holdout::sample_compaction(&params.to_string(), &inner); // CO-5 compaction-only
     Ok(json!({ "content": [{ "type": "text", "text": text }] }))
 }
 
@@ -191,6 +192,7 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
     let compact = crate::payload::compact_enabled() && !unshaped;
     let text = crate::payload::serialize_with(&inner, compact);
     crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
+    crate::holdout::sample_compaction(&params.to_string(), &inner); // CO-5 compaction-only
     Ok(json!({ "content": [{ "type": "text", "text": text }] }))
 }
 
@@ -294,6 +296,7 @@ pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Val
     let compact = crate::payload::compact_enabled() && !unshaped;
     let text = crate::payload::serialize_with(&response, compact);
     crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
+    crate::holdout::sample_compaction(&params.to_string(), &response); // CO-5 compaction-only
     Ok(json!({ "content": [{ "type": "text", "text": text }] }))
 }
 
