@@ -43,6 +43,19 @@ pub struct CostReport {
     /// analyzer leaves this `None` — the crate has no clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_at: Option<String>,
+    /// RFC3339 timestamp of the transcript's **earliest** record — the session's
+    /// active-window start. Derived from the per-record `timestamp` fields, so it
+    /// reflects when work actually happened (not [`Self::generated_at`], the
+    /// later analysis time). `None` when no record carried a parseable timestamp.
+    /// Consumed by the daemon's per-ExecPlan token-burn attribution (the session
+    /// window is overlapped against each plan's fact-activity window).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// RFC3339 timestamp of the transcript's **latest** record — the session's
+    /// active-window end. Pairs with [`Self::started_at`]. `None` when no record
+    /// carried a parseable timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
     /// The screenshot-worthy top-line numbers.
     pub headline: Headline,
     /// The four measured `usage` totals summed across the session.

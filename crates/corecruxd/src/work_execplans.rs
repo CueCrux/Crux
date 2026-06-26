@@ -695,6 +695,9 @@ fn mk_item(
         notes_count: None,
         provenance,
         stale: None,
+        // Stamped read-time at the HTTP layer (needs the async cost store);
+        // the pure aggregator leaves it None.
+        token_burn: None,
     }
 }
 
@@ -1052,6 +1055,7 @@ mod tests {
             notes_count: None,
             provenance: None,
             stale: None,
+            token_burn: None,
         }
     }
 
