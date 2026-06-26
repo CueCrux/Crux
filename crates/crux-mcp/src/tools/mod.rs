@@ -259,12 +259,14 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                     "entity":       { "type": "string",  "description": "Filter to a specific entity" },
                     "top_k":        { "type": "integer", "description": "Maximum facts to return", "default": 10 },
                     "token_budget": { "type": "integer", "description": "Optional token budget" },
-                    "include_superseded": { "type": "boolean", "description": "If true, also return facts explicitly retired via cross-entity supersession (their `superseded_by` is exposed). Default false (retired facts are hidden).", "default": false }
+                    "include_superseded": { "type": "boolean", "description": "If true, also return facts explicitly retired via cross-entity supersession (their `superseded_by` is exposed). Default false (retired facts are hidden).", "default": false },
+                    "as_of": { "type": "string", "description": "Bi-temporal as-of filter (RFC 3339). Return only facts that were TRUE IN THE WORLD at this instant — whose valid-time interval [valid_from, valid_to) contains it — regardless of when they were learned. Omit for present-day recall." }
                 },
                 "examples": [
                     { "query": "deployment strategy", "token_budget": 2000 },
                     { "entity": "project-alpha", "top_k": 5 },
-                    { "entity": "bench:lme-s", "include_superseded": true }
+                    { "entity": "bench:lme-s", "include_superseded": true },
+                    { "entity": "person:alice", "as_of": "2026-03-01T00:00:00Z" }
                 ]
             }),
         },
