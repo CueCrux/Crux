@@ -123,6 +123,14 @@ pub struct WorkItem {
     /// back to the plan `.md`. `None` for kanban items and fact-less plans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Provenance>,
+    /// ExecPlan-aggregator only: `Some(true)` when an `in_progress` plan has had
+    /// no fact/file activity for longer than the staleness window — likely
+    /// finished-but-unmarked or stalling, not actively in flight. `Some(false)`
+    /// for a fresh `in_progress` plan; `None` for kanban items and non-in_progress
+    /// states. Lets the board split in_progress into active vs stale without
+    /// hiding anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<bool>,
 }
 
 /// Compact, fact-derived provenance for an ExecPlan work item. Assembled at
@@ -237,6 +245,7 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         milestones_total: None,
         notes_count: None,
         provenance: None,
+        stale: None,
     };
     write_record(store, &item)?;
     write_transition(
