@@ -21,6 +21,11 @@ pub(super) struct QueryFactsParams {
     pub top_k: Option<usize>,
     /// Token budget — fill results by descending score until exhausted.
     pub token_budget: Option<usize>,
+    /// Bi-temporal as-of filter (RFC 3339). When set, only facts whose
+    /// valid-time interval `[valid_from, valid_to)` contains this instant are
+    /// returned — i.e. facts that were TRUE IN THE WORLD at `as_of`, regardless
+    /// of when they were learned. Omitted ⇒ no valid-time filtering.
+    pub as_of: Option<String>,
 }
 
 /// Query parameters for the GET /v1/facts/export endpoint.
@@ -142,14 +147,30 @@ pub(super) fn query_visible_http_facts(
     q: &corecrux_memory::fact_store::FactQuery,
     ctx: &crate::auth::HttpScopeContext,
 ) -> Vec<corecrux_memory::fact_store::Fact> {
+    query_visible_http_facts_as_of(store, q, ctx, None)
+}
+
+/// As [`query_visible_http_facts`] but with an optional bi-temporal `as_of`
+/// filter (M1): when set, only facts whose valid-time interval contains the
+/// instant are returned. `None` ⇒ identical to the plain variant.
+pub(super) fn query_visible_http_facts_as_of(
+    store: &corecrux_memory::FactStore,
+    q: &corecrux_memory::fact_store::FactQuery,
+    ctx: &crate::auth::HttpScopeContext,
+    as_of: Option<chrono::DateTime<chrono::Utc>>,
+) -> Vec<corecrux_memory::fact_store::Fact> {
     if raw_admin_read(ctx) {
-        return store.query(q).facts;
+        return match as_of {
+            Some(instant) => store.query_as_of(q, instant).facts,
+            None => store.query(q).facts,
+        };
     }
 
     let agent_name = ctx.passport_id.as_deref();
     let mut results: Vec<&corecrux_memory::fact_store::Fact> = store
         .all_facts()
         .filter(|fact| !fact.deleted)
+        .filter(|fact| as_of.is_none_or(|instant| fact.valid_at(instant)))
         .filter(|fact| crux_mcp::scope::fact_visible_to_agent(fact, agent_name))
         .filter(|fact| {
             q.entity_prefix
@@ -416,8 +437,23 @@ pub(super) async fn query_facts(
         top_k: params.top_k.unwrap_or(10).clamp(1, MAX_FACT_QUERY_TOP_K),
         token_budget: params.token_budget,
     };
+    // Bi-temporal as-of (M1): reject an unparseable timestamp rather than
+    // silently ignoring it (a silently-dropped filter would return present-day
+    // facts under a historical query — a correctness trap for the caller).
+    let as_of = match params.as_of.as_deref() {
+        Some(raw) => match chrono::DateTime::parse_from_rfc3339(raw) {
+            Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
+            Err(_) => {
+                return problem_response(
+                    StatusCode::BAD_REQUEST,
+                    "as_of must be an RFC 3339 timestamp (e.g. 2026-01-15T00:00:00Z)",
+                );
+            }
+        },
+        None => None,
+    };
     let store = state.fact_store.read().await;
-    let facts = query_visible_http_facts(&store, &q, &ctx);
+    let facts = query_visible_http_facts_as_of(&store, &q, &ctx, as_of);
     let total_tokens = facts.iter().map(|fact| fact.tokens).sum::<usize>();
     (
         StatusCode::OK,
