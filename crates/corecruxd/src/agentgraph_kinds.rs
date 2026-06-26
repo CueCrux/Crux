@@ -93,8 +93,8 @@ pub fn bootstrap(reg: &mut KindRegistry) -> Result<(), KindError> {
     if !reg.is_registered(PUNCHCARD_KIND) {
         reg.register(KindRegistration {
             kind: PUNCHCARD_KIND.into(),
-            description: "An advisory/enforced lease on a resource (file / deploy target) held \
-                          by a passport (punchcard plan)."
+            description: "An advisory/enforced lease on a resource (file / subtree / service / \
+                          deploy target) held by a passport (punchcard plan)."
                 .into(),
             allowed_outgoing_edges: vec![],
             allowed_incoming_edges: vec![],
@@ -103,7 +103,10 @@ pub fn bootstrap(reg: &mut KindRegistry) -> Result<(), KindError> {
                 "required": ["id", "resource", "mode", "holder_passport", "tenant_id", "status"],
                 "properties": {
                     "id":                  {"type": "string"},
-                    "resource":            {"type": "string"},
+                    // Scheme allowlist: file:// (leaf), tree:// (subtree),
+                    // service:// (named service), deploy:// (point-exclusive
+                    // deploy target, host+path). See punchcards.rs overlap rules.
+                    "resource":            {"type": "string", "pattern": "^(file|tree|service|deploy)://.*$"},
                     "mode":                {"type": "string", "enum": ["modify","deploy"]},
                     "holder_passport":     {"type": "string"},
                     "tenant_id":           {"type": "string"},

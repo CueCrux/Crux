@@ -28,9 +28,19 @@
 //!
 //! A session that overlaps N plans credits all N. That is coarse **by design** —
 //! the [`TokenBurn::method`] label is surfaced so the attribution is never
-//! silently wrong. The explicit hook-written `session:<uuid> → execplan:<slug>`
-//! link (candidate (c) in the plan) is the precision upgrade if window-overlap
-//! proves too coarse against real sessions.
+//! silently wrong.
+//!
+//! ## OD-30 — link-preferring upgrade (landed)
+//!
+//! Window-overlap proved too coarse on real data (~186 multi-day sessions credited
+//! 753/~934 plans). The precision fix is the producer-derived link: a cost report
+//! now carries the ExecPlan slug(s) the session actually worked
+//! (`crux_cost`'s `execplan_slugs`, see [`SessionBurn::execplan_slugs`]). When a
+//! session carries that link, [`attribute`] credits **only** those plans
+//! (`method = "link"`) and skips window-overlap entirely for it; a session with no
+//! link still uses the window-overlap fallback. OD-30 (how to split a multi-plan
+//! session) is resolved as **even-split** (v2): each linked plan gets `burn / N`,
+//! so high-fan-out sessions are not inflated — see [`attribute`].
 //!
 //! This module is split:
 //! * [`attribute`] is the **pure** core (no IO, no clock) — unit-tested
@@ -38,7 +48,7 @@
 //! * [`session_burns_from_reports`] / [`stamp_token_burn`] are the thin glue that
 //!   parses RFC3339 windows and stamps the result onto [`crate::work::WorkItem`]s.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +69,11 @@ pub struct SessionBurn {
     /// Poster passport, or `None` when anonymous (`__anon__`) — i.e. no passport
     /// refinement is possible for this session.
     pub poster_passport: Option<String>,
+    /// The ExecPlan slug(s) this session actually **worked**, derived from the
+    /// transcript by the producer (see `crux_cost`'s `execplan_slugs`). When
+    /// non-empty the join attributes the burn **only** to these plans
+    /// (`method = "link"`, precise); when empty it falls back to window-overlap.
+    pub execplan_slugs: Vec<String>,
     /// Σ measured context (`cache_read + cache_creation + input`) over the
     /// session — the headline burn number.
     pub context_tokens: u64,
@@ -91,8 +106,10 @@ pub struct TokenBurn {
     /// Number of distinct sessions attributed to this plan.
     pub sessions: u32,
     /// How the sessions were attributed, so the UI never reads as falsely
-    /// precise: `passport+window` (every attributed session's poster matched a
-    /// plan agent), `window` (all window-only), or `mixed`.
+    /// precise: `link` (every attributed session named this plan in its
+    /// transcript — precise), `passport+window` (all window-overlap with the
+    /// poster matching a plan agent), `window` (all window-only — coarse), or
+    /// `mixed` (a combination, e.g. one linked session and one window overlap).
     pub method: String,
 }
 
@@ -101,44 +118,103 @@ fn overlaps(a0: i64, a1: i64, b0: i64, b1: i64) -> bool {
     a0 <= b1 && b0 <= a1
 }
 
-/// Pure join: attribute each session's burn to every ExecPlan whose fact window
-/// overlaps the session window. Returns `plan id → TokenBurn` for the plans that
-/// received at least one session. No IO, no clock — deterministic in its inputs.
+/// Pure join: attribute each session's burn to the ExecPlans it worked.
+///
+/// **Link-preferring (OD-30).** A session that carries `execplan_slugs` (the
+/// producer derived which plans it actually worked) is credited **only** to those
+/// plans — precise, `method = "link"`. A session with no link falls back to the
+/// window-overlap path (every plan whose fact window overlaps the session window),
+/// passport-refined as before. This is the precision fix for the parent plan's
+/// `finding:window-overlap-too-coarse` (a multi-day session credited ~every
+/// concurrently-active plan).
+///
+/// **OD-30 v2 — multi-plan split: even-split.** When a session links N plans, its
+/// burn is split **evenly** — each linked plan receives `burn / N` (N = the
+/// emitted slug count). This keeps a high-fan-out session (observed: up to 16
+/// plans) from inflating every plan it touched: the sum across plans is ≤ the
+/// session total, never a multiple of it. A single-plan session still gives the
+/// full burn. The denominator is the worked-plan count, not the projected count,
+/// so a plan's share is stable as siblings project. (v1 was full-credit-each,
+/// which over-counted high-fan-out sessions and relied on a tight top-K cap to
+/// hide it; the cap is now just a sanity bound — see `crux_cost::MAX_EXECPLAN_SLUGS`.)
+///
+/// Returns `plan id → TokenBurn` for the plans that received at least one session.
+/// No IO, no clock — deterministic in its inputs.
 #[must_use]
 pub fn attribute(sessions: &[SessionBurn], plans: &[PlanWindow]) -> BTreeMap<String, TokenBurn> {
-    /// Per-plan accumulator (`passport_hits` tracks how many attributed sessions
-    /// were passport-confirmed, to derive the method label).
+    /// Per-plan accumulator. `link_hits`/`window_hits` count how each attributed
+    /// session reached this plan; `passport_hits ⊆ window_hits` are the
+    /// poster-confirmed window edges. The `method` label is derived from these.
     #[derive(Default)]
     struct Acc {
         ctx: u64,
         out: u64,
         sessions: u32,
+        link_hits: u32,
+        window_hits: u32,
         passport_hits: u32,
     }
+
+    // Plan ids that currently project as work items. The link path only credits a
+    // slug that resolves to a known plan; an as-yet-unprojected slug (rsync lag)
+    // is skipped, and the read-time recompute self-heals once it lands.
+    let plan_ids: HashSet<&str> = plans.iter().map(|p| p.id.as_str()).collect();
+
     let mut acc: BTreeMap<String, Acc> = BTreeMap::new();
     for s in sessions {
-        for p in plans {
-            if !overlaps(s.start_ms, s.end_ms, p.start_ms, p.end_ms) {
-                continue;
+        if s.execplan_slugs.is_empty() {
+            // Fallback: window-overlap, passport-refined (v1 behaviour, unchanged).
+            for p in plans {
+                if !overlaps(s.start_ms, s.end_ms, p.start_ms, p.end_ms) {
+                    continue;
+                }
+                let e = acc.entry(p.id.clone()).or_default();
+                e.ctx = e.ctx.saturating_add(s.context_tokens);
+                e.out = e.out.saturating_add(s.output_tokens);
+                e.sessions += 1;
+                e.window_hits += 1;
+                let confirmed = s
+                    .poster_passport
+                    .as_deref()
+                    .is_some_and(|pp| p.agents.iter().any(|a| a == pp));
+                if confirmed {
+                    e.passport_hits += 1;
+                }
             }
-            let e = acc.entry(p.id.clone()).or_default();
-            e.ctx = e.ctx.saturating_add(s.context_tokens);
-            e.out = e.out.saturating_add(s.output_tokens);
-            e.sessions += 1;
-            let confirmed = s
-                .poster_passport
-                .as_deref()
-                .is_some_and(|pp| p.agents.iter().any(|a| a == pp));
-            if confirmed {
-                e.passport_hits += 1;
+        } else {
+            // Precise: split the session's burn EVENLY across the plans it worked
+            // (OD-30 v2). The denominator is the worked-plan **count** (len of the
+            // emitted slugs), so a plan's share is stable even if a sibling slug
+            // has not yet projected as a work item (it does not jump when the
+            // sibling lands). Integer division floors the share — the dropped
+            // remainder means the sum across plans is ≤ the session total, never
+            // inflated. A single-plan session (n=1) still gets the full burn.
+            let n = s.execplan_slugs.len() as u64; // ≥ 1 in this branch (non-empty)
+            let ctx_share = s.context_tokens / n;
+            let out_share = s.output_tokens / n;
+            for slug in &s.execplan_slugs {
+                let id = format!("execplan:{slug}");
+                if !plan_ids.contains(id.as_str()) {
+                    continue;
+                }
+                let e = acc.entry(id).or_default();
+                e.ctx = e.ctx.saturating_add(ctx_share);
+                e.out = e.out.saturating_add(out_share);
+                e.sessions += 1;
+                e.link_hits += 1;
             }
         }
     }
     acc.into_iter()
         .map(|(id, a)| {
-            let method = if a.passport_hits == 0 {
+            let method = if a.link_hits > 0 && a.window_hits == 0 {
+                "link"
+            } else if a.link_hits > 0 {
+                // Some sessions linked precisely, others window-overlapped this plan.
+                "mixed"
+            } else if a.passport_hits == 0 {
                 "window"
-            } else if a.passport_hits == a.sessions {
+            } else if a.passport_hits == a.window_hits {
                 "passport+window"
             } else {
                 "mixed"
@@ -197,6 +273,7 @@ pub fn session_burns_from_reports(reports: &[StoredReport]) -> Vec<SessionBurn> 
                 start_ms,
                 end_ms,
                 poster_passport: poster,
+                execplan_slugs: r.report.execplan_slugs.clone(),
                 context_tokens: r.report.headline.measured_context_total,
                 output_tokens: r.report.measured.output,
             })
@@ -255,6 +332,21 @@ mod tests {
             start_ms: start,
             end_ms: end,
             poster_passport: poster.map(str::to_string),
+            execplan_slugs: Vec::new(),
+            context_tokens: ctx,
+            output_tokens: out,
+        }
+    }
+
+    /// A session carrying a transcript-derived link to one or more plan slugs.
+    /// Window is irrelevant for the link path, so it is left at a point.
+    fn sess_linked(id: &str, ctx: u64, out: u64, slugs: &[&str]) -> SessionBurn {
+        SessionBurn {
+            session_id: id.to_string(),
+            start_ms: 0,
+            end_ms: 0,
+            poster_passport: None,
+            execplan_slugs: slugs.iter().map(|s| (*s).to_string()).collect(),
             context_tokens: ctx,
             output_tokens: out,
         }
@@ -336,6 +428,102 @@ mod tests {
     }
 
     #[test]
+    fn link_credits_only_worked_plans_and_skips_window() {
+        // The session's *window* overlaps a, b AND c, but its transcript link
+        // names only `a`. Window-overlap would credit all three; the link path
+        // credits a alone, precisely.
+        let sessions = vec![SessionBurn {
+            session_id: "s".to_string(),
+            start_ms: 100,
+            end_ms: 200,
+            poster_passport: None,
+            execplan_slugs: vec!["a".to_string()],
+            context_tokens: 1000,
+            output_tokens: 10,
+        }];
+        let plans = vec![
+            plan("execplan:a", 100, 300, &[]),
+            plan("execplan:b", 100, 300, &[]),
+            plan("execplan:c", 100, 300, &[]),
+        ];
+        let out = attribute(&sessions, &plans);
+        assert_eq!(out.len(), 1);
+        let a = out.get("execplan:a").unwrap();
+        assert_eq!(a.context_tokens, 1000);
+        assert_eq!(a.output_tokens, 10);
+        assert_eq!(a.sessions, 1);
+        assert_eq!(a.method, "link");
+        assert!(!out.contains_key("execplan:b"));
+        assert!(!out.contains_key("execplan:c"));
+    }
+
+    #[test]
+    fn link_even_split_across_multi_plan_session() {
+        // OD-30 v2: a session that worked two plans splits its burn evenly.
+        let sessions = vec![sess_linked("s", 900, 9, &["a", "b"])];
+        let plans = vec![plan("execplan:a", 0, 1, &[]), plan("execplan:b", 0, 1, &[])];
+        let out = attribute(&sessions, &plans);
+        assert_eq!(out.get("execplan:a").unwrap().context_tokens, 450); // 900 / 2
+        assert_eq!(out.get("execplan:b").unwrap().context_tokens, 450);
+        assert_eq!(out.get("execplan:a").unwrap().output_tokens, 4); // 9 / 2, floored
+        assert_eq!(out.get("execplan:a").unwrap().method, "link");
+        // Sum across plans never exceeds the session total (no inflation).
+        let total: u64 = out.values().map(|t| t.context_tokens).sum();
+        assert!(total <= 900);
+    }
+
+    #[test]
+    fn link_single_plan_session_gets_full_burn() {
+        let sessions = vec![sess_linked("s", 1000, 10, &["solo"])];
+        let plans = vec![plan("execplan:solo", 0, 1, &[])];
+        let out = attribute(&sessions, &plans);
+        assert_eq!(out.get("execplan:solo").unwrap().context_tokens, 1000); // n=1
+    }
+
+    #[test]
+    fn link_denominator_is_worked_count_not_projected_count() {
+        // `ghost` has no work item yet (rsync lag) → not credited; but the split
+        // denominator is still 2 (the worked-plan count), so `known` gets 500/2,
+        // NOT 500/1 — its share stays stable when `ghost` later projects.
+        let sessions = vec![sess_linked("s", 500, 5, &["known", "ghost"])];
+        let plans = vec![plan("execplan:known", 0, 1, &[])];
+        let out = attribute(&sessions, &plans);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("execplan:known").unwrap().context_tokens, 250); // 500 / 2
+        assert!(!out.contains_key("execplan:ghost"));
+    }
+
+    #[test]
+    fn linked_session_with_no_known_slug_contributes_nothing() {
+        // A session that *does* carry a link never falls back to window-overlap,
+        // even if none of its slugs project yet (avoids re-introducing over-credit).
+        let sessions = vec![SessionBurn {
+            session_id: "s".to_string(),
+            start_ms: 100,
+            end_ms: 200,
+            poster_passport: None,
+            execplan_slugs: vec!["ghost".to_string()],
+            context_tokens: 1000,
+            output_tokens: 10,
+        }];
+        let plans = vec![plan("execplan:a", 100, 300, &[])]; // window overlaps, but no link match
+        assert!(attribute(&sessions, &plans).is_empty());
+    }
+
+    #[test]
+    fn mixed_method_when_one_session_links_and_another_windows() {
+        // Plan a is reached by a precise link (session 1) and a coarse window
+        // overlap (session 2) → honestly labelled `mixed`.
+        let sessions = vec![sess_linked("s1", 100, 1, &["a"]), sess("s2", 100, 200, None, 50, 1)];
+        let plans = vec![plan("execplan:a", 100, 300, &[])];
+        let out = attribute(&sessions, &plans);
+        let a = out.get("execplan:a").unwrap();
+        assert_eq!(a.sessions, 2);
+        assert_eq!(a.context_tokens, 150);
+        assert_eq!(a.method, "mixed");
+    }
+
+    #[test]
     fn empty_inputs_yield_empty_map() {
         assert!(attribute(&[], &[plan("execplan:a", 0, 10, &[])]).is_empty());
         assert!(attribute(&[sess("s", 0, 10, None, 1, 1)], &[]).is_empty());
@@ -392,6 +580,41 @@ mod tests {
         assert!(items[0].token_burn.is_none());
     }
 
+    #[test]
+    fn stamp_token_burn_prefers_link_over_window() {
+        // Both items' fact windows overlap the session; the session links only `a`.
+        // End-to-end through the glue: only `a` is stamped (precise), not `b`.
+        let mut items = vec![
+            wi_with_provenance("execplan:a", 1_000, 2_000, &["alice"]),
+            wi_with_provenance("execplan:b", 1_000, 2_000, &["alice"]),
+        ];
+        let sessions = vec![SessionBurn {
+            session_id: "s".to_string(),
+            start_ms: 1_500,
+            end_ms: 1_800,
+            poster_passport: Some("alice".to_string()),
+            execplan_slugs: vec!["a".to_string()],
+            context_tokens: 4_242,
+            output_tokens: 99,
+        }];
+        stamp_token_burn(&mut items, &sessions);
+        let a = items[0].token_burn.as_ref().expect("a stamped via link");
+        assert_eq!(a.context_tokens, 4_242);
+        assert_eq!(a.method, "link"); // link wins even though the poster is a plan agent
+        assert!(
+            items[1].token_burn.is_none(),
+            "b is not linked → untouched despite window overlap"
+        );
+    }
+
+    #[test]
+    fn session_burns_carry_execplan_slugs() {
+        let mut s = stored("2026-06-25T11:00:00.000Z", "2026-06-25T12:00:00.000Z");
+        s.report.execplan_slugs = vec!["worked-plan".to_string()];
+        let burns = session_burns_from_reports(std::slice::from_ref(&s));
+        assert_eq!(burns[0].execplan_slugs, vec!["worked-plan".to_string()]);
+    }
+
     /// Minimal ExecPlan-shaped [`WorkItem`] with a provenance fact-window, for the
     /// stamping tests.
     fn wi_with_provenance(id: &str, first_ms: u64, last_ms: u64, agents: &[&str]) -> WorkItem {
@@ -445,6 +668,7 @@ mod tests {
                 generated_at: Some("2026-06-25T12:31:00Z".to_string()),
                 started_at: Some(started.to_string()),
                 ended_at: Some(ended.to_string()),
+                execplan_slugs: Vec::new(),
                 headline: crux_cost::Headline {
                     assistant_turns: 10,
                     tasks: 2,
