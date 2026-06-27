@@ -89,6 +89,26 @@ pub fn fact_full_within_budget(token_costs: &[usize], budget: usize) -> usize {
     full.max(1).min(token_costs.len())
 }
 
+/// M1 part 3 (CO-6) — **budget the emitted fact-pointer tier.** Returns
+/// `(full_count, emit_count)`: the leading `full_count` facts are hydrated at
+/// full cost ([`fact_full_within_budget`]), then the *remaining* budget buys
+/// epitome pointers at [`POINTER_TOKENS`] each; every fact past `emit_count` is
+/// **dropped** (an honest pointer-cost drop, disclosed via `total_candidates`).
+///
+/// This restores QC.2 on the fact path: the emitted payload (full facts +
+/// epitome pointers) stays within `budget`, mirroring the segment path's
+/// [`pointers_within_budget`] — which the fact path lacked, so it used to emit a
+/// pointer for *every* candidate and overshoot the budget. `emit_count` is always
+/// ≥ `full_count` ≥ 1 (a tiny budget still hydrates the top hit).
+pub fn fact_emit_within_budget(token_costs: &[usize], budget: usize) -> (usize, usize) {
+    let full_count = fact_full_within_budget(token_costs, budget);
+    let used_full: usize = token_costs.iter().take(full_count).sum();
+    let remaining = budget.saturating_sub(used_full);
+    let epitomes = remaining / POINTER_TOKENS;
+    let emit_count = full_count.saturating_add(epitomes).min(token_costs.len());
+    (full_count, emit_count.max(full_count))
+}
+
 /// M1 part 2 — OD-A content hash. A short, stable, dependency-free digest of a
 /// fact value, carried on a *demoted* fact pointer so a caller can detect
 /// staleness when it re-addresses the fact (entity+key): a hash mismatch means
@@ -166,6 +186,44 @@ mod tests {
     #[test]
     fn fact_boundary_all_fit_under_budget() {
         assert_eq!(fact_full_within_budget(&[10, 10, 10], 1000), 3);
+    }
+
+    #[test]
+    fn fact_emit_caps_to_budget_with_epitome_tail() {
+        // 30 facts of 300 tok each, budget 1000. Full: 300+300+300=900 (the 4th
+        // would cross 1000), so full_count=3 / used 900. Remaining 100 buys
+        // 100/40 = 2 epitomes ⇒ emit 5 (3 full + 2 epitome), cost 900+80=980 ≤
+        // 1000. The other 25 are dropped (disclosed via total_candidates).
+        let costs = vec![300usize; 30];
+        assert_eq!(fact_emit_within_budget(&costs, 1000), (3, 5));
+    }
+
+    #[test]
+    fn fact_emit_all_fit_no_cap() {
+        // Everything fits full under budget ⇒ emit all, no epitome/cap.
+        let costs = [10, 10, 10];
+        assert_eq!(fact_emit_within_budget(&costs, 1000), (3, 3));
+    }
+
+    #[test]
+    fn fact_emit_single_oversized_fact() {
+        // One fact bigger than the whole budget: full_count=1 (admit-the-top
+        // rule), no remaining ⇒ emit just it. Honest, within-intent.
+        let costs = [500, 80, 80];
+        assert_eq!(fact_emit_within_budget(&costs, 100), (1, 1));
+    }
+
+    #[test]
+    fn fact_emit_stays_within_budget() {
+        // Property: emitted cost (full + 40·epitomes) never exceeds budget.
+        for budget in [40usize, 200, 777, 2000, 4000] {
+            let costs = vec![137usize; 50];
+            let (full, emit) = fact_emit_within_budget(&costs, budget);
+            let used_full: usize = costs.iter().take(full).sum();
+            let cost = used_full + (emit - full) * POINTER_TOKENS;
+            assert!(cost <= budget.max(costs[0]), "budget {budget}: cost {cost} > {budget}");
+            assert!(emit >= full && full >= 1);
+        }
     }
 
     #[test]

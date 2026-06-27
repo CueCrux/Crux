@@ -205,8 +205,9 @@ fn value_str(v: &Value) -> String {
 /// nests this under `structuredContent.crc_v1` so the daemon's audit-envelope
 /// wrapper (which overwrites `structuredContent.envelope`) does NOT collide.
 pub fn wrap_facts(rows: &[Value], entity: Option<&str>, query: Option<&str>) -> Value {
-    // No demotion: every row is hydrated full (byte-identical to pre-M1-part-2).
-    wrap_facts_tiered(rows, entity, query, rows.len())
+    // No demotion, no cap: every row is hydrated full and nothing is dropped
+    // (byte-identical to pre-M1-part-2).
+    wrap_facts_tiered(rows, entity, query, rows.len(), rows.len())
 }
 
 /// As [`wrap_facts`], but the first `full_count` rows (ranked order) are
@@ -217,11 +218,24 @@ pub fn wrap_facts(rows: &[Value], entity: Option<&str>, query: Option<&str>) -> 
 /// overflow on the fact path: over-budget facts are demoted, not dropped, and
 /// the emitted payload pays the epitome price for them, not the full price.
 ///
-/// **Byte-identical guarantee:** when `full_count >= rows.len()` there is no
-/// demotion — no `content_hash`, no `"Demoted"` reason, `content[]` carries
-/// every row, `hydrate_tier` stays `"full"`, and `meta` gains no demotion keys —
-/// so the output is identical to the pre-M1-part-2 `wrap_facts`.
-pub fn wrap_facts_tiered(rows: &[Value], entity: Option<&str>, query: Option<&str>, full_count: usize) -> Value {
+/// **M1 part 3 (CO-6) — budget cap.** `rows` is the *already-capped* emitted set
+/// (≤ the budget's pointer tier); `total_candidates` is the full ranked-set size
+/// before the cap, so `meta` can disclose how many facts were dropped beyond the
+/// budget (`capped`) — the agent re-queries (entity+key) for the rest. Callers
+/// that don't cap pass `total_candidates == rows.len()`.
+///
+/// **Byte-identical guarantee:** when `full_count >= rows.len()` AND
+/// `total_candidates == rows.len()` there is no demotion or cap — no
+/// `content_hash`, no `"Demoted"` reason, `content[]` carries every row,
+/// `hydrate_tier` stays `"full"`, and `meta` gains no demotion/cap keys — so the
+/// output is identical to the pre-M1-part-2 `wrap_facts`.
+pub fn wrap_facts_tiered(
+    rows: &[Value],
+    entity: Option<&str>,
+    query: Option<&str>,
+    full_count: usize,
+    total_candidates: usize,
+) -> Value {
     let mut pointers = Vec::with_capacity(rows.len());
     let mut content = Vec::with_capacity(rows.len());
     let mut memories_used = Vec::with_capacity(rows.len());
@@ -324,13 +338,19 @@ pub fn wrap_facts_tiered(rows: &[Value], entity: Option<&str>, query: Option<&st
         "resolved_by": if addressed { "entity+key" } else { "query" },
         "ranked": query.is_some() && !addressed,
     });
-    if demoted > 0 {
-        // Disclosure (additive, demotion-only): how many facts were demoted to
-        // epitome-only and the full candidate count, so nothing is silently lost.
+    let total = total_candidates as u64;
+    let capped = total.saturating_sub(n); // facts dropped beyond the budget cap
+    if demoted > 0 || capped > 0 {
+        // Disclosure (additive): how many facts were demoted to epitome-only,
+        // how many were dropped beyond the budget cap, and the full candidate
+        // count — so nothing is silently lost (re-query entity+key for the rest).
         if let Some(m) = meta.as_object_mut() {
             m.insert("demoted".into(), json!(demoted));
-            m.insert("total_candidates".into(), json!(n));
+            m.insert("total_candidates".into(), json!(total));
             m.insert("emitted_full".into(), json!(n - demoted));
+            if capped > 0 {
+                m.insert("capped".into(), json!(capped));
+            }
         }
     }
     out.insert("meta".into(), meta);
@@ -477,7 +497,7 @@ mod tests {
         // full_count == rows.len() must equal the plain wrap_facts (the OFF net).
         let rows = vec![fact_row("a", "alpha"), fact_row("b", "beta")];
         let full = wrap_facts(&rows, Some("proj"), None);
-        let tiered = wrap_facts_tiered(&rows, Some("proj"), None, rows.len());
+        let tiered = wrap_facts_tiered(&rows, Some("proj"), None, rows.len(), rows.len());
         assert_eq!(full, tiered);
         // …and neither leaks demotion fields.
         assert_eq!(full["hydrate_tier"], "full");
@@ -488,8 +508,8 @@ mod tests {
     #[test]
     fn wrap_facts_tiered_demotes_overflow_to_epitome_only() {
         let rows = vec![fact_row("a", "alpha"), fact_row("b", "beta"), fact_row("c", "gamma")];
-        // Keep 1 full, demote the other 2.
-        let out = wrap_facts_tiered(&rows, Some("proj"), None, 1);
+        // Keep 1 full, demote the other 2 (all 3 emitted, so total == n, no cap).
+        let out = wrap_facts_tiered(&rows, Some("proj"), None, 1, rows.len());
         assert_eq!(out["hydrate_tier"], "mixed");
         // Only the first fact carries inline content.
         assert_eq!(out["content"].as_array().unwrap().len(), 1);
@@ -506,6 +526,25 @@ mod tests {
         assert_eq!(out["meta"]["demoted"], 2);
         assert_eq!(out["meta"]["total_candidates"], 3);
         assert_eq!(out["meta"]["emitted_full"], 1);
+        assert!(out["meta"].get("capped").is_none(), "nothing dropped beyond the cap");
+    }
+
+    #[test]
+    fn wrap_facts_tiered_caps_to_budget_and_discloses() {
+        // M1 part 3: the emitted set is capped (2 of 5 candidates); meta discloses
+        // the 3 dropped beyond the budget so the agent can re-query for them.
+        let rows = vec![fact_row("a", "alpha"), fact_row("b", "beta")];
+        let out = wrap_facts_tiered(&rows, Some("proj"), None, 1, 5);
+        assert_eq!(
+            out["pointers"].as_array().unwrap().len(),
+            2,
+            "only the budgeted tier is emitted"
+        );
+        assert_eq!(out["meta"]["total_candidates"], 5);
+        assert_eq!(out["meta"]["emitted_full"], 1);
+        assert_eq!(out["meta"]["demoted"], 1);
+        assert_eq!(out["meta"]["capped"], 3, "5 candidates − 2 emitted = 3 dropped");
+        assert_eq!(out["hydrate_tier"], "mixed");
     }
 
     #[test]

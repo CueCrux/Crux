@@ -522,14 +522,20 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     // carries the CRC-v1 envelope for text-reading agents. Absent contract →
     // legacy shape, byte-identical.
     if crate::crc_v1::enabled(args) {
-        // M1 part 2: under reversible mode, demote the over-budget tail to
-        // epitome-only instead of dropping it. `full_count` = how many leading
-        // facts fit the budget at full cost (== the count the legacy drop kept).
+        // M1 part 2/3: under reversible mode, hydrate `full_count` facts full and
+        // demote the rest to epitome-only — but **budget the emitted tier** (M1
+        // pt3 / CO-6): emit only `emit_count` pointers (full + epitomes that fit
+        // the budget), drop the rest, and disclose the full count via
+        // `total_candidates` so the agent re-queries for the remainder. This keeps
+        // the emitted payload within `token_budget` (QC.2), which the uncapped
+        // pt2 path violated by emitting a pointer for every candidate.
         let crc = if reversible {
             let costs: Vec<usize> = visible.iter().map(|f| f.tokens).collect();
             let budget = token_budget.unwrap_or(0);
-            let full_count = crate::budget::fact_full_within_budget(&costs, budget);
-            crate::crc_v1::wrap_facts_tiered(&rows, entity.as_deref(), query.as_deref(), full_count)
+            let (full_count, emit_count) = crate::budget::fact_emit_within_budget(&costs, budget);
+            let total = rows.len();
+            let emitted = &rows[..emit_count.min(rows.len())];
+            crate::crc_v1::wrap_facts_tiered(emitted, entity.as_deref(), query.as_deref(), full_count, total)
         } else {
             crate::crc_v1::wrap_facts(&rows, entity.as_deref(), query.as_deref())
         };
@@ -877,34 +883,37 @@ mod tests {
         assert!(off_crc["meta"].get("demoted").is_none(), "OFF must not demote");
         assert!(off_rows < 6, "OFF drops overflow (kept {off_rows} of 6)");
 
-        // Flag ON: reversible — overflow demoted to epitome-only, nothing dropped.
+        // Flag ON: reversible — M1 pt3 budgets the emitted tier: hydrate the
+        // within-budget head full, demote some to epitome if the budget allows,
+        // and DROP the rest beyond the budget cap (disclosed via total_candidates).
         std::env::set_var(crate::budget::REVERSIBLE_ENV, "1");
         let on = handle_query_facts(&args, &ctx).await.unwrap();
         let on_crc = &on["structuredContent"]["crc_v1"];
         std::env::remove_var(crate::budget::REVERSIBLE_ENV);
 
-        assert_eq!(on_crc["hydrate_tier"], "mixed");
-        let pointers = on_crc["pointers"].as_array().unwrap().len();
-        let content = on_crc["content"].as_array().unwrap().len();
-        let demoted = on_crc["meta"]["demoted"].as_u64().unwrap();
+        let pointers = on_crc["pointers"].as_array().unwrap().len() as u64;
+        let content = on_crc["content"].as_array().unwrap().len() as u64;
         let emitted_full = on_crc["meta"]["emitted_full"].as_u64().unwrap();
-        assert_eq!(pointers, 6, "ON keeps all candidates as pointers (none dropped)");
-        assert!(content < pointers, "ON hydrates only the within-budget head");
+        let capped = on_crc["meta"]["capped"].as_u64().unwrap_or(0);
         assert_eq!(on_crc["meta"]["total_candidates"], 6);
-        assert!(demoted > 0);
-        // Drop→demote parity: the count hydrated full == the count OFF kept.
+        // QC.2 — the emitted tier is BUDGETED, so at this tight budget it does NOT
+        // emit all 6; the overflow is capped (dropped beyond budget), not emitted.
+        assert!(
+            pointers < 6 && capped > 0,
+            "cap must engage: emitted {pointers}, capped {capped}"
+        );
+        // Conservation: emitted + capped == all candidates (nothing silently lost).
+        assert_eq!(pointers + capped, 6);
+        // content[] is exactly the full hydrations; the rest of the emitted tier
+        // (if any) are epitome pointers.
+        assert_eq!(content, emitted_full);
+        // Drop→demote parity: the full-hydration count == the legacy drop count.
         assert_eq!(
             emitted_full as usize, off_rows,
             "emitted_full must match the legacy drop count"
         );
-        // Demoted pointers carry the OD-A content hash for stale detection.
-        let demoted_ptr = on_crc["pointers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["reason"] == "Demoted")
-            .unwrap();
-        assert!(demoted_ptr["content_hash"].is_string());
+        // Recall is still ≥ the legacy drop (cap only drops what won't fit budget).
+        assert!(pointers >= off_rows as u64, "reversible recall ≥ legacy drop");
     }
 
     // ── D1: bi-temporal as_of on query_facts ────────────────────────
