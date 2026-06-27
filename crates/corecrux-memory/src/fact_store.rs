@@ -715,6 +715,11 @@ impl FactStore {
             let text = format!("{} {} {}", fact.entity, fact.key, fact.value);
             match client.embed_one(&text) {
                 Ok(vec) => {
+                    // Free, Bring-Your-Own-embedder dense lane. This store is
+                    // deliberately **uncapped** (ExecPlan
+                    // dense-lane-and-extraction-upsell-2026-06-26, constraint C1):
+                    // do NOT add a corpus cap or eviction here. Scale/quality is
+                    // the metered upsell, never a clip on local dense.
                     self.embeddings.insert(fact.fact_id.clone(), vec);
                 }
                 Err(err) => {
@@ -929,7 +934,10 @@ impl FactStore {
         };
 
         if let Some(ref qe) = query_embedding {
-            // Score = 0.6 * cosine_similarity + 0.4 * confidence
+            // Score = 0.6 * cosine_similarity + 0.4 * confidence.
+            // Ranks the WHOLE filtered result set — the token_budget / top_k
+            // selection below is a presentation limit, not a corpus cap. Keep it
+            // uncapped (ExecPlan dense-lane-and-extraction-upsell C1).
             results.sort_by(|a, b| {
                 let sim_a = self
                     .embeddings

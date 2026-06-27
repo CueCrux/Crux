@@ -553,6 +553,10 @@ async fn maybe_wrap_with_envelope(
 fn enforce_rcx_tool_capability(id: Option<serde_json::Value>, name: &str, ctx: &McpContext) -> Option<JsonRpcResponse> {
     let router = ctx.rcx_router.as_ref()?;
     let tool = tools::rcx_mcp_tool_capability(name);
+    // Capture the capability before it moves into CallContext so a denial of a
+    // metered service scope can carry an upsell hint (M3). Free local lanes are
+    // never service scopes, so this is null for ordinary denials.
+    let denied_capability = tool.capability.clone();
     let decision = router.decide(
         &CallContext {
             capability: tool.capability,
@@ -605,6 +609,8 @@ fn enforce_rcx_tool_capability(id: Option<serde_json::Value>, name: &str, ctx: &
                 "revocation_checked": decision.stamp.revocation_checked,
             },
             "refusal_receipt": refusal_receipt,
+            // Metered-service denials carry an upsell; null for free/local lanes (M3).
+            "upgrade_hint": crate::tools::upsell::upgrade_hint(&denied_capability),
         }),
     ))
 }

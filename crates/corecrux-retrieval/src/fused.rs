@@ -11,16 +11,21 @@
 //! 3. Optionally incorporates dense vector cosine similarity
 //! 4. Returns scored, ranked results
 //!
-//! ## Dense vector lane decision (ADR-CORECRUX-0001, 2026-04-03)
+//! ## Dense vector lane (ExecPlan `dense-lane-and-extraction-upsell-2026-06-26`)
 //!
-//! This legacy Crux crate does not own vector search. Native dense retrieval
-//! lives in CoreCrux `.ccxe` companions; this path keeps the request field for
-//! wire compatibility but reports the dense lane inactive rather than pretending
-//! a local vector score was computed.
+//! The dense lane is now a **first-class, uncapped, local** capability. When the
+//! caller supplies a [`DenseProvider`], the lane re-ranks the BM25 candidate pool
+//! with cosine similarity and `dense_lane_active` is reported `true`. When no
+//! provider is supplied the lane stays inert (`dense_component = 0.0`,
+//! `dense_lane_active = false`) — bit-identical to the prior
+//! ADR-CORECRUX-0001 behaviour. See [`crate::dense`] for the trait and the CE's
+//! exact-cosine provider, and the plan's M2 Decision Log for the
+//! re-rank-vs-ANN-recall scope note.
 
 use serde::{Deserialize, Serialize};
 
 use crate::bm25::{bm25_score_multi, Bm25Params, MergedBm25Hit};
+use crate::dense::DenseProvider;
 use crate::index_manager::IndexManager;
 
 /// Weights for fused scoring.
@@ -126,11 +131,17 @@ pub fn fused_retrieve(
     index_mgr: &IndexManager,
     req: &FusedRetrieveRequest,
     graph_boost_fn: Option<&dyn Fn(u32, usize) -> (f32, u32)>, // (boost_score, hop_distance)
+    dense_provider: Option<&dyn DenseProvider>,
 ) -> crate::Result<FusedRetrieveResponse> {
     let readers = index_mgr.readers();
     if readers.is_empty() {
         return Err(crate::RetrievalError::NoIndex);
     }
+
+    // The dense lane is active whenever a provider is wired in (the caller only
+    // supplies one when it holds a query embedding). Absent a provider the lane
+    // stays inert — bit-identical to the pre-plan ADR-CORECRUX-0001 path.
+    let dense_lane_active = dense_provider.is_some();
 
     // Graph cold-start: if the projection graph has fewer entities than threshold,
     // zero out graph weight and redistribute to BM25. Early users get pure BM25,
@@ -180,7 +191,7 @@ pub fn fused_retrieve(
                 docs_scanned: index_mgr.total_docs(),
                 postings_decoded: 0,
                 graph_nodes_expanded: 0,
-                dense_lane_active: false,
+                dense_lane_active,
             },
         });
     }
@@ -208,10 +219,13 @@ pub fn fused_retrieve(
                 (0.0, 0)
             };
 
-            // Dense vectors are CoreCrux-owned. This legacy Crux path keeps
-            // the response field for compatibility and reports the lane
-            // inactive in `RetrievalStats`.
-            let dense_component = 0.0f32;
+            // Dense lane: re-rank this BM25 candidate with the provider's cosine
+            // score. Absent a provider (or a candidate with no stored vector),
+            // the lane contributes nothing.
+            let dense_component = match dense_provider {
+                Some(p) => p.dense_score(h.doc_id, h.segment_index).unwrap_or(0.0),
+                None => 0.0f32,
+            };
 
             // Fused score
             let score = effective_weights.bm25 * bm25_normalized
@@ -245,7 +259,7 @@ pub fn fused_retrieve(
             docs_scanned: index_mgr.total_docs(),
             postings_decoded: bm25_hits.len(),
             graph_nodes_expanded: graph_expanded,
-            dense_lane_active: false,
+            dense_lane_active,
         },
     })
 }
@@ -352,7 +366,7 @@ mod tests {
             graph_node_count: 0,
             graph_cold_start_threshold: 100,
         };
-        let resp = fused_retrieve(&mgr, &req, None).unwrap();
+        let resp = fused_retrieve(&mgr, &req, None, None).unwrap();
         assert_eq!(resp.results.len(), 1, "should return exactly 1 hit for target tenant");
         assert_eq!(
             resp.results[0].doc_id, 0,
@@ -377,7 +391,7 @@ mod tests {
             graph_node_count: 0,
             graph_cold_start_threshold: 100,
         };
-        let resp2 = fused_retrieve(&mgr, &req2, None).unwrap();
+        let resp2 = fused_retrieve(&mgr, &req2, None, None).unwrap();
         assert_eq!(resp2.results.len(), 1, "collider tenant should see exactly 1 hit");
         assert_eq!(
             resp2.results[0].doc_id, 1,
@@ -407,7 +421,7 @@ mod tests {
             graph_cold_start_threshold: 100,
         };
 
-        let resp = fused_retrieve(&mgr, &req, None).unwrap();
+        let resp = fused_retrieve(&mgr, &req, None, None).unwrap();
         assert!(!resp.results.is_empty());
         // Terraform drift doc should be top result
         assert_eq!(resp.results[0].doc_id, 0);
@@ -435,7 +449,7 @@ mod tests {
             graph_cold_start_threshold: 100,
         };
 
-        let resp = fused_retrieve(&mgr, &req, None).unwrap();
+        let resp = fused_retrieve(&mgr, &req, None, None).unwrap();
         assert!(!resp.stats.dense_lane_active);
         assert!(resp.results.iter().all(|hit| hit.score_breakdown.dense == 0.0));
     }
@@ -466,14 +480,14 @@ mod tests {
 
         // With a graph boost fn that returns 1.0 for everything
         let boost_fn = |_doc_id: u32, _seg_idx: usize| -> (f32, u32) { (1.0, 1) };
-        let resp_cold = fused_retrieve(&mgr, &req_cold, Some(&boost_fn)).unwrap();
+        let resp_cold = fused_retrieve(&mgr, &req_cold, Some(&boost_fn), None).unwrap();
 
         // Same query but with enough graph nodes (above threshold)
         let req_warm = FusedRetrieveRequest {
             graph_node_count: 200, // above threshold
             ..req_cold.clone()
         };
-        let resp_warm = fused_retrieve(&mgr, &req_warm, Some(&boost_fn)).unwrap();
+        let resp_warm = fused_retrieve(&mgr, &req_warm, Some(&boost_fn), None).unwrap();
 
         // In cold start, graph weight is zero, so all scores should be pure BM25.
         // With a universal 1.0 graph boost and 50/50 weights, warm scores should be higher.
@@ -493,5 +507,124 @@ mod tests {
         // But the key test: cold result ignores graph entirely in ranking.
         assert!(cold_top.score > 0.0, "cold-start should still produce scores");
         assert!(warm_top.score > 0.0, "warm should produce scores");
+    }
+
+    /// A trivial provider returning a fixed score for every candidate.
+    struct FixedDenseProvider(f32);
+    impl crate::dense::DenseProvider for FixedDenseProvider {
+        fn dense_score(&self, _doc_id: u32, _segment_index: usize) -> Option<f32> {
+            Some(self.0)
+        }
+    }
+
+    #[test]
+    fn dense_provider_lights_up_lane() {
+        let (mgr, _) = build_test_index_manager();
+        let req = FusedRetrieveRequest {
+            tenant_id: "test-tenant".to_string(),
+            query: "terraform drift detection".to_string(),
+            query_embedding: Some(vec![0.0, 1.0, 0.0]),
+            top_k: 5,
+            weights: FusionWeights {
+                bm25: 0.0,
+                graph: 0.0,
+                dense: 1.0,
+                sparse: 0.0,
+            },
+            graph_hops: 0,
+            min_confidence: 0.0,
+            include_state: false,
+            graph_node_count: 0,
+            graph_cold_start_threshold: 100,
+        };
+
+        let provider = FixedDenseProvider(0.5);
+        let resp = fused_retrieve(&mgr, &req, None, Some(&provider)).unwrap();
+        assert!(resp.stats.dense_lane_active, "provider present → lane active");
+        assert!(!resp.results.is_empty());
+        for hit in &resp.results {
+            assert_eq!(hit.score_breakdown.dense, 0.5);
+            // dense weight 1.0, all other weights 0.0 → fused score == dense score
+            assert!((hit.score - 0.5).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn zero_provider_scores_match_no_provider() {
+        // A provider that always returns 0.0 must produce the SAME fused scores
+        // as no provider at all (dense_component is 0 in both). Only
+        // `dense_lane_active` differs (true vs false).
+        let (mgr, _) = build_test_index_manager();
+        let req = FusedRetrieveRequest {
+            tenant_id: "test-tenant".to_string(),
+            query: "terraform drift detection".to_string(),
+            query_embedding: Some(vec![0.0, 1.0, 0.0]),
+            top_k: 5,
+            weights: FusionWeights::default(),
+            graph_hops: 0,
+            min_confidence: 0.0,
+            include_state: false,
+            graph_node_count: 0,
+            graph_cold_start_threshold: 100,
+        };
+
+        let none_resp = fused_retrieve(&mgr, &req, None, None).unwrap();
+        let zero_provider = FixedDenseProvider(0.0);
+        let zero_resp = fused_retrieve(&mgr, &req, None, Some(&zero_provider)).unwrap();
+
+        assert!(!none_resp.stats.dense_lane_active);
+        assert!(zero_resp.stats.dense_lane_active);
+        assert_eq!(none_resp.results.len(), zero_resp.results.len());
+        for (a, b) in none_resp.results.iter().zip(zero_resp.results.iter()) {
+            assert_eq!(a.doc_id, b.doc_id, "ranking order unchanged");
+            assert!((a.score - b.score).abs() < 1e-9, "scores bit-equal");
+        }
+    }
+
+    #[test]
+    fn cosine_provider_reranks_semantic_match() {
+        use crate::dense::CosineDenseProvider;
+        use std::collections::HashMap;
+
+        let (mgr, _) = build_test_index_manager();
+        // Query that BM25 matches across both terraform docs (0 and 1).
+        let req = FusedRetrieveRequest {
+            tenant_id: "test-tenant".to_string(),
+            query: "terraform infrastructure".to_string(),
+            query_embedding: Some(vec![1.0, 0.0]),
+            top_k: 5,
+            weights: FusionWeights {
+                bm25: 0.5,
+                graph: 0.0,
+                dense: 0.5,
+                sparse: 0.0,
+            },
+            graph_hops: 0,
+            min_confidence: 0.0,
+            include_state: false,
+            graph_node_count: 0,
+            graph_cold_start_threshold: 100,
+        };
+
+        // Give doc 1 a vector aligned with the query, doc 0 an orthogonal one.
+        let mut vectors: HashMap<(u32, usize), Vec<f32>> = HashMap::new();
+        vectors.insert((0, 0), vec![0.0, 1.0]); // orthogonal → 0
+        vectors.insert((1, 0), vec![1.0, 0.0]); // aligned → 1
+        let provider = CosineDenseProvider::new(&[1.0, 0.0], vectors);
+
+        let resp = fused_retrieve(&mgr, &req, None, Some(&provider)).unwrap();
+        assert!(resp.stats.dense_lane_active);
+        let d0 = resp
+            .results
+            .iter()
+            .find(|h| h.doc_id == 0)
+            .map(|h| h.score_breakdown.dense);
+        let d1 = resp
+            .results
+            .iter()
+            .find(|h| h.doc_id == 1)
+            .map(|h| h.score_breakdown.dense);
+        assert_eq!(d0, Some(0.0), "orthogonal doc gets no dense boost");
+        assert_eq!(d1, Some(1.0), "aligned doc gets full dense boost");
     }
 }

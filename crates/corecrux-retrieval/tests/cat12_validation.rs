@@ -255,7 +255,7 @@ fn cat12_fused_retrieve() {
             }
         };
 
-        let resp = fused_retrieve(&mgr, &req, Some(&graph_boost)).unwrap();
+        let resp = fused_retrieve(&mgr, &req, Some(&graph_boost), None).unwrap();
 
         let retrieved_ids: Vec<String> = resp
             .results
