@@ -56,6 +56,17 @@ pub struct CostReport {
     /// carried a parseable timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<String>,
+    /// The ExecPlan slug(s) this session actually **worked**, derived from the
+    /// transcript (MCP fact-writes to `execplan:<slug>`, edits to a plan file) and
+    /// ranked top-K — see `crux_cost::transcript`'s signal extraction. Lets the
+    /// daemon attribute this session's burn to *those* plans (`method = "link"`,
+    /// precise) instead of every plan whose fact-window happens to overlap
+    /// (`method = "window"`, coarse). Empty when no link could be derived (the
+    /// daemon then falls back to window-overlap). Additive + serde-default +
+    /// skip-if-empty, so an old daemon ignores it and a slug-less legacy report is
+    /// unchanged on the wire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub execplan_slugs: Vec<String>,
     /// The screenshot-worthy top-line numbers.
     pub headline: Headline,
     /// The four measured `usage` totals summed across the session.

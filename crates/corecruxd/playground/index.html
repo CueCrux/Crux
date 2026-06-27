@@ -1472,9 +1472,10 @@ const WSTATE = { planned:'planned', in_progress:'in_progress', blocked:'blocked'
 // `passport+window` is poster-confirmed, `mixed` is partial.
 function burnField(tb){
   if(!tb) return null;
-  const note = tb.method==='window' ? ' (coarse — multi-day windows over-credit)'
+  const note = tb.method==='link' ? ' (precise — linked to this plan)'
+             : tb.method==='window' ? ' (coarse — multi-day windows over-credit)'
              : tb.method==='passport+window' ? ' (precise)'
-             : tb.method==='mixed' ? ' (partial)' : '';
+             : tb.method==='mixed' ? ' (partial — link + window)' : '';
   const n = tb.sessions||0;
   return fmtK(tb.context_tokens)+' ctx · '+fmtK(tb.output_tokens)+' out · '+n+' session'+(n===1?'':'s')+' · '+(tb.method||'?')+note;
 }

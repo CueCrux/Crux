@@ -450,6 +450,7 @@ pub async fn handle_coord_announce(args: &Value, ctx: &McpContext) -> Result<Val
         "by_passport",
         "execplan_slug",
         "milestone",
+        "deploy_target",
         "paths",
         "note",
         "ttl_seconds",

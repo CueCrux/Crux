@@ -36,6 +36,7 @@ use std::time::UNIX_EPOCH;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use corecrux_memory::fact_store::{FactQuery, FactStore};
+use serde::{Deserialize, Serialize};
 
 use crate::fact_helpers::dedup_latest;
 use crate::work::{Provenance, WorkItem};
@@ -73,6 +74,77 @@ pub const VIRTUAL_PASSPORT: &str = "system:execplan-aggregator";
 /// (e.g. `_cascade-m1-patch-...md`) and are skipped by the walker.
 const SCRATCH_PREFIX: char = '_';
 
+/// Env var gating the A4 **drafting** board state. **Default OFF** — when set
+/// (`1`/`true`/`on`/`yes`), a plan whose `Status:` line declares "Draft"
+/// projects as `drafting` instead of falling through the normal rules. When
+/// unset the derive path is byte-identical to before.
+pub const DRAFTING_STATE_FLAG_ENV: &str = "CORECRUXD_FEATURE_DRAFTING_STATE";
+
+/// Env var gating the A3 **next-ready milestone** computation. **Default OFF** —
+/// when set, `deps:<ID>` facts are parsed and `WorkItem::next_ready_milestone`
+/// is filled. When unset the field stays `None` and no deps facts are read.
+pub const NEXT_READY_MILESTONE_FLAG_ENV: &str = "CORECRUXD_FEATURE_NEXT_READY_MILESTONE";
+
+/// Truthiness parser shared by the feature flags. **Default OFF** — an empty
+/// value also counts as off. Matches the activity-log / cost-lens parser so the
+/// flag vocabulary is uniform across the daemon.
+fn feature_flag_enabled(env_var: &str) -> bool {
+    match std::env::var(env_var) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "" | "0" | "false" | "off" | "no")
+        }
+        Err(_) => false,
+    }
+}
+
+/// True when the A4 drafting-state derive rule is enabled. **Default OFF**.
+pub fn drafting_state_enabled() -> bool {
+    feature_flag_enabled(DRAFTING_STATE_FLAG_ENV)
+}
+
+/// True when the A3 next-ready-milestone computation is enabled. **Default OFF**.
+pub fn next_ready_milestone_enabled() -> bool {
+    feature_flag_enabled(NEXT_READY_MILESTONE_FLAG_ENV)
+}
+
+/// Stable, total ordering key for an **alphanumeric** milestone id (`M0`, `M10`,
+/// `A1`, `B5`). Milestone ids in this system are *not* `M<number>`-only — gate /
+/// deps / milestone facts can be keyed `A1`, `B5`, etc.
+///
+/// Ordering (documented, deterministic):
+///   1. by the leading non-digit **alpha prefix**, lexicographically (so all
+///      `A*` sort before `B*` before `M*`),
+///   2. then by the trailing **numeric suffix**, numerically (so `M2 < M10`,
+///      not the lexicographic `M10 < M2`),
+///   3. then by the full id string as a final tiebreak (ids with no numeric
+///      suffix, or with internal structure, still order deterministically).
+///
+/// Returned as `(prefix, num, full)` so callers can `sort_by_key`. An id with no
+/// trailing digits gets `num = u32::MAX` so it sorts after numbered siblings of
+/// the same prefix; an unparseable / overflowing suffix likewise.
+fn milestone_id_key(id: &str) -> (String, u32, String) {
+    let digits_start = id.len() - id.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+    let (prefix, suffix) = id.split_at(digits_start);
+    let num = if suffix.is_empty() {
+        u32::MAX
+    } else {
+        suffix.parse::<u32>().unwrap_or(u32::MAX)
+    };
+    (prefix.to_string(), num, id.to_string())
+}
+
+/// Numeric value of a **bare** `M<number>` milestone id (`"M0"` → `0`,
+/// `"M12"` → `12`). Returns `None` for any non-`M<number>` id (`"A1"`, `"B5"`,
+/// `"M1.2"`, `"Mx"`, `""`) so only legacy numeric ids feed the back-compat maps.
+fn numeric_milestone_id(id: &str) -> Option<u32> {
+    let rest = id.strip_prefix('M')?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse::<u32>().ok()
+}
+
 /// One on-disk plan file. The walker produces these; everything downstream
 /// operates on the in-memory representation.
 #[derive(Debug, Clone)]
@@ -104,6 +176,11 @@ pub struct ParsedPlan {
     /// Slugs from `Extended by [[<slug>]]` declaration lines — plans that build
     /// on this one.
     pub extended_by: Vec<String>,
+    /// Deploy-axis edge targets from `Deploys to [[deploy:<host>]]` declaration
+    /// lines — the deploy targets (hosts/lanes) this plan ships to. Captured as
+    /// the full `deploy:<host>` token so the projection can group plans by the
+    /// exact target they queue against. Accumulated across lines, deduped.
+    pub deploys_to: Vec<String>,
     /// Distinct `OD-<n>` Open-Decision ids referenced anywhere in the plan body.
     pub open_decision_refs: Vec<String>,
 }
@@ -113,9 +190,22 @@ pub struct ParsedPlan {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecplanFactSummary {
     /// Highest milestone number for which a `milestone:M<n>` fact exists.
+    /// Numeric-only — retained for the legacy `M<n>` derive rules (current
+    /// milestone, blocked-on-highest). Alphanumeric ids live in the `*_by_id`
+    /// maps below.
     pub highest_milestone_with_fact: Option<u32>,
     /// `n` → status string parsed from gate fact value `{"status": "..."}`.
+    /// Numeric-only mirror of `gate_statuses_by_id`, kept so the existing
+    /// `M<n>`-keyed rules (rule 4 all-gated, rule 5 blocked) stay byte-identical.
     pub gate_statuses: BTreeMap<u32, String>,
+    /// `<milestone-id>` → gate status string, for **all** alphanumeric milestone
+    /// ids (`M0`, `A1`, `B5`), not just numeric `M<n>`. Powers the A3 next-ready
+    /// computation, which must reason over the full id space.
+    pub gate_statuses_by_id: BTreeMap<String, String>,
+    /// `<milestone-id>` → its declared `after` dependency list, parsed from
+    /// `deps:<ID>` facts (value `{"after":["<id>", ...]}`). Empty when the plan
+    /// declares no deps facts, or when the next-ready flag is off.
+    pub deps_by_id: BTreeMap<String, Vec<String>>,
     /// Most recent `stored_at` across all related facts (ms since epoch).
     pub last_fact_at_unix_ms: Option<u64>,
     /// Earliest `stored_at` across all related facts (ms since epoch).
@@ -233,6 +323,17 @@ pub fn parse_plan(md: &str) -> ParsedPlan {
         for slug in extract_ref_slugs(trimmed, "Extended by") {
             if !out.extended_by.contains(&slug) {
                 out.extended_by.push(slug);
+            }
+        }
+        // Deploy-axis edge: `Deploys to [[deploy:<host>]]`. Reuses the shared
+        // declaration parser so it inherits the same prose-rejection discipline
+        // (case-sensitive lead token, required `:`/space separator). The captured
+        // token keeps its `deploy:` prefix; only well-formed `deploy:<host>`
+        // targets are retained so a bare `[[some-plan]]` typo never lands on the
+        // deploy axis.
+        for target in extract_ref_slugs(trimmed, "Deploys to") {
+            if target.starts_with("deploy:") && target.len() > "deploy:".len() && !out.deploys_to.contains(&target) {
+                out.deploys_to.push(target);
             }
         }
 
@@ -477,12 +578,20 @@ fn first_milestone_number(line: &str) -> Option<u32> {
 
 /// Roll up a slice of facts for a single ExecPlan slug into the shape
 /// [`derive_state`] expects. Facts are tuples of `(key, value, stored_at)`.
+///
+/// Milestone ids are **alphanumeric** (`M0`, `A1`, `B5`). The legacy numeric
+/// maps (`highest_milestone_with_fact`, `gate_statuses`) are populated only for
+/// pure `M<number>` ids — preserving the existing `M<n>` derive rules byte-for-
+/// byte — while the `*_by_id` maps capture the full id space for the A3
+/// next-ready computation. `deps:<ID>` facts are read only when the next-ready
+/// flag is on, so the flag-off path is unchanged.
 pub fn summarise_facts(facts: &[(String, String, DateTime<Utc>)]) -> ExecplanFactSummary {
     let mut summary = ExecplanFactSummary::default();
     let mut highest = 0u32;
     let mut seen_milestone = false;
     let mut latest: i64 = 0;
     let mut earliest: i64 = i64::MAX;
+    let read_deps = next_ready_milestone_enabled();
 
     for (key, value, stored_at) in facts {
         let stored_ms = stored_at.timestamp_millis();
@@ -493,19 +602,26 @@ pub fn summarise_facts(facts: &[(String, String, DateTime<Utc>)]) -> ExecplanFac
             earliest = stored_ms;
         }
 
-        if let Some(rest) = key.strip_prefix("milestone:M") {
-            if let Ok(n) = rest.parse::<u32>() {
+        if let Some(id) = key.strip_prefix("milestone:") {
+            // Alphanumeric id (M0, A1, B5). The numeric back-compat map is fed
+            // only when the id is a bare `M<number>`.
+            if let Some(n) = numeric_milestone_id(id) {
                 seen_milestone = true;
                 if n > highest {
                     highest = n;
                 }
             }
-        } else if let Some(rest) = key.strip_prefix("gate:M") {
-            if let Ok(n) = rest.parse::<u32>() {
-                let status = serde_json::from_str::<serde_json::Value>(value)
-                    .ok()
-                    .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
-                    .unwrap_or_default();
+        } else if let Some(id) = key.strip_prefix("gate:") {
+            let status = serde_json::from_str::<serde_json::Value>(value)
+                .ok()
+                .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
+                .unwrap_or_default();
+            // String-keyed map covers the full alphanumeric id space (A3).
+            summary.gate_statuses_by_id.insert(id.to_string(), status.clone());
+            // Numeric back-compat: only bare `M<number>` ids feed the legacy
+            // `M<n>`-keyed rules (rule 4 all-gated, rule 5 blocked-on-highest),
+            // keeping those code paths byte-identical.
+            if let Some(n) = numeric_milestone_id(id) {
                 summary.gate_statuses.insert(n, status);
                 // Gate facts also indicate a milestone-bound observation; track them so
                 // a plan with only `gate:*` facts (no `milestone:*`) still surfaces a
@@ -515,6 +631,21 @@ pub fn summarise_facts(facts: &[(String, String, DateTime<Utc>)]) -> ExecplanFac
                     highest = n;
                 }
             }
+        } else if let Some(id) = key.strip_prefix("deps:").filter(|_| read_deps) {
+            // `deps:<ID>` value = {"after":["<id>", ...]}. Only consulted behind
+            // the next-ready flag (`read_deps`) so the default path reads no deps
+            // facts and stays byte-identical.
+            let after = serde_json::from_str::<serde_json::Value>(value)
+                .ok()
+                .and_then(|v| v.get("after").cloned())
+                .and_then(|a| a.as_array().cloned())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default();
+            summary.deps_by_id.insert(id.to_string(), after);
         } else if key.starts_with("decision:") {
             summary.decision_count += 1;
             // QC.1: decision facts carry a `commit_sha`. Collect distinct ones
@@ -540,6 +671,38 @@ pub fn summarise_facts(facts: &[(String, String, DateTime<Utc>)]) -> ExecplanFac
     summary
 }
 
+/// A3 — compute the **next-ready milestone**: the lowest-ordered milestone id
+/// (per [`milestone_id_key`]) whose declared `after` dependency list is fully
+/// satisfied by milestones with a *passing* gate (per [`is_complete_status`],
+/// the same vocabulary the board already uses for "done").
+///
+/// - Returns `None` when `deps_by_id` is empty (no `deps:*` facts → no graph to
+///   reason over; the brief's "next_ready is None when no deps facts exist").
+/// - A milestone with no `after` entry, or an empty `after`, is ready
+///   immediately (no unmet prerequisites).
+/// - A dependency id with no passing gate (missing gate, or a gate whose status
+///   isn't a completion synonym) is unmet, so the dependent milestone is not yet
+///   ready.
+///
+/// Among ready milestones the lowest-ordered id wins, giving a stable "do this
+/// next" pointer regardless of fact insertion order.
+fn compute_next_ready(
+    deps_by_id: &BTreeMap<String, Vec<String>>,
+    gate_statuses_by_id: &BTreeMap<String, String>,
+) -> Option<String> {
+    if deps_by_id.is_empty() {
+        return None;
+    }
+    let is_done = |id: &str| gate_statuses_by_id.get(id).is_some_and(|s| is_complete_status(s));
+    let mut ready: Vec<&String> = deps_by_id
+        .iter()
+        .filter(|(_, after)| after.iter().all(|dep| is_done(dep)))
+        .map(|(id, _)| id)
+        .collect();
+    ready.sort_by_key(|id| milestone_id_key(id));
+    ready.first().map(|id| (*id).clone())
+}
+
 /// Deterministic state derivation. See module docs for the rule list.
 pub fn derive_state(
     file: &ExecplanFile,
@@ -548,6 +711,16 @@ pub fn derive_state(
     now_unix_ms: u64,
 ) -> WorkItem {
     let status_lc = parsed.status_line.as_deref().unwrap_or("").to_ascii_lowercase();
+
+    // Rule 0 (A4, flag-gated, default OFF): a plan whose declarative `Status:`
+    // line *begins* with "draft" projects as `drafting`. The status_line is
+    // already captured only from declarative `Status:` / `> **Status:**` lines
+    // (never mid-prose), and we require a leading match on its value so a value
+    // like "in draft review" — which merely contains "draft" — is rejected.
+    // Gated so the flag-off derive path is byte-identical to before.
+    if drafting_state_enabled() && status_lc.trim_start().starts_with("draft") {
+        return mk_item(file, parsed, "drafting", None, None, facts);
+    }
 
     // Rule 1: explicit Archived status overrides everything else.
     if status_lc.contains("archived") {
@@ -668,6 +841,16 @@ fn mk_item(
         commit_shas: facts.commit_shas.clone(),
         decision_count: facts.decision_count,
     });
+    // A3 (flag-gated, default OFF): the next milestone ready to start. With the
+    // flag off, `deps_by_id` is never populated (`summarise_facts` skips
+    // `deps:*`) so `compute_next_ready` returns `None` regardless; the extra
+    // flag check makes the no-op explicit and keeps the field omitted on the
+    // wire (`skip_serializing_if = "Option::is_none"`).
+    let next_ready_milestone = if next_ready_milestone_enabled() {
+        compute_next_ready(&facts.deps_by_id, &facts.gate_statuses_by_id)
+    } else {
+        None
+    };
     WorkItem {
         id: format!("execplan:{}", file.slug),
         project_id: VIRTUAL_PROJECT_ID.to_string(),
@@ -684,6 +867,7 @@ fn mk_item(
         updated_at_unix_ms: updated,
         plan_path: Some(file.path.display().to_string()),
         current_milestone,
+        next_ready_milestone,
         superseded_by,
         depends_on: parsed.depends_on.clone(),
         extended_by: parsed.extended_by.clone(),
@@ -874,6 +1058,129 @@ fn apply_reciprocal_refs(items: &mut [WorkItem]) {
     }
 }
 
+// ── Deploy-axis projection (B3 Part 1) ───────────────────────────────────────
+//
+// The deploy queue is a read-time grouping over plans that declare
+// `Deploys to [[deploy:<host>]]`, surfacing — per target host — which ExecPlans
+// are still queued (in an executable, non-archive state) to ship there. It is a
+// pure projection: it reads `WorkItem::state` (already derived) joined with the
+// per-plan `deploys_to` parse, and never mutates a plan or a WorkItem. It lives
+// alongside the lineage projection and shares its closure discipline; it does
+// not touch `derive_state`/`mk_item`/`summarise_facts`.
+
+/// One ExecPlan queued to deploy to a given target. Slug + the state that made
+/// it eligible, so a client can render the queue without re-deriving.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployQueueEntry {
+    /// Bare ExecPlan slug (the `execplan:` id minus its prefix).
+    pub slug: String,
+    /// Derived state at projection time — always an executable (non-archive)
+    /// state for an entry that appears in the queue.
+    pub state: String,
+}
+
+/// Per-deploy-target queue: every executable ExecPlan that declares
+/// `Deploys to [[deploy:<host>]]` for the same `target`. `count` mirrors
+/// `entries.len()` for clients that only want the headline number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployTargetQueue {
+    /// The full `deploy:<host>` target token.
+    pub target: String,
+    /// Number of executable plans queued for this target (`== entries.len()`).
+    pub count: usize,
+    /// Queued plans, sorted by slug for deterministic output.
+    pub entries: Vec<DeployQueueEntry>,
+}
+
+/// States that count as "queued for deploy" — i.e. still executable, not an
+/// archive/superseded terminal. A plan in any of these can still ship; an
+/// `archive` plan never appears in the deploy queue.
+//
+// `dead_code`-allowed because the deploy-queue projection API is consumed only
+// by the tests in this module today; the HTTP wiring (a `/v1/work` deploy-queue
+// query) is a follow-up that lives outside this file's ownership scope. Keeping
+// the projection here (data-flow + tests) mirrors how `list_execplans` shipped
+// its pure layer in M1 before the HTTP layer bound it in M2.
+#[allow(dead_code)]
+fn is_executable_state(state: &str) -> bool {
+    state != "archive"
+}
+
+/// Build the per-deploy-target queue from a slice of derived ExecPlan items
+/// joined with their parsed `deploys_to` edges. `plans` pairs each
+/// [`WorkItem`] with the [`ParsedPlan`] it was derived from (same order is not
+/// required — the join is by id/slug). Only executable (non-archive) plans
+/// contribute. Output is sorted by target, entries within a target sorted by
+/// slug — deterministic for clients and tests.
+// See `is_executable_state` for why this projection API is `dead_code`-allowed
+// pending HTTP wiring outside this file's scope.
+#[allow(dead_code)]
+pub fn deploy_queue_from_pairs(plans: &[(&WorkItem, &ParsedPlan)]) -> Vec<DeployTargetQueue> {
+    let mut by_target: BTreeMap<String, Vec<DeployQueueEntry>> = BTreeMap::new();
+    for (item, parsed) in plans {
+        if !is_executable_state(&item.state) {
+            continue;
+        }
+        let slug = item
+            .id
+            .strip_prefix(EXECPLAN_ENTITY_PREFIX)
+            .unwrap_or(&item.id)
+            .to_string();
+        for target in &parsed.deploys_to {
+            let entries = by_target.entry(target.clone()).or_default();
+            if !entries.iter().any(|e| e.slug == slug) {
+                entries.push(DeployQueueEntry {
+                    slug: slug.clone(),
+                    state: item.state.clone(),
+                });
+            }
+        }
+    }
+    by_target
+        .into_iter()
+        .map(|(target, mut entries)| {
+            entries.sort_by(|a, b| a.slug.cmp(&b.slug));
+            DeployTargetQueue {
+                target,
+                count: entries.len(),
+                entries,
+            }
+        })
+        .collect()
+}
+
+/// Walk `root`, derive each plan's state (reusing the same pure pipeline as
+/// [`list_execplans`]) and parse its deploy edges, then group into the
+/// per-target deploy queue. Read-only; `root` missing/empty → `Ok(vec![])`.
+/// This is the deploy-axis sibling of `list_execplans` — it answers "what is
+/// queued to ship to `deploy:<host>`?" without adding a field to `WorkItem`.
+// `dead_code`-allowed pending HTTP wiring (see `is_executable_state`).
+#[allow(dead_code)]
+pub fn list_deploy_queue(store: &FactStore, root: &Path, now_unix_ms: u64) -> std::io::Result<Vec<DeployTargetQueue>> {
+    let files = walk_execplans_root(root)?;
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut facts_by_slug = collect_execplan_facts(store);
+    // Hold parsed plans alongside their derived items so the pairs borrow lives
+    // for the projection call.
+    let mut parsed_items: Vec<(WorkItem, ParsedPlan)> = Vec::with_capacity(files.len());
+    for file in files {
+        let parsed = parse_plan(&file.content);
+        let facts = facts_by_slug.remove(&file.slug).unwrap_or_default();
+        let owner = owner_from_facts(&facts);
+        let agents = contributing_agents_from_facts(&facts);
+        let rows3: Vec<(String, String, DateTime<Utc>)> = facts.into_iter().map(|(k, v, s, _)| (k, v, s)).collect();
+        let mut summary = summarise_facts(&rows3);
+        summary.owner_passport = owner;
+        summary.contributing_agents = agents;
+        let item = derive_state(&file, &parsed, &summary, now_unix_ms);
+        parsed_items.push((item, parsed));
+    }
+    let pairs: Vec<(&WorkItem, &ParsedPlan)> = parsed_items.iter().map(|(i, p)| (i, p)).collect();
+    Ok(deploy_queue_from_pairs(&pairs))
+}
+
 /// Env var pointing at the Open Decisions registry markdown
 /// (`docs/master-plan/tracking/open-decisions.md`). Unset → OD wiring is off and
 /// `WorkItem::open_decisions` stays empty.
@@ -1045,6 +1352,7 @@ mod tests {
             updated_at_unix_ms: 0,
             plan_path: None,
             current_milestone: None,
+            next_ready_milestone: None,
             superseded_by: None,
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
             extended_by: extended_by.iter().map(|s| s.to_string()).collect(),
@@ -1165,6 +1473,104 @@ mod tests {
             "dangling edge retained on source"
         );
         assert_eq!(items.len(), 1, "no phantom item minted for a missing target");
+    }
+
+    // ── B3 Part 1: deploy-axis lineage edge + queue projection ──
+
+    #[test]
+    fn parse_extracts_deploys_to_edge() {
+        let md = "# T\n\nDeploys to [[deploy:crux]]\n";
+        let p = parse_plan(md);
+        assert_eq!(p.deploys_to, vec!["deploy:crux".to_string()]);
+    }
+
+    #[test]
+    fn parse_deploys_to_multiple_and_comma_group() {
+        let md = "# T\n\n- Deploys to [[deploy:crux]] [[deploy:gpu-1]]\nDeploys to [[deploy:data-1, deploy:crux]]\n";
+        let p = parse_plan(md);
+        // dedup keeps first-seen order; deploy:crux appears once.
+        assert_eq!(
+            p.deploys_to,
+            vec![
+                "deploy:crux".to_string(),
+                "deploy:gpu-1".to_string(),
+                "deploy:data-1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_deploys_to_rejects_non_deploy_target() {
+        // A bare slug or a malformed token (no host after the prefix) is not a
+        // deploy target and must not land on the deploy axis.
+        let md = "# T\n\nDeploys to [[some-plan-2026-01-01]]\nDeploys to [[deploy:]]\n";
+        let p = parse_plan(md);
+        assert!(p.deploys_to.is_empty(), "non-deploy targets rejected");
+    }
+
+    #[test]
+    fn parse_deploys_to_rejects_prose_mention() {
+        let md = "# T\n\n- This milestone deploys to the staging box first.\n";
+        let p = parse_plan(md);
+        assert!(p.deploys_to.is_empty(), "prose 'deploys to' must not match");
+    }
+
+    /// Build an ExecPlan WorkItem with an explicit state for queue tests.
+    fn wi_state(slug: &str, state: &str) -> WorkItem {
+        let mut it = wi(slug, &[], &[]);
+        it.state = state.to_string();
+        it
+    }
+
+    fn parsed_with_deploys(targets: &[&str]) -> ParsedPlan {
+        ParsedPlan {
+            deploys_to: targets.iter().map(|s| s.to_string()).collect(),
+            ..ParsedPlan::default()
+        }
+    }
+
+    #[test]
+    fn deploy_queue_groups_executable_plans_by_target() {
+        let a = wi_state("plan-a", "in_progress");
+        let pa = parsed_with_deploys(&["deploy:crux"]);
+        let b = wi_state("plan-b", "planned");
+        let pb = parsed_with_deploys(&["deploy:crux", "deploy:gpu-1"]);
+        let pairs = vec![(&a, &pa), (&b, &pb)];
+        let q = deploy_queue_from_pairs(&pairs);
+        // Sorted by target: deploy:crux then deploy:gpu-1.
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0].target, "deploy:crux");
+        assert_eq!(q[0].count, 2);
+        assert_eq!(
+            q[0].entries.iter().map(|e| e.slug.as_str()).collect::<Vec<_>>(),
+            vec!["plan-a", "plan-b"]
+        );
+        assert_eq!(q[1].target, "deploy:gpu-1");
+        assert_eq!(q[1].count, 1);
+        assert_eq!(q[1].entries[0].slug, "plan-b");
+    }
+
+    #[test]
+    fn deploy_queue_excludes_archived_plans() {
+        let a = wi_state("plan-a", "archive");
+        let pa = parsed_with_deploys(&["deploy:crux"]);
+        let b = wi_state("plan-b", "blocked");
+        let pb = parsed_with_deploys(&["deploy:crux"]);
+        let pairs = vec![(&a, &pa), (&b, &pb)];
+        let q = deploy_queue_from_pairs(&pairs);
+        // Only the blocked (executable) plan is queued; archived is excluded.
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].count, 1);
+        assert_eq!(q[0].entries[0].slug, "plan-b");
+        assert_eq!(q[0].entries[0].state, "blocked");
+    }
+
+    #[test]
+    fn deploy_queue_empty_when_no_deploy_edges() {
+        let a = wi_state("plan-a", "in_progress");
+        let pa = ParsedPlan::default();
+        let pairs = vec![(&a, &pa)];
+        assert!(deploy_queue_from_pairs(&pairs).is_empty());
     }
 
     // ── M2: provenance rollup ──
@@ -1853,5 +2259,284 @@ mod tests {
         // `new` should sort first or tie. Assert it is not strictly less.
         assert!(items[0].updated_at_unix_ms >= items[1].updated_at_unix_ms);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // A3 — next-ready milestone (alphanumeric ids, deps graph). Default OFF.
+    // A4 — drafting board state. Default OFF.
+    //
+    // The two feature flags mutate process-global env vars, so the tests that
+    // toggle them serialize on FLAG_GUARD to avoid racing the (parallel) rest
+    // of the suite that calls `summarise_facts` / `derive_state`. The pure
+    // graph/ordering helpers are tested directly (no env) where possible.
+    // ══════════════════════════════════════════════════════════════════════
+
+    use std::sync::Mutex;
+    static FLAG_GUARD: Mutex<()> = Mutex::new(());
+
+    /// RAII flag setter that restores the prior value on drop. Holds the
+    /// `FLAG_GUARD` lock for the lifetime of the guard so flag-on windows never
+    /// overlap across tests.
+    struct FlagOn<'a> {
+        _lock: std::sync::MutexGuard<'a, ()>,
+        var: &'static str,
+        prev: Option<String>,
+    }
+    impl<'a> FlagOn<'a> {
+        fn set(var: &'static str) -> Self {
+            let _lock = FLAG_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var(var).ok();
+            std::env::set_var(var, "1");
+            FlagOn { _lock, var, prev }
+        }
+    }
+    impl Drop for FlagOn<'_> {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.var, v),
+                None => std::env::remove_var(self.var),
+            }
+        }
+    }
+
+    fn gates(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+    fn deps(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(k, after)| (k.to_string(), after.iter().map(|s| s.to_string()).collect()))
+            .collect()
+    }
+
+    // ── milestone-id ordering + numeric back-compat ──
+
+    #[test]
+    fn milestone_id_key_orders_numeric_aware_then_by_prefix() {
+        let mut ids = vec!["M10", "M2", "M0", "B5", "A1", "A2", "B1"];
+        ids.sort_by(|a, b| milestone_id_key(a).cmp(&milestone_id_key(b)));
+        // Alpha prefix first (A < B < M), then numeric suffix (M2 < M10).
+        assert_eq!(ids, vec!["A1", "A2", "B1", "B5", "M0", "M2", "M10"]);
+    }
+
+    #[test]
+    fn numeric_milestone_id_only_matches_bare_m_number() {
+        assert_eq!(numeric_milestone_id("M0"), Some(0));
+        assert_eq!(numeric_milestone_id("M12"), Some(12));
+        assert_eq!(numeric_milestone_id("A1"), None);
+        assert_eq!(numeric_milestone_id("B5"), None);
+        assert_eq!(numeric_milestone_id("M1.2"), None);
+        assert_eq!(numeric_milestone_id("Mx"), None);
+        assert_eq!(numeric_milestone_id(""), None);
+        assert_eq!(numeric_milestone_id("M"), None);
+    }
+
+    // ── compute_next_ready: pure graph logic (no env) ──
+
+    #[test]
+    fn next_ready_none_when_no_deps() {
+        assert_eq!(compute_next_ready(&deps(&[]), &gates(&[])), None);
+    }
+
+    #[test]
+    fn next_ready_picks_lowest_ready_milestone() {
+        // A1 ready (no after); A2 needs A1; B1 needs A2.
+        let d = deps(&[("A2", &["A1"]), ("B1", &["A2"]), ("A1", &[])]);
+        // No gates yet → only A1 is ready.
+        assert_eq!(compute_next_ready(&d, &gates(&[])).as_deref(), Some("A1"));
+        // A1 done → A2 becomes ready; A1 itself is still "ready" (after met) but
+        // A2 is the lower-ordered *unblocked-by-its-deps* sibling? No — A1 is
+        // still in the graph and ready, and A1 < A2, so A1 still wins. The
+        // computation reports the lowest ready id; downstream uses gate status to
+        // know A1 is already done.
+        let g = gates(&[("A1", "passed")]);
+        assert_eq!(compute_next_ready(&d, &g).as_deref(), Some("A1"));
+    }
+
+    #[test]
+    fn next_ready_advances_as_gates_pass_alphanumeric() {
+        // Linear chain over alphanumeric ids; only the deps-declared nodes are in
+        // the graph. M0 (no after) → A1 (after M0) → B5 (after A1).
+        let d = deps(&[("A1", &["M0"]), ("B5", &["A1"]), ("M0", &[])]);
+        // Nothing passing → M0 ready (lowest by prefix: M after A/B, but only M0
+        // has its deps met; A1 needs M0, B5 needs A1).
+        assert_eq!(compute_next_ready(&d, &gates(&[])).as_deref(), Some("M0"));
+        // M0 passed → A1 now ready; M0 also still "ready" and M0 sorts after A1
+        // (A < M), so A1 wins.
+        let g = gates(&[("M0", "complete")]);
+        assert_eq!(compute_next_ready(&d, &g).as_deref(), Some("A1"));
+        // M0 + A1 passed → B5 ready; B5 < M0 (B < M) but A1 (A) is lowest of the
+        // three ready nodes, so A1 still wins.
+        let g = gates(&[("M0", "complete"), ("A1", "passed+merged")]);
+        assert_eq!(compute_next_ready(&d, &g).as_deref(), Some("A1"));
+    }
+
+    #[test]
+    fn next_ready_unmet_dep_is_not_ready() {
+        // Only B1 in the graph, needing A1 which has no passing gate → B1 not
+        // ready, and A1 isn't a graph node → nothing ready.
+        let d = deps(&[("B1", &["A1"])]);
+        assert_eq!(compute_next_ready(&d, &gates(&[])), None);
+        // A failing/blocked gate on A1 still doesn't satisfy the dep.
+        assert_eq!(compute_next_ready(&d, &gates(&[("A1", "blocked")])), None);
+        // A passing gate on A1 unblocks B1.
+        assert_eq!(
+            compute_next_ready(&d, &gates(&[("A1", "passed")])).as_deref(),
+            Some("B1")
+        );
+    }
+
+    // ── summarise_facts: deps parsing with ALPHANUMERIC ids (flag ON) ──
+
+    #[test]
+    fn summarise_parses_deps_and_alphanumeric_gates_when_flag_on() {
+        let _flag = FlagOn::set(NEXT_READY_MILESTONE_FLAG_ENV);
+        let facts = vec![
+            ("milestone:A1".to_string(), "{}".to_string(), ts(1_000)),
+            ("gate:A1".to_string(), r#"{"status":"passed"}"#.to_string(), ts(1_500)),
+            ("gate:B5".to_string(), r#"{"status":"blocked"}"#.to_string(), ts(2_000)),
+            ("deps:B5".to_string(), r#"{"after":["A1","A2"]}"#.to_string(), ts(2_500)),
+            ("deps:A1".to_string(), r#"{"after":[]}"#.to_string(), ts(2_600)),
+        ];
+        let s = summarise_facts(&facts);
+        // String-keyed gate map carries alphanumeric ids.
+        assert_eq!(s.gate_statuses_by_id.get("A1").map(String::as_str), Some("passed"));
+        assert_eq!(s.gate_statuses_by_id.get("B5").map(String::as_str), Some("blocked"));
+        // Deps map parsed from `deps:<ID>` facts.
+        assert_eq!(s.deps_by_id.get("A1"), Some(&Vec::<String>::new()));
+        assert_eq!(s.deps_by_id.get("B5"), Some(&vec!["A1".to_string(), "A2".to_string()]));
+        // Alphanumeric ids are NOT counted in the numeric back-compat map.
+        assert!(s.gate_statuses.is_empty(), "numeric map untouched by A1/B5 gates");
+        assert_eq!(s.highest_milestone_with_fact, None, "no numeric M<n> facts");
+    }
+
+    #[test]
+    fn summarise_numeric_back_compat_still_populated() {
+        // Mixed numeric + alphanumeric: the numeric maps see only `M<n>`.
+        let _flag = FlagOn::set(NEXT_READY_MILESTONE_FLAG_ENV);
+        let facts = vec![
+            ("milestone:M1".to_string(), "{}".to_string(), ts(1_000)),
+            ("milestone:M2".to_string(), "{}".to_string(), ts(1_100)),
+            ("gate:M1".to_string(), r#"{"status":"complete"}"#.to_string(), ts(1_500)),
+            ("milestone:A1".to_string(), "{}".to_string(), ts(1_600)),
+        ];
+        let s = summarise_facts(&facts);
+        assert_eq!(s.highest_milestone_with_fact, Some(2));
+        assert_eq!(s.gate_statuses.get(&1).map(String::as_str), Some("complete"));
+        assert_eq!(s.gate_statuses_by_id.get("M1").map(String::as_str), Some("complete"));
+    }
+
+    #[test]
+    fn summarise_skips_deps_when_flag_off() {
+        // Default OFF: a `deps:*` fact must be ignored (byte-identical path).
+        let _lock = FLAG_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(NEXT_READY_MILESTONE_FLAG_ENV);
+        let facts = vec![("deps:A1".to_string(), r#"{"after":["M0"]}"#.to_string(), ts(1_000))];
+        let s = summarise_facts(&facts);
+        assert!(s.deps_by_id.is_empty(), "deps facts unread when flag off");
+    }
+
+    // ── A3 end-to-end through mk_item / derive_state (flag ON) ──
+
+    #[test]
+    fn next_ready_surfaced_on_workitem_when_flag_on() {
+        let _flag = FlagOn::set(NEXT_READY_MILESTONE_FLAG_ENV);
+        let f = file("p", 1_000, "# P\n## Milestones\n- M1\n");
+        let p = parse_plan(&f.content);
+        let facts = vec![
+            ("milestone:A1".to_string(), "{}".to_string(), ts(2_000)),
+            ("gate:M0".to_string(), r#"{"status":"passed"}"#.to_string(), ts(2_100)),
+            ("deps:M0".to_string(), r#"{"after":[]}"#.to_string(), ts(2_200)),
+            ("deps:A1".to_string(), r#"{"after":["M0"]}"#.to_string(), ts(2_300)),
+        ];
+        let s = summarise_facts(&facts);
+        let item = derive_state(&f, &p, &s, 3_000);
+        // M0 passed → A1 ready; A1 (prefix A) sorts below M0 (prefix M).
+        assert_eq!(item.next_ready_milestone.as_deref(), Some("A1"));
+    }
+
+    #[test]
+    fn next_ready_none_on_workitem_when_flag_off() {
+        // Flag OFF: even with deps facts present in the raw rows, the field is
+        // None (deps unread + assignment gated). This is the flag-off no-op.
+        let _lock = FLAG_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(NEXT_READY_MILESTONE_FLAG_ENV);
+        let f = file("p", 1_000, "# P\n## Milestones\n- M1\n");
+        let p = parse_plan(&f.content);
+        let facts = vec![
+            ("deps:M0".to_string(), r#"{"after":[]}"#.to_string(), ts(2_200)),
+            ("milestone:M1".to_string(), "{}".to_string(), ts(2_000)),
+        ];
+        let s = summarise_facts(&facts);
+        let item = derive_state(&f, &p, &s, 3_000);
+        assert_eq!(item.next_ready_milestone, None);
+        // The legacy derive path is unchanged: a single milestone fact → in_progress.
+        assert_eq!(item.state, "in_progress");
+    }
+
+    // ── A4: drafting board state (flag ON) ──
+
+    #[test]
+    fn drafting_status_derives_drafting_when_flag_on() {
+        let _flag = FlagOn::set(DRAFTING_STATE_FLAG_ENV);
+        let f = file("d", 1_000, "# Draft Plan\n\nStatus: Draft\n## Milestones\n- M1\n");
+        let p = parse_plan(&f.content);
+        assert_eq!(p.status_line.as_deref(), Some("Draft"));
+        let item = derive_state(&f, &p, &ExecplanFactSummary::default(), 2_000);
+        assert_eq!(item.state, "drafting");
+    }
+
+    #[test]
+    fn drafting_status_case_insensitive_and_with_trailer() {
+        let _flag = FlagOn::set(DRAFTING_STATE_FLAG_ENV);
+        let f = file("d", 1_000, "# D\n\nStatus: DRAFT (awaiting appraise)\n");
+        let p = parse_plan(&f.content);
+        let item = derive_state(&f, &p, &ExecplanFactSummary::default(), 2_000);
+        assert_eq!(item.state, "drafting");
+    }
+
+    #[test]
+    fn drafting_rejects_prose_not_at_status_start() {
+        // "in draft review" merely *contains* draft; the Status value does not
+        // *start* with draft, so it must NOT derive drafting (falls through to
+        // the normal rules → planned for a recent fact-less plan).
+        let _flag = FlagOn::set(DRAFTING_STATE_FLAG_ENV);
+        let now: u64 = 10 * 24 * 60 * 60 * 1000;
+        let f = file(
+            "d",
+            now - 5 * 24 * 60 * 60 * 1000,
+            "# D\n\nStatus: in draft review\n## Milestones\n- M1\n",
+        );
+        let p = parse_plan(&f.content);
+        let item = derive_state(&f, &p, &ExecplanFactSummary::default(), now);
+        assert_ne!(item.state, "drafting", "prose 'in draft review' must not match");
+        assert_eq!(item.state, "planned");
+    }
+
+    #[test]
+    fn drafting_no_op_when_flag_off() {
+        // Flag OFF: a `Status: Draft` plan derives via the normal rules, NOT
+        // drafting. This is the flag-off byte-identical guarantee for A4.
+        let _lock = FLAG_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(DRAFTING_STATE_FLAG_ENV);
+        let now: u64 = 10 * 24 * 60 * 60 * 1000;
+        let f = file(
+            "d",
+            now - 5 * 24 * 60 * 60 * 1000,
+            "# D\n\nStatus: Draft\n## Milestones\n- M1\n",
+        );
+        let p = parse_plan(&f.content);
+        let item = derive_state(&f, &p, &ExecplanFactSummary::default(), now);
+        assert_ne!(item.state, "drafting", "flag off → no drafting state");
+        assert_eq!(item.state, "planned");
+    }
+
+    #[test]
+    fn feature_flags_default_off() {
+        let _lock = FLAG_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(DRAFTING_STATE_FLAG_ENV);
+        std::env::remove_var(NEXT_READY_MILESTONE_FLAG_ENV);
+        assert!(!drafting_state_enabled(), "A4 flag must default OFF");
+        assert!(!next_ready_milestone_enabled(), "A3 flag must default OFF");
     }
 }

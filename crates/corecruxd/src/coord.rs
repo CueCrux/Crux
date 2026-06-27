@@ -71,6 +71,13 @@ pub struct CoordIntent {
     pub execplan_slug: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub milestone: Option<String>,
+    /// Deploy-axis focus: the deploy target this session intends to ship to
+    /// (e.g. `"deploy:crux"`). Optional + `skip_serializing_if` so an intent
+    /// that declares no deploy focus stays byte-identical on the wire. When two
+    /// live peers announce the same target, `find_overlaps` surfaces a
+    /// `deploy_target` warning — advisory, mirroring the execplan-slug overlap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_target: Option<String>,
     /// Repo-relative paths (files or directory prefixes) the session expects
     /// to touch. Informational — enforceable leases are punchcards.
     #[serde(default)]
@@ -200,6 +207,20 @@ pub fn find_overlaps(
                     peer_session_id_hex: peer.session_id_hex.clone(),
                     peer_passport_id: peer.passport_id.clone(),
                     kind: "execplan".to_string(),
+                    theirs: theirs.to_string(),
+                    yours: mine.to_string(),
+                });
+            }
+        }
+        // Deploy-axis overlap: two live peers intending to ship the same target
+        // is a coordination signal (serialise the deploy, don't double-cut).
+        // Advisory only — mirrors the execplan-slug overlap; never blocks.
+        if let (Some(mine), Some(theirs)) = (announced.deploy_target.as_deref(), peer.deploy_target.as_deref()) {
+            if mine == theirs {
+                out.push(OverlapWarning {
+                    peer_session_id_hex: peer.session_id_hex.clone(),
+                    peer_passport_id: peer.passport_id.clone(),
+                    kind: "deploy_target".to_string(),
                     theirs: theirs.to_string(),
                     yours: mine.to_string(),
                 });
@@ -397,6 +418,7 @@ mod tests {
             passport_id: "p".to_string(),
             execplan_slug: Some(slug.to_string()),
             milestone: None,
+            deploy_target: None,
             paths: vec![],
             note: None,
             announced_at_unix_ms: 0,
@@ -596,6 +618,57 @@ mod tests {
         let lease_w = warnings.iter().find(|w| w.kind == "lease").expect("lease warning");
         assert_eq!(lease_w.peer_passport_id, "p2");
         assert_eq!(lease_w.theirs, "tree://crates/corecruxd/src/http");
+    }
+
+    #[test]
+    fn find_overlaps_flags_same_deploy_target_advisory() {
+        let now: u64 = 1_000_000;
+        // Same deploy target, different (non-overlapping) execplans + paths so
+        // the deploy axis is the only thing that can collide.
+        let mut mine = intent("aaaa", "plan-a", now + 100_000);
+        mine.passport_id = "p1".to_string();
+        mine.execplan_slug = Some("plan-a".to_string());
+        mine.paths = vec![];
+        mine.deploy_target = Some("deploy:crux".to_string());
+
+        let mut peer = intent("bbbb", "plan-b", now + 100_000);
+        peer.passport_id = "p2".to_string();
+        peer.execplan_slug = Some("plan-b".to_string());
+        peer.paths = vec![];
+        peer.deploy_target = Some("deploy:crux".to_string());
+
+        // A peer aiming at a *different* target must NOT collide.
+        let mut other_target = intent("cccc", "plan-c", now + 100_000);
+        other_target.passport_id = "p3".to_string();
+        other_target.execplan_slug = Some("plan-c".to_string());
+        other_target.deploy_target = Some("deploy:gpu-1".to_string());
+
+        let warnings = find_overlaps(&mine, &[mine.clone(), peer, other_target], &[], now);
+        let deploy_w: Vec<&OverlapWarning> = warnings.iter().filter(|w| w.kind == "deploy_target").collect();
+        assert_eq!(deploy_w.len(), 1, "exactly one deploy-target overlap: {warnings:?}");
+        assert_eq!(deploy_w[0].peer_passport_id, "p2");
+        assert_eq!(deploy_w[0].theirs, "deploy:crux");
+        assert_eq!(deploy_w[0].yours, "deploy:crux");
+    }
+
+    #[test]
+    fn find_overlaps_no_deploy_warning_when_target_absent() {
+        let now: u64 = 1_000_000;
+        let mut mine = intent("aaaa", "plan-a", now + 100_000);
+        mine.passport_id = "p1".to_string();
+        mine.paths = vec![];
+        mine.deploy_target = None; // no deploy focus declared
+
+        let mut peer = intent("bbbb", "plan-b", now + 100_000);
+        peer.passport_id = "p2".to_string();
+        peer.paths = vec![];
+        peer.deploy_target = Some("deploy:crux".to_string());
+
+        let warnings = find_overlaps(&mine, &[peer], &[], now);
+        assert!(
+            !warnings.iter().any(|w| w.kind == "deploy_target"),
+            "no deploy overlap when announcer declares no target: {warnings:?}"
+        );
     }
 
     #[test]
