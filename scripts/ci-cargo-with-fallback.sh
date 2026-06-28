@@ -32,6 +32,10 @@
 #   - run: bash scripts/ci-cargo-with-fallback.sh test --workspace
 #   - run: bash scripts/ci-cargo-with-fallback.sh doc --workspace --no-deps
 #
+# These steps also run under the merge queue's `merge_group` event (the
+# Lint / Test / MSRV / Coverage jobs trigger on it), so this wrapper covers
+# queue builds too — see .github/merge-queue-ruleset.README.md.
+#
 # Safe for local use too — when sccache isn't present the first attempt
 # succeeds and the retry path is never taken.
 #
