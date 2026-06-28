@@ -11,6 +11,11 @@
 //! - the **observe capture** hooks via the embedded `crux-observe.sh` (signed
 //!   lifecycle evidence → daemon).
 //!
+//! It also ships the embedded `crux-filemod.sh` (B4 write-side file-modification
+//! ledger) into the hooks dir so it is available to install; its `settings.json`
+//! wiring stays operator/opt-in (the script self-gates on `CRUX_HOOK_FILEMOD`,
+//! default off).
+//!
 //! Both run through a launcher (`crux-hook-env.sh`) that sources
 //! `~/.config/cuecrux/env` (0600, written by `corecruxctl login`) so the daemon
 //! URL + bearer token never live in `settings.json`. Idempotent; backs up the
@@ -71,6 +76,11 @@ esac
 /// The observe-capture script, embedded so install works without the repo.
 const OBSERVE_SH: &str = include_str!("../../../integrations/claude-code/hooks/crux-observe.sh");
 
+/// The B4 write-side file-modification ledger script, embedded so install works
+/// without the repo. Shipped executable into the hooks dir; its `settings.json`
+/// wiring stays operator/opt-in (script self-gates on `CRUX_HOOK_FILEMOD`).
+const FILEMOD_SH: &str = include_str!("../../../integrations/claude-code/hooks/crux-filemod.sh");
+
 /// Resolve the `crux-hook` binary (banner/context/pre-compact). `None` ⇒ install
 /// observe-only and note the banner needs the binary.
 fn locate_crux_hook() -> Option<PathBuf> {
@@ -125,6 +135,7 @@ fn install_assets() -> Result<(PathBuf, bool), DynErr> {
     let wrapper = dir.join("crux-hook-env.sh");
     write_exec(&wrapper, WRAPPER_SH)?;
     write_exec(&dir.join("crux-observe.sh"), OBSERVE_SH)?;
+    write_exec(&dir.join("crux-filemod.sh"), FILEMOD_SH)?;
     Ok((wrapper, locate_crux_hook().is_some()))
 }
 
@@ -437,9 +448,18 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert!(v["hooks"]["SessionStart"].is_array());
         assert!(!v["hooks"].as_object().unwrap().contains_key("PreCompact"));
-        // launcher + observe script landed under ~/.local/share/crux/hooks.
+        // launcher + observe + filemod scripts landed under ~/.local/share/crux/hooks.
         assert!(home.join(".local/share/crux/hooks/crux-hook-env.sh").is_file());
         assert!(home.join(".local/share/crux/hooks/crux-observe.sh").is_file());
+        let filemod = home.join(".local/share/crux/hooks/crux-filemod.sh");
+        assert!(filemod.is_file(), "crux-filemod.sh must be installed");
+        // It must be executable (write_exec sets mode 0o755 on unix).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&filemod).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "crux-filemod.sh must be executable: {mode:o}");
+        }
 
         // run_install + run_status execute without error. (No endpoint + no TTY
         // in tests → configure_endpoint takes the non-interactive note branch.)
