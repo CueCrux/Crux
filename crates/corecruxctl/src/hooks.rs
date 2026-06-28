@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn hooks_block_wires_optin_filemod_pre_and_post() {
+    fn hooks_block_wires_opt_in_filemod_pre_and_post() {
         let w = Path::new("/x/crux-hook-env.sh");
         // Wiring is present regardless of the crux-hook binary (filemod is
         // independent of it, like the cost leg).
