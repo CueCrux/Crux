@@ -272,11 +272,27 @@ fn owner_from_facts(facts: &[ExecplanFactRow]) -> Option<String> {
 pub fn parse_plan(md: &str) -> ParsedPlan {
     let mut out = ParsedPlan::default();
     let mut in_milestones = false;
+    let mut in_fence = false;
     let mut seen_milestone_numbers = Vec::new();
     let mut checked_milestone_numbers = Vec::new();
 
     for line in md.lines() {
         let trimmed = line.trim_start();
+
+        // Fenced code blocks (```…```) hold ASCII diagrams / pattern examples
+        // that look like declarations but are not — e.g. a `Status:Draft)` line
+        // inside a state-machine diagram, or a `Depends on [[slug]]` example in a
+        // docs fence. Toggle the fence flag on each ``` line and skip declaration
+        // detection while inside, so a plan that merely *documents* a feature is
+        // not misclassified (A4 drafting false-positive fix). The fence-toggle
+        // line itself is consumed (no detection runs for it).
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
 
         if out.title.is_empty() {
             if let Some(rest) = trimmed.strip_prefix("# ") {
@@ -672,20 +688,26 @@ pub fn summarise_facts(facts: &[(String, String, DateTime<Utc>)]) -> ExecplanFac
 }
 
 /// A3 — compute the **next-ready milestone**: the lowest-ordered milestone id
-/// (per [`milestone_id_key`]) whose declared `after` dependency list is fully
-/// satisfied by milestones with a *passing* gate (per [`is_complete_status`],
-/// the same vocabulary the board already uses for "done").
+/// (per [`milestone_id_key`]) that is BOTH (a) not itself already complete (its
+/// own gate status is not a completion synonym per [`is_complete_status`]) AND
+/// (b) whose declared `after` dependency list is fully satisfied by milestones
+/// with a passing gate — the same vocabulary the board already uses for "done".
 ///
 /// - Returns `None` when `deps_by_id` is empty (no `deps:*` facts → no graph to
 ///   reason over; the brief's "next_ready is None when no deps facts exist").
-/// - A milestone with no `after` entry, or an empty `after`, is ready
-///   immediately (no unmet prerequisites).
+/// - A milestone with no `after` entry, or an empty `after`, has no unmet
+///   prerequisites — but it is still only "ready" if it isn't itself done.
 /// - A dependency id with no passing gate (missing gate, or a gate whose status
 ///   isn't a completion synonym) is unmet, so the dependent milestone is not yet
 ///   ready.
+/// - A milestone whose OWN gate is already passing is excluded — pointing "do
+///   this next" at an already-done milestone was the A3 live-smoke bug (it
+///   returned "A2" whose `gate:A2` was passed). The pointer now advances past
+///   completed milestones to the next incomplete, dep-satisfied one.
 ///
-/// Among ready milestones the lowest-ordered id wins, giving a stable "do this
-/// next" pointer regardless of fact insertion order.
+/// Among the qualifying milestones the lowest-ordered id wins, giving a stable
+/// "do this next" pointer regardless of fact insertion order. Returns `None`
+/// when none qualify (every dep-satisfied milestone is already complete).
 fn compute_next_ready(
     deps_by_id: &BTreeMap<String, Vec<String>>,
     gate_statuses_by_id: &BTreeMap<String, String>,
@@ -696,7 +718,9 @@ fn compute_next_ready(
     let is_done = |id: &str| gate_statuses_by_id.get(id).is_some_and(|s| is_complete_status(s));
     let mut ready: Vec<&String> = deps_by_id
         .iter()
-        .filter(|(_, after)| after.iter().all(|dep| is_done(dep)))
+        // (a) the milestone itself must not already be complete, and
+        // (b) all of its declared `after` deps must be complete.
+        .filter(|(id, after)| !is_done(id) && after.iter().all(|dep| is_done(dep)))
         .map(|(id, _)| id)
         .collect();
     ready.sort_by_key(|id| milestone_id_key(id));
@@ -713,12 +737,16 @@ pub fn derive_state(
     let status_lc = parsed.status_line.as_deref().unwrap_or("").to_ascii_lowercase();
 
     // Rule 0 (A4, flag-gated, default OFF): a plan whose declarative `Status:`
-    // line *begins* with "draft" projects as `drafting`. The status_line is
-    // already captured only from declarative `Status:` / `> **Status:**` lines
-    // (never mid-prose), and we require a leading match on its value so a value
-    // like "in draft review" — which merely contains "draft" — is rejected.
+    // line value *equals* "draft" (trimmed, ASCII-case-insensitive) projects as
+    // `drafting`. The status_line is captured only from declarative `Status:` /
+    // `> **Status:**` lines outside fenced code blocks (see `parse_plan`'s
+    // `in_fence` guard), never mid-prose. We require an EXACT-value match — not a
+    // prefix — so a code-span / diagram value like "Draft)", "Draft → a new …",
+    // or "in draft review" is rejected, while a real declarative `Status: Draft`
+    // (value "Draft") still matches. This mirrors how the archived/complete
+    // Status values are interpreted (a declarative value, not a prose mention).
     // Gated so the flag-off derive path is byte-identical to before.
-    if drafting_state_enabled() && status_lc.trim_start().starts_with("draft") {
+    if drafting_state_enabled() && status_lc.trim() == "draft" {
         return mk_item(file, parsed, "drafting", None, None, facts);
     }
 
@@ -2342,15 +2370,13 @@ mod tests {
     fn next_ready_picks_lowest_ready_milestone() {
         // A1 ready (no after); A2 needs A1; B1 needs A2.
         let d = deps(&[("A2", &["A1"]), ("B1", &["A2"]), ("A1", &[])]);
-        // No gates yet → only A1 is ready.
+        // No gates yet → only A1 is ready (A2 needs A1, B1 needs A2).
         assert_eq!(compute_next_ready(&d, &gates(&[])).as_deref(), Some("A1"));
-        // A1 done → A2 becomes ready; A1 itself is still "ready" (after met) but
-        // A2 is the lower-ordered *unblocked-by-its-deps* sibling? No — A1 is
-        // still in the graph and ready, and A1 < A2, so A1 still wins. The
-        // computation reports the lowest ready id; downstream uses gate status to
-        // know A1 is already done.
+        // A1 done → A1 is EXCLUDED (its own gate is passing); A2 now has its dep
+        // (A1) met and isn't itself done, so A2 is the next-ready. The pointer
+        // must skip the already-complete A1 (A3 completed-exclusion fix).
         let g = gates(&[("A1", "passed")]);
-        assert_eq!(compute_next_ready(&d, &g).as_deref(), Some("A1"));
+        assert_eq!(compute_next_ready(&d, &g).as_deref(), Some("A2"));
     }
 
     #[test]
@@ -2358,17 +2384,20 @@ mod tests {
         // Linear chain over alphanumeric ids; only the deps-declared nodes are in
         // the graph. M0 (no after) → A1 (after M0) → B5 (after A1).
         let d = deps(&[("A1", &["M0"]), ("B5", &["A1"]), ("M0", &[])]);
-        // Nothing passing → M0 ready (lowest by prefix: M after A/B, but only M0
-        // has its deps met; A1 needs M0, B5 needs A1).
+        // Nothing passing → M0 ready (only M0 has its deps met; A1 needs M0, B5
+        // needs A1).
         assert_eq!(compute_next_ready(&d, &gates(&[])).as_deref(), Some("M0"));
-        // M0 passed → A1 now ready; M0 also still "ready" and M0 sorts after A1
-        // (A < M), so A1 wins.
+        // M0 passed → M0 excluded (done); A1's dep (M0) is met and A1 isn't done,
+        // so A1 is next-ready.
         let g = gates(&[("M0", "complete")]);
         assert_eq!(compute_next_ready(&d, &g).as_deref(), Some("A1"));
-        // M0 + A1 passed → B5 ready; B5 < M0 (B < M) but A1 (A) is lowest of the
-        // three ready nodes, so A1 still wins.
+        // M0 + A1 passed → both excluded (done); B5's dep (A1) is met and B5 isn't
+        // done, so B5 is next-ready.
         let g = gates(&[("M0", "complete"), ("A1", "passed+merged")]);
-        assert_eq!(compute_next_ready(&d, &g).as_deref(), Some("A1"));
+        assert_eq!(compute_next_ready(&d, &g).as_deref(), Some("B5"));
+        // M0 + A1 + B5 all passed → every dep-satisfied node is complete → None.
+        let g = gates(&[("M0", "complete"), ("A1", "passed+merged"), ("B5", "done")]);
+        assert_eq!(compute_next_ready(&d, &g), None);
     }
 
     #[test]
@@ -2384,6 +2413,34 @@ mod tests {
             compute_next_ready(&d, &gates(&[("A1", "passed")])).as_deref(),
             Some("B1")
         );
+    }
+
+    #[test]
+    fn next_ready_skips_completed_lowest_milestone() {
+        // Live-smoke regression: a partially-complete plan whose lowest
+        // dep-satisfied milestone is ITSELF complete must skip to the next
+        // incomplete dep-satisfied one — not point back at the done milestone.
+        // (The smoke returned "A2" whose gate:A2 was passed.) Chain: A1 → A2 → A3.
+        let d = deps(&[("A1", &[]), ("A2", &["A1"]), ("A3", &["A2"])]);
+        // A1 and A2 both done → A1/A2 excluded; A3's dep (A2) met, A3 not done.
+        let g = gates(&[("A1", "passed"), ("A2", "passed")]);
+        assert_eq!(compute_next_ready(&d, &g).as_deref(), Some("A3"));
+    }
+
+    #[test]
+    fn next_ready_none_when_all_milestones_complete() {
+        // Every dep-satisfied milestone already complete → nothing left to do.
+        let d = deps(&[("A1", &[]), ("A2", &["A1"])]);
+        let g = gates(&[("A1", "passed"), ("A2", "done")]);
+        assert_eq!(compute_next_ready(&d, &g), None);
+    }
+
+    #[test]
+    fn next_ready_fresh_plan_picks_first_incomplete() {
+        // A fresh plan (no passing gates) → the lowest dep-satisfied, not-yet-done
+        // milestone is next. Regression for the original "fresh plan" behaviour.
+        let d = deps(&[("A1", &[]), ("A2", &["A1"]), ("B1", &["A2"])]);
+        assert_eq!(compute_next_ready(&d, &gates(&[])).as_deref(), Some("A1"));
     }
 
     // ── summarise_facts: deps parsing with ALPHANUMERIC ids (flag ON) ──
@@ -2487,29 +2544,70 @@ mod tests {
     }
 
     #[test]
-    fn drafting_status_case_insensitive_and_with_trailer() {
+    fn drafting_status_case_insensitive_exact_value() {
+        // Case-insensitive on the EXACT value: "DRAFT" (any case, trimmed) → draft.
         let _flag = FlagOn::set(DRAFTING_STATE_FLAG_ENV);
-        let f = file("d", 1_000, "# D\n\nStatus: DRAFT (awaiting appraise)\n");
+        let f = file("d", 1_000, "# D\n\nStatus: DRAFT\n");
         let p = parse_plan(&f.content);
         let item = derive_state(&f, &p, &ExecplanFactSummary::default(), 2_000);
         assert_eq!(item.state, "drafting");
     }
 
     #[test]
-    fn drafting_rejects_prose_not_at_status_start() {
-        // "in draft review" merely *contains* draft; the Status value does not
-        // *start* with draft, so it must NOT derive drafting (falls through to
-        // the normal rules → planned for a recent fact-less plan).
+    fn drafting_rejects_value_with_trailer() {
+        // A trailer after the word ("Draft → a new state", "Draft)", "in draft
+        // review") means the value is NOT exactly "draft"; under the exact-match
+        // discipline none of these derive drafting (falls through → planned for a
+        // recent fact-less plan). This is the A4 false-positive fix.
         let _flag = FlagOn::set(DRAFTING_STATE_FLAG_ENV);
         let now: u64 = 10 * 24 * 60 * 60 * 1000;
-        let f = file(
-            "d",
-            now - 5 * 24 * 60 * 60 * 1000,
-            "# D\n\nStatus: in draft review\n## Milestones\n- M1\n",
-        );
+        for value in ["in draft review", "Draft → a new state", "Draft)"] {
+            let f = file(
+                "d",
+                now - 5 * 24 * 60 * 60 * 1000,
+                &format!("# D\n\nStatus: {value}\n## Milestones\n- M1\n"),
+            );
+            let p = parse_plan(&f.content);
+            let item = derive_state(&f, &p, &ExecplanFactSummary::default(), now);
+            assert_ne!(item.state, "drafting", "{value:?} must not derive drafting");
+            assert_eq!(item.state, "planned", "{value:?} should fall through to planned");
+        }
+    }
+
+    #[test]
+    fn drafting_ignores_status_inside_code_fence() {
+        // A `Status: Draft` (and the bare `Status:Draft)` diagram form) inside a
+        // fenced ``` block is documentation, not a declaration. The fence guard in
+        // parse_plan must suppress it so the plan does NOT derive drafting (A4
+        // false-positive fix). The plan body has no real declarative Status line.
+        let _flag = FlagOn::set(DRAFTING_STATE_FLAG_ENV);
+        let now: u64 = 10 * 24 * 60 * 60 * 1000;
+        let md = "# D\n\nThis plan documents the drafting feature.\n\n```text\nstate machine:\n  Status:Draft) --> appraise\n  Status: Draft\n```\n\n## Milestones\n- M1\n";
+        let f = file("d", now - 5 * 24 * 60 * 60 * 1000, md);
         let p = parse_plan(&f.content);
+        assert_eq!(p.status_line, None, "fenced Status line must not be captured");
         let item = derive_state(&f, &p, &ExecplanFactSummary::default(), now);
-        assert_ne!(item.state, "drafting", "prose 'in draft review' must not match");
+        assert_ne!(item.state, "drafting", "fenced Status:Draft must not derive drafting");
+        assert_eq!(item.state, "planned");
+    }
+
+    #[test]
+    fn drafting_ignores_status_in_prose_code_span() {
+        // A prose line that *mentions* the pattern in a code span — e.g.
+        // "- `Status: Draft` → a new state" — is not a declarative Status line
+        // (it begins with a list marker, and the value carries a trailer). It must
+        // not be captured as the status_line, nor derive drafting.
+        let _flag = FlagOn::set(DRAFTING_STATE_FLAG_ENV);
+        let now: u64 = 10 * 24 * 60 * 60 * 1000;
+        let md = "# D\n\n- `Status: Draft` → a new state the board can show.\n\n## Milestones\n- M1\n";
+        let f = file("d", now - 5 * 24 * 60 * 60 * 1000, md);
+        let p = parse_plan(&f.content);
+        assert_eq!(p.status_line, None, "code-span prose mention must not be captured");
+        let item = derive_state(&f, &p, &ExecplanFactSummary::default(), now);
+        assert_ne!(
+            item.state, "drafting",
+            "prose code-span mention must not derive drafting"
+        );
         assert_eq!(item.state, "planned");
     }
 
