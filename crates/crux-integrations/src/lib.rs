@@ -1306,16 +1306,15 @@ mod tests {
         }
     }
 
-    fn temp_data_dir(name: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "crux-integrations-{name}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).expect("create temp integration dir");
-        root
+    /// Self-cleaning temp dir: the returned [`tempfile::TempDir`] removes itself
+    /// on Drop (even when a test returns early via `?` or panics), so tests bind
+    /// it to a guard instead of leaking a `crux-integrations-*` dir into `/tmp`
+    /// every run. Prefix retained for debuggability.
+    fn temp_data_dir(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("crux-integrations-{name}-"))
+            .tempdir()
+            .expect("create temp integration dir")
     }
 
     #[test]
@@ -1446,7 +1445,8 @@ mod tests {
 
     #[test]
     fn install_grant_disable_roundtrip_persists() -> Result<(), IntegrationError> {
-        let root = temp_data_dir("grant-roundtrip");
+        let tmp = temp_data_dir("grant-roundtrip");
+        let root = tmp.path().to_path_buf();
         let mut manifest = builtin_manifests()
             .into_iter()
             .find(|manifest| manifest.id == "sdk.typescript.quickstart")
@@ -1509,7 +1509,8 @@ mod tests {
 
     #[test]
     fn grant_rejects_capability_not_declared_by_pack() -> Result<(), IntegrationError> {
-        let root = temp_data_dir("capability-subset");
+        let tmp = temp_data_dir("capability-subset");
+        let root = tmp.path().to_path_buf();
         let manifest = builtin_manifests()
             .into_iter()
             .find(|manifest| manifest.id == "mcp.cursor")
