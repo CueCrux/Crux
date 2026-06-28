@@ -4,40 +4,46 @@
 #
 # crux-filemod.sh — B4 write-side file-modification ledger for Claude Code.
 #
-# The Crux-native form of "log what was modified, not just that a tree was
-# claimed". Pairs two legs of one edit:
+# Pairs two legs of one edit:
 #   pre  (PreToolUse)  — stash the file's pre-edit content + content hash.
 #   post (PostToolUse) — hash the post-edit file, diff against the stash for an
-#                        exact line delta, and POST a `filemod` observation to
-#                        the daemon's append-only (receipted) observation lane.
+#                        exact line delta, and POST a receipted `filemod`
+#                        observation to the daemon's append-only observation lane.
 #
-# Design notes:
-#   * Self-contained: sources ~/.config/cuecrux/env for CRUX_HTTP_URL +
-#     CRUX_AGENT_TOKEN exactly like crux-hook-env.sh, so it does NOT depend on
-#     the corecruxctl-managed wrapper (a `hooks install` won't clobber it).
-#   * Gated by CRUX_HOOK_FILEMOD=1 (opt-in, like the other observe legs).
-#   * Fire-and-forget: a daemon outage or any error must never block a tool
-#     call, so every path exits 0; failures go to the error log.
-#   * Content address: sha256 (no blake3 CLI on this host). `hash_algo` is
-#     recorded so a future blake3 alignment is unambiguous.
+# Content address: blake3 when available (b3sum, else python `blake3`), else
+# sha256. `hash_algo` records which was used (blake3 aligns with the daemon's own
+# content addressing; sha256 is the portable fallback). Self-contained: sources
+# ~/.config/cuecrux/env for CRUX_HTTP_URL + CRUX_AGENT_TOKEN like crux-hook-env.sh.
+# Gated by CRUX_HOOK_FILEMOD=1. Fire-and-forget: always exits 0.
 #
-# Requires: jq, sha256sum, curl, diff (coreutils + diffutils).
+# Requires: jq, curl, diff, and one of {b3sum | python3+blake3 | sha256sum}.
 
 set -u
 MODE="${1:-}"
 
-# Source hook env (token + urls). Never echo secrets.
 set -a
 # shellcheck disable=SC1090
 . "$HOME/.config/cuecrux/env" 2>/dev/null || true
 set +a
 
-# Gate: opt-in only.
 [ "${CRUX_HOOK_FILEMOD:-0}" = "1" ] || exit 0
+# Hooks may run with a minimal PATH; make user-local tool dirs visible (b3sum etc.).
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+command -v jq   >/dev/null 2>&1 || exit 0
+command -v curl >/dev/null 2>&1 || exit 0
 
-command -v jq        >/dev/null 2>&1 || exit 0
-command -v sha256sum >/dev/null 2>&1 || exit 0
-command -v curl      >/dev/null 2>&1 || exit 0
+# ── content hasher: blake3-preferred, sha256 fallback (chosen once) ───────────
+if command -v b3sum >/dev/null 2>&1; then
+  HASH_ALGO="blake3"; _hash() { b3sum "$1" 2>/dev/null | cut -d' ' -f1; }
+elif python3 -c 'import blake3' >/dev/null 2>&1; then
+  HASH_ALGO="blake3"; _hash() { python3 -c 'import blake3,sys;print(blake3.blake3(open(sys.argv[1],"rb").read()).hexdigest())' "$1" 2>/dev/null; }
+elif command -v sha256sum >/dev/null 2>&1; then
+  HASH_ALGO="sha256"; _hash() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+else
+  exit 0
+fi
+hash_file() { [ -f "$1" ] && _hash "$1" || printf ''; }
+size_of()   { [ -f "$1" ] && wc -c < "$1" 2>/dev/null | tr -dc '0-9' || printf '0'; }
 
 URL="${CRUX_HTTP_URL:-http://127.0.0.1:14800}"
 TOK="${CRUX_AGENT_TOKEN:-}"
@@ -65,16 +71,12 @@ KEY="$(printf '%s' "${SID}::${FP}" | sha256sum | cut -c1-40)"
 DIR="$STASH_ROOT/$SID"
 BEFORE="$DIR/$KEY.before"
 
-hash_file() { [ -f "$1" ] && sha256sum "$1" 2>/dev/null | cut -d' ' -f1 || printf ''; }
-size_of()   { [ -f "$1" ] && wc -c < "$1" 2>/dev/null | tr -dc '0-9' || printf '0'; }
-
 # ── pre leg: stash the before-image (content for diff; absent file = new) ─────
 if [ "$MODE" = "pre" ]; then
   mkdir -p "$DIR" 2>/dev/null || true
   if [ -f "$FP" ] && [ "$(size_of "$FP")" -le "$MAX_BYTES" ]; then
     cp -f "$FP" "$BEFORE" 2>/dev/null || true
   else
-    # too big (or new) → no content stash; record absence so post knows.
     rm -f "$BEFORE" 2>/dev/null || true
   fi
   exit 0
@@ -91,7 +93,6 @@ if [ -f "$BEFORE" ]; then
   ADDED="$(printf '%s\n' "$D"  | grep -c '^> ' || true)"
   REMOVED="$(printf '%s\n' "$D" | grep -c '^< ' || true)"
 elif [ -f "$FP" ]; then
-  # new file (no before-image) → all current lines are additions.
   ADDED="$(wc -l < "$FP" 2>/dev/null | tr -dc '0-9' || printf '0')"
 fi
 ADDED="$(printf '%s' "${ADDED:-0}" | tr -dc '0-9')"; ADDED="${ADDED:-0}"
@@ -103,13 +104,13 @@ MILESTONE="${CRUX_FILEMOD_MILESTONE:-}"
 TS="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
 
 BODY="$(jq -nc \
-  --arg fp "$FP" --arg bh "$BEFORE_HASH" --arg ah "$AFTER_HASH" \
+  --arg fp "$FP" --arg bh "$BEFORE_HASH" --arg ah "$AFTER_HASH" --arg algo "$HASH_ALGO" \
   --argjson add "$ADDED" --argjson rem "$REMOVED" \
   --arg tool "$TOOL" --arg ep "$EXECPLAN" --arg ms "$MILESTONE" --arg ts "$TS" '
   {kind:"filemod", provider:"claude-code", client_ts:$ts,
-   payload:{path:$fp, hash_algo:"sha256",
-            content_sha256_before:(if $bh=="" then null else $bh end),
-            content_sha256_after:(if $ah=="" then null else $ah end),
+   payload:{path:$fp, hash_algo:$algo,
+            content_hash_before:(if $bh=="" then null else $bh end),
+            content_hash_after:(if $ah=="" then null else $ah end),
             lines_added:$add, lines_removed:$rem, tool:$tool,
             execplan_slug:(if $ep=="" then null else $ep end),
             milestone:(if $ms=="" then null else $ms end)}}' 2>>"$ERR_LOG")"
@@ -128,4 +129,5 @@ if [ -n "$BODY" ]; then
 fi
 
 rm -f "$BEFORE" 2>/dev/null || true
+rmdir "$DIR" 2>/dev/null || true
 exit 0
