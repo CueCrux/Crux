@@ -156,13 +156,15 @@ pub fn supported_edge_types() -> &'static [&'static str] {
 mod tests {
     use super::*;
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!("corecruxd-relations-{name}-{nanos}"));
-        fs::create_dir_all(&dir).expect("mkdir");
-        dir
+    /// Self-cleaning temp dir: the returned [`tempfile::TempDir`] removes itself
+    /// on Drop (even on panic), so tests bind it to a guard for their lifetime
+    /// instead of leaking a `corecruxd-relations-*` dir into `/tmp` every run.
+    /// Prefix retained for debuggability.
+    fn temp_dir(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("corecruxd-relations-{name}-"))
+            .tempdir()
+            .expect("mkdir")
     }
 
     fn sample(tenant: &str, from: u32, to: u32, edge: &str) -> RelationRecord {
@@ -179,7 +181,8 @@ mod tests {
 
     #[test]
     fn append_then_reload_round_trip() {
-        let dir = temp_dir("roundtrip");
+        let tmp = temp_dir("roundtrip");
+        let dir = tmp.path().to_path_buf();
         let r1 = sample("alpha", 1, 2, "supports");
         let r2 = sample("alpha", 2, 3, "elaborates");
         append_record(&dir, &r1).expect("append r1");
@@ -194,7 +197,8 @@ mod tests {
 
     #[test]
     fn list_outgoing_filters_by_tenant_and_source() {
-        let dir = temp_dir("listout");
+        let tmp = temp_dir("listout");
+        let dir = tmp.path().to_path_buf();
         let mut state = ProjectionState::default();
         for record in [
             sample("alpha", 1, 2, "supports"),
@@ -220,7 +224,8 @@ mod tests {
 
     #[test]
     fn missing_jsonl_returns_zero() {
-        let dir = temp_dir("missing");
+        let tmp = temp_dir("missing");
+        let dir = tmp.path().to_path_buf();
         let mut state = ProjectionState::default();
         let n = load_into_state(&dir, &mut state).expect("load empty");
         assert_eq!(n, 0);
@@ -229,7 +234,8 @@ mod tests {
 
     #[test]
     fn reload_skips_malformed_lines_without_failing() {
-        let dir = temp_dir("malformed");
+        let tmp = temp_dir("malformed");
+        let dir = tmp.path().to_path_buf();
         let path = dir.join("relations.jsonl");
         fs::write(&path, b"not json\n{\"tenant_id\":\"a\",\"from_id\":1,\"to_id\":2,\"edge_type\":\"supports\",\"confidence_bp\":9000,\"created_at_micros\":1,\"updated_at_micros\":2}\n").expect("seed");
         let mut state = ProjectionState::default();

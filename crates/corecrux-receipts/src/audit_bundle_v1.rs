@@ -1018,13 +1018,14 @@ mod tests {
     #[test]
     fn read_witnessed_proofs_jsonl_filters_pending_and_skips_garbage() {
         use std::io::Write as _;
-        let dir = std::env::temp_dir().join(format!(
-            "corecruxd-witness-read-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Self-cleaning temp dir (auto-removed on Drop, even on panic) — the
+        // `tmp` guard is held for the test's lifetime so it no longer leaks a
+        // `corecruxd-witness-read-*` dir into `/tmp` every run.
+        let tmp = tempfile::Builder::new()
+            .prefix("corecruxd-witness-read-")
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path().to_path_buf();
         let path = dir.join("witness_proofs.jsonl");
         let proof = sample_witness_proof("ab");
         let mut f = std::fs::File::create(&path).unwrap();

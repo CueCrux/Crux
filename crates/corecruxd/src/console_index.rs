@@ -294,18 +294,21 @@ fn with_index_lock<T>(
 mod tests {
     use super::*;
 
-    fn temp_data_dir(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        let root = std::env::temp_dir().join(format!("corecruxd-console-index-{name}-{nanos}"));
-        fs::create_dir_all(&root).expect("create temp dir");
-        root
+    /// Self-cleaning temp dir: the returned [`tempfile::TempDir`] removes itself
+    /// on Drop (even when a test returns early via `?` or panics), so tests bind
+    /// it to a guard instead of leaking a `corecruxd-console-index-*` dir into
+    /// `/tmp` every run. Prefix retained for debuggability.
+    fn temp_data_dir(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("corecruxd-console-index-{name}-"))
+            .tempdir()
+            .expect("create temp dir")
     }
 
     #[test]
     fn record_and_page_chunks_without_raw_secret_preview() -> Result<(), ConsoleIndexError> {
-        let root = temp_data_dir("record");
+        let tmp = temp_data_dir("record");
+        let root = tmp.path().to_path_buf();
         let events = vec![AppendEvent {
             event_id: "evt-1".to_string(),
             occurred_at: "2026-05-01T12:00:00Z".to_string(),
@@ -329,7 +332,8 @@ mod tests {
 
     #[test]
     fn console_index_concurrent_appends_preserve_all_chunks() -> Result<(), ConsoleIndexError> {
-        let root = temp_data_dir("concurrent");
+        let tmp = temp_data_dir("concurrent");
+        let root = tmp.path().to_path_buf();
         let handles: Vec<_> = (0..16)
             .map(|idx| {
                 let root = root.clone();
