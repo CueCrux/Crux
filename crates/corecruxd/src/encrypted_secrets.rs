@@ -40,9 +40,10 @@ pub fn seal(plaintext: &[u8], key: &[u8; 32]) -> EncryptedEnvelope {
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce_bytes = [0u8; 24];
     rand::rng().fill_bytes(&mut nonce_bytes);
-    let nonce = XNonce::from_slice(&nonce_bytes);
+    let nonce =
+        XNonce::try_from(&nonce_bytes[..]).expect("nonce_bytes is exactly 24 bytes — XNonce length is constant");
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .expect("XChaCha20Poly1305::encrypt only fails on programmer error");
     EncryptedEnvelope {
         scheme: SCHEME_V1.to_string(),
@@ -61,9 +62,10 @@ pub fn open(envelope: &EncryptedEnvelope, key: &[u8; 32]) -> Result<Vec<u8>, Enc
     }
     let ciphertext = hex::decode(&envelope.ciphertext_hex).map_err(|_| EncryptedSecretError::InvalidHex)?;
     let cipher = XChaCha20Poly1305::new(key.into());
-    let nonce = XNonce::from_slice(&nonce_bytes);
+    let nonce =
+        XNonce::try_from(nonce_bytes.as_slice()).map_err(|_| EncryptedSecretError::InvalidNonce(nonce_bytes.len()))?;
     cipher
-        .decrypt(nonce, ciphertext.as_ref())
+        .decrypt(&nonce, ciphertext.as_ref())
         .map_err(|_| EncryptedSecretError::DecryptionFailed)
 }
 
