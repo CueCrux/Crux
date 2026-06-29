@@ -125,7 +125,7 @@ pub fn run(http_base: &str, non_interactive: bool) -> Result<(), Box<dyn std::er
     eprintln!("    Update status  {base}/v1/version");
     eprintln!("    Docs           https://docs.cuecrux.com/corecrux/");
     eprintln!("    Benchmark      corecruxctl audit-pack --offline");
-    eprintln!("    Playground     {base}/playground");
+    eprintln!("    Console        {base}/console");
     eprintln!();
 
     Ok(())

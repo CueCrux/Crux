@@ -75,7 +75,7 @@ fn console_shell_renders() {
     // to ecosystem sites (cuecrux.com, vaultcrux.com, memorycrux.com,
     // github.com, etc.) are FINE — they don't load anything until the user
     // clicks them. Mirrors the unit-side check in
-    // `corecruxd::playground::tests::console_shell_has_no_external_runtime_dependencies`.
+    // `corecruxd::console::tests::console_shell_has_no_external_runtime_dependencies`.
     for blocked in [
         r#"<script src="http"#,
         r#"<link rel="stylesheet" href="http"#,
@@ -92,7 +92,7 @@ fn console_shell_renders() {
     assert!(root.contains("Crux Console"));
 
     let alias = daemon()
-        .get("/playground")
+        .get("/console")
         .unwrap()
         .into_body()
         .read_to_string()

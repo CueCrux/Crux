@@ -68,7 +68,7 @@ mod ops_events;
 mod passports;
 mod plane_layer_sync;
 mod planes;
-mod playground;
+mod console;
 mod policy;
 mod pool;
 mod presence;

@@ -1311,7 +1311,6 @@ pub(super) async fn get_console_summary(State(state): State<AppState>, headers: 
             "console": {
                 "enabled": state.console_enabled,
                 "route": "/console",
-                "playground_alias": "/playground",
                 "external_network_dependencies": 0
             },
             "daemon": {
