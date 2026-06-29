@@ -77,10 +77,41 @@ else
   log "rollback ref : none (no running '$SERVICE' container — first deploy)"
 fi
 
+# Resolve what compose will actually RUN for the service. Override hosts pin a
+# locally-built image (e.g. the wolfi `*:local-with-git` git layer built via
+# Dockerfile.update-check) that is distinct from the pulled tag — so a plain
+# `up` would recreate that STALE local image and silently ignore the pull. We
+# detect a service `build:` (json first, yaml fallback) and, when present,
+# rebuild the local image from the freshly-pulled base before recreating.
+svc_field() {
+  dc config --format json 2>/dev/null \
+    | SVC="$SERVICE" FIELD="$1" python3 -c 'import json,sys,os
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+s=d.get("services",{}).get(os.environ["SVC"],{})
+v=s.get(os.environ["FIELD"])
+print(v if isinstance(v,str) else ("1" if v else ""))' 2>/dev/null || true
+}
+SERVICE_IMAGE="$(svc_field image)"
+SERVICE_HAS_BUILD="$(svc_field build)"
+# Fallback when `config --format json` is unavailable: treat the documented
+# wolfi override (`*:local-with-git`) as a locally-built service.
+if [ -z "$SERVICE_HAS_BUILD" ] && dc config 2>/dev/null | grep -q 'local-with-git'; then
+  SERVICE_HAS_BUILD=1
+  [ -n "$SERVICE_IMAGE" ] || SERVICE_IMAGE="$(dc config 2>/dev/null | grep -oE '[^[:space:]]*crux-daemon:local-with-git' | head -n1 || true)"
+fi
+
 # ── 3. Pull the target image and (re)create the service ─────────────
 log "pulling ${IMAGE}:${IMAGE_TAG} ..."
 if ! docker pull "${IMAGE}:${IMAGE_TAG}"; then
   err "docker pull failed for ${IMAGE}:${IMAGE_TAG}"; exit 1
+fi
+
+if [ -n "$SERVICE_HAS_BUILD" ]; then
+  log "override host: '$SERVICE' runs a locally-built image (${SERVICE_IMAGE:-?}) — retag pulled base to :latest + rebuild"
+  # The local build's FROM is the repo's `:latest`; point it at the exact pulled tag.
+  docker tag "${IMAGE}:${IMAGE_TAG}" "${IMAGE}:latest" 2>/dev/null || true
+  if ! dc build "$SERVICE"; then err "'docker compose build $SERVICE' failed"; exit 1; fi
 fi
 
 log "starting '$SERVICE' ..."
@@ -97,9 +128,11 @@ rollback() {
     return 1
   fi
   err "health gate failed — rolling back to $ROLLBACK_IMAGE_ID"
-  # Re-tag the previous image to the deploy tag so compose recreates it, then
-  # bring the service back up on that image.
-  if docker tag "$ROLLBACK_IMAGE_ID" "${IMAGE}:${IMAGE_TAG}" \
+  # Re-tag the previous image to the name compose actually RUNS (the locally
+  # pinned image on override hosts, else the deploy tag), then recreate on it.
+  rb_target="${IMAGE}:${IMAGE_TAG}"
+  if [ -n "$SERVICE_HAS_BUILD" ] && [ -n "$SERVICE_IMAGE" ]; then rb_target="$SERVICE_IMAGE"; fi
+  if docker tag "$ROLLBACK_IMAGE_ID" "$rb_target" \
      && dc up -d --force-recreate "$SERVICE"; then
     err "rollback complete — '$SERVICE' restored to previous image $ROLLBACK_IMAGE_ID"
   else
