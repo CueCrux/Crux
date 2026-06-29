@@ -429,14 +429,14 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
     // When unshaped, force the efficiency flags OFF for this request so the
     // control arm pays the full (legacy) cost. No-op when CRUX_OUTPUT_HOLDOUT=0.
     let unshaped = crate::holdout::request_is_control(&args.to_string());
-    // M1 part 2 — reversible overflow on the fact path. Active only for the
-    // CRC-v1 surface (the legacy text path has no epitome tier to demote into, so
-    // it keeps its budget-drop). When active, the store query does NOT budget-drop
-    // overflow facts (it returns the full ranked top_k); the CRC-v1 reshape below
-    // demotes the over-budget tail to epitome-only pointers instead. Flag OFF (or
-    // legacy contract, or holdout control) ⇒ legacy budget-drop, byte-identical.
-    let reversible =
-        crate::budget::reversible_enabled() && !unshaped && token_budget.is_some() && crate::crc_v1::enabled(args);
+    // M1 part 2/3 — reversible overflow on the fact path (unconditional since CO-5,
+    // but only for the CRC-v1 surface — the legacy text path has no epitome tier to
+    // demote into, so it keeps its budget-drop). When active, the store query does
+    // NOT budget-drop overflow facts (it returns the full ranked top_k); the CRC-v1
+    // reshape below demotes the over-budget tail to epitome-only pointers and caps
+    // the emitted tier to budget. Legacy contract OR holdout control (`unshaped`) ⇒
+    // legacy budget-drop.
+    let reversible = !unshaped && token_budget.is_some() && crate::crc_v1::enabled(args);
     let q = FactQuery {
         // cloned so `query`/`entity` remain available for the CRC-v1 reshape below
         query: query.clone(),
@@ -539,10 +539,9 @@ pub async fn handle_query_facts(args: &Value, ctx: &McpContext) -> Result<Value,
         } else {
             crate::crc_v1::wrap_facts(&rows, entity.as_deref(), query.as_deref())
         };
-        // M3: minified text surface when CRUX_PAYLOAD_COMPACT is on (query_facts
-        // is the heaviest retrieval payload per the M0 baseline); the structured
+        // M3: minified text surface unconditionally (since CO-5); the structured
         // `crc_v1` Value below is unchanged. CO-4: unshaped control forces pretty.
-        let compact = crate::payload::compact_enabled() && !unshaped;
+        let compact = !unshaped;
         let text = crate::payload::serialize_with(&crc, compact);
         crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
         crate::holdout::sample_compaction(&args.to_string(), &crc); // CO-5 compaction-only
@@ -873,23 +872,25 @@ mod tests {
         }
         let args = json!({"query": "needle", "token_budget": 80, "top_k": 50});
 
-        // Flag OFF (explicit opt-out, since CO-3 makes ON the default): legacy
-        // budget-drop — overflow facts vanish.
-        std::env::set_var(crate::budget::REVERSIBLE_ENV, "0");
+        // Unshaped (holdout=1 ⇒ every request is control, since CO-5 removed the
+        // reversible flag): legacy budget-drop — overflow facts vanish.
+        std::env::set_var(crate::holdout::HOLDOUT_ENV, "1");
         let off = handle_query_facts(&args, &ctx).await.unwrap();
         let off_rows = off["structuredContent"]["rows"].as_array().unwrap().len();
         let off_crc = &off["structuredContent"]["crc_v1"];
         assert_eq!(off_crc["hydrate_tier"], "full");
-        assert!(off_crc["meta"].get("demoted").is_none(), "OFF must not demote");
-        assert!(off_rows < 6, "OFF drops overflow (kept {off_rows} of 6)");
+        assert!(off_crc["meta"].get("demoted").is_none(), "unshaped must not demote");
+        assert!(off_rows < 6, "unshaped drops overflow (kept {off_rows} of 6)");
 
-        // Flag ON: reversible — M1 pt3 budgets the emitted tier: hydrate the
-        // within-budget head full, demote some to epitome if the budget allows,
-        // and DROP the rest beyond the budget cap (disclosed via total_candidates).
-        std::env::set_var(crate::budget::REVERSIBLE_ENV, "1");
+        // Shaped (holdout=0 ⇒ reversible): M1 pt3 budgets the emitted tier —
+        // hydrate the within-budget head full, demote some to epitome if the
+        // budget allows, and DROP the rest beyond the cap (disclosed via
+        // total_candidates).
+        std::env::set_var(crate::holdout::HOLDOUT_ENV, "0");
         let on = handle_query_facts(&args, &ctx).await.unwrap();
         let on_crc = &on["structuredContent"]["crc_v1"];
-        std::env::remove_var(crate::budget::REVERSIBLE_ENV);
+        std::env::remove_var(crate::holdout::HOLDOUT_ENV);
+        crate::holdout::accumulator().lock().unwrap().clear_for_test();
 
         let pointers = on_crc["pointers"].as_array().unwrap().len() as u64;
         let content = on_crc["content"].as_array().unwrap().len() as u64;

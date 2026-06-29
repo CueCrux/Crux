@@ -4,6 +4,11 @@
 > Harness: [`crates/crux-mcp/examples/token_bench.rs`](../../crates/crux-mcp/examples/token_bench.rs).
 > Corpus: **`__synthetic__::token-bench`** (deterministic, in-process — no daemon/network/prod data).
 > Baseline commit: `f9d8e6b` (origin/main at branch cut). All efficiency flags OFF (`lane_flags=baseline:all-off`).
+>
+> **Historical note (CO-5, 2026-06-30):** the per-mechanism `CRUX_PAYLOAD_COMPACT` / `CRUX_BUDGET_REVERSIBLE`
+> flags referenced below were **removed** once the cutover was confirmed — those mechanisms are now unconditional.
+> The flag descriptions are retained as the M0 baseline record. The unshaped baseline is now reached only via the
+> holdout control arm (`CRUX_OUTPUT_HOLDOUT`), and the harness's `lane_flags` reads `m1+m3:unconditional;holdout=…`.
 
 ## Reproduce
 

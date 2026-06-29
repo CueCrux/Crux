@@ -1,8 +1,11 @@
 # Cache-Aligned Boot Banner (M2)
 
 > Token-efficiency learnings (Headroom *CacheAligner* port) — milestone **M2**.
-> Flag: `CRUX_BANNER_CACHE_ALIGN` (default **OFF**). Source:
-> [`crates/crux-claude-hooks/src/cmds/session_start.rs`](../../crates/crux-claude-hooks/src/cmds/session_start.rs).
+> Source: [`crates/crux-claude-hooks/src/cmds/session_start.rs`](../../crates/crux-claude-hooks/src/cmds/session_start.rs).
+>
+> **Status (CO-5, 2026-06-30):** shipped behind `CRUX_BANNER_CACHE_ALIGN` (default-ON CO-2, 2026-06-25); the
+> escape-hatch flag is now **removed** — the banner is **always** cache-aligned. The sections below describe the
+> behaviour; the historical flag references are retained for context.
 
 ## Problem
 

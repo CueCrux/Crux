@@ -16,8 +16,11 @@ and an interval, never a bare point estimate (plan risk **R5**; QC.4/QC.5).
 ## Control-group assignment (`is_control`)
 
 `CRUX_OUTPUT_HOLDOUT=f` diverts a fraction `f ∈ [0,1]` of requests to the
-**control** arm, where every efficiency flag (`CRUX_PAYLOAD_COMPACT`,
-`CRUX_BUDGET_REVERSIBLE`) is treated as OFF. Assignment is **deterministic per
+**control** arm, where the efficiency mechanisms (compaction, reversible
+overflow) are forced **off** for that request (legacy drop + pretty). Since the
+per-mechanism `CRUX_PAYLOAD_COMPACT` / `CRUX_BUDGET_REVERSIBLE` flags were removed
+(CO-5, 2026-06-30), the holdout fraction is now the *only* lever for the unshaped
+path — efficiency is otherwise unconditional. Assignment is **deterministic per
 request key**: the key is hashed (FNV-1a + splitmix64 finalizer) to a stable
 point in `[0,1)` and compared against `f`. Consequences:
 
@@ -53,13 +56,16 @@ and **commit_sha**:
 token savings 21.0% (95% CI 12.5–29.4%) · n=7 · control_tokens=… · treatment_tokens=… · corpus=__synthetic__::token-bench · commit=…
 ```
 
-## Reproducing the M3 saving through the holdout path
+## Reproducing the net saving through the holdout path
 
 The harness measures the compaction-sensitive scenarios (`query@{500,2000,4000}`,
-`query_facts@{…}`, `query_scan`) twice — control (all flags OFF) then treatment
-(M3 `CRUX_PAYLOAD_COMPACT` ON) — and emits the paired savings under the JSON
-`savings` block. M3 is the clean reproduction: identical hits, pure wire
-reduction. (M1 is a *recall* lift, not a pure token saving, so it is not the
+`query_facts@{…}`, `query_scan`) twice — control (`CRUX_OUTPUT_HOLDOUT=1` ⇒ every
+request unshaped: legacy drop + pretty) then treatment (`=0` ⇒ fully shaped:
+reversible-cap + compaction) — and emits the paired **net** savings under the JSON
+`savings` block. (Before CO-5 the harness toggled the per-mechanism flags to
+isolate M3's compaction-only saving; with those flags removed it reports the net,
+which CO-6's budget cap turned positive. The live `token_savings` tool still
+breaks compaction out separately. M1 was historically a *recall* lift, not the
 treatment for this savings demo.)
 
 ```bash

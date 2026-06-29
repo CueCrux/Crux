@@ -45,19 +45,18 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
         min_score,
     );
 
-    // Apply token budget. M1 (CRUX_BUDGET_REVERSIBLE, default OFF): the response
-    // is pointer-only, so budget the *emitted* pointer tier — admit
+    // Apply token budget. M1 reversible overflow (unconditional since CO-5): the
+    // response is pointer-only, so budget the *emitted* pointer tier — admit
     // `budget / POINTER_TOKENS` hits — instead of charging the *full-doc*
     // hydration cost and dropping the overflow. Far more candidates fit the same
     // budget (the full price stays in `cost_estimate.full`; `total_candidates`
-    // discloses any capped remainder; expand via `result_id`). OFF ⇒ the legacy
-    // `take_while`-drop, byte-identical to pre-M1.
-    // CO-4 live holdout: a sampled fraction of requests run UNSHAPED (control)
-    // so savings are measured against a live control, not a counterfactual. When
-    // unshaped, force the efficiency flags OFF for this request. No-op (always
-    // shaped) when CRUX_OUTPUT_HOLDOUT is 0 (the default).
+    // discloses any capped remainder; expand via `result_id`).
+    // CO-4 live holdout: a sampled fraction of requests run UNSHAPED (control) so
+    // savings are measured against a live control. When unshaped, fall back to the
+    // legacy `take_while`-drop + pretty serialization. No-op (always shaped) when
+    // CRUX_OUTPUT_HOLDOUT is 0 (the default).
     let unshaped = crate::holdout::request_is_control(&params.to_string());
-    let reversible = crate::budget::reversible_enabled() && !unshaped;
+    let reversible = !unshaped;
     let hits = match token_budget {
         Some(budget) if reversible => {
             let max_pointers = crate::budget::pointers_within_budget(budget);
@@ -120,9 +119,9 @@ pub async fn handle_query(params: &Value, ctx: &McpContext) -> Result<Value, Jso
     if crate::crc_v1::enabled(params) {
         inner = crate::crc_v1::wrap_query(inner);
     }
-    // M3: minified when CRUX_PAYLOAD_COMPACT is on; pretty otherwise. CO-4: the
-    // unshaped control arm forces pretty so it pays the full (unshaped) cost.
-    let compact = crate::payload::compact_enabled() && !unshaped;
+    // M3: minified unconditionally (since CO-5). CO-4 holdout: the unshaped
+    // control arm forces pretty so it pays the full (unshaped) cost.
+    let compact = !unshaped;
     let text = crate::payload::serialize_with(&inner, compact);
     crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
     crate::holdout::sample_compaction(&params.to_string(), &inner); // CO-5 compaction-only
@@ -189,7 +188,7 @@ pub async fn handle_query_scan(params: &Value, ctx: &McpContext) -> Result<Value
     }
     // CO-4 live holdout: unshaped control arm forces pretty; record the cost.
     let unshaped = crate::holdout::request_is_control(&params.to_string());
-    let compact = crate::payload::compact_enabled() && !unshaped;
+    let compact = !unshaped;
     let text = crate::payload::serialize_with(&inner, compact);
     crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
     crate::holdout::sample_compaction(&params.to_string(), &inner); // CO-5 compaction-only
@@ -293,7 +292,7 @@ pub async fn handle_query_expand(params: &Value, ctx: &McpContext) -> Result<Val
 
     // CO-4 live holdout: unshaped control arm forces pretty; record the cost.
     let unshaped = crate::holdout::request_is_control(&params.to_string());
-    let compact = crate::payload::compact_enabled() && !unshaped;
+    let compact = !unshaped;
     let text = crate::payload::serialize_with(&response, compact);
     crate::holdout::record_sample(unshaped, crate::token_estimate::estimate_tokens_str(&text));
     crate::holdout::sample_compaction(&params.to_string(), &response); // CO-5 compaction-only
@@ -450,7 +449,7 @@ mod tests {
         assert_eq!(data["required"], true);
     }
 
-    // ── M1: reversible overflow (CRUX_BUDGET_REVERSIBLE) ──────────────────────
+    // ── M1: reversible overflow (unconditional since CO-5) ────────────────────
 
     /// Seed an index with `n` docs of varied length, all matching "alpha".
     async fn seed_alpha_index(ctx: &McpContext, tenant: &str, n: u32) {
@@ -473,20 +472,22 @@ mod tests {
         parsed["pointers"].as_array().map(Vec::len).unwrap_or(0)
     }
 
-    /// The headline parity: flag OFF drops at full-doc cost; flag ON budgets the
-    /// emitted pointer tier and admits strictly more candidates for the SAME
-    /// budget — while staying within `budget / POINTER_TOKENS` pointers (QC.2).
-    /// One test owns the env var (no other test reads it) to avoid parallel
-    /// races on process-global env.
+    /// The headline parity: the unshaped (holdout-control) path drops at full-doc
+    /// cost; the shaped (default) path budgets the emitted pointer tier and admits
+    /// strictly more candidates for the SAME budget — while staying within
+    /// `budget / POINTER_TOKENS` pointers (QC.2). Since CO-5 removed the
+    /// `CRUX_BUDGET_REVERSIBLE` flag, the shaped/unshaped lever is the holdout
+    /// fraction: `=1` ⇒ every request is control (unshaped/legacy), `=0` ⇒ shaped.
     #[tokio::test]
     async fn reversible_admits_more_than_full_doc_drop() {
+        let _g = crate::test_env_lock().lock().await;
         let ctx = test_ctx();
         seed_alpha_index(&ctx, "t1", 30).await;
         let budget = 200u64; // 200/40 = 5 pointers when reversible.
 
-        // OFF (explicit opt-out, since CO-3 makes ON the default): legacy
-        // take_while over ~100-tok docs → at most 2 fit 200.
-        std::env::set_var(crate::budget::REVERSIBLE_ENV, "0");
+        // Unshaped (holdout=1 ⇒ every request is control): legacy take_while over
+        // ~100-tok docs → at most 2 fit 200.
+        std::env::set_var(crate::holdout::HOLDOUT_ENV, "1");
         let off = handle_query(
             &json!({"tenant_id": "t1", "query": "alpha", "limit": 50, "token_budget": budget}),
             &ctx,
@@ -495,8 +496,8 @@ mod tests {
         .unwrap();
         let off_n = pointer_count(&off);
 
-        // ON: pointer-budgeted → exactly 5, strictly more than OFF.
-        std::env::set_var(crate::budget::REVERSIBLE_ENV, "1");
+        // Shaped (holdout=0 ⇒ reversible): pointer-budgeted → exactly 5.
+        std::env::set_var(crate::holdout::HOLDOUT_ENV, "0");
         let on = handle_query(
             &json!({"tenant_id": "t1", "query": "alpha", "limit": 50, "token_budget": budget}),
             &ctx,
@@ -504,7 +505,8 @@ mod tests {
         .await
         .unwrap();
         let on_n = pointer_count(&on);
-        std::env::remove_var(crate::budget::REVERSIBLE_ENV);
+        std::env::remove_var(crate::holdout::HOLDOUT_ENV);
+        crate::holdout::accumulator().lock().unwrap().clear_for_test();
 
         assert_eq!(
             on_n,
