@@ -2674,6 +2674,17 @@ pub async fn handle_get_agent_identity(_args: &Value, ctx: &McpContext) -> Resul
 
 /// Dispatch a tool call by name. Returns the MCP `content` array.
 pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    // passport-revocation M3: when enforcement is on (CRUX_PASSPORT_REVOCATION=1,
+    // default-off), a REVOKED passport is refused every tool except a tiny
+    // read-only allowlist (so it can learn why — M4). The fact store is
+    // in-process/in-memory, so the per-call passport read is a cheap
+    // RwLock+indexed lookup; no TTL cache is used (it would only add revocation
+    // staleness). Fail-open: only an explicit revoked_at blocks.
+    if ctx.revocation_enforced && !passport::REVOKED_AGENT_ALLOWLIST.contains(&name) {
+        if let Some(reason) = passport::caller_revocation_reason(ctx).await {
+            return Ok(passport::revoked_call_error(name, &reason));
+        }
+    }
     match name {
         "cuecrux_session" => cuecrux_session::handle_cuecrux_session(args, ctx).await,
         "autonomy_contract" => autonomy::handle_autonomy_contract(args, ctx).await,
@@ -3422,6 +3433,55 @@ mod tests {
         let result = call_tool("get_passport", &json!({}), &ctx).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("no agent identity"));
+    }
+
+    // ── passport-revocation M3: dispatch enforcement ───────────────
+
+    #[tokio::test]
+    async fn call_tool_revoked_passport_refused_except_allowlist() {
+        // Enforcement ON: a revoked passport is refused every tool but the
+        // read-only allowlist (get_passport / get_agent_identity).
+        let ctx = McpContext::new_default("test-node").with_revocation_enforced(true);
+        let alice = ctx.with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        call_tool("issue_passport", &json!({}), &alice).await.unwrap();
+        call_tool("revoke_passport", &json!({"reason": "compromised"}), &alice)
+            .await
+            .unwrap();
+
+        // Non-allowlisted tool: refused.
+        let denied = call_tool("query_facts", &json!({"token_budget": 50}), &alice)
+            .await
+            .unwrap();
+        assert_eq!(denied["isError"], json!(true));
+        assert!(denied["content"][0]["text"].as_str().unwrap().contains("revoked"));
+
+        // Allowlisted tool: still reachable, so the agent can learn its status.
+        let allowed = call_tool("get_passport", &json!({}), &alice).await.unwrap();
+        assert!(allowed.get("isError").is_none());
+    }
+
+    #[tokio::test]
+    async fn call_tool_revocation_off_by_default() {
+        // Flag-off (default): a revoked passport is NOT refused.
+        let ctx = test_ctx(); // revocation_enforced = false
+        let alice = ctx.with_agent(AgentIdentity {
+            name: "alice".to_string(),
+            token_hash: [0u8; 32],
+        });
+        call_tool("issue_passport", &json!({}), &alice).await.unwrap();
+        call_tool("revoke_passport", &json!({}), &alice).await.unwrap();
+
+        let r = call_tool("query_facts", &json!({"token_budget": 50}), &alice)
+            .await
+            .unwrap();
+        let text = serde_json::to_string(&r).unwrap();
+        assert!(
+            !text.contains("passport revoked"),
+            "revocation must be off by default: {text}"
+        );
     }
 
     // ── constraint dispatch integration tests ───────────────────────

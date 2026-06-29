@@ -103,6 +103,7 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
             artefact_store: Arc::clone(&ctx.artefact_store),
             agent_passports_enabled: ctx.agent_passports_enabled,
             agent_passport_map: ctx.agent_passport_map.clone(),
+            revocation_enforced: ctx.revocation_enforced,
         }
     };
 

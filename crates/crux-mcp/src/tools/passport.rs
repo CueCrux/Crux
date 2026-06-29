@@ -556,6 +556,37 @@ pub async fn handle_revoke_passport(args: &Value, ctx: &McpContext) -> Result<Va
     )}]}))
 }
 
+// ── passport-revocation M3: enforcement helpers ────────────────────────────
+
+/// Tools a REVOKED passport may still call, so it can discover *why* it was
+/// revoked (M4). Everything else is refused by `call_tool` when
+/// [`McpContext::revocation_enforced`] is on.
+pub(crate) const REVOKED_AGENT_ALLOWLIST: &[&str] = &["get_passport", "get_agent_identity"];
+
+/// If the calling agent's passport is revoked, return its reason (`Some`).
+/// `None` when the agent is anonymous, has no passport, or the passport is
+/// active — fail-open: only an explicit `revoked_at` blocks.
+pub(crate) async fn caller_revocation_reason(ctx: &McpContext) -> Option<String> {
+    let p = get_agent_passport(ctx).await?;
+    p.revoked_at
+        .is_some()
+        .then(|| p.revoked_reason.unwrap_or_else(|| "(no reason recorded)".to_string()))
+}
+
+/// The error a revoked passport gets for a non-allowlisted tool.
+pub(crate) fn revoked_call_error(tool: &str, reason: &str) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": format!(
+                "passport revoked — '{tool}' refused (reason: {reason}). \
+                 Call get_passport for your revocation status."
+            )
+        }],
+        "isError": true
+    })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1099,6 +1130,21 @@ mod tests {
         assert!(r.get("isError").is_none(), "got: {r}");
         let rec = super::get_passport_by_name(&ctx, "bob").await.unwrap();
         assert_eq!(rec.revoked_reason.as_deref(), Some("offboarded"));
+    }
+
+    // ── passport-revocation M3: enforcement helper ─────────────────
+
+    #[tokio::test]
+    async fn caller_revocation_reason_none_when_active_some_when_revoked() {
+        let ctx = test_ctx();
+        let alice = alice_ctx(&ctx);
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+        assert!(super::caller_revocation_reason(&alice).await.is_none());
+
+        handle_revoke_passport(&json!({"reason": "leak"}), &alice)
+            .await
+            .unwrap();
+        assert_eq!(super::caller_revocation_reason(&alice).await.as_deref(), Some("leak"));
     }
 
     // ── require_passport_tier ──────────────────────────────────────

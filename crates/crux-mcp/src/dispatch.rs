@@ -81,6 +81,20 @@ pub struct McpContext {
     /// is true. Empty by default so a stray value cannot change behaviour
     /// while the flag is off.
     pub agent_passport_map: crate::agent_passport::AgentPassportMap,
+    /// passport-revocation M3: when true, `call_tool` refuses calls from a
+    /// REVOKED passport (except a tiny read-only allowlist so the agent can
+    /// learn it was revoked — M4). Wired from `corecruxd::main` off
+    /// `CRUX_PASSPORT_REVOCATION`; default false (no enforcement).
+    pub revocation_enforced: bool,
+}
+
+/// passport-revocation M3: read the `CRUX_PASSPORT_REVOCATION` flag (default
+/// off). `corecruxd::main` threads the result into
+/// [`McpContext::with_revocation_enforced`].
+pub fn revocation_enforced_from_env() -> bool {
+    std::env::var("CRUX_PASSPORT_REVOCATION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 impl McpContext {
@@ -109,6 +123,7 @@ impl McpContext {
             // `with_agent_passports`.
             agent_passports_enabled: false,
             agent_passport_map: crate::agent_passport::AgentPassportMap::empty(),
+            revocation_enforced: false,
         }
     }
 
@@ -141,6 +156,7 @@ impl McpContext {
             artefact_store: Arc::new(RwLock::new(ArtefactStore::new())),
             agent_passports_enabled: false,
             agent_passport_map: crate::agent_passport::AgentPassportMap::empty(),
+            revocation_enforced: false,
         }
     }
 
@@ -187,6 +203,7 @@ impl McpContext {
             artefact_store: Arc::clone(&self.artefact_store),
             agent_passports_enabled: self.agent_passports_enabled,
             agent_passport_map: self.agent_passport_map.clone(),
+            revocation_enforced: self.revocation_enforced,
         }
     }
 
@@ -198,6 +215,14 @@ impl McpContext {
     pub fn with_agent_passports(mut self, enabled: bool, map: crate::agent_passport::AgentPassportMap) -> Self {
         self.agent_passports_enabled = enabled;
         self.agent_passport_map = map;
+        self
+    }
+
+    /// passport-revocation M3: enable/disable refusal of revoked passports'
+    /// calls. Wired from `corecruxd::main` off `CRUX_PASSPORT_REVOCATION`; tests
+    /// use it directly to exercise the flag-ON path without a process-global env.
+    pub fn with_revocation_enforced(mut self, enabled: bool) -> Self {
+        self.revocation_enforced = enabled;
         self
     }
 
