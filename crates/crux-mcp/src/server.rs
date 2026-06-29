@@ -53,6 +53,7 @@ pub fn router(ctx: McpContext) -> axum::Router {
             "/.well-known/oauth-protected-resource",
             get(handle_oauth_protected_resource),
         )
+        .route("/.well-known/agent-card", get(handle_agent_card))
         .with_state(state)
 }
 
@@ -65,6 +66,25 @@ async fn handle_oauth_protected_resource() -> Response {
         Some(cfg) => (StatusCode::OK, Json(cfg.protected_resource_document())).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// `GET /.well-known/agent-card` — A2A / GB-Z-185.4-style discovery card
+/// (agent-card M6). PUBLIC (no bearer) so external agents can discover this
+/// daemon. Flag-gated: returns `404` unless `CRUX_AGENT_CARD=1` (default-off —
+/// the operator's local daemon is not public-facing). Describes the service
+/// only — no caller passport, no private facts.
+async fn handle_agent_card(State(ctx): State<Arc<McpContext>>) -> Response {
+    if !agent_card_enabled() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    (StatusCode::OK, Json(crate::agent_card::build_agent_card(&ctx))).into_response()
+}
+
+/// agent-card M6: discovery-endpoint flag (`CRUX_AGENT_CARD=1`, default-off).
+fn agent_card_enabled() -> bool {
+    std::env::var("CRUX_AGENT_CARD")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// `POST /mcp` — JSON-RPC 2.0 endpoint (MCP Streamable HTTP).
@@ -103,6 +123,7 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
             artefact_store: Arc::clone(&ctx.artefact_store),
             agent_passports_enabled: ctx.agent_passports_enabled,
             agent_passport_map: ctx.agent_passport_map.clone(),
+            revocation_enforced: ctx.revocation_enforced,
         }
     };
 
@@ -477,6 +498,42 @@ mod tests {
         let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body_bytes).unwrap();
         assert!(rpc_resp.error.is_none());
         assert_eq!(rpc_resp.result.as_ref().unwrap()["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn well_known_agent_card_flag_gated() {
+        // agent-card M6. This is the only test that touches CRUX_AGENT_CARD, and
+        // it sets+clears within itself, so there is no cross-test env race.
+        std::env::remove_var("CRUX_AGENT_CARD");
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/.well-known/agent-card")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "default-off => 404");
+
+        std::env::set_var("CRUX_AGENT_CARD", "1");
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/.well-known/agent-card")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "flag-on => 200, no bearer");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["schema"], crate::agent_card::AGENT_CARD_SCHEMA);
+        assert!(v["access"]["wellKnown"].as_str().unwrap().contains("agent-card"));
+        std::env::remove_var("CRUX_AGENT_CARD");
     }
 
     #[tokio::test]

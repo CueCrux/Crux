@@ -45,6 +45,17 @@ pub(crate) struct PassportRecord {
     /// decision; M5 (gated) is where group-visibility enforcement reads it.
     #[serde(default)]
     pub tenant_group: Option<String>,
+    /// passport-revocation M1: when set (RFC3339), this passport is REVOKED and
+    /// must be refused at the dispatch gate (M3). Terminal + supersede-don't-
+    /// delete — the fact stays for audit; a revoked passport is never un-revoked
+    /// (re-grant = a NEW passport). `serde(default)` keeps pre-revocation
+    /// records deserialising (T.2 back-compat).
+    #[serde(default)]
+    pub revoked_at: Option<String>,
+    /// passport-revocation M2: optional human-readable reason captured at revoke
+    /// time, surfaced by `get_passport` (M4) so a revoked agent learns why.
+    #[serde(default)]
+    pub revoked_reason: Option<String>,
 }
 
 // ── Tier resolution ───────────────────────────────────────────────────────
@@ -73,6 +84,21 @@ fn tier_rank(tier: &str) -> u8 {
         "basic" => 1,
         _ => 0,
     }
+}
+
+/// passport-revocation M2: may `caller` revoke `target`?
+///
+/// Authorized iff one of:
+/// - **self-revoke** — the caller's own passport key equals the target's;
+/// - **operator** — the caller holds the top (`elite`) tier;
+/// - **sponsor** — the caller is the principal that sponsored the target.
+///
+/// (Decision 2026-06-29: operator/admin-or-self, plus sponsor. No third-party
+/// revoke. Configurable later via an OD row.)
+fn can_revoke(caller_key: &str, caller: &PassportRecord, target_key: &str, target: &PassportRecord) -> bool {
+    caller_key == target_key
+        || caller.reputation_tier == "elite"
+        || target.sponsor_id.as_deref() == Some(caller.principal_id.as_str())
 }
 
 // ── MCP-vs-daemon passport boundary ───────────────────────────────────────
@@ -119,13 +145,20 @@ pub(crate) fn passport_key_name(ctx: &McpContext) -> Option<String> {
 /// Returns `None` if no passport exists or the agent is anonymous.
 pub(crate) async fn get_agent_passport(ctx: &McpContext) -> Option<PassportRecord> {
     let agent_name = passport_key_name(ctx)?;
+    get_passport_by_name(ctx, &agent_name).await
+}
 
-    let entity = format!("{PASSPORT_PREFIX}{agent_name}");
+/// Load a passport by its key-name (the entity component after `__passport__::`).
+/// Used by `get_agent_passport` (the caller's own) and by `revoke_passport` (an
+/// explicit target). `top_k` is >1 so a co-located `revocation` audit fact under
+/// the same entity (M2) doesn't crowd out the `passport` fact.
+pub(crate) async fn get_passport_by_name(ctx: &McpContext, name: &str) -> Option<PassportRecord> {
+    let entity = format!("{PASSPORT_PREFIX}{name}");
     let q = FactQuery {
         query: None,
         entity: Some(entity),
         entity_prefix: None,
-        top_k: 1,
+        top_k: 16,
         token_budget: None,
     };
 
@@ -276,6 +309,8 @@ async fn mint_passport(
         issued_at: chrono::Utc::now().to_rfc3339(),
         passport_hash: String::new(),
         tenant_group,
+        revoked_at: None,
+        revoked_reason: None,
     };
     let hash_input = serde_json::to_string(&record).unwrap_or_default();
     record.passport_hash = blake3::hash(hash_input.as_bytes()).to_hex().to_string();
@@ -398,11 +433,22 @@ pub async fn handle_get_passport(_args: &Value, ctx: &McpContext) -> Result<Valu
                 String::new()
             };
 
+            // passport-revocation M4: a revoked passport learns it was revoked
+            // (and why) via get_passport — the one tool the M3 gate still allows.
+            let revoked_note = match &record.revoked_at {
+                Some(at) => format!(
+                    " ⚠ REVOKED at {} (reason: {}).",
+                    at,
+                    record.revoked_reason.as_deref().unwrap_or("none")
+                ),
+                None => String::new(),
+            };
+
             Ok(json!({
                 "content": [{
                     "type": "text",
                     "text": format!(
-                        "passport for {} (tier={}, receipts={}, sponsor={}, group={}, issued={}, hash={}).{}",
+                        "passport for {} (tier={}, receipts={}, sponsor={}, group={}, issued={}, hash={}).{}{}",
                         record.principal_id,
                         record.reputation_tier,
                         record.receipt_count,
@@ -410,12 +456,147 @@ pub async fn handle_get_passport(_args: &Value, ctx: &McpContext) -> Result<Valu
                         record.tenant_group.as_deref().unwrap_or("none"),
                         record.issued_at,
                         &record.passport_hash[..16],
-                        upgrade_hint
+                        upgrade_hint,
+                        revoked_note
                     )
                 }]
             }))
         }
     }
+}
+
+/// `revoke_passport` — revoke an agent passport (passport-revocation M2).
+///
+/// Terminal + supersede-don't-delete: the passport fact stays (revoked), and a
+/// separate `revocation` audit fact records who/why/when (RCX
+/// `AttestationRevokedReceipt` semantics). Enforcement (refusing a revoked
+/// passport's calls) is M3, gated behind `CRUX_PASSPORT_REVOCATION=1`.
+pub async fn handle_revoke_passport(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let Some(caller_key) = passport_key_name(ctx) else {
+        return Err(JsonRpcError {
+            code: INVALID_PARAMS,
+            message: "revoke_passport requires an authenticated agent identity".to_string(),
+            data: Some(json!({"requires_agent_identity": true})),
+        });
+    };
+
+    let target_key = args
+        .get("target_passport")
+        .and_then(|v| v.as_str())
+        .map_or_else(|| caller_key.clone(), String::from);
+    let reason = args.get("reason").and_then(|v| v.as_str()).map(String::from);
+
+    let err_content = |text: String| json!({"content": [{"type": "text", "text": text}], "isError": true});
+
+    let Some(caller) = get_passport_by_name(ctx, &caller_key).await else {
+        return Ok(err_content(format!(
+            "revoke_passport: caller '{caller_key}' has no passport. Call issue_passport() first."
+        )));
+    };
+    let Some(mut target) = get_passport_by_name(ctx, &target_key).await else {
+        return Ok(err_content(format!(
+            "revoke_passport: no passport found for '{target_key}'."
+        )));
+    };
+
+    // Idempotent: a revoked passport is terminal — re-revoke is a no-op.
+    if target.revoked_at.is_some() {
+        return Ok(json!({"content": [{"type": "text", "text": format!(
+            "passport '{}' is already revoked (at {}, reason={}).",
+            target_key,
+            target.revoked_at.as_deref().unwrap_or("?"),
+            target.revoked_reason.as_deref().unwrap_or("none")
+        )}]}));
+    }
+
+    if !can_revoke(&caller_key, &caller, &target_key, &target) {
+        return Ok(err_content(format!(
+            "revoke_passport: '{caller_key}' is not authorized to revoke '{target_key}'. \
+             Allowed: self-revoke, the passport's sponsor, or an elite-tier operator."
+        )));
+    }
+
+    // Stamp revocation (supersede-don't-delete) and recompute the integrity hash.
+    let revoked_at = chrono::Utc::now().to_rfc3339();
+    target.revoked_at = Some(revoked_at.clone());
+    target.revoked_reason.clone_from(&reason);
+    target.passport_hash = String::new();
+    let hash_input = serde_json::to_string(&target).unwrap_or_default();
+    target.passport_hash = blake3::hash(hash_input.as_bytes()).to_hex().to_string();
+
+    let entity = format!("{PASSPORT_PREFIX}{target_key}");
+    let canonical = serde_json::to_string(&target).unwrap_or_default();
+    let event = json!({
+        "revoker_passport": caller_key,
+        "reason": reason,
+        "revoked_at": revoked_at,
+    });
+
+    {
+        let mut store = ctx.fact_store.write().await;
+        // 1. Mark the passport record revoked.
+        store.store(StoreFact {
+            entity: entity.clone(),
+            key: "passport".to_string(),
+            value: canonical,
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: Some(caller_key.clone()),
+        });
+        // 2. Receipted audit record of the revocation event (QC.3-attributed,
+        //    T.4 audit trail via the store's append/receipt path).
+        store.store(StoreFact {
+            entity,
+            key: "revocation".to_string(),
+            value: event.to_string(),
+            source_receipt: None,
+            confidence: 1.0,
+            private: false,
+            horizon_class: None,
+            actor: Some(caller_key.clone()),
+        });
+    }
+
+    Ok(json!({"content": [{"type": "text", "text": format!(
+        "passport '{}' revoked by '{}' (reason={}). Access is refused once revocation \
+         enforcement (CRUX_PASSPORT_REVOCATION=1) is enabled.",
+        target_key,
+        caller_key,
+        reason.as_deref().unwrap_or("none")
+    )}]}))
+}
+
+// ── passport-revocation M3: enforcement helpers ────────────────────────────
+
+/// Tools a REVOKED passport may still call, so it can discover *why* it was
+/// revoked (M4). Everything else is refused by `call_tool` when
+/// [`McpContext::revocation_enforced`] is on.
+pub(crate) const REVOKED_AGENT_ALLOWLIST: &[&str] = &["get_passport", "get_agent_identity"];
+
+/// If the calling agent's passport is revoked, return its reason (`Some`).
+/// `None` when the agent is anonymous, has no passport, or the passport is
+/// active — fail-open: only an explicit `revoked_at` blocks.
+pub(crate) async fn caller_revocation_reason(ctx: &McpContext) -> Option<String> {
+    let p = get_agent_passport(ctx).await?;
+    p.revoked_at
+        .is_some()
+        .then(|| p.revoked_reason.unwrap_or_else(|| "(no reason recorded)".to_string()))
+}
+
+/// The error a revoked passport gets for a non-allowlisted tool.
+pub(crate) fn revoked_call_error(tool: &str, reason: &str) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": format!(
+                "passport revoked — '{tool}' refused (reason: {reason}). \
+                 Call get_passport for your revocation status."
+            )
+        }],
+        "isError": true
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -830,6 +1011,169 @@ mod tests {
         let rec = super::get_agent_passport(&anthropic).await.unwrap();
         assert_eq!(rec.reputation_tier, "basic");
         assert_eq!(rec.tenant_group.as_deref(), Some("work"));
+    }
+
+    // ── passport-revocation M1: data model back-compat ─────────────
+
+    #[test]
+    fn pre_revocation_passport_fact_without_revoked_fields_still_loads() {
+        // serde(default): a passport fact written before revocation (no
+        // revoked_at / revoked_reason) must still deserialise (T.2 back-compat).
+        let legacy = r#"{"principal_id":"legacy","sponsor_id":null,"reputation_tier":"unverified","receipt_count":0,"issued_at":"2026-01-01T00:00:00Z","passport_hash":"abc","tenant_group":"work"}"#;
+        let rec: PassportRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(rec.tenant_group.as_deref(), Some("work"));
+        assert_eq!(rec.revoked_at, None);
+        assert_eq!(rec.revoked_reason, None);
+    }
+
+    #[tokio::test]
+    async fn minted_passport_is_not_revoked() {
+        let ctx = test_ctx();
+        let alice = alice_ctx(&ctx);
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+        let rec = super::get_agent_passport(&alice).await.unwrap();
+        assert_eq!(rec.revoked_at, None);
+        assert_eq!(rec.revoked_reason, None);
+    }
+
+    // ── passport-revocation M2: revoke_passport ────────────────────
+
+    #[test]
+    fn can_revoke_matrix() {
+        let mk = |principal: &str, tier: &str, sponsor: Option<&str>| PassportRecord {
+            principal_id: principal.to_string(),
+            sponsor_id: sponsor.map(String::from),
+            reputation_tier: tier.to_string(),
+            receipt_count: 0,
+            issued_at: "t".to_string(),
+            passport_hash: "h".to_string(),
+            tenant_group: None,
+            revoked_at: None,
+            revoked_reason: None,
+        };
+        let caller = mk("alice", "basic", None);
+        // self-revoke
+        assert!(super::can_revoke("alice", &caller, "alice", &caller));
+        // operator (elite) cross-revoke
+        let elite = mk("op", "elite", None);
+        let bob = mk("bob", "basic", None);
+        assert!(super::can_revoke("op", &elite, "bob", &bob));
+        // sponsor cross-revoke
+        let sponsored = mk("bob", "basic", Some("alice"));
+        assert!(super::can_revoke("alice", &caller, "bob", &sponsored));
+        // unauthorized: not self, not elite, not sponsor
+        assert!(!super::can_revoke("alice", &caller, "bob", &bob));
+    }
+
+    #[tokio::test]
+    async fn revoke_requires_agent() {
+        let ctx = test_ctx();
+        let err = handle_revoke_passport(&json!({}), &ctx).await.unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn self_revoke_stamps_audits_and_is_idempotent() {
+        let ctx = test_ctx();
+        let alice = alice_ctx(&ctx);
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+
+        let r = handle_revoke_passport(&json!({"reason": "compromised"}), &alice)
+            .await
+            .unwrap();
+        assert!(r.get("isError").is_none(), "got: {r}");
+        assert!(r["content"][0]["text"].as_str().unwrap().contains("revoked"));
+
+        let rec = super::get_agent_passport(&alice).await.unwrap();
+        assert!(rec.revoked_at.is_some());
+        assert_eq!(rec.revoked_reason.as_deref(), Some("compromised"));
+
+        // A receipted revocation audit fact sits beside the passport.
+        {
+            let store = ctx.fact_store.read().await;
+            assert!(store
+                .all_facts()
+                .any(|f| f.entity == "__passport__::alice" && f.key == "revocation" && !f.deleted));
+        }
+
+        // Second revoke is a terminal no-op.
+        let r2 = handle_revoke_passport(&json!({}), &alice).await.unwrap();
+        assert!(r2["content"][0]["text"].as_str().unwrap().contains("already revoked"));
+    }
+
+    #[tokio::test]
+    async fn cross_revoke_unauthorized_is_denied() {
+        let ctx = test_ctx();
+        let alice = alice_ctx(&ctx);
+        let bob = ctx.with_agent(AgentIdentity {
+            name: "bob".to_string(),
+            token_hash: [1u8; 32],
+        });
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+        handle_issue_passport(&json!({}), &bob).await.unwrap();
+
+        let r = handle_revoke_passport(&json!({"target_passport": "alice"}), &bob)
+            .await
+            .unwrap();
+        assert_eq!(r["isError"], json!(true));
+        assert!(r["content"][0]["text"].as_str().unwrap().contains("not authorized"));
+
+        // alice's passport stays active.
+        let rec = super::get_agent_passport(&alice).await.unwrap();
+        assert!(rec.revoked_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn sponsor_can_revoke_sponsored_passport() {
+        let ctx = test_ctx();
+        let alice = alice_ctx(&ctx);
+        let bob = ctx.with_agent(AgentIdentity {
+            name: "bob".to_string(),
+            token_hash: [1u8; 32],
+        });
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+        handle_issue_passport(&json!({"sponsor_id": "alice"}), &bob)
+            .await
+            .unwrap();
+
+        let r = handle_revoke_passport(&json!({"target_passport": "bob", "reason": "offboarded"}), &alice)
+            .await
+            .unwrap();
+        assert!(r.get("isError").is_none(), "got: {r}");
+        let rec = super::get_passport_by_name(&ctx, "bob").await.unwrap();
+        assert_eq!(rec.revoked_reason.as_deref(), Some("offboarded"));
+    }
+
+    // ── passport-revocation M3: enforcement helper ─────────────────
+
+    #[tokio::test]
+    async fn caller_revocation_reason_none_when_active_some_when_revoked() {
+        let ctx = test_ctx();
+        let alice = alice_ctx(&ctx);
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+        assert!(super::caller_revocation_reason(&alice).await.is_none());
+
+        handle_revoke_passport(&json!({"reason": "leak"}), &alice)
+            .await
+            .unwrap();
+        assert_eq!(super::caller_revocation_reason(&alice).await.as_deref(), Some("leak"));
+    }
+
+    // ── passport-revocation M4: get_passport surfaces revoked state ─
+
+    #[tokio::test]
+    async fn get_passport_surfaces_revoked_state() {
+        let ctx = test_ctx();
+        let alice = alice_ctx(&ctx);
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+        handle_revoke_passport(&json!({"reason": "key leaked"}), &alice)
+            .await
+            .unwrap();
+
+        let result = handle_get_passport(&json!({}), &alice).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("REVOKED"), "got: {text}");
+        assert!(text.contains("key leaked"), "got: {text}");
     }
 
     // ── require_passport_tier ──────────────────────────────────────
