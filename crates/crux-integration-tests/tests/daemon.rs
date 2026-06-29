@@ -91,12 +91,7 @@ fn console_shell_renders() {
     let root = daemon().get("/").unwrap().into_body().read_to_string().unwrap();
     assert!(root.contains("Crux Console"));
 
-    let alias = daemon()
-        .get("/console")
-        .unwrap()
-        .into_body()
-        .read_to_string()
-        .unwrap();
+    let alias = daemon().get("/console").unwrap().into_body().read_to_string().unwrap();
     assert!(alias.contains("Crux Console"));
 }
 
