@@ -1383,6 +1383,34 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                 "examples": [{}]
             }),
         },
+        ToolDefinition {
+            name: "revoke_passport".to_string(),
+            description: "Revoke an agent passport (terminal; supersede-don't-delete). \
+                          Defaults to the caller's own passport (self-revoke); pass \
+                          `target_passport` to revoke another. Authorized for: self, the \
+                          passport's sponsor, or an elite-tier operator. Writes a receipted \
+                          revocation event. Access refusal is gated behind \
+                          CRUX_PASSPORT_REVOCATION=1."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target_passport": {
+                        "type": "string",
+                        "description": "Passport id to revoke (defaults to the caller's own)"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional human-readable revocation reason"
+                    }
+                },
+                "examples": [
+                    {},
+                    { "reason": "key compromised" },
+                    { "target_passport": "codex-work", "reason": "offboarded" }
+                ]
+            }),
+        },
         // ── Identity continuity (agent-ux-08) ──────────────────────
         ToolDefinition {
             name: "passport_split".to_string(),
@@ -2571,6 +2599,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "audit_export_bundle", "output": "{ content: [...], bundle_id, bytes_path, manifest_signature_b64, fact_count, receipt_count, scope, since, until, events_jsonl_sha256, receipts_cbor_sha256 } — bundle persisted to CORECRUXD_AUDIT_EXPORT_DIR; verify offline via `corecruxctl audit-verify`. agent-ux-11 (EU AI Act Art. 12)." },
         { "tool": "issue_passport",     "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id }" },
         { "tool": "get_passport",       "output": "{ principal_id, reputation_tier, receipt_count, sponsor_id, issued_at, passport_hash }" },
+        { "tool": "revoke_passport",    "output": "{ content: [...], revoked target_passport, revoker_passport, reason; isError on unauthorized / no-passport }" },
         { "tool": "passport_split",        "output": "{ content: [...], new_passport_id, split_receipt_id, receipt_body_cbor_hex, receipt_body_hash_hex, tenant_id }" },
         { "tool": "passport_merge",        "output": "{ content: [...], merged_passport_id, merge_receipt_id, conflicts_resolved, conflict_policy, receipt_body_cbor_hex, receipt_body_hash_hex, tenant_id, retired_passport_id }" },
         { "tool": "passport_link_device",  "output": "{ content: [...], link_receipt_id, passport_id, device_fingerprint, capabilities_subset, receipt_body_cbor_hex, receipt_body_hash_hex, tenant_id }" },
@@ -2709,6 +2738,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "enrich_action" => action::handle_enrich_action(args, ctx).await,
         "issue_passport" => passport::handle_issue_passport(args, ctx).await,
         "get_passport" => passport::handle_get_passport(args, ctx).await,
+        "revoke_passport" => passport::handle_revoke_passport(args, ctx).await,
         // Identity continuity (agent-ux-08).
         "passport_split" => identity::handle_passport_split(args, ctx).await,
         "passport_merge" => identity::handle_passport_merge(args, ctx).await,
@@ -2864,7 +2894,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 111; // main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
+    const TOOL_COUNT: usize = 112; // +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
