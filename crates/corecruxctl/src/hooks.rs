@@ -12,9 +12,11 @@
 //!   lifecycle evidence → daemon).
 //!
 //! It also ships the embedded `crux-filemod.sh` (B4 write-side file-modification
-//! ledger) into the hooks dir so it is available to install; its `settings.json`
-//! wiring stays operator/opt-in (the script self-gates on `CRUX_HOOK_FILEMOD`,
-//! default off).
+//! ledger) into the hooks dir AND wires it on `PreToolUse` + `PostToolUse`
+//! (matcher `Edit|Write|MultiEdit|NotebookEdit`) via the launcher's `filemod`
+//! mode. This auto-wiring is **safe-by-default / opt-in**: the script self-gates
+//! on `CRUX_HOOK_FILEMOD` (default off) and always exits 0, so the entries are
+//! inert until an operator sets `CRUX_HOOK_FILEMOD=1` in `~/.config/cuecrux/env`.
 //!
 //! Both run through a launcher (`crux-hook-env.sh`) that sources
 //! `~/.config/cuecrux/env` (0600, written by `corecruxctl login`) so the daemon
@@ -52,6 +54,7 @@ case "$mode" in
   context)    exec crux-hook context-monitor ;;
   precompact) exec crux-hook pre-compact ;;
   observe)    exec "$OBSERVE" "$@" ;;
+  filemod)    exec "$HOME/.local/share/crux/hooks/crux-filemod.sh" "$@" ;;
   cost)
     # SessionEnd: post the just-ended transcript's token-burn cost report to the
     # daemon (feeds the cx-cost lens + per-ExecPlan token_burn). Read the hook
@@ -158,8 +161,18 @@ fn cmd(wrapper: &Path, args: &str) -> serde_json::Value {
 }
 
 fn event(hooks: Vec<serde_json::Value>) -> serde_json::Value {
-    serde_json::json!([{ "matcher": ".*", "hooks": hooks }])
+    event_matched(".*", hooks)
 }
+
+/// A single matcher-scoped hook group (for events whose hooks should only fire
+/// on specific tool names, e.g. the opt-in `filemod` ledger on edit tools).
+fn event_matched(matcher: &str, hooks: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!([{ "matcher": matcher, "hooks": hooks }])
+}
+
+/// Tool-name matcher for the write-side `filemod` ledger (mirrors the script's
+/// own `case "$TOOL"` allowlist).
+const FILEMOD_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit";
 
 /// Build the `hooks` block. Observe runs on all five lifecycle events; the
 /// banner/context/pre-compact entries are added only when `crux-hook` exists.
@@ -177,7 +190,25 @@ fn build_hooks_block(wrapper: &Path, have_binary: bool) -> serde_json::Value {
         "UserPromptSubmit".to_string(),
         event(vec![cmd(wrapper, "observe user_prompt")]),
     );
-    map.insert("PostToolUse".to_string(), event(post_tool));
+    // PreToolUse: stash the pre-edit before-image for the opt-in filemod ledger.
+    // Scoped to the edit tools; inert until the operator sets CRUX_HOOK_FILEMOD=1
+    // (the script self-gates and always exits 0).
+    map.insert(
+        "PreToolUse".to_string(),
+        event_matched(FILEMOD_MATCHER, vec![cmd(wrapper, "filemod pre")]),
+    );
+    // PostToolUse: the existing observe (`.*`) group, plus the opt-in filemod
+    // post leg scoped to the edit tools (hash + line-delta → daemon).
+    let mut post_tool_groups = event(post_tool);
+    if let Some(arr) = post_tool_groups.as_array_mut() {
+        if let Some(group) = event_matched(FILEMOD_MATCHER, vec![cmd(wrapper, "filemod post")])
+            .as_array_mut()
+            .and_then(|g| g.first().cloned())
+        {
+            arr.push(group);
+        }
+    }
+    map.insert("PostToolUse".to_string(), post_tool_groups);
     map.insert("Stop".to_string(), event(vec![cmd(wrapper, "observe stop")]));
     // SessionEnd: capture the lifecycle node AND post the token-burn cost report
     // (cost runs corecruxctl directly, so it is independent of the crux-hook
@@ -363,6 +394,49 @@ mod tests {
         assert!(cmds.iter().any(|c| c.ends_with(" cost")), "cost mode wired: {cmds:?}");
         // And the launcher knows the `cost` mode.
         assert!(WRAPPER_SH.contains("session cost --post"));
+    }
+
+    #[test]
+    fn hooks_block_wires_opt_in_filemod_pre_and_post() {
+        let w = Path::new("/x/crux-hook-env.sh");
+        // Wiring is present regardless of the crux-hook binary (filemod is
+        // independent of it, like the cost leg).
+        for have_binary in [false, true] {
+            let h = build_hooks_block(w, have_binary);
+            let map = h.as_object().unwrap();
+
+            // PreToolUse: a single matcher group scoped to the edit tools, running
+            // `filemod pre`.
+            let pre = map.get("PreToolUse").unwrap_or_else(|| panic!("missing PreToolUse"));
+            let pre_groups = pre.as_array().unwrap();
+            assert!(
+                pre_groups
+                    .iter()
+                    .any(|g| g["matcher"] == FILEMOD_MATCHER && g["hooks"].to_string().contains("filemod pre")),
+                "PreToolUse must wire `filemod pre` on {FILEMOD_MATCHER}: {pre}"
+            );
+
+            // PostToolUse: keeps the existing observe (`.*`) group AND adds a
+            // matcher-scoped `filemod post` group.
+            let post = map.get("PostToolUse").unwrap();
+            let post_groups = post.as_array().unwrap();
+            assert!(
+                post_groups
+                    .iter()
+                    .any(|g| g["matcher"] == ".*" && g["hooks"].to_string().contains("observe tool_use")),
+                "PostToolUse must keep the observe group: {post}"
+            );
+            assert!(
+                post_groups
+                    .iter()
+                    .any(|g| g["matcher"] == FILEMOD_MATCHER && g["hooks"].to_string().contains("filemod post")),
+                "PostToolUse must wire `filemod post` on {FILEMOD_MATCHER}: {post}"
+            );
+
+            // The launcher knows the `filemod` mode and dispatches to the script.
+            assert!(WRAPPER_SH.contains("filemod)"));
+            assert!(WRAPPER_SH.contains("crux-filemod.sh"));
+        }
     }
 
     #[test]
