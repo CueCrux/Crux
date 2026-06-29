@@ -33,7 +33,7 @@ ENV CORECRUX_GIT_SHA=${GIT_SHA}
 # corecruxd via include_str!, so it must be substituted before `cargo build`.
 # Empty value → the console footer falls back to the build commit.
 ARG RELEASE_VERSION=
-RUN sed -i "s|__CRUX_RELEASE__|${RELEASE_VERSION}|g" crates/corecruxd/playground/index.html
+RUN sed -i "s|__CRUX_RELEASE__|${RELEASE_VERSION}|g" crates/corecruxd/console/index.html
 
 RUN cargo build --locked --release --bin corecruxd --bin corecruxctl
 
