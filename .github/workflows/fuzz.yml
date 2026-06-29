@@ -141,7 +141,12 @@ jobs:
           cargo fuzz --version
 
       - name: Build fuzz target
-        run: cargo fuzz build "${{ matrix.target }}"
+        # Routed through the sccache-crash fallback (scripts/ci-fuzz-with-fallback.sh):
+        # the shared self-hosted sccache server dies under load while building ring's
+        # C sources and previously failed the whole PR here with no retry — unlike
+        # every other Rust job, which goes through ci-cargo-with-fallback.sh. Real
+        # build errors still surface (only sccache crash signatures are retried).
+        run: bash scripts/ci-fuzz-with-fallback.sh cargo fuzz build "${{ matrix.target }}"
 
       - name: Run bounded fuzz
         run: |
@@ -155,7 +160,10 @@ jobs:
           fi
           echo "::notice::Fuzzing ${{ matrix.target }} for ${SECS}s (rss ${FUZZ_RSS_LIMIT_MB}MiB)"
           mkdir -p "fuzz/corpus/${{ matrix.target }}"
-          cargo fuzz run "${{ matrix.target }}" -- \
+          # Same sccache-crash fallback as the build step. A real libFuzzer crash
+          # exits non-zero WITHOUT an sccache signature, so it is surfaced, not
+          # retried/suppressed.
+          bash scripts/ci-fuzz-with-fallback.sh cargo fuzz run "${{ matrix.target }}" -- \
             -max_total_time="$SECS" \
             -rss_limit_mb="$FUZZ_RSS_LIMIT_MB" \
             -malloc_limit_mb="$FUZZ_MALLOC_LIMIT_MB" \
