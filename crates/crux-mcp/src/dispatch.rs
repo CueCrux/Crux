@@ -2004,6 +2004,8 @@ mod tests {
                     issued_at: "2026-05-28T00:00:00Z".to_string(),
                     passport_hash: "deadbeef".to_string(),
                     tenant_group: None,
+                    revoked_at: None,
+                    revoked_reason: None,
                 })
                 .unwrap(),
                 source_receipt: None,

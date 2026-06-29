@@ -45,6 +45,17 @@ pub(crate) struct PassportRecord {
     /// decision; M5 (gated) is where group-visibility enforcement reads it.
     #[serde(default)]
     pub tenant_group: Option<String>,
+    /// passport-revocation M1: when set (RFC3339), this passport is REVOKED and
+    /// must be refused at the dispatch gate (M3). Terminal + supersede-don't-
+    /// delete — the fact stays for audit; a revoked passport is never un-revoked
+    /// (re-grant = a NEW passport). `serde(default)` keeps pre-revocation
+    /// records deserialising (T.2 back-compat).
+    #[serde(default)]
+    pub revoked_at: Option<String>,
+    /// passport-revocation M2: optional human-readable reason captured at revoke
+    /// time, surfaced by `get_passport` (M4) so a revoked agent learns why.
+    #[serde(default)]
+    pub revoked_reason: Option<String>,
 }
 
 // ── Tier resolution ───────────────────────────────────────────────────────
@@ -276,6 +287,8 @@ async fn mint_passport(
         issued_at: chrono::Utc::now().to_rfc3339(),
         passport_hash: String::new(),
         tenant_group,
+        revoked_at: None,
+        revoked_reason: None,
     };
     let hash_input = serde_json::to_string(&record).unwrap_or_default();
     record.passport_hash = blake3::hash(hash_input.as_bytes()).to_hex().to_string();
@@ -830,6 +843,29 @@ mod tests {
         let rec = super::get_agent_passport(&anthropic).await.unwrap();
         assert_eq!(rec.reputation_tier, "basic");
         assert_eq!(rec.tenant_group.as_deref(), Some("work"));
+    }
+
+    // ── passport-revocation M1: data model back-compat ─────────────
+
+    #[test]
+    fn pre_revocation_passport_fact_without_revoked_fields_still_loads() {
+        // serde(default): a passport fact written before revocation (no
+        // revoked_at / revoked_reason) must still deserialise (T.2 back-compat).
+        let legacy = r#"{"principal_id":"legacy","sponsor_id":null,"reputation_tier":"unverified","receipt_count":0,"issued_at":"2026-01-01T00:00:00Z","passport_hash":"abc","tenant_group":"work"}"#;
+        let rec: PassportRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(rec.tenant_group.as_deref(), Some("work"));
+        assert_eq!(rec.revoked_at, None);
+        assert_eq!(rec.revoked_reason, None);
+    }
+
+    #[tokio::test]
+    async fn minted_passport_is_not_revoked() {
+        let ctx = test_ctx();
+        let alice = alice_ctx(&ctx);
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+        let rec = super::get_agent_passport(&alice).await.unwrap();
+        assert_eq!(rec.revoked_at, None);
+        assert_eq!(rec.revoked_reason, None);
     }
 
     // ── require_passport_tier ──────────────────────────────────────
