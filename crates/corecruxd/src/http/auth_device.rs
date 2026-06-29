@@ -9,7 +9,7 @@
 //! 1. `POST /v1/auth/device/start` → `{device_code, user_code, verification_uri,
 //!    interval, expires_in}`. The client shows `user_code` + `verification_uri`
 //!    to the human and begins polling.
-//! 2. The human opens `/activate` (served by `playground.rs`), authenticates as a
+//! 2. The human opens `/activate` (served by `console.rs`), authenticates as a
 //!    console admin, enters the `user_code`, and approves — choosing the tenant +
 //!    scopes. `POST /v1/auth/device/approve` records the approver's choice.
 //! 3. `POST /v1/auth/device/token` (poll) → `authorization_pending` /

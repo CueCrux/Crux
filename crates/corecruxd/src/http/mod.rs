@@ -1193,8 +1193,8 @@ pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Rout
         // AND the path matches a configured hosted-surface prefix).
         .layer(middleware::from_fn_with_state(state.clone(), self::quota::quota_middleware))
         .with_state(state)
-        // Built-in web playground (stateless, merged after with_state)
-        .merge(crate::playground::routes(console_enabled))
+        // Built-in web console (stateless, merged after with_state)
+        .merge(crate::console::routes(console_enabled))
         .layer(CatchPanicLayer::custom(self::health::handle_panic))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(30)))
         .layer(middleware::from_fn(traceparent_middleware))

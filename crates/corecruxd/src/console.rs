@@ -2,7 +2,7 @@
 // Licensed under the CueCrux Community Licence (CCL v1.0).
 // See LICENCE.md in the repository root.
 
-//! Embedded `/playground` HTML asset server — small static-file router for the in-process console.
+//! Embedded console HTML asset server — small static-file router for the in-process console.
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -14,36 +14,31 @@ use axum::routing::get;
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
-const PLAYGROUND_HTML: &str = include_str!("../playground/index.html");
-// Frozen pre-graph-navigator console, served at `/console-classic` as an instant
-// in-binary fallback during the graph-console cutover bake window. Removed (with
-// this const) in a follow-up once panel parity is confirmed. See ExecPlan
-// crux-console-graph-cutover-2026-05-30.
-const CLASSIC_HTML: &str = include_str!("../playground/index.classic.html");
+const CONSOLE_HTML: &str = include_str!("../console/index.html");
 // Activity log human lane (ExecPlan crux-dual-surface-activity-log-2026-06-18,
 // M3). A new self-contained page on the embedded console, served at
 // `/console/activity`. The page itself is inert unless the daemon has
 // `CORECRUXD_FEATURE_ACTIVITY_LOG=1` (its API calls 404 otherwise).
-const ACTIVITY_HTML: &str = include_str!("../playground/activity.html");
+const ACTIVITY_HTML: &str = include_str!("../console/activity.html");
 const CONSOLE_DEV_PATH_ENV: &str = "CORECRUXD_CONSOLE_DEV_PATH";
 
 // Bundled PNG assets — embedded so the binary can serve them with no on-disk
 // dependency. Dev override (CORECRUXD_CONSOLE_DEV_PATH) falls back to reading
 // from `<dev>/assets/<name>` so design iterations don't need a rebuild.
-const ASSET_LOGO_DARK: &[u8] = include_bytes!("../playground/assets/CueCrux-Arc-Loop.png");
-const ASSET_LOGO_WHITE: &[u8] = include_bytes!("../playground/assets/CueCrux-Arc-Loop-White.png");
+const ASSET_LOGO_DARK: &[u8] = include_bytes!("../console/assets/CueCrux-Arc-Loop.png");
+const ASSET_LOGO_WHITE: &[u8] = include_bytes!("../console/assets/CueCrux-Arc-Loop-White.png");
 
 // Embedded 3D substrate view (the `2D | 3D` toolbar switch in the console
 // loads `console-3d/index.html?embed=1` in an iframe). Same in-binary,
 // no-on-disk-dependency story as the console itself.
-const CONSOLE3D_HTML: &str = include_str!("../playground/console-3d/index.html");
-const CONSOLE3D_CSS: &str = include_str!("../playground/console-3d/css/console3d.css");
-const CONSOLE3D_JS_DATA: &str = include_str!("../playground/console-3d/js/data.js");
-const CONSOLE3D_JS_WORLD: &str = include_str!("../playground/console-3d/js/world.js");
-const CONSOLE3D_JS_MAIN: &str = include_str!("../playground/console-3d/js/main.js");
-const CONSOLE3D_VENDOR_THREE: &str = include_str!("../playground/console-3d/vendor/three.module.min.js");
-const CONSOLE3D_VENDOR_ORBIT: &str = include_str!("../playground/console-3d/vendor/OrbitControls.js");
-const CONSOLE3D_VENDOR_ROUNDED: &str = include_str!("../playground/console-3d/vendor/RoundedBoxGeometry.js");
+const CONSOLE3D_HTML: &str = include_str!("../console/console-3d/index.html");
+const CONSOLE3D_CSS: &str = include_str!("../console/console-3d/css/console3d.css");
+const CONSOLE3D_JS_DATA: &str = include_str!("../console/console-3d/js/data.js");
+const CONSOLE3D_JS_WORLD: &str = include_str!("../console/console-3d/js/world.js");
+const CONSOLE3D_JS_MAIN: &str = include_str!("../console/console-3d/js/main.js");
+const CONSOLE3D_VENDOR_THREE: &str = include_str!("../console/console-3d/vendor/three.module.min.js");
+const CONSOLE3D_VENDOR_ORBIT: &str = include_str!("../console/console-3d/vendor/OrbitControls.js");
+const CONSOLE3D_VENDOR_ROUNDED: &str = include_str!("../console/console-3d/vendor/RoundedBoxGeometry.js");
 
 fn embedded_asset(name: &str) -> Option<&'static [u8]> {
     match name {
@@ -55,12 +50,6 @@ fn embedded_asset(name: &str) -> Option<&'static [u8]> {
 
 async fn serve_console() -> impl IntoResponse {
     Html(resolve_console_html().into_owned())
-}
-
-/// Fallback to the frozen pre-graph-navigator console (no dev override) — the
-/// cutover escape hatch served from the same binary.
-async fn serve_classic() -> impl IntoResponse {
-    Html(CLASSIC_HTML)
 }
 
 /// Activity log human-lane page (M3), served at `/console/activity`. A dev
@@ -164,8 +153,6 @@ pub fn routes(enabled: bool) -> Router {
         .route("/", get(redirect_to_console))
         .route("/console", get(serve_console))
         .route("/console/activity", get(serve_activity))
-        .route("/console-classic", get(serve_classic))
-        .route("/playground", get(serve_console))
         .route("/console-assets/{name}", get(serve_console_asset))
         .route("/console-3d/{*path}", get(serve_console3d))
         // Device-grant approval page (ExecPlan crux-unified-login-rails, M3).
@@ -248,7 +235,7 @@ async function decide(deny) {
 fn resolve_console_html() -> Cow<'static, str> {
     match dev_html_override() {
         Some(html) => Cow::Owned(html),
-        None => Cow::Borrowed(PLAYGROUND_HTML),
+        None => Cow::Borrowed(CONSOLE_HTML),
     }
 }
 
@@ -263,7 +250,7 @@ fn dev_html_override() -> Option<String> {
         Ok(contents) => Some(contents),
         Err(err) => {
             tracing::warn!(
-                target: "corecruxd::playground",
+                target: "corecruxd::console",
                 path = %html_path.display(),
                 error = %err,
                 "console dev override unreadable; falling back to embedded HTML"
@@ -283,7 +270,7 @@ fn resolve_dev_html_path(base: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{dev_html_override, resolve_console_html, CONSOLE_DEV_PATH_ENV, PLAYGROUND_HTML};
+    use super::{dev_html_override, resolve_console_html, CONSOLE_DEV_PATH_ENV, CONSOLE_HTML};
     use std::sync::Mutex;
 
     // The dev-path env var is process-global; serialise tests that mutate it.
@@ -297,9 +284,9 @@ mod tests {
         // the guard exists to catch unbounded growth, not to enforce a product
         // constraint.
         assert!(
-            PLAYGROUND_HTML.len() < 480 * 1024,
+            CONSOLE_HTML.len() < 480 * 1024,
             "embedded console shell should stay below 480KB raw HTML/CSS/JS (currently {} bytes)",
-            PLAYGROUND_HTML.len()
+            CONSOLE_HTML.len()
         );
     }
 
@@ -314,7 +301,7 @@ mod tests {
             "min-height: 44px",
         ] {
             assert!(
-                PLAYGROUND_HTML.contains(required),
+                CONSOLE_HTML.contains(required),
                 "missing accessibility marker: {required}"
             );
         }
@@ -336,7 +323,7 @@ mod tests {
             "cdn.jsdelivr",
         ] {
             assert!(
-                !PLAYGROUND_HTML.contains(blocked),
+                !CONSOLE_HTML.contains(blocked),
                 "external runtime dependency marker found: {blocked}"
             );
         }
@@ -358,7 +345,7 @@ mod tests {
             "putApi('/v1/console/corecrux/lane-weights'",
         ] {
             assert!(
-                PLAYGROUND_HTML.contains(required),
+                CONSOLE_HTML.contains(required),
                 "missing lane-weight console marker: {required}"
             );
         }
@@ -396,7 +383,7 @@ mod tests {
         }
         // The main console links to the new page.
         assert!(
-            super::PLAYGROUND_HTML.contains(r#"href="/console/activity""#),
+            super::CONSOLE_HTML.contains(r#"href="/console/activity""#),
             "console shell should link to the activity page"
         );
     }
@@ -406,7 +393,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var(CONSOLE_DEV_PATH_ENV);
         let html = resolve_console_html();
-        assert_eq!(&*html, PLAYGROUND_HTML);
+        assert_eq!(&*html, CONSOLE_HTML);
     }
 
     #[test]

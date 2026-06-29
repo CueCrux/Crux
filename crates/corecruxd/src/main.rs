@@ -61,6 +61,7 @@ mod integrations_openai;
 mod mcp_stdio;
 // metrics: Prometheus register!() macros use expect() at init — safe, panics
 // only on duplicate registration (programmer error caught in tests).
+mod console;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod metrics;
 mod onboarding;
@@ -68,7 +69,6 @@ mod ops_events;
 mod passports;
 mod plane_layer_sync;
 mod planes;
-mod playground;
 mod policy;
 mod pool;
 mod presence;
