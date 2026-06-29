@@ -344,8 +344,11 @@ pub const PROTOCOL_VERSION: &str = "2024-11-05";
 /// Server name returned in `initialize`.
 pub const SERVER_NAME: &str = "crux";
 
-/// Server version returned in `initialize`.
-pub const SERVER_VERSION: &str = "0.1.0";
+/// Server version returned in `initialize`. Sourced from the crate version
+/// (`[workspace.package].version`), which is kept in lock-step with the release
+/// tag — so MCP `initialize`, `/v1/version`, and the agent card all report the
+/// same release version instead of three drifting strings.
+pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Route a JSON-RPC request to the appropriate handler.
 pub async fn dispatch(req: JsonRpcRequest, ctx: &McpContext, _agent: Option<&AgentIdentity>) -> JsonRpcResponse {
