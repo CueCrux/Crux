@@ -1,0 +1,31 @@
+name: Version sync
+
+# Fail any v* tag whose [workspace.package].version does not match the tag, so
+# the crate version — reported by /v1/version, MCP `initialize`, and the agent
+# card (`.well-known/agent-card`) — can never drift from the release tag.
+# Bump the version with scripts/cut-release.sh, which keeps the two in lock-step
+# by construction.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  version-matches-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Assert [workspace.package].version == release tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(sed -n '/^\[workspace\.package\]/,/^\[/ { s/^version = "\([^"]*\)".*/\1/p }' Cargo.toml | head -1)"
+          echo "release tag:       v$tag"
+          echo "workspace version: $ver"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::[workspace.package].version ($ver) != release tag v$tag. Bump the crate version to match before tagging — use: scripts/cut-release.sh $tag"
+            exit 1
+          fi
+          echo "OK — crate version is in lock-step with the release tag."
