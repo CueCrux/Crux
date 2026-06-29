@@ -186,6 +186,10 @@ const ACTIVATE_HTML: &str = r#"<!doctype html>
   #result { margin-top: 1rem; padding: 0.75rem; border-radius: 6px; white-space: pre-wrap; }
   .ok { background: #e6ffed; } .err { background: #ffeef0; }
   small { color: #555; }
+  #scopes { border: 1px solid #ddd; border-radius: 6px; padding: 0.4rem 0.6rem; }
+  #scopes label { display: flex; align-items: center; gap: 0.45rem; font-weight: normal; margin: 0.25rem 0; cursor: pointer; }
+  #scopes code { background: #f3f3f3; padding: 0 0.3rem; border-radius: 3px; }
+  .hint { color: #555; margin-top: 0.25rem; }
 </style>
 </head>
 <body>
@@ -196,8 +200,15 @@ const ACTIVATE_HTML: &str = r#"<!doctype html>
   <input id="user_code" placeholder="ABCD-2345" autocomplete="off" />
   <label for="tenant_id">Tenant</label>
   <input id="tenant_id" placeholder="acme" autocomplete="off" />
-  <label for="scopes">Scopes (space or comma separated)</label>
-  <input id="scopes" placeholder="query:read facts:write" autocomplete="off" />
+  <label>Scopes</label>
+  <div id="scopes">
+    <label><input type="checkbox" value="query:read" /> <code>query:read</code> — run retrieval / text-search queries</label>
+    <label><input type="checkbox" value="facts:read" /> <code>facts:read</code> — read stored facts</label>
+    <label><input type="checkbox" value="facts:write" /> <code>facts:write</code> — append facts</label>
+    <label><input type="checkbox" value="admin:read" /> <code>admin:read</code> — read tenant config</label>
+    <label><input type="checkbox" value="admin:write" /> <code>admin:write</code> — ingest / append content &amp; manage the tenant</label>
+  </div>
+  <p class="hint"><small>Tip: content ingest (e.g. the MediaCrux archive) needs <code>admin:write</code> + <code>query:read</code>. Grant only what the client needs.</small></p>
   <div class="row">
     <button class="approve" onclick="decide(false)">Approve</button>
     <button class="deny" onclick="decide(true)">Deny</button>
@@ -206,7 +217,7 @@ const ACTIVATE_HTML: &str = r#"<!doctype html>
 <script>
 async function decide(deny) {
   const out = document.getElementById('result');
-  const scopes = document.getElementById('scopes').value.split(/[\s,]+/).filter(Boolean);
+  const scopes = Array.from(document.querySelectorAll('#scopes input:checked')).map(function (c) { return c.value; });
   const body = {
     user_code: document.getElementById('user_code').value.trim(),
     tenant_id: document.getElementById('tenant_id').value.trim(),
