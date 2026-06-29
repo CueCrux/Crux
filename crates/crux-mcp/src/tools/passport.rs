@@ -433,11 +433,22 @@ pub async fn handle_get_passport(_args: &Value, ctx: &McpContext) -> Result<Valu
                 String::new()
             };
 
+            // passport-revocation M4: a revoked passport learns it was revoked
+            // (and why) via get_passport — the one tool the M3 gate still allows.
+            let revoked_note = match &record.revoked_at {
+                Some(at) => format!(
+                    " ⚠ REVOKED at {} (reason: {}).",
+                    at,
+                    record.revoked_reason.as_deref().unwrap_or("none")
+                ),
+                None => String::new(),
+            };
+
             Ok(json!({
                 "content": [{
                     "type": "text",
                     "text": format!(
-                        "passport for {} (tier={}, receipts={}, sponsor={}, group={}, issued={}, hash={}).{}",
+                        "passport for {} (tier={}, receipts={}, sponsor={}, group={}, issued={}, hash={}).{}{}",
                         record.principal_id,
                         record.reputation_tier,
                         record.receipt_count,
@@ -445,7 +456,8 @@ pub async fn handle_get_passport(_args: &Value, ctx: &McpContext) -> Result<Valu
                         record.tenant_group.as_deref().unwrap_or("none"),
                         record.issued_at,
                         &record.passport_hash[..16],
-                        upgrade_hint
+                        upgrade_hint,
+                        revoked_note
                     )
                 }]
             }))
@@ -1145,6 +1157,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(super::caller_revocation_reason(&alice).await.as_deref(), Some("leak"));
+    }
+
+    // ── passport-revocation M4: get_passport surfaces revoked state ─
+
+    #[tokio::test]
+    async fn get_passport_surfaces_revoked_state() {
+        let ctx = test_ctx();
+        let alice = alice_ctx(&ctx);
+        handle_issue_passport(&json!({}), &alice).await.unwrap();
+        handle_revoke_passport(&json!({"reason": "key leaked"}), &alice)
+            .await
+            .unwrap();
+
+        let result = handle_get_passport(&json!({}), &alice).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("REVOKED"), "got: {text}");
+        assert!(text.contains("key leaked"), "got: {text}");
     }
 
     // ── require_passport_tier ──────────────────────────────────────
