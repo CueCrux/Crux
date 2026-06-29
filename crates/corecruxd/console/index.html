@@ -466,20 +466,21 @@
   .links .ilink .il-body { min-width:0; }
   .links .ilink .il-main { display:block; word-break:break-word; }
   .links .ilink small { display:block; margin-top:2px; font-family:var(--font-sans); font-size:9.5px; color:var(--text-muted); }
-  /* ── Settings: full-screen card ── */
-  #settingsPage { position:absolute; inset:10px; z-index:20; display:none; flex-direction:column;
-    background:#f4f7fb; border:1px solid var(--border-default); border-radius:16px;
-    box-shadow:var(--shadow-lg); padding:18px 22px; }
-  html.dark #settingsPage { background:#0e1118; }
+  /* ── Operator pages: full-bleed + flat in the body (like the activity page),
+     not a floating full-screen card. Inline-pages refactor. ── */
+  #settingsPage { position:absolute; inset:0; z-index:20; display:none; flex-direction:column;
+    background:var(--bg-page); padding:14px 18px 0; }
   .sp-head { display:flex; align-items:center; gap:12px; margin-bottom:16px; }
   .sp-head h1 { margin:0; font-size:19px; font-weight:740; letter-spacing:-.01em; color:var(--text-primary); flex:1; }
   #sp-close { width:30px; height:30px; border-radius:9px; border:1px solid var(--border-default);
     background:none; color:var(--text-secondary); font-size:16px; line-height:1; cursor:pointer; }
   #sp-close:hover { color:var(--text-primary); border-color:var(--accent); }
-  .sp-grid { flex:1; overflow:auto; display:grid; grid-template-columns:repeat(auto-fill,minmax(310px,1fr));
-    gap:14px; align-content:start; padding-bottom:8px; }
-  .sp-card { background:var(--surface-glass); border:1px solid var(--border-default); border-radius:13px;
-    padding:14px 16px; box-shadow:var(--shadow-sm); }
+  .sp-grid { flex:1; overflow:auto; display:grid; grid-template-columns:minmax(0,880px);
+    gap:0; align-content:start; padding-bottom:30px; }
+  /* flat body sections separated by a divider — no floating-card chrome (inline-pages refactor) */
+  .sp-card { background:none; border:0; border-bottom:1px solid var(--border-default); border-radius:0;
+    padding:14px 2px; box-shadow:none; }
+  .sp-card:last-child { border-bottom:0; }
   .sp-card h2 { margin:0 0 2px; font-size:13.5px; font-weight:700; letter-spacing:0; text-transform:none; color:var(--text-primary); }
   .sp-sub { font-family:var(--font-mono); font-size:10px; color:var(--text-muted); margin-bottom:10px; }
   .sp-card pre { margin-top:10px; }
