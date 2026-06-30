@@ -24,15 +24,21 @@ pub const RCX_ENTERPRISE_ENCRYPTED_BLOB_MIRROR_CAPABILITY: &str = "vaultcrux.ent
 
 // ── CoreCrux retrieval-lane registry (free → paid) ───────────────────────────
 //
-// The AMR lane authority in CoreCrux (`corecrux-rcx-token::lanes`) gates the 11
+// The AMR lane authority in CoreCrux (`corecrux-rcx-token::lanes`) gates the 13
 // premium retrieval lanes on a verified token capability. These constants are
 // the MINT side: a paid token carries one `corecrux.lane.<slug>` capability per
 // premium lane. The slugs MUST stay identical to the CoreCrux `lanes::Lane`
 // vocabulary (free baseline bm25/dense/sparse are never minted — never gated).
+//
+// `rerank` / `dense_managed` are the metered "better dense" upsell (ExecPlan
+// dense-lane-and-extraction-upsell / corecrux-dense-extraction-services). They are
+// premium like the rest — local dense retrieval is the FREE `dense` baseline lane
+// and is never clipped (C1).
 pub const CORECRUX_LANE_CAPABILITY_PREFIX: &str = "corecrux.lane.";
 
-/// The 11 premium retrieval-lane slugs. Order is the canonical lane order.
-pub const CORECRUX_PREMIUM_LANE_SLUGS: [&str; 11] = [
+/// The 13 premium retrieval-lane slugs. Order is the canonical lane order
+/// (must match CoreCrux `lanes::ALL_LANES` premium ordering).
+pub const CORECRUX_PREMIUM_LANE_SLUGS: [&str; 13] = [
     "topology",
     "trait",
     "entity",
@@ -44,6 +50,8 @@ pub const CORECRUX_PREMIUM_LANE_SLUGS: [&str; 11] = [
     "indexing",
     "hyde",
     "amr_orchestration",
+    "rerank",
+    "dense_managed",
 ];
 
 /// Full capability name for a lane slug, e.g. `corecrux.lane.topology`.
@@ -887,11 +895,18 @@ mod tests {
     #[test]
     fn corecrux_premium_lane_registry_is_complete_and_named() {
         let caps = corecrux_premium_lane_capabilities(3);
-        assert_eq!(caps.len(), 11, "exactly 11 premium lanes");
+        assert_eq!(caps.len(), 13, "exactly 13 premium lanes");
         for (cap, slug) in caps.iter().zip(CORECRUX_PREMIUM_LANE_SLUGS) {
             assert_eq!(cap.capability, format!("corecrux.lane.{slug}"));
             assert_eq!(cap.credit_cost.as_ref().map(|c| c.cost), Some(3));
             assert_eq!(cap.data_egress_classes, vec![DataEgressClass::Text]);
+        }
+        // the metered dense-service lanes are present and premium
+        for slug in ["rerank", "dense_managed"] {
+            assert!(
+                CORECRUX_PREMIUM_LANE_SLUGS.contains(&slug),
+                "{slug} should be a premium lane"
+            );
         }
         // free baseline must NOT appear in the premium registry
         for free in ["bm25", "dense", "sparse"] {
