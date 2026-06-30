@@ -175,70 +175,173 @@ const ACTIVATE_HTML: &str = r#"<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Crux — Approve device login</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }
-  h1 { font-size: 1.3rem; }
-  label { display: block; margin: 0.75rem 0 0.25rem; font-weight: 600; }
-  input { width: 100%; padding: 0.5rem; font-size: 1rem; box-sizing: border-box; }
-  .row { display: flex; gap: 0.75rem; margin-top: 1.25rem; }
-  button { flex: 1; padding: 0.6rem; font-size: 1rem; cursor: pointer; border-radius: 6px; border: 1px solid #888; }
-  button.approve { background: #1a7f37; color: #fff; border-color: #1a7f37; }
-  button.deny { background: #fff; color: #b00; border-color: #b00; }
-  #result { margin-top: 1rem; padding: 0.75rem; border-radius: 6px; white-space: pre-wrap; }
-  .ok { background: #e6ffed; } .err { background: #ffeef0; }
-  small { color: #555; }
-  #scopes { border: 1px solid #ddd; border-radius: 6px; padding: 0.4rem 0.6rem; }
-  #scopes label { display: flex; align-items: center; gap: 0.45rem; font-weight: normal; margin: 0.25rem 0; cursor: pointer; }
-  #scopes code { background: #f3f3f3; padding: 0 0.3rem; border-radius: 3px; }
-  .hint { color: #555; margin-top: 0.25rem; }
+  :root {
+    --blue: #0369a1; --blue-dark: #075985; --sky: #0ea5e9;
+    --green: #15803d; --green-dark: #166534;
+    --bg: #f0f9ff; --card: #ffffff; --text: #0c4a6e; --muted: #475569;
+    --border: #cfe2f0; --border-strong: #94c2e0;
+    --danger: #b42318; --danger-bg: #fef3f2; --danger-border: #f1c4bf;
+    --ok-bg: #ecfdf3; --ok-border: #abefc6; --ok-text: #067647;
+    --code-bg: #eef6fc; --radius: 10px;
+    --font: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: var(--font); color: var(--text); background: var(--bg); margin: 0; min-height: 100vh;
+         display: flex; align-items: flex-start; justify-content: center; padding: 2.5rem 1rem; line-height: 1.5;
+         -webkit-font-smoothing: antialiased; }
+  .card { width: 100%; max-width: 30rem; background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+          box-shadow: 0 1px 2px rgba(12,74,110,.06), 0 10px 28px rgba(12,74,110,.09); padding: 1.5rem 1.5rem 1.75rem; }
+  .head { display: flex; align-items: center; gap: .65rem; }
+  .badge { width: 34px; height: 34px; flex: none; border-radius: 9px; background: var(--blue);
+           display: flex; align-items: center; justify-content: center; }
+  .badge svg { width: 19px; height: 19px; color: #fff; }
+  h1 { font-size: 1.15rem; font-weight: 700; margin: 0; letter-spacing: -.01em; }
+  .sub { color: var(--muted); font-size: .83rem; margin: .55rem 0 1.3rem; }
+  label.lbl { display: block; margin: 0 0 .3rem; font-weight: 600; font-size: .82rem; }
+  .field { margin-bottom: 1rem; }
+  input[type=text], select { width: 100%; padding: .55rem .65rem; font-size: .95rem; font-family: var(--font);
+          color: var(--text); background: #fff; border: 1px solid var(--border-strong); border-radius: var(--radius);
+          transition: border-color .15s, box-shadow .15s; }
+  input::placeholder { color: #93a7b5; }
+  input:focus, select:focus, button:focus-visible { outline: none; border-color: var(--sky);
+          box-shadow: 0 0 0 3px rgba(14,165,233,.28); }
+  .mono { font-family: var(--mono); letter-spacing: .02em; }
+  .scopes { border: 1px solid var(--border); border-radius: var(--radius); padding: 0 .55rem; background: #fbfdff; }
+  .scopes label { display: flex; align-items: flex-start; gap: .55rem; font-weight: 500; font-size: .85rem;
+          margin: 0; padding: .55rem .15rem; cursor: pointer; border-bottom: 1px solid var(--border); }
+  .scopes label:last-child { border-bottom: 0; }
+  .scopes input { width: 18px; height: 18px; margin-top: 1px; flex: none; accent-color: var(--blue); cursor: pointer; }
+  .scopes code { font-family: var(--mono); font-size: .8rem; background: var(--code-bg); color: var(--blue-dark);
+          padding: .05rem .35rem; border-radius: 5px; }
+  .scopes .desc { color: var(--muted); }
+  .tip { font-size: .78rem; color: var(--muted); margin: .55rem 0 0; }
+  .tip code { font-family: var(--mono); background: var(--code-bg); color: var(--blue-dark); padding: 0 .25rem; border-radius: 4px; }
+  .row { display: flex; gap: .65rem; margin-top: 1.4rem; }
+  button { flex: 1; min-height: 44px; padding: .65rem 1rem; font-size: .95rem; font-weight: 600; font-family: var(--font);
+          cursor: pointer; border-radius: var(--radius); border: 1px solid transparent;
+          transition: background .15s, border-color .15s, opacity .15s; }
+  button:disabled { opacity: .6; cursor: default; }
+  .approve { background: var(--green); color: #fff; }
+  .approve:hover:not(:disabled) { background: var(--green-dark); }
+  .deny { background: #fff; color: var(--danger); border-color: var(--danger-border); }
+  .deny:hover:not(:disabled) { background: var(--danger-bg); }
+  #result { margin-top: 1.1rem; padding: .7rem .8rem; border-radius: var(--radius); white-space: pre-wrap;
+          font-size: .82rem; font-family: var(--mono); display: none; word-break: break-word; }
+  #result.show { display: block; }
+  #result.ok { background: var(--ok-bg); border: 1px solid var(--ok-border); color: var(--ok-text); }
+  #result.err { background: var(--danger-bg); border: 1px solid var(--danger-border); color: var(--danger); }
+  .signin { display: none; text-align: center; padding: 1rem 0 .5rem; }
+  .signin.show { display: block; }
+  .signin p { color: var(--muted); font-size: .88rem; margin: .25rem 0 1rem; }
+  .signin a { display: inline-flex; align-items: center; gap: .5rem; min-height: 44px; padding: 0 1.1rem;
+          background: var(--text); color: #fff; text-decoration: none; border-radius: var(--radius); font-weight: 600; font-size: .9rem; }
+  .signin a:hover { background: #0b3a56; }
+  .newrow { display: none; margin-top: .5rem; }
+  .newrow.show { display: block; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
 <body>
-  <h1>Approve a device login</h1>
-  <p><small>Enter the code shown by the client, choose the tenant and scopes to
-  grant, then approve. Only approve codes you initiated.</small></p>
-  <label for="user_code">User code</label>
-  <input id="user_code" placeholder="ABCD-2345" autocomplete="off" />
-  <label for="tenant_id">Tenant</label>
-  <input id="tenant_id" placeholder="acme" autocomplete="off" />
-  <label>Scopes</label>
-  <div id="scopes">
-    <label><input type="checkbox" value="query:read" /> <code>query:read</code> — run retrieval / text-search queries</label>
-    <label><input type="checkbox" value="facts:read" /> <code>facts:read</code> — read stored facts</label>
-    <label><input type="checkbox" value="facts:write" /> <code>facts:write</code> — append facts</label>
-    <label><input type="checkbox" value="admin:read" /> <code>admin:read</code> — read tenant config</label>
-    <label><input type="checkbox" value="admin:write" /> <code>admin:write</code> — ingest / append content &amp; manage the tenant</label>
-  </div>
-  <p class="hint"><small>Tip: content ingest (e.g. the MediaCrux archive) needs <code>admin:write</code> + <code>query:read</code>. Grant only what the client needs.</small></p>
-  <div class="row">
-    <button class="approve" onclick="decide(false)">Approve</button>
-    <button class="deny" onclick="decide(true)">Deny</button>
-  </div>
-  <div id="result" hidden></div>
+  <main class="card">
+    <div class="head">
+      <span class="badge" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
+      <h1>Approve a device login</h1>
+    </div>
+    <p class="sub">A client is requesting access. Grant a tenant and only the scopes it needs, then approve. Only approve a code you initiated.</p>
+
+    <div id="signin" class="signin">
+      <p>Your session has expired or you are not signed in. Sign in to approve this device.</p>
+      <a id="signin_link" href="/oauth2/sign_in">Sign in with GitHub</a>
+    </div>
+
+    <form id="form" onsubmit="return false">
+      <div class="field">
+        <label class="lbl" for="user_code">User code</label>
+        <input type="text" id="user_code" class="mono" placeholder="ABCD-2345" autocomplete="off" autocapitalize="characters" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label class="lbl" for="tenant_sel">Tenant</label>
+        <select id="tenant_sel" onchange="onTenantChange()"></select>
+        <div id="newrow" class="newrow">
+          <input type="text" id="tenant_new" class="mono" placeholder="new-tenant-id" autocomplete="off" spellcheck="false" />
+        </div>
+      </div>
+      <div class="field">
+        <label class="lbl">Scopes</label>
+        <div id="scopes" class="scopes">
+          <label><input type="checkbox" value="query:read" /><span><code>query:read</code><span class="desc"> — run retrieval / text-search queries</span></span></label>
+          <label><input type="checkbox" value="facts:read" /><span><code>facts:read</code><span class="desc"> — read stored facts</span></span></label>
+          <label><input type="checkbox" value="facts:write" /><span><code>facts:write</code><span class="desc"> — append facts</span></span></label>
+          <label><input type="checkbox" value="admin:read" /><span><code>admin:read</code><span class="desc"> — read tenant config</span></span></label>
+          <label><input type="checkbox" value="admin:write" /><span><code>admin:write</code><span class="desc"> — ingest / append content &amp; manage the tenant</span></span></label>
+        </div>
+        <p class="tip">Content ingest (e.g. the MediaCrux archive) needs <code>admin:write</code> + <code>query:read</code>. Grant only what the client needs.</p>
+      </div>
+      <div class="row">
+        <button type="button" class="approve" id="approve_btn" onclick="decide(false)">Approve</button>
+        <button type="button" class="deny" id="deny_btn" onclick="decide(true)">Deny</button>
+      </div>
+      <div id="result" role="status" aria-live="polite"></div>
+    </form>
+  </main>
 <script>
-async function decide(deny) {
-  const out = document.getElementById('result');
-  const scopes = Array.from(document.querySelectorAll('#scopes input:checked')).map(function (c) { return c.value; });
-  const body = {
-    user_code: document.getElementById('user_code').value.trim(),
-    tenant_id: document.getElementById('tenant_id').value.trim(),
-    scopes: scopes,
-    deny: deny,
-  };
+var ADD_NEW = '__add_new__';
+function el(id) { return document.getElementById(id); }
+function onTenantChange() {
+  var add = el('tenant_sel').value === ADD_NEW;
+  el('newrow').classList.toggle('show', add);
+  if (add) el('tenant_new').focus();
+}
+function showSignin() {
+  el('form').style.display = 'none';
+  el('signin').classList.add('show');
+  el('signin_link').href = '/oauth2/sign_in?rd=' + encodeURIComponent(location.href);
+}
+async function loadTenants() {
   try {
-    const resp = await fetch('/v1/auth/device/approve', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      credentials: 'same-origin',
-      body: JSON.stringify(body),
+    var r = await fetch('/v1/console/tenants', { credentials: 'same-origin', headers: { accept: 'application/json' } });
+    var ct = r.headers.get('content-type') || '';
+    if (r.redirected || !r.ok || ct.indexOf('application/json') < 0) { showSignin(); return; }
+    var j = await r.json();
+    var list = (j.tenants || (Array.isArray(j) ? j : [])).map(function (t) { return typeof t === 'string' ? t : t.tenant_id; }).filter(Boolean);
+    var html = list.length ? '' : '<option value="" disabled selected>No tenants yet — add one</option>';
+    list.forEach(function (t) { html += '<option value="' + t + '">' + t + '</option>'; });
+    html += '<option value="' + ADD_NEW + '">+ Add new tenant…</option>';
+    el('tenant_sel').innerHTML = html;
+    onTenantChange();
+  } catch (e) { showSignin(); }
+}
+function currentTenant() {
+  var v = el('tenant_sel').value;
+  return v === ADD_NEW ? el('tenant_new').value.trim() : v;
+}
+async function decide(deny) {
+  var out = el('result'), a = el('approve_btn'), d = el('deny_btn');
+  var scopes = Array.prototype.slice.call(document.querySelectorAll('#scopes input:checked')).map(function (c) { return c.value; });
+  var tenant = currentTenant();
+  function fail(msg) { out.className = 'show err'; out.textContent = msg; }
+  if (!el('user_code').value.trim()) return fail('Enter the user code shown by the client.');
+  if (!deny && !tenant) return fail('Choose or enter a tenant.');
+  if (!deny && !scopes.length) return fail('Select at least one scope.');
+  a.disabled = true; d.disabled = true;
+  out.className = 'show'; out.textContent = deny ? 'Denying…' : 'Approving…';
+  try {
+    var resp = await fetch('/v1/auth/device/approve', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, credentials: 'same-origin',
+      body: JSON.stringify({ user_code: el('user_code').value.trim(), tenant_id: tenant, scopes: scopes, deny: deny }),
     });
-    const text = await resp.text();
-    out.hidden = false;
-    out.className = resp.ok ? 'ok' : 'err';
+    var text = await resp.text();
+    if (resp.redirected || text.trim().charAt(0) === '<') { showSignin(); return; }
+    out.className = 'show ' + (resp.ok ? 'ok' : 'err');
     out.textContent = (resp.ok ? 'OK — ' : ('HTTP ' + resp.status + ' — ')) + text;
   } catch (e) {
-    out.hidden = false; out.className = 'err'; out.textContent = String(e);
+    out.className = 'show err'; out.textContent = String(e);
+  } finally {
+    a.disabled = false; d.disabled = false;
   }
 }
+loadTenants();
 </script>
 </body>
 </html>"#;
