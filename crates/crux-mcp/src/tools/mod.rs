@@ -17,6 +17,7 @@ pub mod audit_export;
 pub mod autonomy;
 pub mod consolidation;
 pub mod constraint;
+pub mod context_custody_audit;
 pub mod coordination;
 pub mod cuecrux_session;
 pub mod decision;
@@ -1610,6 +1611,12 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                 "examples": [{}]
             }),
         },
+        // ── Context-custody audit (race-to-context positioning) ────
+        ToolDefinition {
+            name: "context_custody_audit".to_string(),
+            description: context_custody_audit::CONTEXT_CUSTODY_AUDIT_DESCRIPTION.to_string(),
+            input_schema: context_custody_audit::tool_input_schema(),
+        },
         // ── Coordination (Plan A M5) ───────────────────────────
         ToolDefinition {
             name: "list_projects".to_string(),
@@ -2546,6 +2553,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "query",              "output": "{ results: [{doc_id, score, segment_index, token_count}], coverage: {score, gaps, below_floor}, meta: {backend, took_ms, segments_searched} }" },
         { "tool": "query_scan",         "output": "{ results: [{doc_id, score, token_count}], meta: {took_ms, segments_searched} }" },
         { "tool": "query_expand",       "output": "{ results: [{doc_id, content, token_count}] }" },
+        { "tool": "context_custody_audit", "output": "{ daemon_version, four_questions: [{axis, question, verdict, evidence}], exit_test: [{axis, question, verdict, evidence}], lock_in_risk: 1..5, lock_in_label, trust_posture: {recommendations: [string], standing_gap}, thesis, note }. Returns {enabled:false, note} unless CRUX_CONTEXT_CUSTODY_AUDIT=1." },
         { "tool": "store_fact",         "output": "{ fact_id, entity, key, version, superseded_fact_ids: [string] }. `superseded_fact_ids` lists facts this write explicitly retired via the `supersedes` param (M6 cross-entity supersession)." },
         { "tool": "query_facts",        "output": "{ rows: [{fact_id, entity, key, value, confidence, effective_confidence, horizon_class, freshness, age_hours, superseded_by?}] }. Superseded (retired) facts are excluded by default; pass include_superseded=true to include them (then `superseded_by` is populated)." },
         { "tool": "delete_fact",        "output": "{ deleted: bool, fact_id }" },
@@ -2758,6 +2766,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "sync_push" => sync::handle_sync_push(args, ctx).await,
         "sync_status" => sync::handle_sync_status(args, ctx).await,
         "update_status" => update::handle_update_status(args, ctx).await,
+        "context_custody_audit" => context_custody_audit::handle_context_custody_audit(args, ctx).await,
         // Coordination — projects + work kanban (Plan A M5).
         "list_projects" => coordination::handle_list_projects(args, ctx).await,
         "get_project_context" => coordination::handle_get_project_context(args, ctx).await,
@@ -2905,7 +2914,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 112; // +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
+    const TOOL_COUNT: usize = 113; // +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")
