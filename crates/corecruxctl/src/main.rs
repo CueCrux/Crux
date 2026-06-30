@@ -19,7 +19,7 @@ use corecruxctl::{
     admin, audit_export, audit_pack, c2pa_x509, code_chain, code_health, config_bundle, cost, evidence, explain,
     export, extensions, fixture_digest, gaps, hooks, identity_cli, inspect_receipt, learn, login, machine, memory,
     memory_pack, observe_ingest, output_verify, parity, projections, receipts, reconcile, replay, session_sync, shard,
-    shardmap, smoke, snapshot, stage1_import, storage, structured_log, tooling_env, verify_store,
+    shardmap, smoke, snapshot, stage1_import, start, storage, structured_log, tooling_env, verify_store,
 };
 
 #[derive(Debug, Parser)]
@@ -33,7 +33,26 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)] // CLI subcommands — allocation cost is negligible at startup
 enum Command {
-    /// Authenticate to a Crux Daemon, auto-selecting the lowest-friction secure rail.
+    /// START HERE — the one command to get live: detect daemon, authenticate,
+    /// wire MCP + hooks, round-trip a first fact, print a "you're live" summary.
+    ///
+    /// This is the canonical zero→first-loop on-ramp. It runs the happy path by
+    /// delegating to `login` (verification + hooks ON) and printing one
+    /// next-steps summary. For specific rails use the advanced entry points
+    /// (`login`, `quickstart`, or `docker compose up`) directly.
+    Start {
+        /// Explicit daemon URL (e.g. http://127.0.0.1:14800). Omit to discover.
+        #[arg(long)]
+        url: Option<String>,
+        /// Static named token for CI / headless / air-gapped clients.
+        #[arg(long)]
+        token: Option<String>,
+    },
+
+    /// (advanced) Authenticate to a Crux Daemon, auto-selecting the lowest-friction secure rail.
+    ///
+    /// Most users want `start` instead — it wraps this with hooks + verification
+    /// and a summary. Use `login` directly to pick a specific rail.
     ///
     /// Discovers the daemon (--url → ~/.config/cuecrux/env → localhost), probes
     /// reachability + auth posture, picks a rail (loopback / static token / —
@@ -458,7 +477,10 @@ enum Command {
         command: CodeHealthCommand,
     },
 
-    /// Interactive quickstart wizard for new users.
+    /// (advanced) Interactive quickstart wizard for new users.
+    ///
+    /// Prefer `start` for the canonical one-command on-ramp; use `quickstart`
+    /// when you want the guided store→query→cleanup walkthrough instead.
     Quickstart {
         /// CoreCrux HTTP base URL.
         #[arg(long, default_value = "http://localhost:14800")]
@@ -2208,6 +2230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match cli.command {
+        Command::Start { url, token } => start::run(start::StartArgs { url, token }),
         Command::Login {
             url,
             token,
