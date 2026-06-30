@@ -56,7 +56,9 @@ dashboard. Including a 3D view of your work graph and your receipt chain.
 No signup. No OpenAI key. BM25 retrieval works out of the box — embeddings are optional and
 pluggable when you want them.
 
-**Docker (recommended):**
+**Two steps to live:** bring the daemon up, then run the one on-ramp command.
+
+**1 — bring the daemon up** (Docker recommended):
 
 ```bash
 docker compose up -d
@@ -81,14 +83,34 @@ cargo build --release
 CORECRUXD_AUTH_MODE=off CORECRUXD_DATA_DIR=./data ./target/release/corecruxd
 ```
 
-**Connect your agent** (Claude Code, Claude Desktop, Cursor — any MCP client):
+**2 — get live (one command):**
 
-```jsonc
-// .mcp.json
-{ "crux": { "url": "http://127.0.0.1:14801/mcp" } }
+```bash
+corecruxctl start
 ```
 
-Ready-made connector configs live in [`examples/mcp-configs/`](examples/mcp-configs/).
+`start` is the canonical on-ramp: it detects the daemon, authenticates on the lowest-friction
+secure rail, wires the MCP endpoint + Claude Code hooks, round-trips a first fact, and prints a
+single "you're live" summary. That's the whole first loop.
+
+<details>
+<summary>Advanced / specific rails</summary>
+
+`start` wraps the lower-level entry points; reach for them directly only when you need a specific
+rail:
+
+- `corecruxctl login` — pick an explicit auth rail (`--token` for CI/headless, `--device`, …).
+- `corecruxctl quickstart` — guided store→query→cleanup walkthrough.
+- **Connect an agent manually** (any MCP client — Claude Code, Claude Desktop, Cursor):
+
+  ```jsonc
+  // .mcp.json
+  { "crux": { "url": "http://127.0.0.1:14801/mcp" } }
+  ```
+
+  Ready-made connector configs live in [`examples/mcp-configs/`](examples/mcp-configs/).
+</details>
+
 `CORECRUXD_AUTH_MODE` is required; use `off` only for local development.
 
 **Local storage boundary:** Crux receipts and BLAKE3 chains prove integrity,

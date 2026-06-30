@@ -1057,11 +1057,24 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                     "session_id":    { "type": "string",  "description": "Session to hand off" },
                     "include_facts": { "type": "boolean", "description": "Include relevant facts in the package", "default": false },
                     "target_agent":  { "type": "string",  "description": "Optional receiving agent name. If set, only that agent may accept the package." },
-                    "message":       { "type": "string",  "description": "Free-text message for the receiving agent" }
+                    "message":       { "type": "string",  "description": "Free-text message for the receiving agent" },
+                    "task_record":   {
+                        "type": "object",
+                        "description": "Optional structured statement of intent (Open Engine task record) so the receiver does not reconstruct the task from facts.",
+                        "properties": {
+                            "requester":           { "type": "string" },
+                            "desired_outcome":     { "type": "string" },
+                            "sources":             { "type": "array", "items": { "type": "string" } },
+                            "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+                            "boundaries":          { "type": "array", "items": { "type": "string" } },
+                            "blocker_rule":        { "type": "string" }
+                        }
+                    }
                 },
                 "required": ["session_id"],
                 "examples": [
-                    { "session_id": "session-42", "include_facts": true, "target_agent": "implementer", "message": "Architecture review complete, one open question." }
+                    { "session_id": "session-42", "include_facts": true, "target_agent": "implementer", "message": "Architecture review complete, one open question." },
+                    { "session_id": "session-42", "include_facts": true, "target_agent": "codex-work", "task_record": { "requester": "claude-work", "desired_outcome": "wire the dense lane", "sources": ["crates/corecrux-retrieval/src/dense.rs"], "acceptance_criteria": ["cargo test green"], "boundaries": ["do not touch the GPU path"], "blocker_rule": "block needs_approval before any deploy" } }
                 ]
             }),
         },
@@ -1681,12 +1694,14 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                     "work_id":         { "type": "string" },
                     "state":           { "type": "string", "enum": ["planned", "in_progress", "blocked", "archive", "complete", "deployed"] },
                     "by_passport":     { "type": "string" },
-                    "blocker_reason":  { "type": "string", "description": "Required when transitioning to 'blocked'." }
+                    "blocker_reason":  { "type": "string", "description": "Required when transitioning to 'blocked'." },
+                    "blocker_kind":    { "type": "string", "enum": ["needs_info", "needs_approval"], "description": "Typed kind of block: 'needs_info' (waiting on an answer about the task) vs 'needs_approval' (waiting on an owner's go/no-go). Defaults to 'needs_info' on a blocked transition." }
                 },
                 "required": ["work_id", "state", "by_passport"],
                 "examples": [
                     { "work_id": "w_abc123", "state": "in_progress", "by_passport": "personal-default" },
-                    { "work_id": "w_abc123", "state": "blocked", "by_passport": "personal-default", "blocker_reason": "waiting on infra rotation" }
+                    { "work_id": "w_abc123", "state": "blocked", "by_passport": "personal-default", "blocker_reason": "waiting on infra rotation", "blocker_kind": "needs_info" },
+                    { "work_id": "w_abc123", "state": "blocked", "by_passport": "personal-default", "blocker_reason": "needs sign-off to deploy", "blocker_kind": "needs_approval" }
                 ]
             }),
         },
@@ -1704,6 +1719,18 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                 "examples": [
                     { "work_id": "w_abc123", "author_passport": "personal-default", "body": "tried option A; fails on env reload — recommending option B" }
                 ]
+            }),
+        },
+        ToolDefinition {
+            name: "status_feed".to_string(),
+            description: coordination::STATUS_FEED_DESCRIPTION.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "work_id": { "type": "string", "description": "Optional single work-item id to scope the feed to; omit for all items." },
+                    "limit":   { "type": "integer", "description": "Max events to return (most recent kept). Default 200." }
+                },
+                "examples": [ {}, { "work_id": "w_abc123" } ]
             }),
         },
         ToolDefinition {
@@ -2596,7 +2623,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "get_agent_identity", "output": "{ agent_name: string }" },
         { "tool": "resolve_principal",  "output": "{ content: [...], principal: { passport_id, category, tier, tier_rank: int, capabilities: [string], tenant_id, agent_work_gate: bool, resolved_via: 'session'|'passport'|'identity_link:<id>', federation_grant?: { capability, scope, allowed_capabilities } }, resolved_param: 'session_id'|'passport_id' } — loopback to GET /v1/principal/resolve; tenant-scoped server-side. agent→passport resolution parity for the MCP surface." },
         { "tool": "create_handoff",     "output": "{ package_json, content_hash, signature, relevant_fact_count }" },
-        { "tool": "accept_handoff",     "output": "{ session_loaded, facts_loaded, verified: bool }" },
+        { "tool": "accept_handoff",     "output": "{ session_loaded, facts_loaded, verified: bool, task_record? }" },
         { "tool": "record_decision",    "output": "{ decision_id, decision_hash, entity, action }" },
         { "tool": "declare_constraint", "output": "{ constraint_id, constraint_hash, constraint_type, assertion }" },
         { "tool": "get_constraints",    "output": "{ constraints: [{constraint_id, constraint_type, assertion, severity, status, created_at}], count }" },
@@ -2621,6 +2648,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "create_work",        "output": "WorkItem record (same shape as list_work entries, includes the freshly minted id)." },
         { "tool": "update_work_state",  "output": "{ applied: bool, work?: WorkItem, queued?: { action_id, work_id, requested_by_passport, target_state, status: 'pending', requested_at_unix_ms } }" },
         { "tool": "comment_on_work",    "output": "{ id, work_id, author_passport, body, posted_at_unix_ms }" },
+        { "tool": "status_feed",        "output": "{ enabled: bool, events: [{ work_id, verb: 'CLAIMED'|'BLOCKED'|'HUMAN_HOLD'|'RESUMED'|'DONE'|'FAILED', transition_id, from_state, to_state, by_passport, at_unix_ms }], note? }" },
         { "tool": "coord_status",       "output": "{ now_unix_ms, presence_ttl_secs, project_id?, active_sessions: [{ session_id_hex, passport_id, tenant_id, project_id?, bound_at_unix_ms, last_seen_at_unix_ms, active_until_unix_ms, intent?: { execplan_slug?, milestone?, paths, note?, announced_at_unix_ms, expires_at_unix_ms }, leases?: [{ punchcard_id, resource, mode, holder_passport, expires_at_unix_ms }] }], work_in_flight: [WorkItem] }" },
         { "tool": "coord_announce",     "output": "{ intent: { project_id, session_id_hex, passport_id, execplan_slug?, milestone?, deploy_target?, paths, note?, announced_at_unix_ms, expires_at_unix_ms }, cleared: bool, live_peer_intents: n, overlaps: [{ peer_session_id_hex, peer_passport_id, kind: execplan|deploy_target|intent_path|lease, theirs, yours }] } — surface any overlaps to the operator and coordinate before editing those paths or cutting that deploy" },
         { "tool": "github_search",         "output": "{ count, facts: [{ entity, key, value, ... }] } — value strings hold JSON-encoded CommitRecord / PrRecord / IssueRecord / CommentRecord depending on the entity prefix." },
@@ -2774,6 +2802,7 @@ pub async fn call_tool(name: &str, args: &Value, ctx: &McpContext) -> Result<Val
         "create_work" => coordination::handle_create_work(args, ctx).await,
         "update_work_state" => coordination::handle_update_work_state(args, ctx).await,
         "comment_on_work" => coordination::handle_comment_on_work(args, ctx).await,
+        "status_feed" => coordination::handle_status_feed(args, ctx).await,
         // Coordination plane — live-session board (presence-coordination plan).
         "coord_status" => coordination::handle_coord_status(args, ctx).await,
         "coord_announce" => coordination::handle_coord_announce(args, ctx).await,
@@ -2914,7 +2943,7 @@ mod tests {
         PermittedCapability, RcxTier, RCX_CT_SIGNATURE_LEN,
     };
 
-    const TOOL_COUNT: usize = 113; // +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
+    const TOOL_COUNT: usize = 114; // +1 status_feed (open-engine-coordination-surfaces M3). +1 context_custody_audit (race-to-context positioning). +1 revoke_passport (passport-revocation M2). main 94 (agent-ux + identity-continuity + memory_sweep_candidates + resolve_principal (B1 mediator parity) + 5 audit-hardening: session_checkpoint + route_access_matrix + execplan_gate + auth_posture_audit + egress_policy_check + 2 coord-plane: coord_status + coord_announce + session_token_usage (action-ledger M1)) + 2 session-archive (archive_session + unarchive_session) + 10 backend (5 orchestrator + 4 punchcard + check_punchcard) + 1 activity (activity_recent, crux-dual-surface-activity-log M2) + 2 consolidation (memory_contradictions + memory_consolidate, audit-ii M4) + 1 session-mining (learn, token-efficiency M4) + 1 holdout (token_savings, token-efficiency cutover CO-4).
 
     fn test_ctx() -> McpContext {
         McpContext::new_default("test-node")

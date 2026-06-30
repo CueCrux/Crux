@@ -55,6 +55,7 @@ pub mod shardmap;
 pub mod smoke;
 pub mod snapshot;
 pub mod stage1_import;
+pub mod start;
 pub mod storage;
 pub mod structured_log;
 pub mod tooling_env;

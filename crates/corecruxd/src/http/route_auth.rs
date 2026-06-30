@@ -266,6 +266,7 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
     }
 
     if path.starts_with("/v1/work")
+        || path.starts_with("/v1/status-feed")
         || path.starts_with("/v1/projects")
         || path.starts_with("/v1/rcx/publish/")
         || path.starts_with("/v1/workspace/")
