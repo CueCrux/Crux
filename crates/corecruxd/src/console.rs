@@ -233,6 +233,11 @@ async function decide(deny) {
     });
     const text = await resp.text();
     out.hidden = false;
+    if (resp.redirected || text.trim().charAt(0) === '<') {
+      out.className = 'err';
+      out.textContent = 'Session expired or not signed in — reload this page, sign in with GitHub, then approve again.';
+      return;
+    }
     out.className = resp.ok ? 'ok' : 'err';
     out.textContent = (resp.ok ? 'OK — ' : ('HTTP ' + resp.status + ' — ')) + text;
   } catch (e) {
