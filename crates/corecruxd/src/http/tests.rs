@@ -10296,6 +10296,7 @@ async fn work_post_then_list_then_patch_state_round_trip() {
             linked_pr: None,
             linked_issue: None,
             blocker_reason: None,
+            blocker_kind: None,
             by_passport: "personal-default".to_string(),
         }),
     )
@@ -10373,6 +10374,7 @@ async fn work_patch_with_gated_passport_returns_202_queued() {
             linked_pr: None,
             linked_issue: None,
             blocker_reason: None,
+            blocker_kind: None,
             by_passport: "personal-default".to_string(),
         }),
     )
@@ -10485,6 +10487,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
             linked_pr: None,
             linked_issue: None,
             blocker_reason: Some(Some("needs approval".to_string())),
+            blocker_kind: Some(crate::work::BlockerKind::NeedsApproval),
             by_passport: "personal-default".to_string(),
         }),
     )
@@ -10518,6 +10521,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
             linked_pr: None,
             linked_issue: None,
             blocker_reason: None,
+            blocker_kind: None,
             by_passport: "personal-default".to_string(),
         }),
     )

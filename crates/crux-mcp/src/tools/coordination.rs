@@ -376,6 +376,9 @@ pub async fn handle_update_work_state(args: &Value, ctx: &McpContext) -> Result<
     if let Some(reason) = args.get("blocker_reason") {
         body["blocker_reason"] = reason.clone();
     }
+    if let Some(kind) = args.get("blocker_kind") {
+        body["blocker_kind"] = kind.clone();
+    }
     let base = loopback_base(ctx)?;
     let (_, resp_body) = loopback_patch(format!("{base}/v1/work/{id}"), body, ctx.scope_identity()).await?;
     Ok(text_content(

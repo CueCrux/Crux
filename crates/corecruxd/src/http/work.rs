@@ -90,6 +90,10 @@ pub(super) struct UpdateWorkBody {
     pub linked_issue: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_some_option")]
     pub blocker_reason: Option<Option<String>>,
+    /// Typed blocker kind (`needs_info` | `needs_approval`). Unknown strings are
+    /// rejected by serde; absent = leave unchanged.
+    #[serde(default)]
+    pub blocker_kind: Option<crate::work::BlockerKind>,
     /// Identity making the change. Determines whether the change is gated.
     /// Aliases: `created_by_passport`, `author_passport`.
     #[serde(alias = "created_by_passport", alias = "author_passport")]
@@ -365,6 +369,7 @@ pub(super) async fn patch_work(
             linked_pr: body.linked_pr,
             linked_issue: body.linked_issue,
             blocker_reason: body.blocker_reason,
+            blocker_kind: body.blocker_kind,
         },
         crate::work::UpdateWorkContext {
             by_passport: body.by_passport,

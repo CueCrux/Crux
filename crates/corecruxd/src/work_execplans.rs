@@ -39,7 +39,7 @@ use corecrux_memory::fact_store::{FactQuery, FactStore};
 use serde::{Deserialize, Serialize};
 
 use crate::fact_helpers::dedup_latest;
-use crate::work::{Provenance, WorkItem};
+use crate::work::{BlockerKind, Provenance, WorkItem};
 
 /// Env var that resolves the plan root for the aggregator. Unset → no plans.
 pub const EXECPLANS_ROOT_ENV: &str = "CRUX_EXECPLANS_ROOT";
@@ -785,12 +785,20 @@ pub fn derive_state(
 
     // Rule 5: blocked gate on the highest fact'd milestone.
     if let Some(cur) = facts.highest_milestone_with_fact {
-        if facts
-            .gate_statuses
-            .get(&cur)
-            .is_some_and(|s| s.to_ascii_lowercase().contains("blocked"))
-        {
-            return mk_item(file, parsed, "blocked", Some(format!("M{cur}")), None, facts);
+        if let Some(status) = facts.gate_statuses.get(&cur) {
+            let status_lc = status.to_ascii_lowercase();
+            if status_lc.contains("blocked") {
+                let mut item = mk_item(file, parsed, "blocked", Some(format!("M{cur}")), None, facts);
+                // A gate status that names approval / a human hold is a
+                // needs_approval block (M3 maps it to HUMAN_HOLD); any other
+                // blocked gate reads as needs_info.
+                item.blocker_kind = Some(if status_lc.contains("approval") || status_lc.contains("hold") {
+                    BlockerKind::NeedsApproval
+                } else {
+                    BlockerKind::NeedsInfo
+                });
+                return item;
+            }
         }
     }
 
@@ -890,6 +898,7 @@ fn mk_item(
         linked_pr: None,
         linked_issue: None,
         blocker_reason: None,
+        blocker_kind: None,
         created_by_passport: VIRTUAL_PASSPORT.to_string(),
         created_at_unix_ms: created,
         updated_at_unix_ms: updated,
@@ -1319,6 +1328,8 @@ fn apply_open_decisions(items: &mut [WorkItem], registry: Option<&HashMap<String
             if item.state == "planned" || item.state == "in_progress" {
                 item.state = "blocked".to_string();
                 item.blocker_reason = Some(format!("Overdue open decision {id} (decides-by {decides_by})"));
+                // An overdue decision is waiting on an owner's call → HUMAN_HOLD.
+                item.blocker_kind = Some(BlockerKind::NeedsApproval);
             }
         }
     }
@@ -1375,6 +1386,7 @@ mod tests {
             linked_pr: None,
             linked_issue: None,
             blocker_reason: None,
+            blocker_kind: None,
             created_by_passport: VIRTUAL_PASSPORT.to_string(),
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,

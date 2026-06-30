@@ -1681,12 +1681,14 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                     "work_id":         { "type": "string" },
                     "state":           { "type": "string", "enum": ["planned", "in_progress", "blocked", "archive", "complete", "deployed"] },
                     "by_passport":     { "type": "string" },
-                    "blocker_reason":  { "type": "string", "description": "Required when transitioning to 'blocked'." }
+                    "blocker_reason":  { "type": "string", "description": "Required when transitioning to 'blocked'." },
+                    "blocker_kind":    { "type": "string", "enum": ["needs_info", "needs_approval"], "description": "Typed kind of block: 'needs_info' (waiting on an answer about the task) vs 'needs_approval' (waiting on an owner's go/no-go). Defaults to 'needs_info' on a blocked transition." }
                 },
                 "required": ["work_id", "state", "by_passport"],
                 "examples": [
                     { "work_id": "w_abc123", "state": "in_progress", "by_passport": "personal-default" },
-                    { "work_id": "w_abc123", "state": "blocked", "by_passport": "personal-default", "blocker_reason": "waiting on infra rotation" }
+                    { "work_id": "w_abc123", "state": "blocked", "by_passport": "personal-default", "blocker_reason": "waiting on infra rotation", "blocker_kind": "needs_info" },
+                    { "work_id": "w_abc123", "state": "blocked", "by_passport": "personal-default", "blocker_reason": "needs sign-off to deploy", "blocker_kind": "needs_approval" }
                 ]
             }),
         },
