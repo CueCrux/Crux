@@ -722,6 +722,7 @@ pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Rout
         )
         .route("/v1/work/{id}/comments", get(self::work::get_comments))
         .route("/v1/work/{id}/transitions", get(self::work::get_transitions))
+        .route("/v1/status-feed", get(self::work::get_status_feed))
         // Project endpoints.
         .route("/v1/projects", get(self::projects::get_projects))
         .route(

@@ -221,6 +221,12 @@ pub struct WorkTransition {
     /// `rejected`, `auto_approved` (timeout fallback).
     pub gate_status: String,
     pub at_unix_ms: u64,
+    /// The typed blocker kind in effect when this transition landed on
+    /// `blocked` (M1). Lets the status feed (M3) distinguish BLOCKED from
+    /// HUMAN_HOLD per historical event without re-reading the live item.
+    /// Additive + skip-if-`None` so pre-existing transition records load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker_kind: Option<BlockerKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -309,6 +315,7 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
             by_passport: input.created_by_passport,
             gate_status: "allowed".to_string(),
             at_unix_ms: now_unix_ms,
+            blocker_kind: None,
         },
     )?;
     Ok(item)
@@ -459,6 +466,7 @@ pub fn update_work(
                     by_passport: ctx.by_passport,
                     gate_status: "allowed".to_string(),
                     at_unix_ms: ctx.now_unix_ms,
+                    blocker_kind: item.blocker_kind,
                 },
             )?;
         }
@@ -633,6 +641,15 @@ pub fn resolve_gate(
             let mut updated = item;
             let from_state = updated.state.clone();
             updated.state = target.clone();
+            // Mirror the direct path's M1 semantics: default a blocked target to
+            // needs_info, clear the kind when leaving blocked.
+            if target == "blocked" {
+                if updated.blocker_kind.is_none() {
+                    updated.blocker_kind = Some(BlockerKind::NeedsInfo);
+                }
+            } else {
+                updated.blocker_kind = None;
+            }
             updated.updated_at_unix_ms = now_unix_ms;
             write_record(store, &updated)?;
             write_transition(
@@ -645,6 +662,7 @@ pub fn resolve_gate(
                     by_passport: approver_passport.to_string(),
                     gate_status: "approved".to_string(),
                     at_unix_ms: now_unix_ms,
+                    blocker_kind: updated.blocker_kind,
                 },
             )?;
             return Ok(updated);

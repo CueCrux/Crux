@@ -82,6 +82,7 @@ mod redaction;
 mod relations;
 mod session_bindings;
 mod shard_map;
+mod status_feed;
 mod storybook;
 mod structured_log;
 mod tenant_metadata;
