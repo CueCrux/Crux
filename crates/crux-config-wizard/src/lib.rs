@@ -32,6 +32,7 @@ pub const DEFAULT_PROFILES: &[&str] = &[
     "token-conservation",
     "execplan-discipline",
     "code-grounding",
+    "scratchpad-survival",
     "pre-deploy-gate",
     "eu-ai-act",
     "audit-soc2",
@@ -67,7 +68,7 @@ mod tests {
 
     #[test]
     fn default_profiles_present_and_unique() {
-        assert_eq!(DEFAULT_PROFILES.len(), 8);
+        assert_eq!(DEFAULT_PROFILES.len(), 9);
         let mut seen = std::collections::HashSet::new();
         for p in DEFAULT_PROFILES {
             assert!(seen.insert(*p), "duplicate default profile '{p}'");

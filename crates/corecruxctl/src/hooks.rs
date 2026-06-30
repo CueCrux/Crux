@@ -33,6 +33,14 @@ fn hooks_dir() -> Result<PathBuf, DynErr> {
     Ok(Path::new(&home).join(".local").join("share").join("crux").join("hooks"))
 }
 
+/// Where helper *binaries* the agent invokes directly live (on PATH). The
+/// scratchpad-survival helper lands here so `crux-scratchpad-persist --execplan`
+/// is callable from any shell, and the SessionEnd launcher mode execs it here.
+fn local_bin_dir() -> Result<PathBuf, DynErr> {
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    Ok(Path::new(&home).join(".local").join("bin"))
+}
+
 /// The embedded launcher: sources the cuecrux env, maps it to the names each
 /// hook expects, then dispatches. Kept in sync with the in-repo copy.
 const WRAPPER_SH: &str = r#"#!/usr/bin/env bash
@@ -55,6 +63,7 @@ case "$mode" in
   precompact) exec crux-hook pre-compact ;;
   observe)    exec "$OBSERVE" "$@" ;;
   filemod)    exec "$HOME/.local/share/crux/hooks/crux-filemod.sh" "$@" ;;
+  scratchpad) exec "$HOME/.local/bin/crux-scratchpad-persist" --hook ;;
   cost)
     # SessionEnd: post the just-ended transcript's token-burn cost report to the
     # daemon (feeds the cx-cost lens + per-ExecPlan token_burn). Read the hook
@@ -83,6 +92,14 @@ const OBSERVE_SH: &str = include_str!("../../../integrations/claude-code/hooks/c
 /// without the repo. Shipped executable into the hooks dir; its `settings.json`
 /// wiring stays operator/opt-in (script self-gates on `CRUX_HOOK_FILEMOD`).
 const FILEMOD_SH: &str = include_str!("../../../integrations/claude-code/hooks/crux-filemod.sh");
+
+/// The scratchpad-survival helper: copies a session's ephemeral
+/// `/tmp/.../scratchpad` (+ background task outputs) into
+/// `~/.crux/scratchpad-archive/` so work product survives session close. Wired on
+/// SessionEnd via the `scratchpad` launcher mode (`--hook`: fact-free, best-effort
+/// backstop); the agent calls it directly with `--execplan <slug>` for a
+/// deliberate, fact-emitting handoff. Installed to `~/.local/bin` (on PATH).
+const SCRATCHPAD_SH: &str = include_str!("../../../integrations/claude-code/hooks/crux-scratchpad-persist");
 
 /// Resolve the `crux-hook` binary (banner/context/pre-compact). `None` ⇒ install
 /// observe-only and note the banner needs the binary.
@@ -139,6 +156,12 @@ fn install_assets() -> Result<(PathBuf, bool), DynErr> {
     write_exec(&wrapper, WRAPPER_SH)?;
     write_exec(&dir.join("crux-observe.sh"), OBSERVE_SH)?;
     write_exec(&dir.join("crux-filemod.sh"), FILEMOD_SH)?;
+    // The scratchpad-survival helper goes on PATH (~/.local/bin) so the agent can
+    // call `crux-scratchpad-persist --execplan <slug>` directly, and the SessionEnd
+    // `scratchpad` launcher mode execs it by absolute path.
+    let bin = local_bin_dir()?;
+    std::fs::create_dir_all(&bin)?;
+    write_exec(&bin.join("crux-scratchpad-persist"), SCRATCHPAD_SH)?;
     Ok((wrapper, locate_crux_hook().is_some()))
 }
 
@@ -210,12 +233,18 @@ fn build_hooks_block(wrapper: &Path, have_binary: bool) -> serde_json::Value {
     }
     map.insert("PostToolUse".to_string(), post_tool_groups);
     map.insert("Stop".to_string(), event(vec![cmd(wrapper, "observe stop")]));
-    // SessionEnd: capture the lifecycle node AND post the token-burn cost report
-    // (cost runs corecruxctl directly, so it is independent of the crux-hook
-    // binary and is always wired).
+    // SessionEnd: capture the lifecycle node, post the token-burn cost report, AND
+    // archive the session scratchpad so its work product survives session close
+    // (all three run independent of the crux-hook binary, so always wired). The
+    // scratchpad leg is best-effort + fact-free (`--hook`); deliberate handoff
+    // facts come from the agent's explicit `--execplan` call.
     map.insert(
         "SessionEnd".to_string(),
-        event(vec![cmd(wrapper, "observe session_end"), cmd(wrapper, "cost")]),
+        event(vec![
+            cmd(wrapper, "observe session_end"),
+            cmd(wrapper, "cost"),
+            cmd(wrapper, "scratchpad"),
+        ]),
     );
     serde_json::Value::Object(map)
 }
@@ -392,8 +421,15 @@ mod tests {
             .collect();
         assert!(cmds.iter().any(|c| c.ends_with("observe session_end")));
         assert!(cmds.iter().any(|c| c.ends_with(" cost")), "cost mode wired: {cmds:?}");
-        // And the launcher knows the `cost` mode.
+        // …and the scratchpad-survival backstop is wired alongside cost.
+        assert!(
+            cmds.iter().any(|c| c.ends_with(" scratchpad")),
+            "scratchpad mode wired: {cmds:?}"
+        );
+        // And the launcher knows the `cost` + `scratchpad` modes.
         assert!(WRAPPER_SH.contains("session cost --post"));
+        assert!(WRAPPER_SH.contains("scratchpad)"));
+        assert!(WRAPPER_SH.contains("crux-scratchpad-persist"));
     }
 
     #[test]
@@ -533,6 +569,22 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             let mode = std::fs::metadata(&filemod).unwrap().permissions().mode();
             assert_eq!(mode & 0o111, 0o111, "crux-filemod.sh must be executable: {mode:o}");
+        }
+        // The scratchpad-survival helper lands on PATH (~/.local/bin), executable.
+        let scratch = home.join(".local/bin/crux-scratchpad-persist");
+        assert!(
+            scratch.is_file(),
+            "crux-scratchpad-persist must be installed to ~/.local/bin"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&scratch).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o111,
+                0o111,
+                "crux-scratchpad-persist must be executable: {mode:o}"
+            );
         }
 
         // run_install + run_status execute without error. (No endpoint + no TTY

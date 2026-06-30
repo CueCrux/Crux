@@ -303,8 +303,8 @@ mod tests {
     fn list_without_init_shows_all_unchecked() {
         let ws = fresh_ws();
         let r = run_list(ws.path()).unwrap();
-        // 8 bundled, none enabled.
-        assert_eq!(r.stdout.matches("[ ]").count(), 8);
+        // 9 bundled, none enabled.
+        assert_eq!(r.stdout.matches("[ ]").count(), 9);
         assert_eq!(r.stdout.matches("[x]").count(), 0);
     }
 

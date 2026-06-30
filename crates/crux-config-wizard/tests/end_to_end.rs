@@ -22,7 +22,7 @@ fn full_init_regenerate_loop() {
     let workspace = dir.path();
 
     let bundled = load_bundled_profiles().expect("bundled profiles parse");
-    assert_eq!(bundled.len(), 8, "8 bundled profiles expected");
+    assert_eq!(bundled.len(), 9, "9 bundled profiles expected");
 
     // init with all defaults.
     let mut cfg = AgentProfileConfig::new(workspace_fingerprint(workspace));
@@ -41,7 +41,7 @@ fn full_init_regenerate_loop() {
     for t in [Target::ClaudeMd, Target::AgentsMd] {
         let r = compose_file(workspace, t, &enabled, false, false).unwrap();
         assert!(r.wrote);
-        assert_eq!(r.managed_sections_added, 8);
+        assert_eq!(r.managed_sections_added, 9);
     }
 
     // idempotency: second compose makes no change.
