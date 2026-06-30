@@ -1057,11 +1057,24 @@ pub fn list_tools_local_surface(agent_passports_enabled: bool) -> Vec<ToolDefini
                     "session_id":    { "type": "string",  "description": "Session to hand off" },
                     "include_facts": { "type": "boolean", "description": "Include relevant facts in the package", "default": false },
                     "target_agent":  { "type": "string",  "description": "Optional receiving agent name. If set, only that agent may accept the package." },
-                    "message":       { "type": "string",  "description": "Free-text message for the receiving agent" }
+                    "message":       { "type": "string",  "description": "Free-text message for the receiving agent" },
+                    "task_record":   {
+                        "type": "object",
+                        "description": "Optional structured statement of intent (Open Engine task record) so the receiver does not reconstruct the task from facts.",
+                        "properties": {
+                            "requester":           { "type": "string" },
+                            "desired_outcome":     { "type": "string" },
+                            "sources":             { "type": "array", "items": { "type": "string" } },
+                            "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+                            "boundaries":          { "type": "array", "items": { "type": "string" } },
+                            "blocker_rule":        { "type": "string" }
+                        }
+                    }
                 },
                 "required": ["session_id"],
                 "examples": [
-                    { "session_id": "session-42", "include_facts": true, "target_agent": "implementer", "message": "Architecture review complete, one open question." }
+                    { "session_id": "session-42", "include_facts": true, "target_agent": "implementer", "message": "Architecture review complete, one open question." },
+                    { "session_id": "session-42", "include_facts": true, "target_agent": "codex-work", "task_record": { "requester": "claude-work", "desired_outcome": "wire the dense lane", "sources": ["crates/corecrux-retrieval/src/dense.rs"], "acceptance_criteria": ["cargo test green"], "boundaries": ["do not touch the GPU path"], "blocker_rule": "block needs_approval before any deploy" } }
                 ]
             }),
         },
@@ -2598,7 +2611,7 @@ pub fn tool_output_docs() -> Value {
         { "tool": "get_agent_identity", "output": "{ agent_name: string }" },
         { "tool": "resolve_principal",  "output": "{ content: [...], principal: { passport_id, category, tier, tier_rank: int, capabilities: [string], tenant_id, agent_work_gate: bool, resolved_via: 'session'|'passport'|'identity_link:<id>', federation_grant?: { capability, scope, allowed_capabilities } }, resolved_param: 'session_id'|'passport_id' } — loopback to GET /v1/principal/resolve; tenant-scoped server-side. agent→passport resolution parity for the MCP surface." },
         { "tool": "create_handoff",     "output": "{ package_json, content_hash, signature, relevant_fact_count }" },
-        { "tool": "accept_handoff",     "output": "{ session_loaded, facts_loaded, verified: bool }" },
+        { "tool": "accept_handoff",     "output": "{ session_loaded, facts_loaded, verified: bool, task_record? }" },
         { "tool": "record_decision",    "output": "{ decision_id, decision_hash, entity, action }" },
         { "tool": "declare_constraint", "output": "{ constraint_id, constraint_hash, constraint_type, assertion }" },
         { "tool": "get_constraints",    "output": "{ constraints: [{constraint_id, constraint_type, assertion, severity, status, created_at}], count }" },

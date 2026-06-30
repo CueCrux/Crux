@@ -18,6 +18,18 @@ pub async fn handle_create_handoff(args: &Value, ctx: &McpContext) -> Result<Val
     let include_facts = args.get("include_facts").and_then(|v| v.as_bool()).unwrap_or(false);
     let message = args.get("message").and_then(|v| v.as_str()).map(|s| s.to_string());
     let target_agent = args.get("target_agent").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let task_record = match args.get("task_record") {
+        Some(v) if !v.is_null() => {
+            Some(
+                serde_json::from_value::<handoff::TaskRecord>(v.clone()).map_err(|e| JsonRpcError {
+                    code: INVALID_PARAMS,
+                    message: format!("invalid task_record: {e}"),
+                    data: None,
+                })?,
+            )
+        }
+        _ => None,
+    };
 
     let agent_name = ctx.agent.as_ref().map_or("anonymous", |a| a.name.as_str());
     let stored_session_id = scope::scoped_session_id(scope::agent_name(ctx.agent.as_ref()), session_id);
@@ -35,6 +47,7 @@ pub async fn handle_create_handoff(args: &Value, ctx: &McpContext) -> Result<Val
             source_agent: agent_name,
             target_agent,
             message,
+            task_record,
         },
         &ctx.handoff_key,
     )
@@ -87,13 +100,23 @@ pub async fn handle_accept_handoff(args: &Value, ctx: &McpContext) -> Result<Val
         data: None,
     })?;
 
+    let mut text = format!(
+        "handoff accepted: session_loaded={}, facts_loaded={}, verified={}",
+        result.session_loaded, result.facts_loaded, result.verified
+    );
+    // Surface the structured intent to the receiver so it does not have to
+    // re-derive the task from the bundled facts blob.
+    if let Some(record) = &result.task_record {
+        if let Ok(pretty) = serde_json::to_string_pretty(record) {
+            text.push_str("\ntask_record:\n");
+            text.push_str(&pretty);
+        }
+    }
+
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": format!(
-                "handoff accepted: session_loaded={}, facts_loaded={}, verified={}",
-                result.session_loaded, result.facts_loaded, result.verified
-            )
+            "text": text
         }]
     }))
 }
