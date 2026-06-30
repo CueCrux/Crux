@@ -103,6 +103,10 @@ fn bundled_raw() -> Vec<(&'static str, &'static str)> {
             include_str!("../profiles/execplan-discipline.md"),
         ),
         ("code-grounding.md", include_str!("../profiles/code-grounding.md")),
+        (
+            "scratchpad-survival.md",
+            include_str!("../profiles/scratchpad-survival.md"),
+        ),
         ("pre-deploy-gate.md", include_str!("../profiles/pre-deploy-gate.md")),
         ("eu-ai-act.md", include_str!("../profiles/eu-ai-act.md")),
         ("audit-soc2.md", include_str!("../profiles/audit-soc2.md")),
@@ -167,9 +171,9 @@ This is the body.
     }
 
     #[test]
-    fn bundled_load_returns_eight_in_order() {
+    fn bundled_load_returns_nine_in_order() {
         let bundled = load_bundled_profiles().unwrap();
-        assert_eq!(bundled.len(), 8);
+        assert_eq!(bundled.len(), 9);
         for win in bundled.windows(2) {
             assert!(
                 win[0].frontmatter.order <= win[1].frontmatter.order,
