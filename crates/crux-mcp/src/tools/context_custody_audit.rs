@@ -176,7 +176,7 @@ pub fn build_scorecard(inputs: &CustodyInputs) -> Value {
         "Can I leave with my context in a usable form?",
         "strong",
         format!(
-            "corecruxctl context-export — one signed, re-importable bundle of facts + sessions + receipts (offline, always available); online audit_export_bundle is {} (CORECRUXD_FEATURE_AUDIT_EXPORT)",
+            "corecruxctl context export — one signed, re-importable bundle of facts + sessions + receipts (offline, always available); online audit_export_bundle is {} (CORECRUXD_FEATURE_AUDIT_EXPORT)",
             on_off(inputs.audit_export_online)
         ),
     );
@@ -227,14 +227,17 @@ pub fn build_scorecard(inputs: &CustodyInputs) -> Value {
             }
         ),
     );
-    // PROVE is Crux's honest gap: re-verification exists, end-to-end proof
-    // export does not yet.
+    // PROVE: a first-class signed custody-proof export now ships
+    // (`corecruxctl context-export` → passport-signed manifest binding both
+    // component hashes + an embedded offline audit-verify report;
+    // `corecruxctl context-verify` re-checks it offline). receipt_verify
+    // additionally re-verifies individual receipts when enabled.
     let prove = axis(
         "PROVE",
         "Can I produce evidence of what it saw and did?",
-        "partial",
+        "strong",
         format!(
-            "receipt_verify re-verifies signatures (currently {}); witness proofs exist (witness_v1) but a dedicated end-to-end custody-proof export is NOT yet a first-class tool — honest gap",
+            "corecruxctl context export emits a passport-signed custody proof (manifest binds cruxpack + audit-bundle hashes + an offline audit-verify report); context verify re-checks it offline. receipt_verify (per-receipt) is {}. Transparency-log witness inclusion stays optional.",
             on_off(inputs.receipt_verify_enabled)
         ),
     );
@@ -282,7 +285,7 @@ pub fn build_scorecard(inputs: &CustodyInputs) -> Value {
         "lock_in_label": lock_in_label,
         "trust_posture": {
             "recommendations": trust_recommendations,
-            "standing_gap": "PROVE: end-to-end custody-proof export is not yet a first-class tool (witness_v1 exists, unexposed)"
+            "standing_gap": "none — first-class signed custody-proof export shipped (corecruxctl context export -> context verify); transparency-log witness inclusion remains optional"
         },
         "thesis": "A substrate you can leave is the product: useful (strong on the four questions) AND low lock-in (you keep custody, can export, and route to any model).",
         "note": "Verdicts reflect this process's RUNTIME flags, not just what exists in code. A flag-gated-OFF capability is reported `partial`."
@@ -334,19 +337,17 @@ mod tests {
     }
 
     #[test]
-    fn all_flags_on_is_low_lock_in_but_prove_is_still_a_gap() {
+    fn all_flags_on_is_low_lock_in_and_all_exit_axes_strong() {
         let card = build_scorecard(&inputs(true));
         // The four questions are all strong when verification is on.
         for id in ["SEE", "DO", "REMEMBER", "CHECK"] {
             assert_eq!(find(&card, "four_questions", id)["verdict"], "strong", "{id}");
         }
-        // Revoke + route strong with flags on; export + keep-local always strong.
-        assert_eq!(find(&card, "exit_test", "REVOKE")["verdict"], "strong");
-        assert_eq!(find(&card, "exit_test", "ROUTE")["verdict"], "strong");
-        assert_eq!(find(&card, "exit_test", "EXPORT")["verdict"], "strong");
-        assert_eq!(find(&card, "exit_test", "KEEP-LOCAL")["verdict"], "strong");
-        // PROVE is the honest standing gap regardless of flags.
-        assert_eq!(find(&card, "exit_test", "PROVE")["verdict"], "partial");
+        // Every exit-test axis is strong with flags on, including PROVE now that
+        // the signed custody-proof export ships (context-export/context-verify).
+        for id in ["EXPORT", "INSPECT", "REVOKE", "ROUTE", "KEEP-LOCAL", "PROVE"] {
+            assert_eq!(find(&card, "exit_test", id)["verdict"], "strong", "{id}");
+        }
         // Trivial to leave.
         assert_eq!(card["lock_in_risk"], 1);
         assert_eq!(card["lock_in_label"], "trivial to leave");

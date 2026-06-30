@@ -510,35 +510,17 @@ enum Command {
         command: IdentityCommand,
     },
 
-    /// One-shot context-export bundle (context-custody-surface M2).
-    /// Composes the cruxpack (facts + sessions, re-importable) and the
-    /// audit bundle (signed journal + receipt refs, offline-verifiable)
-    /// into one directory with an index manifest — the single answer to
-    /// the context-custody exit test's "can you export it?". Read-only
-    /// against the data dir.
-    #[command(name = "context-export")]
-    ContextExport {
-        /// Data directory (defaults to CORECRUXD_DATA_DIR).
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-        /// Output bundle DIRECTORY (created if absent).
-        #[arg(long)]
-        out: PathBuf,
-        /// Tenant id stamped on the cruxpack.
-        #[arg(long, default_value = "local")]
-        tenant: String,
-        /// RFC3339 lower bound, inclusive (optional); applied to both halves.
-        #[arg(long)]
-        since: Option<String>,
-        /// Copy born-private facts into the bundle (Art.14 typed consent prompt).
-        #[arg(long, default_value_t = false)]
-        include_private: bool,
-        /// Operator-only: include reserved-prefix entries in the audit half.
-        #[arg(long, default_value_t = false)]
-        include_reserved: bool,
-        /// Optional caller label embedded in the audit-bundle scope.
-        #[arg(long)]
-        caller: Option<String>,
+    /// Context-custody portability + proof (context-custody-surface).
+    /// `context export` composes the cruxpack (facts + sessions,
+    /// re-importable) and the audit bundle (signed journal + receipt refs,
+    /// offline-verifiable) into one passport-signed bundle; `context verify`
+    /// re-checks it offline. The answer to the exit test's "can you export
+    /// it?" / "can you prove what it saw and did?". Read-only against the
+    /// data dir.
+    #[command(name = "context")]
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
     },
 
     /// BYO Audit Trail export (agent-ux-11). Builds a signed,
@@ -673,6 +655,48 @@ enum Command {
         #[arg(long)]
         expected_receipt: Option<String>,
         /// Emit compact JSON instead of pretty JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ContextCommand {
+    /// One-shot context-export bundle (context-custody-surface M2).
+    /// Composes the cruxpack (facts + sessions, re-importable) + the audit
+    /// bundle (signed journal + receipt refs) into one directory with a
+    /// passport-signed custody-proof manifest. Read-only against the data dir.
+    Export {
+        /// Data directory (defaults to CORECRUXD_DATA_DIR).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output bundle DIRECTORY (created if absent).
+        #[arg(long)]
+        out: PathBuf,
+        /// Tenant id stamped on the cruxpack.
+        #[arg(long, default_value = "local")]
+        tenant: String,
+        /// RFC3339 lower bound, inclusive (optional); applied to both halves.
+        #[arg(long)]
+        since: Option<String>,
+        /// Copy born-private facts into the bundle (Art.14 typed consent prompt).
+        #[arg(long, default_value_t = false)]
+        include_private: bool,
+        /// Operator-only: include reserved-prefix entries in the audit half.
+        #[arg(long, default_value_t = false)]
+        include_reserved: bool,
+        /// Optional caller label embedded in the audit-bundle scope.
+        #[arg(long)]
+        caller: Option<String>,
+    },
+    /// Verify a context-export bundle OFFLINE — no daemon, no network.
+    /// Checks the passport signature on the custody-proof manifest, the
+    /// per-component blake3 hashes, the cruxpack self-verification, and
+    /// re-runs audit-verify. Exits non-zero on any failure.
+    Verify {
+        /// Path to the bundle DIRECTORY produced by `context export`.
+        bundle: PathBuf,
+        /// Emit the verification report as JSON.
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -3819,52 +3843,97 @@ fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(())
             }
         },
-        Command::ContextExport {
-            data_dir,
-            out,
-            tenant,
-            since,
-            include_private,
-            include_reserved,
-            caller,
-        } => {
-            let data_dir = data_dir
-                .or_else(|| std::env::var("CORECRUXD_DATA_DIR").ok().map(PathBuf::from))
-                .ok_or("context-export requires --data-dir or CORECRUXD_DATA_DIR")?;
-            let report = export::run_context_export(
-                &export::ContextExportArgs {
-                    data_dir,
-                    out_dir: out.clone(),
-                    tenant,
-                    since,
-                    include_private,
-                    include_reserved,
-                    caller,
-                },
-                |summary| {
-                    print!("{}", memory_pack::render_private_summary(summary));
-                    print!("Type '{}' to proceed: ", memory_pack::INCLUDE_PRIVATE_CONFIRM_PHRASE);
-                    use std::io::Write as _;
-                    let _ = std::io::stdout().flush();
-                    let mut line = String::new();
-                    if std::io::stdin().read_line(&mut line).is_err() {
-                        return false;
+        Command::Context { command } => match command {
+            ContextCommand::Export {
+                data_dir,
+                out,
+                tenant,
+                since,
+                include_private,
+                include_reserved,
+                caller,
+            } => {
+                let data_dir = data_dir
+                    .or_else(|| std::env::var("CORECRUXD_DATA_DIR").ok().map(PathBuf::from))
+                    .ok_or("context export requires --data-dir or CORECRUXD_DATA_DIR")?;
+                let report = export::run_context_export(
+                    &export::ContextExportArgs {
+                        data_dir,
+                        out_dir: out.clone(),
+                        tenant,
+                        since,
+                        include_private,
+                        include_reserved,
+                        caller,
+                    },
+                    |summary| {
+                        print!("{}", memory_pack::render_private_summary(summary));
+                        print!("Type '{}' to proceed: ", memory_pack::INCLUDE_PRIVATE_CONFIRM_PHRASE);
+                        use std::io::Write as _;
+                        let _ = std::io::stdout().flush();
+                        let mut line = String::new();
+                        if std::io::stdin().read_line(&mut line).is_err() {
+                            return false;
+                        }
+                        line.trim() == memory_pack::INCLUDE_PRIVATE_CONFIRM_PHRASE
+                    },
+                )?;
+                println!(
+                    "context export OK (signed={} audit_verify_ok={}): facts={} sessions={} audit_facts={} receipts={} passport_fpr={} manifest_blake3={} out={}",
+                    report.signed,
+                    report.audit_verify_ok,
+                    report.facts,
+                    report.sessions,
+                    report.audit_facts,
+                    report.receipts,
+                    report.passport_fpr,
+                    report.manifest_blake3,
+                    report.out_dir.display()
+                );
+                println!(
+                    "verify offline with: corecruxctl context verify {}",
+                    report.out_dir.display()
+                );
+                Ok(())
+            }
+            ContextCommand::Verify { bundle, json } => {
+                let report = export::run_context_verify(&bundle)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "ok": report.ok,
+                            "passport_fpr": report.passport_fpr,
+                            "signature_valid": report.signature_valid,
+                            "cruxpack_hash_match": report.cruxpack_hash_match,
+                            "audit_bundle_hash_match": report.audit_bundle_hash_match,
+                            "cruxpack_verify_ok": report.cruxpack_verify_ok,
+                            "audit_verify_ok": report.audit_verify_ok,
+                            "failures": report.failures,
+                        })
+                    );
+                } else {
+                    println!(
+                        "context verify {}: passport_fpr={} signature_valid={} cruxpack_hash={} audit_hash={} cruxpack_verify={} audit_verify={}",
+                        if report.ok { "OK" } else { "FAIL" },
+                        report.passport_fpr,
+                        report.signature_valid,
+                        report.cruxpack_hash_match,
+                        report.audit_bundle_hash_match,
+                        report.cruxpack_verify_ok,
+                        report.audit_verify_ok,
+                    );
+                    for f in &report.failures {
+                        println!("  - {f}");
                     }
-                    line.trim() == memory_pack::INCLUDE_PRIVATE_CONFIRM_PHRASE
-                },
-            )?;
-            println!(
-                "context-export OK: facts={} sessions={} audit_facts={} receipts={} passport_fpr={} manifest_blake3={} out={}",
-                report.facts,
-                report.sessions,
-                report.audit_facts,
-                report.receipts,
-                report.passport_fpr,
-                report.manifest_blake3,
-                report.out_dir.display()
-            );
-            Ok(())
-        }
+                }
+                if report.ok {
+                    Ok(())
+                } else {
+                    Err("context verify failed".into())
+                }
+            }
+        },
         Command::AuditExport {
             data_dir,
             out,
