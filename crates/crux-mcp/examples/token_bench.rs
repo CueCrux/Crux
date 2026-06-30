@@ -188,10 +188,10 @@ struct RunMeta {
 }
 
 /// Run the compaction-sensitive scenarios and return `(scenario_key, response_text)`
-/// for each, honouring whatever efficiency flags are currently set in the env
-/// (the handlers read them at call time). Used by the M5 paired holdout
-/// measurement, which calls this once with flags OFF (control) and once with
-/// M3 compaction ON (treatment).
+/// for each, honouring whatever `CRUX_OUTPUT_HOLDOUT` fraction is set (the
+/// handlers read it at call time). Used by the M5 paired holdout measurement,
+/// which calls this once with holdout=1 (unshaped control) and once with
+/// holdout=0 (fully shaped treatment).
 async fn measure_scenarios(ctx: &McpContext) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for &budget in &BUDGETS {
@@ -215,30 +215,27 @@ async fn measure_scenarios(ctx: &McpContext) -> Vec<(String, String)> {
     out
 }
 
-/// M5 — paired holdout savings of a treatment (M3 payload compaction ON) vs. the
-/// control arm (all efficiency flags OFF), measured on the same scenarios, with
-/// a 95% CI. Reproduces the M3 saving through the holdout path rather than as a
-/// bare counterfactual number (gate M5). Env is saved/restored around the toggle.
+/// M5 — paired NET savings of the fully-shaped path (reversible-cap + compaction)
+/// vs. the unshaped control (legacy drop + pretty), measured on the same
+/// scenarios, with a 95% CI. Since CO-5 removed the per-mechanism env flags, the
+/// shaped/unshaped lever is the holdout fraction: `=1` forces every request into
+/// the unshaped control arm, `=0` is fully shaped. Env is saved/restored.
 async fn paired_holdout_savings(ctx: &McpContext) -> crux_mcp::holdout::SavingsReport {
-    use crux_mcp::{budget::REVERSIBLE_ENV, payload::COMPACT_ENV};
-    let saved_compact = std::env::var(COMPACT_ENV).ok();
-    let saved_reversible = std::env::var(REVERSIBLE_ENV).ok();
-    let restore = |k: &str, v: &Option<String>| match v {
-        Some(val) => std::env::set_var(k, val),
-        None => std::env::remove_var(k),
-    };
+    use crux_mcp::holdout::HOLDOUT_ENV;
+    let saved = std::env::var(HOLDOUT_ENV).ok();
 
-    // Control arm: every efficiency flag OFF.
-    std::env::set_var(COMPACT_ENV, "0");
-    std::env::set_var(REVERSIBLE_ENV, "0");
+    // Control arm: holdout=1 ⇒ every request unshaped (legacy drop + pretty).
+    std::env::set_var(HOLDOUT_ENV, "1");
     let control = measure_scenarios(ctx).await;
 
-    // Treatment arm: M3 payload compaction ON (the clean, hits-identical win).
-    std::env::set_var(COMPACT_ENV, "1");
+    // Treatment arm: holdout=0 ⇒ fully shaped (reversible-cap + compaction).
+    std::env::set_var(HOLDOUT_ENV, "0");
     let treatment = measure_scenarios(ctx).await;
 
-    restore(COMPACT_ENV, &saved_compact);
-    restore(REVERSIBLE_ENV, &saved_reversible);
+    match saved {
+        Some(v) => std::env::set_var(HOLDOUT_ENV, v),
+        None => std::env::remove_var(HOLDOUT_ENV),
+    }
 
     let control_tokens: Vec<u64> = control.iter().map(|(_, t)| estimate_tokens_str(t)).collect();
     let treatment_tokens: Vec<u64> = treatment.iter().map(|(_, t)| estimate_tokens_str(t)).collect();
@@ -263,20 +260,13 @@ fn record(scenario: &str, budget: Option<usize>, text: &str, m: &RunMeta) -> Val
 
 #[tokio::main]
 async fn main() {
-    // lane_flags reflects the LIVE flag state the handlers read, so an M1/M3 run
-    // is self-documenting against the baseline.
-    let mut flags: Vec<&str> = Vec::new();
-    if crux_mcp::budget::reversible_enabled() {
-        flags.push("m1:budget-reversible");
-    }
-    if crux_mcp::payload::compact_enabled() {
-        flags.push("m3:payload-compact");
-    }
-    let lane_flags = if flags.is_empty() {
-        "baseline:all-off".to_string()
-    } else {
-        flags.join("+")
-    };
+    // Since CO-5 the efficiency mechanisms (m1 reversible-cap + m3 compaction) are
+    // unconditional; the primary records pass runs fully shaped unless a holdout
+    // fraction diverts a sample to the unshaped control. lane_flags documents that.
+    let lane_flags = format!(
+        "m1+m3:unconditional;holdout={:.3}",
+        crux_mcp::holdout::holdout_fraction()
+    );
     let m = RunMeta {
         commit: std::env::var("CRUX_BENCH_COMMIT").unwrap_or_else(|_| "unknown".to_string()),
         run_id: std::env::var("CRUX_BENCH_RUN_ID").unwrap_or_else(|_| "local".to_string()),
@@ -311,8 +301,8 @@ async fn main() {
         .expect("query_scan");
     records.push(record("query_scan", None, &content_text(&qs), &m));
 
-    // M5 — paired holdout savings (M3 compaction treatment vs. all-OFF control),
-    // reported as a point estimate WITH a 95% CI (never a bare number).
+    // M5 — paired NET holdout savings (fully-shaped treatment vs. unshaped
+    // control), reported as a point estimate WITH a 95% CI (never a bare number).
     let savings = paired_holdout_savings(&ctx).await;
     let savings_line = savings.format(CORPUS, &m.commit);
 
@@ -333,11 +323,11 @@ async fn main() {
         "run_id": m.run_id,
         "lane_flags": m.lane_flags,
         "records": records,
-        // M5 — holdout savings: M3 compaction (treatment) vs all-OFF (control),
+        // M5 — net holdout savings: fully-shaped (treatment) vs unshaped (control),
         // paired per scenario, with a 95% CI (Headroom holdout / QC.4 / QC.5).
         "savings": {
-            "treatment": "m3:payload-compact",
-            "control": "baseline:all-off",
+            "treatment": "m1+m3:fully-shaped",
+            "control": "unshaped:legacy-drop+pretty",
             "method": "paired per-scenario reduction, 95% CI (normal approx, z=1.96)",
             "n": savings.n,
             "reduction_pct": savings.reduction * 100.0,

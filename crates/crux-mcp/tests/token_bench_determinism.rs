@@ -20,10 +20,11 @@ fn run_bench() -> String {
         .args(["run", "--quiet", "-p", "crux-mcp", "--example", "token_bench"])
         .env("CRUX_BENCH_COMMIT", "determinism-test")
         .env("CRUX_BENCH_RUN_ID", "fixed")
-        // Pin efficiency flags OFF for the *primary* records pass so the run is
-        // fully specified; the holdout savings pass toggles them internally.
-        .env("CRUX_PAYLOAD_COMPACT", "0")
-        .env("CRUX_BUDGET_REVERSIBLE", "0")
+        // Pin the holdout off for the *primary* records pass so the run is fully
+        // specified (fully shaped); the savings pass toggles the holdout internally.
+        // (The per-mechanism CRUX_PAYLOAD_COMPACT / CRUX_BUDGET_REVERSIBLE flags
+        // were removed in CO-5 — efficiency is unconditional.)
+        .env("CRUX_OUTPUT_HOLDOUT", "0")
         .output()
         .expect("run token_bench example");
     assert!(

@@ -20,44 +20,21 @@
 //! (timestamps, `local_fact_count`, sync mode) and the live-session coord
 //! digest — so a single changed fact count busts the whole prefix.
 //!
-//! Behind `CRUX_BANNER_CACHE_ALIGN` (**default ON** since the CO-2 cutover) we
-//! tag each section `Stable` (playbook/patterns — identical session-to-session)
+//! We tag each section `Stable` (playbook/patterns — identical session-to-session)
 //! or `Volatile` (sync state, live sessions, config hashes) and emit all stable
 //! sections first, volatile last. The stable *prefix* then stays byte-identical
-//! across boots; only the tail churns. Opt out with `CRUX_BANNER_CACHE_ALIGN=0`
-//! for the original insertion order (byte-identical to pre-M2) — the escape hatch.
+//! across boots; only the tail churns.
+//!
+//! Cache alignment shipped behind `CRUX_BANNER_CACHE_ALIGN` (CO-2, default-ON
+//! 2026-06-25). The escape-hatch env flag is now **removed** (CO-5, 2026-06-30):
+//! the banner is always cache-aligned (the reorder is consumer-free — nothing
+//! parses the banner positionally).
 
 use serde_json::{json, Value};
 
 use crate::{config_audit, hook_input::HookInput, hook_output::HookOutput, mcp_client};
 
 const BOOTSTRAP_TOKEN_BUDGET: u64 = 500;
-
-/// Env flag name for M2 cache-aligned banner ordering. **Default ON** since the
-/// CO-2 cutover; set to `0`/`false`/`off`/`no` to opt back out to insertion order.
-const CACHE_ALIGN_ENV: &str = "CRUX_BANNER_CACHE_ALIGN";
-
-/// Opt-out env parse: **ON unless explicitly disabled**. Unset / `""` / any value
-/// other than `0`/`false`/`off`/`no` ⇒ true; only an explicit falsey value ⇒
-/// false. The banner reorder is consumer-free (it only reorders sections in the
-/// agent's `additionalContext`), so default-ON is safe; the OFF path stays the
-/// original insertion order — the escape hatch / instant rollback.
-fn env_opt_out_enabled(var: &str) -> bool {
-    match std::env::var(var) {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !matches!(v.as_str(), "0" | "false" | "off" | "no")
-        }
-        // Unset ⇒ default ON (the CO-2 cutover).
-        Err(_) => true,
-    }
-}
-
-/// True when cache-aligned banner ordering is enabled (the default since CO-2).
-/// `CRUX_BANNER_CACHE_ALIGN=0`/`false`/`off`/`no` opts back out to insertion order.
-fn cache_align_enabled() -> bool {
-    env_opt_out_enabled(CACHE_ALIGN_ENV)
-}
 
 /// Boot-banner section stability, for M2 cache alignment. `Stable` content is
 /// identical session-to-session (playbook/patterns) and belongs at the front so
@@ -95,9 +72,8 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Each section is tagged with its M2 cache-alignment stability. Insertion
-    // order is preserved when the flag is OFF (byte-identical to pre-M2); when
-    // ON, `order_sections` floats `Stable` ahead of `Volatile`.
+    // Each section is tagged with its M2 cache-alignment stability; at emit time
+    // `order_sections` floats `Stable` ahead of `Volatile` (unconditional since CO-5).
     let mut sections: Vec<(Stability, String)> = Vec::new();
 
     match mcp_client::call_tool("sync_status", json!({})) {
@@ -180,7 +156,8 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
         }
     }
 
-    let ordered = order_sections(sections, cache_align_enabled());
+    // CO-5: cache alignment is unconditional (the env flag was removed).
+    let ordered = order_sections(sections, true);
     if !ordered.is_empty() {
         let body = ordered.join("\n\n");
         HookOutput::new("SessionStart", body).emit()?;
@@ -412,22 +389,6 @@ mod tests {
             common(&boot_a, &boot_b),
             common(&off_a, &off_b)
         );
-    }
-
-    #[test]
-    fn cache_align_env_default_on_with_opt_out() {
-        // CO-2: default ON when unset; only an explicit falsey value opts out.
-        let k = "CRUX_BANNER_CACHE_ALIGN_TEST_A";
-        std::env::remove_var(k);
-        assert!(env_opt_out_enabled(k), "unset ⇒ default ON");
-        std::env::set_var(k, "1");
-        assert!(env_opt_out_enabled(k));
-        std::env::set_var(k, "off");
-        assert!(!env_opt_out_enabled(k), "off ⇒ opt-out");
-        std::env::set_var(k, "0");
-        assert!(!env_opt_out_enabled(k), "0 ⇒ opt-out");
-        std::env::remove_var(k);
-        assert!(env_opt_out_enabled(k));
     }
 
     #[test]
