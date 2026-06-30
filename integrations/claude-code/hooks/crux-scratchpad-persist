@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 CueCrux Ltd. All rights reserved.
+# Licensed under the CueCrux Community Licence (CCL v1.0).
+#
+# crux-scratchpad-persist — copy a Claude Code session scratchpad (+ task outputs)
+# out of the ephemeral /tmp session dir into a durable archive, so work product
+# survives session close and can be handed to a new session / ExecPlan pickup.
+#
+# WHY: the harness forces temp files into
+#   /tmp/claude-<uid>/<encoded-cwd>/<session_id>/scratchpad
+# which is GC'd when the session closes. create_handoff carries facts, never
+# files, and the Crux daemon is often remote — so anything written to scratchpad
+# is unreachable from the next session unless it is archived locally first.
+#
+# Modes:
+#   crux-scratchpad-persist [<session_id>]
+#       Explicit. Archive the given (or auto-detected newest) session; print the
+#       archive dir + manifest path. No fact written.
+#
+#   crux-scratchpad-persist --execplan <slug> [<session_id>]
+#       Explicit + deliberate handoff. Archive, then PUT a pointer fact
+#       execplan:<slug>/scratchpad_archive to the daemon so the next session
+#       reaches it via query_facts. Facts are written ONLY in this mode (never in
+#       a hook) — deliberate, per the facts-stay-deliberate rule.
+#
+#   crux-scratchpad-persist --hook
+#       SessionEnd hook. Reads the hook JSON on stdin, archives that session
+#       quietly, runs the retention sweep, always exits 0 (never blocks session
+#       end), writes NO fact. Best-effort backstop: a no-op if the harness has
+#       already GC'd the dir, which is why --execplan above is the reliable path
+#       for a real handoff.
+#
+# Archive layout:  $CRUX_SCRATCH_ARCHIVE_ROOT/<YYYY-MM-DD>-<session_id>/
+#                    ├── scratchpad/...   (verbatim copy)
+#                    ├── tasks/...        (background task outputs, if any)
+#                    └── MANIFEST.txt     (source path, ts, file list + sizes)
+#
+# Tunables (env): CRUX_SCRATCH_ARCHIVE_ROOT (default ~/.crux/scratchpad-archive),
+#   CRUX_SCRATCH_RETENTION_DAYS (30), CRUX_SCRATCH_MAX_MB (512),
+#   CRUX_HTTP_URL (default http://127.0.0.1:14800), CRUX_AGENT_TOKEN (--execplan).
+set -uo pipefail
+
+ARCHIVE_ROOT="${CRUX_SCRATCH_ARCHIVE_ROOT:-$HOME/.crux/scratchpad-archive}"
+RETENTION_DAYS="${CRUX_SCRATCH_RETENTION_DAYS:-30}"
+MAX_MB="${CRUX_SCRATCH_MAX_MB:-512}"
+TMP_BASE="/tmp/claude-$(id -u)"
+LOG="$HOME/.local/share/crux-guardrails/scratchpad-archive.log"
+
+mkdir -p "$ARCHIVE_ROOT" "$(dirname "$LOG")" 2>/dev/null || true
+
+# Populated by archive_session on success.
+R_DEST=""; R_MANIFEST=""; R_NFILES=0; R_BYTES=""
+
+log() { printf '%s %s\n' "$(date -Is 2>/dev/null || true)" "$*" >> "$LOG" 2>/dev/null || true; }
+
+usage() { sed -n '5,46p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# Locate /tmp/claude-<uid>/<encoded-cwd>/<session_id> by session id (any cwd).
+find_session_dir() {
+  local sid="$1" d
+  for d in "$TMP_BASE"/*/"$sid"; do
+    [ -d "$d" ] && { printf '%s\n' "$d"; return 0; }
+  done
+  return 1
+}
+
+# Fallback for no-arg use: the session dir holding the most recently modified file.
+newest_session_dir() {
+  local f
+  f="$(find "$TMP_BASE" -mindepth 3 -maxdepth 5 -type f -printf '%T@ %p\n' 2>/dev/null \
+        | sort -nr | head -1 | cut -d' ' -f2-)"
+  [ -n "$f" ] || return 1
+  sed -E "s#^($TMP_BASE/[^/]+/[^/]+)/.*#\1#" <<<"$f"
+}
+
+# Archive a session dir. Sets R_DEST/R_MANIFEST/R_NFILES/R_BYTES on success.
+# Args: <session_dir> [quiet]   Returns 0 if archived, 1 if skipped.
+archive_session() {
+  local sdir="$1" quiet="${2:-0}" sid dest sub have=0 size_kb datestamp
+  R_DEST=""; R_MANIFEST=""; R_NFILES=0; R_BYTES=""
+  sid="$(basename "$sdir")"
+
+  for sub in scratchpad tasks; do
+    [ -d "$sdir/$sub" ] && [ -n "$(ls -A "$sdir/$sub" 2>/dev/null)" ] && have=1
+  done
+  if [ "$have" -eq 0 ]; then
+    log "skip (empty): $sdir"
+    [ "$quiet" = 1 ] || echo "crux-scratchpad-persist: nothing to archive in $sdir"
+    return 1
+  fi
+
+  size_kb="$(du -sk "$sdir" 2>/dev/null | cut -f1)"
+  if [ -n "$size_kb" ] && [ "$size_kb" -gt $((MAX_MB * 1024)) ]; then
+    log "skip (too big ${size_kb}KB > ${MAX_MB}MB): $sdir"
+    [ "$quiet" = 1 ] || echo "crux-scratchpad-persist: $sdir is >${MAX_MB}MB; skipped (raise CRUX_SCRATCH_MAX_MB)"
+    return 1
+  fi
+
+  datestamp="$(date +%Y-%m-%d 2>/dev/null || echo undated)"
+  dest="$ARCHIVE_ROOT/${datestamp}-${sid}"
+  mkdir -p "$dest"
+  for sub in scratchpad tasks; do
+    [ -d "$sdir/$sub" ] && cp -a "$sdir/$sub" "$dest/" 2>/dev/null || true
+  done
+
+  {
+    echo "# crux scratchpad archive"
+    echo "source:      $sdir"
+    echo "session_id:  $sid"
+    echo "archived_at: $(date -Is 2>/dev/null || true)"
+    echo "files:"
+    find "$dest" -type f ! -name MANIFEST.txt -printf '  %10s  %p\n' 2>/dev/null | sort -k2
+  } > "$dest/MANIFEST.txt"
+
+  R_DEST="$dest"
+  R_MANIFEST="$dest/MANIFEST.txt"
+  R_NFILES="$(find "$dest" -type f ! -name MANIFEST.txt 2>/dev/null | wc -l | tr -d ' ')"
+  R_BYTES="$(du -sh "$dest" 2>/dev/null | cut -f1)"
+  log "archived $sdir -> $dest ($R_NFILES files, $R_BYTES)"
+  if [ "$quiet" != 1 ]; then
+    echo "$R_DEST"
+    echo "  files: $R_NFILES   size: $R_BYTES   manifest: $R_MANIFEST"
+  fi
+  return 0
+}
+
+# Deliberate handoff fact: PUT execplan:<slug>/scratchpad_archive to the daemon.
+# Non-fatal — a missing token/curl/daemon prints a notice; the archive stands.
+emit_fact() {
+  local slug="$1" dest="$2" manifest="$3" nfiles="$4" bytes="$5" sid="$6"
+  if [ -r "$HOME/.config/cuecrux/env" ]; then
+    set -a; . "$HOME/.config/cuecrux/env" 2>/dev/null || true; set +a
+  fi
+  local url token value body code
+  url="${CRUX_HTTP_URL:-${CORECRUXD_URL:-http://127.0.0.1:14800}}"
+  token="${CRUX_AGENT_TOKEN:-${CORECRUXD_AUTH_TOKEN:-}}"
+  if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    echo "  (curl/jq missing — fact not written; pointer: $dest)" >&2
+    return 0
+  fi
+  value="$(jq -cn --arg p "$dest" --arg m "$manifest" --arg s "$sid" \
+                  --argjson f "${nfiles:-0}" --arg b "$bytes" \
+           '{path:$p, manifest:$m, source_session:$s, files:$f, bytes:$b}')"
+  body="$(jq -cn --arg e "execplan:$slug" --arg k "scratchpad_archive" --arg v "$value" \
+           '{entity:$e, key:$k, value:$v, horizon_class:"stable"}')"
+  local -a auth=()
+  [ -n "$token" ] && auth=(-H "Authorization: Bearer $token")
+  code="$(curl -sS -X PUT -H 'Content-Type: application/json' "${auth[@]}" \
+            -o /dev/null -w '%{http_code}' --max-time 8 \
+            --data "$body" "$url/v1/facts" 2>/dev/null || true)"
+  if [ "$code" = "201" ] || [ "$code" = "200" ]; then
+    echo "  fact: execplan:$slug/scratchpad_archive  (HTTP $code)"
+    log "fact execplan:$slug/scratchpad_archive -> $dest (HTTP $code)"
+  else
+    # Common on remote daemons whose token carries a category-less passport
+    # (the local-first loopback admin token bypasses category enforcement and
+    # writes directly). Degrade to the correctly-attributed MCP write: hand the
+    # agent the exact call to run with its own categorised passport.
+    echo "  fact NOT written over HTTP (status ${code:-no-response} at $url)." >&2
+    echo "  Emit it via MCP with your agent passport instead:" >&2
+    echo "    store_fact(entity=\"execplan:$slug\", key=\"scratchpad_archive\", horizon_class=\"stable\"," >&2
+    echo "               value='$value')" >&2
+    log "fact write deferred to MCP execplan:$slug (HTTP ${code:-?})"
+  fi
+}
+
+sweep() {
+  [ -d "$ARCHIVE_ROOT" ] || return 0
+  find "$ARCHIVE_ROOT" -mindepth 1 -maxdepth 1 -type d -mtime +"$RETENTION_DAYS" \
+    -exec rm -rf {} + 2>/dev/null || true
+}
+
+case "${1:-}" in
+  --hook)
+    payload="$(cat 2>/dev/null || true)"
+    sid="$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null || true)"
+    if [ -n "$sid" ]; then
+      sdir="$(find_session_dir "$sid" || true)"
+      [ -n "$sdir" ] && archive_session "$sdir" 1
+    fi
+    sweep
+    exit 0
+    ;;
+  --execplan)
+    slug="${2:-}"
+    [ -n "$slug" ] || { echo "usage: crux-scratchpad-persist --execplan <slug> [<session_id>]" >&2; exit 2; }
+    if [ -n "${3:-}" ]; then
+      sdir="$(find_session_dir "$3" || true)"
+    else
+      sdir="$(newest_session_dir || true)"
+    fi
+    [ -n "$sdir" ] || { echo "no session scratchpad found under $TMP_BASE" >&2; exit 1; }
+    if archive_session "$sdir" 0; then
+      emit_fact "$slug" "$R_DEST" "$R_MANIFEST" "$R_NFILES" "$R_BYTES" "$(basename "$sdir")"
+    fi
+    sweep
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  "")
+    sdir="$(newest_session_dir || true)"
+    [ -n "$sdir" ] || { echo "no session scratchpad found under $TMP_BASE" >&2; exit 1; }
+    archive_session "$sdir" 0
+    sweep
+    ;;
+  *)
+    sdir="$(find_session_dir "$1" || true)"
+    [ -n "$sdir" ] || { echo "session $1 not found under $TMP_BASE" >&2; exit 1; }
+    archive_session "$sdir" 0
+    sweep
+    ;;
+esac
