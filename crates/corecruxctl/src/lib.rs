@@ -28,6 +28,7 @@ pub mod config_bundle;
 pub mod cost;
 pub mod evidence;
 pub mod explain;
+pub mod export;
 pub mod extensions;
 pub mod fixture_digest;
 pub mod gaps;
