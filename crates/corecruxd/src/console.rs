@@ -276,7 +276,7 @@ const ACTIVATE_HTML: &str = r#"<!doctype html>
           <label><input type="checkbox" value="admin:read" /><span><code>admin:read</code><span class="desc"> — read tenant config</span></span></label>
           <label><input type="checkbox" value="admin:write" /><span><code>admin:write</code><span class="desc"> — ingest / append content &amp; manage the tenant</span></span></label>
         </div>
-        <p class="tip">Content ingest (e.g. the MediaCrux archive) needs <code>admin:write</code> + <code>query:read</code>. Grant only what the client needs.</p>
+        <p class="tip">Content ingest needs <code>admin:write</code> + <code>query:read</code>. Grant only what the client needs.</p>
       </div>
       <div class="row">
         <button type="button" class="approve" id="approve_btn" onclick="decide(false)">Approve</button>
