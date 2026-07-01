@@ -33,6 +33,10 @@ pub struct ProseChunk {
     pub chunk_id: String,
     /// The chunk text. Stored verbatim as the frame payload and tokenized for BM25.
     pub text: String,
+    /// Optional precomputed dense vector (from CruxEngine). When present, persisted
+    /// as the `.ccxv` companion and served via `CosineDenseProvider` (M3). All
+    /// vectors in one ingest must share a dimension.
+    pub dense_vector: Option<Vec<f32>>,
 }
 
 /// A prose document: an ordered set of chunks written under one stream.
@@ -60,6 +64,10 @@ pub struct SealSummary {
     /// The sealed segment's receipt material hash (T.4 integrity receipt), if a
     /// segment was sealed. Hex-encoded and surfaced as `receipt_id` to callers.
     pub receipt_material_hash: Option<[u8; 32]>,
+    /// Dense vector dimension, if any chunk carried a `dense_vector` (M3).
+    pub dense_dim: Option<usize>,
+    /// Number of dense vectors persisted to the `.ccxv` companion (M3).
+    pub dense_vectors: usize,
 }
 
 /// Errors from the local seal path.
@@ -67,15 +75,23 @@ pub struct SealSummary {
 pub enum LocalIngestError {
     /// A stream hash could not be derived from the (tenant, corpus, doc) triple.
     StreamHash(String),
+    /// Dense vectors in the batch disagree on dimension (`expected` vs `found`).
+    DenseDimMismatch { expected: usize, found: usize },
     /// The underlying `corecrux-storage` append/seal path failed.
     Storage(StorageError),
+    /// Persisting the `.ccxv` dense companion failed.
+    DenseIo(String),
 }
 
 impl std::fmt::Display for LocalIngestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LocalIngestError::StreamHash(msg) => write!(f, "stream hash error: {msg}"),
+            LocalIngestError::DenseDimMismatch { expected, found } => {
+                write!(f, "dense vector dimension mismatch: expected {expected}, found {found}")
+            }
             LocalIngestError::Storage(err) => write!(f, "storage error: {err:?}"),
+            LocalIngestError::DenseIo(msg) => write!(f, "dense companion write failed: {msg}"),
         }
     }
 }
@@ -120,6 +136,39 @@ pub fn seal_prose_documents(
         build_ccxi: true,
         ..Default::default()
     };
+    // Pre-pass: validate dense vectors and collect (doc_id, vector) entries.
+    // `doc_id` is the frame index in append order (skipping empty documents),
+    // matching the `.ccxi` doc ordering (`build_ccxi_companion` iterates frames
+    // in the same order) and therefore the `(doc_id, segment_index)` keying the
+    // dense lane uses at query time.
+    let mut dense_dim: Option<usize> = None;
+    let mut dense_entries: Vec<(u32, Vec<f32>)> = Vec::new();
+    {
+        let mut next_doc_id: u32 = 0;
+        for doc in documents {
+            if doc.chunks.is_empty() {
+                continue;
+            }
+            for chunk in &doc.chunks {
+                let this_doc_id = next_doc_id;
+                next_doc_id += 1;
+                if let Some(v) = &chunk.dense_vector {
+                    match dense_dim {
+                        None => dense_dim = Some(v.len()),
+                        Some(d) if d != v.len() => {
+                            return Err(LocalIngestError::DenseDimMismatch {
+                                expected: d,
+                                found: v.len(),
+                            });
+                        }
+                        _ => {}
+                    }
+                    dense_entries.push((this_doc_id, v.clone()));
+                }
+            }
+        }
+    }
+
     let mut storage = ShardStorage::open(&shards_root, shard_id, epoch, options)?;
 
     let mut total_chunks = 0usize;
@@ -166,6 +215,19 @@ pub fn seal_prose_documents(
 
     let seal = storage.force_seal_head()?;
 
+    // M3: persist the dense companion (`.ccxv`) alongside the sealed segment,
+    // named with the same stem as its `.ccxseg` so the loader can find it by seq.
+    let mut dense_written = 0usize;
+    if seal.sealed && !dense_entries.is_empty() {
+        if let (Some(receipt), Some(dim)) = (seal.seal_receipt.as_ref(), dense_dim) {
+            let segments_dir = shards_root.join(format!("shard-{shard_id:04}")).join("segments");
+            let stem = format!("seg-{:020}-{}", receipt.segment_seq, hex16(&receipt.segment_id.0));
+            let path = segments_dir.join(format!("{stem}.ccxv"));
+            write_ccxv(&path, dim as u32, &dense_entries).map_err(|e| LocalIngestError::DenseIo(e.to_string()))?;
+            dense_written = dense_entries.len();
+        }
+    }
+
     Ok(SealSummary {
         segment_seq: seal.segment_seq.unwrap_or(0),
         frame_count: seal.frame_count.unwrap_or(0),
@@ -173,7 +235,154 @@ pub fn seal_prose_documents(
         chunks: total_chunks,
         sealed: seal.sealed,
         receipt_material_hash: seal.seal_receipt.as_ref().map(|r| r.material_hash()),
+        dense_dim: if dense_written > 0 { dense_dim } else { None },
+        dense_vectors: dense_written,
     })
+}
+
+// ── `.ccxv` dense companion (CPU `.ccxe`-equivalent) ────────────────────────
+//
+// Minimal, deterministic on-disk format co-located with a sealed segment:
+//   magic:  u32 LE = "CCXV"
+//   version:u16 LE = 1
+//   dim:    u32 LE  (all vectors share this dimension)
+//   count:  u32 LE
+//   count × { doc_id: u32 LE, dim × f32 LE }
+//
+// `doc_id` is the segment-local frame index (matches the `.ccxi` doc ordering).
+// This is the free CPU counterpart to the paid GPU `.ccxe`; both are consumed
+// behind the `DenseProvider` trait.
+
+const CCXV_MAGIC: u32 = 0x5643_5843; // "CXCV"-ish tag; version-guarded below.
+const CCXV_VERSION: u16 = 1;
+
+/// `(doc_id, vector)` entries read from a `.ccxv` companion.
+type DenseEntries = Vec<(u32, Vec<f32>)>;
+
+fn write_ccxv(path: &Path, dim: u32, entries: &[(u32, Vec<f32>)]) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity(16 + entries.len() * (4 + dim as usize * 4));
+    buf.extend_from_slice(&CCXV_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&CCXV_VERSION.to_le_bytes());
+    buf.extend_from_slice(&dim.to_le_bytes());
+    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (doc_id, vec) in entries {
+        buf.extend_from_slice(&doc_id.to_le_bytes());
+        for &f in vec {
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+    // Atomic write: tmp → rename.
+    let tmp = path.with_extension("ccxv.partial");
+    std::fs::write(&tmp, &buf)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Read a `.ccxv` companion → (dim, [(doc_id, vector)]). Returns `None` on a bad
+/// magic/version or a truncated file (treated as absent rather than fatal).
+///
+/// Serve-side (consumed by [`build_dense_provider`]): exercised by M3 tests and
+/// the deferred query-embedding track; not on the daemon's default query path.
+#[allow(dead_code)]
+fn read_ccxv(path: &Path) -> Option<(u32, DenseEntries)> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() < 14 {
+        return None;
+    }
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let version = u16::from_le_bytes(bytes[4..6].try_into().ok()?);
+    if magic != CCXV_MAGIC || version != CCXV_VERSION {
+        return None;
+    }
+    let dim = u32::from_le_bytes(bytes[6..10].try_into().ok()?);
+    let count = u32::from_le_bytes(bytes[10..14].try_into().ok()?) as usize;
+    let stride = 4 + dim as usize * 4;
+    let mut off = 14;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if off + stride > bytes.len() {
+            return None;
+        }
+        let doc_id = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
+        let mut v = Vec::with_capacity(dim as usize);
+        let mut p = off + 4;
+        for _ in 0..dim {
+            v.push(f32::from_le_bytes(bytes[p..p + 4].try_into().ok()?));
+            p += 4;
+        }
+        out.push((doc_id, v));
+        off += stride;
+    }
+    Some((dim, out))
+}
+
+/// Build a [`CosineDenseProvider`] over all sealed `.ccxv` companions, keyed by
+/// `(doc_id, segment_index)` to match [`corecrux_retrieval::fused::fused_retrieve`]'s
+/// enumeration (`segment_index` = position in `index_mgr.readers()`, which is
+/// ascending `segment_seq`). Returns `None` when no dense vectors are stored, so
+/// the caller leaves the dense lane inert.
+///
+/// Consumed by the M3 fusion fixture tests and by the deferred query-embedding
+/// track (`cruxengine-prose-payload-processor`); the daemon does not embed queries.
+#[allow(dead_code)]
+pub fn build_dense_provider(
+    index_mgr: &corecrux_retrieval::IndexManager,
+    data_dir: &Path,
+    query_embedding: &[f32],
+) -> Option<corecrux_retrieval::CosineDenseProvider> {
+    use std::collections::HashMap;
+
+    let shards_dir = data_dir.join("shards");
+    let mut vectors: HashMap<(u32, usize), Vec<f32>> = HashMap::new();
+
+    for (segment_index, reader) in index_mgr.readers().iter().enumerate() {
+        let seq = reader.header.segment_seq;
+        let Some(path) = find_ccxv_for_seq(&shards_dir, seq) else {
+            continue;
+        };
+        let Some((_dim, entries)) = read_ccxv(&path) else {
+            continue;
+        };
+        for (doc_id, v) in entries {
+            vectors.insert((doc_id, segment_index), v);
+        }
+    }
+
+    if vectors.is_empty() {
+        return None;
+    }
+    Some(corecrux_retrieval::CosineDenseProvider::new(query_embedding, vectors))
+}
+
+/// Locate the `.ccxv` companion for a segment sequence across all shards.
+#[allow(dead_code)]
+fn find_ccxv_for_seq(shards_dir: &Path, seq: u64) -> Option<std::path::PathBuf> {
+    let prefix = format!("seg-{seq:020}-");
+    let shard_entries = std::fs::read_dir(shards_dir).ok()?;
+    for shard in shard_entries.flatten() {
+        let segments = shard.path().join("segments");
+        let Ok(files) = std::fs::read_dir(&segments) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let name = f.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(".ccxv") {
+                return Some(f.path());
+            }
+        }
+    }
+    None
+}
+
+/// Lower-hex encode a 16-byte segment id (matches the storage filename scheme).
+fn hex16(bytes: &[u8; 16]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(32);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 #[cfg(test)]
@@ -200,6 +409,7 @@ mod tests {
             chunks: vec![ProseChunk {
                 chunk_id: "doc-1::0".to_string(),
                 text: "the peregrine falcon is the fastest animal on earth".to_string(),
+                dense_vector: None,
             }],
         }];
 
@@ -266,6 +476,7 @@ mod tests {
                 chunks: vec![ProseChunk {
                     chunk_id: format!("{doc_id}::0"),
                     text: text.to_string(),
+                    dense_vector: None,
                 }],
             }]
         };
@@ -311,5 +522,136 @@ mod tests {
             1,
             "second ingest must be retrievable"
         );
+    }
+
+    use corecrux_retrieval::fused::{fused_retrieve, FusedRetrieveRequest, FusionWeights};
+
+    fn fused_req(tenant: &str, query: &str, embedding: Vec<f32>, weights: FusionWeights) -> FusedRetrieveRequest {
+        FusedRetrieveRequest {
+            tenant_id: tenant.to_string(),
+            query: query.to_string(),
+            query_embedding: Some(embedding),
+            top_k: 10,
+            weights,
+            graph_hops: 0,
+            min_confidence: 0.0,
+            include_state: false,
+            graph_node_count: 0,
+            graph_cold_start_threshold: 100,
+        }
+    }
+
+    fn dense_chunk(id: &str, text: &str, v: Vec<f32>) -> ProseChunk {
+        ProseChunk {
+            chunk_id: id.to_string(),
+            text: text.to_string(),
+            dense_vector: Some(v),
+        }
+    }
+
+    /// M3 gate (a): ingest-with-vectors → fused retrieval returns the expected
+    /// top-k. Both docs match the BM25 query equally; the dense lane (query
+    /// aligned to doc B) decides the ranking.
+    #[test]
+    fn m3_dense_fusion_returns_expected_topk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let tenant = "tenant-m3";
+
+        let docs = vec![
+            ProseDocument {
+                doc_id: "doc-a".to_string(),
+                chunks: vec![dense_chunk("doc-a::0", "shared keyword alpha", vec![1.0, 0.0])],
+            },
+            ProseDocument {
+                doc_id: "doc-b".to_string(),
+                chunks: vec![dense_chunk("doc-b::0", "shared keyword beta", vec![0.0, 1.0])],
+            },
+        ];
+        let summary = seal_prose_documents(data_dir, 0, 1, tenant, "corpus", "2026-07-01T00:00:00Z", &docs)
+            .expect("seal with vectors");
+        assert_eq!(summary.dense_dim, Some(2));
+        assert_eq!(summary.dense_vectors, 2);
+
+        let segments_dir = data_dir.join("shards").join("shard-0000").join("segments");
+        let mut mgr = IndexManager::new();
+        mgr.scan_and_load(&segments_dir).expect("scan");
+
+        // Query embedding aligned to doc B (doc_id 1). Weight dense heavily.
+        let provider = build_dense_provider(&mgr, data_dir, &[0.0, 1.0]).expect("provider from .ccxv");
+        assert_eq!(provider.len(), 2);
+        let weights = FusionWeights {
+            bm25: 0.1,
+            graph: 0.0,
+            dense: 0.9,
+            sparse: 0.0,
+        };
+        let req = fused_req(tenant, "shared keyword", vec![0.0, 1.0], weights);
+
+        let resp = fused_retrieve(&mgr, &req, None, Some(&provider)).expect("fused");
+        assert!(resp.stats.dense_lane_active, "dense lane must be active");
+        assert_eq!(resp.results.len(), 2);
+        // doc-b is the 2nd appended frame → doc_id 1, and is query-aligned.
+        assert_eq!(resp.results[0].doc_id, 1, "query-aligned doc must rank first");
+        assert!(resp.results[0].score_breakdown.dense > 0.99, "top hit dense score ~1.0");
+    }
+
+    /// M3 gate (c): dimension mismatch is rejected cleanly (no partial write).
+    #[test]
+    fn m3_dense_dim_mismatch_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let docs = vec![
+            ProseDocument {
+                doc_id: "d1".to_string(),
+                chunks: vec![dense_chunk("d1::0", "text one", vec![1.0, 0.0])],
+            },
+            ProseDocument {
+                doc_id: "d2".to_string(),
+                chunks: vec![dense_chunk("d2::0", "text two", vec![1.0, 0.0, 0.0])],
+            },
+        ];
+        let err = seal_prose_documents(tmp.path(), 0, 1, "t", "corpus", "2026-07-01T00:00:00Z", &docs)
+            .expect_err("dim mismatch must be rejected");
+        match err {
+            LocalIngestError::DenseDimMismatch { expected, found } => {
+                assert_eq!(expected, 2);
+                assert_eq!(found, 3);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// M3 gate (b): ingest-without-vectors writes no `.ccxv`, the provider is
+    /// absent, and BM25-only fused retrieval still serves.
+    #[test]
+    fn m3_no_vectors_serves_bm25_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let tenant = "tenant-m3b";
+        let docs = vec![ProseDocument {
+            doc_id: "d1".to_string(),
+            chunks: vec![ProseChunk {
+                chunk_id: "d1::0".to_string(),
+                text: "plain bm25 only document".to_string(),
+                dense_vector: None,
+            }],
+        }];
+        let summary = seal_prose_documents(data_dir, 0, 1, tenant, "corpus", "2026-07-01T00:00:00Z", &docs)
+            .expect("seal no vectors");
+        assert_eq!(summary.dense_vectors, 0);
+        assert_eq!(summary.dense_dim, None);
+
+        let segments_dir = data_dir.join("shards").join("shard-0000").join("segments");
+        let mut mgr = IndexManager::new();
+        mgr.scan_and_load(&segments_dir).expect("scan");
+
+        // No .ccxv → no provider.
+        assert!(build_dense_provider(&mgr, data_dir, &[0.0, 1.0]).is_none());
+
+        // BM25-only fused retrieval still returns the doc (dense lane inert).
+        let req = fused_req(tenant, "bm25 document", vec![0.0], FusionWeights::default());
+        let resp = fused_retrieve(&mgr, &req, None, None).expect("fused bm25-only");
+        assert!(!resp.stats.dense_lane_active);
+        assert_eq!(resp.results.len(), 1);
     }
 }

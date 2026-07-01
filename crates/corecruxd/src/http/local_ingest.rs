@@ -100,6 +100,7 @@ pub(super) fn validate_payload(body: &LocalIngestBody) -> Result<AcceptedCounts,
     }
 
     let mut total_chunks = 0usize;
+    let mut dense_dim: Option<usize> = None;
     for doc in &body.documents {
         if doc.doc_id.trim().is_empty() {
             return Err((StatusCode::BAD_REQUEST, "document doc_id must not be empty".to_string()));
@@ -128,6 +129,31 @@ pub(super) fn validate_payload(body: &LocalIngestBody) -> Result<AcceptedCounts,
                     StatusCode::BAD_REQUEST,
                     format!("chunk `{}` text exceeds {MAX_CHUNK_TEXT_BYTES} bytes", chunk.chunk_id),
                 ));
+            }
+            // M3: all dense vectors in a request must share a dimension, and an
+            // empty vector is a client error. Reject cleanly before any write.
+            if let Some(v) = &chunk.dense_vector {
+                if v.is_empty() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("chunk `{}` dense_vector must not be empty", chunk.chunk_id),
+                    ));
+                }
+                match dense_dim {
+                    None => dense_dim = Some(v.len()),
+                    Some(d) if d != v.len() => {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "chunk `{}` dense_vector dimension {} != {} (all vectors must match)",
+                                chunk.chunk_id,
+                                v.len(),
+                                d
+                            ),
+                        ));
+                    }
+                    _ => {}
+                }
             }
             total_chunks += 1;
         }
@@ -188,6 +214,7 @@ pub(super) async fn post_local_ingest(
                 .map(|c| ProseChunk {
                     chunk_id: c.chunk_id.clone(),
                     text: c.text.clone(),
+                    dense_vector: c.dense_vector.clone(),
                 })
                 .collect(),
         })
@@ -249,6 +276,8 @@ pub(super) async fn post_local_ingest(
             chunks: summary.chunks,
             sealed: summary.sealed,
             receipt_id: summary.receipt_material_hash.map(hex32),
+            dense_dim: summary.dense_dim,
+            dense_vectors: summary.dense_vectors,
         })
     })
     .await;
@@ -297,6 +326,8 @@ pub(super) async fn post_local_ingest(
             "sealed": outcome.sealed,
             "segment_seq": outcome.segment_seq,
             "receipt_id": outcome.receipt_id,
+            "dense_vectors": outcome.dense_vectors,
+            "dense_dim": outcome.dense_dim,
         })),
     )
         .into_response()
@@ -310,6 +341,8 @@ struct SealOutcome {
     chunks: usize,
     sealed: bool,
     receipt_id: Option<String>,
+    dense_dim: Option<usize>,
+    dense_vectors: usize,
 }
 
 /// Lower-hex encode a 32-byte digest.
@@ -385,6 +418,22 @@ mod tests {
         let mut b = valid_body();
         b.documents[0].chunks[0].text = "   ".to_string();
         assert_eq!(validate_payload(&b).unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_rejects_dense_dim_mismatch() {
+        let mut b = valid_body();
+        b.documents[0].chunks[0].dense_vector = Some(vec![1.0, 0.0]);
+        b.documents[0].chunks[1].dense_vector = Some(vec![1.0, 0.0, 0.0]);
+        assert_eq!(validate_payload(&b).unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_accepts_consistent_dense_dims() {
+        let mut b = valid_body();
+        b.documents[0].chunks[0].dense_vector = Some(vec![1.0, 0.0]);
+        b.documents[0].chunks[1].dense_vector = Some(vec![0.0, 1.0]);
+        assert!(validate_payload(&b).is_ok());
     }
 
     #[tokio::test]
