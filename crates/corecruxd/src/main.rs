@@ -41,6 +41,7 @@ mod dataplane_store;
 #[allow(dead_code)]
 mod grpc;
 mod http;
+mod local_ingest;
 // Candidate proposers are staged behind the identity-candidates rollout path; tests
 // exercise creation/proposal before daemon startup wires automatic proposer runs.
 #[allow(dead_code)]
