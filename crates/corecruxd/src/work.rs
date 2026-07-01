@@ -67,6 +67,26 @@ pub enum WorkError {
     Json(#[from] serde_json::Error),
 }
 
+/// Why a `blocked` work item is paused — Open Engine's "BLOCKED vs HUMAN HOLD"
+/// distinction (audit §2.1). `needs_info` is "blocked, waiting on an answer
+/// about the task"; `needs_approval` is "blocked, waiting on an owner's
+/// go/no-go". The free-text `blocker_reason` still carries the prose; this
+/// typed dimension carries the *kind* so a glance feed (M3) can separate the
+/// two without parsing English. Decoupled from the gate layer (`agent_work_gate`
+/// / `approval_request`): `needs_approval` is a *hint* that an approval is owed,
+/// not the gate itself (the gate stays keyed on passport/risk).
+///
+/// Back-compat: serialised as a snake_case string and `#[serde(default)]` +
+/// skip-if-`None` on `WorkItem`, so pre-existing `blocked` rows (no field)
+/// deserialise as `None` ("unspecified", read as needs_info) and unknown
+/// strings are rejected by serde.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockerKind {
+    NeedsInfo,
+    NeedsApproval,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkItem {
     pub id: String,
@@ -85,6 +105,11 @@ pub struct WorkItem {
     pub linked_issue: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker_reason: Option<String>,
+    /// Typed kind of a block (`needs_info` | `needs_approval`); `None` when the
+    /// item is not blocked or the block predates this field. Additive +
+    /// `#[serde(default)]` so the kanban path stays byte-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker_kind: Option<BlockerKind>,
     pub created_by_passport: String,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
@@ -196,6 +221,12 @@ pub struct WorkTransition {
     /// `rejected`, `auto_approved` (timeout fallback).
     pub gate_status: String,
     pub at_unix_ms: u64,
+    /// The typed blocker kind in effect when this transition landed on
+    /// `blocked` (M1). Lets the status feed (M3) distinguish BLOCKED from
+    /// HUMAN_HOLD per historical event without re-reading the live item.
+    /// Additive + skip-if-`None` so pre-existing transition records load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker_kind: Option<BlockerKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -254,6 +285,7 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
         linked_pr: input.linked_pr,
         linked_issue: input.linked_issue,
         blocker_reason: None,
+        blocker_kind: None,
         created_by_passport: input.created_by_passport.clone(),
         created_at_unix_ms: now_unix_ms,
         updated_at_unix_ms: now_unix_ms,
@@ -283,6 +315,7 @@ pub fn create_work(store: &mut FactStore, input: CreateWorkInput, now_unix_ms: u
             by_passport: input.created_by_passport,
             gate_status: "allowed".to_string(),
             at_unix_ms: now_unix_ms,
+            blocker_kind: None,
         },
     )?;
     Ok(item)
@@ -339,6 +372,9 @@ pub struct UpdateWorkInput {
     pub linked_pr: Option<Option<String>>,
     pub linked_issue: Option<Option<String>>,
     pub blocker_reason: Option<Option<String>>,
+    /// Set the typed blocker kind. `None` = leave unchanged. A `blocked`
+    /// transition with no kind defaults to `needs_info` (applied below).
+    pub blocker_kind: Option<BlockerKind>,
 }
 
 pub struct UpdateWorkContext {
@@ -404,6 +440,16 @@ pub fn update_work(
     apply_non_state_fields(&mut item, &input);
     if let Some(new_state) = &input.state {
         item.state = new_state.clone();
+        // A `blocked` transition with no explicit kind defaults to `needs_info`
+        // (Open Engine: the unqualified block is "waiting on an answer").
+        if new_state == "blocked" && item.blocker_kind.is_none() {
+            item.blocker_kind = Some(BlockerKind::NeedsInfo);
+        }
+        // Leaving `blocked` clears the kind so a stale needs_approval doesn't
+        // linger on an item that is no longer paused.
+        if new_state != "blocked" {
+            item.blocker_kind = None;
+        }
     }
     item.updated_at_unix_ms = ctx.now_unix_ms;
     write_record(store, &item)?;
@@ -420,6 +466,7 @@ pub fn update_work(
                     by_passport: ctx.by_passport,
                     gate_status: "allowed".to_string(),
                     at_unix_ms: ctx.now_unix_ms,
+                    blocker_kind: item.blocker_kind,
                 },
             )?;
         }
@@ -448,6 +495,9 @@ fn apply_non_state_fields(item: &mut WorkItem, input: &UpdateWorkInput) {
     }
     if let Some(r) = &input.blocker_reason {
         item.blocker_reason = r.clone();
+    }
+    if let Some(k) = input.blocker_kind {
+        item.blocker_kind = Some(k);
     }
 }
 
@@ -591,6 +641,15 @@ pub fn resolve_gate(
             let mut updated = item;
             let from_state = updated.state.clone();
             updated.state = target.clone();
+            // Mirror the direct path's M1 semantics: default a blocked target to
+            // needs_info, clear the kind when leaving blocked.
+            if target == "blocked" {
+                if updated.blocker_kind.is_none() {
+                    updated.blocker_kind = Some(BlockerKind::NeedsInfo);
+                }
+            } else {
+                updated.blocker_kind = None;
+            }
             updated.updated_at_unix_ms = now_unix_ms;
             write_record(store, &updated)?;
             write_transition(
@@ -603,6 +662,7 @@ pub fn resolve_gate(
                     by_passport: approver_passport.to_string(),
                     gate_status: "approved".to_string(),
                     at_unix_ms: now_unix_ms,
+                    blocker_kind: updated.blocker_kind,
                 },
             )?;
             return Ok(updated);
@@ -769,6 +829,7 @@ mod tests {
                     } else {
                         None
                     },
+                    blocker_kind: None,
                 },
                 UpdateWorkContext {
                     by_passport: "personal-default".to_string(),
@@ -803,6 +864,7 @@ mod tests {
                 linked_pr: None,
                 linked_issue: None,
                 blocker_reason: None,
+                blocker_kind: None,
             },
             UpdateWorkContext {
                 by_passport: "personal-default".to_string(),
@@ -831,6 +893,7 @@ mod tests {
                 linked_pr: None,
                 linked_issue: None,
                 blocker_reason: None,
+                blocker_kind: None,
             },
             UpdateWorkContext {
                 by_passport: "personal-default".to_string(),
@@ -868,6 +931,7 @@ mod tests {
                 linked_pr: None,
                 linked_issue: None,
                 blocker_reason: None,
+                blocker_kind: None,
             },
             UpdateWorkContext {
                 by_passport: "personal-default".to_string(),
@@ -917,6 +981,7 @@ mod tests {
                 linked_pr: None,
                 linked_issue: None,
                 blocker_reason: None,
+                blocker_kind: None,
             },
             UpdateWorkContext {
                 by_passport: "work-default".to_string(),
@@ -952,6 +1017,143 @@ mod tests {
         )
         .expect_err("rejected");
         assert!(matches!(err, WorkError::ProjectNotFound(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M1: typed blocker reason -----------------------------------------
+
+    /// Build an `UpdateWorkInput` with only the fields a blocker test needs.
+    fn blocker_update(state: Option<&str>, kind: Option<BlockerKind>, reason: Option<&str>) -> UpdateWorkInput {
+        UpdateWorkInput {
+            title: None,
+            body: None,
+            state: state.map(str::to_string),
+            assignee_passport: None,
+            tenant_id: None,
+            linked_pr: None,
+            linked_issue: None,
+            blocker_reason: reason.map(|r| Some(r.to_string())),
+            blocker_kind: kind,
+        }
+    }
+
+    fn ctx_at(now: u64) -> UpdateWorkContext {
+        UpdateWorkContext {
+            by_passport: "personal-default".to_string(),
+            passport_gated: false,
+            now_unix_ms: now,
+        }
+    }
+
+    #[test]
+    fn blocker_kind_serde_round_trips_both_values() {
+        for (kind, wire) in [
+            (BlockerKind::NeedsInfo, "needs_info"),
+            (BlockerKind::NeedsApproval, "needs_approval"),
+        ] {
+            let json = serde_json::to_string(&kind).expect("serialize");
+            assert_eq!(json, format!("\"{wire}\""));
+            let back: BlockerKind = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, kind);
+        }
+    }
+
+    #[test]
+    fn legacy_blocked_row_without_kind_deserializes_to_none() {
+        // A pre-M1 serialized WorkItem has no `blocker_kind` field at all.
+        let legacy = r#"{
+            "id": "w_legacy",
+            "project_id": "p",
+            "state": "blocked",
+            "title": "old",
+            "blocker_reason": "waiting",
+            "created_by_passport": "personal-default",
+            "created_at_unix_ms": 1,
+            "updated_at_unix_ms": 2
+        }"#;
+        let item: WorkItem = serde_json::from_str(legacy).expect("legacy row must deserialize");
+        assert_eq!(item.state, "blocked");
+        assert_eq!(
+            item.blocker_kind, None,
+            "missing field defaults to None (read as needs_info)"
+        );
+        // And it does not re-serialize a spurious null field.
+        let round = serde_json::to_string(&item).expect("serialize");
+        assert!(!round.contains("blocker_kind"), "None is skipped on the wire");
+    }
+
+    #[test]
+    fn unknown_blocker_kind_is_rejected() {
+        let bad = serde_json::from_str::<BlockerKind>("\"needs_coffee\"");
+        assert!(bad.is_err(), "serde must reject unknown blocker kinds");
+    }
+
+    #[test]
+    fn blocked_transition_defaults_to_needs_info() {
+        let (dir, mut store) = seeded_store();
+        let item = mk_work(&mut store);
+        let outcome = update_work(
+            &mut store,
+            &item.id,
+            blocker_update(Some("blocked"), None, Some("waiting on infra")),
+            ctx_at(2_000),
+        )
+        .expect("update");
+        match outcome {
+            UpdateOutcome::Applied(w) => assert_eq!(w.blocker_kind, Some(BlockerKind::NeedsInfo)),
+            UpdateOutcome::Queued(_) => panic!("ungated update should apply"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocked_transition_honours_explicit_needs_approval() {
+        let (dir, mut store) = seeded_store();
+        let item = mk_work(&mut store);
+        let outcome = update_work(
+            &mut store,
+            &item.id,
+            blocker_update(
+                Some("blocked"),
+                Some(BlockerKind::NeedsApproval),
+                Some("needs sign-off"),
+            ),
+            ctx_at(2_000),
+        )
+        .expect("update");
+        let UpdateOutcome::Applied(w) = outcome else {
+            panic!("should apply")
+        };
+        assert_eq!(w.blocker_kind, Some(BlockerKind::NeedsApproval));
+        // Persisted, not just returned.
+        let reloaded = get_work(&store, &item.id).expect("reload");
+        assert_eq!(reloaded.blocker_kind, Some(BlockerKind::NeedsApproval));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leaving_blocked_clears_kind() {
+        let (dir, mut store) = seeded_store();
+        let item = mk_work(&mut store);
+        update_work(
+            &mut store,
+            &item.id,
+            blocker_update(Some("blocked"), Some(BlockerKind::NeedsApproval), Some("hold")),
+            ctx_at(2_000),
+        )
+        .expect("block");
+        let outcome = update_work(
+            &mut store,
+            &item.id,
+            blocker_update(Some("in_progress"), None, None),
+            ctx_at(3_000),
+        )
+        .expect("unblock");
+        let UpdateOutcome::Applied(w) = outcome else {
+            panic!("should apply")
+        };
+        assert_eq!(w.state, "in_progress");
+        assert_eq!(w.blocker_kind, None, "kind cleared once no longer blocked");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

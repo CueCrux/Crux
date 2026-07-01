@@ -21,6 +21,41 @@ use crate::scope;
 
 const HANDOFF_SIGNATURE_ALG: &str = "blake3-mac-v1";
 
+/// A structured statement of intent travelling with a handoff (Open Engine's
+/// "task record" — audit §2.3). Without it the receiver reconstructs intent
+/// from the bundled `facts` / `session_state` blob plus the free-text
+/// `message`; with it the requester's outcome, curated sources, acceptance
+/// criteria, boundaries, and blocker rule travel as first-class fields.
+///
+/// Every field is optional/empty-skipped: an all-empty `TaskRecord` serialises
+/// to `{}` and a `HandoffPackage` with no record at all omits the block
+/// entirely (back-compat — see `HandoffPackage::task_record`). The crypto
+/// receipt is the surrounding `SignedHandoff`, so the 7th Open-Engine field
+/// (receipt) is the envelope, not a member here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskRecord {
+    /// Who is asking (defaults to `source_agent` if unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<String>,
+    /// The outcome the receiver should drive toward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_outcome: Option<String>,
+    /// Curated source pointers (paths, urls, fact ids) — distinct from the
+    /// auto-bundled `work_ids`, which point at work items not a source set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    /// What "done" means — checkable conditions, not prose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance_criteria: Vec<String>,
+    /// What the receiver must NOT do (scope fences).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boundaries: Vec<String>,
+    /// When to stop and hand back (e.g. "block needs_approval before any
+    /// deploy") — the rule, not an after-the-fact blocker note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker_rule: Option<String>,
+}
+
 /// A handoff package containing session state and facts for delegation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoffPackage {
@@ -38,6 +73,12 @@ pub struct HandoffPackage {
     /// Additive + `#[serde(default)]` so existing packages deserialise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub work_ids: Vec<String>,
+    /// Structured statement of intent (Open Engine task record). Optional +
+    /// skip-if-`None`, and placed last so a package created without it
+    /// serialises byte-identically to a pre-`task_record` package — legacy
+    /// bundles verify unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_record: Option<TaskRecord>,
 }
 
 /// An authenticated handoff package.
@@ -59,6 +100,11 @@ pub struct AcceptResult {
     pub session_loaded: bool,
     pub facts_loaded: usize,
     pub verified: bool,
+    /// The handoff's task record, surfaced to the receiver so it can read the
+    /// requester's intent without re-deriving it from facts. `None` for legacy
+    /// (pre-`task_record`) packages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_record: Option<TaskRecord>,
 }
 
 /// Inputs required to build a handoff package.
@@ -70,6 +116,8 @@ pub struct CreateHandoffRequest<'a> {
     pub source_agent: &'a str,
     pub target_agent: Option<String>,
     pub message: Option<String>,
+    /// Optional structured statement of intent to travel with the handoff.
+    pub task_record: Option<TaskRecord>,
 }
 
 /// Errors that can occur during handoff creation or acceptance.
@@ -129,6 +177,7 @@ pub fn create_handoff(
         target_agent: request.target_agent,
         message: request.message,
         work_ids,
+        task_record: request.task_record,
     };
 
     let payload_json = serde_json::to_vec(&package)?;
@@ -175,6 +224,10 @@ pub fn accept_handoff(
 
     let package: HandoffPackage = serde_json::from_slice(&payload_bytes)?;
 
+    // Capture the task record before `package` is partially moved below, so it
+    // can be surfaced to the receiver in the result.
+    let task_record = package.task_record.clone();
+
     if let Some(target_agent) = &package.target_agent {
         let actual = receiver_agent.unwrap_or("anonymous").to_string();
         if receiver_agent != Some(target_agent.as_str()) {
@@ -220,6 +273,7 @@ pub fn accept_handoff(
         session_loaded,
         facts_loaded,
         verified: true,
+        task_record,
     })
 }
 
@@ -435,6 +489,7 @@ mod tests {
                 source_agent: "agent-alpha",
                 target_agent: Some("agent-beta".to_string()),
                 message: Some("Handing off deployment task".to_string()),
+                task_record: None,
             },
             &HANDOFF_KEY,
         )
@@ -492,6 +547,7 @@ mod tests {
                 source_agent: "agent-alpha",
                 target_agent: None,
                 message: None,
+                task_record: None,
             },
             &HANDOFF_KEY,
         )
@@ -526,6 +582,7 @@ mod tests {
                 source_agent: "agent-alpha",
                 target_agent: None,
                 message: None,
+                task_record: None,
             },
             &HANDOFF_KEY,
         )
@@ -565,6 +622,7 @@ mod tests {
                 source_agent: "agent-alpha",
                 target_agent: Some("agent-beta".to_string()),
                 message: None,
+                task_record: None,
             },
             &HANDOFF_KEY,
         )
@@ -597,6 +655,7 @@ mod tests {
                 source_agent: "agent-alpha",
                 target_agent: None,
                 message: None,
+                task_record: None,
             },
             &HANDOFF_KEY,
         )
@@ -671,6 +730,7 @@ mod tests {
                 source_agent: "agent-alpha",
                 target_agent: None,
                 message: None,
+                task_record: None,
             },
             &HANDOFF_KEY,
         )
@@ -703,6 +763,7 @@ mod tests {
                 source_agent: "agent-alpha",
                 target_agent: None,
                 message: None,
+                task_record: None,
             },
             &HANDOFF_KEY,
         )
@@ -721,5 +782,147 @@ mod tests {
 
         assert!(!result.session_loaded);
         assert_eq!(result.facts_loaded, 0);
+    }
+
+    // --- M2: structured task_record --------------------------------------
+
+    fn sample_task_record() -> TaskRecord {
+        TaskRecord {
+            requester: Some("claude-work".to_string()),
+            desired_outcome: Some("wire the dense lane".to_string()),
+            sources: vec!["crates/corecrux-retrieval/src/dense.rs".to_string()],
+            acceptance_criteria: vec!["cargo test green".to_string()],
+            boundaries: vec!["do not touch the GPU path".to_string()],
+            blocker_rule: Some("block needs_approval before any deploy".to_string()),
+        }
+    }
+
+    #[test]
+    fn task_record_roundtrips_and_surfaces_on_accept() {
+        let (sessions, facts) = seed_stores();
+        let record = sample_task_record();
+
+        let signed = create_handoff(
+            &sessions,
+            &facts,
+            CreateHandoffRequest {
+                session_id: "sess_handoff",
+                stored_session_id: "sess_handoff",
+                include_facts: false,
+                source_agent: "agent-alpha",
+                target_agent: Some("codex-work".to_string()),
+                message: None,
+                task_record: Some(record.clone()),
+            },
+            &HANDOFF_KEY,
+        )
+        .expect("create");
+
+        let mut recv_sessions = SessionStore::new();
+        let mut recv_facts = FactStore::new();
+        let result = accept_handoff(
+            &mut recv_sessions,
+            &mut recv_facts,
+            &signed,
+            Some("codex-work"),
+            &HANDOFF_KEY,
+        )
+        .expect("accept");
+
+        assert!(result.verified);
+        assert_eq!(
+            result.task_record.as_ref(),
+            Some(&record),
+            "the receiver sees the requester's intent"
+        );
+    }
+
+    #[test]
+    fn legacy_package_without_task_record_serializes_identically_and_verifies() {
+        let (sessions, facts) = seed_stores();
+
+        // A package created with no task_record must be byte-identical to a
+        // pre-M2 package: the field is omitted entirely from the JSON.
+        let signed = create_handoff(
+            &sessions,
+            &facts,
+            CreateHandoffRequest {
+                session_id: "sess_handoff",
+                stored_session_id: "sess_handoff",
+                include_facts: false,
+                source_agent: "agent-alpha",
+                target_agent: Some("agent-beta".to_string()),
+                message: None,
+                task_record: None,
+            },
+            &HANDOFF_KEY,
+        )
+        .expect("create");
+
+        let payload = B64.decode(&signed.payload_b64).expect("decode");
+        let payload_str = String::from_utf8(payload).expect("utf8");
+        assert!(
+            !payload_str.contains("task_record"),
+            "absent task_record is omitted from the wire (back-compat)"
+        );
+
+        // And it still verifies + accept tolerates the absent block.
+        let mut recv_sessions = SessionStore::new();
+        let mut recv_facts = FactStore::new();
+        let result = accept_handoff(
+            &mut recv_sessions,
+            &mut recv_facts,
+            &signed,
+            Some("agent-beta"),
+            &HANDOFF_KEY,
+        )
+        .expect("accept");
+        assert!(result.verified);
+        assert_eq!(result.task_record, None);
+    }
+
+    #[test]
+    fn empty_task_record_serializes_to_empty_object() {
+        let json = serde_json::to_string(&TaskRecord::default()).expect("serialize");
+        assert_eq!(json, "{}", "every field is skip-if-empty");
+    }
+
+    #[test]
+    fn tampered_task_record_fails_signature() {
+        let (sessions, facts) = seed_stores();
+        let signed = create_handoff(
+            &sessions,
+            &facts,
+            CreateHandoffRequest {
+                session_id: "sess_handoff",
+                stored_session_id: "sess_handoff",
+                include_facts: false,
+                source_agent: "agent-alpha",
+                target_agent: None,
+                message: None,
+                task_record: Some(sample_task_record()),
+            },
+            &HANDOFF_KEY,
+        )
+        .expect("create");
+
+        // Re-encode the payload with a mutated task_record but keep the old
+        // signature → the keyed MAC must reject it.
+        let payload = B64.decode(&signed.payload_b64).expect("decode");
+        let mut package: HandoffPackage = serde_json::from_slice(&payload).expect("parse");
+        package.task_record.as_mut().unwrap().desired_outcome = Some("exfiltrate secrets".to_string());
+        let tampered_json = serde_json::to_vec(&package).expect("reserialize");
+        let tampered = SignedHandoff {
+            payload_b64: B64.encode(&tampered_json),
+            content_hash: blake3::hash(&tampered_json).to_hex().to_string(),
+            signature_b64: signed.signature_b64.clone(), // stale signature
+            signature_alg: signed.signature_alg.clone(),
+        };
+
+        let mut recv_sessions = SessionStore::new();
+        let mut recv_facts = FactStore::new();
+        let err = accept_handoff(&mut recv_sessions, &mut recv_facts, &tampered, None, &HANDOFF_KEY)
+            .expect_err("tampered payload must fail verification");
+        assert!(matches!(err, HandoffError::SignatureInvalid));
     }
 }

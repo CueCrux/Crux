@@ -90,6 +90,10 @@ pub(super) struct UpdateWorkBody {
     pub linked_issue: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_some_option")]
     pub blocker_reason: Option<Option<String>>,
+    /// Typed blocker kind (`needs_info` | `needs_approval`). Unknown strings are
+    /// rejected by serde; absent = leave unchanged.
+    #[serde(default)]
+    pub blocker_kind: Option<crate::work::BlockerKind>,
     /// Identity making the change. Determines whether the change is gated.
     /// Aliases: `created_by_passport`, `author_passport`.
     #[serde(alias = "created_by_passport", alias = "author_passport")]
@@ -365,6 +369,7 @@ pub(super) async fn patch_work(
             linked_pr: body.linked_pr,
             linked_issue: body.linked_issue,
             blocker_reason: body.blocker_reason,
+            blocker_kind: body.blocker_kind,
         },
         crate::work::UpdateWorkContext {
             by_passport: body.by_passport,
@@ -503,4 +508,51 @@ pub(super) async fn post_gate_reject(
         }
         Err(err) => problem_response(StatusCode::BAD_REQUEST, err.to_string()),
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct StatusFeedQuery {
+    /// Optional single-work-item filter; omit to span every item.
+    pub work_id: Option<String>,
+    /// Max events returned (most recent kept). Defaults to 200.
+    pub limit: Option<usize>,
+}
+
+/// `GET /v1/status-feed` — the Open Engine 6-state glance feed (M3).
+///
+/// Flag-gated behind `CORECRUXD_FEATURE_STATUS_FEED` (default OFF). When off,
+/// returns a 200 disabled-notice (mirroring the `context_custody_audit`
+/// handler-gate idiom) rather than an error, so clients can probe it safely.
+pub(super) async fn get_status_feed(
+    State(state): State<AppState>,
+    Query(q): Query<StatusFeedQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(problem) = require_http_scopes(&state.auth, &headers, &["admin:read"]) {
+        return problem.into_response();
+    }
+    if !crate::status_feed::status_feed_enabled() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "enabled": false,
+                "feature_flag": crate::status_feed::STATUS_FEED_FLAG_ENV,
+                "note": format!(
+                    "status feed is disabled; set {}=1 to enable",
+                    crate::status_feed::STATUS_FEED_FLAG_ENV
+                ),
+                "events": [],
+            })),
+        )
+            .into_response();
+    }
+    let limit = q.limit.unwrap_or(200).clamp(1, 2000);
+    let store = state.fact_store.read().await;
+    let events = crate::status_feed::status_feed(&store, q.work_id.as_deref(), limit);
+    drop(store);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "enabled": true, "events": events })),
+    )
+        .into_response()
 }

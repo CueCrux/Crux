@@ -41,6 +41,7 @@ mod dataplane_store;
 #[allow(dead_code)]
 mod grpc;
 mod http;
+mod local_ingest;
 // Candidate proposers are staged behind the identity-candidates rollout path; tests
 // exercise creation/proposal before daemon startup wires automatic proposer runs.
 #[allow(dead_code)]
@@ -82,6 +83,7 @@ mod redaction;
 mod relations;
 mod session_bindings;
 mod shard_map;
+mod status_feed;
 mod storybook;
 mod structured_log;
 mod tenant_metadata;
@@ -591,6 +593,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         coord_enabled: config.coord_enabled,
         coord_presence_ttl_secs: config.coord_presence_ttl_secs,
         context_surface_enabled: config.context_surface_enabled,
+        local_ingest_enabled: config.local_ingest_enabled,
         stream_receipts_enabled: config.stream_receipts_enabled,
         quota_enabled: config.quota_enabled,
         assembly_cache: config.assembly_cache_enabled.then(|| {
@@ -633,10 +636,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         corruption_detected,
         capacity,
         admin_force_seal_enabled: config.admin_force_seal_enabled,
+        local_ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
         retention_days: config.retention_days,
         retrieval_index: {
             let mut idx = corecrux_retrieval::IndexManager::new();
-            if config.build_ccxi {
+            // Load-at-startup wiring: reload sealed `.ccxi` companions when the
+            // storage layer builds them (`build_ccxi`) OR when the local
+            // prose-ingest door is enabled — otherwise local-ingest segments
+            // would not be served after a daemon restart (ExecPlan
+            // cpu-prose-ingest-door-2026-07-01 M2, R2 restart-survival).
+            if config.build_ccxi || config.local_ingest_enabled {
                 // Scan all shard directories for .ccxi files
                 let shards_dir = config.data_dir.join("shards");
                 let mut total = 0usize;
@@ -4152,6 +4161,7 @@ mod tests {
             coord_enabled: false,
             coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
             context_surface_enabled: false,
+            local_ingest_enabled: false,
             stream_receipts_enabled: false,
             quota_enabled: false,
             assembly_cache: None,
@@ -4190,6 +4200,7 @@ mod tests {
             corruption_detected: std::sync::Arc::new(tokio::sync::RwLock::new(false)),
             capacity: std::sync::Arc::new(tokio::sync::RwLock::new(crate::http::CapacityState::default())),
             admin_force_seal_enabled: false,
+            local_ingest_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             retention_days: None,
             retrieval_index: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_retrieval::IndexManager::new())),
             fact_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::FactStore::new())),

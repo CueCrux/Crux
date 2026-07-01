@@ -629,6 +629,7 @@ mod tests {
             linked_pr: None,
             linked_issue: None,
             blocker_reason: None,
+            blocker_kind: None,
             created_by_passport: "system:execplan-aggregator".to_string(),
             created_at_unix_ms: first_ms,
             updated_at_unix_ms: last_ms,

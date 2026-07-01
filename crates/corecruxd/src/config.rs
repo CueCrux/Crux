@@ -468,6 +468,12 @@ pub struct Config {
     // `crate::http::context_surface`). Default OFF.
     pub context_surface_enabled: bool,
 
+    // Local CPU prose-ingest door (`/v1/local/ingest`,
+    // `crate::http::local_ingest`). Seals pre-formatted prose payloads into
+    // local segments served over BM25 — no GPU dataplane. Default OFF
+    // (`CORECRUXD_LOCAL_INGEST=1`); when off, the route returns 404.
+    pub local_ingest_enabled: bool,
+
     // G19 stream/context receipt wiring (`crate::http::stream_receipts`).
     // Default OFF.
     pub stream_receipts_enabled: bool,
@@ -1153,6 +1159,7 @@ pub fn load_config() -> Config {
             .unwrap_or(crate::coord::DEFAULT_PRESENCE_TTL_SECS)
             .clamp(60, crate::coord::MAX_TTL_SECS),
         context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE").unwrap_or(false),
+        local_ingest_enabled: env_bool("CORECRUXD_LOCAL_INGEST").unwrap_or(false),
         stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS").unwrap_or(false),
         assembly_cache_enabled: env_bool("CORECRUXD_ASSEMBLY_CACHE").unwrap_or(false),
         quota_enabled: env_bool("CORECRUXD_QUOTA").unwrap_or(false),

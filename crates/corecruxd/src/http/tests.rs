@@ -381,6 +381,7 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         coord_enabled: true,
         coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
         context_surface_enabled: true,
+        local_ingest_enabled: false,
         stream_receipts_enabled: false,
         quota_enabled: false,
         assembly_cache: None,
@@ -418,6 +419,7 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         admin_actions: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
         corruption_detected: Arc::new(RwLock::new(false)),
         admin_force_seal_enabled: false,
+        local_ingest_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         retention_days: None,
         retrieval_index: Arc::new(RwLock::new(corecrux_retrieval::IndexManager::new())),
         fact_store: Arc::new(RwLock::new(corecrux_memory::FactStore::new())),
@@ -10296,6 +10298,7 @@ async fn work_post_then_list_then_patch_state_round_trip() {
             linked_pr: None,
             linked_issue: None,
             blocker_reason: None,
+            blocker_kind: None,
             by_passport: "personal-default".to_string(),
         }),
     )
@@ -10314,6 +10317,28 @@ async fn work_post_then_list_then_patch_state_round_trip() {
     assert_eq!(txns.len(), 2, "create + transition");
     assert_eq!(txns[0]["from_state"], "(none)");
     assert_eq!(txns[1]["to_state"], "in_progress");
+}
+
+#[tokio::test]
+async fn status_feed_disabled_returns_notice_not_error() {
+    // With the feature flag unset (the default), the handler returns a 200
+    // disabled-notice rather than an error — clients can probe it safely.
+    let state = test_app_state_with_auth(16, AuthMode::DevScopes);
+    let resp = super::work::get_status_feed(
+        State(state),
+        axum::extract::Query(super::work::StatusFeedQuery {
+            work_id: None,
+            limit: None,
+        }),
+        dev_scope_headers("admin:read"),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["feature_flag"], "CORECRUXD_FEATURE_STATUS_FEED");
+    assert!(body["events"].as_array().expect("events array").is_empty());
 }
 
 #[tokio::test]
@@ -10373,6 +10398,7 @@ async fn work_patch_with_gated_passport_returns_202_queued() {
             linked_pr: None,
             linked_issue: None,
             blocker_reason: None,
+            blocker_kind: None,
             by_passport: "personal-default".to_string(),
         }),
     )
@@ -10485,6 +10511,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
             linked_pr: None,
             linked_issue: None,
             blocker_reason: Some(Some("needs approval".to_string())),
+            blocker_kind: Some(crate::work::BlockerKind::NeedsApproval),
             by_passport: "personal-default".to_string(),
         }),
     )
@@ -10518,6 +10545,7 @@ async fn work_comments_get_item_and_gate_resolution_paths() {
             linked_pr: None,
             linked_issue: None,
             blocker_reason: None,
+            blocker_kind: None,
             by_passport: "personal-default".to_string(),
         }),
     )

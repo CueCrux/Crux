@@ -918,6 +918,7 @@ mod tests {
             linked_pr: None,
             linked_issue: None,
             blocker_reason: None,
+            blocker_kind: None,
             created_by_passport: "p1".to_string(),
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,

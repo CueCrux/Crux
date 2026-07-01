@@ -36,6 +36,9 @@ pub const UPDATE_WORK_STATE_DESCRIPTION: &str =
 pub const COMMENT_ON_WORK_DESCRIPTION: &str =
     "Post a comment on a work item. Use this to leave context for the next agent or human — what you tried, what blocked, what's next.";
 
+pub const STATUS_FEED_DESCRIPTION: &str =
+    "Glance feed of work lifecycle in the six Open Engine verbs — CLAIMED / BLOCKED / HUMAN_HOLD / RESUMED / DONE / FAILED — projected over the work board. Use it to WATCH sessions work (not command them). Pass work_id to scope to one item, or omit for all. Read-only; requires CORECRUXD_FEATURE_STATUS_FEED=1 on the daemon (otherwise returns a disabled notice).";
+
 pub const COORD_STATUS_DESCRIPTION: &str =
     "See which other agent sessions are live RIGHT NOW and what each is doing: presence heartbeat, declared focus (execplan/milestone/paths), punchcard leases held, and work items in flight. Call at session start and before editing files another session may be touching. Requires CORECRUXD_COORD=1 on the daemon.";
 
@@ -376,6 +379,9 @@ pub async fn handle_update_work_state(args: &Value, ctx: &McpContext) -> Result<
     if let Some(reason) = args.get("blocker_reason") {
         body["blocker_reason"] = reason.clone();
     }
+    if let Some(kind) = args.get("blocker_kind") {
+        body["blocker_kind"] = kind.clone();
+    }
     let base = loopback_base(ctx)?;
     let (_, resp_body) = loopback_patch(format!("{base}/v1/work/{id}"), body, ctx.scope_identity()).await?;
     Ok(text_content(
@@ -420,6 +426,24 @@ pub async fn handle_comment_on_work(args: &Value, ctx: &McpContext) -> Result<Va
     Ok(text_content(
         serde_json::from_str(&resp_body).unwrap_or(Value::String(resp_body)),
     ))
+}
+
+pub async fn handle_status_feed(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
+    let mut params = Vec::new();
+    if let Some(w) = args.get("work_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        params.push(format!("work_id={}", urlencoding(w)));
+    }
+    if let Some(limit) = args.get("limit").and_then(|v| v.as_u64()) {
+        params.push(format!("limit={limit}"));
+    }
+    let qs = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    };
+    let base = loopback_base(ctx)?;
+    let (_, body) = loopback_get(format!("{base}/v1/status-feed{qs}")).await?;
+    Ok(text_content(serde_json::from_str(&body).unwrap_or(Value::String(body))))
 }
 
 pub async fn handle_coord_status(args: &Value, ctx: &McpContext) -> Result<Value, JsonRpcError> {
