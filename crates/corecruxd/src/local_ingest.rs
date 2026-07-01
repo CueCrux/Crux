@@ -316,7 +316,7 @@ fn read_ccxv(path: &Path) -> Option<(u32, DenseEntries)> {
     Some((dim, out))
 }
 
-/// Build a [`CosineDenseProvider`] over all sealed `.ccxv` companions, keyed by
+/// Build a [`corecrux_retrieval::CosineDenseProvider`] over all sealed `.ccxv` companions, keyed by
 /// `(doc_id, segment_index)` to match [`corecrux_retrieval::fused::fused_retrieve`]'s
 /// enumeration (`segment_index` = position in `index_mgr.readers()`, which is
 /// ascending `segment_seq`). Returns `None` when no dense vectors are stored, so
