@@ -78,7 +78,10 @@ pub fn decode_segment_v1(bytes: &[u8]) -> Result<(SegmentHeaderV1, TocHeaderV1, 
     }
     let toc_payload_len = read_u64(toc_area, 40)?; // toc_payload_len field offset
     let toc_payload_len = toc_payload_len as usize;
-    if toc_payload_len > toc_area.len() {
+    // Must fit within toc_area AND be at least a full TOC header — a mutated
+    // short length would otherwise panic on the `[..TOC_HEADER_LEN]` slice below
+    // instead of failing verification cleanly.
+    if toc_payload_len > toc_area.len() || toc_payload_len < TOC_HEADER_LEN {
         return Err(SegmentError::BufferTooSmall);
     }
     let toc_payload = &toc_area[..toc_payload_len];
