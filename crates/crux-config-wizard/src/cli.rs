@@ -33,12 +33,21 @@ pub enum Command {
         /// Comma-separated profile names (required if --non-interactive).
         #[arg(long)]
         profiles: Option<String>,
+        /// Don't install the Claude Code hooks (banner / observe / cost /
+        /// scratchpad-survival) via `corecruxctl hooks install`. By default
+        /// `init` installs them so one command sets up the whole workspace.
+        #[arg(long)]
+        no_hooks: bool,
     },
     /// Re-compose CLAUDE.md and AGENTS.md from the saved .crux/agent-profile.toml.
     /// Refuses to overwrite hand-edited managed sections unless --force.
     Regenerate {
         #[arg(long)]
         force: bool,
+        /// Also refresh the Claude Code hooks via `corecruxctl hooks install`
+        /// (e.g. after a corecruxctl upgrade adds a new hook). Off by default.
+        #[arg(long)]
+        hooks: bool,
     },
     /// CI mode: exit 0 if files match what regenerate would produce, non-zero otherwise.
     Check {

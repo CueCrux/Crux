@@ -31,3 +31,13 @@ pub fn prompt_for_profiles(fragments: &[ProfileFragment]) -> std::io::Result<Vec
     }
     Ok(enabled)
 }
+
+/// Ask whether to install the Claude Code hooks after composing the profiles.
+/// Defaults to yes; a prompt error (no TTY, ^C) is treated as "no".
+pub fn confirm_install_hooks() -> bool {
+    Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt("Install/refresh Claude Code hooks now (banner, observe, cost, scratchpad-survival)?")
+        .default(true)
+        .interact()
+        .unwrap_or(false)
+}
