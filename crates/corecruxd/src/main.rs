@@ -593,6 +593,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         coord_enabled: config.coord_enabled,
         coord_presence_ttl_secs: config.coord_presence_ttl_secs,
         context_surface_enabled: config.context_surface_enabled,
+        local_ingest_enabled: config.local_ingest_enabled,
         stream_receipts_enabled: config.stream_receipts_enabled,
         quota_enabled: config.quota_enabled,
         assembly_cache: config.assembly_cache_enabled.then(|| {
@@ -4154,6 +4155,7 @@ mod tests {
             coord_enabled: false,
             coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
             context_surface_enabled: false,
+            local_ingest_enabled: false,
             stream_receipts_enabled: false,
             quota_enabled: false,
             assembly_cache: None,

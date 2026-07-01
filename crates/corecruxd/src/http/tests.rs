@@ -381,6 +381,7 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         coord_enabled: true,
         coord_presence_ttl_secs: crate::coord::DEFAULT_PRESENCE_TTL_SECS,
         context_surface_enabled: true,
+        local_ingest_enabled: false,
         stream_receipts_enabled: false,
         quota_enabled: false,
         assembly_cache: None,

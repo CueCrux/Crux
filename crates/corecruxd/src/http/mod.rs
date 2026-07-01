@@ -33,6 +33,7 @@ pub mod ingress;
 mod integrations_github;
 mod integrations_openai;
 pub mod invocation;
+mod local_ingest;
 mod memory_import;
 pub(crate) mod observations;
 mod observe;
@@ -192,6 +193,10 @@ pub struct AppState {
     /// Provider-agnostic injection-bundle surface (`/v1/context`). Default
     /// OFF (`CORECRUXD_CONTEXT_SURFACE=1`); when off, routes return 404.
     pub context_surface_enabled: bool,
+    /// Local CPU prose-ingest door (`/v1/local/ingest`). Seals pre-formatted
+    /// prose payloads into local segments served over BM25 — no GPU dataplane.
+    /// Default OFF (`CORECRUXD_LOCAL_INGEST=1`); when off, the route returns 404.
+    pub local_ingest_enabled: bool,
     /// G19 stream/context receipt wiring (`Streaming-Receipts-Spec` §5):
     /// `/v1/mediation/receipts` lifts `context_injected` /
     /// `stream_completed` / `stream_aborted` drafts into canonical signed
@@ -490,6 +495,10 @@ pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Rout
         .route(
             "/v1/admin/append",
             axum::routing::post(self::append::post_admin_append),
+        )
+        .route(
+            "/v1/local/ingest",
+            axum::routing::post(self::local_ingest::post_local_ingest),
         )
         .route(
             "/v1/query/text-search",

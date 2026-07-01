@@ -176,7 +176,7 @@ pub fn seal_prose_documents(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use corecrux_retrieval::bm25::{bm25_search, Bm25Params};
@@ -202,9 +202,16 @@ mod tests {
             }],
         }];
 
-        let summary =
-            seal_prose_documents(data_dir, 0, 1, tenant, "mediacrux-archive", "2026-07-01T00:00:00Z", &docs)
-                .expect("seal should succeed on CPU");
+        let summary = seal_prose_documents(
+            data_dir,
+            0,
+            1,
+            tenant,
+            "mediacrux-archive",
+            "2026-07-01T00:00:00Z",
+            &docs,
+        )
+        .expect("seal should succeed on CPU");
 
         assert!(summary.sealed, "a segment must have been sealed");
         assert_eq!(summary.documents, 1);
