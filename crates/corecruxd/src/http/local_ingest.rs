@@ -587,4 +587,83 @@ mod tests {
         assert_eq!(bm25_search(&readers, "quartz", 10, th, &p, None).hits.len(), 1);
         assert_eq!(bm25_search(&readers, "arctic terns", 10, th, &p, None).hits.len(), 1);
     }
+
+    /// M4 (daemon side): a MediaCrux-scale backfill — 357 prose documents in one
+    /// request — is accepted and all documents are BM25-served. This proves the
+    /// door handles the archive size; the live MediaCrux client + backfill run
+    /// happens where that repo and a Linux daemon exist (see plan M4 blocker).
+    #[tokio::test]
+    async fn m4_backfill_357_docs_all_served() {
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        let idx = state.retrieval_index.clone();
+
+        // Simulate the MediaCrux `articles` table: unique per-doc token so each
+        // is individually retrievable.
+        let documents: Vec<LocalIngestDocument> = (0..357)
+            .map(|i| LocalIngestDocument {
+                doc_id: format!("article-{i}"),
+                title: Some(format!("Essay {i}")),
+                url: Some(format!("https://example.substack.com/p/essay-{i}")),
+                source_timestamp: Some("2026-01-01T00:00:00Z".to_string()),
+                chunks: vec![chunk(
+                    &format!("article-{i}::0"),
+                    &format!("newsletter essay body number articletoken{i} shared corpus prose"),
+                )],
+            })
+            .collect();
+        let body = LocalIngestBody {
+            tenant_id: "mediacrux".to_string(),
+            corpus_id: "mediacrux-archive".to_string(),
+            documents,
+        };
+
+        let resp = post_local_ingest(State(state), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let guard = idx.read().await;
+        assert_eq!(guard.total_docs(), 357, "all 357 articles must be indexed");
+        let readers = guard.readers();
+        let th = Some(tenant_hash("mediacrux"));
+        let p = Bm25Params::default();
+        // Spot-check a few individual articles are retrievable by their token.
+        for i in [0usize, 42, 200, 356] {
+            let hits = bm25_search(&readers, &format!("articletoken{i}"), 10, th, &p, None).hits;
+            assert_eq!(hits.len(), 1, "article {i} must be BM25-served");
+        }
+    }
+
+    /// M5 (T.4): a successful ingest returns a non-null `receipt_id` and writes a
+    /// timeline row discoverable via the console chunk index.
+    #[tokio::test]
+    async fn m5_receipt_and_timeline_emitted() {
+        let mut state = super::super::tests::test_app_state(16);
+        state.local_ingest_enabled = true;
+        let data_dir = state.data_dir.clone();
+
+        let body = body_with(
+            "tenant-t4",
+            "mediacrux-archive",
+            &[("a1", "auditable receipt and timeline row")],
+        );
+        let resp = post_local_ingest(State(state), HeaderMap::new(), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // Receipt present in the response body.
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json["receipt_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "receipt_id must be present"
+        );
+        assert_eq!(json["sealed"], serde_json::json!(true));
+
+        // Timeline row recorded in the console chunk index for this tenant.
+        let page = crate::console_index::list_chunks(&data_dir, "tenant-t4", 100, None).unwrap();
+        assert!(!page.chunks.is_empty(), "a timeline row must be recorded (T.4)");
+    }
 }

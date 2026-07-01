@@ -226,6 +226,13 @@ fn classify_route(method: &str, path: &str) -> Option<RouteAuthContract> {
         return Some(RouteAuthContract::new(class, scopes));
     }
 
+    if path.starts_with("/v1/local/ingest") {
+        // Local prose-ingest door: mutation, gated to admin:write and checked
+        // against the payload tenant in the handler (ExecPlan
+        // cpu-prose-ingest-door-2026-07-01).
+        return Some(RouteAuthContract::new(RouteAuthClass::AdminWrite, &["admin:write"]));
+    }
+
     if path.starts_with("/v1/console/") {
         let mutating = !matches!(method, "GET")
             || path.ends_with("/install")

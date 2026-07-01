@@ -654,4 +654,103 @@ mod tests {
         assert!(!resp.stats.dense_lane_active);
         assert_eq!(resp.results.len(), 1);
     }
+
+    /// M5: re-ingesting the same document (same `chunk_id` = storage `event_id`)
+    /// is a no-op — the storage idempotency layer dedups the frame on the cold
+    /// segment scan, so no duplicate is indexed. (The MediaCrux client also
+    /// filters `cruxPushedAt IS NULL`, so this is defence-in-depth.)
+    #[test]
+    fn m5_idempotent_reingest_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let tenant = "tenant-m5";
+        let docs = vec![ProseDocument {
+            doc_id: "dup-doc".to_string(),
+            chunks: vec![ProseChunk {
+                chunk_id: "dup-doc::0".to_string(),
+                text: "idempotent supersession target document".to_string(),
+                dense_vector: None,
+            }],
+        }];
+
+        let s1 = seal_prose_documents(data_dir, 0, 1, tenant, "corpus", "2026-07-01T00:00:00Z", &docs)
+            .expect("first ingest");
+        assert!(s1.sealed);
+        let s2 = seal_prose_documents(data_dir, 0, 1, tenant, "corpus", "2026-07-01T00:00:05Z", &docs)
+            .expect("second ingest of the same doc");
+
+        // The second ingest must not produce a second live frame: either it seals
+        // nothing (all events deduped) — the expected outcome.
+        assert!(!s2.sealed, "duplicate re-ingest must dedup and seal nothing");
+
+        let segments_dir = data_dir.join("shards").join("shard-0000").join("segments");
+        let mut mgr = IndexManager::new();
+        mgr.scan_and_load(&segments_dir).expect("scan");
+        assert_eq!(mgr.total_docs(), 1, "no duplicate document after re-ingest");
+        let readers = mgr.readers();
+        let hits = bm25_search(
+            &readers,
+            "supersession",
+            10,
+            Some(tenant_hash(tenant)),
+            &Bm25Params::default(),
+            None,
+        );
+        assert_eq!(hits.hits.len(), 1, "exactly one copy served");
+    }
+
+    /// M5 (T.1): two tenants ingest documents sharing query terms; each tenant's
+    /// query returns only its own documents.
+    #[test]
+    fn m5_tenant_isolation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+
+        let mk = |txt: &str| {
+            vec![ProseDocument {
+                doc_id: "shared-id".to_string(),
+                chunks: vec![ProseChunk {
+                    chunk_id: "shared-id::0".to_string(),
+                    text: txt.to_string(),
+                    dense_vector: None,
+                }],
+            }]
+        };
+        seal_prose_documents(
+            data_dir,
+            0,
+            1,
+            "tenant-a",
+            "corpus",
+            "2026-07-01T00:00:00Z",
+            &mk("common secret alpha-only"),
+        )
+        .expect("tenant a");
+        seal_prose_documents(
+            data_dir,
+            0,
+            1,
+            "tenant-b",
+            "corpus",
+            "2026-07-01T00:00:01Z",
+            &mk("common secret beta-only"),
+        )
+        .expect("tenant b");
+
+        let segments_dir = data_dir.join("shards").join("shard-0000").join("segments");
+        let mut mgr = IndexManager::new();
+        mgr.scan_and_load(&segments_dir).expect("scan");
+        let readers = mgr.readers();
+        let p = Bm25Params::default();
+
+        // Tenant A sees only its own doc for the shared term.
+        let a = bm25_search(&readers, "common secret", 10, Some(tenant_hash("tenant-a")), &p, None);
+        assert_eq!(a.hits.len(), 1, "tenant-a sees exactly its own doc");
+        // Tenant B likewise.
+        let b = bm25_search(&readers, "common secret", 10, Some(tenant_hash("tenant-b")), &p, None);
+        assert_eq!(b.hits.len(), 1, "tenant-b sees exactly its own doc");
+        // A third tenant sees nothing.
+        let c = bm25_search(&readers, "common secret", 10, Some(tenant_hash("tenant-c")), &p, None);
+        assert_eq!(c.hits.len(), 0, "unrelated tenant sees nothing");
+    }
 }
