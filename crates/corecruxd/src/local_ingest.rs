@@ -15,10 +15,7 @@
 //!
 //! ExecPlan: `cpu-prose-ingest-door-2026-07-01`.
 //! - M0: CPU seal spike (this module's `seal_prose_documents` + roundtrip test).
-
-// M0 spike: the seal core is exercised by tests only until the M2 HTTP handler
-// calls it. Removed once the flagged endpoint wires these in.
-#![allow(dead_code)]
+//! - M2: consumed by the `/v1/local/ingest` handler for the real write path.
 
 use std::path::Path;
 
@@ -60,6 +57,9 @@ pub struct SealSummary {
     pub chunks: usize,
     /// Whether a segment was actually sealed (false when all documents were empty).
     pub sealed: bool,
+    /// The sealed segment's receipt material hash (T.4 integrity receipt), if a
+    /// segment was sealed. Hex-encoded and surfaced as `receipt_id` to callers.
+    pub receipt_material_hash: Option<[u8; 32]>,
 }
 
 /// Errors from the local seal path.
@@ -172,6 +172,7 @@ pub fn seal_prose_documents(
         documents: accepted_docs,
         chunks: total_chunks,
         sealed: seal.sealed,
+        receipt_material_hash: seal.seal_receipt.as_ref().map(|r| r.material_hash()),
     })
 }
 
@@ -248,5 +249,67 @@ mod tests {
             None,
         );
         assert_eq!(other.hits.len(), 0, "cross-tenant query must not match");
+    }
+
+    /// M2 probe: two sequential ingests into the SAME data_dir/shard must both
+    /// survive — i.e. reopening the shard for the 2nd seal must not quarantine
+    /// the 1st segment's `.ccxi` companion (the R2 quarantine-on-restart class).
+    #[test]
+    fn m2_two_ingests_both_survive_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let tenant = "tenant-m2";
+
+        let batch = |doc_id: &str, text: &str| {
+            vec![ProseDocument {
+                doc_id: doc_id.to_string(),
+                chunks: vec![ProseChunk {
+                    chunk_id: format!("{doc_id}::0"),
+                    text: text.to_string(),
+                }],
+            }]
+        };
+
+        seal_prose_documents(
+            data_dir,
+            0,
+            1,
+            tenant,
+            "corpus",
+            "2026-07-01T00:00:00Z",
+            &batch("d1", "alpha centauri star system"),
+        )
+        .expect("first seal");
+        seal_prose_documents(
+            data_dir,
+            0,
+            1,
+            tenant,
+            "corpus",
+            "2026-07-01T00:00:01Z",
+            &batch("d2", "betelgeuse red supergiant"),
+        )
+        .expect("second seal");
+
+        // Simulate daemon restart: fresh IndexManager scanning the segments dir.
+        let segments_dir = data_dir.join("shards").join("shard-0000").join("segments");
+        let mut mgr = IndexManager::new();
+        mgr.scan_and_load(&segments_dir).expect("scan_and_load");
+
+        // Both documents must still be present and retrievable.
+        assert_eq!(mgr.total_docs(), 2, "both segments' docs must survive reopen");
+        let readers = mgr.readers();
+        let th = Some(tenant_hash(tenant));
+        let p = Bm25Params::default();
+        assert_eq!(
+            bm25_search(&readers, "alpha centauri", 10, th, &p, None).hits.len(),
+            1,
+            "first ingest must survive the second ingest's shard reopen"
+        );
+        assert_eq!(
+            bm25_search(&readers, "betelgeuse", 10, th, &p, None).hits.len(),
+            1,
+            "second ingest must be retrievable"
+        );
     }
 }

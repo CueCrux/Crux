@@ -267,6 +267,11 @@ pub struct AppState {
     pub corruption_detected: Arc<RwLock<bool>>,
     pub capacity: Arc<RwLock<CapacityState>>,
     pub admin_force_seal_enabled: bool,
+    /// Serializes local prose-ingest seals (`/v1/local/ingest`). Each seal opens
+    /// the shard's exclusive `ShardStorage` handle; this mutex prevents two
+    /// concurrent ingests from racing on that lock. Ingest is a batch/occasional
+    /// path, so serialization is not on any hot query path.
+    pub local_ingest_lock: Arc<tokio::sync::Mutex<()>>,
     /// Fact-store retention window in days (launch-gate 5.1 / W2.E2). `None` =
     /// retention off; the `compact-facts` admin action then only scrubs already
     /// soft-deleted facts. Sourced from `CORECRUXD_RETENTION_DAYS`.

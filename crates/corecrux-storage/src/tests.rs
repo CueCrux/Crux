@@ -5156,6 +5156,73 @@ mod tests {
             other => panic!("unexpected: {other}"),
         }
     }
+
+    /// Reopening a shard must NOT quarantine the `.ccxi` companion of a segment
+    /// that is still referenced by the MANIFEST. Companions are collateral of
+    /// their `.ccxseg`, not standalone MANIFEST entries; treating them as orphans
+    /// on reopen destroys live retrieval indexes (quarantine-on-restart class;
+    /// ExecPlan cpu-prose-ingest-door-2026-07-01 M2).
+    #[test]
+    fn reopen_preserves_ccxi_companion_of_referenced_segment() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let opts = ShardStorageOptions {
+            head_max_record_bytes: 1024 * 1024,
+            build_ccxi: true,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let segments_dir = dir.path().join("shard-0001").join("segments");
+
+        let count_ccxi = || {
+            std::fs::read_dir(&segments_dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "ccxi"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+
+        {
+            let mut storage = ShardStorage::open(dir.path(), 1, 1, opts.clone()).unwrap();
+            let tenant_id = "t1";
+            let stream_type = "prose";
+            let stream_id = "doc-1";
+            let stream_hash = corecrux_frame::stream_hash_xxhash64(tenant_id, stream_type, stream_id).unwrap();
+            storage
+                .append_batch(
+                    stream_hash,
+                    0,
+                    tenant_id,
+                    stream_type,
+                    stream_id,
+                    "2026-07-01T00:00:01Z",
+                    std::slice::from_ref(&AppendEventInput {
+                        event_id: "doc-1::0",
+                        occurred_at: "2026-07-01T00:00:00Z",
+                        event_type: "corecrux.prose.chunk.v1",
+                        content_type: "text/plain; charset=utf-8",
+                        payload_bytes: b"the companion index must survive a shard reopen",
+                    }),
+                )
+                .unwrap();
+            storage.force_seal_head().unwrap();
+        }
+
+        assert_eq!(count_ccxi(), 1, "seal should have written one .ccxi companion");
+
+        // Reopen the shard — the orphan sweep runs here.
+        {
+            let _storage = ShardStorage::open(dir.path(), 1, 1, opts).unwrap();
+        }
+
+        assert_eq!(
+            count_ccxi(),
+            1,
+            "the referenced segment's .ccxi companion must NOT be quarantined on reopen"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1441,6 +1441,17 @@ impl ShardStorage {
                 if let Some(seq) = parse_segment_seq_from_filename(name) {
                     max_seg_seq_on_disk = max_seg_seq_on_disk.max(seq);
                 }
+                // Companion index files (`.ccxi`) are collateral of their sealed
+                // `.ccxseg`, not standalone MANIFEST entries. A companion whose
+                // segment is still referenced must be kept — otherwise reopening a
+                // shard quarantines live retrieval indexes (quarantine-on-restart
+                // class; ExecPlan cpu-prose-ingest-door-2026-07-01 M2). Only
+                // genuinely orphaned companions (segment gone) are swept.
+                if let Some(stem) = name.strip_suffix(".ccxi") {
+                    if referenced.contains(&format!("segments/{stem}.ccxseg")) {
+                        continue;
+                    }
+                }
                 let rel = format!("segments/{name}");
                 if referenced.contains(&rel) {
                     continue;

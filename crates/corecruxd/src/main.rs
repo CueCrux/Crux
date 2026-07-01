@@ -636,10 +636,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         corruption_detected,
         capacity,
         admin_force_seal_enabled: config.admin_force_seal_enabled,
+        local_ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
         retention_days: config.retention_days,
         retrieval_index: {
             let mut idx = corecrux_retrieval::IndexManager::new();
-            if config.build_ccxi {
+            // Load-at-startup wiring: reload sealed `.ccxi` companions when the
+            // storage layer builds them (`build_ccxi`) OR when the local
+            // prose-ingest door is enabled — otherwise local-ingest segments
+            // would not be served after a daemon restart (ExecPlan
+            // cpu-prose-ingest-door-2026-07-01 M2, R2 restart-survival).
+            if config.build_ccxi || config.local_ingest_enabled {
                 // Scan all shard directories for .ccxi files
                 let shards_dir = config.data_dir.join("shards");
                 let mut total = 0usize;
@@ -4194,6 +4200,7 @@ mod tests {
             corruption_detected: std::sync::Arc::new(tokio::sync::RwLock::new(false)),
             capacity: std::sync::Arc::new(tokio::sync::RwLock::new(crate::http::CapacityState::default())),
             admin_force_seal_enabled: false,
+            local_ingest_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             retention_days: None,
             retrieval_index: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_retrieval::IndexManager::new())),
             fact_store: std::sync::Arc::new(tokio::sync::RwLock::new(corecrux_memory::FactStore::new())),
