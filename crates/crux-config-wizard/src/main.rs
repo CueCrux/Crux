@@ -20,6 +20,7 @@ use crux_config_wizard::config::AgentProfileConfig;
 use crux_config_wizard::profile::load_bundled_profiles;
 
 mod cli;
+mod hooks_bridge;
 mod interactive;
 
 fn main() -> ExitCode {
@@ -37,12 +38,31 @@ fn main() -> ExitCode {
 
 fn run(workspace: &Path, cmd: cli::Command) -> std::io::Result<ExitCode> {
     let workspace = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
+
+    // Decide whether to hand off to `corecruxctl hooks install` after composing.
+    // `init` installs by default (prompting on a TTY); `regenerate` only with
+    // `--hooks`. Computed before `cmd` is consumed by the match below.
+    let hooks_plan = match &cmd {
+        cli::Command::Init {
+            non_interactive,
+            no_hooks,
+            ..
+        } if !no_hooks => Some(if !*non_interactive && is_tty() {
+            hooks_bridge::Mode::Prompt
+        } else {
+            hooks_bridge::Mode::Auto
+        }),
+        cli::Command::Regenerate { hooks: true, .. } => Some(hooks_bridge::Mode::Auto),
+        _ => None,
+    };
+
     let report = match cmd {
         cli::Command::Init {
             non_interactive,
             profiles,
+            no_hooks: _,
         } => init_dispatch(&workspace, non_interactive, profiles)?,
-        cli::Command::Regenerate { force } => run_regenerate(&workspace, force)?,
+        cli::Command::Regenerate { force, hooks: _ } => run_regenerate(&workspace, force)?,
         cli::Command::Check { strict } => run_check(&workspace, strict)?,
         cli::Command::List => run_list(&workspace)?,
         cli::Command::Add { name } => run_add(&workspace, &name)?,
@@ -50,6 +70,15 @@ fn run(workspace: &Path, cmd: cli::Command) -> std::io::Result<ExitCode> {
         cli::Command::Diff { strict } => run_diff(&workspace, strict)?,
     };
     emit(&report);
+
+    // Only install hooks when the compose step itself succeeded; a hooks
+    // problem is non-fatal and never changes the wizard's exit code.
+    if matches!(report.outcome, CommandOutcome::Ok) {
+        if let Some(mode) = hooks_plan {
+            hooks_bridge::ensure_hooks(mode);
+        }
+    }
+
     Ok(match report.outcome {
         CommandOutcome::Ok => ExitCode::SUCCESS,
         CommandOutcome::Exit(c) => ExitCode::from(c),
