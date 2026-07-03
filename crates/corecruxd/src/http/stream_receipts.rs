@@ -593,6 +593,59 @@ pub(super) fn handle_usage_receipt_draft(state: &AppState, headers: &HeaderMap, 
     }
 }
 
+/// M1 daemon-boot auto-emit: mint exactly one `daemon_start` usage ping,
+/// keyed to the daemon ROOT passport (`state.passport_fpr`, NOT a per-agent
+/// passport), via the same [`mint_usage_receipt`] path the HTTP surface uses,
+/// then hand the metadata-only submission to the consent-gated M1 submitter.
+///
+/// **No-op with ZERO network unless opted in.** The very first line is the
+/// three-way consent gate (`active_endpoint().is_some()`): a default install
+/// has not opted into submission, so this returns before any mint, any signing
+/// key read, and any network task — keeping `assert-no-phone-home.sh` green.
+/// Once the operator has opted in, auto-emit on boot is the default (no extra
+/// flag), so the ≥25-ping adoption gate self-populates.
+///
+/// Called once per boot from `main.rs` after the HTTP server is serving.
+/// Fire-and-forget: a mint failure is logged, never surfaced — an adoption
+/// ping must never destabilize startup.
+pub(crate) fn emit_daemon_start_usage_ping(state: &AppState) {
+    // ── Consent gate: no opt-in → no mint, no submit, ZERO network ───────
+    if state.usage_submit.active_endpoint().is_none() {
+        return;
+    }
+    // Actor = the daemon root passport fingerprint. Distinct passports ==
+    // distinct daemons/installs, so the collector counts installs — not the
+    // ephemeral per-agent fanout the turnaround F2 flagged.
+    let actor = state.passport_fpr.clone();
+    let draft = UsagePingDraft {
+        event_class: Some(UsageEventClassV1::DaemonStart.as_str().to_string()),
+        count: Some(1),
+        ..UsagePingDraft::default()
+    };
+    match mint_usage_receipt(state, &actor, &draft) {
+        Ok((minted, submission)) => {
+            // Opt-in, consent-gated egress — fired only after the local receipt
+            // is persisted. Inert unless the three-way gate holds (already true
+            // here). Offloads any network onto a blocking task; never blocks.
+            crate::usage_submit::maybe_spawn_submit(state, submission);
+            tracing::info!(
+                target: "usage_submit",
+                receipt_id = %minted.receipt_id,
+                passport_fpr = %state.passport_fpr,
+                "daemon_start usage ping minted on boot"
+            );
+        }
+        Err((status, msg)) => {
+            tracing::warn!(
+                target: "usage_submit",
+                status = %status,
+                error = %msg,
+                "daemon_start usage ping mint failed on boot"
+            );
+        }
+    }
+}
+
 /// Drop-guard for SSE surfaces: mints a `stream_aborted` receipt when the
 /// stream is torn down by a client disconnect (the only way the daemon's
 /// infinite event stream ends). Inert when `CORECRUXD_STREAM_RECEIPTS` is
@@ -999,6 +1052,63 @@ mod tests {
         let err = mint_usage_receipt(&state, "operator", &draft).expect_err("must reject");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(read_usage_records(&state, "operator").is_empty());
+    }
+
+    // ── M1 daemon-boot auto-emit ────────────────────────────────────────
+
+    /// A fully-satisfied three-way submit gate. The endpoint is `http://` so
+    /// that even if the (spawned) submit task runs, `submit_usage_ping` blocks
+    /// egress on the https-only rule *before* any byte leaves — the test stays
+    /// hermetic while still exercising gate-active → mint-once.
+    fn opted_in_usage_submit() -> crate::usage_submit::UsageSubmitConfig {
+        crate::usage_submit::UsageSubmitConfig {
+            enabled: true,
+            endpoint: Some("http://collector.example.com/usage".to_string()),
+            consent_at: Some("2026-07-03T00:00:00Z".to_string()),
+        }
+    }
+
+    #[test]
+    fn boot_emit_is_inert_when_not_opted_in() {
+        // Default (un-opted-in) config: the boot emit must mint NOTHING and
+        // attempt no network — this is what keeps assert-no-phone-home green.
+        let state = signing_state();
+        assert!(
+            state.usage_submit.active_endpoint().is_none(),
+            "default config is not opted in"
+        );
+        emit_daemon_start_usage_ping(&state);
+        // Keyed to the root passport fingerprint — assert that group is empty.
+        assert!(
+            read_usage_records(&state, &state.passport_fpr).is_empty(),
+            "un-opted-in boot must not mint a usage receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_emit_mints_exactly_one_daemon_start_when_opted_in() {
+        // With the three-way gate satisfied, boot emits exactly one
+        // `daemon_start` ping keyed to the daemon root passport. (tokio runtime
+        // present so `maybe_spawn_submit`'s spawn_blocking has a handle; the
+        // http:// endpoint means that task performs zero network.)
+        let mut state = signing_state();
+        state.usage_submit = opted_in_usage_submit();
+        assert!(state.usage_submit.active_endpoint().is_some(), "gate is active");
+
+        emit_daemon_start_usage_ping(&state);
+
+        let records = read_usage_records(&state, &state.passport_fpr);
+        assert_eq!(records.len(), 1, "exactly one daemon_start ping on boot");
+        let payload = &records[0].payload;
+        assert_eq!(payload["kind"], USAGE_PING_KIND_V1);
+        assert_eq!(payload["event_class"], "daemon_start");
+
+        // Metadata-only, and signed by the daemon over the canonical body.
+        let body = hex::decode(payload["body_cbor_hex"].as_str().expect("cbor hex")).expect("hex");
+        assert!(corecrux_receipts::assert_usage_ping_kind_v1(&body));
+
+        // Idempotence guard is the caller's (once per boot); a second call would
+        // mint a second receipt, so callers must invoke exactly once.
     }
 
     #[tokio::test]

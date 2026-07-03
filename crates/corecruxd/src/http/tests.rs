@@ -385,6 +385,7 @@ pub(super) fn test_app_state_with_auth(action_max_pending: usize, auth_mode: Aut
         stream_receipts_enabled: false,
         usage_receipts_enabled: false,
         usage_submit: crate::usage_submit::UsageSubmitConfig::default(),
+        latest_release: Arc::new(std::sync::RwLock::new(None)),
         quota_enabled: false,
         assembly_cache: None,
         quota_hosted_surfaces: Arc::new(Vec::new()),

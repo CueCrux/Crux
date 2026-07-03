@@ -598,6 +598,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         stream_receipts_enabled: config.stream_receipts_enabled,
         usage_receipts_enabled: config.usage_receipts_enabled,
         usage_submit: config.usage_submit.clone(),
+        // Phase T (M2) version-notify slot; the consent-gated usage submitter
+        // writes the collector-reported latest release here, `/v1/version` reads it.
+        latest_release: Arc::new(std::sync::RwLock::new(None)),
         quota_enabled: config.quota_enabled,
         assembly_cache: config.assembly_cache_enabled.then(|| {
             Arc::new(std::sync::Mutex::new(
@@ -912,6 +915,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         corecrux_memory::CaseStore::new()
     }));
+    // Phase T (M1): clone the assembled AppState for the once-per-boot
+    // `daemon_start` usage-ping emit *before* `state` is moved into the router.
+    // The emit itself is fired only after the HTTP server is serving (below).
+    let boot_emit_state = state.clone();
     let app: Router =
         http::ingress::apply_ingress_limits(http::router(state, case_store), &config.ingress, Some(&metrics))
             .layer(TraceLayer::new_for_http());
@@ -1154,6 +1161,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let drain_cap = config.ingress.shutdown_drain_cap();
         tokio::spawn(async move { serve_http(http_addr, app, rx, drain_cap).await })
     };
+
+    // Phase T (M1): now that the HTTP server is serving, emit exactly one
+    // consent-gated `daemon_start` usage ping keyed to the daemon root passport.
+    // A no-op with ZERO network under default config — `emit_daemon_start_usage_ping`
+    // returns before any mint or network task unless the three-way submit gate
+    // (`CORECRUXD_USAGE_RECEIPTS_SUBMIT` + `_ENDPOINT` + `_CONSENT_AT`) is fully
+    // set, so `assert-no-phone-home.sh` stays green. Spawned on the blocking pool
+    // so the boot path is never blocked; fires at most once per boot.
+    tokio::task::spawn_blocking(move || {
+        http::emit_daemon_start_usage_ping(&boot_emit_state);
+    });
 
     let grpc_task = {
         let mut rx = shutdown_tx.subscribe();
@@ -4168,6 +4186,7 @@ mod tests {
             stream_receipts_enabled: false,
             usage_receipts_enabled: false,
             usage_submit: crate::usage_submit::UsageSubmitConfig::default(),
+            latest_release: std::sync::Arc::new(std::sync::RwLock::new(None)),
             quota_enabled: false,
             assembly_cache: None,
             quota_hosted_surfaces: std::sync::Arc::new(Vec::new()),
