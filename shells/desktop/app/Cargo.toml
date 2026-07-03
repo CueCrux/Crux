@@ -1,0 +1,33 @@
+# Crux desktop shell — Tauri v2 wrapper.
+#
+# Own [workspace] table: this crate is EXCLUDED from the root daemon workspace
+# (root Cargo.toml `[workspace].exclude`) and pulls the webkit2gtk / tauri stack,
+# which cannot build on a headless WSL dev box. It compiles in CI only
+# (.github/workflows/desktop-shell.yml). Validate locally with
+# `cargo metadata --no-deps`, not `cargo build`.
+[package]
+name = "crux-desktop-shell"
+version = "0.5.34"
+edition = "2021"
+rust-version = "1.88.0"
+license = "LicenseRef-CCL-1.0"
+publish = false
+description = "Crux desktop shell — Tauri v2 webview over a bundled corecruxd sidecar."
+
+[workspace]
+
+[[bin]]
+name = "crux-desktop-shell"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+crux-shell-lifecycle = { path = "../lifecycle" }
+
+[features]
+# Enabled by the bundler (`cargo tauri build`) for production asset embedding.
+custom-protocol = ["tauri/custom-protocol"]

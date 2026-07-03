@@ -1,0 +1,118 @@
+# Desktop shell (Tauri v2) — build gates for `shells/desktop/**`.
+#
+# The desktop app pulls the webkit2gtk / GTK stack and cannot build on the
+# headless CueCrux CI *self-hosted* runners or the WSL dev box, so this workflow
+# runs on GitHub-hosted `ubuntu-latest` and installs the Tauri v2 Linux
+# prerequisites itself. It is NOT part of the required `ci.yml` gate — it fires
+# only on desktop-shell changes and on manual dispatch. No release/deploy steps.
+name: desktop-shell
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "shells/desktop/**"
+      - ".github/workflows/desktop-shell.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-shell-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 1) The std-only lifecycle crate: fully unit-tested (also green on the dev box).
+  lifecycle:
+    name: lifecycle crate (std-only unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test (lifecycle)
+        run: cargo test --manifest-path shells/desktop/lifecycle/Cargo.toml --locked
+
+  # 2) Compile gate for the Tauri app on Linux. Builds the sidecar first and
+  #    stages it into the externalBin slot, then compiles the app crate.
+  app-compile:
+    name: desktop app compile gate (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: install Tauri v2 Linux prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            build-essential curl wget file libxdo-dev libssl-dev pkg-config
+
+      - name: build corecruxd sidecar (release, CPU-only)
+        run: cargo build --locked --release --bin corecruxd
+
+      - name: stage sidecar into the externalBin slot
+        run: |
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p shells/desktop/app/binaries
+          cp target/release/corecruxd "shells/desktop/app/binaries/corecruxd-${triple}"
+          ls -l shells/desktop/app/binaries
+
+      - name: compile gate — cargo build (desktop app)
+        run: cargo build --locked --release --manifest-path shells/desktop/app/Cargo.toml
+
+  # 3) Full bundle (installer artifacts). Follow-up only: non-blocking while the
+  #    icon pipeline and per-platform bundlers are finalised.
+  app-bundle:
+    name: desktop bundle (follow-up, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: install Tauri v2 Linux prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            build-essential curl wget file libxdo-dev libssl-dev pkg-config
+
+      - name: install tauri-cli v2
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: generate icon set from the CueCrux arc-loop art
+        run: |
+          cargo tauri icon crates/corecruxd/console/assets/CueCrux-Arc-Loop.png \
+            --output shells/desktop/app/icons
+
+      - name: build corecruxd sidecar (release, CPU-only)
+        run: cargo build --locked --release --bin corecruxd
+
+      - name: stage sidecar into the externalBin slot
+        run: |
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p shells/desktop/app/binaries
+          cp target/release/corecruxd "shells/desktop/app/binaries/corecruxd-${triple}"
+
+      - name: bundle (cargo tauri build)
+        working-directory: shells/desktop/app
+        run: cargo tauri build
+
+      - name: upload bundle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: crux-desktop-shell-linux
+          path: |
+            shells/desktop/app/target/release/bundle/**
+          if-no-files-found: warn
