@@ -404,11 +404,15 @@
         break;
       }
       case 'toggle': {
-        var box = el('label', { 'class': 'ctl-toggle' });
+        // LED toggle (legacy .active-toggle, index.html:388-392): a squarer
+        // family chip with an 8px LED that glows (--ok) when on. The .on class
+        // reflects control.v (the server value); the input carries the a11y
+        // state and is disabled by applyMutationGate on mut toggles.
+        var box = el('label', { 'class': 'ctl-toggle' + (control.v ? ' on' : '') });
         var cb = el('input', { type: 'checkbox' });
         if (control.v) { cb.setAttribute('checked', 'checked'); }
         box.appendChild(cb);
-        box.appendChild(el('span', { 'class': 'ctl-track', 'aria-hidden': 'true' }));
+        box.appendChild(el('span', { 'class': 'led', 'aria-hidden': 'true' }));
         box.appendChild(el('span', { 'class': 'ctl-toggle-label', text: control.label || '' }));
         var wrap = el('div', { 'class': 'ctl-row' }, [box]);
         if (control.desc) { wrap.appendChild(el('p', { 'class': 'ctl-desc', text: control.desc })); }

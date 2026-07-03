@@ -646,19 +646,32 @@ function extractThemeVars(theme) {
 })();
 
 // =========================================================================
-//  Check 19 — (round 3) nav-family consolidation. .nav-item, .btn-quiet, and
-//  .pill share ONE look ruleset (one source of truth, no duplicated near-
-//  identical colour/hover/current blocks); the sub-nav pill dropped its rounded
-//  solid-accent fill for the squarer nav-family look. .btn-primary stays the
-//  single accent variant.
+//  Check 19 — (round 3 → round 4) nav-family consolidation, with the left rail
+//  restored to borderless-at-rest. .nav-item, .btn-quiet, and .pill still share
+//  ONE look ruleset (one source of truth — shape/size/transition/hover/current),
+//  and the sub-nav pill still has the squarer (not rounded solid-accent) look.
+//  NEW: the LEFT RAIL items rest borderless (transparent border) — the shared
+//  resting outline is for body buttons + sub-nav pills only; the rail's border
+//  returns on hover / aria-current. .btn-primary stays the single accent variant.
 // =========================================================================
 (function checkNavFamily() {
   // The three selectors are grouped in one shared look ruleset.
   check(/\.nav-item,\s*\.btn-quiet,\s*\.pill\s*\{/.test(shellHtml),
     '[navfamily] shell.html must consolidate .nav-item, .btn-quiet, .pill into one shared look ruleset');
+  // Body buttons + pills keep their resting outline: the shared family ruleset
+  // still declares the 1px var(--edge) resting border (only the rail drops it).
+  check(/\.nav-item,\s*\.btn-quiet,\s*\.pill\s*\{[^}]*border:\s*1px solid var\(--edge\)/.test(shellHtml),
+    '[navfamily] the shared family ruleset must keep the resting outline (border: 1px solid var(--edge)) for body buttons + sub-nav pills');
   // Their current/pressed states also share one ruleset (not three near-identical blocks).
   check(/\.nav-item\[aria-current="page"\],\s*\.pill\[aria-current="page"\],\s*\.btn-quiet\[aria-pressed="true"\]\s*\{/.test(shellHtml),
     '[navfamily] current/pressed states for nav-item/pill/btn-quiet must share one ruleset');
+  // NEW (round 4): the left rail rests borderless — a .rail .nav-item at-rest
+  // override sets border-color: transparent (restored pre-round-3 look).
+  check(/\.rail \.nav-item\s*\{[^}]*border-color:\s*transparent/.test(shellHtml),
+    '[navfamily] the left rail .nav-item must rest borderless (.rail .nav-item { border-color: transparent }) — body buttons + pills keep their resting outline');
+  // ...and the rail's border returns on hover / aria-current (rail-scoped rule).
+  check(/\.rail \.nav-item:hover,\s*\.rail \.nav-item\[aria-current="page"\]\s*\{[^}]*border-color:\s*var\(--edge-strong\)/.test(shellHtml),
+    '[navfamily] the rail border must return on hover / aria-current (rail-scoped edge-strong rule)');
   // The pill no longer solid-fills with --acc (it now uses the squarer nav look).
   check(!/\.pill\[aria-current="page"\]\s*\{\s*background:\s*var\(--acc\)/.test(shellHtml),
     '[navfamily] .pill must NOT solid-fill with var(--acc) — it adopts the nav-family current look (edge-strong + accent icon)');
@@ -668,7 +681,7 @@ function extractThemeVars(theme) {
   // .btn-primary remains the single accent (gradient) variant.
   check(/\.btn-primary\s*\{[^}]*linear-gradient/.test(shellHtml),
     '[navfamily] .btn-primary must remain the single accent (approve gradient) variant');
-  notes.push('nav-family: .nav-item/.btn-quiet/.pill share one look ruleset; pill dropped the rounded solid-accent fill; .btn-primary sole accent.');
+  notes.push('nav-family: shared look ruleset (shape/hover/current) + rail-at-rest-borderless; body buttons + pills keep the resting outline; pill squarer; .btn-primary sole accent.');
 })();
 
 // =========================================================================
@@ -720,13 +733,51 @@ function extractThemeVars(theme) {
   notes.push('topbar chips: .topchip + the status pill (.health) share one 32px-height ruleset (baseline-aligned).');
 })();
 
+// =========================================================================
+//  Check 22 — (round 4) legacy list/toggle language ported. (a) The v2 `toggle`
+//  control renders the legacy LED toggle (.active-toggle, index.html:388-392):
+//  a squarer chip with an 8px .led that glows (box-shadow) when on, on-state via
+//  the .on class from control.v. (b) The topbar chips + status pill carry the
+//  squarer family radius (var(--radius-sm), no longer a rounded 999px pill),
+//  keeping their round-3 32px height.
+// =========================================================================
+(function checkLegacyListAndToggle() {
+  // (a) LED toggle markers — the .led dot, its glow, and the squarer chip shape.
+  check(/case 'toggle'/.test(renderSrc), '[legacy-ui] render.js must keep the `toggle` control branch');
+  check(/'class':\s*'led'/.test(renderSrc) || /class="led"/.test(renderSrc),
+    '[legacy-ui] the toggle branch must render an 8px LED dot (a .led span)');
+  check(/'ctl-toggle'\s*\+\s*\(control\.v\s*\?\s*' on'/.test(renderSrc),
+    '[legacy-ui] the toggle on-state must come from the .on class set from control.v (legacy .active-toggle.on)');
+  check(/\.ctl-toggle\s+\.led\s*\{[^}]*width:\s*8px/.test(shellHtml),
+    '[legacy-ui] shell.html must style the 8px LED dot (.ctl-toggle .led)');
+  check(/\.ctl-toggle\.on\s+\.led\s*\{[^}]*box-shadow:\s*0 0 7px/.test(shellHtml),
+    '[legacy-ui] the on-state LED must glow with box-shadow: 0 0 7px (ported from index.html:392)');
+  check(/\.ctl-toggle\.on\s+\.led\s*\{[^}]*background:\s*var\(--ok\)/.test(shellHtml),
+    '[legacy-ui] the on-state LED must light with var(--ok) (the operator-chosen glow colour)');
+  check(/\.ctl-toggle\s*\{[^}]*border-radius:\s*var\(--radius-sm\)/.test(shellHtml),
+    '[legacy-ui] the LED toggle must carry the squarer family shape (var(--radius-sm), not a rounded 999px pill)');
+  check(!/\.ctl-track\b/.test(shellHtml) && !/ctl-track/.test(renderSrc),
+    '[legacy-ui] the retired sliding .ctl-track toggle must be gone from shell.html + render.js');
+  // (b) Squarer radius on the topbar chips + status pill (item 2).
+  check(/\.topchip,\s*\.health\s*\{[^}]*border-radius:\s*var\(--radius-sm\)/.test(shellHtml),
+    '[legacy-ui] .topchip + .health (status pill) must use the squarer family radius var(--radius-sm) (not 999px)');
+  check(!/\.topchip,\s*\.health\s*\{[^}]*border-radius:\s*999px/.test(shellHtml),
+    '[legacy-ui] the topbar chip ruleset must NOT keep the rounded 999px pill radius');
+  // (c) The list rows adopt the legacy row language: hover treatment + mono sub.
+  check(/\.exp-sum:hover\s*\{[^}]*background/.test(shellHtml),
+    '[legacy-ui] .exp-sum must gain the legacy row hover treatment (background lift on hover)');
+  check(/\.exp-sub\s*\{[^}]*var\(--font-mono\)/.test(shellHtml),
+    '[legacy-ui] the list-row metadata column (.exp-sub) must be mono (legacy .sp-expname small)');
+  notes.push('legacy list/toggle language: LED toggle (.led + glowing --ok on-state, squarer shape) + squarer topbar chips/pill + list-row hover + mono metadata.');
+})();
+
 // ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — round 3 smoke');
+console.log('unified-shell-console v2 — round 4 smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
 if (failures.length) {
   console.error('\nFAIL (' + failures.length + '):');
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation, projects disclosure + repo grid, topbar chip height).');
+console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language).');
 process.exit(0);

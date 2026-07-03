@@ -202,14 +202,15 @@
     color: var(--ink3); font-weight: 600; padding: 14px 10px 6px;
   }
   /* ---- Nav-family interactive surface — ONE source of truth --------------
-     The rail nav-item look IS the interactive style console-wide. .nav-item
-     (rail), .btn-quiet (buttons), and .pill (sub-nav) all share this single
-     glass ruleset: squarer var(--radius-sm) corners, transparent →
-     var(--surface2) on hover, a 1px var(--edge) → var(--edge-strong) border,
-     and an accent icon on the current/pressed item. Each selector then adds
-     ONLY its own layout (size · gap · font) below — no duplicated colour /
-     hover / current blocks. .btn-primary (the approve gradient) is the single
-     accent variant and opts out of this tint. */
+     The nav-item / button / pill family shares this single glass ruleset:
+     squarer var(--radius-sm) corners, transparent → var(--surface2) on hover,
+     a 1px var(--edge) → var(--edge-strong) border, and an accent icon on the
+     current/pressed item. Each selector then adds ONLY its own layout
+     (size · gap · font) below — no duplicated colour / hover / current blocks.
+     Shape/size/transition/hover/current are shared here; the LEFT RAIL items
+     take one at-rest override just below (they rest borderless — the resting
+     outline belongs to body buttons + sub-nav pills only). .btn-primary (the
+     approve gradient) is the single accent variant and opts out of this tint. */
   .nav-item, .btn-quiet, .pill {
     color: var(--ink2); background: transparent;
     border: 1px solid var(--edge); border-radius: var(--radius-sm);
@@ -223,6 +224,15 @@
     background: var(--surface2); color: var(--ink); border-color: var(--edge-strong);
   }
   .nav-item[aria-current="page"] svg, .pill[aria-current="page"] svg { opacity: 1; color: var(--acc); }
+  /* Left-rail items rest BORDERLESS (transparent) — restored to the pre-round-3
+     look. Body buttons (.btn-quiet) + sub-nav pills keep the shared resting
+     outline; only the rail drops it at rest. The --surface2 fill +
+     --edge-strong border still appear on hover / aria-current (the two
+     rail-scoped selectors below out-specify the family hover/current rules).
+     Everything else (shape/size/transition/current-accent) stays shared above. */
+  .rail .nav-item { border-color: transparent; }
+  .rail .nav-item:hover,
+  .rail .nav-item[aria-current="page"] { border-color: var(--edge-strong); }
 
   /* nav-item layout only (colour/border/hover live in the shared rule above). */
   .nav-item {
@@ -315,12 +325,14 @@
   .topchips:empty { display: none; }
   /* Every topbar chip AND the status pill share ONE height + padding + font
      metric so they baseline-align in the .topbar-right cluster (item 3):
-     32px min-height, 0 12px padding, 11.5px/1 text. Per-chip rules below only
-     add family colour (mono chips, DEMO warn, health dot). */
+     32px min-height, 0 12px padding, 11.5px/1 text. They now carry the same
+     squarer var(--radius-sm) corners as the rest of the family (no longer a
+     rounded 999px pill). Per-chip rules below only add family colour (mono
+     chips, DEMO warn, health dot). */
   .topchip, .health {
     display: inline-flex; align-items: center;
     min-height: 32px; padding: 0 12px;
-    border: 1px solid var(--edge); border-radius: 999px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
     font-size: 11.5px; line-height: 1; white-space: nowrap;
     color: var(--ink2); background: var(--surface2);
   }
@@ -442,19 +454,32 @@
   .ctl-info-k { font-size: 12px; color: var(--ink3); font-weight: 500; flex: none; }
   .ctl-info-v { font-size: 12.5px; color: var(--ink); text-align: right; word-break: break-word; font-variant-numeric: tabular-nums; }
 
-  .ctl-toggle { display: inline-flex; align-items: center; gap: 10px; cursor: not-allowed; }
+  /* ---- LED toggle — ported from the legacy console .active-toggle -----------
+     (crates/corecruxd/console/index.html:388-392). A compact squarer chip with
+     an 8px LED dot that glows when on. The v2 DSL `toggle` renders this: LED +
+     label, family shape (var(--radius-sm), NOT a rounded 999px pill). On-state
+     (.on, set from control.v) = accent border + a glowing --ok LED (index.html
+     used --run; the operator asked for --ok here); off = an --ink3 LED. The
+     glow is a static box-shadow — no animation, so it survives reduced-motion
+     untouched. Toggle semantics/gating are unchanged: mut toggles stay
+     operator-gated and disabled (the input is disabled by applyMutationGate). */
+  .ctl-toggle {
+    display: inline-flex; align-items: center; gap: 8px; align-self: flex-start;
+    padding: 5px 11px; border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface2); color: var(--ink2);
+    font-size: 12.5px; font-weight: 600; cursor: pointer;
+    transition: color .18s ease, border-color .18s ease, background .18s ease;
+  }
   .ctl-toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
-  .ctl-track {
-    width: 38px; height: 22px; flex: none; border-radius: 999px;
-    background: var(--edge); border: 1px solid var(--edge-strong); position: relative; transition: background .16s ease;
+  .ctl-toggle:hover { color: var(--ink); border-color: var(--edge-strong); }
+  .ctl-toggle .led {
+    width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--ink3);
+    transition: background .18s ease, box-shadow .18s ease;
   }
-  .ctl-track::after {
-    content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
-    border-radius: 50%; background: var(--ink2); transition: transform .16s ease;
-  }
-  .ctl-toggle input:checked + .ctl-track { background: color-mix(in srgb, var(--acc) 60%, transparent); }
-  .ctl-toggle input:checked + .ctl-track::after { transform: translateX(16px); background: #fff; }
-  .ctl-toggle-label { font-size: 13px; color: var(--ink); }
+  .ctl-toggle.on { color: var(--ink); border-color: var(--acc); }
+  .ctl-toggle.on .led { background: var(--ok); box-shadow: 0 0 7px var(--ok); }
+  .ctl-toggle input:disabled ~ .ctl-toggle-label { opacity: .72; }
+  .ctl-toggle-label { font-size: 12.5px; color: inherit; }
 
   /* ---- Unified buttons — exactly two families console-wide ---------------
      Every button in the console is one of two families:
@@ -504,11 +529,27 @@
     font-family: var(--font-mono); font-size: 12px; color: var(--ink2); white-space: pre-wrap; word-break: break-word;
   }
 
+  /* ---- List rows — legacy list-page language ported (item 3b) --------------
+     Ported from the legacy searchable list rows (.sp-exp / .sp-exphead /
+     .sp-expname / .sp-expbody, crates/corecruxd/console/index.html:514-524):
+     the row rhythm (compact 8px 12px head), the hover treatment (the whole row
+     head lifts to a brighter surface on hover), mono metadata columns (the sub
+     line is mono + ellipsised, as the legacy .sp-expname small was), and a
+     top-border separator between the head and the body. Extracted into v2
+     tokens — no legacy var names copied. */
   .exp { border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2); overflow: hidden; }
-  .exp-sum { list-style: none; cursor: pointer; padding: 10px 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .exp-sum {
+    list-style: none; cursor: pointer; padding: 8px 12px;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    transition: background .16s ease;
+  }
+  .exp-sum:hover { background: var(--surface); }
   .exp-sum::-webkit-details-marker { display: none; }
   .exp-label { font-weight: 600; font-size: 13px; color: var(--ink); }
-  .exp-sub { font-size: 12px; color: var(--ink3); flex: 1; min-width: 0; }
+  .exp-sub {
+    font-family: var(--font-mono); font-size: 11px; color: var(--ink3);
+    flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   .exp-badge {
     font-size: 10.5px; letter-spacing: .03em; text-transform: uppercase; font-weight: 600; color: var(--ink2);
     border: 1px solid var(--edge); border-radius: 999px; padding: 1px 8px; background: var(--surface);
