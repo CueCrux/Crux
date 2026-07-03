@@ -478,6 +478,11 @@ pub struct Config {
     // Default OFF.
     pub stream_receipts_enabled: bool,
 
+    // Phase T opt-in usage-ping receipts (`crate::http::stream_receipts` usage
+    // path). Local signed metadata-only adoption pings; no egress in M0.
+    // Default OFF (`CORECRUXD_FEATURE_USAGE_RECEIPTS=1`).
+    pub usage_receipts_enabled: bool,
+
     // G21b assembly cache for /v1/context bundles. Default OFF.
     pub assembly_cache_enabled: bool,
 
@@ -1163,6 +1168,7 @@ pub fn load_config() -> Config {
         context_surface_enabled: env_bool("CORECRUXD_CONTEXT_SURFACE").unwrap_or(false),
         local_ingest_enabled: env_bool("CORECRUXD_LOCAL_INGEST").unwrap_or(false),
         stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS").unwrap_or(false),
+        usage_receipts_enabled: env_bool("CORECRUXD_FEATURE_USAGE_RECEIPTS").unwrap_or(false),
         assembly_cache_enabled: env_bool("CORECRUXD_ASSEMBLY_CACHE").unwrap_or(false),
         quota_enabled: env_bool("CORECRUXD_QUOTA").unwrap_or(false),
         quota_hosted_surfaces: std::env::var("CORECRUXD_QUOTA_HOSTED_SURFACES")

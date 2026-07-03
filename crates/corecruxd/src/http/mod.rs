@@ -203,6 +203,12 @@ pub struct AppState {
     /// receipts, and SSE surfaces mint `stream_aborted` on disconnect.
     /// Default OFF (`CORECRUXD_STREAM_RECEIPTS=1`).
     pub stream_receipts_enabled: bool,
+    /// Phase T opt-in usage-ping receipts: `/v1/mediation/receipts` accepts a
+    /// `usage_ping` metadata-only draft and lifts it into a local signed
+    /// receipt. No egress in M0. Default OFF
+    /// (`CORECRUXD_FEATURE_USAGE_RECEIPTS=1`); when off the draft hits the
+    /// legacy tool-mediation parse and is rejected, exactly as before.
+    pub usage_receipts_enabled: bool,
     /// G20 per-surface request quota (`GET /v1/quota` + middleware over
     /// `crux_router::quota::QuotaLedger`). Default OFF
     /// (`CORECRUXD_QUOTA=1`); when off the middleware passes through and

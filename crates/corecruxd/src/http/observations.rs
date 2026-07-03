@@ -785,6 +785,15 @@ pub(super) async fn post_mediation_receipt(
             }
         }
     }
+    // Phase T dispatch — separate opt-in flag, metadata-only adoption ping.
+    // Local-only (no egress); the submitter is a later milestone.
+    if state.usage_receipts_enabled {
+        if let Some(kind) = raw.get("kind").and_then(serde_json::Value::as_str) {
+            if super::stream_receipts::is_usage_receipt_kind(kind) {
+                return super::stream_receipts::handle_usage_receipt_draft(&state, &headers, &raw);
+            }
+        }
+    }
     let body: PostMediationReceiptBody = match serde_json::from_value(raw) {
         Ok(body) => body,
         Err(err) => {

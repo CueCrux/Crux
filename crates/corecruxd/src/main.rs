@@ -595,6 +595,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         context_surface_enabled: config.context_surface_enabled,
         local_ingest_enabled: config.local_ingest_enabled,
         stream_receipts_enabled: config.stream_receipts_enabled,
+        usage_receipts_enabled: config.usage_receipts_enabled,
         quota_enabled: config.quota_enabled,
         assembly_cache: config.assembly_cache_enabled.then(|| {
             Arc::new(std::sync::Mutex::new(
@@ -4163,6 +4164,7 @@ mod tests {
             context_surface_enabled: false,
             local_ingest_enabled: false,
             stream_receipts_enabled: false,
+            usage_receipts_enabled: false,
             quota_enabled: false,
             assembly_cache: None,
             quota_hosted_surfaces: std::sync::Arc::new(Vec::new()),
