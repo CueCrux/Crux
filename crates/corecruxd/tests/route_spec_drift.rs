@@ -23,7 +23,10 @@
 //! byte-for-byte so this test sees exactly the route set that module already
 //! validates for auth coverage.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// `generate_api_js` is a string-builder codegen; `s.push_str(&format!(..))` is
+// the established idiom throughout it, so silence the (stylistic) push-string
+// lint file-wide rather than scatter `write!` calls through a generator.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::format_push_string)]
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -32,6 +35,29 @@ use std::path::PathBuf;
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
+
+// ── Curated gated-mutation allowlist (unified-shell-console M3) ───────────────
+//
+// The ENTIRE set of write routes the v2 console may call, as
+// `(METHOD, path, jsName)`. `generate_api_js()` emits a second, frozen
+// `CruxApiGated` object from exactly this list (each method does a
+// JSON-body `fetch` with the given verb). Every entry is BOTH operator-posture
+// UI-gated (render.js `operatorGatedCall` refuses unless `isOperator()`) AND
+// server-side auth-gated (the daemon enforces admin/facts scopes).
+//
+// Keep this tiny. Adding a row is the *only* way to widen what the console can
+// mutate, and it lands as a reviewable diff here + a regenerated `api.js`.
+// Grounded against the handlers:
+//   * work.rs::post_gate_approve  — POST /v1/work/gate/{actionId}/approve  (body {approver_passport})
+//   * work.rs::post_gate_reject   — POST /v1/work/gate/{actionId}/reject   (body {approver_passport})
+//   * work.rs::post_comment       — POST /v1/work/{id}/comments            (body {author_passport, body})
+//   * actions.rs::post_action_enrich — POST /v1/actions/enrich             (body ActionEnrichmentInput)
+const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
+    ("POST", "/v1/work/gate/{actionId}/approve", "gateApprove"),
+    ("POST", "/v1/work/gate/{actionId}/reject", "gateReject"),
+    ("POST", "/v1/work/{id}/comments", "workComment"),
+    ("POST", "/v1/actions/enrich", "actionsEnrich"),
+];
 
 // ── Router source scanning (mirrors route_auth::parse_routes_in_source) ──────
 
@@ -359,10 +385,13 @@ fn generate_api_js() -> String {
     s.push_str("// Regenerate:\n");
     s.push_str("//   cargo test -p corecruxd --test route_spec_drift -- --ignored regen_api_js\n");
     s.push_str("//\n");
-    s.push_str("// Customer-safe posture: only GET (read) routes are exposed here. The v2 console\n");
-    s.push_str("// performs NO mutations through this client — POST/PUT/PATCH/DELETE routes are\n");
-    s.push_str("// deliberately omitted until M3 wires specific gated mutations explicitly.\n");
-    s.push_str("// The generic CruxApi.get(path) is allowlist-guarded to literal manifest GET paths.\n");
+    s.push_str("// Customer-safe posture: CruxApi (below) exposes only GET (read) routes; its\n");
+    s.push_str("// generic get(path) is allowlist-guarded to literal manifest GET paths. The ONLY\n");
+    s.push_str("// writes this console can perform live in the separate CruxApiGated object at the\n");
+    s.push_str(&format!(
+        "// bottom — exactly {} curated, operator-posture-gated mutation(s), no more.\n",
+        GATED_MUTATIONS.len()
+    ));
     s.push_str("//\n");
     s.push_str("// Every call is same-origin credentialed; the browser never holds a bearer\n");
     s.push_str("// token (the daemon authenticates the session at its own origin).\n");
@@ -430,9 +459,50 @@ fn generate_api_js() -> String {
         ));
     }
     s.push_str("});\n\n");
-    s.push_str("// Classic-script global for the no-build v2 console. No `export` — the\n");
+
+    // ── Gated mutation surface (M3) ──────────────────────────────────────────
+    s.push_str("// ─────────────────────────────────────────────────────────────────────────────\n");
+    s.push_str("// CruxApiGated — the ONLY mutations the v2 console can perform.\n");
+    s.push_str("//\n");
+    s.push_str("// Every method below is BOTH:\n");
+    s.push_str("//   * operator-posture UI-gated — pages/render/shell reach these only through\n");
+    s.push_str("//     render.js operatorGatedCall(), which refuses unless CRUX_POSTURE==='operator';\n");
+    s.push_str("//   * server-side auth-gated — the daemon enforces admin/facts scopes on each.\n");
+    s.push_str("//\n");
+    s.push_str("// Adding a mutation requires editing GATED_MUTATIONS in the generator\n");
+    s.push_str("// (crates/corecruxd/tests/route_spec_drift.rs) — a reviewable diff + a regenerated\n");
+    s.push_str("// api.js. Do NOT widen this list casually: the customer-safe posture depends on\n");
+    s.push_str("// it staying tiny. The GATED_MUTATIONS array is the machine-readable twin the\n");
+    s.push_str("// smoke audits against the methods below.\n");
+    s.push_str("// ─────────────────────────────────────────────────────────────────────────────\n");
+    s.push_str("const GATED_MUTATIONS = Object.freeze([\n");
+    for (method, path, _name) in GATED_MUTATIONS {
+        s.push_str(&format!("  Object.freeze(['{method}', '{path}']),\n"));
+    }
+    s.push_str("]);\n\n");
+
+    s.push_str("const CruxApiGated = Object.freeze({\n");
+    for (method, path, name) in GATED_MUTATIONS {
+        let mut args = path_params(path);
+        args.push("body".to_string());
+        let args = args.join(", ");
+        let url = url_template(path);
+        s.push_str(&format!(
+            "  {name}({args}) {{\n    \
+             return fetch(`{url}`, {{ method: '{method}', credentials: 'same-origin', \
+             headers: {{ 'content-type': 'application/json' }}, body: JSON.stringify(body || {{}}) }});\n  \
+             }},\n"
+        ));
+    }
+    s.push_str("});\n\n");
+
+    s.push_str("// Classic-script globals for the no-build v2 console. No `export` — the\n");
     s.push_str("// console loads this with a plain <script src=\"/console-v2/api.js\">.\n");
-    s.push_str("if (typeof window !== 'undefined') { window.CruxApi = CruxApi; }\n");
+    s.push_str("if (typeof window !== 'undefined') {\n");
+    s.push_str("  window.CruxApi = CruxApi;\n");
+    s.push_str("  window.CruxApiGated = CruxApiGated;\n");
+    s.push_str("  window.CRUX_GATED_MUTATIONS = GATED_MUTATIONS;\n");
+    s.push_str("}\n");
     s
 }
 

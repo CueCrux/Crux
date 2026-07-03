@@ -14,6 +14,11 @@
 //   4. every MUTATING_ACTIONS entry maps to a control tagged mut:true, and
 //      render.js routes mutating controls through the operator posture gate.
 //   5. no v2 file loads an external http(s) dependency.
+//   6. reads go only through the generated client (no direct fetch in
+//      pages/render/shell; api.js is the sole network layer).
+//   7. (M3) CruxApiGated is EXACTLY the curated (method,path) mutation set and
+//      is referenced only inside render.js operatorGatedCall (isOperator-guarded).
+//   8. (M3) derivePosture() is a pure function with the documented truth table.
 
 'use strict';
 
@@ -30,6 +35,23 @@ const renderSrc = fs.readFileSync(path.join(DIR, 'render.js'), 'utf8');
 const failures = [];
 const notes = [];
 function check(ok, msg) { if (!ok) { failures.push(msg); } }
+
+// Extract a brace-matched `function <name>(...) { ... }` span from `src`.
+// (operatorGatedCall contains no string-literal braces, so a plain depth
+// counter is sufficient for the containment audit in check 7.)
+function funcBody(src, name) {
+  const at = src.indexOf('function ' + name);
+  if (at < 0) { return null; }
+  const open = src.indexOf('{', at);
+  if (open < 0) { return null; }
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '{') { depth++; }
+    else if (ch === '}') { depth--; if (depth === 0) { return src.slice(at, i + 1); } }
+  }
+  return null;
+}
 
 // The 26 legacy CX pages (scope table, index.html:764).
 const LEGACY_26 = [
@@ -240,13 +262,91 @@ function extractThemeVars(theme) {
   notes.push('through-client rule: pages/render/shell contain zero direct fetch() calls; api.js is the sole network layer.');
 })();
 
+// =========================================================================
+//  Check 7 — M3 gated-mutations audit. CruxApiGated in api.js contains EXACTLY
+//  the curated (method, path) set (asserted against the machine-readable
+//  GATED_MUTATIONS twin), and the gated client is referenced ONLY inside
+//  render.js operatorGatedCall (which guards on isOperator) — never in
+//  pages.js / shell.html.
+// =========================================================================
+(function checkGatedMutations() {
+  const apiSrc = fs.readFileSync(path.join(DIR, 'api.js'), 'utf8');
+  check(/const CruxApiGated = Object\.freeze\(/.test(apiSrc), '[gated] api.js must define CruxApiGated');
+  check(/window\.CruxApiGated\s*=\s*CruxApiGated/.test(apiSrc), '[gated] api.js must expose window.CruxApiGated');
+
+  // The curated set the M3 plan authorises — the ONLY writes the console may do.
+  const EXPECTED = [
+    ['POST', '/v1/work/gate/{actionId}/approve'],
+    ['POST', '/v1/work/gate/{actionId}/reject'],
+    ['POST', '/v1/work/{id}/comments'],
+    ['POST', '/v1/actions/enrich']
+  ];
+  // Parse the machine-readable GATED_MUTATIONS array and assert set-equality.
+  const arrM = apiSrc.match(/const GATED_MUTATIONS = Object\.freeze\(\[([\s\S]*?)\]\);/);
+  check(!!arrM, '[gated] api.js must declare the GATED_MUTATIONS array');
+  const declared = [];
+  if (arrM) {
+    const re = /\[\s*'([A-Z]+)'\s*,\s*'([^']+)'\s*\]/g;
+    let m;
+    while ((m = re.exec(arrM[1])) !== null) { declared.push([m[1], m[2]]); }
+  }
+  const norm = function (pairs) { return pairs.map(function (p) { return p[0] + ' ' + p[1]; }).sort(); };
+  check(JSON.stringify(norm(declared)) === JSON.stringify(norm(EXPECTED)),
+    '[gated] GATED_MUTATIONS must be EXACTLY the curated set; got ' + JSON.stringify(norm(declared)));
+
+  // Each declared mutation has a matching CruxApiGated fetch (verb + path stem).
+  declared.forEach(function (pair) {
+    const method = pair[0];
+    const stem = pair[1].split('{')[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const hasFetch = new RegExp('fetch\\(`' + stem + "[^`]*`,\\s*\\{\\s*method:\\s*'" + method + "'").test(apiSrc);
+    check(hasFetch, '[gated] CruxApiGated missing a ' + method + ' fetch for ' + pair[1]);
+  });
+  // No mutating verbs beyond the curated count anywhere in api.js.
+  const verbCount = (apiSrc.match(/method:\s*'(POST|PUT|PATCH|DELETE)'/g) || []).length;
+  check(verbCount === EXPECTED.length, '[gated] api.js has ' + verbCount + ' mutating fetch(es); expected ' + EXPECTED.length);
+
+  // Static containment: pages.js + shell.html never touch CruxApiGated; render.js
+  // touches it ONLY inside operatorGatedCall (which guards on isOperator()).
+  ['pages.js', 'shell.html'].forEach(function (f) {
+    const src = fs.readFileSync(path.join(DIR, f), 'utf8');
+    check(!/CruxApiGated/.test(src), '[gated] ' + f + ' must not reference CruxApiGated (use CruxRender operator helpers)');
+  });
+  const gc = funcBody(renderSrc, 'operatorGatedCall');
+  check(!!gc, '[gated] render.js must define operatorGatedCall');
+  check(gc && /isOperator\(\)/.test(gc), '[gated] operatorGatedCall must guard on isOperator()');
+  if (gc) {
+    const outside = renderSrc.split(gc).join('');
+    check(!/CruxApiGated/.test(outside), '[gated] render.js references CruxApiGated outside operatorGatedCall');
+  }
+  notes.push('gated mutations: ' + declared.length + ' curated; client invoked only inside operator-guarded operatorGatedCall.');
+})();
+
+// =========================================================================
+//  Check 8 — posture derivation is a pure function with the documented truth
+//  table (operator for auth-off, operator for probe-200, customer else).
+// =========================================================================
+(function checkPostureDerivation() {
+  const derive = render.derivePosture;
+  check(typeof derive === 'function', '[posture] render.js must export derivePosture()');
+  if (typeof derive === 'function') {
+    check(derive({ authMode: 'off' }) === 'operator', '[posture] derivePosture(off) must be operator');
+    check(derive({ authMode: 'local_only' }) === 'customer', '[posture] local_only is NOT a real auth mode (config enum: off|dev_scopes|jwt_hs256|jwt_jwks) — must not grant operator');
+    check(derive({ adminProbeStatus: 200 }) === 'operator', '[posture] derivePosture(probe 200) must be operator');
+    check(derive({ authMode: 'token', adminProbeStatus: 401 }) === 'customer', '[posture] derivePosture(token/401) must be customer');
+    check(derive({ authMode: 'token', adminProbeStatus: 403 }) === 'customer', '[posture] derivePosture(token/403) must be customer');
+    check(derive({ adminProbeStatus: 0 }) === 'customer', '[posture] derivePosture(network fail) must be customer');
+    check(derive({}) === 'customer', '[posture] derivePosture(empty) must be customer');
+    notes.push('posture derivation truth table verified (auth-off→operator, probe200→operator, else→customer; local_only rejected).');
+  }
+})();
+
 // ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — M1 smoke');
+console.log('unified-shell-console v2 — M3 smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
 if (failures.length) {
   console.error('\nFAIL (' + failures.length + '):');
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all gates green (26/26 ids, control coverage, theme contrast, posture gate, no external deps, through-client fetches).');
+console.log('\nPASS — all gates green (26/26 ids, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation).');
 process.exit(0);

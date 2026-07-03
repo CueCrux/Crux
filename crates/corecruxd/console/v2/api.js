@@ -7,10 +7,10 @@
 // Regenerate:
 //   cargo test -p corecruxd --test route_spec_drift -- --ignored regen_api_js
 //
-// Customer-safe posture: only GET (read) routes are exposed here. The v2 console
-// performs NO mutations through this client — POST/PUT/PATCH/DELETE routes are
-// deliberately omitted until M3 wires specific gated mutations explicitly.
-// The generic CruxApi.get(path) is allowlist-guarded to literal manifest GET paths.
+// Customer-safe posture: CruxApi (below) exposes only GET (read) routes; its
+// generic get(path) is allowlist-guarded to literal manifest GET paths. The ONLY
+// writes this console can perform live in the separate CruxApiGated object at the
+// bottom — exactly 4 curated, operator-posture-gated mutation(s), no more.
 //
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
@@ -597,6 +597,46 @@ const CruxApi = Object.freeze({
   },
 });
 
-// Classic-script global for the no-build v2 console. No `export` — the
+// ─────────────────────────────────────────────────────────────────────────────
+// CruxApiGated — the ONLY mutations the v2 console can perform.
+//
+// Every method below is BOTH:
+//   * operator-posture UI-gated — pages/render/shell reach these only through
+//     render.js operatorGatedCall(), which refuses unless CRUX_POSTURE==='operator';
+//   * server-side auth-gated — the daemon enforces admin/facts scopes on each.
+//
+// Adding a mutation requires editing GATED_MUTATIONS in the generator
+// (crates/corecruxd/tests/route_spec_drift.rs) — a reviewable diff + a regenerated
+// api.js. Do NOT widen this list casually: the customer-safe posture depends on
+// it staying tiny. The GATED_MUTATIONS array is the machine-readable twin the
+// smoke audits against the methods below.
+// ─────────────────────────────────────────────────────────────────────────────
+const GATED_MUTATIONS = Object.freeze([
+  Object.freeze(['POST', '/v1/work/gate/{actionId}/approve']),
+  Object.freeze(['POST', '/v1/work/gate/{actionId}/reject']),
+  Object.freeze(['POST', '/v1/work/{id}/comments']),
+  Object.freeze(['POST', '/v1/actions/enrich']),
+]);
+
+const CruxApiGated = Object.freeze({
+  gateApprove(actionId, body) {
+    return fetch(`/v1/work/gate/${encodeURIComponent(actionId)}/approve`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  gateReject(actionId, body) {
+    return fetch(`/v1/work/gate/${encodeURIComponent(actionId)}/reject`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  workComment(id, body) {
+    return fetch(`/v1/work/${encodeURIComponent(id)}/comments`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  actionsEnrich(body) {
+    return fetch(`/v1/actions/enrich`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+});
+
+// Classic-script globals for the no-build v2 console. No `export` — the
 // console loads this with a plain <script src="/console-v2/api.js">.
-if (typeof window !== 'undefined') { window.CruxApi = CruxApi; }
+if (typeof window !== 'undefined') {
+  window.CruxApi = CruxApi;
+  window.CruxApiGated = CruxApiGated;
+  window.CRUX_GATED_MUTATIONS = GATED_MUTATIONS;
+}

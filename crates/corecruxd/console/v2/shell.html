@@ -407,6 +407,34 @@
   .exp[open] > .exp-sum { border-bottom: 1px solid var(--edge); }
   .exp-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
 
+  /* ---- Overwatch landing (M3) ------------------------------------------- */
+  .ow-landing-region { margin-bottom: 22px; }
+  .ow-landing { align-items: start; }
+  .ow-srcchips, .ow-meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; }
+  .ow-chip {
+    font-size: 11px; color: var(--ink2); background: var(--surface2);
+    border: 1px solid var(--edge); border-radius: 999px; padding: 2px 9px;
+    white-space: nowrap;
+  }
+  /* The landing rows are always-open panels (plain divs, not <details>), so
+     stamp the summary/body divider the [open] selector would otherwise supply. */
+  .ow-gate > .exp-sum, .ow-fleet > .exp-sum, .ow-activity > .exp-sum {
+    cursor: default; border-bottom: 1px solid var(--edge);
+  }
+  .ow-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 2px; }
+  .ow-actions .ctl-btn { align-self: auto; }
+  .ow-conseq {
+    display: flex; flex-direction: column; gap: 8px;
+    border-left: 3px solid var(--trust); padding: 4px 0 4px 12px; margin: 2px 0;
+  }
+  .ow-narrative { color: var(--ink2); }
+  .ow-status:empty { display: none; }
+  .ow-status { color: var(--warn); }
+  .ow-await { color: var(--ink3); }
+  .ow-gate.is-resolved {
+    opacity: .78; border-color: color-mix(in srgb, var(--ok) 40%, var(--edge));
+  }
+
   /* ---- Accessibility & motion ------------------------------------------- */
   .skip {
     position: absolute; left: -9999px; top: 0; z-index: 100;
@@ -533,13 +561,17 @@
     }
   }
 
-  // ---- Posture (customer-safe foundation) --------------------------------
-  // Default 'customer' until wired to the capability plan in M3. Any element
-  // tagged data-requires="operator" is hidden unless POSTURE === 'operator'.
+  // ---- Posture (customer-safe, server-derived) ---------------------------
+  // Posture is a SERVER property, derived fresh at boot (see boot()) and cached
+  // in memory only — never localStorage. Default 'customer' until derivation
+  // completes; any element tagged data-requires="operator" is hidden unless
+  // POSTURE === 'operator'. render.js reads window.CRUX_POSTURE for the same call.
   var POSTURE = 'customer';
-  // render.js reads window.CRUX_POSTURE to decide whether a mutating (operator)
-  // control is visible. Keep it in sync with POSTURE.
   if (typeof window !== 'undefined') { window.CRUX_POSTURE = POSTURE; }
+  function setPosture(p) {
+    POSTURE = (p === 'operator') ? 'operator' : 'customer';
+    if (typeof window !== 'undefined') { window.CRUX_POSTURE = POSTURE; }
+  }
   function applyPosture(root) {
     var scope = root || document;
     var gated = scope.querySelectorAll('[data-requires="operator"]');
@@ -714,6 +746,13 @@
 
     var content = document.getElementById('content');
     content.textContent = '';
+    // Overwatch is the real landing: stat tiles → needs-you → fleet → activity,
+    // above the page-pill row (cx-overview etc. still reachable below).
+    if (destId === 'overwatch' && window.CruxRender && window.CruxRender.renderOverwatchLanding) {
+      var landing = el('div', { 'class': 'ow-landing-region', id: 'owLanding' });
+      content.appendChild(landing);
+      window.CruxRender.renderOverwatchLanding(landing, { summary: BOOT.summary });
+    }
     content.appendChild(buildSubnav(destId, pageId));
     var host = el('div', { 'class': 'page-host', id: 'pageHost' });
     content.appendChild(host);
@@ -764,7 +803,38 @@
           setHealth('degraded', 'Summary unavailable');
         }
         route();
+        // Derive posture from the server, then re-render with it (nav + pills +
+        // landing + mutating controls all follow). Never blocks the first paint.
+        return derivePostureFromServer().then(applyDerivedPosture);
       });
+  }
+
+  // operator ⟺ auth_mode 'off' (unauthenticated local instance) OR the admin-scoped capability probe
+  // (GET /v1/admin/version) resolves 200. The derivation logic itself lives in
+  // render.js (derivePosture, unit-tested); this only feeds it the probe.
+  function derivePostureFromServer() {
+    var authMode = get(BOOT.summary, ['daemon', 'auth_mode']);
+    var derive = (window.CruxRender && window.CruxRender.derivePosture)
+      || function (p) { return (p && (p.authMode === 'off' || p.adminProbeStatus === 200)) ? 'operator' : 'customer'; };
+    if (authMode === 'off') {
+      return Promise.resolve(derive({ authMode: authMode }));
+    }
+    return fetchJSON('/v1/admin/version').then(function (r) {
+      return derive({ authMode: authMode, adminProbeStatus: r.status });
+    });
+  }
+
+  function applyDerivedPosture(p) {
+    setPosture(p);
+    var authMode = get(BOOT.summary, ['daemon', 'auth_mode']);
+    var name = (p === 'operator') ? 'Operator' : 'Customer';
+    var sub = (p === 'operator') ? (authMode === 'off' ? 'operator · local' : 'operator · admin') : 'customer view';
+    var nameEl = document.getElementById('passportName');
+    var subEl = document.getElementById('passportSub');
+    if (nameEl) { nameEl.textContent = name; }
+    if (subEl) { subEl.textContent = sub; }
+    applyPosture(document);
+    route();   // re-render nav/pills/landing under the derived posture
   }
 
   // ---- Init --------------------------------------------------------------

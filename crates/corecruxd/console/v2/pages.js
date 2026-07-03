@@ -483,7 +483,7 @@
     return [
       { h: 'Access posture', sub: 'who may call :14800',
         controls: [
-          { t: 'select', k: 'auth_mode', label: 'auth mode', options: arr(a.supported_modes).length ? a.supported_modes.slice() : ['local_only', 'open', 'token', 'jwt_hs256'], v: a.chosen_mode || a.running_mode || 'local_only', mut: true },
+          { t: 'select', k: 'auth_mode', label: 'auth mode', options: arr(a.supported_modes).length ? a.supported_modes.slice() : ['off', 'dev_scopes', 'jwt_hs256', 'jwt_jwks'], v: a.chosen_mode || a.running_mode || 'off', mut: true },
           { t: 'toggle', k: 'require_bind', label: 'require passport binding', v: true, mut: true },
           info('node id', str(get(s, ['node_id']) || get(s, ['daemon', 'node_id'])))
         ] },
