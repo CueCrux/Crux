@@ -15,7 +15,7 @@
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
 //
-// 149 read endpoints, generated from the route manifest.
+// 152 read endpoints, generated from the route manifest.
 
 /**
  * Append a plain query object to a path as a URL search string.
@@ -54,6 +54,9 @@ const LITERAL_GET_PATHS = Object.freeze({
   '/v1/bootstrap/status': true,
   '/v1/cloud/access-contract': true,
   '/v1/console/corecrux/lane-weights': true,
+  '/v1/console/engine/bench': true,
+  '/v1/console/engine/spend': true,
+  '/v1/console/engine/summary': true,
   '/v1/console/facts': true,
   '/v1/console/infra/summary': true,
   '/v1/console/integrations': true,
@@ -225,6 +228,15 @@ const CruxApi = Object.freeze({
   },
   consoleCorecruxLaneWeights(query) {
     return fetch(withQuery(`/v1/console/corecrux/lane-weights`, query), { credentials: 'same-origin' });
+  },
+  consoleEngineBench(query) {
+    return fetch(withQuery(`/v1/console/engine/bench`, query), { credentials: 'same-origin' });
+  },
+  consoleEngineSpend(query) {
+    return fetch(withQuery(`/v1/console/engine/spend`, query), { credentials: 'same-origin' });
+  },
+  consoleEngineSummary(query) {
+    return fetch(withQuery(`/v1/console/engine/summary`, query), { credentials: 'same-origin' });
   },
   consoleFacts(query) {
     return fetch(withQuery(`/v1/console/facts`, query), { credentials: 'same-origin' });

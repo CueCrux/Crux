@@ -555,6 +555,34 @@
     return [sel, head, where, levers];
   }
 
+  // ---- Engine mediation (M4) — read-only, daemon-mediated summary card ----
+  // Both Trust › Mediation and Meters › Usage surface the Engine through the
+  // daemon proxy GET /v1/console/engine/summary (CruxApi allowlist literal).
+  // The browser never addresses the Engine directly. 404 ⇒ mediation is off
+  // (CORECRUXD_ENGINE_BASE_URL unset on the daemon) ⇒ feature-off copy; other
+  // failures ⇒ the existing degraded pattern.
+  function engineMediatedSection(res) {
+    var sec = { h: 'Engine (mediated)', sub: 'read-only · via daemon origin · never browser → Engine', wide: true };
+    if (res && res.status === 404) {
+      sec.controls = [info('mediation', 'off')]
+        .concat(degraded(res.status, 'Engine mediation off — set CORECRUXD_ENGINE_BASE_URL on the daemon'));
+      return sec;
+    }
+    if (!res || !res.ok || !res.data) {
+      sec.controls = degraded(res ? res.status : 0, 'Engine summary unavailable — GET /v1/console/engine/summary');
+      return sec;
+    }
+    var d = res.data;
+    sec.controls = [
+      info('mediated', d.mediated === true ? 'yes · daemon-proxied' : '—'),
+      info('engine', d.engine_reachable ? ('reachable · ' + str(d.engine_latency_ms) + ' ms') : 'unreachable'),
+      info('fetched', str(d.fetched_at_unix_ms))
+    ];
+    return sec;
+  }
+  function buildUsageEngine(res) { return STATIC['cx-usage'].concat([engineMediatedSection(res)]); }
+  function buildMediationEngine(res) { return STATIC['cx-mediation'].concat([engineMediatedSection(res)]); }
+
   // =======================================================================
   //  Static pages — sections ported directly from the legacy PAGES DSL.
   // =======================================================================
@@ -715,10 +743,10 @@
     'cx-gates': page('cx-gates', 'trust', 'Gates', 'human approvals — destructive / high-risk transitions wait here (Art. 14)', { load: { endpoint: '/v1/work/gate/pending', build: buildGates } }),
     'cx-passport': page('cx-passport', 'trust', 'Passport', 'agent + people identities · create and view passports', { load: { endpoint: '/v1/passports', build: buildPassports } }),
     'cx-identity': page('cx-identity', 'trust', 'Identity', 'candidate links — inference proposes, consent disposes', { load: { endpoint: '/v1/identity/candidates', build: buildIdentity } }),
-    'cx-mediation': page('cx-mediation', 'trust', 'Mediation', 'the gateway plane — identity, capability ladder, foresight'),
+    'cx-mediation': page('cx-mediation', 'trust', 'Mediation', 'the gateway plane — identity, capability ladder, foresight', { load: { endpoint: '/v1/console/engine/summary', build: buildMediationEngine } }),
     // ---- Meters ----------------------------------------------------------
     'cx-cost': page('cx-cost', 'meters', 'Token burn', 'ground-truth cost lens — what each session cost + how to cut it', { load: { endpoint: '/v1/cost/report?tenant_id=default&token_budget=4000', build: buildCost } }),
-    'cx-usage': page('cx-usage', 'meters', 'Token usage', 'aggregate call volume and spend · /v1/observations/aggregate'),
+    'cx-usage': page('cx-usage', 'meters', 'Token usage', 'aggregate call volume and spend · /v1/observations/aggregate', { load: { endpoint: '/v1/console/engine/summary', build: buildUsageEngine } }),
     // ---- System ----------------------------------------------------------
     'cx-settings': page('cx-settings', 'system', 'Settings', 'daemon configuration and console preferences', { load: { endpoint: '/v1/console/settings', build: buildSettings } }),
     'cx-integrations': page('cx-integrations', 'system', 'Integrations', 'installed packs and their grants', { load: { endpoint: '/v1/console/integrations', build: buildIntegrations } }),

@@ -340,13 +340,51 @@ function extractThemeVars(theme) {
   }
 })();
 
+// =========================================================================
+//  Check 9 — M4 engine mediation. (a) No shipped v2 file addresses the Engine
+//  directly (ports :14343 / :14344 must never appear — reads go through the
+//  daemon proxy). (b) The three /v1/console/engine/* GET paths, and every
+//  /v1/console/engine/ path pages.js references, are in api.js's allowlist.
+// =========================================================================
+(function checkEngineMediation() {
+  const shipped = fs.readdirSync(DIR).filter(function (f) {
+    return (/\.(js|html|css)$/.test(f)) && f !== 'smoke.cjs';
+  });
+  ['14343', '14344'].forEach(function (port) {
+    shipped.forEach(function (f) {
+      const src = fs.readFileSync(path.join(DIR, f), 'utf8');
+      check(src.indexOf(':' + port) < 0, '[engine] ' + f + ' addresses the Engine directly (:' + port + ') — reads must go through the daemon proxy');
+    });
+  });
+
+  const apiSrc = fs.readFileSync(path.join(DIR, 'api.js'), 'utf8');
+  const allowM = apiSrc.match(/const LITERAL_GET_PATHS = Object\.freeze\(\{([\s\S]*?)\}\);/);
+  check(!!allowM, '[engine] api.js must declare LITERAL_GET_PATHS');
+  const allow = new Set();
+  if (allowM) {
+    const re = /'([^']+)'\s*:\s*true/g;
+    let m;
+    while ((m = re.exec(allowM[1])) !== null) { allow.add(m[1]); }
+  }
+  const ENGINE_GETS = ['/v1/console/engine/summary', '/v1/console/engine/bench', '/v1/console/engine/spend'];
+  ENGINE_GETS.forEach(function (p) {
+    check(allow.has(p), '[engine] api.js allowlist (LITERAL_GET_PATHS) missing engine GET: ' + p);
+  });
+  // Every /v1/console/engine/ path referenced in pages.js must be allowlisted.
+  const refs = new Set((pagesSrc.match(/\/v1\/console\/engine\/[a-z]+/g) || []));
+  refs.forEach(function (p) {
+    check(allow.has(p), '[engine] pages.js references ' + p + ' but it is not in the api.js allowlist');
+  });
+  notes.push('engine mediation: no direct :14343/:14344 addressing; ' + ENGINE_GETS.length + ' engine GETs allowlisted; ' + refs.size + ' referenced in pages.js.');
+})();
+
 // ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — M3 smoke');
+console.log('unified-shell-console v2 — M4 smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
 if (failures.length) {
   console.error('\nFAIL (' + failures.length + '):');
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all gates green (26/26 ids, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation).');
+console.log('\nPASS — all gates green (26/26 ids, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation).');
 process.exit(0);
