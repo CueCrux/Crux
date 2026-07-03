@@ -80,11 +80,13 @@ async fn handle_agent_card(State(ctx): State<Arc<McpContext>>) -> Response {
     (StatusCode::OK, Json(crate::agent_card::build_agent_card(&ctx))).into_response()
 }
 
-/// agent-card M6: discovery-endpoint flag (`CRUX_AGENT_CARD=1`, default-off).
-fn agent_card_enabled() -> bool {
+/// agent-card M6: discovery-endpoint flag (`CRUX_AGENT_CARD`). Launch default
+/// ON — `/.well-known/agent-card` is exposed for A2A discovery. Explicit
+/// `CRUX_AGENT_CARD=0` disables it.
+pub(crate) fn agent_card_enabled() -> bool {
     std::env::var("CRUX_AGENT_CARD")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// `POST /mcp` — JSON-RPC 2.0 endpoint (MCP Streamable HTTP).
@@ -504,6 +506,7 @@ mod tests {
     async fn well_known_agent_card_flag_gated() {
         // agent-card M6. This is the only test that touches CRUX_AGENT_CARD, and
         // it sets+clears within itself, so there is no cross-test env race.
+        // Launch default is ON: with the flag unset the endpoint serves.
         std::env::remove_var("CRUX_AGENT_CARD");
         let resp = test_app()
             .oneshot(
@@ -515,7 +518,21 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "default-off => 404");
+        assert_eq!(resp.status(), StatusCode::OK, "default-on => 200");
+
+        // Explicit opt-out still disables the endpoint.
+        std::env::set_var("CRUX_AGENT_CARD", "0");
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/.well-known/agent-card")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "explicit off => 404");
 
         std::env::set_var("CRUX_AGENT_CARD", "1");
         let resp = test_app()

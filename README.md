@@ -314,11 +314,11 @@ budgets, receipts. That's not a demo — it's the same engine the paid lanes plu
 | Append-only event store with BLAKE3 integrity | yes | | |
 | CROWN receipts and receipt verification | yes | | |
 | Local fact store with freshness decay + `memory_reverify` | yes | | |
-| Scoped forget with dry-run (GDPR Art. 17) | yes·flag | | |
+| Scoped forget with dry-run (GDPR Art. 17) | yes | | |
 | Local session store + cross-session handoffs | yes | | |
 | Built-in MCP server, token-filtered tools | yes | | |
 | Agent passports + RCX capability tokens | yes | | |
-| Live multi-session coordination board | yes·flag | | |
+| Live multi-session coordination board | yes | | |
 | Typed action traces (reasoning refs — never raw CoT) | yes·flag | | |
 | C2PA output attestation | yes·flag | | |
 | HTTP, gRPC, health, readiness, and metrics | yes | | |

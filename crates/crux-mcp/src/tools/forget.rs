@@ -62,9 +62,13 @@ const MEMORY_PIN_PREFIX: &str = "__memory_pin::";
 const DEFAULT_RECOVERY_WINDOW_DAYS: i64 = 7;
 
 fn feature_enabled() -> bool {
+    // Launch default ON — scoped forget (GDPR Art. 17 surface) is available
+    // out of the box. It requires an authenticated passport and soft-deletes
+    // within a recovery window. Explicit `CORECRUXD_FEATURE_SCOPED_FORGET=0`
+    // disables the mutating tool.
     env::var(FEATURE_FLAG_ENV)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn recovery_window() -> Duration {
@@ -526,7 +530,9 @@ mod tests {
         async fn disabled() -> Self {
             let lock = flag_lock().lock().await;
             let prior = env::var(FEATURE_FLAG_ENV).ok();
-            env::remove_var(FEATURE_FLAG_ENV);
+            // Launch default is ON, so disabling now means an explicit opt-out
+            // rather than an unset var.
+            env::set_var(FEATURE_FLAG_ENV, "0");
             Self { prior, _lock: lock }
         }
     }
