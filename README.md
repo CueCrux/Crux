@@ -425,6 +425,11 @@ a real auth mode; non-loopback MCP binds should set `CRUX_AGENT_TOKEN(S)`; set
 `CRUX_MCP_HANDOFF_SECRET` if handoff packages must survive restarts. The daemon refuses to start
 unless `CORECRUXD_AUTH_MODE` is explicit (`off` | `dev_scopes` | `jwt_hs256` | `jwt_jwks`).
 
+Usage receipts (adoption signal) are **opt-in and off by default** — the daemon sends no outbound
+signal unless you set an `https://` collector endpoint *and* record consent. See
+[`docs/usage-receipts.md`](docs/usage-receipts.md) (`CORECRUXD_USAGE_RECEIPTS_SUBMIT` /
+`_ENDPOINT` / `_CONSENT_AT`).
+
 </details>
 
 <details>

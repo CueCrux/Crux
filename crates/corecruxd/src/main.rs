@@ -88,6 +88,7 @@ mod storybook;
 mod structured_log;
 mod tenant_metadata;
 mod update;
+mod usage_submit;
 #[cfg(feature = "wasm-extensions")]
 mod wasm_dispatcher;
 #[cfg(feature = "wasm-extensions")]
@@ -596,6 +597,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         local_ingest_enabled: config.local_ingest_enabled,
         stream_receipts_enabled: config.stream_receipts_enabled,
         usage_receipts_enabled: config.usage_receipts_enabled,
+        usage_submit: config.usage_submit.clone(),
         quota_enabled: config.quota_enabled,
         assembly_cache: config.assembly_cache_enabled.then(|| {
             Arc::new(std::sync::Mutex::new(
@@ -4165,6 +4167,7 @@ mod tests {
             local_ingest_enabled: false,
             stream_receipts_enabled: false,
             usage_receipts_enabled: false,
+            usage_submit: crate::usage_submit::UsageSubmitConfig::default(),
             quota_enabled: false,
             assembly_cache: None,
             quota_hosted_surfaces: std::sync::Arc::new(Vec::new()),

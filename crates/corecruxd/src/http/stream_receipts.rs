@@ -433,12 +433,15 @@ pub(super) struct UsagePingDraft {
 
 /// Lift a usage-ping draft into a canonical signed receipt and record it
 /// through the signed-observation path (`append_one` — never a raw store
-/// write). Local only: this function performs no network I/O.
+/// write). Local only: this function performs **no** network I/O — it also
+/// returns the metadata-only [`crate::usage_submit::UsagePingSubmission`] the
+/// caller may (opt-in, consent-gated) hand to the M1 submitter *after* this
+/// local persist. Building it here does not send it.
 pub(super) fn mint_usage_receipt(
     state: &AppState,
     actor: &str,
     draft: &UsagePingDraft,
-) -> Result<MintedStreamReceipt, (StatusCode, String)> {
+) -> Result<(MintedStreamReceipt, crate::usage_submit::UsagePingSubmission), (StatusCode, String)> {
     let receipt_id = draft
         .receipt_id
         .clone()
@@ -480,6 +483,8 @@ pub(super) fn mint_usage_receipt(
         &state.passport_fpr,
         &now,
     );
+    let body_hash_hex = format!("blake3:{}", hex::encode(body_hash));
+    let signature_hex = hex::encode(&sig.signature);
 
     // Record through the signed-observation path — scoped per actor so the M2
     // collector can tally distinct passports.
@@ -493,31 +498,60 @@ pub(super) fn mint_usage_receipt(
             "kind": USAGE_PING_KIND_V1,
             "body_schema": USAGE_PING_BODY_SCHEMA_V1,
             "body_cbor_hex": hex::encode(&body_bytes),
-            "body_hash": format!("blake3:{}", hex::encode(body_hash)),
+            "body_hash": body_hash_hex.clone(),
             "sig": {
                 "schema": sig.schema,
                 "alg": sig.alg,
                 "key_id": sig.key_id,
                 "signed_at": sig.signed_at,
-                "signature_hex": hex::encode(&sig.signature),
+                "signature_hex": signature_hex.clone(),
             },
             "event_class": event_class.as_str(),
             "count": count,
         }),
     };
     let (resp, _tip) = append_one(state, &scoped, actor, obs_body, None)?;
-    Ok(MintedStreamReceipt {
-        receipt_id,
-        kind: USAGE_PING_KIND_V1.to_string(),
-        body_hash: format!("blake3:{}", hex::encode(body_hash)),
-        signature_hex: hex::encode(&sig.signature),
-        observation_id: resp.observation_id,
-    })
+
+    // Metadata-only submission the caller may forward to the M1 opt-in
+    // submitter. Built here from the same signed material, but NOT sent —
+    // sending is the caller's consent-gated decision.
+    let submission = crate::usage_submit::UsagePingSubmission {
+        receipt_id: receipt_id.clone(),
+        body_hash: body_hash_hex.clone(),
+        passport_fpr: state.passport_fpr.clone(),
+        event_class: event_class.as_str().to_string(),
+        created_at: created_at.clone(),
+        sig: crate::usage_submit::UsagePingSubmissionSig {
+            alg: sig.alg.clone(),
+            key_id: sig.key_id.clone(),
+            signed_at: sig.signed_at.clone(),
+            signature_hex: signature_hex.clone(),
+        },
+    };
+    Ok((
+        MintedStreamReceipt {
+            receipt_id,
+            kind: USAGE_PING_KIND_V1.to_string(),
+            body_hash: body_hash_hex,
+            signature_hex,
+            observation_id: resp.observation_id,
+        },
+        submission,
+    ))
 }
 
 /// Handle a `usage_ping` draft POSTed to `/v1/mediation/receipts`. The caller
 /// (`observations::post_mediation_receipt`) has already checked the
 /// `CORECRUXD_FEATURE_USAGE_RECEIPTS` flag and dispatched on `kind`.
+///
+/// After the local signed receipt is persisted, the opt-in, consent-gated M1
+/// submitter is offered the metadata-only submission. It is a no-op unless the
+/// three-way gate (`CORECRUXD_USAGE_RECEIPTS_SUBMIT` + a set `https://`
+/// `..._ENDPOINT` + a recorded `..._CONSENT_AT`) is fully satisfied — so under
+/// default config this dials nothing.
+///
+/// Synchronous: `maybe_spawn_submit` offloads any actual network call onto a
+/// blocking task, so this handler never awaits and never blocks the runtime.
 pub(super) fn handle_usage_receipt_draft(state: &AppState, headers: &HeaderMap, raw: &Value) -> Response {
     let ctx = match super::facts::require_session_write_ctx(state, headers) {
         Ok(ctx) => ctx,
@@ -531,18 +565,23 @@ pub(super) fn handle_usage_receipt_draft(state: &AppState, headers: &HeaderMap, 
     };
     let actor = ctx.passport_id.clone().unwrap_or_else(|| "operator".to_string());
     match mint_usage_receipt(state, &actor, &draft) {
-        Ok(minted) => (
-            StatusCode::CREATED,
-            Json(json!({
-                "receipt_id": minted.receipt_id,
-                "kind": minted.kind,
-                "body_hash": minted.body_hash,
-                "signature_hex": minted.signature_hex,
-                "observation_id": minted.observation_id,
-                "signed_by": state.passport_fpr,
-            })),
-        )
-            .into_response(),
+        Ok((minted, submission)) => {
+            // Opt-in, consent-gated egress — fired only after local persist,
+            // never on boot or a timer. Inert unless the three-way gate holds.
+            crate::usage_submit::maybe_spawn_submit(state, submission);
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "receipt_id": minted.receipt_id,
+                    "kind": minted.kind,
+                    "body_hash": minted.body_hash,
+                    "signature_hex": minted.signature_hex,
+                    "observation_id": minted.observation_id,
+                    "signed_by": state.passport_fpr,
+                })),
+            )
+                .into_response()
+        }
         Err((status, msg)) => problem_response(status, msg),
     }
 }
@@ -870,9 +909,17 @@ mod tests {
             count: Some(7),
             ..UsagePingDraft::default()
         };
-        let minted = mint_usage_receipt(&state, "operator", &draft).expect("mint usage");
+        let (minted, submission) = mint_usage_receipt(&state, "operator", &draft).expect("mint usage");
         assert_eq!(minted.kind, USAGE_PING_KIND_V1);
         assert!(minted.body_hash.starts_with("blake3:"));
+
+        // The metadata-only submission is built (but NOT sent) alongside the
+        // local receipt: it mirrors the signed material and carries no content.
+        assert_eq!(submission.receipt_id, minted.receipt_id);
+        assert_eq!(submission.body_hash, minted.body_hash);
+        assert_eq!(submission.event_class, "session");
+        assert_eq!(submission.passport_fpr, state.passport_fpr);
+        assert_eq!(submission.sig.signature_hex, minted.signature_hex);
 
         let records = read_usage_records(&state, "operator");
         assert_eq!(records.len(), 1);

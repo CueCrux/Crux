@@ -209,6 +209,12 @@ pub struct AppState {
     /// (`CORECRUXD_FEATURE_USAGE_RECEIPTS=1`); when off the draft hits the
     /// legacy tool-mediation parse and is rejected, exactly as before.
     pub usage_receipts_enabled: bool,
+    /// Phase T (M1) consent-gated opt-in usage-ping *submitter* config — the
+    /// daemon's only sanctioned outbound signal. Default-absent on every leg
+    /// (`CORECRUXD_USAGE_RECEIPTS_SUBMIT` / `_ENDPOINT` / `_CONSENT_AT`); the
+    /// submitter fires only on an explicit `usage_ping` mint, after local
+    /// persist, and only when all three are set. See `crate::usage_submit`.
+    pub usage_submit: crate::usage_submit::UsageSubmitConfig,
     /// G20 per-surface request quota (`GET /v1/quota` + middleware over
     /// `crux_router::quota::QuotaLedger`). Default OFF
     /// (`CORECRUXD_QUOTA=1`); when off the middleware passes through and
