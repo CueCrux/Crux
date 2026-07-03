@@ -17,10 +17,9 @@ install — or any install where the operator has not deliberately turned this o
 
 ## What it is
 
-The daemon already mints a **local, signed `usage_ping` receipt** (Phase T M0): a deliberately
-metadata-only CROWN receipt that records "a thing happened" (a session opened, a query ran, the
-daemon started) without disclosing *what* happened. That receipt is persisted locally like any other
-signed observation.
+The daemon already mints a **local, signed `usage_ping` receipt**: a deliberately metadata-only CROWN
+receipt that records "a thing happened" (a session opened, a query ran, the daemon started) without
+disclosing *what* happened. That receipt is persisted locally like any other signed observation.
 
 When — and only when — you opt in, the daemon additionally **submits a metadata-only copy** of that
 receipt to a collector endpoint you control. The submission carries just enough to let the collector
@@ -41,7 +40,7 @@ If any one of the three is missing, the submitter is a no-op. It is also never w
 path or a background timer — it is triggered **only** by an explicit `usage_ping` mint on the
 `/v1/mediation/receipts` surface, and only *after* the local signed receipt has been persisted.
 
-> Note: submitting also requires the M0 feature flag `CORECRUXD_FEATURE_USAGE_RECEIPTS=1` so that the
+> Note: submitting also requires the `CORECRUXD_FEATURE_USAGE_RECEIPTS=1` feature flag so that the
 > daemon accepts `usage_ping` drafts at all. Without it, no `usage_ping` is minted and there is
 > nothing to submit.
 
@@ -71,8 +70,8 @@ The wire payload is metadata only. Exactly these fields, and nothing else:
 
 ```bash
 # All three legs — a fresh install would dial nothing without these.
-export CORECRUXD_FEATURE_USAGE_RECEIPTS=1                       # M0: mint usage_ping receipts
-export CORECRUXD_USAGE_RECEIPTS_SUBMIT=1                        # M1: master enable for submit
+export CORECRUXD_FEATURE_USAGE_RECEIPTS=1                       # mint usage_ping receipts locally
+export CORECRUXD_USAGE_RECEIPTS_SUBMIT=1                        # master enable for submit
 export CORECRUXD_USAGE_RECEIPTS_ENDPOINT="https://collector.example.com/usage"
 export CORECRUXD_USAGE_RECEIPTS_CONSENT_AT="yes"               # or an explicit RFC3339 timestamp
 ```
@@ -80,6 +79,7 @@ export CORECRUXD_USAGE_RECEIPTS_CONSENT_AT="yes"               # or an explicit 
 ## How to revoke
 
 Unset (or set to `0`/`false`) `CORECRUXD_USAGE_RECEIPTS_SUBMIT` and restart the daemon. The submitter
-is immediately inert again; local `usage_ping` receipts (if the M0 flag is still on) continue to be
-minted and stored locally, but nothing is submitted. Clearing the endpoint or the consent timestamp
+is immediately inert again; local `usage_ping` receipts (if `CORECRUXD_FEATURE_USAGE_RECEIPTS` is
+still on) continue to be minted and stored locally, but nothing is submitted. Clearing the endpoint or
+the consent timestamp
 also disables submission — the gate requires all three.
