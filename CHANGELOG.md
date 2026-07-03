@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.36] - 2026-07-03
+
+### Added
+
+- **Usage receipts self-populate.** The daemon now auto-emits one `usage_ping`
+  (`event_class=daemon_start`, keyed to the root passport) on startup — but only
+  when the operator has opted into submission (the three-way consent gate).
+  Default installs still dial nothing (`assert-no-phone-home` stays green); once
+  opted in, the adoption signal registers on every boot with no manual mint (#322).
+- **Version-notify.** The usage-receipt collector's response advertises the
+  latest Crux release; the daemon compares it to its own version and, when
+  behind, logs a warning and surfaces `update.latest_release` / `update.behind`
+  on `/v1/version` (#322).
+
 ## [0.5.35] - 2026-07-03
 
 ### Added
