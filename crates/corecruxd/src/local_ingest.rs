@@ -392,6 +392,16 @@ mod tests {
     use corecrux_retrieval::bm25::{bm25_search, Bm25Params};
     use corecrux_retrieval::IndexManager;
 
+    // These tests seal through `corecrux-storage`, whose seal/append path reads a
+    // process-global env var (`CORECRUX_STORAGE_FAILPOINT`) in non-test builds —
+    // and this crate builds `corecrux-storage` as a normal (non-test) dependency.
+    // Many other corecruxd tests mutate process env via `set_var` under
+    // `#[serial_test::serial]`; running these seal tests concurrently with those
+    // raced the env read and intermittently failed the seal (flaky
+    // `m5_tenant_isolation` / `m5_idempotent_reingest_is_noop` in the merge queue).
+    // Join the default serial group so they never overlap env-mutating tests.
+    // (Mirrors `corecrux-storage`'s own `TEST_LOCK`-serialised seal tests.)
+
     fn tenant_hash(tenant_id: &str) -> u64 {
         xxhash_rust::xxh64::xxh64(tenant_id.as_bytes(), 0)
     }
@@ -399,6 +409,7 @@ mod tests {
     /// M0 gate: seal a 1-doc / 1-chunk segment to a temp data_dir entirely on CPU
     /// (no `DataPlaneStore`), then BM25-retrieve it via the ordinary retrieval path.
     #[test]
+    #[serial_test::serial]
     fn m0_seal_one_chunk_and_bm25_retrieve() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
@@ -465,6 +476,7 @@ mod tests {
     /// survive — i.e. reopening the shard for the 2nd seal must not quarantine
     /// the 1st segment's `.ccxi` companion (the R2 quarantine-on-restart class).
     #[test]
+    #[serial_test::serial]
     fn m2_two_ingests_both_survive_reopen() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
@@ -553,6 +565,7 @@ mod tests {
     /// top-k. Both docs match the BM25 query equally; the dense lane (query
     /// aligned to doc B) decides the ranking.
     #[test]
+    #[serial_test::serial]
     fn m3_dense_fusion_returns_expected_topk() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
@@ -598,6 +611,7 @@ mod tests {
 
     /// M3 gate (c): dimension mismatch is rejected cleanly (no partial write).
     #[test]
+    #[serial_test::serial]
     fn m3_dense_dim_mismatch_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let docs = vec![
@@ -624,6 +638,7 @@ mod tests {
     /// M3 gate (b): ingest-without-vectors writes no `.ccxv`, the provider is
     /// absent, and BM25-only fused retrieval still serves.
     #[test]
+    #[serial_test::serial]
     fn m3_no_vectors_serves_bm25_only() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
@@ -660,6 +675,7 @@ mod tests {
     /// segment scan, so no duplicate is indexed. (The MediaCrux client also
     /// filters `cruxPushedAt IS NULL`, so this is defence-in-depth.)
     #[test]
+    #[serial_test::serial]
     fn m5_idempotent_reingest_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
@@ -702,6 +718,7 @@ mod tests {
     /// M5 (T.1): two tenants ingest documents sharing query terms; each tenant's
     /// query returns only its own documents.
     #[test]
+    #[serial_test::serial]
     fn m5_tenant_isolation() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
