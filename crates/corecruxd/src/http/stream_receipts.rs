@@ -33,10 +33,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use corecrux_receipts::{
-    build_context_injected_body_v1, build_model_invocation_body_v1, build_stream_end_body_v1, sign_model_invocation_v1,
-    sign_stream_v1, ContextInjectedBodyInputV1, MemoryUseEntryV1, ModelInvocationBodyInputV1, StreamEndBodyInputV1,
-    StreamEndStateV1, AUDIT_GAP_BODY_SCHEMA_V1, CONTEXT_INJECTED_KIND_V1, MODEL_INVOCATION_KIND_V1,
-    STREAM_ABORTED_KIND_V1, STREAM_BODY_SCHEMA_V1, STREAM_COMPLETED_KIND_V1,
+    build_context_injected_body_v1, build_model_invocation_body_v1, build_stream_end_body_v1, build_usage_ping_body_v1,
+    sign_model_invocation_v1, sign_stream_v1, sign_usage_ping_v1, ContextInjectedBodyInputV1, MemoryUseEntryV1,
+    ModelInvocationBodyInputV1, StreamEndBodyInputV1, StreamEndStateV1, UsageEventClassV1, UsagePingBodyInputV1,
+    AUDIT_GAP_BODY_SCHEMA_V1, CONTEXT_INJECTED_KIND_V1, MODEL_INVOCATION_KIND_V1, STREAM_ABORTED_KIND_V1,
+    STREAM_BODY_SCHEMA_V1, STREAM_COMPLETED_KIND_V1, USAGE_EVENT_CLASSES_V1, USAGE_PING_BODY_SCHEMA_V1,
+    USAGE_PING_KIND_V1,
 };
 use ed25519_dalek::SigningKey;
 use serde::Deserialize;
@@ -51,6 +53,13 @@ pub(super) fn is_stream_receipt_kind(kind: &str) -> bool {
         kind,
         CONTEXT_INJECTED_KIND_V1 | STREAM_COMPLETED_KIND_V1 | STREAM_ABORTED_KIND_V1 | MODEL_INVOCATION_KIND_V1
     )
+}
+
+/// Is `kind` the Phase T opt-in usage-ping adoption receipt? Gated by the
+/// separate `CORECRUXD_FEATURE_USAGE_RECEIPTS` flag (NOT
+/// `CORECRUXD_STREAM_RECEIPTS`).
+pub(super) fn is_usage_receipt_kind(kind: &str) -> bool {
+    kind == USAGE_PING_KIND_V1
 }
 
 /// One fact entry inside an injected-side draft (`{fact_id, entity}` —
@@ -396,6 +405,148 @@ pub(super) fn handle_stream_receipt_draft(state: &AppState, headers: &HeaderMap,
     }
 }
 
+// ── Phase T: opt-in usage-ping receipts ─────────────────────────────────
+//
+// A deliberately metadata-only adoption signal (ExecPlan
+// `phase-t-usage-receipts`). M0 is the LOCAL primitive only: build → sign →
+// record through the same signed-observation path the stream receipts ride.
+// There is NO outbound/network code here — the opt-in, consent-gated
+// submitter is M1 — so this keeps `assert-no-phone-home.sh` green.
+
+/// A usage-ping draft as POSTed to `/v1/mediation/receipts`. Metadata only —
+/// there is no field through which fact content, query text, or corpus
+/// identity could be smuggled. Unknown fields (including the `kind`
+/// discriminator, already validated by the recognizer dispatch) are ignored.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(super) struct UsagePingDraft {
+    #[serde(default)]
+    pub receipt_id: Option<String>,
+    /// One of `USAGE_EVENT_CLASSES_V1` (`session` / `query` / `daemon_start`).
+    /// Defaults to `session`; an unknown value is rejected.
+    #[serde(default)]
+    pub event_class: Option<String>,
+    #[serde(default)]
+    pub count: Option<u64>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+/// Lift a usage-ping draft into a canonical signed receipt and record it
+/// through the signed-observation path (`append_one` — never a raw store
+/// write). Local only: this function performs no network I/O.
+pub(super) fn mint_usage_receipt(
+    state: &AppState,
+    actor: &str,
+    draft: &UsagePingDraft,
+) -> Result<MintedStreamReceipt, (StatusCode, String)> {
+    let receipt_id = draft
+        .receipt_id
+        .clone()
+        .unwrap_or_else(|| format!("r_{}", uuid::Uuid::new_v4()));
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let created_at = draft.created_at.clone().unwrap_or_else(|| now.clone());
+    // Local daemon: single-tenant store, tenant identity rides the auth
+    // scoping (same posture as the stream/context surfaces).
+    let tenant_id = "local";
+
+    let event_class_str = draft.event_class.as_deref().unwrap_or("session");
+    let event_class = UsageEventClassV1::parse(event_class_str).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("usage_ping draft has unknown event_class '{event_class_str}' (allowed: {USAGE_EVENT_CLASSES_V1:?})"),
+    ))?;
+    let count = draft.count.unwrap_or(1);
+
+    let (body_bytes, body_hash) = build_usage_ping_body_v1(&UsagePingBodyInputV1 {
+        tenant_id,
+        receipt_id: &receipt_id,
+        passport_fpr: &state.passport_fpr,
+        event_class,
+        count,
+        created_at: &created_at,
+    });
+    if body_bytes.is_empty() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "canonical usage_ping body encoding failed".to_string(),
+        ));
+    }
+
+    let signing_key = load_signing_key(state).map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let sig = sign_usage_ping_v1(
+        &receipt_id,
+        &body_bytes,
+        body_hash,
+        &signing_key,
+        &state.passport_fpr,
+        &now,
+    );
+
+    // Record through the signed-observation path — scoped per actor so the M2
+    // collector can tally distinct passports.
+    let scoped = format!("usage::{actor}");
+    let obs_body = PostObservationBody {
+        kind: USAGE_PING_KIND_V1.to_string(),
+        provider: "crux-usage-receipts".to_string(),
+        client_ts: None,
+        payload: json!({
+            "receipt_id": receipt_id,
+            "kind": USAGE_PING_KIND_V1,
+            "body_schema": USAGE_PING_BODY_SCHEMA_V1,
+            "body_cbor_hex": hex::encode(&body_bytes),
+            "body_hash": format!("blake3:{}", hex::encode(body_hash)),
+            "sig": {
+                "schema": sig.schema,
+                "alg": sig.alg,
+                "key_id": sig.key_id,
+                "signed_at": sig.signed_at,
+                "signature_hex": hex::encode(&sig.signature),
+            },
+            "event_class": event_class.as_str(),
+            "count": count,
+        }),
+    };
+    let (resp, _tip) = append_one(state, &scoped, actor, obs_body, None)?;
+    Ok(MintedStreamReceipt {
+        receipt_id,
+        kind: USAGE_PING_KIND_V1.to_string(),
+        body_hash: format!("blake3:{}", hex::encode(body_hash)),
+        signature_hex: hex::encode(&sig.signature),
+        observation_id: resp.observation_id,
+    })
+}
+
+/// Handle a `usage_ping` draft POSTed to `/v1/mediation/receipts`. The caller
+/// (`observations::post_mediation_receipt`) has already checked the
+/// `CORECRUXD_FEATURE_USAGE_RECEIPTS` flag and dispatched on `kind`.
+pub(super) fn handle_usage_receipt_draft(state: &AppState, headers: &HeaderMap, raw: &Value) -> Response {
+    let ctx = match super::facts::require_session_write_ctx(state, headers) {
+        Ok(ctx) => ctx,
+        Err(resp) => return resp,
+    };
+    let draft: UsagePingDraft = match serde_json::from_value(raw.clone()) {
+        Ok(d) => d,
+        Err(err) => {
+            return problem_response(StatusCode::BAD_REQUEST, format!("malformed usage_ping draft: {err}"));
+        }
+    };
+    let actor = ctx.passport_id.clone().unwrap_or_else(|| "operator".to_string());
+    match mint_usage_receipt(state, &actor, &draft) {
+        Ok(minted) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "receipt_id": minted.receipt_id,
+                "kind": minted.kind,
+                "body_hash": minted.body_hash,
+                "signature_hex": minted.signature_hex,
+                "observation_id": minted.observation_id,
+                "signed_by": state.passport_fpr,
+            })),
+        )
+            .into_response(),
+        Err((status, msg)) => problem_response(status, msg),
+    }
+}
+
 /// Drop-guard for SSE surfaces: mints a `stream_aborted` receipt when the
 /// stream is torn down by a client disconnect (the only way the daemon's
 /// infinite event stream ends). Inert when `CORECRUXD_STREAM_RECEIPTS` is
@@ -687,5 +838,122 @@ mod tests {
         assert!(is_stream_receipt_kind("model_invocation"));
         assert!(!is_stream_receipt_kind("tool_mediation"));
         assert!(!is_stream_receipt_kind(""));
+    }
+
+    // ── Phase T usage-ping tests ────────────────────────────────────────
+
+    fn read_usage_records(state: &AppState, group: &str) -> Vec<ObservationRecordV1> {
+        let path = crate::http::observations::observation_file_path(&state.data_dir, &format!("usage::{group}"));
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    #[test]
+    fn usage_kind_predicate() {
+        assert!(is_usage_receipt_kind("usage_ping"));
+        assert!(!is_usage_receipt_kind("context_injected"));
+        assert!(!is_usage_receipt_kind(""));
+        // The usage kind is NOT a stream kind — separate flag, separate path.
+        assert!(!is_stream_receipt_kind("usage_ping"));
+    }
+
+    #[test]
+    fn usage_ping_lifts_signs_and_records_metadata_only() {
+        let state = signing_state();
+        let draft = UsagePingDraft {
+            event_class: Some("session".to_string()),
+            count: Some(7),
+            ..UsagePingDraft::default()
+        };
+        let minted = mint_usage_receipt(&state, "operator", &draft).expect("mint usage");
+        assert_eq!(minted.kind, USAGE_PING_KIND_V1);
+        assert!(minted.body_hash.starts_with("blake3:"));
+
+        let records = read_usage_records(&state, "operator");
+        assert_eq!(records.len(), 1);
+        let payload = &records[0].payload;
+        assert_eq!(payload["kind"], USAGE_PING_KIND_V1);
+        assert_eq!(payload["event_class"], "session");
+        assert_eq!(payload["count"], 7);
+
+        let body = hex::decode(payload["body_cbor_hex"].as_str().expect("cbor hex")).expect("hex");
+        assert!(corecrux_receipts::assert_usage_ping_kind_v1(&body));
+        // Metadata-only: no content-bearing keys ride the canonical body.
+        let body_text = String::from_utf8_lossy(&body);
+        for content_key in ["fact_id", "entity", "entries", "prompt_hash", "corpus"] {
+            assert!(
+                !body_text.contains(content_key),
+                "usage body must not carry {content_key}"
+            );
+        }
+
+        // The daemon signature verifies over the canonical body bytes.
+        let sig_hex = payload["sig"]["signature_hex"].as_str().expect("sig hex");
+        let sig_bytes: [u8; 64] = hex::decode(sig_hex).expect("hex").try_into().expect("64 bytes");
+        let pubkey: [u8; 32] = hex::decode(&state.passport_public_key_hex)
+            .expect("pubkey hex")
+            .try_into()
+            .expect("32 bytes");
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&pubkey).expect("vk");
+        vk.verify(&body, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
+            .expect("daemon signature verifies over canonical usage body bytes");
+    }
+
+    #[test]
+    fn usage_ping_unknown_event_class_is_rejected() {
+        let state = signing_state();
+        let draft = UsagePingDraft {
+            event_class: Some("telemetry".to_string()),
+            ..UsagePingDraft::default()
+        };
+        let err = mint_usage_receipt(&state, "operator", &draft).expect_err("must reject");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(read_usage_records(&state, "operator").is_empty());
+    }
+
+    #[tokio::test]
+    async fn usage_route_lifts_when_flag_on_and_rejects_when_off() {
+        use axum::extract::State;
+
+        let draft = serde_json::json!({
+            "kind": "usage_ping",
+            "event_class": "session",
+            "count": 1,
+        });
+
+        // Flag ON → draft is lifted into a signed local receipt (201).
+        let mut state = signing_state();
+        state.usage_receipts_enabled = true;
+        let resp = crate::http::observations::post_mediation_receipt(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(draft.clone()),
+        )
+        .await;
+        let status = resp.status();
+        if status != StatusCode::CREATED {
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+            panic!("unexpected status {status}: {}", String::from_utf8_lossy(&bytes));
+        }
+        assert_eq!(read_usage_records(&state, "operator").len(), 1);
+
+        // Flag OFF (default) → the usage dispatch is inert; the draft hits the
+        // legacy tool-mediation parse and is rejected. Nothing is recorded.
+        let mut state_off = signing_state();
+        state_off.usage_receipts_enabled = false;
+        let resp =
+            crate::http::observations::post_mediation_receipt(State(state_off.clone()), HeaderMap::new(), Json(draft))
+                .await;
+        let status = resp.status();
+        if status != StatusCode::UNPROCESSABLE_ENTITY {
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+            panic!("unexpected status {status}: {}", String::from_utf8_lossy(&bytes));
+        }
+        assert!(read_usage_records(&state_off, "operator").is_empty());
     }
 }

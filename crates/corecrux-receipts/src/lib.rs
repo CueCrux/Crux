@@ -25,6 +25,7 @@ mod memory_use_v1;
 mod store_v1;
 mod stream_v1;
 mod subject_index_v1;
+mod usage_receipt_v1;
 pub mod vault_pki_x509_signer;
 mod verify_v1;
 mod witness_v1;
@@ -114,6 +115,10 @@ pub use stream_v1::{
 pub use subject_index_v1::{
     resolve_subject_receipt_id_v1, subject_index_path_v1, update_subject_index_v1, ReceiptSubjectIndexV1,
     ReceiptSubjectLatestV1, SubjectResolveModeV1,
+};
+pub use usage_receipt_v1::{
+    assert_usage_ping_kind_v1, build_usage_ping_body_v1, sign_usage_ping_v1, UsageEventClassV1, UsagePingBodyInputV1,
+    USAGE_EVENT_CLASSES_V1, USAGE_PING_ALLOWED_KEYS_V1, USAGE_PING_BODY_SCHEMA_V1, USAGE_PING_KIND_V1,
 };
 pub use verify_v1::{verify_receipt_v1, ReceiptSigV1, VerificationReportV1, VerifyErrorCodeV1, VerifyReceiptInput};
 pub use witness_v1::{
