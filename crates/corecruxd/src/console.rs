@@ -20,6 +20,13 @@ const CONSOLE_HTML: &str = include_str!("../console/index.html");
 // `/console/activity`. The page itself is inert unless the daemon has
 // `CORECRUXD_FEATURE_ACTIVITY_LOG=1` (its API calls 404 otherwise).
 const ACTIVITY_HTML: &str = include_str!("../console/activity.html");
+// Receipts-vs-console side-by-side demo (roadmap Production-Cutover Phase T /
+// the F3 test). A self-contained page served at `/console/receipts-vs-console`:
+// the left column reuses the activity-log receipt timeline (with an
+// observation-feed fallback when `CORECRUXD_FEATURE_ACTIVITY_LOG` is off) and
+// the right column is a clearly-labelled static mock of a typical vendor
+// console. No external runtime deps, same posture as the console shell.
+const RECEIPTS_VS_CONSOLE_HTML: &str = include_str!("../console/receipts-vs-console.html");
 const CONSOLE_DEV_PATH_ENV: &str = "CORECRUXD_CONSOLE_DEV_PATH";
 
 // Bundled PNG assets — embedded so the binary can serve them with no on-disk
@@ -66,6 +73,22 @@ async fn serve_activity() -> impl IntoResponse {
         }
     }
     Html(ACTIVITY_HTML).into_response()
+}
+
+/// Receipts-vs-console side-by-side demo, served at
+/// `/console/receipts-vs-console`. Same dev-override story as the activity
+/// page so the page can be iterated without a rebuild.
+async fn serve_receipts_vs_console() -> impl IntoResponse {
+    if let Some(dev_path) = std::env::var(CONSOLE_DEV_PATH_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let file_path = resolve_dev_html_path(Path::new(dev_path.trim())).with_file_name("receipts-vs-console.html");
+        if let Ok(contents) = std::fs::read_to_string(&file_path) {
+            return Html(contents).into_response();
+        }
+    }
+    Html(RECEIPTS_VS_CONSOLE_HTML).into_response()
 }
 
 async fn redirect_to_console() -> impl IntoResponse {
@@ -153,6 +176,7 @@ pub fn routes(enabled: bool) -> Router {
         .route("/", get(redirect_to_console))
         .route("/console", get(serve_console))
         .route("/console/activity", get(serve_activity))
+        .route("/console/receipts-vs-console", get(serve_receipts_vs_console))
         .route("/console-assets/{name}", get(serve_console_asset))
         .route("/console-3d/{*path}", get(serve_console3d))
         // Device-grant approval page (ExecPlan crux-unified-login-rails, M3).
@@ -499,6 +523,72 @@ mod tests {
         assert!(
             super::CONSOLE_HTML.contains(r#"href="/console/activity""#),
             "console shell should link to the activity page"
+        );
+    }
+
+    #[test]
+    fn receipts_vs_console_demo_wires_both_columns_and_stays_dependency_free() {
+        // Left column reuses the receipt-timeline + verify wiring and the
+        // observation-feed fallback; right column is the labelled vendor mock.
+        for required in [
+            "/v1/activity?",                             // left: backfill the receipt timeline
+            "/v1/activity/turn/",                        // left: row-expand to verbatim
+            "/verify",                                   // left: Ed25519 verify cross-walk badge
+            "/v1/observations/aggregate",                // left: fallback when the flag is off
+            "/v1/events/stream?types=activity.appended", // left: live tail
+            "token_budget",
+            "CORECRUXD_FEATURE_ACTIVITY_LOG",  // caveat surfaced to the operator
+            "CueCrux — receipts as debugging", // left column heading
+            "Your vendor's free console",      // right column heading
+            "No signature to verify",          // honest contrast callouts
+            "No cross-agent handoff",
+            "No cost-per-agent attribution",
+            "Gone when you rotate the key",
+        ] {
+            assert!(
+                super::RECEIPTS_VS_CONSOLE_HTML.contains(required),
+                "receipts-vs-console page missing wiring: {required}"
+            );
+        }
+        // Same security posture as the console shell — no external runtime deps.
+        for blocked in [
+            r#"<script src="http"#,
+            r#"<link rel="stylesheet" href="http"#,
+            r#"<iframe src="http"#,
+            "unpkg.com",
+            "jsdelivr.net",
+            "cdnjs.cloudflare",
+            "cdn.jsdelivr",
+        ] {
+            assert!(
+                !super::RECEIPTS_VS_CONSOLE_HTML.contains(blocked),
+                "receipts-vs-console page has external runtime dependency: {blocked}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn receipts_vs_console_route_serves_the_demo_page() {
+        use tower::ServiceExt;
+
+        let resp = super::routes(true)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/console/receipts-vs-console")
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8(bytes.to_vec()).expect("utf8 body");
+        assert!(
+            body.contains("CueCrux — receipts as debugging") && body.contains("Your vendor's free console"),
+            "served page should contain both column headings"
         );
     }
 
