@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<!-- Copyright (c) 2026 CueCrux Ltd. All rights reserved. Licensed under the CueCrux Community Licence (CCL v1.0). -->
+<!-- Unified Shell Console v2 — M0 scaffold (ExecPlan unified-shell-console-2026-07-03).
+     One embedded, no-build SPA shell: 5 destinations (Overwatch · Work · Memory ·
+     Trust · Meters) + a System group, a token-registry theme system (Glass/Dark/
+     Light), plan-driven boot off same-origin GET /v1/version + /v1/console/summary.
+     Self-contained: no external requests of any kind (strict-CSP assumption),
+     vanilla JS, inline SVG icons. Served at /console when CORECRUXD_CONSOLE_V2 is
+     truthy; the legacy console is untouched when the flag is off. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crux Console — Unified Shell</title>
+<!-- Apply the persisted theme before first paint to avoid a flash. Mirrors the
+     THEMES registry below; unknown/absent value falls back to the default. -->
+<script>
+  (function () {
+    try {
+      var allowed = { glass: 1, dark: 1, light: 1 };
+      var t = localStorage.getItem('crux.console.theme');
+      document.documentElement.setAttribute('data-theme', allowed[t] ? t : 'glass');
+    } catch (e) {
+      document.documentElement.setAttribute('data-theme', 'glass');
+    }
+  })();
+</script>
+<style>
+  /* ---- Base reset -------------------------------------------------------- */
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  :root {
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --radius: 14px;
+    --radius-sm: 10px;
+  }
+
+  /* ---- Theme token registry --------------------------------------------- */
+  /* Adding a 4th theme = one JS THEMES entry + one CSS block here. Nothing
+     else in the shell references literal colours. */
+  :root[data-theme="glass"] {
+    --bg: #060A12;
+    --surface: rgba(255,255,255,.055);
+    --surface2: rgba(255,255,255,.03);
+    --edge: rgba(255,255,255,.10);
+    --edge-strong: rgba(255,255,255,.18);
+    --ink: #EAF0F7;
+    --ink2: #93A4B8;
+    --ink3: #5E6E80;
+    --acc: #6CA8FF;
+    --ok: #3DDC97;
+    --warn: #F5B94B;
+    --crit: #F0716C;
+    --trust: #A78BFA;
+    --blur: 18px;
+    --card-shadow: none;
+    --aurora-opacity: 1;
+  }
+  :root[data-theme="dark"] {
+    --bg: #0D1117;
+    --surface: #161B22;
+    --surface2: #11151C;
+    --edge: #2A313C;
+    --edge-strong: #3D4654;
+    --ink: #E6EDF3;
+    --ink2: #9BA7B4;
+    --ink3: #6E7B8A;
+    --acc: #58A6FF;
+    --ok: #2EA043;
+    --warn: #D29922;
+    --crit: #F85149;
+    --trust: #BC8CFF;
+    --blur: 0px;
+    --card-shadow: none;
+    --aurora-opacity: 0;
+  }
+  :root[data-theme="light"] {
+    --bg: #F4F6F8;
+    --surface: #FFFFFF;
+    --surface2: #EDF1F5;
+    --edge: #D7DEE5;
+    --edge-strong: #B9C4CF;
+    --ink: #1B2733;
+    --ink2: #4A5866;
+    --ink3: #68788A;
+    --acc: #2456A6;
+    --ok: #1A7F4E;
+    --warn: #9A5B00;
+    --crit: #B91C1C;
+    --trust: #6D28D9;
+    --blur: 0px;
+    --card-shadow: 0 1px 3px rgba(27,39,51,.08);
+    --aurora-opacity: 0;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink);
+    background: var(--bg);
+    min-height: 100vh;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  a { color: var(--acc); text-decoration: none; }
+  button { font: inherit; }
+
+  /* ---- Aurora background (glass theme only) ------------------------------ */
+  .aurora {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    opacity: var(--aurora-opacity);
+    transition: opacity .4s ease;
+    background:
+      radial-gradient(48rem 48rem at 12% -8%, rgba(108,168,255,.20), transparent 60%),
+      radial-gradient(42rem 42rem at 96% 4%, rgba(167,139,250,.16), transparent 58%),
+      radial-gradient(46rem 46rem at 78% 108%, rgba(61,220,151,.12), transparent 60%);
+  }
+  :root[data-theme="glass"] .aurora {
+    animation: auroraDrift 34s ease-in-out infinite alternate;
+  }
+  @keyframes auroraDrift {
+    from { transform: translate3d(0, 0, 0) scale(1); }
+    to   { transform: translate3d(-1.5%, 1.2%, 0) scale(1.06); }
+  }
+
+  /* ---- App shell layout -------------------------------------------------- */
+  .app { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
+
+  .rail {
+    position: sticky;
+    top: 0;
+    align-self: start;
+    height: 100vh;
+    min-width: 200px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 16px 12px;
+    border-right: 1px solid var(--edge);
+    background: var(--surface);
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+  }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 12px; }
+  .brand .mark {
+    width: 30px; height: 30px; flex: none; border-radius: 9px;
+    display: grid; place-items: center;
+    background: linear-gradient(140deg, var(--acc), var(--trust));
+    color: #fff;
+  }
+  .brand .mark svg { width: 18px; height: 18px; }
+  .brand .name { font-weight: 700; letter-spacing: -.01em; font-size: 15px; }
+  .brand .name small { display: block; font-weight: 500; font-size: 11px; color: var(--ink3); letter-spacing: .02em; }
+
+  nav { display: flex; flex-direction: column; gap: 3px; overflow-y: auto; }
+  .nav-group-label {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--ink3); font-weight: 600; padding: 14px 10px 6px;
+  }
+  .nav-item {
+    display: flex; align-items: center; gap: 11px;
+    min-height: 44px; padding: 0 12px;
+    border-radius: var(--radius-sm);
+    color: var(--ink2); background: none; border: 1px solid transparent;
+    width: 100%; text-align: left; cursor: pointer;
+    transition: background .18s ease, color .18s ease, border-color .18s ease;
+  }
+  .nav-item svg { width: 18px; height: 18px; flex: none; opacity: .9; }
+  .nav-item .label { flex: 1; font-weight: 500; }
+  .nav-item .kbd {
+    font-family: var(--font-mono); font-size: 11px; color: var(--ink3);
+    border: 1px solid var(--edge); border-radius: 6px; padding: 1px 6px;
+    min-width: 20px; text-align: center;
+  }
+  .nav-item:hover { background: var(--surface2); color: var(--ink); }
+  .nav-item[aria-current="page"] {
+    background: var(--surface2); color: var(--ink);
+    border-color: var(--edge-strong);
+  }
+  .nav-item[aria-current="page"] svg { opacity: 1; color: var(--acc); }
+
+  .rail-footer { margin-top: auto; padding-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .passport-chip {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface2);
+  }
+  .passport-chip .avatar {
+    width: 30px; height: 30px; flex: none; border-radius: 50%;
+    display: grid; place-items: center; color: #fff;
+    background: linear-gradient(140deg, var(--trust), var(--acc));
+  }
+  .passport-chip .avatar svg { width: 16px; height: 16px; }
+  .passport-chip .who { min-width: 0; line-height: 1.25; }
+  .passport-chip .who b { display: block; font-size: 12.5px; font-weight: 600; }
+  .passport-chip .who span {
+    display: block; font-size: 11px; color: var(--ink3);
+    font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
+  .theme-switch {
+    display: flex; gap: 4px; padding: 4px;
+    border: 1px solid var(--edge); border-radius: 12px; background: var(--surface2);
+  }
+  .theme-btn {
+    flex: 1; min-height: 44px; min-width: 40px;
+    display: grid; place-items: center;
+    background: none; border: 1px solid transparent; border-radius: 9px;
+    color: var(--ink2); cursor: pointer;
+    transition: background .18s ease, color .18s ease;
+  }
+  .theme-btn svg { width: 18px; height: 18px; }
+  .theme-btn:hover { color: var(--ink); background: var(--surface); }
+  .theme-btn[aria-pressed="true"] { background: var(--acc); color: #fff; }
+
+  /* ---- Main column ------------------------------------------------------- */
+  .main { min-width: 0; display: flex; flex-direction: column; }
+  .topbar {
+    display: flex; align-items: center; gap: 16px;
+    padding: 18px 28px; border-bottom: 1px solid var(--edge);
+    position: sticky; top: 0; z-index: 4;
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+  }
+  .topbar h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -.01em; }
+  .topbar .sub { margin: 2px 0 0; font-size: 12.5px; color: var(--ink2); }
+  .health {
+    margin-left: auto; display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 12px; min-height: 32px;
+    border: 1px solid var(--edge); border-radius: 999px;
+    font-size: 12px; color: var(--ink2); background: var(--surface2);
+  }
+  .health .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink3); flex: none; }
+  .health.ok .dot { background: var(--ok); }
+  .health.degraded .dot { background: var(--warn); }
+  .health.down .dot { background: var(--crit); }
+
+  .content { padding: 26px 28px 48px; }
+
+  /* ---- Stat tiles (Overwatch boot readout) ------------------------------ */
+  .stats {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+    gap: 12px; margin-bottom: 26px;
+  }
+  .stat {
+    padding: 14px 16px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+  }
+  .stat .k { font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--ink3); font-weight: 600; }
+  .stat .v {
+    margin-top: 6px; font-size: 22px; font-weight: 650; color: var(--ink);
+    font-variant-numeric: tabular-nums; word-break: break-word;
+  }
+  .stat .v small { font-size: 12px; font-weight: 500; color: var(--ink2); }
+
+  .degraded-card {
+    border: 1px solid var(--edge); border-left: 3px solid var(--warn);
+    border-radius: var(--radius); background: var(--surface); padding: 18px 20px; margin-bottom: 26px;
+  }
+  .degraded-card.down { border-left-color: var(--crit); }
+  .degraded-card h3 { margin: 0 0 6px; font-size: 14px; }
+  .degraded-card p { margin: 0; color: var(--ink2); font-size: 13px; }
+
+  /* ---- Destination card grid -------------------------------------------- */
+  .section-label {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--ink3); font-weight: 600; margin: 0 0 12px;
+  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(244px, 1fr)); gap: 14px; }
+  .card {
+    padding: 16px 18px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .card .card-top { display: flex; align-items: center; gap: 10px; }
+  .card .glyph {
+    width: 30px; height: 30px; flex: none; border-radius: 9px;
+    display: grid; place-items: center;
+    background: var(--surface2); border: 1px solid var(--edge); color: var(--acc);
+  }
+  .card .glyph svg { width: 16px; height: 16px; }
+  .card h3 { margin: 0; font-size: 14.5px; font-weight: 650; }
+  .card p { margin: 0; font-size: 12.5px; color: var(--ink2); }
+  .card .soon {
+    align-self: flex-start; margin-top: 2px;
+    font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase; font-weight: 600;
+    color: var(--trust); background: color-mix(in srgb, var(--trust) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--trust) 30%, transparent);
+    padding: 2px 8px; border-radius: 999px;
+  }
+
+  /* ---- Accessibility & motion ------------------------------------------- */
+  .skip {
+    position: absolute; left: -9999px; top: 0; z-index: 100;
+    padding: 10px 14px; background: var(--acc); color: #fff; border-radius: 0 0 8px 0; font-weight: 600;
+  }
+  .skip:focus { left: 0; }
+  *:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; border-radius: 6px; }
+  a:focus:not(:focus-visible), button:focus:not(:focus-visible) { outline: none; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    .aurora { animation: none !important; }
+  }
+
+  @media (max-width: 720px) {
+    .app { grid-template-columns: 1fr; }
+    .rail { position: static; height: auto; min-width: 0; flex-direction: column; }
+    .content, .topbar { padding-left: 16px; padding-right: 16px; }
+  }
+</style>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to console content</a>
+  <div class="aurora" aria-hidden="true"></div>
+
+  <div class="app">
+    <aside class="rail">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <span class="name">Crux Console<small>Unified shell · v2</small></span>
+      </div>
+      <nav id="nav" aria-label="Primary"></nav>
+      <div class="rail-footer">
+        <div class="passport-chip" id="passportChip" title="Passport identity — wired to the capability plan in M3">
+          <span class="avatar" aria-hidden="true"></span>
+          <span class="who">
+            <b id="passportName">Passport</b>
+            <span id="passportSub">not yet wired</span>
+          </span>
+        </div>
+        <div class="theme-switch" id="themeSwitch" role="group" aria-label="Colour theme"></div>
+      </div>
+    </aside>
+
+    <main class="main" id="main">
+      <div class="topbar">
+        <div>
+          <h1 id="destTitle">Overwatch</h1>
+          <p class="sub" id="destSub">Loading…</p>
+        </div>
+        <span class="health" id="health" role="status" aria-live="polite">
+          <span class="dot" aria-hidden="true"></span>
+          <span id="healthText">Connecting…</span>
+        </span>
+      </div>
+      <div class="content" id="content"></div>
+    </main>
+  </div>
+
+<script>
+"use strict";
+(function () {
+  // ---- Inline SVG icon set (no emoji, no external assets) ----------------
+  var ICONS = {
+    logo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 3v9l6 3"/></svg>',
+    overwatch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg>',
+    work: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1"/><rect x="10" y="4" width="5" height="10" rx="1"/><rect x="17" y="4" width="4" height="13" rx="1"/></svg>',
+    memory: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>',
+    trust: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg>',
+    meters: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19a8 8 0 0 1 16 0"/><path d="M12 19l4-5"/><circle cx="12" cy="19" r="1.4"/></svg>',
+    settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>',
+    integrations: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v6"/><path d="M8 9V5M16 9V5"/><rect x="6" y="9" width="12" height="6" rx="2"/><path d="M12 15v3a3 3 0 0 0 3 3"/></svg>',
+    developer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 9l-4 3 4 3"/><path d="M16 9l4 3-4 3"/><path d="M13 6l-2 12"/></svg>',
+    passport: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="9" r="3"/><path d="M6 20a6 6 0 0 1 12 0"/></svg>',
+    glass: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.2 4.8L19 9l-3.5 3.4.9 4.9L12 15l-4.4 2.3.9-4.9L5 9l4.8-1.2z"/></svg>',
+    dark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a7 7 0 1 0 10.5 10.5z"/></svg>',
+    light: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></svg>'
+  };
+
+  // ---- Theme registry ----------------------------------------------------
+  // Adding a theme = one entry here + one CSS block in <style>. `tokens`
+  // documents the palette the CSS block sets and drives no colour by itself.
+  var LS_THEME = 'crux.console.theme';
+  var DEFAULT_THEME = 'glass';
+  var THEMES = [
+    { id: 'glass', label: 'Glass', icon: 'glass', tokens: {
+      bg: '#060A12', surface: 'rgba(255,255,255,.055)', surface2: 'rgba(255,255,255,.03)',
+      edge: 'rgba(255,255,255,.10)', edgeStrong: 'rgba(255,255,255,.18)',
+      ink: '#EAF0F7', ink2: '#93A4B8', ink3: '#5E6E80',
+      acc: '#6CA8FF', ok: '#3DDC97', warn: '#F5B94B', crit: '#F0716C', trust: '#A78BFA', blur: '18px' } },
+    { id: 'dark', label: 'Dark', icon: 'dark', tokens: {
+      bg: '#0D1117', surface: '#161B22', surface2: '#11151C',
+      edge: '#2A313C', edgeStrong: '#3D4654',
+      ink: '#E6EDF3', ink2: '#9BA7B4', ink3: '#6E7B8A',
+      acc: '#58A6FF', ok: '#2EA043', warn: '#D29922', crit: '#F85149', trust: '#BC8CFF', blur: '0px' } },
+    { id: 'light', label: 'Light', icon: 'light', tokens: {
+      bg: '#F4F6F8', surface: '#FFFFFF', surface2: '#EDF1F5',
+      edge: '#D7DEE5', edgeStrong: '#B9C4CF',
+      ink: '#1B2733', ink2: '#4A5866', ink3: '#68788A',
+      acc: '#2456A6', ok: '#1A7F4E', warn: '#9A5B00', crit: '#B91C1C', trust: '#6D28D9', blur: '0px' } }
+  ];
+  function themeById(id) {
+    for (var i = 0; i < THEMES.length; i++) { if (THEMES[i].id === id) return THEMES[i]; }
+    return null;
+  }
+  function readTheme() {
+    try { var t = localStorage.getItem(LS_THEME); return themeById(t) ? t : DEFAULT_THEME; }
+    catch (e) { return DEFAULT_THEME; }
+  }
+  function applyTheme(id) {
+    if (!themeById(id)) id = DEFAULT_THEME;
+    document.documentElement.setAttribute('data-theme', id);
+    try { localStorage.setItem(LS_THEME, id); } catch (e) { /* private mode: in-memory only */ }
+    var btns = document.querySelectorAll('#themeSwitch .theme-btn');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].setAttribute('aria-pressed', btns[i].getAttribute('data-theme') === id ? 'true' : 'false');
+    }
+  }
+
+  // ---- Posture (customer-safe foundation) --------------------------------
+  // Default 'customer' until wired to the capability plan in M3. Any element
+  // tagged data-requires="operator" is hidden unless POSTURE === 'operator'.
+  var POSTURE = 'customer';
+  function applyPosture(root) {
+    var scope = root || document;
+    var gated = scope.querySelectorAll('[data-requires="operator"]');
+    for (var i = 0; i < gated.length; i++) {
+      gated[i].hidden = (POSTURE !== 'operator');
+    }
+  }
+
+  // ---- Navigation model (data-driven) ------------------------------------
+  // Each destination lists the legacy CX pages that land there in M1+; those
+  // render as "arrives in M1+" placeholder cards until wired.
+  var NAV = [
+    { group: null, items: [
+      { id: 'overwatch', label: 'Overwatch', icon: 'overwatch', key: '1',
+        sub: 'Needs-you queue, fleet, and live activity.',
+        cards: [
+          ['Overview', 'Daemon posture, readiness, and capacity at a glance.'],
+          ['Activity', 'Live rolling activity feed across both lanes.'],
+          ['Live board', 'Coordination plane: who is live and where they collide.'],
+          ['Sessions (live)', 'Currently-bound sessions with intent + lease.'],
+          ['Orchestrators', 'Orchestrator fan-out and child-session tree.'],
+          ['Punchcards', 'Advisory path leases held across sessions.'],
+          ['Gates (actionable)', 'Work gates awaiting a passport-attributed approval.']
+        ] },
+      { id: 'work', label: 'Work', icon: 'work', key: '2',
+        sub: 'ExecPlans, projects, and per-run usage.',
+        cards: [
+          ['ExecPlans', 'Read-time projection over .agent/execplans/*.md.'],
+          ['Projects', 'Kanban work items grouped by project.'],
+          ['Sessions (archive)', 'Saved session snapshots for resume + audit.'],
+          ['Usage (per-run)', 'Per-run token and cost attribution.']
+        ] },
+      { id: 'memory', label: 'Memory', icon: 'memory', key: '3',
+        sub: 'Facts, tenants, documents, and retrieval tuning.',
+        cards: [
+          ['Facts', 'Stored facts with entity/key/freshness metadata.'],
+          ['Memory', 'Cross-session memory index and recall.'],
+          ['Tenants', 'Per-tenant isolation and configuration.'],
+          ['Documents', 'Ingested corpora and segment status.'],
+          ['Review', 'Queued items awaiting curation.'],
+          ['Lane weights (advanced)', 'Retrieval signal fusion weights per tenant.']
+        ] },
+      { id: 'trust', label: 'Trust', icon: 'trust', key: '4',
+        sub: 'Receipts, gates, identity, and posture.',
+        cards: [
+          ['Receipts', 'CROWN receipt timeline; verify offline with the key.'],
+          ['Gates', 'Human-oversight gates and their approval trail.'],
+          ['Passport', 'This daemon’s RCX passport identity.'],
+          ['Identity', 'Agents, tokens, and device-grant approvals.'],
+          ['Mediation', 'Engine reads proxied through the daemon origin.'],
+          ['Posture (new)', 'Regulated-customer posture: attribution front-and-centre.']
+        ] },
+      { id: 'meters', label: 'Meters', icon: 'meters', key: '5',
+        sub: 'Cost, usage, storage, and benchmarks.',
+        cards: [
+          ['Token burn', 'Per-ExecPlan and per-agent token attribution.'],
+          ['Usage', 'Aggregate call volume and spend.'],
+          ['Storage & node', 'Segment storage, capacity, and node health.'],
+          ['Benchmarks (new)', 'Corpus-identified benchmark runs and lifts.']
+        ] }
+    ] },
+    { group: 'System', items: [
+      { id: 'settings', label: 'Settings', icon: 'settings',
+        sub: 'Daemon configuration and preferences.',
+        cards: [
+          ['Settings', 'Auth mode, feature flags, and console preferences.']
+        ] },
+      { id: 'integrations', label: 'Integrations', icon: 'integrations',
+        sub: 'Installed packs and extensions.',
+        cards: [
+          ['Integrations', 'Installed integration packs and their grants.'],
+          ['Extensions', 'Optional capability extensions.']
+        ] },
+      { id: 'developer', label: 'Developer', icon: 'developer', requires: 'operator',
+        sub: 'Raw protocol access (operator only).',
+        cards: [
+          ['Raw JSON-RPC', 'Direct MCP / JSON-RPC console for debugging.']
+        ] }
+    ] }
+  ];
+  var DEST_INDEX = {};
+  (function indexNav() {
+    for (var g = 0; g < NAV.length; g++) {
+      for (var i = 0; i < NAV[g].items.length; i++) { DEST_INDEX[NAV[g].items[i].id] = NAV[g].items[i]; }
+    }
+  })();
+  var KEY_TO_DEST = {};
+  (function indexKeys() {
+    for (var id in DEST_INDEX) {
+      if (DEST_INDEX[id].key) { KEY_TO_DEST[DEST_INDEX[id].key] = id; }
+    }
+  })();
+
+  // ---- Boot state --------------------------------------------------------
+  var BOOT = { version: null, summary: null, health: 'loading', reason: '' };
+
+  // ---- Small DOM + format helpers ---------------------------------------
+  function el(tag, attrs, children) {
+    var node = document.createElement(tag);
+    if (attrs) {
+      for (var k in attrs) {
+        if (k === 'html') { node.innerHTML = attrs[k]; }
+        else if (k === 'text') { node.textContent = attrs[k]; }
+        else if (attrs[k] != null) { node.setAttribute(k, attrs[k]); }
+      }
+    }
+    if (children) {
+      for (var i = 0; i < children.length; i++) {
+        var c = children[i];
+        if (c == null) continue;
+        node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+      }
+    }
+    return node;
+  }
+  function get(obj, path) {
+    var cur = obj;
+    for (var i = 0; i < path.length; i++) {
+      if (cur == null) return undefined;
+      cur = cur[path[i]];
+    }
+    return cur;
+  }
+  function fmtNum(n) {
+    if (typeof n !== 'number' || !isFinite(n)) return '—';
+    try { return n.toLocaleString('en-US'); } catch (e) { return String(n); }
+  }
+  function fmtPct(ratio) {
+    if (typeof ratio !== 'number' || !isFinite(ratio)) return '—';
+    return (ratio * 100).toFixed(ratio < 0.1 ? 1 : 0) + '%';
+  }
+  function fmtBytes(b) {
+    if (typeof b !== 'number' || !isFinite(b) || b < 0) return '—';
+    var u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'], i = 0, v = b;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return (v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)) + ' ' + u[i];
+  }
+  function str(v) { return (v == null || v === '') ? '—' : String(v); }
+
+  // ---- Network: never throws, never spams the console --------------------
+  function fetchJSON(url) {
+    return fetch(url, { credentials: 'same-origin', headers: { accept: 'application/json' } })
+      .then(function (r) {
+        return r.json().then(
+          function (data) { return { ok: r.ok, status: r.status, data: data }; },
+          function () { return { ok: r.ok, status: r.status, data: null }; }
+        );
+      })
+      .catch(function () { return { ok: false, status: 0, data: null }; });
+  }
+
+  // ---- Renderers ---------------------------------------------------------
+  function buildRail() {
+    var nav = document.getElementById('nav');
+    nav.textContent = '';
+    for (var g = 0; g < NAV.length; g++) {
+      var grp = NAV[g];
+      if (grp.group) {
+        nav.appendChild(el('div', { 'class': 'nav-group-label', text: grp.group }));
+      }
+      for (var i = 0; i < grp.items.length; i++) {
+        var item = grp.items[i];
+        var btn = el('button', {
+          'class': 'nav-item', type: 'button', 'data-dest': item.id,
+          'aria-current': 'false'
+        });
+        if (item.requires) { btn.setAttribute('data-requires', item.requires); }
+        btn.innerHTML = ICONS[item.icon] || '';   // inline SVG glyph
+        btn.appendChild(el('span', { 'class': 'label', text: item.label }));
+        if (item.key) { btn.appendChild(el('span', { 'class': 'kbd', text: item.key })); }
+        (function (id) {
+          btn.addEventListener('click', function () { location.hash = '#/' + id; });
+        })(item.id);
+        nav.appendChild(btn);
+      }
+    }
+    applyPosture(nav);
+  }
+
+  function buildThemeSwitch() {
+    var wrap = document.getElementById('themeSwitch');
+    wrap.textContent = '';
+    for (var i = 0; i < THEMES.length; i++) {
+      var t = THEMES[i];
+      var b = el('button', {
+        'class': 'theme-btn', type: 'button', 'data-theme': t.id,
+        'aria-pressed': 'false', 'aria-label': t.label + ' theme', title: t.label + ' theme',
+        html: ICONS[t.icon] || ''
+      });
+      (function (id) {
+        b.addEventListener('click', function () { applyTheme(id); });
+      })(t.id);
+      wrap.appendChild(b);
+    }
+  }
+
+  function setHealth(kind, text) {
+    var box = document.getElementById('health');
+    box.className = 'health ' + kind;
+    document.getElementById('healthText').textContent = text;
+  }
+
+  function statTile(k, v, sub) {
+    var vNode = el('div', { 'class': 'v', text: v });
+    if (sub) { vNode.appendChild(document.createTextNode(' ')); vNode.appendChild(el('small', { text: sub })); }
+    return el('div', { 'class': 'stat' }, [el('div', { 'class': 'k', text: k }), vNode]);
+  }
+
+  function renderOverwatchStats(container) {
+    var s = BOOT.summary;
+    if (!s) {
+      var down = BOOT.health === 'down';
+      container.appendChild(el('div', { 'class': 'degraded-card' + (down ? ' down' : '') }, [
+        el('h3', { text: down ? 'Cannot reach the daemon' : 'Daemon reachable, summary unavailable' }),
+        el('p', { text: down
+          ? 'The console could not reach the daemon at this origin. Check that corecruxd is running on port 14800 and reload.'
+          : 'The daemon answered but /v1/console/summary did not return data (it may require console-read auth). Live counts are hidden; navigation still works.' })
+      ]));
+      return;
+    }
+    var version = get(BOOT.version, ['version']) || get(s, ['daemon', 'build', 'version']);
+    var stats = el('div', { 'class': 'stats' });
+    stats.appendChild(statTile('Node', str(get(s, ['daemon', 'node_id']))));
+    stats.appendChild(statTile('Build', str(version)));
+    stats.appendChild(statTile('Facts', fmtNum(get(s, ['stores', 'facts']))));
+    stats.appendChild(statTile('Sessions', fmtNum(get(s, ['stores', 'sessions']))));
+    stats.appendChild(statTile('Shards', fmtNum(get(s, ['routing', 'shard_count'])),
+      'map v' + str(get(s, ['routing', 'shard_map_version']))));
+    stats.appendChild(statTile('Storage free', fmtPct(get(s, ['capacity', 'free_ratio'])),
+      'of ' + fmtBytes(get(s, ['capacity', 'total_bytes']))));
+    stats.appendChild(statTile('MCP agents', fmtNum(get(s, ['daemon', 'mcp_agent_count'])),
+      get(s, ['daemon', 'mcp_enabled']) ? 'enabled' : 'off'));
+    stats.appendChild(statTile('Integrations', fmtNum(get(s, ['integrations', 'builtin_pack_count'])),
+      get(s, ['integrations', 'enabled']) ? 'enabled' : 'off'));
+    stats.appendChild(statTile('Auth mode', str(get(s, ['daemon', 'auth_mode']))));
+    stats.appendChild(statTile('Dataplane', get(s, ['daemon', 'dataplane_enabled']) ? 'on' : 'off'));
+    container.appendChild(stats);
+  }
+
+  function renderCards(container, item) {
+    var grid = el('div', { 'class': 'grid' });
+    for (var i = 0; i < item.cards.length; i++) {
+      var c = item.cards[i];
+      grid.appendChild(el('div', { 'class': 'card' }, [
+        el('div', { 'class': 'card-top' }, [
+          el('span', { 'class': 'glyph', html: ICONS[item.icon] || '' }),
+          el('h3', { text: c[0] })
+        ]),
+        el('p', { text: c[1] }),
+        el('span', { 'class': 'soon', text: 'arrives in M1+' })
+      ]));
+    }
+    container.appendChild(el('p', { 'class': 'section-label', text: 'Lands here in M1+' }));
+    container.appendChild(grid);
+  }
+
+  function renderDestination(id) {
+    var item = DEST_INDEX[id];
+    if (!item || (item.requires && item.requires === 'operator' && POSTURE !== 'operator')) {
+      id = 'overwatch';
+      item = DEST_INDEX[id];
+    }
+    // Nav active state.
+    var btns = document.querySelectorAll('#nav .nav-item');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].setAttribute('aria-current', btns[i].getAttribute('data-dest') === id ? 'page' : 'false');
+    }
+    document.getElementById('destTitle').textContent = item.label;
+    document.getElementById('destSub').textContent = item.sub || '';
+
+    var content = document.getElementById('content');
+    content.textContent = '';
+    if (id === 'overwatch') { renderOverwatchStats(content); }
+    renderCards(content, item);
+    if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+  }
+
+  function currentDest() {
+    var h = (location.hash || '').replace(/^#\/?/, '');
+    return DEST_INDEX[h] ? h : 'overwatch';
+  }
+
+  function route() { renderDestination(currentDest()); }
+
+  // ---- Keyboard shortcuts 1..5 ------------------------------------------
+  function onKey(ev) {
+    if (ev.defaultPrevented || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    var tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toLowerCase() : '';
+    if (tag === 'input' || tag === 'textarea' || tag === 'select' || (ev.target && ev.target.isContentEditable)) return;
+    var dest = KEY_TO_DEST[ev.key];
+    if (dest) { location.hash = '#/' + dest; ev.preventDefault(); }
+  }
+
+  // ---- Boot --------------------------------------------------------------
+  function boot() {
+    return Promise.all([fetchJSON('/v1/version'), fetchJSON('/v1/console/summary')])
+      .then(function (res) {
+        var ver = res[0], sum = res[1];
+        if (ver && ver.data) { BOOT.version = ver.data; }
+        if (sum && sum.ok && sum.data) { BOOT.summary = sum.data; }
+        var reachable = (ver && ver.status !== 0) || (sum && sum.status !== 0);
+        if (!reachable) {
+          BOOT.health = 'down';
+          setHealth('down', 'Daemon unreachable');
+        } else if (BOOT.summary) {
+          BOOT.health = 'ok';
+          var node = get(BOOT.summary, ['daemon', 'node_id']);
+          setHealth('ok', node ? ('Connected · ' + node) : 'Connected');
+          var pv = get(BOOT.version, ['version']) || get(BOOT.summary, ['daemon', 'build', 'version']);
+          if (pv) { document.getElementById('passportSub').textContent = 'node build ' + pv; }
+        } else {
+          BOOT.health = 'degraded';
+          setHealth('degraded', 'Summary unavailable');
+        }
+        route();
+      });
+  }
+
+  // ---- Init --------------------------------------------------------------
+  function init() {
+    document.querySelector('.brand .mark').innerHTML = ICONS.logo;
+    document.querySelector('.passport-chip .avatar').innerHTML = ICONS.passport;
+    buildRail();
+    buildThemeSwitch();
+    applyTheme(readTheme());
+    window.addEventListener('hashchange', route);
+    document.addEventListener('keydown', onKey);
+    route();   // paint the shell immediately; boot() fills in live data
+    boot();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+</script>
+</body>
+</html>

@@ -27,6 +27,14 @@ const ACTIVITY_HTML: &str = include_str!("../console/activity.html");
 // the right column is a clearly-labelled static mock of a typical vendor
 // console. No external runtime deps, same posture as the console shell.
 const RECEIPTS_VS_CONSOLE_HTML: &str = include_str!("../console/receipts-vs-console.html");
+// Unified Shell Console v2 (ExecPlan unified-shell-console-2026-07-03, M0). A
+// self-contained, no-build shell embedded alongside the legacy console and
+// selected at `/console` when `CORECRUXD_CONSOLE_V2` is truthy. With the flag
+// off/unset/garbage the `/console` body stays byte-identical to today's console
+// (see `resolve_console_body`). Same embedded, no-on-disk-dependency posture as
+// the sibling `activity.html` / `console-3d/*` assets.
+const CONSOLE_V2_HTML: &str = include_str!("../console/v2/shell.html");
+const CONSOLE_V2_ENV: &str = "CORECRUXD_CONSOLE_V2";
 const CONSOLE_DEV_PATH_ENV: &str = "CORECRUXD_CONSOLE_DEV_PATH";
 
 // Bundled PNG assets — embedded so the binary can serve them with no on-disk
@@ -56,7 +64,7 @@ fn embedded_asset(name: &str) -> Option<&'static [u8]> {
 }
 
 async fn serve_console() -> impl IntoResponse {
-    Html(resolve_console_html().into_owned())
+    Html(resolve_console_body().into_owned())
 }
 
 /// Activity log human-lane page (M3), served at `/console/activity`. A dev
@@ -370,6 +378,55 @@ loadTenants();
 </body>
 </html>"#;
 
+/// The `/console` body: v2 shell when `CORECRUXD_CONSOLE_V2` is truthy, else the
+/// legacy console. Flag off/unset/garbage ⇒ byte-identical to today (M0 gate).
+fn resolve_console_body() -> Cow<'static, str> {
+    if console_v2_enabled() {
+        match console_v2_dev_override() {
+            Some(html) => Cow::Owned(html),
+            None => Cow::Borrowed(CONSOLE_V2_HTML),
+        }
+    } else {
+        resolve_console_html()
+    }
+}
+
+/// `CORECRUXD_CONSOLE_V2` flag: trimmed, case-insensitive; truthy = 1/true/on.
+/// Anything else (including unset, empty, or garbage) is off.
+fn console_v2_enabled() -> bool {
+    std::env::var(CONSOLE_V2_ENV).is_ok_and(|raw| {
+        let value = raw.trim().to_ascii_lowercase();
+        matches!(value.as_str(), "1" | "true" | "on")
+    })
+}
+
+/// Dev override for the v2 shell: reads `v2/shell.html` relative to the
+/// `CORECRUXD_CONSOLE_DEV_PATH` dir (same resolve-then-rewrite pattern as the
+/// sibling `activity.html` override) so the shell can be iterated without a
+/// rebuild. Unreadable/unset ⇒ fall back to the embedded `CONSOLE_V2_HTML`.
+fn console_v2_dev_override() -> Option<String> {
+    let raw = std::env::var(CONSOLE_DEV_PATH_ENV).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let html_path = resolve_dev_html_path(Path::new(trimmed))
+        .with_file_name("v2")
+        .join("shell.html");
+    match std::fs::read_to_string(&html_path) {
+        Ok(contents) => Some(contents),
+        Err(err) => {
+            tracing::warn!(
+                target: "corecruxd::console",
+                path = %html_path.display(),
+                error = %err,
+                "console v2 dev override unreadable; falling back to embedded HTML"
+            );
+            None
+        }
+    }
+}
+
 fn resolve_console_html() -> Cow<'static, str> {
     match dev_html_override() {
         Some(html) => Cow::Owned(html),
@@ -408,11 +465,19 @@ fn resolve_dev_html_path(base: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{dev_html_override, resolve_console_html, CONSOLE_DEV_PATH_ENV, CONSOLE_HTML};
+    use super::{
+        dev_html_override, resolve_console_body, resolve_console_html, CONSOLE_DEV_PATH_ENV, CONSOLE_HTML,
+        CONSOLE_V2_ENV, CONSOLE_V2_HTML,
+    };
     use std::sync::Mutex;
 
-    // The dev-path env var is process-global; serialise tests that mutate it.
+    // The dev-path / v2 flag env vars are process-global; serialise tests that
+    // mutate either of them. Recover a poisoned lock so one failing env test
+    // does not cascade into the others.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
 
     #[test]
     fn console_asset_budget_stays_lightweight() {
@@ -594,7 +659,7 @@ mod tests {
 
     #[test]
     fn dev_override_unset_returns_embedded_html() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         std::env::remove_var(CONSOLE_DEV_PATH_ENV);
         let html = resolve_console_html();
         assert_eq!(&*html, CONSOLE_HTML);
@@ -602,7 +667,7 @@ mod tests {
 
     #[test]
     fn dev_override_reads_file_when_path_set() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
@@ -621,10 +686,85 @@ mod tests {
 
     #[test]
     fn dev_override_falls_back_when_path_unreadable() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         std::env::set_var(CONSOLE_DEV_PATH_ENV, "/this/path/does/not/exist/index.html");
         let result = dev_html_override();
         std::env::remove_var(CONSOLE_DEV_PATH_ENV);
         assert!(result.is_none(), "missing dev path should fall back to embedded HTML");
+    }
+
+    // ---- Unified Shell Console v2 flag (M0) --------------------------------
+
+    #[test]
+    fn console_v2_flag_unset_serves_legacy_body_byte_identical() {
+        let _guard = env_lock();
+        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
+        std::env::remove_var(CONSOLE_V2_ENV);
+        let body = resolve_console_body();
+        // M0 gate: flag off ⇒ /console body is exactly today's console.
+        assert_eq!(&*body, CONSOLE_HTML);
+    }
+
+    #[test]
+    fn console_v2_flag_truthy_serves_v2_shell() {
+        let _guard = env_lock();
+        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
+        for truthy in ["1", "TRUE", "on", " True ", "ON"] {
+            std::env::set_var(CONSOLE_V2_ENV, truthy);
+            let body = resolve_console_body();
+            assert_eq!(&*body, CONSOLE_V2_HTML, "flag {truthy:?} should serve the v2 shell");
+        }
+        std::env::remove_var(CONSOLE_V2_ENV);
+    }
+
+    #[test]
+    fn console_v2_flag_falsey_or_garbage_serves_legacy_body() {
+        let _guard = env_lock();
+        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
+        for falsey in ["0", "junk", "", "   ", "off", "false", "2", "yes"] {
+            std::env::set_var(CONSOLE_V2_ENV, falsey);
+            let body = resolve_console_body();
+            assert_eq!(&*body, CONSOLE_HTML, "flag {falsey:?} should serve the legacy console");
+        }
+        std::env::remove_var(CONSOLE_V2_ENV);
+    }
+
+    #[test]
+    fn console_v2_shell_has_licence_header_and_no_external_runtime_deps() {
+        // CCL licence header carried in the leading HTML comment.
+        assert!(
+            CONSOLE_V2_HTML.contains("CueCrux Community Licence (CCL v1.0)"),
+            "v2 shell must carry the CCL licence header"
+        );
+        // Same no-external-runtime-deps posture as the console shell.
+        for blocked in [
+            r#"<script src="http"#,
+            r#"<link rel="stylesheet" href="http"#,
+            r#"<iframe src="http"#,
+            "unpkg.com",
+            "jsdelivr.net",
+            "cdnjs.cloudflare",
+            "cdn.jsdelivr",
+            "fonts.googleapis",
+        ] {
+            assert!(
+                !CONSOLE_V2_HTML.contains(blocked),
+                "v2 shell has external runtime dependency: {blocked}"
+            );
+        }
+        // Same-origin plan-driven boot + a11y guardrails are present.
+        for required in [
+            "/v1/console/summary",
+            "/v1/version",
+            "crux.console.theme",
+            "data-requires=\"operator\"",
+            "prefers-reduced-motion",
+            "focus-visible",
+        ] {
+            assert!(
+                CONSOLE_V2_HTML.contains(required),
+                "v2 shell missing expected marker: {required}"
+            );
+        }
     }
 }
