@@ -435,7 +435,8 @@
       case 'btn': {
         if (control.href) {
           // Deep-machinery fallback links (Pro console / 3D substrate) — quiet family.
-          node = el('a', { 'class': 'btn-quiet', href: control.href, title: control.hint || '' }, [control.label || 'Open']);
+          // A graphLaunch link (M9 "View graph") takes the small .cx-graphlink size.
+          node = el('a', { 'class': 'btn-quiet' + (control.graphLaunch ? ' cx-graphlink' : ''), href: control.href, title: control.hint || '' }, [control.label || 'Open']);
           break;
         }
         // Every page-level button is the quiet family; `danger` is a colour cue.
@@ -662,6 +663,9 @@
       if (overlaps.length) { lz.appendChild(el('span', { 'class': 'ow-lease ov', text: '⚠ ' + overlaps.length + ' overlap' + (overlaps.length === 1 ? '' : 's') })); }
       meta.appendChild(lz);
     }
+    // Cross-feature launch point (M9): open this session's neighbourhood in the
+    // Canvas relation graph. Read-only link — visible in both postures.
+    meta.appendChild(el('a', { 'class': 'btn-quiet cx-graphlink', href: '#/canvas/graph?focus=session:' + (row.sessionHex || row.passport || ''), title: 'Open in the Canvas relation graph' }, ['View graph']));
     frow.appendChild(meta);
     var side = el('div', { 'class': 'ow-fleet-side' });
     if ((row.orchestrators || []).length) { side.appendChild(el('div', { text: row.orchestrators.join(', ') })); }
@@ -1211,9 +1215,426 @@
     });
   }
 
+  // =======================================================================
+  //  Canvas (M9) — a size-adaptive dashboard Board + a real-edge relation
+  //  Graph. Both reuse the EXISTING builders/panels as self-contained cells so
+  //  the readout never drifts. Every fetch stays inside a function (never at
+  //  module load), so this module still `require()`s cleanly under node.
+  // =======================================================================
+
+  // ---- canvasTier — PURE viewport→tier mapping (smoke check 25) ----------
+  // xs (<720w: single column, 4 widgets) · s (<1600w: ~6) · m (<2560w: ~10) ·
+  // l (<3840w: ~14) · xl (≥3840w — the 4K+ tier: the full board, 16+ widgets).
+  // Width-driven so the truth table is stable; a very short height steps DOWN
+  // one tier (only when a finite height is supplied — the smoke calls it width-
+  // only, so the canonical 500/1200/2000/3000/4000 → xs/s/m/l/xl table holds).
+  var CANVAS_TIER_ORDER = ['xs', 's', 'm', 'l', 'xl'];
+  function canvasTier(width, height) {
+    var w = Number(width) || 0;
+    var tier;
+    if (w < 720) { tier = 'xs'; }
+    else if (w < 1600) { tier = 's'; }
+    else if (w < 2560) { tier = 'm'; }
+    else if (w < 3840) { tier = 'l'; }
+    else { tier = 'xl'; }
+    var h = Number(height);
+    if (isFinite(h) && h > 0 && h < 560) {
+      var idx = CANVAS_TIER_ORDER.indexOf(tier);
+      if (idx > 0) { tier = CANVAS_TIER_ORDER[idx - 1]; }
+    }
+    return tier;
+  }
+
+  // ---- parseFocus — PURE deep-link focus parser (smoke check 26) ---------
+  // "<type>:<id>" → { type, id }; splits on the FIRST colon so composite ids
+  // (e.g. work:execplan:unified-shell-console) survive. Malformed → null.
+  function parseFocus(str) {
+    if (typeof str !== 'string') { return null; }
+    var s = str.trim();
+    var i = s.indexOf(':');
+    if (i <= 0 || i >= s.length - 1) { return null; }
+    var type = s.slice(0, i), id = s.slice(i + 1);
+    if (!type || !id) { return null; }
+    return { type: type, id: id };
+  }
+
+  // ---- Board cell builders (reuse existing surfaces) ---------------------
+  function canvasCellHead(cell, title) { cell.appendChild(el('h3', { 'class': 'v2card-h', text: title })); }
+
+  // Reuse a whole ported page's real build() as a cell — real data wins,
+  // demo fixtures fill only flag-off feeds (via the page builder's own logic).
+  // Wrapped so one failed feed degrades ONE cell, never the board.
+  function canvasPageCell(cell, pageId) {
+    var CP = (typeof window !== 'undefined') ? window.CruxPages : null;
+    var page = CP && CP.PAGES && CP.PAGES[pageId];
+    var body = el('div', { 'class': 'canvas-cell-body' });
+    cell.appendChild(body);
+    function paint(sections) { body.textContent = ''; (sections || []).forEach(function (s) { try { body.appendChild(renderSection(s)); } catch (e) { /* skip one bad section */ } }); }
+    if (!page) { canvasCellHead(cell, pageId); body.appendChild(el('p', { 'class': 'ctl-desc', text: 'page unavailable' })); return Promise.resolve(); }
+    if (page.sections && page.sections.length) { paint(page.sections); }
+    if (!page.load || typeof page.load.build !== 'function') { return Promise.resolve(); }
+    return fetchJSON(page.load.endpoint).then(function (res) {
+      var sections;
+      try { sections = page.load.build(res); }
+      catch (e) { sections = [{ h: page.title, controls: [{ t: 'info', label: 'render error', v: String(e && e.message || e) }] }]; }
+      paint(sections);
+    }).catch(function () { /* degraded state already painted */ });
+  }
+
+  // Reuse an Overwatch landing panel (needs-you / fleet / activity / engine).
+  function canvasPanelCell(cell, title, filler, ct) {
+    var wrap = panel(title, ct || 'loading…', true);
+    cell.appendChild(wrap);
+    try { filler(wrap); } catch (e) { /* one failed feed degrades one cell */ }
+  }
+
+  // A D/W/M chart cell (real series where one exists, else demo/empty — same
+  // posture as the cost/usage trend cards).
+  function canvasChartCell(cell, title, demoKey) {
+    cell.appendChild(renderChart({ t: 'chart', title: title, demoKey: demoKey, fmt: 'compact', range: 'week', sub: 'measured over time' }));
+  }
+
+  // The Pro dashboard strip as a cell (daemon · execplans · usage · MCP gateway).
+  function canvasDashCell(cell, ctx) {
+    canvasCellHead(cell, 'Fleet dashboard');
+    var strip = el('div', { 'class': 'ow-dashstrip' });
+    cell.appendChild(strip);
+    try { renderDashStrip(strip, ctx || {}); } catch (e) { /* degrade one cell */ }
+  }
+
+  // ---- Widget registry (smoke check 25) ----------------------------------
+  // { id, span, minTier, build }. minTier gates a widget IN at that tier and up.
+  // Cumulative counts: xs 4 · s 6 · m 10 · l 14 · xl 18 (the 4K+ board).
+  var CANVAS_WIDGETS = [
+    { id: 'stat-tiles', span: 2, minTier: 'xs', title: 'Daemon at a glance', build: function (cell) { return canvasPageCell(cell, 'cx-overview'); } },
+    { id: 'needs-you', span: 2, minTier: 'xs', title: 'Needs you', build: function (cell) { return canvasPanelCell(cell, 'Needs you', fillNeedsYou, 'loading gate queue…'); } },
+    { id: 'fleet', span: 1, minTier: 'xs', title: 'Fleet', build: function (cell) { return canvasPanelCell(cell, 'Fleet', fillFleet, 'loading fleet…'); } },
+    { id: 'activity', span: 1, minTier: 'xs', title: 'Activity', build: function (cell) { return canvasPanelCell(cell, 'Activity', fillActivity, 'loading…'); } },
+    { id: 'cost-chart', span: 2, minTier: 's', title: 'Token burn', build: function (cell) { return canvasChartCell(cell, 'Token burn', 'costSeries'); } },
+    { id: 'work', span: 2, minTier: 's', title: 'ExecPlans', build: function (cell) { return canvasPageCell(cell, 'cx-work'); } },
+    { id: 'usage-chart', span: 2, minTier: 'm', title: 'Token usage', build: function (cell) { return canvasChartCell(cell, 'Token usage', 'usageSeries'); } },
+    { id: 'facts', span: 2, minTier: 'm', title: 'Facts', build: function (cell) { return canvasPageCell(cell, 'cx-facts'); } },
+    { id: 'engine', span: 1, minTier: 'm', title: 'Engine', build: function (cell) { return canvasPanelCell(cell, 'Engine', fillEngine, 'checking mediation…'); } },
+    { id: 'dashboard-strip', span: 4, minTier: 'm', title: 'Fleet dashboard', build: function (cell, ctx) { return canvasDashCell(cell, ctx); } },
+    { id: 'projects', span: 2, minTier: 'l', title: 'Projects', build: function (cell) { return canvasPageCell(cell, 'cx-projects'); } },
+    { id: 'sessions', span: 2, minTier: 'l', title: 'Sessions', build: function (cell) { return canvasPageCell(cell, 'cx-sessions'); } },
+    { id: 'tenants', span: 2, minTier: 'l', title: 'Tenants', build: function (cell) { return canvasPageCell(cell, 'cx-tenants'); } },
+    { id: 'live-board', span: 2, minTier: 'l', title: 'Live board', build: function (cell) { return canvasPageCell(cell, 'cx-coord'); } },
+    { id: 'passports', span: 1, minTier: 'xl', title: 'Passports', build: function (cell) { return canvasPageCell(cell, 'cx-passport'); } },
+    { id: 'gates', span: 2, minTier: 'xl', title: 'Gates', build: function (cell) { return canvasPageCell(cell, 'cx-gates'); } },
+    { id: 'orchestrators', span: 1, minTier: 'xl', title: 'Orchestrators', build: function (cell) { return canvasPageCell(cell, 'cx-orchestrators'); } },
+    { id: 'integrations', span: 1, minTier: 'xl', title: 'Integrations', build: function (cell) { return canvasPageCell(cell, 'cx-integrations'); } }
+  ];
+
+  // ---- Board renderer — recompose on (debounced) resize, tier-driven -----
+  var __canvasResizeHandler = null;
+  function renderCanvasBoard(host, ctx) {
+    ctx = ctx || {};
+    var lastTier = null;
+    function viewport() {
+      var W = (typeof window !== 'undefined' && window.innerWidth) || 1280;
+      var H = (typeof window !== 'undefined' && window.innerHeight) || 800;
+      return { W: W, H: H };
+    }
+    function paint() {
+      // Stop + detach once the board leaves the DOM (route change).
+      if (host.ownerDocument && host.isConnected === false && __canvasResizeHandler) {
+        if (typeof window !== 'undefined') { window.removeEventListener('resize', __canvasResizeHandler); }
+        __canvasResizeHandler = null;
+        return;
+      }
+      var vp = viewport();
+      var tier = canvasTier(vp.W, vp.H);
+      if (tier === lastTier) { return; }   // only recompose on a real tier change (no churn)
+      lastTier = tier;
+      host.textContent = '';
+      host.setAttribute('data-tier', tier);
+      var maxIdx = CANVAS_TIER_ORDER.indexOf(tier);
+      var board = el('div', { 'class': 'canvas-board' });
+      host.appendChild(board);
+      var shown = 0;
+      CANVAS_WIDGETS.forEach(function (w) {
+        if (CANVAS_TIER_ORDER.indexOf(w.minTier) > maxIdx) { return; }
+        shown++;
+        var cell = el('div', { 'class': 'canvas-cell', 'data-span': String(w.span), 'data-widget': w.id });
+        board.appendChild(cell);
+        try { w.build(cell, ctx); }
+        catch (e) { cell.textContent = ''; canvasCellHead(cell, w.title || w.id); cell.appendChild(el('p', { 'class': 'ctl-desc', text: 'widget unavailable' })); }
+      });
+      var meta = el('p', { 'class': 'ctl-desc', text: tier + ' tier · ' + shown + ' widget' + (shown === 1 ? '' : 's') + ' · resize to recompose' });
+      host.appendChild(meta);
+    }
+    paint();
+    // Debounced resize recompose (no animated reflow — reduced-motion-safe by
+    // construction: the grid re-lays out instantly, nothing is transitioned).
+    if (__canvasResizeHandler && typeof window !== 'undefined') { window.removeEventListener('resize', __canvasResizeHandler); }
+    var t = null;
+    __canvasResizeHandler = function () { if (t) { clearTimeout(t); } t = setTimeout(paint, 200); };
+    if (typeof window !== 'undefined') { window.addEventListener('resize', __canvasResizeHandler); }
+  }
+
+  // ---- Graph model — nodes/edges STRICTLY from real endpoint fields ------
+  // Grounded (api.js allowlist + the page builders):
+  //   projects (GET /v1/projects → .projects[]: id,name,is_default,planning_target)
+  //   work     (GET /v1/work     → .work|.items[]: id,title,state,project_id,
+  //             created_by_passport,assignee_passport)
+  //   gates    (GET /v1/work/gate/pending → .pending[]: action_id,work_id,
+  //             target_state,requested_by_passport,risk_class)
+  //   passports(GET /v1/passports → .passports[]: id,name,category,reputation_tier)
+  //   sessions (GET /v1/coord/active → .active_sessions[]: session_id_hex,
+  //             passport_id, intent.execplan_slug, intent.milestone) — 404-tolerant
+  //   repos    (GET /v1/projects/{id}/repos → .links[]: owner,repo,role,plane_id)
+  // Real edges only: an edge is kept ONLY when BOTH endpoints resolved to a node.
+  function buildGraphModel(data) {
+    data = data || {};
+    var nodes = [], edges = [], index = {};
+    function add(type, rawId, label, extra) {
+      if (rawId == null || rawId === '') { return null; }
+      var key = type + ':' + rawId;
+      if (index[key]) { return index[key]; }
+      var n = { key: key, type: type, id: rawId, label: label || String(rawId), extra: extra || {} };
+      index[key] = n; nodes.push(n); return n;
+    }
+    function edge(from, to, kind) { if (from && to) { edges.push({ from: from, to: to, kind: kind }); } }
+
+    var projects = (data.projects && data.projects.projects) || [];
+    projects.forEach(function (p) {
+      add('project', p.id, p.name || p.id, { name: p.name, 'default': p.is_default ? 'yes' : null, planning: p.planning_target });
+    });
+
+    (data.repos || []).forEach(function (r) {
+      (r.links || []).forEach(function (lk) {
+        var rid = (lk.owner != null && lk.repo != null) ? (lk.owner + '/' + lk.repo) : (lk.repo || lk.slug);
+        if (add('repo', rid, rid, { role: lk.role, plane: lk.plane_id })) { edge('repo:' + rid, 'project:' + r.projectId, 'repo-of'); }
+      });
+    });
+
+    var work = (data.work && (data.work.work || data.work.items)) || [];
+    work.forEach(function (w) {
+      var n = add('work', w.id, w.title || w.id, { state: w.state, risk: w.risk_class, milestone: w.current_milestone });
+      if (n) { n.strip = workStageLite(w); }
+      if (w.project_id) { edge('work:' + w.id, 'project:' + w.project_id, 'in-project'); }
+      if (w.created_by_passport) { edge('work:' + w.id, 'passport:' + w.created_by_passport, 'created-by'); }
+      if (w.assignee_passport) { edge('work:' + w.id, 'passport:' + w.assignee_passport, 'assigned-to'); }
+    });
+
+    var gates = (data.gates && data.gates.pending) || [];
+    gates.forEach(function (p) {
+      add('gate', p.action_id, p.work_id || p.action_id, { work: p.work_id, target: p.target_state, risk: p.risk_class, requested_by: p.requested_by_passport });
+      if (p.work_id) { edge('gate:' + p.action_id, 'work:' + p.work_id, 'gates'); }
+      if (p.requested_by_passport) { edge('gate:' + p.action_id, 'passport:' + p.requested_by_passport, 'requested-by'); }
+    });
+
+    var passports = (data.passports && data.passports.passports) || [];
+    passports.forEach(function (p) {
+      add('passport', p.id, p.name || p.id, { category: p.category, tier: p.reputation_tier });
+    });
+
+    var sessions = (data.sessions && data.sessions.active_sessions) || [];
+    sessions.forEach(function (s) {
+      var sid = s.session_id_hex || s.passport_id;
+      var i = s.intent || {};
+      add('session', sid, (s.session_id_hex ? s.session_id_hex.slice(0, 8) : (s.passport_id || 'session')), { execplan: i.execplan_slug, milestone: i.milestone, passport: s.passport_id });
+      if (s.passport_id) { edge('session:' + sid, 'passport:' + s.passport_id, 'runs-as'); }
+      var slug = i.execplan_slug;
+      if (slug) {
+        var wk = index['work:' + slug] ? ('work:' + slug) : (index['work:execplan:' + slug] ? ('work:execplan:' + slug) : null);
+        if (wk) { edge('session:' + sid, wk, 'working-on'); }
+      }
+    });
+
+    // Real edges only — drop any edge whose endpoints did not both resolve.
+    edges = edges.filter(function (e) { return index[e.from] && index[e.to]; });
+    return { nodes: nodes, edges: edges };
+  }
+
+  // Deterministic layered layout — columns by node type. No random seed: node
+  // positions are a pure function of type + insertion order (replayable).
+  function layoutGraph(nodes) {
+    var COLS = ['project', 'work', 'gate', 'passport', 'session', 'repo'];
+    var byType = {};
+    COLS.forEach(function (t) { byType[t] = []; });
+    nodes.forEach(function (n) { (byType[n.type] || (byType[n.type] = [])).push(n); });
+    var colGap = 210, rowGap = 44, marginX = 90, marginY = 46;
+    var maxRows = 1;
+    COLS.forEach(function (t) { maxRows = Math.max(maxRows, byType[t].length); });
+    var height = marginY * 2 + Math.max(0, maxRows - 1) * rowGap;
+    var width = marginX * 2 + (COLS.length - 1) * colGap;
+    COLS.forEach(function (t, ci) {
+      var list = byType[t] || [];
+      var colH = Math.max(0, list.length - 1) * rowGap;
+      var y0 = marginY + ((height - marginY * 2) - colH) / 2;
+      list.forEach(function (n, ri) { n.x = marginX + ci * colGap; n.y = y0 + ri * rowGap; });
+    });
+    return { width: width, height: height };
+  }
+  function graphNodeRadius(type) { return type === 'project' ? 9 : (type === 'work' ? 8 : 6); }
+  function graphNeighbourhood(edges, key) {
+    var out = {};
+    edges.forEach(function (e) { if (e.from === key) { out[e.to] = true; } if (e.to === key) { out[e.from] = true; } });
+    return out;
+  }
+  // Lenient focus→node match (handles composite / prefixed ids).
+  function graphMatchNode(nodes, focus) {
+    var exactKey = focus.type + ':' + focus.id;
+    for (var i = 0; i < nodes.length; i++) { if (nodes[i].key === exactKey) { return nodes[i]; } }
+    for (var j = 0; j < nodes.length; j++) {
+      var n = nodes[j];
+      if (n.type === focus.type && (String(n.id).indexOf(focus.id) >= 0 || String(focus.id).indexOf(String(n.id)) >= 0)) { return n; }
+    }
+    return null;
+  }
+  function graphInspector(inspector, n) {
+    inspector.textContent = '';
+    inspector.appendChild(el('div', { 'class': 'canvas-insp-type', text: n.type }));
+    inspector.appendChild(el('h3', { 'class': 'v2card-h', text: n.label }));
+    var rows = [['id', n.id]];
+    Object.keys(n.extra || {}).forEach(function (k) { rows.push([k, n.extra[k]]); });
+    rows.forEach(function (kvp) { if (kvp[1] == null || kvp[1] === '') { return; } inspector.appendChild(kv(kvp[0], kvp[1])); });
+  }
+
+  var __canvasGraphCleanup = null;
+  function drawGraph(stage, inspector, model, focus) {
+    stage.textContent = '';
+    if (!model.nodes.length) { stage.appendChild(el('p', { 'class': 'ctl-desc', text: 'No graph yet — no projects / work / passports available.' })); return; }
+    var dims = layoutGraph(model.nodes);
+    var index = {}; model.nodes.forEach(function (n) { index[n.key] = n; });
+    var svg = svgEl('svg', { 'class': 'canvas-graph-svg', role: 'img', 'aria-label': 'Relation graph — projects, work, gates, passports, sessions' });
+    var g = svgEl('g', { 'class': 'canvas-graph-g' });
+    svg.appendChild(g);
+    var VW = Math.max(dims.width + 180, 900), VH = Math.max(dims.height + 120, 520);
+    svg.setAttribute('viewBox', '0 0 ' + VW + ' ' + VH);
+    svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+
+    var edgeEls = [];
+    model.edges.forEach(function (e) {
+      var a = index[e.from], b = index[e.to];
+      if (!a || !b) { return; }
+      var ln = svgEl('line', { 'class': 'cx-gedge', x1: a.x, y1: a.y, x2: b.x, y2: b.y });
+      ln.__from = e.from; ln.__to = e.to;
+      g.appendChild(ln); edgeEls.push(ln);
+    });
+    var nodeEls = {};
+    model.nodes.forEach(function (n) {
+      var grp = svgEl('g', { 'class': 'cx-gnodewrap', 'data-key': n.key, tabindex: '0', role: 'button' });
+      var r = graphNodeRadius(n.type);
+      var c = svgEl('circle', { 'class': 'cx-gnode g-' + n.type, cx: n.x, cy: n.y, r: r });
+      if (n.type === 'work' && n.strip) { c.setAttribute('data-strip', n.strip); }
+      var lab = svgEl('text', { 'class': 'cx-glabel', x: n.x + r + 4, y: n.y + 3 });
+      lab.textContent = n.label;
+      grp.appendChild(c); grp.appendChild(lab);
+      grp.appendChild(svgEl('title', {})).textContent = n.type + ' · ' + n.label;
+      function open() { graphInspector(inspector, n); highlight(n.key); }
+      grp.addEventListener('click', open);
+      grp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); } });
+      g.appendChild(grp); nodeEls[n.key] = grp;
+    });
+
+    var view = { tx: 0, ty: 0, scale: 1 };
+    function apply() { g.setAttribute('transform', 'translate(' + view.tx + ',' + view.ty + ') scale(' + view.scale + ')'); }
+    function highlight(key) {
+      var nbr = graphNeighbourhood(model.edges, key); nbr[key] = true;
+      Object.keys(nodeEls).forEach(function (k) { nodeEls[k].classList.toggle('is-dim', !nbr[k]); });
+      edgeEls.forEach(function (ln) { ln.classList.toggle('is-dim', !(nbr[ln.__from] && nbr[ln.__to])); });
+    }
+
+    // Pan (drag) + zoom (wheel) — direct manipulation, nothing animated
+    // (reduced-motion-safe; no CSS transition rides the transform).
+    var drag = null;
+    function onDown(ev) { drag = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty }; }
+    function onMove(ev) { if (!drag) { return; } view.tx = drag.tx + (ev.clientX - drag.x); view.ty = drag.ty + (ev.clientY - drag.y); apply(); }
+    function onUp() { drag = null; }
+    svg.addEventListener('mousedown', onDown);
+    svg.addEventListener('wheel', function (ev) { ev.preventDefault(); var f = ev.deltaY < 0 ? 1.1 : 0.9; view.scale = Math.max(0.3, Math.min(3, view.scale * f)); apply(); });
+    if (typeof window !== 'undefined') { window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp); }
+    __canvasGraphCleanup = function () { if (typeof window !== 'undefined') { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); } };
+
+    stage.appendChild(svg);
+
+    // Focus deep-link: centre + highlight the node's neighbourhood, dim the rest.
+    if (focus && focus.type && focus.id != null) {
+      var fn = index[focus.type + ':' + focus.id] || graphMatchNode(model.nodes, focus);
+      if (fn) { highlight(fn.key); graphInspector(inspector, fn); view.tx = (VW / 2) - fn.x; view.ty = (VH / 2) - fn.y; apply(); }
+    }
+  }
+
+  function renderCanvasGraph(host, ctx, focus) {
+    host.textContent = '';
+    if (__canvasGraphCleanup) { __canvasGraphCleanup(); __canvasGraphCleanup = null; }
+    var wrap = el('div', { 'class': 'canvas-graph' });
+    var stage = el('div', { 'class': 'canvas-graph-stage' }, [el('p', { 'class': 'ctl-desc', text: 'Building graph…' })]);
+    var inspector = el('div', { 'class': 'canvas-graph-inspector' }, [
+      el('div', { 'class': 'canvas-insp-type', text: 'inspector' }),
+      el('p', { 'class': 'ctl-desc', text: 'Click a node to inspect its real fields. Drag to pan · wheel to zoom.' })
+    ]);
+    wrap.appendChild(stage); wrap.appendChild(inspector);
+    host.appendChild(wrap);
+    return fetchJSON('/v1/projects').then(function (projRes) {
+      var projList = (projRes.ok && projRes.data && projRes.data.projects) || [];
+      var repoReqs = projList.slice(0, 12).map(function (p) {
+        return fetchRepos(p.id).then(function (r) { return { projectId: p.id, links: (r.ok && r.data && r.data.links) || [] }; });
+      });
+      return Promise.all([
+        Promise.resolve(projRes),
+        fetchJSON('/v1/work?source=all'),
+        fetchJSON('/v1/work/gate/pending'),
+        fetchJSON('/v1/passports'),
+        fetchJSON('/v1/coord/active'),
+        Promise.all(repoReqs)
+      ]);
+    }).then(function (r) {
+      var data = {
+        projects: (r[0].ok && r[0].data) || null,
+        work: (r[1].ok && r[1].data) || null,
+        gates: (r[2].ok && r[2].data) || null,
+        passports: (r[3].ok && r[3].data) || null,
+        sessions: (r[4].ok && r[4].data) || null,   // /v1/coord/active 404 → null (tolerated)
+        repos: r[5] || []
+      };
+      var model = buildGraphModel(data);
+      if (!model.nodes.length && demoOn()) {
+        var demoModel = buildGraphModel({ work: { work: demoData('work') || [] }, gates: { pending: demoData('needsYou') || [] } });
+        if (demoModel.nodes.length) {
+          model = demoModel;
+          var head = wrap.querySelector('.canvas-graph-inspector .canvas-insp-type');
+          if (head) { head.textContent = 'inspector · demo'; }
+        }
+      }
+      drawGraph(stage, inspector, model, focus);
+    }).catch(function () { stage.textContent = ''; stage.appendChild(el('p', { 'class': 'ctl-desc', text: 'Graph unavailable.' })); });
+  }
+
+  // ---- Canvas entry point (shell routes the canvas destination here) -----
+  // No sub-pills: Canvas IS the page, with a nav-family Board | Graph switch.
+  function renderCanvas(host, ctx) {
+    ctx = ctx || {};
+    var view = ctx.view === 'graph' ? 'graph' : 'board';
+    host.textContent = '';
+    var region = el('div', { 'class': 'canvas-region' });
+    var seg = el('div', { 'class': 'modeseg canvas-seg', role: 'group', 'aria-label': 'Canvas view' });
+    [['board', 'Board'], ['graph', 'Graph']].forEach(function (v) {
+      var b = el('button', { 'class': 'modeseg-btn', type: 'button', 'data-view': v[0], 'aria-pressed': v[0] === view ? 'true' : 'false' }, [v[1]]);
+      (function (vid) { b.addEventListener('click', function () { location.hash = '#/canvas/' + vid; }); })(v[0]);
+      seg.appendChild(b);
+    });
+    region.appendChild(el('div', { 'class': 'canvas-head' }, [seg]));
+    var body = el('div', { 'class': 'canvas-body' });
+    region.appendChild(body);
+    host.appendChild(region);
+    if (view === 'graph') { return renderCanvasGraph(body, ctx, ctx.focus); }
+    renderCanvasBoard(body, ctx);
+    return Promise.resolve();
+  }
+
   return {
     CONTROL_TYPES: CONTROL_TYPES,
     GATE_TITLE: GATE_TITLE,
+    // M9 — Canvas: size-adaptive board + real-edge relation graph.
+    canvasTier: canvasTier,
+    parseFocus: parseFocus,
+    CANVAS_WIDGETS: CANVAS_WIDGETS,
+    buildGraphModel: buildGraphModel,
+    renderCanvas: renderCanvas,
     renderPage: renderPage,
     renderSections: renderSections,
     fetchJSON: fetchJSON,

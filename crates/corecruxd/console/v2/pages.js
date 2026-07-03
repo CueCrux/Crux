@@ -41,6 +41,15 @@
     if (extra) { for (var k in extra) { c[k] = extra[k]; } }
     return c;
   }
+  // Cross-feature launch point → the Canvas relation graph, focused on this
+  // node's neighbourhood (M9). A read-only nav-family LINK (t:'btn' + href), so
+  // it is visible in BOTH postures (never a mutation); render.js renders it small
+  // (.cx-graphlink) and the shell routes the hash to the graph view. `id` may
+  // itself contain colons (e.g. execplan-prefixed work ids) — parseFocus splits
+  // on the first colon only, so the composite id survives.
+  function graphLink(type, id) {
+    return { t: 'btn', label: 'View graph', href: '#/canvas/graph?focus=' + type + ':' + id, graphLaunch: true };
+  }
   function get(obj, path) {
     var cur = obj;
     for (var i = 0; i < path.length; i++) { if (cur == null) { return undefined; } cur = cur[path[i]]; }
@@ -292,7 +301,7 @@
       rows.push({ t: 'exp', strip: strip, label: p.name || p.id,
         sub: [p.id, p.planning_target, p.is_default ? 'default' : null, p.archived ? 'archived' : null].filter(Boolean).join(' · ') || 'project',
         badge: p.archived ? 'archived' : (p.is_default ? 'default' : 'project'),
-        controls: infos.concat([{ t: 'repogrid', projectId: p.id }]) });
+        controls: infos.concat([{ t: 'repogrid', projectId: p.id }, graphLink('project', p.id)]) });
     });
     if (!ps.length) { rows.push(info('none', 'no projects yet — use ＋ New project')); }
     return [{ h: 'Projects', sub: ps.length + ' project' + (ps.length === 1 ? '' : 's') + ' · click to expand · /v1/projects', wide: true, controls: rows }];
@@ -308,7 +317,7 @@
         meta: [w.id, w.plan_path, w.updated_at].filter(Boolean).join(' · '),   // Pro-mode mono metadata
         controls: [['state', w.state], ['risk', w.risk_class], ['plan', w.plan_path], ['milestone', w.current_milestone], ['owner', w.assignee_passport], ['pr', w.linked_pr]]
           .filter(function (kv) { return kv[1] != null && kv[1] !== ''; }).map(function (kv) { return info(kv[0], String(kv[1])); })
-          .concat([rbtn('Open in kanban')]) };
+          .concat([rbtn('Open in kanban'), graphLink('work', w.id)]) };
     };
     return [head].concat(WORK_STAGES.map(function (st) {
       var rows = items.filter(function (w) { return workStageOf(w) === st[0]; }).map(mk);
@@ -324,7 +333,7 @@
         desc: 'Approval is passport-attributed (Art. 14); one approval never extends to other actions.',
         controls: [info('action id', p.action_id), info('requested', p.requested_at || '—'),
           mbtn('Approve ' + p.action_id, { hint: 'records approving passport + timestamp' }),
-          mbtn('Reject ' + p.action_id)] };
+          mbtn('Reject ' + p.action_id), graphLink('work', p.work_id)] };
     }));
     if (!pend.length) { rows.push(info('none pending', 'gated transitions appear here when an agent requests a high-risk state change')); }
     rows.push(mbtn('Withhold all', { hint: 'keeps gates pending' }));
@@ -958,7 +967,12 @@
     { id: 'memory', label: 'Memory', icon: 'memory', key: '3', sub: 'Facts, tenants, documents, and retrieval tuning.' },
     { id: 'trust', label: 'Trust', icon: 'trust', key: '4', sub: 'Receipts, gates, identity, and posture.' },
     { id: 'meters', label: 'Meters', icon: 'meters', key: '5', sub: 'Cost and usage.' },
-    { id: 'system', label: 'System', icon: 'settings', key: '6', sub: 'Settings, integrations, and developer tools.' }
+    { id: 'system', label: 'System', icon: 'settings', key: '6', sub: 'Settings, integrations, and developer tools.' },
+    // Canvas (M9) — a destination with no sub-pills: it IS the page. A
+    // size-adaptive Board plus a real-edge relation Graph, switched by a
+    // nav-family segmented control (deep-linkable #/canvas/board · #/canvas/graph).
+    // Phone tier: lives in the "More" sheet (not one of the three direct tabs).
+    { id: 'canvas', label: 'Canvas', icon: 'canvas', key: '7', sub: 'Size-adaptive dashboard + relation graph.' }
   ];
 
   // ---- Legacy id inventory (the 26 CX pages this plan must keep reachable)

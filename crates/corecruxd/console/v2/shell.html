@@ -921,6 +921,77 @@
   *:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; border-radius: 6px; }
   a:focus:not(:focus-visible), button:focus:not(:focus-visible) { outline: none; }
 
+  /* ---- Canvas (M9) — size-adaptive board + relation graph ---------------
+     The board is a CSS-grid of self-contained cells (auto-fill + span classes);
+     the tier (xs/s/m/l/xl) is picked by the pure canvasTier() and drives which
+     widgets appear — a 4K+ viewport fills the full board. No animated reflow:
+     recompose is instant (reduced-motion-safe). The graph is a no-dependency
+     inline SVG with drag-pan + wheel-zoom; every node colour is a theme token. */
+  .canvas-region { display: flex; flex-direction: column; gap: 16px; }
+  .canvas-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .canvas-seg { flex: none; }
+  .canvas-board {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 14px; align-items: start; grid-auto-flow: row dense;
+  }
+  .canvas-cell {
+    padding: 16px 18px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    min-width: 0; display: flex; flex-direction: column; gap: 10px; overflow: hidden;
+  }
+  .canvas-cell[data-span="2"] { grid-column: span 2; }
+  .canvas-cell[data-span="3"] { grid-column: span 3; }
+  .canvas-cell[data-span="4"] { grid-column: span 4; }
+  .canvas-cell-body { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+  /* Cells host reused surfaces flush (no nested card chrome). */
+  .canvas-cell .v2card, .canvas-cell .chart-card {
+    background: none; border: none; box-shadow: none;
+    backdrop-filter: none; -webkit-backdrop-filter: none; padding: 0;
+  }
+  /* xs tier (<720w): a single column — spans collapse. */
+  @media (max-width: 720px) {
+    .canvas-board { grid-template-columns: 1fr; }
+    .canvas-cell[data-span] { grid-column: auto; }
+  }
+
+  .canvas-graph { display: grid; grid-template-columns: 1fr 260px; gap: 14px; align-items: stretch; }
+  .canvas-graph-stage {
+    position: relative; min-height: 520px; overflow: hidden;
+    border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface2); touch-action: none;
+  }
+  .canvas-graph-svg { display: block; width: 100%; height: 100%; min-height: 520px; cursor: grab; }
+  .canvas-graph-svg:active { cursor: grabbing; }
+  .cx-gedge { stroke: var(--edge-strong); stroke-width: 1; }
+  .cx-gedge.is-dim { opacity: .1; }
+  .cx-gnodewrap { outline: none; cursor: pointer; }
+  .cx-gnodewrap.is-dim { opacity: .16; }
+  .cx-gnodewrap:focus-visible .cx-gnode { stroke: var(--acc); stroke-width: 2.5; }
+  .cx-gnode { stroke: var(--bg); stroke-width: 1.5; }
+  .g-project { fill: var(--acc); }
+  .g-work { fill: var(--ink3); }
+  .g-work[data-strip="in_progress"] { fill: var(--acc); }
+  .g-work[data-strip="blocked"], .g-work[data-strip="review"] { fill: var(--warn); }
+  .g-work[data-strip="done"] { fill: var(--ok); }
+  .g-gate { fill: var(--warn); }
+  .g-passport { fill: var(--trust); }
+  .g-session { fill: var(--ok); }
+  .g-repo { fill: var(--ink3); }
+  .cx-glabel { fill: var(--ink2); font-family: var(--font-mono); font-size: 9px; pointer-events: none; }
+  .canvas-graph-inspector {
+    padding: 14px 16px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow); min-width: 0;
+    display: flex; flex-direction: column; gap: 8px; align-self: start;
+  }
+  .canvas-insp-type {
+    font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--ink3); font-weight: 600;
+  }
+  /* "View graph" cross-feature launch link — a small nav-family button. */
+  .cx-graphlink { min-height: 30px; padding: 0 11px; font-size: 12px; align-self: flex-start; }
+  @media (max-width: 720px) { .canvas-graph { grid-template-columns: 1fr; } }
+
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation: none !important; transition: none !important; }
     .aurora { animation: none !important; }
@@ -1076,6 +1147,7 @@
     memory: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>',
     trust: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg>',
     meters: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19a8 8 0 0 1 16 0"/><path d="M12 19l4-5"/><circle cx="12" cy="19" r="1.4"/></svg>',
+    canvas: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
     settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>',
     integrations: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v6"/><path d="M8 9V5M16 9V5"/><rect x="6" y="9" width="12" height="6" rx="2"/><path d="M12 15v3a3 3 0 0 0 3 3"/></svg>',
     developer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 9l-4 3 4 3"/><path d="M16 9l4 3-4 3"/><path d="M13 6l-2 12"/></svg>',
@@ -1560,11 +1632,32 @@
       btns[i].setAttribute('aria-current', btns[i].getAttribute('data-dest') === destId ? 'page' : 'false');
     }
     syncMobileChrome(destId);   // mirror active dest into the phone tab bar + sheet
-    document.getElementById('destTitle').textContent = page ? page.title : dest.label;
-    document.getElementById('destSub').textContent = page ? (page.sub || '') : (dest.sub || '');
 
     var content = document.getElementById('content');
     content.textContent = '';
+
+    // Canvas (M9): no sub-pills — Canvas IS the page. Parse view + focus from the
+    // live hash and hand off to render.js renderCanvas (Board | Graph).
+    if (destId === 'canvas') {
+      var cr = parseCanvasHash(location.hash);
+      document.getElementById('destTitle').textContent = dest.label;
+      document.getElementById('destSub').textContent = cr.view === 'graph'
+        ? 'Relation graph — real edges only (projects ⋈ work ⋈ gates ⋈ passports ⋈ sessions)'
+        : 'Size-adaptive dashboard — composes to your viewport (4K+ = the full board)';
+      var canvasHost = el('div', { 'class': 'canvas-region-host', id: 'canvasHost' });
+      content.appendChild(canvasHost);
+      if (window.CruxRender && window.CruxRender.renderCanvas) {
+        window.CruxRender.renderCanvas(canvasHost, { summary: BOOT.summary, view: cr.view, focus: cr.focus });
+      } else {
+        canvasHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
+      }
+      applyPosture(content);
+      if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+      return;
+    }
+
+    document.getElementById('destTitle').textContent = page ? page.title : dest.label;
+    document.getElementById('destSub').textContent = page ? (page.sub || '') : (dest.sub || '');
     // Overwatch is the real landing: stat tiles → needs-you → fleet → activity,
     // above the page-pill row (cx-overview etc. still reachable below).
     if (destId === 'overwatch' && window.CruxRender && window.CruxRender.renderOverwatchLanding) {
@@ -1583,10 +1676,32 @@
 
   function currentRoute() {
     var h = (location.hash || '').replace(/^#\/?/, '');
+    var qi = h.indexOf('?');
+    if (qi >= 0) { h = h.slice(0, qi); }   // strip a query (Canvas graph carries ?focus=)
     var parts = h.split('/').filter(Boolean);
     var destId = DEST_INDEX[parts[0]] ? parts[0] : (DESTS[0] && DESTS[0].id);
     var pageId = (parts[1] && PAGES[parts[1]] && PAGES[parts[1]].dest === destId) ? parts[1] : firstPageId(destId);
     return { dest: destId, page: pageId };
+  }
+
+  // Canvas (M9) parses its own hash: #/canvas/<view>?focus=<type>:<id>. The view
+  // is the nav-family Board|Graph switch; the focus (graph only) is parsed by the
+  // pure render.js parseFocus so board/graph share one deep-link grammar.
+  function parseCanvasHash(hash) {
+    var h = (hash || '').replace(/^#\/?/, '');
+    var q = '';
+    var qi = h.indexOf('?');
+    if (qi >= 0) { q = h.slice(qi + 1); h = h.slice(0, qi); }
+    var parts = h.split('/').filter(Boolean);
+    var view = (parts[1] === 'graph') ? 'graph' : 'board';
+    var focus = null;
+    var m = q.match(/(?:^|&)focus=([^&]+)/);
+    if (m) {
+      var raw;
+      try { raw = decodeURIComponent(m[1]); } catch (e) { raw = m[1]; }
+      focus = (window.CruxRender && window.CruxRender.parseFocus) ? window.CruxRender.parseFocus(raw) : null;
+    }
+    return { view: view, focus: focus };
   }
 
   function route() { var r = currentRoute(); renderDestination(r.dest, r.page); }

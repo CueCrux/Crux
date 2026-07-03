@@ -898,13 +898,111 @@ function extractThemeVars(theme) {
   notes.push('legacy port: ' + EXPECTED.length + ' sections — ' + tally.home + ' home, ' + tally['ported-pro'] + ' ported-pro, ' + tally.deferred + ' deferred; nothing dropped.');
 })();
 
+// =========================================================================
+//  Check 25 — (M9) Canvas board. (a) canvasTier is a PURE exported fn with the
+//  documented width truth table (500/1200/2000/3000/4000 → xs/s/m/l/xl).
+//  (b) the widget registry integrity: every widget carries id/span/minTier/build
+//  with unique ids, and the per-tier cumulative counts honour the size-adaptive
+//  contract (xs 4 · s ≥6 · m ≥10 · l ≥14 · xl ≥16 — the 4K+ full board).
+// =========================================================================
+(function checkCanvasBoard() {
+  const tier = render.canvasTier;
+  check(typeof tier === 'function', '[canvas] render.js must export the pure canvasTier(width,height) fn');
+  if (typeof tier === 'function') {
+    [[500, 'xs'], [1200, 's'], [2000, 'm'], [3000, 'l'], [4000, 'xl']].forEach(function (row) {
+      check(tier(row[0]) === row[1], '[canvas] canvasTier(' + row[0] + ') must be "' + row[1] + '" (got ' + tier(row[0]) + ')');
+    });
+  }
+  const widgets = render.CANVAS_WIDGETS;
+  const ORDER = ['xs', 's', 'm', 'l', 'xl'];
+  check(Array.isArray(widgets) && widgets.length >= 16, '[canvas] render.CANVAS_WIDGETS must be an array of ≥16 widgets (the 4K+ board); got ' + (widgets ? widgets.length : 'none'));
+  const seen = {};
+  (widgets || []).forEach(function (w, i) {
+    check(w && typeof w.id === 'string' && w.id, '[canvas] widget ' + i + ' missing id');
+    check(w && typeof w.span === 'number' && w.span >= 1, '[canvas] widget ' + (w && w.id) + ' must carry a numeric span ≥1');
+    check(w && ORDER.indexOf(w.minTier) >= 0, '[canvas] widget ' + (w && w.id) + ' minTier must be one of xs/s/m/l/xl');
+    check(w && typeof w.build === 'function', '[canvas] widget ' + (w && w.id) + ' must carry a build() fn');
+    if (w && w.id) { check(!seen[w.id], '[canvas] duplicate widget id: ' + w.id); seen[w.id] = true; }
+  });
+  function upTo(t) { const max = ORDER.indexOf(t); return (widgets || []).filter(function (w) { return ORDER.indexOf(w.minTier) <= max; }).length; }
+  check(upTo('xs') === 4, '[canvas] xs tier must expose exactly 4 widgets (single column); got ' + upTo('xs'));
+  check(upTo('s') >= 6, '[canvas] s tier must expose ≥6 widgets; got ' + upTo('s'));
+  check(upTo('m') >= 10, '[canvas] m tier must expose ≥10 widgets; got ' + upTo('m'));
+  check(upTo('l') >= 14, '[canvas] l tier must expose ≥14 widgets; got ' + upTo('l'));
+  check(upTo('xl') >= 16, '[canvas] xl (4K+) tier must expose ≥16 widgets; got ' + upTo('xl'));
+  // Canvas is a destination with no sub-pills: a nav-family Board|Graph view
+  // switch (deep-linkable) IS the page. The shell routes it to render.renderCanvas.
+  check((pages.DESTS || []).some(function (d) { return d.id === 'canvas'; }), '[canvas] pages.DESTS must carry the "canvas" destination');
+  check(typeof render.renderCanvas === 'function', '[canvas] render.js must export renderCanvas');
+  check(/window\.CruxRender\.renderCanvas/.test(shellHtml) && /destId === 'canvas'/.test(shellHtml), '[canvas] shell.html must route the canvas destination to render.renderCanvas');
+  check(/data-view/.test(renderSrc) && /\['board', 'Board'\]/.test(renderSrc) && /\['graph', 'Graph'\]/.test(renderSrc) && renderSrc.indexOf("'#/canvas/' + vid") >= 0,
+    '[canvas] Canvas must carry a Board|Graph view switch (deep-linkable #/canvas/<view>)');
+  check(/setTimeout\(paint, 200\)/.test(renderSrc), '[canvas] the board must recompose on a debounced resize');
+  notes.push('canvas board: canvasTier xs/s/m/l/xl truth table + ' + (widgets ? widgets.length : 0) + '-widget registry (xs' + upTo('xs') + '·s' + upTo('s') + '·m' + upTo('m') + '·l' + upTo('l') + '·xl' + upTo('xl') + '); Board|Graph deep-linkable.');
+})();
+
+// =========================================================================
+//  Check 26 — (M9) Canvas graph honesty + wiring. (a) Deterministic layout —
+//  NO Math.random anywhere in render.js. (b) buildGraphModel edges reference
+//  ONLY the real endpoint field names (grounded in api.js/handlers) and drop any
+//  dangling edge (real edges only). (c) parseFocus (pure, exported) handles
+//  work:/session:/project:/passport: and composite ids. (d) launch-point markers
+//  present on the fleet (render) + work/project/gate (pages) renderers.
+// =========================================================================
+(function checkCanvasGraph() {
+  check(!/Math\.random/.test(renderSrc), '[graph] canvas/graph layout must be deterministic — no Math.random in render.js');
+  const gm = funcBody(renderSrc, 'buildGraphModel');
+  check(!!gm, '[graph] render.js must define buildGraphModel');
+  const GROUNDED = ['projects', 'project_id', 'work', 'items', 'title', 'created_by_passport', 'assignee_passport',
+    'pending', 'action_id', 'work_id', 'requested_by_passport', 'target_state', 'passports', 'reputation_tier',
+    'active_sessions', 'session_id_hex', 'passport_id', 'intent', 'execplan_slug', 'links', 'owner', 'repo', 'role', 'plane_id'];
+  GROUNDED.forEach(function (f) {
+    check(gm && gm.indexOf(f) >= 0, '[graph] buildGraphModel must reference the real endpoint field "' + f + '" (edges grounded in real handlers)');
+  });
+  check(gm && /index\[e\.from\]\s*&&\s*index\[e\.to\]/.test(gm), '[graph] buildGraphModel must keep ONLY real edges (both endpoints resolved) — no invented relations');
+  check(/coord\/active/.test(renderSrc), '[graph] the graph must read live sessions from /v1/coord/active (404-tolerant)');
+  // Deterministic layered layout by node type.
+  check(/function layoutGraph/.test(renderSrc), '[graph] render.js must define the deterministic layoutGraph');
+  // Focus deep-link parser — pure, exported, first-colon split.
+  const pf = render.parseFocus;
+  check(typeof pf === 'function', '[graph] render.js must export the pure parseFocus() deep-link parser');
+  if (typeof pf === 'function') {
+    ['work', 'session', 'project', 'passport'].forEach(function (ty) {
+      const r = pf(ty + ':abc123');
+      check(r && r.type === ty && r.id === 'abc123', '[graph] parseFocus must handle ' + ty + ':<id>');
+    });
+    const c = pf('work:execplan:unified-shell-console');
+    check(c && c.type === 'work' && c.id === 'execplan:unified-shell-console', '[graph] parseFocus must split on the FIRST colon (composite ids preserved)');
+    check(pf('') === null && pf('nocolon') === null && pf(null) === null, '[graph] parseFocus must reject malformed focus params');
+  }
+  // Focus centres + highlights the node neighbourhood (dims the rest).
+  const dg = funcBody(renderSrc, 'drawGraph');
+  check(dg && /focus/.test(dg) && /is-dim/.test(renderSrc), '[graph] a focus deep-link must centre + highlight the node neighbourhood (dim the rest via .is-dim)');
+  // Launch-point markers: fleet (render) + work/project/gate (pages).
+  const fr = funcBody(renderSrc, 'fleetRow');
+  check(fr && /cx-graphlink/.test(fr) && fr.indexOf('#/canvas/graph?focus=session:') >= 0, '[graph] the fleet row must carry a "View graph" launch point (focus=session:…)');
+  check(/function graphLink/.test(pagesSrc) && pagesSrc.indexOf('#/canvas/graph?focus=') >= 0, '[graph] pages.js must define graphLink() (the cross-feature launch control)');
+  ['buildWork', 'buildProjects', 'buildGates'].forEach(function (fn) {
+    const b = funcBody(pagesSrc, fn);
+    check(b && /graphLink\(/.test(b), '[graph] ' + fn + ' must carry a "View graph" launch point (graphLink)');
+  });
+  // Node styling by type uses theme tokens (project=acc, passport=trust, session=ok, gate=warn).
+  check(/\.g-project\s*\{[^}]*var\(--acc\)/.test(shellHtml) && /\.g-passport\s*\{[^}]*var\(--trust\)/.test(shellHtml) &&
+    /\.g-session\s*\{[^}]*var\(--ok\)/.test(shellHtml) && /\.g-gate\s*\{[^}]*var\(--warn\)/.test(shellHtml),
+    '[graph] node fills must come from theme tokens (project=acc · passport=trust · session=ok · gate=warn)');
+  // Pan (drag) + zoom (wheel).
+  check(/canvas-graph-svg/.test(shellHtml) && /addEventListener\('wheel'/.test(renderSrc) && /addEventListener\('mousedown'/.test(renderSrc),
+    '[graph] the graph must support pan (mousedown drag) + zoom (wheel)');
+  notes.push('canvas graph: real-edge-only model (grounded fields, dangling edges dropped), deterministic layered layout, pan+zoom, focus parser (work/session/project/passport), launch points on fleet/work/project/gate.');
+})();
+
 // ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — round 4 smoke');
+console.log('unified-shell-console v2 — M9 (canvas) smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
 if (failures.length) {
   console.error('\nFAIL (' + failures.length + '):');
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity).');
+console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity, M9 canvas board (canvasTier + widget registry), M9 canvas graph (real-edge-only model + focus parser + launch points)).');
 process.exit(0);
