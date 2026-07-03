@@ -483,6 +483,12 @@ pub struct Config {
     // Default OFF (`CORECRUXD_FEATURE_USAGE_RECEIPTS=1`).
     pub usage_receipts_enabled: bool,
 
+    // Phase T (M1) opt-in usage-ping *submitter* — the only sanctioned
+    // outbound path. All three legs are default-absent so a fresh install
+    // dials nothing (`CORECRUXD_USAGE_RECEIPTS_SUBMIT` / `_ENDPOINT` /
+    // `_CONSENT_AT`). See `crate::usage_submit`.
+    pub usage_submit: crate::usage_submit::UsageSubmitConfig,
+
     // G21b assembly cache for /v1/context bundles. Default OFF.
     pub assembly_cache_enabled: bool,
 
@@ -1169,6 +1175,19 @@ pub fn load_config() -> Config {
         local_ingest_enabled: env_bool("CORECRUXD_LOCAL_INGEST").unwrap_or(false),
         stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS").unwrap_or(false),
         usage_receipts_enabled: env_bool("CORECRUXD_FEATURE_USAGE_RECEIPTS").unwrap_or(false),
+        // Phase T (M1) opt-in submitter — the daemon's only outbound signal.
+        // All three legs default to absent/false: a fresh install dials
+        // nothing. No hardcoded endpoint.
+        usage_submit: crate::usage_submit::UsageSubmitConfig {
+            enabled: env_bool("CORECRUXD_USAGE_RECEIPTS_SUBMIT").unwrap_or(false),
+            endpoint: std::env::var("CORECRUXD_USAGE_RECEIPTS_ENDPOINT")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            consent_at: crate::usage_submit::parse_consent_at(
+                std::env::var("CORECRUXD_USAGE_RECEIPTS_CONSENT_AT").ok(),
+            ),
+        },
         assembly_cache_enabled: env_bool("CORECRUXD_ASSEMBLY_CACHE").unwrap_or(false),
         quota_enabled: env_bool("CORECRUXD_QUOTA").unwrap_or(false),
         quota_hosted_surfaces: std::env::var("CORECRUXD_QUOTA_HOSTED_SURFACES")
