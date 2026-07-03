@@ -172,7 +172,10 @@ function extractThemeVars(theme) {
     const mm = body.match(new RegExp('--' + name + '\\s*:\\s*([^;]+);'));
     return mm ? parseColor(mm[1]) : null;
   }
-  return { bg: v('bg'), surface: v('surface'), ink: v('ink'), ink2: v('ink2'), ink3: v('ink3') };
+  return {
+    bg: v('bg'), surface: v('surface'), ink: v('ink'), ink2: v('ink2'), ink3: v('ink3'),
+    approveInk: v('approve-ink'), approveB: v('approve-b')
+  };
 }
 (function checkContrast() {
   ['glass', 'dark', 'light'].forEach(function (theme) {
@@ -187,6 +190,15 @@ function extractThemeVars(theme) {
       check(cSurf >= floor, '[contrast] ' + theme + ' --' + name + ' over --surface = ' + cSurf.toFixed(2) + ':1 (need >= ' + floor + ')');
       notes.push('contrast ' + theme + '/' + name + ': bg ' + cBg.toFixed(2) + ':1 · surface ' + cSurf.toFixed(2) + ':1');
     });
+    // Approve button (Overwatch gate action): the label ink must clear 4.5:1
+    // over the button's solid base --approve-b on every theme.
+    if (!t.approveInk || !t.approveB) {
+      check(false, '[contrast] ' + theme + ' missing --approve-ink / --approve-b token');
+    } else {
+      const cApprove = contrast(t.approveInk, t.approveB);
+      check(cApprove >= 4.5, '[contrast] ' + theme + ' --approve-ink over --approve-b = ' + cApprove.toFixed(2) + ':1 (need >= 4.5)');
+      notes.push('contrast ' + theme + '/approve-ink over approve-b: ' + cApprove.toFixed(2) + ':1');
+    }
   });
 })();
 

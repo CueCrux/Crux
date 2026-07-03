@@ -60,6 +60,9 @@
     --warn: #F5B94B;
     --crit: #F0716C;
     --trust: #A78BFA;
+    --approve-a: #43E6A2;
+    --approve-b: #2BB983;
+    --approve-ink: #05261A;
     --blur: 18px;
     --card-shadow: none;
     --aurora-opacity: 1;
@@ -78,6 +81,9 @@
     --warn: #D29922;
     --crit: #F85149;
     --trust: #BC8CFF;
+    --approve-a: #2EA043;
+    --approve-b: #238636;
+    --approve-ink: #FFFFFF;
     --blur: 0px;
     --card-shadow: none;
     --aurora-opacity: 0;
@@ -96,6 +102,9 @@
     --warn: #9A5B00;
     --crit: #B91C1C;
     --trust: #6D28D9;
+    --approve-a: #1A7F4E;
+    --approve-b: #14663E;
+    --approve-ink: #FFFFFF;
     --blur: 0px;
     --card-shadow: 0 1px 3px rgba(27,39,51,.08);
     --aurora-opacity: 0;
@@ -414,32 +423,222 @@
   .exp[open] > .exp-sum { border-bottom: 1px solid var(--edge); }
   .exp-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
 
-  /* ---- Overwatch landing (M3) ------------------------------------------- */
+  /* ---- Overwatch landing — Overwatch-concept restyle (post-M6) ----------
+     Ports the concept's Overwatch view: a full-width stat-tile row, then a
+     7fr/5fr split — NEEDS YOU gate cards on the left, FLEET + ACTIVITY ticker
+     on the right. Every colour comes from a theme token (the approve gradient
+     via --approve-a/-b/-ink), so all three themes render correctly. Behaviour
+     (render.js) is unchanged; this is look only. */
   .ow-landing-region { margin-bottom: 22px; }
-  .ow-landing { align-items: start; }
-  .ow-srcchips, .ow-meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; }
+  .ow-landing { display: flex; flex-direction: column; gap: 2px; }
+
+  /* Tagline subtitle introducing the Overwatch view (concept apphead sub). */
+  .ow-tagline { margin: 0 2px 16px; font-size: 13px; color: var(--ink2); }
+
+  /* Section header: mono · uppercase · wide tracking, with a right-aligned
+     count/hint (concept .sechead). */
+  .ow-sec { display: flex; align-items: baseline; gap: 10px; margin: 18px 2px 10px; }
+  .ow-sec.first { margin-top: 2px; }
+  .ow-sec h2 {
+    margin: 0; font-family: var(--font-mono); font-size: 10.5px; font-weight: 600;
+    letter-spacing: .22em; text-transform: uppercase; color: var(--ink2);
+  }
+  .ow-ct { font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .ow-ct:empty { display: none; }
+  .ow-sec .ow-link { margin-left: auto; font-size: 11.5px; color: var(--acc); cursor: pointer; text-decoration: none; }
+  .ow-sec .ow-link:hover { text-decoration: underline; }
+
+  /* Two-column grid — 7fr left (needs-you) / 5fr right (fleet · activity). */
+  .ow-cols { display: grid; grid-template-columns: 7fr 5fr; gap: 16px; align-items: start; }
+  .ow-col { min-width: 0; }
+
+  /* Stat tiles — reused from the cx-overview build so the readout never drifts
+     from the page; styled to the concept .tile look, scoped to the landing so
+     the Overview page itself is untouched. */
+  .ow-tiles .v2card {
+    background: none; border: none; box-shadow: none; backdrop-filter: none;
+    -webkit-backdrop-filter: none; padding: 0; min-width: 0;
+  }
+  .ow-tiles .v2card-h {
+    font-family: var(--font-mono); font-size: 10.5px; font-weight: 600;
+    letter-spacing: .22em; text-transform: uppercase; color: var(--ink2);
+  }
+  .ow-tiles .v2card-sub { font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .ow-tiles .v2card-body { margin-top: 12px; }
+  .ow-tiles .stats { gap: 12px; }
+  .ow-tiles .stat { padding: 13px 15px; border-radius: var(--radius-sm); }
+  .ow-tiles .stat .k {
+    font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--ink3); font-weight: 600;
+  }
+  .ow-tiles .stat .v { margin-top: 5px; font-size: 23px; letter-spacing: -.02em; }
+  .ow-tiles .stat .v small { font-size: 11px; color: var(--ink3); }
+
+  /* Source chips (which fleet sources answered) + enrich meta chips. */
+  .ow-srcchips, .ow-meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
   .ow-chip {
-    font-size: 11px; color: var(--ink2); background: var(--surface2);
-    border: 1px solid var(--edge); border-radius: 999px; padding: 2px 9px;
-    white-space: nowrap;
+    font-family: var(--font-mono); font-size: 10px; color: var(--ink2); background: var(--surface2);
+    border: 1px solid var(--edge); border-radius: 999px; padding: 2px 9px; white-space: nowrap;
   }
-  /* The landing rows are always-open panels (plain divs, not <details>), so
-     stamp the summary/body divider the [open] selector would otherwise supply. */
-  .ow-gate > .exp-sum, .ow-fleet > .exp-sum, .ow-activity > .exp-sum {
-    cursor: default; border-bottom: 1px solid var(--edge);
+
+  /* ---- Gate card (Art.14 human gate) — concept .gate anatomy ------------- */
+  .ow-gate {
+    position: relative; overflow: hidden; padding: 15px 17px; margin-bottom: 12px;
+    border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    transition: opacity .3s ease, border-color .3s ease;
   }
-  .ow-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 2px; }
-  .ow-actions .ctl-btn { align-self: auto; }
+  .ow-gate::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--warn); }
+  .ow-gate.is-resolved::before { background: var(--ok); }
+  .ow-gate.is-resolved { opacity: .8; border-color: color-mix(in srgb, var(--ok) 40%, var(--edge)); }
+  .ow-gate-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ow-badge {
+    font-family: var(--font-mono); font-size: 9px; font-weight: 600; letter-spacing: .12em;
+    text-transform: uppercase; padding: 3px 8px; border-radius: 7px;
+    color: var(--trust); background: color-mix(in srgb, var(--trust) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--trust) 28%, transparent);
+  }
+  .ow-badge.risk {
+    color: var(--warn); background: color-mix(in srgb, var(--warn) 13%, transparent);
+    border-color: color-mix(in srgb, var(--warn) 30%, transparent);
+  }
+  .ow-slug {
+    font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3);
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .ow-gate h3 { margin: 10px 0 3px; font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
+  .ow-gate-action { font-family: var(--font-mono); font-size: 11px; color: var(--ink2); margin: 0 0 4px; }
+
+  /* Consequences block (only when /v1/actions/enrich returns). */
   .ow-conseq {
-    display: flex; flex-direction: column; gap: 8px;
-    border-left: 3px solid var(--trust); padding: 4px 0 4px 12px; margin: 2px 0;
+    display: flex; flex-direction: column; gap: 6px; margin: 10px 0;
+    padding: 10px 12px; border-radius: var(--radius-sm);
+    background: var(--surface2); border: 1px solid var(--edge);
   }
-  .ow-narrative { color: var(--ink2); }
+  .ow-narrative { color: var(--ink2); font-size: 12.5px; margin: 0; line-height: 1.45; }
+  .ow-conseq-row { display: flex; gap: 9px; font-size: 12.5px; color: var(--ink2); line-height: 1.4; }
+  .ow-conseq-row::before {
+    content: ""; flex: none; width: 6px; height: 6px; margin-top: 6px; border-radius: 50%; background: var(--trust);
+  }
+  .ow-conseq-row b { color: var(--ink); font-weight: 600; }
+
+  /* Attribution line — mono, with a mini gradient avatar. */
+  .ow-attr {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    font-family: var(--font-mono); font-size: 10px; color: var(--ink3); margin: 10px 0;
+  }
+  .ow-avatar {
+    width: 18px; height: 18px; flex: none; border-radius: 50%; display: grid; place-items: center;
+    font-size: 8px; font-weight: 700; color: #fff; font-family: var(--font-sans);
+    background: linear-gradient(135deg, var(--trust), var(--acc));
+  }
+
+  /* Action row: gradient approve · ghost return · inline note (concept .actions). */
+  .ow-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+  .ow-btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    min-height: 44px; padding: 0 16px; border-radius: var(--radius-sm);
+    font-weight: 600; font-size: 13px; cursor: pointer; border: 1px solid transparent;
+    transition: filter .18s ease, background .18s ease, color .18s ease;
+  }
+  .ow-btn svg { width: 15px; height: 15px; flex: none; }
+  .ow-btn:disabled { opacity: .55; cursor: not-allowed; }
+  .ow-approve { background: linear-gradient(180deg, var(--approve-a), var(--approve-b)); color: var(--approve-ink); }
+  .ow-approve:hover:not(:disabled) { filter: brightness(1.07); }
+  .ow-ghost { background: var(--surface2); color: var(--ink2); border-color: var(--edge-strong); }
+  .ow-ghost:hover:not(:disabled) { color: var(--ink); }
+  .ow-note {
+    width: 100%; min-height: 40px; margin-top: 8px; padding: 8px 11px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface2); color: var(--ink); font: inherit; font-size: 12.5px;
+  }
+  .ow-note::placeholder { color: var(--ink3); }
   .ow-status:empty { display: none; }
-  .ow-status { color: var(--warn); }
-  .ow-await { color: var(--ink3); }
-  .ow-gate.is-resolved {
-    opacity: .78; border-color: color-mix(in srgb, var(--ok) 40%, var(--edge));
+  .ow-status { color: var(--warn); font-size: 12px; margin: 6px 0 0; }
+  .ow-await { color: var(--ink3); font-size: 12.5px; margin: 8px 0 0; }
+
+  /* Post-approve done-line (concept .doneline). */
+  .ow-done { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; color: var(--ok); margin-top: 4px; }
+  .ow-done svg { width: 16px; height: 16px; flex: none; }
+  .ow-done.returned { color: var(--warn); }
+  .ow-done .ow-hash {
+    font-family: var(--font-mono); font-size: 10.5px; color: var(--ink2);
+    background: color-mix(in srgb, var(--ok) 9%, transparent);
+    border: 1px solid color-mix(in srgb, var(--ok) 25%, transparent);
+    padding: 2px 8px; border-radius: 7px;
+  }
+
+  /* All-clear empty state (concept "all clear — agents unblocked"). */
+  .ow-allclear {
+    display: flex; align-items: center; gap: 10px; padding: 16px 18px;
+    border: 1px solid color-mix(in srgb, var(--ok) 30%, var(--edge)); border-radius: var(--radius);
+    background: color-mix(in srgb, var(--ok) 6%, var(--surface));
+  }
+  .ow-allclear svg { width: 20px; height: 20px; flex: none; color: var(--ok); }
+  .ow-allclear b { display: block; font-size: 13.5px; color: var(--ink); }
+  .ow-allclear span { font-size: 12px; color: var(--ink3); }
+
+  /* ---- Fleet rows (concept .sess) --------------------------------------- */
+  .ow-fleet-row {
+    display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; margin-bottom: 9px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface); box-shadow: var(--card-shadow);
+  }
+  .ow-dot { width: 8px; height: 8px; flex: none; margin-top: 5px; border-radius: 50%; background: var(--ok); }
+  .ow-dot.pulse { animation: owPulse 2s ease-in-out infinite; }
+  .ow-dot.idle { background: var(--ink3); }
+  @keyframes owPulse { 50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--ok) 14%, transparent); } }
+  .ow-fleet-meta { min-width: 0; flex: 1; }
+  .ow-fleet-meta b { font-size: 13px; display: block; }
+  .ow-focus {
+    font-family: var(--font-mono); font-size: 10px; color: var(--ink3); margin-top: 3px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .ow-leases { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+  .ow-lease {
+    font-family: var(--font-mono); font-size: 9px; color: var(--ink2);
+    background: var(--surface2); border: 1px solid var(--edge); padding: 2px 7px; border-radius: 6px;
+  }
+  .ow-lease.ov {
+    color: var(--warn); background: color-mix(in srgb, var(--warn) 8%, transparent);
+    border-color: color-mix(in srgb, var(--warn) 35%, transparent);
+  }
+  .ow-fleet-side { font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); text-align: right; flex: none; max-width: 42%; }
+  .ow-fleet-side div { margin-top: 2px; word-break: break-word; }
+
+  /* ---- Activity ticker (concept trust ticker) --------------------------- */
+  .ow-ticker {
+    border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    padding: 4px 14px;
+  }
+  .ow-tick { display: flex; align-items: center; gap: 9px; padding: 9px 0; border-bottom: 1px solid var(--edge); font-size: 12px; }
+  .ow-tick:last-child { border-bottom: none; }
+  .ow-tick-label { color: var(--ink2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ow-tick-ts { margin-left: auto; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); flex: none; }
+  .ow-hash {
+    font-family: var(--font-mono); font-size: 10px; color: var(--trust);
+    background: color-mix(in srgb, var(--trust) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--trust) 25%, transparent);
+    padding: 2px 8px; border-radius: 7px; white-space: nowrap; flex: none;
+  }
+
+  /* ---- Engine-mediated card (right column; only when it answers) -------- */
+  .ow-engine {
+    border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    padding: 12px 15px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .ow-body .ctl-info { margin-bottom: 0; }
+
+  /* Phone (<720px): columns stack, action buttons go full-width. */
+  @media (max-width: 720px) {
+    .ow-cols { grid-template-columns: 1fr; }
+    .ow-actions .ow-btn { flex: 1; }
+    .ow-fleet-side { max-width: none; }
   }
 
   /* ---- Accessibility & motion ------------------------------------------- */
@@ -621,17 +820,20 @@
       bg: '#060A12', surface: 'rgba(255,255,255,.055)', surface2: 'rgba(255,255,255,.03)',
       edge: 'rgba(255,255,255,.10)', edgeStrong: 'rgba(255,255,255,.18)',
       ink: '#EAF0F7', ink2: '#93A4B8', ink3: '#6E7E96',
-      acc: '#6CA8FF', ok: '#3DDC97', warn: '#F5B94B', crit: '#F0716C', trust: '#A78BFA', blur: '18px' } },
+      acc: '#6CA8FF', ok: '#3DDC97', warn: '#F5B94B', crit: '#F0716C', trust: '#A78BFA',
+      approveA: '#43E6A2', approveB: '#2BB983', approveInk: '#05261A', blur: '18px' } },
     { id: 'dark', label: 'Dark', icon: 'dark', tokens: {
       bg: '#0D1117', surface: '#161B22', surface2: '#11151C',
       edge: '#2A313C', edgeStrong: '#3D4654',
       ink: '#E6EDF3', ink2: '#9BA7B4', ink3: '#6E7B8A',
-      acc: '#58A6FF', ok: '#2EA043', warn: '#D29922', crit: '#F85149', trust: '#BC8CFF', blur: '0px' } },
+      acc: '#58A6FF', ok: '#2EA043', warn: '#D29922', crit: '#F85149', trust: '#BC8CFF',
+      approveA: '#2EA043', approveB: '#238636', approveInk: '#FFFFFF', blur: '0px' } },
     { id: 'light', label: 'Light', icon: 'light', tokens: {
       bg: '#F4F6F8', surface: '#FFFFFF', surface2: '#EDF1F5',
       edge: '#D7DEE5', edgeStrong: '#B9C4CF',
       ink: '#1B2733', ink2: '#4A5866', ink3: '#5B6B7D',
-      acc: '#2456A6', ok: '#1A7F4E', warn: '#9A5B00', crit: '#B91C1C', trust: '#6D28D9', blur: '0px' } }
+      acc: '#2456A6', ok: '#1A7F4E', warn: '#9A5B00', crit: '#B91C1C', trust: '#6D28D9',
+      approveA: '#1A7F4E', approveB: '#14663E', approveInk: '#FFFFFF', blur: '0px' } }
   ];
   function themeById(id) {
     for (var i = 0; i < THEMES.length; i++) { if (THEMES[i].id === id) return THEMES[i]; }

@@ -315,22 +315,51 @@
   }
 
   // =======================================================================
-  //  Overwatch landing (M3) — needs-you · fleet · activity, over the M0 stat
-  //  tiles. Built with bespoke DOM (not the page DSL) so the needs-you gate
-  //  cards can carry real, posture-gated approve/return handlers. Every panel
-  //  renders an empty/degraded state and never throws on a failure path.
+  //  Overwatch landing — Overwatch-concept look (post-M6). A full-width stat-
+  //  tile row, then a 7fr/5fr split: NEEDS YOU gate cards on the left, FLEET +
+  //  ACTIVITY ticker (+ the engine card when mediation answers) on the right.
+  //  Bespoke DOM (not the page DSL) so the gate cards carry real, posture-gated
+  //  approve/return handlers. Behaviour is unchanged from M3 — every panel still
+  //  renders a real-fields-only degraded/empty state and never throws. Only the
+  //  DOM/class shape changed to match the concept.
   // =======================================================================
 
-  function panelCard(title, sub) {
-    var card = el('section', { 'class': 'v2card wide ow-panel' });
-    if (title) { card.appendChild(el('h3', { 'class': 'v2card-h', text: title })); }
-    card.appendChild(el('p', { 'class': 'v2card-sub', text: sub || '' }));
-    var body = el('div', { 'class': 'v2card-body' });
-    card.appendChild(body);
-    card.__body = body;
-    return card;
+  // A landing panel: a mono section header (concept .sechead) with a right-
+  // aligned live count/link, over a body the async fills populate.
+  function panel(title, ctText, first, linkText, linkHref) {
+    var wrap = el('div', { 'class': 'ow-panel' });
+    var head = el('div', { 'class': 'ow-sec' + (first ? ' first' : '') }, [el('h2', { text: title })]);
+    var ct = el('span', { 'class': 'ow-ct', text: ctText || '' });
+    head.appendChild(ct);
+    if (linkText) { head.appendChild(el('a', { 'class': 'ow-link', href: linkHref || '#' }, [linkText])); }
+    var body = el('div', { 'class': 'ow-body' });
+    wrap.appendChild(head);
+    wrap.appendChild(body);
+    wrap.__ct = ct; wrap.__body = body;
+    return wrap;
   }
-  function setSub(card, text) { var s = card.querySelector('.v2card-sub'); if (s) { s.textContent = text; } }
+  function setCt(wrap, text) { if (wrap && wrap.__ct) { wrap.__ct.textContent = String(text); } }
+
+  // Minimal inline SVGs (this module has no icon set) — a check + a return
+  // arrow, used on the approve button, the done-line, and the all-clear state.
+  function svgIcon(paths, w) {
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="' + (w || 2) +
+      '" stroke-linecap="round" stroke-linejoin="round">' + paths + '</svg>';
+  }
+  var SVG_CHECK = svgIcon('<path d="M4.5 12.5l5 5L19.5 7"/>', 2.4);
+  var SVG_RETURN = svgIcon('<path d="M9 14L4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-4"/>');
+  function iconBtn(cls, iconHtml, label) {
+    var b = el('button', { 'class': cls, type: 'button' });
+    if (iconHtml) { b.innerHTML = iconHtml; }
+    b.appendChild(doc().createTextNode(label));
+    return b;
+  }
+  // Two-letter initials for the mini gradient avatar (derived from the real
+  // passport id — never a fabricated display name).
+  function initials(pid) {
+    var s = String(pid || '').replace(/^p_/, '').replace(/[^A-Za-z0-9]/g, '');
+    return (s.slice(0, 2) || '··').toUpperCase();
+  }
   function noteChip(text) { return el('span', { 'class': 'ow-chip', text: String(text) }); }
   function kv(k, v) {
     return el('div', { 'class': 'ctl-info' }, [
@@ -367,50 +396,68 @@
   // Needs-you: pending gates from GET /v1/work/gate/pending. Operator posture
   // gets approve / return-with-note (+ foresight); customer gets a read-only
   // queue.
-  function fillNeedsYou(card) {
-    var body = card.__body;
+  function fillNeedsYou(wrap) {
+    var body = wrap.__body;
     return fetchJSON('/v1/work/gate/pending').then(function (res) {
       body.textContent = '';
       if (!res.ok || !res.data) {
-        setSub(card, 'gate queue unavailable');
+        setCt(wrap, 'gate queue unavailable');
         body.appendChild(kv(res.status === 0 ? 'unreachable' : ('HTTP ' + res.status), 'GET /v1/work/gate/pending'));
         return;
       }
       var pending = (res.data.pending || []).filter(function (p) { return (p.status || 'pending') === 'pending'; });
-      setSub(card, pending.length + ' pending · /v1/work/gate/pending' + (isOperator() ? '' : ' · awaiting operator'));
-      if (!pending.length) { body.appendChild(kv('all clear', 'no gated transitions are waiting')); return; }
+      setCt(wrap, pending.length + ' pending · /v1/work/gate/pending' + (isOperator() ? '' : ' · awaiting operator'));
+      if (!pending.length) {
+        var ok = el('div', { 'class': 'ow-allclear' });
+        ok.innerHTML = SVG_CHECK;
+        ok.appendChild(el('div', {}, [
+          el('b', { text: 'All clear — agents unblocked' }),
+          el('span', { text: 'no gated transitions are waiting' })
+        ]));
+        body.appendChild(ok);
+        return;
+      }
       pending.forEach(function (p) { body.appendChild(gateCard(p)); });
     });
   }
 
   function gateCard(p) {
-    var wrap = el('div', { 'class': 'exp ow-gate', 'data-action-id': p.action_id });
-    var sum = el('div', { 'class': 'exp-sum' }, [
-      el('span', { 'class': 'exp-label', text: p.work_id || p.action_id }),
-      el('span', { 'class': 'exp-sub', text: (p.requested_action || 'update_state') + (p.target_state ? ' → ' + p.target_state : '') + ' · by ' + (p.requested_by_passport || '?') })
-    ]);
-    if (p.risk_class) { sum.appendChild(el('span', { 'class': 'exp-badge', text: String(p.risk_class).toUpperCase() })); }
-    wrap.appendChild(sum);
-    var body = el('div', { 'class': 'exp-body' });
-    body.appendChild(kv('action id', p.action_id));
-    body.appendChild(kv('requested', tsLabel(p.requested_at_unix_ms)));
-    wrap.appendChild(body);
+    var wrap = el('div', { 'class': 'ow-gate', 'data-action-id': p.action_id });
+    var who = p.requested_by_passport || '?';
+    // Top row: the Art.14 badge (these pending items ARE human gates), a real
+    // risk badge only if the API carries one, and the action-id slug chip.
+    var top = el('div', { 'class': 'ow-gate-top' }, [el('span', { 'class': 'ow-badge', text: 'ART.14 HUMAN GATE' })]);
+    if (p.risk_class) { top.appendChild(el('span', { 'class': 'ow-badge risk', text: 'RISK · ' + String(p.risk_class).toUpperCase() })); }
+    top.appendChild(el('span', { 'class': 'ow-slug', text: p.action_id || '' }));
+    wrap.appendChild(top);
+    // Title = the work being gated; the requested transition sits under it.
+    wrap.appendChild(el('h3', { text: p.work_id || p.action_id || 'gated transition' }));
+    wrap.appendChild(el('p', { 'class': 'ow-gate-action', text: (p.requested_action || 'update_state') + (p.target_state ? ' → ' + p.target_state : '') }));
+    // Attribution — mono line with a mini gradient avatar from the passport id.
+    wrap.appendChild(el('div', { 'class': 'ow-attr' }, [
+      el('span', { 'class': 'ow-avatar', text: initials(who) }),
+      el('span', { text: 'requested by ' + who + ' · ' + tsLabel(p.requested_at_unix_ms) })
+    ]));
     if (!isOperator()) {
-      body.appendChild(el('p', { 'class': 'ctl-desc ow-await', text: 'Read-only in customer view — awaiting operator approval.' }));
+      wrap.appendChild(el('p', { 'class': 'ow-await', text: 'Read-only in customer view — awaiting operator approval.' }));
       return wrap;
     }
-    // Operator: foresight consequences + approve / return-with-note.
-    var conseq = el('div', { 'class': 'ow-conseq' }, [el('p', { 'class': 'ctl-desc', text: 'Loading consequences…' })]);
-    body.appendChild(conseq);
+    // Operator: foresight consequences + approve / return-with-note. All the
+    // interactive machinery lives in .ow-gate-op so markResolved can swap it for
+    // the done-line without touching the header above.
+    var op = el('div', { 'class': 'ow-gate-op' });
+    wrap.appendChild(op);
+    var conseq = el('div', { 'class': 'ow-conseq' }, [el('p', { 'class': 'ow-narrative', text: 'Loading consequences…' })]);
+    op.appendChild(conseq);
     loadConsequences(p, conseq);
-    var note = el('textarea', { 'class': 'ctl-input ctl-textarea', rows: 2, placeholder: 'optional note — returned to the requester as a work comment' });
-    body.appendChild(kv('approving as', boundPassport() || 'bind a passport (Art. 14)'));
-    body.appendChild(el('div', { 'class': 'ctl-row' }, [note]));
-    var status = el('p', { 'class': 'ctl-desc ow-status' });
-    var approveBtn = el('button', { 'class': 'ctl-btn', type: 'button' }, ['Approve']);
-    var returnBtn = el('button', { 'class': 'ctl-btn danger', type: 'button' }, ['Return with note']);
-    body.appendChild(el('div', { 'class': 'ow-actions' }, [approveBtn, returnBtn]));
-    body.appendChild(status);
+    op.appendChild(el('div', { 'class': 'ow-attr' }, [el('span', { text: 'approving as ' + (boundPassport() || 'bind a passport (Art. 14)') })]));
+    var note = el('input', { 'class': 'ow-note', type: 'text', placeholder: 'optional note — returned to the requester as a work comment', 'aria-label': 'Return note' });
+    var status = el('p', { 'class': 'ow-status' });
+    var approveBtn = iconBtn('ow-btn ow-approve', SVG_CHECK, 'Approve');
+    var returnBtn = iconBtn('ow-btn ow-ghost', SVG_RETURN, 'Return with note');
+    op.appendChild(el('div', { 'class': 'ow-actions' }, [approveBtn, returnBtn]));
+    op.appendChild(note);
+    op.appendChild(status);
     function unlock() { approveBtn.disabled = false; returnBtn.disabled = false; }
     function lock(msg) { approveBtn.disabled = true; returnBtn.disabled = true; status.textContent = msg || ''; }
     approveBtn.addEventListener('click', function () {
@@ -440,13 +487,16 @@
   // receipt), so surface only REAL fields; a receipt id renders here only if
   // the response carries one, else "recorded" — never a fabricated hash.
   function markResolved(wrap, kind, data, who) {
-    wrap.classList.add('is-resolved');
-    var body = wrap.querySelector('.exp-body');
-    if (body) { body.textContent = ''; } else { body = el('div', { 'class': 'exp-body' }); wrap.appendChild(body); }
+    wrap.classList.add('is-resolved');   // stripe flips --warn → --ok
+    var op = wrap.querySelector('.ow-gate-op');
+    if (op) { op.textContent = ''; } else { op = el('div', { 'class': 'ow-gate-op' }); wrap.appendChild(op); }
     var receipt = data && (data.receipt_id || (data.receipt && data.receipt.receipt_id) || data.receipt);
-    body.appendChild(kv(kind === 'approved' ? 'approved' : 'returned', 'by ' + who));
-    if (data && data.state) { body.appendChild(kv('new state', data.state)); }
-    body.appendChild(kv('receipt', (receipt && typeof receipt === 'string') ? receipt : 'recorded'));
+    var line = el('div', { 'class': 'ow-done' + (kind === 'returned' ? ' returned' : '') });
+    line.innerHTML = (kind === 'returned' ? SVG_RETURN : SVG_CHECK);
+    line.appendChild(el('span', { text: (kind === 'approved' ? 'Approved' : 'Returned') + ' by ' + who + (data && data.state ? ' · ' + data.state : '') }));
+    // A receipt id only if the backend returned one; otherwise "recorded" — never a fabricated hash.
+    line.appendChild(el('span', { 'class': 'ow-hash', text: (receipt && typeof receipt === 'string') ? receipt : 'recorded' }));
+    op.appendChild(line);
   }
 
   // Foresight (Art. 15) via POST /v1/actions/enrich. Degrades silently on any
@@ -460,24 +510,32 @@
     };
     enrichAction(input).then(readJson).then(function (r) {
       mount.textContent = '';
-      if (!r.ok || !r.data || !r.data.proposal) { return; }
+      // Consequences block renders ONLY when enrich returns a proposal; on any
+      // non-ok / empty path the block is removed rather than left as an empty box.
+      if (!r.ok || !r.data || !r.data.proposal) { if (mount.parentNode) { mount.parentNode.removeChild(mount); } return; }
       var prop = r.data.proposal, meta = prop.consequence_metadata || {};
-      mount.appendChild(el('p', { 'class': 'ctl-desc ow-narrative', text: prop.narrative || '' }));
+      if (prop.narrative) { mount.appendChild(el('p', { 'class': 'ow-narrative', text: prop.narrative })); }
       var bits = [meta.materiality && ('materiality ' + meta.materiality), meta.reversibility, meta.blast_radius && ('blast ' + meta.blast_radius)].filter(Boolean);
       if (bits.length) { mount.appendChild(el('div', { 'class': 'ow-meta' }, bits.map(noteChip))); }
       (prop.consequences || []).slice(0, 5).forEach(function (c) {
-        mount.appendChild(kv(c.consequence_type || 'consequence', (c.detail || '') + (c.target ? ' · ' + c.target : '')));
+        mount.appendChild(el('div', { 'class': 'ow-conseq-row' }, [
+          el('span', {}, [
+            el('b', { text: c.consequence_type || 'consequence' }),
+            doc().createTextNode(' — ' + (c.detail || '') + (c.target ? ' · ' + c.target : ''))
+          ])
+        ]));
       });
-    }).catch(function () { mount.textContent = ''; });
+      if (!mount.childNodes.length && mount.parentNode) { mount.parentNode.removeChild(mount); }
+    }).catch(function () { if (mount.parentNode) { mount.parentNode.removeChild(mount); } });
   }
 
   // Fleet: one client-side join of coord_active ⋈ punchcards ⋈ sessions ⋈
   // orchestrators, keyed by passport. A 404/400 source is skipped with a quiet
   // chip; the panel still renders from whatever is available.
-  function fillFleet(card) {
-    var body = card.__body;
+  function fillFleet(wrap) {
+    var body = wrap.__body;
     var chips = el('div', { 'class': 'ow-srcchips' });
-    card.insertBefore(chips, body);
+    wrap.insertBefore(chips, body);
     return Promise.all([
       fetchJSON('/v1/coord/active'),
       fetchJSON('/v1/punchcards'),
@@ -493,7 +551,7 @@
         chips.appendChild(noteChip(pair[0] + ' · ' + (ok ? 'on' : (off ? 'off' : 'n/a'))));
       });
       var rows = {};
-      function slot(pid) { pid = pid || '—'; return rows[pid] || (rows[pid] = { passport: pid, intent: null, milestone: null, execplan: null, leases: [], orchestrators: [], snapshot: null, sessionHex: null }); }
+      function slot(pid) { pid = pid || '—'; return rows[pid] || (rows[pid] = { passport: pid, intent: null, milestone: null, execplan: null, leases: [], orchestrators: [], snapshot: null, sessionHex: null, overlaps: [] }); }
       if (coord.ok && coord.data) {
         (coord.data.active_sessions || []).forEach(function (s) {
           var row = slot(s.passport_id); var i = s.intent || {};
@@ -502,6 +560,7 @@
           row.intent = i.note || row.intent;
           row.sessionHex = (s.session_id_hex || '').slice(0, 8) || row.sessionHex;
           (s.leases || []).forEach(function (l) { if (l.resource) { row.leases.push(l.resource); } });
+          (s.overlaps || []).forEach(function (o) { row.overlaps.push(o); });   // real coord overlap rows only
         });
       }
       if (punch.ok && punch.data) {
@@ -524,58 +583,88 @@
         });
       }
       var keys = Object.keys(rows);
-      setSub(card, keys.length + ' session' + (keys.length === 1 ? '' : 's') + ' · coord ⋈ punchcards ⋈ sessions ⋈ orchestrators');
+      setCt(wrap, keys.length + ' session' + (keys.length === 1 ? '' : 's') + ' · coord ⋈ punchcards ⋈ sessions ⋈ orchestrators');
       if (!keys.length) { body.appendChild(kv('quiet', 'no live sessions right now')); return; }
       keys.forEach(function (k) {
         var row = rows[k];
-        var fleet = el('div', { 'class': 'exp ow-fleet' });
-        fleet.appendChild(el('div', { 'class': 'exp-sum' }, [
-          el('span', { 'class': 'exp-label', text: (row.sessionHex ? row.sessionHex + ' · ' : '') + row.passport }),
-          el('span', { 'class': 'exp-sub', text: [row.execplan && (row.execplan + (row.milestone ? ' @ ' + row.milestone : '')), row.intent].filter(Boolean).join(' · ') || 'idle' })
-        ]));
-        var fb = el('div', { 'class': 'exp-body' });
-        if (row.leases.length) { fb.appendChild(kv('leases', row.leases.join(', '))); }
-        if (row.orchestrators.length) { fb.appendChild(kv('orchestrators', row.orchestrators.join(', '))); }
-        if (row.snapshot) { fb.appendChild(kv('snapshot', row.snapshot)); }
-        if (!fb.childNodes.length) { fb.appendChild(kv('focus', 'no declared focus / lease')); }
-        fleet.appendChild(fb);
-        body.appendChild(fleet);
+        var live = !!(row.sessionHex || row.intent || row.milestone);   // has a live coord footprint
+        var frow = el('div', { 'class': 'ow-fleet-row' });
+        frow.appendChild(el('span', { 'class': 'ow-dot' + (live ? ' pulse' : ' idle'), 'aria-hidden': 'true' }));
+        var meta = el('div', { 'class': 'ow-fleet-meta' }, [
+          el('b', { text: (row.sessionHex ? row.sessionHex + ' · ' : '') + row.passport })
+        ]);
+        var focusText = [row.execplan && (row.execplan + (row.milestone ? ' @ ' + row.milestone : '')), row.intent].filter(Boolean).join(' · ') || 'idle';
+        meta.appendChild(el('div', { 'class': 'ow-focus', text: focusText, title: focusText }));
+        if (row.leases.length || row.overlaps.length) {
+          var lz = el('div', { 'class': 'ow-leases' });
+          row.leases.forEach(function (l) { lz.appendChild(el('span', { 'class': 'ow-lease', text: l })); });
+          if (row.overlaps.length) { lz.appendChild(el('span', { 'class': 'ow-lease ov', text: '⚠ ' + row.overlaps.length + ' overlap' + (row.overlaps.length === 1 ? '' : 's') })); }
+          meta.appendChild(lz);
+        }
+        frow.appendChild(meta);
+        var side = el('div', { 'class': 'ow-fleet-side' });
+        if (row.orchestrators.length) { side.appendChild(el('div', { text: row.orchestrators.join(', ') })); }
+        if (row.snapshot) { side.appendChild(el('div', { text: 'snap ' + row.snapshot })); }
+        if (side.childNodes.length) { frow.appendChild(side); }
+        body.appendChild(frow);
       });
     });
   }
 
   // Activity strip: latest N from /v1/activity. When the feature flag is off it
   // 404s → M1-style link card to the dedicated /console/activity surface.
-  function fillActivity(card) {
-    var body = card.__body;
+  function fillActivity(wrap) {
+    var body = wrap.__body;
     return fetchJSON('/v1/activity?tenant_id=default&token_budget=1500').then(function (res) {
       body.textContent = '';
       if (res.status === 404) {
-        setSub(card, 'the streaming activity log lives on a dedicated surface');
+        setCt(wrap, 'dedicated surface');
         body.appendChild(kv('stream', 'GET /v1/events/stream?types=activity.appended'));
-        body.appendChild(el('a', { 'class': 'ctl-btn ctl-link', href: '/console/activity' }, ['Open the activity log']));
+        body.appendChild(el('a', { 'class': 'ow-link', href: '/console/activity' }, ['Open the activity log →']));
         return;
       }
       if (!res.ok || !res.data) {
-        setSub(card, 'activity unavailable');
+        setCt(wrap, 'activity unavailable');
         body.appendChild(kv(res.status === 0 ? 'unreachable' : ('HTTP ' + res.status), 'GET /v1/activity'));
         return;
       }
       var rows = (res.data.rows || []).slice(0, 12);
-      setSub(card, (res.data.returned != null ? res.data.returned : rows.length) + ' recent · /v1/activity');
+      setCt(wrap, (res.data.returned != null ? res.data.returned : rows.length) + ' recent · /v1/activity');
       if (!rows.length) { body.appendChild(kv('quiet', 'no activity captured yet')); return; }
+      // Ticker: one card of border-separated rows. Receipt ids ride as trust
+      // hash-chips; the preview folds into the row's hover title to stay one-line.
+      var ticker = el('div', { 'class': 'ow-ticker' });
       rows.forEach(function (r0) {
-        var item = el('div', { 'class': 'exp ow-activity' }, [
-          el('div', { 'class': 'exp-sum' }, [
-            el('span', { 'class': 'exp-label', text: (r0.kind || 'event') + (r0.tool ? ' · ' + r0.tool : '') }),
-            el('span', { 'class': 'exp-sub', text: [r0.session_id, r0.ts].filter(Boolean).join(' · ') })
-          ])
-        ]);
-        var pv = el('div', { 'class': 'exp-body' }, [el('p', { 'class': 'ctl-desc', text: r0.preview || '' })]);
-        if ((r0.receipt_ids || []).length) { pv.appendChild(kv('receipt', r0.receipt_ids[0])); }
-        item.appendChild(pv);
-        body.appendChild(item);
+        var tick = el('div', { 'class': 'ow-tick' });
+        if ((r0.receipt_ids || []).length) { tick.appendChild(el('span', { 'class': 'ow-hash', text: r0.receipt_ids[0] })); }
+        var label = (r0.kind || 'event') + (r0.tool ? ' · ' + r0.tool : '');
+        tick.appendChild(el('span', { 'class': 'ow-tick-label', text: label, title: r0.preview || label }));
+        if (r0.ts) { tick.appendChild(el('span', { 'class': 'ow-tick-ts', text: String(r0.ts) })); }
+        ticker.appendChild(tick);
       });
+      body.appendChild(ticker);
+    });
+  }
+
+  // Engine (mediated) card — reuses the existing daemon-proxied read
+  // (GET /v1/console/engine/summary). It renders ONLY when the mediation
+  // endpoint answers with data; a 404 / off / unreachable removes the panel
+  // entirely (no fabricated engine card when mediation is off).
+  function fillEngine(wrap) {
+    var body = wrap.__body;
+    return fetchJSON('/v1/console/engine/summary').then(function (res) {
+      if (res.status === 404 || res.status === 0 || !res.ok || !res.data) {
+        if (wrap.parentNode) { wrap.parentNode.removeChild(wrap); }
+        return;
+      }
+      var d = res.data;
+      setCt(wrap, 'via daemon origin');
+      body.textContent = '';
+      body.appendChild(el('div', { 'class': 'ow-engine' }, [
+        kv('mediated', d.mediated === true ? 'yes · daemon-proxied' : '—'),
+        kv('engine', d.engine_reachable ? ('reachable · ' + (d.engine_latency_ms != null ? d.engine_latency_ms + ' ms' : '—')) : 'unreachable'),
+        kv('fetched', d.fetched_at_unix_ms != null ? tsLabel(d.fetched_at_unix_ms) : '—')
+      ]));
     });
   }
 
@@ -585,21 +674,33 @@
   function renderOverwatchLanding(region, ctx) {
     ctx = ctx || {};
     region.textContent = '';
-    var grid = el('div', { 'class': 'v2grid ow-landing' });
-    region.appendChild(grid);
-    var tileCard = el('section', { 'class': 'v2card wide ow-panel ow-tiles' }, [el('p', { 'class': 'v2card-sub', text: 'Loading…' })]);
-    grid.appendChild(tileCard);
-    var needsCard = panelCard('Needs you', 'loading gate queue…');
-    var fleetCard = panelCard('Fleet', 'loading live sessions…');
-    var actCard = panelCard('Activity', 'loading…');
-    grid.appendChild(needsCard);
-    grid.appendChild(fleetCard);
-    grid.appendChild(actCard);
+    var root = el('div', { 'class': 'ow-landing' });
+    region.appendChild(root);
+    // Tagline introducing the Overwatch view (concept apphead sub).
+    root.appendChild(el('p', { 'class': 'ow-tagline', text: 'You steer. Agents work. Everything receipts.' }));
+    // Stat tiles — full width, reused from the cx-overview build.
+    var tileCard = el('div', { 'class': 'ow-tiles' }, [el('p', { 'class': 'v2card-sub', text: 'Loading…' })]);
+    root.appendChild(tileCard);
+    // 7fr / 5fr split: NEEDS YOU on the left; FLEET · ACTIVITY · ENGINE right.
+    var cols = el('div', { 'class': 'ow-cols' });
+    var left = el('div', { 'class': 'ow-col' });
+    var right = el('div', { 'class': 'ow-col' });
+    cols.appendChild(left); cols.appendChild(right);
+    root.appendChild(cols);
+    var needs = panel('Needs you', 'loading gate queue…', true);
+    left.appendChild(needs);
+    var fleet = panel('Fleet', 'loading live sessions…', true);
+    var activity = panel('Activity', 'loading…', false, 'open log →', '/console/activity');
+    var engine = panel('Engine', 'checking mediation…', false);
+    right.appendChild(fleet);
+    right.appendChild(activity);
+    right.appendChild(engine);
     return Promise.all([
       fillTiles(tileCard, ctx),
-      fillNeedsYou(needsCard),
-      fillFleet(fleetCard),
-      fillActivity(actCard)
+      fillNeedsYou(needs),
+      fillFleet(fleet),
+      fillActivity(activity),
+      fillEngine(engine)
     ]);
   }
 
