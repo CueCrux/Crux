@@ -47,7 +47,7 @@
     --edge-strong: rgba(255,255,255,.18);
     --ink: #EAF0F7;
     --ink2: #93A4B8;
-    --ink3: #5E6E80;
+    --ink3: #6E7E96;
     --acc: #6CA8FF;
     --ok: #3DDC97;
     --warn: #F5B94B;
@@ -83,7 +83,7 @@
     --edge-strong: #B9C4CF;
     --ink: #1B2733;
     --ink2: #4A5866;
-    --ink3: #68788A;
+    --ink3: #5B6B7D;
     --acc: #2456A6;
     --ok: #1A7F4E;
     --warn: #9A5B00;
@@ -298,6 +298,115 @@
     padding: 2px 8px; border-radius: 999px;
   }
 
+  /* ---- Sub-nav pill row (destination → pages) --------------------------- */
+  .subnav {
+    display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 22px;
+    padding-bottom: 16px; border-bottom: 1px solid var(--edge);
+  }
+  .pill {
+    min-height: 36px; padding: 0 14px;
+    display: inline-flex; align-items: center;
+    border: 1px solid var(--edge); border-radius: 999px;
+    background: var(--surface2); color: var(--ink2);
+    font-weight: 500; font-size: 13px; cursor: pointer;
+    transition: background .16s ease, color .16s ease, border-color .16s ease;
+  }
+  .pill:hover { color: var(--ink); border-color: var(--edge-strong); }
+  .pill[aria-current="page"] { background: var(--acc); color: #fff; border-color: var(--acc); }
+
+  /* ---- Page card grid + control DSL ------------------------------------- */
+  .page-host { min-height: 40px; }
+  .v2grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; align-items: start; }
+  .v2card {
+    padding: 16px 18px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    min-width: 0;
+  }
+  .v2card.wide { grid-column: 1 / -1; }
+  .v2card-h { margin: 0; font-size: 14.5px; font-weight: 650; }
+  .v2card-sub { margin: 4px 0 0; font-size: 12.5px; color: var(--ink2); }
+  .v2card-body { display: flex; flex-direction: column; gap: 12px; margin-top: 14px; }
+  .v2card-body:empty { margin-top: 0; }
+
+  .ctl-row { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .ctl-label { font-size: 11.5px; font-weight: 600; color: var(--ink3); text-transform: uppercase; letter-spacing: .04em; }
+  .ctl-desc { margin: 0; font-size: 12px; color: var(--ink3); line-height: 1.45; }
+  .ctl-input {
+    width: 100%; min-height: 40px; padding: 8px 11px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface2); color: var(--ink); font: inherit;
+  }
+  .ctl-input.mono { font-family: var(--font-mono); font-size: 12.5px; }
+  .ctl-textarea { min-height: 68px; resize: vertical; line-height: 1.5; }
+  .ctl-input:disabled { opacity: .72; cursor: not-allowed; }
+  .ctl-input::placeholder { color: var(--ink3); }
+
+  .ctl-info {
+    display: flex; align-items: baseline; gap: 12px; justify-content: space-between;
+    padding: 8px 10px; border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+  }
+  .ctl-info-k { font-size: 12px; color: var(--ink3); font-weight: 500; flex: none; }
+  .ctl-info-v { font-size: 12.5px; color: var(--ink); text-align: right; word-break: break-word; font-variant-numeric: tabular-nums; }
+
+  .ctl-toggle { display: inline-flex; align-items: center; gap: 10px; cursor: not-allowed; }
+  .ctl-toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .ctl-track {
+    width: 38px; height: 22px; flex: none; border-radius: 999px;
+    background: var(--edge); border: 1px solid var(--edge-strong); position: relative; transition: background .16s ease;
+  }
+  .ctl-track::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+    border-radius: 50%; background: var(--ink2); transition: transform .16s ease;
+  }
+  .ctl-toggle input:checked + .ctl-track { background: color-mix(in srgb, var(--acc) 60%, transparent); }
+  .ctl-toggle input:checked + .ctl-track::after { transform: translateX(16px); background: #fff; }
+  .ctl-toggle-label { font-size: 13px; color: var(--ink); }
+
+  .ctl-btn {
+    align-self: flex-start; min-height: 40px; padding: 0 16px;
+    display: inline-flex; align-items: center; gap: 8px;
+    border: 1px solid var(--edge-strong); border-radius: var(--radius-sm);
+    background: var(--surface2); color: var(--ink); font-weight: 600; font-size: 13px; cursor: pointer;
+  }
+  .ctl-btn:disabled { opacity: .55; cursor: not-allowed; }
+  .ctl-btn.danger { border-color: color-mix(in srgb, var(--crit) 45%, var(--edge)); color: var(--crit); }
+  .ctl-link { background: var(--acc); color: #fff; border-color: var(--acc); text-decoration: none; }
+  .ctl-link:hover { filter: brightness(1.06); }
+
+  .gate-tag {
+    margin-left: 8px; font-size: 10px; letter-spacing: .04em; text-transform: uppercase; font-weight: 600;
+    color: var(--trust); background: color-mix(in srgb, var(--trust) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--trust) 30%, transparent); padding: 1px 7px; border-radius: 999px;
+  }
+  .ctl-row.is-gated, .exp.is-gated { position: relative; }
+
+  .ctl-bar { display: flex; flex-direction: column; gap: 6px; }
+  .ctl-bar-head { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--ink2); }
+  .ctl-bar-val { color: var(--ink); font-variant-numeric: tabular-nums; }
+  .ctl-bar-track { height: 10px; border-radius: 999px; background: var(--surface2); border: 1px solid var(--edge); overflow: hidden; }
+  .ctl-bar-fill { height: 100%; background: var(--acc); border-radius: 999px; }
+  .ctl-bar-fill.ok { background: var(--ok); }
+  .ctl-bar-fill.err { background: var(--crit); }
+
+  .ctl-rpcout {
+    margin: 0; padding: 12px; min-height: 90px; max-height: 300px; overflow: auto;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+    font-family: var(--font-mono); font-size: 12px; color: var(--ink2); white-space: pre-wrap; word-break: break-word;
+  }
+
+  .exp { border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2); overflow: hidden; }
+  .exp-sum { list-style: none; cursor: pointer; padding: 10px 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .exp-sum::-webkit-details-marker { display: none; }
+  .exp-label { font-weight: 600; font-size: 13px; color: var(--ink); }
+  .exp-sub { font-size: 12px; color: var(--ink3); flex: 1; min-width: 0; }
+  .exp-badge {
+    font-size: 10.5px; letter-spacing: .03em; text-transform: uppercase; font-weight: 600; color: var(--ink2);
+    border: 1px solid var(--edge); border-radius: 999px; padding: 1px 8px; background: var(--surface);
+  }
+  .exp[open] > .exp-sum { border-bottom: 1px solid var(--edge); }
+  .exp-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+
   /* ---- Accessibility & motion ------------------------------------------- */
   .skip {
     position: absolute; left: -9999px; top: 0; z-index: 100;
@@ -357,6 +466,10 @@
     </main>
   </div>
 
+<!-- No-build module split, served same-origin (console.rs embeds these). pages.js
+     carries the ported 26-page registry; render.js is the DSL renderer. -->
+<script src="/console-v2/pages.js"></script>
+<script src="/console-v2/render.js"></script>
 <script>
 "use strict";
 (function () {
@@ -386,7 +499,7 @@
     { id: 'glass', label: 'Glass', icon: 'glass', tokens: {
       bg: '#060A12', surface: 'rgba(255,255,255,.055)', surface2: 'rgba(255,255,255,.03)',
       edge: 'rgba(255,255,255,.10)', edgeStrong: 'rgba(255,255,255,.18)',
-      ink: '#EAF0F7', ink2: '#93A4B8', ink3: '#5E6E80',
+      ink: '#EAF0F7', ink2: '#93A4B8', ink3: '#6E7E96',
       acc: '#6CA8FF', ok: '#3DDC97', warn: '#F5B94B', crit: '#F0716C', trust: '#A78BFA', blur: '18px' } },
     { id: 'dark', label: 'Dark', icon: 'dark', tokens: {
       bg: '#0D1117', surface: '#161B22', surface2: '#11151C',
@@ -396,7 +509,7 @@
     { id: 'light', label: 'Light', icon: 'light', tokens: {
       bg: '#F4F6F8', surface: '#FFFFFF', surface2: '#EDF1F5',
       edge: '#D7DEE5', edgeStrong: '#B9C4CF',
-      ink: '#1B2733', ink2: '#4A5866', ink3: '#68788A',
+      ink: '#1B2733', ink2: '#4A5866', ink3: '#5B6B7D',
       acc: '#2456A6', ok: '#1A7F4E', warn: '#9A5B00', crit: '#B91C1C', trust: '#6D28D9', blur: '0px' } }
   ];
   function themeById(id) {
@@ -421,6 +534,9 @@
   // Default 'customer' until wired to the capability plan in M3. Any element
   // tagged data-requires="operator" is hidden unless POSTURE === 'operator'.
   var POSTURE = 'customer';
+  // render.js reads window.CRUX_POSTURE to decide whether a mutating (operator)
+  // control is visible. Keep it in sync with POSTURE.
+  if (typeof window !== 'undefined') { window.CRUX_POSTURE = POSTURE; }
   function applyPosture(root) {
     var scope = root || document;
     var gated = scope.querySelectorAll('[data-requires="operator"]');
@@ -429,90 +545,31 @@
     }
   }
 
-  // ---- Navigation model (data-driven) ------------------------------------
-  // Each destination lists the legacy CX pages that land there in M1+; those
-  // render as "arrives in M1+" placeholder cards until wired.
-  var NAV = [
-    { group: null, items: [
-      { id: 'overwatch', label: 'Overwatch', icon: 'overwatch', key: '1',
-        sub: 'Needs-you queue, fleet, and live activity.',
-        cards: [
-          ['Overview', 'Daemon posture, readiness, and capacity at a glance.'],
-          ['Activity', 'Live rolling activity feed across both lanes.'],
-          ['Live board', 'Coordination plane: who is live and where they collide.'],
-          ['Sessions (live)', 'Currently-bound sessions with intent + lease.'],
-          ['Orchestrators', 'Orchestrator fan-out and child-session tree.'],
-          ['Punchcards', 'Advisory path leases held across sessions.'],
-          ['Gates (actionable)', 'Work gates awaiting a passport-attributed approval.']
-        ] },
-      { id: 'work', label: 'Work', icon: 'work', key: '2',
-        sub: 'ExecPlans, projects, and per-run usage.',
-        cards: [
-          ['ExecPlans', 'Read-time projection over .agent/execplans/*.md.'],
-          ['Projects', 'Kanban work items grouped by project.'],
-          ['Sessions (archive)', 'Saved session snapshots for resume + audit.'],
-          ['Usage (per-run)', 'Per-run token and cost attribution.']
-        ] },
-      { id: 'memory', label: 'Memory', icon: 'memory', key: '3',
-        sub: 'Facts, tenants, documents, and retrieval tuning.',
-        cards: [
-          ['Facts', 'Stored facts with entity/key/freshness metadata.'],
-          ['Memory', 'Cross-session memory index and recall.'],
-          ['Tenants', 'Per-tenant isolation and configuration.'],
-          ['Documents', 'Ingested corpora and segment status.'],
-          ['Review', 'Queued items awaiting curation.'],
-          ['Lane weights (advanced)', 'Retrieval signal fusion weights per tenant.']
-        ] },
-      { id: 'trust', label: 'Trust', icon: 'trust', key: '4',
-        sub: 'Receipts, gates, identity, and posture.',
-        cards: [
-          ['Receipts', 'CROWN receipt timeline; verify offline with the key.'],
-          ['Gates', 'Human-oversight gates and their approval trail.'],
-          ['Passport', 'This daemon’s RCX passport identity.'],
-          ['Identity', 'Agents, tokens, and device-grant approvals.'],
-          ['Mediation', 'Engine reads proxied through the daemon origin.'],
-          ['Posture (new)', 'Regulated-customer posture: attribution front-and-centre.']
-        ] },
-      { id: 'meters', label: 'Meters', icon: 'meters', key: '5',
-        sub: 'Cost, usage, storage, and benchmarks.',
-        cards: [
-          ['Token burn', 'Per-ExecPlan and per-agent token attribution.'],
-          ['Usage', 'Aggregate call volume and spend.'],
-          ['Storage & node', 'Segment storage, capacity, and node health.'],
-          ['Benchmarks (new)', 'Corpus-identified benchmark runs and lifts.']
-        ] }
-    ] },
-    { group: 'System', items: [
-      { id: 'settings', label: 'Settings', icon: 'settings',
-        sub: 'Daemon configuration and preferences.',
-        cards: [
-          ['Settings', 'Auth mode, feature flags, and console preferences.']
-        ] },
-      { id: 'integrations', label: 'Integrations', icon: 'integrations',
-        sub: 'Installed packs and extensions.',
-        cards: [
-          ['Integrations', 'Installed integration packs and their grants.'],
-          ['Extensions', 'Optional capability extensions.']
-        ] },
-      { id: 'developer', label: 'Developer', icon: 'developer', requires: 'operator',
-        sub: 'Raw protocol access (operator only).',
-        cards: [
-          ['Raw JSON-RPC', 'Direct MCP / JSON-RPC console for debugging.']
-        ] }
-    ] }
-  ];
+  // ---- Navigation model — sourced from the ported page registry ----------
+  // The 6 destinations + 26 pages live in pages.js (CruxPages). Each dest shows
+  // its real pages as a sub-nav pill row; pages render via render.js (CruxRender).
+  var CP = (typeof window !== 'undefined' && window.CruxPages) || { PAGES: {}, DESTS: [], LEGACY_IDS: [], MUTATING_ACTIONS: [] };
+  var DESTS = CP.DESTS;
+  var PAGES = CP.PAGES;
   var DEST_INDEX = {};
-  (function indexNav() {
-    for (var g = 0; g < NAV.length; g++) {
-      for (var i = 0; i < NAV[g].items.length; i++) { DEST_INDEX[NAV[g].items[i].id] = NAV[g].items[i]; }
+  for (var _di = 0; _di < DESTS.length; _di++) { DEST_INDEX[DESTS[_di].id] = DESTS[_di]; }
+  var PAGES_BY_DEST = {};
+  (function indexPages() {
+    for (var id in PAGES) {
+      var p = PAGES[id];
+      (PAGES_BY_DEST[p.dest] = PAGES_BY_DEST[p.dest] || []).push(p);
     }
   })();
+  function pagesForDest(destId) { return PAGES_BY_DEST[destId] || []; }
+  function firstPageId(destId) {
+    var list = pagesForDest(destId);
+    for (var i = 0; i < list.length; i++) {
+      if (!(list[i].operatorOnly && POSTURE !== 'operator')) { return list[i].id; }
+    }
+    return list.length ? list[0].id : null;
+  }
   var KEY_TO_DEST = {};
-  (function indexKeys() {
-    for (var id in DEST_INDEX) {
-      if (DEST_INDEX[id].key) { KEY_TO_DEST[DEST_INDEX[id].key] = id; }
-    }
-  })();
+  for (var _ki = 0; _ki < DESTS.length; _ki++) { if (DESTS[_ki].key) { KEY_TO_DEST[DESTS[_ki].key] = DESTS[_ki].id; } }
 
   // ---- Boot state --------------------------------------------------------
   var BOOT = { version: null, summary: null, health: 'loading', reason: '' };
@@ -576,26 +633,18 @@
   function buildRail() {
     var nav = document.getElementById('nav');
     nav.textContent = '';
-    for (var g = 0; g < NAV.length; g++) {
-      var grp = NAV[g];
-      if (grp.group) {
-        nav.appendChild(el('div', { 'class': 'nav-group-label', text: grp.group }));
-      }
-      for (var i = 0; i < grp.items.length; i++) {
-        var item = grp.items[i];
-        var btn = el('button', {
-          'class': 'nav-item', type: 'button', 'data-dest': item.id,
-          'aria-current': 'false'
-        });
-        if (item.requires) { btn.setAttribute('data-requires', item.requires); }
-        btn.innerHTML = ICONS[item.icon] || '';   // inline SVG glyph
-        btn.appendChild(el('span', { 'class': 'label', text: item.label }));
-        if (item.key) { btn.appendChild(el('span', { 'class': 'kbd', text: item.key })); }
-        (function (id) {
-          btn.addEventListener('click', function () { location.hash = '#/' + id; });
-        })(item.id);
-        nav.appendChild(btn);
-      }
+    for (var i = 0; i < DESTS.length; i++) {
+      var item = DESTS[i];
+      var btn = el('button', {
+        'class': 'nav-item', type: 'button', 'data-dest': item.id, 'aria-current': 'false'
+      });
+      btn.innerHTML = ICONS[item.icon] || '';   // inline SVG glyph
+      btn.appendChild(el('span', { 'class': 'label', text: item.label }));
+      if (item.key) { btn.appendChild(el('span', { 'class': 'kbd', text: item.key })); }
+      (function (id) {
+        btn.addEventListener('click', function () { location.hash = '#/' + id; });
+      })(item.id);
+      nav.appendChild(btn);
     }
     applyPosture(nav);
   }
@@ -623,87 +672,60 @@
     document.getElementById('healthText').textContent = text;
   }
 
-  function statTile(k, v, sub) {
-    var vNode = el('div', { 'class': 'v', text: v });
-    if (sub) { vNode.appendChild(document.createTextNode(' ')); vNode.appendChild(el('small', { text: sub })); }
-    return el('div', { 'class': 'stat' }, [el('div', { 'class': 'k', text: k }), vNode]);
+  // ---- Sub-nav (pill row) + page render ----------------------------------
+  function buildSubnav(destId, activePageId) {
+    var row = el('div', { 'class': 'subnav', role: 'tablist', 'aria-label': 'Pages in this destination' });
+    var list = pagesForDest(destId);
+    for (var i = 0; i < list.length; i++) {
+      var p = list[i];
+      var pill = el('button', {
+        'class': 'pill', type: 'button', 'data-page': p.id,
+        'aria-current': p.id === activePageId ? 'page' : 'false'
+      }, [p.title]);
+      if (p.operatorOnly) { pill.setAttribute('data-requires', 'operator'); }   // hidden for customers
+      (function (dest, pid) {
+        pill.addEventListener('click', function () { location.hash = '#/' + dest + '/' + pid; });
+      })(destId, p.id);
+      row.appendChild(pill);
+    }
+    applyPosture(row);
+    return row;
   }
 
-  function renderOverwatchStats(container) {
-    var s = BOOT.summary;
-    if (!s) {
-      var down = BOOT.health === 'down';
-      container.appendChild(el('div', { 'class': 'degraded-card' + (down ? ' down' : '') }, [
-        el('h3', { text: down ? 'Cannot reach the daemon' : 'Daemon reachable, summary unavailable' }),
-        el('p', { text: down
-          ? 'The console could not reach the daemon at this origin. Check that corecruxd is running on port 14800 and reload.'
-          : 'The daemon answered but /v1/console/summary did not return data (it may require console-read auth). Live counts are hidden; navigation still works.' })
-      ]));
-      return;
-    }
-    var version = get(BOOT.version, ['version']) || get(s, ['daemon', 'build', 'version']);
-    var stats = el('div', { 'class': 'stats' });
-    stats.appendChild(statTile('Node', str(get(s, ['daemon', 'node_id']))));
-    stats.appendChild(statTile('Build', str(version)));
-    stats.appendChild(statTile('Facts', fmtNum(get(s, ['stores', 'facts']))));
-    stats.appendChild(statTile('Sessions', fmtNum(get(s, ['stores', 'sessions']))));
-    stats.appendChild(statTile('Shards', fmtNum(get(s, ['routing', 'shard_count'])),
-      'map v' + str(get(s, ['routing', 'shard_map_version']))));
-    stats.appendChild(statTile('Storage free', fmtPct(get(s, ['capacity', 'free_ratio'])),
-      'of ' + fmtBytes(get(s, ['capacity', 'total_bytes']))));
-    stats.appendChild(statTile('MCP agents', fmtNum(get(s, ['daemon', 'mcp_agent_count'])),
-      get(s, ['daemon', 'mcp_enabled']) ? 'enabled' : 'off'));
-    stats.appendChild(statTile('Integrations', fmtNum(get(s, ['integrations', 'builtin_pack_count'])),
-      get(s, ['integrations', 'enabled']) ? 'enabled' : 'off'));
-    stats.appendChild(statTile('Auth mode', str(get(s, ['daemon', 'auth_mode']))));
-    stats.appendChild(statTile('Dataplane', get(s, ['daemon', 'dataplane_enabled']) ? 'on' : 'off'));
-    container.appendChild(stats);
-  }
+  function renderDestination(destId, pageId) {
+    var dest = DEST_INDEX[destId] || DESTS[0];
+    destId = dest.id;
+    var page = PAGES[pageId];
+    if (!page || page.dest !== destId) { pageId = firstPageId(destId); page = PAGES[pageId]; }
 
-  function renderCards(container, item) {
-    var grid = el('div', { 'class': 'grid' });
-    for (var i = 0; i < item.cards.length; i++) {
-      var c = item.cards[i];
-      grid.appendChild(el('div', { 'class': 'card' }, [
-        el('div', { 'class': 'card-top' }, [
-          el('span', { 'class': 'glyph', html: ICONS[item.icon] || '' }),
-          el('h3', { text: c[0] })
-        ]),
-        el('p', { text: c[1] }),
-        el('span', { 'class': 'soon', text: 'arrives in M1+' })
-      ]));
-    }
-    container.appendChild(el('p', { 'class': 'section-label', text: 'Lands here in M1+' }));
-    container.appendChild(grid);
-  }
-
-  function renderDestination(id) {
-    var item = DEST_INDEX[id];
-    if (!item || (item.requires && item.requires === 'operator' && POSTURE !== 'operator')) {
-      id = 'overwatch';
-      item = DEST_INDEX[id];
-    }
-    // Nav active state.
+    // Rail active state.
     var btns = document.querySelectorAll('#nav .nav-item');
     for (var i = 0; i < btns.length; i++) {
-      btns[i].setAttribute('aria-current', btns[i].getAttribute('data-dest') === id ? 'page' : 'false');
+      btns[i].setAttribute('aria-current', btns[i].getAttribute('data-dest') === destId ? 'page' : 'false');
     }
-    document.getElementById('destTitle').textContent = item.label;
-    document.getElementById('destSub').textContent = item.sub || '';
+    document.getElementById('destTitle').textContent = page ? page.title : dest.label;
+    document.getElementById('destSub').textContent = page ? (page.sub || '') : (dest.sub || '');
 
     var content = document.getElementById('content');
     content.textContent = '';
-    if (id === 'overwatch') { renderOverwatchStats(content); }
-    renderCards(content, item);
+    content.appendChild(buildSubnav(destId, pageId));
+    var host = el('div', { 'class': 'page-host', id: 'pageHost' });
+    content.appendChild(host);
+    if (window.CruxRender && page) { window.CruxRender.renderPage(page, host); }
+    else if (page) { host.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' })); }
+    applyPosture(content);
     if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
   }
 
-  function currentDest() {
+  function currentRoute() {
     var h = (location.hash || '').replace(/^#\/?/, '');
-    return DEST_INDEX[h] ? h : 'overwatch';
+    var parts = h.split('/').filter(Boolean);
+    var destId = DEST_INDEX[parts[0]] ? parts[0] : (DESTS[0] && DESTS[0].id);
+    var pageId = (parts[1] && PAGES[parts[1]] && PAGES[parts[1]].dest === destId) ? parts[1] : firstPageId(destId);
+    return { dest: destId, page: pageId };
   }
 
-  function route() { renderDestination(currentDest()); }
+  function route() { var r = currentRoute(); renderDestination(r.dest, r.page); }
 
   // ---- Keyboard shortcuts 1..5 ------------------------------------------
   function onKey(ev) {

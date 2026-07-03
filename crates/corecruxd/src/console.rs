@@ -34,6 +34,12 @@ const RECEIPTS_VS_CONSOLE_HTML: &str = include_str!("../console/receipts-vs-cons
 // (see `resolve_console_body`). Same embedded, no-on-disk-dependency posture as
 // the sibling `activity.html` / `console-3d/*` assets.
 const CONSOLE_V2_HTML: &str = include_str!("../console/v2/shell.html");
+// Unified Shell Console v2 — no-build module split (M1). The shell references
+// these same-origin at `/console-v2/pages.js` / `/console-v2/render.js`. Same
+// embedded, dev-overridable posture as the shell itself. `pages.js` is the
+// ported 26-page registry; `render.js` is the DSL renderer.
+const CONSOLE_V2_PAGES_JS: &str = include_str!("../console/v2/pages.js");
+const CONSOLE_V2_RENDER_JS: &str = include_str!("../console/v2/render.js");
 const CONSOLE_V2_ENV: &str = "CORECRUXD_CONSOLE_V2";
 const CONSOLE_DEV_PATH_ENV: &str = "CORECRUXD_CONSOLE_DEV_PATH";
 
@@ -101,6 +107,54 @@ async fn serve_receipts_vs_console() -> impl IntoResponse {
 
 async fn redirect_to_console() -> impl IntoResponse {
     Redirect::to("/console")
+}
+
+/// `/console/legacy` — the legacy console served unconditionally (the same body
+/// `/console` serves when `CORECRUXD_CONSOLE_V2` is off). Deep-machinery
+/// fallbacks in the v2 shell (e.g. the Workbench card) link here so the full Pro
+/// console stays reachable even while v2 is the default surface.
+async fn serve_console_legacy() -> impl IntoResponse {
+    Html(resolve_console_html().into_owned())
+}
+
+/// Embedded v2 module assets (`pages.js`, `render.js`), served same-origin at
+/// `/console-v2/{name}`. A dev override (`CORECRUXD_CONSOLE_DEV_PATH`) reads
+/// `v2/<name>` next to the console index so the modules can be iterated without
+/// a rebuild — same resolve-then-rewrite pattern as the shell override.
+async fn serve_console_v2_asset(AxumPath(name): AxumPath<String>) -> Response {
+    // Single path segment; be paranoid about traversal anyway.
+    if name.contains('/') || name.contains("..") {
+        return (axum::http::StatusCode::BAD_REQUEST, "invalid asset name").into_response();
+    }
+    let embedded: &'static str = match name.as_str() {
+        "pages.js" => CONSOLE_V2_PAGES_JS,
+        "render.js" => CONSOLE_V2_RENDER_JS,
+        _ => return (axum::http::StatusCode::NOT_FOUND, "no such console-v2 asset").into_response(),
+    };
+    // Dev override wins when present.
+    if let Some(dev_path) = std::env::var(CONSOLE_DEV_PATH_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let file_path = resolve_dev_html_path(Path::new(dev_path.trim()))
+            .with_file_name("v2")
+            .join(&name);
+        if let Ok(contents) = std::fs::read_to_string(&file_path) {
+            return console_js_response(contents);
+        }
+    }
+    console_js_response(embedded.to_string())
+}
+
+fn console_js_response(body: String) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 async fn serve_console_asset(AxumPath(name): AxumPath<String>) -> Response {
@@ -183,9 +237,11 @@ pub fn routes(enabled: bool) -> Router {
     Router::new()
         .route("/", get(redirect_to_console))
         .route("/console", get(serve_console))
+        .route("/console/legacy", get(serve_console_legacy))
         .route("/console/activity", get(serve_activity))
         .route("/console/receipts-vs-console", get(serve_receipts_vs_console))
         .route("/console-assets/{name}", get(serve_console_asset))
+        .route("/console-v2/{name}", get(serve_console_v2_asset))
         .route("/console-3d/{*path}", get(serve_console3d))
         // Device-grant approval page (ExecPlan crux-unified-login-rails, M3).
         .route("/activate", get(serve_activate))
@@ -467,7 +523,7 @@ fn resolve_dev_html_path(base: &Path) -> PathBuf {
 mod tests {
     use super::{
         dev_html_override, resolve_console_body, resolve_console_html, CONSOLE_DEV_PATH_ENV, CONSOLE_HTML,
-        CONSOLE_V2_ENV, CONSOLE_V2_HTML,
+        CONSOLE_V2_ENV, CONSOLE_V2_HTML, CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS,
     };
     use std::sync::Mutex;
 
@@ -764,6 +820,146 @@ mod tests {
             assert!(
                 CONSOLE_V2_HTML.contains(required),
                 "v2 shell missing expected marker: {required}"
+            );
+        }
+        // The M1 module split is wired: the shell loads the two same-origin modules.
+        for required in ["/console-v2/pages.js", "/console-v2/render.js"] {
+            assert!(
+                CONSOLE_V2_HTML.contains(required),
+                "v2 shell must load the module: {required}"
+            );
+        }
+    }
+
+    // ---- Unified Shell Console v2 modules (M1) -----------------------------
+
+    #[test]
+    fn console_v2_modules_carry_licence_and_no_external_runtime_deps() {
+        // Every v2 file keeps the CCL header + the no-external-runtime-deps posture.
+        for (name, body) in [("pages.js", CONSOLE_V2_PAGES_JS), ("render.js", CONSOLE_V2_RENDER_JS)] {
+            assert!(
+                body.contains("CueCrux Community Licence (CCL v1.0)"),
+                "{name} must carry the CCL licence header"
+            );
+            // Block remote loaders + CDN hosts. Bare http(s) literals are NOT
+            // blocked — the embedding-endpoint placeholder (`http://localhost:…`)
+            // is display text, not a runtime dependency (same as the legacy console).
+            for blocked in [
+                "src=\"http",
+                "from \"http",
+                "from 'http",
+                "import(\"http",
+                "import('http",
+                "unpkg.com",
+                "jsdelivr.net",
+                "cdnjs.cloudflare",
+                "cdn.jsdelivr",
+                "fonts.googleapis",
+            ] {
+                assert!(
+                    !body.contains(blocked),
+                    "{name} has an external runtime dependency marker: {blocked}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn console_v2_modules_expose_the_expected_surface() {
+        // pages.js carries all 26 legacy ids + the mutating-action gate list.
+        for id in [
+            "cx-overview",
+            "cx-activity",
+            "cx-cost",
+            "cx-projects",
+            "cx-work",
+            "cx-usage",
+            "cx-documents",
+            "cx-gates",
+            "cx-review",
+            "cx-coord",
+            "cx-sessions",
+            "cx-orchestrators",
+            "cx-punchcards",
+            "cx-passport",
+            "cx-identity",
+            "cx-receipts",
+            "cx-mediation",
+            "cx-workbench",
+            "cx-integrations",
+            "cx-extensions",
+            "cx-facts",
+            "cx-memory",
+            "cx-tenants",
+            "cx-lane-weights",
+            "cx-settings",
+            "cx-raw",
+        ] {
+            assert!(CONSOLE_V2_PAGES_JS.contains(id), "pages.js missing legacy id: {id}");
+        }
+        assert!(
+            CONSOLE_V2_PAGES_JS.contains("MUTATING_ACTIONS"),
+            "pages.js must expose MUTATING_ACTIONS as the posture-gate source of truth"
+        );
+        // render.js implements the DSL control types + the posture gate.
+        for required in ["CONTROL_TYPES", "applyMutationGate", "wired in M3+", "data-requires"] {
+            assert!(
+                CONSOLE_V2_RENDER_JS.contains(required),
+                "render.js missing expected marker: {required}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn console_legacy_route_serves_the_legacy_console() {
+        use tower::ServiceExt;
+        let _guard = env_lock();
+        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
+        std::env::set_var(CONSOLE_V2_ENV, "1"); // even with v2 on, /console/legacy is the old console
+        let resp = super::routes(true)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/console/legacy")
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        std::env::remove_var(CONSOLE_V2_ENV);
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert_eq!(String::from_utf8(bytes.to_vec()).expect("utf8 body"), CONSOLE_HTML);
+    }
+
+    #[tokio::test]
+    async fn console_v2_asset_route_serves_the_modules() {
+        use tower::ServiceExt;
+        let _guard = env_lock();
+        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
+        for (uri, needle) in [
+            ("/console-v2/pages.js", "MUTATING_ACTIONS"),
+            ("/console-v2/render.js", "CONTROL_TYPES"),
+        ] {
+            let resp = super::routes(true)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .expect("build request"),
+                )
+                .await
+                .expect("router response");
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{uri} should be served");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            assert!(
+                String::from_utf8(bytes.to_vec()).expect("utf8 body").contains(needle),
+                "{uri} body should contain {needle}"
             );
         }
     }
