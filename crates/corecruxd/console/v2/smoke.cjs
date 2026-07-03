@@ -8,6 +8,10 @@
 //
 // Checks (all must pass; exit non-zero on any failure):
 //   1. pages.js carries all 26 legacy CX ids, each with a valid destination.
+//      A page tagged pill:false (e.g. cx-overview) is folded out of its
+//      destination's pill row but stays reachable — its content is rendered by
+//      the destination's landing (render.js references its id), so it still
+//      counts toward the 26/26 reachability.
 //   2. every control type used in pages.js has a renderer branch in render.js.
 //   3. the three theme CSS blocks in shell.html clear the WCAG contrast floor
 //      (ink/ink2 >= 4.5:1, ink3 >= 4.0:1, over bg AND over surface).
@@ -24,6 +28,19 @@
 //  11. (M5) sw.js precache == the exact app-shell set; /v1/* never cached; SW_REV
 //      matches shell.html (bump-together).
 //  12. (M5) phone tier: bottom tab bar (4 tabs) + safe-area-inset + ≥44px targets.
+//  13. (round 2) demo mode: CruxDemo fixtures are reachable ONLY behind the demo
+//      flag (render.js reads them solely via the demoOn()-guarded demoData());
+//      the DEMO DATA chip + ?demo activation live in the shell.
+//  14. (round 2) exactly two button families console-wide (.btn-primary +
+//      .btn-quiet); the retired ow-btn/ctl-btn classes are gone.
+//  15. (round 2) collapsible rail: railToggle + <html data-rail> + persisted
+//      crux.console.rail + aria-expanded, desktop-guarded (min-width:721px).
+//  16. (round 2) status pill drops the node id; topbar chips carry auth /
+//      dataplane / build; the node origin+id+build move to System › Node.
+//  17. (round 2) charts: an areaChart helper + a Day/Week/Month range switch
+//      (aria-pressed, no legend), used on cx-cost + cx-usage.
+//  18. (round 2) pro-board strips: work rows + gate cards share a 3px
+//      state-keyed left strip.
 
 'use strict';
 
@@ -104,7 +121,21 @@ function walkPage(page, fn) {
   Object.keys(pages.PAGES).forEach(function (id) {
     check(LEGACY_26.indexOf(id) >= 0, '[ids] unexpected page id not in the legacy 26: ' + id);
   });
-  notes.push('26/26 legacy CX ids mapped across ' + destIds.size + ' destinations.');
+  // Item 0: a pill:false page is folded out of its destination's pill row but
+  // must still be reachable — its content is rendered inline by the
+  // destination's landing (render.js references its id). cx-overview is the one.
+  let pillFalse = 0;
+  Object.keys(pages.PAGES).forEach(function (id) {
+    const p = pages.PAGES[id];
+    if (p && p.pill === false) {
+      pillFalse++;
+      check(renderSrc.indexOf("'" + id + "'") >= 0,
+        '[ids] pill:false page ' + id + ' must be rendered by its destination landing (render.js must reference ' + id + ')');
+    }
+  });
+  check(pages.PAGES['cx-overview'] && pages.PAGES['cx-overview'].pill === false,
+    '[ids] cx-overview must be pill:false — folded out of the Overwatch pills, reachable via the landing tiles');
+  notes.push('26/26 legacy CX ids mapped across ' + destIds.size + ' destinations (' + pillFalse + ' pill:false, landing-rendered).');
 })();
 
 // =========================================================================
@@ -487,13 +518,140 @@ function extractThemeVars(theme) {
   notes.push('phone tier: 4-tab bottom bar (' + tabIds.join('/') + '/More), safe-area-inset respected, .tab ≥44px.');
 })();
 
+// =========================================================================
+//  Check 13 — demo mode is labelled + gated. CruxDemo fixtures are reachable
+//  ONLY behind the demo flag: render.js reads them solely through demoData(),
+//  which guards on demoOn() (window.CRUX_DEMO). The DEMO DATA chip + the ?demo
+//  activation live in the shell. This mirrors the gated-mutation containment
+//  audit (check 7) — a static proof that fixtures can never render un-flagged.
+// =========================================================================
+(function checkDemoMode() {
+  check(/var CruxDemo = /.test(pagesSrc), '[demo] pages.js must define the CruxDemo fixtures module');
+  check(/root\.CruxDemo\s*=\s*api\.CruxDemo/.test(pagesSrc), '[demo] pages.js must expose window.CruxDemo for render.js');
+  check(pages.CruxDemo && typeof pages.CruxDemo === 'object', '[demo] CruxDemo must be exported from pages.js');
+  ['needsYou', 'fleet', 'activity', 'engine', 'costSeries', 'usageSeries'].forEach(function (k) {
+    check(pages.CruxDemo && pages.CruxDemo[k] != null, '[demo] CruxDemo missing representative fixture: ' + k);
+  });
+  // Representative shapes: one fleet overlap, one gate with consequences, 12 ticks.
+  check(Array.isArray(pages.CruxDemo.fleet) && pages.CruxDemo.fleet.some(function (s) { return (s.overlaps || []).length; }),
+    '[demo] CruxDemo.fleet must include a ⚠ overlap session');
+  check(Array.isArray(pages.CruxDemo.needsYou) && pages.CruxDemo.needsYou.some(function (g) { return (g.consequences || []).length; }),
+    '[demo] CruxDemo.needsYou must include a gate with consequences');
+  check(Array.isArray(pages.CruxDemo.activity) && pages.CruxDemo.activity.length === 12 && pages.CruxDemo.activity.every(function (r) { return (r.receipt_ids || []).length; }),
+    '[demo] CruxDemo.activity must be 12 rows, each with a receipt id');
+  // Containment: CruxDemo is named in render.js ONLY inside demoData(), which
+  // guards on demoOn() (window.CRUX_DEMO). Nothing else touches the fixtures.
+  const dd = funcBody(renderSrc, 'demoData');
+  check(!!dd, '[demo] render.js must define demoData()');
+  check(dd && /demoOn\(\)/.test(dd), '[demo] demoData() must guard on demoOn() (the demo flag)');
+  check(/window\.CRUX_DEMO/.test(renderSrc), '[demo] demoOn() must read window.CRUX_DEMO');
+  if (dd) {
+    const outside = renderSrc.split(dd).join('');
+    check(!/window\.CruxDemo/.test(outside), '[demo] render.js reads window.CruxDemo outside the demoData() choke point');
+  }
+  // The DEMO DATA chip + ?demo activation live in the shell (flag-driven).
+  check(/DEMO DATA/.test(shellHtml), '[demo] shell.html must render the fixed DEMO DATA chip when demo mode is on');
+  check(/crux\.console\.demo/.test(shellHtml), '[demo] shell.html must persist the demo flag (crux.console.demo)');
+  check(/window\.CRUX_DEMO\s*=/.test(shellHtml), '[demo] shell.html must set window.CRUX_DEMO');
+  check(/demo=1/.test(shellHtml) && /demo=0/.test(shellHtml), '[demo] shell.html must honour ?demo=1 / ?demo=0');
+  notes.push('demo mode: fixtures reachable only via demoOn()-guarded demoData(); DEMO DATA chip + ?demo activation present.');
+})();
+
+// =========================================================================
+//  Check 14 — exactly two button families console-wide (.btn-primary +
+//  .btn-quiet); the retired ow-btn / ow-approve / ow-ghost / ctl-btn / ctl-link
+//  classes are gone from every shipped browser file.
+// =========================================================================
+(function checkUnifiedButtons() {
+  check(/\.btn-primary\b/.test(shellHtml) && /\.btn-quiet\b/.test(shellHtml), '[buttons] shell.html must define both .btn-primary and .btn-quiet');
+  check(/btn-quiet/.test(renderSrc), '[buttons] render.js must render page/DSL buttons with the .btn-quiet family');
+  check(/btn-primary/.test(renderSrc), '[buttons] render.js must render the gate approve as .btn-primary');
+  ['ow-approve', 'ow-ghost', 'ow-btn', 'ctl-btn', 'ctl-link'].forEach(function (cls) {
+    check(shellHtml.indexOf(cls) < 0, '[buttons] shell.html still references the retired button class: ' + cls);
+    check(renderSrc.indexOf(cls) < 0, '[buttons] render.js still references the retired button class: ' + cls);
+  });
+  notes.push('unified buttons: two families (.btn-primary/.btn-quiet); retired ow-btn/ctl-btn classes removed.');
+})();
+
+// =========================================================================
+//  Check 15 — collapsible rail (persisted, desktop-guarded).
+// =========================================================================
+(function checkCollapsibleRail() {
+  check(/id="railToggle"/.test(shellHtml), '[rail] shell.html must carry the rail toggle (id="railToggle")');
+  check(/crux\.console\.rail/.test(shellHtml), '[rail] shell.html must persist the rail state (crux.console.rail)');
+  check(/data-rail/.test(shellHtml), '[rail] shell.html must toggle <html data-rail>');
+  check(/aria-expanded/.test(shellHtml), '[rail] the rail toggle must set aria-expanded');
+  check(shellHtml.indexOf('Collapse navigation') >= 0, '[rail] the rail toggle must carry the "Collapse navigation" aria-label');
+  // Collapsed rules are guarded to the desktop tier so they never fight the
+  // phone media query (which hides the rail entirely).
+  check(/@media \(min-width: 721px\)[\s\S]*data-rail="collapsed"/.test(shellHtml), '[rail] collapsed rail CSS must be guarded to @media (min-width: 721px)');
+  notes.push('collapsible rail: railToggle + data-rail + crux.console.rail, desktop-guarded (min-width:721px).');
+})();
+
+// =========================================================================
+//  Check 16 — status pill (no node id) + topbar chips + System Node section.
+// =========================================================================
+(function checkStatusAndChips() {
+  ['Connected · Local', 'Connected · Platform', 'Offline', 'read-only'].forEach(function (t) {
+    check(shellHtml.indexOf(t) >= 0, '[status] status pill missing state text: "' + t + '"');
+  });
+  check(shellHtml.indexOf("'Connected · ' + node") < 0, '[status] status pill must NOT embed the node id in its text');
+  check(/id="topchips"/.test(shellHtml), '[chips] shell.html must carry the topbar chip cluster (id="topchips")');
+  check(/function setTopChips/.test(shellHtml), '[chips] shell.html must build the topbar chips');
+  check(shellHtml.indexOf("'auth: '") >= 0 && shellHtml.indexOf("'dataplane: '") >= 0, '[chips] topbar chips must include auth + dataplane');
+  // Node origin + id + build move to System › Settings › Node.
+  check(/h:\s*'Node'/.test(pagesSrc), '[status] Settings must gain a "Node" section for origin + node id + build');
+  check(/window\.location\.origin/.test(pagesSrc), '[status] the Node section origin must read window.location.origin');
+  notes.push('status pill (state-only, +read-only) · topbar chips (auth/dataplane/build) · System Node section.');
+})();
+
+// =========================================================================
+//  Check 17 — charts (single-series area, Day/Week/Month range, no legend),
+//  used on cx-cost + cx-usage.
+// =========================================================================
+(function checkCharts() {
+  check((render.CONTROL_TYPES || []).indexOf('chart') >= 0, '[charts] render.CONTROL_TYPES must include "chart"');
+  check(new RegExp("case 'chart'").test(renderSrc), '[charts] render.js must have a `case \'chart\'` branch');
+  check(/function areaChart/.test(renderSrc), '[charts] render.js must define the areaChart helper');
+  check(/chart-line/.test(renderSrc) && /chart-line/.test(shellHtml), '[charts] the area-chart line class must be defined + used');
+  check(/var\(--acc\)/.test(shellHtml) && /\.chart-line\s*\{[^}]*var\(--acc\)/.test(shellHtml), '[charts] the chart line must stroke with var(--acc)');
+  ["'Day'", "'Week'", "'Month'"].forEach(function (t) {
+    check(renderSrc.indexOf(t) >= 0, '[charts] range switcher missing label ' + t);
+  });
+  check(/aria-pressed/.test(renderSrc), '[charts] chart range buttons must set aria-pressed');
+  check(/chart-title/.test(renderSrc), '[charts] the chart must render a title (no legend)');
+  let chartUsed = 0;
+  ['cx-cost', 'cx-usage'].forEach(function (id) {
+    walkPage(pages.PAGES[id], function (c) { if (c.t === 'chart') { chartUsed++; } });
+  });
+  check(chartUsed > 0, '[charts] cx-cost + cx-usage must carry a chart control');
+  // A single-scalar series is never fabricated — the tile-sparkline series comes
+  // from bucketed /v1/activity, else a demo fixture.
+  check(/function bucketActivityByDay/.test(renderSrc), '[charts] tile sparklines must bucket /v1/activity (never fabricate from a scalar)');
+  notes.push('charts: areaChart + Day/Week/Month range (aria-pressed, no legend); used on cost + usage; sparklines from real /v1/activity or demo.');
+})();
+
+// =========================================================================
+//  Check 18 — pro-board strips: work rows + gate cards share the 3px
+//  state-keyed left strip.
+// =========================================================================
+(function checkBoardStrips() {
+  check(/exp-strip/.test(renderSrc), '[strips] render.js must add the exp-strip class for state-keyed rows');
+  check(/strip:\s*stage/.test(pagesSrc), '[strips] buildWork rows must carry a state strip (strip: stage)');
+  check(/\.exp-strip\[data-strip="in_progress"\]/.test(shellHtml), '[strips] shell.html must key the work strip colour by state');
+  // Gate cards already stripe (::before); the two strips share the 3px geometry.
+  check(/\.ow-gate::before[\s\S]{0,160}width:\s*3px/.test(shellHtml), '[strips] the gate strip must be 3px');
+  check(/\.exp-strip::before[\s\S]{0,160}width:\s*3px/.test(shellHtml), '[strips] the work strip must be 3px (one consistent system)');
+  notes.push('pro-board strips: work rows + gate cards share the 3px state-keyed left strip.');
+})();
+
 // ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — M5 smoke');
+console.log('unified-shell-console v2 — round 2 smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
 if (failures.length) {
   console.error('\nFAIL (' + failures.length + '):');
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all gates green (26/26 ids, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier).');
+console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips).');
 process.exit(0);

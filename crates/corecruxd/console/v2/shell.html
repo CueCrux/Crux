@@ -30,6 +30,14 @@
     } catch (e) {
       document.documentElement.setAttribute('data-theme', 'glass');
     }
+    // Apply the persisted rail state before first paint too (icon-only vs full
+    // rail) so the grid width doesn't jump on load. Mirrors crux.console.rail.
+    try {
+      document.documentElement.setAttribute(
+        'data-rail', localStorage.getItem('crux.console.rail') === 'collapsed' ? 'collapsed' : 'open');
+    } catch (e) {
+      document.documentElement.setAttribute('data-rail', 'open');
+    }
   })();
 </script>
 <style>
@@ -146,14 +154,14 @@
   }
 
   /* ---- App shell layout -------------------------------------------------- */
-  .app { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
+  .app { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; transition: grid-template-columns .2s ease; }
 
   .rail {
     position: sticky;
     top: 0;
     align-self: start;
     height: 100vh;
-    min-width: 200px;
+    min-width: 0;
     display: flex;
     flex-direction: column;
     gap: 6px;
@@ -162,7 +170,21 @@
     background: var(--surface);
     backdrop-filter: blur(var(--blur));
     -webkit-backdrop-filter: blur(var(--blur));
+    overflow: hidden;
   }
+
+  /* Rail collapse toggle — a 44px chevron at the rail top. aria-expanded +
+     aria-label are set in JS; the glyph rotates when collapsed. */
+  .rail-toggle {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 44px; min-width: 44px; margin: -4px -4px 2px auto;
+    background: none; border: 1px solid transparent; border-radius: var(--radius-sm);
+    color: var(--ink3); cursor: pointer;
+    transition: background .18s ease, color .18s ease, border-color .18s ease;
+  }
+  .rail-toggle svg { width: 18px; height: 18px; transition: transform .2s ease; }
+  .rail-toggle:hover { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
+
   .brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 12px; }
   .brand .mark {
     width: 30px; height: 30px; flex: none; border-radius: 9px;
@@ -235,6 +257,29 @@
   .theme-btn:hover { color: var(--ink); background: var(--surface); }
   .theme-btn[aria-pressed="true"] { background: var(--acc); color: #fff; }
 
+  /* ---- Collapsed rail (icon-only, ~64px) --------------------------------
+     Guarded to the desktop tier (min-width:721px) so it never fights the
+     phone media query that hides the rail entirely. Toggled via
+     :root[data-rail="collapsed"]; state persists in localStorage
+     (crux.console.rail). Labels, group labels, kbd hints, the brand name, the
+     passport identity text and the footer collapse; nav items keep a title
+     tooltip (set in JS) and the theme switch stacks its icons vertically. */
+  @media (min-width: 721px) {
+    :root[data-rail="collapsed"] .app { grid-template-columns: 64px 1fr; }
+    :root[data-rail="collapsed"] .rail { padding: 16px 8px; align-items: stretch; }
+    :root[data-rail="collapsed"] .rail-toggle { margin: -4px auto 2px; }
+    :root[data-rail="collapsed"] .rail-toggle svg { transform: rotate(180deg); }
+    :root[data-rail="collapsed"] .brand { justify-content: center; padding: 4px 0 12px; gap: 0; }
+    :root[data-rail="collapsed"] .brand .name { display: none; }
+    :root[data-rail="collapsed"] .nav-item { justify-content: center; padding: 0; gap: 0; }
+    :root[data-rail="collapsed"] .nav-item .label,
+    :root[data-rail="collapsed"] .nav-item .kbd,
+    :root[data-rail="collapsed"] .nav-group-label { display: none; }
+    :root[data-rail="collapsed"] .passport-chip { justify-content: center; padding: 8px 0; gap: 0; }
+    :root[data-rail="collapsed"] .passport-chip .who { display: none; }
+    :root[data-rail="collapsed"] .theme-switch { flex-direction: column; }
+  }
+
   /* ---- Main column ------------------------------------------------------- */
   .main { min-width: 0; display: flex; flex-direction: column; }
   .topbar {
@@ -247,8 +292,24 @@
   }
   .topbar h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -.01em; }
   .topbar .sub { margin: 2px 0 0; font-size: 12.5px; color: var(--ink2); }
+
+  /* Right cluster: compact mono chips (build · auth · dataplane · optional DEMO)
+     then the status pill. Chips ride the same pill language as the health pill. */
+  .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .topchips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .topchips:empty { display: none; }
+  .topchip {
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: .02em;
+    color: var(--ink2); background: var(--surface2);
+    border: 1px solid var(--edge); border-radius: 999px; padding: 3px 9px; white-space: nowrap;
+  }
+  .topchip.demo {
+    color: var(--warn); font-weight: 600; letter-spacing: .08em;
+    background: color-mix(in srgb, var(--warn) 13%, transparent);
+    border-color: color-mix(in srgb, var(--warn) 34%, transparent);
+  }
   .health {
-    margin-left: auto; display: inline-flex; align-items: center; gap: 8px;
+    display: inline-flex; align-items: center; gap: 8px;
     padding: 6px 12px; min-height: 32px;
     border: 1px solid var(--edge); border-radius: 999px;
     font-size: 12px; color: var(--ink2); background: var(--surface2);
@@ -379,16 +440,32 @@
   .ctl-toggle input:checked + .ctl-track::after { transform: translateX(16px); background: #fff; }
   .ctl-toggle-label { font-size: 13px; color: var(--ink); }
 
-  .ctl-btn {
-    align-self: flex-start; min-height: 40px; padding: 0 16px;
-    display: inline-flex; align-items: center; gap: 8px;
-    border: 1px solid var(--edge-strong); border-radius: var(--radius-sm);
-    background: var(--surface2); color: var(--ink); font-weight: 600; font-size: 13px; cursor: pointer;
+  /* ---- Unified buttons — exactly two families console-wide ---------------
+     Every button in the console is one of two families:
+       .btn-quiet   — the nav-item look (transparent → var(--surface2) on hover,
+                      1px var(--edge) → var(--edge-strong), radius-sm, 44px, 150–
+                      300ms). Used for the DSL `btn`, page-level buttons, deep-
+                      machinery links, chart range toggles, and the gate "return".
+       .btn-primary — the approve gradient (--approve-a/-b/-ink). Used only where
+                      an action is the primary affirmative (the gate "Approve").
+     `.danger` on .btn-quiet is a colour cue (crit text/edge), not a third family. */
+  .btn-primary, .btn-quiet {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    min-height: 44px; padding: 0 16px; border-radius: var(--radius-sm);
+    font: inherit; font-weight: 600; font-size: 13px; cursor: pointer;
+    text-decoration: none;
+    transition: background .2s ease, color .2s ease, border-color .2s ease, filter .2s ease;
   }
-  .ctl-btn:disabled { opacity: .55; cursor: not-allowed; }
-  .ctl-btn.danger { border-color: color-mix(in srgb, var(--crit) 45%, var(--edge)); color: var(--crit); }
-  .ctl-link { background: var(--acc); color: #fff; border-color: var(--acc); text-decoration: none; }
-  .ctl-link:hover { filter: brightness(1.06); }
+  .btn-primary svg, .btn-quiet svg { width: 15px; height: 15px; flex: none; }
+  .btn-quiet { background: transparent; color: var(--ink2); border: 1px solid var(--edge); }
+  .btn-quiet:hover:not(:disabled) { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
+  .btn-quiet.danger { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 45%, var(--edge)); }
+  .btn-quiet[aria-pressed="true"] { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
+  .btn-primary { background: linear-gradient(180deg, var(--approve-a), var(--approve-b)); color: var(--approve-ink); border: 1px solid transparent; }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.07); }
+  .btn-primary:disabled, .btn-quiet:disabled { opacity: .55; cursor: not-allowed; }
+  /* In a stacked control row a button hugs the start rather than stretching. */
+  .ctl-row > .btn-primary, .ctl-row > .btn-quiet { align-self: flex-start; }
 
   .gate-tag {
     margin-left: 8px; font-size: 10px; letter-spacing: .04em; text-transform: uppercase; font-weight: 600;
@@ -422,6 +499,22 @@
   }
   .exp[open] > .exp-sum { border-bottom: 1px solid var(--edge); }
   .exp-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+
+  /* ---- Pro-board card strips — one consistent left-strip system ----------
+     Work items + plan rows carry a 3px left strip keyed by state, matching the
+     Overwatch gate card's ::before geometry (same 3px width, radius-clipped by
+     the card). planned → ink3 · in_progress → acc · blocked/review → warn ·
+     done → ok. The strip rides inside the rounded, overflow:hidden .exp. */
+  .exp-strip { position: relative; }
+  .exp-strip::before {
+    content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--ink3); z-index: 1;
+  }
+  .exp-strip[data-strip="in_progress"]::before { background: var(--acc); }
+  .exp-strip[data-strip="blocked"]::before,
+  .exp-strip[data-strip="review"]::before { background: var(--warn); }
+  .exp-strip[data-strip="done"]::before { background: var(--ok); }
+  .exp-strip[data-strip="planned"]::before { background: var(--ink3); }
+  .exp-strip > .exp-sum { padding-left: 15px; }
 
   /* ---- Overwatch landing — Overwatch-concept restyle (post-M6) ----------
      Ports the concept's Overwatch view: a full-width stat-tile row, then a
@@ -534,20 +627,10 @@
     background: linear-gradient(135deg, var(--trust), var(--acc));
   }
 
-  /* Action row: gradient approve · ghost return · inline note (concept .actions). */
+  /* Action row: primary approve · quiet return · inline note (concept .actions).
+     The buttons themselves are the two unified families (.btn-primary /
+     .btn-quiet) defined above — this row only owns the layout. */
   .ow-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
-  .ow-btn {
-    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
-    min-height: 44px; padding: 0 16px; border-radius: var(--radius-sm);
-    font-weight: 600; font-size: 13px; cursor: pointer; border: 1px solid transparent;
-    transition: filter .18s ease, background .18s ease, color .18s ease;
-  }
-  .ow-btn svg { width: 15px; height: 15px; flex: none; }
-  .ow-btn:disabled { opacity: .55; cursor: not-allowed; }
-  .ow-approve { background: linear-gradient(180deg, var(--approve-a), var(--approve-b)); color: var(--approve-ink); }
-  .ow-approve:hover:not(:disabled) { filter: brightness(1.07); }
-  .ow-ghost { background: var(--surface2); color: var(--ink2); border-color: var(--edge-strong); }
-  .ow-ghost:hover:not(:disabled) { color: var(--ink); }
   .ow-note {
     width: 100%; min-height: 40px; margin-top: 8px; padding: 8px 11px;
     border: 1px solid var(--edge); border-radius: var(--radius-sm);
@@ -637,9 +720,53 @@
   /* Phone (<720px): columns stack, action buttons go full-width. */
   @media (max-width: 720px) {
     .ow-cols { grid-template-columns: 1fr; }
-    .ow-actions .ow-btn { flex: 1; }
+    .ow-actions .btn-primary, .ow-actions .btn-quiet { flex: 1; }
     .ow-fleet-side { max-width: none; }
   }
+
+  /* ---- Charts (single-series area/line, no dependency) ------------------
+     Rendered by CruxRender.areaChart(). One series only: a 2px var(--acc)
+     stroke over an area fill (svg gradient --acc→transparent), faint var(--edge)
+     gridlines, an emphasised endpoint dot, and NO legend (the title names the
+     series). Value labels are ink tokens, tabular-nums — never the series
+     colour. Range = a row of three .btn-quiet toggles above the chart. */
+  .chart-card {
+    padding: 16px 18px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    display: flex; flex-direction: column; gap: 12px; position: relative; min-width: 0;
+  }
+  .chart-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .chart-title { margin: 0; font-size: 14.5px; font-weight: 650; }
+  .chart-sub { margin: 0; font-size: 12px; color: var(--ink2); }
+  .chart-latest {
+    margin-left: auto; font-variant-numeric: tabular-nums;
+    font-size: 18px; font-weight: 650; color: var(--ink);
+  }
+  .chart-range { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chart-range .btn-quiet { min-height: 30px; padding: 0 12px; font-size: 12px; }
+  .chart-figure { width: 100%; }
+  .chart-svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .chart-grid { stroke: var(--edge); stroke-width: 1; }
+  .chart-line { fill: none; stroke: var(--acc); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .chart-dot { fill: var(--acc); }
+  .chart-dot-ring { fill: none; stroke: var(--acc); stroke-width: 1.5; opacity: .35; }
+  .chart-axis { fill: var(--ink3); font-family: var(--font-mono); font-size: 9px; font-variant-numeric: tabular-nums; }
+  .chart-empty { font-size: 12.5px; color: var(--ink3); padding: 18px 2px; }
+  .spark { display: block; width: 76px; height: 24px; margin-top: 8px; overflow: visible; }
+  .spark .chart-line { stroke-width: 1.6; }
+
+  /* Demo-mode corner chip — marks any panel whose data came from fixtures. */
+  .demo-chip {
+    position: absolute; top: 10px; right: 12px;
+    font-family: var(--font-mono); font-size: 8.5px; font-weight: 600; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
+    border-radius: 6px; padding: 1px 6px; pointer-events: none;
+  }
+  .ow-panel { position: relative; }
+  .demo-chip.inline { position: static; align-self: flex-start; }
 
   /* ---- Accessibility & motion ------------------------------------------- */
   .skip {
@@ -736,6 +863,7 @@
 
   <div class="app">
     <aside class="rail">
+      <button class="rail-toggle" id="railToggle" type="button" aria-expanded="true" aria-label="Collapse navigation" title="Collapse navigation"></button>
       <div class="brand">
         <span class="mark" aria-hidden="true"></span>
         <span class="name">Crux Console<small>Unified shell · v2</small></span>
@@ -759,10 +887,13 @@
           <h1 id="destTitle">Overwatch</h1>
           <p class="sub" id="destSub">Loading…</p>
         </div>
-        <span class="health" id="health" role="status" aria-live="polite">
-          <span class="dot" aria-hidden="true"></span>
-          <span id="healthText">Connecting…</span>
-        </span>
+        <div class="topbar-right">
+          <div class="topchips" id="topchips"></div>
+          <span class="health" id="health" role="status" aria-live="polite">
+            <span class="dot" aria-hidden="true"></span>
+            <span id="healthText">Connecting…</span>
+          </span>
+        </div>
       </div>
       <div class="content" id="content"></div>
     </main>
@@ -805,6 +936,7 @@
     developer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 9l-4 3 4 3"/><path d="M16 9l4 3-4 3"/><path d="M13 6l-2 12"/></svg>',
     passport: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="9" r="3"/><path d="M6 20a6 6 0 0 1 12 0"/></svg>',
     more: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></svg>',
+    chevron: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>',
     glass: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.2 4.8L19 9l-3.5 3.4.9 4.9L12 15l-4.4 2.3.9-4.9L5 9l4.8-1.2z"/></svg>',
     dark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a7 7 0 1 0 10.5 10.5z"/></svg>',
     light: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></svg>'
@@ -891,6 +1023,7 @@
   function firstPageId(destId) {
     var list = pagesForDest(destId);
     for (var i = 0; i < list.length; i++) {
+      if (list[i].pill === false) { continue; }   // folded out of the pill row (reachable via the landing) — never the default
       if (!(list[i].operatorOnly && POSTURE !== 'operator')) { return list[i].id; }
     }
     return list.length ? list[0].id : null;
@@ -966,7 +1099,8 @@
     for (var i = 0; i < DESTS.length; i++) {
       var item = DESTS[i];
       var btn = el('button', {
-        'class': 'nav-item', type: 'button', 'data-dest': item.id, 'aria-current': 'false'
+        'class': 'nav-item', type: 'button', 'data-dest': item.id, 'aria-current': 'false',
+        title: item.label   // tooltip — the only label shown when the rail is collapsed
       });
       btn.innerHTML = ICONS[item.icon] || '';   // inline SVG glyph
       btn.appendChild(el('span', { 'class': 'label', text: item.label }));
@@ -1000,6 +1134,91 @@
     var box = document.getElementById('health');
     box.className = 'health ' + kind;
     document.getElementById('healthText').textContent = text;
+  }
+
+  // ---- Status pill (top-right) -------------------------------------------
+  // No address / node-id in the text — origin + node id now live on the System
+  // destination. States: Connected · Local (auth 'off') / Connected · Platform
+  // (any other auth) / Degraded (reachable, no summary) / Offline (unreachable);
+  // a "· read-only" suffix rides along whenever posture is customer.
+  function setStatusPill() {
+    var authMode = get(BOOT.summary, ['daemon', 'auth_mode']);
+    var kind, text;
+    if (BOOT.health === 'down') { kind = 'down'; text = 'Offline'; }
+    else if (BOOT.health === 'degraded') { kind = 'degraded'; text = 'Degraded'; }
+    else { kind = 'ok'; text = 'Connected · ' + (authMode === 'off' ? 'Local' : 'Platform'); }
+    if (POSTURE === 'customer') { text += ' · read-only'; }
+    setHealth(kind, text);
+  }
+
+  // ---- Top-bar chips -----------------------------------------------------
+  // Compact mono chips in the right cluster: the build / auth-mode / dataplane
+  // facts that used to be landing tiles, plus the DEMO DATA chip when demo mode
+  // is on. Every chip is real boot data; a chip is omitted when its value is
+  // unknown (never fabricated).
+  function setTopChips() {
+    var host = document.getElementById('topchips');
+    if (!host) { return; }
+    host.textContent = '';
+    if (typeof window !== 'undefined' && window.CRUX_DEMO) {
+      host.appendChild(el('span', { 'class': 'topchip demo', text: 'DEMO DATA' }));
+    }
+    var authMode = get(BOOT.summary, ['daemon', 'auth_mode']);
+    var dataplane = get(BOOT.summary, ['daemon', 'dataplane_enabled']);
+    var version = get(BOOT.version, ['version']) || get(BOOT.summary, ['daemon', 'build', 'version']);
+    if (authMode != null) { host.appendChild(el('span', { 'class': 'topchip', text: 'auth: ' + authMode })); }
+    if (dataplane != null) { host.appendChild(el('span', { 'class': 'topchip', text: 'dataplane: ' + (dataplane ? 'on' : 'off') })); }
+    if (version) { host.appendChild(el('span', { 'class': 'topchip', text: 'v' + String(version).replace(/^v/, '') })); }
+  }
+
+  // ---- Collapsible rail --------------------------------------------------
+  // A chevron toggle collapses the rail to an icon-only ~64px column. State
+  // persists in localStorage (crux.console.rail); a pre-paint script mirrors it
+  // onto <html data-rail> before first paint. Phone tier (<720px) hides the
+  // rail entirely, so this is desktop-only (CSS guards to min-width:721px).
+  var LS_RAIL = 'crux.console.rail';
+  function readRail() {
+    try { return localStorage.getItem(LS_RAIL) === 'collapsed' ? 'collapsed' : 'open'; }
+    catch (e) { return 'open'; }
+  }
+  function applyRail(state) {
+    var collapsed = state === 'collapsed';
+    document.documentElement.setAttribute('data-rail', collapsed ? 'collapsed' : 'open');
+    try { localStorage.setItem(LS_RAIL, collapsed ? 'collapsed' : 'open'); } catch (e) { /* private mode */ }
+    var btn = document.getElementById('railToggle');
+    if (btn) {
+      var lbl = collapsed ? 'Expand navigation' : 'Collapse navigation';
+      btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      btn.setAttribute('aria-label', lbl);
+      btn.setAttribute('title', lbl);
+    }
+  }
+  function initRail() {
+    var btn = document.getElementById('railToggle');
+    if (btn) {
+      btn.innerHTML = ICONS.chevron;
+      btn.addEventListener('click', function () {
+        applyRail(document.documentElement.getAttribute('data-rail') === 'collapsed' ? 'open' : 'collapsed');
+      });
+    }
+    applyRail(readRail());
+  }
+
+  // ---- Demo mode (labelled, gated) --------------------------------------
+  // ?demo=1 turns on labelled demo fixtures (persisted to localStorage); ?demo=0
+  // clears. The flag lives on window.CRUX_DEMO. Fixtures themselves live in
+  // CruxDemo (pages.js) and are read ONLY by render.js behind this flag; real
+  // data always wins where an endpoint answers.
+  var LS_DEMO = 'crux.console.demo';
+  function initDemo() {
+    var on = false;
+    try {
+      var q = location.search || '';
+      if (/[?&]demo=1\b/.test(q)) { localStorage.setItem(LS_DEMO, '1'); }
+      else if (/[?&]demo=0\b/.test(q)) { localStorage.removeItem(LS_DEMO); }
+      on = localStorage.getItem(LS_DEMO) === '1';
+    } catch (e) { on = /[?&]demo=1\b/.test(location.search || ''); }
+    if (typeof window !== 'undefined') { window.CRUX_DEMO = on; }
   }
 
   // ---- Phone tier: bottom tab bar + "More" sheet ------------------------
@@ -1098,6 +1317,10 @@
     var list = pagesForDest(destId);
     for (var i = 0; i < list.length; i++) {
       var p = list[i];
+      // Pages tagged pill:false are folded out of the pill row (item 0). They
+      // stay in PAGES (reachable by direct hash + rendered inline by the
+      // destination's landing), just not shown here.
+      if (p.pill === false) { continue; }
       var pill = el('button', {
         'class': 'pill', type: 'button', 'data-page': p.id,
         'aria-current': p.id === activePageId ? 'page' : 'false'
@@ -1174,17 +1397,15 @@
         var reachable = (ver && ver.status !== 0) || (sum && sum.status !== 0);
         if (!reachable) {
           BOOT.health = 'down';
-          setHealth('down', 'Daemon unreachable');
         } else if (BOOT.summary) {
           BOOT.health = 'ok';
-          var node = get(BOOT.summary, ['daemon', 'node_id']);
-          setHealth('ok', node ? ('Connected · ' + node) : 'Connected');
           var pv = get(BOOT.version, ['version']) || get(BOOT.summary, ['daemon', 'build', 'version']);
           if (pv) { document.getElementById('passportSub').textContent = 'node build ' + pv; }
         } else {
           BOOT.health = 'degraded';
-          setHealth('degraded', 'Summary unavailable');
         }
+        setStatusPill();
+        setTopChips();
         route();
         // Derive posture from the server, then re-render with it (nav + pills +
         // landing + mutating controls all follow). Never blocks the first paint.
@@ -1216,17 +1437,21 @@
     var subEl = document.getElementById('passportSub');
     if (nameEl) { nameEl.textContent = name; }
     if (subEl) { subEl.textContent = sub; }
+    setStatusPill();   // posture drives the "· read-only" suffix
     applyPosture(document);
     route();   // re-render nav/pills/landing under the derived posture
   }
 
   // ---- Init --------------------------------------------------------------
   function init() {
+    initDemo();   // set window.CRUX_DEMO before any module render reads it
     document.querySelector('.brand .mark').innerHTML = ICONS.logo;
     document.querySelector('.passport-chip .avatar').innerHTML = ICONS.passport;
     buildRail();
     buildThemeSwitch();
     applyTheme(readTheme());
+    initRail();       // collapsible rail (persisted, desktop-only)
+    setTopChips();    // paint the DEMO chip (+ any cached facts) immediately
     // Phone tier: build the tab bar + sheet, place the passport/theme chrome for
     // the current breakpoint, and keep it in sync as the viewport crosses 720px.
     buildTabbar();

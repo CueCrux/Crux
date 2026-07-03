@@ -17,7 +17,7 @@
 ;(function (root, factory) {
   var api = factory();
   if (typeof module === 'object' && module.exports) { module.exports = api; }
-  else { root.CruxPages = api; }
+  else { root.CruxPages = api; root.CruxDemo = api.CruxDemo; }   // window.CruxDemo for render.js demoData()
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
@@ -133,20 +133,18 @@
           ? 'Could not reach the daemon at this origin. Check corecruxd is running on :14800 and reload.'
           : '/v1/console/summary returned no data (it may require console-read auth). Navigation still works.') }];
     }
-    var version = get(s, ['daemon', 'build', 'version']);
+    // Build / auth mode / dataplane / node moved off the tiles: build/auth/
+    // dataplane are now compact chips in the topbar, node id lives on System ›
+    // Settings › Node (items 3 + 4). Tiles keep the six live counters.
     return [
       { h: 'Daemon at a glance', sub: 'live from /v1/console/summary', wide: true,
         tiles: [
-          ['Node', str(get(s, ['daemon', 'node_id']))],
-          ['Build', str(version)],
           ['Facts', fmtNum(get(s, ['stores', 'facts']))],
           ['Sessions', fmtNum(get(s, ['stores', 'sessions']))],
           ['Shards', fmtNum(get(s, ['routing', 'shard_count'])), 'map v' + str(get(s, ['routing', 'shard_map_version']))],
           ['Storage free', fmtPct(get(s, ['capacity', 'free_ratio'])), 'of ' + fmtBytes(get(s, ['capacity', 'total_bytes']))],
           ['MCP agents', fmtNum(get(s, ['daemon', 'mcp_agent_count'])), get(s, ['daemon', 'mcp_enabled']) ? 'enabled' : 'off'],
-          ['Integrations', fmtNum(get(s, ['integrations', 'builtin_pack_count'])), get(s, ['integrations', 'enabled']) ? 'enabled' : 'off'],
-          ['Auth mode', str(get(s, ['daemon', 'auth_mode']))],
-          ['Dataplane', get(s, ['daemon', 'dataplane_enabled']) ? 'on' : 'off']
+          ['Integrations', fmtNum(get(s, ['integrations', 'builtin_pack_count'])), get(s, ['integrations', 'enabled']) ? 'enabled' : 'off']
         ], controls: [] }
     ];
   }
@@ -261,7 +259,8 @@
     if (!res.ok || !res.data) { return [head, { h: 'Work', wide: true, controls: degraded(res.status, 'Work board unavailable — GET /v1/work?source=all') }]; }
     var items = arr(res.data.work || res.data.items);
     var mk = function (w) {
-      return { t: 'exp', label: w.title || w.id, sub: (w.milestones_total ? ('M ' + (w.milestones_done || 0) + '/' + w.milestones_total) : '') || w.current_milestone || w.plan_path || '', badge: workStageOf(w).replace('_', ' '),
+      var stage = workStageOf(w);   // planned | in_progress | blocked | done — drives the left strip (item 7)
+      return { t: 'exp', strip: stage, label: w.title || w.id, sub: (w.milestones_total ? ('M ' + (w.milestones_done || 0) + '/' + w.milestones_total) : '') || w.current_milestone || w.plan_path || '', badge: stage.replace('_', ' '),
         controls: [['state', w.state], ['risk', w.risk_class], ['plan', w.plan_path], ['milestone', w.current_milestone], ['owner', w.assignee_passport], ['pr', w.linked_pr]]
           .filter(function (kv) { return kv[1] != null && kv[1] !== ''; }).map(function (kv) { return info(kv[0], String(kv[1])); })
           .concat([rbtn('Open in kanban')]) };
@@ -480,12 +479,19 @@
   function buildSettings(res) {
     var s = (res.ok && res.data) ? res.data : {};
     var a = s.auth || {}, e = s.embedding || {};
+    // The status pill dropped the origin + node id (item 3); they land here.
+    var origin = (typeof window !== 'undefined' && window.location && window.location.origin) ? window.location.origin : '—';
     return [
+      { h: 'Node', sub: 'this daemon origin + identity',
+        controls: [
+          info('origin', origin),
+          info('node id', str(get(s, ['node_id']) || get(s, ['daemon', 'node_id']))),
+          info('build', str(get(s, ['daemon', 'build', 'version'])))
+        ] },
       { h: 'Access posture', sub: 'who may call :14800',
         controls: [
           { t: 'select', k: 'auth_mode', label: 'auth mode', options: arr(a.supported_modes).length ? a.supported_modes.slice() : ['off', 'dev_scopes', 'jwt_hs256', 'jwt_jwks'], v: a.chosen_mode || a.running_mode || 'off', mut: true },
-          { t: 'toggle', k: 'require_bind', label: 'require passport binding', v: true, mut: true },
-          info('node id', str(get(s, ['node_id']) || get(s, ['daemon', 'node_id'])))
+          { t: 'toggle', k: 'require_bind', label: 'require passport binding', v: true, mut: true }
         ] },
       { h: 'Embedding (semantic retrieval)', sub: 'Crux ships no embedding model — point at your endpoint',
         controls: [
@@ -524,16 +530,25 @@
     ];
   }
 
+  // A full-width trend card (item 5). No real time-series endpoint exists for
+  // the cost lens yet, so the chart renders from a demo fixture when demo mode
+  // is on, else an honest empty state — never a series faked from one scalar.
+  function costTrend() {
+    return { h: 'Spend over time', wide: true, controls: [
+      { t: 'chart', title: 'Tokens in', sub: 'measured usage over time (message.usage)', demoKey: 'costSeries', fmt: 'compact', range: 'week',
+        hint: 'the cost lens has no bucketed series endpoint yet — enable demo mode (?demo=1) to preview' }
+    ] };
+  }
   function buildCost(res) {
     var sel = { h: 'Session', sub: 'measured from the transcript message.usage (not an estimate)', wide: true, controls: [{ t: 'select', k: 'sess', label: 'session', options: ['latest'], v: 'latest' }] };
     if (!res.ok || !res.data) {
       sel.controls.push(info('status', 'cost lens off or unreachable — set CORECRUXD_FEATURE_COST_LENS=1'));
-      return [sel, { h: 'Headline', wide: true, controls: [info('no data', 'run:  corecruxctl session cost --post')] }];
+      return [sel, { h: 'Headline', wide: true, controls: [info('no data', 'run:  corecruxctl session cost --post')] }, costTrend()];
     }
     var d = res.data;
     if (!d.has_report) {
       sel.controls.push(info('status', arr(d.sessions).length ? 'pick a session above' : 'no reports posted yet'));
-      return [sel, { h: 'Headline', wide: true, controls: [info('get started', 'run:  corecruxctl session cost --post   (then refresh)')] }];
+      return [sel, { h: 'Headline', wide: true, controls: [info('get started', 'run:  corecruxctl session cost --post   (then refresh)')] }, costTrend()];
     }
     var r = (d.report && d.report.report) || {}, h = r.headline || {}, m = r.measured || {};
     sel.controls.push(info('status', (r.source || 'report') + ' · received ' + String((d.report && d.report.received_at) || '').slice(0, 16).replace('T', ' ')));
@@ -552,7 +567,7 @@
       return { t: 'exp', label: (lv.severity ? '● ' + String(lv.severity).toUpperCase() + '  ' : '') + lv.title, sub: lv.est_pct ? ('addresses ~' + Math.round(lv.est_pct) + '% of carried cost') : '', badge: lv.severity || 'lever', controls: [info('how', lv.detail || '')] };
     }) };
     if (!levers.controls.length) { levers.controls = [info('—', 'already lean')]; }
-    return [sel, head, where, levers];
+    return [sel, head, where, levers, costTrend()];
   }
 
   // ---- Engine mediation (M4) — read-only, daemon-mediated summary card ----
@@ -580,7 +595,15 @@
     ];
     return sec;
   }
-  function buildUsageEngine(res) { return STATIC['cx-usage'].concat([engineMediatedSection(res)]); }
+  // cx-usage gets a full-width trend card too (item 5). Same posture as the cost
+  // trend: demo fixture when demo mode is on, else an honest empty state.
+  function usageTrend() {
+    return { h: 'Call volume over time', wide: true, controls: [
+      { t: 'chart', title: 'Tokens in / period', sub: 'aggregate call volume', demoKey: 'usageSeries', fmt: 'compact', range: 'week',
+        hint: '/v1/observations/aggregate has no bucketed series yet — enable demo mode (?demo=1) to preview' }
+    ] };
+  }
+  function buildUsageEngine(res) { return STATIC['cx-usage'].concat([usageTrend(), engineMediatedSection(res)]); }
   function buildMediationEngine(res) { return STATIC['cx-mediation'].concat([engineMediatedSection(res)]); }
 
   // =======================================================================
@@ -722,7 +745,11 @@
 
   var PAGES = {
     // ---- Overwatch -------------------------------------------------------
-    'cx-overview': page('cx-overview', 'overwatch', 'Overview', 'daemon posture, readiness, and capacity at a glance', { load: { endpoint: '/v1/console/summary', build: buildOverview } }),
+    // pill:false — folded out of the Overwatch pill row (item 0). The landing
+    // tiles ARE the overview (render.js fillTiles reuses this page's build), so
+    // cx-overview stays in PAGES (reachable via the tiles + direct #/overwatch/
+    // cx-overview) but is never shown as a pill nor used as the default page.
+    'cx-overview': page('cx-overview', 'overwatch', 'Overview', 'daemon posture, readiness, and capacity at a glance', { pill: false, load: { endpoint: '/v1/console/summary', build: buildOverview } }),
     'cx-activity': page('cx-activity', 'overwatch', 'Activity', 'all sessions · live rolling log'),
     'cx-coord': page('cx-coord', 'overwatch', 'Live board', 'who is working right now · /v1/coord/active', { load: { endpoint: '/v1/coord/active', build: buildCoord } }),
     'cx-orchestrators': page('cx-orchestrators', 'overwatch', 'Orchestrators', 'group plans for a session · /v1/orchestrators', { load: { endpoint: '/v1/orchestrators', build: buildOrchestrators } }),
@@ -803,11 +830,88 @@
     'Set as planning repo'             // cx-projects
   ];
 
+  // =======================================================================
+  //  Demo mode fixtures (labelled, gated). Representative populated states,
+  //  surfaced ONLY when ?demo=1 (window.CRUX_DEMO) AND the matching real panel
+  //  came back empty/degraded. render.js reads these exclusively through its
+  //  single demoData() choke point, so nothing here can render without the demo
+  //  flag — and real data always wins where an endpoint answers.
+  // =======================================================================
+  var CruxDemo = (function () {
+    var NOW = Date.now(), MIN = 60000, HOUR = 3600000, DAY = 86400000;
+    function wave(n, base, amp, seed) {
+      var out = [];
+      for (var i = 0; i < n; i++) {
+        var v = base + amp * Math.sin((i + seed) / 2) + amp * 0.4 * Math.sin(i / 1.3 + seed);
+        out.push(Math.max(0, Math.round(v)));
+      }
+      return out;
+    }
+    return {
+      // 2 pending gates — the first carries foresight consequences.
+      needsYou: [
+        { action_id: 'act_9f21c4', work_id: 'execplan:corecrux-trait-expansion', requested_action: 'update_state', target_state: 'deployed',
+          risk_class: 'high', requested_by_passport: 'p_sonnet_ce4e6c', requested_at_unix_ms: NOW - 8 * MIN,
+          narrative: 'Flipping the trait-expansion lane to default-on touches every tenant’s retrieval path.',
+          consequences: [
+            { consequence_type: 'blast_radius', detail: 'all 50 pilot tenants re-rank on next query', target: 'lme-m' },
+            { consequence_type: 'reversibility', detail: 'revertible via overlay flag; no data migration' },
+            { consequence_type: 'latency', detail: '+6 ms p50 on the fused lane' }
+          ] },
+        { action_id: 'act_3b70de', work_id: 'execplan:unified-shell-console', requested_action: 'update_state', target_state: 'done',
+          risk_class: 'medium', requested_by_passport: 'p_opus_local', requested_at_unix_ms: NOW - 41 * MIN }
+      ],
+      // 3 live sessions — the middle one has a ⚠ overlap.
+      fleet: [
+        { sessionHex: '7f3a1c2b', passport: 'p_opus_local', execplan: 'unified-shell-console', milestone: 'M7', intent: 'restyle round 2',
+          leases: ['tree://crates/corecruxd/console/v2'], orchestrators: ['orc_7a1c'], snapshot: '9c5a9271' },
+        { sessionHex: '2be40d19', passport: 'p_sonnet_ce4e6c', execplan: 'corecrux-trait-expansion', milestone: 'M3', intent: 'default-on pilot',
+          leases: ['file://crates/corecrux-retrieval/src/fuse.rs'], overlaps: [{ resource: 'fuse.rs' }] },
+        { sessionHex: null, passport: 'p_haiku_bench', intent: null, leases: [], snapshot: 'a1b2c3d4' }
+      ],
+      // 12 activity rows, each with a receipt id.
+      activity: (function () {
+        var kinds = [
+          ['store_fact', 'store_fact', 'gate:M6 recorded'], ['work', 'update_state', 'execplan → in_progress'],
+          ['receipt', null, 'CROWN signed'], ['query', 'query_scan', 'retrieval · 12 hits'],
+          ['session', 'save_session', 'pre-compact snapshot'], ['gate', 'approve', 'Art.14 approval'],
+          ['fact', 'store_fact', 'decision:packaging'], ['activity', null, 'appended'],
+          ['work', 'comment', 'return note to requester'], ['query', 'query_expand', 'expand · 4 lanes'],
+          ['session', 'save_session', 'resume point'], ['store_fact', 'store_fact', 'bench:cdb-v1']
+        ];
+        return kinds.map(function (k, i) {
+          return { kind: k[0], tool: k[1], preview: k[2], ts: new Date(NOW - i * 7 * MIN).toISOString().slice(11, 16),
+            receipt_ids: ['crn_' + (0x8f21 + i * 37).toString(16)] };
+        });
+      })(),
+      engine: { mediated: true, engine_reachable: true, engine_latency_ms: 41, fetched_at_unix_ms: NOW - 2 * MIN },
+      // Cost / usage time-series: 24h (hourly) · 7d · 30d.
+      costSeries: { day: wave(24, 42000, 12000, 1), week: wave(7, 480000, 90000, 2), month: wave(30, 2100000, 300000, 3) },
+      usageSeries: { day: wave(24, 39000, 9000, 4), week: wave(7, 517000, 70000, 5), month: wave(30, 2220000, 260000, 6) },
+      // Tile sparkline series (events/day) for Facts + Sessions.
+      factsSpark: wave(7, 40, 18, 7),
+      sessionsSpark: wave(7, 6, 4, 8),
+      // Representative work + memory states (fixtures kept complete).
+      work: [
+        { id: 'execplan:unified-shell-console', title: 'unified-shell-console', state: 'in_progress', risk_class: 'medium', current_milestone: 'M7', milestones_total: 8, milestones_done: 6 },
+        { id: 'execplan:corecrux-trait-expansion', title: 'corecrux-trait-expansion', state: 'blocked', risk_class: 'high', current_milestone: 'M3' },
+        { id: 'execplan:cruxengine-carry-all', title: 'cruxengine-carry-all', state: 'planned', risk_class: 'low' },
+        { id: 'execplan:context-custody-surface', title: 'context-custody-surface', state: 'done', risk_class: 'medium' }
+      ],
+      facts: [
+        { entity: 'execplan:unified-shell-console', key: 'gate:M6', value: '{ status: passing, commit_sha: 1a60d25 }', stored_at: new Date(NOW - 3 * HOUR).toISOString() },
+        { entity: 'bench:cdb-v1', key: 'result', value: 'crux ties vendor-native on static recall', stored_at: new Date(NOW - 20 * HOUR).toISOString() },
+        { entity: 'decision:packaging', key: 'scenario', value: 'hybrid keep-vow + free-verifier', stored_at: new Date(NOW - 2 * DAY).toISOString() }
+      ]
+    };
+  })();
+
   return {
     PAGES: PAGES,
     DESTS: DESTS,
     LEGACY_IDS: LEGACY_IDS,
     MUTATING_ACTIONS: MUTATING_ACTIONS,
+    CruxDemo: CruxDemo,
     // Exposed for tests / render composition.
     _helpers: { workStageOf: workStageOf, laneWeightControls: laneWeightControls, amrLaneToggles: amrLaneToggles }
   };

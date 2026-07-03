@@ -23,7 +23,7 @@
 
   // The control types this renderer knows how to draw. The smoke asserts every
   // control type used anywhere in pages.js has a branch here.
-  var CONTROL_TYPES = ['search', 'input', 'textarea', 'select', 'toggle', 'btn', 'info', 'exp', 'rpcout', 'bar', 'theme'];
+  var CONTROL_TYPES = ['search', 'input', 'textarea', 'select', 'toggle', 'btn', 'info', 'exp', 'rpcout', 'bar', 'theme', 'chart'];
   var GATE_TITLE = 'wired in M3+';
 
   // ---- Environment shims (only used when rendering in a browser) ---------
@@ -132,6 +132,151 @@
   }
 
   // =======================================================================
+  //  Demo mode (labelled, gated). window.CRUX_DEMO is set by the shell (from
+  //  ?demo / localStorage). demoData() is the SINGLE choke point that reads the
+  //  CruxDemo fixture module — every fixture-fed panel goes through it, so the
+  //  smoke can prove fixtures are reachable ONLY behind the demo flag. Real data
+  //  always wins: callers reach demoData() only when a panel is empty/degraded.
+  // =======================================================================
+  function demoOn() { return typeof window !== 'undefined' && !!window.CRUX_DEMO; }
+  function demoData(key) {
+    if (!demoOn()) { return null; }
+    var d = (typeof window !== 'undefined') ? window.CruxDemo : null;
+    return (d && key && d[key] != null) ? d[key] : null;
+  }
+  function demoChip(inline) { return el('span', { 'class': 'demo-chip' + (inline ? ' inline' : ''), text: 'demo' }); }
+
+  // =======================================================================
+  //  Charts — a no-dependency, single-series inline-SVG area/line helper. One
+  //  series only; the title names it, so there is NO legend. Stroke = var(--acc)
+  //  2px (non-scaling); the area fills from a per-instance svg gradient
+  //  (--acc low-opacity → transparent); gridlines are faint var(--edge); the
+  //  final point carries an emphasised dot. Value labels are ink tokens with
+  //  tabular-nums — never the series colour.
+  // =======================================================================
+  var __chartSeq = 0;
+  function svgEl(name, attrs) {
+    var node = doc().createElementNS('http://www.w3.org/2000/svg', name);
+    if (attrs) { for (var k in attrs) { if (attrs[k] != null) { node.setAttribute(k, String(attrs[k])); } } }
+    return node;
+  }
+  // Area+line chart over `values` (finite numbers). `opts`: { spark }. Returns an
+  // <svg>, or null for a series too short to plot (caller shows an empty state).
+  function areaChart(values, opts) {
+    opts = opts || {};
+    var vals = (values || []).map(Number).filter(function (n) { return isFinite(n); });
+    if (vals.length < 2) { return null; }
+    var spark = !!opts.spark;
+    var W = spark ? 76 : 640, H = spark ? 24 : 180;
+    var pad = spark ? 2 : 14, padB = spark ? pad : pad + 10;
+    var min = Math.min.apply(null, vals), max = Math.max.apply(null, vals);
+    var span = (max - min) || 1;
+    var innerW = W - pad * 2, innerH = H - pad - padB;
+    function x(i) { return pad + (innerW * i) / (vals.length - 1); }
+    function y(v) { return pad + innerH * (1 - (v - min) / span); }
+    var id = 'cxg' + (++__chartSeq);
+    var svg = svgEl('svg', { 'class': spark ? 'chart-svg spark' : 'chart-svg', viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-hidden': 'true' });
+    var defs = svgEl('defs');
+    var grad = svgEl('linearGradient', { id: id, x1: '0', y1: '0', x2: '0', y2: '1' });
+    grad.appendChild(svgEl('stop', { offset: '0%', 'stop-color': 'var(--acc)', 'stop-opacity': spark ? '0.3' : '0.34' }));
+    grad.appendChild(svgEl('stop', { offset: '100%', 'stop-color': 'var(--acc)', 'stop-opacity': '0' }));
+    defs.appendChild(grad); svg.appendChild(defs);
+    if (!spark) {
+      for (var g = 0; g <= 2; g++) {
+        var gy = (pad + (innerH * g) / 2).toFixed(1);
+        svg.appendChild(svgEl('line', { 'class': 'chart-grid', x1: pad, y1: gy, x2: W - pad, y2: gy, 'vector-effect': 'non-scaling-stroke' }));
+      }
+    }
+    var line = '';
+    for (var i = 0; i < vals.length; i++) { line += (i ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(vals[i]).toFixed(1) + ' '; }
+    var base = (pad + innerH).toFixed(1);
+    var area = line + 'L' + x(vals.length - 1).toFixed(1) + ' ' + base + ' L' + x(0).toFixed(1) + ' ' + base + ' Z';
+    svg.appendChild(svgEl('path', { d: area, fill: 'url(#' + id + ')', stroke: 'none' }));
+    svg.appendChild(svgEl('path', { 'class': 'chart-line', d: line.trim(), 'vector-effect': 'non-scaling-stroke' }));
+    var ex = x(vals.length - 1).toFixed(1), ey = y(vals[vals.length - 1]).toFixed(1);
+    if (!spark) { svg.appendChild(svgEl('circle', { 'class': 'chart-dot-ring', cx: ex, cy: ey, r: 4.5 })); }
+    svg.appendChild(svgEl('circle', { 'class': 'chart-dot', cx: ex, cy: ey, r: spark ? 1.8 : 3 }));
+    return svg;
+  }
+  function fmtChartVal(v, fmt) {
+    if (typeof v !== 'number' || !isFinite(v)) { return '—'; }
+    if (fmt === 'compact') {
+      var abs = Math.abs(v);
+      if (abs >= 1e6) { return (v / 1e6).toFixed(1) + 'M'; }
+      if (abs >= 1e3) { return (v / 1e3).toFixed(1) + 'k'; }
+    }
+    try { return v.toLocaleString('en-US'); } catch (e) { return String(v); }
+  }
+
+  // The full chart CARD body: title + latest value, a Day / Week / Month range
+  // switch (three .btn-quiet toggles, aria-pressed), and the area chart for the
+  // active range. Series come from control.series (real) or — only when none is
+  // provided and demo mode is on — from the CruxDemo fixture named by
+  // control.demoKey. No series at all ⇒ an honest empty state (never a
+  // fabricated single-scalar series).
+  function renderChart(control) {
+    var wrap = el('div', { 'class': 'chart-card' });
+    var demoSeries = null;
+    var series = control.series || null;
+    if ((!series || !hasSeries(series)) && control.demoKey) { demoSeries = demoData(control.demoKey); series = demoSeries || series; }
+    var head = el('div', { 'class': 'chart-head' }, [el('h3', { 'class': 'chart-title', text: control.title || 'Trend' })]);
+    var latest = el('span', { 'class': 'chart-latest' });
+    head.appendChild(latest);
+    wrap.appendChild(head);
+    if (control.sub) { wrap.appendChild(el('p', { 'class': 'chart-sub', text: control.sub })); }
+    if (!series || !hasSeries(series)) {
+      wrap.appendChild(el('p', { 'class': 'chart-empty', text: 'No time-series available yet' + (control.hint ? ' — ' + control.hint : '') + '.' }));
+      return wrap;
+    }
+    if (demoSeries) { wrap.appendChild(demoChip(false)); }
+    var figure = el('div', { 'class': 'chart-figure' });
+    var rangeRow = el('div', { 'class': 'chart-range', role: 'group', 'aria-label': 'Chart range' });
+    var order = [['day', 'Day'], ['week', 'Week'], ['month', 'Month']];
+    function draw(rk) {
+      var vals = series[rk] || [];
+      figure.textContent = '';
+      var chart = areaChart(vals, {});
+      if (chart) { latest.textContent = fmtChartVal(vals[vals.length - 1], control.fmt); figure.appendChild(chart); }
+      else { latest.textContent = ''; figure.appendChild(el('p', { 'class': 'chart-empty', text: 'Not enough points in this range.' })); }
+      var btns = rangeRow.querySelectorAll('.btn-quiet');
+      for (var i = 0; i < btns.length; i++) { btns[i].setAttribute('aria-pressed', btns[i].getAttribute('data-range') === rk ? 'true' : 'false'); }
+    }
+    order.forEach(function (r) {
+      var b = el('button', { 'class': 'btn-quiet', type: 'button', 'data-range': r[0], 'aria-pressed': 'false' }, [r[1]]);
+      if (!series[r[0]] || series[r[0]].length < 2) { b.disabled = true; }
+      b.addEventListener('click', function () { draw(r[0]); });
+      rangeRow.appendChild(b);
+    });
+    wrap.appendChild(rangeRow);
+    wrap.appendChild(figure);
+    var initial = (control.range && series[control.range] && series[control.range].length >= 2) ? control.range
+      : (series.week && series.week.length >= 2 ? 'week' : (series.day && series.day.length >= 2 ? 'day' : 'month'));
+    draw(initial);
+    return wrap;
+  }
+  function hasSeries(s) {
+    if (!s) { return false; }
+    return ['day', 'week', 'month'].some(function (k) { return Array.isArray(s[k]) && s[k].length >= 2; });
+  }
+
+  // Bucket /v1/activity rows into a per-day count series (last `days` days) over
+  // rows whose kind/tool matches `pred` — a REAL time-series (events/day), used
+  // for the Facts + Sessions tile sparklines. Returns null when there's no signal.
+  function bucketActivityByDay(rows, pred, days) {
+    if (!Array.isArray(rows) || !rows.length) { return null; }
+    var DAY = 86400000, now = Date.now();
+    var buckets = new Array(days).fill(0), any = false;
+    rows.forEach(function (r) {
+      if (!pred(r)) { return; }
+      var t = Number(r.ts_unix_ms || r.ts || r.at || r.time);
+      if (!isFinite(t)) { return; }
+      var idx = days - 1 - Math.floor((now - t) / DAY);
+      if (idx >= 0 && idx < days) { buckets[idx]++; any = true; }
+    });
+    return any ? buckets : null;
+  }
+
+  // =======================================================================
   //  Control renderers — one branch per CONTROL_TYPES entry.
   // =======================================================================
 
@@ -221,14 +366,19 @@
       }
       case 'btn': {
         if (control.href) {
-          // Deep-machinery fallback links (Pro console / 3D substrate).
-          node = el('a', { 'class': 'ctl-btn ctl-link', href: control.href, title: control.hint || '' }, [control.label || 'Open']);
+          // Deep-machinery fallback links (Pro console / 3D substrate) — quiet family.
+          node = el('a', { 'class': 'btn-quiet', href: control.href, title: control.hint || '' }, [control.label || 'Open']);
           break;
         }
-        var btn = el('button', { 'class': 'ctl-btn' + (control.danger ? ' danger' : ''), type: 'button', disabled: 'disabled', title: GATE_TITLE }, [control.label || 'Action']);
+        // Every page-level button is the quiet family; `danger` is a colour cue.
+        var btn = el('button', { 'class': 'btn-quiet' + (control.danger ? ' danger' : ''), type: 'button', disabled: 'disabled', title: GATE_TITLE }, [control.label || 'Action']);
         node = el('div', { 'class': 'ctl-row' }, [btn]);
         if (control.mut) { node = applyMutationGate(node, control); }
         else { node.appendChild(el('span', { 'class': 'gate-tag', text: GATE_TITLE })); }
+        break;
+      }
+      case 'chart': {
+        node = renderChart(control);
         break;
       }
       case 'bar': {
@@ -256,6 +406,9 @@
         var det = el('details', { 'class': 'exp' });
         if (control.open) { det.setAttribute('open', 'open'); }
         if (control.hideIf && control.sys) { det.setAttribute('data-hideif', control.hideIf); }
+        // Pro-board left colour strip, keyed by work/plan state (item 7). The
+        // strip geometry (3px, radius-clipped) matches the Overwatch gate cards.
+        if (control.strip) { det.classList.add('exp-strip'); det.setAttribute('data-strip', String(control.strip)); }
         var sum = el('summary', { 'class': 'exp-sum' }, [
           el('span', { 'class': 'exp-label', text: control.label || '' }),
           control.sub ? el('span', { 'class': 'exp-sub', text: control.sub }) : null,
@@ -373,6 +526,113 @@
     return isNaN(d.getTime()) ? String(ms) : d.toISOString().slice(0, 16).replace('T', ' ');
   }
 
+  // Mark a landing panel as demo-fed (an inline chip in its section header).
+  function markPanelDemo(wrap) {
+    var head = wrap && wrap.querySelector ? wrap.querySelector('.ow-sec') : null;
+    if (head && !head.querySelector('.demo-chip')) { head.appendChild(demoChip(true)); }
+  }
+
+  // Shared fleet-row builder (real join rows AND demo fixtures use it, so the two
+  // render byte-identically). `row`: { sessionHex, passport, execplan, milestone,
+  // intent, leases[], overlaps[], orchestrators[], snapshot, live }.
+  function fleetRow(row) {
+    var live = !!(row.sessionHex || row.intent || row.milestone || row.live);
+    var frow = el('div', { 'class': 'ow-fleet-row' });
+    frow.appendChild(el('span', { 'class': 'ow-dot' + (live ? ' pulse' : ' idle'), 'aria-hidden': 'true' }));
+    var meta = el('div', { 'class': 'ow-fleet-meta' }, [
+      el('b', { text: (row.sessionHex ? row.sessionHex + ' · ' : '') + (row.passport || '—') })
+    ]);
+    var focusText = [row.execplan && (row.execplan + (row.milestone ? ' @ ' + row.milestone : '')), row.intent].filter(Boolean).join(' · ') || 'idle';
+    meta.appendChild(el('div', { 'class': 'ow-focus', text: focusText, title: focusText }));
+    var leases = row.leases || [], overlaps = row.overlaps || [];
+    if (leases.length || overlaps.length) {
+      var lz = el('div', { 'class': 'ow-leases' });
+      leases.forEach(function (l) { lz.appendChild(el('span', { 'class': 'ow-lease', text: l })); });
+      if (overlaps.length) { lz.appendChild(el('span', { 'class': 'ow-lease ov', text: '⚠ ' + overlaps.length + ' overlap' + (overlaps.length === 1 ? '' : 's') })); }
+      meta.appendChild(lz);
+    }
+    frow.appendChild(meta);
+    var side = el('div', { 'class': 'ow-fleet-side' });
+    if ((row.orchestrators || []).length) { side.appendChild(el('div', { text: row.orchestrators.join(', ') })); }
+    if (row.snapshot) { side.appendChild(el('div', { text: 'snap ' + row.snapshot })); }
+    if (side.childNodes.length) { frow.appendChild(side); }
+    return frow;
+  }
+
+  // Shared activity ticker builder (real rows AND demo fixtures).
+  function activityTicker(rows) {
+    var ticker = el('div', { 'class': 'ow-ticker' });
+    (rows || []).slice(0, 12).forEach(function (r0) {
+      var tick = el('div', { 'class': 'ow-tick' });
+      var rid = (r0.receipt_ids || [])[0] || r0.receipt_id;
+      if (rid) { tick.appendChild(el('span', { 'class': 'ow-hash', text: rid })); }
+      var label = (r0.kind || 'event') + (r0.tool ? ' · ' + r0.tool : '');
+      tick.appendChild(el('span', { 'class': 'ow-tick-label', text: label, title: r0.preview || label }));
+      if (r0.ts) { tick.appendChild(el('span', { 'class': 'ow-tick-ts', text: String(r0.ts) })); }
+      ticker.appendChild(tick);
+    });
+    return ticker;
+  }
+
+  // ---- Demo panel fills — each returns true when it painted from fixtures ---
+  // These run ONLY when a real panel came back empty/degraded (real data wins).
+  // A read-only demo gate card (no live approve/return in demo mode).
+  function demoGateCard(p) {
+    var wrap = el('div', { 'class': 'ow-gate' });
+    var top = el('div', { 'class': 'ow-gate-top' }, [el('span', { 'class': 'ow-badge', text: 'ART.14 HUMAN GATE' })]);
+    if (p.risk_class) { top.appendChild(el('span', { 'class': 'ow-badge risk', text: 'RISK · ' + String(p.risk_class).toUpperCase() })); }
+    top.appendChild(el('span', { 'class': 'ow-slug', text: p.action_id || '' }));
+    wrap.appendChild(top);
+    wrap.appendChild(el('h3', { text: p.work_id || p.action_id || 'gated transition' }));
+    wrap.appendChild(el('p', { 'class': 'ow-gate-action', text: (p.requested_action || 'update_state') + (p.target_state ? ' → ' + p.target_state : '') }));
+    wrap.appendChild(el('div', { 'class': 'ow-attr' }, [
+      el('span', { 'class': 'ow-avatar', text: initials(p.requested_by_passport) }),
+      el('span', { text: 'requested by ' + (p.requested_by_passport || '?') + ' · ' + tsLabel(p.requested_at_unix_ms) })
+    ]));
+    if (p.consequences && p.consequences.length) {
+      var c = el('div', { 'class': 'ow-conseq' });
+      if (p.narrative) { c.appendChild(el('p', { 'class': 'ow-narrative', text: p.narrative })); }
+      p.consequences.slice(0, 5).forEach(function (row) {
+        c.appendChild(el('div', { 'class': 'ow-conseq-row' }, [
+          el('span', {}, [el('b', { text: row.consequence_type || 'consequence' }), doc().createTextNode(' — ' + (row.detail || '') + (row.target ? ' · ' + row.target : ''))])
+        ]));
+      });
+      wrap.appendChild(c);
+    }
+    wrap.appendChild(el('p', { 'class': 'ow-await', text: 'Demo fixture — approve / return is disabled in demo mode.' }));
+    return wrap;
+  }
+  function demoNeedsYou(wrap) {
+    var list = demoData('needsYou');
+    if (!list || !list.length) { return false; }
+    var body = wrap.__body;
+    body.textContent = '';
+    setCt(wrap, list.length + ' pending · demo fixtures');
+    markPanelDemo(wrap);
+    list.forEach(function (p) { body.appendChild(demoGateCard(p)); });
+    return true;
+  }
+  function demoFleet(wrap) {
+    var list = demoData('fleet');
+    if (!list || !list.length) { return false; }
+    var body = wrap.__body;
+    body.textContent = '';
+    setCt(wrap, list.length + ' session' + (list.length === 1 ? '' : 's') + ' · demo fixtures');
+    markPanelDemo(wrap);
+    list.forEach(function (row) { body.appendChild(fleetRow(row)); });
+    return true;
+  }
+  function demoActivity(wrap) {
+    var rows = demoData('activity');
+    if (!rows || !rows.length) { return false; }
+    var body = wrap.__body;
+    body.textContent = '';
+    setCt(wrap, rows.length + ' recent · demo fixtures');
+    markPanelDemo(wrap);
+    body.appendChild(activityTicker(rows));
+    return true;
+  }
+
   // Stat tiles: reuse cx-overview's exact tile set (pages.js buildOverview via
   // its load.build) so the landing readout never drifts from the page.
   function fillTiles(card, ctx) {
@@ -389,8 +649,38 @@
         (sections || []).forEach(function (sec) { card.appendChild(renderSection(sec)); });
       } else {
         card.appendChild(kv('summary', res.ok ? 'loaded' : 'unavailable'));
+        return;
       }
+      // Mini sparklines on the Facts + Sessions tiles — a REAL series bucketed
+      // from /v1/activity (events/day), or a demo fixture when demo mode is on.
+      // Never a series fabricated from the single scalar tile value.
+      return addTileSparklines(card);
     });
+  }
+  function addTileSparklines(card) {
+    return fetchJSON('/v1/activity?tenant_id=default&token_budget=1500').then(function (res) {
+      var rows = (res.ok && res.data && res.data.rows) ? res.data.rows : [];
+      attachSpark(card, 'Facts', seriesFor(rows, /fact/i, 'factsSpark'));
+      attachSpark(card, 'Sessions', seriesFor(rows, /session/i, 'sessionsSpark'));
+    });
+  }
+  function seriesFor(rows, re, demoKey) {
+    var real = bucketActivityByDay(rows, function (r) { return re.test((r.kind || '') + ' ' + (r.tool || '')); }, 7);
+    if (real) { return { vals: real, demo: false }; }
+    var d = demoData(demoKey);
+    return d ? { vals: d, demo: true } : null;
+  }
+  function attachSpark(card, label, s) {
+    if (!s || !s.vals) { return; }
+    var stats = card.querySelectorAll('.stat');
+    for (var i = 0; i < stats.length; i++) {
+      var k = stats[i].querySelector('.k');
+      if (k && k.textContent.trim().toLowerCase() === label.toLowerCase()) {
+        var sp = areaChart(s.vals, { spark: true });
+        if (sp) { stats[i].appendChild(sp); if (s.demo) { stats[i].appendChild(demoChip(true)); } }
+        return;
+      }
+    }
   }
 
   // Needs-you: pending gates from GET /v1/work/gate/pending. Operator posture
@@ -401,11 +691,13 @@
     return fetchJSON('/v1/work/gate/pending').then(function (res) {
       body.textContent = '';
       if (!res.ok || !res.data) {
+        if (demoNeedsYou(wrap)) { return; }   // demo fills only a degraded panel
         setCt(wrap, 'gate queue unavailable');
         body.appendChild(kv(res.status === 0 ? 'unreachable' : ('HTTP ' + res.status), 'GET /v1/work/gate/pending'));
         return;
       }
       var pending = (res.data.pending || []).filter(function (p) { return (p.status || 'pending') === 'pending'; });
+      if (!pending.length && demoNeedsYou(wrap)) { return; }   // demo fills only an empty panel
       setCt(wrap, pending.length + ' pending · /v1/work/gate/pending' + (isOperator() ? '' : ' · awaiting operator'));
       if (!pending.length) {
         var ok = el('div', { 'class': 'ow-allclear' });
@@ -453,8 +745,8 @@
     op.appendChild(el('div', { 'class': 'ow-attr' }, [el('span', { text: 'approving as ' + (boundPassport() || 'bind a passport (Art. 14)') })]));
     var note = el('input', { 'class': 'ow-note', type: 'text', placeholder: 'optional note — returned to the requester as a work comment', 'aria-label': 'Return note' });
     var status = el('p', { 'class': 'ow-status' });
-    var approveBtn = iconBtn('ow-btn ow-approve', SVG_CHECK, 'Approve');
-    var returnBtn = iconBtn('ow-btn ow-ghost', SVG_RETURN, 'Return with note');
+    var approveBtn = iconBtn('btn-primary', SVG_CHECK, 'Approve');
+    var returnBtn = iconBtn('btn-quiet', SVG_RETURN, 'Return with note');
     op.appendChild(el('div', { 'class': 'ow-actions' }, [approveBtn, returnBtn]));
     op.appendChild(note);
     op.appendChild(status);
@@ -583,31 +875,10 @@
         });
       }
       var keys = Object.keys(rows);
+      if (!keys.length && demoFleet(wrap)) { return; }   // demo fills only an empty fleet
       setCt(wrap, keys.length + ' session' + (keys.length === 1 ? '' : 's') + ' · coord ⋈ punchcards ⋈ sessions ⋈ orchestrators');
       if (!keys.length) { body.appendChild(kv('quiet', 'no live sessions right now')); return; }
-      keys.forEach(function (k) {
-        var row = rows[k];
-        var live = !!(row.sessionHex || row.intent || row.milestone);   // has a live coord footprint
-        var frow = el('div', { 'class': 'ow-fleet-row' });
-        frow.appendChild(el('span', { 'class': 'ow-dot' + (live ? ' pulse' : ' idle'), 'aria-hidden': 'true' }));
-        var meta = el('div', { 'class': 'ow-fleet-meta' }, [
-          el('b', { text: (row.sessionHex ? row.sessionHex + ' · ' : '') + row.passport })
-        ]);
-        var focusText = [row.execplan && (row.execplan + (row.milestone ? ' @ ' + row.milestone : '')), row.intent].filter(Boolean).join(' · ') || 'idle';
-        meta.appendChild(el('div', { 'class': 'ow-focus', text: focusText, title: focusText }));
-        if (row.leases.length || row.overlaps.length) {
-          var lz = el('div', { 'class': 'ow-leases' });
-          row.leases.forEach(function (l) { lz.appendChild(el('span', { 'class': 'ow-lease', text: l })); });
-          if (row.overlaps.length) { lz.appendChild(el('span', { 'class': 'ow-lease ov', text: '⚠ ' + row.overlaps.length + ' overlap' + (row.overlaps.length === 1 ? '' : 's') })); }
-          meta.appendChild(lz);
-        }
-        frow.appendChild(meta);
-        var side = el('div', { 'class': 'ow-fleet-side' });
-        if (row.orchestrators.length) { side.appendChild(el('div', { text: row.orchestrators.join(', ') })); }
-        if (row.snapshot) { side.appendChild(el('div', { text: 'snap ' + row.snapshot })); }
-        if (side.childNodes.length) { frow.appendChild(side); }
-        body.appendChild(frow);
-      });
+      keys.forEach(function (k) { body.appendChild(fleetRow(rows[k])); });
     });
   }
 
@@ -618,31 +889,25 @@
     return fetchJSON('/v1/activity?tenant_id=default&token_budget=1500').then(function (res) {
       body.textContent = '';
       if (res.status === 404) {
+        if (demoActivity(wrap)) { return; }   // demo fills only when the surface is off
         setCt(wrap, 'dedicated surface');
         body.appendChild(kv('stream', 'GET /v1/events/stream?types=activity.appended'));
         body.appendChild(el('a', { 'class': 'ow-link', href: '/console/activity' }, ['Open the activity log →']));
         return;
       }
       if (!res.ok || !res.data) {
+        if (demoActivity(wrap)) { return; }
         setCt(wrap, 'activity unavailable');
         body.appendChild(kv(res.status === 0 ? 'unreachable' : ('HTTP ' + res.status), 'GET /v1/activity'));
         return;
       }
       var rows = (res.data.rows || []).slice(0, 12);
+      if (!rows.length && demoActivity(wrap)) { return; }
       setCt(wrap, (res.data.returned != null ? res.data.returned : rows.length) + ' recent · /v1/activity');
       if (!rows.length) { body.appendChild(kv('quiet', 'no activity captured yet')); return; }
       // Ticker: one card of border-separated rows. Receipt ids ride as trust
       // hash-chips; the preview folds into the row's hover title to stay one-line.
-      var ticker = el('div', { 'class': 'ow-ticker' });
-      rows.forEach(function (r0) {
-        var tick = el('div', { 'class': 'ow-tick' });
-        if ((r0.receipt_ids || []).length) { tick.appendChild(el('span', { 'class': 'ow-hash', text: r0.receipt_ids[0] })); }
-        var label = (r0.kind || 'event') + (r0.tool ? ' · ' + r0.tool : '');
-        tick.appendChild(el('span', { 'class': 'ow-tick-label', text: label, title: r0.preview || label }));
-        if (r0.ts) { tick.appendChild(el('span', { 'class': 'ow-tick-ts', text: String(r0.ts) })); }
-        ticker.appendChild(tick);
-      });
-      body.appendChild(ticker);
+      body.appendChild(activityTicker(rows));
     });
   }
 
@@ -654,6 +919,18 @@
     var body = wrap.__body;
     return fetchJSON('/v1/console/engine/summary').then(function (res) {
       if (res.status === 404 || res.status === 0 || !res.ok || !res.data) {
+        var dd = demoData('engine');
+        if (dd) {
+          setCt(wrap, 'demo fixtures');
+          markPanelDemo(wrap);
+          body.textContent = '';
+          body.appendChild(el('div', { 'class': 'ow-engine' }, [
+            kv('mediated', dd.mediated === true ? 'yes · daemon-proxied' : '—'),
+            kv('engine', dd.engine_reachable ? ('reachable · ' + (dd.engine_latency_ms != null ? dd.engine_latency_ms + ' ms' : '—')) : 'unreachable'),
+            kv('fetched', dd.fetched_at_unix_ms != null ? tsLabel(dd.fetched_at_unix_ms) : '—')
+          ]));
+          return;
+        }
         if (wrap.parentNode) { wrap.parentNode.removeChild(wrap); }
         return;
       }
