@@ -23,7 +23,7 @@
 
   // The control types this renderer knows how to draw. The smoke asserts every
   // control type used anywhere in pages.js has a branch here.
-  var CONTROL_TYPES = ['search', 'input', 'textarea', 'select', 'toggle', 'btn', 'info', 'exp', 'rpcout', 'bar', 'theme', 'chart'];
+  var CONTROL_TYPES = ['search', 'input', 'textarea', 'select', 'toggle', 'btn', 'info', 'exp', 'rpcout', 'bar', 'theme', 'chart', 'disclose', 'repogrid'];
   var GATE_TITLE = 'wired in M3+';
 
   // ---- Environment shims (only used when rendering in a browser) ---------
@@ -131,6 +131,23 @@
       .catch(function () { return { ok: false, status: 0, data: null }; });
   }
 
+  // Repos for one project: GET /v1/projects/{id}/repos via the generated
+  // named CruxApi method (a parameterised route — reachable only through the
+  // method, never CruxApi.get's literal allowlist). render.js keeps zero raw
+  // network calls of its own: the network layer lives inside api.js's method.
+  function fetchRepos(projectId) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api.projectsByIdRepos !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    return api.projectsByIdRepos(projectId)
+      .then(function (r) {
+        return r.json().then(
+          function (data) { return { ok: r.ok, status: r.status, data: data }; },
+          function () { return { ok: r.ok, status: r.status, data: null }; }
+        );
+      })
+      .catch(function () { return { ok: false, status: 0, data: null }; });
+  }
+
   // =======================================================================
   //  Demo mode (labelled, gated). window.CRUX_DEMO is set by the shell (from
   //  ?demo / localStorage). demoData() is the SINGLE choke point that reads the
@@ -145,6 +162,40 @@
     return (d && key && d[key] != null) ? d[key] : null;
   }
   function demoChip(inline) { return el('span', { 'class': 'demo-chip' + (inline ? ' inline' : ''), text: 'demo' }); }
+
+  // ---- Project repo card grid (item 2b) ---------------------------------
+  // One card per linked repo — real GET /v1/projects/{id}/repos rows win; a demo
+  // fixture (demoData('projectRepos'), demoOn()-guarded) fills the grid ONLY when
+  // the real list is empty. Fields are surfaced real (slug · role · plane) —
+  // never fabricated.
+  function repoCard(link) {
+    var slug = (link.owner != null && link.repo != null) ? (link.owner + '/' + link.repo) : String(link.slug || link.repo || 'repo');
+    var meta = [link.role, link.plane_id].filter(Boolean).join(' · ');
+    var card = el('div', { 'class': 'repo-card' }, [el('div', { 'class': 'repo-card-name', text: slug })]);
+    if (meta) { card.appendChild(el('div', { 'class': 'repo-card-meta', text: meta })); }
+    return card;
+  }
+  function loadRepoGrid(host, projectId) {
+    return fetchRepos(projectId).then(function (res) {
+      host.textContent = '';
+      var links = (res.ok && res.data && res.data.links) ? res.data.links : [];
+      if (!links.length) {
+        var demo = demoData('projectRepos');   // demoOn()-guarded fixture — only when the real list is empty
+        if (demo && demo.length) {
+          var dg = el('div', { 'class': 'repo-grid' });
+          demo.forEach(function (l) { dg.appendChild(repoCard(l)); });
+          host.appendChild(dg);
+          host.appendChild(demoChip(true));
+          return;
+        }
+        host.appendChild(el('p', { 'class': 'ctl-desc', text: res.ok ? 'No repos linked yet.' : ('Repos unavailable — ' + (res.status === 0 ? 'unreachable' : 'HTTP ' + res.status) + '.') }));
+        return;
+      }
+      var grid = el('div', { 'class': 'repo-grid' });
+      links.forEach(function (l) { grid.appendChild(repoCard(l)); });
+      host.appendChild(grid);
+    });
+  }
 
   // =======================================================================
   //  Charts — a no-dependency, single-series inline-SVG area/line helper. One
@@ -424,6 +475,42 @@
         }
         det.appendChild(body);
         node = det;
+        break;
+      }
+      case 'disclose': {
+        // Progressive disclosure (item 2c): a nav-family button that reveals its
+        // form on click; a second click OR Escape collapses it. The whole control
+        // carries data-requires="operator" (it leads to mutations — customers
+        // never see it); the inner submit controls stay mut-gated (disabled,
+        // "wired in M3+") exactly as elsewhere.
+        var dwrap = el('div', { 'class': 'ctl-disclose' });
+        var dbtn = el('button', { 'class': 'btn-quiet ctl-disclose-btn', type: 'button', 'aria-expanded': 'false' }, [control.label || 'Show']);
+        var dpanel = el('div', { 'class': 'ctl-disclose-panel', hidden: 'hidden' });
+        var dkids = control.controls || [];
+        for (var dci = 0; dci < dkids.length; dci++) {
+          var dcn = renderControl(dkids[dci], sectionCard);
+          if (dcn) { dpanel.appendChild(dcn); }
+        }
+        var setOpen = function (open) {
+          dbtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+          dpanel.hidden = !open;
+        };
+        dbtn.addEventListener('click', function () { setOpen(dbtn.getAttribute('aria-expanded') !== 'true'); });
+        dpanel.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { setOpen(false); dbtn.focus(); } });
+        dwrap.appendChild(dbtn);
+        dwrap.appendChild(dpanel);
+        if (control.requires === 'operator' || control.mut) {
+          dwrap.setAttribute('data-requires', 'operator');   // shell.applyPosture hides for customers
+          dwrap.hidden = !isOperator();
+        }
+        node = dwrap;
+        break;
+      }
+      case 'repogrid': {
+        // A project's linked repos as a card grid, fetched lazily (real rows win;
+        // demo fixture fills only when empty — see loadRepoGrid).
+        node = el('div', { 'class': 'repogrid-host' }, [el('p', { 'class': 'ctl-desc', text: 'Loading repos…' })]);
+        loadRepoGrid(node, control.projectId);
         break;
       }
       default: {

@@ -254,6 +254,48 @@
     ];
   }
 
+  // cx-projects (item 2): real projects from GET /v1/projects render as
+  // expandable cards (collapsed by default) carrying the pro-board left strip;
+  // each expanded card shows real fields + a repo card grid (repogrid, fetched
+  // per-project by render.js). "＋ New project" / "＋ Add repos" are nav-family
+  // disclosure buttons (data-requires:operator) that reveal their mut-gated
+  // forms on click — the forms never render immediately.
+  function buildProjects(res) {
+    var addRepos = { t: 'disclose', label: '＋ Add repos', requires: 'operator',
+      controls: [
+        info('github', 'not connected — connect under Integrations to add repos'),
+        { t: 'select', k: 'gh_addrepo', label: 'repo', options: ['— connect GitHub first —'], v: '— connect GitHub first —', mut: true },
+        mbtn('Add repo', { hint: 'POST /v1/projects/{id}/repos' }),
+        mbtn('Set as planning repo', { hint: 'designates where ExecPlans live' })
+      ] };
+    var newProject = { t: 'disclose', label: '＋ New project', requires: 'operator',
+      controls: [
+        { t: 'input', k: 'proj_name', label: 'name', ph: 'My project', mut: true },
+        { t: 'input', k: 'proj_id', label: 'id', ph: 'proj-slug', mono: true, mut: true },
+        { t: 'select', k: 'proj_storage', label: 'execplan storage', options: ['planning repo (recommended)', 'daemon-native', 'hybrid — repo files + daemon kanban'], v: 'planning repo (recommended)', mut: true },
+        mbtn('Create project')
+      ] };
+    var head = { h: 'Projects', sub: 'a project pairs repos to track + search, a planning repo for ExecPlans, passports and working tenants', wide: true,
+      controls: [{ t: 'search', ph: 'Filter projects…' }, newProject, addRepos] };
+    if (!res.ok || !res.data) {
+      return [{ h: head.h, sub: head.sub, wide: true, controls: head.controls.concat(degraded(res.status, 'Projects unavailable — GET /v1/projects (needs admin:read)')) }];
+    }
+    var ps = arr(res.data.projects);
+    var rows = head.controls.slice();
+    ps.forEach(function (p) {
+      var strip = p.archived ? 'done' : (p.is_default ? 'in_progress' : 'planned');   // pro-board left strip
+      var infos = [['id', p.id], ['name', p.name], ['planning target', p.planning_target], ['default passport', p.default_passport_id],
+        ['created', p.created_at_unix_ms ? new Date(p.created_at_unix_ms).toISOString().slice(0, 10) : null]]
+        .filter(function (kv) { return kv[1] != null && kv[1] !== ''; }).map(function (kv) { return info(kv[0], String(kv[1])); });
+      rows.push({ t: 'exp', strip: strip, label: p.name || p.id,
+        sub: [p.id, p.planning_target, p.is_default ? 'default' : null, p.archived ? 'archived' : null].filter(Boolean).join(' · ') || 'project',
+        badge: p.archived ? 'archived' : (p.is_default ? 'default' : 'project'),
+        controls: infos.concat([{ t: 'repogrid', projectId: p.id }]) });
+    });
+    if (!ps.length) { rows.push(info('none', 'no projects yet — use ＋ New project')); }
+    return [{ h: 'Projects', sub: ps.length + ' project' + (ps.length === 1 ? '' : 's') + ' · click to expand · /v1/projects', wide: true, controls: rows }];
+  }
+
   function buildWork(res) {
     var head = { h: 'ExecPlans', sub: 'list view — same data as the kanban · /v1/work?source=all', wide: true, controls: [{ t: 'search', ph: 'Filter plans…' }] };
     if (!res.ok || !res.data) { return [head, { h: 'Work', wide: true, controls: degraded(res.status, 'Work board unavailable — GET /v1/work?source=all') }]; }
@@ -691,33 +733,6 @@
           link('Open the 3D substrate', '/console-3d/index.html?embed=1', { hint: 'opens the Pro 3D substrate view' })
         ] }
     ],
-    'cx-projects': [
-      { h: 'Projects', sub: 'a project pairs repos to track + search, a planning repo for ExecPlans, passports and working tenants', wide: true,
-        controls: [
-          { t: 'search', ph: 'Filter projects…' },
-          { t: 'exp', label: 'CueCrux', sub: 'workspace · 12 repos · 3 sessions', badge: 'active',
-            controls: [
-              { t: 'select', k: 'pr_planrepo', label: 'planning repo', options: ['PlanCrux', 'Crux', 'AuditCrux', 'CruxEngine', '(daemon-native)'], v: 'PlanCrux', mut: true },
-              { t: 'toggle', k: 'pr_track_crux', label: 'Crux · tracked', v: true, mut: true },
-              { t: 'input', k: 'pr_tenants', label: 'working tenants', v: 'default, lme-s', mono: true, mut: true },
-              mbtn('Save cuecrux', { hint: 'PATCH /v1/projects/cuecrux — kept locally until the daemon grows an update route' })
-            ] }
-        ] },
-      { h: 'Add repos · GitHub', sub: 'activates when the GitHub integration is connected', wide: true,
-        controls: [
-          info('github', 'not connected — connect under Integrations to add repos'),
-          { t: 'select', k: 'gh_addrepo', label: 'repo', options: ['— connect GitHub first —'], v: '— connect GitHub first —', mut: true },
-          mbtn('Add repo', { hint: 'POST /v1/integrations/github/repos/{owner}/{repo}/select' }),
-          mbtn('Set as planning repo', { hint: 'designates where ExecPlans live' })
-        ] },
-      { h: 'New project', wide: true,
-        controls: [
-          { t: 'input', k: 'proj_name', label: 'name', ph: 'My project', mut: true },
-          { t: 'input', k: 'proj_id', label: 'id', ph: 'proj-slug', mono: true, mut: true },
-          { t: 'select', k: 'proj_storage', label: 'execplan storage', options: ['planning repo (recommended)', 'daemon-native', 'hybrid — repo files + daemon kanban'], v: 'planning repo (recommended)', mut: true },
-          mbtn('Create project')
-        ] }
-    ],
     'cx-raw': [
       { h: 'Request', controls: [
         { t: 'select', k: 'rpc_method', label: 'method', options: ['tools/list', 'tools/call · query', 'tools/call · store_fact', 'resources/list'], v: 'tools/list', mut: true },
@@ -756,7 +771,7 @@
     'cx-punchcards': page('cx-punchcards', 'overwatch', 'Punchcards', 'advisory path leases grouped by session · /v1/punchcards', { load: { endpoint: '/v1/punchcards', build: buildPunchcards } }),
     // ---- Work ------------------------------------------------------------
     'cx-work': page('cx-work', 'work', 'ExecPlans', 'read-time projection over .agent/execplans/*.md · /v1/work', { load: { endpoint: '/v1/work?source=all', build: buildWork } }),
-    'cx-projects': page('cx-projects', 'work', 'Projects', 'repos to track + search, a planning repo, passports and working tenants'),
+    'cx-projects': page('cx-projects', 'work', 'Projects', 'repos to track + search, a planning repo, passports and working tenants', { load: { endpoint: '/v1/projects', build: buildProjects } }),
     'cx-sessions': page('cx-sessions', 'work', 'Sessions', 'saved session snapshots for resume + audit · /v1/console/sessions', { load: { endpoint: '/v1/console/sessions', build: buildSessions } }),
     // ---- Memory ----------------------------------------------------------
     'cx-facts': page('cx-facts', 'memory', 'Facts', 'the durable record — grouped by entity prefix', { load: { endpoint: '/v1/console/facts?top_k=100', build: buildFacts } }),
@@ -824,10 +839,9 @@
     'Scan path',                       // cx-documents
     'Confirm candidate',               // cx-identity
     'Withhold all',                    // cx-gates
-    'Create project',                  // cx-projects
-    'Save cuecrux',                    // cx-projects
-    'Add repo',                        // cx-projects
-    'Set as planning repo'             // cx-projects
+    'Create project',                  // cx-projects (＋ New project disclosure)
+    'Add repo',                        // cx-projects (＋ Add repos disclosure)
+    'Set as planning repo'             // cx-projects (＋ Add repos disclosure)
   ];
 
   // =======================================================================
@@ -885,6 +899,13 @@
         });
       })(),
       engine: { mediated: true, engine_reachable: true, engine_latency_ms: 41, fetched_at_unix_ms: NOW - 2 * MIN },
+      // Repo card grid fixture (item 2b) — fills an expanded project's repo grid
+      // ONLY when the real /v1/projects/{id}/repos list is empty AND demo is on.
+      projectRepos: [
+        { owner: 'cuecrux', repo: 'PlanCrux', role: 'planning', plane_id: 'shared' },
+        { owner: 'cuecrux', repo: 'Crux', role: 'work' },
+        { owner: 'cuecrux', repo: 'AuditCrux', role: 'reference' }
+      ],
       // Cost / usage time-series: 24h (hourly) · 7d · 30d.
       costSeries: { day: wave(24, 42000, 12000, 1), week: wave(7, 480000, 90000, 2), month: wave(30, 2100000, 300000, 3) },
       usageSeries: { day: wave(24, 39000, 9000, 4), week: wave(7, 517000, 70000, 5), month: wave(30, 2220000, 260000, 6) },

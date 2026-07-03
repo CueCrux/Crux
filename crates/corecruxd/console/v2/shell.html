@@ -201,13 +201,34 @@
     font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
     color: var(--ink3); font-weight: 600; padding: 14px 10px 6px;
   }
+  /* ---- Nav-family interactive surface — ONE source of truth --------------
+     The rail nav-item look IS the interactive style console-wide. .nav-item
+     (rail), .btn-quiet (buttons), and .pill (sub-nav) all share this single
+     glass ruleset: squarer var(--radius-sm) corners, transparent →
+     var(--surface2) on hover, a 1px var(--edge) → var(--edge-strong) border,
+     and an accent icon on the current/pressed item. Each selector then adds
+     ONLY its own layout (size · gap · font) below — no duplicated colour /
+     hover / current blocks. .btn-primary (the approve gradient) is the single
+     accent variant and opts out of this tint. */
+  .nav-item, .btn-quiet, .pill {
+    color: var(--ink2); background: transparent;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background .18s ease, color .18s ease, border-color .18s ease;
+  }
+  .nav-item:hover, .btn-quiet:hover:not(:disabled), .pill:hover {
+    background: var(--surface2); color: var(--ink); border-color: var(--edge-strong);
+  }
+  .nav-item[aria-current="page"], .pill[aria-current="page"], .btn-quiet[aria-pressed="true"] {
+    background: var(--surface2); color: var(--ink); border-color: var(--edge-strong);
+  }
+  .nav-item[aria-current="page"] svg, .pill[aria-current="page"] svg { opacity: 1; color: var(--acc); }
+
+  /* nav-item layout only (colour/border/hover live in the shared rule above). */
   .nav-item {
     display: flex; align-items: center; gap: 11px;
     min-height: 44px; padding: 0 12px;
-    border-radius: var(--radius-sm);
-    color: var(--ink2); background: none; border: 1px solid transparent;
-    width: 100%; text-align: left; cursor: pointer;
-    transition: background .18s ease, color .18s ease, border-color .18s ease;
+    width: 100%; text-align: left;
   }
   .nav-item svg { width: 18px; height: 18px; flex: none; opacity: .9; }
   .nav-item .label { flex: 1; font-weight: 500; }
@@ -216,12 +237,6 @@
     border: 1px solid var(--edge); border-radius: 6px; padding: 1px 6px;
     min-width: 20px; text-align: center;
   }
-  .nav-item:hover { background: var(--surface2); color: var(--ink); }
-  .nav-item[aria-current="page"] {
-    background: var(--surface2); color: var(--ink);
-    border-color: var(--edge-strong);
-  }
-  .nav-item[aria-current="page"] svg { opacity: 1; color: var(--acc); }
 
   .rail-footer { margin-top: auto; padding-top: 12px; display: flex; flex-direction: column; gap: 10px; }
   .passport-chip {
@@ -298,22 +313,24 @@
   .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
   .topchips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .topchips:empty { display: none; }
-  .topchip {
-    font-family: var(--font-mono); font-size: 10px; letter-spacing: .02em;
+  /* Every topbar chip AND the status pill share ONE height + padding + font
+     metric so they baseline-align in the .topbar-right cluster (item 3):
+     32px min-height, 0 12px padding, 11.5px/1 text. Per-chip rules below only
+     add family colour (mono chips, DEMO warn, health dot). */
+  .topchip, .health {
+    display: inline-flex; align-items: center;
+    min-height: 32px; padding: 0 12px;
+    border: 1px solid var(--edge); border-radius: 999px;
+    font-size: 11.5px; line-height: 1; white-space: nowrap;
     color: var(--ink2); background: var(--surface2);
-    border: 1px solid var(--edge); border-radius: 999px; padding: 3px 9px; white-space: nowrap;
   }
+  .topchip { font-family: var(--font-mono); letter-spacing: .02em; }
   .topchip.demo {
     color: var(--warn); font-weight: 600; letter-spacing: .08em;
     background: color-mix(in srgb, var(--warn) 13%, transparent);
     border-color: color-mix(in srgb, var(--warn) 34%, transparent);
   }
-  .health {
-    display: inline-flex; align-items: center; gap: 8px;
-    padding: 6px 12px; min-height: 32px;
-    border: 1px solid var(--edge); border-radius: 999px;
-    font-size: 12px; color: var(--ink2); background: var(--surface2);
-  }
+  .health { gap: 8px; }
   .health .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink3); flex: none; }
   .health.ok .dot { background: var(--ok); }
   .health.degraded .dot { background: var(--warn); }
@@ -380,16 +397,15 @@
     display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 22px;
     padding-bottom: 16px; border-bottom: 1px solid var(--edge);
   }
+  /* Sub-nav page pills — layout only; the glass look + current state come from
+     the shared nav-family ruleset above (squarer, edge → edge-strong, accent on
+     the current page — no longer a rounded solid-accent fill). */
   .pill {
     min-height: 36px; padding: 0 14px;
-    display: inline-flex; align-items: center;
-    border: 1px solid var(--edge); border-radius: 999px;
-    background: var(--surface2); color: var(--ink2);
-    font-weight: 500; font-size: 13px; cursor: pointer;
-    transition: background .16s ease, color .16s ease, border-color .16s ease;
+    display: inline-flex; align-items: center; gap: 8px;
+    font-weight: 500; font-size: 13px;
   }
-  .pill:hover { color: var(--ink); border-color: var(--edge-strong); }
-  .pill[aria-current="page"] { background: var(--acc); color: #fff; border-color: var(--acc); }
+  .pill svg { width: 16px; height: 16px; flex: none; opacity: .9; }
 
   /* ---- Page card grid + control DSL ------------------------------------- */
   .page-host { min-height: 40px; }
@@ -449,6 +465,9 @@
        .btn-primary — the approve gradient (--approve-a/-b/-ink). Used only where
                       an action is the primary affirmative (the gate "Approve").
      `.danger` on .btn-quiet is a colour cue (crit text/edge), not a third family. */
+  /* Button box model. .btn-quiet's glass tint (bg/border/hover/pressed) comes
+     from the shared nav-family ruleset near the rail; this only owns the button
+     geometry + font. .btn-primary keeps its own (gradient) surface below. */
   .btn-primary, .btn-quiet {
     display: inline-flex; align-items: center; justify-content: center; gap: 8px;
     min-height: 44px; padding: 0 16px; border-radius: var(--radius-sm);
@@ -457,10 +476,7 @@
     transition: background .2s ease, color .2s ease, border-color .2s ease, filter .2s ease;
   }
   .btn-primary svg, .btn-quiet svg { width: 15px; height: 15px; flex: none; }
-  .btn-quiet { background: transparent; color: var(--ink2); border: 1px solid var(--edge); }
-  .btn-quiet:hover:not(:disabled) { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
   .btn-quiet.danger { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 45%, var(--edge)); }
-  .btn-quiet[aria-pressed="true"] { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
   .btn-primary { background: linear-gradient(180deg, var(--approve-a), var(--approve-b)); color: var(--approve-ink); border: 1px solid transparent; }
   .btn-primary:hover:not(:disabled) { filter: brightness(1.07); }
   .btn-primary:disabled, .btn-quiet:disabled { opacity: .55; cursor: not-allowed; }
@@ -515,6 +531,26 @@
   .exp-strip[data-strip="done"]::before { background: var(--ok); }
   .exp-strip[data-strip="planned"]::before { background: var(--ink3); }
   .exp-strip > .exp-sum { padding-left: 15px; }
+
+  /* ---- Projects — progressive disclosure + repo card grid (item 2) -------
+     "＋ New project" / "＋ Add repos" are nav-family buttons (.btn-quiet) that
+     reveal their form on click; the panel collapses on a second click or Esc.
+     A project's repos render as a small card grid inside its expanded card. */
+  .ctl-disclose { display: flex; flex-direction: column; gap: 8px; }
+  .ctl-disclose-btn { align-self: flex-start; }
+  .ctl-disclose-panel {
+    display: flex; flex-direction: column; gap: 12px; padding: 12px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+  }
+  .ctl-disclose-panel[hidden] { display: none; }
+  .repogrid-host { display: flex; flex-direction: column; gap: 8px; }
+  .repo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+  .repo-card {
+    padding: 10px 12px; border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface); box-shadow: var(--card-shadow); min-width: 0;
+  }
+  .repo-card-name { font-size: 12.5px; font-weight: 600; color: var(--ink); word-break: break-word; }
+  .repo-card-meta { margin-top: 3px; font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
 
   /* ---- Overwatch landing — Overwatch-concept restyle (post-M6) ----------
      Ports the concept's Overwatch view: a full-width stat-tile row, then a

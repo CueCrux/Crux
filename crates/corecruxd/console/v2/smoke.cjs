@@ -645,13 +645,88 @@ function extractThemeVars(theme) {
   notes.push('pro-board strips: work rows + gate cards share the 3px state-keyed left strip.');
 })();
 
+// =========================================================================
+//  Check 19 — (round 3) nav-family consolidation. .nav-item, .btn-quiet, and
+//  .pill share ONE look ruleset (one source of truth, no duplicated near-
+//  identical colour/hover/current blocks); the sub-nav pill dropped its rounded
+//  solid-accent fill for the squarer nav-family look. .btn-primary stays the
+//  single accent variant.
+// =========================================================================
+(function checkNavFamily() {
+  // The three selectors are grouped in one shared look ruleset.
+  check(/\.nav-item,\s*\.btn-quiet,\s*\.pill\s*\{/.test(shellHtml),
+    '[navfamily] shell.html must consolidate .nav-item, .btn-quiet, .pill into one shared look ruleset');
+  // Their current/pressed states also share one ruleset (not three near-identical blocks).
+  check(/\.nav-item\[aria-current="page"\],\s*\.pill\[aria-current="page"\],\s*\.btn-quiet\[aria-pressed="true"\]\s*\{/.test(shellHtml),
+    '[navfamily] current/pressed states for nav-item/pill/btn-quiet must share one ruleset');
+  // The pill no longer solid-fills with --acc (it now uses the squarer nav look).
+  check(!/\.pill\[aria-current="page"\]\s*\{\s*background:\s*var\(--acc\)/.test(shellHtml),
+    '[navfamily] .pill must NOT solid-fill with var(--acc) — it adopts the nav-family current look (edge-strong + accent icon)');
+  // The pill is no longer independently rounded (999px) — it inherits radius-sm.
+  check(!/\.pill\s*\{[^}]*border-radius:\s*999px/.test(shellHtml),
+    '[navfamily] .pill must drop the rounded 999px corners for the squarer var(--radius-sm) family');
+  // .btn-primary remains the single accent (gradient) variant.
+  check(/\.btn-primary\s*\{[^}]*linear-gradient/.test(shellHtml),
+    '[navfamily] .btn-primary must remain the single accent (approve gradient) variant');
+  notes.push('nav-family: .nav-item/.btn-quiet/.pill share one look ruleset; pill dropped the rounded solid-accent fill; .btn-primary sole accent.');
+})();
+
+// =========================================================================
+//  Check 20 — (round 3) cx-projects progressive disclosure + repo grid.
+//  "＋ New project" / "＋ Add repos" are operator-tagged disclose controls;
+//  projects load from the REAL /v1/projects list as expandable cards; repos
+//  render via a repogrid control that fetches per-project + demo-fills only when
+//  the real list is empty.
+// =========================================================================
+(function checkProjectsDisclosure() {
+  const found = { newp: false, addr: false };
+  walkPage(pages.PAGES['cx-projects'], function (c) {
+    if (c.t === 'disclose' && c.requires === 'operator') {
+      if (/New project/.test(c.label || '')) { found.newp = true; }
+      if (/Add repos/.test(c.label || '')) { found.addr = true; }
+    }
+  });
+  check(found.newp, '[projects] "＋ New project" must be an operator-tagged (requires:operator) disclose control');
+  check(found.addr, '[projects] "＋ Add repos" must be an operator-tagged (requires:operator) disclose control');
+  // render.js knows the disclose control + stamps data-requires="operator".
+  check((render.CONTROL_TYPES || []).indexOf('disclose') >= 0, '[projects] render.CONTROL_TYPES must include "disclose"');
+  check(new RegExp("case 'disclose'").test(renderSrc), '[projects] render.js must have a `case \'disclose\'` branch');
+  check(/setAttribute\('data-requires', 'operator'\)/.test(renderSrc), '[projects] the disclose branch must stamp data-requires="operator"');
+  // cx-projects builds from the real /v1/projects list (not a hardcoded card).
+  check(/build:\s*buildProjects/.test(pagesSrc) && /endpoint:\s*'\/v1\/projects'/.test(pagesSrc),
+    '[projects] cx-projects must load the real /v1/projects list via buildProjects');
+  check(/strip:\s*strip/.test(pagesSrc), '[projects] project cards must carry the pro-board left strip (strip: strip)');
+  // Repo grid: a repogrid control fetched via the named CruxApi method, demo-
+  // filled ONLY when the real list is empty (via demoData, demoOn()-guarded).
+  check((render.CONTROL_TYPES || []).indexOf('repogrid') >= 0, '[projects] render.CONTROL_TYPES must include "repogrid"');
+  check(new RegExp("case 'repogrid'").test(renderSrc), '[projects] render.js must have a `case \'repogrid\'` branch');
+  check(/projectsByIdRepos/.test(renderSrc), '[projects] the repo grid must fetch via CruxApi.projectsByIdRepos (named method, not raw fetch)');
+  check(/demoData\('projectRepos'\)/.test(renderSrc), '[projects] repo cards must demo-fill via demoData(\'projectRepos\') (demoOn()-guarded)');
+  check(pages.CruxDemo && Array.isArray(pages.CruxDemo.projectRepos) && pages.CruxDemo.projectRepos.length > 0,
+    '[projects] CruxDemo must carry a representative projectRepos fixture');
+  notes.push('projects: real /v1/projects expandable cards + operator-tagged ＋New/＋Add-repos disclosures + per-project repo grid (named method, demo-filled when empty).');
+})();
+
+// =========================================================================
+//  Check 21 — (round 3) topbar chip height. Every topbar chip AND the status
+//  pill share one height/padding/font ruleset (32px min-height) so they baseline
+//  -align in the .topbar-right cluster.
+// =========================================================================
+(function checkTopbarChipHeight() {
+  check(/\.topchip,\s*\.health\s*\{/.test(shellHtml),
+    '[topbar] .topchip + .health (status pill) must share ONE height/padding/font ruleset');
+  check(/\.topchip,\s*\.health\s*\{[^}]*min-height:\s*32px/.test(shellHtml),
+    '[topbar] the shared topbar chip ruleset must set min-height: 32px (one height for every chip + the status pill)');
+  notes.push('topbar chips: .topchip + the status pill (.health) share one 32px-height ruleset (baseline-aligned).');
+})();
+
 // ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — round 2 smoke');
+console.log('unified-shell-console v2 — round 3 smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
 if (failures.length) {
   console.error('\nFAIL (' + failures.length + '):');
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips).');
+console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation, projects disclosure + repo grid, topbar chip height).');
 process.exit(0);
