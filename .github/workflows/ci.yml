@@ -239,6 +239,16 @@ jobs:
             | jq -r '.result.tools | length')
           echo "MCP tools/list returned: $TOOL_COUNT tools"
           [ "$TOOL_COUNT" -gt 0 ]
+      # PR-time validation of the trust-surface release gates wired into
+      # release.yml (roadmap Phase 1.3). Only the receipt-tamper demo runs here:
+      # it's pure offline verification (no ports), so it's reliable on the shared
+      # persistent self-hosted runner. The no-phone-home check boots a daemon on
+      # fixed ports (MCP :24801) and collides with leftover daemons from earlier
+      # runs on this runner (AddrInUse) — it runs in release.yml on ephemeral
+      # ubuntu-latest, where the clean env is exactly the binary-install shape it
+      # asserts and there is no port leak.
+      - name: Trust-surface gate (receipt tamper)
+        run: CORECRUXCTL=./target/debug/corecruxctl bash scripts/demo-receipt-tamper.sh
       - name: Reclaim per-job CARGO_HOME
         if: always()
         run: rm -rf "$CARGO_HOME"  # see lint job — prevents data-disk leak

@@ -66,6 +66,20 @@ jobs:
       - name: Build release
         run: cargo build --locked --release
 
+      # --- Trust-surface release gates (roadmap Phase 1.3; production-cutover) ---
+      # The "reason people install this" checks, now release-blocking:
+      #   * assert-no-phone-home.sh boots corecruxd under strace (linux-only)
+      #     and fails the release if any non-loopback egress is attempted.
+      #   * demo-receipt-tamper.sh proves CROWN verify-store catches an on-disk
+      #     byte flip (pure offline; needs only corecruxctl + jq).
+      # Linux leg only: strace network tracing is linux-specific; ubuntu-latest
+      # ships strace + jq. See the script headers for the CI-wiring rationale.
+      - name: Trust-surface gates (no phone-home + receipt tamper)
+        if: matrix.suffix == 'linux-amd64'
+        run: |
+          bash scripts/assert-no-phone-home.sh target/release/corecruxd
+          CORECRUXCTL=target/release/corecruxctl bash scripts/demo-receipt-tamper.sh
+
       # --- SBOM + keyless signing (ExecPlan crux-supply-chain-attestation-2026-06-11, M3) ---
       # SBOM is generated into dist/ BEFORE packaging so the packaging
       # script's RELEASE-MANIFEST sha256 list covers it.
