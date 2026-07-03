@@ -1,9 +1,10 @@
 # Usage receipts (opt-in adoption signal)
 
 > **CueCrux usage receipts (opt-in, off by default).** When you enable this, the daemon submits a
-> *signed, metadata-only* usage receipt — receipt id, content hash, your passport fingerprint, event
-> class, and timestamp — to the collector endpoint you configure. **No fact content, query text, or
-> corpus data is ever included.** This is the only outbound signal the daemon sends. It requires you
+> *signed, metadata-only* usage receipt — receipt id, the receipt's own metadata body (CBOR-encoded),
+> receipt-body hash, your passport fingerprint, your passport's public key, event class, and
+> timestamp — to the collector endpoint you configure. **No fact content, query text, or corpus data
+> is ever included.** This is the only outbound signal the daemon sends. It requires you
 > to (1) set an `https://` collector endpoint and (2) explicitly record consent
 > (`CORECRUXD_USAGE_RECEIPTS_CONSENT_AT`). Revoke anytime by unsetting
 > `CORECRUXD_USAGE_RECEIPTS_SUBMIT`. It exists so CueCrux can count adoption; it is never required to
@@ -24,7 +25,9 @@ disclosing *what* happened. That receipt is persisted locally like any other sig
 When — and only when — you opt in, the daemon additionally **submits a metadata-only copy** of that
 receipt to a collector endpoint you control. The submission carries just enough to let the collector
 verify the Ed25519 signature and count distinct daemon instances (by passport fingerprint) toward an
-adoption number. It never carries the receipt body content, the fact, the query, or the corpus.
+adoption number: the receipt's own metadata body (so the signed message can be reconstructed) and the
+daemon's public key (so the signature can be checked). It never carries fact content, query text, or
+corpus data — the receipt body it does carry is metadata-only by construction.
 
 ## The three-part opt-in gate
 
@@ -51,8 +54,10 @@ The wire payload is metadata only. Exactly these fields, and nothing else:
 | Field | Example | What it is |
 |---|---|---|
 | `receipt_id` | `r_9f1c…` | The signed receipt's id. |
+| `body_cbor_hex` | `a8667363…` | The receipt's own metadata fields, CBOR-encoded, so the collector can verify the signature; never fact/query/corpus content. |
 | `body_hash` | `blake3:5e88…` | A hash of the canonical receipt body — a digest, not the body. |
 | `passport_fpr` | `p_1a2b…` | The daemon's passport fingerprint (the adoption unit counted). |
+| `public_key_hex` | `9a3f…` | Your passport's public key, used to verify the signature. |
 | `event_class` | `session` | One of the closed set `session` / `query` / `daemon_start`. |
 | `created_at` | `2026-07-03T00:00:00Z` | The receipt timestamp. |
 | `sig` | `{alg, key_id, signed_at, signature_hex}` | The Ed25519 signature envelope, so the collector can verify the ping. |
@@ -62,7 +67,9 @@ The wire payload is metadata only. Exactly these fields, and nothing else:
 - **No fact content** — not the value, not the key, not the entity.
 - **No query text** and no prompt text.
 - **No corpus identity** or corpus data.
-- **No receipt body** — only its hash.
+- **No content in the receipt body** — the metadata-only body *is* sent (as `body_cbor_hex`) so the
+  signature can be verified, but by construction it holds only receipt metadata (id, kind, tenant,
+  passport fingerprint, event class, count, timestamp), never a fact, query, or corpus.
 - No general telemetry, no host metrics, no environment, no IP-derived data beyond what the transport
   layer inherently exposes to the endpoint you chose.
 
