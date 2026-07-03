@@ -239,6 +239,15 @@ jobs:
             | jq -r '.result.tools | length')
           echo "MCP tools/list returned: $TOOL_COUNT tools"
           [ "$TOOL_COUNT" -gt 0 ]
+      # PR-time validation of the trust-surface release gates wired into
+      # release.yml (roadmap Phase 1.3). Runs against the debug binaries the
+      # test job already built, so a broken gate turns this PR red instead of
+      # surfacing only on a tag push. no-phone-home auto-selects strace/netns.
+      - name: Trust-surface gates (no phone-home + receipt tamper)
+        run: |
+          set -euo pipefail
+          bash scripts/assert-no-phone-home.sh ./target/debug/corecruxd
+          CORECRUXCTL=./target/debug/corecruxctl bash scripts/demo-receipt-tamper.sh
       - name: Reclaim per-job CARGO_HOME
         if: always()
         run: rm -rf "$CARGO_HOME"  # see lint job — prevents data-disk leak
