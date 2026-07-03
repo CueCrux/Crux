@@ -657,7 +657,7 @@ mod tests {
         assert!(!is_behind("0.5.36+build.7", "0.5.36"));
         // Missing minor/patch default to 0.
         assert!(is_behind("0.5", "0.5.1"));
-        // Unparseable either side → never "behind" (safe default: no warn).
+        // Unparsable either side → never "behind" (safe default: no warn).
         assert!(!is_behind("garbage", "0.5.36"));
         assert!(!is_behind("0.5.36", "garbage"));
     }
