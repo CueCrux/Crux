@@ -1171,9 +1171,14 @@ mod tests {
         assert_eq!(token.tier, RcxTier::Pro);
         assert!(token.token_id.starts_with("rcxct_paid_"));
         assert_eq!(token.credits.balance, Some(100));
-        // all 11 premium lanes present with cost 2; the free baseline is absent
+        // all 13 premium lanes present, each at its per-lane cost (base 2, but the
+        // metered dense lanes are 3:1 — rerank=3, dense_managed=1); baseline absent
         for slug in rcx_capability_token::CORECRUX_PREMIUM_LANE_SLUGS {
-            assert_eq!(lane_call_cost(&token, slug), 2, "lane {slug} cost");
+            assert_eq!(
+                lane_call_cost(&token, slug),
+                rcx_capability_token::corecrux_lane_credit_cost(slug, 2),
+                "lane {slug} cost"
+            );
         }
         assert_eq!(lane_call_cost(&token, "bm25"), 0, "free baseline never minted");
         // Pro tier needs no team/enterprise scope → structurally valid.
