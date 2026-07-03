@@ -517,8 +517,15 @@ pub(super) fn mint_usage_receipt(
     // sending is the caller's consent-gated decision.
     let submission = crate::usage_submit::UsagePingSubmission {
         receipt_id: receipt_id.clone(),
+        // The exact signed message: the canonical CBOR body bytes (metadata
+        // only, by `build_usage_ping_body_v1` construction). Lets the collector
+        // reconstruct the signed message to verify the signature.
+        body_cbor_hex: hex::encode(&body_bytes),
         body_hash: body_hash_hex.clone(),
         passport_fpr: state.passport_fpr.clone(),
+        // The daemon's Ed25519 public key — non-secret, needed to verify the
+        // sig; `passport_fpr == blake3(public_key)[..16]` binds the two.
+        public_key_hex: hex::encode(signing_key.verifying_key().to_bytes()),
         event_class: event_class.as_str().to_string(),
         created_at: created_at.clone(),
         sig: crate::usage_submit::UsagePingSubmissionSig {
@@ -949,6 +956,37 @@ mod tests {
         let vk = ed25519_dalek::VerifyingKey::from_bytes(&pubkey).expect("vk");
         vk.verify(&body, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
             .expect("daemon signature verifies over canonical usage body bytes");
+
+        // M1.1: the metadata-only submission now carries everything a collector
+        // needs to VERIFY the ping without local access — the signed body bytes
+        // (`body_cbor_hex`) and the daemon public key (`public_key_hex`) — and
+        // both are consistent with the locally recorded receipt.
+        assert_eq!(
+            submission.body_cbor_hex,
+            hex::encode(&body),
+            "submission body_cbor_hex is the exact recorded canonical body"
+        );
+        let sub_pubkey: [u8; 32] = hex::decode(&submission.public_key_hex)
+            .expect("submission pubkey hex")
+            .try_into()
+            .expect("32 bytes");
+        assert_eq!(
+            sub_pubkey, pubkey,
+            "submission public key matches the daemon signing key"
+        );
+        // End to end: reconstruct the signed message from body_cbor_hex and
+        // verify the signature with public_key_hex — exactly what the collector does.
+        let sub_sig: [u8; 64] = hex::decode(&submission.sig.signature_hex)
+            .expect("submission sig hex")
+            .try_into()
+            .expect("64 bytes");
+        ed25519_dalek::VerifyingKey::from_bytes(&sub_pubkey)
+            .expect("vk from submission pubkey")
+            .verify(
+                &hex::decode(&submission.body_cbor_hex).expect("body hex"),
+                &ed25519_dalek::Signature::from_bytes(&sub_sig),
+            )
+            .expect("a collector can verify the ping from the submission fields alone");
     }
 
     #[test]

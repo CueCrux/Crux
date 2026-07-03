@@ -30,11 +30,17 @@
 //!
 //! ## Metadata-only payload
 //!
-//! [`UsagePingSubmission`] carries ONLY receipt id, body hash, passport
-//! fingerprint, event class, timestamp, and the Ed25519 signature envelope —
-//! enough for a collector to verify the signature and count distinct
-//! passports. It has no field through which fact content, query text, or
-//! corpus identity could be expressed.
+//! [`UsagePingSubmission`] carries ONLY receipt id, the receipt's own metadata
+//! body (canonical CBOR, hex-encoded), body hash, passport fingerprint, the
+//! daemon's Ed25519 public key, event class, timestamp, and the signature
+//! envelope — enough for a collector to reconstruct the signed message, verify
+//! the signature, and count distinct passports. The receipt body is
+//! metadata-only *by construction* (`build_usage_ping_body_v1` takes a
+//! strongly-typed input that cannot express content), so sending its bytes
+//! still leaks nothing: there is no field through which fact content, query
+//! text, or corpus identity could be expressed, and `passport_fpr ==
+//! blake3(public_key)[..16]` binds the key to the fingerprint the collector
+//! tallies by.
 //!
 //! ## Never on a timer, never on boot
 //!
@@ -120,12 +126,22 @@ pub struct UsagePingSubmissionSig {
 pub struct UsagePingSubmission {
     /// The signed receipt's id.
     pub receipt_id: String,
+    /// Hex of the canonical CBOR receipt body — the exact bytes the daemon
+    /// signed. This is the **signed message** the collector reconstructs to
+    /// verify the signature. Safe to send: the usage_ping body is metadata-only
+    /// by construction (receipt_id, kind, tenant_id, passport_fpr, event_class,
+    /// count, created_at — **never** fact / query / corpus content).
+    pub body_cbor_hex: String,
     /// `blake3:<hex>` digest of the canonical receipt body (a hash, not the
     /// body).
     pub body_hash: String,
     /// The daemon's passport fingerprint — the adoption unit the collector
     /// tallies distinct instances by.
     pub passport_fpr: String,
+    /// The daemon's Ed25519 public key, hex-encoded. Not secret; the collector
+    /// needs it to verify the signature, and `passport_fpr ==
+    /// blake3(public_key)[..16]` binds it to the fingerprint above.
+    pub public_key_hex: String,
     /// One of the closed `usage_ping` event classes (`session` / `query` /
     /// `daemon_start`).
     pub event_class: String,
@@ -287,10 +303,24 @@ mod tests {
     }
 
     fn submission() -> UsagePingSubmission {
+        // Build the *real* canonical body via the metadata-only constructor so
+        // the metadata-only test can hex-decode `body_cbor_hex` and re-parse it:
+        // `build_usage_ping_body_v1` takes a strongly-typed input that cannot
+        // express content, so the resulting body is provably metadata-only.
+        let (body_bytes, _) = corecrux_receipts::build_usage_ping_body_v1(&corecrux_receipts::UsagePingBodyInputV1 {
+            tenant_id: "local",
+            receipt_id: "r-1",
+            passport_fpr: "fpr_test",
+            event_class: corecrux_receipts::UsageEventClassV1::Session,
+            count: 1,
+            created_at: "2026-07-03T00:00:00Z",
+        });
         UsagePingSubmission {
             receipt_id: "r-1".to_string(),
+            body_cbor_hex: hex::encode(&body_bytes),
             body_hash: "blake3:deadbeef".to_string(),
             passport_fpr: "fpr_test".to_string(),
+            public_key_hex: hex::encode([0xbbu8; 32]),
             event_class: "session".to_string(),
             created_at: "2026-07-03T00:00:00Z".to_string(),
             sig: UsagePingSubmissionSig {
@@ -395,7 +425,10 @@ mod tests {
         let (url, body_json) = &calls[0];
         assert_eq!(url, "https://collector.example.com/usage");
 
-        // The wire payload carries ONLY the metadata fields.
+        // The wire payload carries ONLY the metadata fields. `body_cbor_hex`
+        // (the receipt's own metadata body) and `public_key_hex` (the passport
+        // public key, needed to verify the sig) are legitimate metadata: the
+        // body is metadata-only by construction, proven below.
         let sent: serde_json::Value = serde_json::from_str(body_json).expect("payload is json");
         let obj = sent.as_object().expect("payload is an object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
@@ -403,10 +436,12 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                "body_cbor_hex",
                 "body_hash",
                 "created_at",
                 "event_class",
                 "passport_fpr",
+                "public_key_hex",
                 "receipt_id",
                 "sig"
             ],
@@ -419,19 +454,36 @@ mod tests {
         assert_eq!(obj["passport_fpr"], "fpr_test");
         assert_eq!(obj["event_class"], "session");
         assert_eq!(obj["sig"]["alg"], "ed25519");
+        // The public key is present and 32 bytes (64 hex chars).
+        let public_key_hex = obj["public_key_hex"].as_str().expect("public_key_hex is a string");
+        assert_eq!(public_key_hex.len(), 64, "public key is 32 bytes hex-encoded");
 
-        // Negative: not one content-bearing key rides the wire. (`body_hash`
-        // is a hash, not the body; the banned list avoids substrings of the
-        // six legitimate keys.)
+        // Stronger guarantee: decode `body_cbor_hex` back to bytes, parse the
+        // CBOR body, and prove the *decoded body itself* is metadata-only — no
+        // content-bearing key can ride even inside the signed message.
+        let body_cbor_hex = obj["body_cbor_hex"].as_str().expect("body_cbor_hex is a string");
+        let decoded = hex::decode(body_cbor_hex).expect("body_cbor_hex is valid hex");
+        assert!(
+            corecrux_receipts::assert_usage_ping_kind_v1(&decoded),
+            "the decoded body must parse as a metadata-only usage_ping (any content key would fail this)"
+        );
+        let decoded_text = String::from_utf8_lossy(&decoded);
+        for content_key in ["fact", "query", "entity", "entries", "corpus", "value", "prompt"] {
+            assert!(
+                !decoded_text.contains(content_key),
+                "the decoded receipt body must not carry content key {content_key}"
+            );
+        }
+
+        // Negative: not one content-bearing key rides the wire. (`body_hash` is
+        // a hash and `body_cbor_hex` a metadata-only body; the banned list
+        // avoids substrings of the legitimate keys and of hex digits.)
         for banned in [
-            "body_cbor_hex",
             "body_bytes",
             "count",
             "tenant_id",
             "fact_id",
-            "entity",
             "entries",
-            "query",
             "prompt_hash",
             "corpus",
         ] {
