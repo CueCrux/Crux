@@ -73,6 +73,9 @@ mod workspace;
 pub mod session_metrics;
 
 pub(crate) use admin::AdminActionRecord;
+// Phase T M1 daemon-boot auto-emit — called once per boot from main.rs after
+// the HTTP server is serving.
+pub(crate) use stream_receipts::emit_daemon_start_usage_ping;
 // HttpDataplane trait re-exported for test fakes (FakeHttpDataplane in tests.rs).
 #[allow(unused_imports)]
 pub(crate) use dataplane::{pool_backed_http_dataplane, HttpDataplane, HttpDataplaneError, SharedHttpDataplane};
@@ -215,6 +218,14 @@ pub struct AppState {
     /// submitter fires only on an explicit `usage_ping` mint, after local
     /// persist, and only when all three are set. See `crate::usage_submit`.
     pub usage_submit: crate::usage_submit::UsageSubmitConfig,
+    /// Phase T (M2) version-notify — the last `latest_version` release string
+    /// the consent-gated usage submitter saw in a collector 2xx response, if
+    /// any. Written by the submit task (`crate::usage_submit`), read by
+    /// `/v1/version` to surface an "update available" notice. `None` until the
+    /// first successful submit whose response carried `latest_version`; never
+    /// populated on a default (un-opted-in) install, since the submitter never
+    /// runs there.
+    pub latest_release: Arc<std::sync::RwLock<Option<String>>>,
     /// G20 per-surface request quota (`GET /v1/quota` + middleware over
     /// `crux_router::quota::QuotaLedger`). Default OFF
     /// (`CORECRUXD_QUOTA=1`); when off the middleware passes through and

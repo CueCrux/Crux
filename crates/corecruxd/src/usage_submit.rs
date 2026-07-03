@@ -157,8 +157,14 @@ pub struct UsagePingSubmission {
 pub enum UsageSubmitOutcome {
     /// The submitter was inert; the reason is a static string for logging.
     Skipped(&'static str),
-    /// The collector accepted the ping with a 2xx status.
-    Submitted { status: u16 },
+    /// The collector accepted the ping with a 2xx status. `latest_version` is
+    /// the current-latest Crux release string the collector reported in its
+    /// response body (M2 version-notify), or `None` when the response omitted
+    /// it (older collector) or was unparseable — a no-op in either case.
+    Submitted {
+        status: u16,
+        latest_version: Option<String>,
+    },
 }
 
 /// Attempt a consent-gated submit of one usage ping.
@@ -226,7 +232,75 @@ pub fn submit_usage_ping(
             body: resp.body.chars().take(256).collect(),
         });
     }
-    Ok(UsageSubmitOutcome::Submitted { status: resp.status })
+    // M2 version-notify: the collector's 2xx body may carry a `latest_version`
+    // string (the current-latest Crux release). Parse it best-effort — a body
+    // without it (older collector) or an unparseable body yields `None`, which
+    // the caller treats as a no-op.
+    let latest_version = parse_latest_version(&resp.body);
+    Ok(UsageSubmitOutcome::Submitted {
+        status: resp.status,
+        latest_version,
+    })
+}
+
+/// Parse the optional `latest_version` string from a collector response body.
+///
+/// A body without the field (older collector), an empty value, or an
+/// unparseable body all yield `None` — version-notify is then a no-op. Never
+/// errors: this must not destabilize the submit path.
+fn parse_latest_version(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let s = v.get("latest_version")?.as_str()?.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Parse a `MAJOR.MINOR.PATCH` version string into a comparable tuple. Strips a
+/// leading `v` and any `-pre` / `+build` metadata; missing minor/patch default
+/// to `0`. Returns `None` if the major component is not a number.
+fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.trim().trim_start_matches('v');
+    // Drop any pre-release / build metadata suffix before splitting on '.'.
+    let core = core.split(['-', '+']).next().unwrap_or(core);
+    let mut it = core.split('.');
+    let major = it.next()?.trim().parse::<u64>().ok()?;
+    let minor = it.next().unwrap_or("0").trim().parse::<u64>().ok()?;
+    let patch = it.next().unwrap_or("0").trim().parse::<u64>().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Is `own` strictly older (by semver) than `latest`? Returns `false` when
+/// either string is unparseable — an unknown comparison never warns (safe
+/// default), and a current/ahead daemon is not "behind".
+pub fn is_behind(own: &str, latest: &str) -> bool {
+    match (parse_semver(own), parse_semver(latest)) {
+        (Some(o), Some(l)) => o < l,
+        _ => false,
+    }
+}
+
+/// Record the collector-reported latest release into the shared `/v1/version`
+/// slot and, if this daemon's own build is behind it, log an upgrade WARN.
+///
+/// The value is always stored (so `/v1/version` reflects the last-seen latest,
+/// current or not); the WARN fires only when strictly behind. Own version is
+/// `env!("CARGO_PKG_VERSION")` — the same string surfaced as `build.version`.
+pub fn note_latest_release(slot: &std::sync::RwLock<Option<String>>, latest: &str) {
+    let own = env!("CARGO_PKG_VERSION");
+    if is_behind(own, latest) {
+        tracing::warn!(
+            target: "usage_submit",
+            own_version = own,
+            latest_release = latest,
+            "crux daemon {own} is behind latest release {latest}; upgrade recommended"
+        );
+    }
+    if let Ok(mut guard) = slot.write() {
+        *guard = Some(latest.to_string());
+    }
 }
 
 /// Best-effort, fire-and-forget submit invoked from the `usage_ping` mint path
@@ -242,12 +316,21 @@ pub fn maybe_spawn_submit(state: &crate::http::AppState, submission: UsagePingSu
     }
     let rate_table = state.extension_rate_table.clone();
     let cfg = state.usage_submit.clone();
+    // M2 version-notify: the submit task writes the collector-reported latest
+    // release here; `/v1/version` reads it.
+    let latest_release = state.latest_release.clone();
     tokio::task::spawn_blocking(move || {
         let transport = UreqTransport;
         let outbound = OutboundConfig::from_env();
         match submit_usage_ping(&transport, &rate_table, &outbound, &cfg, &submission) {
-            Ok(UsageSubmitOutcome::Submitted { status }) => {
+            Ok(UsageSubmitOutcome::Submitted { status, latest_version }) => {
                 tracing::info!(target: "usage_submit", status, receipt_id = %submission.receipt_id, "usage ping submitted");
+                // M2: surface an upgrade notice (WARN + `/v1/version`) when the
+                // collector reports a newer release than this build. A response
+                // without `latest_version` is a no-op.
+                if let Some(latest) = latest_version {
+                    note_latest_release(&latest_release, &latest);
+                }
             }
             Ok(UsageSubmitOutcome::Skipped(reason)) => {
                 tracing::debug!(target: "usage_submit", reason, "usage ping submit skipped");
@@ -272,6 +355,7 @@ mod tests {
     struct SpyTransport {
         seen: Arc<Mutex<Vec<(String, String)>>>,
         status: u16,
+        resp_body: String,
     }
 
     impl SpyTransport {
@@ -279,6 +363,16 @@ mod tests {
             Self {
                 seen: Arc::new(Mutex::new(Vec::new())),
                 status: 200,
+                resp_body: "{}".to_string(),
+            }
+        }
+        /// A 2xx transport whose response body is `resp_body` — used to feed the
+        /// M2 `latest_version` parse path a realistic collector response.
+        fn with_body(resp_body: &str) -> Self {
+            Self {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                status: 200,
+                resp_body: resp_body.to_string(),
             }
         }
         fn calls(&self) -> Vec<(String, String)> {
@@ -297,7 +391,7 @@ mod tests {
             self.seen.lock().unwrap().push((url.to_string(), body_json.clone()));
             Ok(TransportResponse {
                 status: self.status,
-                body: "{}".to_string(),
+                body: self.resp_body.clone(),
             })
         }
     }
@@ -418,7 +512,14 @@ mod tests {
         let cfg = fully_configured();
         let spy = SpyTransport::ok();
         let out = submit_usage_ping(&spy, &RateTable::new(), &OutboundConfig::default(), &cfg, &submission()).unwrap();
-        assert_eq!(out, UsageSubmitOutcome::Submitted { status: 200 });
+        // The spy's `{}` body carries no `latest_version` → None (no-op notify).
+        assert_eq!(
+            out,
+            UsageSubmitOutcome::Submitted {
+                status: 200,
+                latest_version: None
+            }
+        );
 
         let calls = spy.calls();
         assert_eq!(calls.len(), 1, "exactly one network call when fully configured");
@@ -508,6 +609,101 @@ mod tests {
         assert_eq!(
             parse_consent_at(Some("  2026-07-03T12:00:00Z ".to_string())).as_deref(),
             Some("2026-07-03T12:00:00Z")
+        );
+    }
+
+    // ── M2 version-notify ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_latest_version_variants() {
+        assert_eq!(
+            parse_latest_version(r#"{"latest_version":"0.5.36"}"#).as_deref(),
+            Some("0.5.36")
+        );
+        // Trimmed.
+        assert_eq!(
+            parse_latest_version(r#"{"latest_version":"  0.5.36  "}"#).as_deref(),
+            Some("0.5.36")
+        );
+        // Extra fields alongside are ignored.
+        assert_eq!(
+            parse_latest_version(r#"{"ok":true,"latest_version":"1.2.3"}"#).as_deref(),
+            Some("1.2.3")
+        );
+        // Older collector: no field → None (no-op).
+        assert!(parse_latest_version(r#"{"ok":true}"#).is_none());
+        // Empty value → None.
+        assert!(parse_latest_version(r#"{"latest_version":""}"#).is_none());
+        // Non-string / malformed → None (never errors).
+        assert!(parse_latest_version(r#"{"latest_version":123}"#).is_none());
+        assert!(parse_latest_version("not json at all").is_none());
+        assert!(parse_latest_version("").is_none());
+    }
+
+    #[test]
+    fn is_behind_semver_compare() {
+        // Strictly older on each component → behind.
+        assert!(is_behind("0.5.35", "0.5.36"));
+        assert!(is_behind("0.5.35", "0.6.0"));
+        assert!(is_behind("0.5.35", "1.0.0"));
+        // Equal → not behind.
+        assert!(!is_behind("0.5.36", "0.5.36"));
+        // Ahead → not behind.
+        assert!(!is_behind("0.5.37", "0.5.36"));
+        assert!(!is_behind("1.0.0", "0.9.9"));
+        // Leading `v` and pre-release/build metadata are tolerated.
+        assert!(is_behind("v0.5.35", "v0.5.36"));
+        assert!(is_behind("0.5.35-rc1", "0.5.36"));
+        assert!(!is_behind("0.5.36+build.7", "0.5.36"));
+        // Missing minor/patch default to 0.
+        assert!(is_behind("0.5", "0.5.1"));
+        // Unparseable either side → never "behind" (safe default: no warn).
+        assert!(!is_behind("garbage", "0.5.36"));
+        assert!(!is_behind("0.5.36", "garbage"));
+    }
+
+    #[test]
+    fn note_latest_release_writes_slot() {
+        // The slot is always populated so `/v1/version` reflects the last-seen
+        // latest, whether or not this build is behind it.
+        let slot = std::sync::RwLock::new(None);
+        note_latest_release(&slot, "9999.0.0");
+        assert_eq!(slot.read().unwrap().as_deref(), Some("9999.0.0"));
+        // A subsequent notice overwrites.
+        note_latest_release(&slot, "0.0.1");
+        assert_eq!(slot.read().unwrap().as_deref(), Some("0.0.1"));
+    }
+
+    #[test]
+    fn submit_parses_latest_version_from_collector_body() {
+        let cfg = fully_configured();
+        // A collector that reports the current-latest release in its 2xx body.
+        let spy = SpyTransport::with_body(r#"{"accepted":true,"latest_version":"9999.0.0"}"#);
+        let out = submit_usage_ping(&spy, &RateTable::new(), &OutboundConfig::default(), &cfg, &submission()).unwrap();
+        assert_eq!(
+            out,
+            UsageSubmitOutcome::Submitted {
+                status: 200,
+                latest_version: Some("9999.0.0".to_string())
+            }
+        );
+
+        // A collector that omits the field (older build) → None, still Submitted.
+        let spy_old = SpyTransport::with_body(r#"{"accepted":true}"#);
+        let out_old = submit_usage_ping(
+            &spy_old,
+            &RateTable::new(),
+            &OutboundConfig::default(),
+            &cfg,
+            &submission(),
+        )
+        .unwrap();
+        assert_eq!(
+            out_old,
+            UsageSubmitOutcome::Submitted {
+                status: 200,
+                latest_version: None
+            }
         );
     }
 }

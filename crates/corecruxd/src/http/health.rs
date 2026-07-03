@@ -410,6 +410,13 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
     // and tracking refs) stay admin-only on /v1/admin/version, consistent with
     // the top-level `commit` redaction.
     let update = state.update_status.read().await.clone();
+    // Phase T (M2) version-notify: the last release string the consent-gated
+    // usage submitter saw a collector report (`None` on a default install — the
+    // submitter never runs). `behind` recomputes against this daemon's own build.
+    let latest_release = state.latest_release.read().ok().and_then(|g| g.clone());
+    let behind_latest = latest_release
+        .as_deref()
+        .is_some_and(|latest| crate::usage_submit::is_behind(&state.build.version, latest));
     let update_public = serde_json::json!({
         "enabled": update.enabled,
         "state": update.state,
@@ -417,6 +424,8 @@ pub(super) async fn get_version(State(state): State<AppState>) -> impl IntoRespo
         "behind_by": update.behind_by,
         "comparison_stale": update.comparison_stale,
         "upgrade_hint": update.upgrade_hint,
+        "latest_release": latest_release,
+        "behind": behind_latest,
     });
     Json(serde_json::json!({
         "version": state.build.version,
