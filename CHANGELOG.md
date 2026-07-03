@@ -11,18 +11,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.35] - 2026-07-03
+
 ### Added
 
-- *(unmerged branch `feat/openapi-m0`)* OpenAPI: receipts routes covered in
-  `/v1/openapi.json` plus a route-level contract test (M0).
-- *(unmerged branch `feat/upgrade-aware-501s`)* Upgrade-aware `501` responses
-  on platform-only endpoints (HTTP + MCP) that signpost the hosted platform
-  instead of a bare not-implemented (W1.A3).
-- Workspace wizard: live-session coordination protocol in `workspace-cuecrux`
-  (v2 → v3).
+- **Opt-in signed usage receipts (Phase T).** A local, signed, metadata-only
+  `usage_ping` CROWN receipt (default-OFF), plus a consent-gated, verifiable
+  opt-in submitter — the daemon's only sanctioned outbound signal, gated behind
+  `CORECRUXD_USAGE_RECEIPTS_{SUBMIT,ENDPOINT,CONSENT_AT}`; inert under default
+  config so `assert-no-phone-home` stays green (#315, #317, #318). See
+  `docs/usage-receipts.md`.
+- **Side-by-side demo** — `/console/receipts-vs-console`: the CROWN
+  receipts-as-debugging timeline next to a vendor free-console mock (#316).
+- OpenAPI: receipts routes covered in `/v1/openapi.json` plus a route-level
+  contract test (#168).
+- Upgrade-aware `501` responses on platform-only endpoints (HTTP + MCP) that
+  signpost the hosted platform instead of a bare not-implemented (#169).
+- Workspace wizard: live-session coordination protocol (`workspace-cuecrux` v2 → v3).
 
 ### Changed
 
+- **Launch defaults ON** — coordination plane (`CORECRUXD_COORD`),
+  passport-revocation enforcement (`CRUX_PASSPORT_REVOCATION`), agent-card
+  discovery (`CRUX_AGENT_CARD`), and scoped-forget default to ON for fresh
+  installs; typed action traces + activity signing remain documented opt-in (#314).
+- Trust surface: `assert-no-phone-home.sh` + the CROWN receipt-tamper demo are
+  now release-blocking gates in `release.yml` (#313).
 - CI: `paths-ignore` replaced with a skip-but-report change-scope gate.
 
 ## [0.4.6] - 2026-06-11
