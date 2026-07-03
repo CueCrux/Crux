@@ -95,6 +95,13 @@
     );
   }
 
+  // Safe nested property access (used by the Pro dashboard strip). Pure.
+  function get(obj, path) {
+    var cur = obj;
+    for (var i = 0; i < path.length; i++) { if (cur == null) { return undefined; } cur = cur[path[i]]; }
+    return cur;
+  }
+
   function el(tag, attrs, children) {
     var node = doc().createElement(tag);
     if (attrs) {
@@ -156,6 +163,12 @@
   //  always wins: callers reach demoData() only when a panel is empty/degraded.
   // =======================================================================
   function demoOn() { return typeof window !== 'undefined' && !!window.CRUX_DEMO; }
+  // ---- Presentation mode (Standard | Professional) ----------------------
+  // Mode is PRESENTATION only — it never gates writes or reads. The security
+  // boundary is posture (operator/customer), which is derived server-side and is
+  // wholly independent of mode. proMode() drives density, Pro-only sections/
+  // pages, the full pill row, and the Overwatch dashboard strip — nothing more.
+  function proMode() { return typeof window !== 'undefined' && window.CRUX_MODE === 'professional'; }
   function demoData(key) {
     if (!demoOn()) { return null; }
     var d = (typeof window !== 'undefined') ? window.CruxDemo : null;
@@ -467,6 +480,9 @@
         var sum = el('summary', { 'class': 'exp-sum' }, [
           el('span', { 'class': 'exp-label', text: control.label || '' }),
           control.sub ? el('span', { 'class': 'exp-sub', text: control.sub }) : null,
+          // Extra mono metadata (ids/timestamps) — always in the DOM but CSS-
+          // hidden in Standard; Professional mode reveals it (legacy-list density).
+          control.meta ? el('span', { 'class': 'exp-meta', text: String(control.meta) }) : null,
           control.badge ? el('span', { 'class': 'exp-badge', text: String(control.badge) }) : null
         ]);
         det.appendChild(sum);
@@ -552,7 +568,11 @@
   function renderSections(container, sections) {
     container.textContent = '';
     var grid = el('div', { 'class': 'v2grid' });
+    var pro = proMode();
     for (var i = 0; i < sections.length; i++) {
+      // A section tagged pro:true renders only in Professional mode (full page
+      // surface). Standard curates it away. This is presentation, never posture.
+      if (sections[i] && sections[i].pro && !pro) { continue; }
       grid.appendChild(renderSection(sections[i]));
     }
     container.appendChild(grid);
@@ -1036,6 +1056,85 @@
     });
   }
 
+  // =======================================================================
+  //  Pro-mode dashboard strip (M8) — the home for the legacy CX-landing top
+  //  cards (renderDash, index.html:2119): daemon · execplans · token usage ·
+  //  MCP gateway. Renders ONLY in Professional mode, between the stat tiles and
+  //  the needs-you/fleet columns. Every card reads REAL data; a demo fixture
+  //  fills a card only when its real feed is flag-off (demoOn()-guarded). The
+  //  MCP-gateway card is the one legacy card that had no v2 home before M8.
+  // =======================================================================
+  function numstr(n) { return (typeof n === 'number' && isFinite(n)) ? n.toLocaleString('en-US') : '—'; }
+  function workStageLite(w) {
+    var s = String(w.state || w.status || 'planned').toLowerCase();
+    return ({ complete: 'done', deployed: 'done', run: 'in_progress', ok: 'done', err: 'blocked', idle: 'planned' })[s] || s;
+  }
+  function dashCard(kind, label, value, chips) {
+    var card = el('div', { 'class': 'ow-dashcard', 'data-card': kind });
+    card.appendChild(el('div', { 'class': 'ow-dashcard-k', text: label }));
+    card.appendChild(el('div', { 'class': 'ow-dashcard-v', text: value == null ? '—' : String(value) }));
+    var row = el('div', { 'class': 'ow-dashcard-chips' });
+    (chips || []).filter(Boolean).forEach(function (c) { row.appendChild(noteChip(String(c))); });
+    card.appendChild(row);
+    return card;
+  }
+  function swapVal(card, v) { var e = card.querySelector('.ow-dashcard-v'); if (e) { e.textContent = String(v); } }
+  function swapChips(card, chips) {
+    var old = card.querySelector('.ow-dashcard-chips');
+    var row = el('div', { 'class': 'ow-dashcard-chips' });
+    (chips || []).filter(Boolean).forEach(function (c) { row.appendChild(noteChip(String(c))); });
+    if (old && old.parentNode) { old.parentNode.replaceChild(row, old); } else { card.appendChild(row); }
+  }
+  function markCardDemo(card) { if (card && !card.querySelector('.demo-chip')) { card.appendChild(demoChip(true)); } }
+  function renderDashStrip(host, ctx) {
+    host.textContent = '';
+    var summary = ctx && ctx.summary;
+    var facts = get(summary, ['stores', 'facts']);
+    var sessions = get(summary, ['stores', 'sessions']);
+    var authMode = get(summary, ['daemon', 'auth_mode']);
+    // 1 · Daemon — facts / sessions / auth, straight from the boot summary.
+    host.appendChild(dashCard('daemon', 'DAEMON', numstr(facts) + ' facts',
+      [sessions != null ? (sessions + ' sessions') : null, authMode ? ('auth ' + authMode) : null]));
+    // 2 · ExecPlans — kanban stage counts from /v1/work.
+    var execCard = dashCard('execplans', 'EXECPLANS', 'loading…', null);
+    host.appendChild(execCard);
+    // 3 · Token usage — measured headline from the cost lens.
+    var usageCard = dashCard('usage', 'TOKEN USAGE', 'loading…', null);
+    host.appendChild(usageCard);
+    // 4 · MCP gateway — the legacy card that had no v2 home before M8.
+    var mcpAgents = get(summary, ['daemon', 'mcp_agent_count']);
+    var mcpCard = dashCard('mcp', 'MCP GATEWAY', get(summary, ['daemon', 'mcp_enabled']) ? 'listening' : 'off',
+      ['/mcp · :14801', mcpAgents != null ? (mcpAgents + ' agents') : null]);
+    host.appendChild(mcpCard);
+    // Async fills (real data first; demo fixtures fill only a flag-off feed).
+    fetchJSON('/v1/work?source=all').then(function (r) {
+      var items = (r.ok && r.data) ? (r.data.work || r.data.items || []) : [];
+      if ((!items || !items.length)) { var dw = demoData('work'); if (dw) { items = dw; markCardDemo(execCard); } }
+      var counts = { planned: 0, in_progress: 0, blocked: 0, done: 0 };
+      (items || []).forEach(function (w) { var st = workStageLite(w); if (counts[st] != null) { counts[st]++; } });
+      swapVal(execCard, (items ? items.length : 0) + ' plans');
+      swapChips(execCard, [counts.in_progress + ' in progress', counts.blocked + ' blocked', counts.done + ' done']);
+    });
+    fetchJSON('/v1/cost/report?tenant_id=default&token_budget=1500').then(function (r) {
+      var d = (r.ok && r.data) ? r.data : null;
+      var head = d && d.report && d.report.report && d.report.report.headline;
+      if (head && head.context_tokens_per_turn != null) {
+        swapVal(usageCard, fmtChartVal(head.context_tokens_per_turn, 'compact') + ' / turn');
+        swapChips(usageCard, [Math.round(head.cache_read_to_output_ratio || 0) + '× cache replay', (head.assistant_turns || 0) + ' turns']);
+      } else {
+        var ds = demoData('usageSeries');
+        if (ds && ds.week && ds.week.length) { swapVal(usageCard, fmtChartVal(ds.week[ds.week.length - 1], 'compact') + ' / wk'); markCardDemo(usageCard); }
+        else { swapVal(usageCard, 'no report'); swapChips(usageCard, ['corecruxctl session cost --post']); }
+      }
+    });
+    fetchJSON('/v1/mcp/tools').then(function (r) {
+      var tools = (r.ok && r.data) ? (r.data.tools || r.data.items || r.data) : null;
+      if (Array.isArray(tools)) {
+        swapChips(mcpCard, ['/mcp · :14801', tools.length + ' tools', mcpAgents != null ? (mcpAgents + ' agents') : null]);
+      }
+    });
+  }
+
   // The Overwatch landing entry point (shell.html calls this for the overwatch
   // destination, above the page-pill row). Panels are appended in order first,
   // then filled async, so ordering is stable regardless of fetch timing.
@@ -1049,6 +1148,13 @@
     // Stat tiles — full width, reused from the cx-overview build.
     var tileCard = el('div', { 'class': 'ow-tiles' }, [el('p', { 'class': 'v2card-sub', text: 'Loading…' })]);
     root.appendChild(tileCard);
+    // Pro-mode dashboard strip — a home for the legacy landing's four top cards
+    // (daemon · execplans · usage · MCP gateway). Standard mode omits it.
+    if (proMode()) {
+      var strip = el('div', { 'class': 'ow-dashstrip', id: 'owDashStrip' });
+      root.appendChild(strip);
+      renderDashStrip(strip, ctx);
+    }
     // 7fr / 5fr split: NEEDS YOU on the left; FLEET · ACTIVITY · ENGINE right.
     var cols = el('div', { 'class': 'ow-cols' });
     var left = el('div', { 'class': 'ow-col' });
@@ -1111,6 +1217,8 @@
     renderPage: renderPage,
     renderSections: renderSections,
     fetchJSON: fetchJSON,
+    // M8 — presentation mode helper (never gates posture; see proMode()).
+    proMode: proMode,
     // exposed so the shell can re-run the gate after a posture change
     isOperator: isOperator,
     // M3 — posture derivation (pure; unit-tested by the smoke) + the Overwatch

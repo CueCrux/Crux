@@ -165,6 +165,7 @@
       rows.push({ t: 'exp', label: g.slice(-2) === '::' ? g + '*' : g + ':*', sub: list.length + ' recent facts', badge: 'group',
         controls: list.slice(0, 15).map(function (f) {
           return { t: 'exp', label: f.key || f.entity, sub: f.entity, badge: 'fact',
+            meta: [f.fact_id || f.id, f.stored_at].filter(Boolean).join(' · '),   // Pro-mode mono metadata (ids/timestamps Standard elides)
             controls: [info('stored', str(f.stored_at)), info('value', clip(f.value, 140))] };
         }) });
     });
@@ -244,6 +245,7 @@
     var arch = list.filter(function (s) { return s.archived; });
     var row = function (s) {
       return { t: 'exp', label: s.session_id || s.id || s.label || 'session', sub: [s.execplan_slug, s.passport_id, s.last_active || s.updated_at].filter(Boolean).join(' · '), badge: s.archived ? 'archived' : (s.status || 'session'),
+        meta: [s.session_id || s.id, s.updated_at || s.last_active].filter(Boolean).join(' · '),   // Pro-mode mono metadata
         controls: [['passport', s.passport_id], ['execplan', s.execplan_slug], ['tenant', s.tenant_id], ['turns', s.turn_count], ['updated', s.updated_at]]
           .filter(function (kv) { return kv[1] != null && kv[1] !== ''; }).map(function (kv) { return info(kv[0], String(kv[1])); }) };
     };
@@ -303,6 +305,7 @@
     var mk = function (w) {
       var stage = workStageOf(w);   // planned | in_progress | blocked | done — drives the left strip (item 7)
       return { t: 'exp', strip: stage, label: w.title || w.id, sub: (w.milestones_total ? ('M ' + (w.milestones_done || 0) + '/' + w.milestones_total) : '') || w.current_milestone || w.plan_path || '', badge: stage.replace('_', ' '),
+        meta: [w.id, w.plan_path, w.updated_at].filter(Boolean).join(' · '),   // Pro-mode mono metadata
         controls: [['state', w.state], ['risk', w.risk_class], ['plan', w.plan_path], ['milestone', w.current_milestone], ['owner', w.assignee_passport], ['pr', w.linked_pr]]
           .filter(function (kv) { return kv[1] != null && kv[1] !== ''; }).map(function (kv) { return info(kv[0], String(kv[1])); })
           .concat([rbtn('Open in kanban')]) };
@@ -649,6 +652,120 @@
   function buildMediationEngine(res) { return STATIC['cx-mediation'].concat([engineMediatedSection(res)]); }
 
   // =======================================================================
+  //  Ported legacy scopes (Professional mode only). The legacy console
+  //  (crates/corecruxd/console/index.html) carried four scopes beyond CX —
+  //  DX (Docs), GX (Global), AX (Agent), IX (Infra). Each portable-with-a-real-
+  //  GET-endpoint section is ported here as a Pro-mode page; the rest are folded
+  //  into an existing v2 home or explicitly deferred. The LEGACY_PORT manifest
+  //  (below) is the machine-readable checklist that proves nothing is dropped.
+  // =======================================================================
+
+  // IX / Infra — one real endpoint (/v1/console/infra/summary, in the api.js
+  // allowlist) feeds all five legacy IX panels: onboarding checklist, machines,
+  // auth rails, config bundles and session sync. Ported from the legacy
+  // txInfra* transforms (index.html:1513-1546).
+  function buildInfra(res) {
+    if (!res.ok || !res.data) {
+      return [{ h: 'Infra', wide: true, controls: degraded(res.status, 'Infra summary unavailable — GET /v1/console/infra/summary (needs console:read)') }];
+    }
+    var d = res.data, s = d.s || d, c = s.checklist || {}, r = s.rails || {};
+    var tick = function (b) { return b ? '✓' : '○'; };
+    var checklist = { h: 'Onboarding checklist', sub: 'machine setup · corecruxctl login', wide: true, controls: [
+      info('login auth', tick(c.auth_configured) + ' ' + (s.auth_mode || '?')),
+      info('MCP', tick(c.mcp_enabled) + ' ' + (c.mcp_enabled ? 'enabled' : 'disabled')),
+      info('machines captured', (c.machines_registered || 0) + ' registered · ' + (c.machines_with_hooks || 0) + ' with hooks')
+    ] };
+    var rails = { h: 'Auth rails', sub: 'what is enabled', wide: true, controls: [
+      info('tailscale identity', r.tailscale ? 'enabled' : 'disabled'),
+      info('device grant', r.device ? 'enabled' : 'disabled'),
+      info('agent token → HTTP', r.http_accept_agent_tokens ? 'enabled' : 'disabled')
+    ] };
+    var machines = arr(d.machines);
+    var mSec = { h: 'Machines', sub: machines.length + ' logged into this daemon', wide: true,
+      controls: [{ t: 'search', ph: 'Filter machines…' }].concat(machines.length ? machines.map(function (m) {
+        var rec = m.record || {};
+        return { t: 'exp', label: m.id, sub: [rec.os, rec.rail].filter(Boolean).join(' · ') || 'machine', badge: rec.hooks_installed ? 'hooks' : 'no hooks',
+          meta: [rec.tailnet_ip, rec.ctl_version].filter(Boolean).join(' · '),
+          controls: [['tailnet_ip', rec.tailnet_ip], ['os', (rec.os || '?') + '/' + (rec.arch || '?')], ['rail', rec.rail], ['hooks', rec.hooks_installed ? 'yes' : 'no'], ['ctl', rec.ctl_version]]
+            .filter(function (kv) { return kv[1] != null; }).map(function (kv) { return info(kv[0], String(kv[1])); }) };
+      }) : [info('none', 'no machines captured — run corecruxctl login')]) };
+    var configs = arr(d.configs);
+    var cfgSec = { h: 'Config bundles', sub: 'saved ~/.claude configs (secrets redacted)', wide: true,
+      controls: configs.length ? configs.map(function (cf) { return info(cf.name, (cf.files || 0) + ' files · from ' + (cf.source_host || '?')); }) : [info('none', 'no config bundles — corecruxctl config push <name>')] };
+    var syncs = arr(d.sessions);
+    var syncSec = { h: 'Session sync', sub: 'shared session snapshots across machines', wide: true,
+      controls: syncs.length ? syncs.map(function (ss) { return info(ss.id, (ss.bytes || 0) + ' bytes · from ' + (ss.source_host || '?')); }) : [info('none', 'no shared session snapshots')] };
+    return [checklist, rails, mSec, cfgSec, syncSec];
+  }
+
+  // GX / Global — shared surfaces that outlive a session. Engrams load live
+  // (/v1/engrams, allowlisted); the ScoreCrux bench board + hypernym sites have
+  // no local endpoint (deferred, honest notes); the fact store's real home is
+  // Memory › Facts.
+  function buildGlobal(res) {
+    var engrams;
+    if (!res.ok || !res.data) {
+      engrams = { h: 'Engrams', sub: 'shared memory pinned into every boot', wide: true, controls: [{ t: 'search', ph: 'Filter engrams…' }].concat(degraded(res.status, 'Engrams unavailable — GET /v1/engrams')) };
+    } else {
+      var list = arr(res.data.engrams || res.data.items || res.data);
+      engrams = { h: 'Engrams', sub: list.length + ' shared engram' + (list.length === 1 ? '' : 's') + ' · /v1/engrams', wide: true,
+        controls: [{ t: 'search', ph: 'Filter engrams…' }].concat(list.length ? list.map(function (e) {
+          var id = e.name || e.id || e.entity || 'engram';
+          return { t: 'exp', label: id, sub: [e.kind, e.scope].filter(Boolean).join(' · ') || 'engram', badge: e.pinned ? 'pinned' : 'engram',
+            meta: str(e.updated_at || e.stored_at || ''),
+            controls: [info('kind', e.kind || 'engram')].concat((e.summary || e.value) ? [info('summary', clip(e.summary || e.value, 140))] : []) };
+        }) : [info('none', 'no shared engrams')]) };
+    }
+    var bench = { h: 'Bench', sub: 'ScoreCrux benchmark board', wide: true, controls: [
+      info('deferred', 'the ScoreCrux board is an external surface — this daemon has no local bench endpoint'),
+      info('scorecrux.com', 'the published leaderboard lives off-daemon')
+    ] };
+    var sites = { h: 'Sites', sub: 'hypernym surface', wide: true, controls: [
+      info('deferred', 'no hypernym-sites endpoint on this daemon build')
+    ] };
+    var factstore = { h: 'Fact store', sub: 'the durable record', wide: true, controls: [
+      info('home', 'the fact store surfaces at Memory › Facts and Memory › Memory'),
+      info('endpoint', 'GET /v1/console/facts')
+    ] };
+    return [engrams, bench, sites, factstore];
+  }
+
+  // AX / Agent — the agent-side cockpit. MCP tools load live (/v1/mcp/tools,
+  // allowlisted); activity / memory / snapshots already have v2 homes; graph
+  // opens on the Pro 3D substrate; bulk / handoff / storybook / story / dossiers
+  // have no daemon read endpoint (deferred, honest notes).
+  function buildAgent(res) {
+    var tools;
+    if (!res.ok || !res.data) {
+      tools = { h: 'MCP tools', sub: 'the agent tool surface · /v1/mcp/tools', wide: true, controls: [{ t: 'search', ph: 'Filter tools…' }].concat(degraded(res.status, 'MCP tools unavailable — GET /v1/mcp/tools')) };
+    } else {
+      var list = arr(res.data.tools || res.data.items || res.data);
+      tools = { h: 'MCP tools', sub: list.length + ' tool' + (list.length === 1 ? '' : 's') + ' loaded at session bind · /v1/mcp/tools', wide: true,
+        controls: [{ t: 'search', ph: 'Filter tools…' }].concat(list.length ? list.map(function (tl) {
+          var name = tl.name || tl.tool || tl.id || 'tool';
+          return { t: 'exp', label: name, sub: clip(tl.description || tl.summary || '', 90) || 'mcp tool', badge: tl.scope || 'tool',
+            meta: (arr(tl.scopes).length ? arr(tl.scopes).join(' · ') : str(tl.scope)),
+            controls: [info('description', clip(tl.description || tl.summary || '—', 200))] };
+        }) : [info('none', 'no MCP tools reported')]) };
+    }
+    var cockpit = { h: 'Agent cockpit', sub: 'agent observability — where each legacy AX surface lives now', wide: true, controls: [
+      info('activity', 'live tool stream → Overwatch › Activity'),
+      info('memory recall', 'agent recall → Memory › Facts / Memory'),
+      info('snapshots', 'session captures → Work › Sessions'),
+      info('graph', 'context graph → the Pro 3D substrate (below)'),
+      link('Open the 3D substrate', '/console-3d/index.html?embed=1', { hint: 'entity graph · shard topology · lane overlay' })
+    ] };
+    var deferred = { h: 'Not yet ported', sub: 'surfaces with no read endpoint on this daemon', wide: true, controls: [
+      info('bulk ops', 'batch import / sweep are mutations — no read surface'),
+      info('handoff', 'create_handoff is MCP-only — no list endpoint'),
+      info('storybook', 'tile/pattern catalog is a design artifact, not a data feed'),
+      info('story', 'call-tree story view stays on the Pro / 3D canvas'),
+      info('dossiers', 'per-project — see Work › Projects (/v1/projects/{id}/dossiers)')
+    ] };
+    return [tools, cockpit, deferred];
+  }
+
+  // =======================================================================
   //  Static pages — sections ported directly from the legacy PAGES DSL.
   // =======================================================================
 
@@ -733,6 +850,29 @@
           link('Open the 3D substrate', '/console-3d/index.html?embed=1', { hint: 'opens the Pro 3D substrate view' })
         ] }
     ],
+    // DX / Docs — daemon reference + platform docs. No live docs endpoint on
+    // this build (the legacy reader merged a docs:: fact group), so this is a
+    // static Pro-mode page; the eventual home is the reserved 'documents' mode.
+    'dx-docs': [
+      { h: 'Bundled docs', sub: 'daemon reference shipped with this build · live mode merges docs:: facts', wide: true,
+        controls: [
+          { t: 'search', ph: 'Filter docs…' },
+          { t: 'exp', label: 'mcp-system-prompt.md', sub: 'tool surface reference', badge: 'doc', controls: [info('scope', 'the MCP tool surface + capability ladder')] },
+          { t: 'exp', label: 'PLANS.md', sub: 'ExecPlan format', badge: 'doc', controls: [info('required sections', 'Purpose · Non-goals · Context · Constraints · Milestones · Test plan · Risks · Progress · Decision log')] },
+          { t: 'exp', label: 'agent-guide.md', sub: 'QC / threat references', badge: 'doc', controls: [info('scope', 'quality-control gates + threat model refs')] }
+        ] },
+      { h: 'README · corecruxd', sub: '17 crates · port 14800', wide: true,
+        controls: [
+          info('build', 'cargo build --release (CPU-only)'),
+          info('architecture', 'axum HTTP :14800 + tonic gRPC · append-only shard store · Ed25519 CROWN receipts'),
+          info('key rules', 'no GPU/CUDA · CCL licence · port 14800 fixed')
+        ] },
+      { h: 'External docs', sub: 'platform surfaces (open in a browser tab)', wide: true,
+        controls: [
+          info('cuecrux.com', 'marketing + product'),
+          info('signals.cuecrux.com', 'status + signals')
+        ] }
+    ],
     'cx-raw': [
       { h: 'Request', controls: [
         { t: 'select', k: 'rpc_method', label: 'method', options: ['tools/list', 'tools/call · query', 'tools/call · store_fact', 'resources/list'], v: 'tools/list', mut: true },
@@ -794,8 +934,22 @@
     'cx-integrations': page('cx-integrations', 'system', 'Integrations', 'installed packs and their grants', { load: { endpoint: '/v1/console/integrations', build: buildIntegrations } }),
     'cx-extensions': page('cx-extensions', 'system', 'Extensions', 'signed third-party manifests · per-passport grants', { load: { endpoint: '/v1/extensions', build: buildExtensions } }),
     'cx-workbench': page('cx-workbench', 'system', 'Workbench', 'operator tooling — opens the Pro console'),
-    'cx-raw': page('cx-raw', 'system', 'Raw · JSON-RPC', '/mcp on :14801 · scopes header attaches automatically', { operatorOnly: true })
+    'cx-raw': page('cx-raw', 'system', 'Raw · JSON-RPC', '/mcp on :14801 · scopes header attaches automatically', { operatorOnly: true }),
+
+    // ---- Ported legacy scopes (Professional mode only; pro:true) ----------
+    // The legacy console's other four scopes (DX/GX/AX/IX) land here as Pro-only
+    // pages so Standard mode stays the curated forward-facing surface. See the
+    // LEGACY_PORT manifest below for the full section-by-section disposition.
+    'ix-infra': page('ix-infra', 'system', 'Infra', 'machines, auth rails, config + session sync · /v1/console/infra/summary', { pro: true, load: { endpoint: '/v1/console/infra/summary', build: buildInfra } }),
+    'dx-docs': page('dx-docs', 'system', 'Docs', 'daemon reference + platform docs', { pro: true }),
+    'gx-global': page('gx-global', 'memory', 'Global', 'shared surfaces that outlive a session — engrams, bench, sites, fact store', { pro: true, load: { endpoint: '/v1/engrams', build: buildGlobal } }),
+    'ax-agent': page('ax-agent', 'overwatch', 'Agent', 'agent-side cockpit — MCP tools, graph, and where each surface lives', { pro: true, load: { endpoint: '/v1/mcp/tools', build: buildAgent } })
   };
+
+  // ---- Pro-ported page ids (the DX/GX/AX/IX pages above) ----------------
+  // These are the ONLY page ids outside the legacy 26; each is pro:true (hidden
+  // in Standard mode). The smoke asserts no page id exists beyond 26 ∪ this set.
+  var PRO_PORTED_IDS = ['ix-infra', 'dx-docs', 'gx-global', 'ax-agent'];
 
   // ---- Destinations (rail order + pill grouping) ------------------------
   var DESTS = [
@@ -814,6 +968,53 @@
     'cx-receipts', 'cx-mediation', 'cx-workbench', 'cx-integrations', 'cx-extensions', 'cx-facts', 'cx-memory',
     'cx-tenants', 'cx-lane-weights', 'cx-settings', 'cx-raw'
   ];
+
+  // ---- LEGACY_PORT — the port checklist (M8) ----------------------------
+  // Every legacy console section (the 5 scopes in index.html:763 + the four
+  // renderDash landing cards) mapped to its v2 disposition. Status is one of:
+  //   'home:<v2-page-id>'    — already has a v2 home (the page id it lives on)
+  //   'ported-pro:<target>'  — ported in M8 as a Pro-mode page/section (target =
+  //                            a pro:true page id, or the overwatch dashboard strip)
+  //   'deferred:<reason>'    — intentionally not ported (no read endpoint / stays
+  //                            an embed / design artifact). Reason is required.
+  // The smoke (check 24) embeds the expected legacy inventory and asserts this
+  // manifest covers it EXACTLY — zero missing, zero unlabeled, zero stray. This
+  // is the machine-readable proof that nothing from /console/legacy was dropped.
+  var LEGACY_PORT = {
+    // ── CX (26) — the forward-facing scope, ported in M1; each keeps its id ──
+    'cx-overview': 'home:cx-overview', 'cx-activity': 'home:cx-activity', 'cx-cost': 'home:cx-cost',
+    'cx-projects': 'home:cx-projects', 'cx-work': 'home:cx-work', 'cx-usage': 'home:cx-usage',
+    'cx-documents': 'home:cx-documents', 'cx-gates': 'home:cx-gates', 'cx-review': 'home:cx-review',
+    'cx-coord': 'home:cx-coord', 'cx-sessions': 'home:cx-sessions', 'cx-orchestrators': 'home:cx-orchestrators',
+    'cx-punchcards': 'home:cx-punchcards', 'cx-passport': 'home:cx-passport', 'cx-identity': 'home:cx-identity',
+    'cx-receipts': 'home:cx-receipts', 'cx-mediation': 'home:cx-mediation', 'cx-workbench': 'home:cx-workbench',
+    'cx-integrations': 'home:cx-integrations', 'cx-extensions': 'home:cx-extensions', 'cx-facts': 'home:cx-facts',
+    'cx-memory': 'home:cx-memory', 'cx-tenants': 'home:cx-tenants', 'cx-lane-weights': 'home:cx-lane-weights',
+    'cx-settings': 'home:cx-settings', 'cx-raw': 'home:cx-raw',
+    // ── DX (Docs) — no live docs endpoint → one static Pro page ──
+    'dx-articles': 'ported-pro:dx-docs', 'dx-readme': 'ported-pro:dx-docs', 'dx-sites': 'ported-pro:dx-docs',
+    // ── GX (Global) — engrams live; fact store has a home; bench/sites deferred ──
+    'gx-engrams': 'ported-pro:gx-global',
+    'gx-factstore': 'home:cx-facts',
+    'gx-bench': 'deferred:no local ScoreCrux bench endpoint (external board)',
+    'gx-sites': 'deferred:no hypernym-sites endpoint on this daemon build',
+    // ── AX (Agent) — tools/graph/overview ported; activity/memory/snapshots have homes; rest deferred ──
+    'ax-overview': 'ported-pro:ax-agent', 'ax-tools': 'ported-pro:ax-agent', 'ax-graph': 'ported-pro:ax-agent',
+    'ax-activity': 'home:cx-activity', 'ax-memory': 'home:cx-memory', 'ax-snapshots': 'home:cx-sessions',
+    'ax-bulk': 'deferred:batch ops are mutations — no read surface',
+    'ax-handoff': 'deferred:create_handoff is MCP-only — no list endpoint',
+    'ax-storybook': 'deferred:tile/pattern catalog is a design artifact, not a data feed',
+    'ax-story': 'deferred:call-tree story view stays on the Pro / 3D canvas',
+    'ax-dossiers': 'deferred:per-project — /v1/projects/{id}/dossiers is per-project (see Work › Projects)',
+    // ── IX (Infra) — all five panels fed by one live endpoint → one Pro page ──
+    'ix-index': 'ported-pro:ix-infra', 'ix-machines': 'ported-pro:ix-infra', 'ix-rails': 'ported-pro:ix-infra',
+    'ix-config': 'ported-pro:ix-infra', 'ix-sync': 'ported-pro:ix-infra',
+    // ── Legacy CX dashboard (renderDash) top cards — homes + the new Pro strip ──
+    'dash-daemon': 'home:cx-overview',          // Overwatch landing stat tiles
+    'dash-execplans': 'home:cx-work',           // Work › ExecPlans (+ Pro dashboard strip)
+    'dash-usage': 'home:cx-usage',              // Meters › Token usage
+    'dash-mcp': 'ported-pro:overwatch-dashboard-strip'   // NEW: the MCP-gateway card had no v2 home
+  };
 
   // ---- MUTATING_ACTIONS — single source of truth for the posture gate ---
   // Every label here corresponds to a control tagged `mut:true`; render.js
@@ -931,6 +1132,8 @@
     PAGES: PAGES,
     DESTS: DESTS,
     LEGACY_IDS: LEGACY_IDS,
+    PRO_PORTED_IDS: PRO_PORTED_IDS,
+    LEGACY_PORT: LEGACY_PORT,
     MUTATING_ACTIONS: MUTATING_ACTIONS,
     CruxDemo: CruxDemo,
     // Exposed for tests / render composition.

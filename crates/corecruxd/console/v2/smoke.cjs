@@ -41,6 +41,13 @@
 //      (aria-pressed, no legend), used on cx-cost + cx-usage.
 //  18. (round 2) pro-board strips: work rows + gate cards share a 3px
 //      state-keyed left strip.
+//  23. (M8) presentation mode system (Standard | Professional + reserved
+//      Documents): registry, persisted, pre-paint, segmented control (aria-
+//      pressed, left of chips), and STATIC posture-independence (no posture fn
+//      branches on mode; applyMode touches no posture).
+//  24. (M8) legacy port-checklist integrity: the LEGACY_PORT manifest covers the
+//      EXACT known legacy inventory (5 scopes + 4 renderDash cards) with a valid
+//      disposition each (home:/ported-pro:/deferred:) — nothing dropped.
 
 'use strict';
 
@@ -117,10 +124,20 @@ function walkPage(page, fn) {
       check(destIds.has(p.dest), '[ids] ' + id + ' has invalid dest: ' + String(p.dest));
     }
   });
-  // No stray pages outside the 26.
+  // No stray pages outside the 26 — EXCEPT the M8 Pro-ported pages, each of
+  // which must be declared in PRO_PORTED_IDS and be pro:true (hidden in Standard
+  // mode). This extends the guarantee (documents the only allowed extras) without
+  // weakening it: any page id neither in the 26 nor in PRO_PORTED_IDS still fails.
+  const proPorted = new Set(pages.PRO_PORTED_IDS || []);
   Object.keys(pages.PAGES).forEach(function (id) {
-    check(LEGACY_26.indexOf(id) >= 0, '[ids] unexpected page id not in the legacy 26: ' + id);
+    if (LEGACY_26.indexOf(id) >= 0) { return; }
+    check(proPorted.has(id), '[ids] unexpected page id not in the legacy 26 nor PRO_PORTED_IDS: ' + id);
+    const pp = pages.PAGES[id];
+    check(pp && pp.pro === true, '[ids] PRO_PORTED page ' + id + ' must be pro:true (Pro-mode only)');
+    check(pp && destIds.has(pp.dest), '[ids] PRO_PORTED page ' + id + ' has invalid dest: ' + String(pp && pp.dest));
   });
+  check((pages.PRO_PORTED_IDS || []).length === 4,
+    '[ids] expected exactly 4 Pro-ported legacy pages (dx-docs, gx-global, ax-agent, ix-infra); got ' + (pages.PRO_PORTED_IDS || []).length);
   // Item 0: a pill:false page is folded out of its destination's pill row but
   // must still be reachable — its content is rendered inline by the
   // destination's landing (render.js references its id). cx-overview is the one.
@@ -771,6 +788,116 @@ function extractThemeVars(theme) {
   notes.push('legacy list/toggle language: LED toggle (.led + glowing --ok on-state, squarer shape) + squarer topbar chips/pill + list-row hover + mono metadata.');
 })();
 
+// =========================================================================
+//  Check 23 — (M8) presentation mode system (Standard | Professional +
+//  reserved Documents). Registry + persisted + pre-paint + segmented control
+//  (aria-pressed, sat left of the chips). POSTURE INDEPENDENCE is asserted
+//  statically: mode is presentation only — no posture function branches on
+//  mode, and applyMode touches no posture. Customer posture behaves identically
+//  in every mode because the gate keys on posture, never on data-mode.
+// =========================================================================
+(function checkModeSystem() {
+  // Registry with the three slots (documents reserved / not selectable).
+  check(/var MODES = \[/.test(shellHtml), '[mode] shell.html must declare a MODES registry');
+  ['standard', 'professional', 'documents'].forEach(function (m) {
+    check(new RegExp("id:\\s*'" + m + "'").test(shellHtml), '[mode] MODES must include the "' + m + '" slot');
+  });
+  check(/soon:\s*true/.test(shellHtml), '[mode] the reserved third slot (documents) must be marked soon:true (visible but not selectable)');
+  check(/arrives in M10/.test(shellHtml), '[mode] the reserved documents slot must be labelled "arrives in M10"');
+  // Persisted + pre-paint applied as html[data-mode].
+  check(/crux\.console\.mode/.test(shellHtml), '[mode] mode must persist at localStorage crux.console.mode');
+  check(/setAttribute\('data-mode'/.test(shellHtml), '[mode] mode must be applied as html[data-mode] (pre-paint + applyMode)');
+  const head = shellHtml.slice(0, shellHtml.indexOf('</head>'));
+  check(/setAttribute\('data-mode'/.test(head), '[mode] data-mode must be applied pre-paint (in <head>) to avoid a Pro-density flash');
+  // Segmented control: id, buildModeSeg, aria-pressed, sat LEFT of the chips.
+  check(/id="modeSeg"/.test(shellHtml), '[mode] topbar must carry the segmented control (id="modeSeg")');
+  check(/function buildModeSeg/.test(shellHtml), '[mode] shell.html must build the segmented control (buildModeSeg)');
+  check(/modeseg-btn/.test(shellHtml) && /aria-pressed/.test(shellHtml), '[mode] segmented control buttons must set aria-pressed');
+  check(shellHtml.indexOf('id="modeSeg"') >= 0 && shellHtml.indexOf('id="topchips"') >= 0 &&
+    shellHtml.indexOf('id="modeSeg"') < shellHtml.indexOf('id="topchips"'),
+    '[mode] the segmented control must sit LEFT of the chips cluster (modeSeg before topchips)');
+  // applyMode re-renders + persists + sets the window flag, and NEVER touches posture.
+  const am = funcBody(shellHtml, 'applyMode');
+  check(!!am, '[mode] shell.html must define applyMode');
+  check(am && /route\(\)/.test(am), '[mode] applyMode must re-render (route()) so the Pro surface appears/disappears');
+  check(am && /window\.CRUX_MODE\s*=/.test(am), '[mode] applyMode must set window.CRUX_MODE for render.js proMode()');
+  check(am && !/setPosture|isOperator|CRUX_POSTURE|derivePosture/.test(am),
+    '[mode] applyMode must NOT touch posture — mode is presentation, posture is the security boundary');
+  // render.js honours the mode: proMode() reads window.CRUX_MODE; renderSections
+  // drops pro:true sections in Standard; the Overwatch dashboard strip is Pro-only.
+  check(typeof render.proMode === 'function', '[mode] render.js must export proMode()');
+  check(/window\.CRUX_MODE/.test(renderSrc), '[mode] render.js proMode() must read window.CRUX_MODE');
+  check(/sections\[i\]\.pro/.test(renderSrc), '[mode] renderSections must drop pro:true sections outside Professional mode');
+  check(/renderDashStrip/.test(renderSrc) && /proMode\(\)/.test(renderSrc), '[mode] the Overwatch dashboard strip must be Pro-only (proMode()-guarded)');
+  // POSTURE INDEPENDENCE (statically): no posture function branches on mode.
+  const modeTokens = /CRUX_MODE|data-mode|crux\.console\.mode|proMode|professional/;
+  ['setPosture', 'applyPosture', 'derivePostureFromServer', 'applyDerivedPosture'].forEach(function (fn) {
+    const b = funcBody(shellHtml, fn);
+    check(!!b, '[mode] shell.html must define the posture fn ' + fn);
+    check(b && !modeTokens.test(b), '[mode] posture fn ' + fn + '() must not branch on mode (presentation ≠ security)');
+  });
+  ['derivePosture', 'applyMutationGate', 'operatorGatedCall'].forEach(function (fn) {
+    const b = funcBody(renderSrc, fn);
+    check(!!b, '[mode] render.js must define ' + fn);
+    check(b && !modeTokens.test(b), '[mode] render.js ' + fn + '() must not branch on mode (posture is mode-independent)');
+  });
+  notes.push('mode system: Standard|Professional (+reserved Documents) — persisted, pre-paint, segmented control (aria-pressed, left of chips); posture statically mode-independent.');
+})();
+
+// =========================================================================
+//  Check 24 — (M8) legacy port-checklist integrity. The LEGACY_PORT manifest in
+//  pages.js maps EVERY legacy console section (the 5 scopes at index.html:763 +
+//  the 4 renderDash landing cards) to a disposition: home:<page> | ported-pro:
+//  <target> | deferred:<reason>. The known legacy inventory is embedded here, so
+//  a silently-dropped section fails the build. Nothing may be missing, unlabeled,
+//  or stray; every target must resolve.
+// =========================================================================
+(function checkLegacyPort() {
+  const LP = pages.LEGACY_PORT;
+  check(LP && typeof LP === 'object', '[port] pages.js must export the LEGACY_PORT manifest');
+  const CX = ['cx-overview', 'cx-activity', 'cx-cost', 'cx-projects', 'cx-work', 'cx-usage', 'cx-documents', 'cx-gates', 'cx-review', 'cx-coord', 'cx-sessions', 'cx-orchestrators', 'cx-punchcards', 'cx-passport', 'cx-identity', 'cx-receipts', 'cx-mediation', 'cx-workbench', 'cx-integrations', 'cx-extensions', 'cx-facts', 'cx-memory', 'cx-tenants', 'cx-lane-weights', 'cx-settings', 'cx-raw'];
+  const DX = ['dx-articles', 'dx-readme', 'dx-sites'];
+  const GX = ['gx-engrams', 'gx-bench', 'gx-sites', 'gx-factstore'];
+  const AX = ['ax-overview', 'ax-activity', 'ax-memory', 'ax-bulk', 'ax-snapshots', 'ax-tools', 'ax-handoff', 'ax-graph', 'ax-storybook', 'ax-dossiers', 'ax-story'];
+  const IX = ['ix-index', 'ix-machines', 'ix-rails', 'ix-config', 'ix-sync'];
+  const DASH = ['dash-daemon', 'dash-execplans', 'dash-usage', 'dash-mcp'];   // renderDash top cards
+  const EXPECTED = [].concat(CX, DX, GX, AX, IX, DASH);
+  EXPECTED.forEach(function (id) {
+    const s = LP && LP[id];
+    check(typeof s === 'string' && s.length > 0, '[port] LEGACY_PORT missing/unlabeled legacy section: ' + id);
+    check(typeof s === 'string' && /^(home:|ported-pro:|deferred:)/.test(s), '[port] LEGACY_PORT ' + id + ' has an invalid status label: ' + s);
+  });
+  const expectedSet = new Set(EXPECTED);
+  Object.keys(LP || {}).forEach(function (id) {
+    check(expectedSet.has(id), '[port] LEGACY_PORT has a stray key not in the known legacy inventory: ' + id);
+  });
+  check(Object.keys(LP || {}).length === EXPECTED.length,
+    '[port] LEGACY_PORT must cover EXACTLY the ' + EXPECTED.length + '-section legacy inventory; got ' + Object.keys(LP || {}).length);
+  // Disposition targets resolve.
+  const proPorted = new Set(pages.PRO_PORTED_IDS || []);
+  Object.keys(LP || {}).forEach(function (id) {
+    const s = LP[id];
+    if (s.indexOf('home:') === 0) {
+      const pid = s.slice('home:'.length);
+      check(!!pages.PAGES[pid], '[port] ' + id + ' home target is not a real page: ' + pid);
+    } else if (s.indexOf('ported-pro:') === 0) {
+      const target = s.slice('ported-pro:'.length);
+      if (target === 'overwatch-dashboard-strip') {
+        check(/renderDashStrip/.test(renderSrc), '[port] ' + id + ' → overwatch-dashboard-strip but render.js has no renderDashStrip');
+      } else {
+        check(pages.PAGES[target] && pages.PAGES[target].pro === true, '[port] ' + id + ' ported-pro target must be a pro:true page: ' + target);
+        check(proPorted.has(target), '[port] ' + id + ' ported-pro target must be listed in PRO_PORTED_IDS: ' + target);
+      }
+    } else {
+      check(s.slice('deferred:'.length).trim().length > 0, '[port] ' + id + ' deferred status must carry a reason');
+    }
+  });
+  proPorted.forEach(function (pid) { check(!!pages.PAGES[pid], '[port] PRO_PORTED page not registered in PAGES: ' + pid); });
+  const tally = { home: 0, 'ported-pro': 0, deferred: 0 };
+  Object.keys(LP || {}).forEach(function (id) { tally[LP[id].split(':')[0]]++; });
+  notes.push('legacy port: ' + EXPECTED.length + ' sections — ' + tally.home + ' home, ' + tally['ported-pro'] + ' ported-pro, ' + tally.deferred + ' deferred; nothing dropped.');
+})();
+
 // ---- Report -------------------------------------------------------------
 console.log('unified-shell-console v2 — round 4 smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
@@ -779,5 +906,5 @@ if (failures.length) {
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language).');
+console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity).');
 process.exit(0);

@@ -38,6 +38,16 @@
     } catch (e) {
       document.documentElement.setAttribute('data-rail', 'open');
     }
+    // Apply the persisted presentation mode (Standard | Professional) before
+    // first paint so Pro density doesn't flash. Mirrors crux.console.mode; the
+    // reserved 'documents' mode is not yet a paintable state (arrives in M10) so
+    // it falls back to 'standard' here. Mode is PRESENTATION — never posture.
+    try {
+      var m = localStorage.getItem('crux.console.mode');
+      document.documentElement.setAttribute('data-mode', m === 'professional' ? 'professional' : 'standard');
+    } catch (e) {
+      document.documentElement.setAttribute('data-mode', 'standard');
+    }
   })();
 </script>
 <style>
@@ -845,6 +855,63 @@
   .ow-panel { position: relative; }
   .demo-chip.inline { position: static; align-self: flex-start; }
 
+  /* ---- Presentation mode: Standard | Professional (M8) ------------------
+     Mode is PRESENTATION only — the security boundary is posture, which is
+     independent of mode (a customer sees the SAME gated surface in either
+     mode). Standard is the curated forward-facing view; Professional adds
+     legacy-style density, extra mono metadata on list rows, Pro-only sections
+     /pages, and the full sub-nav pill row. Every colour is a theme token. */
+
+  /* Topbar segmented control (nav-family look, aria-pressed), sat left of the
+     chip cluster in .topbar-right. */
+  .modeseg {
+    display: inline-flex; gap: 3px; padding: 3px; flex: none;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+  }
+  .modeseg-btn {
+    min-height: 26px; padding: 0 11px; font-size: 11.5px; font-weight: 600;
+    border: 1px solid transparent; border-radius: 8px; background: none; color: var(--ink2);
+    cursor: pointer; white-space: nowrap;
+    transition: background .18s ease, color .18s ease, border-color .18s ease;
+  }
+  .modeseg-btn:hover:not(:disabled) { color: var(--ink); }
+  .modeseg-btn[aria-pressed="true"] { background: var(--surface); color: var(--ink); border-color: var(--edge-strong); }
+  .modeseg-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+  /* Extra mono metadata on list rows — hidden in Standard, revealed in Pro. */
+  .exp-meta {
+    display: none; font-family: var(--font-mono); font-size: 10px; color: var(--ink3);
+    min-width: 0; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  /* Pro-mode dashboard strip — the home for the legacy CX-landing top cards
+     (daemon · execplans · token usage · MCP gateway). Rendered by render.js
+     renderDashStrip() only in Professional mode. */
+  .ow-dashstrip { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin: 0 0 18px; }
+  .ow-dashcard {
+    position: relative; padding: 13px 15px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    display: flex; flex-direction: column; gap: 7px; min-width: 0;
+  }
+  .ow-dashcard-k { font-family: var(--font-mono); font-size: 9.5px; font-weight: 600; letter-spacing: .16em; text-transform: uppercase; color: var(--ink3); }
+  .ow-dashcard-v { font-size: 20px; font-weight: 650; color: var(--ink); font-variant-numeric: tabular-nums; letter-spacing: -.01em; word-break: break-word; }
+  .ow-dashcard-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+
+  /* Professional density — tighter rhythm across cards / rows / tiles, and the
+     mono metadata revealed. Standard keeps the roomier forward-facing look. */
+  :root[data-mode="professional"] .v2card { padding: 12px 14px; }
+  :root[data-mode="professional"] .v2card-body { gap: 8px; margin-top: 10px; }
+  :root[data-mode="professional"] .v2grid { gap: 10px; }
+  :root[data-mode="professional"] .exp-sum { padding: 6px 10px; }
+  :root[data-mode="professional"] .exp-strip > .exp-sum { padding-left: 13px; }
+  :root[data-mode="professional"] .exp-body { padding: 8px 10px; gap: 7px; }
+  :root[data-mode="professional"] .stat { padding: 10px 12px; }
+  :root[data-mode="professional"] .card { padding: 12px 14px; }
+  :root[data-mode="professional"] .ow-fleet-row { padding: 9px 11px; margin-bottom: 7px; }
+  :root[data-mode="professional"] .ow-gate { padding: 12px 14px; }
+  :root[data-mode="professional"] .exp-meta { display: inline-block; }
+
   /* ---- Accessibility & motion ------------------------------------------- */
   .skip {
     position: absolute; left: -9999px; top: 0; z-index: 100;
@@ -965,6 +1032,7 @@
           <p class="sub" id="destSub">Loading…</p>
         </div>
         <div class="topbar-right">
+          <div class="modeseg" id="modeSeg" role="group" aria-label="Presentation mode"></div>
           <div class="topchips" id="topchips"></div>
           <span class="health" id="health" role="status" aria-live="polite">
             <span class="dot" aria-hidden="true"></span>
@@ -1062,6 +1130,63 @@
     }
   }
 
+  // ---- Presentation mode registry (Standard | Professional | Documents) --
+  // Mode is PRESENTATION, never posture: a customer sees the SAME gated surface
+  // in every mode. Standard is the curated forward-facing view; Professional
+  // adds density + the full page/section surface + the full pill row. 'documents'
+  // is a reserved third slot (arrives in M10) — shown in the control but not yet
+  // selectable. applyMode NEVER touches posture (no setPosture / isOperator /
+  // CRUX_POSTURE) — the two axes are strictly independent (smoke check 23).
+  var LS_MODE = 'crux.console.mode';
+  var DEFAULT_MODE = 'standard';
+  var MODES = [
+    { id: 'standard', label: 'Standard' },
+    { id: 'professional', label: 'Professional' },
+    { id: 'documents', label: 'Documents', soon: true }   // reserved — arrives in M10
+  ];
+  function readMode() {
+    try { return localStorage.getItem(LS_MODE) === 'professional' ? 'professional' : DEFAULT_MODE; }
+    catch (e) { return DEFAULT_MODE; }
+  }
+  function syncModeSeg(id) {
+    var btns = document.querySelectorAll('#modeSeg .modeseg-btn');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].setAttribute('aria-pressed', btns[i].getAttribute('data-mode') === id ? 'true' : 'false');
+    }
+  }
+  function buildModeSeg() {
+    var wrap = document.getElementById('modeSeg');
+    if (!wrap) { return; }
+    wrap.textContent = '';
+    for (var i = 0; i < MODES.length; i++) {
+      var m = MODES[i];
+      var b = el('button', {
+        'class': 'modeseg-btn', type: 'button', 'data-mode': m.id, 'aria-pressed': 'false',
+        title: m.soon ? (m.label + ' — arrives in M10') : (m.label + ' mode')
+      }, [m.label]);
+      if (m.soon) { b.disabled = true; }   // reserved slot: visible, clearly marked, not selectable
+      else { (function (id) { b.addEventListener('click', function () { applyMode(id); }); })(m.id); }
+      wrap.appendChild(b);
+    }
+  }
+  function applyMode(id) {
+    // Selectable modes are standard|professional; 'documents' is not paintable
+    // yet (falls back to standard). Presentation only — no posture side effects.
+    if (id !== 'professional') { id = DEFAULT_MODE; }
+    document.documentElement.setAttribute('data-mode', id);
+    try { localStorage.setItem(LS_MODE, id); } catch (e) { /* private mode: in-memory only */ }
+    if (typeof window !== 'undefined') { window.CRUX_MODE = id; }
+    syncModeSeg(id);
+    route();   // re-render: Pro density, Pro-only sections/pages, and the full pill row
+  }
+  function initMode() {
+    var m = readMode();
+    if (typeof window !== 'undefined') { window.CRUX_MODE = m; }
+    document.documentElement.setAttribute('data-mode', m);
+    buildModeSeg();
+    syncModeSeg(m);
+  }
+
   // ---- Posture (customer-safe, server-derived) ---------------------------
   // Posture is a SERVER property, derived fresh at boot (see boot()) and cached
   // in memory only — never localStorage. Default 'customer' until derivation
@@ -1101,6 +1226,7 @@
     var list = pagesForDest(destId);
     for (var i = 0; i < list.length; i++) {
       if (list[i].pill === false) { continue; }   // folded out of the pill row (reachable via the landing) — never the default
+      if (list[i].pro === true) { continue; }     // Pro-only ported page — never the default (stable across modes)
       if (!(list[i].operatorOnly && POSTURE !== 'operator')) { return list[i].id; }
     }
     return list.length ? list[0].id : null;
@@ -1392,12 +1518,17 @@
   function buildSubnav(destId, activePageId) {
     var row = el('div', { 'class': 'subnav', role: 'tablist', 'aria-label': 'Pages in this destination' });
     var list = pagesForDest(destId);
+    var pro = (typeof window !== 'undefined' && window.CRUX_MODE === 'professional');
     for (var i = 0; i < list.length; i++) {
       var p = list[i];
-      // Pages tagged pill:false are folded out of the pill row (item 0). They
-      // stay in PAGES (reachable by direct hash + rendered inline by the
-      // destination's landing), just not shown here.
-      if (p.pill === false) { continue; }
+      // Standard mode: pages tagged pill:false are folded out of the pill row
+      // (reachable via the landing / direct hash), and pro:true ported pages are
+      // hidden entirely. Professional mode shows ALL pages of the destination as
+      // pills — incl. the pill:false cx-overview and the ported Pro pages.
+      if (!pro) {
+        if (p.pill === false) { continue; }
+        if (p.pro === true) { continue; }
+      }
       var pill = el('button', {
         'class': 'pill', type: 'button', 'data-page': p.id,
         'aria-current': p.id === activePageId ? 'page' : 'false'
@@ -1417,6 +1548,11 @@
     destId = dest.id;
     var page = PAGES[pageId];
     if (!page || page.dest !== destId) { pageId = firstPageId(destId); page = PAGES[pageId]; }
+    // A Pro-only page directly routed in Standard mode redirects to the
+    // destination's default page (presentation gate — never a posture gate).
+    if (page && page.pro === true && !(typeof window !== 'undefined' && window.CRUX_MODE === 'professional')) {
+      pageId = firstPageId(destId); page = PAGES[pageId];
+    }
 
     // Rail active state.
     var btns = document.querySelectorAll('#nav .nav-item');
@@ -1522,6 +1658,7 @@
   // ---- Init --------------------------------------------------------------
   function init() {
     initDemo();   // set window.CRUX_DEMO before any module render reads it
+    initMode();   // set window.CRUX_MODE + build the mode segmented control before first render
     document.querySelector('.brand .mark').innerHTML = ICONS.logo;
     document.querySelector('.passport-chip .avatar').innerHTML = ICONS.passport;
     buildRail();
