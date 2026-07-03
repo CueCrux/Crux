@@ -88,13 +88,16 @@ pub struct McpContext {
     pub revocation_enforced: bool,
 }
 
-/// passport-revocation M3: read the `CRUX_PASSPORT_REVOCATION` flag (default
-/// off). `corecruxd::main` threads the result into
+/// passport-revocation M3: read the `CRUX_PASSPORT_REVOCATION` flag. Launch
+/// default ON (proven live) — a revoked passport is reduced to read-only.
+/// On a fresh install nothing is revoked, so enforcement is a no-op until a
+/// revocation is issued. Explicit `CRUX_PASSPORT_REVOCATION=0` disables it.
+/// `corecruxd::main` threads the result into
 /// [`McpContext::with_revocation_enforced`].
 pub fn revocation_enforced_from_env() -> bool {
     std::env::var("CRUX_PASSPORT_REVOCATION")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 impl McpContext {

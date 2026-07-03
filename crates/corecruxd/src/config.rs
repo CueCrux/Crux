@@ -1152,7 +1152,9 @@ pub fn load_config() -> Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(3600)
             .clamp(60, 86_400),
-        coord_enabled: env_bool("CORECRUXD_COORD").unwrap_or(false),
+        // Launch default: coordination plane ON (proven live on host crux).
+        // Explicit `CORECRUXD_COORD=0` still disables it.
+        coord_enabled: env_bool("CORECRUXD_COORD").unwrap_or(true),
         coord_presence_ttl_secs: std::env::var("CORECRUXD_COORD_PRESENCE_TTL_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1620,8 +1622,9 @@ mod tests {
         assert_eq!(cfg.dir_l0_max_runs, 8);
         // Ephemeral GC is default OFF.
         assert!(!cfg.ephemeral_gc_enabled);
-        // Coordination plane is default OFF; presence TTL defaults to 15 min.
-        assert!(!cfg.coord_enabled);
+        // Coordination plane is default ON for launch; presence TTL defaults
+        // to 15 min. Explicit `CORECRUXD_COORD=0` disables it.
+        assert!(cfg.coord_enabled);
         assert_eq!(cfg.coord_presence_ttl_secs, crate::coord::DEFAULT_PRESENCE_TTL_SECS);
     }
 

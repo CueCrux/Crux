@@ -105,7 +105,9 @@ impl CustodyInputs {
             // Prefer the threaded runtime value over re-reading env, so a
             // test that sets it via `with_revocation_enforced` is honoured.
             revocation_enforced: ctx.revocation_enforced,
-            agent_card_enabled: env_flag("CRUX_AGENT_CARD"),
+            // Use the same resolver as the live gate so the scorecard reflects
+            // the launch default (agent-card ON unless CRUX_AGENT_CARD=0).
+            agent_card_enabled: crate::server::agent_card_enabled(),
             receipt_verify_enabled: env_flag("CORECRUXD_FEATURE_RECEIPT_VERIFY"),
             audit_export_online: env_flag("CORECRUXD_FEATURE_AUDIT_EXPORT"),
             router_present: ctx.rcx_router.is_some(),
