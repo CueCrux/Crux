@@ -466,8 +466,11 @@
     </main>
   </div>
 
-<!-- No-build module split, served same-origin (console.rs embeds these). pages.js
-     carries the ported 26-page registry; render.js is the DSL renderer. -->
+<!-- No-build module split, served same-origin (console.rs embeds these). api.js
+     is the generated allowlist fetch client (must load first — pages/render use
+     window.CruxApi); pages.js carries the ported 26-page registry; render.js is
+     the DSL renderer. -->
+<script src="/console-v2/api.js"></script>
 <script src="/console-v2/pages.js"></script>
 <script src="/console-v2/render.js"></script>
 <script>
@@ -617,9 +620,12 @@
   }
   function str(v) { return (v == null || v === '') ? '—' : String(v); }
 
-  // ---- Network: never throws, never spams the console --------------------
+  // ---- Network: never throws, never spams the console. Reads go through the
+  // generated allowlist client (window.CruxApi) — no raw fetches (M2 gate).
   function fetchJSON(url) {
-    return fetch(url, { credentials: 'same-origin', headers: { accept: 'application/json' } })
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api.get !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    return api.get(url)
       .then(function (r) {
         return r.json().then(
           function (data) { return { ok: r.ok, status: r.status, data: data }; },

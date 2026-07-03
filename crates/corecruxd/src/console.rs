@@ -40,6 +40,10 @@ const CONSOLE_V2_HTML: &str = include_str!("../console/v2/shell.html");
 // ported 26-page registry; `render.js` is the DSL renderer.
 const CONSOLE_V2_PAGES_JS: &str = include_str!("../console/v2/pages.js");
 const CONSOLE_V2_RENDER_JS: &str = include_str!("../console/v2/render.js");
+// Generated read-only fetch client (M2): produced from the ROUTES manifest by
+// `cargo test -p corecruxd --test route_spec_drift -- --ignored regen_api_js`.
+// GET routes only — the customer-safe posture holds at the client layer too.
+const CONSOLE_V2_API_JS: &str = include_str!("../console/v2/api.js");
 const CONSOLE_V2_ENV: &str = "CORECRUXD_CONSOLE_V2";
 const CONSOLE_DEV_PATH_ENV: &str = "CORECRUXD_CONSOLE_DEV_PATH";
 
@@ -129,6 +133,7 @@ async fn serve_console_v2_asset(AxumPath(name): AxumPath<String>) -> Response {
     let embedded: &'static str = match name.as_str() {
         "pages.js" => CONSOLE_V2_PAGES_JS,
         "render.js" => CONSOLE_V2_RENDER_JS,
+        "api.js" => CONSOLE_V2_API_JS,
         _ => return (axum::http::StatusCode::NOT_FOUND, "no such console-v2 asset").into_response(),
     };
     // Dev override wins when present.
@@ -523,7 +528,7 @@ fn resolve_dev_html_path(base: &Path) -> PathBuf {
 mod tests {
     use super::{
         dev_html_override, resolve_console_body, resolve_console_html, CONSOLE_DEV_PATH_ENV, CONSOLE_HTML,
-        CONSOLE_V2_ENV, CONSOLE_V2_HTML, CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS,
+        CONSOLE_V2_API_JS, CONSOLE_V2_ENV, CONSOLE_V2_HTML, CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS,
     };
     use std::sync::Mutex;
 
@@ -822,8 +827,9 @@ mod tests {
                 "v2 shell missing expected marker: {required}"
             );
         }
-        // The M1 module split is wired: the shell loads the two same-origin modules.
-        for required in ["/console-v2/pages.js", "/console-v2/render.js"] {
+        // The module split is wired: the shell loads the same-origin modules
+        // (api.js first — pages/render read window.CruxApi).
+        for required in ["/console-v2/api.js", "/console-v2/pages.js", "/console-v2/render.js"] {
             assert!(
                 CONSOLE_V2_HTML.contains(required),
                 "v2 shell must load the module: {required}"
@@ -836,7 +842,11 @@ mod tests {
     #[test]
     fn console_v2_modules_carry_licence_and_no_external_runtime_deps() {
         // Every v2 file keeps the CCL header + the no-external-runtime-deps posture.
-        for (name, body) in [("pages.js", CONSOLE_V2_PAGES_JS), ("render.js", CONSOLE_V2_RENDER_JS)] {
+        for (name, body) in [
+            ("pages.js", CONSOLE_V2_PAGES_JS),
+            ("render.js", CONSOLE_V2_RENDER_JS),
+            ("api.js", CONSOLE_V2_API_JS),
+        ] {
             assert!(
                 body.contains("CueCrux Community Licence (CCL v1.0)"),
                 "{name} must carry the CCL licence header"

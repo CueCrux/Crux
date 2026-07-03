@@ -51,10 +51,13 @@
     return node;
   }
 
-  // ---- Network: never throws, never spams the console --------------------
+  // ---- Network: never throws, never spams the console. Every read goes
+  // through the generated allowlist client (window.CruxApi from
+  // /console-v2/api.js) — the v2 console performs no raw fetches (M2 gate).
   function fetchJSON(url) {
-    if (typeof fetch !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
-    return fetch(url, { credentials: 'same-origin', headers: { accept: 'application/json' } })
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api.get !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    return api.get(url)
       .then(function (r) {
         return r.json().then(
           function (data) { return { ok: r.ok, status: r.status, data: data }; },

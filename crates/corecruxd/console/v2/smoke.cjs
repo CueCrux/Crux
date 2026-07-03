@@ -216,6 +216,30 @@ function extractThemeVars(theme) {
   notes.push('scanned ' + files.length + ' shipped v2 file(s) for external deps: ' + files.join(', '));
 })();
 
+// =========================================================================
+//  Check 6 — M2 contract gate: reads only through the generated client.
+//  The ONLY shipped v2 file allowed to call fetch() is the generated api.js;
+//  pages/render/shell route every read through window.CruxApi.get (allowlist-
+//  guarded). api.js must load before pages.js/render.js in the shell.
+// =========================================================================
+(function checkThroughClientFetches() {
+  ['pages.js', 'render.js', 'shell.html'].forEach(function (f) {
+    const src = fs.readFileSync(path.join(DIR, f), 'utf8');
+    const hits = (src.match(/\bfetch\s*\(/g) || []).length;
+    check(hits === 0, '[through-client] ' + f + ' calls fetch() directly (' + hits + '×) — route reads via CruxApi.get');
+  });
+  const shellSrc = fs.readFileSync(path.join(DIR, 'shell.html'), 'utf8');
+  const apiAt = shellSrc.indexOf('/console-v2/api.js');
+  const pagesAt = shellSrc.indexOf('/console-v2/pages.js');
+  check(apiAt >= 0 && pagesAt > apiAt, '[through-client] shell.html must load api.js before pages.js');
+  const apiSrc = fs.readFileSync(path.join(DIR, 'api.js'), 'utf8');
+  check(/LITERAL_GET_PATHS/.test(apiSrc) && /window\.CruxApi\s*=\s*CruxApi/.test(apiSrc),
+    '[through-client] api.js must expose the allowlist-guarded window.CruxApi global');
+  check(!/^\s*export\s+(const|default|function|let|var|class)\b/m.test(apiSrc),
+    '[through-client] api.js must be a classic script (no export statements) for the no-build shell');
+  notes.push('through-client rule: pages/render/shell contain zero direct fetch() calls; api.js is the sole network layer.');
+})();
+
 // ---- Report -------------------------------------------------------------
 console.log('unified-shell-console v2 — M1 smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
@@ -224,5 +248,5 @@ if (failures.length) {
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all M1 gates green (26/26 ids, control-type coverage, theme contrast, posture gate, no external deps).');
+console.log('\nPASS — all gates green (26/26 ids, control coverage, theme contrast, posture gate, no external deps, through-client fetches).');
 process.exit(0);
