@@ -125,6 +125,14 @@ async fn redirect_to_console() -> impl IntoResponse {
 /// `/console` serves when `CORECRUXD_CONSOLE_V2` is off). Deep-machinery
 /// fallbacks in the v2 shell (e.g. the Workbench card) link here so the full Pro
 /// console stays reachable even while v2 is the default surface.
+///
+/// DEPRECATED (retired 2026-07-03, ExecPlan `unified-shell-console-2026-07-03`,
+/// M10). The unified v2 shell is now THE console surface; this legacy body is
+/// retained only as a fallback for deep-machinery links (the Pro workbench) and
+/// as the flag-off byte-parity baseline. It is not the forward-facing surface
+/// and gains no new features — treat it as frozen. Do not build against it; new
+/// work lands in `crates/corecruxd/console/v2/`. (Comment-only marker: the
+/// flag-off byte-parity test asserts the served body is unchanged.)
 async fn serve_console_legacy() -> impl IntoResponse {
     Html(resolve_console_html().into_owned())
 }

@@ -851,7 +851,10 @@
         controls: [
           info('scope', 'brief · context-pack · impact-preflight · policy-simulation · route-probe · query lanes · entities'),
           info('note', 'the workbench is operator deep machinery; it opens on the Pro console'),
-          link('Open the Pro console', '/console/legacy', { hint: 'opens the full legacy workbench' })
+          // Retirement (M10): the v2 shell is the surface. The legacy console is
+          // retained only as a fallback for the deep-machinery workbench.
+          info('legacy console', '(legacy — retired, kept as fallback)'),
+          link('Open the Pro console', '/console/legacy', { hint: 'opens the full legacy workbench (legacy — retired, kept as fallback)' })
         ] },
       { h: '3D substrate', sub: 'the graph/topology view renders on the Pro 3D canvas', wide: true,
         controls: [
@@ -995,6 +998,13 @@
   // manifest covers it EXACTLY — zero missing, zero unlabeled, zero stray. This
   // is the machine-readable proof that nothing from /console/legacy was dropped.
   var LEGACY_PORT = {
+    // ── Retirement marker (M10) — the top-level metadata key. On this date the
+    // legacy console (crates/corecruxd/src/console.rs serve_console_legacy) was
+    // formally RETIRED: the v2 unified shell is the surface, and the legacy body
+    // is retained only as a fallback (still reachable at /console/legacy). Not a
+    // legacy section — the smoke's port-checklist integrity check skips this key
+    // and asserts its value directly. See ExecPlan unified-shell-console-2026-07-03.
+    retired_at: '2026-07-03',
     // ── CX (26) — the forward-facing scope, ported in M1; each keeps its id ──
     'cx-overview': 'home:cx-overview', 'cx-activity': 'home:cx-activity', 'cx-cost': 'home:cx-cost',
     'cx-projects': 'home:cx-projects', 'cx-work': 'home:cx-work', 'cx-usage': 'home:cx-usage',
@@ -1138,7 +1148,55 @@
         { entity: 'execplan:unified-shell-console', key: 'gate:M6', value: '{ status: passing, commit_sha: 1a60d25 }', stored_at: new Date(NOW - 3 * HOUR).toISOString() },
         { entity: 'bench:cdb-v1', key: 'result', value: 'crux ties vendor-native on static recall', stored_at: new Date(NOW - 20 * HOUR).toISOString() },
         { entity: 'decision:packaging', key: 'scenario', value: 'hybrid keep-vow + free-verifier', stored_at: new Date(NOW - 2 * DAY).toISOString() }
-      ]
+      ],
+      // Documents mode (M10) fixture — the WebCrux Proof reader narrative
+      // (webcrux-surfaces-demo-v3.jsx PROOF), ported so the reader shows its
+      // full Section/Card composition + evidence material in demo mode. Surfaced
+      // ONLY behind demoOn() via demoData('docsReader'); every panel is demo-
+      // chipped. The reading body composes as sections → chunks (each with a
+      // coverage label + score); the evidence side rail carries support/context/
+      // challenge EvidenceCards, a coverage breakdown, and CROWN receipt rows.
+      docsReader: {
+        title: 'Q3 2025 Market Outlook — European Semiconductor Supply Chain',
+        subtitle: 'Internal Research Brief · Compliance Review Requested',
+        mode: 'verified', receiptId: 'rcpt_4f8a2b1c9e3d7f6a',
+        coverage: { label: 'Medium', score: 0.61, fragility: 0.42,
+          components: [['retrieval', 0.68], ['domains', 0.57], ['temporal', 0.65], ['clusters', 0.58]] },
+        sections: [
+          { title: 'Executive Summary', chunks: [
+            { id: 'c01', label: 'supported', cov: { label: 'High', score: 0.82 },
+              text: 'European chip manufacturers have committed to investing €43 billion in domestic fabrication capacity by 2030, aiming to double the region’s share of global production from 10% to 20%.',
+              claims: ['EU Chips Act investment figure of €43bn', 'Current EU share approximately 10%', 'Target of 20% by 2030'] },
+            { id: 'c02', label: 'contested', cov: { label: 'Medium', score: 0.45 }, fragile: true,
+              text: 'ASML’s latest EUV lithography systems are now capable of producing chips at the 2nm node, positioning the Netherlands as the critical bottleneck in global advanced semiconductor supply chains.',
+              claims: ['ASML EUV systems at 2nm production capability', 'Netherlands as critical single-point bottleneck'] } ] },
+          { title: 'Supply Chain Analysis', chunks: [
+            { id: 'c03', label: 'supported', cov: { label: 'High', score: 0.74 },
+              text: 'Germany’s new semiconductor cluster in Dresden, anchored by Intel’s planned €30 billion facility and TSMC’s joint venture with Bosch, NXP, and Infineon, represents the largest single investment in European chip manufacturing history.',
+              claims: ['Intel €30bn Dresden facility', 'TSMC-Bosch-NXP-Infineon joint venture'] },
+            { id: 'c04', label: 'thin', cov: { label: 'Low', score: 0.28 },
+              text: 'Legacy chip shortages continue to affect European automotive manufacturers, with lead times for microcontrollers still averaging 32 weeks as of July 2025.',
+              claims: ['Ongoing legacy chip shortages', 'MCU lead times at 32 weeks as of July 2025'] } ] },
+          { title: 'Conclusion', chunks: [
+            { id: 'c12', label: 'supported', cov: { label: 'Medium', score: 0.62 },
+              text: 'Structural dependencies on ASML lithography, Asian packaging expertise, and specialised materials supply chains mean European strategic autonomy in semiconductors remains aspirational rather than achievable within the current planning horizon.',
+              claims: ['ASML lithography dependency', 'Asian packaging dependency'] } ] }
+        ],
+        evidence: [
+          { role: 'support', domain: 'eur-lex.europa.eu', score: 0.94, source: 'EU Chips Act Official Text (2023)', observedAt: '2025-09-20',
+            quote: '…mobilise more than 43 billion euros in public and private investment…' },
+          { role: 'support', domain: 'semi.org', score: 0.87, source: 'SEMI Industry Report Q2 2025', observedAt: '2025-08-15',
+            quote: '…European share of global semiconductor manufacturing stood at 9.8%…' },
+          { role: 'context', domain: 'brookings.edu', source: 'US CHIPS Act Comparison',
+            summary: 'US allocated $52.7bn under the CHIPS and Science Act, creating competitive dynamics with EU policy.' },
+          { role: 'challenge', domain: 'spectrum.ieee.org', type: 'counterfactual', source: 'IEEE Spectrum Analysis',
+            summary: 'Multiple lithography vendors including Canon’s NIL approach may reduce single-vendor dependency at advanced nodes.' }
+        ],
+        receipts: [
+          { id: 'rcpt_4f8a2b1c9e3d7f6a', label: 'proof · verified', ts: '2025-10-14 09:32' },
+          { id: 'rcpt_2b4c6d8e0f1a3g5i', label: 'replay · deterministic', ts: '2025-10-14 09:52' }
+        ]
+      }
     };
   })();
 

@@ -1626,9 +1626,342 @@
     return Promise.resolve();
   }
 
+  // =======================================================================
+  //  Documents mode (M10) — the console-as-reader.
+  //
+  //  Ported COMPOSITION + MATERIAL from the WebCrux Proof reader
+  //  (PlanCrux/docs/roadmaps/webcrux/UIWebSurfaces/webcrux-surfaces-demo-v3.jsx):
+  //  the Section/Card reading composition, the EvidenceCard side surface, Receipt
+  //  chips, and coverage/progress affordances — rebuilt in v2 tokens (no React,
+  //  no JSX colour values). Its three-rail Proof layout (LEFT context rail ·
+  //  CENTRE ~72ch reading column · RIGHT coverage/evidence rail) becomes the
+  //  documents-mode 3-zone: the slimmed rail is the document tree, the main column
+  //  is the reading surface, and the right panel is the evidence material.
+  //
+  //  Mode is PRESENTATION: renderDocuments NEVER touches posture (the security
+  //  boundary). Real sources ground the reader — bundled daemon reference docs
+  //  (genuinely shipped with this build; the same content the Pro dx-docs page
+  //  lists) + per-tenant document corpora (GET /v1/console/tenants, chunks via the
+  //  named CruxApi.consoleTenantsByTenantIdChunks method). Evidence is grounded in
+  //  real facts (/v1/console/facts) + receipt refs (/v1/activity). The JSX's rich
+  //  Proof narrative is a demoOn()-gated fixture (demoData('docsReader')) so the
+  //  reader shows its full composition in demo mode — clearly demo-chipped.
+  // =======================================================================
+
+  // Bundled daemon reference docs — real, offline, no endpoint (the same static
+  // reference content the Pro dx-docs page carries, composed here as a reader).
+  var DOC_REFERENCE = [
+    { slug: 'readme-corecruxd', title: 'README · corecruxd', subtitle: '17 crates · axum HTTP :14800 · Ed25519 CROWN receipts',
+      sections: [
+        { h: 'Build', body: ['cargo build --release builds the CPU-only daemon.', 'cargo test --workspace runs the suite; cargo clippy --workspace -- -D warnings gates the lint.'] },
+        { h: 'Architecture', body: ['An axum HTTP surface on :14800 alongside a tonic gRPC plane.', 'An append-only shard store with sealed segments; Ed25519 CROWN receipts sign every mutation.'] },
+        { h: 'Key rules', body: ['No GPU/CUDA in this repo — the daemon is CPU-only.', 'Port 14800 is fixed. Source-available under the CueCrux Community Licence.'] }
+      ] },
+    { slug: 'plans-md', title: 'PLANS.md', subtitle: 'the ExecPlan format',
+      sections: [
+        { h: 'Required sections', body: ['Every ExecPlan carries Purpose, Non-goals, Context, Constraints, Proposed design, Milestones, Test plan, Rollout/rollback, Risks, Progress, and a Decision log.', 'Plans are living documents: the Progress checklist and Decision log stay current milestone-by-milestone.'] }
+      ] },
+    { slug: 'mcp-system-prompt', title: 'mcp-system-prompt.md', subtitle: 'the MCP tool surface + capability ladder',
+      sections: [
+        { h: 'Tool surface', body: ['Retrieval: query, query_scan, query_expand.', 'Memory: store_fact, query_facts, delete_fact.', 'Coordination + observability: create_handoff, accept_handoff, sync_status, get_bootstrap.'] },
+        { h: 'Two non-negotiables', body: ['token_budget is mandatory on every retrieval call.', 'Chat is for state transitions; durable content goes to store_fact or files.'] }
+      ] }
+  ];
+
+  // Per-tenant document chunks via the named method (a parameterised route —
+  // reachable only through the method, never CruxApi.get's literal allowlist).
+  // Keeps renderDocuments at zero raw fetches (the network layer lives in api.js).
+  function fetchTenantChunks(tenantId) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api.consoleTenantsByTenantIdChunks !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    return api.consoleTenantsByTenantIdChunks(tenantId)
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, status: r.status, data: d }; }, function () { return { ok: r.ok, status: r.status, data: null }; }); })
+      .catch(function () { return { ok: false, status: 0, data: null }; });
+  }
+
+  // Small module cache so selecting a doc doesn't re-fetch the tenant list.
+  var __docCache = { tenants: null };
+
+  // ---- Reader material — ported micro-surfaces (v2 tokens) ---------------
+  function docStr(v) { return (v == null || v === '') ? '—' : String(v); }
+  var DOC_COV_TONE = { high: 'ok', medium: 'warn', low: 'crit' };
+  function docCovTone(label) { return DOC_COV_TONE[String(label || '').toLowerCase()] || 'ink3'; }
+  function docCovBadge(label, score) {
+    var tone = docCovTone(label);
+    var txt = String(label || '—') + (score != null ? ' · ' + Math.round(score * 100) + '%' : '');
+    return el('span', { 'class': 'doc-cov doc-cov-' + tone, text: txt });
+  }
+  // Section micro-label (ported Section): mono · uppercase · wide tracking.
+  function docSection(text) { return el('div', { 'class': 'doc-sec', text: String(text) }); }
+  // A coverage component bar (ported CovBar) — reuses the .ctl-bar track/fill.
+  function docCovBar(label, value) {
+    var pct = Math.max(0, Math.min(100, Math.round((Number(value) || 0) * 100)));
+    var tone = pct > 66 ? 'ok' : (pct > 33 ? '' : 'err');
+    var track = el('div', { 'class': 'ctl-bar-track' }, [el('div', { 'class': 'ctl-bar-fill' + (tone ? ' ' + tone : '') })]);
+    track.firstChild.style.width = pct + '%';
+    return el('div', { 'class': 'ctl-bar' }, [
+      el('div', { 'class': 'ctl-bar-head' }, [el('span', { text: String(label) }), el('span', { 'class': 'ctl-bar-val', text: pct + '%' })]),
+      track
+    ]);
+  }
+  // Receipt chip (ported Receipt): a mono ⛓ hash chip.
+  function docReceipt(id, label, tsText) {
+    var row = el('div', { 'class': 'doc-receipt' }, [
+      el('span', { 'class': 'doc-receipt-id', text: '⛓ ' + String(id) })
+    ]);
+    if (label) { row.appendChild(el('span', { 'class': 'doc-receipt-label', text: String(label) })); }
+    if (tsText) { row.appendChild(el('span', { 'class': 'doc-receipt-ts', text: String(tsText) })); }
+    return row;
+  }
+  // EvidenceCard (ported) — a card with a role-keyed left strip: support→ok,
+  // context→trust, challenge→warn. Surfaces real fields only.
+  var DOC_ROLE_TONE = { support: 'ok', context: 'trust', challenge: 'warn' };
+  function docEvidenceCard(e) {
+    var tone = DOC_ROLE_TONE[e.role] || 'ink3';
+    var card = el('div', { 'class': 'doc-evcard doc-ev-' + tone });
+    var top = el('div', { 'class': 'doc-evcard-top' }, [el('span', { 'class': 'doc-evcard-domain', text: docStr(e.domain || e.source || 'source') })]);
+    if (e.score != null) { top.appendChild(el('span', { 'class': 'doc-cov doc-cov-' + (e.score > 0.7 ? 'ok' : 'warn'), text: Math.round(e.score * 100) + '%' })); }
+    card.appendChild(top);
+    if (e.quote) { card.appendChild(el('div', { 'class': 'doc-evcard-quote', text: '“' + e.quote + '”' })); }
+    if (e.summary) { card.appendChild(el('div', { 'class': 'doc-evcard-summary', text: e.summary })); }
+    if (e.type) { card.appendChild(el('span', { 'class': 'doc-cov doc-cov-' + (e.type === 'contradiction' ? 'crit' : 'warn'), text: e.type })); }
+    var foot = el('div', { 'class': 'doc-evcard-foot' }, [el('span', { text: docStr(e.source || e.domain) })]);
+    if (e.observedAt) { foot.appendChild(el('span', { 'class': 'doc-evcard-ts', text: String(e.observedAt) })); }
+    card.appendChild(foot);
+    return card;
+  }
+
+  // ---- Document source model (real + demo) -------------------------------
+  // Resolve a docId ("ref:<slug>" · "tenant:<id>" · "demo:proof") + the source
+  // list. Real tenants win; the demo Proof doc appears only when demoOn().
+  function docDefaultId(tenants) {
+    if (demoOn()) { return 'demo:proof'; }
+    if (DOC_REFERENCE.length) { return 'ref:' + DOC_REFERENCE[0].slug; }
+    if (tenants && tenants.length) { return 'tenant:' + (tenants[0].tenant_id || tenants[0].id); }
+    return null;
+  }
+
+  // Build the rail document tree (left zone) + the phone sources sheet share it.
+  function buildDocTree(host, tenants, activeId) {
+    host.textContent = '';
+    function group(title) { host.appendChild(el('div', { 'class': 'doc-tree-group', text: title })); }
+    function item(id, label, sub) {
+      var b = el('button', { 'class': 'doc-tree-item', type: 'button', 'data-doc': id, 'aria-current': id === activeId ? 'page' : 'false' }, [
+        el('span', { 'class': 'doc-tree-label', text: label })
+      ]);
+      if (sub) { b.appendChild(el('span', { 'class': 'doc-tree-sub', text: sub })); }
+      b.addEventListener('click', function () { location.hash = '#/documents/' + id; });
+      host.appendChild(b);
+    }
+    if (demoOn()) {
+      var dr = demoData('docsReader');
+      group('Demo');
+      item('demo:proof', dr ? dr.title.split(' — ')[0] : 'Proof reader', 'verified · demo fixture');
+    }
+    group('Reference');
+    DOC_REFERENCE.forEach(function (d) { item('ref:' + d.slug, d.title, d.subtitle); });
+    group('Corpora · tenants');
+    var live = (tenants || []).filter(function (t) { return !/^__/.test(String(t.tenant_id || t.id || '')); });
+    if (live.length) {
+      live.forEach(function (t) {
+        var id = t.tenant_id || t.id;
+        item('tenant:' + id, String(id), [t.category, t.source].filter(Boolean).join(' · ') || 'tenant corpus');
+      });
+    } else {
+      host.appendChild(el('p', { 'class': 'ctl-desc doc-tree-empty', text: demoOn() ? 'No live tenant corpora — demo Proof doc shown above.' : 'No tenant corpora yet — the daemon has read no documents.' }));
+    }
+  }
+
+  // ---- Reading surface (centre) ------------------------------------------
+  function docReadHeader(main, title, subtitle, mode, cov) {
+    var head = el('div', { 'class': 'doc-read-head' });
+    head.appendChild(el('h1', { 'class': 'doc-read-title', text: title }));
+    if (subtitle) { head.appendChild(el('p', { 'class': 'doc-read-sub', text: subtitle })); }
+    var chips = el('div', { 'class': 'doc-read-chips' });
+    if (mode) { chips.appendChild(el('span', { 'class': 'doc-cov doc-cov-trust', text: mode })); }
+    if (cov) { chips.appendChild(docCovBadge(cov.label, cov.score)); }
+    if (chips.childNodes.length) { head.appendChild(chips); }
+    main.appendChild(head);
+  }
+  function docReadChunk(container, ch) {
+    var tone = docCovTone(ch.cov && ch.cov.label);
+    var block = el('div', { 'class': 'doc-chunk doc-chunk-' + tone });
+    block.appendChild(el('p', { 'class': 'doc-chunk-text', text: ch.text }));
+    var meta = el('div', { 'class': 'doc-chunk-meta' });
+    if (ch.label) { meta.appendChild(el('span', { 'class': 'doc-cov doc-cov-' + tone, text: String(ch.label).replace(/_/g, ' ') })); }
+    if (ch.cov && ch.cov.score > 0) { meta.appendChild(docCovBadge(ch.cov.label, ch.cov.score)); }
+    if (ch.claims && ch.claims.length) { meta.appendChild(el('span', { 'class': 'doc-chunk-claims', text: ch.claims.length + ' claim' + (ch.claims.length === 1 ? '' : 's') })); }
+    if (ch.fragile) { meta.appendChild(el('span', { 'class': 'doc-cov doc-cov-crit', text: '⚠ fragile' })); }
+    if (meta.childNodes.length) { block.appendChild(meta); }
+    container.appendChild(block);
+  }
+  function renderDocReference(main, doc) {
+    docReadHeader(main, doc.title, doc.subtitle, 'reference', null);
+    (doc.sections || []).forEach(function (sec) {
+      main.appendChild(docSection(sec.h));
+      var card = el('div', { 'class': 'doc-card' });
+      (sec.body || []).forEach(function (p) { card.appendChild(el('p', { 'class': 'doc-chunk-text', text: p })); });
+      main.appendChild(card);
+    });
+  }
+  function renderDocDemo(main, doc) {
+    docReadHeader(main, doc.title, doc.subtitle, doc.mode, doc.coverage);
+    main.appendChild(demoChip(true));
+    (doc.sections || []).forEach(function (sec) {
+      main.appendChild(docSection(sec.title));
+      (sec.chunks || []).forEach(function (ch) { docReadChunk(main, ch); });
+    });
+  }
+  function renderDocTenant(main, tenantId) {
+    docReadHeader(main, tenantId, 'tenant corpus · what the daemon has read', 'corpus', null);
+    var host = el('div', { 'class': 'doc-tenant-body' }, [el('p', { 'class': 'ctl-desc', text: 'Loading documents…' })]);
+    main.appendChild(host);
+    fetchTenantChunks(tenantId).then(function (res) {
+      host.textContent = '';
+      if (!res.ok || !res.data) {
+        host.appendChild(el('p', { 'class': 'ctl-desc', text: res.status === 404 ? 'No per-tenant chunk endpoint on this build.' : ('Documents unavailable — ' + (res.status === 0 ? 'unreachable' : 'HTTP ' + res.status) + '.') }));
+        return;
+      }
+      var chunks = res.data.chunks || res.data.items || (Array.isArray(res.data) ? res.data : []);
+      if (!chunks.length) { host.appendChild(el('p', { 'class': 'ctl-desc', text: 'No documents read into this tenant yet.' })); return; }
+      // Group by document/source when the chunk carries one; else a flat read.
+      var groups = {};
+      chunks.slice(0, 60).forEach(function (c) {
+        var g = c.doc_id || c.document || c.source || c.section || 'document';
+        (groups[g] = groups[g] || []).push(c);
+      });
+      Object.keys(groups).forEach(function (g) {
+        main.appendChild(docSection(g));
+        var card = el('div', { 'class': 'doc-card' });
+        groups[g].slice(0, 20).forEach(function (c) {
+          var text = c.text || c.preview || c.content || c.body || (c.digest ? ('chunk ' + c.digest) : JSON.stringify(c).slice(0, 200));
+          card.appendChild(el('p', { 'class': 'doc-chunk-text', text: String(text) }));
+        });
+        main.appendChild(card);
+      });
+    });
+  }
+
+  // ---- Evidence panel (right zone) ---------------------------------------
+  // Real facts as EvidenceCards + receipt refs from activity + coverage/progress
+  // where real numbers exist; the demo doc fills all three from its fixture.
+  function renderDocEvidence(panel, ctx, docId) {
+    panel.textContent = '';
+    var isDemoDoc = docId === 'demo:proof';
+    var dr = isDemoDoc ? demoData('docsReader') : null;
+
+    // 1 · Coverage / progress — only where real numbers exist.
+    if (dr && dr.coverage) {
+      panel.appendChild(docSection('Coverage'));
+      var covCard = el('div', { 'class': 'doc-card' }, [docCovBadge(dr.coverage.label, dr.coverage.score)]);
+      (dr.coverage.components || []).forEach(function (c) { covCard.appendChild(docCovBar(c[0], c[1])); });
+      if (dr.coverage.fragility != null) { covCard.appendChild(el('p', { 'class': 'ctl-desc', text: 'Fragility ' + Math.round(dr.coverage.fragility * 100) + '% — evidence base concentration.' })); }
+      covCard.appendChild(demoChip(true));
+      panel.appendChild(covCard);
+    } else {
+      var s = ctx && ctx.summary;
+      var free = get(s, ['capacity', 'free_ratio']);
+      var facts = get(s, ['stores', 'facts']);
+      if (free != null || facts != null) {
+        panel.appendChild(docSection('Corpus'));
+        var card = el('div', { 'class': 'doc-card' });
+        if (facts != null) { card.appendChild(kv('facts', fmtChartVal(facts, 'compact'))); }
+        if (free != null) { card.appendChild(docCovBar('storage free', free)); }
+        panel.appendChild(card);
+      }
+    }
+
+    // 2 · Related facts as EvidenceCards.
+    panel.appendChild(docSection('Related facts'));
+    if (dr) {
+      (dr.evidence || []).forEach(function (e) { panel.appendChild(docEvidenceCard(e)); });
+      panel.appendChild(demoChip(true));
+    } else {
+      var factsHost = el('div', { 'class': 'doc-ev-host' }, [el('p', { 'class': 'ctl-desc', text: 'Loading facts…' })]);
+      panel.appendChild(factsHost);
+      fetchJSON('/v1/console/facts?top_k=8').then(function (res) {
+        factsHost.textContent = '';
+        var fs = (res.ok && res.data && res.data.facts) ? res.data.facts : [];
+        if (!fs.length) { factsHost.appendChild(el('p', { 'class': 'ctl-desc', text: res.ok ? 'No related facts.' : 'Facts unavailable.' })); return; }
+        fs.slice(0, 8).forEach(function (f) {
+          factsHost.appendChild(docEvidenceCard({ role: 'support', domain: f.entity, summary: String(f.value != null ? f.value : f.key).slice(0, 160), source: f.key || f.entity, observedAt: f.stored_at ? String(f.stored_at).slice(0, 10) : null }));
+        });
+      });
+    }
+
+    // 3 · Receipts.
+    panel.appendChild(docSection('Receipts'));
+    if (dr) {
+      (dr.receipts || []).forEach(function (r) { panel.appendChild(docReceipt(r.id, r.label, r.ts)); });
+      panel.appendChild(demoChip(true));
+    } else {
+      var rcptHost = el('div', { 'class': 'doc-ev-host' }, [el('p', { 'class': 'ctl-desc', text: 'Loading receipts…' })]);
+      panel.appendChild(rcptHost);
+      fetchJSON('/v1/activity?tenant_id=default&token_budget=1500').then(function (res) {
+        rcptHost.textContent = '';
+        var rows = (res.ok && res.data && res.data.rows) ? res.data.rows : [];
+        var seen = {}, n = 0;
+        rows.forEach(function (r0) {
+          var rid = (r0.receipt_ids || [])[0] || r0.receipt_id;
+          if (!rid || seen[rid] || n >= 8) { return; }
+          seen[rid] = true; n++;
+          rcptHost.appendChild(docReceipt(rid, (r0.kind || 'event') + (r0.tool ? ' · ' + r0.tool : ''), r0.ts ? String(r0.ts) : null));
+        });
+        if (!n) { rcptHost.appendChild(el('p', { 'class': 'ctl-desc', text: res.status === 404 ? 'Activity surface off — no receipt refs.' : 'No receipts captured yet.' })); }
+      });
+    }
+  }
+
+  // ---- Documents entry point (the shell routes documents mode here) ------
+  // ctx: { summary, docId, railHost }. Builds the rail document tree (left zone),
+  // the ~72ch reading surface (centre), and the evidence panel (right zone /
+  // stacked on phone). Presentation only — no posture side effects.
+  function renderDocuments(host, ctx) {
+    ctx = ctx || {};
+    host.textContent = '';
+    function paint(tenants) {
+      var docId = ctx.docId || docDefaultId(tenants);
+      // Rail tree (desktop) — the shell hands us the rail host.
+      if (ctx.railHost) { buildDocTree(ctx.railHost, tenants, docId); }
+      var reader = el('div', { 'class': 'doc-reader' });
+      // Phone sources sheet (CSS hides it on the desktop tier, where the rail
+      // tree is shown instead).
+      var sheet = el('details', { 'class': 'doc-sources-sheet' });
+      sheet.appendChild(el('summary', { 'class': 'doc-sources-summary', text: 'Sources' }));
+      var sheetTree = el('div', { 'class': 'doc-tree' });
+      buildDocTree(sheetTree, tenants, docId);
+      sheet.appendChild(sheetTree);
+      reader.appendChild(sheet);
+      var main = el('main', { 'class': 'doc-main' });
+      var evidence = el('aside', { 'class': 'doc-evidence' });
+      reader.appendChild(main);
+      reader.appendChild(evidence);
+      host.appendChild(reader);
+      // Centre reading surface.
+      if (!docId) { main.appendChild(el('p', { 'class': 'ctl-desc', text: 'No documents to read yet. Ingest a corpus, or enable demo mode (?demo=1) to preview the reader.' })); }
+      else if (docId === 'demo:proof' && demoData('docsReader')) { renderDocDemo(main, demoData('docsReader')); }
+      else if (docId.indexOf('ref:') === 0) {
+        var ref = DOC_REFERENCE.filter(function (d) { return 'ref:' + d.slug === docId; })[0];
+        if (ref) { renderDocReference(main, ref); } else { main.appendChild(el('p', { 'class': 'ctl-desc', text: 'Unknown reference doc.' })); }
+      } else if (docId.indexOf('tenant:') === 0) { renderDocTenant(main, docId.slice('tenant:'.length)); }
+      else { main.appendChild(el('p', { 'class': 'ctl-desc', text: 'Unknown document.' })); }
+      // Evidence panel (real facts + receipts + coverage where real).
+      renderDocEvidence(evidence, ctx, docId);
+    }
+    if (__docCache.tenants) { paint(__docCache.tenants); return Promise.resolve(); }
+    return fetchJSON('/v1/console/tenants').then(function (res) {
+      var tenants = (res.ok && res.data && (res.data.tenants || res.data.items)) || [];
+      __docCache.tenants = tenants;
+      paint(tenants);
+    }).catch(function () { paint([]); });
+  }
+
   return {
     CONTROL_TYPES: CONTROL_TYPES,
     GATE_TITLE: GATE_TITLE,
+    // M10 — Documents mode (the console-as-reader).
+    renderDocuments: renderDocuments,
+    DOC_REFERENCE: DOC_REFERENCE,
     // M9 — Canvas: size-adaptive board + real-edge relation graph.
     canvasTier: canvasTier,
     parseFocus: parseFocus,

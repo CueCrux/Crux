@@ -802,8 +802,14 @@ function extractThemeVars(theme) {
   ['standard', 'professional', 'documents'].forEach(function (m) {
     check(new RegExp("id:\\s*'" + m + "'").test(shellHtml), '[mode] MODES must include the "' + m + '" slot');
   });
-  check(/soon:\s*true/.test(shellHtml), '[mode] the reserved third slot (documents) must be marked soon:true (visible but not selectable)');
-  check(/arrives in M10/.test(shellHtml), '[mode] the reserved documents slot must be labelled "arrives in M10"');
+  // M10: the reserved third slot is ACTIVATED — all three modes are selectable
+  // (Documents is the console-as-reader). No soon:true / disabled reserved slot
+  // remains; buildModeSeg wires every mode to applyMode. (This supersedes the M8
+  // "documents reserved / arrives in M10" assertion — the mode-system guarantees
+  // below are unchanged; check 27 owns the documents-mode surface.)
+  check(!/soon:\s*true/.test(shellHtml), '[mode] Documents is activated (M10) — the soon:true reserved marker must be gone');
+  const modeSegBody = funcBody(shellHtml, 'buildModeSeg');
+  check(modeSegBody && !/\.disabled\s*=\s*true/.test(modeSegBody), '[mode] buildModeSeg must not disable any mode (all three selectable in M10)');
   // Persisted + pre-paint applied as html[data-mode].
   check(/crux\.console\.mode/.test(shellHtml), '[mode] mode must persist at localStorage crux.console.mode');
   check(/setAttribute\('data-mode'/.test(shellHtml), '[mode] mode must be applied as html[data-mode] (pre-paint + applyMode)');
@@ -820,7 +826,12 @@ function extractThemeVars(theme) {
   const am = funcBody(shellHtml, 'applyMode');
   check(!!am, '[mode] shell.html must define applyMode');
   check(am && /route\(\)/.test(am), '[mode] applyMode must re-render (route()) so the Pro surface appears/disappears');
-  check(am && /window\.CRUX_MODE\s*=/.test(am), '[mode] applyMode must set window.CRUX_MODE for render.js proMode()');
+  // M10: applyMode delegates the window-flag write to the shared setModeSilently
+  // (also used by route()'s deep-link-out auto-switch); that helper sets
+  // window.CRUX_MODE for render.js proMode(). The guarantee is unchanged.
+  check(am && /setModeSilently\(/.test(am), '[mode] applyMode must set the mode via setModeSilently (shared with the route auto-switch)');
+  const setModeBody = funcBody(shellHtml, 'setModeSilently');
+  check(setModeBody && /window\.CRUX_MODE\s*=/.test(setModeBody), '[mode] setModeSilently must set window.CRUX_MODE for render.js proMode()');
   check(am && !/setPosture|isOperator|CRUX_POSTURE|derivePosture/.test(am),
     '[mode] applyMode must NOT touch posture — mode is presentation, posture is the security boundary');
   // render.js honours the mode: proMode() reads window.CRUX_MODE; renderSections
@@ -830,7 +841,9 @@ function extractThemeVars(theme) {
   check(/sections\[i\]\.pro/.test(renderSrc), '[mode] renderSections must drop pro:true sections outside Professional mode');
   check(/renderDashStrip/.test(renderSrc) && /proMode\(\)/.test(renderSrc), '[mode] the Overwatch dashboard strip must be Pro-only (proMode()-guarded)');
   // POSTURE INDEPENDENCE (statically): no posture function branches on mode.
-  const modeTokens = /CRUX_MODE|data-mode|crux\.console\.mode|proMode|professional/;
+  // Extended in M10 to include the 'documents' token (Documents mode is
+  // presentation only — posture must be blind to it too).
+  const modeTokens = /CRUX_MODE|data-mode|crux\.console\.mode|proMode|professional|documents/;
   ['setPosture', 'applyPosture', 'derivePostureFromServer', 'applyDerivedPosture'].forEach(function (fn) {
     const b = funcBody(shellHtml, fn);
     check(!!b, '[mode] shell.html must define the posture fn ' + fn);
@@ -855,6 +868,12 @@ function extractThemeVars(theme) {
 (function checkLegacyPort() {
   const LP = pages.LEGACY_PORT;
   check(LP && typeof LP === 'object', '[port] pages.js must export the LEGACY_PORT manifest');
+  // M10: LEGACY_PORT carries a top-level `retired_at` metadata key (NOT a legacy
+  // section). It is excluded from the section-inventory checks below; check 28
+  // owns the retirement asserts. The section-integrity guarantee is unchanged for
+  // the real section keys.
+  const META_KEYS = new Set(['retired_at']);
+  const sectionKeys = Object.keys(LP || {}).filter(function (k) { return !META_KEYS.has(k); });
   const CX = ['cx-overview', 'cx-activity', 'cx-cost', 'cx-projects', 'cx-work', 'cx-usage', 'cx-documents', 'cx-gates', 'cx-review', 'cx-coord', 'cx-sessions', 'cx-orchestrators', 'cx-punchcards', 'cx-passport', 'cx-identity', 'cx-receipts', 'cx-mediation', 'cx-workbench', 'cx-integrations', 'cx-extensions', 'cx-facts', 'cx-memory', 'cx-tenants', 'cx-lane-weights', 'cx-settings', 'cx-raw'];
   const DX = ['dx-articles', 'dx-readme', 'dx-sites'];
   const GX = ['gx-engrams', 'gx-bench', 'gx-sites', 'gx-factstore'];
@@ -868,14 +887,14 @@ function extractThemeVars(theme) {
     check(typeof s === 'string' && /^(home:|ported-pro:|deferred:)/.test(s), '[port] LEGACY_PORT ' + id + ' has an invalid status label: ' + s);
   });
   const expectedSet = new Set(EXPECTED);
-  Object.keys(LP || {}).forEach(function (id) {
+  sectionKeys.forEach(function (id) {
     check(expectedSet.has(id), '[port] LEGACY_PORT has a stray key not in the known legacy inventory: ' + id);
   });
-  check(Object.keys(LP || {}).length === EXPECTED.length,
-    '[port] LEGACY_PORT must cover EXACTLY the ' + EXPECTED.length + '-section legacy inventory; got ' + Object.keys(LP || {}).length);
+  check(sectionKeys.length === EXPECTED.length,
+    '[port] LEGACY_PORT must cover EXACTLY the ' + EXPECTED.length + '-section legacy inventory; got ' + sectionKeys.length);
   // Disposition targets resolve.
   const proPorted = new Set(pages.PRO_PORTED_IDS || []);
-  Object.keys(LP || {}).forEach(function (id) {
+  sectionKeys.forEach(function (id) {
     const s = LP[id];
     if (s.indexOf('home:') === 0) {
       const pid = s.slice('home:'.length);
@@ -894,7 +913,7 @@ function extractThemeVars(theme) {
   });
   proPorted.forEach(function (pid) { check(!!pages.PAGES[pid], '[port] PRO_PORTED page not registered in PAGES: ' + pid); });
   const tally = { home: 0, 'ported-pro': 0, deferred: 0 };
-  Object.keys(LP || {}).forEach(function (id) { tally[LP[id].split(':')[0]]++; });
+  sectionKeys.forEach(function (id) { tally[LP[id].split(':')[0]]++; });
   notes.push('legacy port: ' + EXPECTED.length + ' sections — ' + tally.home + ' home, ' + tally['ported-pro'] + ' ported-pro, ' + tally.deferred + ' deferred; nothing dropped.');
 })();
 
@@ -996,13 +1015,103 @@ function extractThemeVars(theme) {
   notes.push('canvas graph: real-edge-only model (grounded fields, dangling edges dropped), deterministic layered layout, pan+zoom, focus parser (work/session/project/passport), launch points on fleet/work/project/gate.');
 })();
 
+// =========================================================================
+//  Check 27 — (M10) Documents mode: the console-as-reader. (a) three-mode
+//  registry all ENABLED (no reserved/disabled slot); pre-paint honours
+//  documents. (b) the reader entry point + 3-zone layout + ~72ch reading
+//  measure + evidence-panel material (EvidenceCards / Receipt rows / coverage).
+//  (c) real sources (tenants + per-tenant chunks named method + facts) with the
+//  demo Proof fixture behind demoData('docsReader'). (d) deep-link-out auto-
+//  switch (a real destination hash while in documents mode flips back to
+//  standard). (e) posture-independence still statically clean (extends check 23).
+// =========================================================================
+(function checkDocumentsMode() {
+  // (a) Three-mode registry, all enabled.
+  ['standard', 'professional', 'documents'].forEach(function (m) {
+    check(new RegExp("id:\\s*'" + m + "'").test(shellHtml), '[documents] MODES must include the "' + m + '" slot');
+  });
+  check(!/soon:\s*true/.test(shellHtml), '[documents] Documents must be activated (no soon:true reserved marker)');
+  check(/isSelectableMode/.test(shellHtml) && /id === 'documents'/.test(shellHtml),
+    '[documents] applyMode must treat documents as a selectable, paintable mode');
+  const head = shellHtml.slice(0, shellHtml.indexOf('</head>'));
+  check(/'documents'/.test(head) && /data-mode/.test(head),
+    '[documents] pre-paint (<head>) must apply data-mode=documents to avoid a reader-layout flash');
+  // (b) Reader entry point + 3-zone layout + ~72ch measure + evidence markers.
+  check(typeof render.renderDocuments === 'function', '[documents] render.js must export renderDocuments (the reader entry point)');
+  check(/renderDocuments/.test(shellHtml), '[documents] shell.html must route documents mode to render.renderDocuments');
+  check(/\.doc-reader\b/.test(shellHtml) && /\.doc-evidence\b/.test(shellHtml),
+    '[documents] shell.html must style the 3-zone reader (.doc-reader + .doc-evidence panel)');
+  check(/\.doc-main\s*\{[^}]*max-width:\s*72ch/.test(shellHtml),
+    '[documents] the reading surface must carry the ~72ch measure rule (.doc-main { max-width: 72ch })');
+  check(/function renderDocEvidence/.test(renderSrc), '[documents] render.js must build the evidence panel (renderDocEvidence)');
+  check(/doc-evcard/.test(renderSrc) && /doc-receipt/.test(renderSrc),
+    '[documents] the evidence panel must carry EvidenceCards + Receipt rows (ported Proof material)');
+  // (c) Real sources grounded + demo Proof fixture behind the demo choke point.
+  check(/consoleTenantsByTenantIdChunks/.test(renderSrc),
+    '[documents] per-tenant document chunks must load via the named CruxApi method (no raw fetch)');
+  check(renderSrc.indexOf('/v1/console/tenants') >= 0 && renderSrc.indexOf('/v1/console/facts') >= 0,
+    '[documents] the reader must ground on real /v1/console/tenants + /v1/console/facts');
+  check(/demoData\('docsReader'\)/.test(renderSrc),
+    '[documents] the demo Proof reader must come from demoData(\'docsReader\') (demoOn()-guarded choke point)');
+  check(pages.CruxDemo && pages.CruxDemo.docsReader && Array.isArray(pages.CruxDemo.docsReader.sections) && pages.CruxDemo.docsReader.sections.length > 0,
+    '[documents] CruxDemo.docsReader fixture (ported Proof narrative) must be present');
+  check(Array.isArray(pages.CruxDemo.docsReader.evidence) && pages.CruxDemo.docsReader.evidence.length > 0 &&
+        Array.isArray(pages.CruxDemo.docsReader.receipts) && pages.CruxDemo.docsReader.receipts.length > 0,
+    '[documents] the docsReader fixture must carry evidence + receipts (the full reader composition)');
+  // (d) Deep-link-out auto-switch + reader routing.
+  const rt = funcBody(shellHtml, 'route');
+  check(rt && /CRUX_MODE === 'documents'/.test(rt) && /setModeSilently\('standard'\)/.test(rt),
+    '[documents] route() must auto-switch documents→standard on a deep link to a real destination');
+  check(rt && /renderDocumentsRoute/.test(rt),
+    '[documents] route() must render the reader for #/documents (renderDocumentsRoute)');
+  // (e) Posture independence (statically): documents is presentation-only.
+  const modeTokens = /CRUX_MODE|data-mode|crux\.console\.mode|proMode|professional|documents/;
+  ['setPosture', 'applyPosture', 'derivePostureFromServer', 'applyDerivedPosture'].forEach(function (fn) {
+    const b = funcBody(shellHtml, fn);
+    check(b && !modeTokens.test(b), '[documents] posture fn ' + fn + '() must not branch on mode (incl. documents)');
+  });
+  const rd = funcBody(renderSrc, 'renderDocuments');
+  check(rd && !/setPosture|derivePosture|applyMutationGate|CRUX_POSTURE|isOperator/.test(rd),
+    '[documents] renderDocuments must not touch posture (presentation ≠ the security boundary)');
+  notes.push('documents mode (M10): three-mode registry all enabled · ~72ch reader + evidence panel (EvidenceCards/Receipts/coverage) · real tenants+facts sources + demoOn() Proof fixture · deep-link-out auto-switch · posture statically mode-independent.');
+})();
+
+// =========================================================================
+//  Check 28 — (M10) legacy retirement. (a) LEGACY_PORT.retired_at marker.
+//  (b) the v2 shell carries the "(legacy — retired, kept as fallback)" copy on
+//  the /console/legacy link (retained as a fallback, not dropped). (c) the
+//  console.rs serve_console_legacy handler carries a DEPRECATED doc-comment
+//  referencing the ExecPlan slug (read via a relative path — comment-only, the
+//  flag-off byte-parity test proves the served body is unchanged).
+// =========================================================================
+(function checkRetirement() {
+  check(pages.LEGACY_PORT && pages.LEGACY_PORT.retired_at === '2026-07-03',
+    '[retire] LEGACY_PORT.retired_at must be "2026-07-03" (the formal legacy-console retirement date)');
+  check(/\(legacy — retired, kept as fallback\)/.test(pagesSrc),
+    '[retire] the v2 /console/legacy link must carry the "(legacy — retired, kept as fallback)" copy');
+  check(pagesSrc.indexOf('/console/legacy') >= 0,
+    '[retire] the v2 shell must keep /console/legacy reachable as a fallback (not removed)');
+  const consoleRsPath = path.join(DIR, '..', '..', 'src', 'console.rs');
+  let consoleRs = '';
+  try { consoleRs = fs.readFileSync(consoleRsPath, 'utf8'); }
+  catch (e) { check(false, '[retire] could not read console.rs at ' + consoleRsPath + ': ' + e.message); }
+  const legAt = consoleRs.indexOf('fn serve_console_legacy');
+  check(legAt >= 0, '[retire] console.rs must define serve_console_legacy');
+  const preamble = legAt >= 0 ? consoleRs.slice(Math.max(0, legAt - 1200), legAt) : '';
+  check(/DEPRECATED/.test(preamble) && /unified-shell-console-2026-07-03/.test(preamble),
+    '[retire] serve_console_legacy must carry a DEPRECATED doc-comment referencing the ExecPlan slug');
+  check(/fallback/.test(preamble),
+    '[retire] the deprecation comment must note the legacy console is retained only as a fallback');
+  notes.push('retirement (M10): LEGACY_PORT.retired_at=2026-07-03 · v2 legacy-fallback copy · console.rs serve_console_legacy DEPRECATED doc-comment (ExecPlan-referenced, comment-only).');
+})();
+
 // ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — M9 (canvas) smoke');
+console.log('unified-shell-console v2 — M10 (documents + retirement) smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
 if (failures.length) {
   console.error('\nFAIL (' + failures.length + '):');
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity, M9 canvas board (canvasTier + widget registry), M9 canvas graph (real-edge-only model + focus parser + launch points)).');
+console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity, M9 canvas board (canvasTier + widget registry), M9 canvas graph (real-edge-only model + focus parser + launch points), M10 documents mode (3-mode reader + ~72ch measure + evidence panel + real sources + demo Proof fixture + deep-link-out auto-switch), M10 legacy retirement (retired_at + fallback copy + console.rs DEPRECATED comment)).');
 process.exit(0);

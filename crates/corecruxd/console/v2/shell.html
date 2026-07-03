@@ -38,13 +38,13 @@
     } catch (e) {
       document.documentElement.setAttribute('data-rail', 'open');
     }
-    // Apply the persisted presentation mode (Standard | Professional) before
-    // first paint so Pro density doesn't flash. Mirrors crux.console.mode; the
-    // reserved 'documents' mode is not yet a paintable state (arrives in M10) so
-    // it falls back to 'standard' here. Mode is PRESENTATION — never posture.
+    // Apply the persisted presentation mode (Standard | Professional | Documents)
+    // before first paint so Pro density / the reader layout don't flash. Mirrors
+    // crux.console.mode. 'documents' (M10) is the console-as-reader. Mode is
+    // PRESENTATION — never posture.
     try {
       var m = localStorage.getItem('crux.console.mode');
-      document.documentElement.setAttribute('data-mode', m === 'professional' ? 'professional' : 'standard');
+      document.documentElement.setAttribute('data-mode', (m === 'professional' || m === 'documents') ? m : 'standard');
     } catch (e) {
       document.documentElement.setAttribute('data-mode', 'standard');
     }
@@ -912,6 +912,143 @@
   :root[data-mode="professional"] .ow-gate { padding: 12px 14px; }
   :root[data-mode="professional"] .exp-meta { display: inline-block; }
 
+  /* ---- Documents mode (M10) — the console-as-reader ---------------------
+     Ported COMPOSITION + MATERIAL from the WebCrux Proof reader
+     (webcrux-surfaces-demo-v3.jsx): the Section/Card reading composition, the
+     EvidenceCard side surface, Receipt chips, and coverage/progress affordances
+     — rebuilt in v2 tokens (every colour is a theme token, so all three themes
+     render). Under [data-mode="documents"] the console becomes a READER: the
+     rail slims to a document tree, the main column is a ~72ch reading surface,
+     and the right panel (≥1280px; stacked below on phone) is the evidence
+     material. Mode is presentation only — posture is untouched. */
+
+  /* The rail hosts the document tree in place of the destination nav. */
+  :root[data-mode="documents"] .rail nav { gap: 1px; }
+  .doc-tree-group {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .12em; font-family: var(--font-mono);
+    color: var(--ink3); font-weight: 600; padding: 14px 8px 5px;
+  }
+  .doc-tree-item {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+    width: 100%; text-align: left; min-height: 40px; padding: 7px 10px;
+    color: var(--ink2); background: transparent;
+    border: 1px solid transparent; border-radius: var(--radius-sm); cursor: pointer;
+    transition: background .16s ease, color .16s ease, border-color .16s ease;
+  }
+  .doc-tree-item:hover { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
+  .doc-tree-item[aria-current="page"] { background: var(--surface2); color: var(--ink); border-color: var(--edge-strong); }
+  .doc-tree-item[aria-current="page"] .doc-tree-label { color: var(--acc); }
+  .doc-tree-label { font-weight: 600; font-size: 12.5px; }
+  .doc-tree-sub {
+    font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3);
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .doc-tree-empty { padding: 8px 10px; }
+  :root[data-rail="collapsed"] .doc-tree-sub, :root[data-rail="collapsed"] .doc-tree-group { display: none; }
+
+  /* 3-zone reader inside the content column: reading surface + evidence panel.
+     A single column below 1280px (the evidence stacks under the reading). */
+  .doc-reader { display: grid; grid-template-columns: 1fr; gap: 22px; align-items: start; }
+  @media (min-width: 1280px) {
+    .doc-reader { grid-template-columns: minmax(0, 1fr) 320px; }
+    .doc-evidence { position: sticky; top: 92px; }
+  }
+
+  /* Reading surface — a ~72ch measure with generous line-height (the ported
+     Proof reading column). 72ch is the reading measure token/rule. */
+  .doc-main { min-width: 0; max-width: 72ch; }
+  .doc-read-head { margin-bottom: 18px; padding-bottom: 12px; border-bottom: 1px solid var(--edge); }
+  .doc-read-title { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -.01em; line-height: 1.3; }
+  .doc-read-sub { margin: 4px 0 0; font-size: 13px; color: var(--ink2); }
+  .doc-read-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+
+  /* Section micro-label (ported Section) — mono · uppercase · wide tracking. */
+  .doc-sec {
+    font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .14em;
+    font-family: var(--font-mono); color: var(--ink3);
+    margin: 22px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--edge);
+  }
+  .doc-card {
+    padding: 14px 16px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  /* A reading chunk with a state-keyed left strip (matches the pro-board 3px). */
+  .doc-chunk { position: relative; padding: 10px 14px; margin-bottom: 6px; border-radius: var(--radius-sm); }
+  .doc-chunk::before { content: ""; position: absolute; inset: 2px auto 2px 0; width: 3px; border-radius: 2px; background: var(--ink3); }
+  .doc-chunk-ok::before { background: var(--ok); }
+  .doc-chunk-warn::before { background: var(--warn); }
+  .doc-chunk-crit::before { background: var(--crit); }
+  .doc-chunk-text { margin: 0; font-size: 14px; line-height: 1.75; color: var(--ink); }
+  .doc-card .doc-chunk-text + .doc-chunk-text { margin-top: 10px; }
+  .doc-chunk-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+  .doc-chunk-claims { font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); }
+
+  /* Coverage / label badge (ported CovBadge/Badge) — squarer family pill. */
+  .doc-cov {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-family: var(--font-mono); font-size: 9.5px; font-weight: 600; letter-spacing: .04em;
+    text-transform: uppercase; padding: 2px 8px; border-radius: 999px; white-space: nowrap;
+    color: var(--ink2); background: var(--surface2); border: 1px solid var(--edge);
+  }
+  .doc-cov-ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
+  .doc-cov-warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
+  .doc-cov-crit { color: var(--crit); background: color-mix(in srgb, var(--crit) 12%, transparent); border-color: color-mix(in srgb, var(--crit) 30%, transparent); }
+  .doc-cov-trust { color: var(--trust); background: color-mix(in srgb, var(--trust) 12%, transparent); border-color: color-mix(in srgb, var(--trust) 30%, transparent); }
+
+  /* Evidence panel (right zone). */
+  .doc-evidence { min-width: 0; display: flex; flex-direction: column; }
+  .doc-ev-host { display: flex; flex-direction: column; gap: 8px; }
+  /* EvidenceCard (ported) — a card with a role-keyed left strip. */
+  .doc-evcard {
+    position: relative; padding: 11px 13px 11px 15px; margin-bottom: 8px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface); box-shadow: var(--card-shadow);
+  }
+  .doc-evcard::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 2px; border-radius: 2px 0 0 2px; background: var(--ink3); }
+  .doc-ev-ok::before { background: var(--ok); }
+  .doc-ev-trust::before { background: var(--trust); }
+  .doc-ev-warn::before { background: var(--warn); }
+  .doc-evcard-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 5px; }
+  .doc-evcard-domain { font-family: var(--font-mono); font-size: 10px; font-weight: 600; color: var(--acc); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .doc-evcard-quote {
+    font-size: 11.5px; font-style: italic; line-height: 1.5; color: var(--ink);
+    padding: 5px 9px; margin-bottom: 6px; border-radius: 0 6px 6px 0;
+    border-left: 2px solid color-mix(in srgb, var(--acc) 40%, transparent);
+    background: color-mix(in srgb, var(--acc) 7%, transparent);
+  }
+  .doc-evcard-summary { font-size: 11.5px; line-height: 1.5; color: var(--ink2); margin-bottom: 6px; }
+  .doc-evcard-foot { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-top: 4px; font-size: 10px; color: var(--ink3); }
+  .doc-evcard-ts { font-family: var(--font-mono); font-size: 9px; color: var(--ink3); flex: none; }
+
+  /* Receipt chip (ported Receipt) — mono ⛓ hash rows. */
+  .doc-receipt {
+    display: flex; align-items: center; gap: 8px; padding: 7px 10px; margin-bottom: 6px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+  }
+  .doc-receipt-id { font-family: var(--font-mono); font-size: 10.5px; color: var(--trust); flex: none; }
+  .doc-receipt-label { font-size: 11px; color: var(--ink2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .doc-receipt-ts { margin-left: auto; font-family: var(--font-mono); font-size: 9px; color: var(--ink3); flex: none; }
+
+  /* Phone sources sheet — the reader's document list as a collapsible sheet.
+     Hidden on the desktop tier (the rail tree is the source list there). */
+  .doc-sources-sheet { display: none; }
+  @media (max-width: 720px) {
+    .doc-sources-sheet {
+      display: block; margin-bottom: 16px;
+      border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+    }
+    .doc-sources-summary {
+      list-style: none; cursor: pointer; padding: 11px 14px; min-height: 44px;
+      display: flex; align-items: center; font-weight: 600; font-size: 13px; color: var(--ink);
+    }
+    .doc-sources-summary::-webkit-details-marker { display: none; }
+    .doc-sources-sheet[open] .doc-sources-summary { border-bottom: 1px solid var(--edge); }
+    .doc-sources-sheet .doc-tree { padding: 6px 8px 10px; }
+    .doc-main { max-width: none; }
+  }
+
   /* ---- Accessibility & motion ------------------------------------------- */
   .skip {
     position: absolute; left: -9999px; top: 0; z-index: 100;
@@ -1206,18 +1343,23 @@
   // Mode is PRESENTATION, never posture: a customer sees the SAME gated surface
   // in every mode. Standard is the curated forward-facing view; Professional
   // adds density + the full page/section surface + the full pill row. 'documents'
-  // is a reserved third slot (arrives in M10) — shown in the control but not yet
-  // selectable. applyMode NEVER touches posture (no setPosture / isOperator /
-  // CRUX_POSTURE) — the two axes are strictly independent (smoke check 23).
+  // (activated in M10) turns the console into a READER — a slimmed document-tree
+  // rail, a ~72ch reading surface, and an evidence side panel. All three modes
+  // are now selectable. applyMode NEVER touches posture (no setPosture /
+  // isOperator / CRUX_POSTURE) — the two axes are strictly independent (smoke
+  // check 23). Standard/Professional destinations are hidden while in Documents;
+  // the mode segment is the way back, and a deep link to any #/<destination>
+  // auto-switches the mode back to standard (see route()).
   var LS_MODE = 'crux.console.mode';
   var DEFAULT_MODE = 'standard';
   var MODES = [
     { id: 'standard', label: 'Standard' },
     { id: 'professional', label: 'Professional' },
-    { id: 'documents', label: 'Documents', soon: true }   // reserved — arrives in M10
+    { id: 'documents', label: 'Documents' }   // M10 — the console-as-reader
   ];
+  function isSelectableMode(id) { return id === 'professional' || id === 'documents' || id === DEFAULT_MODE; }
   function readMode() {
-    try { return localStorage.getItem(LS_MODE) === 'professional' ? 'professional' : DEFAULT_MODE; }
+    try { var m = localStorage.getItem(LS_MODE); return isSelectableMode(m) && m !== DEFAULT_MODE ? m : DEFAULT_MODE; }
     catch (e) { return DEFAULT_MODE; }
   }
   function syncModeSeg(id) {
@@ -1234,22 +1376,33 @@
       var m = MODES[i];
       var b = el('button', {
         'class': 'modeseg-btn', type: 'button', 'data-mode': m.id, 'aria-pressed': 'false',
-        title: m.soon ? (m.label + ' — arrives in M10') : (m.label + ' mode')
+        title: m.label + ' mode'
       }, [m.label]);
-      if (m.soon) { b.disabled = true; }   // reserved slot: visible, clearly marked, not selectable
-      else { (function (id) { b.addEventListener('click', function () { applyMode(id); }); })(m.id); }
+      (function (id) { b.addEventListener('click', function () { applyMode(id); }); })(m.id);
       wrap.appendChild(b);
     }
   }
-  function applyMode(id) {
-    // Selectable modes are standard|professional; 'documents' is not paintable
-    // yet (falls back to standard). Presentation only — no posture side effects.
-    if (id !== 'professional') { id = DEFAULT_MODE; }
+  // Set the mode WITHOUT re-rendering (used by route() when a deep link to a real
+  // destination auto-switches Documents mode back to standard). Presentation only.
+  function setModeSilently(id) {
+    if (!isSelectableMode(id)) { id = DEFAULT_MODE; }
     document.documentElement.setAttribute('data-mode', id);
-    try { localStorage.setItem(LS_MODE, id); } catch (e) { /* private mode: in-memory only */ }
+    try { localStorage.setItem(LS_MODE, id); } catch (e) { /* private mode */ }
     if (typeof window !== 'undefined') { window.CRUX_MODE = id; }
     syncModeSeg(id);
-    route();   // re-render: Pro density, Pro-only sections/pages, and the full pill row
+  }
+  function applyMode(id) {
+    // Selectable modes: standard | professional | documents. Presentation only —
+    // no posture side effects. Documents drives the hash to the reader
+    // (#/documents); leaving Documents returns to the default destination.
+    if (!isSelectableMode(id)) { id = DEFAULT_MODE; }
+    setModeSilently(id);
+    if (id === 'documents') {
+      if (!/^#\/documents/.test(location.hash || '')) { location.hash = '#/documents'; return; }   // hashchange → route()
+    } else if (/^#\/documents/.test(location.hash || '')) {
+      location.hash = '#/' + (DESTS[0] && DESTS[0].id); return;   // hashchange → route()
+    }
+    route();   // re-render: Pro density / Pro-only surface, or the reader
   }
   function initMode() {
     var m = readMode();
@@ -1308,6 +1461,10 @@
 
   // ---- Boot state --------------------------------------------------------
   var BOOT = { version: null, summary: null, health: 'loading', reason: '' };
+  // Which content the left rail currently holds: 'dest' (the destination nav) or
+  // 'docs' (the Documents-mode tree). renderDestination restores 'dest' when it
+  // finds the rail swapped to the tree (leaving Documents mode).
+  var RAIL_MODE = 'dest';
 
   // ---- Small DOM + format helpers ---------------------------------------
   function el(tag, attrs, children) {
@@ -1371,6 +1528,7 @@
   function buildRail() {
     var nav = document.getElementById('nav');
     nav.textContent = '';
+    RAIL_MODE = 'dest';   // restored to the destination nav
     for (var i = 0; i < DESTS.length; i++) {
       var item = DESTS[i];
       var btn = el('button', {
@@ -1616,6 +1774,9 @@
   }
 
   function renderDestination(destId, pageId) {
+    // Leaving Documents mode: restore the destination nav into the rail (it was
+    // swapped to the document tree by renderDocumentsRoute).
+    if (RAIL_MODE === 'docs') { buildRail(); }
     var dest = DEST_INDEX[destId] || DESTS[0];
     destId = dest.id;
     var page = PAGES[pageId];
@@ -1704,7 +1865,55 @@
     return { view: view, focus: focus };
   }
 
-  function route() { var r = currentRoute(); renderDestination(r.dest, r.page); }
+  // Route. Documents mode (M10) is presentation: it renders the reader instead of
+  // a destination surface, entered via the mode segment (#/documents) or by being
+  // in documents mode. A deep link to any real #/<destination> while in Documents
+  // mode AUTO-SWITCHES the mode back to standard (destinations win over the reader
+  // — mode is presentation, not a route). #/documents[/<docId>] keeps the reader.
+  function route() {
+    var h = (location.hash || '').replace(/^#\/?/, '');
+    var qi = h.indexOf('?'); if (qi >= 0) { h = h.slice(0, qi); }
+    var parts = h.split('/').filter(Boolean);
+    var first = parts[0];
+    var inDocsMode = (typeof window !== 'undefined' && window.CRUX_MODE === 'documents');
+    var docsHash = first === 'documents';
+    if (docsHash || inDocsMode) {
+      if (first && !docsHash && DEST_INDEX[first]) {
+        if (inDocsMode) { setModeSilently('standard'); }   // deep-link-out auto-switch
+        // fall through to the normal destination render below
+      } else {
+        if (!inDocsMode) { setModeSilently('documents'); }
+        renderDocumentsRoute(parts[1]);
+        return;
+      }
+    }
+    var r = currentRoute();
+    renderDestination(r.dest, r.page);
+  }
+
+  // Documents-mode render: swap the rail to the document tree (render.js builds
+  // it into #nav) and render the reader into #content. Presentation only.
+  function renderDocumentsRoute(docId) {
+    RAIL_MODE = 'docs';
+    document.getElementById('destTitle').textContent = 'Documents';
+    document.getElementById('destSub').textContent = 'Reader — real corpora + bundled reference docs';
+    var content = document.getElementById('content');
+    content.textContent = '';
+    var host = el('div', { 'class': 'doc-region-host', id: 'docHost' });
+    content.appendChild(host);
+    var nav = document.getElementById('nav');
+    if (window.CruxRender && window.CruxRender.renderDocuments) {
+      window.CruxRender.renderDocuments(host, {
+        summary: BOOT.summary,
+        docId: docId ? decodeURIComponent(docId) : null,
+        railHost: nav
+      });
+    } else {
+      host.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
+    }
+    syncMobileChrome(null);   // no destination is active in the phone tab bar
+    if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+  }
 
   // ---- Keyboard shortcuts 1..5 ------------------------------------------
   function onKey(ev) {
