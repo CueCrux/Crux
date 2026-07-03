@@ -44,6 +44,14 @@ const CONSOLE_V2_RENDER_JS: &str = include_str!("../console/v2/render.js");
 // `cargo test -p corecruxd --test route_spec_drift -- --ignored regen_api_js`.
 // GET routes only — the customer-safe posture holds at the client layer too.
 const CONSOLE_V2_API_JS: &str = include_str!("../console/v2/api.js");
+// PWA app-shell assets (M5). Served same-origin at `/console-v2/{name}` alongside
+// the JS modules. `sw.js` is the app-shell service worker (never caches `/v1/*`);
+// `manifest.webmanifest` is the install manifest; `icon.svg` is the app icon.
+// `sw.js` is served with `Service-Worker-Allowed: /console` so a script under
+// `/console-v2/` may control the `/console` scope (see `serve_console_v2_asset`).
+const CONSOLE_V2_SW_JS: &str = include_str!("../console/v2/sw.js");
+const CONSOLE_V2_MANIFEST: &str = include_str!("../console/v2/manifest.webmanifest");
+const CONSOLE_V2_ICON_SVG: &str = include_str!("../console/v2/icon.svg");
 const CONSOLE_V2_ENV: &str = "CORECRUXD_CONSOLE_V2";
 const CONSOLE_DEV_PATH_ENV: &str = "CORECRUXD_CONSOLE_DEV_PATH";
 
@@ -121,45 +129,64 @@ async fn serve_console_legacy() -> impl IntoResponse {
     Html(resolve_console_html().into_owned())
 }
 
-/// Embedded v2 module assets (`pages.js`, `render.js`), served same-origin at
+/// Embedded v2 module + PWA assets (`pages.js`, `render.js`, `api.js`, plus the
+/// M5 `sw.js` / `manifest.webmanifest` / `icon.svg`), served same-origin at
 /// `/console-v2/{name}`. A dev override (`CORECRUXD_CONSOLE_DEV_PATH`) reads
-/// `v2/<name>` next to the console index so the modules can be iterated without
-/// a rebuild — same resolve-then-rewrite pattern as the shell override.
+/// `v2/<name>` next to the console index so the assets can be iterated without a
+/// rebuild — same resolve-then-rewrite pattern as the shell override.
 async fn serve_console_v2_asset(AxumPath(name): AxumPath<String>) -> Response {
     // Single path segment; be paranoid about traversal anyway.
     if name.contains('/') || name.contains("..") {
         return (axum::http::StatusCode::BAD_REQUEST, "invalid asset name").into_response();
     }
-    let embedded: &'static str = match name.as_str() {
-        "pages.js" => CONSOLE_V2_PAGES_JS,
-        "render.js" => CONSOLE_V2_RENDER_JS,
-        "api.js" => CONSOLE_V2_API_JS,
+    // (embedded body, content-type). The three JS modules keep `text/javascript`;
+    // the PWA assets carry their own content-types. `sw.js` additionally gets a
+    // `Service-Worker-Allowed: /console` header in `console_v2_asset_response`.
+    let (embedded, content_type): (&'static str, &'static str) = match name.as_str() {
+        "pages.js" => (CONSOLE_V2_PAGES_JS, "text/javascript; charset=utf-8"),
+        "render.js" => (CONSOLE_V2_RENDER_JS, "text/javascript; charset=utf-8"),
+        "api.js" => (CONSOLE_V2_API_JS, "text/javascript; charset=utf-8"),
+        "sw.js" => (CONSOLE_V2_SW_JS, "application/javascript; charset=utf-8"),
+        "manifest.webmanifest" => (CONSOLE_V2_MANIFEST, "application/manifest+json; charset=utf-8"),
+        "icon.svg" => (CONSOLE_V2_ICON_SVG, "image/svg+xml; charset=utf-8"),
         _ => return (axum::http::StatusCode::NOT_FOUND, "no such console-v2 asset").into_response(),
     };
     // Dev override wins when present.
-    if let Some(dev_path) = std::env::var(CONSOLE_DEV_PATH_ENV)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    {
-        let file_path = resolve_dev_html_path(Path::new(dev_path.trim()))
-            .with_file_name("v2")
-            .join(&name);
-        if let Ok(contents) = std::fs::read_to_string(&file_path) {
-            return console_js_response(contents);
-        }
-    }
-    console_js_response(embedded.to_string())
+    let body = console_v2_dev_asset(&name).unwrap_or_else(|| embedded.to_string());
+    console_v2_asset_response(&name, content_type, body)
 }
 
-fn console_js_response(body: String) -> Response {
-    (
+/// Read `v2/<name>` under the `CORECRUXD_CONSOLE_DEV_PATH` dir, if set + readable.
+fn console_v2_dev_asset(name: &str) -> Option<String> {
+    let raw = std::env::var(CONSOLE_DEV_PATH_ENV).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let file_path = resolve_dev_html_path(Path::new(trimmed))
+        .with_file_name("v2")
+        .join(name);
+    std::fs::read_to_string(&file_path).ok()
+}
+
+fn console_v2_asset_response(name: &str, content_type: &'static str, body: String) -> Response {
+    let mut resp = (
         [
-            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, "no-cache"),
         ],
         body,
     )
-        .into_response()
+        .into_response();
+    // The service-worker script lives under `/console-v2/`, but it registers for
+    // the `/console` scope; without this header the browser rejects that scope.
+    if name == "sw.js" {
+        resp.headers_mut().insert(
+            header::HeaderName::from_static("service-worker-allowed"),
+            header::HeaderValue::from_static("/console"),
+        );
+    }
+    resp
 }
 
 async fn serve_console_asset(AxumPath(name): AxumPath<String>) -> Response {
@@ -528,7 +555,8 @@ fn resolve_dev_html_path(base: &Path) -> PathBuf {
 mod tests {
     use super::{
         dev_html_override, resolve_console_body, resolve_console_html, CONSOLE_DEV_PATH_ENV, CONSOLE_HTML,
-        CONSOLE_V2_API_JS, CONSOLE_V2_ENV, CONSOLE_V2_HTML, CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS,
+        CONSOLE_V2_API_JS, CONSOLE_V2_ENV, CONSOLE_V2_HTML, CONSOLE_V2_ICON_SVG, CONSOLE_V2_MANIFEST,
+        CONSOLE_V2_PAGES_JS, CONSOLE_V2_RENDER_JS, CONSOLE_V2_SW_JS,
     };
     use std::sync::Mutex;
 
@@ -821,6 +849,15 @@ mod tests {
             "data-requires=\"operator\"",
             "prefers-reduced-motion",
             "focus-visible",
+            // M5 PWA + phone tier.
+            "rel=\"manifest\"",
+            "/console-v2/manifest.webmanifest",
+            "name=\"theme-color\"",
+            "serviceWorker.register('/console-v2/sw.js",
+            "id=\"tabbar\"",
+            "SW_REV",
+            "safe-area-inset",
+            "min-height: 44px",
         ] {
             assert!(
                 CONSOLE_V2_HTML.contains(required),
@@ -964,6 +1001,148 @@ mod tests {
                 .await
                 .expect("router response");
             assert_eq!(resp.status(), axum::http::StatusCode::OK, "{uri} should be served");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            assert!(
+                String::from_utf8(bytes.to_vec()).expect("utf8 body").contains(needle),
+                "{uri} body should contain {needle}"
+            );
+        }
+    }
+
+    // ---- Unified Shell Console v2 PWA + phone tier (M5) --------------------
+
+    /// Pull the `SW_REV = '<value>'` literal from a source string (matches both
+    /// `const SW_REV = '…'` in sw.js and `var SW_REV = '…'` in shell.html).
+    fn sw_rev(src: &str) -> Option<&str> {
+        let marker = "SW_REV = '";
+        let start = src.find(marker)? + marker.len();
+        let rest = &src[start..];
+        let end = rest.find('\'')?;
+        Some(&rest[..end])
+    }
+
+    #[test]
+    fn console_v2_pwa_assets_carry_licence_and_markers() {
+        // sw.js + icon.svg can carry the CCL header as a comment; assert it plus
+        // their structural markers. (manifest.webmanifest is pure JSON — no
+        // comments — so its header is intentionally absent; markers checked below.)
+        for (name, body) in [("sw.js", CONSOLE_V2_SW_JS), ("icon.svg", CONSOLE_V2_ICON_SVG)] {
+            assert!(
+                body.contains("CueCrux Community Licence (CCL v1.0)"),
+                "{name} must carry the CCL licence header"
+            );
+        }
+        for required in [
+            "const SW_REV",
+            "const CACHE_NAME",
+            "const APP_SHELL",
+            "addEventListener('fetch'",
+            "/v1/",
+        ] {
+            assert!(CONSOLE_V2_SW_JS.contains(required), "sw.js missing marker: {required}");
+        }
+        for required in ["viewBox=\"0 0 512 512\"", "#060A12", "Crux Console"] {
+            assert!(
+                CONSOLE_V2_ICON_SVG.contains(required),
+                "icon.svg missing marker: {required}"
+            );
+        }
+        for required in [
+            "\"name\"",
+            "\"Crux Console\"",
+            "\"start_url\"",
+            "\"/console\"",
+            "\"standalone\"",
+            "\"icons\"",
+        ] {
+            assert!(
+                CONSOLE_V2_MANIFEST.contains(required),
+                "manifest missing marker: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn console_v2_sw_rev_matches_shell() {
+        // Bump-together discipline: the no-build cache key lives in two files; a
+        // drift between them means the cache never invalidates. Assert equality.
+        let sw = sw_rev(CONSOLE_V2_SW_JS).expect("sw.js SW_REV literal");
+        let shell = sw_rev(CONSOLE_V2_HTML).expect("shell.html SW_REV literal");
+        assert_eq!(
+            sw, shell,
+            "sw.js and shell.html SW_REV must be bumped together (sw={sw} shell={shell})"
+        );
+    }
+
+    #[test]
+    fn console_v2_sw_never_caches_control_plane() {
+        // Compliance invariant: /v1/* is network-only, never cached. The SW must
+        // bypass it, and no cache write (addAll / .put) may target a /v1/ path.
+        assert!(
+            CONSOLE_V2_SW_JS.contains("startsWith('/v1/')"),
+            "sw.js must bypass /v1/ (network-only passthrough)"
+        );
+        for line in CONSOLE_V2_SW_JS.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue; // comments may legitimately mention /v1/ and cache.put
+            }
+            let is_cache_write = trimmed.contains("addAll(") || trimmed.contains(".put(");
+            assert!(
+                !(is_cache_write && trimmed.contains("/v1/")),
+                "sw.js must never cache a /v1/ path: {line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn console_v2_pwa_asset_routes_serve_with_content_types() {
+        use tower::ServiceExt;
+        let _guard = env_lock();
+        std::env::remove_var(CONSOLE_DEV_PATH_ENV);
+        for (uri, content_type, needle) in [
+            (
+                "/console-v2/sw.js",
+                "application/javascript; charset=utf-8",
+                "APP_SHELL",
+            ),
+            (
+                "/console-v2/manifest.webmanifest",
+                "application/manifest+json; charset=utf-8",
+                "\"standalone\"",
+            ),
+            ("/console-v2/icon.svg", "image/svg+xml; charset=utf-8", "<svg"),
+        ] {
+            let resp = super::routes(true)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .expect("build request"),
+                )
+                .await
+                .expect("router response");
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{uri} should be served");
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(content_type),
+                "{uri} should carry content-type {content_type}"
+            );
+            // The service worker needs the scope-widening header.
+            if uri.ends_with("sw.js") {
+                assert_eq!(
+                    resp.headers()
+                        .get("service-worker-allowed")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("/console"),
+                    "sw.js must be served with Service-Worker-Allowed: /console"
+                );
+            }
             let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .expect("read body");

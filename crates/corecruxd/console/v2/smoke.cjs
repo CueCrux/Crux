@@ -19,6 +19,11 @@
 //   7. (M3) CruxApiGated is EXACTLY the curated (method,path) mutation set and
 //      is referenced only inside render.js operatorGatedCall (isOperator-guarded).
 //   8. (M3) derivePosture() is a pure function with the documented truth table.
+//   9. (M4) no shipped file addresses the Engine directly; engine GETs allowlisted.
+//  10. (M5) manifest.webmanifest parses as JSON with the installability fields.
+//  11. (M5) sw.js precache == the exact app-shell set; /v1/* never cached; SW_REV
+//      matches shell.html (bump-together).
+//  12. (M5) phone tier: bottom tab bar (4 tabs) + safe-area-inset + ≥44px targets.
 
 'use strict';
 
@@ -378,13 +383,105 @@ function extractThemeVars(theme) {
   notes.push('engine mediation: no direct :14343/:14344 addressing; ' + ENGINE_GETS.length + ' engine GETs allowlisted; ' + refs.size + ' referenced in pages.js.');
 })();
 
+// =========================================================================
+//  Check 10 — M5 PWA manifest. Parses as JSON and carries the installability
+//  fields (name, start_url "/console", display "standalone", ≥1 icon).
+// =========================================================================
+(function checkManifest() {
+  const raw = fs.readFileSync(path.join(DIR, 'manifest.webmanifest'), 'utf8');
+  let manifest = null;
+  try { manifest = JSON.parse(raw); }
+  catch (e) { check(false, '[manifest] manifest.webmanifest is not valid JSON: ' + e.message); return; }
+  check(typeof manifest.name === 'string' && manifest.name.length > 0, '[manifest] missing "name"');
+  check(manifest.start_url === '/console', '[manifest] start_url must be "/console" (got ' + JSON.stringify(manifest.start_url) + ')');
+  check(manifest.scope === '/console', '[manifest] scope should be "/console" (got ' + JSON.stringify(manifest.scope) + ')');
+  check(manifest.display === 'standalone', '[manifest] display must be "standalone" (got ' + JSON.stringify(manifest.display) + ')');
+  check(Array.isArray(manifest.icons) && manifest.icons.length >= 1, '[manifest] must declare ≥1 icon');
+  const hasSvg = (manifest.icons || []).some(function (i) { return i && i.src === '/console-v2/icon.svg'; });
+  check(hasSvg, '[manifest] icons must include /console-v2/icon.svg');
+  notes.push('manifest: name "' + manifest.name + '", start_url ' + manifest.start_url + ', display ' + manifest.display + ', ' + (manifest.icons || []).length + ' icon(s).');
+})();
+
+// =========================================================================
+//  Check 11 — M5 service worker. (a) APP_SHELL precache list == the EXACT
+//  app-shell set. (b) /v1/* is network-only (bypass present) and NO cache write
+//  (addAll/put) targets /v1/. (c) SW_REV matches shell.html's (bump-together).
+// =========================================================================
+(function checkServiceWorker() {
+  const swSrc = fs.readFileSync(path.join(DIR, 'sw.js'), 'utf8');
+  const EXPECTED_SHELL = [
+    '/console',
+    '/console-v2/api.js',
+    '/console-v2/pages.js',
+    '/console-v2/render.js',
+    '/console-v2/icon.svg',
+    '/console-v2/manifest.webmanifest'
+  ].slice().sort();
+
+  const arrM = swSrc.match(/const APP_SHELL = \[([\s\S]*?)\];/);
+  check(!!arrM, '[sw] sw.js must declare the APP_SHELL precache array');
+  const declared = [];
+  if (arrM) {
+    const re = /'([^']+)'/g;
+    let m;
+    while ((m = re.exec(arrM[1])) !== null) { declared.push(m[1]); }
+  }
+  check(JSON.stringify(declared.slice().sort()) === JSON.stringify(EXPECTED_SHELL),
+    '[sw] APP_SHELL must be EXACTLY the app-shell set; got ' + JSON.stringify(declared.slice().sort()));
+
+  // /v1/ network-only bypass present.
+  check(/url\.pathname\.startsWith\(['"]\/v1\/['"]\)/.test(swSrc),
+    '[sw] fetch handler must bypass /v1/ (network-only) — url.pathname.startsWith("/v1/")');
+  // No cache write (addAll / .put) targets a /v1/ path. Comments may mention it.
+  swSrc.split('\n').forEach(function (line) {
+    const t = line.replace(/^\s+/, '');
+    if (t.indexOf('//') === 0) { return; }   // skip comment lines
+    if ((/(?:addAll|\.put)\(/.test(t)) && t.indexOf('/v1/') >= 0) {
+      check(false, '[sw] cache write must never target /v1/: ' + line.trim());
+    }
+  });
+
+  // SW_REV bump-together with shell.html.
+  function rev(src) { const m = src.match(/SW_REV\s*=\s*'([^']+)'/); return m ? m[1] : null; }
+  const swRev = rev(swSrc), shellRev = rev(shellHtml);
+  check(!!swRev, '[sw] sw.js must declare SW_REV');
+  check(!!shellRev, '[sw] shell.html must declare SW_REV');
+  check(swRev && shellRev && swRev === shellRev,
+    '[sw] SW_REV must match between sw.js (' + swRev + ') and shell.html (' + shellRev + ')');
+  notes.push('service worker: ' + declared.length + '-asset app shell, /v1/ network-only, SW_REV=' + swRev + ' (matches shell).');
+})();
+
+// =========================================================================
+//  Check 12 — M5 phone tier. shell.html carries the fixed bottom tab bar with
+//  the four tabs (Overwatch · Work · Trust · More), respects safe-area-inset,
+//  and the tab CSS uses ≥44px touch targets.
+// =========================================================================
+(function checkPhoneTier() {
+  check(shellHtml.indexOf('id="tabbar"') >= 0, '[phone] shell.html must carry the bottom tab bar (id="tabbar")');
+  check(shellHtml.indexOf('id="moreSheet"') >= 0, '[phone] shell.html must carry the "More" sheet (id="moreSheet")');
+  // The four tabs: three direct destination ids + the "More" tab.
+  const tabM = shellHtml.match(/TAB_DEST_IDS\s*=\s*\[([^\]]*)\]/);
+  check(!!tabM, '[phone] shell.html must declare TAB_DEST_IDS (the three direct tabs)');
+  const tabIds = tabM ? (tabM[1].match(/'([^']+)'/g) || []).map(function (s) { return s.replace(/'/g, ''); }) : [];
+  ['overwatch', 'work', 'trust'].forEach(function (id) {
+    check(tabIds.indexOf(id) >= 0, '[phone] TAB_DEST_IDS must include the "' + id + '" tab');
+  });
+  check(/label:\s*'More'/.test(shellHtml), '[phone] the 4th tab must be "More"');
+  check((tabIds.length + 1) === 4, '[phone] tab bar must have exactly 4 tabs (3 direct + More); got ' + (tabIds.length + 1));
+  // Safe-area inset respected (fixed bar + content padding).
+  check(shellHtml.indexOf('safe-area-inset') >= 0, '[phone] phone tier must respect env(safe-area-inset-*)');
+  // ≥44px touch target in the .tab CSS rule.
+  check(/\.tab\s*\{[^}]*min-height:\s*44px/.test(shellHtml), '[phone] .tab CSS must set min-height: 44px (touch target)');
+  notes.push('phone tier: 4-tab bottom bar (' + tabIds.join('/') + '/More), safe-area-inset respected, .tab ≥44px.');
+})();
+
 // ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — M4 smoke');
+console.log('unified-shell-console v2 — M5 smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
 if (failures.length) {
   console.error('\nFAIL (' + failures.length + '):');
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all gates green (26/26 ids, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation).');
+console.log('\nPASS — all gates green (26/26 ids, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier).');
 process.exit(0);
