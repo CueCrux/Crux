@@ -328,6 +328,12 @@ mod tests {
 
     #[test]
     fn empty_stdin_is_handled() {
+        // Serialize with every other test that mutates the process-global
+        // CRUX_MCP_URL (e.g. observe_post's mock-server tests). Without this
+        // guard, `run` here calls `sync_status` against whatever URL is live at
+        // the instant it reads the env — which, mid-race, can be another test's
+        // mock MCP server, tripping that test's "zero MCP calls" assertion.
+        let _env = crate::test_support::env_guard();
         // Without a daemon, this is a graceful no-op.
         let prev = std::env::var("CRUX_MCP_URL").ok();
         std::env::set_var("CRUX_MCP_URL", "http://127.0.0.1:1/mcp");
