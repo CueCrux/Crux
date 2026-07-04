@@ -251,11 +251,26 @@ fn render_sync_status(result: &Value) -> String {
     }
 }
 
-/// `sync_status` is "healthy" if it does not contain `degraded` or `behind`
-/// strings. Heuristic; conservative — when in doubt, skip bootstrap fetch.
+/// Whether sync state is healthy enough to fetch the patterns bootstrap.
+///
+/// The real signal is the `degraded` boolean the daemon reports, not a substring
+/// scan of the payload: `sync_status` *always* embeds the literal `"degraded":
+/// false` and a `"degraded_reason"` field, so the old `text.contains("degraded")`
+/// heuristic fired on every healthy boot and permanently suppressed the banner.
+/// `local_only` is a normal steady state — the patterns playbook is still useful
+/// there (the daemon's own welcome hint tells cold starts to fetch it), so mode
+/// alone does not gate the fetch; only an actually-degraded daemon does.
+///
+/// Falls back to the conservative substring heuristic when the payload is not the
+/// expected JSON object (defensive; keeps behaviour sane for stub responses).
 fn sync_is_healthy(result: &Value) -> bool {
-    let text = extract_text(result).to_lowercase();
-    !text.contains("degraded") && !text.contains("behind") && !text.contains("diverged")
+    let text = extract_text(result);
+    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+        return !v.get("degraded").and_then(Value::as_bool).unwrap_or(false);
+    }
+    // Fallback: payload was not the expected JSON object (stub / plain text).
+    let lower = text.to_lowercase();
+    !lower.contains("degraded") && !lower.contains("behind") && !lower.contains("diverged")
 }
 
 #[cfg(test)]
@@ -306,6 +321,32 @@ mod tests {
     #[test]
     fn sync_unhealthy_when_behind() {
         let r = json!({"content": [{"text": "Sync is BEHIND remote"}]});
+        assert!(!sync_is_healthy(&r));
+    }
+
+    /// Regression: the real `sync_status` payload is a JSON object that always
+    /// carries `"degraded": false` and a `"degraded_reason"` string. The old
+    /// substring heuristic matched "degraded" here and suppressed the bootstrap
+    /// banner on every healthy boot. Parsing the boolean fixes it.
+    #[test]
+    fn sync_healthy_when_local_only_degraded_false_json() {
+        let payload = r#"{
+            "mode": "local_only",
+            "configured": false,
+            "degraded": false,
+            "degraded_reason": "remote sync is not configured; continuing with the local fact and session store only"
+        }"#;
+        let r = json!({"content": [{"text": payload}]});
+        assert!(
+            sync_is_healthy(&r),
+            "local_only with degraded:false must fetch the patterns bootstrap"
+        );
+    }
+
+    #[test]
+    fn sync_unhealthy_when_degraded_true_json() {
+        let payload = r#"{"mode": "remote", "degraded": true, "degraded_reason": "remote unreachable"}"#;
+        let r = json!({"content": [{"text": payload}]});
         assert!(!sync_is_healthy(&r));
     }
 
