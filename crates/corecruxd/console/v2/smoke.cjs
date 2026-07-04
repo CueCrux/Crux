@@ -1240,13 +1240,97 @@ function extractThemeVars(theme) {
   notes.push('explorer destination (M11): search icon + key 8, shell special-cases like Canvas, render.renderExplorer surfaces Local | WikiCrux cards (real fields), reads-only → shows in every posture.');
 })();
 
+// =========================================================================
+//  Check 32 — (M12) JSX surface port. All 11 WebCrux Proof surfaces
+//  (webcrux-surfaces-demo-v3.jsx NAV, line 3028) are the Documents-mode surface
+//  list: render.DOC_SURFACES carries the 11 ids; each has a render function
+//  (Proof reuses renderDocuments; the other ten are renderDocSurface_<id>);
+//  pages.JSX_PORT covers all 11 with a source_line + status + component; the
+//  rail nav is built from DOC_SURFACES and each surface is a #/documents/<id>
+//  route reachable through renderDocuments.
+// =========================================================================
+(function checkSurfacePort() {
+  const NAV_IDS = ['proof', 'watch', 'ask', 'living', 'deps', 'signals', 'diff', 'sourcing', 'lanes', 'domains', 'reverse'];
+  // render.DOC_SURFACES — the ported NAV.
+  const surfaces = render.DOC_SURFACES || [];
+  check(surfaces.length === 11, '[surfaces] render.DOC_SURFACES must list exactly 11 surfaces (got ' + surfaces.length + ')');
+  const surfaceIds = surfaces.map(function (s) { return s.id; });
+  NAV_IDS.forEach(function (id) {
+    check(surfaceIds.indexOf(id) >= 0, '[surfaces] render.DOC_SURFACES missing the "' + id + '" surface');
+    check(surfaces.some(function (s) { return s.id === id && s.label && s.icon; }), '[surfaces] surface "' + id + '" must carry a label + icon (the ported NAV entry)');
+  });
+  // render.renderDocSurface dispatch + a render fn per non-Proof surface.
+  check(typeof render.renderDocSurface === 'function', '[surfaces] render.js must export renderDocSurface (the surface dispatch)');
+  check(/var DOC_SURFACE_RENDER = \{/.test(renderSrc), '[surfaces] render.js must declare the DOC_SURFACE_RENDER dispatch table');
+  NAV_IDS.forEach(function (id) {
+    if (id === 'proof') { check(typeof render.renderDocuments === 'function', '[surfaces] Proof must reuse renderDocuments (the M11 reader)'); return; }
+    check(new RegExp('function renderDocSurface_' + id + '\\b').test(renderSrc), '[surfaces] render.js must define renderDocSurface_' + id);
+  });
+  // pages.JSX_PORT — every surface mapped with source_line + status + component.
+  const port = pages.JSX_PORT || {};
+  check(Object.keys(port).length === 11, '[surfaces] pages.JSX_PORT must cover exactly 11 surfaces (got ' + Object.keys(port).length + ')');
+  NAV_IDS.forEach(function (id) {
+    const e = port[id];
+    check(!!e, '[surfaces] JSX_PORT missing surface: ' + id);
+    if (e) {
+      check(typeof e.source_line === 'number' && e.source_line > 0, '[surfaces] JSX_PORT.' + id + ' must carry a numeric source_line');
+      check(/^real:/.test(e.status) || e.status === 'demo-surface', '[surfaces] JSX_PORT.' + id + ' status must be real:<endpoint> or demo-surface (got ' + e.status + ')');
+      check(typeof e.component === 'string' && renderSrc.indexOf(e.component) >= 0, '[surfaces] JSX_PORT.' + id + ' component "' + e.component + '" must exist in render.js');
+    }
+  });
+  // Rail nav + route reachability: the rail tree is built from DOC_SURFACES, each
+  // surface navigates to #/documents/<id>, and renderDocuments dispatches surfaces.
+  check(/DOC_SURFACES\.forEach/.test(renderSrc), '[surfaces] buildDocTree must render the 11-surface nav from DOC_SURFACES');
+  check(/isDocSurface/.test(renderSrc) && /renderDocSurface\(/.test(renderSrc), '[surfaces] renderDocuments must dispatch non-Proof surfaces via isDocSurface + renderDocSurface');
+  check(renderSrc.indexOf("'#/documents/' + id") >= 0, '[surfaces] surface nav items must deep-link to #/documents/<id>');
+  notes.push('surface port (M12): 11/11 WebCrux surfaces in DOC_SURFACES + JSX_PORT; Proof→reader, 10× renderDocSurface_<id>; rail nav from DOC_SURFACES; #/documents/<id> routes.');
+})();
+
+// =========================================================================
+//  Check 33 — (M12) real-vs-demo honesty. A JSX_PORT 'real:<endpoint>' surface
+//  reads through the api.js client (fetchJSON → window.CruxApi.get); a
+//  'demo-surface' renders its fixture ONLY behind the demoOn()-guarded choke
+//  point (surfaceDemo → demoData) and carries an honest empty state. Nothing is
+//  fabricated as if real, and every colour in the new surface CSS is a var(--…).
+// =========================================================================
+(function checkSurfaceHonesty() {
+  const port = pages.JSX_PORT || {};
+  // surfaceDemo is the fixture choke point — it must read via demoData().
+  const sd = funcBody(renderSrc, 'surfaceDemo');
+  check(!!sd && /demoData\(/.test(sd), '[honesty] surfaceDemo must read fixtures via the demoData() choke point');
+  Object.keys(port).forEach(function (id) {
+    if (id === 'proof') { return; }   // the reader's honesty is covered by check 27
+    const body = funcBody(renderSrc, port[id].component);
+    check(!!body, '[honesty] could not extract ' + port[id].component + ' body');
+    if (!body) { return; }
+    if (/^real:/.test(port[id].status)) {
+      check(/fetchJSON\(/.test(body), '[honesty] real surface ' + id + ' must read via the api.js client (fetchJSON)');
+    } else {
+      check(/surfaceDemo\(/.test(body), '[honesty] demo-surface ' + id + ' must read its fixture only via the surfaceDemo() choke point');
+      check(/docSurfaceEmpty\(/.test(body), '[honesty] demo-surface ' + id + ' must show an honest empty state when demo is off (docSurfaceEmpty)');
+    }
+  });
+  // The four real surfaces (+ Proof reader) are named in JSX_PORT with an endpoint.
+  const realCount = Object.keys(port).filter(function (id) { return /^real:/.test(port[id].status); }).length;
+  check(realCount >= 4, '[honesty] at least 4 surfaces must be wired to real endpoints (watch/diff/lanes/domains + Proof reader); got ' + realCount);
+  // Every colour in the new surface CSS block is a theme token (no hex/rgb).
+  const cssM = shellHtml.match(/M12-SURFACE-CSS-START([\s\S]*?)M12-SURFACE-CSS-END/);
+  check(!!cssM, '[honesty] shell.html must delimit the M12 surface CSS block (colour audit region)');
+  if (cssM) {
+    const block = cssM[1];
+    check(!/#[0-9a-fA-F]{3,8}\b/.test(block), '[honesty] the M12 surface CSS must use only var(--…) tokens — a hex literal was found');
+    check(!/\brgba?\(/.test(block), '[honesty] the M12 surface CSS must use only var(--…) tokens — an rgb()/rgba() literal was found');
+  }
+  notes.push('surface honesty (M12): real surfaces read via fetchJSON (CruxApi); demo surfaces render fixtures only behind surfaceDemo()/demoData() + carry honest empty states; new surface CSS is 100% var(--…) tokens.');
+})();
+
 // ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — M11 (documents reader fix + read-POST client + Explorer) smoke');
+console.log('unified-shell-console v2 — M12 (11 WebCrux surfaces ported into the Documents-mode nav) smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
 if (failures.length) {
   console.error('\nFAIL (' + failures.length + '):');
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity, M9 canvas board (canvasTier + widget registry), M9 canvas graph (real-edge-only model + focus parser + launch points), M10 documents mode (3-mode reader + ~72ch measure + evidence panel + real sources + demo Proof fixture + deep-link-out auto-switch), M10 legacy retirement (retired_at + fallback copy + console.rs DEPRECATED comment)).');
+console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity, M9 canvas board (canvasTier + widget registry), M9 canvas graph (real-edge-only model + focus parser + launch points), M10 documents mode (3-mode reader + ~72ch measure + evidence panel + real sources + demo Proof fixture + deep-link-out auto-switch), M10 legacy retirement (retired_at + fallback copy + console.rs DEPRECATED comment), M12 11-surface JSX port (DOC_SURFACES + JSX_PORT + rail nav + #/documents/<id> routes + real-vs-demo honesty)).');
 process.exit(0);

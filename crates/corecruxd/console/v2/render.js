@@ -1731,6 +1731,500 @@
     return card;
   }
 
+  // =======================================================================
+  //  JSX SURFACE PORT (M12) — the 11 WebCrux Proof surfaces
+  //  (webcrux-surfaces-demo-v3.jsx) become the Documents-mode surface list.
+  //  The rail's document tree is prefixed with the JSX's own 11-surface NAV
+  //  (its `NAV` const, line 3028); each surface is a route #/documents/<id>.
+  //  Proof (id 'proof') reuses the M11-fixed 3-zone reader below. The other ten
+  //  are ported here as `renderDocSurface_<id>` composition functions (React →
+  //  plain DOM). Every JSX colour token (T.accent/T.cyan/T.purple/…) maps to a
+  //  v2 theme token via the ported micro-kit (docBadge/docDot/docStatusChip/
+  //  docModeTag/docTiles + the existing docSection/docCard/docCovBar/docReceipt/
+  //  docEvidenceCard) — so nothing carries a literal colour.
+  //
+  //  Honesty (the M12 gate): a surface with a real daemon endpoint reads it via
+  //  the api.js client (fetchJSON → window.CruxApi.get) and shows real fields;
+  //  a surface with NO clean endpoint renders the JSX's own data ONLY behind the
+  //  demoOn()-guarded demoData('surfaces') choke point, clearly demo-chipped, and
+  //  otherwise shows an honest "sample surface — enable demo data" empty state.
+  //  NOTHING is fabricated as if real. Presentation only — no posture side effects.
+  // =======================================================================
+  var DOC_SURFACES = [
+    { id: 'proof', label: 'Proof', icon: '◈' },
+    { id: 'watch', label: 'Watch', icon: '◎' },
+    { id: 'ask', label: 'Ask', icon: '◇' },
+    { id: 'living', label: 'Living Objects', icon: '⬡' },
+    { id: 'deps', label: 'Dependencies', icon: '⬙' },
+    { id: 'signals', label: 'Signals', icon: '⚡' },
+    { id: 'diff', label: 'Receipt Diff', icon: '⟷' },
+    { id: 'sourcing', label: 'Sourcing', icon: '🔍' },
+    { id: 'lanes', label: 'Lanes', icon: '⧈' },
+    { id: 'domains', label: 'Domains', icon: '🏛' },
+    { id: 'reverse', label: 'Reverse', icon: '⊘' }
+  ];
+  var DOC_SURFACE_IDS = DOC_SURFACES.map(function (s) { return s.id; });
+  function isDocSurface(id) { return DOC_SURFACE_IDS.indexOf(id) >= 0; }
+  // Reader docs ('ref:'/'tenant:'/'demo:proof'/null) belong to the Proof surface.
+  function surfaceIdOf(docId) { return (docId && isDocSurface(docId)) ? docId : 'proof'; }
+
+  // ---- Ported micro-kit (JSX tokens → v2 tokens) -------------------------
+  // Generic pill (ported Badge). tone ∈ {ok,warn,crit,trust,''} → the doc-cov
+  // family (already theme-tokenised); '' is the neutral surface pill.
+  function docBadge(text, tone) { return el('span', { 'class': 'doc-cov' + (tone ? ' doc-cov-' + tone : ''), text: String(text) }); }
+  // Coloured dot (ported Dot).
+  function docDot(tone) { return el('span', { 'class': 'doc-dot' + (tone ? ' doc-dot-' + tone : ''), 'aria-hidden': 'true' }); }
+  // Confidence band (ported CovBadge) — High→ok · Medium→warn · Low→crit.
+  var DOC_BAND_TONE = { high: 'ok', medium: 'warn', low: 'crit' };
+  function docBandTone(label) { return DOC_BAND_TONE[String(label || '').toLowerCase()] || ''; }
+  var DOC_BAND_SCORE = { high: 0.82, medium: 0.55, low: 0.22 };
+  function docBandBadge(label, score) {
+    var s = (score != null) ? score : DOC_BAND_SCORE[String(label || '').toLowerCase()];
+    return el('span', { 'class': 'doc-cov doc-cov-' + (docBandTone(label) || 'trust'), text: String(label || '—') + (s != null ? ' · ' + Math.round(s * 100) + '%' : '') });
+  }
+  // Status chip (ported StatusChip) — Stable→ok · Updated→warn · Attention→crit.
+  var DOC_STATUS = { stable: ['ok', '●'], updated: ['warn', '◐'], attention: ['crit', '◉'], fresh: ['ok', '●'], stale: ['warn', '◐'], contested: ['crit', '◉'], superseded: ['', '○'], healthy: ['ok', '●'], error: ['crit', '◉'] };
+  function docStatusChip(status) { var c = DOC_STATUS[String(status || '').toLowerCase()] || ['', '○']; return el('span', { 'class': 'doc-cov' + (c[0] ? ' doc-cov-' + c[0] : ''), text: c[1] + ' ' + status }); }
+  // Mode tag (ported ModeTag) — verified→trust · audit→warn · light→neutral.
+  var DOC_MODE_TONE = { verified: 'trust', audit: 'warn', light: '' };
+  function docModeTag(mode) { return el('span', { 'class': 'doc-cov' + (DOC_MODE_TONE[String(mode || '').toLowerCase()] ? ' doc-cov-' + DOC_MODE_TONE[String(mode).toLowerCase()] : ''), text: String(mode) }); }
+  // A quiet, inert surface button (ported Btn) — demo surfaces carry no live
+  // behaviour, so these are nav-family .btn-quiet with no handler.
+  function docBtn(label) { return el('button', { 'class': 'btn-quiet', type: 'button', text: String(label) }); }
+  // Stat-tile row (ported the repeated {value / label} triples).
+  function docTiles(pairs) {
+    var row = el('div', { 'class': 'doc-tiles' });
+    (pairs || []).forEach(function (p) {
+      row.appendChild(el('div', { 'class': 'doc-tile' }, [
+        el('div', { 'class': 'doc-tile-v', text: String(p[0]) }),
+        el('div', { 'class': 'doc-tile-k', text: String(p[1]) })
+      ]));
+    });
+    return row;
+  }
+  function docSurfaceHead(main, icon, title, sub, note) {
+    var head = el('div', { 'class': 'doc-read-head' });
+    head.appendChild(el('h1', { 'class': 'doc-read-title', text: icon + ' ' + title }));
+    if (sub) { head.appendChild(el('p', { 'class': 'doc-read-sub', text: sub })); }
+    if (note) { head.appendChild(el('p', { 'class': 'doc-surface-note', text: note })); }
+    main.appendChild(head);
+  }
+  // A clickable/expandable list card (ported the repeated <Card> row). `opts`:
+  // { chips:[node], title, text, side:[str], strip:tone, detail:fn(body) }.
+  function docListCard(opts) {
+    var card = el('details', { 'class': 'doc-card doc-list-card' + (opts.strip ? ' doc-strip doc-strip-' + opts.strip : '') });
+    var sum = el('summary', { 'class': 'doc-list-sum' });
+    var mainCol = el('div', { 'class': 'doc-surface-row-main' });
+    if (opts.chips && opts.chips.length) { var cw = el('div', { 'class': 'doc-chips' }); opts.chips.forEach(function (c) { if (c) { cw.appendChild(c); } }); mainCol.appendChild(cw); }
+    if (opts.title) { mainCol.appendChild(el('div', { 'class': 'doc-row-title', text: opts.title })); }
+    if (opts.text) { mainCol.appendChild(el('div', { 'class': 'doc-row-text', text: opts.text })); }
+    var row = el('div', { 'class': 'doc-surface-row' }, [mainCol]);
+    if (opts.side && opts.side.length) {
+      var sideCol = el('div', { 'class': 'doc-surface-row-side' });
+      opts.side.forEach(function (s) { if (s != null) { sideCol.appendChild(el('div', { text: String(s) })); } });
+      row.appendChild(sideCol);
+    }
+    sum.appendChild(row);
+    card.appendChild(sum);
+    if (typeof opts.detail === 'function') {
+      var body = el('div', { 'class': 'doc-list-body' });
+      opts.detail(body);
+      card.appendChild(body);
+    }
+    return card;
+  }
+  function docArrow() { return el('span', { 'class': 'doc-arrow', 'aria-hidden': 'true', text: '→' }); }
+  // Honest empty state for a demo surface with demo mode off.
+  function docSurfaceEmpty(host, msg) {
+    host.appendChild(el('div', { 'class': 'doc-surface-empty' }, [
+      el('p', { 'class': 'ctl-desc', text: msg || 'Sample surface — enable demo data (?demo=1) to preview.' })
+    ]));
+  }
+  // The demo-fixture choke point for surfaces: reads CruxDemo.surfaces[id] ONLY
+  // through demoData() (demoOn()-guarded), so a surface can never render its
+  // fixture un-flagged. Returns null when demo is off / the fixture is absent.
+  function surfaceDemo(id) { var s = demoData('surfaces'); return (s && s[id]) ? s[id] : null; }
+
+  // ---- 2 · Watch (real /v1/activity change feed + demo watched items) -----
+  function renderDocSurface_watch(main, ctx) {
+    docSurfaceHead(main, '◎', 'Watch', "We'll tell you when something you rely on changes.");
+    var host = el('div', { 'class': 'doc-ev-host' }, [el('p', { 'class': 'ctl-desc', text: 'Loading change feed…' })]);
+    main.appendChild(host);
+    fetchJSON('/v1/activity?tenant_id=default&token_budget=1500').then(function (res) {
+      host.textContent = '';
+      var rows = (res.ok && res.data && res.data.rows) ? res.data.rows : [];
+      if (rows.length) {
+        host.appendChild(docSection('Change feed · /v1/activity'));
+        rows.slice(0, 20).forEach(function (r) {
+          var rid = (r.receipt_ids || [])[0] || r.receipt_id;
+          host.appendChild(docListCard({ chips: [docBadge(r.kind || 'event', 'trust'), r.tool ? docBadge(r.tool, '') : null], title: r.preview || (r.kind || 'event'), side: [r.ts || null, rid || null] }));
+        });
+        return;
+      }
+      var w = surfaceDemo('watch');
+      if (w && w.length) {
+        var counts = { updated: w.filter(function (x) { return x.status !== 'Stable'; }).length, attn: w.filter(function (x) { return x.status === 'Attention'; }).length };
+        host.appendChild(docTiles([[String(w.length), 'watched'], [String(counts.updated), 'updated (7d)'], [String(counts.attn), 'attention']]));
+        host.appendChild(demoChip(true));
+        host.appendChild(docSection('Watched items · demo'));
+        w.forEach(function (x) {
+          host.appendChild(docListCard({
+            chips: [docBadge(x.type, ''), docStatusChip(x.status), x.dependents ? docBadge(x.dependents + ' deps', '') : null],
+            title: x.name, side: [x.lastChecked ? String(x.lastChecked).slice(0, 10) : null], strip: docBandTone(x.band),
+            detail: (x.history && x.history.length) ? function (body) {
+              body.appendChild(docSection('Change log (' + x.history.length + ')'));
+              x.history.forEach(function (h) {
+                var c = el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-row-title', text: h.what })]);
+                if (h.why) { c.appendChild(el('div', { 'class': 'doc-row-text', text: h.why })); }
+                var chips = el('div', { 'class': 'doc-chips' }, [docBandBadge(h.cBefore), docArrow(), docBandBadge(h.cAfter)]);
+                (h.codes || []).forEach(function (code) { chips.appendChild(docBadge(code, 'trust')); });
+                c.appendChild(chips);
+                body.appendChild(c);
+              });
+            } : null
+          }));
+        });
+        return;
+      }
+      docSurfaceEmpty(host, 'Nothing you rely on has changed — silence is success. Enable demo data (?demo=1) to preview watched items.');
+    });
+  }
+
+  // ---- 3 · Ask (demo surface — no live answer endpoint on this daemon) -----
+  function renderDocSurface_ask(main, ctx) {
+    docSurfaceHead(main, '◇', 'Ask', 'A verified answer canvas — claims linked to evidence, every iteration receipted.');
+    var d = surfaceDemo('ask');
+    if (!d) { docSurfaceEmpty(main, 'Ask has no live answer endpoint on this daemon build. Enable demo data (?demo=1) to preview the answer canvas.'); return; }
+    main.appendChild(el('div', { 'class': 'doc-chips' }, [docModeTag(d.mode || 'verified'), docBandBadge(d.cov && d.cov.label, d.cov && d.cov.score), demoChip(true)]));
+    main.appendChild(el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-row-text', text: d.query })]));
+    if (d.thread && d.thread.length) {
+      main.appendChild(docSection('Thread · ' + d.thread.length + ' iterations'));
+      var strip = el('div', { 'class': 'doc-chips' });
+      d.thread.forEach(function (t) { strip.appendChild(docBadge(t.label, t.type === 'ask' ? 'trust' : (t.type === 'alter_query' ? '' : 'warn'))); });
+      main.appendChild(strip);
+    }
+    main.appendChild(docSection('Answer'));
+    var ans = el('div', { 'class': 'doc-card' });
+    (d.paragraphs || []).forEach(function (p) { ans.appendChild(el('p', { 'class': 'doc-chunk-text', text: p })); });
+    main.appendChild(ans);
+    main.appendChild(docSection('Claims (' + (d.claims || []).length + ')'));
+    (d.claims || []).forEach(function (cl) {
+      main.appendChild(el('div', { 'class': 'doc-claim-row' }, [docDot(cl.status === 'contested' ? 'warn' : 'ok'), el('span', { 'class': 'doc-row-text', text: cl.text }), el('span', { 'class': 'doc-chunk-claims', text: cl.id })]));
+    });
+    main.appendChild(docSection('Evidence (' + (d.evidence || []).length + ')'));
+    (d.evidence || []).forEach(function (e) { main.appendChild(docEvidenceCard({ role: e.role === 'primary' ? 'support' : (e.role === 'context' ? 'context' : 'support'), domain: e.domain, summary: e.title, source: e.role, score: e.score })); });
+    main.appendChild(docSection('Coverage'));
+    var cov = el('div', { 'class': 'doc-card' }, [docBandBadge(d.cov && d.cov.label, d.cov && d.cov.score)]);
+    var comp = (d.cov && d.cov.comp) || {};
+    ['retrieval', 'domains', 'temporal', 'clusters'].forEach(function (k) { if (comp[k] != null) { cov.appendChild(docCovBar(k, comp[k])); } });
+    main.appendChild(cov);
+    main.appendChild(demoChip(true));
+  }
+
+  // ---- 4 · Living Objects (demo surface) ---------------------------------
+  function renderDocSurface_living(main, ctx) {
+    docSurfaceHead(main, '⬡', 'Living Objects', 'Artefacts with state, subscriptions, pressure, and auto-maintenance.');
+    var list = surfaceDemo('living');
+    if (!list || !list.length) { docSurfaceEmpty(main, 'No living-object endpoint on this daemon build. Enable demo data (?demo=1) to preview artefact state + pressure.'); return; }
+    main.appendChild(demoChip(true));
+    list.forEach(function (a) {
+      main.appendChild(docListCard({
+        chips: [docStatusChip(a.state), docBandBadge(a.confidence), docBadge('T' + a.trunkTier, ''), docBadge(a.lane, ''), a.pressureLevel > 0 ? docBadge('⚡ P' + a.pressureLevel, a.pressureLevel >= 3 ? 'crit' : (a.pressureLevel >= 2 ? 'warn' : '')) : null],
+        title: a.title, text: a.domain, strip: DOC_STATUS[a.state] ? DOC_STATUS[a.state][0] : '',
+        side: [(a.dependents.answers) + 'a · ' + a.dependents.mises + 'm', a.relations.length + ' rels'],
+        detail: function (body) {
+          body.appendChild(docTiles([[String(a.dependents.answers), 'answers'], [String(a.dependents.mises), 'mises'], [String(a.dependents.collections), 'collections']]));
+          if (a.pressure && a.pressure.length) {
+            body.appendChild(docSection('Active pressure'));
+            a.pressure.forEach(function (p) {
+              var tone = p.severity >= 3 ? 'crit' : (p.severity >= 2 ? 'warn' : '');
+              var c = el('div', { 'class': 'doc-card doc-strip doc-strip-' + tone }, [el('div', { 'class': 'doc-chips' }, [docBadge(p.code, tone), docBadge('severity ' + p.severity, tone)])]);
+              c.appendChild(el('div', { 'class': 'doc-row-text', text: p.summary }));
+              c.appendChild(el('div', { 'class': 'doc-cov doc-cov-warn', text: '→ ' + p.action }));
+              body.appendChild(c);
+            });
+          }
+          body.appendChild(docSection('Relations (' + a.relations.length + ')'));
+          a.relations.forEach(function (r) {
+            body.appendChild(el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-chips' }, [docBadge(r.type.replace(/_/g, ' '), r.type.indexOf('contradict') >= 0 ? 'crit' : (r.type === 'supports' || r.type === 'supersedes' ? 'ok' : '')), docBadge(r.method, '')]), el('div', { 'class': 'doc-row-title', text: r.target }), el('div', { 'class': 'doc-row-text', text: 'confidence ' + Math.round(r.confidence * 100) + '%' })]));
+          });
+          body.appendChild(docSection('Version chain'));
+          a.versions.forEach(function (v, i) { body.appendChild(el('div', { 'class': 'doc-receipt' }, [docDot(i === 0 ? 'ok' : ''), el('span', { 'class': 'doc-receipt-label', text: v.v }), el('span', { 'class': 'doc-receipt-ts', text: v.date + ' · ' + v.hash })])); });
+        }
+      }));
+    });
+  }
+
+  // ---- 5 · Dependencies (demo surface — assumption-loaded dependency tree) -
+  function renderDocSurface_deps(main, ctx) {
+    docSurfaceHead(main, '⬙', 'Dependencies', 'What the answer rests on — confidence beams and assumption loading, node by node.');
+    var d = surfaceDemo('deps');
+    if (!d || !d.root) { docSurfaceEmpty(main, 'No dependency-graph endpoint on this daemon build. Enable demo data (?demo=1) to preview the assumption-loaded tree.'); return; }
+    main.appendChild(el('div', { 'class': 'doc-chips' }, [docBandBadge(null, d.root.confidence), docBadge('fragility ' + Math.round(d.root.fragility * 100) + '%', d.root.fragility > 0.5 ? 'crit' : 'warn'), demoChip(true)]));
+    main.appendChild(el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-row-text', text: d.query })]));
+    main.appendChild(docSection('Dependency tree'));
+    function assumTone(load) { return load <= 0.25 ? 'ok' : (load <= 0.5 ? 'warn' : 'crit'); }
+    function walkNode(node, depth) {
+      var row = el('div', { 'class': 'doc-dep-node', style: 'margin-left:' + (depth * 16) + 'px' });
+      row.appendChild(el('div', { 'class': 'doc-chips' }, [
+        docDot(assumTone(node.assumptionLoad)),
+        el('span', { 'class': 'doc-row-title', text: node.label }),
+        node.trunkTier ? docBadge('T' + node.trunkTier, '') : null,
+        docBadge(node.type, node.type === 'assumption' ? 'warn' : '')
+      ].filter(Boolean)));
+      if (node.sublabel) { row.appendChild(el('div', { 'class': 'doc-row-text', text: node.sublabel })); }
+      row.appendChild(docCovBar('confidence', node.confidence));
+      row.appendChild(el('div', { 'class': 'doc-chunk-claims', text: 'assumption load ' + Math.round(node.assumptionLoad * 100) + '% · coverage ' + Math.round((node.coverageContribution || 0) * 100) + '%' }));
+      main.appendChild(row);
+      (node.children || []).forEach(function (c) { walkNode(c, depth + 1); });
+    }
+    walkNode(d.root, 0);
+    main.appendChild(el('p', { 'class': 'ctl-desc', text: 'Assumption load: green ≤25% grounded · amber ≤50% · red assumption-heavy. Beam = confidence.' }));
+    main.appendChild(demoChip(true));
+  }
+
+  // ---- 6 · Signals (demo surface — epistemic status-change feed) ----------
+  function renderDocSurface_signals(main, ctx) {
+    docSurfaceHead(main, '⚡', 'Signals', 'No breaking news. Only broken assumptions.', 'Epistemic status changes backed by receipts and diffs.');
+    var list = surfaceDemo('signals');
+    if (!list || !list.length) { docSurfaceEmpty(main, 'No signal feed on this daemon build. Enable demo data (?demo=1) to preview epistemic status changes.'); return; }
+    main.appendChild(demoChip(true));
+    var sevTone = { high: 'crit', medium: 'warn', low: 'ok' };
+    list.forEach(function (s) {
+      var tone = sevTone[s.severity] || '';
+      main.appendChild(docListCard({
+        chips: [docBadge(s.severity, tone), docBadge(s.type.replace(/_/g, ' '), ''), docBadge(s.target.type, '')],
+        title: s.title, text: s.what, strip: tone,
+        side: [s.publishedAt ? String(s.publishedAt).slice(0, 10) : null, s.depImpact.answers + 'a · ' + s.depImpact.artefacts + 'art'],
+        detail: function (body) {
+          body.appendChild(docSection('Why it changed'));
+          body.appendChild(el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-row-text', text: s.why })]));
+          var chips = el('div', { 'class': 'doc-chips' });
+          (s.codes || []).forEach(function (c) { chips.appendChild(docBadge(c, 'trust')); });
+          body.appendChild(chips);
+          body.appendChild(el('div', { 'class': 'doc-chips' }, [docBandBadge(s.cBefore), docArrow(), docBandBadge(s.cAfter)]));
+          if (s.rBefore || s.rAfter) {
+            body.appendChild(docSection('Receipts'));
+            if (s.rBefore) { body.appendChild(docReceipt(s.rBefore, 'before', null)); }
+            if (s.rAfter) { body.appendChild(docReceipt(s.rAfter, 'after', null)); }
+          }
+        }
+      }));
+    });
+  }
+
+  // ---- 7 · Receipt Diff (real receipt timeline + demo before/after diff) ---
+  function renderDocSurface_diff(main, ctx) {
+    docSurfaceHead(main, '⟷', 'Receipt Diff', 'Side-by-side CROWN snapshot comparison — what changed and why.');
+    var d = surfaceDemo('diff');
+    if (d && d.before && d.after) {
+      var b = d.before, a = d.after;
+      var grid = el('div', { 'class': 'doc-diff-grid' });
+      grid.appendChild(el('div', { 'class': 'doc-card doc-strip doc-strip-trust' }, [el('div', { 'class': 'doc-chips' }, [docBadge('BEFORE', 'trust'), docModeTag(b.mode)]), docReceipt(b.id, null, b.ts)]));
+      grid.appendChild(el('div', { 'class': 'doc-card doc-strip doc-strip-warn' }, [el('div', { 'class': 'doc-chips' }, [docBadge('AFTER', 'warn'), docModeTag(a.mode)]), docReceipt(a.id, null, a.ts)]));
+      main.appendChild(grid);
+      main.appendChild(demoChip(true));
+      main.appendChild(docSection('Confidence band'));
+      var cd = a.confidence.score - b.confidence.score;
+      main.appendChild(el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-chips' }, [docBandBadge(b.confidence.band, b.confidence.score), docArrow(), docBandBadge(a.confidence.band, a.confidence.score), docBadge((cd >= 0 ? '+' : '') + Math.round(cd * 100) + '%', cd >= 0 ? 'ok' : 'crit')])]));
+      main.appendChild(docSection('Coverage components'));
+      var covCard = el('div', { 'class': 'doc-card' });
+      ['retrieval', 'domains', 'temporal', 'clusters'].forEach(function (k) {
+        var delta = (a.coverage[k] || 0) - (b.coverage[k] || 0);
+        var r = el('div', { 'class': 'doc-diff-row' }, [el('span', { 'class': 'doc-chunk-claims', text: k })]);
+        r.appendChild(docCovBar('before', b.coverage[k]));
+        r.appendChild(docCovBar('after', a.coverage[k]));
+        r.appendChild(el('span', { 'class': 'doc-cov doc-cov-' + (delta >= 0 ? 'ok' : 'crit'), text: (delta >= 0 ? '+' : '') + Math.round(delta * 100) + '%' }));
+        covCard.appendChild(r);
+      });
+      main.appendChild(covCard);
+      if (a.dropped && a.dropped.length) {
+        main.appendChild(docSection('Dropped evidence'));
+        a.dropped.forEach(function (e) { main.appendChild(docEvidenceCard({ role: 'challenge', domain: e.domain, summary: e.title, source: e.reason, type: 'contradiction' })); });
+      }
+      return;
+    }
+    // Real receipt timeline (grounds the surface even without the demo diff).
+    var host = el('div', { 'class': 'doc-ev-host' }, [el('p', { 'class': 'ctl-desc', text: 'Loading receipts…' })]);
+    main.appendChild(host);
+    fetchJSON('/v1/activity?tenant_id=default&token_budget=1500').then(function (res) {
+      host.textContent = '';
+      var rows = (res.ok && res.data && res.data.rows) ? res.data.rows : [];
+      var seen = {}, n = 0;
+      host.appendChild(docSection('Receipt timeline · /v1/activity'));
+      rows.forEach(function (r) { var rid = (r.receipt_ids || [])[0] || r.receipt_id; if (!rid || seen[rid] || n >= 12) { return; } seen[rid] = true; n++; host.appendChild(docReceipt(rid, (r.kind || 'event') + (r.tool ? ' · ' + r.tool : ''), r.ts ? String(r.ts) : null)); });
+      if (!n) { docSurfaceEmpty(host, 'No receipts to compare yet. Enable demo data (?demo=1) to preview a before/after CROWN diff.'); }
+    });
+  }
+
+  // ---- 8 · Sourcing (demo surface — coverage-gap → sourcing lifecycle) -----
+  function renderDocSurface_sourcing(main, ctx) {
+    docSurfaceHead(main, '🔍', 'Sourcing', "When answers are thin, here's the path to fix them.", 'Policy-gated, costed, budgeted. Structured sourcing, not scraping.');
+    var list = surfaceDemo('sourcing');
+    if (!list || !list.length) { docSurfaceEmpty(main, 'No sourcing-request endpoint on this daemon build. Enable demo data (?demo=1) to preview the coverage-gap → sourcing lifecycle.'); return; }
+    main.appendChild(demoChip(true));
+    var stTone = { discovering: 'trust', quoted: '', awaiting_user_choice: 'warn', completed: 'ok', failed: 'crit' };
+    list.forEach(function (s) {
+      main.appendChild(docListCard({
+        chips: [docBadge(String(s.status).replace(/_/g, ' '), stTone[s.status] || ''), docBandBadge(s.covLabel, s.covScore), s.fragility > 0.6 ? docBadge('fragility ' + Math.round(s.fragility * 100) + '%', 'crit') : null],
+        title: s.query, side: [s.quoteEstimate ? s.quoteEstimate.crux + ' Crux' : null, s.suggestions.length + ' suggestion' + (s.suggestions.length === 1 ? '' : 's')],
+        detail: function (body) {
+          body.appendChild(docSection('Source suggestions (' + s.suggestions.length + ')'));
+          s.suggestions.forEach(function (sg) {
+            var sgTone = { accepted: 'ok', rejected: 'crit', ingested: 'trust' }[sg.status] || '';
+            var c = el('div', { 'class': 'doc-card doc-strip doc-strip-' + sgTone }, [el('div', { 'class': 'doc-evcard-domain', text: sg.url })]);
+            c.appendChild(el('div', { 'class': 'doc-row-text', text: sg.rationale }));
+            c.appendChild(el('div', { 'class': 'doc-chips' }, [docBadge(sg.status, sgTone), docBadge(sg.lane + ' lane', '')]));
+            body.appendChild(c);
+          });
+          if (s.quoteEstimate) {
+            body.appendChild(docSection('Cost estimate'));
+            body.appendChild(docTiles([[String(s.quoteEstimate.crux), 'Crux'], ['£' + s.quoteEstimate.gbp.toFixed(2), 'GBP'], ['~' + s.quoteEstimate.chunks, 'chunks est.']]));
+            body.appendChild(el('p', { 'class': 'ctl-desc', text: 'No token pricing. No surprise bills.' }));
+          }
+          if (s.status === 'awaiting_user_choice') { body.appendChild(el('div', { 'class': 'doc-btn-row' }, [docBtn('✓ Upgrade (fund ingestion)'), docBtn('⏳ Backlog'), docBtn('⊘ Cancel')])); }
+          body.appendChild(docSection('Discovered domains'));
+          var dz = el('div', { 'class': 'doc-chips' });
+          (s.discoveredDomains || []).forEach(function (dm) { dz.appendChild(docBadge(dm, 'trust')); });
+          body.appendChild(dz);
+        }
+      }));
+    });
+  }
+
+  // ---- 9 · Lanes (real RRF lane weights + demo embedding lane stack) -------
+  function renderDocSurface_lanes(main, ctx) {
+    docSurfaceHead(main, '⧈', 'Lanes', 'Fast baseline for everything. Selective upgrades for what matters.', 'Late-fusion retrieval · no cross-dimension maths.');
+    var host = el('div', { 'class': 'doc-ev-host' }, [el('p', { 'class': 'ctl-desc', text: 'Loading lane weights…' })]);
+    main.appendChild(host);
+    fetchJSON('/v1/console/corecrux/lane-weights').then(function (res) {
+      host.textContent = '';
+      var d = (res.ok && res.data) ? res.data : null;
+      if (d && d.weights) {
+        host.appendChild(docSection('RRF fusion weights · ' + (d.scope || 'global') + (d.fusion_rrf_enabled ? ' · RRF on' : ' · RRF off')));
+        var card = el('div', { 'class': 'doc-card' });
+        var mx = 1; Object.keys(d.weights).forEach(function (k) { mx = Math.max(mx, Number(d.weights[k]) || 0); });
+        Object.keys(d.weights).forEach(function (k) { card.appendChild(docCovBar(k, (Number(d.weights[k]) || 0) / mx)); });
+        host.appendChild(card);
+      } else {
+        host.appendChild(el('p', { 'class': 'ctl-desc', text: res.status === 0 ? 'Lane weights unreachable.' : 'CoreCrux lane-weight overlay unavailable (subscription lanes off).' }));
+      }
+      // Embedding lane stack — the JSX material (no live per-lane throughput
+      // endpoint on this daemon), demo-chipped.
+      var stack = surfaceDemo('lanes');
+      if (stack && stack.lanes && stack.lanes.length) {
+        host.appendChild(docSection('Embedding lane stack · demo'));
+        host.appendChild(demoChip(true));
+        var maxArt = Math.max.apply(null, stack.lanes.map(function (l) { return l.stats.artefacts; }).concat([1]));
+        stack.lanes.forEach(function (l) {
+          host.appendChild(docListCard({
+            chips: [docBadge(l.tier, 'trust'), docBadge(l.dim + ' dim', ''), docBadge(l.provider, '')],
+            title: l.model, text: l.desc,
+            side: [l.stats.artefacts.toLocaleString() + ' artefacts', l.stats.cost + ' · p95 ' + l.stats.p95],
+            detail: function (body) {
+              body.appendChild(docCovBar('share of stack', l.stats.artefacts / maxArt));
+              body.appendChild(docTiles([[String(l.stats.backlog), 'backlog'], [l.stats.throughput, 'throughput'], [l.modes.join(' · '), 'modes']]));
+            }
+          }));
+        });
+        if (stack.promotions && stack.promotions.length) {
+          host.appendChild(docSection('Recent promotions · demo'));
+          stack.promotions.forEach(function (p) {
+            host.appendChild(docListCard({ chips: [docBadge(p.from + ' → ' + p.to, ''), docBadge(p.reason, 'trust'), docBadge(p.status, p.status === 'done' ? 'ok' : (p.status === 'running' ? 'warn' : ''))], title: p.artefact, side: [p.score != null ? 'score ' + p.score : (p.budget || null)] }));
+          });
+        }
+      }
+    });
+  }
+
+  // ---- 10 · Domains (real feature coverage + demo domain health) ----------
+  function renderDocSurface_domains(main, ctx) {
+    docSurfaceHead(main, '🏛', 'Domains', 'Corpus health per source — coverage, freshness, trust, contradiction.');
+    var host = el('div', { 'class': 'doc-ev-host' }, [el('p', { 'class': 'ctl-desc', text: 'Loading coverage…' })]);
+    main.appendChild(host);
+    fetchJSON('/v1/features/capabilities/analysis/coverage').then(function (res) {
+      host.textContent = '';
+      var systems = (res.ok && res.data && (res.data.systems || res.data.coverage || res.data.rows)) || [];
+      if (Array.isArray(systems) && systems.length) {
+        host.appendChild(docSection('Feature coverage by system · /v1/features/…/coverage'));
+        systems.slice(0, 20).forEach(function (s) {
+          var total = s.total || s.count || 0, tested = s.tested || 0;
+          var ratio = total ? tested / total : 0;
+          host.appendChild(docListCard({ chips: [docBandBadge(ratio > 0.66 ? 'High' : (ratio > 0.33 ? 'Medium' : 'Low'), ratio)], title: s.system || s.name || s.id || 'system', side: [tested + '/' + total + ' tested'], detail: function (body) { body.appendChild(docCovBar('tested', ratio)); } }));
+        });
+      } else {
+        host.appendChild(el('p', { 'class': 'ctl-desc', text: res.status === 0 ? 'Coverage unreachable.' : 'Feature coverage unavailable on this daemon (needs the features lens).' }));
+      }
+      var doms = surfaceDemo('domains');
+      if (doms && doms.length) {
+        host.appendChild(docSection('Source domain health · demo'));
+        host.appendChild(demoChip(true));
+        doms.forEach(function (dm) {
+          host.appendChild(docListCard({
+            chips: [docStatusChip(dm.ingestionStatus), docBadge(dm.type, ''), dm.flags && dm.flags.length ? docBadge('⚠ ' + dm.flags.length, 'warn') : null],
+            title: dm.name + ' · ' + dm.slug, side: [dm.artefacts + ' artefacts', dm.dependents.answers + 'a · ' + dm.dependents.mises + 'm'],
+            detail: function (body) {
+              body.appendChild(docCovBar('coverage', dm.coverage));
+              body.appendChild(docCovBar('freshness', dm.freshness));
+              body.appendChild(docCovBar('trust', dm.trust));
+              body.appendChild(docCovBar('contradiction', dm.contradiction));
+              (dm.flags || []).forEach(function (f) { body.appendChild(el('div', { 'class': 'doc-cov doc-cov-warn', text: f.msg })); });
+            }
+          }));
+        });
+      }
+    });
+  }
+
+  // ---- 11 · Reverse (demo surface — assertion verification + counterfactuals)
+  function renderDocSurface_reverse(main, ctx) {
+    docSurfaceHead(main, '⊘', 'Reverse', 'Paste an assertion — the engine finds what supports or contests it, then shows what breaks if you remove a source.');
+    var d = surfaceDemo('reverse');
+    if (!d) { docSurfaceEmpty(main, 'No reverse-verification endpoint on this daemon build. Enable demo data (?demo=1) to preview assertion verification.'); return; }
+    main.appendChild(el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-row-text', text: d.assertion })]));
+    main.appendChild(demoChip(true));
+    var an = d.analysis || {};
+    var vTone = an.verdictColor === 'red' ? 'crit' : (an.verdictColor === 'amber' ? 'warn' : 'ok');
+    main.appendChild(docSection('Verdict'));
+    main.appendChild(el('div', { 'class': 'doc-card doc-strip doc-strip-' + vTone }, [
+      el('div', { 'class': 'doc-chips' }, [docBadge(an.verdict, vTone), docBandBadge(an.covLabel, an.covScore), docBadge('confidence ' + Math.round((an.confidence || 0) * 100) + '%', vTone), docBadge('fragility ' + Math.round((an.fragility || 0) * 100) + '%', an.fragility > 0.5 ? 'crit' : 'warn')]),
+      el('div', { 'class': 'doc-issues' })
+    ]));
+    (an.issues || []).forEach(function (iss) { main.appendChild(el('div', { 'class': 'doc-card doc-strip doc-strip-' + (iss.severity === 'medium' ? 'warn' : ''), }, [el('div', { 'class': 'doc-chips' }, [docBadge(iss.severity, iss.severity === 'medium' ? 'warn' : '')]), el('div', { 'class': 'doc-row-text', text: iss.text })])); });
+    main.appendChild(docSection('Evidence (' + (d.evidence || []).length + ') — remove a source to see what breaks'));
+    (d.evidence || []).forEach(function (e) {
+      var cf = (d.counterfactuals || {})[e.id];
+      main.appendChild(docListCard({
+        chips: [docBadge(e.role, e.role === 'primary' ? 'trust' : ''), docBadge(Math.round(e.score * 100) + '%', e.score > 0.7 ? 'ok' : 'warn')],
+        title: e.title, text: e.domain,
+        detail: function (body) {
+          (e.supports || []).forEach(function (sp) { body.appendChild(el('div', { 'class': 'doc-claim-row' }, [docDot('ok'), el('span', { 'class': 'doc-row-text', text: sp })])); });
+          if (e.note) { body.appendChild(el('p', { 'class': 'ctl-desc', text: e.note })); }
+          if (cf) {
+            var t = cf.verdictColor === 'red' ? 'crit' : (cf.verdictColor === 'amber' ? 'warn' : 'ok');
+            body.appendChild(docSection('If removed →'));
+            body.appendChild(el('div', { 'class': 'doc-card doc-strip doc-strip-' + t }, [el('div', { 'class': 'doc-chips' }, [docBadge(cf.verdict, t), docBadge('confidence ' + Math.round(cf.confidence * 100) + '%', t)]), el('div', { 'class': 'doc-row-text', text: cf.answer })]));
+            if (cf.warning) { body.appendChild(el('div', { 'class': 'doc-cov doc-cov-crit', text: '⚠ ' + cf.warning })); }
+          }
+        }
+      }));
+    });
+  }
+
+  // Surface dispatch — Proof is the reader (handled in renderDocuments); the
+  // other ten are the ported composition functions above.
+  var DOC_SURFACE_RENDER = {
+    watch: renderDocSurface_watch, ask: renderDocSurface_ask, living: renderDocSurface_living,
+    deps: renderDocSurface_deps, signals: renderDocSurface_signals, diff: renderDocSurface_diff,
+    sourcing: renderDocSurface_sourcing, lanes: renderDocSurface_lanes, domains: renderDocSurface_domains,
+    reverse: renderDocSurface_reverse
+  };
+  function renderDocSurface(main, id, ctx) {
+    var fn = DOC_SURFACE_RENDER[id];
+    if (fn) { fn(main, ctx || {}); }
+    else { main.appendChild(el('p', { 'class': 'ctl-desc', text: 'Unknown surface.' })); }
+  }
+
   // ---- Document source model (real + demo) -------------------------------
   // Resolve a docId ("ref:<slug>" · "tenant:<id>" · "demo:proof") + the source
   // list. Real tenants win; the demo Proof doc appears only when demoOn().
@@ -1742,30 +2236,38 @@
   }
 
   // Build the rail document tree (left zone) + the phone sources sheet share it.
+  // The tree now LEADS with the JSX's own 11-surface NAV (Proof · Watch · Ask ·
+  // Living Objects · Dependencies · Signals · Receipt Diff · Sourcing · Lanes ·
+  // Domains · Reverse) as the primary Documents-mode navigation; the bundled
+  // reference docs + tenant corpora follow as a "Docs" group (Proof-reader docs).
   function buildDocTree(host, tenants, activeId) {
     host.textContent = '';
+    var activeSurface = surfaceIdOf(activeId);
     function group(title) { host.appendChild(el('div', { 'class': 'doc-tree-group', text: title })); }
-    function item(id, label, sub) {
-      var b = el('button', { 'class': 'doc-tree-item', type: 'button', 'data-doc': id, 'aria-current': id === activeId ? 'page' : 'false' }, [
+    function item(id, label, sub, current) {
+      var b = el('button', { 'class': 'doc-tree-item', type: 'button', 'data-doc': id, 'aria-current': current ? 'page' : 'false' }, [
         el('span', { 'class': 'doc-tree-label', text: label })
       ]);
       if (sub) { b.appendChild(el('span', { 'class': 'doc-tree-sub', text: sub })); }
       b.addEventListener('click', function () { location.hash = '#/documents/' + id; });
       host.appendChild(b);
     }
+    // 11-surface nav (the ported JSX NAV) — active = the surface the docId maps to.
+    group('Surfaces');
+    DOC_SURFACES.forEach(function (s) { item(s.id, s.icon + ' ' + s.label, null, s.id === activeSurface); });
     if (demoOn()) {
       var dr = demoData('docsReader');
-      group('Demo');
-      item('demo:proof', dr ? dr.title.split(' — ')[0] : 'Proof reader', 'verified · demo fixture');
+      group('Docs · demo');
+      item('demo:proof', dr ? dr.title.split(' — ')[0] : 'Proof reader', 'verified · demo fixture', activeId === 'demo:proof');
     }
-    group('Reference');
-    DOC_REFERENCE.forEach(function (d) { item('ref:' + d.slug, d.title, d.subtitle); });
-    group('Corpora · tenants');
+    group('Docs · reference');
+    DOC_REFERENCE.forEach(function (d) { item('ref:' + d.slug, d.title, d.subtitle, activeId === 'ref:' + d.slug); });
+    group('Docs · corpora');
     var live = (tenants || []).filter(function (t) { return !/^__/.test(String(t.tenant_id || t.id || '')); });
     if (live.length) {
       live.forEach(function (t) {
         var id = t.tenant_id || t.id;
-        item('tenant:' + id, String(id), [t.category, t.source].filter(Boolean).join(' · ') || 'tenant corpus');
+        item('tenant:' + id, String(id), [t.category, t.source].filter(Boolean).join(' · ') || 'tenant corpus', activeId === 'tenant:' + id);
       });
     } else {
       host.appendChild(el('p', { 'class': 'ctl-desc doc-tree-empty', text: demoOn() ? 'No live tenant corpora — demo Proof doc shown above.' : 'No tenant corpora yet — the daemon has read no documents.' }));
@@ -1923,26 +2425,42 @@
     var treeHosts = [];
     var activeDocId = null;
     function paint(tenants) {
-      var docId = ctx.docId || docDefaultId(tenants);
-      activeDocId = docId;
+      // The docId (route #/documents/<id>) is EITHER one of the 10 non-Proof
+      // surfaces (a full-width composition) OR a reader doc ('ref:'/'tenant:'/
+      // 'demo:proof') / 'proof' / null (the 3-zone Proof reader — the M11 default).
+      var raw = ctx.docId;
+      var surfaceId = (raw && isDocSurface(raw) && raw !== 'proof') ? raw : null;
+      var readerDocId = (raw && !isDocSurface(raw)) ? raw : docDefaultId(tenants);
+      var railActive = surfaceId || readerDocId || 'proof';
+      activeDocId = railActive;
       treeHosts = [];
-      // Rail tree (desktop) — the shell hands us the rail host.
-      if (ctx.railHost) { buildDocTree(ctx.railHost, tenants, docId); treeHosts.push(ctx.railHost); }
-      var reader = el('div', { 'class': 'doc-reader' });
+      // Rail tree (desktop) — the shell hands us the rail host. Leads with the
+      // 11-surface nav; the active surface (or the Proof reader) is aria-current.
+      if (ctx.railHost) { buildDocTree(ctx.railHost, tenants, railActive); treeHosts.push(ctx.railHost); }
+      var reader = el('div', { 'class': 'doc-reader' + (surfaceId ? ' doc-surface-wrap' : '') });
       // Phone sources sheet (CSS hides it on the desktop tier, where the rail
-      // tree is shown instead).
+      // tree is shown instead) — carries the same 11-surface nav + docs tree.
       var sheet = el('details', { 'class': 'doc-sources-sheet' });
-      sheet.appendChild(el('summary', { 'class': 'doc-sources-summary', text: 'Sources' }));
+      sheet.appendChild(el('summary', { 'class': 'doc-sources-summary', text: 'Surfaces & sources' }));
       var sheetTree = el('div', { 'class': 'doc-tree' });
-      buildDocTree(sheetTree, tenants, docId); treeHosts.push(sheetTree);
+      buildDocTree(sheetTree, tenants, railActive); treeHosts.push(sheetTree);
       sheet.appendChild(sheetTree);
       reader.appendChild(sheet);
+      if (surfaceId) {
+        // A ported JSX surface — full-width single column, no evidence rail.
+        var smain = el('main', { 'class': 'doc-surface-main' });
+        reader.appendChild(smain);
+        host.appendChild(reader);
+        renderDocSurface(smain, surfaceId, ctx);
+        return;
+      }
+      // Proof reader — the M11 3-zone layout (reading surface + evidence panel).
       var main = el('main', { 'class': 'doc-main' });
       var evidence = el('aside', { 'class': 'doc-evidence' });
       reader.appendChild(main);
       reader.appendChild(evidence);
       host.appendChild(reader);
-      // Centre reading surface.
+      var docId = readerDocId;
       if (!docId) { main.appendChild(el('p', { 'class': 'ctl-desc', text: 'No documents to read yet. Ingest a corpus, or enable demo mode (?demo=1) to preview the reader.' })); }
       else if (docId === 'demo:proof' && demoData('docsReader')) { renderDocDemo(main, demoData('docsReader')); }
       else if (docId.indexOf('ref:') === 0) {
@@ -2133,6 +2651,9 @@
     // M10 — Documents mode (the console-as-reader).
     renderDocuments: renderDocuments,
     DOC_REFERENCE: DOC_REFERENCE,
+    // M12 — the 11 ported JSX surfaces (Documents-mode surface list).
+    DOC_SURFACES: DOC_SURFACES,
+    renderDocSurface: renderDocSurface,
     // M9 — Canvas: size-adaptive board + real-edge relation graph.
     canvasTier: canvasTier,
     parseFocus: parseFocus,

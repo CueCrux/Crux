@@ -1215,9 +1215,188 @@
         { title: 'Albert Einstein', snippet: 'Albert Einstein (1879–1955) was a German-born theoretical physicist who developed the theory of relativity.', source: 'tenant', score: 0.93, tenant: 'wikicrux' },
         { title: 'Theory of relativity', snippet: 'The theory of relativity usually encompasses two interrelated theories by Einstein: special and general relativity.', source: 'commons', score: 0.81, tenant: 'wikicrux' },
         { title: 'Photoelectric effect', snippet: 'Einstein’s 1905 explanation of the photoelectric effect earned him the 1921 Nobel Prize in Physics.', source: 'tenant', score: 0.76, tenant: 'wikicrux' }
-      ]
+      ],
+      // Documents-mode surface fixtures (M12) — the JSX's own data consts
+      // (webcrux-surfaces-demo-v3.jsx), ported so the ten non-Proof surfaces show
+      // their full composition in demo mode. Surfaced ONLY behind demoOn() via
+      // demoData('surfaces') → render.js's surfaceDemo() choke point; every panel
+      // is demo-chipped. A surface with a real endpoint (watch/diff/lanes/domains)
+      // uses this only as an empty/degraded fallback — real data always wins.
+      surfaces: {
+        // Watch (WATCHES) — watched items with epistemic status + change log.
+        watch: [
+          { type: 'Answer', name: 'What are the DORA compliance requirements for third-party ICT providers?', status: 'Stable', band: 'High', dependents: 0, lastChecked: '2025-10-14', history: [] },
+          { type: 'Answer', name: 'How does the EU AI Act classify foundation model providers?', status: 'Updated', band: 'Medium', dependents: 3, lastChecked: '2025-10-14',
+            history: [{ what: 'Confidence band shifted: High → Medium', why: 'Load-bearing evidence (EC draft guidelines) was superseded by final published text with material differences.', codes: ['evidence_superseded', 'confidence_band_crossed'], cBefore: 'High', cAfter: 'Medium' }] },
+          { type: 'Artefact', name: 'NIST AI RMF Playbook v1.0', status: 'Stable', band: 'High', dependents: 7, lastChecked: '2025-10-14',
+            history: [{ what: 'New version detected (v1.1 draft published)', why: 'NIST published updated playbook; source artefact integrity hash changed.', codes: ['artefact_version_change'], cBefore: 'High', cAfter: 'High' }] },
+          { type: 'Domain', name: 'eur-lex.europa.eu', status: 'Attention', band: 'Low', dependents: 23, lastChecked: '2025-10-14',
+            history: [{ what: '3 answers depending on this domain lost coverage', why: 'Domain ingestion pipeline returned errors for 48h; 3 load-bearing artefacts are stale beyond threshold.', codes: ['domain_ingestion_failure', 'temporal_threshold_exceeded'], cBefore: 'Medium', cAfter: 'Low' }] }
+        ],
+        // Ask (ASK + THREAD) — verified answer canvas with claim↔evidence links.
+        ask: {
+          mode: 'verified', query: 'What are the key compliance requirements under the EU AI Act for high-risk AI systems?',
+          cov: { label: 'High', score: 0.78, comp: { retrieval: 0.85, domains: 0.72, temporal: 0.81, clusters: 0.74 } },
+          thread: [{ label: 'Original question', type: 'ask' }, { label: 'Narrowed to transparency', type: 'alter_query' }, { label: 'Removed EC draft guidelines', type: 'exclude_source' }],
+          paragraphs: [
+            'High-risk AI systems under the EU AI Act must satisfy a comprehensive set of requirements before they can be placed on the market or put into service within the EU.',
+            'Risk management must be established as a continuous, iterative process throughout the entire lifecycle of the system.',
+            'Data governance requirements mandate that training, validation, and testing datasets meet specific quality criteria.',
+            'Technical documentation must be drawn up before the system is placed on the market and kept up to date.',
+            'Transparency obligations require that high-risk AI systems be designed to ensure their operation is sufficiently transparent for users.',
+            'Human oversight measures must allow natural persons to effectively oversee the AI system during its period of use.',
+            'Accuracy, robustness, and cybersecurity requirements ensure the system is resilient and protected against manipulation.'
+          ],
+          claims: [
+            { id: 'cl1', text: 'Risk management as continuous iterative lifecycle process', status: 'supported' },
+            { id: 'cl2', text: 'Data governance with quality criteria for training data', status: 'supported' },
+            { id: 'cl3', text: 'Technical documentation before market placement', status: 'supported' },
+            { id: 'cl4', text: 'Transparency for user interpretability', status: 'supported' },
+            { id: 'cl5', text: 'Human oversight with intervention capability', status: 'supported' },
+            { id: 'cl6', text: 'Accuracy, robustness, cybersecurity standards', status: 'supported' }
+          ],
+          evidence: [
+            { id: 'art_01', title: 'EU AI Act — Regulation 2024/1689', domain: 'eur-lex.europa.eu', role: 'primary', score: 0.96 },
+            { id: 'art_02', title: 'European Commission AI Act Guidelines (Draft)', domain: 'ec.europa.eu', role: 'supporting', score: 0.88 },
+            { id: 'art_03', title: 'OECD AI Principles Alignment Analysis', domain: 'oecd.org', role: 'context', score: 0.72 },
+            { id: 'art_04', title: 'BSI AI Standard Landscape Report', domain: 'bsigroup.com', role: 'supporting', score: 0.65 }
+          ]
+        },
+        // Living Objects (LIVING) — artefacts with state, pressure, relations.
+        living: [
+          { id: 'art_01', title: 'EU AI Act — Regulation 2024/1689', domain: 'eur-lex.europa.eu', state: 'fresh', confidence: 'High', trunkTier: 3, lane: 'dense_1536', pressureLevel: 0,
+            dependents: { answers: 14, mises: 8, collections: 3 },
+            relations: [{ target: 'EU AI Act Guidelines (Draft)', type: 'supersedes', confidence: 0.91, method: 'version_chain' }, { target: 'OECD AI Principles', type: 'supports', confidence: 0.74, method: 'semantic_similarity' }, { target: 'UK AI White Paper', type: 'contradicts', confidence: 0.42, method: 'claim_comparison' }],
+            pressure: [], versions: [{ v: 'v3', date: '2025-07-01', hash: 'blake3:9f2a...' }, { v: 'v2', date: '2024-08-01', hash: 'blake3:7b1c...' }, { v: 'v1', date: '2024-03-13', hash: 'blake3:3e4d...' }] },
+          { id: 'art_02', title: 'European Commission AI Act Guidelines (Draft)', domain: 'ec.europa.eu', state: 'stale', confidence: 'Medium', trunkTier: 2, lane: 'dense_1024', pressureLevel: 2,
+            dependents: { answers: 6, mises: 4, collections: 1 },
+            relations: [{ target: 'EU AI Act — Regulation 2024/1689', type: 'superseded_by', confidence: 0.91, method: 'version_chain' }, { target: 'AI Act Compliance Checklist v2', type: 'supports', confidence: 0.68, method: 'semantic_similarity' }],
+            pressure: [{ code: 'FRESHNESS_DECAY', severity: 2, summary: 'Last validated 43 days ago. Exceeds 30-day freshness threshold for tier-2 trunk artefacts.', action: 'Re-validate or mark superseded' }, { code: 'SUPERSEDED_BY_FINAL', severity: 2, summary: 'Final regulation text published, superseding this draft. 6 dependent answers may need rebuild.', action: 'Trigger dependent rebuild' }],
+            versions: [{ v: 'v2 (draft)', date: '2025-03-15', hash: 'blake3:5a2b...' }, { v: 'v1 (draft)', date: '2024-11-20', hash: 'blake3:1c3d...' }] },
+          { id: 'art_03', title: 'NIST AI RMF Playbook v1.0', domain: 'nist.gov', state: 'fresh', confidence: 'High', trunkTier: 3, lane: 'dense_1536', pressureLevel: 1,
+            dependents: { answers: 9, mises: 6, collections: 2 },
+            relations: [{ target: 'ISO 42001 AI Management', type: 'supports', confidence: 0.82, method: 'semantic_similarity' }, { target: 'NIST AI RMF Playbook v1.1 (draft)', type: 'superseded_by', confidence: 0.65, method: 'version_chain' }],
+            pressure: [{ code: 'USAGE_SPIKE', severity: 1, summary: 'Query volume referencing this artefact increased 340% over the 7-day average.', action: 'Monitor; consider lane upgrade if sustained' }],
+            versions: [{ v: 'v1.0', date: '2024-01-26', hash: 'blake3:8d7e...' }] },
+          { id: 'art_04', title: 'BCG Manufacturing Cost Analysis', domain: 'bcg.com', state: 'contested', confidence: 'Low', trunkTier: 1, lane: 'dense_768', pressureLevel: 3,
+            dependents: { answers: 3, mises: 2, collections: 0 },
+            relations: [{ target: 'Roland Berger Energy Report', type: 'contradicted_by', confidence: 0.61, method: 'claim_comparison' }, { target: 'McKinsey Semiconductor Cost Study', type: 'supports', confidence: 0.53, method: 'semantic_similarity' }],
+            pressure: [{ code: 'CONTRADICTION_SPIKE', severity: 3, summary: 'New evidence from Roland Berger directly contradicts key cost projections.', action: 'Trigger dependent answer rebuild' }, { code: 'ANCHOR_DRIFT', severity: 2, summary: 'Anchor set Jaccard similarity dropped below 0.6 threshold.', action: 'Re-embed with current anchor set' }],
+            versions: [{ v: 'v1', date: '2025-04-10', hash: 'blake3:2f1a...' }] }
+        ],
+        // Dependencies (DEP_TREE) — assumption-loaded dependency tree (2 levels).
+        deps: {
+          query: 'What are the key compliance requirements under the EU AI Act for high-risk AI systems?',
+          root: { id: 'answer', label: 'Answer', sublabel: 'EU AI Act High-Risk Requirements', confidence: 0.78, fragility: 0.35, assumptionLoad: 0.22, coverageContribution: 1.0, trunkTier: null, type: 'answer',
+            children: [
+              { id: 'ev_1', label: 'EU AI Act — Reg. 2024/1689', sublabel: 'eur-lex.europa.eu', confidence: 0.96, fragility: 0.08, assumptionLoad: 0.05, coverageContribution: 0.42, trunkTier: 3, type: 'primary',
+                children: [
+                  { id: 'd_1b', label: 'Translation accuracy (EN)', sublabel: 'Authentic language version', confidence: 0.94, fragility: 0.12, assumptionLoad: 0.18, coverageContribution: 0.08, type: 'assumption', children: [] },
+                  { id: 'd_1c', label: 'Regulation in force', sublabel: 'Not yet repealed or amended', confidence: 0.98, fragility: 0.04, assumptionLoad: 0.06, coverageContribution: 0.12, type: 'temporal', children: [] }
+                ] },
+              { id: 'ev_2', label: 'EC AI Act Guidelines (Draft)', sublabel: 'ec.europa.eu', confidence: 0.88, fragility: 0.52, assumptionLoad: 0.48, coverageContribution: 0.28, trunkTier: 2, type: 'supporting',
+                children: [
+                  { id: 'd_2b', label: 'Draft ≈ Final alignment', sublabel: 'Material changes possible', confidence: 0.54, fragility: 0.85, assumptionLoad: 0.82, coverageContribution: 0.06, type: 'assumption', children: [] }
+                ] },
+              { id: 'ev_3', label: 'OECD AI Principles Analysis', sublabel: 'oecd.org', confidence: 0.72, fragility: 0.41, assumptionLoad: 0.38, coverageContribution: 0.18, trunkTier: 2, type: 'context', children: [] },
+              { id: 'ev_4', label: 'BSI AI Standard Report', sublabel: 'bsigroup.com', confidence: 0.65, fragility: 0.58, assumptionLoad: 0.52, coverageContribution: 0.12, trunkTier: 1, type: 'supporting',
+                children: [{ id: 'd_4b', label: 'Standard still current', sublabel: 'No superseding publication', confidence: 0.49, fragility: 0.82, assumptionLoad: 0.84, coverageContribution: 0.03, type: 'temporal', children: [] }] }
+            ] }
+        },
+        // Signals (SIGNALS) — epistemic status-change feed.
+        signals: [
+          { id: 'sig_01', type: 'confidence_band_crossed', severity: 'high', title: 'EU AI Act classification answer — confidence dropped High → Medium', target: { type: 'Answer' }, what: 'Confidence band crossed from High to Medium after load-bearing evidence was superseded.', why: 'EC draft guidelines superseded by final published regulation text with material differences in provider obligation scope.', codes: ['evidence_superseded', 'confidence_band_crossed', 'mises_recomputed'], cBefore: 'High', cAfter: 'Medium', rBefore: 'rcpt_a1b2c3d4', rAfter: 'rcpt_e5f6g7h8', depImpact: { answers: 3, artefacts: 1 }, publishedAt: '2025-10-13' },
+          { id: 'sig_02', type: 'trunk_tier_shift', severity: 'medium', title: 'NIST AI RMF Playbook promoted to Trunk Tier 3', target: { type: 'Artefact' }, what: 'Trunk tier promoted from T2 to T3 after sustained dependency growth.', why: '9 answers and 6 MiSES sets now depend on this artefact. Promotion score crossed the 80 threshold.', codes: ['DEPENDENCY_GROWTH', 'trunk_tier_shift'], cBefore: 'High', cAfter: 'High', rBefore: null, rAfter: null, depImpact: { answers: 9, artefacts: 4 }, publishedAt: '2025-10-12' },
+          { id: 'sig_03', type: 'load_bearing_swap', severity: 'high', title: 'BCG cost analysis contradicted — 3 dependent answers weakened', target: { type: 'Artefact' }, what: 'Load-bearing evidence contradicted by new source. 3 dependent answers lost coverage.', why: 'Roland Berger Energy Report published with directly contradicting cost projections. Anchor set Jaccard dropped below 0.6.', codes: ['CONTRADICTION_SPIKE', 'ANCHOR_DRIFT', 'dependent_rebuild_triggered'], cBefore: 'Medium', cAfter: 'Low', rBefore: 'rcpt_d4e5f6', rAfter: 'rcpt_g7h8i9', depImpact: { answers: 3, artefacts: 2 }, publishedAt: '2025-10-10' },
+          { id: 'sig_04', type: 'rebuild_triggered', severity: 'low', title: 'DORA compliance answer rebuilt — confidence stable', target: { type: 'Answer' }, what: 'Scheduled rebuild completed. New receipt minted. Confidence unchanged.', why: 'Periodic rebuild triggered by freshness schedule. Candidate digest stable (Jaccard 0.96).', codes: ['scheduled_rebuild', 'receipt_lineage_updated'], cBefore: 'High', cAfter: 'High', rBefore: 'rcpt_x1y2z3', rAfter: 'rcpt_m4n5o6', depImpact: { answers: 0, artefacts: 0 }, publishedAt: '2025-10-14' },
+          { id: 'sig_05', type: 'anchor_drift', severity: 'medium', title: 'Semiconductor supply chain domain — retrieval regression detected', target: { type: 'Domain' }, what: 'Anchor drift threshold crossed for 4 answers in this domain.', why: 'Bulk re-ingestion of semi.org content changed chunk boundaries. Prior anchor sets no longer align.', codes: ['ANCHOR_DRIFT', 'RETRIEVAL_REGRESSION', 'bulk_reindex'], cBefore: 'High', cAfter: 'Medium', rBefore: null, rAfter: null, depImpact: { answers: 4, artefacts: 12 }, publishedAt: '2025-10-11' }
+        ],
+        // Receipt Diff (DIFF_DATA) — before/after CROWN snapshot comparison.
+        diff: {
+          before: { id: 'rcpt_a1b2c3d4', mode: 'verified', ts: '2025-10-01 09:00', confidence: { band: 'High', score: 0.81 }, coverage: { retrieval: 0.82, domains: 0.71, temporal: 0.79, clusters: 0.72 } },
+          after: { id: 'rcpt_e5f6g7h8', mode: 'verified', ts: '2025-10-13 14:25', confidence: { band: 'Medium', score: 0.62 }, coverage: { retrieval: 0.72, domains: 0.58, temporal: 0.68, clusters: 0.58 },
+            dropped: [{ id: 'ev_01', title: 'EC AI Act Guidelines (Draft)', domain: 'ec.europa.eu', reason: 'Superseded by final text' }] }
+        },
+        // Sourcing (SOURCING) — coverage-gap → structured sourcing lifecycle.
+        sourcing: [
+          { id: 'sr_01', query: 'What are the EU AI Act penalties for non-compliance?', covLabel: 'Low', covScore: 0.24, fragility: 0.78, status: 'discovering', quoteEstimate: null,
+            suggestions: [{ url: 'https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32024R1689', rationale: 'Official regulation text — Chapter XII contains penalty provisions', status: 'accepted', lane: 'fast' }, { url: 'https://digital-strategy.ec.europa.eu/en/policies/regulatory-framework-ai', rationale: 'EC implementation guidance and penalty schedule references', status: 'proposed', lane: 'slow' }],
+            discoveredDomains: ['eur-lex.europa.eu', 'digital-strategy.ec.europa.eu', 'edpb.europa.eu'] },
+          { id: 'sr_02', query: 'How do automotive OEMs comply with UNECE R155 cybersecurity requirements?', covLabel: 'Low', covScore: 0.18, fragility: 0.85, status: 'quoted', quoteEstimate: { crux: 12, gbp: 0.12, chunks: 45 },
+            suggestions: [{ url: 'https://unece.org/transport/documents/2021/03/standards/un-regulation-no-155', rationale: 'Official UNECE R155 regulation text', status: 'accepted', lane: 'fast' }, { url: 'https://www.iso.org/standard/70918.html', rationale: 'ISO/SAE 21434 road vehicle cybersecurity engineering', status: 'accepted', lane: 'slow' }],
+            discoveredDomains: ['unece.org', 'iso.org', 'enisa.europa.eu'] },
+          { id: 'sr_03', query: 'What are the current CBAM reporting obligations for semiconductor imports?', covLabel: 'Low', covScore: 0.0, fragility: 0, status: 'awaiting_user_choice', quoteEstimate: { crux: 8, gbp: 0.08, chunks: 30 },
+            suggestions: [{ url: 'https://taxation-customs.ec.europa.eu/carbon-border-adjustment-mechanism_en', rationale: 'Official CBAM implementation page', status: 'proposed', lane: 'fast' }],
+            discoveredDomains: ['taxation-customs.ec.europa.eu'] },
+          { id: 'sr_04', query: 'What is the current status of the EU-US Data Privacy Framework adequacy decision?', covLabel: 'Medium', covScore: 0.41, fragility: 0.62, status: 'completed', quoteEstimate: { crux: 5, gbp: 0.05, chunks: 22 },
+            suggestions: [{ url: 'https://commission.europa.eu/document/fa09cbad-dd7d-4684-ae60-be03fcb0fddf_en', rationale: 'EC adequacy decision document', status: 'ingested', lane: 'fast' }],
+            discoveredDomains: ['commission.europa.eu', 'edpb.europa.eu'] }
+        ],
+        // Lanes (LANES + PROMOTIONS) — embedding lane stack + promotion feed.
+        lanes: {
+          lanes: [
+            { tier: 'Base', dim: 768, provider: 'ollama (local)', model: 'nomic-embed-text', desc: 'Broad recall · every artefact, always', stats: { artefacts: 24680, backlog: 42, throughput: '1,240/min', cost: '£0.00/day', p95: '8ms' }, modes: ['light', 'verified', 'audit'] },
+            { tier: 'Premium', dim: 1024, provider: 'voyage', model: 'voyage-3.5-lite', desc: 'Better semantic neighbourhoods · promoted artefacts', stats: { artefacts: 3842, backlog: 156, throughput: '320/min', cost: '£2.40/day', p95: '45ms' }, modes: ['verified', 'audit'] },
+            { tier: 'Premium+', dim: 1536, provider: 'openai', model: 'text-embedding-3-small', desc: 'High-quality retrieval · paid + high-score auto', stats: { artefacts: 892, backlog: 23, throughput: '80/min', cost: '£4.80/day', p95: '120ms' }, modes: ['verified', 'audit'] },
+            { tier: 'Pro', dim: 3072, provider: 'openai', model: 'text-embedding-3-large', desc: 'Highest precision · critical content only', stats: { artefacts: 124, backlog: 3, throughput: '12/min', cost: '£8.60/day', p95: '280ms' }, modes: ['audit'] }
+          ],
+          promotions: [
+            { artefact: 'EU AI Act — Regulation 2024/1689', from: 'Lane 1', to: 'Lane 2', reason: 'auto_score', score: 84, status: 'done' },
+            { artefact: 'NIST AI RMF Playbook v1.0', from: 'Lane 0', to: 'Lane 1', reason: 'auto_score', score: 67, status: 'done' },
+            { artefact: 'BCG Manufacturing Cost Analysis', from: 'Lane 0', to: 'Lane 1', reason: 'watchcrux', score: 52, status: 'pending' },
+            { artefact: 'BSI AI Standard Report', from: 'Lane 1', to: 'Lane 2', reason: 'paid', score: null, status: 'running', budget: '£0.04' }
+          ]
+        },
+        // Domains (DOMAINS) — source-corpus health.
+        domains: [
+          { slug: 'eur-lex.europa.eu', name: 'EUR-Lex', type: 'Regulator', artefacts: 342, coverage: 0.84, freshness: 0.91, trust: 0.96, contradiction: 0.02, ingestionStatus: 'healthy', dependents: { answers: 47, mises: 32 }, flags: [] },
+          { slug: 'ec.europa.eu', name: 'European Commission', type: 'Regulator', artefacts: 218, coverage: 0.72, freshness: 0.68, trust: 0.89, contradiction: 0.05, ingestionStatus: 'stale', dependents: { answers: 31, mises: 22 }, flags: [{ msg: '6 days since last successful ingestion' }] },
+          { slug: 'nist.gov', name: 'NIST', type: 'Standards Body', artefacts: 156, coverage: 0.78, freshness: 0.85, trust: 0.94, contradiction: 0.01, ingestionStatus: 'healthy', dependents: { answers: 22, mises: 16 }, flags: [] },
+          { slug: 'semi.org', name: 'SEMI', type: 'Industry Association', artefacts: 89, coverage: 0.58, freshness: 0.52, trust: 0.81, contradiction: 0.08, ingestionStatus: 'error', dependents: { answers: 12, mises: 8 }, flags: [{ msg: 'Pipeline errors for 48h — 3 load-bearing artefacts stale' }, { msg: 'Contradiction rate 8% exceeds 5% threshold' }] },
+          { slug: 'bsigroup.com', name: 'BSI Group', type: 'Standards Body', artefacts: 64, coverage: 0.45, freshness: 0.38, trust: 0.72, contradiction: 0.11, ingestionStatus: 'stale', dependents: { answers: 8, mises: 5 }, flags: [{ msg: '16 days since last ingestion' }, { msg: 'Contradiction rate 11% — multiple superseded standards' }] }
+        ],
+        // Reverse (REVERSE_DATA) — assertion verification + counterfactuals.
+        reverse: {
+          assertion: 'The EU AI Act requires high-risk AI systems to undergo conformity assessments before being placed on the market, and non-compliance can result in fines of up to €35 million or 7% of global turnover.',
+          analysis: { verdict: 'Mostly accurate', verdictColor: 'amber', confidence: 0.74, covLabel: 'High', covScore: 0.82, fragility: 0.31,
+            issues: [{ severity: 'medium', text: 'The €35M/7% figure is the maximum tier for prohibited practices, not specifically for high-risk system non-compliance. High-risk violations face €15M/3%. The assertion conflates penalty tiers.' }, { severity: 'low', text: 'Conformity assessments vary: third-party for biometric high-risk, self-assessment for most Annex III systems. The assertion implies a single process.' }] },
+          evidence: [
+            { id: 'rv_e1', title: 'EU AI Act — Regulation 2024/1689', domain: 'eur-lex.europa.eu', role: 'primary', score: 0.97, supports: ['Conformity assessment required for high-risk systems (Art. 43)', 'Fines up to €35M or 7% turnover for prohibited practices (Art. 99)'], note: 'Directly confirms both claims.' },
+            { id: 'rv_e2', title: 'European Commission AI Act Guidelines (Draft)', domain: 'ec.europa.eu', role: 'supporting', score: 0.84, supports: ['Conformity assessment process includes technical documentation review'], note: 'Elaborates the conformity procedure. Draft status — may be superseded.' },
+            { id: 'rv_e3', title: 'Bird & Bird: EU AI Act Penalties Analysis', domain: 'twobirds.com', role: 'supporting', score: 0.76, supports: ['€35M/7% is the maximum tier — applies to prohibited AI practices', 'Lower tiers: €15M/3% for most high-risk violations'], note: 'Clarifies that €35M/7% is the top tier.' },
+            { id: 'rv_e4', title: 'OECD AI Policy Observatory: EU AI Act Summary', domain: 'oecd.ai', role: 'context', score: 0.62, supports: ['Overview confirms conformity assessment framework'], note: 'General confirmation at lower specificity.' }
+          ],
+          counterfactuals: {
+            rv_e1: { verdict: 'Unsupported', verdictColor: 'red', confidence: 0.18, answer: 'Without the primary regulation text, the assertion cannot be verified from secondary sources alone. Exact figures and article numbers come only from the regulation itself.', warning: 'Removing the primary legal source collapses confidence. This is a load-bearing source.' },
+            rv_e2: { verdict: 'Mostly accurate', verdictColor: 'amber', confidence: 0.71, answer: 'Without the EC draft guidelines, practical implementation detail is reduced. The core legal claims remain supported by the regulation text and third-party analysis.', warning: null },
+            rv_e3: { verdict: 'Accurate but incomplete', verdictColor: 'amber', confidence: 0.69, answer: 'Without the penalty tier analysis, the distinction between violation levels is less clear.', warning: 'Losing the penalty analysis source makes it harder to flag the tier conflation issue.' },
+            rv_e4: { verdict: 'Mostly accurate', verdictColor: 'amber', confidence: 0.73, answer: 'Removing the OECD summary has minimal impact — it provided general corroboration already covered by higher-authority sources.', warning: null }
+          }
+        }
+      }
     };
   })();
+
+  // ---- JSX_PORT — the M12 surface-port manifest -------------------------
+  // Every WebCrux Proof surface (webcrux-surfaces-demo-v3.jsx) → its v2
+  // disposition: the JSX source line, whether it renders REAL daemon data (and
+  // which endpoint) or is a demo-only surface, and the render.js component. The
+  // smoke (check 32) asserts all 11 NAV ids are present + covered; check 33 that
+  // every 'real:' surface reads via the api.js client and every 'demo-surface'
+  // renders its fixture only behind demoOn(). Proof reuses the M11 reader.
+  var JSX_PORT = {
+    proof: { source_line: 246, status: 'real:reader (/v1/console/tenants+/v1/console/facts+/v1/activity)', component: 'renderDocuments' },
+    watch: { source_line: 696, status: 'real:/v1/activity', component: 'renderDocSurface_watch' },
+    ask: { source_line: 860, status: 'demo-surface', component: 'renderDocSurface_ask' },
+    living: { source_line: 1250, status: 'demo-surface', component: 'renderDocSurface_living' },
+    deps: { source_line: 1487, status: 'demo-surface', component: 'renderDocSurface_deps' },
+    signals: { source_line: 1934, status: 'demo-surface', component: 'renderDocSurface_signals' },
+    diff: { source_line: 2074, status: 'real:/v1/activity', component: 'renderDocSurface_diff' },
+    sourcing: { source_line: 2268, status: 'demo-surface', component: 'renderDocSurface_sourcing' },
+    lanes: { source_line: 2415, status: 'real:/v1/console/corecrux/lane-weights', component: 'renderDocSurface_lanes' },
+    domains: { source_line: 2574, status: 'real:/v1/features/capabilities/analysis/coverage', component: 'renderDocSurface_domains' },
+    reverse: { source_line: 2781, status: 'demo-surface', component: 'renderDocSurface_reverse' }
+  };
 
   return {
     PAGES: PAGES,
@@ -1226,6 +1405,7 @@
     PRO_PORTED_IDS: PRO_PORTED_IDS,
     LEGACY_PORT: LEGACY_PORT,
     MUTATING_ACTIONS: MUTATING_ACTIONS,
+    JSX_PORT: JSX_PORT,
     CruxDemo: CruxDemo,
     // Exposed for tests / render composition.
     _helpers: { workStageOf: workStageOf, laneWeightControls: laneWeightControls, amrLaneToggles: amrLaneToggles }

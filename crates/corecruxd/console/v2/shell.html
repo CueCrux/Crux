@@ -1049,6 +1049,54 @@
     .doc-main { max-width: none; }
   }
 
+  /* ---- Documents-mode surfaces (M12) — the 11 ported WebCrux Proof surfaces
+     (webcrux-surfaces-demo-v3.jsx) rebuilt in v2 tokens. Every colour below is a
+     theme token (var(--…)) — the smoke (check 33) scans this delimited block and
+     rejects any hex/rgb literal. The composition (Section/Card rows, stat tiles,
+     coloured dots/badges, state strips) mirrors the JSX micro-kit. */
+  /* M12-SURFACE-CSS-START */
+  .doc-surface-wrap { grid-template-columns: 1fr; }
+  @media (min-width: 1280px) { .doc-surface-wrap { grid-template-columns: 1fr; } }
+  .doc-surface-main { min-width: 0; max-width: 920px; }
+  .doc-surface-note { margin: 4px 0 0; font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .doc-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--ink3); flex: none; }
+  .doc-dot-ok { background: var(--ok); }
+  .doc-dot-warn { background: var(--warn); }
+  .doc-dot-crit { background: var(--crit); }
+  .doc-dot-trust { background: var(--trust); }
+  .doc-tiles { display: flex; flex-wrap: wrap; gap: 22px; }
+  .doc-tile-v { font-size: 20px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .doc-tile-k { font-size: 10px; color: var(--ink3); text-transform: uppercase; letter-spacing: .06em; margin-top: 2px; }
+  .doc-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .doc-row-title { font-size: 13px; font-weight: 600; color: var(--ink); line-height: 1.4; }
+  .doc-row-text { font-size: 12.5px; color: var(--ink2); line-height: 1.55; }
+  .doc-arrow { color: var(--ink3); font-size: 13px; padding: 0 2px; }
+  /* A list/detail card (ported <Card> row) — a native disclosure. */
+  .doc-list-card { cursor: default; }
+  .doc-list-card > .doc-list-sum { list-style: none; cursor: pointer; display: block; }
+  .doc-list-card > .doc-list-sum::-webkit-details-marker { display: none; }
+  .doc-surface-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .doc-surface-row-main { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 6px; }
+  .doc-surface-row-side { flex: none; text-align: right; display: flex; flex-direction: column; gap: 3px; align-items: flex-end; font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
+  .doc-list-body { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--edge); }
+  .doc-list-card[open] > .doc-list-sum { margin-bottom: 2px; }
+  /* State-keyed 3px left strip (shares the pro-board geometry). */
+  .doc-strip { position: relative; padding-left: 16px; }
+  .doc-strip::before { content: ""; position: absolute; inset: 2px auto 2px 0; width: 3px; border-radius: 2px; background: var(--ink3); }
+  .doc-strip-ok::before { background: var(--ok); }
+  .doc-strip-warn::before { background: var(--warn); }
+  .doc-strip-crit::before { background: var(--crit); }
+  .doc-strip-trust::before { background: var(--trust); }
+  .doc-claim-row { display: flex; align-items: flex-start; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--edge); }
+  .doc-claim-row .doc-chunk-claims { margin-left: auto; }
+  .doc-dep-node { padding: 8px 10px; margin-bottom: 4px; border-left: 1px solid var(--edge); display: flex; flex-direction: column; gap: 5px; }
+  .doc-btn-row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .doc-surface-empty { padding: 26px 16px; text-align: center; border: 1px dashed var(--edge); border-radius: var(--radius-sm); background: var(--surface2); }
+  .doc-diff-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .doc-diff-row { display: grid; grid-template-columns: 84px 1fr 1fr 52px; align-items: center; gap: 8px; }
+  @media (max-width: 560px) { .doc-diff-grid { grid-template-columns: 1fr; } .doc-diff-row { grid-template-columns: 1fr; } }
+  /* M12-SURFACE-CSS-END */
+
   /* ---- Explorer (M11) — corpus search surface --------------------------
      A query box + a Local | WikiCrux backend toggle (nav-family .btn-quiet,
      aria-pressed) + a budget control, above a results column of cards. Cards
