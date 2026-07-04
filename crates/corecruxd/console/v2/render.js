@@ -23,7 +23,7 @@
 
   // The control types this renderer knows how to draw. The smoke asserts every
   // control type used anywhere in pages.js has a branch here.
-  var CONTROL_TYPES = ['search', 'input', 'textarea', 'select', 'toggle', 'btn', 'info', 'exp', 'rpcout', 'bar', 'theme', 'chart', 'disclose', 'repogrid'];
+  var CONTROL_TYPES = ['search', 'input', 'textarea', 'select', 'toggle', 'btn', 'info', 'exp', 'rpcout', 'bar', 'theme', 'chart', 'disclose', 'repogrid', 'wbread'];
   var GATE_TITLE = 'wired in M3+';
 
   // ---- Environment shims (only used when rendering in a browser) ---------
@@ -207,6 +207,47 @@
       var grid = el('div', { 'class': 'repo-grid' });
       links.forEach(function (l) { grid.appendChild(repoCard(l)); });
       host.appendChild(grid);
+    });
+  }
+
+  // ---- Workbench live READ tool (M13a) ----------------------------------
+  // A wbread control self-loads one /v1/workbench/* GET through the named api.js
+  // client method (window.CruxApi.<method>) and paints a compact summary. This
+  // is a READ: it is GET-only, never the operator-gated write client, never a POST — the M13a
+  // workbench port wires only non-mutating reads live (writes stay gated for
+  // M13b). render.js keeps zero raw network calls of its own; the fetch lives
+  // inside the api.js generated method.
+  function fetchWorkbench(apiMethod, query) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api[apiMethod] !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    return api[apiMethod](query)
+      .then(function (r) {
+        return r.json().then(
+          function (data) { return { ok: r.ok, status: r.status, data: data }; },
+          function () { return { ok: r.ok, status: r.status, data: null }; }
+        );
+      })
+      .catch(function () { return { ok: false, status: 0, data: null }; });
+  }
+  function loadWorkbenchRead(host, control) {
+    return fetchWorkbench(control.api, control.query).then(function (res) {
+      host.textContent = '';
+      host.appendChild(el('div', { 'class': 'ctl-info' }, [
+        el('span', { 'class': 'ctl-info-k', text: control.label || 'read tool' }),
+        el('span', { 'class': 'ctl-info-v', text: control.hint || '' })
+      ]));
+      if (res.ok && res.data) {
+        var schema = res.data.schema || '';
+        var count = (res.data.count != null) ? res.data.count
+          : (Array.isArray(res.data.queues) ? res.data.queues.length
+            : (Array.isArray(res.data.events) ? res.data.events.length
+              : (Array.isArray(res.data.entries) ? res.data.entries.length : null)));
+        host.appendChild(el('p', { 'class': 'ctl-desc', text: (schema ? String(schema) : 'ok · HTTP ' + res.status) + (count != null ? ' · ' + count + ' item(s)' : '') }));
+      } else if (res.status === 402) {
+        host.appendChild(el('p', { 'class': 'ctl-desc', text: 'Pro capability required — enable this workbench surface to read it.' }));
+      } else {
+        host.appendChild(el('p', { 'class': 'ctl-desc', text: res.status === 0 ? 'unreachable' : ('HTTP ' + res.status) }));
+      }
     });
   }
 
@@ -532,6 +573,17 @@
         // demo fixture fills only when empty — see loadRepoGrid).
         node = el('div', { 'class': 'repogrid-host' }, [el('p', { 'class': 'ctl-desc', text: 'Loading repos…' })]);
         loadRepoGrid(node, control.projectId);
+        break;
+      }
+      case 'wbread': {
+        // A live workbench READ tool (M13a): self-loads a /v1/workbench/* GET via
+        // the api.js client (never a mutation, never the gated write client). Real payload
+        // wins; an honest degraded / pro-gate note otherwise.
+        node = el('div', { 'class': 'wbread-host' }, [el('div', { 'class': 'ctl-info' }, [
+          el('span', { 'class': 'ctl-info-k', text: control.label || 'read tool' }),
+          el('span', { 'class': 'ctl-info-v', text: 'loading…' })
+        ])]);
+        loadWorkbenchRead(node, control);
         break;
       }
       default: {

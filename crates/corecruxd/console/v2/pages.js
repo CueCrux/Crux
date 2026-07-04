@@ -774,6 +774,43 @@
     return [tools, cockpit, deferred];
   }
 
+  // CX / Workbench (M13a) — the operator deep-machinery surface, ported native
+  // (was a link-only fallback to /console/legacy). READ tools load LIVE over
+  // /v1/workbench/* (GET): the page loads the contract (/v1/workbench/contract)
+  // to enumerate every surface + its live entitlement, and the readsSec panels
+  // self-load the GET reads through the api.js client (wbread → CruxApi GET,
+  // never a mutation). WRITE tools (context-pack, impact-preflight, policy-
+  // simulation, route-probe, capability-audit) stay operator-gated + disabled in
+  // STATIC['cx-workbench'] — genuine live writes are deferred to M13b. Legacy
+  // ref: index.html cx-workbench PAGES def (index.html:4008-4038, 24 controls:
+  // 11 btn / 5 info / 5 input / 3 select).
+  function wbBadge(status) {
+    if (status === 'enabled') { return 'enabled'; }
+    if (status === 'pro_required') { return 'pro'; }
+    if (status === 'entitled_not_enabled') { return 'entitled'; }
+    return status || 'surface';
+  }
+  function buildWorkbench(res) {
+    var surfaces = (res.ok && res.data) ? arr(res.data.surfaces) : [];
+    var rows = surfaces.length ? surfaces.map(function (s) {
+      var method = String(s.method || '?');
+      var kind = (method.indexOf('GET') >= 0) ? 'read' : 'write · gated (M13b)';
+      return { t: 'exp', label: String(s.capability || 'surface'), sub: method + ' ' + str(s.path), badge: wbBadge(s.status),
+        controls: [info('method', method), info('path', str(s.path)), info('status', str(s.status)), info('kind', kind)] };
+    }) : (res.ok ? [info('surfaces', 'no surfaces reported')] : degraded(res.status, 'Workbench contract unavailable — GET /v1/workbench/contract'));
+    var contractSec = { h: 'Workbench contract', sub: 'live tool surface + entitlement · GET /v1/workbench/contract', wide: true,
+      controls: [{ t: 'search', ph: 'Filter tools…' }].concat(rows) };
+    var readsSec = { h: 'Live read tools', sub: 'GET /v1/workbench/* — pro capabilities gate the payload; nothing here writes', wide: true,
+      controls: [
+        { t: 'wbread', label: 'API drift', api: 'workbenchApiDrift', query: { tenant_id: 'default' }, hint: 'GET /v1/workbench/api-drift' },
+        { t: 'wbread', label: 'Command ledger', api: 'workbenchCommandLedger', query: { tenant_id: 'default' }, hint: 'GET /v1/workbench/command-ledger' },
+        { t: 'wbread', label: 'Reasoning timeline', api: 'workbenchReasoningTimeline', query: { tenant_id: 'default' }, hint: 'GET /v1/workbench/reasoning-timeline' },
+        { t: 'wbread', label: 'Audit triage', api: 'workbenchAuditTriage', query: { tenant_id: 'default' }, hint: 'GET /v1/workbench/audit-triage' },
+        { t: 'wbread', label: 'Agent brief', api: 'workbenchBrief', query: { tenant_id: 'default' }, hint: 'GET /v1/workbench/brief' }
+      ] };
+    return STATIC['cx-workbench'].concat([contractSec, readsSec]);
+  }
+
   // =======================================================================
   //  Static pages — sections ported directly from the legacy PAGES DSL.
   // =======================================================================
@@ -846,20 +883,74 @@
         ] },
       { h: 'Results', sub: 'ladder / principal / foresight responses land here', wide: true, controls: [info('—', 'run an action above to populate this card')] }
     ],
+    // cx-workbench (M13a) — native port. The live contract + read panels are
+    // appended by buildWorkbench (over GET /v1/workbench/contract); these STATIC
+    // sections carry the ported legacy tool cards (index.html:4008-4038): read
+    // tools as info/inert-read buttons, write tools as operator-gated mbtn
+    // placeholders (mut:true → hidden for customers, disabled "wired in M3+" for
+    // operators). No live write is introduced here — writes land in M13b.
     'cx-workbench': [
-      { h: 'Workbench', sub: 'operator tooling over /v1/workbench/* — the full deep-machinery surface stays on the Pro console', wide: true,
+      { h: 'Workbench', sub: 'operator tooling over /v1/workbench/* — read tools load live; write tools are gated (M13b)', wide: true,
         controls: [
-          info('scope', 'brief · context-pack · impact-preflight · policy-simulation · route-probe · query lanes · entities'),
-          info('note', 'the workbench is operator deep machinery; it opens on the Pro console'),
-          // Retirement (M10): the v2 shell is the surface. The legacy console is
-          // retained only as a fallback for the deep-machinery workbench.
-          info('legacy console', '(legacy — retired, kept as fallback)'),
-          link('Open the Pro console', '/console/legacy', { hint: 'opens the full legacy workbench (legacy — retired, kept as fallback)' })
+          info('surface', '/v1/workbench/contract enumerates every tool + its entitlement'),
+          { t: 'input', k: 'wb_tenant', label: 'tenant (read scope)', ph: 'default', v: 'default', mono: true },
+          info('note', 'reads run through the GET client; writes stay operator-gated until M13b')
+        ] },
+      { h: 'Briefing & context', sub: 'agent brief + command ledger (reads) · context pack (write)', wide: true,
+        controls: [
+          info('agent brief', 'GET /v1/workbench/brief — tenant memory, sessions, constraints, open work'),
+          info('command ledger', 'GET /v1/workbench/command-ledger — recorded command metadata'),
+          mbtn('Build context pack', { hint: 'POST /v1/workbench/context-pack — writes a receipted pack fact (M13b)' })
+        ] },
+      { h: 'Preflight & policy', sub: 'impact preflight · policy simulation (writes)', wide: true,
+        controls: [
+          { t: 'input', k: 'wb_target', label: 'impact target', ph: 'crates/corecruxd/src/http', mono: true },
+          mbtn('Run impact preflight', { hint: 'POST /v1/workbench/impact-preflight — writes a preflight fact (M13b)' }),
+          { t: 'select', k: 'wb_policy', label: 'policy profile', options: ['eu-ai-act', 'workspace', 'none'], v: 'eu-ai-act' },
+          mbtn('Simulate policy', { hint: 'POST /v1/workbench/policy-simulation — writes a simulation fact (M13b)' })
+        ] },
+      { h: 'Drift & timeline', sub: 'api drift · reasoning timeline (reads) · route probe (write scope)', wide: true,
+        controls: [
+          info('api drift', 'GET /v1/workbench/api-drift — route/tool contract drift'),
+          info('reasoning timeline', 'GET /v1/workbench/reasoning-timeline — receipted event stream'),
+          mbtn('Probe route', { hint: 'POST /v1/workbench/route-probe — admin:write scoped (M13b)' })
+        ] },
+      { h: 'Feature registry', sub: '/v1/features/capabilities — gap + promise coverage (reads)', wide: true,
+        controls: [
+          info('gap analysis', 'GET /v1/features/capabilities/analysis/gaps'),
+          info('promise coverage', 'GET /v1/features/capabilities/analysis/promises'),
+          mbtn('Record capability audit', { hint: 'POST …/capabilities/{id}/audit — writes an audit (M13b)' })
+        ] },
+      { h: 'Query workbench', sub: '/v1/query/* curated read-POST lanes — the live search surface is Explorer', wide: true,
+        controls: [
+          { t: 'search', ph: 'Filter query lanes…' },
+          { t: 'input', k: 'wbq_tenant', label: 'tenant', v: 'default', mono: true },
+          { t: 'input', k: 'wbq_query', label: 'text search', ph: 'retrieval cascade', mono: true },
+          rbtn('Run text search', { hint: 'POST /v1/query/text-search — curated read-POST · runs live in Explorer' }),
+          { t: 'input', k: 'wbq_seeds', label: 'graph seeds · artifact ids', ph: '12, 44', mono: true },
+          rbtn('Graph expand', { hint: 'POST /v1/query/graph-expand — curated read-POST' }),
+          { t: 'select', k: 'wbq_window', label: 'time window', options: ['24h', '7d', '30d'], v: '24h' },
+          rbtn('Time range', { hint: 'POST /v1/query/time-range — curated read-POST' }),
+          rbtn('Browse results as graph', { hint: 'opens the Canvas relation graph' })
+        ] },
+      { h: 'Entities', sub: '/v1/entities/{kind}/{id} + /history (read)', wide: true,
+        controls: [
+          { t: 'select', k: 'wbe_kind', label: 'kind', options: ['capability'], v: 'capability' },
+          { t: 'input', k: 'wbe_id', label: 'id', ph: 'entity id', mono: true },
+          rbtn('Load entity', { hint: 'GET /v1/entities/{kind}/{id}' })
         ] },
       { h: '3D substrate', sub: 'the graph/topology view renders on the Pro 3D canvas', wide: true,
         controls: [
           info('view', 'entity graph · shard topology · lane overlay'),
           link('Open the 3D substrate', '/console-3d/index.html?embed=1', { hint: 'opens the Pro 3D substrate view' })
+        ] },
+      // Retirement (M10) fallback: the deep-machinery workbench is native now, but
+      // the legacy console stays reachable as a fallback (the smoke's retirement
+      // check asserts this copy + the /console/legacy link survive).
+      { h: 'Legacy fallback', sub: 'the workbench is native now; the legacy console remains reachable', wide: true,
+        controls: [
+          info('legacy console', '(legacy — retired, kept as fallback)'),
+          link('Open the legacy console', '/console/legacy', { hint: 'the retired legacy workbench (legacy — retired, kept as fallback)' })
         ] }
     ],
     // DX / Docs — daemon reference + platform docs. No live docs endpoint on
@@ -945,7 +1036,7 @@
     'cx-settings': page('cx-settings', 'system', 'Settings', 'daemon configuration and console preferences', { load: { endpoint: '/v1/console/settings', build: buildSettings } }),
     'cx-integrations': page('cx-integrations', 'system', 'Integrations', 'installed packs and their grants', { load: { endpoint: '/v1/console/integrations', build: buildIntegrations } }),
     'cx-extensions': page('cx-extensions', 'system', 'Extensions', 'signed third-party manifests · per-passport grants', { load: { endpoint: '/v1/extensions', build: buildExtensions } }),
-    'cx-workbench': page('cx-workbench', 'system', 'Workbench', 'operator tooling — opens the Pro console'),
+    'cx-workbench': page('cx-workbench', 'system', 'Workbench', 'operator tooling over /v1/workbench/* — read tools live, writes gated (M13b)', { load: { endpoint: '/v1/workbench/contract', build: buildWorkbench } }),
     'cx-raw': page('cx-raw', 'system', 'Raw · JSON-RPC', '/mcp on :14801 · scopes header attaches automatically', { operatorOnly: true }),
 
     // ---- Ported legacy scopes (Professional mode only; pro:true) ----------
@@ -1074,8 +1165,74 @@
     'Withhold all',                    // cx-gates
     'Create project',                  // cx-projects (＋ New project disclosure)
     'Add repo',                        // cx-projects (＋ Add repos disclosure)
-    'Set as planning repo'             // cx-projects (＋ Add repos disclosure)
+    'Set as planning repo',            // cx-projects (＋ Add repos disclosure)
+    // ---- M13a: native workbench write tools (gated placeholders; live in M13b)
+    'Build context pack',              // cx-workbench — POST /v1/workbench/context-pack (writes fact)
+    'Run impact preflight',            // cx-workbench — POST /v1/workbench/impact-preflight (writes fact)
+    'Simulate policy',                 // cx-workbench — POST /v1/workbench/policy-simulation (writes fact)
+    'Probe route',                     // cx-workbench — POST /v1/workbench/route-probe (admin:write scoped)
+    'Record capability audit'          // cx-workbench — POST …/capabilities/{id}/audit (writes audit)
   ];
+
+  // =======================================================================
+  //  CONTROL_DIFF (M13a) — per-legacy-CX-page control-parity manifest.
+  //  For each legacy CX page: the grounded legacy control inventory (by type,
+  //  from index.html PAGES — the interactive control DSL, index.html:3520-4038),
+  //  the v2 read/display controls now PRESENT, the non-destructive read/display
+  //  controls still MISSING (the M13a-eligible worklist, added where safe), and
+  //  the write controls that stay operator-GATED (the M13b worklist).
+  //
+  //  This is the M13a gate evidence: v2 Pro was ~52% of legacy interactive
+  //  controls (audit console-control-parity-audit-2026-07-04.md). M13a closes the
+  //  NON-destructive half — the native workbench port + the missing read/display
+  //  controls — and enumerates the genuine writes for M13b.
+  //
+  //  `legacy` counts: pages whose legacy sections are generator-built (list/graph
+  //  projections: cx-overview/activity/work/sessions/identity/receipts/facts/coord/
+  //  orchestrators/punchcards) carry `{ projection: '<kind>' }` instead of a static
+  //  type tally — their v2 home is a live read over the named endpoint.
+  // =======================================================================
+  var CONTROL_DIFF = {
+    // ── Item 3 grounding: the 5 controls the audit flagged as possibly-mislabeled
+    //    "mutations". Each was GROUNDED against its handler; ALL retain a real
+    //    side effect, so all stay operator-gated and defer to M13b (conservative
+    //    per the M13a hard-safety rule "when unsure, gate it"). No safe read among
+    //    them was wired live; the newly-wired safe ops are the workbench GET reads.
+    _grounding: {
+      'Probe endpoint': 'gated — POST /v1/console/embedding/probe makes an OUTBOUND SSRF-guarded HTTP call to the embedding URL under admin:write (console.rs post_console_embedding_probe → probe_embedding_url); outbound → gate.',
+      'Verify connection': 'gated — GitHub connect validates the PAT with an OUTBOUND call carrying the operator credential; outbound + secret → gate.',
+      'Test call': 'gated — OpenAI-compatible test call is an OUTBOUND request that may spend tokens; outbound + spend → gate.',
+      'Export audit bundle': 'gated — maps to the audit_export_bundle MCP tool / the feature-gated GET /v1/observe/sessions/{id}/audit/export (needs a session id + CORECRUXD_OBSERVE); no unparameterised console GET → gate.',
+      'Scan path': 'gated — POST /v1/workspace/scan RUNS a scan and PERSISTS a scan fact (workspace.rs post_scan → fact_store.store); state mutation → gate. (GET /v1/workspace/scan is a read but is not what "Scan path" triggers.)',
+      _wired_safe: 'none of the 5 — all retain a side effect; the M13a live wiring is the workbench GET read surface (contract + api-drift/command-ledger/reasoning-timeline/audit-triage/brief).'
+    },
+    'cx-overview':      { legacy: { projection: 'panel' }, v2_present: ['live /v1/console/summary', 'stat tiles'], v2_missing_read: [], v2_gated_write: [] },
+    'cx-activity':      { legacy: { projection: 'stream' }, v2_present: ['stream link', 'info rows'], v2_missing_read: ['in-page rolling log (dedicated streaming surface)'], v2_gated_write: [] },
+    'cx-cost':          { legacy: { select: 1, info: 1 }, v2_present: ['live /v1/cost/report', 'D/W/M chart', 'window select'], v2_missing_read: [], v2_gated_write: [] },
+    'cx-projects':      { legacy: { search: 1, btn: 8, exp: 1, select: 6, toggle: 8, input: 5, info: 1 }, v2_present: ['live /v1/projects', 'repo grid', 'search', 'disclosure'], v2_missing_read: ['per-repo role/plane display selects'], v2_gated_write: ['Create project', 'Add repo', 'Set as planning repo'] },
+    'cx-work':          { legacy: { projection: 'kanban' }, v2_present: ['live /v1/work?source=all', 'state strips', 'graph link'], v2_missing_read: [], v2_gated_write: [] },
+    'cx-usage':         { legacy: { select: 1, search: 1, info: 7, bar: 12, exp: 10 }, v2_present: ['window select', 'search', 'info rows', 'savings bars', 'D/W/M chart'], v2_missing_read: [], v2_gated_write: [] },
+    'cx-documents':     { legacy: { search: 1, exp: 3, info: 9, btn: 5, input: 2, select: 2, toggle: 3 }, v2_present: ['live /v1/console/tenants', 'search', 'ingest inputs/selects (read)'], v2_missing_read: ['per-tenant chunk/doc counts display'], v2_gated_write: ['Queue ingest', 'Scan path'] },
+    'cx-gates':         { legacy: { search: 1, exp: 2, info: 3, btn: 5 }, v2_present: ['live /v1/work/gate/pending', 'search', 'approve/reject (operator-gated, wired)'], v2_missing_read: [], v2_gated_write: ['Withhold all'] },
+    'cx-review':        { legacy: { search: 1, info: 3, btn: 6, input: 6, textarea: 3, select: 2, toggle: 1 }, v2_present: ['live /v1/console/review/contradictions', 'search'], v2_missing_read: ['side-by-side contradiction display rows'], v2_gated_write: ['Consolidate facts'] },
+    'cx-coord':         { legacy: { projection: 'panel' }, v2_present: ['live /v1/coord/active'], v2_missing_read: [], v2_gated_write: [] },
+    'cx-sessions':      { legacy: { projection: 'list' }, v2_present: ['live /v1/console/sessions', 'search'], v2_missing_read: [], v2_gated_write: [] },
+    'cx-orchestrators': { legacy: { projection: 'panel' }, v2_present: ['live /v1/orchestrators'], v2_missing_read: [], v2_gated_write: [] },
+    'cx-punchcards':    { legacy: { projection: 'panel' }, v2_present: ['live /v1/punchcards'], v2_missing_read: [], v2_gated_write: [] },
+    'cx-passport':      { legacy: { input: 5, select: 1, textarea: 1, btn: 2, search: 1 }, v2_present: ['live /v1/passports', 'search'], v2_missing_read: ['capability list display'], v2_gated_write: ['Create passport'] },
+    'cx-identity':      { legacy: { projection: 'list' }, v2_present: ['live /v1/identity/candidates'], v2_missing_read: [], v2_gated_write: ['Confirm candidate'] },
+    'cx-receipts':      { legacy: { projection: 'list' }, v2_present: ['browser-local lookup', 'search', 'verify dock (read)'], v2_missing_read: [], v2_gated_write: [] },
+    'cx-mediation':     { legacy: { search: 1, exp: 4, info: 7, btn: 4, input: 1 }, v2_present: ['live /v1/console/engine/summary', 'principal/ladder/foresight info', 'search'], v2_missing_read: [], v2_gated_write: [] },
+    'cx-workbench':     { legacy: { btn: 11, info: 5, input: 5, select: 3 }, v2_present: ['live /v1/workbench/contract', 'api-drift (read)', 'command-ledger (read)', 'reasoning-timeline (read)', 'audit-triage (read)', 'brief (read)', 'tenant filter', 'search', 'query inputs/selects'], v2_missing_read: ['live text-search/graph-expand/time-range in-page (available in Explorer)', 'live entity loader'], v2_gated_write: ['Build context pack', 'Run impact preflight', 'Simulate policy', 'Probe route', 'Record capability audit'] },
+    'cx-integrations':  { legacy: { search: 1, exp: 14, info: 18, input: 3, toggle: 1, btn: 4, select: 1 }, v2_present: ['live /v1/console/integrations', 'pack expanders', 'grants (read)', 'search'], v2_missing_read: ['per-pack capability display rows'], v2_gated_write: ['Verify connection', 'Test call'] },
+    'cx-extensions':    { legacy: { search: 1, exp: 2, info: 5, input: 3, select: 1, btn: 2 }, v2_present: ['live /v1/extensions', 'manifest expanders', 'search'], v2_missing_read: ['per-grant scope display'], v2_gated_write: ['Add key', 'Install'] },
+    'cx-facts':         { legacy: { projection: 'cascade' }, v2_present: ['live /v1/console/facts', 'entity-prefix groups', 'search'], v2_missing_read: [], v2_gated_write: [] },
+    'cx-memory':        { legacy: { search: 1, toggle: 1, exp: 2, info: 4, btn: 1 }, v2_present: ['live /v1/console/facts', 'per-tenant groups', 'hide-system toggle (display)', 'search'], v2_missing_read: [], v2_gated_write: [] },
+    'cx-tenants':       { legacy: { info: 1, btn: 2, search: 1, toggle: 1 }, v2_present: ['live /v1/console/tenants', 'AMR lane toggles (display)', 'search'], v2_missing_read: [], v2_gated_write: ['Apply defaults to all tenants'] },
+    'cx-lane-weights':  { legacy: { projection: 'panel' }, v2_present: ['live /v1/console/corecrux/lane-weights', 'weight inputs (display)'], v2_missing_read: [], v2_gated_write: ['Apply lane weights', 'Reset lane weights'] },
+    'cx-settings':      { legacy: { select: 7, toggle: 6, info: 8, input: 3, btn: 5, theme: 1 }, v2_present: ['live /v1/console/settings', 'auth/embedding/retention info', 'display selects/toggles', 'theme'], v2_missing_read: ['ops health / bootstrap status info rows'], v2_gated_write: ['Restart daemon', 'Run sweep now', 'Re-run onboarding', 'Probe endpoint', 'Export audit bundle'] },
+    'cx-raw':           { legacy: { select: 1, textarea: 1, btn: 2, rpcout: 1, info: 1, input: 1 }, v2_present: ['method select', 'params textarea', 'rpcout', 'scopes input'], v2_missing_read: [], v2_gated_write: ['Send'] }
+  };
 
   // =======================================================================
   //  Demo mode fixtures (labelled, gated). Representative populated states,
@@ -1405,6 +1562,7 @@
     PRO_PORTED_IDS: PRO_PORTED_IDS,
     LEGACY_PORT: LEGACY_PORT,
     MUTATING_ACTIONS: MUTATING_ACTIONS,
+    CONTROL_DIFF: CONTROL_DIFF,
     JSX_PORT: JSX_PORT,
     CruxDemo: CruxDemo,
     // Exposed for tests / render composition.

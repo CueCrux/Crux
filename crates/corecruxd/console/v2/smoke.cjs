@@ -48,6 +48,12 @@
 //  24. (M8) legacy port-checklist integrity: the LEGACY_PORT manifest covers the
 //      EXACT known legacy inventory (5 scopes + 4 renderDash cards) with a valid
 //      disposition each (home:/ported-pro:/deferred:) — nothing dropped.
+//  34. (M13a) safe control parity: the 17 enumerated write controls + the 5
+//      audit-flagged controls (all grounded as still-side-effecting) stay
+//      operator-gated + disabled; 0 live writes added; grounding documented.
+//  35. (M13a) native workbench port + CONTROL_DIFF coverage: the manifest covers
+//      every legacy CX page; cx-workbench loads /v1/workbench/contract and renders
+//      its GET read tools via a GET-only self-loader; every wired op is a GET.
 
 'use strict';
 
@@ -1324,13 +1330,137 @@ function extractThemeVars(theme) {
   notes.push('surface honesty (M12): real surfaces read via fetchJSON (CruxApi); demo surfaces render fixtures only behind surfaceDemo()/demoData() + carry honest empty states; new surface CSS is 100% var(--…) tokens.');
 })();
 
+// =========================================================================
+//  Check 34 — (M13a) SAFE control parity: the genuine destructive/write
+//  controls STAY operator-gated + disabled. M13a introduces ZERO new live
+//  writes: the 17 enumerated write controls + the 5 controls the audit flagged
+//  as possibly-mislabeled "mutations" (all GROUNDED as still-side-effecting →
+//  conservatively kept gated) all remain in MUTATING_ACTIONS, each mapping to a
+//  mut:true control that render.js disables. The set of ops M13a wired live is
+//  the NON-mutating workbench GET reads (asserted in check 35) — never any of
+//  these. This is the hard-safety assertion for the milestone.
+// =========================================================================
+(function checkSafeControlParity() {
+  // The genuine writes that MUST remain disabled + operator-gated (unchanged).
+  const REQUIRED_DISABLED = [
+    'Create passport', 'Consolidate facts', 'Apply lane weights', 'Reset lane weights',
+    'Apply defaults to all tenants', 'Restart daemon', 'Run sweep now', 'Re-run onboarding',
+    'Confirm candidate', 'Withhold all', 'Create project', 'Add repo', 'Set as planning repo',
+    'Add key', 'Install', 'Queue ingest', 'Send'
+  ];
+  // The 5 audit-flagged controls GROUNDED as still-side-effecting (outbound /
+  // spend / config or fact write) → stay gated, deferred to M13b.
+  const STILL_GATED_AFTER_GROUNDING = ['Probe endpoint', 'Export audit bundle', 'Verify connection', 'Test call', 'Scan path'];
+  // The M13a live-wired safe ops (must be reads → NEVER in MUTATING_ACTIONS).
+  // Grounding deferred all 5 mislabeled controls to M13b, so this is empty; the
+  // newly-wired safe ops are the workbench GET reads (check 35).
+  const WIRED_SAFE = [];
+
+  const mut = new Set(pages.MUTATING_ACTIONS || []);
+  REQUIRED_DISABLED.concat(STILL_GATED_AFTER_GROUNDING).forEach(function (label) {
+    check(mut.has(label), '[m13a] required-disabled write control missing from MUTATING_ACTIONS: ' + label);
+  });
+  WIRED_SAFE.forEach(function (label) {
+    check(!mut.has(label), '[m13a] wired-safe op must NOT be gated as a mutation: ' + label);
+  });
+
+  // Every MUTATING_ACTIONS entry still maps to a mut:true control (belt-and-braces
+  // over the static sections + both build() branches; same walk as check 4).
+  const mutLabels = new Set();
+  Object.keys(pages.PAGES).forEach(function (id) {
+    walkPage(pages.PAGES[id], function (c) { if (c.mut === true && c.label) { mutLabels.add(String(c.label)); } });
+  });
+  (pages.MUTATING_ACTIONS || []).forEach(function (label) {
+    check(mutLabels.has(label), '[m13a] MUTATING_ACTIONS "' + label + '" has no mut:true control');
+  });
+
+  // render.js gate DISABLES the control (not just hides it) — the disabled half
+  // is what keeps a gated write inert even when an operator sees it.
+  check(/target && 'disabled' in target/.test(renderSrc) && /target\.disabled = true/.test(renderSrc),
+    '[m13a] applyMutationGate must disable the underlying input/button');
+
+  // The audit-flagged 5 are documented in CONTROL_DIFF._grounding with a reason.
+  const grounding = (pages.CONTROL_DIFF || {})._grounding || {};
+  STILL_GATED_AFTER_GROUNDING.forEach(function (label) {
+    check(typeof grounding[label] === 'string' && grounding[label].length > 0,
+      '[m13a] CONTROL_DIFF._grounding must record why "' + label + '" stays gated');
+  });
+  notes.push('m13a safe parity: ' + (REQUIRED_DISABLED.length + STILL_GATED_AFTER_GROUNDING.length) + ' write controls stay operator-gated + disabled (0 live writes added); the 5 audit-flagged controls grounded as still-side-effecting → deferred to M13b.');
+})();
+
+// =========================================================================
+//  Check 35 — (M13a) native workbench port + CONTROL_DIFF coverage. The
+//  CONTROL_DIFF manifest covers every legacy CX page; cx-workbench is a native
+//  page that loads the /v1/workbench/contract GET and renders its GET read
+//  tools; and every op the workbench newly wires live is NON-mutating (a GET on
+//  the allowlisted read client — never a mutation route, never the gated write
+//  client).
+// =========================================================================
+(function checkWorkbenchAndControlDiff() {
+  const CD = pages.CONTROL_DIFF;
+  check(CD && typeof CD === 'object', '[m13a] pages.js must export the CONTROL_DIFF manifest');
+  // Coverage: every legacy CX page (the 26) has a diff entry with the required shape.
+  LEGACY_26.forEach(function (id) {
+    const e = CD && CD[id];
+    check(!!e, '[m13a] CONTROL_DIFF missing legacy CX page: ' + id);
+    if (e) {
+      check(e.legacy && typeof e.legacy === 'object', '[m13a] CONTROL_DIFF.' + id + ' must carry a grounded `legacy` inventory');
+      check(Array.isArray(e.v2_present), '[m13a] CONTROL_DIFF.' + id + ' must carry v2_present[]');
+      check(Array.isArray(e.v2_missing_read), '[m13a] CONTROL_DIFF.' + id + ' must carry v2_missing_read[] (the M13a-eligible worklist)');
+      check(Array.isArray(e.v2_gated_write), '[m13a] CONTROL_DIFF.' + id + ' must carry v2_gated_write[] (the M13b worklist)');
+    }
+  });
+  // Every v2_gated_write label across the manifest is actually gated in MUTATING_ACTIONS.
+  const mut = new Set(pages.MUTATING_ACTIONS || []);
+  LEGACY_26.forEach(function (id) {
+    const e = CD && CD[id];
+    (e && e.v2_gated_write || []).forEach(function (label) {
+      check(mut.has(label), '[m13a] CONTROL_DIFF.' + id + ' lists gated write "' + label + '" not in MUTATING_ACTIONS');
+    });
+  });
+
+  // Native workbench: loads the contract GET + has a build (no link-only fallback).
+  const wb = pages.PAGES['cx-workbench'];
+  check(wb && wb.load && wb.load.endpoint === '/v1/workbench/contract', '[m13a] cx-workbench must load GET /v1/workbench/contract');
+  check(wb && wb.load && typeof wb.load.build === 'function', '[m13a] cx-workbench must have a live build (buildWorkbench)');
+
+  // buildWorkbench wires the workbench GET read tools through the api.js GET client.
+  const WB_GET_METHODS = ['workbenchApiDrift', 'workbenchCommandLedger', 'workbenchReasoningTimeline', 'workbenchAuditTriage', 'workbenchBrief'];
+  WB_GET_METHODS.forEach(function (m) {
+    check(pagesSrc.indexOf(m) >= 0, '[m13a] buildWorkbench must wire the GET read tool ' + m);
+  });
+
+  // The workbench read self-loader is GET-ONLY: it reads through CruxApi and never
+  // POSTs / never touches the gated write client. (A newly-wired op is a read.)
+  const fw = funcBody(renderSrc, 'fetchWorkbench');
+  check(!!fw, '[m13a] render.js must define fetchWorkbench (the workbench GET self-loader)');
+  if (fw) {
+    check(/window\.CruxApi\b/.test(fw), '[m13a] fetchWorkbench must read through window.CruxApi');
+    check(!/CruxApiGated/.test(fw), '[m13a] fetchWorkbench must never touch the gated write client');
+    check(!/method:\s*'(POST|PUT|PATCH|DELETE)'/.test(fw), '[m13a] fetchWorkbench must be GET-only (no write verb)');
+  }
+  check(typeof render === 'object', '[m13a] render.js module must load');
+  const lw = funcBody(renderSrc, 'loadWorkbenchRead');
+  check(!!lw && /fetchWorkbench\(/.test(lw), '[m13a] loadWorkbenchRead must paint via the GET-only fetchWorkbench');
+
+  // Every workbench route the port wires live is an allowlisted GET in api.js
+  // (LITERAL_GET_PATHS) — proof no wired op is a mutation route.
+  const apiSrc = fs.readFileSync(path.join(DIR, 'api.js'), 'utf8');
+  ['/v1/workbench/contract', '/v1/workbench/api-drift', '/v1/workbench/command-ledger',
+    '/v1/workbench/reasoning-timeline', '/v1/workbench/audit-triage', '/v1/workbench/brief'].forEach(function (p) {
+    check(new RegExp("'" + p.replace(/[-/]/g, '\\$&') + "': true").test(apiSrc),
+      '[m13a] wired workbench read ' + p + ' must be an allowlisted GET in api.js (never a mutation route)');
+  });
+  notes.push('m13a workbench + control-diff: CONTROL_DIFF covers all 26 legacy CX pages; cx-workbench is native (loads /v1/workbench/contract + 5 live GET read tools via a GET-only self-loader); every newly-wired op is an allowlisted GET.');
+})();
+
 // ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — M12 (11 WebCrux surfaces ported into the Documents-mode nav) smoke');
+console.log('unified-shell-console v2 — M13a (native workbench port + safe control parity) smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
 if (failures.length) {
   console.error('\nFAIL (' + failures.length + '):');
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity, M9 canvas board (canvasTier + widget registry), M9 canvas graph (real-edge-only model + focus parser + launch points), M10 documents mode (3-mode reader + ~72ch measure + evidence panel + real sources + demo Proof fixture + deep-link-out auto-switch), M10 legacy retirement (retired_at + fallback copy + console.rs DEPRECATED comment), M12 11-surface JSX port (DOC_SURFACES + JSX_PORT + rail nav + #/documents/<id> routes + real-vs-demo honesty)).');
+console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity, M9 canvas board (canvasTier + widget registry), M9 canvas graph (real-edge-only model + focus parser + launch points), M10 documents mode (3-mode reader + ~72ch measure + evidence panel + real sources + demo Proof fixture + deep-link-out auto-switch), M10 legacy retirement (retired_at + fallback copy + console.rs DEPRECATED comment), M12 11-surface JSX port (DOC_SURFACES + JSX_PORT + rail nav + #/documents/<id> routes + real-vs-demo honesty), M13a safe control parity (17+5 write controls stay operator-gated + disabled, 0 live writes added, grounding documented) + native workbench port (CONTROL_DIFF covers all 26 CX pages; cx-workbench loads /v1/workbench/contract + 5 GET read tools via a GET-only self-loader; every wired op is an allowlisted GET)).');
 process.exit(0);
