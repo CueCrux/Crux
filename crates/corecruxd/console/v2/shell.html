@@ -525,6 +525,19 @@
   }
   .ctl-row.is-gated, .exp.is-gated { position: relative; }
 
+  /* M13b live-write harness: result line + two-step confirm dialog. */
+  .wired-out { margin-top: 6px; }
+  .wired-result { margin: 0; font-size: 12px; line-height: 1.45; font-variant-numeric: tabular-nums; }
+  .wired-result.is-ok { color: var(--ok); }
+  .wired-result.is-err { color: var(--crit); }
+  .wired-confirm {
+    margin-top: 6px; padding: 10px 12px; border-radius: 10px;
+    background: color-mix(in srgb, var(--crit) 8%, var(--surface));
+    border: 1px solid color-mix(in srgb, var(--crit) 32%, transparent);
+  }
+  .wired-confirm-msg { margin: 0 0 9px; font-size: 12.5px; line-height: 1.5; color: var(--ink); }
+  .wired-confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
   .ctl-bar { display: flex; flex-direction: column; gap: 6px; }
   .ctl-bar-head { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--ink2); }
   .ctl-bar-val { color: var(--ink); font-variant-numeric: tabular-nums; }

@@ -345,12 +345,31 @@ function extractThemeVars(theme) {
   check(/const CruxApiGated = Object\.freeze\(/.test(apiSrc), '[gated] api.js must define CruxApiGated');
   check(/window\.CruxApiGated\s*=\s*CruxApiGated/.test(apiSrc), '[gated] api.js must expose window.CruxApiGated');
 
-  // The curated set the M3 plan authorises — the ONLY writes the console may do.
+  // The curated set — the ONLY writes the console may do (M3 + M13b live-wiring).
   const EXPECTED = [
     ['POST', '/v1/work/gate/{actionId}/approve'],
     ['POST', '/v1/work/gate/{actionId}/reject'],
     ['POST', '/v1/work/{id}/comments'],
-    ['POST', '/v1/actions/enrich']
+    ['POST', '/v1/actions/enrich'],
+    // M13b live-wired write controls (each behind the WIRED_WRITES harness):
+    ['POST', '/v1/projects'],
+    ['POST', '/v1/passports'],
+    ['POST', '/v1/console/review/consolidations'],
+    ['POST', '/v1/identity/candidates/{candidateId}/confirm'],
+    ['PUT', '/v1/console/corecrux/lane-weights'],
+    ['DELETE', '/v1/console/corecrux/lane-weights'],
+    ['POST', '/v1/admin/restart'],
+    ['POST', '/v1/console/onboarding/restart'],
+    ['POST', '/v1/console/embedding/probe'],
+    ['POST', '/v1/integrations/github/connect'],
+    ['POST', '/v1/integrations/openai/chat'],
+    ['POST', '/v1/extensions/keys'],
+    ['POST', '/v1/workspace/scan'],
+    ['POST', '/v1/workbench/context-pack'],
+    ['POST', '/v1/workbench/impact-preflight'],
+    ['POST', '/v1/workbench/policy-simulation'],
+    ['POST', '/v1/workbench/route-probe'],
+    ['POST', '/v1/features/capabilities/{id}/audit']
   ];
   // Parse the machine-readable GATED_MUTATIONS array and assert set-equality.
   const arrM = apiSrc.match(/const GATED_MUTATIONS = Object\.freeze\(\[([\s\S]*?)\]\);/);
@@ -1341,27 +1360,19 @@ function extractThemeVars(theme) {
 //  these. This is the hard-safety assertion for the milestone.
 // =========================================================================
 (function checkSafeControlParity() {
-  // The genuine writes that MUST remain disabled + operator-gated (unchanged).
-  const REQUIRED_DISABLED = [
-    'Create passport', 'Consolidate facts', 'Apply lane weights', 'Reset lane weights',
-    'Apply defaults to all tenants', 'Restart daemon', 'Run sweep now', 'Re-run onboarding',
-    'Confirm candidate', 'Withhold all', 'Create project', 'Add repo', 'Set as planning repo',
-    'Add key', 'Install', 'Queue ingest', 'Send'
+  const WIRED = (render && render.WIRED_WRITES) || {};
+  // The write controls that STAY operator-gated + disabled after the M13b flip.
+  // Each is ungroundable in this UI (no groundable route/body) or would break the
+  // curated no-arbitrary-mutation invariant — and must NOT be in WIRED_WRITES.
+  const STILL_GATED = [
+    'Add repo', 'Set as planning repo', 'Queue ingest', 'Install',
+    'Apply defaults to all tenants', 'Run sweep now', 'Export audit bundle', 'Send'
   ];
-  // The 5 audit-flagged controls GROUNDED as still-side-effecting (outbound /
-  // spend / config or fact write) → stay gated, deferred to M13b.
-  const STILL_GATED_AFTER_GROUNDING = ['Probe endpoint', 'Export audit bundle', 'Verify connection', 'Test call', 'Scan path'];
-  // The M13a live-wired safe ops (must be reads → NEVER in MUTATING_ACTIONS).
-  // Grounding deferred all 5 mislabeled controls to M13b, so this is empty; the
-  // newly-wired safe ops are the workbench GET reads (check 35).
-  const WIRED_SAFE = [];
 
   const mut = new Set(pages.MUTATING_ACTIONS || []);
-  REQUIRED_DISABLED.concat(STILL_GATED_AFTER_GROUNDING).forEach(function (label) {
-    check(mut.has(label), '[m13a] required-disabled write control missing from MUTATING_ACTIONS: ' + label);
-  });
-  WIRED_SAFE.forEach(function (label) {
-    check(!mut.has(label), '[m13a] wired-safe op must NOT be gated as a mutation: ' + label);
+  STILL_GATED.forEach(function (label) {
+    check(mut.has(label), '[m13b] still-gated write control missing from MUTATING_ACTIONS: ' + label);
+    check(!WIRED[label], '[m13b] still-gated control "' + label + '" must NOT be in WIRED_WRITES (it stays disabled)');
   });
 
   // Every MUTATING_ACTIONS entry still maps to a mut:true control (belt-and-braces
@@ -1371,21 +1382,29 @@ function extractThemeVars(theme) {
     walkPage(pages.PAGES[id], function (c) { if (c.mut === true && c.label) { mutLabels.add(String(c.label)); } });
   });
   (pages.MUTATING_ACTIONS || []).forEach(function (label) {
-    check(mutLabels.has(label), '[m13a] MUTATING_ACTIONS "' + label + '" has no mut:true control');
+    check(mutLabels.has(label), '[m13b] MUTATING_ACTIONS "' + label + '" has no mut:true control');
   });
 
-  // render.js gate DISABLES the control (not just hides it) — the disabled half
-  // is what keeps a gated write inert even when an operator sees it.
+  // Partition invariant: every MUTATING_ACTIONS entry is EITHER live-wired
+  // (WIRED_WRITES) OR still-gated — never both, never neither.
+  (pages.MUTATING_ACTIONS || []).forEach(function (label) {
+    const wired = !!WIRED[label], gated = STILL_GATED.indexOf(label) >= 0;
+    check(wired !== gated, '[m13b] MUTATING_ACTIONS "' + label + '" must be exactly one of live-wired / still-gated (wired=' + wired + ', gated=' + gated + ')');
+  });
+
+  // render.js STILL keeps the gated path: applyMutationGate DISABLES a still-gated
+  // control (not just hides it) — the disabled half keeps it inert for operators.
   check(/target && 'disabled' in target/.test(renderSrc) && /target\.disabled = true/.test(renderSrc),
-    '[m13a] applyMutationGate must disable the underlying input/button');
+    '[m13b] applyMutationGate must still disable a still-gated input/button');
+  check(/wired in M3\+/.test(renderSrc), '[m13b] render.js must still tag a still-gated write with "wired in M3+"');
 
-  // The audit-flagged 5 are documented in CONTROL_DIFF._grounding with a reason.
+  // Each still-gated control is documented in CONTROL_DIFF._grounding with a reason.
   const grounding = (pages.CONTROL_DIFF || {})._grounding || {};
-  STILL_GATED_AFTER_GROUNDING.forEach(function (label) {
+  STILL_GATED.forEach(function (label) {
     check(typeof grounding[label] === 'string' && grounding[label].length > 0,
-      '[m13a] CONTROL_DIFF._grounding must record why "' + label + '" stays gated');
+      '[m13b] CONTROL_DIFF._grounding must record why "' + label + '" stays gated');
   });
-  notes.push('m13a safe parity: ' + (REQUIRED_DISABLED.length + STILL_GATED_AFTER_GROUNDING.length) + ' write controls stay operator-gated + disabled (0 live writes added); the 5 audit-flagged controls grounded as still-side-effecting → deferred to M13b.');
+  notes.push('m13b partition: ' + Object.keys(WIRED).length + ' write controls live-wired (guard harness) + ' + STILL_GATED.length + ' stay operator-gated + disabled (ungroundable/invariant-breaking, documented in _grounding).');
 })();
 
 // =========================================================================
@@ -1454,13 +1473,103 @@ function extractThemeVars(theme) {
   notes.push('m13a workbench + control-diff: CONTROL_DIFF covers all 26 legacy CX pages; cx-workbench is native (loads /v1/workbench/contract + 5 live GET read tools via a GET-only self-loader); every newly-wired op is an allowlisted GET.');
 })();
 
+// =========================================================================
+//  Check 36 — (M13b) every live-wired write dispatches through the single
+//  operatorGatedCall→CruxApiGated choke point. No wired run calls a raw route,
+//  fetch(), or a client (CruxApi/CruxApiRead/CruxApiGated) directly — the write
+//  fires ONLY through operatorGatedCall (which guards on isOperator).
+// =========================================================================
+(function checkWiredThroughGate() {
+  const WIRED = (render && render.WIRED_WRITES) || {};
+  const labels = Object.keys(WIRED);
+  check(labels.length === 19, '[m13b] expected 19 live-wired write controls; got ' + labels.length);
+  labels.forEach(function (label) {
+    const spec = WIRED[label];
+    check(spec && typeof spec.run === 'function', '[m13b] WIRED_WRITES.' + label + ' must expose a run() fn');
+    const src = spec && typeof spec.run === 'function' ? spec.run.toString() : '';
+    check(/operatorGatedCall/.test(src), '[m13b] WIRED_WRITES "' + label + '" run must dispatch through operatorGatedCall');
+    check(!/\bfetch\s*\(/.test(src), '[m13b] WIRED_WRITES "' + label + '" run must not call fetch() directly');
+    check(!/CruxApiGated|CruxApiRead|window\.CruxApi\b|CruxApi\./.test(src), '[m13b] WIRED_WRITES "' + label + '" run must not touch a client directly (only operatorGatedCall)');
+  });
+  // Every wired label is still a mutation (in MUTATING_ACTIONS).
+  const mut = new Set(pages.MUTATING_ACTIONS || []);
+  labels.forEach(function (label) { check(mut.has(label), '[m13b] wired write "' + label + '" must be in MUTATING_ACTIONS'); });
+  // The btn renderer looks up WIRED_WRITES and hands off to attachWiredWrite,
+  // which invokes spec.run — never a bespoke fetch.
+  check(/WIRED_WRITES\[control\.label\]/.test(renderSrc), '[m13b] btn renderer must look up WIRED_WRITES[control.label]');
+  const aw = funcBody(renderSrc, 'attachWiredWrite');
+  check(!!aw, '[m13b] render.js must define attachWiredWrite');
+  check(aw && /spec\.run\(/.test(aw), '[m13b] attachWiredWrite must invoke spec.run()');
+  notes.push('m13b gate routing: all ' + labels.length + ' live-wired writes dispatch through operatorGatedCall→CruxApiGated (no raw route / no direct client), each still a MUTATING_ACTIONS entry.');
+})();
+
+// =========================================================================
+//  Check 37 — (M13b) the destructive/spend subset each carries a two-step
+//  confirm dialog BEFORE the gated call fires; additive creates do not.
+// =========================================================================
+(function checkDestructiveConfirm() {
+  const WIRED = (render && render.WIRED_WRITES) || {};
+  const MUST_CONFIRM = [
+    'Restart daemon', 'Re-run onboarding', 'Apply lane weights', 'Reset lane weights',
+    'Consolidate facts', 'Withhold all', 'Confirm candidate', 'Test call'
+  ];
+  MUST_CONFIRM.forEach(function (label) {
+    const spec = WIRED[label];
+    check(!!spec, '[m13b] destructive/spend control "' + label + '" must be live-wired');
+    check(spec && !!spec.confirm, '[m13b] destructive/spend control "' + label + '" must require a confirm dialog (spec.confirm)');
+  });
+  // Additive creates fire directly — no needless confirm friction.
+  ['Create passport', 'Create project', 'Add key', 'Probe endpoint', 'Scan path', 'Verify connection'].forEach(function (label) {
+    const spec = WIRED[label];
+    check(spec && !spec.confirm, '[m13b] additive create "' + label + '" should not carry a confirm dialog');
+  });
+  // The handler branches on spec.confirm and shows the dialog before firing.
+  const aw = funcBody(renderSrc, 'attachWiredWrite');
+  check(aw && /spec\.confirm/.test(aw), '[m13b] attachWiredWrite must branch on spec.confirm');
+  check(aw && /showConfirm\(/.test(aw), '[m13b] attachWiredWrite must call showConfirm for the destructive subset');
+  // showConfirm is a genuine two-step: onConfirm runs only from the Confirm click.
+  const sc = funcBody(renderSrc, 'showConfirm');
+  check(!!sc && /onConfirm\(\)/.test(sc), '[m13b] showConfirm must invoke onConfirm only from the Confirm button');
+  check(sc && /wired-confirm/.test(sc), '[m13b] showConfirm must render a wired-confirm dialog naming the consequence');
+  // The highest-risk control names its consequence explicitly.
+  check(/RESTARTS THE DAEMON PROCESS/.test(renderSrc), '[m13b] Restart daemon confirm must explicitly state it restarts the daemon process');
+  notes.push('m13b confirm guard: ' + MUST_CONFIRM.length + ' destructive/spend controls each require a two-step confirm (consequence + scope) before the gated call; additive creates fire directly.');
+})();
+
+// =========================================================================
+//  Check 38 — (M13b) customer posture hides AND refuses every write. The
+//  security boundary is posture/mode-independent: writes are hidden
+//  (data-requires="operator") AND refused (operatorGatedCall + attachWiredWrite
+//  re-check isOperator + require a bound passport for Art.14 attribution).
+// =========================================================================
+(function checkCustomerPostureRefusesWrites() {
+  // operatorGatedCall refuses (rejects) unless operator — the server-independent
+  // client-side boundary every wired write funnels through.
+  const gc = funcBody(renderSrc, 'operatorGatedCall');
+  check(gc && /isOperator\(\)/.test(gc) && /reject/i.test(gc), '[m13b] operatorGatedCall must refuse (reject) unless isOperator()');
+  // attachWiredWrite double-checks posture AND requires a bound passport (Art.14).
+  const aw = funcBody(renderSrc, 'attachWiredWrite');
+  check(aw && /isOperator\(\)/.test(aw), '[m13b] attachWiredWrite must re-check isOperator() (customer refusal)');
+  check(aw && /boundPassport\(\)/.test(aw), '[m13b] attachWiredWrite must require boundPassport() (Art.14 attribution)');
+  check(aw && /ART14_MSG/.test(aw), '[m13b] attachWiredWrite must refuse with the Art.14 message when unbound');
+  // The wired button is stamped operator-only so the shell hides it from customers.
+  check(/wired-write/.test(renderSrc) && /stampOperatorOnly\(node\)/.test(renderSrc), '[m13b] a wired write button must be stampOperatorOnly (data-requires="operator")');
+  const so = funcBody(renderSrc, 'stampOperatorOnly');
+  check(so && /data-requires/.test(so) && /operator/.test(so), '[m13b] stampOperatorOnly must set data-requires="operator"');
+  check(so && /hidden = !isOperator\(\)/.test(so), '[m13b] stampOperatorOnly must hide the control for non-operators');
+  // shell.applyPosture hides every data-requires="operator" node in customer view.
+  check(/\[data-requires="operator"\]/.test(shellHtml) && /POSTURE !== 'operator'/.test(shellHtml),
+    '[m13b] shell.applyPosture must hide data-requires="operator" nodes unless operator');
+  notes.push('m13b customer safety: writes are hidden (data-requires="operator") AND refused (operatorGatedCall + attachWiredWrite re-check isOperator + Art.14 bound passport) in customer posture — the boundary is posture/mode-independent.');
+})();
+
 // ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — M13a (native workbench port + safe control parity) smoke');
+console.log('unified-shell-console v2 — M13b (live mutation wiring) smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
 if (failures.length) {
   console.error('\nFAIL (' + failures.length + '):');
   failures.forEach(function (f) { console.error('  ✗ ' + f); });
   process.exit(1);
 }
-console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity, M9 canvas board (canvasTier + widget registry), M9 canvas graph (real-edge-only model + focus parser + launch points), M10 documents mode (3-mode reader + ~72ch measure + evidence panel + real sources + demo Proof fixture + deep-link-out auto-switch), M10 legacy retirement (retired_at + fallback copy + console.rs DEPRECATED comment), M12 11-surface JSX port (DOC_SURFACES + JSX_PORT + rail nav + #/documents/<id> routes + real-vs-demo honesty), M13a safe control parity (17+5 write controls stay operator-gated + disabled, 0 live writes added, grounding documented) + native workbench port (CONTROL_DIFF covers all 26 CX pages; cx-workbench loads /v1/workbench/contract + 5 GET read tools via a GET-only self-loader; every wired op is an allowlisted GET)).');
+console.log('\nPASS — all gates green (26/26 ids incl. pill:false landing-render + 4 Pro-ported legacy pages, control coverage, theme contrast, posture gate, no external deps, through-client fetches, gated-mutations audit, posture derivation, engine mediation, PWA manifest, service worker, phone tier, demo-mode gating, unified buttons, collapsible rail, status pill + chips, charts, board strips, nav-family consolidation + rail-at-rest-borderless, projects disclosure + repo grid, topbar chip height, legacy LED toggle + squarer topbar chips + list-row language, M8 mode system + posture-independence, M8 legacy port-checklist integrity, M9 canvas board (canvasTier + widget registry), M9 canvas graph (real-edge-only model + focus parser + launch points), M10 documents mode (3-mode reader + ~72ch measure + evidence panel + real sources + demo Proof fixture + deep-link-out auto-switch), M10 legacy retirement (retired_at + fallback copy + console.rs DEPRECATED comment), M12 11-surface JSX port (DOC_SURFACES + JSX_PORT + rail nav + #/documents/<id> routes + real-vs-demo honesty), M13a safe control parity + native workbench port (CONTROL_DIFF covers all 26 CX pages; cx-workbench loads /v1/workbench/contract + 5 GET read tools via a GET-only self-loader), M13b live mutation wiring (19 write controls live behind the guard harness — operatorGatedCall→CruxApiGated + bound-passport Art.14 refusal + confirm dialog on the destructive/spend subset + real receipt; 22 curated GATED_MUTATIONS; 8 controls stay operator-gated + disabled for documented ungroundable/invariant reasons; customer posture hides AND refuses every write)).');
 process.exit(0);

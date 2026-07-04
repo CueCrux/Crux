@@ -400,6 +400,182 @@
     return node;
   }
 
+  // ---- M13b live-write harness -------------------------------------------
+  // A control whose label is a key in WIRED_WRITES is rendered ENABLED for
+  // operators (never disabled, no "wired in M3+" tag) and fires a REAL, guarded
+  // mutation. The guard harness on every wired write:
+  //   1. operator posture — stampOperatorOnly hides it from customers AND
+  //      operatorGatedCall refuses in customer posture (belt-and-braces);
+  //   2. bound-passport Art.14 refusal — no passport ⇒ the write refuses;
+  //   3. confirm dialog on the destructive subset (spec.confirm) BEFORE firing;
+  //   4. the write runs ONLY through operatorGatedCall (the gated choke point, spec.run);
+  //   5. the REAL backend response is rendered (receipt/id/state) — never faked.
+  var ART14_MSG = 'Bind a passport first — Art.14 requires an attributed approver before any gated write.';
+
+  // Operator-only stamp: hidden for customers (shell.applyPosture + belt-and-
+  // braces here), but — unlike applyMutationGate — never disabled. Used for the
+  // operator form fields and the live-wired write buttons.
+  function stampOperatorOnly(node) {
+    node.setAttribute('data-requires', 'operator');
+    node.hidden = !isOperator();
+    return node;
+  }
+
+  // Gather a { key: value } map from the enclosing form scope by data-k. Toggles
+  // (data-toggle) yield booleans; everything else yields its string value.
+  function collectForm(scope) {
+    var out = {};
+    if (!scope || !scope.querySelectorAll) { return out; }
+    var nodes = scope.querySelectorAll('[data-k]');
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      var k = n.getAttribute('data-k');
+      if (!k) { continue; }
+      if (n.getAttribute('data-toggle') === '1') { out[k] = !!n.checked; }
+      else { out[k] = (n.value != null ? n.value : ''); }
+    }
+    return out;
+  }
+
+  function splitIds(s) { return String(s == null ? '' : s).split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean); }
+  function num(s, dflt) { var v = parseFloat(s); return isFinite(v) ? v : dflt; }
+
+  // Render the REAL response — a receipt id / created id / new state when the
+  // backend returns one, an honest HTTP error otherwise. NEVER a fabricated hash.
+  function formatReceipt(r) {
+    if (!r) { return 'no response'; }
+    var d = r.data || {};
+    var rid = d.receipt_id || (d.receipt && (d.receipt.receipt_id || (typeof d.receipt === 'string' ? d.receipt : null)))
+      || d.id || d.link_id || d.passport_id || d.scan_id || d.action_id;
+    if (r.ok) {
+      var bits = [];
+      if (rid && typeof rid === 'string') { bits.push(rid); }
+      if (d.status && typeof d.status === 'string') { bits.push(d.status); }
+      if (d.state && typeof d.state === 'string') { bits.push(d.state); }
+      if (d.connected != null) { bits.push(d.connected ? 'connected' : 'not connected'); }
+      return 'OK · ' + (bits.length ? bits.join(' · ') : ('HTTP ' + r.status + ' · recorded'));
+    }
+    var detail = (d && (d.detail || d.error || d.message));
+    return 'HTTP ' + r.status + (detail ? ' · ' + detail : '');
+  }
+
+  function showWiredResult(host, text, isErr) {
+    host.textContent = '';
+    host.appendChild(el('p', { 'class': 'wired-result' + (isErr ? ' is-err' : ' is-ok'), text: text }));
+  }
+
+  // Two-step in-DOM confirm for the destructive subset. Names the consequence +
+  // scope; the write fires ONLY after the operator clicks Confirm.
+  function showConfirm(host, message, onConfirm) {
+    host.textContent = '';
+    var panel = el('div', { 'class': 'wired-confirm', 'role': 'alertdialog', 'aria-label': 'Confirm destructive action' });
+    panel.appendChild(el('p', { 'class': 'wired-confirm-msg', text: message }));
+    var actions = el('div', { 'class': 'wired-confirm-actions' });
+    var no = el('button', { 'class': 'btn-quiet wired-confirm-no', type: 'button' }, ['Cancel']);
+    var yes = el('button', { 'class': 'btn-primary wired-confirm-go', type: 'button' }, ['Confirm']);
+    no.addEventListener('click', function () { host.textContent = ''; });
+    yes.addEventListener('click', function () { host.textContent = ''; onConfirm(); });
+    actions.appendChild(no);
+    actions.appendChild(yes);
+    panel.appendChild(actions);
+    host.appendChild(panel);
+  }
+
+  // The curated live-write registry. The key is the exact button label; each
+  // `run(f, pp)` builds its body from the gathered form `f` + bound passport `pp`
+  // and dispatches through operatorGatedCall (the sole gated-client choke point),
+  // resolving to a normalised { ok, status, data }. `confirm` (string or fn(f))
+  // marks the destructive/spend subset that requires a confirm dialog first.
+  var WIRED_WRITES = {
+    // ── additive creates (no confirm) ──────────────────────────────────────
+    'Create project': { destructive: false, confirm: null,
+      run: function (f) { return operatorGatedCall(function (g) { return g.createProject({ id: f.proj_id, name: f.proj_name }); }).then(readJson); } },
+    'Create passport': { destructive: false, confirm: null,
+      run: function (f) { return operatorGatedCall(function (g) { return g.createPassport({ id: f.pp_id, category: f.pp_category, name: f.pp_name, owner: f.pp_owner, position: f.pp_position, company: f.pp_company, notes: f.pp_notes }); }).then(readJson); } },
+    'Add key': { destructive: false, confirm: null,
+      run: function (f, pp) { return operatorGatedCall(function (g) { return g.extensionAddKey({ passport_fpr: f.key_fpr, public_key_hex: f.key_pub, trust_tier: f.key_tier, added_by: pp }); }).then(readJson); } },
+    // ── outbound probes (SSRF-guarded / connect) — no confirm ───────────────
+    'Probe endpoint': { destructive: false, confirm: null,
+      run: function (f) { return operatorGatedCall(function (g) { return g.embeddingProbe({ url: f.embed_url }); }).then(readJson); } },
+    'Verify connection': { destructive: false, confirm: null,
+      run: function (f) { return operatorGatedCall(function (g) { return g.githubConnect({ pat: f.gh_pat, skip_verify: !!f.gh_skiptls }); }).then(readJson); } },
+    'Scan path': { destructive: false, confirm: null,
+      run: function () { return operatorGatedCall(function (g) { return g.workspaceScanRun({}); }).then(readJson); } },
+    // ── workbench writes (receipted; additive) ──────────────────────────────
+    'Build context pack': { destructive: false, confirm: null,
+      run: function (f) { return operatorGatedCall(function (g) { return g.workbenchContextPack({ tenant_id: f.wb_ctx_tenant || f.wb_tenant || 'default', query: f.wb_ctx_query || '', token_budget: num(f.wb_ctx_budget, 2000) }); }).then(readJson); } },
+    'Run impact preflight': { destructive: false, confirm: null,
+      run: function (f) { return operatorGatedCall(function (g) { return g.workbenchImpactPreflight({ tenant_id: f.wb_pf_tenant || f.wb_tenant || 'default', changed_paths: splitIds(f.wb_target) }); }).then(readJson); } },
+    'Simulate policy': { destructive: false, confirm: null,
+      run: function (f) { return operatorGatedCall(function (g) { return g.workbenchPolicySimulation({ tool_name: 'policy.simulate', action_description: f.wb_sim_action || ('simulate ' + (f.wb_policy || 'policy')), tool_parameters: { policy_profile: f.wb_policy } }); }).then(readJson); } },
+    'Probe route': { destructive: false, confirm: null,
+      run: function (f) { return operatorGatedCall(function (g) { return g.workbenchRouteProbe({ route: f.wb_route || '', include_tests: false, include_storyline: false }); }).then(readJson); } },
+    'Record capability audit': { destructive: false, confirm: null,
+      run: function (f, pp) { return operatorGatedCall(function (g) { return g.featureCapabilityAudit(f.wb_cap_id || '', { status: f.wb_cap_status || 'pass', auditor: pp, notes: f.wb_cap_notes || '' }); }).then(readJson); } },
+    // ── token-spend: outbound LLM call → confirm noting spend ────────────────
+    'Test call': { destructive: false, confirm: 'This makes an OUTBOUND request to the connected LLM and MAY SPEND TOKENS on your account. Proceed?',
+      run: function (f) { return operatorGatedCall(function (g) { return g.openaiChat({ model: (f.oa_model && f.oa_model !== 'none') ? f.oa_model : undefined, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 }); }).then(readJson); } },
+    // ── destructive subset — each names its consequence + scope in confirm ──
+    'Consolidate facts': { destructive: true,
+      confirm: function (f) { return 'Writes a canonical fact for ' + (f.cr_entity || '?') + ' · ' + (f.cr_key || '?') + ' and SUPERSEDES the ' + splitIds(f.cr_targets).length + ' listed target fact(s) — they stop resolving. Fact-store mutation. Proceed?'; },
+      run: function (f, pp) { return operatorGatedCall(function (g) { return g.reviewConsolidation({ consolidation_id: 'cons_' + Date.now().toString(36), entity: f.cr_entity, key: f.cr_key, canonical_value: f.cr_value, target_fact_ids: splitIds(f.cr_targets), protected_fact_ids: splitIds(f.cr_protected), confidence: num(f.cr_conf, 0.8), protected_confidence_floor: num(f.cr_floor, 0.99), actor: pp }); }).then(readJson); } },
+    'Confirm candidate': { destructive: true,
+      confirm: function (f) { return 'Creates the resolving identity link for candidate ' + (f.ic_candidate_id || '?') + ' (local ' + (f.ic_local_passport_id || '?') + ' ↔ remote ' + (f.ic_remote_fpr || '?') + ') — only if both signatures verify server-side. Irreversible resolution. Proceed?'; },
+      run: function (f) { return operatorGatedCall(function (g) { return g.identityCandidateConfirm(f.ic_candidate_id || '', { local_passport_id: f.ic_local_passport_id, remote_fpr: f.ic_remote_fpr, remote_public_key_hex: f.ic_remote_public_key_hex, created_at: f.ic_created_at, sig_local: f.ic_sig_local, sig_remote: f.ic_sig_remote }); }).then(readJson); } },
+    'Apply lane weights': { destructive: true,
+      confirm: function (f) { return 'Writes FUSION_RRF_LANE_WEIGHTS to CoreCrux for ' + (f.tenant_id || f.tenant_pick || 'GLOBAL (all tenants)') + ' — changes retrieval ranking for that scope. Proceed?'; },
+      run: function (f, pp) { var weights = {}; ['bm25', 'cosine', 'sparse', 'hyde', 'topology', 'vernacular', 'indexing', 'topology_trait_expansion', 'navtree', 'events'].forEach(function (lane) { var v = f['w_' + lane]; if (v != null && v !== '') { weights[lane] = num(v, 0); } }); return operatorGatedCall(function (g) { return g.laneWeightsApply({ tenant_id: f.tenant_id || f.tenant_pick || undefined, weights: weights, fusion_rrf_enabled: !!f.fusion_rrf, reason: f.reason || '', actor: pp }); }).then(readJson); } },
+    'Reset lane weights': { destructive: true,
+      confirm: 'Clears the lane-weight overlay (global scope) — retrieval reverts to CoreCrux defaults for every tenant that inherited it. Proceed?',
+      run: function () { return operatorGatedCall(function (g) { return g.laneWeightsReset({}); }).then(readJson); } },
+    'Restart daemon': { destructive: true,
+      confirm: 'This RESTARTS THE DAEMON PROCESS — the daemon exits immediately (POST /v1/admin/restart) and relies on the service/container restart policy to come back. All in-flight requests drop and the console briefly disconnects. Proceed?',
+      run: function () { return operatorGatedCall(function (g) { return g.adminRestart({}); }).then(readJson); } },
+    'Re-run onboarding': { destructive: true,
+      confirm: 'Resets onboarding — the first-run wizard shows again on next load and the recorded completion is cleared for this node. Proceed?',
+      run: function () { return operatorGatedCall(function (g) { return g.onboardingRestart({}); }).then(readJson); } },
+    // ── "Withhold all": no batch route — loops gateReject over every pending
+    //    gate (read via fetchJSON, each reject through operatorGatedCall). ──────
+    'Withhold all': { destructive: true,
+      confirm: 'Rejects ALL currently-pending gated transitions (keeps every one from proceeding), each attributed to your passport. Bulk action across every pending gate. Proceed?',
+      run: function (f, pp) {
+        return fetchJSON('/v1/work/gate/pending').then(function (res) {
+          var pend = (res && res.data && (res.data.pending || res.data.items)) || [];
+          pend = pend.filter(function (p) { return (p.status || 'pending') === 'pending' && p.action_id; });
+          if (!pend.length) { return { ok: true, status: 200, data: { status: '0 withheld — none pending' } }; }
+          var okN = 0, errN = 0;
+          return pend.reduce(function (chain, p) {
+            return chain.then(function () {
+              return operatorGatedCall(function (g) { return g.gateReject(p.action_id, { approver_passport: pp }); }).then(readJson).then(function (r) { if (r && r.ok) { okN++; } else { errN++; } });
+            });
+          }, Promise.resolve()).then(function () { return { ok: errN === 0, status: 200, data: { status: okN + ' withheld' + (errN ? ', ' + errN + ' failed' : '') } }; });
+        });
+      } }
+  };
+
+  // Wire a live-write button: the click handler runs the full guard harness.
+  function attachWiredWrite(btn, node, control, spec) {
+    var host = el('div', { 'class': 'wired-out', 'aria-live': 'polite' });
+    node.appendChild(host);
+    btn.addEventListener('click', function () {
+      if (!isOperator()) { showWiredResult(host, 'Operator posture required — this control is unavailable in customer view.', true); return; }
+      var pp = boundPassport();
+      if (!pp) { showWiredResult(host, ART14_MSG, true); return; }
+      var scope = btn.closest('.ctl-disclose-panel') || btn.closest('.exp-body') || btn.closest('.v2card') || node;
+      var f = collectForm(scope);
+      var fire = function () {
+        host.textContent = '';
+        btn.disabled = true;
+        Promise.resolve().then(function () { return spec.run(f, pp); })
+          .then(function (r) { showWiredResult(host, formatReceipt(r), !(r && r.ok)); })
+          .catch(function (e) { showWiredResult(host, 'refused · ' + (e && e.message ? e.message : e), true); })
+          .then(function () { btn.disabled = false; });
+      };
+      var msg = spec.confirm ? (typeof spec.confirm === 'function' ? spec.confirm(f) : spec.confirm) : null;
+      if (msg) { showConfirm(host, msg, fire); } else { fire(); }
+    });
+  }
+
   function labelled(control, inner) {
     var row = el('div', { 'class': 'ctl-row' });
     if (control.label) { row.appendChild(el('label', { 'class': 'ctl-label', text: control.label })); }
@@ -434,17 +610,19 @@
         break;
       }
       case 'input': {
-        var inp = el('input', { 'class': 'ctl-input' + (control.mono ? ' mono' : ''), type: control.secret ? 'password' : 'text', placeholder: control.ph || '', value: control.v != null ? control.v : '' });
-        node = applyMutationGate(labelled(control, inp), control);
+        var inp = el('input', { 'class': 'ctl-input' + (control.mono ? ' mono' : ''), type: control.secret ? 'password' : 'text', placeholder: control.ph || '', value: control.v != null ? control.v : '', 'data-k': control.k });
+        // A mut input is operator-only (hidden for customers) but, unlike M1,
+        // now ENABLED so the operator can fill a live-wired write's body.
+        node = control.mut ? stampOperatorOnly(labelled(control, inp)) : labelled(control, inp);
         break;
       }
       case 'textarea': {
-        var ta = el('textarea', { 'class': 'ctl-input ctl-textarea' + (control.mono ? ' mono' : ''), rows: control.rows || 3, placeholder: control.ph || '', text: control.v != null ? control.v : '' });
-        node = applyMutationGate(labelled(control, ta), control);
+        var ta = el('textarea', { 'class': 'ctl-input ctl-textarea' + (control.mono ? ' mono' : ''), rows: control.rows || 3, placeholder: control.ph || '', text: control.v != null ? control.v : '', 'data-k': control.k });
+        node = control.mut ? stampOperatorOnly(labelled(control, ta)) : labelled(control, ta);
         break;
       }
       case 'select': {
-        var sel = el('select', { 'class': 'ctl-input ctl-select' });
+        var sel = el('select', { 'class': 'ctl-input ctl-select', 'data-k': control.k });
         var opts = control.options || [];
         for (var oi = 0; oi < opts.length; oi++) {
           var o = opts[oi];
@@ -454,23 +632,24 @@
           if (String(val) === String(control.v)) { opt.setAttribute('selected', 'selected'); }
           sel.appendChild(opt);
         }
-        node = applyMutationGate(labelled(control, sel), control);
+        node = control.mut ? stampOperatorOnly(labelled(control, sel)) : labelled(control, sel);
         break;
       }
       case 'toggle': {
         // LED toggle (legacy .active-toggle, index.html:388-392): a squarer
         // family chip with an 8px LED that glows (--ok) when on. The .on class
         // reflects control.v (the server value); the input carries the a11y
-        // state and is disabled by applyMutationGate on mut toggles.
+        // state; a mut toggle is operator-only but ENABLED (M13b) so its boolean
+        // can feed a live-wired write (e.g. fusion_rrf → Apply lane weights).
         var box = el('label', { 'class': 'ctl-toggle' + (control.v ? ' on' : '') });
-        var cb = el('input', { type: 'checkbox' });
+        var cb = el('input', { type: 'checkbox', 'data-k': control.k, 'data-toggle': control.k ? '1' : null });
         if (control.v) { cb.setAttribute('checked', 'checked'); }
         box.appendChild(cb);
         box.appendChild(el('span', { 'class': 'led', 'aria-hidden': 'true' }));
         box.appendChild(el('span', { 'class': 'ctl-toggle-label', text: control.label || '' }));
         var wrap = el('div', { 'class': 'ctl-row' }, [box]);
         if (control.desc) { wrap.appendChild(el('p', { 'class': 'ctl-desc', text: control.desc })); }
-        node = applyMutationGate(wrap, control);
+        node = control.mut ? stampOperatorOnly(wrap) : wrap;
         break;
       }
       case 'btn': {
@@ -480,7 +659,18 @@
           node = el('a', { 'class': 'btn-quiet' + (control.graphLaunch ? ' cx-graphlink' : ''), href: control.href, title: control.hint || '' }, [control.label || 'Open']);
           break;
         }
-        // Every page-level button is the quiet family; `danger` is a colour cue.
+        // A mut button whose label is in WIRED_WRITES is LIVE (M13b): operator-
+        // only + enabled, firing a real guarded mutation via attachWiredWrite.
+        var wspec = control.mut ? WIRED_WRITES[control.label] : null;
+        if (wspec) {
+          var wbtn = el('button', { 'class': 'btn-quiet' + (control.danger ? ' danger' : ''), type: 'button', title: control.hint || control.label || 'Action' }, [control.label || 'Action']);
+          node = el('div', { 'class': 'ctl-row wired-write' }, [wbtn]);
+          stampOperatorOnly(node);
+          attachWiredWrite(wbtn, node, control, wspec);
+          break;
+        }
+        // Every other page-level button is the quiet family; `danger` is a colour
+        // cue. A still-gated mut write stays disabled + "wired in M3+".
         var btn = el('button', { 'class': 'btn-quiet' + (control.danger ? ' danger' : ''), type: 'button', disabled: 'disabled', title: GATE_TITLE }, [control.label || 'Action']);
         node = el('div', { 'class': 'ctl-row' }, [btn]);
         if (control.mut) { node = applyMutationGate(node, control); }
@@ -2728,6 +2918,11 @@
     approveGate: approveGate,
     rejectGate: rejectGate,
     commentWork: commentWork,
-    enrichAction: enrichAction
+    enrichAction: enrichAction,
+    // M13b — the live-write registry (exposed so the smoke can audit the harness:
+    // every entry fires through operatorGatedCall; the destructive subset carries
+    // a confirm). The runtime never reaches the gated write client except via these + the
+    // operator helpers above, all funnelling through operatorGatedCall.
+    WIRED_WRITES: WIRED_WRITES
   };
 });

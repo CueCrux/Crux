@@ -47,16 +47,61 @@ fn manifest_dir() -> PathBuf {
 //
 // Keep this tiny. Adding a row is the *only* way to widen what the console can
 // mutate, and it lands as a reviewable diff here + a regenerated `api.js`.
-// Grounded against the handlers:
+//
+// Every row is BOTH operator-posture UI-gated (render.js `operatorGatedCall` +
+// the `WIRED_WRITES` harness: bound-passport Art.14 refusal, a confirm dialog on
+// the destructive subset, and a real-receipt render) AND server-side auth-gated.
+// Grounded against the handlers (unified-shell-console M3 + M13b live wiring):
 //   * work.rs::post_gate_approve  — POST /v1/work/gate/{actionId}/approve  (body {approver_passport})
-//   * work.rs::post_gate_reject   — POST /v1/work/gate/{actionId}/reject   (body {approver_passport})
+//   * work.rs::post_gate_reject   — POST /v1/work/gate/{actionId}/reject   (body {approver_passport}; also drives "Withhold all" as a pending-gate loop)
 //   * work.rs::post_comment       — POST /v1/work/{id}/comments            (body {author_passport, body})
 //   * actions.rs::post_action_enrich — POST /v1/actions/enrich             (body ActionEnrichmentInput)
+//   * projects.rs::post_project              — POST /v1/projects                              (body {id,name,planning_target,…})  [mod.rs:757]
+//   * passports.rs::post_passport            — POST /v1/passports                             (body {id,category,name,owner,…})   [mod.rs:1022]
+//   * console.rs::post_console_review_consolidation — POST /v1/console/review/consolidations  (ConsolidationRequestV1 {entity,key,canonical_value,target_fact_ids,actor,…}) [mod.rs:1151]
+//   * identity_links.rs::post_identity_candidate_confirm — POST /v1/identity/candidates/{candidateId}/confirm (CreateLinkRequest {local_passport_id,remote_fpr,remote_public_key_hex,created_at,sig_local,sig_remote}) [mod.rs:545]
+//   * console.rs::put_console_corecrux_lane_weights    — PUT  /v1/console/corecrux/lane-weights (body {tenant_id?,weights,fusion_rrf_enabled,reason?,actor?}) [mod.rs:1142]
+//   * console.rs::delete_console_corecrux_lane_weights — DELETE /v1/console/corecrux/lane-weights (no body; global-scope reset) [mod.rs:1143]
+//   * admin.rs::post_restart_daemon          — POST /v1/admin/restart                         (no body; std::process::exit + restart policy) [mod.rs:435]
+//   * console.rs::post_console_onboarding_restart — POST /v1/console/onboarding/restart       (no body) [mod.rs:1161]
+//   * console.rs::post_console_embedding_probe    — POST /v1/console/embedding/probe          (body {url}; SSRF-guarded outbound probe) [mod.rs:1137]
+//   * integrations_github.rs::post_connect   — POST /v1/integrations/github/connect           (body {pat,skip_verify,username_override}) [mod.rs:1068]
+//   * integrations_openai.rs::post_chat      — POST /v1/integrations/openai/chat              (body {messages,model,max_tokens,temperature}; token spend → confirm) [mod.rs:1117]
+//   * extensions.rs::add_trusted_key         — POST /v1/extensions/keys                       (body {passport_fpr,public_key_hex,trust_tier,added_by}) [mod.rs:886]
+//   * workspace.rs::post_scan                — POST /v1/workspace/scan                        (no body; persists a scan fact) [mod.rs:835]
+//   * workbench.rs::post_context_pack        — POST /v1/workbench/context-pack                (body {tenant_id,query,token_budget,…}; returns receipt.receipt_id) [mod.rs:675]
+//   * workbench.rs::post_impact_preflight    — POST /v1/workbench/impact-preflight            (body {tenant_id,changed_paths,…}; returns receipt.receipt_id) [mod.rs:679]
+//   * workbench.rs::post_policy_simulation   — POST /v1/workbench/policy-simulation           (flattened ActionEnrichmentInput {tool_name,action_description,tool_parameters}; returns receipt.receipt_id) [mod.rs:702]
+//   * workbench.rs::post_route_probe         — POST /v1/workbench/route-probe                 (body {route,include_storyline,include_tests}; returns receipt.receipt_id) [mod.rs:697]
+//   * features.rs::post_audit                — POST /v1/features/capabilities/{id}/audit      (body {status,auditor,notes}) [mod.rs:591]
 const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
     ("POST", "/v1/work/gate/{actionId}/approve", "gateApprove"),
     ("POST", "/v1/work/gate/{actionId}/reject", "gateReject"),
     ("POST", "/v1/work/{id}/comments", "workComment"),
     ("POST", "/v1/actions/enrich", "actionsEnrich"),
+    // ── M13b: live-wired write controls (each behind the WIRED_WRITES harness) ──
+    ("POST", "/v1/projects", "createProject"),
+    ("POST", "/v1/passports", "createPassport"),
+    ("POST", "/v1/console/review/consolidations", "reviewConsolidation"),
+    (
+        "POST",
+        "/v1/identity/candidates/{candidateId}/confirm",
+        "identityCandidateConfirm",
+    ),
+    ("PUT", "/v1/console/corecrux/lane-weights", "laneWeightsApply"),
+    ("DELETE", "/v1/console/corecrux/lane-weights", "laneWeightsReset"),
+    ("POST", "/v1/admin/restart", "adminRestart"),
+    ("POST", "/v1/console/onboarding/restart", "onboardingRestart"),
+    ("POST", "/v1/console/embedding/probe", "embeddingProbe"),
+    ("POST", "/v1/integrations/github/connect", "githubConnect"),
+    ("POST", "/v1/integrations/openai/chat", "openaiChat"),
+    ("POST", "/v1/extensions/keys", "extensionAddKey"),
+    ("POST", "/v1/workspace/scan", "workspaceScanRun"),
+    ("POST", "/v1/workbench/context-pack", "workbenchContextPack"),
+    ("POST", "/v1/workbench/impact-preflight", "workbenchImpactPreflight"),
+    ("POST", "/v1/workbench/policy-simulation", "workbenchPolicySimulation"),
+    ("POST", "/v1/workbench/route-probe", "workbenchRouteProbe"),
+    ("POST", "/v1/features/capabilities/{id}/audit", "featureCapabilityAudit"),
 ];
 
 // ── Curated read-POST allowlist (unified-shell-console M11) ───────────────────

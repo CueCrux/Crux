@@ -896,30 +896,37 @@
           { t: 'input', k: 'wb_tenant', label: 'tenant (read scope)', ph: 'default', v: 'default', mono: true },
           info('note', 'reads run through the GET client; writes stay operator-gated until M13b')
         ] },
-      { h: 'Briefing & context', sub: 'agent brief + command ledger (reads) · context pack (write)', wide: true,
+      { h: 'Briefing & context', sub: 'agent brief + command ledger (reads) · context pack (write, live)', wide: true,
         controls: [
           info('agent brief', 'GET /v1/workbench/brief — tenant memory, sessions, constraints, open work'),
           info('command ledger', 'GET /v1/workbench/command-ledger — recorded command metadata'),
-          mbtn('Build context pack', { hint: 'POST /v1/workbench/context-pack — writes a receipted pack fact (M13b)' })
+          { t: 'input', k: 'wb_ctx_tenant', label: 'pack tenant', v: 'default', mono: true, mut: true },
+          { t: 'input', k: 'wb_ctx_query', label: 'pack query', ph: 'what to assemble context for', mut: true },
+          mbtn('Build context pack', { hint: 'POST /v1/workbench/context-pack — writes a receipted pack fact' })
         ] },
-      { h: 'Preflight & policy', sub: 'impact preflight · policy simulation (writes)', wide: true,
+      { h: 'Preflight & policy', sub: 'impact preflight · policy simulation (writes, live)', wide: true,
         controls: [
-          { t: 'input', k: 'wb_target', label: 'impact target', ph: 'crates/corecruxd/src/http', mono: true },
-          mbtn('Run impact preflight', { hint: 'POST /v1/workbench/impact-preflight — writes a preflight fact (M13b)' }),
-          { t: 'select', k: 'wb_policy', label: 'policy profile', options: ['eu-ai-act', 'workspace', 'none'], v: 'eu-ai-act' },
-          mbtn('Simulate policy', { hint: 'POST /v1/workbench/policy-simulation — writes a simulation fact (M13b)' })
+          { t: 'input', k: 'wb_target', label: 'impact target · changed paths', ph: 'crates/corecruxd/src/http, crates/x/y.rs', mono: true, mut: true },
+          mbtn('Run impact preflight', { hint: 'POST /v1/workbench/impact-preflight — writes a preflight fact' }),
+          { t: 'select', k: 'wb_policy', label: 'policy profile', options: ['eu-ai-act', 'workspace', 'none'], v: 'eu-ai-act', mut: true },
+          { t: 'input', k: 'wb_sim_action', label: 'action to simulate', ph: 'deploy corecruxd to gpu-1', mut: true },
+          mbtn('Simulate policy', { hint: 'POST /v1/workbench/policy-simulation — writes a simulation fact' })
         ] },
-      { h: 'Drift & timeline', sub: 'api drift · reasoning timeline (reads) · route probe (write scope)', wide: true,
+      { h: 'Drift & timeline', sub: 'api drift · reasoning timeline (reads) · route probe (write, live)', wide: true,
         controls: [
           info('api drift', 'GET /v1/workbench/api-drift — route/tool contract drift'),
           info('reasoning timeline', 'GET /v1/workbench/reasoning-timeline — receipted event stream'),
-          mbtn('Probe route', { hint: 'POST /v1/workbench/route-probe — admin:write scoped (M13b)' })
+          { t: 'input', k: 'wb_route', label: 'route to probe', ph: 'POST /v1/work/gate/{id}/approve', mono: true, mut: true },
+          mbtn('Probe route', { hint: 'POST /v1/workbench/route-probe — admin:write scoped' })
         ] },
-      { h: 'Feature registry', sub: '/v1/features/capabilities — gap + promise coverage (reads)', wide: true,
+      { h: 'Feature registry', sub: '/v1/features/capabilities — gap + promise coverage (reads) · audit (write, live)', wide: true,
         controls: [
           info('gap analysis', 'GET /v1/features/capabilities/analysis/gaps'),
           info('promise coverage', 'GET /v1/features/capabilities/analysis/promises'),
-          mbtn('Record capability audit', { hint: 'POST …/capabilities/{id}/audit — writes an audit (M13b)' })
+          { t: 'input', k: 'wb_cap_id', label: 'capability id', ph: 'cap-…', mono: true, mut: true },
+          { t: 'select', k: 'wb_cap_status', label: 'audit status', options: ['pass', 'partial', 'fail'], v: 'pass', mut: true },
+          { t: 'input', k: 'wb_cap_notes', label: 'audit notes', ph: 'what was audited', mut: true },
+          mbtn('Record capability audit', { hint: 'POST …/capabilities/{id}/audit — writes an audit' })
         ] },
       { h: 'Query workbench', sub: '/v1/query/* curated read-POST lanes — the live search surface is Explorer', wide: true,
         controls: [
@@ -1198,13 +1205,24 @@
     //    side effect, so all stay operator-gated and defer to M13b (conservative
     //    per the M13a hard-safety rule "when unsure, gate it"). No safe read among
     //    them was wired live; the newly-wired safe ops are the workbench GET reads.
+    // M13b live-wiring flip (operator greenlit read-mostly → state-mutating).
+    // 19 write controls are now LIVE behind the guard harness (render.js
+    // WIRED_WRITES: operatorGatedCall → the gated write client, bound-passport Art.14
+    // refusal, a confirm dialog on the destructive subset, and a REAL receipt/
+    // response render). 8 controls stay operator-GATED + disabled for the honest
+    // reasons below — each is ungroundable in this UI or would break the curated
+    // no-arbitrary-mutation invariant. Every wired route is a curated row in the
+    // curated gated-mutation allowlist (route_spec_drift.rs GATED_MUTATIONS).
     _grounding: {
-      'Probe endpoint': 'gated — POST /v1/console/embedding/probe makes an OUTBOUND SSRF-guarded HTTP call to the embedding URL under admin:write (console.rs post_console_embedding_probe → probe_embedding_url); outbound → gate.',
-      'Verify connection': 'gated — GitHub connect validates the PAT with an OUTBOUND call carrying the operator credential; outbound + secret → gate.',
-      'Test call': 'gated — OpenAI-compatible test call is an OUTBOUND request that may spend tokens; outbound + spend → gate.',
-      'Export audit bundle': 'gated — maps to the audit_export_bundle MCP tool / the feature-gated GET /v1/observe/sessions/{id}/audit/export (needs a session id + CORECRUXD_OBSERVE); no unparameterised console GET → gate.',
-      'Scan path': 'gated — POST /v1/workspace/scan RUNS a scan and PERSISTS a scan fact (workspace.rs post_scan → fact_store.store); state mutation → gate. (GET /v1/workspace/scan is a read but is not what "Scan path" triggers.)',
-      _wired_safe: 'none of the 5 — all retain a side effect; the M13a live wiring is the workbench GET read surface (contract + api-drift/command-ledger/reasoning-timeline/audit-triage/brief).'
+      'Add repo': 'GATED — POST /v1/projects/{id}/repos (projects.rs:324) needs a project id + a real repo; the ＋Add repos disclosure has neither (GitHub unconnected, placeholder select). No groundable body.',
+      'Set as planning repo': 'GATED — same as Add repo: the disclosure form carries no project id / repo to target PATCH /v1/projects/{id} (projects.rs:133).',
+      'Queue ingest': 'GATED — the only real route (POST /v1/local/ingest, local_ingest.rs:183) is a SYNCHRONOUS ingest needing a documents[] payload; the control models "queue a path fact for the agent". Shape mismatch — no path→documents bridge to ground.',
+      'Install': 'GATED — POST /v1/extensions/register (extensions.rs:117) wants a full IntegrationManifest object and install-from-registry wants {id,index_path}; the form supplies only a URL/path. No groundable body.',
+      'Apply defaults to all tenants': 'GATED — no bulk route; only per-tenant PATCH /v1/console/tenants/{id}/category (console.rs:1953). "All" would be an unbounded client loop over every tenant — out of scope for a curated single-call mutation.',
+      'Run sweep now': 'GATED — no HTTP route: memory_sweep_candidates is an MCP tool (dry-run) and the real sweep is a background timer (ephemeral_gc::run_sweep_once) with no daemon endpoint.',
+      'Export audit bundle': 'GATED — GET /v1/observe/sessions/{id}/audit/export (observe_audit.rs:481) is a READ needing a session id + CORECRUXD_OBSERVE; not a write, and no unparameterised console trigger.',
+      'Send': 'GATED — POST /v1/openai/invoke (openai_shim.rs:218) dispatches an ARBITRARY MCP tools/call; a live console control there is an arbitrary-write surface that breaks the curated no-arbitrary-mutation invariant (also env-gated CORECRUXD_OPENAI_SHIM).',
+      _wired: 'Create project · Create passport · Add key · Probe endpoint · Verify connection · Scan path · Build context pack · Run impact preflight · Simulate policy · Probe route · Record capability audit · Test call(confirm=spend) · Consolidate facts(confirm) · Confirm candidate(confirm) · Apply lane weights(confirm) · Reset lane weights(confirm) · Restart daemon(confirm) · Re-run onboarding(confirm) · Withhold all(confirm; loops gateReject over pending) — all via operatorGatedCall + Art.14 + real receipt.'
     },
     'cx-overview':      { legacy: { projection: 'panel' }, v2_present: ['live /v1/console/summary', 'stat tiles'], v2_missing_read: [], v2_gated_write: [] },
     'cx-activity':      { legacy: { projection: 'stream' }, v2_present: ['stream link', 'info rows'], v2_missing_read: ['in-page rolling log (dedicated streaming surface)'], v2_gated_write: [] },

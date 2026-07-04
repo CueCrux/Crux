@@ -10,7 +10,7 @@
 // Customer-safe posture: CruxApi (below) exposes only GET (read) routes; its
 // generic get(path) is allowlist-guarded to literal manifest GET paths. The ONLY
 // writes this console can perform live in the separate CruxApiGated object at the
-// bottom — exactly 4 curated, operator-posture-gated mutation(s), no more.
+// bottom — exactly 22 curated, operator-posture-gated mutation(s), no more.
 //
 // Every call is same-origin credentialed; the browser never holds a bearer
 // token (the daemon authenticates the session at its own origin).
@@ -628,6 +628,24 @@ const GATED_MUTATIONS = Object.freeze([
   Object.freeze(['POST', '/v1/work/gate/{actionId}/reject']),
   Object.freeze(['POST', '/v1/work/{id}/comments']),
   Object.freeze(['POST', '/v1/actions/enrich']),
+  Object.freeze(['POST', '/v1/projects']),
+  Object.freeze(['POST', '/v1/passports']),
+  Object.freeze(['POST', '/v1/console/review/consolidations']),
+  Object.freeze(['POST', '/v1/identity/candidates/{candidateId}/confirm']),
+  Object.freeze(['PUT', '/v1/console/corecrux/lane-weights']),
+  Object.freeze(['DELETE', '/v1/console/corecrux/lane-weights']),
+  Object.freeze(['POST', '/v1/admin/restart']),
+  Object.freeze(['POST', '/v1/console/onboarding/restart']),
+  Object.freeze(['POST', '/v1/console/embedding/probe']),
+  Object.freeze(['POST', '/v1/integrations/github/connect']),
+  Object.freeze(['POST', '/v1/integrations/openai/chat']),
+  Object.freeze(['POST', '/v1/extensions/keys']),
+  Object.freeze(['POST', '/v1/workspace/scan']),
+  Object.freeze(['POST', '/v1/workbench/context-pack']),
+  Object.freeze(['POST', '/v1/workbench/impact-preflight']),
+  Object.freeze(['POST', '/v1/workbench/policy-simulation']),
+  Object.freeze(['POST', '/v1/workbench/route-probe']),
+  Object.freeze(['POST', '/v1/features/capabilities/{id}/audit']),
 ]);
 
 const CruxApiGated = Object.freeze({
@@ -642,6 +660,60 @@ const CruxApiGated = Object.freeze({
   },
   actionsEnrich(body) {
     return fetch(`/v1/actions/enrich`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  createProject(body) {
+    return fetch(`/v1/projects`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  createPassport(body) {
+    return fetch(`/v1/passports`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  reviewConsolidation(body) {
+    return fetch(`/v1/console/review/consolidations`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  identityCandidateConfirm(candidateId, body) {
+    return fetch(`/v1/identity/candidates/${encodeURIComponent(candidateId)}/confirm`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  laneWeightsApply(body) {
+    return fetch(`/v1/console/corecrux/lane-weights`, { method: 'PUT', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  laneWeightsReset(body) {
+    return fetch(`/v1/console/corecrux/lane-weights`, { method: 'DELETE', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  adminRestart(body) {
+    return fetch(`/v1/admin/restart`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  onboardingRestart(body) {
+    return fetch(`/v1/console/onboarding/restart`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  embeddingProbe(body) {
+    return fetch(`/v1/console/embedding/probe`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  githubConnect(body) {
+    return fetch(`/v1/integrations/github/connect`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  openaiChat(body) {
+    return fetch(`/v1/integrations/openai/chat`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  extensionAddKey(body) {
+    return fetch(`/v1/extensions/keys`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  workspaceScanRun(body) {
+    return fetch(`/v1/workspace/scan`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  workbenchContextPack(body) {
+    return fetch(`/v1/workbench/context-pack`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  workbenchImpactPreflight(body) {
+    return fetch(`/v1/workbench/impact-preflight`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  workbenchPolicySimulation(body) {
+    return fetch(`/v1/workbench/policy-simulation`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  workbenchRouteProbe(body) {
+    return fetch(`/v1/workbench/route-probe`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  featureCapabilityAudit(id, body) {
+    return fetch(`/v1/features/capabilities/${encodeURIComponent(id)}/audit`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
   },
 });
 
