@@ -1320,6 +1320,12 @@
       // Tile sparkline series (events/day) for Facts + Sessions.
       factsSpark: wave(7, 40, 18, 7),
       sessionsSpark: wave(7, 6, 4, 8),
+      // Demo-only tile series for pure scalars with no real time-series (MCP
+      // agents / Integrations counts) + the engine latency micro-series. These
+      // render ONLY behind demoOn() (demo-chipped) — never as fabricated real lines.
+      mcpSeries: wave(7, 5, 3, 9),
+      integrationsSeries: wave(7, 8, 4, 10),
+      engineLatencySeries: wave(12, 41, 9, 11),
       // Representative work + memory states (fixtures kept complete).
       work: [
         { id: 'execplan:unified-shell-console', title: 'unified-shell-console', state: 'in_progress', risk_class: 'medium', current_milestone: 'M7', milestones_total: 8, milestones_done: 6 },

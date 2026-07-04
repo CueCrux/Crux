@@ -1008,10 +1008,9 @@
         card.appendChild(kv('summary', res.ok ? 'loaded' : 'unavailable'));
         return;
       }
-      // Mini sparklines on the Facts + Sessions tiles — a REAL series bucketed
-      // from /v1/activity (events/day), or a demo fixture when demo mode is on.
-      // Never a series fabricated from the single scalar tile value.
-      return addTileSparklines(card);
+      // Expand + chart the Daemon-at-a-glance tiles (ExecPlans + Token usage +
+      // the moved Engine tile, legacy-size identity numbers, honest charts).
+      return decorateTiles(card, ctx, res);
     });
   }
   function addTileSparklines(card) {
@@ -1038,6 +1037,147 @@
         return;
       }
     }
+  }
+
+  // ---- Daemon-at-a-glance expansion (landing-only) -----------------------
+  // buildOverview (pages.js) emits the six base tiles; the landing owns the
+  // expansion so the standalone cx-overview page stays lean. HONESTY per tile:
+  //  · Facts / Sessions — legacy-size number + REAL /v1/activity events/day
+  //    sparkline (bucketActivityByDay; demo only when the feed is empty + demo on).
+  //  · ExecPlans — legacy-size number, REAL count from /v1/work?source=all.
+  //  · Token usage — REAL headline scalar from /v1/cost/report; the trend chart is
+  //    demoOn()-guarded because the cost lens has NO real bucketed series yet (see
+  //    pages.js usageTrend hint), so a fabricated line never renders as real.
+  //  · Storage free — an honest METER from the REAL free_ratio (no series at all).
+  //  · MCP agents / Integrations — pure scalars with no real series: the chart is
+  //    demoOn()-guarded demo only (demo-chipped), never a fabricated real line.
+  //  · Engine — a REAL rolling latency micro-series measured client-side (probes
+  //    /v1/console/engine/summary); demo/scalar fallback when mediation is off.
+  function statByLabel(card, label) {
+    var stats = card.querySelectorAll('.stat');
+    for (var i = 0; i < stats.length; i++) {
+      var k = stats[i].querySelector('.k');
+      if (k && k.textContent.trim().toLowerCase() === String(label).toLowerCase()) { return stats[i]; }
+    }
+    return null;
+  }
+  function markStatLarge(card, label) { var s = statByLabel(card, label); if (s) { s.classList.add('stat-lg'); } }
+  function markStatDemo(stat) { if (stat && !stat.querySelector('.demo-chip')) { stat.appendChild(demoChip(true)); } }
+  // Build a .stat node with the SAME structure renderSection emits.
+  function makeStat(label, value, sub) {
+    var v = el('div', { 'class': 'v', text: String(value) });
+    if (sub) { v.appendChild(doc().createTextNode(' ')); v.appendChild(el('small', { text: String(sub) })); }
+    return el('div', { 'class': 'stat' }, [el('div', { 'class': 'k', text: String(label) }), v]);
+  }
+  // Insert a new tile before/after an anchor tile (by label), or at the grid end.
+  function injectStat(card, anchorLabel, pos, label, value) {
+    var grid = card.querySelector('.stats');
+    if (!grid) { return null; }
+    var stat = makeStat(label, value, null);
+    var anchor = anchorLabel ? statByLabel(card, anchorLabel) : null;
+    if (pos === 'end' || !anchor) { grid.appendChild(stat); return stat; }
+    if (pos === 'before') { grid.insertBefore(stat, anchor); }
+    else { grid.insertBefore(stat, anchor.nextSibling); }
+    return stat;
+  }
+  function setStatValue(stat, value, sub) {
+    if (!stat) { return; }
+    var v = stat.querySelector('.v');
+    if (!v) { return; }
+    v.textContent = String(value);
+    if (sub) { v.appendChild(doc().createTextNode(' ')); v.appendChild(el('small', { text: String(sub) })); }
+  }
+  // demoOn()-guarded demo spark for a pure-scalar tile (no real series exists);
+  // demoData() returns null when demo is off, so nothing shows unless demo mode.
+  function attachDemoSpark(card, label, demoKey) {
+    var stat = statByLabel(card, label);
+    if (!stat) { return; }
+    var d = demoData(demoKey);                       // demoOn()-guarded choke point
+    if (!d) { return; }
+    var vals = Array.isArray(d) ? d : (d.week || d.day || d.month);
+    var sp = areaChart(vals, { spark: true });
+    if (sp) { stat.appendChild(sp); markStatDemo(stat); }
+  }
+  // Honest gauge/meter for a REAL ratio (0..1) — no fabricated series.
+  function attachMeter(stat, ratio) {
+    if (!stat) { return; }
+    var r = Number(ratio);
+    if (!isFinite(r)) { return; }
+    var pct = Math.max(0, Math.min(100, r * 100));
+    var track = el('div', { 'class': 'tile-meter', role: 'img', 'aria-label': pct.toFixed(0) + '% free' },
+      [el('div', { 'class': 'tile-meter-fill' })]);
+    track.firstChild.style.width = pct.toFixed(1) + '%';
+    stat.appendChild(track);
+  }
+  // Rolling REAL latency buffer — accumulates measured engine round-trips across
+  // landing renders. A single view bursts a few probes so the spark is real data.
+  var __engineLatencyBuf = [];
+  function fillEngineTile(stat) {
+    if (!stat) { return; }
+    var MAX = 30, BURST = 4;
+    function paint() {
+      var old = stat.querySelector('.chart-svg'); if (old && old.parentNode) { old.parentNode.removeChild(old); }
+      if (__engineLatencyBuf.length) {
+        setStatValue(stat, __engineLatencyBuf[__engineLatencyBuf.length - 1], 'ms');
+        if (__engineLatencyBuf.length >= 2) {
+          var sp = areaChart(__engineLatencyBuf, { spark: true });
+          if (sp) { stat.appendChild(sp); }
+        }
+        return;
+      }
+      // No real sample — a demoOn()-guarded demo series (demo-chipped) or an
+      // honest "off" scalar. Never a fabricated real latency line.
+      var d = demoData('engineLatencySeries');
+      if (d && d.length) { setStatValue(stat, d[d.length - 1], 'ms'); var s2 = areaChart(d, { spark: true }); if (s2) { stat.appendChild(s2); } markStatDemo(stat); }
+      else { setStatValue(stat, 'off', null); }
+    }
+    function probe(n) {
+      if (n <= 0) { paint(); return; }
+      fetchJSON('/v1/console/engine/summary').then(function (r) {
+        if (r.ok && r.data && r.data.engine_reachable && r.data.engine_latency_ms != null) {
+          __engineLatencyBuf.push(Number(r.data.engine_latency_ms));
+          if (__engineLatencyBuf.length > MAX) { __engineLatencyBuf.shift(); }
+          probe(n - 1);   // keep probing to fill the rolling buffer with REAL samples
+        } else { paint(); }   // unreachable / off — stop early, fall back honestly
+      }).catch(function () { paint(); });
+    }
+    probe(BURST);
+  }
+  function decorateTiles(card, ctx, res) {
+    var summary = (res && res.data) || (ctx && ctx.summary) || {};
+    // Legacy-size numbers on the identity tiles (index.html renderDash .dash-num).
+    markStatLarge(card, 'Facts');
+    markStatLarge(card, 'Sessions');
+    // Inject the two new tiles in place + the moved Engine tile at the end.
+    var execStat = injectStat(card, 'Sessions', 'after', 'ExecPlans', 'loading…');
+    if (execStat) { execStat.classList.add('stat-lg'); }
+    injectStat(card, 'Storage free', 'before', 'Token usage', 'loading…');
+    var engineStat = injectStat(card, null, 'end', 'Engine', '—');
+    // Facts + Sessions REAL activity sparklines (unchanged behaviour).
+    var work = addTileSparklines(card);
+    // ExecPlans — REAL count from /v1/work (demo fixture only when the feed is empty).
+    fetchJSON('/v1/work?source=all').then(function (r) {
+      var items = (r.ok && r.data) ? (r.data.work || r.data.items || []) : [];
+      if (!items || !items.length) { var dw = demoData('work'); if (dw) { items = dw; markStatDemo(execStat); } }
+      setStatValue(execStat, (items ? items.length : 0), 'plans');
+    });
+    // Token usage — REAL headline scalar; the trend spark is demoOn()-guarded.
+    fetchJSON('/v1/cost/report?tenant_id=default&token_budget=1500').then(function (r) {
+      var d = (r.ok && r.data) ? r.data : null;
+      var head = d && d.report && d.report.report && d.report.report.headline;
+      var us = statByLabel(card, 'Token usage');
+      if (head && head.context_tokens_per_turn != null) { setStatValue(us, fmtChartVal(head.context_tokens_per_turn, 'compact'), '/ turn'); }
+      else { setStatValue(us, '—', 'no report'); }
+      attachDemoSpark(card, 'Token usage', 'usageSeries');
+    });
+    // Storage free — an honest meter from the REAL free_ratio.
+    attachMeter(statByLabel(card, 'Storage free'), get(summary, ['capacity', 'free_ratio']));
+    // MCP agents + Integrations — demoOn()-guarded demo sparks only (no real series).
+    attachDemoSpark(card, 'MCP agents', 'mcpSeries');
+    attachDemoSpark(card, 'Integrations', 'integrationsSeries');
+    // Engine — REAL client-side latency micro-series (moved off the right column).
+    fillEngineTile(engineStat);
+    return work;
   }
 
   // Needs-you: pending gates from GET /v1/work/gate/pending. Operator posture
@@ -1381,9 +1521,46 @@
     });
   }
 
+  // Right-column page navigation for the Overwatch destination — the nav-family
+  // section that REPLACES the suppressed top sub-nav pill row (the shell
+  // suppresses the pill row for the overwatch destination only; every other
+  // destination keeps its pills). The page list is reused from pages.js
+  // (window.CruxPages.PAGES filtered to dest==='overwatch') — never hardcoded —
+  // so it stays in sync: Overview · Activity · Live board · Orchestrators ·
+  // Punchcards · Agent. Pro-only pages (Agent) show only in Professional mode,
+  // mirroring the pill row's gating so a Standard click never dead-redirects.
+  function owPageNav() {
+    var wrap = panel('Pages', 'this destination', true);
+    var nav = el('nav', { 'class': 'ow-pagenav', 'aria-label': 'Overwatch pages' });
+    var CP = (typeof window !== 'undefined') ? window.CruxPages : null;
+    var PAGES = CP && CP.PAGES;
+    var activeId = null;
+    if (typeof location !== 'undefined' && location.hash) {
+      var parts = String(location.hash).replace(/^#\/?/, '').split('/');
+      if (parts[0] === 'overwatch' && parts[1]) { activeId = parts[1]; }
+    }
+    if (PAGES) {
+      Object.keys(PAGES).forEach(function (id) {
+        var p = PAGES[id];
+        if (!p || p.dest !== 'overwatch') { return; }
+        if (p.pro === true && !proMode()) { return; }   // Pro pages only in Pro mode (mirror the pill row)
+        var a = el('a', { 'class': 'pill', href: '#/overwatch/' + id, 'aria-current': id === activeId ? 'page' : 'false' }, [p.title]);
+        if (p.operatorOnly) { a.setAttribute('data-requires', 'operator'); }   // hidden for customers
+        nav.appendChild(a);
+      });
+    }
+    if (!nav.childNodes.length) { nav.appendChild(el('span', { 'class': 'ow-ct', text: 'no pages' })); }
+    wrap.__body.appendChild(nav);
+    return wrap;
+  }
+
   // The Overwatch landing entry point (shell.html calls this for the overwatch
-  // destination, above the page-pill row). Panels are appended in order first,
-  // then filled async, so ordering is stable regardless of fetch timing.
+  // destination, above the — now suppressed — page-pill row). Nodes are appended
+  // in order first, then filled async, so ordering is stable regardless of fetch
+  // timing. Layout: tagline → Daemon-at-a-glance tiles → two columns (LEFT:
+  // Needs-you then Fleet; RIGHT: the destination page nav). The dashboard strip
+  // + activity ticker are gone (duplicated the strip cards / Activity page); the
+  // Engine card folded into the tiles.
   function renderOverwatchLanding(region, ctx) {
     ctx = ctx || {};
     region.textContent = '';
@@ -1391,36 +1568,26 @@
     region.appendChild(root);
     // Tagline introducing the Overwatch view (concept apphead sub).
     root.appendChild(el('p', { 'class': 'ow-tagline', text: 'You steer. Agents work. Everything receipts.' }));
-    // Stat tiles — full width, reused from the cx-overview build.
+    // Daemon-at-a-glance — full-width stat tiles, reused from the cx-overview
+    // build and expanded in decorateTiles (ExecPlans + Token usage + Engine).
     var tileCard = el('div', { 'class': 'ow-tiles' }, [el('p', { 'class': 'v2card-sub', text: 'Loading…' })]);
     root.appendChild(tileCard);
-    // Pro-mode dashboard strip — a home for the legacy landing's four top cards
-    // (daemon · execplans · usage · MCP gateway). Standard mode omits it.
-    if (proMode()) {
-      var strip = el('div', { 'class': 'ow-dashstrip', id: 'owDashStrip' });
-      root.appendChild(strip);
-      renderDashStrip(strip, ctx);
-    }
-    // 7fr / 5fr split: NEEDS YOU on the left; FLEET · ACTIVITY · ENGINE right.
+    // Two columns — LEFT: Needs-you then Fleet (fleet moved under needs-you);
+    // RIGHT: the destination page nav (replaces the suppressed pill row).
     var cols = el('div', { 'class': 'ow-cols' });
     var left = el('div', { 'class': 'ow-col' });
     var right = el('div', { 'class': 'ow-col' });
     cols.appendChild(left); cols.appendChild(right);
     root.appendChild(cols);
     var needs = panel('Needs you', 'loading gate queue…', true);
+    var fleet = panel('Fleet', 'loading live sessions…', false);
     left.appendChild(needs);
-    var fleet = panel('Fleet', 'loading live sessions…', true);
-    var activity = panel('Activity', 'loading…', false, 'open log →', '/console/activity');
-    var engine = panel('Engine', 'checking mediation…', false);
-    right.appendChild(fleet);
-    right.appendChild(activity);
-    right.appendChild(engine);
+    left.appendChild(fleet);          // Fleet directly under Needs-you
+    right.appendChild(owPageNav());   // page nav replaces the top pill row
     return Promise.all([
       fillTiles(tileCard, ctx),
       fillNeedsYou(needs),
-      fillFleet(fleet),
-      fillActivity(activity),
-      fillEngine(engine)
+      fillFleet(fleet)
     ]);
   }
 

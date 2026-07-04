@@ -1563,6 +1563,150 @@ function extractThemeVars(theme) {
   notes.push('m13b customer safety: writes are hidden (data-requires="operator") AND refused (operatorGatedCall + attachWiredWrite re-check isOperator + Art.14 bound passport) in customer posture — the boundary is posture/mode-independent.');
 })();
 
+// =========================================================================
+//  Check 39 — Overwatch landing layout rework. The landing drops the Pro
+//  dashboard strip (ow-dashstrip) and the Activity ticker (ow-ticker); expands
+//  Daemon-at-a-glance with ExecPlans + Token-usage tiles + the moved Engine
+//  tile; puts Fleet directly under Needs-you (LEFT column) and the destination
+//  page nav in the RIGHT column (the top sub-nav pill row is suppressed for
+//  overwatch only). Honesty: tile charts are a REAL series OR demoOn()-guarded
+//  demo / an honest meter — never a fabricated real line. Exercised both
+//  statically (source) and with a hand-rolled DOM (jsdom-independent).
+// =========================================================================
+(function checkOverwatchLandingLayout() {
+  // ---- Static source assertions on the landing + tile decoration ----------
+  const landing = funcBody(renderSrc, 'renderOverwatchLanding');
+  check(!!landing, '[overwatch] render.js must define renderOverwatchLanding');
+  if (landing) {
+    check(!/renderDashStrip/.test(landing), '[overwatch] landing must NOT render the Pro dashboard strip (renderDashStrip removed)');
+    check(!/ow-dashstrip/.test(landing), '[overwatch] landing must NOT build an ow-dashstrip');
+    check(!/fillActivity/.test(landing), '[overwatch] landing must NOT render the Activity ticker panel (fillActivity removed — duplicates the Activity page)');
+    check(!/activityTicker/.test(landing), '[overwatch] landing must NOT build an activity ticker');
+    check(!/fillEngine\b/.test(landing), '[overwatch] landing must NOT render the standalone Engine panel (folded into the tiles)');
+    check(/fillNeedsYou/.test(landing) && /fillFleet/.test(landing), '[overwatch] landing must still fill Needs-you + Fleet');
+    check(/left\.appendChild\(needs\)/.test(landing) && /left\.appendChild\(fleet\)/.test(landing),
+      '[overwatch] Fleet must sit UNDER Needs-you in the LEFT column');
+    check(/right\.appendChild\(owPageNav\(\)\)/.test(landing), '[overwatch] the RIGHT column must carry the destination page nav (owPageNav)');
+  }
+  // owPageNav reuses the page list from pages.js (dest==='overwatch'), never hardcoded.
+  const nav = funcBody(renderSrc, 'owPageNav');
+  check(!!nav, '[overwatch] render.js must define owPageNav');
+  if (nav) {
+    check(/window\.CruxPages/.test(nav) && /'overwatch'/.test(nav), '[overwatch] owPageNav must reuse CruxPages.PAGES filtered to the overwatch destination (not hardcoded)');
+    check(/'#\/overwatch\/'/.test(nav), '[overwatch] owPageNav pills must deep-link to #/overwatch/<id>');
+    check(/proMode\(\)/.test(nav), '[overwatch] owPageNav must gate Pro pages behind proMode() (mirror the pill row)');
+  }
+  // Tile decoration: the two new tiles + the honest-chart contract.
+  const dt = funcBody(renderSrc, 'decorateTiles');
+  check(!!dt, '[overwatch] render.js must define decorateTiles (the tile expansion)');
+  if (dt) {
+    check(/'ExecPlans'/.test(dt) && /\/v1\/work/.test(dt), '[overwatch] decorateTiles must add an ExecPlans tile grounded in /v1/work');
+    check(/'Token usage'/.test(dt) && /\/v1\/cost\/report/.test(dt), '[overwatch] decorateTiles must add a Token-usage tile grounded in /v1/cost/report');
+    check(/markStatLarge\(card, 'Facts'\)/.test(dt) && /markStatLarge\(card, 'Sessions'\)/.test(dt) && /'ExecPlans'\)\s*;\s*[\s\S]*stat-lg|stat-lg/.test(dt),
+      '[overwatch] Facts + Sessions + ExecPlans must render with the legacy stat-lg number size');
+    check(/attachMeter\(/.test(dt), '[overwatch] Storage free must render an honest meter (attachMeter), not a fabricated series');
+    check(/attachDemoSpark\(card, 'Token usage'/.test(dt) && /attachDemoSpark\(card, 'MCP agents'/.test(dt) && /attachDemoSpark\(card, 'Integrations'/.test(dt),
+      '[overwatch] Token-usage / MCP-agents / Integrations charts must be demoOn()-guarded (attachDemoSpark)');
+    check(/fillEngineTile\(/.test(dt), '[overwatch] the Engine tile must be filled by fillEngineTile (moved into the tiles)');
+  }
+  // Honesty of the chart helpers: demo sparks go through the demoData() choke
+  // point; the meter is a real ratio; the engine series is a real probe buffer.
+  const ads = funcBody(renderSrc, 'attachDemoSpark');
+  check(ads && /demoData\(/.test(ads), '[overwatch] attachDemoSpark must read fixtures only via the demoData() choke point (demoOn()-guarded)');
+  const meter = funcBody(renderSrc, 'attachMeter');
+  check(meter && /tile-meter-fill/.test(meter) && !/demoData\(/.test(meter), '[overwatch] attachMeter must render a REAL ratio meter (no demo fabrication)');
+  const eng = funcBody(renderSrc, 'fillEngineTile');
+  check(eng && /\/v1\/console\/engine\/summary/.test(eng) && /engine_reachable/.test(eng),
+    '[overwatch] fillEngineTile must build a REAL latency series by probing /v1/console/engine/summary');
+  check(eng && /engineLatencySeries/.test(eng), '[overwatch] fillEngineTile must fall back to a demoOn()-guarded demo series when the engine is off');
+  // Demo fixtures exist (demo-only tile series).
+  const demo = pages.CruxDemo || {};
+  ['mcpSeries', 'integrationsSeries', 'engineLatencySeries'].forEach(function (k) {
+    check(Array.isArray(demo[k]) && demo[k].length >= 2, '[overwatch] CruxDemo.' + k + ' must be a demo-only series (length >= 2)');
+  });
+  // Shell suppresses the sub-nav pill row for overwatch ONLY.
+  check(/if \(destId !== 'overwatch'\) \{ content\.appendChild\(buildSubnav/.test(shellHtml),
+    '[overwatch] shell.html must suppress the sub-nav pill row for the overwatch destination only');
+  // CSS: the new tokens exist (all colours are var(--…) — checked below).
+  check(/\.stat\.stat-lg \.v/.test(shellHtml), '[overwatch] shell.html must style the legacy stat-lg number size');
+  check(/\.ow-pagenav/.test(shellHtml), '[overwatch] shell.html must style the .ow-pagenav right-column nav');
+  check(/\.ow-tiles \.tile-meter/.test(shellHtml), '[overwatch] shell.html must style the honest .tile-meter gauge');
+
+  // ---- DOM render assertions (jsdom-independent, like check 30) ------------
+  function mkEl(tag) {
+    const node = {
+      tagName: String(tag || 'div').toUpperCase(), nodeType: 1,
+      childNodes: [], _attrs: {}, className: '', style: {},
+      setAttribute: function (k, v) { this._attrs[k] = String(v); if (k === 'class') { this.className = String(v); } },
+      getAttribute: function (k) { return (k in this._attrs) ? this._attrs[k] : null; },
+      appendChild: function (c) { if (c.parentNode) { const i = c.parentNode.childNodes.indexOf(c); if (i >= 0) { c.parentNode.childNodes.splice(i, 1); } } this.childNodes.push(c); c.parentNode = this; return c; },
+      insertBefore: function (c, ref) { if (c.parentNode) { const j = c.parentNode.childNodes.indexOf(c); if (j >= 0) { c.parentNode.childNodes.splice(j, 1); } } const i = this.childNodes.indexOf(ref); if (i < 0) { this.childNodes.push(c); } else { this.childNodes.splice(i, 0, c); } c.parentNode = this; return c; },
+      removeChild: function (c) { const i = this.childNodes.indexOf(c); if (i >= 0) { this.childNodes.splice(i, 1); } return c; },
+      addEventListener: function () {},
+      querySelector: function (sel) { const out = []; collect(this, sel, out); return out[0] || null; },
+      querySelectorAll: function (sel) { const out = []; collect(this, sel, out); return out; }
+    };
+    node.classList = {
+      add: function (c) { const s = node.className.split(/\s+/).filter(Boolean); if (s.indexOf(c) < 0) { s.push(c); } node.className = s.join(' '); node._attrs['class'] = node.className; },
+      contains: function (c) { return node.className.split(/\s+/).indexOf(c) >= 0; }
+    };
+    Object.defineProperty(node, 'textContent', { get: function () { return this._text || ''; }, set: function (v) { this._text = String(v); this.childNodes.length = 0; } });
+    Object.defineProperty(node, 'innerHTML', { get: function () { return this._html || ''; }, set: function (v) { this._html = String(v); } });
+    Object.defineProperty(node, 'firstChild', { get: function () { return this.childNodes[0] || null; } });
+    Object.defineProperty(node, 'nextSibling', { get: function () { const p = this.parentNode; if (!p) { return null; } const i = p.childNodes.indexOf(this); return p.childNodes[i + 1] || null; } });
+    Object.defineProperty(node, 'children', { get: function () { return this.childNodes.filter(function (n) { return n.nodeType === 1; }); } });
+    return node;
+  }
+  function collect(node, sel, out) {
+    const cls = sel.charAt(0) === '.' ? sel.slice(1) : sel;
+    (node.childNodes || []).forEach(function (c) {
+      if (c && c.nodeType === 1) {
+        if (String(c.className).split(/\s+/).indexOf(cls) >= 0) { out.push(c); }
+        collect(c, sel, out);
+      }
+    });
+  }
+  function panelTitle(p) { try { return p.childNodes[0].childNodes[0].textContent; } catch (e) { return null; } }
+  const savedDoc = global.document, savedWin = global.window, savedLoc = global.location;
+  global.document = { createElement: mkEl, createElementNS: function (ns, tag) { return mkEl(tag); }, createTextNode: function (t) { return { nodeType: 3, textContent: String(t), childNodes: [] }; } };
+  global.window = { CruxApi: { get: function () { return new Promise(function () { /* daemon hang */ }); } }, CruxPages: pages, CRUX_MODE: 'professional' };
+  global.location = { hash: '#/overwatch/cx-activity' };
+  try {
+    const region = mkEl('div');
+    render.renderOverwatchLanding(region, { summary: { capacity: { free_ratio: 0.5 } } });
+    // Strip + ticker are gone from the landing.
+    check(region.querySelectorAll('.ow-dashstrip').length === 0, '[overwatch] rendered landing must have NO ow-dashstrip');
+    check(region.querySelectorAll('.ow-ticker').length === 0, '[overwatch] rendered landing must have NO ow-ticker');
+    // The page nav is in the RIGHT column (one only), never the left.
+    const cols = region.querySelectorAll('.ow-cols')[0];
+    check(!!cols, '[overwatch] rendered landing must have an .ow-cols region');
+    if (cols) {
+      const left = cols.children[0], right = cols.children[1];
+      check(left.querySelectorAll('.ow-panel').length === 2, '[overwatch] LEFT column must hold exactly 2 panels (Needs-you + Fleet)');
+      check(left.querySelectorAll('.ow-pagenav').length === 0, '[overwatch] the page nav must NOT be in the LEFT column');
+      check(right.querySelectorAll('.ow-pagenav').length === 1, '[overwatch] the page nav must be in the RIGHT column');
+      const lp = left.querySelectorAll('.ow-panel');
+      check(panelTitle(lp[0]) === 'Needs you', '[overwatch] LEFT column panel 1 must be Needs-you (got ' + panelTitle(lp[0]) + ')');
+      check(panelTitle(lp[1]) === 'Fleet', '[overwatch] LEFT column panel 2 must be Fleet — directly under Needs-you (got ' + panelTitle(lp[1]) + ')');
+    }
+    // The page nav lists the overwatch destination pages, deep-linked.
+    const pn = region.querySelectorAll('.ow-pagenav')[0];
+    check(pn && pn.querySelectorAll('.pill').length >= 5, '[overwatch] the page nav must list the overwatch destination pages (>=5 pills)');
+    if (pn) {
+      const hrefs = pn.querySelectorAll('.pill').map(function (a) { return a.getAttribute('href'); });
+      check(hrefs.indexOf('#/overwatch/cx-activity') >= 0, '[overwatch] the page nav must deep-link Activity (#/overwatch/cx-activity)');
+      check(hrefs.every(function (h) { return /^#\/overwatch\//.test(h); }), '[overwatch] every page-nav pill must deep-link into #/overwatch/<id>');
+    }
+    notes.push('overwatch layout (rework): no ow-dashstrip + no ow-ticker; Daemon-at-a-glance adds ExecPlans (/v1/work) + Token usage (/v1/cost/report) + a moved Engine tile; Facts/Sessions/ExecPlans at legacy stat-lg size; charts are real-series-or-demoOn()-guarded-or-honest-meter; Fleet under Needs-you (left); page nav in the right column (sub-nav pills suppressed for overwatch).');
+  } catch (e) {
+    check(false, '[overwatch] renderOverwatchLanding threw on the synchronous paint: ' + (e && e.stack || e));
+  } finally {
+    if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
+    if (savedWin === undefined) { delete global.window; } else { global.window = savedWin; }
+    if (savedLoc === undefined) { delete global.location; } else { global.location = savedLoc; }
+  }
+})();
+
 // ---- Report -------------------------------------------------------------
 console.log('unified-shell-console v2 — M13b (live mutation wiring) smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });

@@ -641,7 +641,7 @@
   .ow-sec .ow-link { margin-left: auto; font-size: 11.5px; color: var(--acc); cursor: pointer; text-decoration: none; }
   .ow-sec .ow-link:hover { text-decoration: underline; }
 
-  /* Two-column grid — 7fr left (needs-you) / 5fr right (fleet · activity). */
+  /* Two-column grid — 7fr left (needs-you → fleet) / 5fr right (page nav). */
   .ow-cols { display: grid; grid-template-columns: 7fr 5fr; gap: 16px; align-items: start; }
   .ow-col { min-width: 0; }
 
@@ -666,6 +666,20 @@
   }
   .ow-tiles .stat .v { margin-top: 5px; font-size: 23px; letter-spacing: -.02em; }
   .ow-tiles .stat .v small { font-size: 11px; color: var(--ink3); }
+  /* Identity tiles (Facts · Sessions · ExecPlans) carry the LEGACY card
+     stat-number size — matches index.html renderDash .dash-num (44px/800/-.025em). */
+  .ow-tiles .stat.stat-lg .v { font-size: 44px; font-weight: 800; letter-spacing: -.025em; line-height: 1; }
+  .ow-tiles .stat.stat-lg .v small { display: block; margin-top: 7px; font-size: 10.5px; font-weight: 500; letter-spacing: 0; }
+  /* Honest gauge/meter for a REAL ratio tile (Storage free) — the measured
+     free-space fraction, never a fabricated series. */
+  .ow-tiles .tile-meter { margin-top: 10px; height: 6px; border-radius: 999px; background: var(--surface2); border: 1px solid var(--edge); overflow: hidden; }
+  .ow-tiles .tile-meter-fill { height: 100%; background: var(--acc); border-radius: 999px; }
+
+  /* Overwatch page nav (right column) — the nav-family section that replaces the
+     suppressed sub-nav pill row. Pills stack; active state via the shared .pill
+     rule. 44px targets for the primary nav. */
+  .ow-pagenav { display: flex; flex-direction: column; gap: 6px; }
+  .ow-pagenav .pill { min-height: 44px; width: 100%; justify-content: flex-start; }
 
   /* Source chips (which fleet sources answered) + enrich meta chips. */
   .ow-srcchips, .ow-meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
@@ -1931,14 +1945,16 @@
 
     document.getElementById('destTitle').textContent = page ? page.title : dest.label;
     document.getElementById('destSub').textContent = page ? (page.sub || '') : (dest.sub || '');
-    // Overwatch is the real landing: stat tiles → needs-you → fleet → activity,
-    // above the page-pill row (cx-overview etc. still reachable below).
+    // Overwatch is the real landing: Daemon-at-a-glance tiles → Needs-you + Fleet
+    // (left) → the destination page nav (right). The page nav lives IN the landing
+    // (owPageNav), so the top sub-nav pill row is suppressed for overwatch only —
+    // every other destination keeps its pills. cx-overview etc. still render below.
     if (destId === 'overwatch' && window.CruxRender && window.CruxRender.renderOverwatchLanding) {
       var landing = el('div', { 'class': 'ow-landing-region', id: 'owLanding' });
       content.appendChild(landing);
       window.CruxRender.renderOverwatchLanding(landing, { summary: BOOT.summary });
     }
-    content.appendChild(buildSubnav(destId, pageId));
+    if (destId !== 'overwatch') { content.appendChild(buildSubnav(destId, pageId)); }
     var host = el('div', { 'class': 'page-host', id: 'pageHost' });
     content.appendChild(host);
     if (window.CruxRender && page) { window.CruxRender.renderPage(page, host); }
