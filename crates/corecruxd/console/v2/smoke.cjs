@@ -366,9 +366,19 @@ function extractThemeVars(theme) {
     const hasFetch = new RegExp('fetch\\(`' + stem + "[^`]*`,\\s*\\{\\s*method:\\s*'" + method + "'").test(apiSrc);
     check(hasFetch, '[gated] CruxApiGated missing a ' + method + ' fetch for ' + pair[1]);
   });
-  // No mutating verbs beyond the curated count anywhere in api.js.
+  // No non-GET verbs beyond the two curated sets anywhere in api.js: the gated
+  // MUTATIONS (writes) + the curated READ POSTs (retrieval). READ_POST_ROUTES all
+  // use POST, so the total method-verb count is gated + read.
+  const READ_POST_EXPECTED = [
+    ['POST', '/v1/query/text-search'],
+    ['POST', '/v1/query/text-search/expand'],
+    ['POST', '/v1/query/graph-expand'],
+    ['POST', '/v1/query/time-range'],
+    ['POST', '/v1/console/engine/search']
+  ];
   const verbCount = (apiSrc.match(/method:\s*'(POST|PUT|PATCH|DELETE)'/g) || []).length;
-  check(verbCount === EXPECTED.length, '[gated] api.js has ' + verbCount + ' mutating fetch(es); expected ' + EXPECTED.length);
+  const verbExpected = EXPECTED.length + READ_POST_EXPECTED.length;
+  check(verbCount === verbExpected, '[gated] api.js has ' + verbCount + ' non-GET fetch(es); expected ' + verbExpected + ' (' + EXPECTED.length + ' gated writes + ' + READ_POST_EXPECTED.length + ' curated read POSTs)');
 
   // Static containment: pages.js + shell.html never touch CruxApiGated; render.js
   // touches it ONLY inside operatorGatedCall (which guards on isOperator()).
@@ -1105,8 +1115,133 @@ function extractThemeVars(theme) {
   notes.push('retirement (M10): LEGACY_PORT.retired_at=2026-07-03 · v2 legacy-fallback copy · console.rs serve_console_legacy DEPRECATED doc-comment (ExecPlan-referenced, comment-only).');
 })();
 
+// =========================================================================
+//  Check 29 — (M11) CruxApiRead curated read-POST client. Searches are POST
+//  reads; the GET-only CruxApi cannot express them, so api.js carries a THIRD
+//  frozen client, CruxApiRead, from EXACTLY the curated READ_POST_ROUTES set
+//  (retrieval, not mutation). render.js is the only shipped file that calls it
+//  (pages.js/shell.html never do); the through-client rule now allows it
+//  alongside CruxApi (GET reads) + CruxApiGated (operator writes).
+// =========================================================================
+(function checkReadPostClient() {
+  const apiSrc = fs.readFileSync(path.join(DIR, 'api.js'), 'utf8');
+  check(/const CruxApiRead = Object\.freeze\(/.test(apiSrc), '[read-post] api.js must define CruxApiRead');
+  check(/window\.CruxApiRead\s*=\s*CruxApiRead/.test(apiSrc), '[read-post] api.js must expose window.CruxApiRead');
+  check(/window\.CRUX_READ_POST_ROUTES\s*=\s*READ_POST_ROUTES/.test(apiSrc), '[read-post] api.js must expose window.CRUX_READ_POST_ROUTES');
+
+  // The curated read-POST set the M11 plan authorises — the ONLY read POSTs.
+  const EXPECTED = [
+    ['POST', '/v1/query/text-search'],
+    ['POST', '/v1/query/text-search/expand'],
+    ['POST', '/v1/query/graph-expand'],
+    ['POST', '/v1/query/time-range'],
+    ['POST', '/v1/console/engine/search']
+  ];
+  const arrM = apiSrc.match(/const READ_POST_ROUTES = Object\.freeze\(\[([\s\S]*?)\]\);/);
+  check(!!arrM, '[read-post] api.js must declare the READ_POST_ROUTES array');
+  const declared = [];
+  if (arrM) {
+    const re = /\[\s*'([A-Z]+)'\s*,\s*'([^']+)'\s*\]/g;
+    let m;
+    while ((m = re.exec(arrM[1])) !== null) { declared.push([m[1], m[2]]); }
+  }
+  const norm = function (pairs) { return pairs.map(function (p) { return p[0] + ' ' + p[1]; }).sort(); };
+  check(JSON.stringify(norm(declared)) === JSON.stringify(norm(EXPECTED)),
+    '[read-post] READ_POST_ROUTES must be EXACTLY the curated set; got ' + JSON.stringify(norm(declared)));
+
+  // Each declared read-POST has a matching CruxApiRead fetch (verb + path stem).
+  declared.forEach(function (pair) {
+    const stem = pair[1].split('{')[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const hasFetch = new RegExp('fetch\\(`' + stem + "[^`]*`,\\s*\\{\\s*method:\\s*'" + pair[0] + "'").test(apiSrc);
+    check(hasFetch, '[read-post] CruxApiRead missing a ' + pair[0] + ' fetch for ' + pair[1]);
+  });
+
+  // Static containment: search goes ONLY through render.js's CruxApiRead — the
+  // shell + page registry never touch the read-POST client directly.
+  ['pages.js', 'shell.html'].forEach(function (f) {
+    const src = fs.readFileSync(path.join(DIR, f), 'utf8');
+    check(!/CruxApiRead/.test(src), '[read-post] ' + f + ' must not reference CruxApiRead (search lives in render.js renderExplorer)');
+  });
+  check(/window\.CruxApiRead/.test(renderSrc), '[read-post] render.js must reach searches through window.CruxApiRead');
+  notes.push('read-post client (M11): CruxApiRead = ' + declared.length + ' curated retrieval POSTs (through-client rule extended; render.js is the sole caller).');
+})();
+
+// =========================================================================
+//  Check 30 — (M11) Documents reader renders. renderDocuments must paint a
+//  main pane (.doc-main) + a document tree SYNCHRONOUSLY — even before (or
+//  without) the /v1/console/tenants fetch resolving. The earlier bug deferred
+//  ALL painting behind that fetch, so a slow/hung/unreachable daemon left the
+//  reader blank (no .doc-main, empty tree). Exercised with a minimal hand-rolled
+//  DOM (jsdom-independent) using the SAME {railHost} ctx shape the shell passes,
+//  and a never-resolving CruxApi.get (the daemon-hang case).
+// =========================================================================
+(function checkDocumentsReaderPaints() {
+  function mkEl(tag) {
+    const node = {
+      tagName: String(tag || 'div').toUpperCase(), nodeType: 1,
+      childNodes: [], _attrs: {}, className: '', style: {},
+      setAttribute: function (k, v) { this._attrs[k] = String(v); if (k === 'class') { this.className = String(v); } },
+      getAttribute: function (k) { return (k in this._attrs) ? this._attrs[k] : null; },
+      appendChild: function (c) { this.childNodes.push(c); c.parentNode = this; return c; },
+      addEventListener: function () {},
+      querySelectorAll: function (sel) { const out = []; collect(this, sel, out); return out; }
+    };
+    Object.defineProperty(node, 'textContent', { get: function () { return this._text || ''; }, set: function (v) { this._text = String(v); this.childNodes.length = 0; } });
+    Object.defineProperty(node, 'innerHTML', { get: function () { return this._html || ''; }, set: function (v) { this._html = String(v); } });
+    Object.defineProperty(node, 'firstChild', { get: function () { return this.childNodes[0] || null; } });
+    Object.defineProperty(node, 'children', { get: function () { return this.childNodes.filter(function (n) { return n.nodeType === 1; }); } });
+    return node;
+  }
+  function collect(node, sel, out) {
+    const cls = sel.charAt(0) === '.' ? sel.slice(1) : sel;
+    (node.childNodes || []).forEach(function (c) {
+      if (c && c.nodeType === 1) {
+        if (String(c.className).split(/\s+/).indexOf(cls) >= 0) { out.push(c); }
+        collect(c, sel, out);
+      }
+    });
+  }
+  const savedDoc = global.document, savedWin = global.window;
+  global.document = { createElement: mkEl, createElementNS: function (ns, tag) { return mkEl(tag); }, createTextNode: function (t) { return { nodeType: 3, textContent: String(t), childNodes: [] }; } };
+  global.window = { CruxApi: { get: function () { return new Promise(function () { /* daemon hang — never resolves */ }); } } };
+  try {
+    const host = mkEl('div');
+    const rail = mkEl('nav');
+    render.renderDocuments(host, { summary: null, docId: null, railHost: rail });
+    // SYNCHRONOUS assertions — the reader must exist before any fetch resolves.
+    check(host.querySelectorAll('.doc-main').length === 1, '[documents] renderDocuments must paint a .doc-main synchronously (daemon-hang case)');
+    check(host.querySelectorAll('.doc-reader').length === 1, '[documents] renderDocuments must paint the reader synchronously');
+    check(rail.querySelectorAll('.doc-tree-item').length >= 3, '[documents] renderDocuments must populate the rail document tree synchronously (>=3 reference docs)');
+    notes.push('documents reader (M11): renderDocuments paints .doc-main + a >=3-item tree synchronously under a never-resolving daemon (bug was: whole reader deferred behind /v1/console/tenants).');
+  } catch (e) {
+    check(false, '[documents] renderDocuments threw on the synchronous paint: ' + e.message);
+  } finally {
+    if (savedDoc === undefined) { delete global.document; } else { global.document = savedDoc; }
+    if (savedWin === undefined) { delete global.window; } else { global.window = savedWin; }
+  }
+})();
+
+// =========================================================================
+//  Check 31 — (M11) Explorer destination. A new nav destination (search icon,
+//  key '8') with a renderExplorer entry point; the shell special-cases it (like
+//  Canvas) and provides the 'search' icon. Reads only → posture-independent.
+// =========================================================================
+(function checkExplorerDestination() {
+  const explorer = (pages.DESTS || []).filter(function (d) { return d.id === 'explorer'; })[0];
+  check(!!explorer, '[explorer] pages.DESTS must register the explorer destination');
+  if (explorer) {
+    check(explorer.key === '8', '[explorer] explorer destination must bind keyboard key "8" (got ' + explorer.key + ')');
+    check(explorer.icon === 'search', '[explorer] explorer destination must use the search icon');
+  }
+  check(/search:\s*'<svg/.test(shellHtml), '[explorer] shell.html must define the "search" icon glyph');
+  check(/destId === 'explorer'/.test(shellHtml) && /renderExplorer/.test(shellHtml),
+    '[explorer] shell.html must route the explorer destination to render.renderExplorer');
+  check(typeof render.renderExplorer === 'function', '[explorer] render.js must export renderExplorer (the search surface entry point)');
+  notes.push('explorer destination (M11): search icon + key 8, shell special-cases like Canvas, render.renderExplorer surfaces Local | WikiCrux cards (real fields), reads-only → shows in every posture.');
+})();
+
 // ---- Report -------------------------------------------------------------
-console.log('unified-shell-console v2 — M10 (documents + retirement) smoke');
+console.log('unified-shell-console v2 — M11 (documents reader fix + read-POST client + Explorer) smoke');
 notes.forEach(function (n) { console.log('  · ' + n); });
 if (failures.length) {
   console.error('\nFAIL (' + failures.length + '):');

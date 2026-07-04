@@ -1214,6 +1214,12 @@ pub fn router(state: AppState, case_store: self::cases::SharedCaseStore) -> Rout
         )
         .route("/v1/console/engine/bench", get(self::engine_console::get_engine_bench))
         .route("/v1/console/engine/spend", get(self::engine_console::get_engine_spend))
+        // The ONE mediated read POST (M11): proxies CruxEngine POST /v1/retrieve.
+        // Mounted post-only, so GET /v1/console/engine/search 405s. Env-gated.
+        .route(
+            "/v1/console/engine/search",
+            axum::routing::post(self::engine_console::post_engine_search),
+        )
         // Agent-graph backends (Package S scaffold). Each surface is gated
         // default-OFF and merged here so Wave-2 plans never touch this file.
         .merge(self::observe_audit::routes())

@@ -184,6 +184,7 @@ const ROUTES: &[RouteEntry] = &[
     RouteEntry { path: "/v1/console/corecrux/lane-weights", methods: &["GET", "PUT", "DELETE"], tag: "Console", auth: "admin", summary: "Console corecrux lane weights" },
     RouteEntry { path: "/v1/console/embedding/probe", methods: &["POST"], tag: "Console", auth: "admin-write", summary: "Console embedding probe" },
     RouteEntry { path: "/v1/console/engine/bench", methods: &["GET"], tag: "console-engine", auth: "admin-read", summary: "Console engine bench (read-only Engine mediation)" },
+    RouteEntry { path: "/v1/console/engine/search", methods: &["POST"], tag: "console-engine", auth: "admin-read", summary: "Console engine search (mediated WikiCrux retrieval; curated read POST)" },
     RouteEntry { path: "/v1/console/engine/spend", methods: &["GET"], tag: "console-engine", auth: "admin-read", summary: "Console engine spend (read-only Engine mediation)" },
     RouteEntry { path: "/v1/console/engine/summary", methods: &["GET"], tag: "console-engine", auth: "admin-read", summary: "Console engine summary (read-only Engine mediation)" },
     RouteEntry { path: "/v1/console/facts", methods: &["GET"], tag: "Console", auth: "admin-read", summary: "Console facts" },

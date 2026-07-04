@@ -975,7 +975,15 @@
     // size-adaptive Board plus a real-edge relation Graph, switched by a
     // nav-family segmented control (deep-linkable #/canvas/board · #/canvas/graph).
     // Phone tier: lives in the "More" sheet (not one of the three direct tabs).
-    { id: 'canvas', label: 'Canvas', icon: 'canvas', key: '7', sub: 'Size-adaptive dashboard + relation graph.' }
+    { id: 'canvas', label: 'Canvas', icon: 'canvas', key: '7', sub: 'Size-adaptive dashboard + relation graph.' },
+    // Explorer (M11) — a destination with no sub-pills: it IS a search surface.
+    // A query box + a Local | WikiCrux backend toggle (nav-family, aria-pressed) +
+    // a budget/top_k control; results as cards (title/snippet · source · score ·
+    // tenant, real fields only). Both backends are READS, so Explorer is visible
+    // in every posture. Local → daemon BM25 text-search; WikiCrux → the
+    // daemon-mediated retrieval — both go through render.js's curated read-POST
+    // client. Phone tier: lives in the "More" sheet (not a direct tab).
+    { id: 'explorer', label: 'Explorer', icon: 'search', key: '8', sub: 'Search the corpus — local retrieval or mediated WikiCrux.' }
   ];
 
   // ---- Legacy id inventory (the 26 CX pages this plan must keep reachable)
@@ -1196,7 +1204,18 @@
           { id: 'rcpt_4f8a2b1c9e3d7f6a', label: 'proof · verified', ts: '2025-10-14 09:32' },
           { id: 'rcpt_2b4c6d8e0f1a3g5i', label: 'replay · deterministic', ts: '2025-10-14 09:52' }
         ]
-      }
+      },
+      // Explorer (M11) fixture — sample search cards, surfaced ONLY behind
+      // demoOn() via demoData('explorer') and ONLY when the chosen backend is
+      // unreachable/off (real results always win). Each card is demo-chipped. The
+      // field names mirror the REAL response shapes so the demo composes exactly
+      // like a live search: WikiCrux (/v1/retrieve RetrievalResult) carries
+      // title/content/score/source/tenantId.
+      explorer: [
+        { title: 'Albert Einstein', snippet: 'Albert Einstein (1879–1955) was a German-born theoretical physicist who developed the theory of relativity.', source: 'tenant', score: 0.93, tenant: 'wikicrux' },
+        { title: 'Theory of relativity', snippet: 'The theory of relativity usually encompasses two interrelated theories by Einstein: special and general relativity.', source: 'commons', score: 0.81, tenant: 'wikicrux' },
+        { title: 'Photoelectric effect', snippet: 'Einstein’s 1905 explanation of the photoelectric effect earned him the 1921 Nobel Prize in Physics.', source: 'tenant', score: 0.76, tenant: 'wikicrux' }
+      ]
     };
   })();
 

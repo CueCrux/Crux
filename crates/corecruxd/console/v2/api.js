@@ -645,10 +645,53 @@ const CruxApiGated = Object.freeze({
   },
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CruxApiRead — curated READ POSTs (retrieval, not mutation).
+//
+// Searches are reads, but the daemon carries the query + budget in a JSON body,
+// so they are POSTs — which the GET-only CruxApi (and its allowlisted get())
+// cannot express. Each method below POSTs a JSON body, same-origin credentialed.
+// Every route is customer-safe and allowlist-guarded: there is NO arbitrary POST
+// here — only these curated retrieval routes. This is NOT a mutation surface
+// (that is CruxApiGated); nothing here writes.
+//
+// Adding a route requires editing READ_POST_ROUTES in the generator
+// (crates/corecruxd/tests/route_spec_drift.rs) — a reviewable diff + a regenerated
+// api.js. The READ_POST_ROUTES array is the machine-readable twin the smoke
+// audits against the methods below.
+// ─────────────────────────────────────────────────────────────────────────────
+const READ_POST_ROUTES = Object.freeze([
+  Object.freeze(['POST', '/v1/query/text-search']),
+  Object.freeze(['POST', '/v1/query/text-search/expand']),
+  Object.freeze(['POST', '/v1/query/graph-expand']),
+  Object.freeze(['POST', '/v1/query/time-range']),
+  Object.freeze(['POST', '/v1/console/engine/search']),
+]);
+
+const CruxApiRead = Object.freeze({
+  queryTextSearch(body) {
+    return fetch(`/v1/query/text-search`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  queryTextSearchExpand(body) {
+    return fetch(`/v1/query/text-search/expand`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  queryGraphExpand(body) {
+    return fetch(`/v1/query/graph-expand`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  queryTimeRange(body) {
+    return fetch(`/v1/query/time-range`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+  engineSearch(body) {
+    return fetch(`/v1/console/engine/search`, { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  },
+});
+
 // Classic-script globals for the no-build v2 console. No `export` — the
 // console loads this with a plain <script src="/console-v2/api.js">.
 if (typeof window !== 'undefined') {
   window.CruxApi = CruxApi;
   window.CruxApiGated = CruxApiGated;
+  window.CruxApiRead = CruxApiRead;
   window.CRUX_GATED_MUTATIONS = GATED_MUTATIONS;
+  window.CRUX_READ_POST_ROUTES = READ_POST_ROUTES;
 }

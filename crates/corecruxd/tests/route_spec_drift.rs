@@ -59,6 +59,35 @@ const GATED_MUTATIONS: &[(&str, &str, &str)] = &[
     ("POST", "/v1/actions/enrich", "actionsEnrich"),
 ];
 
+// ── Curated read-POST allowlist (unified-shell-console M11) ───────────────────
+//
+// Retrieval is a READ, but the daemon models searches as POST (a JSON body
+// carries the query + budget). The generated `CruxApi` is GET-only and the
+// generic `get()` allowlist refuses POST, so searches need their own frozen
+// client. `generate_api_js()` emits a THIRD object, `CruxApiRead`, from exactly
+// this list — each method POSTs a JSON body, same-origin credentialed.
+//
+// These are CURATED READ POSTs (retrieval, not mutation): customer-safe,
+// allowlist-guarded, and carry NO write semantics — there is NO arbitrary POST
+// on this client. That is the whole point of keeping them separate from the
+// GET-only `CruxApi` (reads) and the tiny operator-gated `CruxApiGated`
+// (writes). Widening it is a reviewable diff here + a regenerated `api.js`.
+//
+// Grounded against the handlers:
+//   * query.rs::post_query_text_search        — POST /v1/query/text-search
+//   * query.rs::post_query_text_search_expand — POST /v1/query/text-search/expand
+//   * query.rs::post_query_graph_expand       — POST /v1/query/graph-expand
+//   * query.rs::post_query_time_range         — POST /v1/query/time-range
+//   * engine_console.rs::post_engine_search   — POST /v1/console/engine/search
+//     (the ONE mediated read POST; proxies CruxEngine POST /v1/retrieve)
+const READ_POST_ROUTES: &[(&str, &str, &str)] = &[
+    ("POST", "/v1/query/text-search", "queryTextSearch"),
+    ("POST", "/v1/query/text-search/expand", "queryTextSearchExpand"),
+    ("POST", "/v1/query/graph-expand", "queryGraphExpand"),
+    ("POST", "/v1/query/time-range", "queryTimeRange"),
+    ("POST", "/v1/console/engine/search", "engineSearch"),
+];
+
 // ── Router source scanning (mirrors route_auth::parse_routes_in_source) ──────
 
 /// Brace/quote-aware scan of `.route("<path>", <method>(...))` calls. Returns
@@ -496,12 +525,51 @@ fn generate_api_js() -> String {
     }
     s.push_str("});\n\n");
 
+    // ── Curated read-POST surface (M11) ──────────────────────────────────────
+    s.push_str("// ─────────────────────────────────────────────────────────────────────────────\n");
+    s.push_str("// CruxApiRead — curated READ POSTs (retrieval, not mutation).\n");
+    s.push_str("//\n");
+    s.push_str("// Searches are reads, but the daemon carries the query + budget in a JSON body,\n");
+    s.push_str("// so they are POSTs — which the GET-only CruxApi (and its allowlisted get())\n");
+    s.push_str("// cannot express. Each method below POSTs a JSON body, same-origin credentialed.\n");
+    s.push_str("// Every route is customer-safe and allowlist-guarded: there is NO arbitrary POST\n");
+    s.push_str("// here — only these curated retrieval routes. This is NOT a mutation surface\n");
+    s.push_str("// (that is CruxApiGated); nothing here writes.\n");
+    s.push_str("//\n");
+    s.push_str("// Adding a route requires editing READ_POST_ROUTES in the generator\n");
+    s.push_str("// (crates/corecruxd/tests/route_spec_drift.rs) — a reviewable diff + a regenerated\n");
+    s.push_str("// api.js. The READ_POST_ROUTES array is the machine-readable twin the smoke\n");
+    s.push_str("// audits against the methods below.\n");
+    s.push_str("// ─────────────────────────────────────────────────────────────────────────────\n");
+    s.push_str("const READ_POST_ROUTES = Object.freeze([\n");
+    for (method, path, _name) in READ_POST_ROUTES {
+        s.push_str(&format!("  Object.freeze(['{method}', '{path}']),\n"));
+    }
+    s.push_str("]);\n\n");
+
+    s.push_str("const CruxApiRead = Object.freeze({\n");
+    for (method, path, name) in READ_POST_ROUTES {
+        let mut args = path_params(path);
+        args.push("body".to_string());
+        let args = args.join(", ");
+        let url = url_template(path);
+        s.push_str(&format!(
+            "  {name}({args}) {{\n    \
+             return fetch(`{url}`, {{ method: '{method}', credentials: 'same-origin', \
+             headers: {{ 'content-type': 'application/json' }}, body: JSON.stringify(body || {{}}) }});\n  \
+             }},\n"
+        ));
+    }
+    s.push_str("});\n\n");
+
     s.push_str("// Classic-script globals for the no-build v2 console. No `export` — the\n");
     s.push_str("// console loads this with a plain <script src=\"/console-v2/api.js\">.\n");
     s.push_str("if (typeof window !== 'undefined') {\n");
     s.push_str("  window.CruxApi = CruxApi;\n");
     s.push_str("  window.CruxApiGated = CruxApiGated;\n");
+    s.push_str("  window.CruxApiRead = CruxApiRead;\n");
     s.push_str("  window.CRUX_GATED_MUTATIONS = GATED_MUTATIONS;\n");
+    s.push_str("  window.CRUX_READ_POST_ROUTES = READ_POST_ROUTES;\n");
     s.push_str("}\n");
     s
 }

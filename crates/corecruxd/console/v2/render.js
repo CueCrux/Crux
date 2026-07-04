@@ -1919,17 +1919,22 @@
   function renderDocuments(host, ctx) {
     ctx = ctx || {};
     host.textContent = '';
+    // Tree hosts (rail + phone sheet) to re-decorate once the live corpora land.
+    var treeHosts = [];
+    var activeDocId = null;
     function paint(tenants) {
       var docId = ctx.docId || docDefaultId(tenants);
+      activeDocId = docId;
+      treeHosts = [];
       // Rail tree (desktop) — the shell hands us the rail host.
-      if (ctx.railHost) { buildDocTree(ctx.railHost, tenants, docId); }
+      if (ctx.railHost) { buildDocTree(ctx.railHost, tenants, docId); treeHosts.push(ctx.railHost); }
       var reader = el('div', { 'class': 'doc-reader' });
       // Phone sources sheet (CSS hides it on the desktop tier, where the rail
       // tree is shown instead).
       var sheet = el('details', { 'class': 'doc-sources-sheet' });
       sheet.appendChild(el('summary', { 'class': 'doc-sources-summary', text: 'Sources' }));
       var sheetTree = el('div', { 'class': 'doc-tree' });
-      buildDocTree(sheetTree, tenants, docId);
+      buildDocTree(sheetTree, tenants, docId); treeHosts.push(sheetTree);
       sheet.appendChild(sheetTree);
       reader.appendChild(sheet);
       var main = el('main', { 'class': 'doc-main' });
@@ -1948,17 +1953,183 @@
       // Evidence panel (real facts + receipts + coverage where real).
       renderDocEvidence(evidence, ctx, docId);
     }
-    if (__docCache.tenants) { paint(__docCache.tenants); return Promise.resolve(); }
+    // SYNCHRONOUS first paint. The reader (the tree + the bundled reference docs +
+    // the demo Proof doc) needs ZERO network, so it must never sit behind the
+    // /v1/console/tenants fetch. Previously EVERY paint was deferred until that
+    // fetch resolved — on a slow, hung, or unreachable daemon the reader stayed
+    // blank forever (no .doc-main, an empty tree). Paint now runs up front against
+    // the tenant cache (or []); the live corpora list only re-decorates the tree's
+    // "Corpora · tenants" branch when it lands.
+    paint(__docCache.tenants || []);
+    if (__docCache.tenants) { return Promise.resolve(); }
     return fetchJSON('/v1/console/tenants').then(function (res) {
       var tenants = (res.ok && res.data && (res.data.tenants || res.data.items)) || [];
       __docCache.tenants = tenants;
-      paint(tenants);
-    }).catch(function () { paint([]); });
+      // Re-decorate the tree host(s) with the live corpora. The main reading pane
+      // is already painted; with DOC_REFERENCE non-empty the default doc is stable
+      // across the tenant list (docDefaultId only falls through to a tenant when
+      // there are no reference docs), so refreshing the tree alone avoids a
+      // reading-surface flash. A tenant doc's own chunks lazy-fetch on selection.
+      if (tenants.length) { treeHosts.forEach(function (t) { buildDocTree(t, tenants, activeDocId); }); }
+    }).catch(function () {});
+  }
+
+  // =======================================================================
+  //  Explorer (M11) — corpus search. READS ONLY, so it is customer-safe and
+  //  visible in every posture. Two backends:
+  //    * Local    → CruxApiRead.queryTextSearch (daemon BM25 over the local
+  //                 tenant index; response = {results:[{result_id,score,
+  //                 source_label,rank,…}]}, grounded in query.rs
+  //                 post_query_text_search — hits carry an id + score, no text).
+  //    * WikiCrux → CruxApiRead.engineSearch (the daemon-mediated /v1/retrieve
+  //                 proxy; response = {data:{results:[{title,content,score,
+  //                 source,tenantId,…}]}} — RetrievalResult, grounded in the
+  //                 Engine openapi.json). Carries snippet + title + tenant.
+  //  Every network call goes through window.CruxApiRead (the curated read-POST
+  //  client in api.js); render.js performs no raw fetch. Debounced; no throws on
+  //  any failure. demoOn() fills sample cards (chipped) when a backend is
+  //  unreachable/off — real results always win.
+  // =======================================================================
+  var EXPLORER_BACKENDS = [{ id: 'local', label: 'Local' }, { id: 'wikicrux', label: 'WikiCrux' }];
+
+  // Call the curated read-POST client; resolve to {ok,status,data} — never throw.
+  function readPost(method, body) {
+    var api = (typeof window !== 'undefined') ? window.CruxApiRead : null;
+    if (!api || typeof api[method] !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    return api[method](body)
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, status: r.status, data: d }; }, function () { return { ok: r.ok, status: r.status, data: null }; }); })
+      .catch(function () { return { ok: false, status: 0, data: null }; });
+  }
+  // Local text-search hit → card model (real fields only; local BM25 hits have
+  // no stored text, so snippet is null — id + score + source only).
+  function explorerLocalCards(data) {
+    var results = (data && data.results) || [];
+    return results.map(function (h) {
+      var id = h.result_id || ((h.segment_index != null && h.doc_id != null) ? (h.segment_index + ':' + h.doc_id) : 'result');
+      return { title: id, snippet: null, source: h.source_label || 'local_tenant_index', score: h.score, tenant: null, rank: h.rank };
+    });
+  }
+  // WikiCrux /v1/retrieve result (under the mediated envelope's data.results) →
+  // card model. title/content/score/source/tenantId are the real RetrievalResult
+  // fields.
+  function explorerEngineCards(data) {
+    var results = get(data, ['data', 'results']) || (data && data.results) || [];
+    return results.map(function (r) {
+      return { title: r.title || r.docId || r.chunkId || 'result', snippet: r.content || null, source: r.source || null, score: r.score, tenant: r.tenantId || null };
+    });
+  }
+  function explorerScoreTone(score) { return score > 0.66 ? 'ok' : (score > 0.33 ? 'warn' : 'ink3'); }
+  function explorerCard(c, demo) {
+    var card = el('div', { 'class': 'explorer-card' });
+    var top = el('div', { 'class': 'explorer-card-top' }, [el('span', { 'class': 'explorer-card-title', text: String(c.title) })]);
+    if (typeof c.score === 'number' && isFinite(c.score)) {
+      top.appendChild(el('span', { 'class': 'doc-cov doc-cov-' + explorerScoreTone(c.score), text: c.score.toFixed(2) }));
+    }
+    card.appendChild(top);
+    if (c.snippet) { card.appendChild(el('div', { 'class': 'explorer-card-snippet', text: String(c.snippet) })); }
+    var meta = el('div', { 'class': 'explorer-card-meta' });
+    if (c.source) { meta.appendChild(el('span', { 'class': 'doc-cov doc-cov-trust', text: String(c.source) })); }
+    if (c.tenant) { meta.appendChild(el('span', { 'class': 'ctl-desc', text: 'tenant · ' + c.tenant })); }
+    if (c.rank != null) { meta.appendChild(el('span', { 'class': 'ctl-desc', text: '#' + c.rank })); }
+    if (meta.childNodes.length) { card.appendChild(meta); }
+    if (demo) { card.appendChild(demoChip(true)); }
+    return card;
+  }
+
+  function renderExplorer(host, ctx) {
+    ctx = ctx || {};
+    host.textContent = '';
+    var region = el('div', { 'class': 'explorer-region' });
+    host.appendChild(region);
+    // Local carries a token_budget; WikiCrux carries a top_k (Engine limit ≤50).
+    var state = { backend: 'local', query: '', budget: 1500, topk: 8 };
+
+    var controls = el('div', { 'class': 'explorer-controls' });
+    var searchRow = el('div', { 'class': 'explorer-search' });
+    var input = el('input', { 'class': 'explorer-input', type: 'search', placeholder: 'Search the corpus…', 'aria-label': 'Search query' });
+    searchRow.appendChild(input);
+    var toggle = el('div', { 'class': 'explorer-toggle', role: 'group', 'aria-label': 'Search backend' });
+    var toggleBtns = {};
+    EXPLORER_BACKENDS.forEach(function (b) {
+      var btn = el('button', { 'class': 'btn-quiet', type: 'button', 'data-backend': b.id, 'aria-pressed': b.id === state.backend ? 'true' : 'false', text: b.label });
+      btn.addEventListener('click', function () {
+        if (state.backend === b.id) { return; }
+        state.backend = b.id; syncToggle(); relabelBudget();
+        if (state.query.trim()) { doSearch(); }
+      });
+      toggle.appendChild(btn); toggleBtns[b.id] = btn;
+    });
+    searchRow.appendChild(toggle);
+    controls.appendChild(searchRow);
+
+    var budgetRow = el('label', { 'class': 'explorer-budget' });
+    var budgetLabel = el('span', { text: 'token budget' });
+    var budgetInput = el('input', { type: 'number', min: '1', value: String(state.budget), 'aria-label': 'result budget' });
+    budgetRow.appendChild(budgetLabel); budgetRow.appendChild(budgetInput);
+    controls.appendChild(budgetRow);
+    region.appendChild(controls);
+
+    var results = el('div', { 'class': 'explorer-results' });
+    region.appendChild(results);
+    results.appendChild(el('p', { 'class': 'ctl-desc', text: 'Type a query to search the corpus.' }));
+
+    function syncToggle() { EXPLORER_BACKENDS.forEach(function (b) { toggleBtns[b.id].setAttribute('aria-pressed', b.id === state.backend ? 'true' : 'false'); }); }
+    function relabelBudget() {
+      if (state.backend === 'local') { budgetLabel.textContent = 'token budget'; budgetInput.value = String(state.budget); }
+      else { budgetLabel.textContent = 'top_k'; budgetInput.value = String(state.topk); }
+    }
+    input.addEventListener('input', function () { state.query = input.value; scheduleSearch(); });
+    budgetInput.addEventListener('input', function () {
+      var n = parseInt(budgetInput.value, 10);
+      if (!isFinite(n) || n < 1) { return; }
+      if (state.backend === 'local') { state.budget = n; } else { state.topk = Math.min(50, n); }
+      if (state.query.trim()) { scheduleSearch(); }
+    });
+
+    var debTimer = null;
+    function scheduleSearch() { if (debTimer) { clearTimeout(debTimer); } debTimer = setTimeout(doSearch, 250); }
+
+    function maybeDemo() {
+      if (!demoOn()) { return; }
+      var sample = demoData('explorer');
+      if (!sample || !sample.length) { return; }
+      results.appendChild(docSection('Sample results'));
+      sample.forEach(function (c) { results.appendChild(explorerCard(c, true)); });
+    }
+    function paintResults(res, mapper) {
+      results.textContent = '';
+      if (res.status === 404) {
+        results.appendChild(el('p', { 'class': 'ctl-desc', text: state.backend === 'wikicrux' ? 'WikiCrux search unavailable — engine mediation off.' : 'Search unavailable — feature off.' }));
+        maybeDemo(); return;
+      }
+      if (!res.ok || !res.data) {
+        results.appendChild(el('p', { 'class': 'ctl-desc', text: 'Search unavailable — ' + (res.status === 0 ? 'backend unreachable' : 'HTTP ' + res.status) + '.' }));
+        maybeDemo(); return;
+      }
+      var cards = mapper(res.data);
+      if (!cards.length) { results.appendChild(el('p', { 'class': 'ctl-desc', text: 'No results for “' + state.query.trim() + '”.' })); return; }
+      cards.forEach(function (c) { results.appendChild(explorerCard(c, false)); });
+    }
+    function doSearch() {
+      var q = state.query.trim();
+      if (!q) { results.textContent = ''; results.appendChild(el('p', { 'class': 'ctl-desc', text: 'Type a query to search the corpus.' })); return; }
+      results.textContent = '';
+      results.appendChild(el('p', { 'class': 'ctl-desc', text: 'Searching…' }));
+      if (state.backend === 'local') {
+        readPost('queryTextSearch', { query: q, token_budget: state.budget, tenant_id: 'default' }).then(function (res) { paintResults(res, explorerLocalCards); });
+      } else {
+        readPost('engineSearch', { query: q, top_k: state.topk }).then(function (res) { paintResults(res, explorerEngineCards); });
+      }
+    }
+    // Expose the imperative handle for tests / deep integration (no auto-search).
+    return { search: doSearch, state: state };
   }
 
   return {
     CONTROL_TYPES: CONTROL_TYPES,
     GATE_TITLE: GATE_TITLE,
+    // M11 — Explorer (corpus search; reads only, posture-independent).
+    renderExplorer: renderExplorer,
     // M10 — Documents mode (the console-as-reader).
     renderDocuments: renderDocuments,
     DOC_REFERENCE: DOC_REFERENCE,

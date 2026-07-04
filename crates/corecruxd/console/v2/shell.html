@@ -1049,6 +1049,37 @@
     .doc-main { max-width: none; }
   }
 
+  /* ---- Explorer (M11) — corpus search surface --------------------------
+     A query box + a Local | WikiCrux backend toggle (nav-family .btn-quiet,
+     aria-pressed) + a budget control, above a results column of cards. Cards
+     reuse .doc-card material; every field shown is real. Reads only, so it is
+     posture-independent. */
+  .explorer-region { display: flex; flex-direction: column; gap: 16px; max-width: 900px; }
+  .explorer-controls { display: flex; flex-direction: column; gap: 12px; }
+  .explorer-search { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .explorer-input {
+    flex: 1 1 260px; min-width: 0; min-height: 38px; padding: 0 12px;
+    background: var(--surface2); border: 1px solid var(--edge); border-radius: 8px;
+    color: var(--ink); font: inherit; font-size: 14px;
+  }
+  .explorer-input:focus { border-color: var(--edge-strong); outline: none; }
+  .explorer-toggle { display: flex; gap: 6px; flex-wrap: wrap; }
+  .explorer-toggle .btn-quiet { min-height: 34px; padding: 0 14px; font-size: 13px; }
+  .explorer-budget { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink3); }
+  .explorer-budget input {
+    width: 84px; min-height: 32px; padding: 0 8px; background: var(--surface2);
+    border: 1px solid var(--edge); border-radius: 6px; color: var(--ink); font: inherit;
+  }
+  .explorer-results { display: flex; flex-direction: column; gap: 10px; }
+  .explorer-card {
+    padding: 12px 14px; border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); display: flex; flex-direction: column; gap: 6px; min-width: 0;
+  }
+  .explorer-card-top { display: flex; align-items: baseline; gap: 10px; justify-content: space-between; }
+  .explorer-card-title { font-weight: 600; font-size: 14px; color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
+  .explorer-card-snippet { font-size: 13px; color: var(--ink2); line-height: 1.5; overflow-wrap: anywhere; }
+  .explorer-card-meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
   /* ---- Accessibility & motion ------------------------------------------- */
   .skip {
     position: absolute; left: -9999px; top: 0; z-index: 100;
@@ -1285,6 +1316,7 @@
     trust: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg>',
     meters: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19a8 8 0 0 1 16 0"/><path d="M12 19l4-5"/><circle cx="12" cy="19" r="1.4"/></svg>',
     canvas: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
+    search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>',
     settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>',
     integrations: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v6"/><path d="M8 9V5M16 9V5"/><rect x="6" y="9" width="12" height="6" rx="2"/><path d="M12 15v3a3 3 0 0 0 3 3"/></svg>',
     developer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 9l-4 3 4 3"/><path d="M16 9l4 3-4 3"/><path d="M13 6l-2 12"/></svg>',
@@ -1811,6 +1843,25 @@
         window.CruxRender.renderCanvas(canvasHost, { summary: BOOT.summary, view: cr.view, focus: cr.focus });
       } else {
         canvasHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
+      }
+      applyPosture(content);
+      if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+      return;
+    }
+
+    // Explorer (M11): no sub-pills — Explorer IS the page. A search box + a
+    // Local | WikiCrux backend toggle + a budget control; results render as
+    // cards. Reads only, so it shows in every posture. Delegates to render.js
+    // renderExplorer (search runs through render.js's curated read-POST client).
+    if (destId === 'explorer') {
+      document.getElementById('destTitle').textContent = dest.label;
+      document.getElementById('destSub').textContent = dest.sub || '';
+      var explorerHost = el('div', { 'class': 'explorer-region-host', id: 'explorerHost' });
+      content.appendChild(explorerHost);
+      if (window.CruxRender && window.CruxRender.renderExplorer) {
+        window.CruxRender.renderExplorer(explorerHost, { summary: BOOT.summary });
+      } else {
+        explorerHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
       }
       applyPosture(content);
       if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
