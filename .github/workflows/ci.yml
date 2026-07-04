@@ -249,6 +249,11 @@ jobs:
       # asserts and there is no port leak.
       - name: Trust-surface gate (receipt tamper)
         run: CORECRUXCTL=./target/debug/corecruxctl bash scripts/demo-receipt-tamper.sh
+      # Same rationale as the tamper gate: pure offline export+verify (no ports),
+      # reliable on the shared self-hosted runner. Self-runs the custody exit
+      # test — export a signed bundle, verify offline, reject a tamper.
+      - name: Trust-surface gate (context custody exit test)
+        run: CORECRUXCTL=./target/debug/corecruxctl bash scripts/assert-context-custody.sh
       - name: Reclaim per-job CARGO_HOME
         if: always()
         run: rm -rf "$CARGO_HOME"  # see lint job — prevents data-disk leak
