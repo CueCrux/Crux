@@ -76,8 +76,16 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
     // `order_sections` floats `Stable` ahead of `Volatile` (unconditional since CO-5).
     let mut sections: Vec<(Stability, String)> = Vec::new();
 
+    // Boot observations for the wizard self-check (see the block near the end).
+    // `sync_degraded` is assigned on the only path that survives the match (the
+    // `Err` arm returns), so it needs no dead initialiser; `bootstrap_loaded`
+    // stays false unless the playbook actually renders.
+    let sync_degraded;
+    let mut bootstrap_loaded = false;
+
     match mcp_client::call_tool("sync_status", json!({})) {
         Ok(result) => {
+            sync_degraded = sync_reports_degraded(&result);
             let summary = render_sync_status(&result);
             // Volatile: timestamps, local_fact_count, sync mode all change boot-to-boot.
             sections.push((Stability::Volatile, format!("**Crux sync_status**\n{summary}")));
@@ -91,6 +99,7 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
                     Ok(boot) => {
                         let text = extract_text(&boot);
                         if !text.is_empty() {
+                            bootstrap_loaded = true;
                             // Stable: playbook/patterns — identical session-to-session.
                             sections.push((Stability::Stable, format!("**Crux bootstrap (patterns)**\n{text}")));
                         }
@@ -153,6 +162,32 @@ pub fn run<R: std::io::Read>(reader: R) -> anyhow::Result<()> {
             Err(err) => {
                 eprintln!("crux-hook session-start: wizard drift check failed: {err}");
             }
+        }
+    }
+
+    // Boot self-check: catch the class of failure where the daemon is healthy
+    // but the banner silently loses content — a hook regression suppressing the
+    // playbook, or a stale hook binary skewed from the daemon version. The policy
+    // lives in the wizard (`selfcheck`), pure + unit-tested; this block only does
+    // the daemon I/O (a best-effort `initialize` for the daemon version) and feeds
+    // observations in. Gated by the same flag as the drift check. Reaching here
+    // means `sync_status` succeeded (the `Err` arm returned early), so the daemon
+    // was reachable this boot.
+    if std::env::var("CRUX_HOOK_WIZARD_CHECK").as_deref() != Ok("off") {
+        let hook_version = env!("CARGO_PKG_VERSION");
+        let daemon_version = mcp_client::server_version();
+        let obs = crux_config_wizard::selfcheck::BootObservations {
+            hook_version,
+            daemon_version: daemon_version.as_deref(),
+            sync_reachable: true,
+            sync_degraded,
+            bootstrap_loaded,
+        };
+        if let Some(section) =
+            crux_config_wizard::selfcheck::render_section(&crux_config_wizard::selfcheck::evaluate(&obs))
+        {
+            // Volatile: reflects live daemon/hook state, not stable playbook text.
+            sections.push((Stability::Volatile, section));
         }
     }
 
@@ -271,6 +306,19 @@ fn sync_is_healthy(result: &Value) -> bool {
     // Fallback: payload was not the expected JSON object (stub / plain text).
     let lower = text.to_lowercase();
     !lower.contains("degraded") && !lower.contains("behind") && !lower.contains("diverged")
+}
+
+/// The daemon's own `degraded` verdict from a `sync_status` payload — the parsed
+/// boolean, defaulting to `false` when the field or JSON is absent. Distinct from
+/// [`sync_is_healthy`]: this reports *what the daemon said*, used by the boot
+/// self-check to tell a genuinely-degraded daemon (legitimately no playbook) from
+/// a healthy one whose banner was silently suppressed (an anomaly worth warning).
+fn sync_reports_degraded(result: &Value) -> bool {
+    let text = extract_text(result);
+    serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|v| v.get("degraded").and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
