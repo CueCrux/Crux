@@ -154,8 +154,22 @@ The verifier is ~1,250 lines of Rust at
 signature bound to both receipt ID and payload hash so it can't be transplanted. Tamper tests live in
 [`crates/corecrux-receipts/src/tests.rs`](crates/corecrux-receipts/src/tests.rs).
 
+And you can run **the same exit test we run in CI** — export everything the daemon knows (facts +
+sessions) and everything it did (signed journal + receipt refs) into one passport-signed bundle, then
+verify that bundle **offline**, and watch the verifier reject a tampered byte:
+
+```bash
+corecruxctl context export --data-dir <dir> --out ./bundle   # signed=true
+corecruxctl context verify ./bundle --json                   # ok=true, offline, no network
+```
+
+There is no lock-in: the answer to *"can you export it?"* and *"can you prove what it saw and did?"*
+is a command, not a support ticket. We run this same export → offline-verify → tamper-rejection cycle
+as a release-blocking CI gate, so every published build has passed its own exit test.
+
 Release artifacts are signed and attested end-to-end: cosign keyless signatures + CycloneDX SBOMs
 on every binary and image, SLSA provenance on every release — [docs/verify-release.md](docs/verify-release.md).
+Found something? Report it privately per the [security policy](SECURITY.md).
 
 **Testing & coverage:** **4,489** tests and **~87%** CI-gated region coverage, with per-crate floors
 on the trust core (`corecrux-receipts` / `-segment` / `-storage`) and the ungated total reported
