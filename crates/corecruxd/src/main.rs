@@ -887,8 +887,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     crux_mcp::agent_passport::AgentPassportMap::empty()
                 },
             )
-            // passport-revocation M3: refuse revoked passports' calls when
-            // CRUX_PASSPORT_REVOCATION=1 (default-off).
+            // passport-revocation M3: refuse revoked passports' calls —
+            // launch default ON; CRUX_PASSPORT_REVOCATION=0 disables it.
             .with_revocation_enforced(crux_mcp::dispatch::revocation_enforced_from_env())
             .with_substrate(
                 state.entity_store.clone(),

@@ -84,7 +84,7 @@ pub struct McpContext {
     /// passport-revocation M3: when true, `call_tool` refuses calls from a
     /// REVOKED passport (except a tiny read-only allowlist so the agent can
     /// learn it was revoked — M4). Wired from `corecruxd::main` off
-    /// `CRUX_PASSPORT_REVOCATION`; default false (no enforcement).
+    /// `CRUX_PASSPORT_REVOCATION` — **launch default ON**; `=0` disables enforcement.
     pub revocation_enforced: bool,
 }
 
