@@ -70,9 +70,9 @@ async fn handle_oauth_protected_resource() -> Response {
 
 /// `GET /.well-known/agent-card` — A2A / GB-Z-185.4-style discovery card
 /// (agent-card M6). PUBLIC (no bearer) so external agents can discover this
-/// daemon. Flag-gated: returns `404` unless `CRUX_AGENT_CARD=1` (default-off —
-/// the operator's local daemon is not public-facing). Describes the service
-/// only — no caller passport, no private facts.
+/// daemon. **Launch default ON** — served unless `CRUX_AGENT_CARD=0`; the card
+/// describes the service only (no caller passport, no private facts), so it is
+/// safe to expose out of the box.
 async fn handle_agent_card(State(ctx): State<Arc<McpContext>>) -> Response {
     if !agent_card_enabled() {
         return StatusCode::NOT_FOUND.into_response();
