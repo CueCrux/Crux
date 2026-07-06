@@ -2763,32 +2763,79 @@
     livingDemo(out, null);
   }
 
-  // ---- 5 · Dependencies (demo surface — assumption-loaded dependency tree) -
+  // ---- 5 · Dependencies (real: /v1/query/graph-expand) --------------------
+  // Walk the relation graph from a seed artefact id: each node carries its hop
+  // distance from the seed, the edge types traversed to reach it, and (when
+  // include_state) its real living state + confidence. graph-expand is a
+  // feature-flagged read-POST (CORECRUXD_QUERY_GRAPH_EXPAND); off/empty on the
+  // community daemon → honest fallback to the assumption-loaded demo tree.
   function renderDocSurface_deps(main, ctx) {
-    docSurfaceHead(main, '⬙', 'Dependencies', 'What the answer rests on — confidence beams and assumption loading, node by node.');
-    var d = surfaceDemo('deps');
-    if (!d || !d.root) { docSurfaceEmpty(main, 'No dependency-graph endpoint on this daemon build. Enable demo data (?demo=1) to preview the assumption-loaded tree.'); return; }
-    main.appendChild(el('div', { 'class': 'doc-chips' }, [docBandBadge(null, d.root.confidence), docBadge('fragility ' + Math.round(d.root.fragility * 100) + '%', d.root.fragility > 0.5 ? 'crit' : 'warn'), demoChip(true)]));
-    main.appendChild(el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-row-text', text: d.query })]));
-    main.appendChild(docSection('Dependency tree'));
-    function assumTone(load) { return load <= 0.25 ? 'ok' : (load <= 0.5 ? 'warn' : 'crit'); }
-    function walkNode(node, depth) {
-      var row = el('div', { 'class': 'doc-dep-node', style: 'margin-left:' + (depth * 16) + 'px' });
-      row.appendChild(el('div', { 'class': 'doc-chips' }, [
-        docDot(assumTone(node.assumptionLoad)),
-        el('span', { 'class': 'doc-row-title', text: node.label }),
-        node.trunkTier ? docBadge('T' + node.trunkTier, '') : null,
-        docBadge(node.type, node.type === 'assumption' ? 'warn' : '')
-      ].filter(Boolean)));
-      if (node.sublabel) { row.appendChild(el('div', { 'class': 'doc-row-text', text: node.sublabel })); }
-      row.appendChild(docCovBar('confidence', node.confidence));
-      row.appendChild(el('div', { 'class': 'doc-chunk-claims', text: 'assumption load ' + Math.round(node.assumptionLoad * 100) + '% · coverage ' + Math.round((node.coverageContribution || 0) * 100) + '%' }));
-      main.appendChild(row);
-      (node.children || []).forEach(function (c) { walkNode(c, depth + 1); });
+    docSurfaceHead(main, '⬙', 'Dependencies', 'What an artefact rests on — real graph traversal: edge types, hop distance, and living state per node.');
+    var bar = el('div', { 'class': 'doc-card', style: 'display:flex;gap:10px;align-items:center;' });
+    var input = el('input', { 'class': 'ctl-input', type: 'text', placeholder: 'Seed artefact id(s), e.g. 42, 108…', style: 'flex:1;min-width:0;' });
+    var runBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Expand']);
+    bar.appendChild(input); bar.appendChild(runBtn);
+    main.appendChild(bar);
+    main.appendChild(el('p', { 'class': 'ctl-desc', text: 'Traverses the relation graph from your seed(s) via /v1/query/graph-expand (edge types · hops · living state).' }));
+    var out = el('div', { 'class': 'doc-ev-host' });
+    main.appendChild(out);
+
+    function depsDemo(host, note) {
+      var d = surfaceDemo('deps');
+      if (!d || !d.root) { docSurfaceEmpty(host, note || 'Enter a seed artefact id to expand its dependency graph, or enable demo data (?demo=1) to preview the assumption-loaded tree.'); return; }
+      host.appendChild(docSection('Assumption-loaded tree · demo'));
+      host.appendChild(el('div', { 'class': 'doc-chips' }, [docBandBadge(null, d.root.confidence), docBadge('fragility ' + Math.round(d.root.fragility * 100) + '%', d.root.fragility > 0.5 ? 'crit' : 'warn'), demoChip(true)]));
+      host.appendChild(el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-row-text', text: d.query })]));
+      var assumTone = function (load) { return load <= 0.25 ? 'ok' : (load <= 0.5 ? 'warn' : 'crit'); };
+      (function walkNode(node, depth) {
+        var row = el('div', { 'class': 'doc-dep-node', style: 'margin-left:' + (depth * 16) + 'px' });
+        row.appendChild(el('div', { 'class': 'doc-chips' }, [docDot(assumTone(node.assumptionLoad)), el('span', { 'class': 'doc-row-title', text: node.label }), node.trunkTier ? docBadge('T' + node.trunkTier, '') : null, docBadge(node.type, node.type === 'assumption' ? 'warn' : '')].filter(Boolean)));
+        if (node.sublabel) { row.appendChild(el('div', { 'class': 'doc-row-text', text: node.sublabel })); }
+        row.appendChild(docCovBar('confidence', node.confidence));
+        host.appendChild(row);
+        (node.children || []).forEach(function (c) { walkNode(c, depth + 1); });
+      })(d.root, 0);
     }
-    walkNode(d.root, 0);
-    main.appendChild(el('p', { 'class': 'ctl-desc', text: 'Assumption load: green ≤25% grounded · amber ≤50% · red assumption-heavy. Beam = confidence.' }));
-    main.appendChild(demoChip(true));
+
+    function run() {
+      var raw = String(input.value || '').trim();
+      if (!raw) { return; }
+      var seeds = raw.split(/[,\s]+/).map(function (x) { return parseInt(x, 10); }).filter(function (n) { return !isNaN(n); });
+      if (!seeds.length) { return; }
+      out.textContent = '';
+      out.appendChild(el('p', { 'class': 'ctl-desc', text: 'Expanding…' }));
+      readPost('queryGraphExpand', { tenant_id: 'default', seed_artifact_ids: seeds, max_hops: 2, budget: 50, include_state: true }).then(function (res) {
+        out.textContent = '';
+        var d = (res.ok && res.data) ? res.data : null;
+        var arts = (d && d.artifacts) || [];
+        if (!d || !arts.length) {
+          var why;
+          if (res.status === 0) { why = 'Graph unreachable.'; }
+          else if (!res.ok) { why = 'Graph-expand unavailable' + (res.data && res.data.detail ? ' — ' + res.data.detail : ' (CORECRUXD_QUERY_GRAPH_EXPAND)') + '.'; }
+          else { why = 'No dependencies from seed(s) ' + seeds.join(', ') + '.'; }
+          out.appendChild(el('div', { 'class': 'doc-cov doc-cov-warn', text: why }));
+          depsDemo(out, 'No live graph. Enable demo data (?demo=1) to preview the assumption-loaded tree.');
+          return;
+        }
+        var stats = d.traversal_stats || {};
+        out.appendChild(docSection('Dependency graph · ' + arts.length + ' node(s) · /v1/query/graph-expand'));
+        out.appendChild(el('div', { 'class': 'doc-chips' }, [docBadge('seeds ' + seeds.join(', '), 'trust'), docBadge((stats.hops_used != null ? stats.hops_used : '?') + ' hops', ''), docBadge((stats.edges_traversed != null ? stats.edges_traversed : '?') + ' edges', '')]));
+        arts.slice().sort(function (a, b) { return (a.hop_distance || 0) - (b.hop_distance || 0); }).forEach(function (a) {
+          var row = el('div', { 'class': 'doc-dep-node', style: 'margin-left:' + ((a.hop_distance || 0) * 16) + 'px' });
+          var chips = [docDot(''), el('span', { 'class': 'doc-row-title', text: 'artefact ' + a.artifact_id }), docBadge('hop ' + (a.hop_distance != null ? a.hop_distance : '?'), '')];
+          if (a.state && a.state.living_status) { chips.push(docStatusChip(a.state.living_status)); }
+          if (a.state && a.state.trunk_tier != null) { chips.push(docBadge('T' + a.state.trunk_tier, '')); }
+          (a.edge_types_used || []).forEach(function (et) { chips.push(docBadge(String(et).replace(/_/g, ' '), '')); });
+          row.appendChild(el('div', { 'class': 'doc-chips' }, chips));
+          if (a.state && a.state.confidence != null) { row.appendChild(docCovBar('confidence', a.state.confidence)); }
+          else if (a.score != null) { row.appendChild(docCovBar('score', a.score)); }
+          out.appendChild(row);
+        });
+      });
+    }
+    runBtn.addEventListener('click', run);
+    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { run(); } });
+    depsDemo(out, null);
   }
 
   // ---- 6 · Signals (demo surface — epistemic status-change feed) ----------

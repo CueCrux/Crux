@@ -1590,7 +1590,7 @@
     watch: { source_line: 696, status: 'real:/v1/activity', component: 'renderDocSurface_watch' },
     ask: { source_line: 860, status: 'real:/v1/query/text-search', component: 'renderDocSurface_ask' },
     living: { source_line: 1250, status: 'real:/v1/admin/projections/artifacts/{id}/state', component: 'renderDocSurface_living' },
-    deps: { source_line: 1487, status: 'demo-surface', component: 'renderDocSurface_deps' },
+    deps: { source_line: 1487, status: 'real:/v1/query/graph-expand', component: 'renderDocSurface_deps' },
     signals: { source_line: 1934, status: 'demo-surface', component: 'renderDocSurface_signals' },
     diff: { source_line: 2074, status: 'real:/v1/activity', component: 'renderDocSurface_diff' },
     sourcing: { source_line: 2268, status: 'demo-surface', component: 'renderDocSurface_sourcing' },
