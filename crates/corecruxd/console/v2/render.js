@@ -3204,6 +3204,14 @@
         readPost('engineSearch', { query: q, top_k: state.topk }).then(function (res) { paintResults(res, explorerEngineCards); });
       }
     }
+    // Carry a query typed into the top-right search field straight into a search.
+    var pending = (typeof window !== 'undefined' && window.CRUX_PENDING_QUERY) || '';
+    if (pending) {
+      if (typeof window !== 'undefined') { window.CRUX_PENDING_QUERY = ''; }
+      input.value = pending; state.query = pending;
+      region.classList.remove('explorer-empty');
+      doSearch();
+    }
     // Expose the imperative handle for tests / deep integration (no auto-search).
     return { search: doSearch, state: state };
   }

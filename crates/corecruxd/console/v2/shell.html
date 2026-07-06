@@ -380,6 +380,27 @@
   .rail-meta .icon-chip { padding: 0; min-width: 22px; justify-content: center; color: var(--ink3); }
   .rail-meta .icon-chip svg { width: 13px; height: 13px; }
   .rail-meta .icon-chip.on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 34%, var(--edge)); }
+  /* Surface toggle row + the theme quick-cycle icon (theme picker is in Settings). */
+  .rail-surface-row { display: flex; gap: 6px; align-items: stretch; }
+  .rail-surface-row .railseg { flex: 1; }
+  .rail-theme-cycle {
+    flex: none; width: 38px; display: inline-flex; align-items: center; justify-content: center;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+    color: var(--ink2); cursor: pointer; transition: background .18s ease, color .18s ease, border-color .18s ease;
+  }
+  .rail-theme-cycle:hover { color: var(--ink); border-color: var(--edge-strong); background: var(--surface); }
+  .rail-theme-cycle svg { width: 17px; height: 17px; }
+  /* Settings › Theme picker */
+  .theme-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .theme-opt { display: flex; flex-direction: column; gap: 8px; }
+  .theme-opt-btn {
+    display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 0 14px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+    color: var(--ink2); cursor: pointer; font-weight: 500;
+  }
+  .theme-opt-btn svg { width: 18px; height: 18px; flex: none; }
+  .theme-opt-btn[aria-pressed="true"] { color: var(--ink); border-color: var(--acc); background: color-mix(in srgb, var(--acc) 12%, var(--surface2)); }
+  .theme-cycle-toggle { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--ink3); cursor: pointer; }
   @media (min-width: 721px) {
     :root[data-rail="collapsed"] .rail-meta { display: none; }
   }
@@ -390,13 +411,17 @@
     margin-left: auto; display: inline-flex; align-items: center; gap: 10px;
     height: 38px; padding: 0 14px; width: 320px; max-width: 42%;
     border: 1px solid var(--edge); border-radius: var(--radius-sm);
-    background: var(--surface2); color: var(--ink3); font-size: 13px; cursor: pointer;
+    background: var(--surface2); color: var(--ink3); font-size: 13px;
     transition: border-color .18s ease, color .18s ease;
   }
-  .searchstub:hover { border-color: var(--edge-strong); color: var(--ink2); }
+  .searchstub:focus-within { border-color: var(--edge-strong); color: var(--ink2); }
   .searchstub .ss-ico { display: inline-flex; width: 15px; height: 15px; flex: none; }
   .searchstub .ss-ico svg { width: 15px; height: 15px; }
-  .searchstub .ss-ph { flex: 1; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .searchstub .ss-input {
+    flex: 1; min-width: 0; border: 0; background: none; outline: none;
+    color: var(--ink); font: inherit; font-size: 13px;
+  }
+  .searchstub .ss-input::placeholder { color: var(--ink3); }
   .searchstub kbd {
     font-family: var(--font-mono); font-size: 10px; color: var(--ink2); flex: none;
     padding: 2px 6px; border: 1px solid var(--edge); border-radius: 5px;
@@ -410,12 +435,12 @@
   .nav-item[aria-current="page"] .nav-glyph { opacity: 1; color: var(--acc); }
   /* Explorer surface — centred in the page and wider than the default surface
      column (overrides the 920/900 surface widths for the search experience). */
-  .doc-surface-main.explorer-surface { max-width: 1040px; margin: 0 auto; }
+  .doc-surface-main.explorer-surface { width: 100%; max-width: 1240px; margin: 0 auto; }
   .doc-surface-main.explorer-surface .explorer-region { max-width: 100%; }
   .explorer-region.explorer-empty { min-height: 60vh; display: flex; flex-direction: column; justify-content: center; }
-  .explorer-region .explorer-controls { max-width: 720px; width: 100%; margin: 0 auto; }
+  .explorer-region .explorer-controls { max-width: 1120px; width: 100%; margin: 0 auto; }
   .explorer-region .explorer-results,
-  .explorer-region .explorer-detail { width: 100%; }
+  .explorer-region .explorer-detail { max-width: 1120px; width: 100%; margin: 0 auto; }
   .explorer-region.explorer-empty .explorer-results { text-align: center; }
   /* Result cards are clickable → open the detail page. */
   .explorer-card { cursor: pointer; transition: border-color .15s ease, background .15s ease; }
@@ -1276,15 +1301,26 @@
      posture-independent. */
   .explorer-region { display: flex; flex-direction: column; gap: 16px; max-width: 900px; }
   .explorer-controls { display: flex; flex-direction: column; gap: 12px; }
-  .explorer-search { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .explorer-search { display: flex; gap: 10px; flex-wrap: nowrap; align-items: center; }
   .explorer-input {
-    flex: 1 1 260px; min-width: 0; min-height: 38px; padding: 0 12px;
+    flex: 1 1 auto; min-width: 0; min-height: 42px; padding: 0 14px;
     background: var(--surface2); border: 1px solid var(--edge); border-radius: 8px;
     color: var(--ink); font: inherit; font-size: 14px;
   }
   .explorer-input:focus { border-color: var(--edge-strong); outline: none; }
-  .explorer-toggle { display: flex; gap: 6px; flex-wrap: wrap; }
-  .explorer-toggle .btn-quiet { min-height: 34px; padding: 0 14px; font-size: 13px; }
+  /* Local | WikiCrux backend selector — a segmented toggle pinned to the right end. */
+  .explorer-toggle {
+    display: inline-flex; gap: 3px; flex: none; padding: 3px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+  }
+  .explorer-toggle .btn-quiet {
+    min-height: 34px; padding: 0 14px; font-size: 12.5px;
+    border: 1px solid transparent; border-radius: 8px;
+  }
+  .explorer-toggle .btn-quiet[aria-pressed="true"] {
+    background: var(--surface); color: var(--ink); border-color: var(--edge-strong);
+  }
+  @media (max-width: 620px) { .explorer-search { flex-wrap: wrap; } }
   .explorer-budget { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink3); }
   .explorer-budget input {
     width: 84px; min-height: 32px; padding: 0 8px; background: var(--surface2);
@@ -1474,7 +1510,10 @@
       <!-- Compact meta cluster (condensed from the old top bar): the Command |
            Explore surface toggle + the status chips + the connection pill. -->
       <div class="rail-meta" id="railMeta">
-        <div class="modeseg railseg" id="modeSeg" role="group" aria-label="Surface"></div>
+        <div class="rail-surface-row">
+          <div class="modeseg railseg" id="modeSeg" role="group" aria-label="Surface"></div>
+          <button class="rail-theme-cycle" id="themeCycle" type="button" title="Cycle theme" aria-label="Cycle theme"></button>
+        </div>
         <div class="rail-chips">
           <div class="topchips" id="topchips"></div>
           <span class="health" id="health" role="status" aria-live="polite">
@@ -1492,7 +1531,6 @@
             <span id="passportSub">not yet wired</span>
           </span>
         </div>
-        <div class="theme-switch" id="themeSwitch" role="group" aria-label="Colour theme"></div>
       </div>
     </aside>
 
@@ -1502,11 +1540,11 @@
           <h1 id="destTitle">Overwatch</h1>
           <p class="sub" id="destSub">Loading…</p>
         </div>
-        <button class="searchstub" id="searchStub" type="button" aria-label="Search — facts, plans, receipts">
+        <form class="searchstub" id="searchStub" role="search" aria-label="Search">
           <span class="ss-ico" aria-hidden="true"></span>
-          <span class="ss-ph">Search facts, plans, receipts…</span>
+          <input class="ss-input" id="searchStubInput" type="search" placeholder="Search facts, plans, receipts…" aria-label="Search query" autocomplete="off">
           <kbd>⌘K</kbd>
-        </button>
+        </form>
       </div>
       <div class="content" id="content"></div>
     </main>
@@ -1548,6 +1586,7 @@
     search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>',
     map: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="5" rx="1.4"/><rect x="3" y="16" width="6" height="5" rx="1.4"/><rect x="15" y="16" width="6" height="5" rx="1.4"/><path d="M12 8v4M6 16v-2.5h12V16"/></svg>',
     lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>',
+    palette: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 0 18c1 0 1.6-.8 1.6-1.7 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.1 0-.9.8-1.7 1.7-1.7H16a5 5 0 0 0 5-5c0-4.1-4-7.3-9-7.3z"/><circle cx="7.5" cy="11.5" r="1"/><circle cx="12" cy="8" r="1"/><circle cx="16.5" cy="11.5" r="1"/></svg>',
     dataplane: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12a7.5 7.5 0 0 1 15 0"/><path d="M8 12a4 4 0 0 1 8 0"/><circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none"/></svg>',
     settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>',
     integrations: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v6"/><path d="M8 9V5M16 9V5"/><rect x="6" y="9" width="12" height="6" rx="2"/><path d="M12 15v3a3 3 0 0 0 3 3"/></svg>',
@@ -1593,14 +1632,73 @@
     try { var t = localStorage.getItem(LS_THEME); return themeById(t) ? t : DEFAULT_THEME; }
     catch (e) { return DEFAULT_THEME; }
   }
+  // Which themes the rail quick-cycle button rotates through (allocated in
+  // System › Settings › Theme). Defaults to all themes; never empty.
+  var LS_THEME_CYCLE = 'crux.console.theme.cycle';
+  function allThemeIds() { return THEMES.map(function (t) { return t.id; }); }
+  function readThemeCycle() {
+    try {
+      var raw = localStorage.getItem(LS_THEME_CYCLE);
+      if (!raw) { return allThemeIds(); }
+      var ids = raw.split(',').filter(function (id) { return themeById(id); });
+      return ids.length ? ids : allThemeIds();
+    } catch (e) { return allThemeIds(); }
+  }
+  function writeThemeCycle(ids) { try { localStorage.setItem(LS_THEME_CYCLE, ids.join(',')); } catch (e) { /* private mode */ } }
   function applyTheme(id) {
     if (!themeById(id)) id = DEFAULT_THEME;
     document.documentElement.setAttribute('data-theme', id);
     try { localStorage.setItem(LS_THEME, id); } catch (e) { /* private mode: in-memory only */ }
-    var btns = document.querySelectorAll('#themeSwitch .theme-btn');
+    var btns = document.querySelectorAll('.theme-btn');
     for (var i = 0; i < btns.length; i++) {
       btns[i].setAttribute('aria-pressed', btns[i].getAttribute('data-theme') === id ? 'true' : 'false');
     }
+    var cyc = document.getElementById('themeCycle');
+    if (cyc) { var t = themeById(id); cyc.title = 'Theme: ' + (t ? t.label : id) + ' — click to cycle'; }
+  }
+  // Advance to the next allocated theme (rail cycle button).
+  function cycleTheme() {
+    var cycle = readThemeCycle();
+    if (!cycle.length) { return; }
+    var idx = cycle.indexOf(readTheme());
+    applyTheme(cycle[(idx + 1) % cycle.length]);
+  }
+  function initThemeCycle() {
+    var cyc = document.getElementById('themeCycle');
+    if (!cyc) { return; }
+    cyc.innerHTML = ICONS.palette || '';
+    cyc.addEventListener('click', cycleTheme);
+    applyTheme(readTheme());   // set the tooltip
+  }
+  // System › Settings › Theme — the theme picker (moved off the rail footer) plus
+  // per-theme "in cycle" allocation for the rail quick-cycle button.
+  function buildThemeCard() {
+    var card = el('div', { 'class': 'v2card wide theme-card' });
+    card.appendChild(el('h3', { 'class': 'v2card-h' }, ['Theme']));
+    card.appendChild(el('p', { 'class': 'v2card-sub' }, ['Pick the console theme, and choose which themes the quick-cycle button (top of the rail) rotates through.']));
+    var body = el('div', { 'class': 'v2card-body' });
+    var cur = readTheme();
+    var cycle = readThemeCycle();
+    var grid = el('div', { 'class': 'theme-grid' });
+    THEMES.forEach(function (t) {
+      var btn = el('button', { 'class': 'theme-btn theme-opt-btn', type: 'button', 'data-theme': t.id, 'aria-pressed': cur === t.id ? 'true' : 'false', title: t.label + ' theme' });
+      btn.innerHTML = ICONS[t.icon] || '';
+      btn.appendChild(el('span', { 'class': 'theme-opt-label', text: t.label }));
+      btn.addEventListener('click', function () { applyTheme(t.id); });
+      var cb = el('input', { type: 'checkbox' });
+      cb.checked = cycle.indexOf(t.id) >= 0;
+      cb.addEventListener('change', function () {
+        var want = readThemeCycle();
+        want = allThemeIds().filter(function (id) { return id === t.id ? cb.checked : want.indexOf(id) >= 0; });
+        if (!want.length) { want = [t.id]; cb.checked = true; }
+        writeThemeCycle(want);
+      });
+      var inc = el('label', { 'class': 'theme-cycle-toggle' }, [cb, el('span', { text: 'in cycle' })]);
+      grid.appendChild(el('div', { 'class': 'theme-opt' }, [btn, inc]));
+    });
+    body.appendChild(grid);
+    card.appendChild(body);
+    return card;
   }
 
   // ---- Presentation mode registry (Standard | Professional | Documents) --
@@ -1726,13 +1824,28 @@
     window.addEventListener('scroll', onScroll, { passive: true });
     onScroll();
   }
-  // Top-right search stub → the Explorer corpus-search destination (⌘K target).
+  // Top-right search field. Type + Enter (submit) carries the query into the
+  // Explorer surface (via CRUX_PENDING_QUERY, consumed by render.renderExplorer).
+  // ⌘K / Ctrl+K focuses the field.
   function initSearchStub() {
-    var btn = document.getElementById('searchStub');
-    if (!btn) { return; }
-    var ico = btn.querySelector('.ss-ico');
+    var form = document.getElementById('searchStub');
+    if (!form) { return; }
+    var ico = form.querySelector('.ss-ico');
     if (ico) { ico.innerHTML = ICONS.search; }
-    btn.addEventListener('click', function () { location.hash = '#/explorer'; });
+    var input = document.getElementById('searchStubInput');
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      var q = (input && input.value || '').trim();
+      if (typeof window !== 'undefined') { window.CRUX_PENDING_QUERY = q; }
+      if (input) { input.value = ''; input.blur(); }
+      if (/^#\/documents\/explorer/.test(location.hash || '')) { route(); }
+      else { location.hash = '#/documents/explorer'; }
+    });
+    document.addEventListener('keydown', function (e) {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+        e.preventDefault(); if (input) { input.focus(); input.select(); }
+      }
+    });
   }
   // The Command-density preference control, injected at the top of System ›
   // Settings (Standard | Professional). Presentation only — never posture.
@@ -2089,13 +2202,12 @@
   // (desktop) and the sheet (phone) — one instance, so applyTheme's #themeSwitch
   // query and passport updates keep working after the move.
   function placeMobileChrome(isPhone) {
-    var themeSwitch = document.getElementById('themeSwitch');
     var passport = document.getElementById('passportChip');
     var slot = document.getElementById('sheetChromeSlot');
     var footer = document.querySelector('.rail-footer');
-    if (!themeSwitch || !passport) { return; }
-    if (isPhone && slot) { slot.appendChild(passport); slot.appendChild(themeSwitch); }
-    else if (footer) { footer.appendChild(passport); footer.appendChild(themeSwitch); }
+    if (!passport) { return; }
+    if (isPhone && slot) { slot.appendChild(passport); }
+    else if (footer) { footer.appendChild(passport); }
   }
 
   // ---- Sub-nav (pill row) + page render ----------------------------------
@@ -2220,7 +2332,7 @@
     }
     if (destId !== 'overwatch') { content.appendChild(buildSubnav(destId, pageId)); }
     // Settings owns the Command-density switch (moved off the top-level toggle).
-    if (destId === 'system' && page && page.id === 'cx-settings') { content.appendChild(buildDensityCard()); }
+    if (destId === 'system' && page && page.id === 'cx-settings') { content.appendChild(buildDensityCard()); content.appendChild(buildThemeCard()); }
     var host = el('div', { 'class': 'page-host', id: 'pageHost' });
     content.appendChild(host);
     if (window.CruxRender && page) { window.CruxRender.renderPage(page, host); }
@@ -2386,7 +2498,7 @@
     initSearchStub();   // wire the top-right search stub → Explorer
     wireTopbarScroll(); // transparent top bar → glass on scroll
     buildRail();
-    buildThemeSwitch();
+    initThemeCycle();          // rail theme-cycle icon (theme picker lives in Settings)
     applyTheme(readTheme());
     initRail();       // collapsible rail (persisted, desktop-only)
     setTopChips();    // paint the DEMO chip (+ any cached facts) immediately
