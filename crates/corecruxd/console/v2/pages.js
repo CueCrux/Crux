@@ -1588,7 +1588,7 @@
   var JSX_PORT = {
     proof: { source_line: 246, status: 'real:reader (/v1/console/tenants+/v1/console/facts+/v1/activity)', component: 'renderDocuments' },
     watch: { source_line: 696, status: 'real:/v1/activity', component: 'renderDocSurface_watch' },
-    ask: { source_line: 860, status: 'demo-surface', component: 'renderDocSurface_ask' },
+    ask: { source_line: 860, status: 'real:/v1/query/text-search', component: 'renderDocSurface_ask' },
     living: { source_line: 1250, status: 'demo-surface', component: 'renderDocSurface_living' },
     deps: { source_line: 1487, status: 'demo-surface', component: 'renderDocSurface_deps' },
     signals: { source_line: 1934, status: 'demo-surface', component: 'renderDocSurface_signals' },

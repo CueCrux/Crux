@@ -2554,35 +2554,81 @@
     });
   }
 
-  // ---- 3 · Ask (demo surface — no live answer endpoint on this daemon) -----
+  // Coverage band label from a 0..1 score (retrieval coverage → High/Medium/Low).
+  function covBandLabel(score) { var s = Number(score) || 0; return s > 0.66 ? 'High' : (s > 0.33 ? 'Medium' : 'Low'); }
+
+  // ---- 3 · Ask (real: /v1/query/text-search — retrieval + coverage) --------
+  // Ask runs a live BM25 retrieval over the local corpus (the same read-POST the
+  // Explorer uses) and shows REAL coverage + evidence hits. Answer COMPOSITION
+  // (claims · verdict · narrative) needs the reasoning engine, which the community
+  // daemon doesn't ship — that canvas stays an honest demoOn() preview.
   function renderDocSurface_ask(main, ctx) {
-    docSurfaceHead(main, '◇', 'Ask', 'A verified answer canvas — claims linked to evidence, every iteration receipted.');
-    var d = surfaceDemo('ask');
-    if (!d) { docSurfaceEmpty(main, 'Ask has no live answer endpoint on this daemon build. Enable demo data (?demo=1) to preview the answer canvas.'); return; }
-    main.appendChild(el('div', { 'class': 'doc-chips' }, [docModeTag(d.mode || 'verified'), docBandBadge(d.cov && d.cov.label, d.cov && d.cov.score), demoChip(true)]));
-    main.appendChild(el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-row-text', text: d.query })]));
-    if (d.thread && d.thread.length) {
-      main.appendChild(docSection('Thread · ' + d.thread.length + ' iterations'));
-      var strip = el('div', { 'class': 'doc-chips' });
-      d.thread.forEach(function (t) { strip.appendChild(docBadge(t.label, t.type === 'ask' ? 'trust' : (t.type === 'alter_query' ? '' : 'warn'))); });
-      main.appendChild(strip);
+    docSurfaceHead(main, '◇', 'Ask', 'Query the corpus — real BM25 retrieval + coverage; every hit receipt-addressable.');
+    var bar = el('div', { 'class': 'doc-card', style: 'display:flex;gap:10px;align-items:center;' });
+    var input = el('input', { 'class': 'ctl-input', type: 'text', placeholder: 'Ask the corpus…', style: 'flex:1;min-width:0;' });
+    var runBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Ask']);
+    bar.appendChild(input); bar.appendChild(runBtn);
+    main.appendChild(bar);
+    var out = el('div', { 'class': 'doc-ev-host' });
+    main.appendChild(out);
+
+    function askDemoCanvas(host, note) {
+      var d = surfaceDemo('ask');
+      if (!d) { docSurfaceEmpty(host, note || 'Type a question to run a live retrieval. Enable demo data (?demo=1) to preview the verified-answer canvas.'); return; }
+      host.appendChild(docSection('Verified-answer canvas · preview'));
+      host.appendChild(el('div', { 'class': 'doc-chips' }, [docModeTag(d.mode || 'verified'), docBandBadge(d.cov && d.cov.label, d.cov && d.cov.score), demoChip(true)]));
+      host.appendChild(el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-row-text', text: d.query })]));
+      var ans = el('div', { 'class': 'doc-card' });
+      (d.paragraphs || []).forEach(function (p) { ans.appendChild(el('p', { 'class': 'doc-chunk-text', text: p })); });
+      host.appendChild(ans);
+      host.appendChild(docSection('Claims (' + (d.claims || []).length + ')'));
+      (d.claims || []).forEach(function (cl) {
+        host.appendChild(el('div', { 'class': 'doc-claim-row' }, [docDot(cl.status === 'contested' ? 'warn' : 'ok'), el('span', { 'class': 'doc-row-text', text: cl.text }), el('span', { 'class': 'doc-chunk-claims', text: cl.id })]));
+      });
+      host.appendChild(el('p', { 'class': 'ctl-desc', text: 'Claim ↔ evidence composition needs the reasoning engine (not in the community daemon).' }));
     }
-    main.appendChild(docSection('Answer'));
-    var ans = el('div', { 'class': 'doc-card' });
-    (d.paragraphs || []).forEach(function (p) { ans.appendChild(el('p', { 'class': 'doc-chunk-text', text: p })); });
-    main.appendChild(ans);
-    main.appendChild(docSection('Claims (' + (d.claims || []).length + ')'));
-    (d.claims || []).forEach(function (cl) {
-      main.appendChild(el('div', { 'class': 'doc-claim-row' }, [docDot(cl.status === 'contested' ? 'warn' : 'ok'), el('span', { 'class': 'doc-row-text', text: cl.text }), el('span', { 'class': 'doc-chunk-claims', text: cl.id })]));
-    });
-    main.appendChild(docSection('Evidence (' + (d.evidence || []).length + ')'));
-    (d.evidence || []).forEach(function (e) { main.appendChild(docEvidenceCard({ role: e.role === 'primary' ? 'support' : (e.role === 'context' ? 'context' : 'support'), domain: e.domain, summary: e.title, source: e.role, score: e.score })); });
-    main.appendChild(docSection('Coverage'));
-    var cov = el('div', { 'class': 'doc-card' }, [docBandBadge(d.cov && d.cov.label, d.cov && d.cov.score)]);
-    var comp = (d.cov && d.cov.comp) || {};
-    ['retrieval', 'domains', 'temporal', 'clusters'].forEach(function (k) { if (comp[k] != null) { cov.appendChild(docCovBar(k, comp[k])); } });
-    main.appendChild(cov);
-    main.appendChild(demoChip(true));
+
+    function run() {
+      var q = String(input.value || '').trim();
+      if (!q) { return; }
+      out.textContent = '';
+      out.appendChild(el('p', { 'class': 'ctl-desc', text: 'Retrieving…' }));
+      readPost('queryTextSearch', { query: q, tenant_id: 'default', token_budget: 1500 }).then(function (res) {
+        out.textContent = '';
+        var d = (res.ok && res.data) ? res.data : null;
+        var hits = (d && (d.results || d.hits)) || [];
+        if (!d || !hits.length) {
+          var why;
+          if (res.status === 0) { why = 'Retrieval unreachable.'; }
+          else if (!res.ok) { why = 'Retrieval lane unavailable' + (res.data && res.data.detail ? ' — ' + res.data.detail : ' (CORECRUXD_QUERY_TEXT_SEARCH)') + '.'; }
+          else { why = 'No hits for "' + q + '".'; }
+          out.appendChild(el('p', { 'class': 'ctl-desc', text: why }));
+          askDemoCanvas(out, 'No live results. Enable demo data (?demo=1) to preview the verified-answer canvas.');
+          return;
+        }
+        var cov = d.coverage || {};
+        out.appendChild(docSection('Coverage · /v1/query/text-search'));
+        var covCard = el('div', { 'class': 'doc-card' }, [docBandBadge(covBandLabel(cov.score), cov.score)]);
+        if (cov.score != null) { covCard.appendChild(docCovBar('retrieval', cov.score)); }
+        if (cov.below_floor) { covCard.appendChild(el('div', { 'class': 'doc-cov doc-cov-warn', text: cov.below_floor + ' hit(s) below the score floor' })); }
+        out.appendChild(covCard);
+        out.appendChild(docSection('Evidence (' + hits.length + ')'));
+        hits.slice(0, 20).forEach(function (h) {
+          out.appendChild(docEvidenceCard({
+            role: 'support',
+            domain: h.source_label || 'local_tenant_index',
+            summary: h.result_id || ((h.segment_index != null ? h.segment_index : '?') + ':' + (h.doc_id != null ? h.doc_id : '?')),
+            source: h.score_space || 'bm25-lexical',
+            score: h.score
+          }));
+        });
+        out.appendChild(el('p', { 'class': 'ctl-desc', text: 'Local BM25 hits carry an id + score, not stored text. Answer composition (claims · verdict) needs the reasoning engine.' }));
+      });
+    }
+    runBtn.addEventListener('click', run);
+    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { run(); } });
+    // Before the first query, show the honest demo canvas (or an empty prompt).
+    askDemoCanvas(out, null);
   }
 
   // ---- 4 · Living Objects (demo surface) ---------------------------------
