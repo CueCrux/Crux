@@ -1403,11 +1403,10 @@
   }
 
   /* ---- Canvas relation graph — card nodes + node inspector --------------- */
-  .canvas-graph { display: grid; grid-template-columns: 1fr 440px; gap: 14px; align-items: stretch; }
+  .canvas-graph { position: relative; }
+  /* No frame — nodes drop straight onto the page; the stage is just the pannable area. */
   .canvas-graph-stage {
-    position: relative; min-height: 640px; height: 72vh; overflow: hidden;
-    border: 1px solid var(--edge); border-radius: var(--radius);
-    background: radial-gradient(120% 80% at 25% 0%, color-mix(in srgb, var(--acc) 6%, var(--surface2)), var(--surface2));
+    position: relative; min-height: 640px; height: 74vh; overflow: hidden;
     touch-action: none; cursor: grab;
   }
   .canvas-graph-stage:active { cursor: grabbing; }
@@ -1438,12 +1437,23 @@
   .cv-card-title { margin-top: 5px; font-size: 13px; font-weight: 640; line-height: 1.3; color: var(--ink); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; word-break: break-word; }
   .cv-card-sub { margin-top: 4px; font-size: 11px; color: var(--ink3); }
   .cv-card-id { margin-top: 6px; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  /* Node inspector (right rail) */
+  /* Node inspector — slides in from the right edge on node click; pin keeps it. */
   .canvas-graph-inspector {
-    padding: 16px 18px; border: 1px solid var(--edge); border-radius: var(--radius);
-    background: var(--surface); box-shadow: var(--card-shadow); min-width: 0;
-    display: flex; flex-direction: column; gap: 10px; align-self: start; max-height: 78vh; overflow: auto;
+    position: absolute; top: 0; right: 0; bottom: 0; width: 420px; max-width: 92%;
+    display: flex; flex-direction: column; min-width: 0; z-index: 4;
+    border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: -14px 0 44px rgba(0,0,0,.42);
+    transform: translateX(calc(100% + 28px)); opacity: 0; pointer-events: none;
+    transition: transform .28s cubic-bezier(.4,0,.2,1), opacity .24s ease;
   }
+  .canvas-graph-inspector.is-open { transform: translateX(0); opacity: 1; pointer-events: auto; }
+  .cv-insp-topbar { display: flex; align-items: center; gap: 8px; padding: 13px 14px 11px; border-bottom: 1px solid var(--edge); flex: none; }
+  .cv-insp-topbar .canvas-insp-type { flex: 1; }
+  .cv-insp-btn { width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid transparent; border-radius: 7px; background: none; color: var(--ink3); cursor: pointer; transition: color .15s ease, background .15s ease, border-color .15s ease; }
+  .cv-insp-btn:hover { color: var(--ink); background: var(--surface2); border-color: var(--edge); }
+  .cv-insp-btn svg { width: 15px; height: 15px; }
+  .cv-insp-pin[aria-pressed="true"] { color: var(--acc); background: color-mix(in srgb, var(--acc) 14%, transparent); border-color: color-mix(in srgb, var(--acc) 40%, transparent); }
+  .cv-insp-body { flex: 1; overflow: auto; padding: 14px 16px 18px; display: flex; flex-direction: column; gap: 10px; }
   .canvas-insp-type { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink3); font-weight: 600; }
   .cv-insp-badges { display: flex; gap: 6px; align-items: center; }
   .cv-badge { font-family: var(--font-mono); font-size: 9px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px; }
@@ -1464,7 +1474,7 @@
   .cv-linked-sub { margin-left: auto; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); flex: none; }
   /* "View graph" cross-feature launch link — a small nav-family button. */
   .cx-graphlink { min-height: 30px; padding: 0 11px; font-size: 12px; align-self: flex-start; }
-  @media (max-width: 900px) { .canvas-graph { grid-template-columns: 1fr; } }
+  @media (max-width: 720px) { .canvas-graph-inspector { width: 100%; max-width: 100%; } }
 
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation: none !important; transition: none !important; }

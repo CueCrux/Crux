@@ -1962,9 +1962,9 @@
     }
     return null;
   }
+  // Fills the inspector BODY (the topbar with the pin/close lives in the panel shell).
   function graphInspector(inspector, n, model) {
     inspector.textContent = '';
-    inspector.appendChild(el('div', { 'class': 'canvas-insp-type', text: 'Node inspector' }));
     var badges = el('div', { 'class': 'cv-insp-badges' }, [el('span', { 'class': 'cv-badge cv-badge-type', text: n.type })]);
     var state = (n.extra && n.extra.state) || n.strip;
     if (state) { badges.appendChild(el('span', { 'class': 'cv-badge cv-badge-state', text: String(state) })); }
@@ -2003,7 +2003,7 @@
   }
 
   var __canvasGraphCleanup = null;
-  function drawGraph(stage, inspector, model, focus) {
+  function drawGraph(stage, onSelect, model, focus) {
     stage.textContent = '';
     if (!model.nodes.length) { stage.appendChild(el('p', { 'class': 'ctl-desc', text: 'No graph yet — no sessions / work / passports available.' })); return; }
     var dims = layoutGraph(model.nodes);
@@ -2035,7 +2035,7 @@
       if (n.sub) { card.appendChild(el('div', { 'class': 'cv-card-sub', text: n.sub })); }
       var idline = (n.extra && n.extra.session_id) || (n.type === 'work' ? n.id : null);
       if (idline) { card.appendChild(el('div', { 'class': 'cv-card-id', text: idline })); }
-      function open() { select(n.key); graphInspector(inspector, n, model); }
+      function open() { select(n.key); onSelect(n); }
       card.addEventListener('click', function (ev) { ev.stopPropagation(); open(); });
       card.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); } });
       layer.appendChild(card); cardEls[n.key] = card;
@@ -2046,6 +2046,11 @@
     function apply() { layer.style.transform = 'translate(' + view.tx + 'px,' + view.ty + 'px) scale(' + view.scale + ')'; }
     apply();
     function select(key) {
+      if (key == null) {
+        Object.keys(cardEls).forEach(function (k) { cardEls[k].classList.remove('is-sel'); cardEls[k].classList.remove('is-dim'); });
+        edgeEls.forEach(function (ln) { ln.classList.remove('is-dim'); });
+        return;
+      }
       var nbr = graphNeighbourhood(model.edges, key); nbr[key] = true;
       var hasLinks = Object.keys(nbr).length > 1;   // don't grey the world for an isolated node
       Object.keys(cardEls).forEach(function (k) {
@@ -2055,31 +2060,45 @@
       edgeEls.forEach(function (ln) { ln.classList.toggle('is-dim', hasLinks && !(nbr[ln.__from] && nbr[ln.__to])); });
     }
 
-    // Pan (drag on empty stage) + wheel zoom.
-    var drag = null;
-    stage.addEventListener('mousedown', function (ev) { if (ev.target.closest && ev.target.closest('.cv-card')) { return; } drag = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty }; });
-    function onMove(ev) { if (!drag) { return; } view.tx = drag.tx + (ev.clientX - drag.x); view.ty = drag.ty + (ev.clientY - drag.y); apply(); }
+    // Pan (drag on empty stage) + wheel zoom. A click on empty space (no drag)
+    // deselects — the inspector then slides away unless it's pinned.
+    var drag = null, moved = false;
+    stage.addEventListener('mousedown', function (ev) { if (ev.target.closest && ev.target.closest('.cv-card')) { return; } drag = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty }; moved = false; });
+    stage.addEventListener('click', function (ev) { if (ev.target.closest && ev.target.closest('.cv-card')) { return; } if (!moved) { select(null); onSelect(null); } });
+    function onMove(ev) { if (!drag) { return; } moved = true; view.tx = drag.tx + (ev.clientX - drag.x); view.ty = drag.ty + (ev.clientY - drag.y); apply(); }
     function onUp() { drag = null; }
     stage.addEventListener('wheel', function (ev) { ev.preventDefault(); var f = ev.deltaY < 0 ? 1.1 : 0.9; view.scale = Math.max(0.4, Math.min(2.2, view.scale * f)); apply(); });
     if (typeof window !== 'undefined') { window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp); }
     __canvasGraphCleanup = function () { if (typeof window !== 'undefined') { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); } };
 
-    // Focus deep-link: select + highlight the node's neighbourhood.
+    // Focus deep-link: select + highlight the node's neighbourhood + open panel.
     if (focus && focus.type && focus.id != null) {
       var fn = index[focus.type + ':' + focus.id] || graphMatchNode(model.nodes, focus);
-      if (fn) { select(fn.key); graphInspector(inspector, fn, model); }
+      if (fn) { select(fn.key); onSelect(fn); }
     }
   }
 
   function renderCanvasGraph(host, ctx, focus) {
     host.textContent = '';
     if (__canvasGraphCleanup) { __canvasGraphCleanup(); __canvasGraphCleanup = null; }
+    var model = null;
     var wrap = el('div', { 'class': 'canvas-graph' });
     var stage = el('div', { 'class': 'canvas-graph-stage' }, [el('p', { 'class': 'ctl-desc', text: 'Building graph…' })]);
-    var inspector = el('div', { 'class': 'canvas-graph-inspector' }, [
-      el('div', { 'class': 'canvas-insp-type', text: 'inspector' }),
-      el('p', { 'class': 'ctl-desc', text: 'Click a node to inspect its real fields. Drag to pan · wheel to zoom.' })
-    ]);
+    // Inspector panel — hidden off the right edge; slides in on node click. A pin
+    // keeps it loaded when you click empty space or another surface.
+    var inspector = el('div', { 'class': 'canvas-graph-inspector' });
+    var pinBtn = el('button', { 'class': 'cv-insp-btn cv-insp-pin', type: 'button', title: 'Pin inspector', 'aria-pressed': 'false' });
+    pinBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4h6l-1 6 3 3v2H7v-2l3-3z"/><path d="M12 15v5"/></svg>';
+    var closeBtn = el('button', { 'class': 'cv-insp-btn cv-insp-close', type: 'button', title: 'Close', 'aria-label': 'Close inspector' });
+    closeBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+    var inspBody = el('div', { 'class': 'cv-insp-body' });
+    inspector.appendChild(el('div', { 'class': 'cv-insp-topbar' }, [el('span', { 'class': 'canvas-insp-type', text: 'Node inspector' }), pinBtn, closeBtn]));
+    inspector.appendChild(inspBody);
+    var pinned = false;
+    function setPinned(v) { pinned = v; pinBtn.setAttribute('aria-pressed', v ? 'true' : 'false'); inspector.classList.toggle('is-pinned', v); }
+    function onSelect(n) { if (n) { graphInspector(inspBody, n, model); inspector.classList.add('is-open'); } else if (!pinned) { inspector.classList.remove('is-open'); } }
+    pinBtn.addEventListener('click', function (e) { e.stopPropagation(); setPinned(!pinned); });
+    closeBtn.addEventListener('click', function (e) { e.stopPropagation(); setPinned(false); inspector.classList.remove('is-open'); });
     wrap.appendChild(stage); wrap.appendChild(inspector);
     host.appendChild(wrap);
     return fetchJSON('/v1/projects').then(function (projRes) {
@@ -2106,7 +2125,7 @@
         repos: r[5] || [],
         sessionsSaved: (r[6] && r[6].ok && r[6].data) || null   // /v1/console/sessions — saved session ids
       };
-      var model = buildGraphModel(data);
+      model = buildGraphModel(data);
       if (!model.nodes.length && demoOn()) {
         var demoModel = buildGraphModel({ work: { work: demoData('work') || [] }, gates: { pending: demoData('needsYou') || [] } });
         if (demoModel.nodes.length) {
@@ -2115,7 +2134,7 @@
           if (head) { head.textContent = 'inspector · demo'; }
         }
       }
-      drawGraph(stage, inspector, model, focus);
+      drawGraph(stage, onSelect, model, focus);
     }).catch(function () { stage.textContent = ''; stage.appendChild(el('p', { 'class': 'ctl-desc', text: 'Graph unavailable.' })); });
   }
 
