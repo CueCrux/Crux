@@ -72,13 +72,18 @@ jobs:
       #     and fails the release if any non-loopback egress is attempted.
       #   * demo-receipt-tamper.sh proves CROWN verify-store catches an on-disk
       #     byte flip (pure offline; needs only corecruxctl + jq).
+      #   * assert-context-custody.sh self-runs the exit test — exports a
+      #     passport-signed custody bundle, verifies it offline (positive), then
+      #     proves the offline verifier rejects a one-byte tamper (negative).
+      #     Pure offline; needs only corecruxctl + jq.
       # Linux leg only: strace network tracing is linux-specific; ubuntu-latest
       # ships strace + jq. See the script headers for the CI-wiring rationale.
-      - name: Trust-surface gates (no phone-home + receipt tamper)
+      - name: Trust-surface gates (no phone-home + receipt tamper + custody exit test)
         if: matrix.suffix == 'linux-amd64'
         run: |
           bash scripts/assert-no-phone-home.sh target/release/corecruxd
           CORECRUXCTL=target/release/corecruxctl bash scripts/demo-receipt-tamper.sh
+          CORECRUXCTL=target/release/corecruxctl bash scripts/assert-context-custody.sh
 
       # --- SBOM + keyless signing (ExecPlan crux-supply-chain-attestation-2026-06-11, M3) ---
       # SBOM is generated into dist/ BEFORE packaging so the packaging
