@@ -1612,23 +1612,54 @@
     // build and expanded in decorateTiles (ExecPlans + Token usage + Engine).
     var tileCard = el('div', { 'class': 'ow-tiles' }, [el('p', { 'class': 'v2card-sub', text: 'Loading…' })]);
     root.appendChild(tileCard);
-    // Two columns — LEFT: Needs-you then Fleet (fleet moved under needs-you);
-    // RIGHT: the destination page nav (replaces the suppressed pill row).
-    var cols = el('div', { 'class': 'ow-cols' });
-    var left = el('div', { 'class': 'ow-col' });
-    var right = el('div', { 'class': 'ow-col' });
-    cols.appendChild(left); cols.appendChild(right);
-    root.appendChild(cols);
-    var needs = panel('Needs you', 'loading gate queue…', true);
-    var fleet = panel('Fleet', 'loading live sessions…', false);
-    left.appendChild(needs);
-    left.appendChild(fleet);          // Fleet directly under Needs-you
-    right.appendChild(owPageNav());   // page nav replaces the top pill row
-    return Promise.all([
-      fillTiles(tileCard, ctx),
-      fillNeedsYou(needs),
-      fillFleet(fleet)
-    ]);
+    // Tab row (the Overwatch pages minus Overview) + a content area that swaps
+    // below the tiles. Default = Activity: Needs-you + Fleet (50%) | Activity (50%).
+    var CP = (typeof window !== 'undefined') ? window.CruxPages : null;
+    var PAGES = (CP && CP.PAGES) || {};
+    var order = ['cx-activity', 'cx-coord', 'cx-orchestrators', 'cx-punchcards', 'ax-agent'];
+    var tabs = [];
+    order.forEach(function (id) { var p = PAGES[id]; if (p && p.dest === 'overwatch') { tabs.push({ id: id, title: p.title }); } });
+    Object.keys(PAGES).forEach(function (id) {
+      var p = PAGES[id];
+      if (p && p.dest === 'overwatch' && id !== 'cx-overview' && order.indexOf(id) < 0) { tabs.push({ id: id, title: p.title }); }
+    });
+    var tabBar = el('div', { 'class': 'ow-tabs', role: 'tablist', 'aria-label': 'Overwatch views' });
+    var content = el('div', { 'class': 'ow-tabcontent' });
+    root.appendChild(tabBar); root.appendChild(content);
+    var tabBtns = {}, active = tabs.length ? tabs[0].id : null;
+    tabs.forEach(function (t) {
+      var b = el('button', { 'class': 'ow-tab', type: 'button', role: 'tab', 'data-tab': t.id, 'aria-selected': t.id === active ? 'true' : 'false' }, [t.title]);
+      b.addEventListener('click', function () {
+        active = t.id;
+        Object.keys(tabBtns).forEach(function (k) { tabBtns[k].setAttribute('aria-selected', k === t.id ? 'true' : 'false'); });
+        renderTab(t.id);
+      });
+      tabBar.appendChild(b); tabBtns[t.id] = b;
+    });
+    function renderTab(id) {
+      content.textContent = '';
+      var page = PAGES[id];
+      if (id === 'cx-activity') {
+        var cols = el('div', { 'class': 'ow-cols' });
+        var left = el('div', { 'class': 'ow-col' });
+        var right = el('div', { 'class': 'ow-col' });
+        cols.appendChild(left); cols.appendChild(right);
+        content.appendChild(cols);
+        var needs = panel('Needs you', 'loading gate queue…', true);
+        var fleet = panel('Fleet', 'loading live sessions…', false);
+        left.appendChild(needs); left.appendChild(fleet);   // Fleet under Needs-you
+        var actHost = el('div', { 'class': 'page-host' });
+        right.appendChild(actHost);
+        if (page) { renderPage(page, actHost); }
+        fillNeedsYou(needs); fillFleet(fleet);
+        return;
+      }
+      var host = el('div', { 'class': 'page-host' });
+      content.appendChild(host);
+      if (page) { renderPage(page, host); }
+    }
+    if (active) { renderTab(active); }
+    return fillTiles(tileCard, ctx);
   }
 
   // =======================================================================
@@ -3217,7 +3248,7 @@
     function syncToggle() { EXPLORER_BACKENDS.forEach(function (b) { toggleBtns[b.id].setAttribute('aria-pressed', b.id === state.backend ? 'true' : 'false'); }); }
     function relabelBudget() {
       if (state.backend === 'local') { budgetLabel.textContent = 'token budget'; budgetInput.value = String(state.budget); }
-      else { budgetLabel.textContent = 'top_k'; budgetInput.value = String(state.topk); }
+      else { budgetLabel.textContent = 'Number of Results'; budgetInput.value = String(state.topk); }
     }
     input.addEventListener('input', function () { state.query = input.value; scheduleSearch(); });
     budgetInput.addEventListener('input', function () {

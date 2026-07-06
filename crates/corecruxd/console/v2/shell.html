@@ -768,7 +768,18 @@
   .ow-sec .ow-link:hover { text-decoration: underline; }
 
   /* Two-column grid — 7fr left (needs-you → fleet) / 5fr right (page nav). */
-  .ow-cols { display: grid; grid-template-columns: 7fr 5fr; gap: 16px; align-items: start; }
+  .ow-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  /* Overwatch view tabs (under Daemon-at-a-glance) — swap the content below. */
+  .ow-tabs { display: flex; gap: 2px; margin: 8px 0 18px; border-bottom: 1px solid var(--edge); flex-wrap: wrap; }
+  .ow-tab {
+    min-height: 40px; padding: 0 16px; margin-bottom: -1px;
+    background: none; border: 0; border-bottom: 2px solid transparent;
+    color: var(--ink2); font: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer;
+    transition: color .15s ease, border-color .15s ease;
+  }
+  .ow-tab:hover { color: var(--ink); }
+  .ow-tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--acc); }
+  .ow-tabcontent { min-height: 200px; }
   .ow-col { min-width: 0; }
 
   /* Stat tiles — reused from the cx-overview build so the readout never drifts
@@ -1448,7 +1459,9 @@
     position: absolute; top: 0; right: 0; bottom: 0; width: 420px; max-width: 92%;
     display: flex; flex-direction: column; min-width: 0; z-index: 4;
     border: 1px solid var(--edge); border-radius: var(--radius);
-    background: var(--surface); box-shadow: -14px 0 44px rgba(0,0,0,.42);
+    /* Opaque — the surface tint composited over the page bg so nodes don't show through. */
+    background: linear-gradient(var(--surface), var(--surface)), var(--bg);
+    box-shadow: -14px 0 44px rgba(0,0,0,.42);
     transform: translateX(calc(100% + 28px)); opacity: 0; pointer-events: none;
     transition: transform .28s cubic-bezier(.4,0,.2,1), opacity .24s ease;
   }
