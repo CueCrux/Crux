@@ -40,9 +40,12 @@
 //! Grounded from `components.securitySchemes` in the Engine's openapi.json:
 //! `ApiKeyAuth = { type: apiKey, in: header, name: "x-api-key" }`. When
 //! `CORECRUXD_ENGINE_API_KEY` is set we inject `x-api-key: <key>` on the
-//! upstream request. (`TenantHeader` / `x-tenant-id` is a tenant selector, not
-//! an auth header, and is not injected in v1.) The key is never echoed in the
-//! downstream response and upstream response headers are never forwarded.
+//! upstream request. The mediated search additionally injects the corpus
+//! selector `x-tenant-id: <tenant>` — the Engine's `POST /v1/retrieve` rejects
+//! the request with 401 `x-tenant-id is required` otherwise (the tenant also
+//! rides in the body as `tenantId`, but the auth middleware reads the header).
+//! The key is never echoed in the downstream response and upstream response
+//! headers are never forwarded.
 //!
 //! ## Config / posture
 //!
@@ -77,6 +80,9 @@ const ENGINE_BASE_URL_ENV: &str = "CORECRUXD_ENGINE_BASE_URL";
 const ENGINE_API_KEY_ENV: &str = "CORECRUXD_ENGINE_API_KEY";
 /// Grounded from CruxEngine openapi.json `securitySchemes.ApiKeyAuth.name`.
 const ENGINE_API_KEY_HEADER: &str = "x-api-key";
+/// Corpus selector required by CruxEngine `POST /v1/retrieve` (`TenantHeader`);
+/// injected on the mediated search from the resolved corpus tenant.
+const ENGINE_TENANT_HEADER: &str = "x-tenant-id";
 const ENGINE_TIMEOUT_SECS: u64 = 5;
 /// Born-private reserved prefix (see `crate::fact_privacy`).
 const ACCESS_TRAIL_ENTITY: &str = "__ops::engine-proxy";
@@ -194,6 +200,9 @@ pub(super) async fn post_engine_search(
         .unwrap_or(ENGINE_SEARCH_TOP_K_DEFAULT)
         .clamp(1, ENGINE_SEARCH_TOP_K_MAX);
 
+    // The tenant rides both in the body (as `tenantId`) and as the x-tenant-id
+    // header the Engine's auth middleware requires; keep a copy for the header.
+    let tenant_header = tenant.clone();
     // Only the allowlisted fields reach upstream; nothing else from the browser.
     let upstream_body = json!({
         "query": body.query,
@@ -203,8 +212,10 @@ pub(super) async fn post_engine_search(
 
     let url = format!("{base_url}{ENGINE_SEARCH_UPSTREAM_PATH}");
     let api_key = engine_api_key();
-    let fetched =
-        tokio::task::spawn_blocking(move || fetch_upstream_post(&url, api_key.as_deref(), &upstream_body)).await;
+    let fetched = tokio::task::spawn_blocking(move || {
+        fetch_upstream_post(&url, api_key.as_deref(), Some(&tenant_header), &upstream_body)
+    })
+    .await;
 
     let upstream = match fetched {
         Ok(Ok(upstream)) => upstream,
@@ -333,7 +344,7 @@ fn fetch_upstream(url: &str, api_key: Option<&str>) -> Result<Upstream, ()> {
 /// as `fetch_upstream`: any transport error, decode failure, or non-2xx status
 /// returns `Err(())` so no upstream detail (body, headers, or the key) can
 /// escape. The x-api-key is injected here, on the upstream request only.
-fn fetch_upstream_post(url: &str, api_key: Option<&str>, body: &Value) -> Result<Upstream, ()> {
+fn fetch_upstream_post(url: &str, api_key: Option<&str>, tenant: Option<&str>, body: &Value) -> Result<Upstream, ()> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(ENGINE_TIMEOUT_SECS)))
@@ -343,6 +354,9 @@ fn fetch_upstream_post(url: &str, api_key: Option<&str>, body: &Value) -> Result
     let mut request = agent.post(url).header("Accept", "application/json");
     if let Some(key) = api_key {
         request = request.header(ENGINE_API_KEY_HEADER, key);
+    }
+    if let Some(tenant) = tenant {
+        request = request.header(ENGINE_TENANT_HEADER, tenant);
     }
 
     let started = Instant::now();
