@@ -2386,6 +2386,23 @@
   ];
   var DOC_SURFACE_IDS = DOC_SURFACES.map(function (s) { return s.id; });
   function isDocSurface(id) { return DOC_SURFACE_IDS.indexOf(id) >= 0; }
+  // Explore-rail glyphs, drawn in the SAME line-icon style as the Command rail
+  // (viewBox 0 0 24 24, stroke currentColor, stroke-width 1.8, round caps) so the
+  // two menus read as one family. Keyed by surface id (+ 'explorer' for the pin).
+  var SURFACE_ICONS = {
+    explorer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>',
+    proof: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h8l4 4v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v4h4"/><path d="M8.5 13.6l2.2 2.2 4-4.3"/></svg>',
+    watch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>',
+    ask: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 4H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h3v4l5-4h8a1 1 0 0 0 1-1V5a1 1 0 0 0-1-1z"/><path d="M9.6 9.2a2.4 2.4 0 0 1 4.7.7c0 1.6-2.3 1.9-2.3 3.1"/><circle cx="12" cy="15.4" r=".6" fill="currentColor" stroke="none"/></svg>',
+    living: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.6l8 4.4v9.9l-8 4.5-8-4.5V7z"/><path d="M12 12.1l8-4.5M12 12.1v9.8M12 12.1L4 7.6"/></svg>',
+    deps: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6.5" r="2.4"/><circle cx="18" cy="7.5" r="2.4"/><circle cx="12" cy="18" r="2.4"/><path d="M8.1 7.6l2.6 8M15.8 9.3l-2.5 6.9"/></svg>',
+    signals: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5L4.5 13.5H11l-1 8 8.5-11.5H12z"/></svg>',
+    diff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 5L3.5 9.5 8 14"/><path d="M3.5 9.5H15"/><path d="M16 10l4.5 4.5L16 19"/><path d="M20.5 14.5H9"/></svg>',
+    sourcing: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M14.8 9.2l-2 5.6-5.6 2 2-5.6z"/></svg>',
+    lanes: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h16"/><circle cx="8" cy="7" r="1.35" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1.35" fill="currentColor" stroke="none"/><circle cx="10" cy="17" r="1.35" fill="currentColor" stroke="none"/></svg>',
+    domains: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5l9-5.5 9 5.5"/><path d="M5 9.5V18M9.5 9.5V18M14.5 9.5V18M19 9.5V18"/><path d="M3.5 18h17"/></svg>',
+    reverse: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 1 0 2.3-5.6"/><path d="M4 4.5V9h4.5"/></svg>'
+  };
   // Reader docs ('ref:'/'tenant:'/'demo:proof'/null) belong to the Proof surface.
   function surfaceIdOf(docId) { return (docId && isDocSurface(docId)) ? docId : 'proof'; }
 
@@ -2869,18 +2886,22 @@
     host.textContent = '';
     var isExplorer = (activeId === 'explorer');
     var activeSurface = surfaceIdOf(activeId);
-    function navItem(label, glyph, current, target) {
+    function navItem(label, iconKey, current, target) {
+      var glyph = el('span', { 'class': 'nav-glyph', 'aria-hidden': 'true' });
+      glyph.innerHTML = SURFACE_ICONS[iconKey] || '';   // inline SVG, Command-rail style
+      var svg = glyph.querySelector && glyph.querySelector('svg');
+      if (svg) { svg.setAttribute('width', '18'); svg.setAttribute('height', '18'); }
       var b = el('button', { 'class': 'nav-item', type: 'button', 'aria-current': current ? 'page' : 'false' }, [
-        el('span', { 'class': 'nav-glyph', 'aria-hidden': 'true', text: glyph || '' }),
-        el('span', { 'class': 'label', text: label })
+        glyph, el('span', { 'class': 'label', text: label })
       ]);
       b.addEventListener('click', function () { location.hash = target; });
       host.appendChild(b);
     }
-    // Explorer + the surfaces all live in one flat list (no group label).
-    navItem('Explorer', '⌕', isExplorer, '#/documents/explorer');
+    // Explorer + the surfaces all live in one flat list (no group label). Icons
+    // are keyed by surface id (Explorer uses the magnifier, matching Command).
+    navItem('Explorer', 'explorer', isExplorer, '#/documents/explorer');
     DOC_SURFACES.forEach(function (s) {
-      navItem(s.label, s.icon, !isExplorer && s.id === activeSurface, '#/documents/' + s.id);
+      navItem(s.label, s.id, !isExplorer && s.id === activeSurface, '#/documents/' + s.id);
     });
   }
 
