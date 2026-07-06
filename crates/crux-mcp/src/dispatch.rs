@@ -387,8 +387,10 @@ pub async fn dispatch(req: JsonRpcRequest, ctx: &McpContext, _agent: Option<&Age
             }),
         ),
 
-        // Notification — no response required, but we return null result
-        // so the HTTP layer can still send a 200.
+        // Notification — no response is required. The HTTP layer
+        // (`handle_mcp_post`) short-circuits notifications (`id` is `None`) to an
+        // empty `202 Accepted` before dispatch is reached, so this arm is a
+        // defensive fallback for any non-HTTP caller; it returns a null result.
         "notifications/initialized" => JsonRpcResponse::success(req.id, json!(null)),
 
         // ── Tool surface ───────────────────────────────────────────────
