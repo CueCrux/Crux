@@ -1345,7 +1345,7 @@ function extractThemeVars(theme) {
       // (fetchJSON), a named parameterised-read helper (activityRows / fetchVia →
       // CruxApi.<method>), or a curated read-POST (readPost → CruxApiRead). All
       // route through window.Crux* — never a raw fetch.
-      check(/(?:fetchJSON|activityRows|fetchVia|readPost)\(/.test(body),
+      check(/(?:fetchJSON|activityRows|fetchVia|projCall|readPost)\(/.test(body),
         '[honesty] real surface ' + id + ' must read via the api.js client (fetchJSON / named CruxApi method / readPost)');
     } else {
       check(/surfaceDemo\(/.test(body), '[honesty] demo-surface ' + id + ' must read its fixture only via the surfaceDemo() choke point');

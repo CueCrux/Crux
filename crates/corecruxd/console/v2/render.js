@@ -164,6 +164,15 @@
     return fetchVia(api && typeof api.activity === 'function' ? function () { return api.activity(query); } : null);
   }
 
+  // Call a parameterised {id}-path CruxApi method (e.g. the living-object
+  // projection reads adminProjectionsArtifactsByArtifactId{State,Dependents,
+  // Relations,PressureEvents}) → {ok,status,data}. Dataplane-gated on the daemon,
+  // so callers must handle a 501 "dataplane disabled" by degrading honestly.
+  function projCall(method, id, query) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    return fetchVia(api && typeof api[method] === 'function' ? function () { return api[method](id, query); } : null);
+  }
+
   // Repos for one project: GET /v1/projects/{id}/repos via the generated
   // named CruxApi method (a parameterised route — reachable only through the
   // method, never CruxApi.get's literal allowlist). render.js keeps zero raw
@@ -2631,38 +2640,127 @@
     askDemoCanvas(out, null);
   }
 
-  // ---- 4 · Living Objects (demo surface) ---------------------------------
+  // ---- 4 · Living Objects (real: /v1/admin/projections/artifacts/{id}/*) ---
+  // A living object IS an artefact's epistemic projection: living_status,
+  // confidence, pressure, trunk tier, relations, and dependents — where a
+  // dependent typed "mises" is a Minimal Sufficient Evidence Set that cited this
+  // artefact. There is no artefact-LIST route (enumeration is per-id, as in
+  // WebCrux), so the surface hydrates one artefact id at a time from the four
+  // projection reads. Those reads are dataplane-gated (501 "dataplane disabled"
+  // on the CPU-only community daemon) → the surface degrades honestly and shows
+  // the demoOn()-chipped sample so the shape is still legible.
+  function livingRelTone(t) { t = String(t || ''); return t.indexOf('contradict') >= 0 ? 'crit' : (t === 'supports' || t === 'supersedes' ? 'ok' : ''); }
   function renderDocSurface_living(main, ctx) {
-    docSurfaceHead(main, '⬡', 'Living Objects', 'Artefacts with state, subscriptions, pressure, and auto-maintenance.');
-    var list = surfaceDemo('living');
-    if (!list || !list.length) { docSurfaceEmpty(main, 'No living-object endpoint on this daemon build. Enable demo data (?demo=1) to preview artefact state + pressure.'); return; }
-    main.appendChild(demoChip(true));
-    list.forEach(function (a) {
-      main.appendChild(docListCard({
-        chips: [docStatusChip(a.state), docBandBadge(a.confidence), docBadge('T' + a.trunkTier, ''), docBadge(a.lane, ''), a.pressureLevel > 0 ? docBadge('⚡ P' + a.pressureLevel, a.pressureLevel >= 3 ? 'crit' : (a.pressureLevel >= 2 ? 'warn' : '')) : null],
-        title: a.title, text: a.domain, strip: DOC_STATUS[a.state] ? DOC_STATUS[a.state][0] : '',
-        side: [(a.dependents.answers) + 'a · ' + a.dependents.mises + 'm', a.relations.length + ' rels'],
-        detail: function (body) {
-          body.appendChild(docTiles([[String(a.dependents.answers), 'answers'], [String(a.dependents.mises), 'mises'], [String(a.dependents.collections), 'collections']]));
-          if (a.pressure && a.pressure.length) {
-            body.appendChild(docSection('Active pressure'));
-            a.pressure.forEach(function (p) {
-              var tone = p.severity >= 3 ? 'crit' : (p.severity >= 2 ? 'warn' : '');
-              var c = el('div', { 'class': 'doc-card doc-strip doc-strip-' + tone }, [el('div', { 'class': 'doc-chips' }, [docBadge(p.code, tone), docBadge('severity ' + p.severity, tone)])]);
-              c.appendChild(el('div', { 'class': 'doc-row-text', text: p.summary }));
-              c.appendChild(el('div', { 'class': 'doc-cov doc-cov-warn', text: '→ ' + p.action }));
-              body.appendChild(c);
+    docSurfaceHead(main, '⬡', 'Living Objects', 'Artefacts with epistemic state, pressure, relations, and dependents (incl. MiSES — evidence sets that cite them).');
+    var bar = el('div', { 'class': 'doc-card', style: 'display:flex;gap:10px;align-items:center;' });
+    var input = el('input', { 'class': 'ctl-input', type: 'text', placeholder: 'Artefact id (e.g. 42)…', style: 'flex:1;min-width:0;' });
+    var loadBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Load']);
+    bar.appendChild(input); bar.appendChild(loadBtn);
+    main.appendChild(bar);
+    main.appendChild(el('p', { 'class': 'ctl-desc', text: 'Hydrates state · relations · dependents · pressure from /v1/admin/projections/artifacts/{id}/* (a projections/dataplane capability).' }));
+    var out = el('div', { 'class': 'doc-ev-host' });
+    main.appendChild(out);
+
+    // The demoOn() sample list — legible shape when there is no live projection.
+    function livingDemo(host, note) {
+      var list = surfaceDemo('living');
+      if (!list || !list.length) { docSurfaceEmpty(host, note || 'Enter an artefact id to hydrate a living object, or enable demo data (?demo=1) to preview artefact state + pressure.'); return; }
+      host.appendChild(docSection('Sample artefacts · demo'));
+      host.appendChild(demoChip(true));
+      list.forEach(function (a) {
+        host.appendChild(docListCard({
+          chips: [docStatusChip(a.state), docBandBadge(a.confidence), docBadge('T' + a.trunkTier, ''), docBadge(a.lane, ''), a.pressureLevel > 0 ? docBadge('⚡ P' + a.pressureLevel, a.pressureLevel >= 3 ? 'crit' : (a.pressureLevel >= 2 ? 'warn' : '')) : null],
+          title: a.title, text: a.domain, strip: DOC_STATUS[a.state] ? DOC_STATUS[a.state][0] : '',
+          side: [(a.dependents.answers) + 'a · ' + a.dependents.mises + 'm', a.relations.length + ' rels'],
+          detail: function (body) {
+            body.appendChild(docTiles([[String(a.dependents.answers), 'answers'], [String(a.dependents.mises), 'mises'], [String(a.dependents.collections), 'collections']]));
+            if (a.pressure && a.pressure.length) {
+              body.appendChild(docSection('Active pressure'));
+              a.pressure.forEach(function (p) {
+                var tone = p.severity >= 3 ? 'crit' : (p.severity >= 2 ? 'warn' : '');
+                var c = el('div', { 'class': 'doc-card doc-strip doc-strip-' + tone }, [el('div', { 'class': 'doc-chips' }, [docBadge(p.code, tone), docBadge('severity ' + p.severity, tone)])]);
+                c.appendChild(el('div', { 'class': 'doc-row-text', text: p.summary }));
+                c.appendChild(el('div', { 'class': 'doc-cov doc-cov-warn', text: '→ ' + p.action }));
+                body.appendChild(c);
+              });
+            }
+            body.appendChild(docSection('Relations (' + a.relations.length + ')'));
+            a.relations.forEach(function (r) {
+              body.appendChild(el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-chips' }, [docBadge(r.type.replace(/_/g, ' '), livingRelTone(r.type)), docBadge(r.method, '')]), el('div', { 'class': 'doc-row-title', text: r.target }), el('div', { 'class': 'doc-row-text', text: 'confidence ' + Math.round(r.confidence * 100) + '%' })]));
             });
+            body.appendChild(docSection('Version chain'));
+            a.versions.forEach(function (v, i) { body.appendChild(el('div', { 'class': 'doc-receipt' }, [docDot(i === 0 ? 'ok' : ''), el('span', { 'class': 'doc-receipt-label', text: v.v }), el('span', { 'class': 'doc-receipt-ts', text: v.date + ' · ' + v.hash })])); });
           }
-          body.appendChild(docSection('Relations (' + a.relations.length + ')'));
-          a.relations.forEach(function (r) {
-            body.appendChild(el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-chips' }, [docBadge(r.type.replace(/_/g, ' '), r.type.indexOf('contradict') >= 0 ? 'crit' : (r.type === 'supports' || r.type === 'supersedes' ? 'ok' : '')), docBadge(r.method, '')]), el('div', { 'class': 'doc-row-title', text: r.target }), el('div', { 'class': 'doc-row-text', text: 'confidence ' + Math.round(r.confidence * 100) + '%' })]));
-          });
-          body.appendChild(docSection('Version chain'));
-          a.versions.forEach(function (v, i) { body.appendChild(el('div', { 'class': 'doc-receipt' }, [docDot(i === 0 ? 'ok' : ''), el('span', { 'class': 'doc-receipt-label', text: v.v }), el('span', { 'class': 'doc-receipt-ts', text: v.date + ' · ' + v.hash })])); });
+        }));
+      });
+    }
+
+    function load() {
+      var id = String(input.value || '').trim();
+      if (!id) { return; }
+      out.textContent = '';
+      out.appendChild(el('p', { 'class': 'ctl-desc', text: 'Loading artefact ' + id + '…' }));
+      var q = { tenant_id: 'default' };
+      Promise.all([
+        projCall('adminProjectionsArtifactsByArtifactIdState', id, q),
+        projCall('adminProjectionsArtifactsByArtifactIdDependents', id, { tenant_id: 'default', limit: 200 }),
+        projCall('adminProjectionsArtifactsByArtifactIdRelations', id, { tenant_id: 'default', direction: 'out', limit: 200 }),
+        projCall('adminProjectionsArtifactsByArtifactIdPressureEvents', id, { tenant_id: 'default', limit: 200 })
+      ]).then(function (rs) {
+        out.textContent = '';
+        var st = rs[0];
+        if (!st.ok) {
+          var why = st.status === 0 ? 'Projections unreachable.'
+            : ('Living-object projections unavailable' + (st.data && st.data.detail ? ' — ' + st.data.detail : '') + '.');
+          out.appendChild(el('div', { 'class': 'doc-cov doc-cov-warn', text: why }));
+          livingDemo(out, 'Living-object projections need a dataplane build. Enable demo data (?demo=1) to preview artefact state + pressure.');
+          return;
         }
-      }));
-    });
+        var s = st.data || {};
+        if (!s.present) { out.appendChild(el('p', { 'class': 'ctl-desc', text: 'No living object recorded for artefact ' + id + '.' })); livingDemo(out); return; }
+        var deps = (rs[1].data && rs[1].data.dependents) || [];
+        var evs = (rs[3].data && rs[3].data.events) || [];
+        var rels = (rs[2].data && rs[2].data.relations) || [];
+        var byType = { answer: 0, mises: 0, collection: 0, artifact: 0 };
+        deps.forEach(function (d) { if (byType[d.dependent_type] == null) { byType[d.dependent_type] = 0; } byType[d.dependent_type]++; });
+        var c = s.counts || {};
+        out.appendChild(docSection('Living state · artefact ' + id + ' · /v1/admin/projections/artifacts/' + id));
+        out.appendChild(el('div', { 'class': 'doc-chips' }, [
+          docStatusChip(s.living_status || 'dormant'),
+          docBandBadge(covBandLabel(s.confidence), s.confidence),
+          s.trunk_tier != null ? docBadge('T' + s.trunk_tier, '') : null,
+          s.pressure_level > 0 ? docBadge('⚡ P' + s.pressure_level, s.pressure_level >= 3 ? 'crit' : (s.pressure_level >= 2 ? 'warn' : '')) : null
+        ].filter(Boolean)));
+        out.appendChild(docTiles([
+          [String(byType.answer), 'answers'], [String(byType.mises), 'mises'],
+          [String(byType.collection), 'collections'], [String(c.relations_out || 0) + '/' + String(c.relations_in || 0), 'rel out/in']
+        ]));
+        if (evs.length) {
+          out.appendChild(docSection('Pressure events (' + evs.length + ')'));
+          evs.forEach(function (e) {
+            var tone = e.severity >= 4 ? 'crit' : (e.severity >= 2 ? 'warn' : '');
+            var card = el('div', { 'class': 'doc-card doc-strip doc-strip-' + tone }, [el('div', { 'class': 'doc-chips' }, [docBadge('code ' + e.pressure_code_id, tone), docBadge('severity ' + e.severity, tone), e.receipt_id ? docBadge('receipt', 'trust') : null].filter(Boolean))]);
+            card.appendChild(el('div', { 'class': 'doc-cov doc-cov-' + (e.resolved_at_micros ? 'ok' : 'warn'), text: e.resolved_at_micros ? 'resolved' : 'open' }));
+            out.appendChild(card);
+          });
+        }
+        if (rels.length) {
+          out.appendChild(docSection('Relations (' + rels.length + ')'));
+          rels.forEach(function (r) {
+            out.appendChild(el('div', { 'class': 'doc-card' }, [el('div', { 'class': 'doc-chips' }, [docBadge(String(r.relation_type).replace(/_/g, ' '), livingRelTone(r.relation_type)), docBadge('→ ' + r.dst_artifact_id, '')]), docCovBar('confidence', r.confidence)]));
+          });
+        }
+        if (deps.length) {
+          out.appendChild(docSection('Dependents (' + deps.length + ')'));
+          deps.slice(0, 40).forEach(function (d) {
+            out.appendChild(el('div', { 'class': 'doc-claim-row' }, [docDot(d.dependent_type === 'mises' ? 'ok' : ''), el('span', { 'class': 'doc-row-text', text: d.dependent_id }), el('span', { 'class': 'doc-chunk-claims', text: d.dependent_type })]));
+          });
+        }
+      });
+    }
+    loadBtn.addEventListener('click', load);
+    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { load(); } });
+    livingDemo(out, null);
   }
 
   // ---- 5 · Dependencies (demo surface — assumption-loaded dependency tree) -
