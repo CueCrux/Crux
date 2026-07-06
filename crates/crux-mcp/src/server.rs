@@ -143,6 +143,28 @@ async fn handle_mcp_post(State(ctx): State<Arc<McpContext>>, headers: HeaderMap,
         }
     };
 
+    // JSON-RPC notifications carry no `id` and, per the MCP Streamable HTTP
+    // spec, receive no response body — the server acknowledges with an empty
+    // `202 Accepted`. The previous behaviour (a `{"jsonrpc":"2.0","id":null,
+    // "result":null}` body with `200 OK`) is not a valid `JsonRpcMessage`, so
+    // strict native-HTTP clients such as Codex's `rmcp` transport reject it
+    // ("data did not match any variant of untagged enum JsonRpcMessage, when
+    // send initialized notification") — which forced those clients onto a stdio
+    // shim. Ack-and-return keeps native HTTP MCP seamless for any spec-compliant
+    // client. Requests (with an `id`) fall through to dispatch unchanged.
+    if req.id.is_none() {
+        info!(method = %req.method, "mcp notification (202 ack)");
+        let mut response = StatusCode::ACCEPTED.into_response();
+        if let Some(session_id) = &incoming_session {
+            if let Ok(value) = HeaderValue::from_str(session_id) {
+                response
+                    .headers_mut()
+                    .insert(HeaderName::from_static(MCP_SESSION_HEADER), value);
+            }
+        }
+        return response;
+    }
+
     // M3.3: hosted-client OAuth callers (mcp:read) are restricted to the
     // read-only method-allowlist — reject writes before dispatch (default-deny).
     if oauth_read_only {
@@ -500,6 +522,33 @@ mod tests {
         let rpc_resp: JsonRpcResponse = serde_json::from_slice(&body_bytes).unwrap();
         assert!(rpc_resp.error.is_none());
         assert_eq!(rpc_resp.result.as_ref().unwrap()["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn post_notification_returns_202_empty() {
+        // A JSON-RPC notification (no `id`) must get an empty `202 Accepted`,
+        // per the MCP Streamable HTTP spec. The old `200 {id:null,result:null}`
+        // reply broke strict native-HTTP clients (Codex `rmcp`) and is the reason
+        // a stdio shim was needed; this test guards the seamless native path.
+        let app = test_app();
+        let body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body_bytes.is_empty(), "notification ack must have an empty body");
     }
 
     #[tokio::test]
