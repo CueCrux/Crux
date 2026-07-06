@@ -2705,8 +2705,8 @@
       b.addEventListener('click', function () { location.hash = target; });
       host.appendChild(b);
     }
+    // Explorer + the surfaces all live in one flat list (no group label).
     navItem('Explorer', '⌕', isExplorer, '#/documents/explorer');
-    host.appendChild(el('div', { 'class': 'nav-group-label', text: 'Pages' }));
     DOC_SURFACES.forEach(function (s) {
       navItem(s.label, s.icon, !isExplorer && s.id === activeSurface, '#/documents/' + s.id);
     });
@@ -2873,7 +2873,7 @@
       if (raw === 'explorer') {
         if (ctx.railHost) { buildDocTree(ctx.railHost, tenants, 'explorer'); }
         var exWrap = el('div', { 'class': 'doc-reader doc-surface-wrap' });
-        var exMain = el('main', { 'class': 'doc-surface-main' });
+        var exMain = el('main', { 'class': 'doc-surface-main explorer-surface' });
         exWrap.appendChild(exMain);
         host.appendChild(exWrap);
         renderExplorer(exMain, ctx);
@@ -2987,8 +2987,12 @@
     });
   }
   function explorerScoreTone(score) { return score > 0.66 ? 'ok' : (score > 0.33 ? 'warn' : 'ink3'); }
-  function explorerCard(c, demo) {
-    var card = el('div', { 'class': 'explorer-card' });
+  function explorerCard(c, demo, onOpen) {
+    var card = el('div', { 'class': 'explorer-card', role: 'button', tabindex: '0' });
+    if (onOpen) {
+      card.addEventListener('click', function () { onOpen(c); });
+      card.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(c); } });
+    }
     var top = el('div', { 'class': 'explorer-card-top' }, [el('span', { 'class': 'explorer-card-title', text: String(c.title) })]);
     if (typeof c.score === 'number' && isFinite(c.score)) {
       top.appendChild(el('span', { 'class': 'doc-cov doc-cov-' + explorerScoreTone(c.score), text: c.score.toFixed(2) }));
@@ -3146,7 +3150,33 @@
       var sample = demoData('explorer');
       if (!sample || !sample.length) { return; }
       results.appendChild(docSection('Sample results'));
-      sample.forEach(function (c) { results.appendChild(explorerCard(c, true)); });
+      sample.forEach(function (c) { results.appendChild(explorerCard(c, true, showDetail)); });
+    }
+    // Result detail — clicking a result opens it on its own "page". Facts /
+    // execplans / sessions come from the daemon (Command side); articles / living
+    // objects / Proof are Crux Engine (Engine side) — that richer sourcing lands
+    // with the Ask surface wiring.
+    function resetEmpty() {
+      results.textContent = '';
+      results.appendChild(el('p', { 'class': 'ctl-desc', text: 'Type a query to search the corpus.' }));
+      region.classList.add('explorer-empty');
+    }
+    function showDetail(c) {
+      region.classList.remove('explorer-empty');
+      results.textContent = '';
+      var back = el('button', { 'class': 'btn-quiet explorer-back', type: 'button' }, ['← Back to results']);
+      back.addEventListener('click', function () { if (state.query.trim()) { doSearch(); } else { resetEmpty(); } });
+      var head = el('div', { 'class': 'explorer-detail-head' }, [el('h2', { text: String(c.title) })]);
+      if (typeof c.score === 'number' && isFinite(c.score)) { head.appendChild(el('span', { 'class': 'doc-cov doc-cov-' + explorerScoreTone(c.score), text: c.score.toFixed(2) })); }
+      var detail = el('article', { 'class': 'explorer-detail' }, [back, head]);
+      var meta = el('div', { 'class': 'explorer-card-meta' });
+      if (c.source) { meta.appendChild(el('span', { 'class': 'doc-cov doc-cov-trust', text: String(c.source) })); }
+      if (c.tenant) { meta.appendChild(el('span', { 'class': 'ctl-desc', text: 'tenant · ' + c.tenant })); }
+      if (c.rank != null) { meta.appendChild(el('span', { 'class': 'ctl-desc', text: '#' + c.rank })); }
+      if (meta.childNodes.length) { detail.appendChild(meta); }
+      detail.appendChild(el('p', { 'class': 'explorer-detail-body', text: String(c.snippet || c.text || 'No further detail on this result yet.') }));
+      detail.appendChild(el('p', { 'class': 'ctl-desc', text: 'Full detail is sourced from the Crux Engine (Ask surface) — wiring in progress.' }));
+      results.appendChild(detail);
     }
     function paintResults(res, mapper) {
       region.classList.remove('explorer-empty');   // a search ran — dock to the top
@@ -3161,7 +3191,7 @@
       }
       var cards = mapper(res.data);
       if (!cards.length) { results.appendChild(el('p', { 'class': 'ctl-desc', text: 'No results for “' + state.query.trim() + '”.' })); return; }
-      cards.forEach(function (c) { results.appendChild(explorerCard(c, false)); });
+      cards.forEach(function (c) { results.appendChild(explorerCard(c, false, showDetail)); });
     }
     function doSearch() {
       var q = state.query.trim();

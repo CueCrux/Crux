@@ -408,10 +408,22 @@
     align-items: center; justify-content: center; font-size: 14px; line-height: 1; opacity: .9;
   }
   .nav-item[aria-current="page"] .nav-glyph { opacity: 1; color: var(--acc); }
-  /* Explorer empty state — the search docks to the vertical middle until a query runs. */
+  /* Explorer surface — centred in the page and wider than the default surface
+     column (overrides the 920/900 surface widths for the search experience). */
+  .doc-surface-main.explorer-surface { max-width: 1040px; margin: 0 auto; }
+  .doc-surface-main.explorer-surface .explorer-region { max-width: 100%; }
   .explorer-region.explorer-empty { min-height: 60vh; display: flex; flex-direction: column; justify-content: center; }
-  .explorer-region.explorer-empty .explorer-controls { max-width: 620px; width: 100%; margin: 0 auto; }
+  .explorer-region .explorer-controls { max-width: 720px; width: 100%; margin: 0 auto; }
+  .explorer-region .explorer-results,
+  .explorer-region .explorer-detail { width: 100%; }
   .explorer-region.explorer-empty .explorer-results { text-align: center; }
+  /* Result cards are clickable → open the detail page. */
+  .explorer-card { cursor: pointer; transition: border-color .15s ease, background .15s ease; }
+  .explorer-card:hover { border-color: var(--edge-strong); background: var(--surface); }
+  .explorer-back { margin-bottom: 14px; }
+  .explorer-detail-head { display: flex; align-items: baseline; gap: 12px; }
+  .explorer-detail-head h2 { margin: 0; font-size: 20px; font-weight: 650; }
+  .explorer-detail-body { margin: 12px 0; font-size: 14px; line-height: 1.6; color: var(--ink); }
   .health { gap: 8px; }
   .health .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink3); flex: none; }
   .health.ok .dot { background: var(--ok); }
@@ -2277,8 +2289,11 @@
   // it into #nav) and render the reader into #content. Presentation only.
   function renderDocumentsRoute(docId) {
     RAIL_MODE = 'docs';
-    document.getElementById('destTitle').textContent = 'Documents';
-    document.getElementById('destSub').textContent = 'Reader — real corpora + bundled reference docs';
+    var isExplorer = (docId === 'explorer');
+    document.getElementById('destTitle').textContent = isExplorer ? 'Explorer' : 'Documents';
+    document.getElementById('destSub').textContent = isExplorer
+      ? 'search facts, living objects and articles across the corpus'
+      : 'Reader — real corpora + bundled reference docs';
     var content = document.getElementById('content');
     content.textContent = '';
     var host = el('div', { 'class': 'doc-region-host', id: 'docHost' });
