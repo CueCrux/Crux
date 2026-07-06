@@ -1834,17 +1834,46 @@
   //             passport_id, intent.execplan_slug, intent.milestone) — 404-tolerant
   //   repos    (GET /v1/projects/{id}/repos → .links[]: owner,repo,role,plane_id)
   // Real edges only: an edge is kept ONLY when BOTH endpoints resolved to a node.
+  function graphRelTime(ms) {
+    var n = Number(ms); if (!isFinite(n) || n <= 0) { return null; }
+    var diff = Date.now() - n; if (diff < 0) { diff = 0; }
+    var s = Math.floor(diff / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
+    if (d >= 1) { return d + 'd ago'; } if (h >= 1) { return h + 'h ago'; } if (m >= 1) { return m + 'm ago'; } return 'just now';
+  }
+  function sessionKind(id) {
+    id = String(id);
+    if (id.indexOf('handoff:') === 0) { return 'handoff'; }
+    if (id.indexOf('execplan:') === 0) { return 'execplan'; }
+    if (id.indexOf('hook:session:') === 0) { return 'hook'; }
+    if (id.indexOf('orchestrate') === 0) { return 'orchestrator'; }
+    return 'session';
+  }
   function buildGraphModel(data) {
     data = data || {};
     var nodes = [], edges = [], index = {};
-    function add(type, rawId, label, extra) {
+    function add(type, rawId, label, extra, opts) {
       if (rawId == null || rawId === '') { return null; }
       var key = type + ':' + rawId;
       if (index[key]) { return index[key]; }
-      var n = { key: key, type: type, id: rawId, label: label || String(rawId), extra: extra || {} };
+      opts = opts || {};
+      var n = { key: key, type: type, id: rawId, label: label || String(rawId), extra: extra || {},
+        sub: opts.sub || null, raw: opts.raw || null, strip: opts.strip || null };
       index[key] = n; nodes.push(n); return n;
     }
     function edge(from, to, kind) { if (from && to) { edges.push({ from: from, to: to, kind: kind }); } }
+
+    // Saved sessions — the real /v1/console/sessions list (id strings). The card
+    // shows the id + derived kind; deeper per-session fields land when the daemon
+    // exposes them (coord/active is empty at rest locally).
+    var savedList = (data.sessionsSaved && (data.sessionsSaved.sessions || data.sessionsSaved.items)) || [];
+    (Array.isArray(savedList) ? savedList : []).slice(0, 18).forEach(function (item) {
+      var sid = (typeof item === 'string') ? item : (item && (item.session_id || item.id));
+      if (!sid) { return; }
+      var kind = sessionKind(sid);
+      add('session', sid, sid, { session_id: sid, kind: kind, state: 'idle' },
+        { sub: kind + ' · saved', strip: 'idle',
+          raw: { session_id: sid, kind: kind, state: 'idle', archived: false, source: '/v1/console/sessions' } });
+    });
 
     var projects = (data.projects && data.projects.projects) || [];
     projects.forEach(function (p) {
@@ -1860,8 +1889,10 @@
 
     var work = (data.work && (data.work.work || data.work.items)) || [];
     work.forEach(function (w) {
-      var n = add('work', w.id, w.title || w.id, { state: w.state, risk: w.risk_class, milestone: w.current_milestone });
-      if (n) { n.strip = workStageLite(w); }
+      var when = graphRelTime(w.updated_at_unix_ms || w.created_at_unix_ms);
+      add('work', w.id, w.title || w.id, { state: w.state, project: w.project_id, created_by: w.created_by_passport, milestone: w.current_milestone },
+        { strip: workStageLite(w), raw: w,
+          sub: (w.state || 'work') + (w.created_by_passport ? (' · ' + w.created_by_passport) : '') + (when ? (' · ' + when) : '') });
       if (w.project_id) { edge('work:' + w.id, 'project:' + w.project_id, 'in-project'); }
       if (w.created_by_passport) { edge('work:' + w.id, 'passport:' + w.created_by_passport, 'created-by'); }
       if (w.assignee_passport) { edge('work:' + w.id, 'passport:' + w.assignee_passport, 'assigned-to'); }
@@ -1899,23 +1930,21 @@
 
   // Deterministic layered layout — columns by node type. No random seed: node
   // positions are a pure function of type + insertion order (replayable).
+  // Card layout — columns by type (sessions lead, matching the concept). Each
+  // node carries its top-left x/y + card w/h; edges connect card centres.
   function layoutGraph(nodes) {
-    var COLS = ['project', 'work', 'gate', 'passport', 'session', 'repo'];
+    var COLS = ['session', 'work', 'gate', 'project', 'passport', 'repo'];
+    var CARD_W = 300, CARD_H = 106;
     var byType = {};
-    COLS.forEach(function (t) { byType[t] = []; });
     nodes.forEach(function (n) { (byType[n.type] || (byType[n.type] = [])).push(n); });
-    var colGap = 210, rowGap = 44, marginX = 90, marginY = 46;
-    var maxRows = 1;
-    COLS.forEach(function (t) { maxRows = Math.max(maxRows, byType[t].length); });
-    var height = marginY * 2 + Math.max(0, maxRows - 1) * rowGap;
-    var width = marginX * 2 + (COLS.length - 1) * colGap;
-    COLS.forEach(function (t, ci) {
-      var list = byType[t] || [];
-      var colH = Math.max(0, list.length - 1) * rowGap;
-      var y0 = marginY + ((height - marginY * 2) - colH) / 2;
-      list.forEach(function (n, ri) { n.x = marginX + ci * colGap; n.y = y0 + ri * rowGap; });
+    var used = COLS.filter(function (t) { return (byType[t] || []).length; });
+    Object.keys(byType).forEach(function (t) { if (used.indexOf(t) < 0) { used.push(t); } });
+    var colGap = CARD_W + 96, rowGap = CARD_H + 22, marginX = 26, marginY = 26, maxRows = 0;
+    used.forEach(function (t) { maxRows = Math.max(maxRows, (byType[t] || []).length); });
+    used.forEach(function (t, ci) {
+      (byType[t] || []).forEach(function (n, ri) { n.x = marginX + ci * colGap; n.y = marginY + ri * rowGap; n.w = CARD_W; n.h = CARD_H; });
     });
-    return { width: width, height: height };
+    return { width: marginX * 2 + Math.max(1, used.length) * colGap, height: marginY * 2 + Math.max(1, maxRows) * rowGap };
   }
   function graphNodeRadius(type) { return type === 'project' ? 9 : (type === 'work' ? 8 : 6); }
   function graphNeighbourhood(edges, key) {
@@ -1933,77 +1962,112 @@
     }
     return null;
   }
-  function graphInspector(inspector, n) {
+  function graphInspector(inspector, n, model) {
     inspector.textContent = '';
-    inspector.appendChild(el('div', { 'class': 'canvas-insp-type', text: n.type }));
-    inspector.appendChild(el('h3', { 'class': 'v2card-h', text: n.label }));
+    inspector.appendChild(el('div', { 'class': 'canvas-insp-type', text: 'Node inspector' }));
+    var badges = el('div', { 'class': 'cv-insp-badges' }, [el('span', { 'class': 'cv-badge cv-badge-type', text: n.type })]);
+    var state = (n.extra && n.extra.state) || n.strip;
+    if (state) { badges.appendChild(el('span', { 'class': 'cv-badge cv-badge-state', text: String(state) })); }
+    inspector.appendChild(badges);
+    inspector.appendChild(el('h3', { 'class': 'cv-insp-title', text: n.label }));
+    if (n.sub) { inspector.appendChild(el('p', { 'class': 'cv-insp-sub', text: n.sub })); }
+    var fields = el('div', { 'class': 'cv-insp-fields' });
     var rows = [['id', n.id]];
     Object.keys(n.extra || {}).forEach(function (k) { rows.push([k, n.extra[k]]); });
-    rows.forEach(function (kvp) { if (kvp[1] == null || kvp[1] === '') { return; } inspector.appendChild(kv(kvp[0], kvp[1])); });
+    rows.forEach(function (kvp) {
+      if (kvp[1] == null || kvp[1] === '') { return; }
+      fields.appendChild(el('div', { 'class': 'cv-field' }, [el('span', { 'class': 'cv-field-k', text: kvp[0] }), el('span', { 'class': 'cv-field-v', text: String(kvp[1]) })]));
+    });
+    inspector.appendChild(fields);
+    if (n.raw) { inspector.appendChild(el('pre', { 'class': 'cv-insp-json', text: JSON.stringify(n.raw, null, 2) })); }
+    if (model) {
+      var idx = {}; model.nodes.forEach(function (x) { idx[x.key] = x; });
+      var seen = {}, links = [];
+      model.edges.forEach(function (e) {
+        var other = e.from === n.key ? e.to : (e.to === n.key ? e.from : null);
+        if (other && idx[other] && !seen[other]) { seen[other] = true; links.push(idx[other]); }
+      });
+      if (links.length) {
+        inspector.appendChild(el('div', { 'class': 'cv-insp-linked-h', text: 'Linked' }));
+        links.forEach(function (ln) {
+          var item = el('div', { 'class': 'cv-linked-item', role: 'button', tabindex: '0' }, [
+            el('span', { 'class': 'cv-linked-dot' }),
+            el('span', { 'class': 'cv-linked-label', text: ln.label }),
+            el('span', { 'class': 'cv-linked-sub', text: ln.type })
+          ]);
+          item.addEventListener('click', function () { graphInspector(inspector, ln, model); });
+          inspector.appendChild(item);
+        });
+      }
+    }
   }
 
   var __canvasGraphCleanup = null;
   function drawGraph(stage, inspector, model, focus) {
     stage.textContent = '';
-    if (!model.nodes.length) { stage.appendChild(el('p', { 'class': 'ctl-desc', text: 'No graph yet — no projects / work / passports available.' })); return; }
+    if (!model.nodes.length) { stage.appendChild(el('p', { 'class': 'ctl-desc', text: 'No graph yet — no sessions / work / passports available.' })); return; }
     var dims = layoutGraph(model.nodes);
     var index = {}; model.nodes.forEach(function (n) { index[n.key] = n; });
-    var svg = svgEl('svg', { 'class': 'canvas-graph-svg', role: 'img', 'aria-label': 'Relation graph — projects, work, gates, passports, sessions' });
-    var g = svgEl('g', { 'class': 'canvas-graph-g' });
-    svg.appendChild(g);
-    var VW = Math.max(dims.width + 180, 900), VH = Math.max(dims.height + 120, 520);
-    svg.setAttribute('viewBox', '0 0 ' + VW + ' ' + VH);
-    svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
-
+    // One transformed layer holds the SVG edge canvas + the HTML node cards, so
+    // pan/zoom moves cards and edges together.
+    var layer = el('div', { 'class': 'cv-graph-layer' });
+    layer.style.width = dims.width + 'px'; layer.style.height = dims.height + 'px';
+    var svg = svgEl('svg', { 'class': 'cv-graph-edges', width: dims.width, height: dims.height, 'aria-hidden': 'true' });
+    layer.appendChild(svg);
+    function cx(n) { return n.x + (n.w || 300) / 2; }
+    function cy(n) { return n.y + (n.h || 106) / 2; }
     var edgeEls = [];
     model.edges.forEach(function (e) {
-      var a = index[e.from], b = index[e.to];
-      if (!a || !b) { return; }
-      var ln = svgEl('line', { 'class': 'cx-gedge', x1: a.x, y1: a.y, x2: b.x, y2: b.y });
-      ln.__from = e.from; ln.__to = e.to;
-      g.appendChild(ln); edgeEls.push(ln);
+      var a = index[e.from], b = index[e.to]; if (!a || !b) { return; }
+      var ln = svgEl('path', { 'class': 'cv-gedge', d: 'M' + cx(a) + ' ' + cy(a) + ' L' + cx(b) + ' ' + cy(b) });
+      ln.__from = e.from; ln.__to = e.to; svg.appendChild(ln); edgeEls.push(ln);
     });
-    var nodeEls = {};
+    var cardEls = {};
     model.nodes.forEach(function (n) {
-      var grp = svgEl('g', { 'class': 'cx-gnodewrap', 'data-key': n.key, tabindex: '0', role: 'button' });
-      var r = graphNodeRadius(n.type);
-      var c = svgEl('circle', { 'class': 'cx-gnode g-' + n.type, cx: n.x, cy: n.y, r: r });
-      if (n.type === 'work' && n.strip) { c.setAttribute('data-strip', n.strip); }
-      var lab = svgEl('text', { 'class': 'cx-glabel', x: n.x + r + 4, y: n.y + 3 });
-      lab.textContent = n.label;
-      grp.appendChild(c); grp.appendChild(lab);
-      grp.appendChild(svgEl('title', {})).textContent = n.type + ' · ' + n.label;
-      function open() { graphInspector(inspector, n); highlight(n.key); }
-      grp.addEventListener('click', open);
-      grp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); } });
-      g.appendChild(grp); nodeEls[n.key] = grp;
+      var card = el('div', { 'class': 'cv-card', 'data-type': n.type, role: 'button', tabindex: '0' });
+      if (n.strip) { card.setAttribute('data-strip', n.strip); }
+      card.style.left = n.x + 'px'; card.style.top = n.y + 'px';
+      var head = el('div', { 'class': 'cv-card-head' }, [el('span', { 'class': 'cv-card-kind', text: (n.extra && n.extra.kind) || n.type })]);
+      var badge = (n.extra && n.extra.state) || n.strip;
+      if (badge) { head.appendChild(el('span', { 'class': 'cv-card-badge', text: String(badge) })); }
+      card.appendChild(head);
+      card.appendChild(el('div', { 'class': 'cv-card-title', text: n.label }));
+      if (n.sub) { card.appendChild(el('div', { 'class': 'cv-card-sub', text: n.sub })); }
+      var idline = (n.extra && n.extra.session_id) || (n.type === 'work' ? n.id : null);
+      if (idline) { card.appendChild(el('div', { 'class': 'cv-card-id', text: idline })); }
+      function open() { select(n.key); graphInspector(inspector, n, model); }
+      card.addEventListener('click', function (ev) { ev.stopPropagation(); open(); });
+      card.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); } });
+      layer.appendChild(card); cardEls[n.key] = card;
     });
+    stage.appendChild(layer);
 
-    var view = { tx: 0, ty: 0, scale: 1 };
-    function apply() { g.setAttribute('transform', 'translate(' + view.tx + ',' + view.ty + ') scale(' + view.scale + ')'); }
-    function highlight(key) {
+    var view = { tx: 16, ty: 16, scale: 1 };
+    function apply() { layer.style.transform = 'translate(' + view.tx + 'px,' + view.ty + 'px) scale(' + view.scale + ')'; }
+    apply();
+    function select(key) {
       var nbr = graphNeighbourhood(model.edges, key); nbr[key] = true;
-      Object.keys(nodeEls).forEach(function (k) { nodeEls[k].classList.toggle('is-dim', !nbr[k]); });
-      edgeEls.forEach(function (ln) { ln.classList.toggle('is-dim', !(nbr[ln.__from] && nbr[ln.__to])); });
+      var hasLinks = Object.keys(nbr).length > 1;   // don't grey the world for an isolated node
+      Object.keys(cardEls).forEach(function (k) {
+        cardEls[k].classList.toggle('is-sel', k === key);
+        cardEls[k].classList.toggle('is-dim', hasLinks && !nbr[k]);
+      });
+      edgeEls.forEach(function (ln) { ln.classList.toggle('is-dim', hasLinks && !(nbr[ln.__from] && nbr[ln.__to])); });
     }
 
-    // Pan (drag) + zoom (wheel) — direct manipulation, nothing animated
-    // (reduced-motion-safe; no CSS transition rides the transform).
+    // Pan (drag on empty stage) + wheel zoom.
     var drag = null;
-    function onDown(ev) { drag = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty }; }
+    stage.addEventListener('mousedown', function (ev) { if (ev.target.closest && ev.target.closest('.cv-card')) { return; } drag = { x: ev.clientX, y: ev.clientY, tx: view.tx, ty: view.ty }; });
     function onMove(ev) { if (!drag) { return; } view.tx = drag.tx + (ev.clientX - drag.x); view.ty = drag.ty + (ev.clientY - drag.y); apply(); }
     function onUp() { drag = null; }
-    svg.addEventListener('mousedown', onDown);
-    svg.addEventListener('wheel', function (ev) { ev.preventDefault(); var f = ev.deltaY < 0 ? 1.1 : 0.9; view.scale = Math.max(0.3, Math.min(3, view.scale * f)); apply(); });
+    stage.addEventListener('wheel', function (ev) { ev.preventDefault(); var f = ev.deltaY < 0 ? 1.1 : 0.9; view.scale = Math.max(0.4, Math.min(2.2, view.scale * f)); apply(); });
     if (typeof window !== 'undefined') { window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp); }
     __canvasGraphCleanup = function () { if (typeof window !== 'undefined') { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); } };
 
-    stage.appendChild(svg);
-
-    // Focus deep-link: centre + highlight the node's neighbourhood, dim the rest.
+    // Focus deep-link: select + highlight the node's neighbourhood.
     if (focus && focus.type && focus.id != null) {
       var fn = index[focus.type + ':' + focus.id] || graphMatchNode(model.nodes, focus);
-      if (fn) { highlight(fn.key); graphInspector(inspector, fn); view.tx = (VW / 2) - fn.x; view.ty = (VH / 2) - fn.y; apply(); }
+      if (fn) { select(fn.key); graphInspector(inspector, fn, model); }
     }
   }
 
@@ -2029,7 +2093,8 @@
         fetchJSON('/v1/work/gate/pending'),
         fetchJSON('/v1/passports'),
         fetchJSON('/v1/coord/active'),
-        Promise.all(repoReqs)
+        Promise.all(repoReqs),
+        fetchJSON('/v1/console/sessions')
       ]);
     }).then(function (r) {
       var data = {
@@ -2038,7 +2103,8 @@
         gates: (r[2].ok && r[2].data) || null,
         passports: (r[3].ok && r[3].data) || null,
         sessions: (r[4].ok && r[4].data) || null,   // /v1/coord/active 404 → null (tolerated)
-        repos: r[5] || []
+        repos: r[5] || [],
+        sessionsSaved: (r[6] && r[6].ok && r[6].data) || null   // /v1/console/sessions — saved session ids
       };
       var model = buildGraphModel(data);
       if (!model.nodes.length && demoOn()) {

@@ -1044,12 +1044,12 @@ function extractThemeVars(theme) {
     const b = funcBody(pagesSrc, fn);
     check(b && /graphLink\(/.test(b), '[graph] ' + fn + ' must carry a "View graph" launch point (graphLink)');
   });
-  // Node styling by type uses theme tokens (project=acc, passport=trust, session=ok, gate=warn).
-  check(/\.g-project\s*\{[^}]*var\(--acc\)/.test(shellHtml) && /\.g-passport\s*\{[^}]*var\(--trust\)/.test(shellHtml) &&
-    /\.g-session\s*\{[^}]*var\(--ok\)/.test(shellHtml) && /\.g-gate\s*\{[^}]*var\(--warn\)/.test(shellHtml),
-    '[graph] node fills must come from theme tokens (project=acc · passport=trust · session=ok · gate=warn)');
-  // Pan (drag) + zoom (wheel).
-  check(/canvas-graph-svg/.test(shellHtml) && /addEventListener\('wheel'/.test(renderSrc) && /addEventListener\('mousedown'/.test(renderSrc),
+  // Card nodes colour by type from theme tokens (project=acc, passport=trust, session=ok, gate=warn).
+  check(/\.cv-card\[data-type="project"\]\s*\{[^}]*var\(--acc\)/.test(shellHtml) && /\.cv-card\[data-type="passport"\]\s*\{[^}]*var\(--trust\)/.test(shellHtml) &&
+    /\.cv-card\[data-type="session"\]\s*\{[^}]*var\(--ok\)/.test(shellHtml) && /\.cv-card\[data-type="gate"\]\s*\{[^}]*var\(--warn\)/.test(shellHtml),
+    '[graph] node cards must colour by type from theme tokens (project=acc · passport=trust · session=ok · gate=warn)');
+  // Pan (drag on the stage) + zoom (wheel).
+  check(/canvas-graph-stage/.test(shellHtml) && /addEventListener\('wheel'/.test(renderSrc) && /addEventListener\('mousedown'/.test(renderSrc),
     '[graph] the graph must support pan (mousedown drag) + zoom (wheel)');
   notes.push('canvas graph: real-edge-only model (grounded fields, dangling edges dropped), deterministic layered layout, pan+zoom, focus parser (work/session/project/passport), launch points on fleet/work/project/gate.');
 })();
