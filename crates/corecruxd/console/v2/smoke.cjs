@@ -832,11 +832,15 @@ function extractThemeVars(theme) {
 //  in every mode because the gate keys on posture, never on data-mode.
 // =========================================================================
 (function checkModeSystem() {
-  // Registry with the three slots (documents reserved / not selectable).
-  check(/var MODES = \[/.test(shellHtml), '[mode] shell.html must declare a MODES registry');
-  ['standard', 'professional', 'documents'].forEach(function (m) {
-    check(new RegExp("id:\\s*'" + m + "'").test(shellHtml), '[mode] MODES must include the "' + m + '" slot');
+  // The visible top-level toggle is the SURFACES registry (Command | Explore).
+  // Command's density (Standard | Professional) is a Settings preference; Explore
+  // is the documents reader. The three underlying presentation modes remain.
+  check(/var SURFACES = \[/.test(shellHtml), '[mode] shell.html must declare a SURFACES registry (Command | Explore)');
+  ['command', 'explore'].forEach(function (s) {
+    check(new RegExp("id:\\s*'" + s + "'").test(shellHtml), '[mode] SURFACES must include the "' + s + '" slot');
   });
+  check(/DEFAULT_MODE = 'standard'/.test(shellHtml) && /'professional'/.test(shellHtml) && /'documents'/.test(shellHtml),
+    '[mode] the standard | professional | documents presentation modes must remain (density + Explore)');
   // M10: the reserved third slot is ACTIVATED — all three modes are selectable
   // (Documents is the console-as-reader). No soon:true / disabled reserved slot
   // remains; buildModeSeg wires every mode to applyMode. (This supersedes the M8
@@ -1061,10 +1065,10 @@ function extractThemeVars(theme) {
 //  standard). (e) posture-independence still statically clean (extends check 23).
 // =========================================================================
 (function checkDocumentsMode() {
-  // (a) Three-mode registry, all enabled.
-  ['standard', 'professional', 'documents'].forEach(function (m) {
-    check(new RegExp("id:\\s*'" + m + "'").test(shellHtml), '[documents] MODES must include the "' + m + '" slot');
-  });
+  // (a) The three presentation modes remain, all enabled — density (standard |
+  // professional) + documents (the Explore reader). The visible toggle is SURFACES.
+  check(/DEFAULT_MODE = 'standard'/.test(shellHtml) && /'professional'/.test(shellHtml) && /id === 'documents'/.test(shellHtml),
+    '[documents] standard | professional | documents modes must remain selectable');
   check(!/soon:\s*true/.test(shellHtml), '[documents] Documents must be activated (no soon:true reserved marker)');
   check(/isSelectableMode/.test(shellHtml) && /id === 'documents'/.test(shellHtml),
     '[documents] applyMode must treat documents as a selectable, paintable mode');
@@ -1236,8 +1240,8 @@ function extractThemeVars(theme) {
     // SYNCHRONOUS assertions — the reader must exist before any fetch resolves.
     check(host.querySelectorAll('.doc-main').length === 1, '[documents] renderDocuments must paint a .doc-main synchronously (daemon-hang case)');
     check(host.querySelectorAll('.doc-reader').length === 1, '[documents] renderDocuments must paint the reader synchronously');
-    check(rail.querySelectorAll('.doc-tree-item').length >= 3, '[documents] renderDocuments must populate the rail document tree synchronously (>=3 reference docs)');
-    notes.push('documents reader (M11): renderDocuments paints .doc-main + a >=3-item tree synchronously under a never-resolving daemon (bug was: whole reader deferred behind /v1/console/tenants).');
+    check(rail.querySelectorAll('.nav-item').length >= 3, '[documents] renderDocuments must populate the Explore rail synchronously (Explorer + surface pages, >=3 nav-items)');
+    notes.push('documents reader (M11): renderDocuments paints .doc-main + a >=3-item Explore rail (Explorer + surface Pages, Command .nav-item style) synchronously under a never-resolving daemon. Docs/corpora reached via Explorer results, not the menu.');
   } catch (e) {
     check(false, '[documents] renderDocuments threw on the synchronous paint: ' + e.message);
   } finally {
@@ -1255,7 +1259,7 @@ function extractThemeVars(theme) {
   const explorer = (pages.DESTS || []).filter(function (d) { return d.id === 'explorer'; })[0];
   check(!!explorer, '[explorer] pages.DESTS must register the explorer destination');
   if (explorer) {
-    check(explorer.key === '8', '[explorer] explorer destination must bind keyboard key "8" (got ' + explorer.key + ')');
+    check(explorer.railHidden === true, '[explorer] explorer destination must be railHidden — reached via the top-right search field + the top of the Explore menu, not the Command rail');
     check(explorer.icon === 'search', '[explorer] explorer destination must use the search icon');
   }
   check(/search:\s*'<svg/.test(shellHtml), '[explorer] shell.html must define the "search" icon glyph');
@@ -1307,7 +1311,7 @@ function extractThemeVars(theme) {
   // surface navigates to #/documents/<id>, and renderDocuments dispatches surfaces.
   check(/DOC_SURFACES\.forEach/.test(renderSrc), '[surfaces] buildDocTree must render the 11-surface nav from DOC_SURFACES');
   check(/isDocSurface/.test(renderSrc) && /renderDocSurface\(/.test(renderSrc), '[surfaces] renderDocuments must dispatch non-Proof surfaces via isDocSurface + renderDocSurface');
-  check(renderSrc.indexOf("'#/documents/' + id") >= 0, '[surfaces] surface nav items must deep-link to #/documents/<id>');
+  check(renderSrc.indexOf("'#/documents/' + s.id") >= 0, '[surfaces] surface nav items must deep-link to #/documents/<id>');
   notes.push('surface port (M12): 11/11 WebCrux surfaces in DOC_SURFACES + JSX_PORT; Proof→reader, 10× renderDocSurface_<id>; rail nav from DOC_SURFACES; #/documents/<id> routes.');
 })();
 

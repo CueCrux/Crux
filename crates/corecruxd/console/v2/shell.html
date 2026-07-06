@@ -186,8 +186,8 @@
   /* Rail collapse toggle — a 44px chevron at the rail top. aria-expanded +
      aria-label are set in JS; the glyph rotates when collapsed. */
   .rail-toggle {
-    display: flex; align-items: center; justify-content: center;
-    min-height: 44px; min-width: 44px; margin: -4px -4px 2px auto;
+    display: flex; align-items: center; justify-content: center; flex: none;
+    min-height: 32px; min-width: 32px; margin-left: auto; margin-right: -2px;
     background: none; border: 1px solid transparent; border-radius: var(--radius-sm);
     color: var(--ink3); cursor: pointer;
     transition: background .18s ease, color .18s ease, border-color .18s ease;
@@ -304,8 +304,9 @@
     :root[data-rail="collapsed"] .rail { padding: 16px 8px; align-items: stretch; }
     :root[data-rail="collapsed"] .rail-toggle { margin: -4px auto 2px; }
     :root[data-rail="collapsed"] .rail-toggle svg { transform: rotate(180deg); }
-    :root[data-rail="collapsed"] .brand { justify-content: center; padding: 4px 0 12px; gap: 0; }
+    :root[data-rail="collapsed"] .brand { flex-direction: column; justify-content: center; padding: 4px 0 12px; gap: 6px; }
     :root[data-rail="collapsed"] .brand .name { display: none; }
+    :root[data-rail="collapsed"] .rail-toggle { margin: 0 auto; }
     :root[data-rail="collapsed"] .nav-item { justify-content: center; padding: 0; gap: 0; }
     :root[data-rail="collapsed"] .nav-item .label,
     :root[data-rail="collapsed"] .nav-item .kbd,
@@ -319,8 +320,14 @@
   .main { min-width: 0; display: flex; flex-direction: column; }
   .topbar {
     display: flex; align-items: center; gap: 16px;
-    padding: 18px 28px; border-bottom: 1px solid var(--edge);
+    padding: 18px 28px; border-bottom: 1px solid transparent;
     position: sticky; top: 0; z-index: 4;
+    background: transparent;
+    transition: background .25s ease, border-color .25s ease, backdrop-filter .25s ease;
+  }
+  /* Glass only once the view scrolls under it (toggled by wireTopbarScroll). */
+  .topbar.scrolled {
+    border-bottom-color: var(--edge);
     background: color-mix(in srgb, var(--bg) 82%, transparent);
     backdrop-filter: blur(var(--blur));
     -webkit-backdrop-filter: blur(var(--blur));
@@ -352,6 +359,59 @@
     background: color-mix(in srgb, var(--warn) 13%, transparent);
     border-color: color-mix(in srgb, var(--warn) 34%, transparent);
   }
+
+  /* ---- Compact rail meta — the old top bar, condensed under the brand ------
+     A full-width Command | Explore surface toggle, then extremely compact
+     wrapped status chips + the connection pill. Hidden when the rail collapses
+     to icon-only. */
+  .rail-meta {
+    display: flex; flex-direction: column; gap: 8px;
+    padding: 2px 8px 12px; margin-bottom: 4px; border-bottom: 1px solid var(--edge);
+  }
+  .railseg { display: flex; gap: 3px; padding: 3px; }
+  .railseg .modeseg-btn { flex: 1; justify-content: center; min-height: 28px; padding: 0 8px; font-size: 12px; }
+  .rail-chips { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  .rail-meta .topchips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .rail-meta .topchip, .rail-meta .health {
+    min-height: 20px; padding: 0 6px; font-size: 9.5px; border-radius: 6px; gap: 5px;
+  }
+  .rail-meta .health .dot { width: 7px; height: 7px; }
+  /* auth + dataplane as compact icon chips (value in the title tooltip). */
+  .rail-meta .icon-chip { padding: 0; min-width: 22px; justify-content: center; color: var(--ink3); }
+  .rail-meta .icon-chip svg { width: 13px; height: 13px; }
+  .rail-meta .icon-chip.on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 34%, var(--edge)); }
+  @media (min-width: 721px) {
+    :root[data-rail="collapsed"] .rail-meta { display: none; }
+  }
+
+  /* ---- Top-bar search stub (page header left · search right) -------------- */
+  .topbar-title { min-width: 0; }
+  .searchstub {
+    margin-left: auto; display: inline-flex; align-items: center; gap: 10px;
+    height: 38px; padding: 0 14px; width: 320px; max-width: 42%;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface2); color: var(--ink3); font-size: 13px; cursor: pointer;
+    transition: border-color .18s ease, color .18s ease;
+  }
+  .searchstub:hover { border-color: var(--edge-strong); color: var(--ink2); }
+  .searchstub .ss-ico { display: inline-flex; width: 15px; height: 15px; flex: none; }
+  .searchstub .ss-ico svg { width: 15px; height: 15px; }
+  .searchstub .ss-ph { flex: 1; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .searchstub kbd {
+    font-family: var(--font-mono); font-size: 10px; color: var(--ink2); flex: none;
+    padding: 2px 6px; border: 1px solid var(--edge); border-radius: 5px;
+  }
+  /* Explore rail reuses the Command .nav-item look; the surface glyph sits in the
+     icon slot (sized to match the 18px SVG icons of the Command rail). */
+  .nav-item .nav-glyph {
+    width: 18px; height: 18px; flex: none; display: inline-flex;
+    align-items: center; justify-content: center; font-size: 14px; line-height: 1; opacity: .9;
+  }
+  .nav-item[aria-current="page"] .nav-glyph { opacity: 1; color: var(--acc); }
+  /* Explorer empty state — the search docks to the vertical middle until a query runs. */
+  .explorer-region.explorer-empty { min-height: 60vh; display: flex; flex-direction: column; justify-content: center; }
+  .explorer-region.explorer-empty .explorer-controls { max-width: 620px; width: 100%; margin: 0 auto; }
+  .explorer-region.explorer-empty .explorer-results { text-align: center; }
   .health { gap: 8px; }
   .health .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink3); flex: none; }
   .health.ok .dot { background: var(--ok); }
@@ -658,7 +718,7 @@
   }
   .ow-tiles .v2card-sub { font-family: var(--font-mono); font-size: 10px; color: var(--ink3); }
   .ow-tiles .v2card-body { margin-top: 12px; }
-  .ow-tiles .stats { gap: 12px; }
+  .ow-tiles .stats { gap: 14px; grid-template-columns: repeat(auto-fill, minmax(184px, 1fr)); }
   .ow-tiles .stat { padding: 13px 15px; border-radius: var(--radius-sm); }
   .ow-tiles .stat .k {
     font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .16em;
@@ -674,6 +734,79 @@
      free-space fraction, never a fabricated series. */
   .ow-tiles .tile-meter { margin-top: 10px; height: 6px; border-radius: 999px; background: var(--surface2); border: 1px solid var(--edge); overflow: hidden; }
   .ow-tiles .tile-meter-fill { height: 100%; background: var(--acc); border-radius: 999px; }
+
+  /* ---- Glance tiles as gradient hero cards (ref: "Today at a glance") -----
+     Each card overrides --acc, which recolours BOTH the background wash and the
+     area chart (chart-line/fill + meter all read var(--acc)) in one place. The
+     appended spark chart is stretched full-bleed along the card bottom. */
+  .ow-tiles .stat {
+    position: relative; overflow: hidden;
+    min-height: 150px; padding: 15px 17px 14px; border-radius: 16px;
+    border: 1px solid color-mix(in srgb, var(--acc) 24%, var(--edge));
+    background:
+      radial-gradient(130% 100% at 100% 105%, color-mix(in srgb, var(--acc) 22%, transparent), transparent 62%),
+      linear-gradient(158deg, color-mix(in srgb, var(--acc) 11%, var(--surface)), var(--surface) 58%);
+  }
+  .ow-tiles .stat .k { position: relative; z-index: 1; color: color-mix(in srgb, var(--acc) 55%, var(--ink2)); }
+  .ow-tiles .stat .v { position: relative; z-index: 1; }
+  /* full-bleed area chart anchored to the card bottom (stretched via
+     preserveAspectRatio="none" on the spark svg) */
+  .ow-tiles .stat .chart-svg.spark {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    width: 100%; height: 48px; margin: 0; opacity: .92;
+  }
+  .ow-tiles .stat .chart-line { stroke-width: 2; }
+  .ow-tiles .stat .chart-dot { display: none; }
+  /* per-card accent hue cycle (top row lands orange · green · violet, matching ref) */
+  .ow-tiles .stat:nth-child(6n+1) { --acc: #e8823c; }
+  .ow-tiles .stat:nth-child(6n+2) { --acc: #34c790; }
+  .ow-tiles .stat:nth-child(6n+3) { --acc: #7c6cf0; }
+  .ow-tiles .stat:nth-child(6n+4) { --acc: #4a9ff0; }
+  .ow-tiles .stat:nth-child(6n+5) { --acc: #e6608a; }
+  .ow-tiles .stat:nth-child(6n+6) { --acc: #d9b23a; }
+  /* Glance header row: title left, Day/Week/Month range toggle pushed right. */
+  .v2card-head-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .v2card-head-row .v2card-h { margin: 0; }
+
+  /* ---- Site map destination (ported from the unified-shell concept) ------
+     A two-column card grid: each destination is a card with a coloured left
+     rail (--sec-c), a mono tagline, and a list of pages with provenance chips
+     and annotation badges. Closes with the census note. */
+  .map-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .map-sec {
+    position: relative; overflow: hidden; padding: 15px 17px 6px;
+    border: 1px solid var(--edge); border-radius: var(--radius);
+    background: var(--surface); box-shadow: var(--card-shadow);
+  }
+  .map-sec::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--sec-c, var(--acc)); }
+  .map-sec > h3 { margin: 0 0 2px; font-size: 14.5px; font-weight: 650; display: flex; align-items: center; gap: 9px; }
+  .map-ico { display: inline-flex; width: 16px; height: 16px; color: var(--sec-c, var(--acc)); flex: none; }
+  .map-ico svg { width: 16px; height: 16px; }
+  .map-h-note { font-family: var(--font-mono); font-size: 9px; color: var(--ink3); font-weight: 500; }
+  .map-sec > .tag { font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); margin-bottom: 10px; }
+  .map-page { padding: 9px 0; border-top: 1px solid var(--edge); }
+  .map-page b { font-size: 12.5px; font-weight: 600; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+  .map-page .why { font-size: 11px; color: var(--ink2); margin-top: 3px; line-height: 1.5; }
+  .provs { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  .prov {
+    font-family: var(--font-mono); font-size: 9px; padding: 1.5px 7px; border-radius: 6px;
+    border: 1px solid var(--edge); color: var(--ink3); background: var(--surface2);
+  }
+  .prov.new { border-color: color-mix(in srgb, var(--trust) 35%, transparent); color: var(--trust); }
+  .anno { font-family: var(--font-mono); font-size: 8.5px; font-weight: 600; letter-spacing: .1em; padding: 2px 7px; border-radius: 6px; }
+  .anno.merge { background: color-mix(in srgb, var(--acc) 14%, transparent); color: var(--acc); }
+  .anno.promote { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ok); }
+  .anno.new { background: color-mix(in srgb, var(--trust) 15%, transparent); color: var(--trust); }
+  .anno.vsw { background: var(--surface2); color: var(--ink2); }
+  .anno.adv { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
+  .map-note {
+    margin-top: 14px; padding: 14px 17px; border-radius: var(--radius);
+    border: 1px solid var(--edge); background: var(--surface); box-shadow: var(--card-shadow);
+    font-size: 12px; color: var(--ink2); line-height: 1.6;
+  }
+  .map-note b { color: var(--ink); }
+  .map-note .mono { font-family: var(--font-mono); font-size: 10px; color: var(--ink2); }
+  @media (max-width: 900px) { .map-grid { grid-template-columns: 1fr; } }
 
   /* Overwatch page nav (right column) — the nav-family section that replaces the
      suppressed sub-nav pill row. Pills stack; active state via the shared .pill
@@ -1321,10 +1454,22 @@
 
   <div class="app">
     <aside class="rail">
-      <button class="rail-toggle" id="railToggle" type="button" aria-expanded="true" aria-label="Collapse navigation" title="Collapse navigation"></button>
       <div class="brand">
         <span class="mark" aria-hidden="true"></span>
         <span class="name">Crux Console<small>Unified shell · v2</small></span>
+        <button class="rail-toggle" id="railToggle" type="button" aria-expanded="true" aria-label="Collapse navigation" title="Collapse navigation"></button>
+      </div>
+      <!-- Compact meta cluster (condensed from the old top bar): the Command |
+           Explore surface toggle + the status chips + the connection pill. -->
+      <div class="rail-meta" id="railMeta">
+        <div class="modeseg railseg" id="modeSeg" role="group" aria-label="Surface"></div>
+        <div class="rail-chips">
+          <div class="topchips" id="topchips"></div>
+          <span class="health" id="health" role="status" aria-live="polite">
+            <span class="dot" aria-hidden="true"></span>
+            <span id="healthText">Connecting…</span>
+          </span>
+        </div>
       </div>
       <nav id="nav" aria-label="Primary"></nav>
       <div class="rail-footer">
@@ -1341,18 +1486,15 @@
 
     <main class="main" id="main">
       <div class="topbar">
-        <div>
+        <div class="topbar-title">
           <h1 id="destTitle">Overwatch</h1>
           <p class="sub" id="destSub">Loading…</p>
         </div>
-        <div class="topbar-right">
-          <div class="modeseg" id="modeSeg" role="group" aria-label="Presentation mode"></div>
-          <div class="topchips" id="topchips"></div>
-          <span class="health" id="health" role="status" aria-live="polite">
-            <span class="dot" aria-hidden="true"></span>
-            <span id="healthText">Connecting…</span>
-          </span>
-        </div>
+        <button class="searchstub" id="searchStub" type="button" aria-label="Search — facts, plans, receipts">
+          <span class="ss-ico" aria-hidden="true"></span>
+          <span class="ss-ph">Search facts, plans, receipts…</span>
+          <kbd>⌘K</kbd>
+        </button>
       </div>
       <div class="content" id="content"></div>
     </main>
@@ -1392,6 +1534,9 @@
     meters: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19a8 8 0 0 1 16 0"/><path d="M12 19l4-5"/><circle cx="12" cy="19" r="1.4"/></svg>',
     canvas: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
     search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>',
+    map: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="5" rx="1.4"/><rect x="3" y="16" width="6" height="5" rx="1.4"/><rect x="15" y="16" width="6" height="5" rx="1.4"/><path d="M12 8v4M6 16v-2.5h12V16"/></svg>',
+    lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>',
+    dataplane: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12a7.5 7.5 0 0 1 15 0"/><path d="M8 12a4 4 0 0 1 8 0"/><circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none"/></svg>',
     settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>',
     integrations: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v6"/><path d="M8 9V5M16 9V5"/><rect x="6" y="9" width="12" height="6" rx="2"/><path d="M12 15v3a3 3 0 0 0 3 3"/></svg>',
     developer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 9l-4 3 4 3"/><path d="M16 9l4 3-4 3"/><path d="M13 6l-2 12"/></svg>',
@@ -1458,39 +1603,52 @@
   // the mode segment is the way back, and a deep link to any #/<destination>
   // auto-switches the mode back to standard (see route()).
   var LS_MODE = 'crux.console.mode';
+  var LS_DENSITY = 'crux.console.density';
   var DEFAULT_MODE = 'standard';
-  var MODES = [
-    { id: 'standard', label: 'Standard' },
-    { id: 'professional', label: 'Professional' },
-    { id: 'documents', label: 'Documents' }   // M10 — the console-as-reader
+  var DEFAULT_DENSITY = 'standard';
+  // Top-level surface toggle: Command (the ops console) | Explore (the reader).
+  // Command's DENSITY (Standard | Professional) is a preference set in System ›
+  // Settings, NOT a top-level button. Explore == the old 'documents' reader
+  // surface. data-mode still carries standard|professional|documents underneath,
+  // so every existing density CSS rule + render.js proMode()/documents path is
+  // untouched — only the visible control is re-shaped.
+  var SURFACES = [
+    { id: 'command', label: 'Command' },
+    { id: 'explore', label: 'Explore' }
   ];
   function isSelectableMode(id) { return id === 'professional' || id === 'documents' || id === DEFAULT_MODE; }
   function readMode() {
-    try { var m = localStorage.getItem(LS_MODE); return isSelectableMode(m) && m !== DEFAULT_MODE ? m : DEFAULT_MODE; }
+    try { var m = localStorage.getItem(LS_MODE); return isSelectableMode(m) ? m : DEFAULT_MODE; }
     catch (e) { return DEFAULT_MODE; }
   }
-  function syncModeSeg(id) {
+  function readDensity() {
+    try { return localStorage.getItem(LS_DENSITY) === 'professional' ? 'professional' : DEFAULT_DENSITY; }
+    catch (e) { return DEFAULT_DENSITY; }
+  }
+  function surfaceOf(mode) { return mode === 'documents' ? 'explore' : 'command'; }
+  function syncModeSeg(mode) {
+    var surface = surfaceOf(mode);
     var btns = document.querySelectorAll('#modeSeg .modeseg-btn');
     for (var i = 0; i < btns.length; i++) {
-      btns[i].setAttribute('aria-pressed', btns[i].getAttribute('data-mode') === id ? 'true' : 'false');
+      btns[i].setAttribute('aria-pressed', btns[i].getAttribute('data-surface') === surface ? 'true' : 'false');
     }
   }
   function buildModeSeg() {
     var wrap = document.getElementById('modeSeg');
     if (!wrap) { return; }
     wrap.textContent = '';
-    for (var i = 0; i < MODES.length; i++) {
-      var m = MODES[i];
+    for (var i = 0; i < SURFACES.length; i++) {
+      var s = SURFACES[i];
       var b = el('button', {
-        'class': 'modeseg-btn', type: 'button', 'data-mode': m.id, 'aria-pressed': 'false',
-        title: m.label + ' mode'
-      }, [m.label]);
-      (function (id) { b.addEventListener('click', function () { applyMode(id); }); })(m.id);
+        'class': 'modeseg-btn', type: 'button', 'data-surface': s.id, 'aria-pressed': 'false',
+        title: s.label
+      }, [s.label]);
+      (function (id) { b.addEventListener('click', function () { applySurface(id); }); })(s.id);
       wrap.appendChild(b);
     }
   }
   // Set the mode WITHOUT re-rendering (used by route() when a deep link to a real
-  // destination auto-switches Documents mode back to standard). Presentation only.
+  // destination auto-switches the reader back to a console density). Presentation only.
   function setModeSilently(id) {
     if (!isSelectableMode(id)) { id = DEFAULT_MODE; }
     document.documentElement.setAttribute('data-mode', id);
@@ -1499,7 +1657,7 @@
     syncModeSeg(id);
   }
   function applyMode(id) {
-    // Selectable modes: standard | professional | documents. Presentation only —
+    // Underlying modes: standard | professional | documents. Presentation only —
     // no posture side effects. Documents drives the hash to the reader
     // (#/documents); leaving Documents returns to the default destination.
     if (!isSelectableMode(id)) { id = DEFAULT_MODE; }
@@ -1509,7 +1667,33 @@
     } else if (/^#\/documents/.test(location.hash || '')) {
       location.hash = '#/' + (DESTS[0] && DESTS[0].id); return;   // hashchange → route()
     }
-    route();   // re-render: Pro density / Pro-only surface, or the reader
+    route();   // re-render: density change / Pro-only surface, or the reader
+  }
+  // Top-level surface switch. Command → the density-selected console (standard |
+  // professional, per the Settings preference); Explore → the documents reader.
+  function applySurface(id) {
+    if (id !== 'explore') { applyMode(readDensity()); return; }
+    // Explore lands on the Explorer search — its centred entry surface. Staying
+    // within #/documents keeps whatever Explore page is already open.
+    setModeSilently('documents');
+    if (/^#\/documents/.test(location.hash || '')) { route(); }
+    else { location.hash = '#/documents/explorer'; }
+  }
+  // Command density (Standard | Professional), set from System › Settings. Applies
+  // live when currently on the Command surface; always persisted for next entry.
+  function setDensity(d) {
+    d = (d === 'professional') ? 'professional' : 'standard';
+    try { localStorage.setItem(LS_DENSITY, d); } catch (e) { /* private mode */ }
+    var cur = (typeof window !== 'undefined' && window.CRUX_MODE) || readMode();
+    if (cur !== 'documents') { applyMode(d); }
+    syncDensitySegs();
+  }
+  function syncDensitySegs() {
+    var d = readDensity();
+    var btns = document.querySelectorAll('.densityseg .modeseg-btn');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].setAttribute('aria-pressed', btns[i].getAttribute('data-density') === d ? 'true' : 'false');
+    }
   }
   function initMode() {
     var m = readMode();
@@ -1517,6 +1701,42 @@
     document.documentElement.setAttribute('data-mode', m);
     buildModeSeg();
     syncModeSeg(m);
+  }
+  // The top bar is transparent until the view scrolls under it, then goes glass.
+  // The window is the scroll container (rail is sticky, content has no overflow).
+  function wireTopbarScroll() {
+    var bar = document.querySelector('.topbar');
+    if (!bar) { return; }
+    var onScroll = function () {
+      var y = window.scrollY || document.documentElement.scrollTop || 0;
+      bar.classList.toggle('scrolled', y > 4);
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+  }
+  // Top-right search stub → the Explorer corpus-search destination (⌘K target).
+  function initSearchStub() {
+    var btn = document.getElementById('searchStub');
+    if (!btn) { return; }
+    var ico = btn.querySelector('.ss-ico');
+    if (ico) { ico.innerHTML = ICONS.search; }
+    btn.addEventListener('click', function () { location.hash = '#/explorer'; });
+  }
+  // The Command-density preference control, injected at the top of System ›
+  // Settings (Standard | Professional). Presentation only — never posture.
+  function buildDensityCard() {
+    var card = el('div', { 'class': 'v2card wide density-card' });
+    card.appendChild(el('h3', { 'class': 'v2card-h' }, ['Command density']));
+    card.appendChild(el('p', { 'class': 'v2card-sub' }, ['How dense the Command surface renders. Presentation only — it never changes what you can access.']));
+    var seg = el('div', { 'class': 'modeseg densityseg', role: 'group', 'aria-label': 'Command density' });
+    [['standard', 'Standard'], ['professional', 'Professional']].forEach(function (d) {
+      var b = el('button', { 'class': 'modeseg-btn', type: 'button', 'data-density': d[0], 'aria-pressed': readDensity() === d[0] ? 'true' : 'false' }, [d[1]]);
+      (function (id) { b.addEventListener('click', function () { setDensity(id); }); })(d[0]);
+      seg.appendChild(b);
+    });
+    var body = el('div', { 'class': 'v2card-body' }); body.appendChild(seg);
+    card.appendChild(body);
+    return card;
   }
 
   // ---- Posture (customer-safe, server-derived) ---------------------------
@@ -1638,6 +1858,7 @@
     RAIL_MODE = 'dest';   // restored to the destination nav
     for (var i = 0; i < DESTS.length; i++) {
       var item = DESTS[i];
+      if (item.railHidden) { continue; }   // reachable via search / Explore menu, not the Command rail
       var btn = el('button', {
         'class': 'nav-item', type: 'button', 'data-dest': item.id, 'aria-current': 'false',
         title: item.label   // tooltip — the only label shown when the rail is collapsed
@@ -1696,19 +1917,33 @@
   // facts that used to be landing tiles, plus the DEMO DATA chip when demo mode
   // is on. Every chip is real boot data; a chip is omitted when its value is
   // unknown (never fabricated).
+  function iconChip(iconKey, title, on) {
+    var c = el('span', { 'class': 'topchip icon-chip' + (on ? ' on' : ''), title: title, role: 'img', 'aria-label': title });
+    c.innerHTML = ICONS[iconKey] || '';
+    return c;
+  }
   function setTopChips() {
     var host = document.getElementById('topchips');
     if (!host) { return; }
     host.textContent = '';
-    if (typeof window !== 'undefined' && window.CRUX_DEMO) {
-      host.appendChild(el('span', { 'class': 'topchip demo', text: 'DEMO DATA' }));
-    }
+    // auth + dataplane as icon chips (real boot facts; value in the tooltip).
+    // DEMO DATA + version chips are gone — demo shows per-tile, version is in the brand.
     var authMode = get(BOOT.summary, ['daemon', 'auth_mode']);
     var dataplane = get(BOOT.summary, ['daemon', 'dataplane_enabled']);
+    if (authMode != null) { host.appendChild(iconChip('lock', 'auth: ' + authMode, authMode !== 'off')); }
+    if (dataplane != null) { host.appendChild(iconChip('dataplane', 'dataplane: ' + (dataplane ? 'on' : 'off'), !!dataplane)); }
+  }
+  // Brand identity: "Crux Console" when hosted from a platform (auth on), "Crux
+  // Daemon" when served by a local daemon (auth off). Subtitle carries the version.
+  function setBrand() {
+    var nameEl = document.querySelector('.brand .name');
+    if (!nameEl) { return; }
+    var authMode = get(BOOT.summary, ['daemon', 'auth_mode']);
+    var hosted = authMode != null && authMode !== 'off';
     var version = get(BOOT.version, ['version']) || get(BOOT.summary, ['daemon', 'build', 'version']);
-    if (authMode != null) { host.appendChild(el('span', { 'class': 'topchip', text: 'auth: ' + authMode })); }
-    if (dataplane != null) { host.appendChild(el('span', { 'class': 'topchip', text: 'dataplane: ' + (dataplane ? 'on' : 'off') })); }
-    if (version) { host.appendChild(el('span', { 'class': 'topchip', text: 'v' + String(version).replace(/^v/, '') })); }
+    var verStr = version ? ('v' + String(version).replace(/^v/, '')) : 'v2';
+    nameEl.textContent = hosted ? 'Crux Console' : 'Crux Daemon';
+    nameEl.appendChild(el('small', { text: 'Unified ' + verStr }));
   }
 
   // ---- Collapsible rail --------------------------------------------------
@@ -1799,7 +2034,7 @@
     host.textContent = '';
     for (var i = 0; i < DESTS.length; i++) {
       var d = DESTS[i];
-      if (!isMoreDest(d.id)) { continue; }   // only the non-tab destinations
+      if (!isMoreDest(d.id) || d.railHidden) { continue; }   // only non-tab, non-rail-hidden destinations
       var btn = el('button', { 'class': 'sheet-item', type: 'button', 'data-dest': d.id, 'aria-current': 'false' });
       btn.innerHTML = ICONS[d.icon] || '';
       btn.appendChild(el('span', { 'class': 'label', text: d.label }));
@@ -1943,6 +2178,23 @@
       return;
     }
 
+    // Site map — no sub-pills: it IS a static reference page (the flat rail
+    // rearranged into 5 destinations + System). Reads nothing; every posture.
+    if (destId === 'sitemap') {
+      document.getElementById('destTitle').textContent = dest.label;
+      document.getElementById('destSub').textContent = dest.sub || '';
+      var mapHost = el('div', { 'class': 'sitemap-region-host', id: 'sitemapHost' });
+      content.appendChild(mapHost);
+      if (window.CruxRender && window.CruxRender.renderSiteMap) {
+        window.CruxRender.renderSiteMap(mapHost, { summary: BOOT.summary });
+      } else {
+        mapHost.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' }));
+      }
+      applyPosture(content);
+      if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
+      return;
+    }
+
     document.getElementById('destTitle').textContent = page ? page.title : dest.label;
     document.getElementById('destSub').textContent = page ? (page.sub || '') : (dest.sub || '');
     // Overwatch is the real landing: Daemon-at-a-glance tiles → Needs-you + Fleet
@@ -1955,6 +2207,8 @@
       window.CruxRender.renderOverwatchLanding(landing, { summary: BOOT.summary });
     }
     if (destId !== 'overwatch') { content.appendChild(buildSubnav(destId, pageId)); }
+    // Settings owns the Command-density switch (moved off the top-level toggle).
+    if (destId === 'system' && page && page.id === 'cx-settings') { content.appendChild(buildDensityCard()); }
     var host = el('div', { 'class': 'page-host', id: 'pageHost' });
     content.appendChild(host);
     if (window.CruxRender && page) { window.CruxRender.renderPage(page, host); }
@@ -2071,6 +2325,7 @@
         }
         setStatusPill();
         setTopChips();
+        setBrand();
         route();
         // Derive posture from the server, then re-render with it (nav + pills +
         // landing + mutating controls all follow). Never blocks the first paint.
@@ -2113,6 +2368,8 @@
     initMode();   // set window.CRUX_MODE + build the mode segmented control before first render
     document.querySelector('.brand .mark').innerHTML = ICONS.logo;
     document.querySelector('.passport-chip .avatar').innerHTML = ICONS.passport;
+    initSearchStub();   // wire the top-right search stub → Explorer
+    wireTopbarScroll(); // transparent top bar → glass on scroll
     buildRail();
     buildThemeSwitch();
     applyTheme(readTheme());
@@ -2156,6 +2413,22 @@
   'use strict';
   var SW_REV = 'ushell-v2-r1';   // keep in lock-step with /console-v2/sw.js
   if (!('serviceWorker' in navigator)) { return; }
+  // Dev bypass — when the daemon serves this shell from CORECRUXD_CONSOLE_DEV_PATH
+  // it stamps window.__CRUX_CONSOLE_DEV__ (see console.rs inject_console_dev_flag).
+  // In that mode never register a worker, and tear down any existing worker + its
+  // caches, so hot-reloaded edits always show on a plain refresh. Production never
+  // sets the flag, so the PWA service worker behaves exactly as before.
+  if (window.__CRUX_CONSOLE_DEV__) {
+    navigator.serviceWorker.getRegistrations().then(function (rs) {
+      for (var i = 0; i < rs.length; i++) { rs[i].unregister(); }
+    }, function () {});
+    if (window.caches && caches.keys) {
+      caches.keys().then(function (ks) {
+        for (var j = 0; j < ks.length; j++) { caches.delete(ks[j]); }
+      }, function () {});
+    }
+    return;
+  }
   var host = location.hostname;
   var secure = location.protocol === 'https:' || host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
   if (!secure) { return; }

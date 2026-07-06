@@ -280,7 +280,7 @@
     function x(i) { return pad + (innerW * i) / (vals.length - 1); }
     function y(v) { return pad + innerH * (1 - (v - min) / span); }
     var id = 'cxg' + (++__chartSeq);
-    var svg = svgEl('svg', { 'class': spark ? 'chart-svg spark' : 'chart-svg', viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-hidden': 'true' });
+    var svg = svgEl('svg', { 'class': spark ? 'chart-svg spark' : 'chart-svg', viewBox: '0 0 ' + W + ' ' + H, preserveAspectRatio: spark ? 'none' : 'xMidYMid meet', role: 'img', 'aria-hidden': 'true' });
     var defs = svgEl('defs');
     var grad = svgEl('linearGradient', { id: id, x1: '0', y1: '0', x2: '0', y2: '1' });
     grad.appendChild(svgEl('stop', { offset: '0%', 'stop-color': 'var(--acc)', 'stop-opacity': spark ? '0.3' : '0.34' }));
@@ -1013,30 +1013,69 @@
       return decorateTiles(card, ctx, res);
     });
   }
+  var __glanceRows = null;               // cached /v1/activity rows for range re-bucketing
+  var __glanceDays = 7;                   // active window: Day=7 · Week=30 · Month=90
   function addTileSparklines(card) {
     return fetchJSON('/v1/activity?tenant_id=default&token_budget=1500').then(function (res) {
-      var rows = (res.ok && res.data && res.data.rows) ? res.data.rows : [];
-      attachSpark(card, 'Facts', seriesFor(rows, /fact/i, 'factsSpark'));
-      attachSpark(card, 'Sessions', seriesFor(rows, /session/i, 'sessionsSpark'));
+      __glanceRows = (res.ok && res.data && res.data.rows) ? res.data.rows : [];
+      paintGlanceSparks(card, __glanceDays);
     });
   }
-  function seriesFor(rows, re, demoKey) {
-    var real = bucketActivityByDay(rows, function (r) { return re.test((r.kind || '') + ' ' + (r.tool || '')); }, 7);
+  // Re-bucket the two REAL time-series tiles (Facts · Sessions) over the active
+  // window and repaint their sparklines. The scalar/meter tiles are point-in-time
+  // counters with no ranged series, so the range toggle honestly leaves them be.
+  function paintGlanceSparks(card, days) {
+    __glanceDays = days;
+    attachSpark(card, 'Facts', seriesFor(__glanceRows || [], /fact/i, 'factsSpark', days));
+    attachSpark(card, 'Sessions', seriesFor(__glanceRows || [], /session/i, 'sessionsSpark', days));
+  }
+  function seriesFor(rows, re, demoKey, days) {
+    var real = bucketActivityByDay(rows, function (r) { return re.test((r.kind || '') + ' ' + (r.tool || '')); }, days || 7);
     if (real) { return { vals: real, demo: false }; }
     var d = demoData(demoKey);
     return d ? { vals: d, demo: true } : null;
   }
+  // Replace (not stack) the tile's spark + demo chip so range switches repaint cleanly.
   function attachSpark(card, label, s) {
-    if (!s || !s.vals) { return; }
     var stats = card.querySelectorAll('.stat');
     for (var i = 0; i < stats.length; i++) {
       var k = stats[i].querySelector('.k');
       if (k && k.textContent.trim().toLowerCase() === label.toLowerCase()) {
+        var tile = stats[i];
+        var old = tile.querySelector('.chart-svg'); if (old && old.parentNode) { old.parentNode.removeChild(old); }
+        var oldChip = tile.querySelector('.demo-chip'); if (oldChip && oldChip.parentNode) { oldChip.parentNode.removeChild(oldChip); }
+        if (!s || !s.vals) { return; }
         var sp = areaChart(s.vals, { spark: true });
-        if (sp) { stats[i].appendChild(sp); if (s.demo) { stats[i].appendChild(demoChip(true)); } }
+        if (sp) { tile.appendChild(sp); if (s.demo) { tile.appendChild(demoChip(true)); } }
         return;
       }
     }
+  }
+  // Day / Week / Month range toggle, injected top-right of the glance header
+  // (reuses the .modeseg presentation-control look). Only the two real-series
+  // tiles respond; the honest choke point is paintGlanceSparks.
+  function buildGlanceRange(card) {
+    var heads = card.querySelectorAll('.v2card-h'), h = null;
+    for (var i = 0; i < heads.length; i++) {
+      if (heads[i].textContent.trim().toLowerCase() === 'daemon at a glance') { h = heads[i]; break; }
+    }
+    if (!h || !h.parentNode || h.parentNode.querySelector('.glance-range')) { return; }
+    var seg = el('div', { 'class': 'modeseg glance-range', role: 'group', 'aria-label': 'Activity range' });
+    [['Day', 7], ['Week', 30], ['Month', 90]].forEach(function (r) {
+      var b = el('button', { 'class': 'modeseg-btn', type: 'button', text: r[0] });
+      b.setAttribute('aria-pressed', r[1] === __glanceDays ? 'true' : 'false');
+      b.addEventListener('click', function () {
+        var btns = seg.querySelectorAll('.modeseg-btn');
+        for (var j = 0; j < btns.length; j++) { btns[j].setAttribute('aria-pressed', 'false'); }
+        b.setAttribute('aria-pressed', 'true');
+        paintGlanceSparks(card, r[1]);
+      });
+      seg.appendChild(b);
+    });
+    var row = el('div', { 'class': 'v2card-head-row' });
+    h.parentNode.insertBefore(row, h);
+    row.appendChild(h);
+    row.appendChild(seg);
   }
 
   // ---- Daemon-at-a-glance expansion (landing-only) -----------------------
@@ -1153,7 +1192,8 @@
     if (execStat) { execStat.classList.add('stat-lg'); }
     injectStat(card, 'Storage free', 'before', 'Token usage', 'loading…');
     var engineStat = injectStat(card, null, 'end', 'Engine', '—');
-    // Facts + Sessions REAL activity sparklines (unchanged behaviour).
+    // Facts + Sessions REAL activity sparklines + the Day/Week/Month range toggle.
+    buildGlanceRange(card);
     var work = addTileSparklines(card);
     // ExecPlans — REAL count from /v1/work (demo fixture only when the feed is empty).
     fetchJSON('/v1/work?source=all').then(function (r) {
@@ -2649,38 +2689,27 @@
   // Living Objects · Dependencies · Signals · Receipt Diff · Sourcing · Lanes ·
   // Domains · Reverse) as the primary Documents-mode navigation; the bundled
   // reference docs + tenant corpora follow as a "Docs" group (Proof-reader docs).
+  // The Explore rail — styled exactly like the Command rail (.nav-item). Explorer
+  // is pinned at the top and stays inside the Explore surface; the surfaces are
+  // the Explore "Pages". Reader docs + tenant corpora are NOT listed here — they
+  // are reached from Explorer search results (which open in the Ask/reader surface).
   function buildDocTree(host, tenants, activeId) {
     host.textContent = '';
+    var isExplorer = (activeId === 'explorer');
     var activeSurface = surfaceIdOf(activeId);
-    function group(title) { host.appendChild(el('div', { 'class': 'doc-tree-group', text: title })); }
-    function item(id, label, sub, current) {
-      var b = el('button', { 'class': 'doc-tree-item', type: 'button', 'data-doc': id, 'aria-current': current ? 'page' : 'false' }, [
-        el('span', { 'class': 'doc-tree-label', text: label })
+    function navItem(label, glyph, current, target) {
+      var b = el('button', { 'class': 'nav-item', type: 'button', 'aria-current': current ? 'page' : 'false' }, [
+        el('span', { 'class': 'nav-glyph', 'aria-hidden': 'true', text: glyph || '' }),
+        el('span', { 'class': 'label', text: label })
       ]);
-      if (sub) { b.appendChild(el('span', { 'class': 'doc-tree-sub', text: sub })); }
-      b.addEventListener('click', function () { location.hash = '#/documents/' + id; });
+      b.addEventListener('click', function () { location.hash = target; });
       host.appendChild(b);
     }
-    // 11-surface nav (the ported JSX NAV) — active = the surface the docId maps to.
-    group('Surfaces');
-    DOC_SURFACES.forEach(function (s) { item(s.id, s.icon + ' ' + s.label, null, s.id === activeSurface); });
-    if (demoOn()) {
-      var dr = demoData('docsReader');
-      group('Docs · demo');
-      item('demo:proof', dr ? dr.title.split(' — ')[0] : 'Proof reader', 'verified · demo fixture', activeId === 'demo:proof');
-    }
-    group('Docs · reference');
-    DOC_REFERENCE.forEach(function (d) { item('ref:' + d.slug, d.title, d.subtitle, activeId === 'ref:' + d.slug); });
-    group('Docs · corpora');
-    var live = (tenants || []).filter(function (t) { return !/^__/.test(String(t.tenant_id || t.id || '')); });
-    if (live.length) {
-      live.forEach(function (t) {
-        var id = t.tenant_id || t.id;
-        item('tenant:' + id, String(id), [t.category, t.source].filter(Boolean).join(' · ') || 'tenant corpus', activeId === 'tenant:' + id);
-      });
-    } else {
-      host.appendChild(el('p', { 'class': 'ctl-desc doc-tree-empty', text: demoOn() ? 'No live tenant corpora — demo Proof doc shown above.' : 'No tenant corpora yet — the daemon has read no documents.' }));
-    }
+    navItem('Explorer', '⌕', isExplorer, '#/documents/explorer');
+    host.appendChild(el('div', { 'class': 'nav-group-label', text: 'Pages' }));
+    DOC_SURFACES.forEach(function (s) {
+      navItem(s.label, s.icon, !isExplorer && s.id === activeSurface, '#/documents/' + s.id);
+    });
   }
 
   // ---- Reading surface (centre) ------------------------------------------
@@ -2838,6 +2867,18 @@
       // surfaces (a full-width composition) OR a reader doc ('ref:'/'tenant:'/
       // 'demo:proof') / 'proof' / null (the 3-zone Proof reader — the M11 default).
       var raw = ctx.docId;
+      // Explorer — the corpus search, rendered INSIDE the Explore shell so the
+      // Explore rail (Explorer + Pages) stays put. Reader docs are reached from
+      // the search results, not a menu.
+      if (raw === 'explorer') {
+        if (ctx.railHost) { buildDocTree(ctx.railHost, tenants, 'explorer'); }
+        var exWrap = el('div', { 'class': 'doc-reader doc-surface-wrap' });
+        var exMain = el('main', { 'class': 'doc-surface-main' });
+        exWrap.appendChild(exMain);
+        host.appendChild(exWrap);
+        renderExplorer(exMain, ctx);
+        return;
+      }
       var surfaceId = (raw && isDocSurface(raw) && raw !== 'proof') ? raw : null;
       var readerDocId = (raw && !isDocSurface(raw)) ? raw : docDefaultId(tenants);
       var railActive = surfaceId || readerDocId || 'proof';
@@ -2963,10 +3004,94 @@
     return card;
   }
 
+  // =======================================================================
+  //  Site map — a static reference destination: the console's flat rail
+  //  rearranged into 5 destinations + System. Bespoke card grid (no sections
+  //  model). Reads nothing; renders in every posture. Ported from the unified-
+  //  shell concept (rev 1 · 2026-07-03).
+  // =======================================================================
+  var SITEMAP_ICONS = {
+    radar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 12l6-6"/></svg>',
+    board: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1"/><rect x="10" y="4" width="5" height="10" rx="1"/><rect x="17" y="4" width="4" height="13" rx="1"/></svg>',
+    brain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="4.5" rx="2"/><rect x="4" y="12" width="16" height="4.5" rx="2"/><path d="M11 19.5h6"/></svg>',
+    shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg>',
+    gauge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a8 8 0 1 1 16 0"/><path d="M12 14l3.5-3.5"/><path d="M4 19h16"/></svg>',
+    server: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4" width="17" height="6.5" rx="1.8"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="1.8"/><path d="M7 7.2h.01M7 16.7h.01"/></svg>'
+  };
+  var SITEMAP = [
+    { icon: 'radar', color: 'var(--acc)', title: 'Overwatch', tag: "the arm's-length home — glance, decide, get out", items: [
+      { name: 'Home · Needs you', anno: { t: 'PROMOTED', cls: 'promote' }, why: 'Gates rise from rail item #8 to the first thing you see. Review counts and blocked-plan questions surface here too.', provs: [{ t: 'cx-overview' }, { t: 'cx-gates (actionable)' }, { t: 'cx-review (count)' }] },
+      { name: 'Fleet', anno: { t: '4 → 1', cls: 'merge' }, why: "Live board, sessions, orchestrators and punchcards are four rail items describing one question — \"who is working and on what?\" Leases and intents become facets of a session row.", provs: [{ t: 'cx-coord' }, { t: 'cx-sessions (live)' }, { t: 'cx-orchestrators' }, { t: 'cx-punchcards' }] },
+      { name: 'Activity', why: 'The rolling all-sessions log, unchanged — plus the human-lane page folds in as a filter, not a separate URL.', provs: [{ t: 'cx-activity' }, { t: '/console/activity' }] }
+    ] },
+    { icon: 'board', color: '#5EC2E7', title: 'Work', tag: "plans are true north — resume, don't respawn", items: [
+      { name: 'Board', anno: { t: 'VIEW SWITCH', cls: 'vsw' }, why: 'Kanban graduates from a rail pull-out to the primary view; list and graph become a segmented switch on the page — the DUAL_VIEW pattern, made explicit.', provs: [{ t: 'cx-work' }, { t: 'kanban pull-out' }, { t: 'console-3d (work graph)' }] },
+      { name: 'Projects', why: 'Repo pairing, planning repo, working tenants — unchanged, but now feeds Board filters instead of standing alone.', provs: [{ t: 'cx-projects' }] },
+      { name: 'Runs', why: 'Session history splits from the live fleet: archived sessions with their per-run token usage attached, searchable by plan.', provs: [{ t: 'cx-sessions (archive)' }, { t: 'cx-usage (per-run)' }] }
+    ] },
+    { icon: 'brain', color: 'var(--trust)', title: 'Memory', tag: 'the substrate — what the node knows and how fresh it is', items: [
+      { name: 'Facts', anno: { t: '2 → 1', cls: 'merge' }, why: 'cx-facts (by entity prefix) and cx-memory (recent per tenant) are the same data with different lenses — one page, three lenses: by entity · recent · by tenant.', provs: [{ t: 'cx-facts' }, { t: 'cx-memory' }] },
+      { name: 'Tenants & lanes', why: 'Store list with AMR lane policy per tenant; system tenants stay hidden by default.', provs: [{ t: 'cx-tenants' }] },
+      { name: 'Documents · ingest', why: 'What the daemon has read, per tenant — and how to feed it more. Unchanged.', provs: [{ t: 'cx-documents' }] },
+      { name: 'Review', anno: { t: 'COUNT → HOME', cls: 'promote' }, why: 'Contradictions + guarded consolidation live here; the pending count is an Overwatch card because it needs human judgment.', provs: [{ t: 'cx-review' }] },
+      { name: 'Tuning', anno: { t: 'ADVANCED', cls: 'adv' }, why: 'RRF lane weights are expert controls — kept, but behind a disclosure so they stop competing with daily pages.', provs: [{ t: 'cx-lane-weights' }] }
+    ] },
+    { icon: 'shield', color: 'var(--ok)', title: 'Trust', tag: 'regulation is a destination, not a settings page', items: [
+      { name: 'Receipts', anno: { t: 'VIEW SWITCH', cls: 'vsw' }, why: 'CROWN receipt list with the graph pull-out as a view switch; the receipts-vs-console demo becomes the "why receipts" explainer here.', provs: [{ t: 'cx-receipts' }, { t: '/console/receipts-vs-console' }] },
+      { name: 'Gates', why: 'The full Art.14 queue + history + timeout policy. Overwatch shows the actionable slice; this is the canonical record.', provs: [{ t: 'cx-gates' }] },
+      { name: 'Identity', anno: { t: '2 → 1', cls: 'merge' }, why: 'Passports and identity-link ceremonies are one story: who exists, who signs, what links. Device grants (/activate) approve from here too.', provs: [{ t: 'cx-passport' }, { t: 'cx-identity' }, { t: '/activate' }] },
+      { name: 'Policy & posture', anno: { t: 'NEW', cls: 'new' }, why: 'Mediation (capability ladder, foresight) joins a compliance posture panel — the Art.10–15 cards from this concept. Today that story is implicit; regulated buyers need it on one page.', provs: [{ t: 'cx-mediation' }, { t: 'posture panel (new)', 'new': true }] }
+    ] },
+    { icon: 'gauge', color: 'var(--warn)', title: 'Meters', tag: 'cost, capacity, evidence — replaces "Benchmarks" as the 5th section', items: [
+      { name: 'Token burn', why: 'The ground-truth cost lens, unchanged — headline number surfaces as an Overwatch tile.', provs: [{ t: 'cx-cost' }] },
+      { name: 'Usage', why: 'Observation-derived usage aggregates; per-run slices move to Work → Runs.', provs: [{ t: 'cx-usage' }] },
+      { name: 'Storage & node', anno: { t: 'UNBURIED', cls: 'promote' }, why: "Storage breakdown, infra summary, ops health and update/bootstrap status escape the Settings page — they're monitoring, not configuration.", provs: [{ t: 'storage-breakdown' }, { t: 'infra/summary' }, { t: 'ops health' }] },
+      { name: 'Benchmarks', anno: { t: 'NEW', cls: 'new' }, why: 'bench:* facts get a real page — corpus identity, commit, lane flags — with deep links to scorecrux.com for published suites.', provs: [{ t: 'bench:* facts' }, { t: 'ScoreCrux links', 'new': true }] }
+    ] },
+    { icon: 'server', color: 'var(--ink3)', title: 'System', note: 'bottom of rail', tag: 'configure rarely, then leave', items: [
+      { name: 'Settings', why: 'Access posture, embedding endpoint, sync, freshness horizons, retention, appearance, coordination toggles — minus the monitoring sections that moved to Meters.', provs: [{ t: 'cx-settings' }] },
+      { name: 'Integrations', anno: { t: '2 → 1', cls: 'merge' }, why: 'Packs and signed extensions are one catalog with two provenance badges; install stays inert until a passport grant exists.', provs: [{ t: 'cx-integrations' }, { t: 'cx-extensions' }] },
+      { name: 'Developer', why: 'Raw JSON-RPC console and the DX docs scope live under Developer; the GX global-search scope becomes ⌘K everywhere.', provs: [{ t: 'cx-raw' }, { t: 'DX scope' }, { t: 'GX scope → ⌘K' }] }
+    ] }
+  ];
+  function renderSiteMap(host) {
+    host.textContent = '';
+    var grid = el('div', { 'class': 'map-grid' });
+    SITEMAP.forEach(function (s) {
+      var sec = el('div', { 'class': 'map-sec' });
+      sec.style.setProperty('--sec-c', s.color);
+      var ico = el('span', { 'class': 'map-ico' }); ico.innerHTML = SITEMAP_ICONS[s.icon] || '';
+      var icoSvg = ico.querySelector('svg'); if (icoSvg) { icoSvg.setAttribute('width', '16'); icoSvg.setAttribute('height', '16'); }
+      var h = el('h3', null, [ico, doc().createTextNode(s.title)]);
+      if (s.note) { h.appendChild(el('span', { 'class': 'map-h-note', text: ' · ' + s.note })); }
+      sec.appendChild(h);
+      sec.appendChild(el('div', { 'class': 'tag', text: s.tag }));
+      s.items.forEach(function (it) {
+        var b = el('b', null, [doc().createTextNode(it.name)]);
+        if (it.anno) { b.appendChild(el('span', { 'class': 'anno ' + it.anno.cls, text: it.anno.t })); }
+        var pg = el('div', { 'class': 'map-page' }, [b, el('div', { 'class': 'why', text: it.why })]);
+        if (it.provs && it.provs.length) {
+          var provs = el('div', { 'class': 'provs' });
+          it.provs.forEach(function (pv) { provs.appendChild(el('span', { 'class': 'prov' + (pv['new'] ? ' new' : ''), text: pv.t })); });
+          pg.appendChild(provs);
+        }
+        sec.appendChild(pg);
+      });
+      grid.appendChild(sec);
+    });
+    host.appendChild(grid);
+    var note = el('div', { 'class': 'map-note' });
+    note.innerHTML =
+      '<b>The count:</b> today\'s console is 26 flat rail items in the CX scope plus 4 sibling scopes (DX · GX · AX · IX). This arrangement lands the same surface in <b>5 destinations + System</b> — 9 pages merge into 4, three buried things get promoted (gates, review, node health), two get built new (posture, benchmarks), and nothing is dropped. The 2D|3D substrate switch and the kanban/graph pull-outs survive as per-page view switches. Phone gets Overwatch · Work · Trust + More; Memory, Meters and System sit behind More because approving a gate at a bus stop is real and re-tuning lane weights is not.'
+      + '<br><br><b>The function census behind this map:</b> Crux Daemon exposes 118 HTTP routes (~40 groups), 114 registered MCP tools (14 live at free tier — the console renders from the capability plan, not the registry), 98 corecruxctl subcommands; CruxEngine adds 295 paths on port 14343 + 164 on 14344. ≈789 functions total, each assigned a destination in <span class="mono">PlanCrux/docs/architecture/function-map-daemon-engine-2026-07-03.md</span>. Engine functions reach this UI only through daemon-mediated proxy routes (the lane-weights / gpu1 precedent) — one origin, one passport, receipts on every cross-system mutation.';
+    host.appendChild(note);
+  }
+
   function renderExplorer(host, ctx) {
     ctx = ctx || {};
     host.textContent = '';
-    var region = el('div', { 'class': 'explorer-region' });
+    // Starts vertically centred (empty state); un-centres once results render.
+    var region = el('div', { 'class': 'explorer-region explorer-empty' });
     host.appendChild(region);
     // Local carries a token_budget; WikiCrux carries a top_k (Engine limit ≤50).
     var state = { backend: 'local', query: '', budget: 1500, topk: 8 };
@@ -3024,6 +3149,7 @@
       sample.forEach(function (c) { results.appendChild(explorerCard(c, true)); });
     }
     function paintResults(res, mapper) {
+      region.classList.remove('explorer-empty');   // a search ran — dock to the top
       results.textContent = '';
       if (res.status === 404) {
         results.appendChild(el('p', { 'class': 'ctl-desc', text: state.backend === 'wikicrux' ? 'WikiCrux search unavailable — engine mediation off.' : 'Search unavailable — feature off.' }));
@@ -3057,6 +3183,8 @@
     GATE_TITLE: GATE_TITLE,
     // M11 — Explorer (corpus search; reads only, posture-independent).
     renderExplorer: renderExplorer,
+    // Site map — static reference destination (rail → destinations map).
+    renderSiteMap: renderSiteMap,
     // M10 — Documents mode (the console-as-reader).
     renderDocuments: renderDocuments,
     DOC_REFERENCE: DOC_REFERENCE,

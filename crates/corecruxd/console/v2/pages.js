@@ -146,7 +146,7 @@
     // dataplane are now compact chips in the topbar, node id lives on System ›
     // Settings › Node (items 3 + 4). Tiles keep the six live counters.
     return [
-      { h: 'Daemon at a glance', sub: 'live from /v1/console/summary', wide: true,
+      { h: 'Daemon at a glance', wide: true,
         tiles: [
           ['Facts', fmtNum(get(s, ['stores', 'facts']))],
           ['Sessions', fmtNum(get(s, ['stores', 'sessions']))],
@@ -1081,7 +1081,13 @@
     // in every posture. Local → daemon BM25 text-search; WikiCrux → the
     // daemon-mediated retrieval — both go through render.js's curated read-POST
     // client. Phone tier: lives in the "More" sheet (not a direct tab).
-    { id: 'explorer', label: 'Explorer', icon: 'search', key: '8', sub: 'Search the corpus — local retrieval or mediated WikiCrux.' }
+    // railHidden — Explorer is NOT in the Command rail; it's reached via the
+    // top-right search field and from the top of the Explore (documents) menu.
+    { id: 'explorer', label: 'Explorer', icon: 'search', railHidden: true, sub: 'Search the corpus — local retrieval or mediated WikiCrux.' },
+    // Site map — a destination with no sub-pills: it IS a static reference page
+    // (the flat rail rearranged into 5 destinations + System). Delegates to
+    // render.js renderSiteMap; reads nothing, so it shows in every posture.
+    { id: 'sitemap', label: 'Site map', icon: 'map', key: '8', sub: "the 26-item rail, rearranged into 5 destinations + System" }
   ];
 
   // ---- Legacy id inventory (the 26 CX pages this plan must keep reachable)

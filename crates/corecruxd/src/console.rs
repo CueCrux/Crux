@@ -479,11 +479,29 @@ loadTenants();
 fn resolve_console_body() -> Cow<'static, str> {
     if console_v2_enabled() {
         match console_v2_dev_override() {
-            Some(html) => Cow::Owned(html),
+            Some(html) => Cow::Owned(inject_console_dev_flag(html)),
             None => Cow::Borrowed(CONSOLE_V2_HTML),
         }
     } else {
         resolve_console_html()
+    }
+}
+
+/// Dev-only marker: stamp the shell so the client skips PWA service-worker
+/// registration (and tears down any existing worker + its caches). This ONLY
+/// runs on the `console_v2_dev_override` path — i.e. when the shell is being
+/// hot-served from `CORECRUXD_CONSOLE_DEV_PATH` — so an edit under the dev dir
+/// shows on a plain refresh instead of being shadowed by a cached shell. The
+/// embedded (production) `CONSOLE_V2_HTML` never passes through here, so the
+/// shipped console keeps its service worker byte-for-byte.
+fn inject_console_dev_flag(html: String) -> String {
+    const MARK: &str = "<script>window.__CRUX_CONSOLE_DEV__=1;</script>";
+    if html.contains(MARK) {
+        html
+    } else if html.contains("<head>") {
+        html.replacen("<head>", &format!("<head>{MARK}"), 1)
+    } else {
+        format!("{MARK}{html}")
     }
 }
 
