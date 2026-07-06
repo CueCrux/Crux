@@ -105,13 +105,13 @@ function walkControls(controls, fn) {
   });
 }
 function walkPage(page, fn) {
-  (page.sections || []).forEach(function (s) { walkControls(s.controls, fn); });
+  (page.sections || []).forEach(function (s) { walkControls(s.controls, fn); walkControls(s.headControls, fn); });
   if (page.load && typeof page.load.build === 'function') {
     // Exercise both branches so degraded + populated control types are seen.
     [{ ok: true, status: 200, data: {} }, { ok: false, status: 0, data: null }].forEach(function (res) {
       let sections;
       try { sections = page.load.build(res); } catch (e) { sections = []; }
-      (sections || []).forEach(function (s) { walkControls(s.controls, fn); });
+      (sections || []).forEach(function (s) { walkControls(s.controls, fn); walkControls(s.headControls, fn); });
     });
   }
 }

@@ -202,23 +202,28 @@
   }
 
   function buildTenants(res) {
-    var head = { h: 'AMR defaults — all tenants',
+    // AMR defaults sits ABOVE the Tenants card but starts hidden; the cog in the
+    // Tenants header reveals it upward. The "hide system tenants" view-filter is a
+    // header control (top-right, same row as the Tenants title).
+    var head = { h: 'AMR defaults — all tenants', id: 'amrDefaults', hidden: true,
       sub: 'Adaptive Manifest Routing picks lanes per query; set the default policy once — tenants inherit unless pinned', wide: true,
       controls: [info('subscription', 'inactive — CoreCrux lanes activate with a subscription · lexical + verbatim stay free/local')]
         .concat(amrLaneToggles('amr_'))
         .concat([mbtn('Apply defaults to all tenants', { hint: 'resets per-tenant pins back to inherit' })]) };
+    var cog = { label: '⚙', variant: 'cog', title: 'AMR defaults', target: 'amrDefaults' };
+    var hideSys = { t: 'toggle', k: 'hidesys', label: 'hide system tenants', v: true, hideKey: 'hidesys',
+      desc: 'System tenants carry daemon internals.' };
     if (!res.ok || !res.data) {
-      return [head, { h: 'Tenants', wide: true, controls: [{ t: 'search', ph: 'Filter tenants…' }].concat(degraded(res.status, 'Tenants unavailable — GET /v1/console/tenants')) }];
+      return [head, { h: 'Tenants', wide: true, headAction: cog, headControls: [hideSys], controls: [{ t: 'search', ph: 'Filter tenants…' }].concat(degraded(res.status, 'Tenants unavailable — GET /v1/console/tenants')) }];
     }
     var ts = arr(res.data.tenants);
-    var rows = [{ t: 'search', ph: 'Filter tenants…' },
-      { t: 'toggle', k: 'hidesys', label: 'hide system tenants', v: true, desc: 'System tenants carry daemon internals — hidden by default.' }];
+    var rows = [{ t: 'search', ph: 'Filter tenants…' }];
     ts.forEach(function (t) {
       var id = t.tenant_id || t.id; var sys = (t.category === 'system') || /^__/.test(String(id));
       rows.push(tenantExpRow(id, [t.category, t.source].filter(Boolean).join(' · ') || 'tenant', sys));
     });
     if (!ts.length) { rows.push(info('none', 'no tenants registered')); }
-    return [head, { h: 'Tenants', sub: ts.length + ' tenant' + (ts.length === 1 ? '' : 's') + ' · click to expand lane policy', wide: true, controls: rows }];
+    return [head, { h: 'Tenants', sub: ts.length + ' tenant' + (ts.length === 1 ? '' : 's') + ' · click to expand lane policy', wide: true, headAction: cog, headControls: [hideSys], controls: rows }];
   }
 
   function buildPassports(res) {
@@ -235,7 +240,7 @@
         { t: 'textarea', k: 'pp_notes', label: 'notes', rows: 2, ph: 'any other notes', mut: true },
         mbtn('Create passport', { hint: 'POST /v1/passports' })
       ] };
-    var plus = { label: '+', title: 'New passport', target: 'newPassportForm' };
+    var plus = { label: '+', variant: 'plus', title: 'New passport', target: 'newPassportForm' };
     if (!res.ok || !res.data) { return [{ h: 'Passports', wide: true, headAction: plus, controls: [{ t: 'search', ph: 'Filter passports…' }].concat(degraded(res.status, 'Passports unavailable — GET /v1/passports')) }, form]; }
     var ps = arr(res.data.passports);
     var rows = [{ t: 'search', ph: 'Filter passports…' }].concat(ps.map(function (p) {

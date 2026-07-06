@@ -787,23 +787,36 @@
   function renderSection(section) {
     var card = el('section', { 'class': 'v2card' + (section.wide ? ' wide' : '') + (section.hidden ? ' is-collapsed' : '') });
     if (section.id) { card.id = section.id; }
-    if (section.h && section.headAction) {
-      // Card header carries a "+" action that reveals a target card below.
+    var hideToggles = [];   // header view-filter toggles, wired once the body exists
+    var headCtls = section.headControls || [];
+    if (section.h && (section.headAction || headCtls.length)) {
+      // Card header row: title left; view-filter toggles + a "+"/cog action right.
       var hrow = el('div', { 'class': 'v2card-head-row' });
       hrow.appendChild(el('h3', { 'class': 'v2card-h', text: section.h }));
-      var act = section.headAction;
-      var addBtn = el('button', { 'class': 'v2card-addbtn', type: 'button', text: act.label || '+',
-        title: act.title || 'Add', 'aria-expanded': 'false', 'aria-label': act.title || 'Add' });
-      addBtn.addEventListener('click', function () {
-        var tgt = act.target ? doc().getElementById(act.target) : null;
-        if (!tgt) { return; }
-        var opening = tgt.classList.contains('is-collapsed');
-        if (opening) { tgt.classList.remove('is-collapsed'); if (tgt.scrollIntoView) { tgt.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } }
-        else { tgt.classList.add('is-collapsed'); }
-        addBtn.setAttribute('aria-expanded', opening ? 'true' : 'false');
-        addBtn.classList.toggle('is-on', opening);
+      var actions = el('div', { 'class': 'v2card-head-actions' });
+      headCtls.forEach(function (hc) {
+        var cn = renderControl(hc, card);
+        if (!cn) { return; }
+        cn.classList.add('in-head');
+        actions.appendChild(cn);
+        if (hc.hideKey) { hideToggles.push({ node: cn, hideKey: hc.hideKey }); }
       });
-      hrow.appendChild(addBtn);
+      if (section.headAction) {
+        var act = section.headAction;
+        var addBtn = el('button', { 'class': 'v2card-addbtn' + (act.variant ? ' ' + act.variant : ''), type: 'button', text: act.label || '+',
+          title: act.title || 'Add', 'aria-expanded': 'false', 'aria-label': act.title || 'Add' });
+        addBtn.addEventListener('click', function () {
+          var tgt = act.target ? doc().getElementById(act.target) : null;
+          if (!tgt) { return; }
+          var opening = tgt.classList.contains('is-collapsed');
+          if (opening) { tgt.classList.remove('is-collapsed'); if (tgt.scrollIntoView) { tgt.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } }
+          else { tgt.classList.add('is-collapsed'); }
+          addBtn.setAttribute('aria-expanded', opening ? 'true' : 'false');
+          addBtn.classList.toggle('is-on', opening);
+        });
+        actions.appendChild(addBtn);
+      }
+      hrow.appendChild(actions);
       card.appendChild(hrow);
     } else if (section.h) {
       card.appendChild(el('h3', { 'class': 'v2card-h', text: section.h }));
@@ -826,6 +839,21 @@
       if (cn) { body.appendChild(cn); }
     }
     card.appendChild(body);
+    // Wire header view-filter toggles now that the [data-hideif] rows exist.
+    // A checked toggle hides matching rows and lights its LED (the toggle has no
+    // server value to persist — it is a pure view filter).
+    hideToggles.forEach(function (ht) {
+      var cb = ht.node.querySelector ? ht.node.querySelector('input[type="checkbox"]') : null;
+      if (!cb) { return; }
+      var chip = ht.node.querySelector('.ctl-toggle');
+      var apply = function () {
+        if (chip && chip.classList) { chip.classList.toggle('on', cb.checked); }
+        var rows = card.querySelectorAll('[data-hideif="' + ht.hideKey + '"]');
+        for (var r = 0; r < rows.length; r++) { rows[r].classList.toggle('is-hidden', cb.checked); }
+      };
+      apply();
+      cb.addEventListener('change', apply);
+    });
     return card;
   }
 
