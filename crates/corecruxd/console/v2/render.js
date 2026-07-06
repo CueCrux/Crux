@@ -1627,6 +1627,11 @@
     var content = el('div', { 'class': 'ow-tabcontent' });
     root.appendChild(tabBar); root.appendChild(content);
     var tabBtns = {}, active = tabs.length ? tabs[0].id : null;
+    // Honour a deep link (#/overwatch/<id>) by opening that tab.
+    if (typeof location !== 'undefined' && location.hash) {
+      var hp = String(location.hash).replace(/^#\/?/, '').split('/');
+      if (hp[0] === 'overwatch' && hp[1] && tabs.some(function (t) { return t.id === hp[1]; })) { active = hp[1]; }
+    }
     tabs.forEach(function (t) {
       var b = el('button', { 'class': 'ow-tab', type: 'button', role: 'tab', 'data-tab': t.id, 'aria-selected': t.id === active ? 'true' : 'false' }, [t.title]);
       b.addEventListener('click', function () {
@@ -1647,10 +1652,9 @@
         content.appendChild(cols);
         var needs = panel('Needs you', 'loading gate queue…', true);
         var fleet = panel('Fleet', 'loading live sessions…', false);
-        left.appendChild(needs); left.appendChild(fleet);   // Fleet under Needs-you
-        var actHost = el('div', { 'class': 'page-host' });
-        right.appendChild(actHost);
-        if (page) { renderPage(page, actHost); }
+        // Needs-you (left 50%) | Fleet (right 50%). The Live-activity pointer is
+        // dropped here — it duplicated the dedicated Work › Activity log page.
+        left.appendChild(needs); right.appendChild(fleet);
         fillNeedsYou(needs); fillFleet(fleet);
         return;
       }

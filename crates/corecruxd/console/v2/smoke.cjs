@@ -1596,8 +1596,8 @@ function extractThemeVars(theme) {
     check(!/activityTicker/.test(landing), '[overwatch] landing must NOT build an activity ticker');
     check(!/fillEngine\b/.test(landing), '[overwatch] landing must NOT render the standalone Engine panel (folded into the tiles)');
     check(/fillNeedsYou/.test(landing) && /fillFleet/.test(landing), '[overwatch] landing must still fill Needs-you + Fleet');
-    check(/left\.appendChild\(needs\)/.test(landing) && /left\.appendChild\(fleet\)/.test(landing),
-      '[overwatch] Fleet must sit UNDER Needs-you in the LEFT column');
+    check(/left\.appendChild\(needs\)/.test(landing) && /right\.appendChild\(fleet\)/.test(landing),
+      '[overwatch] the Activity tab must show Needs-you (left) | Fleet (right) — no Live-activity pointer (dup of Work › Activity)');
     check(/ow-tabs/.test(landing) && /renderTab/.test(landing) && /ow-tabcontent/.test(landing),
       '[overwatch] the landing must render the view tab bar (ow-tabs) + swappable ow-tabcontent (renderTab)');
   }
@@ -1695,11 +1695,10 @@ function extractThemeVars(theme) {
     check(!!cols, '[overwatch] rendered landing must have an .ow-cols region');
     if (cols) {
       const left = cols.children[0], right = cols.children[1];
-      check(left.querySelectorAll('.ow-panel').length === 2, '[overwatch] LEFT column must hold exactly 2 panels (Needs-you + Fleet)');
-      check(right.querySelectorAll('.page-host').length === 1, '[overwatch] the Activity tab RIGHT column must render the Activity page content (.page-host)');
-      const lp = left.querySelectorAll('.ow-panel');
-      check(panelTitle(lp[0]) === 'Needs you', '[overwatch] LEFT column panel 1 must be Needs-you (got ' + panelTitle(lp[0]) + ')');
-      check(panelTitle(lp[1]) === 'Fleet', '[overwatch] LEFT column panel 2 must be Fleet — directly under Needs-you (got ' + panelTitle(lp[1]) + ')');
+      check(left.querySelectorAll('.ow-panel').length === 1, '[overwatch] Activity LEFT column must hold Needs-you');
+      check(right.querySelectorAll('.ow-panel').length === 1, '[overwatch] Activity RIGHT column must hold Fleet (Live-activity pointer removed — dup of Work › Activity)');
+      check(panelTitle(left.querySelectorAll('.ow-panel')[0]) === 'Needs you', '[overwatch] Activity LEFT panel must be Needs-you (got ' + panelTitle(left.querySelectorAll('.ow-panel')[0]) + ')');
+      check(panelTitle(right.querySelectorAll('.ow-panel')[0]) === 'Fleet', '[overwatch] Activity RIGHT panel must be Fleet (got ' + panelTitle(right.querySelectorAll('.ow-panel')[0]) + ')');
     }
     // The view tab bar lists the overwatch pages; Activity is the default tab.
     const tabbar = region.querySelectorAll('.ow-tabs')[0];

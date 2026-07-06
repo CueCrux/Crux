@@ -2486,10 +2486,14 @@
     if (destId !== 'overwatch') { content.appendChild(buildSubnav(destId, pageId)); }
     // Settings owns the Command-density switch (moved off the top-level toggle).
     if (destId === 'system' && page && page.id === 'cx-settings') { content.appendChild(buildDensityCard()); content.appendChild(buildThemeCard()); }
-    var host = el('div', { 'class': 'page-host', id: 'pageHost' });
-    content.appendChild(host);
-    if (window.CruxRender && page) { window.CruxRender.renderPage(page, host); }
-    else if (page) { host.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' })); }
+    // Overwatch IS its landing (tiles + view tabs) — don't also render the resolved
+    // page below it (that duplicated the Activity page's Live-activity card).
+    if (destId !== 'overwatch') {
+      var host = el('div', { 'class': 'page-host', id: 'pageHost' });
+      content.appendChild(host);
+      if (window.CruxRender && page) { window.CruxRender.renderPage(page, host); }
+      else if (page) { host.appendChild(el('p', { 'class': 'v2card-sub', text: 'Renderer module unavailable.' })); }
+    }
     applyPosture(content);
     if (typeof content.scrollTo === 'function') { content.scrollTo(0, 0); }
   }
