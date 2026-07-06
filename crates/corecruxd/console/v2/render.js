@@ -138,6 +138,32 @@
       .catch(function () { return { ok: false, status: 0, data: null }; });
   }
 
+  // Wrap any CruxApi NAMED-method call (parameterised reads — e.g. activity(query),
+  // the projection artifact endpoints) into the same {ok,status,data} envelope as
+  // fetchJSON. Named methods are how the console reaches routes that carry a query
+  // (CruxApi.get only accepts literal, query-less allowlist paths). render.js keeps
+  // zero raw fetches of its own — the network layer lives in api.js.
+  function fetchVia(invoke) {
+    if (typeof invoke !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    var p;
+    try { p = invoke(); } catch (e) { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    if (!p || typeof p.then !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    return p.then(function (r) {
+      return r.json().then(
+        function (data) { return { ok: r.ok, status: r.status, data: data }; },
+        function () { return { ok: r.ok, status: r.status, data: null }; }
+      );
+    }).catch(function () { return { ok: false, status: 0, data: null }; });
+  }
+
+  // /v1/activity is a parameterised read — reach it via CruxApi.activity(query),
+  // never fetchJSON (a query string is not a literal allowlist path, so get()
+  // rejects it). Used by the Watch + Receipt-Diff change feeds.
+  function activityRows(query) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    return fetchVia(api && typeof api.activity === 'function' ? function () { return api.activity(query); } : null);
+  }
+
   // Repos for one project: GET /v1/projects/{id}/repos via the generated
   // named CruxApi method (a parameterised route — reachable only through the
   // method, never CruxApi.get's literal allowlist). render.js keeps zero raw
@@ -2488,7 +2514,7 @@
     docSurfaceHead(main, '◎', 'Watch', "We'll tell you when something you rely on changes.");
     var host = el('div', { 'class': 'doc-ev-host' }, [el('p', { 'class': 'ctl-desc', text: 'Loading change feed…' })]);
     main.appendChild(host);
-    fetchJSON('/v1/activity?tenant_id=default&token_budget=1500').then(function (res) {
+    activityRows({ tenant_id: 'default', token_budget: 1500 }).then(function (res) {
       host.textContent = '';
       var rows = (res.ok && res.data && res.data.rows) ? res.data.rows : [];
       if (rows.length) {
@@ -2685,7 +2711,7 @@
     // Real receipt timeline (grounds the surface even without the demo diff).
     var host = el('div', { 'class': 'doc-ev-host' }, [el('p', { 'class': 'ctl-desc', text: 'Loading receipts…' })]);
     main.appendChild(host);
-    fetchJSON('/v1/activity?tenant_id=default&token_budget=1500').then(function (res) {
+    activityRows({ tenant_id: 'default', token_budget: 1500 }).then(function (res) {
       host.textContent = '';
       var rows = (res.ok && res.data && res.data.rows) ? res.data.rows : [];
       var seen = {}, n = 0;

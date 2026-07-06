@@ -1341,7 +1341,12 @@ function extractThemeVars(theme) {
     check(!!body, '[honesty] could not extract ' + port[id].component + ' body');
     if (!body) { return; }
     if (/^real:/.test(port[id].status)) {
-      check(/fetchJSON\(/.test(body), '[honesty] real surface ' + id + ' must read via the api.js client (fetchJSON)');
+      // Real surfaces read through the api.js client — the literal-GET helper
+      // (fetchJSON), a named parameterised-read helper (activityRows / fetchVia →
+      // CruxApi.<method>), or a curated read-POST (readPost → CruxApiRead). All
+      // route through window.Crux* — never a raw fetch.
+      check(/(?:fetchJSON|activityRows|fetchVia|readPost)\(/.test(body),
+        '[honesty] real surface ' + id + ' must read via the api.js client (fetchJSON / named CruxApi method / readPost)');
     } else {
       check(/surfaceDemo\(/.test(body), '[honesty] demo-surface ' + id + ' must read its fixture only via the surfaceDemo() choke point');
       check(/docSurfaceEmpty\(/.test(body), '[honesty] demo-surface ' + id + ' must show an honest empty state when demo is off (docSurfaceEmpty)');
