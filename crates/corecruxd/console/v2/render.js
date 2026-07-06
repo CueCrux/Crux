@@ -1673,6 +1673,8 @@
       renderSections(container, [{ h: 'Not found', wide: true, controls: [{ t: 'info', label: '—', v: 'no such page' }] }]);
       return Promise.resolve();
     }
+    // Custom-rendered pages (no section model).
+    if (page.id === 'cx-activity-log') { container.textContent = ''; renderActivityLog(container); return Promise.resolve(); }
     if (page.operatorOnly && !isOperator()) {
       renderSections(container, [{ h: page.title, wide: true, controls: [
         { t: 'info', label: 'operator only', v: 'This surface is only available in operator posture.' },
@@ -3205,6 +3207,143 @@
       '<b>The count:</b> today\'s console is 26 flat rail items in the CX scope plus 4 sibling scopes (DX · GX · AX · IX). This arrangement lands the same surface in <b>5 destinations + System</b> — 9 pages merge into 4, three buried things get promoted (gates, review, node health), two get built new (posture, benchmarks), and nothing is dropped. The 2D|3D substrate switch and the kanban/graph pull-outs survive as per-page view switches. Phone gets Overwatch · Work · Trust + More; Memory, Meters and System sit behind More because approving a gate at a bus stop is real and re-tuning lane weights is not.'
       + '<br><br><b>The function census behind this map:</b> Crux Daemon exposes 118 HTTP routes (~40 groups), 114 registered MCP tools (14 live at free tier — the console renders from the capability plan, not the registry), 98 corecruxctl subcommands; CruxEngine adds 295 paths on port 14343 + 164 on 14344. ≈789 functions total, each assigned a destination in <span class="mono">PlanCrux/docs/architecture/function-map-daemon-engine-2026-07-03.md</span>. Engine functions reach this UI only through daemon-mediated proxy routes (the lane-weights / gpu1 precedent) — one origin, one passport, receipts on every cross-system mutation.';
     host.appendChild(note);
+  }
+
+  // =======================================================================
+  //  Activity log (Work › Activity) — the human-lane rolling activity log,
+  //  ported from the standalone /console/activity into the v2 theme. Backfill
+  //  via /v1/activity (through the client); row-expand derefs the turn's verbatim
+  //  entries + Ed25519 receipt-verify badges via CruxApi.activityTurnByTurnId
+  //  [/Verify]; live tail via EventSource on /v1/events/stream. Gated server-side
+  //  by CORECRUXD_FEATURE_ACTIVITY_LOG (honest 404 copy when off).
+  // =======================================================================
+  var ACT_KINDS = ['question', 'answer', 'reasoning', 'command', 'fact', 'execplan', 'handoff', 'error'];
+  var __actLogES = null;
+  // /v1/activity is a parameterised read — use the named CruxApi.activity(query)
+  // method (CruxApi.get only accepts literal, query-less allowlist paths).
+  function activityBackfill(query) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api.activity !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    return api.activity(query).then(function (r) {
+      return r.json().then(function (d) { return { ok: r.ok, status: r.status, data: d }; }, function () { return { ok: r.ok, status: r.status, data: null }; });
+    }).catch(function () { return { ok: false, status: 0, data: null }; });
+  }
+  function activityTurnCall(method, turnId, query) {
+    var api = (typeof window !== 'undefined') ? window.CruxApi : null;
+    if (!api || typeof api[method] !== 'function') { return Promise.resolve({ ok: false, status: 0, data: null }); }
+    return api[method](turnId, query).then(function (r) {
+      return r.json().then(function (d) { return { ok: r.ok, status: r.status, data: d }; }, function () { return { ok: r.ok, status: r.status, data: null }; });
+    }).catch(function () { return { ok: false, status: 0, data: null }; });
+  }
+  function renderActivityLog(host) {
+    host.textContent = '';
+    if (__actLogES) { try { __actLogES.close(); } catch (e) { /* noop */ } __actLogES = null; }
+    var state = { tenant: 'default', session: '', budget: 2000, kinds: {}, rows: [], deb: null };
+    ACT_KINDS.forEach(function (k) { state.kinds[k] = true; });
+    var sessionInput = el('input', { 'class': 'act-input', type: 'text', placeholder: 'session id…', 'aria-label': 'session id' });
+    var budgetInput = el('input', { 'class': 'act-input act-budget', type: 'number', min: '1', value: '2000', 'aria-label': 'token budget' });
+    var searchInput = el('input', { 'class': 'act-input', type: 'search', placeholder: 'filter text…', 'aria-label': 'search' });
+    function field(label, node) { return el('label', { 'class': 'act-field' }, [el('span', { text: label }), node]); }
+    var kindsWrap = el('div', { 'class': 'act-kinds' });
+    var loadBtn = el('button', { 'class': 'btn-primary', type: 'button' }, ['Load']);
+    var liveBtn = el('button', { 'class': 'btn-quiet', type: 'button' }, ['Go live']);
+    var controls = el('div', { 'class': 'act-controls' }, [field('session', sessionInput), field('token budget', budgetInput), field('search', searchInput), kindsWrap, loadBtn, liveBtn]);
+    var liveDot = el('span', { 'class': 'act-livedot' });
+    var statusText = el('span', { 'class': 'act-statustext', text: 'Enter a session id and Load. The activity log is gated by CORECRUXD_FEATURE_ACTIVITY_LOG.' });
+    var list = el('div', { 'class': 'act-list' }, [el('p', { 'class': 'ctl-desc', text: 'No activity loaded yet.' })]);
+    host.appendChild(el('div', { 'class': 'act-log' }, [controls, el('div', { 'class': 'act-status' }, [liveDot, statusText]), list]));
+
+    function setStatus(t) { statusText.textContent = t; }
+    function activeKinds() { return ACT_KINDS.filter(function (k) { return state.kinds[k]; }); }
+    function renderKinds() {
+      kindsWrap.textContent = '';
+      ACT_KINDS.forEach(function (k) {
+        var chip = el('button', { 'class': 'act-kchip k-' + k + (state.kinds[k] ? ' on' : ''), type: 'button', 'aria-pressed': state.kinds[k] ? 'true' : 'false', text: k });
+        chip.addEventListener('click', function () { state.kinds[k] = !state.kinds[k]; renderKinds(); paint(); });
+        kindsWrap.appendChild(chip);
+      });
+    }
+    function load() {
+      state.session = (sessionInput.value || '').trim();
+      state.budget = parseInt(budgetInput.value, 10) || 2000;
+      if (!state.session) { setStatus('Enter a session id first.'); return; }
+      var ak = activeKinds();
+      var query = { tenant_id: state.tenant, session: state.session, token_budget: state.budget };
+      if (ak.length < ACT_KINDS.length) { query.kinds = ak.join(','); }
+      activityBackfill(query).then(function (res) {
+        if (res.status === 404) { state.rows = []; setStatus('Activity log disabled on this daemon (set CORECRUXD_FEATURE_ACTIVITY_LOG=1).'); paint(); return; }
+        if (!res.ok || !res.data) { state.rows = []; setStatus('Load failed (HTTP ' + (res.status || '?') + ').'); paint(); return; }
+        state.rows = res.data.rows || [];
+        setStatus((res.data.returned != null ? res.data.returned : state.rows.length) + ' row(s)' + (res.data.truncated ? ' (budget-truncated — raise token_budget)' : '') + ' · session ' + state.session);
+        paint();
+      });
+    }
+    function matches(r, q) {
+      if (!q) { return true; }
+      return ((r.kind || '') + ' ' + (r.preview || '') + ' ' + (r.tool || '') + ' ' + (r.intent || '') + ' ' + (r.turn_id || '')).toLowerCase().indexOf(q) >= 0;
+    }
+    function paint() {
+      var q = (searchInput.value || '').trim().toLowerCase();
+      list.textContent = '';
+      var visible = state.rows.filter(function (r) { return state.kinds[r.kind] && matches(r, q); });
+      if (!visible.length) { list.appendChild(el('p', { 'class': 'ctl-desc', text: state.rows.length ? 'No matching activity.' : 'No activity loaded yet.' })); return; }
+      visible.forEach(function (r) { list.appendChild(rowEl(r)); });
+    }
+    function rowEl(r) {
+      var meta = el('div', { 'class': 'act-meta' }, [
+        el('span', { 'class': 'act-kind', text: r.kind || '' }),
+        el('span', { text: 'seq ' + r.seq }),
+        el('span', { text: r.ts || '' }),
+        el('span', { text: r.turn_id ? ('turn ' + r.turn_id) : '—' })
+      ]);
+      var extra = [r.tool, r.intent, (r.confidence != null ? ('conf ' + r.confidence) : null)].filter(Boolean).join(' · ');
+      if (extra) { meta.appendChild(el('span', { text: extra })); }
+      var expand = el('div', { 'class': 'act-expand' }, [el('div', { 'class': 'act-verbatim', text: 'loading verbatim…' }), el('div', { 'class': 'act-receipts' })]);
+      var row = el('div', { 'class': 'act-row k-' + (r.kind || 'idle'), role: 'button', tabindex: '0' }, [meta, el('div', { 'class': 'act-preview', text: r.preview || '' }), expand]);
+      var opened = false;
+      function toggle() { var o = row.classList.toggle('open'); if (o && !opened) { opened = true; expandRow(row, r); } }
+      row.addEventListener('click', toggle);
+      row.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      return row;
+    }
+    function expandRow(row, r) {
+      var vb = row.querySelector('.act-verbatim'), rc = row.querySelector('.act-receipts');
+      if (!r.turn_id) { vb.textContent = r.preview || '(no turn id — preview only)'; return; }
+      var query = { tenant_id: state.tenant, session: state.session };
+      activityTurnCall('activityTurnByTurnId', r.turn_id, query).then(function (res) {
+        if (!res.ok || !res.data) { vb.textContent = 'deref failed (HTTP ' + (res.status || '?') + ')'; return; }
+        var entries = res.data.entries || [];
+        vb.textContent = entries.map(function (e) { return '[' + e.kind + '] ' + e.text; }).join('\n\n') || '(no entries)';
+        rc.textContent = ''; rc.appendChild(el('span', { 'class': 'act-badge', text: '⏳ verifying…' }));
+        activityTurnCall('activityTurnByTurnIdVerify', r.turn_id, query).then(function (vres) {
+          rc.textContent = '';
+          if (!vres.ok || !vres.data) { rc.appendChild(el('span', { 'class': 'act-badge warn', text: '• recorded (verify unavailable HTTP ' + (vres.status || '?') + ')' })); return; }
+          var vrows = vres.data.entries || [], signer = vres.data.signer;
+          if (!vrows.length) { rc.appendChild(el('span', { 'class': 'act-badge', text: 'no entries' })); return; }
+          vrows.forEach(function (v) {
+            var cls = 'act-badge', txt;
+            if (!v.signed) { cls += ' warn'; txt = '• recorded ' + v.entry_id; }
+            else if (v.verified) { cls += ' ok'; txt = '✓ verified ' + v.entry_id + (signer ? (' · ' + String(signer).slice(0, 12)) : ''); }
+            else { cls += ' err'; txt = '✕ ' + ((v.errors && v.errors[0]) || 'unverifiable') + ' ' + v.entry_id; }
+            rc.appendChild(el('span', { 'class': cls, text: txt }));
+          });
+        });
+      });
+    }
+    function toggleLive() {
+      if (__actLogES) { try { __actLogES.close(); } catch (e) { /* noop */ } __actLogES = null; liveDot.classList.remove('on'); liveBtn.textContent = 'Go live'; return; }
+      if (typeof EventSource === 'undefined') { setStatus('Live streaming unsupported in this browser.'); return; }
+      try { __actLogES = new EventSource('/v1/events/stream?types=activity.appended'); }
+      catch (e) { setStatus('Live stream unavailable.'); return; }
+      __actLogES.addEventListener('activity.appended', function () { clearTimeout(state.deb); state.deb = setTimeout(load, 400); });
+      __actLogES.onerror = function () { liveBtn.textContent = 'Live (reconnecting)'; };
+      liveDot.classList.add('on'); liveBtn.textContent = 'Stop live';
+    }
+    loadBtn.addEventListener('click', load);
+    liveBtn.addEventListener('click', toggleLive);
+    searchInput.addEventListener('input', paint);
+    sessionInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') { load(); } });
+    renderKinds();
   }
 
   function renderExplorer(host, ctx) {

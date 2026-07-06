@@ -135,9 +135,17 @@ function walkPage(page, fn) {
   // mode). This extends the guarantee (documents the only allowed extras) without
   // weakening it: any page id neither in the 26 nor in PRO_PORTED_IDS still fails.
   const proPorted = new Set(pages.PRO_PORTED_IDS || []);
+  // Declared native v2 pages beyond the legacy 26 (not pro-gated). cx-activity-log
+  // is the Work › Activity log (ported from /console/activity), custom-rendered.
+  const nativeExtra = new Set(['cx-activity-log']);
   Object.keys(pages.PAGES).forEach(function (id) {
     if (LEGACY_26.indexOf(id) >= 0) { return; }
-    check(proPorted.has(id), '[ids] unexpected page id not in the legacy 26 nor PRO_PORTED_IDS: ' + id);
+    if (nativeExtra.has(id)) {
+      const np = pages.PAGES[id];
+      check(np && destIds.has(np.dest), '[ids] native page ' + id + ' has invalid dest: ' + String(np && np.dest));
+      return;
+    }
+    check(proPorted.has(id), '[ids] unexpected page id not in the legacy 26, PRO_PORTED_IDS, nor a declared native page: ' + id);
     const pp = pages.PAGES[id];
     check(pp && pp.pro === true, '[ids] PRO_PORTED page ' + id + ' must be pro:true (Pro-mode only)');
     check(pp && destIds.has(pp.dest), '[ids] PRO_PORTED page ' + id + ' has invalid dest: ' + String(pp && pp.dest));
