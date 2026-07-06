@@ -1596,8 +1596,10 @@ function extractThemeVars(theme) {
     check(!/activityTicker/.test(landing), '[overwatch] landing must NOT build an activity ticker');
     check(!/fillEngine\b/.test(landing), '[overwatch] landing must NOT render the standalone Engine panel (folded into the tiles)');
     check(/fillNeedsYou/.test(landing) && /fillFleet/.test(landing), '[overwatch] landing must still fill Needs-you + Fleet');
-    check(/left\.appendChild\(needs\)/.test(landing) && /right\.appendChild\(fleet\)/.test(landing),
-      '[overwatch] the Activity tab must show Needs-you (left) | Fleet (right) — no Live-activity pointer (dup of Work › Activity)');
+    check(/left\.appendChild\(needs\)/.test(landing) && /left\.appendChild\(fleet\)/.test(landing),
+      '[overwatch] the Activity tab must stack Needs-you then Fleet in the LEFT column');
+    check(/right\.appendChild\(actHost\)/.test(landing) && /renderPage\(page, actHost\)/.test(landing),
+      '[overwatch] the Activity tab must render the Activity page (cx-activity) in the RIGHT column (50%)');
     check(/ow-tabs/.test(landing) && /renderTab/.test(landing) && /ow-tabcontent/.test(landing),
       '[overwatch] the landing must render the view tab bar (ow-tabs) + swappable ow-tabcontent (renderTab)');
   }
@@ -1695,10 +1697,10 @@ function extractThemeVars(theme) {
     check(!!cols, '[overwatch] rendered landing must have an .ow-cols region');
     if (cols) {
       const left = cols.children[0], right = cols.children[1];
-      check(left.querySelectorAll('.ow-panel').length === 1, '[overwatch] Activity LEFT column must hold Needs-you');
-      check(right.querySelectorAll('.ow-panel').length === 1, '[overwatch] Activity RIGHT column must hold Fleet (Live-activity pointer removed — dup of Work › Activity)');
-      check(panelTitle(left.querySelectorAll('.ow-panel')[0]) === 'Needs you', '[overwatch] Activity LEFT panel must be Needs-you (got ' + panelTitle(left.querySelectorAll('.ow-panel')[0]) + ')');
-      check(panelTitle(right.querySelectorAll('.ow-panel')[0]) === 'Fleet', '[overwatch] Activity RIGHT panel must be Fleet (got ' + panelTitle(right.querySelectorAll('.ow-panel')[0]) + ')');
+      check(left.querySelectorAll('.ow-panel').length === 2, '[overwatch] Activity LEFT column must stack Needs-you + Fleet (2 panels)');
+      check(right.querySelectorAll('.page-host').length === 1, '[overwatch] Activity RIGHT column must host the Activity page (.page-host)');
+      check(panelTitle(left.querySelectorAll('.ow-panel')[0]) === 'Needs you', '[overwatch] Activity LEFT panel 1 must be Needs-you (got ' + panelTitle(left.querySelectorAll('.ow-panel')[0]) + ')');
+      check(panelTitle(left.querySelectorAll('.ow-panel')[1]) === 'Fleet', '[overwatch] Activity LEFT panel 2 must be Fleet (got ' + panelTitle(left.querySelectorAll('.ow-panel')[1]) + ')');
     }
     // The view tab bar lists the overwatch pages; Activity is the default tab.
     const tabbar = region.querySelectorAll('.ow-tabs')[0];
@@ -1710,7 +1712,7 @@ function extractThemeVars(theme) {
       const act = tabButtons.filter(function (b) { return b.getAttribute('data-tab') === 'cx-activity'; })[0];
       check(act && act.getAttribute('aria-selected') === 'true', '[overwatch] Activity must be the default selected tab');
     }
-    notes.push('overwatch layout (tabs): Daemon-at-a-glance tiles → a view tab bar (Activity · Live board · Orchestrators · Punchcards · Agent) that swaps the content below; Activity default = Needs-you + Fleet (left 50%) | Activity page (right 50%); other tabs render their page full-width. Sub-nav pills stay suppressed for overwatch.');
+    notes.push('overwatch layout (tabs): Daemon-at-a-glance tiles → a view tab bar (Activity · Live board · Orchestrators · Punchcards · Agent) that swaps the content below; Activity default = Needs-you then Fleet (left 50%) | Activity page (right 50%); other tabs render their page full-width. The bottom-of-page dup is gone (shell no longer re-renders the resolved overwatch page). Sub-nav pills stay suppressed for overwatch.');
   } catch (e) {
     check(false, '[overwatch] renderOverwatchLanding threw on the synchronous paint: ' + (e && e.stack || e));
   } finally {

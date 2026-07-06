@@ -1652,9 +1652,10 @@
         content.appendChild(cols);
         var needs = panel('Needs you', 'loading gate queue…', true);
         var fleet = panel('Fleet', 'loading live sessions…', false);
-        // Needs-you (left 50%) | Fleet (right 50%). The Live-activity pointer is
-        // dropped here — it duplicated the dedicated Work › Activity log page.
-        left.appendChild(needs); right.appendChild(fleet);
+        left.appendChild(needs); left.appendChild(fleet);   // Needs-you then Fleet (left 50%)
+        var actHost = el('div', { 'class': 'page-host' });
+        right.appendChild(actHost);
+        if (page) { renderPage(page, actHost); }             // Activity (cx-activity) on the right 50%
         fillNeedsYou(needs); fillFleet(fleet);
         return;
       }
