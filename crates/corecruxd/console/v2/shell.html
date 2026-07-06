@@ -844,6 +844,17 @@
   /* Glance header row: title left, Day/Week/Month range toggle pushed right. */
   .v2card-head-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
   .v2card-head-row .v2card-h { margin: 0; }
+  /* "+" header action — reveals a target card below (e.g. New passport). */
+  .v2card-addbtn {
+    flex: 0 0 auto; width: 28px; height: 28px; padding: 0; line-height: 1;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: 500; color: var(--ink2);
+    background: var(--surface); border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    cursor: pointer; transition: color .12s, border-color .12s, background .12s, transform .12s;
+  }
+  .v2card-addbtn:hover { color: var(--ink); border-color: var(--acc); }
+  .v2card-addbtn.is-on { color: var(--acc); border-color: var(--acc); transform: rotate(45deg); }
+  .v2card.is-collapsed { display: none; }
 
   /* ---- Site map destination (ported from the unified-shell concept) ------
      A two-column card grid: each destination is a card with a coloured left

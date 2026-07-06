@@ -785,8 +785,29 @@
   }
 
   function renderSection(section) {
-    var card = el('section', { 'class': 'v2card' + (section.wide ? ' wide' : '') });
-    if (section.h) { card.appendChild(el('h3', { 'class': 'v2card-h', text: section.h })); }
+    var card = el('section', { 'class': 'v2card' + (section.wide ? ' wide' : '') + (section.hidden ? ' is-collapsed' : '') });
+    if (section.id) { card.id = section.id; }
+    if (section.h && section.headAction) {
+      // Card header carries a "+" action that reveals a target card below.
+      var hrow = el('div', { 'class': 'v2card-head-row' });
+      hrow.appendChild(el('h3', { 'class': 'v2card-h', text: section.h }));
+      var act = section.headAction;
+      var addBtn = el('button', { 'class': 'v2card-addbtn', type: 'button', text: act.label || '+',
+        title: act.title || 'Add', 'aria-expanded': 'false', 'aria-label': act.title || 'Add' });
+      addBtn.addEventListener('click', function () {
+        var tgt = act.target ? doc().getElementById(act.target) : null;
+        if (!tgt) { return; }
+        var opening = tgt.classList.contains('is-collapsed');
+        if (opening) { tgt.classList.remove('is-collapsed'); if (tgt.scrollIntoView) { tgt.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } }
+        else { tgt.classList.add('is-collapsed'); }
+        addBtn.setAttribute('aria-expanded', opening ? 'true' : 'false');
+        addBtn.classList.toggle('is-on', opening);
+      });
+      hrow.appendChild(addBtn);
+      card.appendChild(hrow);
+    } else if (section.h) {
+      card.appendChild(el('h3', { 'class': 'v2card-h', text: section.h }));
+    }
     if (section.sub) { card.appendChild(el('p', { 'class': 'v2card-sub', text: section.sub })); }
     if (section.tiles) {
       var grid = el('div', { 'class': 'stats' });

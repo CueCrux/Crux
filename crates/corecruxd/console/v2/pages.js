@@ -222,7 +222,9 @@
   }
 
   function buildPassports(res) {
-    var form = { h: 'New passport', sub: 'mint a passport and attach who owns it (POST /v1/passports)', wide: true,
+    // The mint form starts hidden; the Passports card header carries a "+" that
+    // reveals it BELOW the list (not on top). See renderSection headAction.
+    var form = { h: 'New passport', id: 'newPassportForm', hidden: true, sub: 'mint a passport and attach who owns it (POST /v1/passports)', wide: true,
       controls: [
         { t: 'input', k: 'pp_id', label: 'id', ph: 'lowercase, digits, - or _', mono: true, mut: true },
         { t: 'select', k: 'pp_category', label: 'category', options: ['work', 'personal', 'public'], v: 'work', mut: true },
@@ -233,7 +235,8 @@
         { t: 'textarea', k: 'pp_notes', label: 'notes', rows: 2, ph: 'any other notes', mut: true },
         mbtn('Create passport', { hint: 'POST /v1/passports' })
       ] };
-    if (!res.ok || !res.data) { return [form, { h: 'Passports', wide: true, controls: [{ t: 'search', ph: 'Filter passports…' }].concat(degraded(res.status, 'Passports unavailable — GET /v1/passports')) }]; }
+    var plus = { label: '+', title: 'New passport', target: 'newPassportForm' };
+    if (!res.ok || !res.data) { return [{ h: 'Passports', wide: true, headAction: plus, controls: [{ t: 'search', ph: 'Filter passports…' }].concat(degraded(res.status, 'Passports unavailable — GET /v1/passports')) }, form]; }
     var ps = arr(res.data.passports);
     var rows = [{ t: 'search', ph: 'Filter passports…' }].concat(ps.map(function (p) {
       return { t: 'exp', label: p.name ? (p.name + ' · ' + p.id) : p.id,
@@ -244,7 +247,7 @@
           .concat(p.notes ? [info('notes', String(p.notes))] : []) };
     }));
     if (!ps.length) { rows.push(info('none', 'no passports yet')); }
-    return [form, { h: 'Passports', sub: ps.length + ' passport' + (ps.length === 1 ? '' : 's') + ' · loaded from /v1/passports', wide: true, controls: rows }];
+    return [{ h: 'Passports', sub: ps.length + ' passport' + (ps.length === 1 ? '' : 's') + ' · loaded from /v1/passports', wide: true, headAction: plus, controls: rows }, form];
   }
 
   function buildSessions(res) {
