@@ -380,16 +380,39 @@
   .rail-meta .icon-chip { padding: 0; min-width: 22px; justify-content: center; color: var(--ink3); }
   .rail-meta .icon-chip svg { width: 13px; height: 13px; }
   .rail-meta .icon-chip.on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 34%, var(--edge)); }
-  /* Surface toggle row + the theme quick-cycle icon (theme picker is in Settings). */
-  .rail-surface-row { display: flex; gap: 6px; align-items: stretch; }
-  .rail-surface-row .railseg { flex: 1; }
+  /* Theme quick-cycle icon — lives in the chips row, sized like the status chips. */
   .rail-theme-cycle {
-    flex: none; width: 38px; display: inline-flex; align-items: center; justify-content: center;
-    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface2);
+    flex: none; min-height: 20px; min-width: 22px; padding: 0 5px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: 1px solid var(--edge); border-radius: 6px; background: var(--surface2);
     color: var(--ink2); cursor: pointer; transition: background .18s ease, color .18s ease, border-color .18s ease;
   }
   .rail-theme-cycle:hover { color: var(--ink); border-color: var(--edge-strong); background: var(--surface); }
-  .rail-theme-cycle svg { width: 17px; height: 17px; }
+  .rail-theme-cycle svg { width: 13px; height: 13px; }
+  /* Bottom account roll-up menu (Settings · Language · Log out) — the System button. */
+  .acct-menu-wrap { position: relative; }
+  .passport-chip { width: 100%; font: inherit; cursor: pointer; }
+  .passport-chip[aria-expanded="true"] { border-color: var(--edge-strong); }
+  .passport-chip .acct-caret { margin-left: auto; display: inline-flex; width: 14px; height: 14px; color: var(--ink3); flex: none; }
+  .passport-chip .acct-caret svg { width: 14px; height: 14px; transform: rotate(-90deg); }
+  .passport-chip[aria-expanded="true"] .acct-caret svg { transform: rotate(90deg); }
+  .acct-menu {
+    position: absolute; left: 0; right: 0; bottom: calc(100% + 8px); z-index: 30;
+    display: flex; flex-direction: column; gap: 2px; padding: 6px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm);
+    background: var(--surface); box-shadow: var(--card-shadow);
+    backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
+  }
+  .acct-menu[hidden] { display: none; }
+  .acct-item {
+    display: flex; align-items: center; gap: 11px; width: 100%; min-height: 38px; padding: 8px 10px;
+    border: 0; border-radius: 8px; background: none; color: var(--ink);
+    font: inherit; font-size: 13px; text-align: left; cursor: pointer;
+  }
+  .acct-item:hover { background: var(--surface2); }
+  .acct-ico { display: inline-flex; width: 16px; height: 16px; flex: none; color: var(--ink2); }
+  .acct-ico svg { width: 16px; height: 16px; }
+  .acct-sep { height: 1px; margin: 4px 2px; background: var(--edge); }
   /* Settings › Theme picker */
   .theme-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
   .theme-opt { display: flex; flex-direction: column; gap: 8px; }
@@ -1510,26 +1533,33 @@
       <!-- Compact meta cluster (condensed from the old top bar): the Command |
            Explore surface toggle + the status chips + the connection pill. -->
       <div class="rail-meta" id="railMeta">
-        <div class="rail-surface-row">
-          <div class="modeseg railseg" id="modeSeg" role="group" aria-label="Surface"></div>
-          <button class="rail-theme-cycle" id="themeCycle" type="button" title="Cycle theme" aria-label="Cycle theme"></button>
-        </div>
+        <div class="modeseg railseg" id="modeSeg" role="group" aria-label="Surface"></div>
         <div class="rail-chips">
           <div class="topchips" id="topchips"></div>
           <span class="health" id="health" role="status" aria-live="polite">
             <span class="dot" aria-hidden="true"></span>
             <span id="healthText">Connecting…</span>
           </span>
+          <button class="rail-theme-cycle" id="themeCycle" type="button" title="Cycle theme" aria-label="Cycle theme"></button>
         </div>
       </div>
       <nav id="nav" aria-label="Primary"></nav>
       <div class="rail-footer">
-        <div class="passport-chip" id="passportChip" title="Passport identity — wired to the capability plan in M3">
-          <span class="avatar" aria-hidden="true"></span>
-          <span class="who">
-            <b id="passportName">Passport</b>
-            <span id="passportSub">not yet wired</span>
-          </span>
+        <div class="acct-menu-wrap" id="acctWrap">
+          <div class="acct-menu" id="acctMenu" role="menu" aria-label="Account &amp; system" hidden>
+            <button class="acct-item" type="button" data-acct="settings" role="menuitem"><span class="acct-ico" data-ico="settings" aria-hidden="true"></span>Settings</button>
+            <button class="acct-item" type="button" data-acct="language" role="menuitem"><span class="acct-ico" data-ico="globe" aria-hidden="true"></span>Language</button>
+            <div class="acct-sep"></div>
+            <button class="acct-item" type="button" data-acct="logout" role="menuitem"><span class="acct-ico" data-ico="logout" aria-hidden="true"></span>Log out</button>
+          </div>
+          <button class="passport-chip" id="passportChip" type="button" aria-haspopup="menu" aria-expanded="false" title="Account &amp; system">
+            <span class="avatar" aria-hidden="true"></span>
+            <span class="who">
+              <b id="passportName">Passport</b>
+              <span id="passportSub">not yet wired</span>
+            </span>
+            <span class="acct-caret" aria-hidden="true"></span>
+          </button>
         </div>
       </div>
     </aside>
@@ -1587,6 +1617,8 @@
     map: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="5" rx="1.4"/><rect x="3" y="16" width="6" height="5" rx="1.4"/><rect x="15" y="16" width="6" height="5" rx="1.4"/><path d="M12 8v4M6 16v-2.5h12V16"/></svg>',
     lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>',
     palette: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 0 18c1 0 1.6-.8 1.6-1.7 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.1 0-.9.8-1.7 1.7-1.7H16a5 5 0 0 0 5-5c0-4.1-4-7.3-9-7.3z"/><circle cx="7.5" cy="11.5" r="1"/><circle cx="12" cy="8" r="1"/><circle cx="16.5" cy="11.5" r="1"/></svg>',
+    globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.6 2.5 4 5.6 4 9s-1.4 6.5-4 9c-2.6-2.5-4-5.6-4-9s1.4-6.5 4-9z"/></svg>',
+    logout: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3"/><path d="M10 17l-5-5 5-5"/><path d="M5 12h11"/></svg>',
     dataplane: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12a7.5 7.5 0 0 1 15 0"/><path d="M8 12a4 4 0 0 1 8 0"/><circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none"/></svg>',
     settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>',
     integrations: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v6"/><path d="M8 9V5M16 9V5"/><rect x="6" y="9" width="12" height="6" rx="2"/><path d="M12 15v3a3 3 0 0 0 3 3"/></svg>',
@@ -1699,6 +1731,30 @@
     body.appendChild(grid);
     card.appendChild(body);
     return card;
+  }
+  // Bottom account roll-up menu (Settings · Language · Log out) — the System
+  // destination moved here, Claude-desktop style. Settings routes to System ›
+  // Settings; Language + Log out are placeholders until platform auth is wired
+  // (a local daemon has no session to end).
+  function initAcctMenu() {
+    var btn = document.getElementById('passportChip');
+    var menu = document.getElementById('acctMenu');
+    if (!btn || !menu) { return; }
+    var icons = menu.querySelectorAll('.acct-ico');
+    for (var i = 0; i < icons.length; i++) { icons[i].innerHTML = ICONS[icons[i].getAttribute('data-ico')] || ''; }
+    var caret = btn.querySelector('.acct-caret'); if (caret) { caret.innerHTML = ICONS.chevron || ''; }
+    function closeMenu() { menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); }
+    function openMenu() { menu.hidden = false; btn.setAttribute('aria-expanded', 'true'); }
+    btn.addEventListener('click', function (e) { e.stopPropagation(); if (menu.hidden) { openMenu(); } else { closeMenu(); } });
+    menu.addEventListener('click', function (e) {
+      var item = (e.target && e.target.closest) ? e.target.closest('.acct-item') : null;
+      if (!item) { return; }
+      closeMenu();
+      if (item.getAttribute('data-acct') === 'settings') { location.hash = '#/system/cx-settings'; }
+      // language / logout — placeholders (a local daemon has no session).
+    });
+    document.addEventListener('click', function () { if (!menu.hidden) { closeMenu(); } });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !menu.hidden) { closeMenu(); } });
   }
 
   // ---- Presentation mode registry (Standard | Professional | Documents) --
@@ -2202,12 +2258,12 @@
   // (desktop) and the sheet (phone) — one instance, so applyTheme's #themeSwitch
   // query and passport updates keep working after the move.
   function placeMobileChrome(isPhone) {
-    var passport = document.getElementById('passportChip');
+    var acct = document.getElementById('acctWrap');
     var slot = document.getElementById('sheetChromeSlot');
     var footer = document.querySelector('.rail-footer');
-    if (!passport) { return; }
-    if (isPhone && slot) { slot.appendChild(passport); }
-    else if (footer) { footer.appendChild(passport); }
+    if (!acct) { return; }
+    if (isPhone && slot) { slot.appendChild(acct); }
+    else if (footer) { footer.appendChild(acct); }
   }
 
   // ---- Sub-nav (pill row) + page render ----------------------------------
@@ -2500,6 +2556,7 @@
     buildRail();
     initThemeCycle();          // rail theme-cycle icon (theme picker lives in Settings)
     applyTheme(readTheme());
+    initAcctMenu();            // bottom account roll-up (Settings · Language · Log out)
     initRail();       // collapsible rail (persisted, desktop-only)
     setTopChips();    // paint the DEMO chip (+ any cached facts) immediately
     // Phone tier: build the tab bar + sheet, place the passport/theme chrome for

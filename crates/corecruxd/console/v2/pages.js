@@ -1068,12 +1068,14 @@
     { id: 'memory', label: 'Memory', icon: 'memory', key: '3', sub: 'Facts, tenants, documents, and retrieval tuning.' },
     { id: 'trust', label: 'Trust', icon: 'trust', key: '4', sub: 'Receipts, gates, identity, and posture.' },
     { id: 'meters', label: 'Meters', icon: 'meters', key: '5', sub: 'Cost and usage.' },
-    { id: 'system', label: 'System', icon: 'settings', key: '6', sub: 'Settings, integrations, and developer tools.' },
+    // railHidden — System lives in the bottom account roll-up menu (Settings ·
+    // Language · Log out), not the Command rail; still routable at #/system/*.
+    { id: 'system', label: 'System', icon: 'settings', railHidden: true, sub: 'Settings, integrations, and developer tools.' },
     // Canvas (M9) — a destination with no sub-pills: it IS the page. A
     // size-adaptive Board plus a real-edge relation Graph, switched by a
     // nav-family segmented control (deep-linkable #/canvas/board · #/canvas/graph).
     // Phone tier: lives in the "More" sheet (not one of the three direct tabs).
-    { id: 'canvas', label: 'Canvas', icon: 'canvas', key: '7', sub: 'Size-adaptive dashboard + relation graph.' },
+    { id: 'canvas', label: 'Canvas', icon: 'canvas', key: '6', sub: 'Size-adaptive dashboard + relation graph.' },
     // Explorer (M11) — a destination with no sub-pills: it IS a search surface.
     // A query box + a Local | WikiCrux backend toggle (nav-family, aria-pressed) +
     // a budget/top_k control; results as cards (title/snippet · source · score ·
@@ -1087,7 +1089,7 @@
     // Site map — a destination with no sub-pills: it IS a static reference page
     // (the flat rail rearranged into 5 destinations + System). Delegates to
     // render.js renderSiteMap; reads nothing, so it shows in every posture.
-    { id: 'sitemap', label: 'Site map', icon: 'map', key: '8', sub: "the 26-item rail, rearranged into 5 destinations + System" }
+    { id: 'sitemap', label: 'Site map', icon: 'map', key: '7', sub: "the 26-item rail, rearranged into 5 destinations + System" }
   ];
 
   // ---- Legacy id inventory (the 26 CX pages this plan must keep reachable)
