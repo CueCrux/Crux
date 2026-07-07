@@ -36,8 +36,8 @@ CROWN receipt integrity bugs are treated as **critical severity** regardless of 
 
 | Version | Supported |
 |---|---|
-| 0.1.x | Current release |
-| < 0.1 | Best effort |
+| 0.5.x | Current release |
+| < 0.5 | Best effort |
 
 ## Recognition
 
