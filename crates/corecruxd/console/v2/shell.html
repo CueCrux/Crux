@@ -65,6 +65,7 @@
   /* Adding a 4th theme = one JS THEMES entry + one CSS block here. Nothing
      else in the shell references literal colours. */
   :root[data-theme="glass"] {
+    color-scheme: dark;
     --bg: #060A12;
     --surface: rgba(255,255,255,.055);
     --surface2: rgba(255,255,255,.03);
@@ -86,6 +87,7 @@
     --aurora-opacity: 1;
   }
   :root[data-theme="dark"] {
+    color-scheme: dark;
     --bg: #0D1117;
     --surface: #161B22;
     --surface2: #11151C;
@@ -107,6 +109,7 @@
     --aurora-opacity: 0;
   }
   :root[data-theme="light"] {
+    color-scheme: light;
     --bg: #F4F6F8;
     --surface: #FFFFFF;
     --surface2: #EDF1F5;
@@ -582,6 +585,19 @@
   .ctl-textarea { min-height: 68px; resize: vertical; line-height: 1.5; }
   .ctl-input:disabled { opacity: .72; cursor: not-allowed; }
   .ctl-input::placeholder { color: var(--ink3); }
+  /* Native <select> theming: a custom chevron replaces the OS control art, and a
+     theme-matched `color-scheme` (set per theme below) fixes the broken light /
+     blue popup + option list in dark mode. Options are explicitly re-coloured too
+     (Chromium/Windows honours these on the option list). */
+  .ctl-select {
+    -webkit-appearance: none; -moz-appearance: none; appearance: none;
+    padding-right: 32px; cursor: pointer;
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%237E8CA0' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 10px center;
+  }
+  .ctl-select:hover { border-color: var(--edge-strong); }
+  .ctl-select:focus-visible { border-color: var(--acc); outline: none; }
+  .ctl-select option { background: var(--surface); color: var(--ink); }
 
   .ctl-info {
     display: flex; align-items: baseline; gap: 12px; justify-content: space-between;
@@ -671,6 +687,66 @@
   .ctl-bar-fill { height: 100%; background: var(--acc); border-radius: 999px; }
   .ctl-bar-fill.ok { background: var(--ok); }
   .ctl-bar-fill.err { background: var(--crit); }
+  /* Gradient bar fills (Sessions token/progress bars) — a horizontal gradient
+     reading cool→accent for progress and accent→warm for token burn. */
+  .ctl-bar-fill.grad-prog { background: linear-gradient(90deg, var(--ok), var(--acc)); }
+  .ctl-bar-fill.grad-tok { background: linear-gradient(90deg, var(--acc), var(--warn)); }
+
+  /* ---- ExecPlans kanban board (cx-work) --------------------------------- */
+  .cvx-kanban { display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; padding-bottom: 6px; }
+  .cvx-kcol { flex: 1 1 0; min-width: 224px; display: flex; flex-direction: column; gap: 10px; }
+  .cvx-kcol-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 2px 8px; border-bottom: 1px solid var(--edge); }
+  .cvx-kcol-title { font-size: 11.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--ink2); }
+  .cvx-kcol-count { font-size: 11px; font-variant-numeric: tabular-nums; color: var(--ink3); background: var(--surface2); border: 1px solid var(--edge); border-radius: 999px; padding: 1px 8px; }
+  .cvx-kcol-body { display: flex; flex-direction: column; gap: 10px; min-height: 8px; }
+  .cvx-kempty { margin: 0; font-size: 12px; color: var(--ink3); padding: 8px 2px; }
+  .cvx-kcard {
+    position: relative; overflow: hidden; padding: 11px 13px 10px 15px; display: flex; flex-direction: column; gap: 7px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface); box-shadow: var(--card-shadow);
+  }
+  .cvx-kcard::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--ink3); }
+  .cvx-kcard[data-strip="in_progress"]::before { background: var(--acc); }
+  .cvx-kcard[data-strip="blocked"]::before { background: var(--warn); }
+  .cvx-kcard[data-strip="done"]::before { background: var(--ok); }
+  .cvx-kcard[data-strip="planned"]::before { background: var(--ink3); }
+  .cvx-kcard-top { display: flex; align-items: center; gap: 6px; }
+  .cvx-krisk { font-size: 9.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--edge); color: var(--ink2); background: var(--surface2); }
+  .cvx-krisk.risk-high { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 45%, transparent); background: color-mix(in srgb, var(--crit) 12%, transparent); }
+  .cvx-krisk.risk-medium { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+  .cvx-krisk.risk-low { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 42%, transparent); background: color-mix(in srgb, var(--ok) 11%, transparent); }
+  .cvx-kms { margin-left: auto; font-family: var(--font-mono); font-size: 10.5px; font-weight: 650; color: var(--ink2); background: var(--surface2); border: 1px solid var(--edge); border-radius: 999px; padding: 1px 7px; }
+  .cvx-kslug { font-family: var(--font-mono); font-size: 11px; color: var(--ink3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cvx-ktitle { font-size: 13.5px; font-weight: 650; line-height: 1.3; color: var(--ink); }
+  .cvx-kprog { display: flex; align-items: center; gap: 8px; }
+  .cvx-ktrack { flex: 1; height: 6px; border-radius: 999px; background: var(--surface2); border: 1px solid var(--edge); overflow: hidden; }
+  .cvx-kfill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--ok), var(--acc)); }
+  .cvx-kprogv { font-size: 10.5px; font-variant-numeric: tabular-nums; color: var(--ink2); flex: none; }
+  .cvx-kcard-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 1px; }
+  .cvx-kpass { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .cvx-knote { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); }
+  .cvx-kgraph { margin-left: auto; }
+
+  /* ---- Session cards (cx-sessions) — token/progress gradient bars -------- */
+  .sess-card {
+    position: relative; overflow: hidden; padding: 12px 14px 11px 16px; display: flex; flex-direction: column; gap: 9px;
+    border: 1px solid var(--edge); border-radius: var(--radius-sm); background: var(--surface); box-shadow: var(--card-shadow);
+  }
+  .sess-card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--ink3); }
+  .sess-card[data-strip="in_progress"]::before { background: var(--acc); }
+  .sess-card[data-strip="done"]::before { background: var(--ok); }
+  .sess-card[data-strip="planned"]::before { background: var(--ink3); }
+  .sess-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .sess-id { font-family: var(--font-mono); font-size: 13px; font-weight: 600; color: var(--ink); word-break: break-all; }
+  .sess-card-meta { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+  .sess-chip { font-family: var(--font-mono); font-size: 11px; color: var(--ink2); background: var(--surface2); border: 1px solid var(--edge); border-radius: 999px; padding: 2px 9px; }
+  .sess-chip-plan { color: var(--acc); border-color: color-mix(in srgb, var(--acc) 34%, transparent); background: color-mix(in srgb, var(--acc) 11%, transparent); }
+  .sess-chip-pass { color: var(--trust); border-color: color-mix(in srgb, var(--trust) 30%, transparent); background: color-mix(in srgb, var(--trust) 11%, transparent); }
+  .sess-bar { gap: 5px; }
+  .sess-bar .ctl-bar-head { font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink3); }
+  .sess-bar .ctl-bar-track { height: 8px; }
+  .sess-card-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 1px; }
+  .sess-foot-k { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink3); }
+  .sess-card-foot .cx-graphlink { margin-left: auto; }
 
   .ctl-rpcout {
     margin: 0; padding: 12px; min-height: 90px; max-height: 300px; overflow: auto;

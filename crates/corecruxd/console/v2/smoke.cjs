@@ -107,8 +107,14 @@ function walkControls(controls, fn) {
 function walkPage(page, fn) {
   (page.sections || []).forEach(function (s) { walkControls(s.controls, fn); walkControls(s.headControls, fn); });
   if (page.load && typeof page.load.build === 'function') {
-    // Exercise both branches so degraded + populated control types are seen.
-    [{ ok: true, status: 200, data: {} }, { ok: false, status: 0, data: null }].forEach(function (res) {
+    // Exercise all branches so degraded + empty + populated control types are
+    // seen — the populated res carries a representative row so per-item controls
+    // (e.g. a project's per-project ＋Add-repos disclose) materialise for the walk.
+    [
+      { ok: true, status: 200, data: {} },
+      { ok: false, status: 0, data: null },
+      { ok: true, status: 200, data: { projects: [{ id: 'demo-proj', name: 'Demo project', is_default: true, planning_target: 'PlanCrux' }] } }
+    ].forEach(function (res) {
       let sections;
       try { sections = page.load.build(res); } catch (e) { sections = []; }
       (sections || []).forEach(function (s) { walkControls(s.controls, fn); walkControls(s.headControls, fn); });
@@ -752,15 +758,24 @@ function extractThemeVars(theme) {
 //  the real list is empty.
 // =========================================================================
 (function checkProjectsDisclosure() {
-  const found = { newp: false, addr: false };
-  walkPage(pages.PAGES['cx-projects'], function (c) {
-    if (c.t === 'disclose' && c.requires === 'operator') {
-      if (/New project/.test(c.label || '')) { found.newp = true; }
-      if (/Add repos/.test(c.label || '')) { found.addr = true; }
-    }
+  // "＋ New project" is a top-right card action (headAction "+") that reveals a
+  // hidden #newProjectForm section (mirrors the Passports pattern); its "Create
+  // project" write stays mut-gated (verified by the MUTATING_ACTIONS checks).
+  // "＋ Add repos" is a per-project operator-tagged disclose inside each project
+  // card, so its repo writes target that specific project.
+  const found = { newpAction: false, newpForm: false, addr: false };
+  const projSections = pages.PAGES['cx-projects'].load.build({ ok: true, status: 200, data: { projects: [{ id: 'demo-proj', name: 'Demo project', is_default: true }] } }) || [];
+  projSections.forEach(function (s) {
+    const act = s.headAction;
+    if (act && act.variant === 'plus' && act.target === 'newProjectForm' && /New project/.test(act.title || '')) { found.newpAction = true; }
+    if (s.id === 'newProjectForm' && s.hidden) { found.newpForm = true; }
   });
-  check(found.newp, '[projects] "＋ New project" must be an operator-tagged (requires:operator) disclose control');
-  check(found.addr, '[projects] "＋ Add repos" must be an operator-tagged (requires:operator) disclose control');
+  walkPage(pages.PAGES['cx-projects'], function (c) {
+    if (c.t === 'disclose' && c.requires === 'operator' && /Add repos/.test(c.label || '')) { found.addr = true; }
+  });
+  check(found.newpAction, '[projects] "＋ New project" must be a top-right headAction "+" targeting the newProjectForm');
+  check(found.newpForm, '[projects] the "+" must reveal a hidden #newProjectForm section (its Create project write stays mut-gated)');
+  check(found.addr, '[projects] "＋ Add repos" must be a per-project operator-tagged (requires:operator) disclose control');
   // render.js knows the disclose control + stamps data-requires="operator".
   check((render.CONTROL_TYPES || []).indexOf('disclose') >= 0, '[projects] render.CONTROL_TYPES must include "disclose"');
   check(new RegExp("case 'disclose'").test(renderSrc), '[projects] render.js must have a `case \'disclose\'` branch');

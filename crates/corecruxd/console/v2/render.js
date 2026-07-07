@@ -628,7 +628,7 @@
         // Client-side filter over sibling rows in the same card (real M1 behaviour).
         input.addEventListener('input', function () {
           var q = input.value.trim().toLowerCase();
-          var rows = sectionCard.querySelectorAll('.exp, .ctl-info');
+          var rows = sectionCard.querySelectorAll('.exp, .ctl-info, .cvx-kcard, .sess-card');
           for (var i = 0; i < rows.length; i++) {
             var txt = (rows[i].textContent || '').toLowerCase();
             rows[i].style.display = (!q || txt.indexOf(q) >= 0) ? '' : 'none';
@@ -735,6 +735,77 @@
           el('span', { 'class': 'ctl-info-k', text: 'theme' }),
           el('span', { 'class': 'ctl-info-v', text: 'switch in the sidebar (Glass · Dark · Light)' })
         ]);
+        break;
+      }
+      case 'kanban': {
+        // ExecPlans as a clean board: columns keyed by work state; each card
+        // carries a risk badge, execplan slug, bold title, a gradient progress
+        // bar with its milestone count, the owner passport + a graph link.
+        var board = el('div', { 'class': 'cvx-kanban' });
+        (control.columns || []).forEach(function (col) {
+          var cards = col.cards || [];
+          var colEl = el('div', { 'class': 'cvx-kcol' });
+          colEl.appendChild(el('div', { 'class': 'cvx-kcol-head' }, [
+            el('span', { 'class': 'cvx-kcol-title', text: col.title }),
+            el('span', { 'class': 'cvx-kcol-count', text: String(cards.length) })
+          ]));
+          var colBody = el('div', { 'class': 'cvx-kcol-body' });
+          if (!cards.length) { colBody.appendChild(el('p', { 'class': 'cvx-kempty', text: 'none' })); }
+          cards.forEach(function (c) {
+            var kc = el('div', { 'class': 'cvx-kcard', 'data-strip': c.strip });
+            var top = el('div', { 'class': 'cvx-kcard-top' });
+            if (c.risk) { top.appendChild(el('span', { 'class': 'cvx-krisk risk-' + c.risk, text: c.risk })); }
+            if (c.milestone) { top.appendChild(el('span', { 'class': 'cvx-kms', text: c.milestone })); }
+            kc.appendChild(top);
+            if (c.slug) { kc.appendChild(el('div', { 'class': 'cvx-kslug', text: c.slug })); }
+            kc.appendChild(el('div', { 'class': 'cvx-ktitle', text: c.title }));
+            if (c.prog != null) {
+              var ktrack = el('div', { 'class': 'cvx-ktrack' }, [el('div', { 'class': 'cvx-kfill' })]);
+              ktrack.firstChild.style.width = Math.max(0, Math.min(100, Number(c.pct) || 0)) + '%';
+              kc.appendChild(el('div', { 'class': 'cvx-kprog' }, [ktrack, el('span', { 'class': 'cvx-kprogv', text: String(c.prog) })]));
+            }
+            var foot = el('div', { 'class': 'cvx-kcard-foot' });
+            if (c.passport) { foot.appendChild(el('span', { 'class': 'cvx-kpass', text: c.passport })); }
+            if (c.note) { foot.appendChild(el('span', { 'class': 'cvx-knote', text: c.note })); }
+            if (c.graph && c.graph.href) { foot.appendChild(el('a', { 'class': 'btn-quiet cx-graphlink cvx-kgraph', href: c.graph.href, title: 'View in relation graph' }, ['graph'])); }
+            if (foot.childNodes.length) { kc.appendChild(foot); }
+            colBody.appendChild(kc);
+          });
+          colEl.appendChild(colBody);
+          board.appendChild(colEl);
+        });
+        node = board;
+        break;
+      }
+      case 'sesscard': {
+        // A session as a rich, always-visible card: id + status, the execplan +
+        // passport it carries, and two horizontal gradient bars (tokens · progress).
+        var sc = el('div', { 'class': 'sess-card', 'data-strip': control.status === 'active' ? 'in_progress' : (control.status === 'archived' ? 'done' : 'planned') });
+        sc.appendChild(el('div', { 'class': 'sess-card-head' }, [
+          el('span', { 'class': 'sess-id', text: String(control.id) }),
+          el('span', { 'class': 'exp-badge', text: String(control.status || 'session') })
+        ]));
+        var smeta = el('div', { 'class': 'sess-card-meta' });
+        if (control.execplan) { smeta.appendChild(el('span', { 'class': 'sess-chip sess-chip-plan', text: control.execplan })); }
+        if (control.passport) { smeta.appendChild(el('span', { 'class': 'sess-chip sess-chip-pass', text: control.passport })); }
+        if (control.tenant) { smeta.appendChild(el('span', { 'class': 'sess-chip', text: control.tenant })); }
+        if (smeta.childNodes.length) { sc.appendChild(smeta); }
+        var sessBar = function (label, val, pct, cls) {
+          var track = el('div', { 'class': 'ctl-bar-track' }, [el('div', { 'class': 'ctl-bar-fill ' + cls })]);
+          track.firstChild.style.width = Math.max(0, Math.min(100, Number(pct) || 0)) + '%';
+          return el('div', { 'class': 'ctl-bar sess-bar' }, [
+            el('div', { 'class': 'ctl-bar-head' }, [el('span', { text: label }), el('span', { 'class': 'ctl-bar-val', text: String(val) })]),
+            track
+          ]);
+        };
+        if (control.tokLabel != null) { sc.appendChild(sessBar('token usage', control.tokLabel, control.tokPct, 'grad-tok')); }
+        if (control.progLabel != null) { sc.appendChild(sessBar('progress', control.progLabel, control.progPct, 'grad-prog')); }
+        var sfoot = el('div', { 'class': 'sess-card-foot' });
+        if (control.turns != null) { sfoot.appendChild(el('span', { 'class': 'sess-foot-k', text: control.turns + ' turns' })); }
+        if (control.updated) { sfoot.appendChild(el('span', { 'class': 'sess-foot-k', text: String(control.updated) })); }
+        if (control.focusId) { sfoot.appendChild(el('a', { 'class': 'btn-quiet cx-graphlink', href: '#/canvas/graph?focus=session:' + control.focusId, title: 'View this session in the relation graph' }, ['graph'])); }
+        if (sfoot.childNodes.length) { sc.appendChild(sfoot); }
+        node = sc;
         break;
       }
       case 'exp': {
@@ -2682,6 +2753,22 @@
   function drawGraph(stage, onSelect, model, focus) {
     stage.textContent = '';
     if (!model.nodes.length) { stage.appendChild(el('p', { 'class': 'ctl-desc', text: 'No graph yet — no sessions / work / passports available.' })); return; }
+    // Focus deep-link: when the board is opened on a specific node (e.g. a session
+    // from the Sessions page), show ONLY that node + its direct connections — the
+    // rest of the graph is withheld, not merely dimmed. Falls back to the full
+    // model if the focus doesn't resolve.
+    if (focus && focus.type && focus.id != null) {
+      var fidx = {}; model.nodes.forEach(function (n) { fidx[n.key] = n; });
+      var fnode = fidx[focus.type + ':' + focus.id] || graphMatchNode(model.nodes, focus);
+      if (fnode) {
+        var keep = graphNeighbourhood(model.edges, fnode.key); keep[fnode.key] = true;
+        model = {
+          nodes: model.nodes.filter(function (n) { return keep[n.key]; }),
+          edges: model.edges.filter(function (e) { return keep[e.from] && keep[e.to]; })
+        };
+        focus = { type: fnode.type, id: fnode.id };   // normalise for the select() below
+      }
+    }
     var dims = layoutGraph(model.nodes);
     var index = {}; model.nodes.forEach(function (n) { index[n.key] = n; });
     // One transformed layer holds the SVG edge canvas + the HTML node cards, so
@@ -2802,8 +2889,22 @@
         sessionsSaved: (r[6] && r[6].ok && r[6].data) || null   // /v1/console/sessions — saved session ids
       };
       model = buildGraphModel(data);
-      if (!model.nodes.length && demoOn()) {
-        var demoModel = buildGraphModel({ work: { work: demoData('work') || [] }, gates: { pending: demoData('needsYou') || [] } });
+      // Demo mode: build the graph purely from the labelled fixtures (work +
+      // sessions + their passports + projects + gates) so it is clean and
+      // predictable — and so a demo session/work focus (e.g. the "graph" link on
+      // a Sessions card) resolves to a real node with neighbours to show.
+      if (demoOn()) {
+        var dWork = demoData('work') || [], dSess = demoData('sessions') || [], dProj = demoData('projects') || [];
+        var passIds = {};
+        dWork.forEach(function (w) { if (w.assignee_passport) { passIds[w.assignee_passport] = 1; } });
+        dSess.forEach(function (s) { if (s.passport_id) { passIds[s.passport_id] = 1; } });
+        var demoModel = buildGraphModel({
+          projects: { projects: dProj },
+          work: { work: dWork },
+          gates: { pending: demoData('needsYou') || [] },
+          passports: { passports: Object.keys(passIds).map(function (id) { return { id: id, name: id }; }) },
+          sessions: { active_sessions: dSess.map(function (s) { return { session_id_hex: s.session_id, passport_id: s.passport_id, intent: { execplan_slug: s.execplan_slug, milestone: null } }; }) }
+        });
         if (demoModel.nodes.length) {
           model = demoModel;
           var head = wrap.querySelector('.canvas-graph-inspector .canvas-insp-type');
@@ -4319,6 +4420,18 @@
     searchInput.addEventListener('input', paint);
     sessionInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') { load(); } });
     renderKinds();
+    // Demo mode: a fresh daemon gates the activity log (CORECRUXD_FEATURE_ACTIVITY_LOG),
+    // so the surface is blank until Loaded. Under ?demo=1 paint a labelled fixture
+    // of a session's rolling turns (via the demoData() choke point) — a real
+    // session id + Load still overrides it.
+    var demoAct = demoData('activityLog');
+    if (demoAct && demoAct.length) {
+      state.session = 'sess_7f3a1c2b';
+      sessionInput.value = state.session;
+      state.rows = demoAct;
+      setStatus(state.rows.length + ' row(s) · session ' + state.session + ' · demo');
+      paint();
+    }
   }
 
   function renderExplorer(host, ctx) {

@@ -255,22 +255,40 @@
     return [{ h: 'Passports', sub: ps.length + ' passport' + (ps.length === 1 ? '' : 's') + ' · loaded from /v1/passports', wide: true, headAction: plus, controls: rows }, form];
   }
 
+  // Compact token count → "148k" (keeps the bar label short).
+  function fmtK(n) {
+    if (typeof n !== 'number' || !isFinite(n)) { return null; }
+    if (n >= 1000) { return (n / 1000 >= 100 ? Math.round(n / 1000) : (n / 1000).toFixed(n < 10000 ? 1 : 0)) + 'k'; }
+    return String(n);
+  }
   function buildSessions(res) {
     // Demo mode: real saved sessions are bare id rows locally, so a demoOn()-guarded
-    // fixture paints richer resume/audit detail (execplan · passport · turns).
+    // fixture paints richer resume/audit detail (execplan · passport · turns · token/progress bars).
     if (typeof window !== 'undefined' && window.CRUX_DEMO && CruxDemo.sessions) { res = { ok: true, data: { sessions: CruxDemo.sessions } }; }
     if (!res.ok || !res.data) { return [{ h: 'Sessions', wide: true, controls: [{ t: 'search', ph: 'Filter sessions…' }].concat(degraded(res.status, 'Sessions unavailable — GET /v1/console/sessions')) }]; }
     var list = arr(res.data.sessions || res.data.items || res.data);
     var live = list.filter(function (s) { return !s.archived; });
     var arch = list.filter(function (s) { return s.archived; });
+    // A session renders as a rich card: id + status, the execplan + passport it
+    // carries, and two horizontal gradient bars — token usage and progress.
     var row = function (s) {
-      return { t: 'exp', label: s.session_id || s.id || s.label || 'session', sub: [s.execplan_slug, s.passport_id, s.last_active || s.updated_at].filter(Boolean).join(' · '), badge: s.archived ? 'archived' : (s.status || 'session'),
-        meta: [s.session_id || s.id, s.updated_at || s.last_active].filter(Boolean).join(' · '),   // Pro-mode mono metadata
-        controls: [['passport', s.passport_id], ['execplan', s.execplan_slug], ['tenant', s.tenant_id], ['turns', s.turn_count], ['updated', s.updated_at]]
-          .filter(function (kv) { return kv[1] != null && kv[1] !== ''; }).map(function (kv) { return info(kv[0], String(kv[1])); }) };
+      var used = (typeof s.token_used === 'number') ? s.token_used : null;
+      var lim = (typeof s.token_limit === 'number') ? s.token_limit : null;
+      var tokPct = (used != null && lim) ? Math.round((used / lim) * 100) : null;
+      var mDone = s.milestones_done, mTot = s.milestones_total;
+      var progPct = (typeof s.progress === 'number') ? Math.round(s.progress * 100)
+        : (mTot ? Math.round(((mDone || 0) / mTot) * 100) : null);
+      var progLabel = progPct != null ? (progPct + '%' + (mTot ? (' · M' + (mDone || 0) + '/' + mTot) : '')) : null;
+      return { t: 'sesscard', id: s.session_id || s.id || s.label || 'session',
+        status: s.archived ? 'archived' : (s.status || 'session'),
+        execplan: s.execplan_slug || null, passport: s.passport_id || null, tenant: s.tenant_id || null,
+        turns: (s.turn_count != null) ? s.turn_count : null, updated: s.updated_at || s.last_active || null,
+        tokPct: tokPct, tokLabel: (used != null && lim) ? (fmtK(used) + ' / ' + fmtK(lim)) : null,
+        progPct: progPct, progLabel: progLabel,
+        focusId: s.session_id || s.id || null };
     };
     return [
-      { h: 'Active & idle', sub: live.length + ' session' + (live.length === 1 ? '' : 's') + ' · /v1/console/sessions', wide: true,
+      { h: 'Active & idle', sub: live.length + ' session' + (live.length === 1 ? '' : 's') + ' · token usage · progress · attached execplan + passport · /v1/console/sessions', wide: true,
         controls: [{ t: 'search', ph: 'Filter sessions…' }].concat(live.length ? live.map(row) : [info('none', 'no live sessions')]) },
       { h: 'Archived', sub: arch.length + ' archived', wide: true, controls: arch.length ? arch.map(row) : [info('—', 'no archived sessions')] }
     ];
@@ -282,31 +300,37 @@
   // per-project by render.js). "＋ New project" / "＋ Add repos" are nav-family
   // disclosure buttons (data-requires:operator) that reveal their mut-gated
   // forms on click — the forms never render immediately.
-  function buildProjects(res) {
-    var addRepos = { t: 'disclose', label: '＋ Add repos', requires: 'operator',
+  // Per-project "＋ Add repos" disclosure — one per expanded project card, so the
+  // repo actions target that specific project (not a global control at the top).
+  function projectAddRepos(p) {
+    return { t: 'disclose', label: '＋ Add repos', requires: 'operator',
       controls: [
         info('github', 'not connected — connect under Integrations to add repos'),
-        { t: 'select', k: 'gh_addrepo', label: 'repo', options: ['— connect GitHub first —'], v: '— connect GitHub first —', mut: true },
-        mbtn('Add repo', { hint: 'POST /v1/projects/{id}/repos' }),
+        { t: 'select', k: 'gh_addrepo_' + p.id, label: 'repo', options: ['— connect GitHub first —'], v: '— connect GitHub first —', mut: true },
+        mbtn('Add repo', { hint: 'POST /v1/projects/' + p.id + '/repos' }),
         mbtn('Set as planning repo', { hint: 'designates where ExecPlans live' })
       ] };
-    var newProject = { t: 'disclose', label: '＋ New project', requires: 'operator',
+  }
+  function buildProjects(res) {
+    // "New project" is a top-right "+" on the card header that reveals this form
+    // BELOW the list (mirrors the Passports pattern). See renderSection headAction.
+    var form = { h: 'New project', id: 'newProjectForm', hidden: true, sub: 'a project pairs repos to track + search with a planning repo for ExecPlans (POST /v1/projects)', wide: true,
       controls: [
         { t: 'input', k: 'proj_name', label: 'name', ph: 'My project', mut: true },
         { t: 'input', k: 'proj_id', label: 'id', ph: 'proj-slug', mono: true, mut: true },
         { t: 'select', k: 'proj_storage', label: 'execplan storage', options: ['planning repo (recommended)', 'daemon-native', 'hybrid — repo files + daemon kanban'], v: 'planning repo (recommended)', mut: true },
-        mbtn('Create project')
+        mbtn('Create project', { hint: 'POST /v1/projects' })
       ] };
-    var head = { h: 'Projects', sub: 'a project pairs repos to track + search, a planning repo for ExecPlans, passports and working tenants', wide: true,
-      controls: [{ t: 'search', ph: 'Filter projects…' }, newProject, addRepos] };
+    var plus = { label: '+', variant: 'plus', title: 'New project', target: 'newProjectForm' };
     // Demo mode: override with the projects fixture so the layout shows a fuller
     // portfolio than a fresh local daemon's single default project.
     if (typeof window !== 'undefined' && window.CRUX_DEMO && CruxDemo.projects) { res = { ok: true, data: { projects: CruxDemo.projects } }; }
     var ps = (res && res.ok && res.data) ? arr(res.data.projects) : [];
     if (!ps.length && (!res || !res.ok || !res.data)) {
-      return [{ h: head.h, sub: head.sub, wide: true, controls: head.controls.concat(degraded((res && res.status) || 0, 'Projects unavailable — GET /v1/projects (needs admin:read)')) }];
+      return [{ h: 'Projects', sub: 'a project pairs repos to track + search, a planning repo for ExecPlans, passports and working tenants', wide: true, headAction: plus,
+        controls: [{ t: 'search', ph: 'Filter projects…' }].concat(degraded((res && res.status) || 0, 'Projects unavailable — GET /v1/projects (needs admin:read)')) }, form];
     }
-    var rows = head.controls.slice();
+    var rows = [{ t: 'search', ph: 'Filter projects…' }];
     ps.forEach(function (p) {
       var strip = p.archived ? 'done' : (p.is_default ? 'in_progress' : 'planned');   // pro-board left strip
       var infos = [['id', p.id], ['name', p.name], ['planning target', p.planning_target], ['default passport', p.default_passport_id],
@@ -315,30 +339,40 @@
       rows.push({ t: 'exp', strip: strip, label: p.name || p.id,
         sub: [p.id, p.planning_target, p.is_default ? 'default' : null, p.archived ? 'archived' : null].filter(Boolean).join(' · ') || 'project',
         badge: p.archived ? 'archived' : (p.is_default ? 'default' : 'project'),
-        controls: infos.concat([{ t: 'repogrid', projectId: p.id }, graphLink('project', p.id)]) });
+        controls: infos.concat([{ t: 'repogrid', projectId: p.id }, projectAddRepos(p), graphLink('project', p.id)]) });
     });
-    if (!ps.length) { rows.push(info('none', 'no projects yet — use ＋ New project')); }
-    return [{ h: 'Projects', sub: ps.length + ' project' + (ps.length === 1 ? '' : 's') + ' · click to expand · /v1/projects', wide: true, controls: rows }];
+    if (!ps.length) { rows.push(info('none', 'no projects yet — use the ＋ in the header')); }
+    return [{ h: 'Projects', sub: ps.length + ' project' + (ps.length === 1 ? '' : 's') + ' · click to expand · /v1/projects', wide: true, headAction: plus, controls: rows }, form];
   }
 
+  // Kanban column order (item: ExecPlans as a clean board). Matches the pro
+  // board: Planned → In progress → Blocked → Shipped (recently done).
+  var KANBAN_COLS = [['planned', 'Planned'], ['in_progress', 'In progress'], ['blocked', 'Blocked'], ['done', 'Shipped · 7d']];
+  // Derive a short execplan slug from a plan path or id (drops the dir + .md +
+  // the execplan: prefix), so the card carries the readable plan name.
+  function planSlug(w) {
+    if (w.plan_path) { return String(w.plan_path).split('/').pop().replace(/\.md$/, ''); }
+    return String(w.id || '').replace(/^execplan:/, '');
+  }
   function buildWork(res) {
-    var head = { h: 'ExecPlans', sub: 'list view — same data as the kanban · /v1/work?source=all', wide: true, controls: [{ t: 'search', ph: 'Filter plans…' }] };
+    var head = { h: 'ExecPlans', sub: 'kanban board — live milestone work plans · /v1/work?source=all', wide: true, controls: [{ t: 'search', ph: 'Filter plans…' }] };
     var items = (res && res.ok && res.data) ? arr(res.data.work || res.data.items) : [];
     // Demo mode: fall back to the demoOn()-guarded work fixture when the board is empty.
     if (!items.length && typeof window !== 'undefined' && window.CRUX_DEMO && CruxDemo.work) { items = CruxDemo.work; }
     if (!items.length) { return [head, { h: 'Work', wide: true, controls: degraded((res && res.status) || 0, 'Work board unavailable — GET /v1/work?source=all') }]; }
-    var mk = function (w) {
-      var stage = workStageOf(w);   // planned | in_progress | blocked | done — drives the left strip (item 7)
-      return { t: 'exp', strip: stage, label: w.title || w.id, sub: (w.milestones_total ? ('M ' + (w.milestones_done || 0) + '/' + w.milestones_total) : '') || w.current_milestone || w.plan_path || '', badge: stage.replace('_', ' '),
-        meta: [w.id, w.plan_path, w.updated_at].filter(Boolean).join(' · '),   // Pro-mode mono metadata
-        controls: [['state', w.state], ['risk', w.risk_class], ['plan', w.plan_path], ['milestone', w.current_milestone], ['owner', w.assignee_passport], ['pr', w.linked_pr]]
-          .filter(function (kv) { return kv[1] != null && kv[1] !== ''; }).map(function (kv) { return info(kv[0], String(kv[1])); })
-          .concat([rbtn('Open in kanban'), graphLink('work', w.id)]) };
+    var card = function (w) {
+      var stage = workStageOf(w);   // planned | in_progress | blocked | done — keys the card's left strip
+      var done = w.milestones_done || 0, total = w.milestones_total || 0;
+      var pct = total ? Math.round((done / total) * 100) : (stage === 'done' ? 100 : 0);
+      return { strip: stage, risk: w.risk_class || null, slug: planSlug(w), title: w.title || w.id,
+        milestone: w.current_milestone || null, pct: pct, prog: total ? (done + '/' + total) : null,
+        passport: w.assignee_passport || null, note: w.linked_pr || null,
+        graph: graphLink('work', w.id) };   // cross-feature launch → the relation graph, focused on this plan
     };
-    return [head].concat(WORK_STAGES.map(function (st) {
-      var rows = items.filter(function (w) { return workStageOf(w) === st[0]; }).map(mk);
-      return { h: st[1], wide: true, controls: rows.length ? rows : [info('—', 'none')] };
-    }));
+    var columns = KANBAN_COLS.map(function (st) {
+      return { key: st[0], title: st[1], cards: items.filter(function (w) { return workStageOf(w) === st[0]; }).map(card) };
+    });
+    return [{ h: 'ExecPlans', sub: head.sub, wide: true, controls: [{ t: 'search', ph: 'Filter plans…' }, { t: 'kanban', columns: columns }] }];
   }
 
   function buildGates(res) {
@@ -1356,21 +1390,41 @@
       engineLatencySeries: wave(12, 41, 9, 11),
       // Representative work + memory states (fixtures kept complete).
       work: [
-        { id: 'execplan:unified-shell-console', title: 'unified-shell-console', state: 'in_progress', risk_class: 'medium', current_milestone: 'M7', milestones_total: 8, milestones_done: 6, plan_path: '.agent/execplans/unified-shell-console.md', assignee_passport: 'p_opus_local', linked_pr: 'CueCrux/Crux#332', updated_at: new Date(NOW - 8 * MIN).toISOString() },
-        { id: 'execplan:corecrux-trait-expansion', title: 'corecrux-trait-expansion', state: 'blocked', risk_class: 'high', current_milestone: 'M3', milestones_total: 5, milestones_done: 2, plan_path: '.agent/execplans/corecrux-trait-expansion.md', assignee_passport: 'p_sonnet_ce4e6c', updated_at: new Date(NOW - 41 * MIN).toISOString() },
-        { id: 'execplan:cruxengine-carry-all', title: 'cruxengine-carry-all', state: 'planned', risk_class: 'low', current_milestone: 'M1', milestones_total: 6, milestones_done: 0, plan_path: '.agent/execplans/cruxengine-carry-all.md', updated_at: new Date(NOW - 3 * HOUR).toISOString() },
-        { id: 'execplan:context-custody-surface', title: 'context-custody-surface', state: 'done', risk_class: 'medium', current_milestone: 'M4', milestones_total: 4, milestones_done: 4, plan_path: '.agent/execplans/context-custody-surface.md', assignee_passport: 'p_opus_local', linked_pr: 'CueCrux/Crux#318', updated_at: new Date(NOW - 2 * DAY).toISOString() }
+        { id: 'execplan:unified-shell-console', title: 'unified-shell-console', state: 'in_progress', risk_class: 'medium', current_milestone: 'M7', milestones_total: 8, milestones_done: 6, plan_path: '.agent/execplans/unified-shell-console.md', project_id: 'crux-daemon', assignee_passport: 'p_opus_local', linked_pr: 'CueCrux/Crux#332', updated_at: new Date(NOW - 8 * MIN).toISOString() },
+        { id: 'execplan:corecrux-trait-expansion', title: 'corecrux-trait-expansion', state: 'blocked', risk_class: 'high', current_milestone: 'M3', milestones_total: 5, milestones_done: 2, plan_path: '.agent/execplans/corecrux-trait-expansion.md', project_id: 'crux-daemon', assignee_passport: 'p_sonnet_ce4e6c', updated_at: new Date(NOW - 41 * MIN).toISOString() },
+        { id: 'execplan:cruxengine-carry-all', title: 'cruxengine-carry-all', state: 'planned', risk_class: 'low', current_milestone: 'M1', milestones_total: 6, milestones_done: 0, plan_path: '.agent/execplans/cruxengine-carry-all.md', project_id: 'cruxengine', updated_at: new Date(NOW - 3 * HOUR).toISOString() },
+        { id: 'execplan:context-custody-surface', title: 'context-custody-surface', state: 'done', risk_class: 'medium', current_milestone: 'M4', milestones_total: 4, milestones_done: 4, plan_path: '.agent/execplans/context-custody-surface.md', project_id: 'crux-daemon', assignee_passport: 'p_opus_local', linked_pr: 'CueCrux/Crux#318', updated_at: new Date(NOW - 2 * DAY).toISOString() }
       ],
       // Saved sessions — richer than the bare id rows a fresh local daemon holds,
       // so the resume/audit surface reads well in demo mode.
       sessions: [
-        { session_id: 'sess_7f3a1c2b', execplan_slug: 'unified-shell-console', passport_id: 'p_opus_local', status: 'active', turn_count: 214, tenant_id: 'default', updated_at: new Date(NOW - 4 * MIN).toISOString() },
-        { session_id: 'sess_2be40d19', execplan_slug: 'corecrux-trait-expansion', passport_id: 'p_sonnet_ce4e6c', status: 'active', turn_count: 89, tenant_id: 'default', updated_at: new Date(NOW - 12 * MIN).toISOString() },
-        { session_id: 'handoff:context-custody', execplan_slug: 'context-custody-surface', passport_id: 'p_opus_local', status: 'idle', turn_count: 47, tenant_id: 'default', updated_at: new Date(NOW - 2 * HOUR).toISOString() },
-        { session_id: 'sess_a1b2c3d4', execplan_slug: 'cruxengine-carry-all', passport_id: 'p_haiku_bench', status: 'idle', turn_count: 12, tenant_id: 'bench', updated_at: new Date(NOW - 6 * HOUR).toISOString() },
-        { session_id: 'sess_9c5a9271', execplan_slug: 'unified-shell-console', passport_id: 'p_opus_local', status: 'idle', turn_count: 156, tenant_id: 'default', updated_at: new Date(NOW - 1 * DAY).toISOString() },
-        { session_id: 'sess_e6f81234', execplan_slug: 'wikicrux-agent-first', passport_id: 'p_sonnet_ce4e6c', status: 'archived', archived: true, turn_count: 73, tenant_id: 'default', updated_at: new Date(NOW - 3 * DAY).toISOString() }
+        { session_id: 'sess_7f3a1c2b', execplan_slug: 'unified-shell-console', passport_id: 'p_opus_local', status: 'active', turn_count: 214, tenant_id: 'default', token_used: 148200, token_limit: 200000, milestones_done: 6, milestones_total: 8, updated_at: new Date(NOW - 4 * MIN).toISOString() },
+        { session_id: 'sess_2be40d19', execplan_slug: 'corecrux-trait-expansion', passport_id: 'p_sonnet_ce4e6c', status: 'active', turn_count: 89, tenant_id: 'default', token_used: 96400, token_limit: 200000, milestones_done: 2, milestones_total: 5, updated_at: new Date(NOW - 12 * MIN).toISOString() },
+        { session_id: 'handoff:context-custody', execplan_slug: 'context-custody-surface', passport_id: 'p_opus_local', status: 'idle', turn_count: 47, tenant_id: 'default', token_used: 61800, token_limit: 200000, milestones_done: 4, milestones_total: 4, updated_at: new Date(NOW - 2 * HOUR).toISOString() },
+        { session_id: 'sess_a1b2c3d4', execplan_slug: 'cruxengine-carry-all', passport_id: 'p_haiku_bench', status: 'idle', turn_count: 12, tenant_id: 'bench', token_used: 18300, token_limit: 128000, milestones_done: 0, milestones_total: 6, updated_at: new Date(NOW - 6 * HOUR).toISOString() },
+        { session_id: 'sess_9c5a9271', execplan_slug: 'unified-shell-console', passport_id: 'p_opus_local', status: 'idle', turn_count: 156, tenant_id: 'default', token_used: 132900, token_limit: 200000, milestones_done: 5, milestones_total: 8, updated_at: new Date(NOW - 1 * DAY).toISOString() },
+        { session_id: 'sess_e6f81234', execplan_slug: 'wikicrux-agent-first', passport_id: 'p_sonnet_ce4e6c', status: 'archived', archived: true, turn_count: 73, tenant_id: 'default', token_used: 87600, token_limit: 200000, milestones_done: 3, milestones_total: 7, updated_at: new Date(NOW - 3 * DAY).toISOString() }
       ],
+      // Activity log fixture (ACT_KINDS-typed rows) — a fresh daemon gates the
+      // real log, so ?demo=1 paints this so the Activity surface reads populated.
+      activityLog: (function () {
+        var rows = [
+          ['question', null, 'restyle round 2', 'convert the ExecPlans surface to a kanban board'],
+          ['reasoning', null, 'plan', 'columns keyed by work state; cards carry risk + progress'],
+          ['command', 'edit_file', 'console/v2/pages.js', 'buildWork → kanban columns'],
+          ['fact', 'store_fact', 'gate:M6', 'decision:packaging → hybrid keep-vow'],
+          ['answer', null, 'render', 'kanban control + gradient bars wired into render.js'],
+          ['execplan', 'update_state', 'unified-shell-console', 'M6 → in_progress · milestone advanced'],
+          ['command', 'run_test', 'node smoke.cjs', '26/26 checks green'],
+          ['handoff', 'save_session', 'pre-compact snapshot', 'resume point written · snapshot 9c5a9271'],
+          ['error', null, 'lint', 'clippy warning resolved in fuse.rs'],
+          ['answer', null, 'summary', 'five Work-surface improvements applied']
+        ];
+        return rows.map(function (r, i) {
+          return { kind: r[0], seq: rows.length - i, ts: new Date(NOW - i * 3 * MIN).toISOString().slice(11, 19),
+            turn_id: null, tool: r[1], intent: r[2], preview: r[3], confidence: null };
+        });
+      })(),
       // Projects — a project pairs repos + a planning repo for ExecPlans (repo grid
       // fills from projectRepos above when a card is expanded in demo mode).
       projects: [
