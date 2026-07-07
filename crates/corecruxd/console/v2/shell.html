@@ -1682,8 +1682,19 @@
   .canvas-graph-stage:active { cursor: grabbing; }
   .cv-graph-layer { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
   .cv-graph-edges { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
-  .cv-gedge { stroke: var(--edge-strong); stroke-width: 1.5; fill: none; }
-  .cv-gedge.is-dim { opacity: .12; }
+  /* Directional flow edges: a dashed stroke that marches from source → target
+     (stroke-dashoffset animation), tipped with an arrowhead marker. The head
+     tracks the edge stroke via context-stroke, so it recolours when hot. */
+  .cv-gedge {
+    stroke: var(--edge-strong); stroke-width: 1.6; fill: none; opacity: .82;
+    stroke-linecap: round; stroke-dasharray: 5 7;
+    animation: cv-flow 1.4s linear infinite;
+  }
+  .cv-arrowhead { fill: context-stroke; stroke: none; }
+  .cv-gedge.is-hot { stroke: var(--acc); opacity: 1; stroke-width: 2.1; animation-duration: .7s; }
+  .cv-gedge.is-dim { opacity: .1; animation: none; stroke-dasharray: none; }
+  @keyframes cv-flow { to { stroke-dashoffset: -24; } }
+  @media (prefers-reduced-motion: reduce) { .cv-gedge { animation: none; stroke-dasharray: none; } }
   /* Node cards */
   .cv-card {
     position: absolute; width: 300px; box-sizing: border-box; padding: 12px 14px;
@@ -1707,6 +1718,11 @@
   .cv-card-title { margin-top: 5px; font-size: 13px; font-weight: 640; line-height: 1.3; color: var(--ink); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; word-break: break-word; }
   .cv-card-sub { margin-top: 4px; font-size: 11px; color: var(--ink3); }
   .cv-card-id { margin-top: 6px; font-family: var(--font-mono); font-size: 9.5px; color: var(--ink3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* Milestone progress on work / session nodes — fill uses the node's own accent. */
+  .cv-card-progrow { display: flex; align-items: center; gap: 7px; margin-top: 8px; }
+  .cv-card-prog { flex: 1; height: 5px; border-radius: 999px; background: var(--surface2); border: 1px solid var(--edge); overflow: hidden; }
+  .cv-card-prog-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, color-mix(in srgb, var(--cv-c, var(--acc)) 50%, var(--acc)), var(--cv-c, var(--acc))); }
+  .cv-card-progv { font-family: var(--font-mono); font-size: 9px; color: var(--ink3); white-space: nowrap; }
   /* Node inspector — slides in from the right edge on node click; pin keeps it. */
   .canvas-graph-inspector {
     position: absolute; top: 0; right: 0; bottom: 0; width: 420px; max-width: 92%;

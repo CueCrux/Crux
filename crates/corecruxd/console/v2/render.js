@@ -2604,7 +2604,7 @@
       if (index[key]) { return index[key]; }
       opts = opts || {};
       var n = { key: key, type: type, id: rawId, label: label || String(rawId), extra: extra || {},
-        sub: opts.sub || null, raw: opts.raw || null, strip: opts.strip || null };
+        sub: opts.sub || null, raw: opts.raw || null, strip: opts.strip || null, progress: opts.progress || null };
       index[key] = n; nodes.push(n); return n;
     }
     function edge(from, to, kind) { if (from && to) { edges.push({ from: from, to: to, kind: kind }); } }
@@ -2639,7 +2639,8 @@
       var when = graphRelTime(w.updated_at_unix_ms || w.created_at_unix_ms);
       add('work', w.id, w.title || w.id, { state: w.state, project: w.project_id, created_by: w.created_by_passport, milestone: w.current_milestone },
         { strip: workStageLite(w), raw: w,
-          sub: (w.state || 'work') + (w.created_by_passport ? (' · ' + w.created_by_passport) : '') + (when ? (' · ' + when) : '') });
+          sub: (w.state || 'work') + (w.created_by_passport ? (' · ' + w.created_by_passport) : '') + (when ? (' · ' + when) : ''),
+          progress: (w.milestones_total ? { done: w.milestones_done || 0, total: w.milestones_total, label: w.current_milestone } : null) });
       if (w.project_id) { edge('work:' + w.id, 'project:' + w.project_id, 'in-project'); }
       if (w.created_by_passport) { edge('work:' + w.id, 'passport:' + w.created_by_passport, 'created-by'); }
       if (w.assignee_passport) { edge('work:' + w.id, 'passport:' + w.assignee_passport, 'assigned-to'); }
@@ -2661,7 +2662,8 @@
     sessions.forEach(function (s) {
       var sid = s.session_id_hex || s.passport_id;
       var i = s.intent || {};
-      add('session', sid, (s.session_id_hex ? s.session_id_hex.slice(0, 8) : (s.passport_id || 'session')), { execplan: i.execplan_slug, milestone: i.milestone, passport: s.passport_id });
+      add('session', sid, (s.session_id_hex ? s.session_id_hex.slice(0, 8) : (s.passport_id || 'session')), { execplan: i.execplan_slug, milestone: i.milestone, passport: s.passport_id },
+        { progress: (i.milestones_total ? { done: i.milestones_done || 0, total: i.milestones_total, label: i.milestone } : null) });
       if (s.passport_id) { edge('session:' + sid, 'passport:' + s.passport_id, 'runs-as'); }
       var slug = i.execplan_slug;
       if (slug) {
@@ -2776,13 +2778,37 @@
     var layer = el('div', { 'class': 'cv-graph-layer' });
     layer.style.width = dims.width + 'px'; layer.style.height = dims.height + 'px';
     var svg = svgEl('svg', { 'class': 'cv-graph-edges', width: dims.width, height: dims.height, 'aria-hidden': 'true' });
+    // Arrowhead marker (userSpaceOnUse so it stays a constant size regardless of
+    // stroke width). Its fill tracks the edge stroke via context-stroke, so the
+    // head recolours when an edge lights up on selection.
+    var defs = svgEl('defs');
+    var marker = svgEl('marker', { id: 'cvArrow', viewBox: '0 0 10 10', refX: '8.5', refY: '5', markerWidth: '7', markerHeight: '7', orient: 'auto-start-reverse', markerUnits: 'userSpaceOnUse' });
+    marker.appendChild(svgEl('path', { 'class': 'cv-arrowhead', d: 'M0 0 L10 5 L0 10 z' }));
+    defs.appendChild(marker); svg.appendChild(defs);
     layer.appendChild(svg);
     function cx(n) { return n.x + (n.w || 300) / 2; }
     function cy(n) { return n.y + (n.h || 106) / 2; }
+    // Where the segment from a node's centre toward (tx,ty) exits its card rect —
+    // so edges start/end on the card border (arrowheads land on the edge, and the
+    // line never disappears under a card).
+    function borderPoint(n, tx, ty) {
+      var ox = cx(n), oy = cy(n), dx = tx - ox, dy = ty - oy;
+      if (!dx && !dy) { return { x: ox, y: oy }; }
+      var hw = (n.w || 300) / 2, hh = (n.h || 106) / 2;
+      var s = Math.min(dx ? hw / Math.abs(dx) : Infinity, dy ? hh / Math.abs(dy) : Infinity);
+      return { x: ox + dx * s, y: oy + dy * s };
+    }
     var edgeEls = [];
     model.edges.forEach(function (e) {
       var a = index[e.from], b = index[e.to]; if (!a || !b) { return; }
-      var ln = svgEl('path', { 'class': 'cv-gedge', d: 'M' + cx(a) + ' ' + cy(a) + ' L' + cx(b) + ' ' + cy(b) });
+      var p0 = borderPoint(a, cx(b), cy(b)), p1 = borderPoint(b, cx(a), cy(a));
+      // Gentle horizontal S-curve (control points share each endpoint's y at the
+      // midpoint x) — reads cleanly in the column layout.
+      var mx = (p0.x + p1.x) / 2;
+      var d = 'M' + p0.x.toFixed(1) + ' ' + p0.y.toFixed(1) +
+        ' C' + mx.toFixed(1) + ' ' + p0.y.toFixed(1) + ' ' + mx.toFixed(1) + ' ' + p1.y.toFixed(1) + ' ' + p1.x.toFixed(1) + ' ' + p1.y.toFixed(1);
+      var ln = svgEl('path', { 'class': 'cv-gedge', d: d, 'marker-end': 'url(#cvArrow)' });
+      if (e.kind) { ln.setAttribute('data-kind', e.kind); }
       ln.__from = e.from; ln.__to = e.to; svg.appendChild(ln); edgeEls.push(ln);
     });
     var cardEls = {};
@@ -2796,6 +2822,15 @@
       card.appendChild(head);
       card.appendChild(el('div', { 'class': 'cv-card-title', text: n.label }));
       if (n.sub) { card.appendChild(el('div', { 'class': 'cv-card-sub', text: n.sub })); }
+      // Milestone progress bar on work / session nodes — the fill tracks the
+      // node's accent colour (--cv-c), so the bar reads as "this node's progress".
+      if (n.progress && n.progress.total) {
+        var pv = Math.max(0, Math.min(100, Math.round((n.progress.done / n.progress.total) * 100)));
+        var ptrack = el('div', { 'class': 'cv-card-prog' }, [el('div', { 'class': 'cv-card-prog-fill' })]);
+        ptrack.firstChild.style.width = pv + '%';
+        var plabel = (n.progress.label ? (n.progress.label + ' · ') : '') + n.progress.done + '/' + n.progress.total;
+        card.appendChild(el('div', { 'class': 'cv-card-progrow' }, [ptrack, el('span', { 'class': 'cv-card-progv', text: plabel })]));
+      }
       var idline = (n.extra && n.extra.session_id) || (n.type === 'work' ? n.id : null);
       if (idline) { card.appendChild(el('div', { 'class': 'cv-card-id', text: idline })); }
       function open() { select(n.key); onSelect(n); }
@@ -2807,11 +2842,24 @@
 
     var view = { tx: 16, ty: 16, scale: 1 };
     function apply() { layer.style.transform = 'translate(' + view.tx + 'px,' + view.ty + 'px) scale(' + view.scale + ')'; }
-    apply();
+    // Fit-to-viewport: scale + centre the whole graph into the stage so it lands
+    // on-screen without panning. When a node is focused the inspector slides in
+    // over the right edge, so reserve that width and centre in the space left.
+    function fitView() {
+      var sw = stage.clientWidth || 960, sh = stage.clientHeight || 640, pad = 30;
+      var reserveR = (focus && focus.type && focus.id != null) ? 380 : 0;
+      var availW = Math.max(260, sw - reserveR - pad * 2), availH = Math.max(200, sh - pad * 2);
+      var s = Math.max(0.42, Math.min(availW / dims.width, availH / dims.height, 1.15));
+      view.scale = s;
+      view.tx = pad + Math.max(0, (availW - dims.width * s) / 2);
+      view.ty = pad + Math.max(0, (availH - dims.height * s) / 2);
+      apply();
+    }
+    fitView();
     function select(key) {
       if (key == null) {
         Object.keys(cardEls).forEach(function (k) { cardEls[k].classList.remove('is-sel'); cardEls[k].classList.remove('is-dim'); });
-        edgeEls.forEach(function (ln) { ln.classList.remove('is-dim'); });
+        edgeEls.forEach(function (ln) { ln.classList.remove('is-dim'); ln.classList.remove('is-hot'); });
         return;
       }
       var nbr = graphNeighbourhood(model.edges, key); nbr[key] = true;
@@ -2820,7 +2868,11 @@
         cardEls[k].classList.toggle('is-sel', k === key);
         cardEls[k].classList.toggle('is-dim', hasLinks && !nbr[k]);
       });
-      edgeEls.forEach(function (ln) { ln.classList.toggle('is-dim', hasLinks && !(nbr[ln.__from] && nbr[ln.__to])); });
+      edgeEls.forEach(function (ln) {
+        var touches = ln.__from === key || ln.__to === key;
+        ln.classList.toggle('is-hot', touches);   // the selected node's own edges light up + flow faster
+        ln.classList.toggle('is-dim', hasLinks && !(nbr[ln.__from] && nbr[ln.__to]));
+      });
     }
 
     // Pan (drag on empty stage) + wheel zoom. A click on empty space (no drag)
@@ -2903,7 +2955,7 @@
           work: { work: dWork },
           gates: { pending: demoData('needsYou') || [] },
           passports: { passports: Object.keys(passIds).map(function (id) { return { id: id, name: id }; }) },
-          sessions: { active_sessions: dSess.map(function (s) { return { session_id_hex: s.session_id, passport_id: s.passport_id, intent: { execplan_slug: s.execplan_slug, milestone: null } }; }) }
+          sessions: { active_sessions: dSess.map(function (s) { return { session_id_hex: s.session_id, passport_id: s.passport_id, intent: { execplan_slug: s.execplan_slug, milestone: (s.milestones_total ? ('M' + (s.milestones_done || 0) + '/' + s.milestones_total) : null), milestones_done: s.milestones_done, milestones_total: s.milestones_total } }; }) }
         });
         if (demoModel.nodes.length) {
           model = demoModel;
