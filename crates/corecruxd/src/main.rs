@@ -33,6 +33,10 @@ mod control;
 mod coord;
 mod cost;
 mod cost_attribution;
+// Credit-burn M1a staged primitive; wired into request paths in a later
+// gated milestone after the money-path design review.
+#[allow(dead_code)]
+mod credit_meter;
 // Dataplane store stubs: proprietary edition provides the real implementation.
 #[allow(dead_code)]
 mod dataplane_store;
