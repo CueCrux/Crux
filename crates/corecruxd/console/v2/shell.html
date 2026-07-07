@@ -1694,7 +1694,10 @@
   .cv-pulse.is-dim { opacity: 0 !important; }
   /* Node cards */
   .cv-card {
-    position: absolute; width: 300px; box-sizing: border-box; padding: 12px 14px;
+    position: absolute; width: 300px; height: 128px; box-sizing: border-box; padding: 12px 14px;
+    /* Uniform height (matches CARD_H in render.js) so every node's edge ports line
+       up; content is vertically centred so short nodes don't read as top-heavy. */
+    display: flex; flex-direction: column; justify-content: center; overflow: hidden;
     border: 1px solid var(--edge); border-left: 3px solid var(--cv-c, var(--ink3)); border-radius: 12px;
     /* Frosted glass: a semi-transparent backing + backdrop blur, so a wire that
        passes UNDER a card is softened/blurred (reads as "behind glass") while
@@ -2968,7 +2971,7 @@
 <script>
 (function () {
   'use strict';
-  var SW_REV = 'ushell-v2-r3';   // keep in lock-step with /console-v2/sw.js
+  var SW_REV = 'ushell-v2-r4';   // keep in lock-step with /console-v2/sw.js
   if (!('serviceWorker' in navigator)) { return; }
   // Dev bypass — when the daemon serves this shell from CORECRUXD_CONSOLE_DEV_PATH
   // it stamps window.__CRUX_CONSOLE_DEV__ (see console.rs inject_console_dev_flag).

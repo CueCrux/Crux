@@ -2683,7 +2683,7 @@
   // node carries its top-left x/y + card w/h; edges connect card centres.
   function layoutGraph(nodes) {
     var COLS = ['session', 'work', 'gate', 'project', 'passport', 'repo'];
-    var CARD_W = 300, CARD_H = 106;
+    var CARD_W = 300, CARD_H = 128;   // uniform node height (CSS .cv-card matches) so port anchors line up
     var byType = {};
     nodes.forEach(function (n) { (byType[n.type] || (byType[n.type] = [])).push(n); });
     var used = COLS.filter(function (t) { return (byType[t] || []).length; });
