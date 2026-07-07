@@ -601,6 +601,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         local_ingest_enabled: config.local_ingest_enabled,
         stream_receipts_enabled: config.stream_receipts_enabled,
         usage_receipts_enabled: config.usage_receipts_enabled,
+        handoff_observations_enabled: config.handoff_observations_enabled,
         usage_submit: config.usage_submit.clone(),
         // Phase T (M2) version-notify slot; the consent-gated usage submitter
         // writes the collector-reported latest release here, `/v1/version` reads it.
@@ -4189,6 +4190,7 @@ mod tests {
             local_ingest_enabled: false,
             stream_receipts_enabled: false,
             usage_receipts_enabled: false,
+            handoff_observations_enabled: false,
             usage_submit: crate::usage_submit::UsageSubmitConfig::default(),
             latest_release: std::sync::Arc::new(std::sync::RwLock::new(None)),
             quota_enabled: false,

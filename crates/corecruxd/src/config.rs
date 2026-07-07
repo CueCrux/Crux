@@ -483,6 +483,11 @@ pub struct Config {
     // Default OFF (`CORECRUXD_FEATURE_USAGE_RECEIPTS=1`).
     pub usage_receipts_enabled: bool,
 
+    // Phase T S1 faithful handoff measurement. When enabled, workbench
+    // handoff-v2 writes a local signed observation with source/target vendor
+    // passport attribution. Default OFF (`CORECRUXD_HANDOFF_OBSERVATIONS=1`).
+    pub handoff_observations_enabled: bool,
+
     // Phase T (M1) opt-in usage-ping *submitter* — the only sanctioned
     // outbound path. All three legs are default-absent so a fresh install
     // dials nothing (`CORECRUXD_USAGE_RECEIPTS_SUBMIT` / `_ENDPOINT` /
@@ -1175,6 +1180,7 @@ pub fn load_config() -> Config {
         local_ingest_enabled: env_bool("CORECRUXD_LOCAL_INGEST").unwrap_or(false),
         stream_receipts_enabled: env_bool("CORECRUXD_STREAM_RECEIPTS").unwrap_or(false),
         usage_receipts_enabled: env_bool("CORECRUXD_FEATURE_USAGE_RECEIPTS").unwrap_or(false),
+        handoff_observations_enabled: env_bool("CORECRUXD_HANDOFF_OBSERVATIONS").unwrap_or(false),
         // Phase T (M1) opt-in submitter — the daemon's only outbound signal.
         // All three legs default to absent/false: a fresh install dials
         // nothing. No hardcoded endpoint.
@@ -1651,6 +1657,8 @@ mod tests {
         // to 15 min. Explicit `CORECRUXD_COORD=0` disables it.
         assert!(cfg.coord_enabled);
         assert_eq!(cfg.coord_presence_ttl_secs, crate::coord::DEFAULT_PRESENCE_TTL_SECS);
+        // Phase T S1 handoff observations are default OFF.
+        assert!(!cfg.handoff_observations_enabled);
     }
 
     #[test]

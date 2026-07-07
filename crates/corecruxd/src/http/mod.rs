@@ -212,6 +212,11 @@ pub struct AppState {
     /// (`CORECRUXD_FEATURE_USAGE_RECEIPTS=1`); when off the draft hits the
     /// legacy tool-mediation parse and is rejected, exactly as before.
     pub usage_receipts_enabled: bool,
+    /// Phase T S1 faithful handoff measurement. Default OFF
+    /// (`CORECRUXD_HANDOFF_OBSERVATIONS=1`); when enabled,
+    /// `/v1/workbench/handoff-v2` writes a local signed `kind="handoff"`
+    /// observation with source/target vendor passport attribution.
+    pub handoff_observations_enabled: bool,
     /// Phase T (M1) consent-gated opt-in usage-ping *submitter* config — the
     /// daemon's only sanctioned outbound signal. Default-absent on every leg
     /// (`CORECRUXD_USAGE_RECEIPTS_SUBMIT` / `_ENDPOINT` / `_CONSENT_AT`); the
