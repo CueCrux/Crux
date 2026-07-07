@@ -2789,25 +2789,45 @@
     svg.appendChild(defs);
     layer.appendChild(svg);
     var reduceMotion = (typeof window !== 'undefined' && window.matchMedia) ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false;
-    function nodeC(n) { var w = n.w || 300, h = n.h || 106; return { x: n.x + w / 2, y: n.y + h / 2, w: w, h: h }; }
-    // Exit point on a node's rect toward (tx,ty), OUTSET a few px so a straight
-    // wire stops just past the border and the arrowhead lands right at the box
-    // edge (the MediaCrux diagram-builder model).
-    function edgePoint(c, tx, ty) {
-      var dx = tx - c.x, dy = ty - c.y; if (!dx && !dy) { return { x: c.x, y: c.y }; }
-      var hw = c.w / 2 + 7, hh = c.h / 2 + 7;
-      var s = Math.min(hw / Math.abs(dx || 1e-6), hh / Math.abs(dy || 1e-6));
-      return { x: c.x + dx * s, y: c.y + dy * s };
+    // --- Edge routing with attachment "ports" -----------------------------
+    // Each edge attaches to the SIDE of a node that faces the other node, at a
+    // point distributed along that side — so multiple wires sharing one side fan
+    // out evenly instead of piling onto a single spot. Recomputed on every drag.
+    function nodeBox(n) { var w = n.w || 300, h = n.h || 106; return { x: n.x, y: n.y, w: w, h: h, cx: n.x + w / 2, cy: n.y + h / 2 }; }
+    function facingSide(a, b) { var dx = b.cx - a.cx, dy = b.cy - a.cy; return (Math.abs(dx) >= Math.abs(dy)) ? (dx >= 0 ? 'right' : 'left') : (dy >= 0 ? 'bottom' : 'top'); }
+    function anchor(box, side, slot, count) {
+      var OUT = 6, PAD = 0.16;                        // OUT: sit just off the border · PAD: keep ports off the corners
+      var t = count <= 1 ? 0.5 : PAD + (slot / (count - 1)) * (1 - 2 * PAD);
+      if (side === 'left') { return { x: box.x - OUT, y: box.y + box.h * t }; }
+      if (side === 'right') { return { x: box.x + box.w + OUT, y: box.y + box.h * t }; }
+      if (side === 'top') { return { x: box.x + box.w * t, y: box.y - OUT }; }
+      return { x: box.x + box.w * t, y: box.y + box.h + OUT };   // bottom
     }
-    // Straight wire between two nodes' border-exit points — recomputed live while a
-    // node is dragged so wires + pulses follow it.
-    function layoutEdge(eo) {
-      var a = index[eo.from], b = index[eo.to]; if (!a || !b) { return; }
-      var ca = nodeC(a), cb = nodeC(b);
-      var p1 = edgePoint(ca, cb.x, cb.y), p2 = edgePoint(cb, ca.x, ca.y);
-      eo.wire.setAttribute('d', 'M' + p1.x.toFixed(1) + ' ' + p1.y.toFixed(1) + ' L' + p2.x.toFixed(1) + ' ' + p2.y.toFixed(1));
-      eo.p1 = p1; eo.p2 = p2;
-      if (eo.pulse) { eo.pulse.setAttribute('cx', p1.x.toFixed(1)); eo.pulse.setAttribute('cy', p1.y.toFixed(1)); }
+    function layoutEdges() {
+      var boxes = {}; model.nodes.forEach(function (n) { boxes[n.key] = nodeBox(n); });
+      var ports = {};                                 // "nodeKey|side" -> [{ eo, end, otherCx, otherCy }]
+      edgeObjs.forEach(function (eo) {
+        var a = boxes[eo.from], b = boxes[eo.to]; if (!a || !b) { return; }
+        var sa = facingSide(a, b), sb = facingSide(b, a);
+        (ports[eo.from + '|' + sa] = ports[eo.from + '|' + sa] || []).push({ eo: eo, end: 'a', otherCx: b.cx, otherCy: b.cy });
+        (ports[eo.to + '|' + sb] = ports[eo.to + '|' + sb] || []).push({ eo: eo, end: 'b', otherCx: a.cx, otherCy: a.cy });
+      });
+      Object.keys(ports).forEach(function (pk) {
+        var list = ports[pk], sep = pk.lastIndexOf('|'), nodeKey = pk.slice(0, sep), side = pk.slice(sep + 1), box = boxes[nodeKey];
+        var horiz = (side === 'left' || side === 'right');
+        // Order ports by the OTHER endpoint's cross-axis position so wires meeting
+        // one side don't cross each other at the attachment.
+        list.sort(function (p, q) { return horiz ? (p.otherCy - q.otherCy) : (p.otherCx - q.otherCx); });
+        list.forEach(function (item, i) {
+          var pt = anchor(box, side, i, list.length);
+          if (item.end === 'a') { item.eo.p1 = pt; } else { item.eo.p2 = pt; }
+        });
+      });
+      edgeObjs.forEach(function (eo) {
+        if (!eo.p1 || !eo.p2) { return; }
+        eo.wire.setAttribute('d', 'M' + eo.p1.x.toFixed(1) + ' ' + eo.p1.y.toFixed(1) + ' L' + eo.p2.x.toFixed(1) + ' ' + eo.p2.y.toFixed(1));
+        if (eo.pulse) { eo.pulse.setAttribute('cx', eo.p1.x.toFixed(1)); eo.pulse.setAttribute('cy', eo.p1.y.toFixed(1)); }
+      });
     }
     var edgeObjs = [], edgeEls = [];
     model.edges.forEach(function (e, i) {
@@ -2816,12 +2836,11 @@
       if (e.kind) { wire.setAttribute('data-kind', e.kind); }
       wire.__from = e.from; wire.__to = e.to;
       svg.appendChild(wire);
-      var eo = { from: e.from, to: e.to, wire: wire, pulse: null, phase: (i % 10) / 10 };
+      var eo = { from: e.from, to: e.to, wire: wire, pulse: null, phase: (i % 10) / 10, p1: null, p2: null };
       if (!reduceMotion) { var pulse = svgEl('circle', { 'class': 'cv-pulse', r: '3.2' }); svg.appendChild(pulse); eo.pulse = pulse; }
-      layoutEdge(eo);
       wire.__eo = eo; edgeObjs.push(eo); edgeEls.push(wire);
     });
-    function relayoutEdges() { edgeObjs.forEach(layoutEdge); }
+    layoutEdges();
     // Flow pulses travel source → target along each wire, fading in/out at the ends.
     var rafId = null;
     if (!reduceMotion && edgeObjs.length && typeof window !== 'undefined' && window.requestAnimationFrame) {
@@ -2873,7 +2892,7 @@
           n.x = Math.max(0, ox + (e.clientX - sx) / view.scale);
           n.y = Math.max(0, oy + (e.clientY - sy) / view.scale);
           card.style.left = n.x + 'px'; card.style.top = n.y + 'px';
-          relayoutEdges();
+          layoutEdges();
         }
         function up() {
           window.removeEventListener('mousemove', mv); window.removeEventListener('mouseup', up);

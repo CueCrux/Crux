@@ -1696,10 +1696,11 @@
   .cv-card {
     position: absolute; width: 300px; box-sizing: border-box; padding: 12px 14px;
     border: 1px solid var(--edge); border-left: 3px solid var(--cv-c, var(--ink3)); border-radius: 12px;
-    /* Opaque backing (bg) under the glass tint so edges routed BEHIND a card are
-       fully hidden — only the open-channel segments of an edge stay visible, so
-       the connector layer reads cleanly instead of bleeding through the cards. */
-    background-color: var(--bg); background-image: linear-gradient(0deg, var(--surface), var(--surface));
+    /* Frosted glass: a semi-transparent backing + backdrop blur, so a wire that
+       passes UNDER a card is softened/blurred (reads as "behind glass") while
+       arrowheads sitting just off the box edge stay sharp. */
+    background: color-mix(in srgb, var(--bg) 60%, transparent);
+    backdrop-filter: blur(8px) saturate(1.15); -webkit-backdrop-filter: blur(8px) saturate(1.15);
     box-shadow: var(--card-shadow); cursor: grab; outline: none; user-select: none;
     transition: border-color .12s ease, box-shadow .15s ease, transform .12s ease;
   }
@@ -2967,7 +2968,7 @@
 <script>
 (function () {
   'use strict';
-  var SW_REV = 'ushell-v2-r2';   // keep in lock-step with /console-v2/sw.js
+  var SW_REV = 'ushell-v2-r3';   // keep in lock-step with /console-v2/sw.js
   if (!('serviceWorker' in navigator)) { return; }
   // Dev bypass — when the daemon serves this shell from CORECRUXD_CONSOLE_DEV_PATH
   // it stamps window.__CRUX_CONSOLE_DEV__ (see console.rs inject_console_dev_flag).
