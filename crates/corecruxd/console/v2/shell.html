@@ -1685,14 +1685,19 @@
   /* Directional flow edges: a dashed stroke that marches from source → target
      (stroke-dashoffset animation), tipped with an arrowhead marker. The head
      tracks the edge stroke via context-stroke, so it recolours when hot. */
+  /* Dark casing painted under each edge: reads as a distinct connector layer in
+     the open channels between columns (behind-box runs are occluded by the
+     opaque cards, so only the transition segments show). */
+  .cv-gedge-casing { stroke: var(--bg); stroke-width: 5; fill: none; stroke-linecap: round; opacity: .9; }
+  .cv-gedge-casing.is-dim { opacity: .08; }
   .cv-gedge {
-    stroke: var(--edge-strong); stroke-width: 1.6; fill: none; opacity: .82;
+    stroke: var(--edge-strong); stroke-width: 2.2; fill: none; opacity: .95;
     stroke-linecap: round; stroke-dasharray: 5 7;
     animation: cv-flow 1.4s linear infinite;
   }
   .cv-arrowhead { fill: context-stroke; stroke: none; }
-  .cv-gedge.is-hot { stroke: var(--acc); opacity: 1; stroke-width: 2.1; animation-duration: .7s; }
-  .cv-gedge.is-dim { opacity: .1; animation: none; stroke-dasharray: none; }
+  .cv-gedge.is-hot { stroke: var(--acc); opacity: 1; stroke-width: 2.8; animation-duration: .7s; }
+  .cv-gedge.is-dim { opacity: .12; animation: none; stroke-dasharray: none; }
   @keyframes cv-flow { to { stroke-dashoffset: -24; } }
   @media (prefers-reduced-motion: reduce) { .cv-gedge { animation: none; stroke-dasharray: none; } }
   /* Node cards */

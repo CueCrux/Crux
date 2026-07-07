@@ -2782,8 +2782,8 @@
     // stroke width). Its fill tracks the edge stroke via context-stroke, so the
     // head recolours when an edge lights up on selection.
     var defs = svgEl('defs');
-    var marker = svgEl('marker', { id: 'cvArrow', viewBox: '0 0 10 10', refX: '8.5', refY: '5', markerWidth: '7', markerHeight: '7', orient: 'auto-start-reverse', markerUnits: 'userSpaceOnUse' });
-    marker.appendChild(svgEl('path', { 'class': 'cv-arrowhead', d: 'M0 0 L10 5 L0 10 z' }));
+    var marker = svgEl('marker', { id: 'cvArrow', viewBox: '0 0 10 10', refX: '9', refY: '5', markerWidth: '11', markerHeight: '11', orient: 'auto-start-reverse', markerUnits: 'userSpaceOnUse' });
+    marker.appendChild(svgEl('path', { 'class': 'cv-arrowhead', d: 'M1 1 L9.5 5 L1 9 L3 5 z' }));
     defs.appendChild(marker); svg.appendChild(defs);
     layer.appendChild(svg);
     function cx(n) { return n.x + (n.w || 300) / 2; }
@@ -2801,15 +2801,26 @@
     var edgeEls = [];
     model.edges.forEach(function (e) {
       var a = index[e.from], b = index[e.to]; if (!a || !b) { return; }
-      var p0 = borderPoint(a, cx(b), cy(b)), p1 = borderPoint(b, cx(a), cy(a));
+      var p0 = borderPoint(a, cx(b), cy(b)), pe = borderPoint(b, cx(a), cy(a));
+      // Pull the endpoint a few px OUT of the target card so the arrowhead lands
+      // in the open channel at the box edge — the cards paint on top of the edge
+      // layer, so a head sitting on the border would be hidden under the box.
+      var vx = pe.x - p0.x, vy = pe.y - p0.y, vlen = Math.sqrt(vx * vx + vy * vy) || 1;
+      var GAP = 11;
+      var p1 = { x: pe.x - (vx / vlen) * GAP, y: pe.y - (vy / vlen) * GAP };
       // Gentle horizontal S-curve (control points share each endpoint's y at the
       // midpoint x) — reads cleanly in the column layout.
       var mx = (p0.x + p1.x) / 2;
       var d = 'M' + p0.x.toFixed(1) + ' ' + p0.y.toFixed(1) +
         ' C' + mx.toFixed(1) + ' ' + p0.y.toFixed(1) + ' ' + mx.toFixed(1) + ' ' + p1.y.toFixed(1) + ' ' + p1.x.toFixed(1) + ' ' + p1.y.toFixed(1);
+      // A dark casing under the coloured dash makes each edge read as its own
+      // layer where it crosses open space (behind-box segments are occluded by
+      // the opaque cards, so the visible run is the transition channel).
+      var casing = svgEl('path', { 'class': 'cv-gedge-casing', d: d });
       var ln = svgEl('path', { 'class': 'cv-gedge', d: d, 'marker-end': 'url(#cvArrow)' });
       if (e.kind) { ln.setAttribute('data-kind', e.kind); }
-      ln.__from = e.from; ln.__to = e.to; svg.appendChild(ln); edgeEls.push(ln);
+      ln.__from = e.from; ln.__to = e.to; ln.__casing = casing;
+      svg.appendChild(casing); svg.appendChild(ln); edgeEls.push(ln);
     });
     var cardEls = {};
     model.nodes.forEach(function (n) {
@@ -2859,7 +2870,7 @@
     function select(key) {
       if (key == null) {
         Object.keys(cardEls).forEach(function (k) { cardEls[k].classList.remove('is-sel'); cardEls[k].classList.remove('is-dim'); });
-        edgeEls.forEach(function (ln) { ln.classList.remove('is-dim'); ln.classList.remove('is-hot'); });
+        edgeEls.forEach(function (ln) { ln.classList.remove('is-dim'); ln.classList.remove('is-hot'); if (ln.__casing) { ln.__casing.classList.remove('is-dim'); } });
         return;
       }
       var nbr = graphNeighbourhood(model.edges, key); nbr[key] = true;
@@ -2870,8 +2881,10 @@
       });
       edgeEls.forEach(function (ln) {
         var touches = ln.__from === key || ln.__to === key;
+        var dim = hasLinks && !(nbr[ln.__from] && nbr[ln.__to]);
         ln.classList.toggle('is-hot', touches);   // the selected node's own edges light up + flow faster
-        ln.classList.toggle('is-dim', hasLinks && !(nbr[ln.__from] && nbr[ln.__to]));
+        ln.classList.toggle('is-dim', dim);
+        if (ln.__casing) { ln.__casing.classList.toggle('is-dim', dim); }
       });
     }
 
