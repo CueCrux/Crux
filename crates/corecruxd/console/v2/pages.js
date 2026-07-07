@@ -299,10 +299,13 @@
       ] };
     var head = { h: 'Projects', sub: 'a project pairs repos to track + search, a planning repo for ExecPlans, passports and working tenants', wide: true,
       controls: [{ t: 'search', ph: 'Filter projects…' }, newProject, addRepos] };
-    if (!res.ok || !res.data) {
-      return [{ h: head.h, sub: head.sub, wide: true, controls: head.controls.concat(degraded(res.status, 'Projects unavailable — GET /v1/projects (needs admin:read)')) }];
+    // Demo mode: override with the projects fixture so the layout shows a fuller
+    // portfolio than a fresh local daemon's single default project.
+    if (typeof window !== 'undefined' && window.CRUX_DEMO && CruxDemo.projects) { res = { ok: true, data: { projects: CruxDemo.projects } }; }
+    var ps = (res && res.ok && res.data) ? arr(res.data.projects) : [];
+    if (!ps.length && (!res || !res.ok || !res.data)) {
+      return [{ h: head.h, sub: head.sub, wide: true, controls: head.controls.concat(degraded((res && res.status) || 0, 'Projects unavailable — GET /v1/projects (needs admin:read)')) }];
     }
-    var ps = arr(res.data.projects);
     var rows = head.controls.slice();
     ps.forEach(function (p) {
       var strip = p.archived ? 'done' : (p.is_default ? 'in_progress' : 'planned');   // pro-board left strip
@@ -1367,6 +1370,13 @@
         { session_id: 'sess_a1b2c3d4', execplan_slug: 'cruxengine-carry-all', passport_id: 'p_haiku_bench', status: 'idle', turn_count: 12, tenant_id: 'bench', updated_at: new Date(NOW - 6 * HOUR).toISOString() },
         { session_id: 'sess_9c5a9271', execplan_slug: 'unified-shell-console', passport_id: 'p_opus_local', status: 'idle', turn_count: 156, tenant_id: 'default', updated_at: new Date(NOW - 1 * DAY).toISOString() },
         { session_id: 'sess_e6f81234', execplan_slug: 'wikicrux-agent-first', passport_id: 'p_sonnet_ce4e6c', status: 'archived', archived: true, turn_count: 73, tenant_id: 'default', updated_at: new Date(NOW - 3 * DAY).toISOString() }
+      ],
+      // Projects — a project pairs repos + a planning repo for ExecPlans (repo grid
+      // fills from projectRepos above when a card is expanded in demo mode).
+      projects: [
+        { id: 'crux-daemon', name: 'Crux Daemon', is_default: true, planning_target: 'PlanCrux', default_passport_id: 'p_opus_local', created_at_unix_ms: NOW - 90 * DAY },
+        { id: 'cruxengine', name: 'CruxEngine', planning_target: 'PlanCrux', default_passport_id: 'p_sonnet_ce4e6c', created_at_unix_ms: NOW - 60 * DAY },
+        { id: 'wikicrux', name: 'WikiCrux', planning_target: 'PlanCrux', created_at_unix_ms: NOW - 30 * DAY }
       ],
       facts: [
         { entity: 'execplan:unified-shell-console', key: 'gate:M6', value: '{ status: passing, commit_sha: 1a60d25 }', stored_at: new Date(NOW - 3 * HOUR).toISOString() },
